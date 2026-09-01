@@ -1723,6 +1723,13 @@ static void hle_CreateTlspl(void) {
     uint32_t align = 4;
     if (opt && psp_mem_ptr(opt, 8)) {
         const uint32_t a = psp_read32(opt + 4);
+        /* And it must be a power of two, refused with the *partition* code --
+         * which is what an fpl does with the same field, and the one thing
+         * about either that could not have been guessed. */
+        if (a && (a & (a - 1))) {
+            psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
+            return;
+        }
         if (a > align) align = a;
     }
     const uint32_t stride = (bsize + align - 1) & ~(align - 1);
