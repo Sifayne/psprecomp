@@ -449,10 +449,15 @@ static a_op decode_cop2(uint32_t w, uint32_t addr, a_insn *in) {
     switch (RS_F(w)) {
     case 0x00: return A_MFC1;    /* mfc2: integer move, no vector register */
     case 0x02: return A_CFC1;    /* cfc2 */
-    case 0x03: return A_MFV;
+    /* Bit 7 of the register field selects the VFPU *control* registers, which
+     * are a different instruction with a different register file. Folding them
+     * in with the vector moves would silently read or write lane (imm & 0x7F)
+     * instead -- plausible numbers from the wrong place. Named separately so
+     * they trap until something needs them. */
+    case 0x03: return (w & 0x80) ? A_MFVC : A_MFV;
     case 0x04: return A_MTC1;    /* mtc2 */
     case 0x06: return A_CTC1;    /* ctc2 */
-    case 0x07: return A_MTV;
+    case 0x07: return (w & 0x80) ? A_MTVC : A_MTV;
     case 0x08:
         switch (RT_F(w) & 3) {
         case 0: set_branch(in, addr, 0); return A_BVF;

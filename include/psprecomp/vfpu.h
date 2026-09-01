@@ -107,6 +107,19 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size, int homogeneous);
 void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 
+/* Integer/vector moves: mfv and mtv.
+ *
+ * The value crosses as a *bit pattern*, not a number -- these are how a game
+ * gets a float into the vector file without a round trip through memory, and
+ * how it reads one back out. No conversion, and no prefix: the prefix
+ * registers rewrite the operands of arithmetic, and a move is not arithmetic.
+ *
+ * `vd` is the single-register form of the 7-bit field, so it addresses one
+ * lane. The control-register variants (mfvc/mtvc, bit 7 of the field set) are
+ * a different instruction and are not these. */
+uint32_t psp_mfv(uint32_t vd);
+void     psp_mtv(uint32_t vd, uint32_t bits);
+
 /* Prefix state. Set by vpfxs/vpfxt/vpfxd; consumed (and cleared) by the next
  * arithmetic instruction. While any is pending, arithmetic traps. */
 void psp_vfpu_set_prefix(int which, uint32_t value);

@@ -76,6 +76,20 @@ int psp_vfpu_regs(uint32_t vreg, int size, int out[4]) {
     return len;
 }
 
+/* ---- integer/vector moves ------------------------------------------------ */
+
+uint32_t psp_mfv(uint32_t vd) {
+    int r[4];
+    psp_vfpu_regs(vd, 1, r);
+    return psp_f32_to_bits(psp_cpu.v[r[0]]);
+}
+
+void psp_mtv(uint32_t vd, uint32_t bits) {
+    int r[4];
+    psp_vfpu_regs(vd, 1, r);
+    psp_cpu.v[r[0]] = psp_bits_to_f32(bits);
+}
+
 /* ---- load / store -------------------------------------------------------- */
 
 void psp_lv_s(uint32_t vt, uint32_t addr) {
@@ -381,7 +395,23 @@ void psp_vmmov(uint32_t vd, uint32_t vs, int size) {
  * overlapping pair still produces a defined result here rather than depending
  * on lane order. */
 void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm, int size) {
-    const float arg = psp_cpu.v[vs & 127];
+    if (!take_prefixes(psp_cpu.pc, "vrot")) return;
+
+    /* Through psp_vfpu_regs, like every other op in this file.
+     *
+     * This used to index psp_cpu.v[] directly -- `v[vs & 127]` for the angle
+     * and `v[(vd + i) & 127]` for each lane -- which is wrong twice. Lanes of a
+     * vector are 32 apart in the register file, not adjacent, so stepping by
+     * one walks across four different matrices; and the row offset in bit 6 is
+     * never applied, so a register naming row 2 writes row 0.
+     *
+     * pspgl's glRotatef is one vrot, and it showed both at once: the rotation
+     * landed in registers nobody read, leaving the identity behind, and what
+     * did get read came out two rows over. */
+    int s_reg[4], d[4];
+    psp_vfpu_regs(vs, 1, s_reg);
+    const float arg = psp_cpu.v[s_reg[0]];
+
     const unsigned cl = imm & 3;
     const unsigned sl = (imm >> 2) & 3;
 
@@ -389,12 +419,13 @@ void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm, int size) {
     const float c = cosf(arg * 1.5707963267948966f);
     if (imm & 0x10) s = -s;
 
-    for (int i = 0; i < size; i++) {
+    const int n = psp_vfpu_regs(vd, size, d);
+    for (int i = 0; i < n; i++) {
         float r;
         if (cl == sl) r = ((unsigned)i == cl) ? c : s;
         else          r = ((unsigned)i == cl) ? c
                         : ((unsigned)i == sl) ? s : 0.0f;
-        psp_cpu.v[(vd + i) & 127] = r;
+        psp_cpu.v[d[i]] = r;
     }
 }
 

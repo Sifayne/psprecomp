@@ -361,6 +361,12 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     /* --- VFPU: the subset with a real implementation. Everything else in the
        vector unit still falls through to a trap below, which is deliberate --
        see include/psprecomp/vfpu.h. --- */
+    case A_MFV:
+        if (DEST_ZERO(in->rt)) break;
+        fprintf(f, "%s%s = psp_mfv(%u);\n", ind, rt, in->vd); return;
+    case A_MTV:
+        fprintf(f, "%spsp_mtv(%u, %s);\n", ind, in->vd, rt); return;
+
     case A_LV_S:
         fprintf(f, "%spsp_lv_s(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
     case A_LV_Q:

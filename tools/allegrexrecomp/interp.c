@@ -330,6 +330,9 @@ static psp_interp_status exec_simple(const a_insn *in) {
     case A_MTC0: case A_CTC0: case A_MTIC:                  return I_RUNNING;
 
     /* --- VFPU: the subset with a real implementation behind it. --- */
+    case A_MFV: setr(in->rt, psp_mfv(in->vd));  return I_RUNNING;
+    case A_MTV: psp_mtv(in->vd, R(in->rt));     return I_RUNNING;
+
     case A_LV_S: psp_lv_s(in->vt, R(in->rs) + (in->imm & ~3)); return I_RUNNING;
     case A_LV_Q: psp_lv_q(in->vt, R(in->rs) + (in->imm & ~3)); return I_RUNNING;
     case A_SV_S: psp_sv_s(in->vt, R(in->rs) + (in->imm & ~3)); return I_RUNNING;
