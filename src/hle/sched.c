@@ -760,6 +760,11 @@ int psp_sched_suspend(uint32_t uid) {
     pthread_mutex_lock(&g_lock);
     const int s = slot_of(uid);
     if (s < 0) { pthread_mutex_unlock(&g_lock); return 0; }
+    /* A thread that has finished stays finished. Marking a dead slot SUSPENDED
+     * puts it back in the live count, where nothing can ever clear it -- the
+     * drain then waits out its whole deadline for a thread that ended long ago,
+     * and the test it belongs to never flushes its output. */
+    if (g_slot[s].state == PSP_SCHED_DEAD) { pthread_mutex_unlock(&g_lock); return 1; }
     const int running = (s == g_running);
     if (!running) {
         /* Somebody else: mark it and let it stay off the ready scan. Whatever

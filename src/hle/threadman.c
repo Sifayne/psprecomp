@@ -198,8 +198,12 @@ static void wait_deadlock(const char *what) {
  * clock to it -- and a caller that supplies none is not lied to, it stops the
  * run through wait_deadlock. There is no third case left to warn about. */
 
-/* Defined down with the waits, but needed by the signal above them. */
-static int sema_release(psp_sema *s);
+/* Defined down with the waits, but needed above them: by the signal, and by
+ * sceKernelWaitThreadEnd, which is a thread operation that happens to be a
+ * wait and so lives with the threads. */
+static int      sema_release(psp_sema *s);
+static uint64_t wait_deadline(uint32_t tmo_ptr);
+static void     wait_writeback(uint32_t tmo_ptr, uint64_t deadline);
 
 /* ---- threads ------------------------------------------------------------- */
 
@@ -380,7 +384,14 @@ static void hle_WaitThreadEnd(void) {
     const uint32_t thid    = psp_arg(0);
     const uint32_t timeout = psp_arg(1);
     psp_thread *t = find_thread(thid);
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+
+    /* The same deadline the other waits use. This one was left on the untimed
+     * path when they were converted, and it is not a wait that can be left
+     * there: a caller waiting on a thread that sleeps forever has a timeout
+     * precisely so that it can give up, and without one the whole run stops.
+     * threads/threads/threadend is that test, and it went silent. */
+    const uint64_t deadline = wait_deadline(timeout);
 
     /* Park until it ends. This is what drives a freshly started thread: nothing
      * runs it until the thread holding the token gives it up, and a caller
@@ -388,16 +399,23 @@ static void hle_WaitThreadEnd(void) {
     while (t->state != TH_DORMANT) {
         const uint32_t me = psp_sched_current();
         t->enders[t->nenders++ % MAX_SEMA_WAITERS] = me;
-        if (psp_sched_block(me, PSP_SCHED_BLOCKED, "sceKernelWaitThreadEnd") != 0) {
-            if (timeout) { psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT); return; }
+        const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
+                                             "sceKernelWaitThreadEnd", deadline);
+        if (rc == PSP_SCHED_EXPIRED) {
+            wait_writeback(timeout, deadline);
+            psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+            return;
+        }
+        if (rc != PSP_SCHED_WOKEN) {
             wait_deadlock("sceKernelWaitThreadEnd");
             psp_ret(SCE_KERNEL_ERROR_OK);
             return;
         }
         t = find_thread(thid);
-        if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+        if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
     }
 
+    wait_writeback(timeout, deadline);
     psp_ret(t->exit_status);
 }
 
@@ -438,19 +456,44 @@ static void hle_GetSystemTime(void) {
  * reprioritised one was still ordered by the priority it was created with,
  * forever. With real threads they are the difference between a test passing
  * and the wrong thread holding the CPU. */
+/* **A thread cannot suspend itself**, and neither call takes 0 to mean the
+ * current one -- both answer ILLEGAL_THID. threads/threads/suspend measures all
+ * eight situations for each:
+ *
+ *     Zero 80020197   Invalid 80020198   Created 800201a2   Ready 00000000
+ *     Finished 800201a2   Deleted 80020198   Suspended 800201a3
+ *     Current 80020197
+ *
+ * The self case is not a detail. Implementing suspend as "park until resumed"
+ * and letting a thread apply it to itself deadlocked that test outright, and it
+ * printed nothing at all -- the checkpoint buffer is only flushed at the end. */
 static void hle_SuspendThread(void) {
-    psp_thread *t = find_thread(psp_arg(0));
+    const uint32_t id = psp_arg(0);
+    if (id == 0 || id == psp_sched_current()) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
+        return;
+    }
+    psp_thread *t = find_thread(id);
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    /* Never started, or already finished. */
+    if (t->state == TH_DORMANT)   { psp_ret(SCE_KERNEL_ERROR_DORMANT); return; }
+    if (t->state == TH_SUSPENDED) { psp_ret(SCE_KERNEL_ERROR_SUSPEND); return; }
     t->state = TH_SUSPENDED;
-    /* Does not return until something resumes us, when the argument is our own
-     * uid -- which is the ordinary way a thread parks itself. */
     psp_sched_suspend(t->uid);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_ResumeThread(void) {
-    psp_thread *t = find_thread(psp_arg(0));
+    const uint32_t id = psp_arg(0);
+    if (id == 0 || id == psp_sched_current()) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
+        return;
+    }
+    psp_thread *t = find_thread(id);
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    /* Resuming anything that is not suspended is an error, including a thread
+     * that is merely ready -- the call is not idempotent. */
+    if (t->state != TH_SUSPENDED) { psp_ret(SCE_KERNEL_ERROR_NOT_SUSPEND); return; }
     t->state = TH_READY;
     psp_sched_resume(t->uid);
     psp_ret(SCE_KERNEL_ERROR_OK);
