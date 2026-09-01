@@ -3,6 +3,7 @@
 #include "emit.h"
 #include "decode.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,16 @@ typedef struct {
     const a_func *func;
     uint8_t *is_label;     /* per word, within the current function */
     uint8_t *is_slot;      /* per word: consumed as a delay slot */
+    /* Addresses some *other* function falls through into. Computed once for
+     * the whole module before emission, because the function that needs the
+     * label is not the one that discovers it needs to exist, and the two are
+     * emitted in address order — the consumer usually comes first.
+     *
+     * Without this the fall-through emitted below targets an address that has
+     * no label and no dispatch entry, so the jump misses and the continuation
+     * is lost anyway. In practice the lost continuation is an epilogue, and
+     * the symptom is a function returning with $sp still holding its frame. */
+    uint8_t *is_fallthrough_target;
     uint32_t *entries;     /* interior labels that got a dispatch thunk */
     int nentries, centries;
 } ectx;
@@ -38,20 +49,6 @@ static void entry_push(ectx *c, uint32_t a) {
     c->entries[c->nentries++] = a;
 }
 
-/* vfim carries a half-precision float. Expanding it here keeps the runtime
- * dealing only in single precision. */
-static float half_to_float(uint16_t h) {
-    const uint32_t sign = (uint32_t)(h >> 15) << 31;
-    const uint32_t exp  = (h >> 10) & 0x1F;
-    const uint32_t man  = h & 0x3FF;
-    uint32_t bits;
-    if (exp == 0)        bits = sign | (man ? ((127 - 15 + 1) << 23) | (man << 13) : 0);
-    else if (exp == 31)  bits = sign | 0x7F800000u | (man << 13);
-    else                 bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
-    float f;
-    memcpy(&f, &bits, sizeof f);
-    return f;
-}
 /* ---- helpers ------------------------------------------------------------- */
 
 static uint32_t widx(const a_analysis *an, uint32_t addr) {
@@ -435,10 +432,20 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_VIIM:
         fprintf(f, "%spsp_vimm(%u, %.1ff);\n", ind, in->vd, (double)in->imm);
         return;
-    case A_VFIM:
-        fprintf(f, "%spsp_vimm(%u, %.9gf);\n", ind, in->vd,
-                (double)half_to_float((uint16_t)in->imm));
+    /* `%g` drops the decimal point on whole values, so the `f` suffix lands on
+     * what C then reads as an integer constant -- `-1f` is not a literal and
+     * does not compile. `#` keeps the point. A half can also encode inf/NaN,
+     * neither of which has a literal form, so those are named instead. */
+    case A_VFIM: {
+        float v = a_half_to_float((uint16_t)in->imm);
+        if (isinf(v))
+            fprintf(f, "%spsp_vimm(%u, %sHUGE_VALF);\n", ind, in->vd, v < 0 ? "-" : "");
+        else if (isnan(v))
+            fprintf(f, "%spsp_vimm(%u, (float)NAN);\n", ind, in->vd);
+        else
+            fprintf(f, "%spsp_vimm(%u, %#.9gf);\n", ind, in->vd, (double)v);
         return;
+    }
 
     /* Matrix ops that need no multiply. `vsize` is the matrix order here. */
     case A_VMMUL:
@@ -447,6 +454,9 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         fprintf(f, "%spsp_vtfm(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VMSCL:
         fprintf(f, "%spsp_vmscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VROT:
+        fprintf(f, "%spsp_vrot(%u, %u, 0x%02Xu, %u);\n",
+                ind, in->vd, in->vs, (unsigned)in->imm & 0x1F, in->vsize); return;
     case A_VMIDT:
         fprintf(f, "%spsp_vmidt(%u, %u);\n", ind, in->vd, in->vsize); return;
     case A_VMZERO:
@@ -540,6 +550,34 @@ static void emit_function(ectx *c, const a_func *fn) {
             c->is_slot[widx(an, a + 4)] = 1;
     }
 
+    /* A function's instructions do not always begin at its entry: a backward
+     * jump can pull in a block that lies *below* the entry address, and
+     * emission walks the whole owned range in address order. When that
+     * happens the first statement in the body is not the first statement to
+     * execute, so control has to be sent to the real entry explicitly.
+     *
+     * Without this, calling the function silently runs whatever happens to sit
+     * lowest in its address range -- with none of the entry's setup having
+     * run. Registers hold stale values and the damage surfaces far away.
+     *
+     * This has to be marked *before* the delay-slot pass below, not after it.
+     * When a function's entry is itself the delay slot of the instruction that
+     * pulled the earlier block in, that pass is what gives the address past the
+     * standalone copy its label -- and it only fires for slots already known to
+     * be labels. Marking afterwards leaves emission emitting `goto L_<addr+4>`
+     * against a label nothing declared. */
+    c->is_label[widx(an, fn->addr)] = 1;
+
+    /* Any address another function falls through into has to be reachable
+     * here, even though nothing in this function branches to it. */
+    if (c->is_fallthrough_target) {
+        for (uint32_t a = fn->start; a < fn->end; a += 4) {
+            if (!owned_by(an, a, owner)) continue;
+            if (c->is_fallthrough_target[widx(an, a)])
+                c->is_label[widx(an, a)] = 1;
+        }
+    }
+
     /* A delay slot can also be somebody's branch target. Arriving through the
      * branch, it runs as part of that transfer; arriving by a jump straight to
      * its address, it is an ordinary instruction. Both paths are real, so it
@@ -564,17 +602,6 @@ static void emit_function(ectx *c, const a_func *fn) {
     if (fn->has_indirect)
         fprintf(f, " * Contains a computed jump routed through the dispatch table.\n");
     fprintf(f, " * ------------------------------------------------------------- */\n");
-
-    /* A function's instructions do not always begin at its entry: a backward
-     * jump can pull in a block that lies *below* the entry address, and
-     * emission walks the whole owned range in address order. When that
-     * happens the first statement in the body is not the first statement to
-     * execute, so control has to be sent to the real entry explicitly.
-     *
-     * Without this, calling the function silently runs whatever happens to sit
-     * lowest in its address range -- with none of the entry's setup having
-     * run. Registers hold stale values and the damage surfaces far away. */
-    c->is_label[widx(an, fn->addr)] = 1;
 
     /* The body takes the address to start at, and every label is reachable
      * through it.
@@ -653,14 +680,40 @@ static void emit_function(ectx *c, const a_func *fn) {
         a_decode(fetch(an, a), a, &in);
 
         if (c->is_label[i]) fprintf(f, "L_%08X: PSP_MARK(0x%08Xu);\n", a, a);
-        last_terminal = in.is_return || in.is_indirect ||
-                        (in.is_jump && !in.is_call);
+        /* `is_indirect` covers `jr` and `jalr` alike, but only one of them ends
+         * anything. `jalr` is a *call*: it returns, and execution continues at
+         * the instruction after its delay slot. Treating it as terminal ended
+         * the emitted body there, so whatever followed -- routinely the
+         * epilogue -- was never emitted and the function returned without
+         * releasing its frame.
+         *
+         * The decoder already draws this distinction (it sets ends_block for
+         * `jr` and not for `jalr`); the test here just did not use it. What
+         * makes a transfer terminal is that control does not come back: a
+         * return, or an unconditional jump that is not a call. */
+        last_terminal = in.is_return || (in.is_jump && !in.is_call);
         comment(c, &in);
 
-        /* The delay-slot instruction, if this transfers control. */
+        /* The delay-slot instruction, if this transfers control.
+         *
+         * In range, not owned. A delay slot executes because the hardware
+         * executes it; whether discovery assigned that word to this function
+         * is an artifact of the analysis and says nothing about whether the
+         * instruction runs. Gating emission on ownership silently dropped it
+         * whenever the two disagreed.
+         *
+         * That is not a corner case. A MIPS compiler puts the stack restore in
+         * the delay slot of `jr $ra`, so the dropped instruction is typically
+         * `addiu $sp, $sp, N` -- the function returns having never released
+         * its frame, and the damage shows up in the caller. The oracle found
+         * it as clusters of $sp disagreements, each exactly one frame deep.
+         *
+         * Ownership still decides whether the slot also needs a *labelled*
+         * copy further down: that question is about who can jump to it, which
+         * ownership does answer. */
         a_insn slot;
         int have_slot = 0;
-        if (in.has_delay_slot && owned_by(an, a + 4, owner)) {
+        if (in.has_delay_slot && a_in_range(an, a + 4)) {
             a_decode(fetch(an, a + 4), a + 4, &slot);
             have_slot = 1;
         }
@@ -795,6 +848,26 @@ static void emit_function(ectx *c, const a_func *fn) {
         if (is_function(an, next)) {
             fprintf(f, "    /* falls through into the next function */\n");
             fprintf(f, "    psp_func_%08X();\n", next);
+        } else if (a_in_range(an, next)) {
+            /* The same defect one step further out: the address after this
+             * function is real code, but it is a *label* inside another
+             * function rather than that function's entry, so the
+             * is_function() test above misses it and the fall-through is
+             * dropped -- control simply returns.
+             *
+             * That is silent and it is not rare. memset is split exactly this
+             * way: its word-fill loop ends up in its own body, and the loop's
+             * not-taken exit falls into the byte-fill tail, which lives in the
+             * neighbouring body. Emitting nothing meant memset skipped its
+             * trailing bytes and never ran the `jr $ra` delay slot that sets
+             * its return value -- it returned whatever happened to be in $v0.
+             * The oracle found it as a $v0 disagreement on 27 functions.
+             *
+             * Dispatch reaches interior labels because each one already gets a
+             * thunk and a dispatch entry (see just below). */
+            fprintf(f, "    /* falls through into 0x%08X, a label owned by another function */\n",
+                    next);
+            fprintf(f, "    psp_dispatch(0x%08Xu);\n", next);
         }
     }
     fprintf(f, "}\n");
@@ -965,11 +1038,30 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     c.an = an;
     c.is_label = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
     c.is_slot  = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
+    c.is_fallthrough_target = NULL;
     c.entries = NULL;
     c.nentries = c.centries = 0;
     if (!c.is_label || !c.is_slot) {
-        free(c.is_label); free(c.is_slot); fclose(f);
+        free(c.is_fallthrough_target);
+    free(c.is_label); free(c.is_slot); free(c.is_fallthrough_target); fclose(f);
         return -1;
+    }
+
+    /* Pre-pass: which addresses does some function fall through into?
+     *
+     * A function that ends without a terminal instruction continues at the
+     * address after its extent. If that address belongs to another function
+     * but is not its entry, the owner must emit a label there or the
+     * continuation has nowhere to land. Ownership is global, so this cannot be
+     * decided while emitting a single function. */
+    c.is_fallthrough_target = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
+    if (c.is_fallthrough_target) {
+        for (int i = 0; i < an->nfuncs; i++) {
+            const uint32_t next = an->funcs[i].end;
+            if (!a_in_range(an, next)) continue;
+            if (is_function(an, next)) continue;      /* reached by its entry */
+            c.is_fallthrough_target[widx(an, next)] = 1;
+        }
     }
 
     for (int i = 0; i < an->nfuncs; i++) {
