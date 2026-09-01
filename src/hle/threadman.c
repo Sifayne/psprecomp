@@ -265,7 +265,13 @@ static void hle_CreateThread(void) {
     t->stack_size = psp_arg(3);
     t->attr       = psp_arg(4);
 
-    if (t->stack_size < 0x1000) t->stack_size = 0x1000;
+    /* The requested size, not a floor of our own. It used to be raised to
+     * 0x1000, which is observable twice over: sceKernelReferThreadStatus
+     * reports the size back (`stackSize=10000` for a create that asked for
+     * 0x10000, verbatim), and threads/start locates the argument block as an
+     * offset from the stack *base*, so a stack that is 0x800 too big moves
+     * every one of those offsets by 0x800. */
+    if (t->stack_size < 0x200) t->stack_size = 0x200;
     /* Stacks grow down, so allocate from the top of the heap: a stack that
      * overflows then runs into free space rather than into another block --
      * unless the guest asked for the other end. threads/start creates a thread
