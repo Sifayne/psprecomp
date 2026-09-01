@@ -608,8 +608,18 @@ static void hle_ChangeThreadPriority(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
     /* Lowering your own priority is a reschedule point: something that was
      * behind you may now be ahead. threads/change.expected tags that line `[r]`,
-     * so hardware does switch there and it is observable. */
-    if (t->uid == psp_sched_current()) psp_sched_yield();
+     * so hardware does switch there and it is observable.
+     *
+     * Raising *another* thread above the caller is the same reschedule, and it
+     * was missing. sceKernelStartThread already performs it -- see the comment
+     * in psp_sched_spawn -- and a priority change reaches the same state by a
+     * different route. threads/change sweeps a ready thread through every legal
+     * priority, and the four values higher than the caller's are exactly the
+     * four where ` - testThread` appears *before* the line reporting the change
+     * that caused it: the thread ran to completion inside the call. */
+    if (t->uid == psp_sched_current() ||
+        (int)prio < (int)psp_threadman_current_priority())
+        psp_sched_yield();
 }
 
 /* ---- sleep and wakeup ------------------------------------------------------
