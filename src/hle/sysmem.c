@@ -152,6 +152,13 @@ uint32_t psp_sysmem_free(void) {
 }
 
 uint32_t psp_sysmem_alloc(uint32_t size, int from_high) {
+    /* A request big enough that rounding it up wraps has to be refused here,
+     * before the arithmetic loses it. 0xFFFFFFFF + 0xFF truncates to 0xFE,
+     * masks to 0, and then the zero-size guard below turns it into a *256-byte*
+     * allocation that succeeds -- so a caller asking for four gigabytes got a
+     * handle and no error. msgpipe/create asks for exactly that and expects
+     * `Failed (80020190)`. */
+    if (size > 0xFFFFFF00u) return 0;
     uint32_t rounded = (size + 0xFF) & ~0xFFu;
     if (!rounded) rounded = 0x100;
 
