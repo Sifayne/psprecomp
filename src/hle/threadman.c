@@ -1132,8 +1132,15 @@ static void hle_DeleteSema(void) {
 static void hle_SignalSema(void) {
     psp_sema *s = find_sema(psp_arg(0));
     if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
-    s->count += (int32_t)psp_arg(1);
-    if (s->max_count > 0 && s->count > s->max_count) s->count = s->max_count;
+    /* Past the maximum is refused, not clamped, and nothing moves.
+     * semaphores/signal asks a 0/1 semaphore for +2 and gets SEMA_OVF with the
+     * count still reading 0 on the very next line. */
+    const int32_t by = (int32_t)psp_arg(1);
+    if (s->max_count > 0 && s->count + by > s->max_count) {
+        psp_ret(SCE_KERNEL_ERROR_SEMA_OVF);
+        return;
+    }
+    s->count += by;
     note_signalled(s->uid);
     sema_log(s, "signal", (int32_t)psp_arg(1), 1);
 
@@ -1154,10 +1161,30 @@ static void hle_SignalSema(void) {
  * WaitSema is the whole point of the call: a caller uses it precisely because
  * it has something else to do when the answer is no. */
 static void hle_PollSema(void) {
+    /* Three answers in an order that is not the obvious one, and
+     * semaphores/poll pins every step of it.
+     *
+     * An empty semaphore answers SEMA_ZERO whatever it was asked for, so that
+     * comes first: polling for zero while *not* signalled is SEMA_ZERO and
+     * polling for zero while signalled is ILLEGAL_COUNT.
+     *
+     * Then the count, which is checked before the uid even exists as a
+     * question: `sceKernelPollSema(NULL, 0)` answers ILLEGAL_COUNT where
+     * `sceKernelPollSema(NULL, 1)` answers UNKNOWN_SEMID.
+     *
+     * The waitq test in the first step is the least certain part: a semaphore
+     * at zero *with a waiter* answers ILLEGAL_COUNT rather than SEMA_ZERO, so
+     * "nothing to give" is not the same as "count is zero". One observation
+     * supports it -- `Zero same` -- and nothing contradicts it. */
     psp_sema *s = find_sema(psp_arg(0));
-    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
     const int32_t need = (int32_t)psp_arg(1);
-    if (s->count < need) { psp_ret(SCE_KERNEL_ERROR_SEMA_ZERO); return; }
+    if (s && s->count <= 0 && psp_waitq_count(&s->q) == 0) {
+        psp_ret(SCE_KERNEL_ERROR_SEMA_ZERO);
+        return;
+    }
+    if (need <= 0)          { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_COUNT); return; }
+    if (!s)                 { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
+    if (s->count < need)    { psp_ret(SCE_KERNEL_ERROR_SEMA_ZERO); return; }
     s->count -= need;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }

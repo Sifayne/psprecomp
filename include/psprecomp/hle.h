@@ -164,6 +164,9 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 /* A poll that would have blocked. Distinct from an error: it is the ordinary
  * answer to "is this free?" when it is not. */
 #define SCE_KERNEL_ERROR_SEMA_ZERO       0x800201AD
+/* Signalling past the maximum the semaphore was created with. PSPSDK names it
+ * SEMA_OVF and semaphores/signal is what shows it does not silently clamp. */
+#define SCE_KERNEL_ERROR_SEMA_OVF        0x800201AE
 #define SCE_KERNEL_ERROR_WAIT_TIMEOUT    0x800201A8
 
 /* The uid space is per object type, and a wrong-typed handle is refused with
