@@ -1545,7 +1545,11 @@ static int fpl_release(psp_fpl *f) {
         const psp_waiter w = psp_waitq_take(&f->q, i);
         const uint32_t got = fpl_take(f);
         if (w.out) psp_write32(w.out, got);
-        urgent |= psp_sched_wake(w.uid);
+        /* Woken as *satisfied*, not merely woken. Whether the pool still
+         * exists when the waiter next runs says nothing about whether it got
+         * a block, and fpl/allocate deletes the pool immediately after the
+         * free that hands one over. Same reason a message pipe does it. */
+        urgent |= psp_sched_wake_as(w.uid, PSP_WAIT_WOKE_SATISFIED);
     }
     return urgent;
 }
@@ -1579,12 +1583,22 @@ static void fpl_allocate(int may_block, int has_timeout) {
     }
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, f->waitdesc,
                                          deadline);
-    /* Cancelled rather than deleted: the object is still there, so looking it
-     * up says nothing, and only the waker knew. */
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
-        return;
+    /* Both of these are decided before the pool is looked up again, because
+     * neither answer depends on whether it is still there. A block already
+     * handed over is not taken back by the delete that follows, and a cancel
+     * leaves the pool in place so finding it would prove nothing. */
+    if (rc == PSP_SCHED_WOKEN) {
+        const int why = psp_sched_wake_reason();
+        if (why == PSP_WAIT_WOKE_SATISFIED) {
+            psp_wait_writeback(tmo_ptr, deadline);
+            psp_ret(SCE_KERNEL_ERROR_OK);
+            return;
+        }
+        if (why == PSP_WAIT_WOKE_CANCELLED) {
+            psp_wait_writeback(tmo_ptr, deadline);
+            psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
+            return;
+        }
     }
     f = find_fpl(id);
     if (!f) { psp_wait_writeback(tmo_ptr, deadline);
