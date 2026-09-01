@@ -401,6 +401,15 @@ static void hle_ReferVTimerStatus(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Guest memory for the two clocks a handler is handed. One block, reused every
+ * firing: a handler cannot be running twice at once, and the structures are
+ * only alive for the length of the call. */
+static uint32_t vtimer_clock_scratch(void) {
+    static uint32_t at;
+    if (!at) at = psp_sysmem_alloc(16, 0);
+    return at;
+}
+
 /* Fire any vtimer whose count has reached its schedule. Same contract as an
  * alarm's: the handler's return value re-arms it, zero retires it. */
 static void vtimer_tick(void) {
@@ -411,11 +420,32 @@ static void vtimer_tick(void) {
 
         const uint32_t uid = v->uid, handler = v->handler, common = v->common;
         const uint64_t sched = v->schedule;
+        const uint64_t real  = vtimer_now(v);
+
+        /* The handler takes two SceKernelSysClock *pointers*, not the halves of
+         * one clock:
+         *
+         *   SceUInt handler(SceUID, SceKernelSysClock *elapsedScheduled,
+         *                   SceKernelSysClock *elapsedReal, void *common)
+         *
+         * vtimers/vtimer dereferences the second argument and prints it, so
+         * passing the schedule's low and high words put a small integer where
+         * an address belonged and the test read whatever that addressed. The
+         * two structures need to live in guest memory for the length of the
+         * call, which is what this block is for. */
+        const uint32_t clocks = vtimer_clock_scratch();
+        if (clocks) {
+            psp_write32(clocks + 0, (uint32_t)sched);
+            psp_write32(clocks + 4, (uint32_t)(sched >> 32));
+            psp_write32(clocks + 8, (uint32_t)real);
+            psp_write32(clocks + 12, (uint32_t)(real >> 32));
+        }
+
         g_firing = 1;
         const psp_cpu_state saved = psp_cpu;
         psp_cpu.r[PSP_REG_A0] = uid;
-        psp_cpu.r[PSP_REG_A1] = (uint32_t)sched;
-        psp_cpu.r[PSP_REG_A2] = (uint32_t)(sched >> 32);
+        psp_cpu.r[PSP_REG_A1] = clocks;
+        psp_cpu.r[PSP_REG_A2] = clocks + 8;
         psp_cpu.r[PSP_REG_A3] = common;
         psp_cpu.r[PSP_REG_RA] = 0;
         psp_dispatch(handler);
