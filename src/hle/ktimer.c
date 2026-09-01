@@ -227,11 +227,17 @@ typedef struct {
 } psp_vtimer;
 
 static psp_vtimer g_vtimer[MAX_VTIMERS];
+/* One past the highest slot ever used. vtimer_tick runs at every firmware call
+ * -- that is the whole design, see the note at the top of this file -- so the
+ * scan is on the hottest path there is, and sizing the table for the thousand
+ * vtimers threads/vtimers/create makes turned it into 2048 iterations per
+ * call. utility/msgdialog stopped finishing at all. */
+static int g_vtimer_hi;
 
-static void vtimer_reset(void) { memset(g_vtimer, 0, sizeof g_vtimer); }
+static void vtimer_reset(void) { memset(g_vtimer, 0, sizeof g_vtimer); g_vtimer_hi = 0; }
 
 static psp_vtimer *find_vtimer(uint32_t uid) {
-    for (int i = 0; i < MAX_VTIMERS; i++)
+    for (int i = 0; i < g_vtimer_hi; i++)
         if (g_vtimer[i].alive && g_vtimer[i].uid == uid) return &g_vtimer[i];
     return NULL;
 }
@@ -250,7 +256,9 @@ static void vtimer_set(psp_vtimer *v, uint64_t to) {
 static void hle_CreateVTimer(void) {
     if (!psp_arg(0)) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
     psp_vtimer *v = NULL;
-    for (int i = 0; i < MAX_VTIMERS; i++) if (!g_vtimer[i].alive) { v = &g_vtimer[i]; break; }
+    int vi = 0;
+    for (; vi < MAX_VTIMERS; vi++) if (!g_vtimer[vi].alive) { v = &g_vtimer[vi]; break; }
+    if (v && vi >= g_vtimer_hi) g_vtimer_hi = vi + 1;
     if (!v) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
     memset(v, 0, sizeof *v);
     psp_str(psp_arg(0), v->name, sizeof v->name);
@@ -421,7 +429,7 @@ static uint32_t vtimer_clock_scratch(void) {
 /* Fire any vtimer whose count has reached its schedule. Same contract as an
  * alarm's: the handler's return value re-arms it, zero retires it. */
 static void vtimer_tick(void) {
-    for (int i = 0; i < MAX_VTIMERS; i++) {
+    for (int i = 0; i < g_vtimer_hi; i++) {
         psp_vtimer *v = &g_vtimer[i];
         if (!v->alive || !v->active || !v->handler || !v->schedule) continue;
         if (vtimer_now(v) < v->schedule) continue;
@@ -470,7 +478,7 @@ static void vtimer_tick(void) {
 
 static void vtimer_list(int type, uint32_t out, int max, int *count) {
     if (type != PSP_TMID_VTIMER) return;
-    for (int i = 0; i < MAX_VTIMERS; i++) {
+    for (int i = 0; i < g_vtimer_hi; i++) {
         if (!g_vtimer[i].alive) continue;
         if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_vtimer[i].uid);
         (*count)++;

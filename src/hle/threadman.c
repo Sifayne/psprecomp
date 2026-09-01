@@ -148,6 +148,16 @@ static psp_thread   g_thread[MAX_THREADS];
 static psp_sema     g_sema[MAX_SEMAS];
 static psp_evflag   g_flag[MAX_FLAGS];
 static psp_callback g_cb[MAX_CBS];
+/* One past the highest slot ever handed out, for each table that gets scanned.
+ * The tables are sized for what the tests create -- a thousand of everything --
+ * and a scan of all 2048 is not free: psp_threadman_run_callbacks is reached
+ * from psp_wait_deadline, so it runs on *every waiting firmware call*, and at
+ * the old cap of 64 the full sweep was invisible. utility/msgdialog stopped
+ * producing output entirely when the cap went up, which is what this is for.
+ *
+ * A high-water mark rather than a live count, because the slots are not
+ * compacted: a freed slot in the middle stays in range. */
+static int g_cb_hi, g_sema_hi, g_flag_hi;
 static uint32_t     g_next_uid;
 /* The thread the scheduler says is running, as a thread-manager object.
  *
@@ -163,6 +173,7 @@ void psp_threadman_reset(void) {
     memset(g_sema, 0, sizeof g_sema);
     memset(g_flag, 0, sizeof g_flag);
     memset(g_cb, 0, sizeof g_cb);
+    g_cb_hi = g_sema_hi = g_flag_hi = 0;
     g_next_uid = UID_BASE;
     g_warned_block = 0;
     /* The clock first: the scheduler stamps the main context's timeslice from
@@ -197,12 +208,12 @@ static psp_thread *current_thread(void) {
 }
 
 static psp_sema *find_sema(uint32_t id) {
-    for (int i = 0; i < MAX_SEMAS; i++)
+    for (int i = 0; i < g_sema_hi; i++)
         if (g_sema[i].used && g_sema[i].uid == id) return &g_sema[i];
     return NULL;
 }
 static psp_evflag *find_flag(uint32_t id) {
-    for (int i = 0; i < MAX_FLAGS; i++)
+    for (int i = 0; i < g_flag_hi; i++)
         if (g_flag[i].used && g_flag[i].uid == id) return &g_flag[i];
     return NULL;
 }
@@ -521,7 +532,7 @@ static void hle_TerminateThread(void);
  * deletes the callback and gets UNKNOWN_CBID -- so the thread took it with it.
  * Both delete calls need this, which is why it is not written out twice. */
 static void drop_callbacks_of(uint32_t thread_uid) {
-    for (int i = 0; i < MAX_CBS; i++)
+    for (int i = 0; i < g_cb_hi; i++)
         if (g_cb[i].used && g_cb[i].thread == thread_uid) g_cb[i].used = 0;
 }
 
@@ -1048,7 +1059,7 @@ void psp_threadman_dump_signalled(FILE *out) {
     fprintf(out, "  semaphore uids ever signalled (%d):", g_sig_uids);
     for (int i = 0; i < g_sig_uids; i++) fprintf(out, " 0x%08X", g_sig_uid[i]);
     fprintf(out, "\n");
-    for (int i = 0; i < MAX_SEMAS; i++) {
+    for (int i = 0; i < g_sema_hi; i++) {
         if (!g_sema[i].used) continue;
         int seen = 0;
         for (int k = 0; k < g_sig_uids; k++) if (g_sig_uid[k] == g_sema[i].uid) seen = 1;
@@ -1109,7 +1120,9 @@ static void hle_CreateSema(void) {
     if (!name_ok(psp_arg(0))) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
     if (!sema_attr_ok(psp_arg(1))) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
     psp_sema *s = NULL;
-    for (int i = 0; i < MAX_SEMAS; i++) if (!g_sema[i].used) { s = &g_sema[i]; break; }
+    int si = 0;
+    for (; si < MAX_SEMAS; si++) if (!g_sema[si].used) { s = &g_sema[si]; break; }
+    if (s && si >= g_sema_hi) g_sema_hi = si + 1;
     if (!s) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     memset(s, 0, sizeof *s);
@@ -1382,7 +1395,9 @@ static void hle_CreateEventFlag(void) {
     if (!name_ok(psp_arg(0))) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
     if (!flag_attr_ok(psp_arg(1))) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
     psp_evflag *f = NULL;
-    for (int i = 0; i < MAX_FLAGS; i++) if (!g_flag[i].used) { f = &g_flag[i]; break; }
+    int fi = 0;
+    for (; fi < MAX_FLAGS; fi++) if (!g_flag[fi].used) { f = &g_flag[fi]; break; }
+    if (f && fi >= g_flag_hi) g_flag_hi = fi + 1;
     if (!f) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     memset(f, 0, sizeof *f);
@@ -1695,7 +1710,7 @@ static void hle_ReferEventFlagStatus(void) {
 
 /* No lookup existed: callbacks are only ever created here, never resolved. */
 static psp_callback *find_cb(uint32_t id) {
-    for (int i = 0; i < MAX_CBS; i++)
+    for (int i = 0; i < g_cb_hi; i++)
         if (g_cb[i].used && g_cb[i].uid == id) return &g_cb[i];
     return NULL;
 }
@@ -1845,13 +1860,13 @@ static void threadman_list(int type, uint32_t out, int max, int *count) {
         return;
     }
     if (type == PSP_TMID_SEMA)
-        for (int i = 0; i < MAX_SEMAS; i++)
+        for (int i = 0; i < g_sema_hi; i++)
             if (g_sema[i].used) list_add(g_sema[i].uid, out, max, count);
     if (type == PSP_TMID_EVENTFLAG)
-        for (int i = 0; i < MAX_FLAGS; i++)
+        for (int i = 0; i < g_flag_hi; i++)
             if (g_flag[i].used) list_add(g_flag[i].uid, out, max, count);
     if (type == PSP_TMID_CALLBACK)
-        for (int i = 0; i < MAX_CBS; i++)
+        for (int i = 0; i < g_cb_hi; i++)
             if (g_cb[i].used) list_add(g_cb[i].uid, out, max, count);
 }
 
@@ -1891,7 +1906,9 @@ static void hle_CreateCallback(void) {
      * number is what hardware answers. */
     if ((int32_t)psp_arg(1) < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
     psp_callback *c = NULL;
-    for (int i = 0; i < MAX_CBS; i++) if (!g_cb[i].used) { c = &g_cb[i]; break; }
+    int ci = 0;
+    for (; ci < MAX_CBS; ci++) if (!g_cb[ci].used) { c = &g_cb[ci]; break; }
+    if (c && ci >= g_cb_hi) g_cb_hi = ci + 1;
     if (!c) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     memset(c, 0, sizeof *c);
@@ -1973,7 +1990,7 @@ static void hle_GetThreadExitStatus(void) {
 int psp_threadman_run_callbacks(void) {
     const uint32_t me = psp_sched_current();
     int ran = 0;
-    for (int i = 0; i < MAX_CBS; i++) {
+    for (int i = 0; i < g_cb_hi; i++) {
         psp_callback *c = &g_cb[i];
         if (!c->used || c->thread != me || !c->notify_count) continue;
 
