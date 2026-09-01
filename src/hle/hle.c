@@ -1,6 +1,7 @@
 /* psprecomp — HLE dispatch. See include/psprecomp/hle.h. */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/dispatch.h"
 
@@ -200,6 +201,28 @@ void psp_hle_dump_calls(FILE *out, int top) {
 }
 
 void psp_hle_call(uint32_t nid) {
+    /* Every firmware call costs a tick of guest time.
+     *
+     * The clock advanced three ways and every one of them could stop. A vblank
+     * moves it a frame, but only the thread that waits on vblank calls that. A
+     * *read* moves it a little, for the spin-on-GetSystemTime loop. And the
+     * scheduler moves it to the earliest deadline when nothing is runnable.
+     *
+     * A thread that spins on firmware calls which are neither -- this game's
+     * decode loop runs 562M sceMpegRingbufferAvailableSize and 281M
+     * sceKernelSignalSema without touching the clock -- keeps *something*
+     * runnable forever, so the scheduler's fallback never fires, while calling
+     * nothing that moves time itself. Guest time then stops dead, and any
+     * thread sleeping on a deadline sleeps through the rest of the run. That is
+     * what parked the movie's own frame loop in a 16.9ms delay it could never
+     * leave.
+     *
+     * Charging a tick per call is the same trade clock.h already makes for
+     * reads, for the same reason: unfaithful timing beats a hang. It keeps the
+     * clock deterministic, which is what the oracle needs, because both sides
+     * make the same calls in the same order. */
+    psp_clock_tick();
+
     for (int i = 0; i < g_count; i++) {
         if (g_entry[i].nid == nid) {
             g_calls[i]++;

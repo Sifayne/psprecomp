@@ -26,4 +26,9 @@ uint64_t psp_clock_read(void) {
 
 void psp_clock_frame(void) { g_us += PSP_FRAME_US; }
 
+/* One tick, for a caller that is doing work rather than reading the time.
+ * Separate from psp_clock_read so that "time passed" and "somebody asked what
+ * time it is" stay distinguishable at the call site. */
+void psp_clock_tick(void) { g_us += PSP_READ_TICK_US; }
+
 void psp_clock_advance_to(uint64_t us) { if (us > g_us) g_us = us; }

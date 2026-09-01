@@ -35,6 +35,12 @@ void psp_clock_reset(void);
  * reads never return the same value. */
 uint64_t psp_clock_read(void);
 
+/* Advance the clock by a tick without reading it. Firmware calls charge one,
+ * so a thread spinning on calls that neither read the clock nor wait for a
+ * vblank still lets time pass -- otherwise it starves every sleeping thread by
+ * staying runnable forever. */
+void psp_clock_tick(void);
+
 /* Microseconds since the module started, without advancing it. For diagnostics
  * that should not perturb what they measure. */
 uint64_t psp_clock_peek(void);
