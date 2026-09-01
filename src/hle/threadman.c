@@ -1812,6 +1812,13 @@ static void hle_GetThreadmanIdList(void) {
 
 static void hle_CreateCallback(void) {
     if (!name_ok(psp_arg(0))) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    /* The handler may be null and may be nonsense, but it may not be negative.
+     * callbacks/create takes NULL and 0x07ADBEEF without complaint and refuses
+     * 0xDEADBEEF, and the only thing separating those two is the top bit --
+     * a user callback cannot live in kernel space. The code is 0x800200D3,
+     * whose name in this header is ILLEGAL_SIZE; the name does not fit and the
+     * number is what hardware answers. */
+    if ((int32_t)psp_arg(1) < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
     psp_callback *c = NULL;
     for (int i = 0; i < MAX_CBS; i++) if (!g_cb[i].used) { c = &g_cb[i]; break; }
     if (!c) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
