@@ -127,6 +127,20 @@ static uint32_t vpl_partition_error(int32_t part) {
     }
 }
 
+/* tlspl does not share it. Partitions 8 and 9 are ILLEGAL_PERM to a vpl and an
+ * fpl -- vpl/create.expected and fpl/create.expected both say so -- and
+ * ILLEGAL_PARTITION to a tlspl, which is the answer everything out of range
+ * gets. So the two services validate the same argument against different
+ * tables, and only the 1..7 window is common. Partition 5 is the one value no
+ * tlspl test covers; it keeps vpl's answer for want of any evidence. */
+static uint32_t tlspl_partition_error(int32_t part) {
+    switch (part) {
+        case 2: case 6:                      return SCE_KERNEL_ERROR_OK;
+        case 1: case 3: case 4: case 5:      return SCE_KERNEL_ERROR_ILLEGAL_PERM;
+        default:                             return SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
+    }
+}
+
 static void vpl_init(psp_vpl *v);
 
 static void hle_CreateVpl(void) {
@@ -1693,7 +1707,7 @@ static void hle_CreateTlspl(void) {
     const uint32_t count = psp_arg(4);
 
     if (!name) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
-    const uint32_t pe = vpl_partition_error(part);
+    const uint32_t pe = tlspl_partition_error(part);
     if (pe) { psp_ret(pe); return; }
     if (attr & ~TLSPL_ATTR_KNOWN) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
     if (bsize == 0 || (int32_t)bsize < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
