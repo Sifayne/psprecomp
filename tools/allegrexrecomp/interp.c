@@ -565,9 +565,30 @@ static void note_nested(const char *what, uint32_t entry, const psp_interp *sub)
 
 unsigned long long psp_interp_nest_failed(void) { return g_nest_failed; }
 
-static psp_interp *g_active;      /* the run currently executing, if any */
-static int         g_nest;
+/* Per host thread, because a guest thread *is* a host thread.
+ *
+ * With psp_interp_service_threads on, the scheduler gives each guest thread a
+ * host thread and calls psp_dispatch on it, so several interpreter runs exist at
+ * once -- one per stack, only one holding the token. A file-static g_active
+ * would have them all writing the same answer to "which run am I inside", and
+ * the first switch would leave one thread's hook operating on another thread's
+ * psp_interp. The nesting depth is per thread for the same reason: MAX_NEST
+ * bounds one call chain, and a call chain is a stack.
+ *
+ * The two counters below stay shared, and are safe to increment unguarded for a
+ * reason worth stating rather than assuming: the handoff token means exactly one
+ * thread ever executes guest code at a time, and every handoff passes through
+ * the scheduler's mutex, which orders the increments. */
+static _Thread_local psp_interp *g_active;   /* the run executing on this thread */
+static _Thread_local int         g_nest;
 static uint64_t    g_nest_refused;
+
+/* Whether guest threads get host threads of their own. Off is the model
+ * spawn_hook implements -- see the note there -- and is what the differential
+ * oracle needs, since it runs with the scheduler's threading disabled outright.
+ * On, spawns are declined so the scheduler handles them for real. */
+static int      g_threads;
+static uint64_t g_thread_budget;
 
 static int spawn_hook(uint32_t uid, uint32_t entry, uint32_t sp,
                       uint32_t a0, uint32_t a1, int priority);
@@ -588,8 +609,41 @@ static pending_thread g_pending[MAX_PENDING];
  * draining is picked up by the loop that is already running. */
 static int g_draining;
 
+/* A guest thread's own top-level run.
+ *
+ * sched.c's thread_main builds the thread's register file and calls
+ * psp_dispatch(entry); psp_dispatch consults this hook before the lookup table,
+ * so a thread's body runs interpreted without the scheduler knowing an
+ * interpreter exists. That is why routing tests through the real scheduler
+ * needs no change to sched.c at all.
+ *
+ * There is no outer run on this stack to nest under or to charge against -- this
+ * is the outermost -- so the budget comes from the mode rather than from a
+ * caller. psp_interp_init replaces $ra with the sentinel, which is where
+ * returning from the entry point lands: on a PSP that return is how a thread
+ * ends, and thread_main treats psp_dispatch returning as exactly that. */
+static int run_top_level(uint32_t addr) {
+    psp_interp it;
+    psp_interp_init(&it, addr, NESTED_RA, g_thread_budget);
+    psp_interp_run(&it);                  /* saves and restores g_active itself */
+    note_nested("thread", addr, &it);
+    return 1;
+}
+
 static int dispatch_hook(uint32_t addr) {
-    if (!g_active) return 0;              /* not inside an interpreter run */
+    if (!g_active) {
+        /* Not inside a run *on this thread*, which is two different situations.
+         *
+         * Without host threads it means the call came from recompiled code, and
+         * declining lets psp_dispatch fall through to the lookup table -- which
+         * is what keeps this hook harmless in the boot host.
+         *
+         * With them it means a guest thread is starting, and there is no table
+         * to fall through to: nothing is registered under the interpreter, so
+         * declining would count a miss and kill the thread before its first
+         * instruction. */
+        return g_threads ? run_top_level(addr) : 0;
+    }
 
     /* At the depth limit, refuse the call rather than declining to handle it.
      *
@@ -626,6 +680,21 @@ static int dispatch_hook(uint32_t addr) {
     return 1;
 }
 
+/* Whether re-entry is being served at all, remembered so that the two toggles
+ * compose in either order: the spawn hook belongs to serving *and* to the
+ * non-threaded model, and each function knows only half of that. */
+static int g_serving;
+
+static void install_hooks(void) {
+    psp_set_dispatch_hook(g_serving ? dispatch_hook : NULL);
+    /* The spawn and cancel hooks belong to the *other* model. With host threads
+     * on they must not be installed at all: psp_sched_spawn consults the spawn
+     * hook before anything else, so a hook that takes the thread stops the
+     * scheduler ever seeing it. */
+    psp_sched_set_spawn_hook (g_serving && !g_threads ? spawn_hook  : NULL);
+    psp_sched_set_cancel_hook(g_serving && !g_threads ? cancel_hook : NULL);
+}
+
 void psp_interp_service_dispatch(int enable) {
     /* Clear the nesting state, not just the hook.
      *
@@ -643,11 +712,40 @@ void psp_interp_service_dispatch(int enable) {
      * of a fresh top-level run, is what makes an abandoned run survivable. */
     g_nest = 0;
     g_active = NULL;
-    psp_set_dispatch_hook(enable ? dispatch_hook : NULL);
-    psp_sched_set_spawn_hook(enable ? spawn_hook : NULL);
-    psp_sched_set_cancel_hook(enable ? cancel_hook : NULL);
+    g_serving = enable;
+    install_hooks();
     g_draining = 0;
     for (int i = 0; i < MAX_PENDING; i++) g_pending[i].used = 0;
+}
+
+/* Give each guest thread a host thread, and let the scheduler run them.
+ *
+ * The two models this switches between are not variations on each other, and
+ * the choice is forced rather than a preference:
+ *
+ *   - **Off** is what spawn_hook implements: a started thread either runs
+ *     nested to completion or is parked until the top-level run ends. It models
+ *     "runnable is not running", which is the one scheduling rule reachable
+ *     without a scheduler, and it is all the differential oracle can use --
+ *     that harness disables threading outright, because a comparison whose
+ *     result depends on scheduling cannot attribute a divergence to codegen.
+ *   - **On** hands spawns to sched.c, which gives each guest thread a host
+ *     thread whose C stack holds its context. Waits can then park and resume,
+ *     because there is somewhere to resume *into*.
+ *
+ * A wait that blocks needs the second: under the first, a parked thread has no
+ * context, so psp_sched_block finds nothing runnable and the wait must fail.
+ * Making waits block while keeping spawn_hook would turn every one of them into
+ * a deadlock report.
+ *
+ * The budget is the one each fresh thread's run gets, since a thread started
+ * from a hook has no outer run to inherit one from -- the same role
+ * g_drain_budget plays for the parked model. Without it a thread that loops
+ * forever hangs the harness. */
+void psp_interp_service_threads(int enable, uint64_t budget) {
+    g_threads       = enable;
+    g_thread_budget = budget;
+    install_hooks();
 }
 
 /* Starting a thread does not mean running it.

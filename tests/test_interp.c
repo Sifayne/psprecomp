@@ -373,6 +373,10 @@ static void test_dispatch_serving(void) {
  * register file -- and the starter's registers survive it. */
 static void test_spawn_serving(void) {
     psp_hle_init();
+    /* The oracle's configuration, stated rather than inherited: it disables
+     * threading outright, which is what leaves spawn_hook as the only thing
+     * that can service a thread start. The threaded model is the next test. */
+    psp_sched_set_threading(0);
 
     const uint32_t nid = psp_nid("testSpawnHost");
     psp_hle_register(nid, "test", "testSpawnHost", hle_spawn_thread);
@@ -419,6 +423,102 @@ static void test_spawn_serving(void) {
           psp_read32(DATA));
     CHECK(R(S0) == 99,
           "the starter's registers survived the thread: s0=%u", R(S0));
+    psp_sched_set_threading(1);
+}
+
+/* ---- HLE re-entry with real threads ---------------------------------------
+ *
+ * The property the parked model cannot have, and the whole reason for
+ * psp_interp_service_threads: a thread that *blocks* is resumed.
+ *
+ * Under spawn_hook a started thread runs nested to completion inside its
+ * starter's frame, so a blocked one has no context to be resumed into --
+ * psp_sched_block finds nothing runnable and the wait has to fail. Here each
+ * guest thread gets a host thread whose C stack holds its interpreter run, so
+ * the starter can park, the thread can run, and the starter can carry on from
+ * the instruction after the wait.
+ *
+ * The blocking is done from HLE rather than from hand-assembled guest code
+ * because it is the scheduling that is under test, not the encoding of a
+ * semaphore protocol. The guest side is what it must be: two separate
+ * interpreter runs on two host stacks. */
+#define WAKER_UID 0x00040011u
+
+static int g_starter_blocked, g_starter_resumed, g_woke_from_thread;
+
+static void hle_wake_starter(void) {
+    /* Runs on the spawned thread's own host thread, from its own guest code. */
+    g_woke_from_thread = 1;
+    psp_sched_wake(0);                     /* uid 0 is the main context */
+}
+
+static void hle_spawn_and_block(void) {
+    psp_sched_spawn(WAKER_UID, THREAD, THREAD_SP, 7, 8, 32);
+    g_starter_blocked = 1;
+    /* Parks the caller and hands the token to the thread just started. Returns
+     * 0 once something has made this slot runnable again. */
+    const int rc = psp_sched_block(0, PSP_SCHED_BLOCKED, "test-resume");
+    g_starter_resumed = (rc == 0);
+}
+
+static void test_threaded_spawn_resumes_a_blocked_starter(void) {
+    psp_hle_init();
+    psp_sched_set_threading(1);
+    g_starter_blocked = g_starter_resumed = g_woke_from_thread = 0;
+    psp_write32(DATA, 0);
+
+    const uint32_t spawn_nid = psp_nid("testSpawnAndBlock");
+    const uint32_t wake_nid  = psp_nid("testWakeStarter");
+    psp_hle_register(spawn_nid, "test", "testSpawnAndBlock", hle_spawn_and_block);
+    psp_hle_register(wake_nid,  "test", "testWakeStarter",   hle_wake_starter);
+
+    /* Two thunks: one the starter jumps to, one the thread calls. */
+    const psp_interp_import imps[] = { { THUNK, spawn_nid }, { TARGET, wake_nid } };
+    CHECK(psp_interp_set_imports(imps, 2) == 2, "import table");
+
+    static const uint32_t stub[] = { 0x03E00008, 0x00000000 };   /* jr $ra ; nop */
+    load(THUNK,  stub, 2);
+    load(TARGET, stub, 2);
+
+    /* Thread body: record $a0, then reach the waking thunk with a *non-linking*
+     * jump. A jal would overwrite $ra, and $ra is holding the sentinel that
+     * ends this thread's run -- the thunk returns by setting pc to it. */
+    static const uint32_t body[] = {
+        0x3C080891,             /* lui  $t0,0x0891       */
+        0xAD040000,             /* sw   $a0,0($t0)       */
+        0x3C190893,             /* lui  $t9,0x0893       */
+        0x03200008, 0x00000000, /* jr   $t9 ; slot       */
+    };
+    load(THREAD, body, 5);
+
+    /* The starter: s0=99, then a non-linking jump to the thunk so $ra keeps the
+     * run sentinel and the run ends when the handler returns. */
+    static const uint32_t outer[] = {
+        0x24100063,             /* addiu $s0,$zero,99    */
+        0x3C190892,             /* lui   $t9,0x0892      */
+        0x03200008, 0x00000000, /* jr    $t9 ; slot      */
+    };
+
+    psp_interp_service_dispatch(1);
+    psp_interp_service_threads(1, 10000);
+    psp_interp it = run(outer, 4, 10000);
+    const int live = psp_sched_drain(5);
+    psp_interp_service_threads(0, 0);
+    psp_interp_service_dispatch(0);
+    psp_interp_free_imports();
+
+    CHECK(it.status == I_OK_RETURN, "threaded spawn: %s",
+          psp_interp_status_str(it.status));
+    CHECK(g_starter_blocked, "the starter never reached its block");
+    CHECK(psp_read32(DATA) == 7,
+          "the thread never ran with StartThread's $a0: DATA=%u", psp_read32(DATA));
+    CHECK(g_woke_from_thread,
+          "the thread's own guest code never reached the waking thunk");
+    CHECK(g_starter_resumed,
+          "the starter blocked and was never resumed -- this is the whole "
+          "difference between the two models");
+    CHECK(R(S0) == 99, "the starter's registers survived: s0=%u", R(S0));
+    CHECK(live == 0, "%d thread(s) still alive after the drain", live);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -445,6 +545,7 @@ int main(void) {
     test_syscall_traps();
     test_dispatch_serving();
     test_spawn_serving();
+    test_threaded_spawn_resumes_a_blocked_starter();
 
     psp_mem_free();
     test_no_drift_from_emitter();

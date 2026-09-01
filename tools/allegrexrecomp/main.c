@@ -25,6 +25,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/hle.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/sched.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,7 +44,7 @@ static int usage(void) {
         "  allegrexrecomp cover   <file>\n"
         "  allegrexrecomp funcs   <file> [--list]\n"
         "  allegrexrecomp emit    <file> <outdir> [prefix]\n"
-        "  allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs] [--dispatch]\n"
+        "  allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs] [--dispatch] [--drain <s>]\n"
         "  allegrexrecomp decrypt <file> [--keys <path>]\n"
         "  allegrexrecomp kirk1   <file> [out] [--keys <path>]\n"
         "\n"
@@ -932,7 +933,8 @@ static int interp_bind_imports(const psp_blob *b, const elf_info *e,
 }   /* never mapped: the run stops here */
 
 static int cmd_interp(const char *path, uint32_t from, int have_from,
-                      uint64_t budget, int trace, int trace_regs, int dispatch) {
+                      uint64_t budget, int trace, int trace_regs, int dispatch,
+                      int drain_s) {
     psp_blob b;
     if (psp_blob_read(path, &b) != 0) { fprintf(stderr, "cannot read %s\n", path); return 1; }
 
@@ -977,7 +979,14 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
      * other use: its thread starts and callbacks have to happen for anything
      * after the first instruction to execute at all. Serving them runs the
      * target interpreted, nested, charged against this run's budget. */
-    if (dispatch) psp_interp_service_dispatch(1);
+    if (dispatch) {
+        psp_interp_service_dispatch(1);
+        /* And give each guest thread a host thread, so a wait can park and be
+         * resumed. Running a *program* is what this verb is for, and a program
+         * that blocks needs somewhere to block; the differential oracle, which
+         * shares the dispatch hook, deliberately does not ask for this. */
+        psp_interp_service_threads(1, budget);
+    }
 
     const uint32_t entry = have_from ? from : e.entry;
 
@@ -1005,10 +1014,21 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     printf("---\n");
 
     psp_interp_run(&it);
-    /* Threads the guest started but that never outranked their starter. On
-     * hardware they would have run when the starter blocked or exited; here
-     * the top-level run ending is the closest equivalent point. */
-    if (dispatch) psp_interp_drain_pending(budget);
+
+    /* The entry point has returned; the threads it started have not.
+     *
+     * The main context steps aside and lets the scheduler run them until they
+     * are all done, which is also when a thread that parked gets woken and
+     * resumed -- the drain is not a mop-up pass but the rest of the program.
+     *
+     * Except after sceKernelExitGame, which is a program saying it is finished.
+     * Draining then would run stragglers past the end and let them print, so
+     * the run stops instead. */
+    int live = 0;
+    if (dispatch) {
+        if (it.status == I_EXIT) psp_sched_stop_all("sceKernelExitGame");
+        else                     live = psp_sched_drain(drain_s);
+    }
 
     printf("---\n");
     printf("stopped:  %s\n", psp_interp_status_str(it.status));
@@ -1017,6 +1037,13 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
         printf("re-entry: served interpreted; nest refused %llu, failed %llu\n",
                (unsigned long long)psp_interp_nest_refused(),
                psp_interp_nest_failed());
+    /* No duration is claimed here: the drain gives up either on the deadline or
+     * the moment nothing is runnable, and its return value does not say which.
+     * It has already printed the distinction itself, with the reason. */
+    if (live) {
+        printf("threads:  %d still alive\n", live);
+        psp_sched_dump_threads(stdout);
+    }
     else if (g_reentry_count)
         printf("re-entry: %llu HLE callbacks into guest code, first 0x%08X\n"
                "          (needs the interpreter to service psp_dispatch)\n",
@@ -1212,11 +1239,19 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "interp")) {
         uint32_t from = 0; int have_from = 0, trace = 0, regs = 0, dispatch = 0;
         uint64_t budget = 1000000;
+        /* Wall-clock, not guest time, and deliberately short: the sweep already
+         * wraps each test in `timeout 25`, and a drain that outlasts it turns a
+         * diagnosable "still alive, parked on X" report into a killed process
+         * with no output at all. psp_sched_drain's own default of 60 is for the
+         * game, which is supposed to still be going. */
+        int drain_s = 10;
         for (int i = 3; i < argc; i++) {
             if (!strcmp(argv[i], "--from") && i + 1 < argc) {
                 from = (uint32_t)strtoul(argv[++i], NULL, 0); have_from = 1;
             } else if (!strcmp(argv[i], "--budget") && i + 1 < argc) {
                 budget = strtoull(argv[++i], NULL, 0);
+            } else if (!strcmp(argv[i], "--drain") && i + 1 < argc) {
+                drain_s = (int)strtol(argv[++i], NULL, 0);
             } else if (!strcmp(argv[i], "--trace")) {
                 trace = 1;
             } else if (!strcmp(argv[i], "--regs")) {
@@ -1228,7 +1263,8 @@ int main(int argc, char **argv) {
                 return usage();
             }
         }
-        return cmd_interp(argv[2], from, have_from, budget, trace, regs, dispatch);
+        return cmd_interp(argv[2], from, have_from, budget, trace, regs,
+                          dispatch, drain_s);
     }
     if (!strcmp(cmd, "decrypt")) return cmd_decrypt(argv[2], keypath);
     if (!strcmp(cmd, "kirk1")) {

@@ -145,6 +145,29 @@ psp_interp_status psp_interp_run(psp_interp *it);
  * not return hangs the run rather than failing it. */
 void psp_interp_service_dispatch(int enable);
 
+/* Give each guest thread a host thread, so that waits can block.
+ *
+ * Requires psp_interp_service_dispatch as well -- this decides what happens to
+ * a *spawn*, and the dispatch hook is what runs the thread's body once the
+ * scheduler starts it. The two compose in either order.
+ *
+ * Off (the default), a started thread runs nested to completion or is parked
+ * until the top-level run ends: "runnable is not running", the one scheduling
+ * rule reachable without a scheduler. That is what the differential oracle
+ * needs, since it disables threading outright -- a comparison whose result
+ * depends on scheduling cannot attribute a divergence to codegen.
+ *
+ * On, spawns are handed to sched.c, which gives each guest thread a host thread
+ * whose C stack holds its context, exactly as it does for recompiled code. A
+ * wait can then park and be resumed, because there is somewhere to resume into.
+ * Interleaving, priority and wakeup order become real, which is what a suite
+ * that tests scheduling is measuring.
+ *
+ * `budget` bounds each fresh thread's run: a thread started from a hook has no
+ * outer run to inherit a limit from, and one that loops forever would otherwise
+ * hang the harness at the point it was reporting results. */
+void psp_interp_service_threads(int enable, uint64_t budget);
+
 /* How many re-entries were refused for exceeding the nesting limit. Nonzero
  * means some guest callback did not run; the result is still bounded, but it is
  * not a faithful execution. */
