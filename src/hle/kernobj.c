@@ -298,10 +298,13 @@ static void hle_ReferVplStatus(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static void mpp_reset(void);
+
 void psp_kernobj_reset(void) {
     for (int i = 0; i < MAX_VPLS; i++)
         if (g_vpl[i].used && g_vpl[i].base) psp_sysmem_release(g_vpl[i].base);
     memset(g_vpl, 0, sizeof g_vpl);
+    mpp_reset();
 }
 
 void psp_kernobj_register(void) {
@@ -313,4 +316,286 @@ void psp_kernobj_register(void) {
     psp_hle_register(0xB736E9FF, "ThreadManForUser", "sceKernelFreeVpl",        hle_FreeVpl);
     psp_hle_register(0x1D371B8A, "ThreadManForUser", "sceKernelCancelVpl",      hle_CancelVpl);
     psp_hle_register(0x39810265, "ThreadManForUser", "sceKernelReferVplStatus", hle_ReferVplStatus);
+    psp_kernobj_register_mpp();
+}
+
+/* ---- msgpipe: a byte ring, not a message queue -----------------------------
+ *
+ * The name says messages and the accounting says bytes: a 0x1000 pipe sent 256
+ * bytes reports `free=f00`, and one sent a single unaligned byte reports
+ * `free=fff`. There is no per-message header and no framing at all -- a
+ * receiver takes whatever is there, in order, in whatever quantity it asked
+ * for. Both halves of that are printed by threads/msgpipe/{send,receive}.
+ *
+ * **Only two modes exist.** send.expected sweeps -2, -1, 2..9, 257 and 4097 and
+ * refuses every one with ILLEGAL_MODE; 0 waits for the whole transfer and 1
+ * takes what it can. Fifty-two of the file's lines are that sweep.
+ */
+
+#define MAX_PIPES 64
+#define MPP_MODE_ASAP 1u
+
+typedef struct {
+    uint32_t  uid;
+    char      name[32];
+    uint32_t  attr;
+    uint32_t  base;        /* the ring, in guest memory */
+    uint32_t  buf_size;
+    uint32_t  head, used;  /* head is the read cursor */
+    int       alive;
+    psp_waitq send_q, recv_q;
+    char      senddesc[64], recvdesc[64];
+} psp_msgpipe;
+
+static psp_msgpipe g_pipe[MAX_PIPES];
+
+static void mpp_reset(void) {
+    for (int i = 0; i < MAX_PIPES; i++)
+        if (g_pipe[i].alive && g_pipe[i].base) psp_sysmem_release(g_pipe[i].base);
+    memset(g_pipe, 0, sizeof g_pipe);
+}
+
+static psp_msgpipe *find_pipe(uint32_t id) {
+    for (int i = 0; i < MAX_PIPES; i++)
+        if (g_pipe[i].alive && g_pipe[i].uid == id) return &g_pipe[i];
+    return NULL;
+}
+
+static uint32_t mpp_free(const psp_msgpipe *p) { return p->buf_size - p->used; }
+
+/* The ring, byte at a time. Small transfers, and the wrap is the only thing
+ * worth being careful about. */
+/* Both guard on the buffer size before taking a remainder. A pipe created with
+ * no buffer is legal -- create.expected has several -- and a zero-length
+ * transfer on one is legal too, so the cursor update runs with a modulus of
+ * zero and takes the process down with SIGFPE. */
+static void mpp_put(psp_msgpipe *p, uint32_t src, uint32_t n) {
+    if (!p->buf_size || !n) return;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t at = (p->head + p->used + i) % p->buf_size;
+        psp_write8(p->base + at, src ? psp_read8(src + i) : 0);
+    }
+    p->used += n;
+}
+
+static void mpp_take(psp_msgpipe *p, uint32_t dst, uint32_t n) {
+    if (!p->buf_size || !n) return;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t b = psp_read8(p->base + (p->head + i) % p->buf_size);
+        if (dst) psp_write8(dst + i, b);
+    }
+    p->head = (p->head + n) % p->buf_size;
+    p->used -= n;
+}
+
+static void hle_CreateMsgPipe(void) {
+    /* (name, partition, attr, size, option) */
+    const uint32_t name = psp_arg(0);
+    const int32_t  part = (int32_t)psp_arg(1);
+    const uint32_t attr = psp_arg(2);
+    const uint32_t size = psp_arg(3);
+
+    /* NO_MEMORY for a null name, where a semaphore answers ERROR and an
+     * lwmutex answers ERROR too. threadman.c predicted this one before the
+     * type existed: fpl and msgpipe are the two that differ. */
+    if (!name) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    const uint32_t pe = vpl_partition_error(part);
+    if (pe) { psp_ret(pe); return; }
+
+    const uint32_t base = size ? psp_sysmem_alloc(size, 0) : 0;
+    if (size && !base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    psp_msgpipe *p = NULL;
+    for (int i = 0; i < MAX_PIPES; i++) if (!g_pipe[i].alive) { p = &g_pipe[i]; break; }
+    if (!p) { if (base) psp_sysmem_release(base);
+              psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    memset(p, 0, sizeof *p);
+    psp_str(name, p->name, sizeof p->name);
+    p->attr     = attr;
+    p->base     = base;
+    p->buf_size = size;
+    p->uid      = psp_threadman_next_uid();
+    p->alive    = 1;
+    char nm[sizeof p->name];
+    memcpy(nm, p->name, sizeof nm);
+    snprintf(p->senddesc, sizeof p->senddesc, "sceKernelSendMsgPipe(%s)", nm);
+    memcpy(nm, p->name, sizeof nm);
+    snprintf(p->recvdesc, sizeof p->recvdesc, "sceKernelReceiveMsgPipe(%s)", nm);
+    psp_ret(p->uid);
+}
+
+static void hle_DeleteMsgPipe(void) {
+    psp_msgpipe *p = find_pipe(psp_arg(0));
+    if (!p) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MPPID); return; }
+    int urgent = psp_waitq_release_all(&p->send_q);
+    urgent |= psp_waitq_release_all(&p->recv_q);
+    if (p->base) psp_sysmem_release(p->base);
+    p->alive = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
+}
+
+/* Whoever is waiting on the other side may now be able to move. Each waiter
+ * carries the buffer it was given and how much it wanted; `mode` says whether
+ * a partial transfer will do. */
+static int mpp_wake_receivers(psp_msgpipe *p) {
+    int urgent = 0;
+    for (;;) {
+        const int i = psp_waitq_pick(&p->recv_q, p->attr);
+        if (i < 0) break;
+        const psp_waiter w = p->recv_q.w[i];
+        const uint32_t want = (w.mode & MPP_MODE_ASAP)
+                            ? (p->used < w.need ? p->used : w.need) : w.need;
+        if (!want || want > p->used) break;
+        psp_waitq_take(&p->recv_q, i);
+        mpp_take(p, w.out, want);
+        urgent |= psp_sched_wake(w.uid);
+    }
+    return urgent;
+}
+
+static int mpp_wake_senders(psp_msgpipe *p) {
+    int urgent = 0;
+    for (;;) {
+        const int i = psp_waitq_pick(&p->send_q, p->attr);
+        if (i < 0) break;
+        const psp_waiter w = p->send_q.w[i];
+        const uint32_t room = mpp_free(p);
+        const uint32_t give = (w.mode & MPP_MODE_ASAP)
+                            ? (room < w.need ? room : w.need) : w.need;
+        if (!give || give > room) break;
+        psp_waitq_take(&p->send_q, i);
+        mpp_put(p, w.out, give);
+        urgent |= psp_sched_wake(w.uid);
+    }
+    return urgent;
+}
+
+/* send and receive are the same shape with the direction reversed, so they
+ * share a body: `sending` picks which queue is ours and which is theirs, which
+ * error a full-or-empty poll gives, and which way the bytes go. */
+static void mpp_transfer(int sending, int may_block, int has_timeout) {
+    const uint32_t id      = psp_arg(0);
+    const uint32_t buf     = psp_arg(1);
+    const uint32_t len     = psp_arg(2);
+    const uint32_t mode    = psp_arg(3);
+    const uint32_t out     = psp_arg(4);
+    const uint32_t tmo_ptr = has_timeout ? psp_arg(5) : 0;
+
+    psp_msgpipe *p = find_pipe(id);
+    if (!p) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MPPID); return; }
+    if (mode & ~MPP_MODE_ASAP) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MODE); return; }
+    /* A length with the sign bit set is a different mistake from one merely
+     * bigger than the pipe, and gets a different code. */
+    if ((int32_t)len < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+    /* Bigger than the pipe -- but only when the pipe has a size at all. On a
+     * pipe created with no buffer *every* request is answered FULL rather than
+     * too-big, including ones that are obviously too big: with nowhere to put
+     * anything, "there is no room" is the more specific truth and it is what
+     * hardware says. */
+    if (p->buf_size && len > p->buf_size) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE_MPP);
+        return;
+    }
+
+    const uint64_t deadline = psp_wait_deadline(tmo_ptr);
+    const uint32_t avail = sending ? mpp_free(p) : p->used;
+    uint32_t now = (mode & MPP_MODE_ASAP) ? (avail < len ? avail : len) : len;
+
+    /* Nothing asked for is nothing to wait for: a zero-length transfer
+     * succeeds even on a pipe with no buffer at all. */
+    if (len == 0 || (now && now <= avail)) {
+        if (sending) { mpp_put(p, buf, now); }
+        else         { mpp_take(p, buf, now); }
+        if (out) psp_write32(out, now);
+        const int urgent = sending ? mpp_wake_receivers(p) : mpp_wake_senders(p);
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        if (urgent) psp_sched_yield();
+        return;
+    }
+
+    if (!may_block) {
+        /* ASAP moved nothing, and says so: `ASAP: Failed (800201b3, bytes=0)`.
+         * A full-wait failure leaves the word alone, which is how the tests
+         * tell the two apart -- they pre-seed it with 0x1337. */
+        if ((mode & MPP_MODE_ASAP) && out) psp_write32(out, 0);
+        psp_ret(sending ? SCE_KERNEL_ERROR_MSGPIPE_FULL
+                        : SCE_KERNEL_ERROR_MSGPIPE_EMPTY);
+        return;
+    }
+
+    const uint32_t me = psp_sched_current();
+    psp_waitq *q = sending ? &p->send_q : &p->recv_q;
+    if (psp_waitq_add(q, me, len, mode, buf) != 0) {
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
+                                         sending ? p->senddesc : p->recvdesc,
+                                         deadline);
+    p = find_pipe(id);
+    if (!p) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+
+    if (rc == PSP_SCHED_WOKEN) {
+        /* The other side moved the bytes on our behalf. */
+        if (out) psp_write32(out, len);
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+    psp_waitq_drop(sending ? &p->send_q : &p->recv_q, me);
+    /* A wait that ran out moved nothing, and reports that: `bytes=0`, where an
+     * argument failure leaves the caller's 0x1337 in place. */
+    if (out) psp_write32(out, 0);
+    psp_wait_writeback(tmo_ptr, deadline);
+    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+}
+
+static void hle_SendMsgPipe(void)       { mpp_transfer(1, 1, 1); }
+static void hle_TrySendMsgPipe(void)    { mpp_transfer(1, 0, 0); }
+static void hle_ReceiveMsgPipe(void)    { mpp_transfer(0, 1, 1); }
+static void hle_TryReceiveMsgPipe(void) { mpp_transfer(0, 0, 0); }
+
+static void hle_CancelMsgPipe(void) {
+    psp_msgpipe *p = find_pipe(psp_arg(0));
+    if (!p) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MPPID); return; }
+    const uint32_t nsend = psp_arg(1), nrecv = psp_arg(2);
+    if (nsend) psp_write32(nsend, (uint32_t)psp_waitq_count(&p->send_q));
+    if (nrecv) psp_write32(nrecv, (uint32_t)psp_waitq_count(&p->recv_q));
+    int urgent = psp_waitq_release_all(&p->send_q);
+    urgent |= psp_waitq_release_all(&p->recv_q);
+    p->head = p->used = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
+}
+
+static void hle_ReferMsgPipeStatus(void) {
+    const psp_msgpipe *p = find_pipe(psp_arg(0));
+    const uint32_t info = psp_arg(1);
+    if (!p)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MPPID); return; }
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+    psp_write32(info +  0, 56);
+    psp_threadman_write_name(info + 4, p->name);
+    psp_write32(info + 36, p->attr);
+    psp_write32(info + 40, p->buf_size);
+    psp_write32(info + 44, mpp_free(p));
+    psp_write32(info + 48, (uint32_t)psp_waitq_count(&p->send_q));
+    psp_write32(info + 52, (uint32_t)psp_waitq_count(&p->recv_q));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+void psp_kernobj_register_mpp(void) {
+    psp_hle_register(0x7C0DC2A0, "ThreadManForUser", "sceKernelCreateMsgPipe",     hle_CreateMsgPipe);
+    psp_hle_register(0xF0B7DA1C, "ThreadManForUser", "sceKernelDeleteMsgPipe",     hle_DeleteMsgPipe);
+    psp_hle_register(0x876DBFAD, "ThreadManForUser", "sceKernelSendMsgPipe",       hle_SendMsgPipe);
+    psp_hle_register(0x7C41F2C2, "ThreadManForUser", "sceKernelSendMsgPipeCB",     hle_SendMsgPipe);
+    psp_hle_register(0x884C9F90, "ThreadManForUser", "sceKernelTrySendMsgPipe",    hle_TrySendMsgPipe);
+    psp_hle_register(0x74829B76, "ThreadManForUser", "sceKernelReceiveMsgPipe",    hle_ReceiveMsgPipe);
+    psp_hle_register(0xFBFA697D, "ThreadManForUser", "sceKernelReceiveMsgPipeCB",  hle_ReceiveMsgPipe);
+    psp_hle_register(0xDF52098F, "ThreadManForUser", "sceKernelTryReceiveMsgPipe", hle_TryReceiveMsgPipe);
+    psp_hle_register(0x349B864D, "ThreadManForUser", "sceKernelCancelMsgPipe",     hle_CancelMsgPipe);
+    psp_hle_register(0x33BE4024, "ThreadManForUser", "sceKernelReferMsgPipeStatus",hle_ReferMsgPipeStatus);
 }

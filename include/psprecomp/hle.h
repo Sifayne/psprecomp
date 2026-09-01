@@ -200,6 +200,10 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_ILLEGAL_PARTITION  0x800200D2
 #define SCE_KERNEL_ERROR_UNKNOWN_VPLID      0x8002019C
 #define SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE    0x800201B7
+#define SCE_KERNEL_ERROR_UNKNOWN_MPPID      0x8002019E
+#define SCE_KERNEL_ERROR_MSGPIPE_FULL       0x800201B3
+#define SCE_KERNEL_ERROR_MSGPIPE_EMPTY      0x800201B4
+#define SCE_KERNEL_ERROR_ILLEGAL_SIZE_MPP   0x800201BC
 
 /* ---- the subsystems ------------------------------------------------------ */
 
@@ -344,6 +348,7 @@ void     psp_threadman_write_name(uint32_t dst, const char *name);
 void psp_kernlock_register(void);
 void psp_kernlock_register_lw(void);
 void psp_kernobj_register(void);
+void psp_kernobj_register_mpp(void);
 void psp_kernobj_reset(void);
 void psp_kernlock_reset(void);
 
