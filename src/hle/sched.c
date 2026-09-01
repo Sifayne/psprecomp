@@ -69,10 +69,25 @@ static _Thread_local int g_self = MAIN_SLOT;
 
 /* ---- slots ---------------------------------------------------------------- */
 
+/* A live slot wins over a dead one carrying the same uid.
+ *
+ * Slots are never reused -- see psp_sched_spawn for why that stays true -- so a
+ * thread that is terminated and started again owns *two* slots with one uid,
+ * and this returned the corpse: its priority, its state, and its position in
+ * every scan. threads/change restarts a thread after each priority change and
+ * reads the priority back, which is where it showed
+ * (`Before: Current=18` against hardware's `30`).
+ *
+ * The dead slot is still the answer when it is the only one, because a finished
+ * thread is a thing callers legitimately ask about. */
 static int slot_of(uint32_t uid) {
-    for (int i = 0; i < MAX_SCHED_THREADS; i++)
-        if (g_slot[i].used && g_slot[i].uid == uid) return i;
-    return -1;
+    int dead = -1;
+    for (int i = 0; i < MAX_SCHED_THREADS; i++) {
+        if (!g_slot[i].used || g_slot[i].uid != uid) continue;
+        if (g_slot[i].state != PSP_SCHED_DEAD) return i;
+        if (dead < 0) dead = i;
+    }
+    return dead;
 }
 
 /* The caller's slot. An explicit uid wins when it names a live slot; otherwise
