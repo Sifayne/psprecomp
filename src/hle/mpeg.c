@@ -145,7 +145,9 @@ typedef struct {
      * video is one substream inside it, and a decoder wants it contiguous. */
     uint8_t *es;
     size_t   es_len, es_cap;
-    int      es_eof;
+    int      es_eof;       /* the ring callback has short-delivered: the whole
+                           * stream has now been fed, and whatever is still
+                           * undecoded in `es` is the tail of the file */
     size_t   es_pos;       /* how far the decoder has consumed */
 
     void    *dec;          /* ISVCDecoder*, opaque here so the header stays out */
@@ -552,11 +554,20 @@ static int avc_pump(mpeg_ctx *c) {
         const size_t start = nal_next(c->es, c->es_len, pos);
         if (start >= c->es_len) break;
         size_t end = nal_next(c->es, c->es_len, start);
-        if (end >= c->es_len) break;          /* incomplete: wait for more */
-        /* end points past the next start code's 0x01; back up over it and any
-         * trailing zero of a four-byte start code. */
-        size_t nal_end = end - 3;
-        while (nal_end > start && c->es[nal_end - 1] == 0) nal_end--;
+        size_t nal_end;
+        if (end >= c->es_len) {
+            /* No following start code. Mid-stream that means "incomplete, wait
+             * for more"; at end of stream it means this is the last NAL and
+             * everything left is it -- a tail that would otherwise never
+             * decode, and the last frames of the movie would silently drop. */
+            if (!c->es_eof) break;
+            nal_end = c->es_len;
+        } else {
+            /* end points past the next start code's 0x01; back up over it and
+             * any trailing zero of a four-byte start code. */
+            nal_end = end - 3;
+            while (nal_end > start && c->es[nal_end - 1] == 0) nal_end--;
+        }
 
         unsigned char *planes[3] = { 0, 0, 0 };
         SBufferInfo info;
@@ -642,6 +653,9 @@ static void hle_RingbufferPut(void) {
     if (!mpeg_decoding()) { psp_ret((uint32_t)want); return; }  /* pre-decoder behaviour */
 
     int32_t n = want < avail ? want : avail;
+    /* Fetched before the callback so the short-delivery check below can reach
+     * it even when the delivery is zero packets. */
+    mpeg_ctx *c = ctx_for_ringbuffer(rb);
     const uint32_t cb = psp_read32(rb + RB_CALLBACK);
     if (cb) {
         const uint32_t pkt_size = psp_read32(rb + RB_PACKET_SIZE);
@@ -652,9 +666,16 @@ static void hle_RingbufferPut(void) {
          * wrapping mid-call: the callback fills one contiguous run. */
         const uint32_t slot = packets ? (written % packets) : 0;
         if (packets && slot + (uint32_t)n > packets) n = (int32_t)(packets - slot);
+        const int32_t asked = n;
         if (n > 0)
             n = (int32_t)call_guest(cb, base + slot * pkt_size, (uint32_t)n,
                                     psp_read32(rb + RB_CALLBACK_ARG));
+        /* A short delivery from the callback is the end of the file. The game
+         * reads the stream sequentially, so fewer packets than asked means
+         * fewer exist -- this is the one signal that the stream has ended,
+         * and GetAvcAu turns it into the end-of-stream answer. The clamp
+         * above shorted `asked` itself, and is not this. */
+        if (c && n < asked) c->es_eof = 1;
     }
 
     /* One-shot look at what the callback actually delivered. An MPEG program
@@ -675,7 +696,6 @@ static void hle_RingbufferPut(void) {
      * put them, so this is the one place they are known to be both present and
      * not yet overwritten by the next put. */
     if (n > 0) {
-        mpeg_ctx *c = ctx_for_ringbuffer(rb);
         if (c) {
             const uint32_t pkt_size = psp_read32(rb + RB_PACKET_SIZE);
             const uint32_t base     = psp_read32(rb + RB_DATA);
@@ -843,9 +863,22 @@ static void hle_GetAvcAu(void) {
      * has a whole picture, which saves parsing enough slice-header syntax to
      * work out the same thing a second time.
      *
-     * No picture means the ring buffer has not been fed far enough yet, which
-     * is what NO_DATA is for -- the game answers it by putting more. */
+     * No picture has two causes now, and the game treats them oppositely: the
+     * ring not fed far enough yet, which is what NO_DATA is for and what the
+     * game answers by putting more; and the stream having ended, where NO_DATA
+     * is an instruction to spin forever -- 522 million ring queries in a
+     * sixty-second run, measured, with the intro never leaving. At a true end
+     * -- everything fed, everything consumed, no picture -- the answer is the
+     * one the game's own decode loop reads as "report and stop":
+     *
+     *     0027528C  beq $s3, $a0, 0x00275268   ; NO_DATA -> go round again
+     *     ...                                  ; anything else -> stop
+     */
     if (!c || (!c->pic_ready && avc_pump(c) == 0)) {
+        if (c && c->es_eof && c->es_pos >= c->es_len && !c->pic_ready) {
+            psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
+            return;
+        }
         psp_ret(SCE_MPEG_ERROR_NO_DATA);
         return;
     }
@@ -902,6 +935,15 @@ static void hle_GetAtracAu(void) {
         psp_write32(au + AU_DTS,     c->atrac_pts);
         psp_write32(au + AU_DTS + 4, 0);
         psp_write32(au + AU_ES_SIZE, MPEG_ATRAC_ES_SIZE);
+    }
+    /* The audio stream ends when the video's does: both are substreams of the
+     * one file, and the ring callback's short delivery says so for both.
+     * Answering AUs forever would have SoundThread pumping silence down a
+     * channel long after the movie stopped -- measured at 179 thousand calls
+     * and climbing at the end of a four-minute run. */
+    if (c->es_eof && c->es_pos >= c->es_len && !c->pic_ready) {
+        psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
+        return;
     }
     c->atrac_pts += MPEG_ATRAC_PTS_STEP;
     psp_ret(SCE_KERNEL_ERROR_OK);
