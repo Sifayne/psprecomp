@@ -46,6 +46,68 @@ static void note_write_val(uint32_t addr, uint32_t width, uint32_t val) {
     }
 }
 
+/* A census, because "few enough to simply print" stopped being true.
+ *
+ * Printing the first 32 addresses answered the question while a bad access
+ * meant a botched initialiser. It does not survive a run that makes 1.2
+ * billion of them: the 32 lines are all cascade from one wild pointer, the
+ * count is the only other number, and neither says where it came from.
+ *
+ * Two tables, and the second is the one that matters. Addresses tell you the
+ * shape of the walk -- a stride of 68 through a vertex array reads very
+ * differently from one address hit repeatedly. `$ra` tells you the call site,
+ * and *it works without a TRACE build*, because unlike psp_trace_last() it is
+ * just a register. In the run this was written for, `ra` was the whole
+ * diagnosis: one value, 0x0002E2F8, for all 1.2 billion. */
+#define BAD_ADDRS 256
+#define BAD_SITES 32
+
+typedef struct { uint32_t key; uint64_t count; uint32_t ra, fn, first; int w, width; } bad_slot;
+static bad_slot g_bad_addr[BAD_ADDRS];
+static bad_slot g_bad_site[BAD_SITES];
+static int      g_bad_addr_n, g_bad_site_n;
+static uint64_t g_bad_addr_lost, g_bad_site_lost;
+
+/* Populating the tables costs a hash probe per access, and at a billion
+ * accesses that is the run's whole budget. Past this many the counter keeps
+ * counting and the tables stop learning -- stated in the report, because a
+ * distribution over a sample read as a census is exactly the kind of wrong
+ * number this codebase keeps a list of. */
+static uint64_t g_bad_sample = 1000000;
+
+static void bad_note(bad_slot *tab, int cap, int *n, uint64_t *lost,
+                     uint32_t key, uint32_t addr, int write, int width) {
+    uint32_t h = (key * 2654435761u) % (uint32_t)cap;
+    for (int i = 0; i < cap; i++) {
+        bad_slot *s = &tab[(h + (uint32_t)i) % (uint32_t)cap];
+        if (s->count && s->key != key) continue;
+        if (!s->count) {
+            s->key = key; s->first = addr; s->w = write; s->width = width;
+            s->ra = psp_cpu.r[PSP_REG_RA]; s->fn = psp_trace_last();
+            (*n)++;
+        }
+        s->count++;
+        return;
+    }
+    (*lost)++;
+}
+
+/* Fire once at the Nth bad access, with the faulting frame still live.
+ *
+ * The policy -- stop the run, trap for a debugger, do nothing -- is the
+ * host's, not this layer's. mem.c is a leaf: it includes mem.h, dispatch.h
+ * and cpu.h, and test_runtime links it with no scheduler behind it. Calling
+ * psp_sched_stop_all from here would drag the whole HLE in to serve one
+ * diagnostic. */
+static uint64_t g_bad_at;
+static void (*g_bad_hook)(uint64_t nth, uint32_t addr, int write, int width);
+
+void psp_mem_set_bad_hook(uint64_t nth,
+                          void (*fn)(uint64_t, uint32_t, int, int)) {
+    g_bad_at = nth; g_bad_hook = fn;
+}
+void psp_mem_set_bad_sample(uint64_t n) { g_bad_sample = n; }
+
 /* Bad accesses were only ever counted, which says an initialiser went wrong
  * without saying which one. The addresses are what identify it, and there are
  * few enough of them (28 in the current run) to simply print. */
@@ -68,10 +130,74 @@ static void bad_access(uint32_t addr, int write, int width) {
          * that supplied the bad pointer. Empty unless built -DPSPRECOMP_TRACE. */
         psp_trace_dump();
     }
-    if (psp_mem_bad_access < 32)
+    /* Eight, not thirty-two. When these were all the report had, more was
+     * better; beside the census they are only a sample of the walk's shape,
+     * and thirty-two lines of the same cascade buries the register dump
+     * above them. */
+    if (psp_mem_bad_access < 8)
         fprintf(stderr, "psprecomp: bad %s%d at 0x%08X (last fn 0x%08X)\n",
                 write ? "write" : "read", width * 8, addr, psp_trace_last());
+
+    if (psp_mem_bad_access < g_bad_sample) {
+        bad_note(g_bad_addr, BAD_ADDRS, &g_bad_addr_n, &g_bad_addr_lost,
+                 addr, addr, write, width);
+        bad_note(g_bad_site, BAD_SITES, &g_bad_site_n, &g_bad_site_lost,
+                 psp_cpu.r[PSP_REG_RA], addr, write, width);
+    }
+
     psp_mem_bad_access++;
+    /* Fires at the first, so a host can capture state that the rest of the
+     * run destroys -- the HLE's zero-return ring is sixteen deep and a
+     * cascade this size scrolls it away long before the summary prints -- and
+     * again at whichever one the host armed, to stop or trap there. */
+    if (g_bad_hook && (psp_mem_bad_access == 1 || psp_mem_bad_access == g_bad_at))
+        g_bad_hook(psp_mem_bad_access, addr, write, width);
+}
+
+static int bad_cmp(const void *a, const void *b) {
+    const bad_slot *x = a, *y = b;
+    return x->count < y->count ? 1 : x->count > y->count ? -1 : 0;
+}
+
+static void bad_table(FILE *out, const char *what, bad_slot *tab, int cap,
+                      int n, uint64_t lost, int top, int by_site) {
+    if (!n) return;
+    bad_slot *s = malloc((size_t)cap * sizeof *s);
+    if (!s) return;
+    memcpy(s, tab, (size_t)cap * sizeof *s);
+    qsort(s, (size_t)cap, sizeof *s, bad_cmp);
+
+    fprintf(out, "  %d distinct %s%s:\n", n, what, n > top ? ", top by count" : "");
+    for (int i = 0; i < cap && i < top; i++) {
+        if (!s[i].count) break;
+        if (by_site)
+            fprintf(out, "    ra=0x%08X  x%-12llu  (first: %s%d at 0x%08X",
+                    s[i].key, (unsigned long long)s[i].count,
+                    s[i].w ? "write" : "read", s[i].width * 8, s[i].first);
+        else
+            fprintf(out, "    0x%08X  x%-12llu  (%s%d",
+                    s[i].key, (unsigned long long)s[i].count,
+                    s[i].w ? "write" : "read", s[i].width * 8);
+        if (s[i].fn) fprintf(out, ", fn 0x%08X", s[i].fn);
+        fprintf(out, ")\n");
+    }
+    if (lost) fprintf(out, "    ... and %llu more, past the table's %d slots\n",
+                      (unsigned long long)lost, cap);
+    free(s);
+}
+
+void psp_mem_dump_bad(FILE *out, int top) {
+    if (!psp_mem_bad_access) return;
+    if (top <= 0) top = 16;
+    if (psp_mem_bad_access > g_bad_sample)
+        fprintf(out, "  (tables cover the first %llu of %llu accesses -- a sample, "
+                     "not a census; raise PSPRECOMP_BAD_SAMPLE to widen it)\n",
+                (unsigned long long)g_bad_sample,
+                (unsigned long long)psp_mem_bad_access);
+    bad_table(out, "call site", g_bad_site, BAD_SITES, g_bad_site_n,
+              g_bad_site_lost, top, 1);
+    bad_table(out, "address", g_bad_addr, BAD_ADDRS, g_bad_addr_n,
+              g_bad_addr_lost, top, 0);
 }
 
 int psp_mem_init(void) {
@@ -83,6 +209,10 @@ int psp_mem_init(void) {
         return -1;
     }
     psp_mem_bad_access = 0;
+    memset(g_bad_addr, 0, sizeof g_bad_addr);
+    memset(g_bad_site, 0, sizeof g_bad_site);
+    g_bad_addr_n = g_bad_site_n = 0;
+    g_bad_addr_lost = g_bad_site_lost = 0;
     return 0;
 }
 

@@ -21,6 +21,7 @@
 #define PSPRECOMP_MEM_H
 
 #include <stdint.h>
+#include <stdio.h>      /* psp_mem_dump_bad reports to a caller's stream */
 #include <string.h>
 
 #ifdef __cplusplus
@@ -68,6 +69,33 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size);
  * and bump psp_mem_bad_access — a recompiled game that starts faulting here is
  * telling you the analysis missed something, so it is counted, not ignored. */
 extern uint64_t psp_mem_bad_access;
+
+/* A census of the bad accesses, printed at the end of a run.
+ *
+ * The count alone stopped being an answer once a run could make more than a
+ * billion of them: they are all cascade from one wild pointer, and what
+ * identifies that pointer is the call site. `$ra` gives it without a TRACE
+ * build, because it is a register rather than an instrumented trace. `top`
+ * bounds the printed rows; <= 0 means 16. */
+void psp_mem_dump_bad(FILE *out, int top);
+
+/* Stop learning after `n` accesses. The counter keeps counting; only the
+ * tables stop, so the cost of the census is bounded on a run that faults in a
+ * tight loop. Reported when it bites, because a sample read as a census is
+ * how you get a confident wrong number. */
+void psp_mem_set_bad_sample(uint64_t n);
+
+/* Called at the *first* bad access, and again at the `nth`, with the faulting
+ * frame still live. The first is for capturing state the rest of the run
+ * destroys; the nth is where a host stops or traps.
+ *
+ * A hook rather than acting here: the policy belongs to the host, and this
+ * file is a leaf -- it includes mem.h, dispatch.h and cpu.h, and the runtime
+ * test links it with no scheduler behind it. Pass nth 0 and NULL to disarm. */
+void psp_mem_set_bad_hook(uint64_t nth,
+                          void (*fn)(uint64_t nth, uint32_t addr,
+                                     int write, int width));
+
 void psp_mem_watch_write(uint32_t addr);
 /* As above, but only report writes of this exact value. */
 void psp_mem_watch_write_value(uint32_t addr, uint32_t val);
