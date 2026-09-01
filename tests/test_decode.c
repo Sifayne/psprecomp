@@ -240,10 +240,23 @@ static void test_vfpu(void) {
     /* VFPU0 family: sub-opcode in bits 25..23. */
     dec(0x60000000, 0x08900000, A_VADD, "vadd");
     dec(0x60800000, 0x08900000, A_VSUB, "vsub");
-    /* vdiv is VFPU0 sub-opcode 4, not 7. This encoding previously used 7,
-     * matching a wrong decoder -- the test agreed with the bug rather than
-     * catching it. Both are corrected against the published encoding. */
-    dec(0x62000000, 0x08900000, A_VDIV, "vdiv (VFPU0 sub-opcode 4)");
+    /* vdiv is VFPU0 sub-opcode 7. It has been asserted both ways here: an
+     * earlier revision moved the decoder *and* this test from 7 to 4, on the
+     * reasoning that the test had been agreeing with a wrong decoder rather
+     * than catching it. That reasoning was right in shape and wrong in
+     * direction, and moving both together is what let it stand -- a test
+     * changed in the same commit as the code it checks has stopped being
+     * evidence.
+     *
+     * The evidence, this time, is outside both: Armored Core's .text contains
+     * VFPU0 sub-opcodes 0, 1 and 7 and no 4, cpu/vfpu/vector contains 0, 1, 2
+     * and 7 and no 4, and the published table has 3..6 invalid. */
+    dec(0x63800000, 0x08900000, A_VDIV, "vdiv (VFPU0 sub-opcode 7)");
+    dec(0x61000000, 0x08900000, A_VSBN, "vsbn (VFPU0 sub-opcode 2)");
+
+    a_decode(0x62000000, 0x08900000, &in);
+    CHECK(in.op == A_VFPU_UNKNOWN,
+          "VFPU0 sub-opcode 4 is not an instruction (got %s)", a_mnemonic(in.op));
     dec(0x64000000, 0x08900000, A_VMUL, "vmul");
     dec(0x64800000, 0x08900000, A_VDOT, "vdot");
 

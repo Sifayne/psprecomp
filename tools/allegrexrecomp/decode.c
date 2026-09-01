@@ -2,6 +2,8 @@
 
 #include "decode.h"
 
+#include "psprecomp/recomp_rt.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -267,6 +269,12 @@ static const a_opinfo OPINFO[A_OP_COUNT] = {
     [A_VFIM]     = { "vfim",     F_UNKNOWN },
     [A_VFAD]     = { "vfad",     F_VD_VS },
     [A_VAVG]     = { "vavg",     F_VD_VS },
+    [A_VFPU9]    = { "vfpu9",    F_VD_VS },
+    [A_VSBN]     = { "vsbn",     F_VD_VS_VT },
+    [A_VF2H]     = { "vf2h",     F_VD_VS },
+    [A_VH2F]     = { "vh2f",     F_VD_VS },
+    [A_VX2I]     = { "vx2i",     F_VD_VS },
+    [A_VI2X]     = { "vi2x",     F_VD_VS },
     [A_VT4444]   = { "vt4444",   F_VD_VS },
     [A_VT5551]   = { "vt5551",   F_VD_VS },
     [A_VT5650]   = { "vt5650",   F_VD_VS },
@@ -576,10 +584,16 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         switch ((word >> 23) & 7) {
         case 0: op = A_VADD; break;
         case 1: op = A_VSUB; break;
-        /* vdiv is sub-opcode 4, not 7. An earlier revision had it at 7, which
-         * both mis-decoded two real instructions and left actual vdiv falling
-         * through as unknown. Corrected against the published encoding. */
-        case 4: op = A_VDIV; break;
+        case 2: op = A_VSBN; break;
+        /* vdiv is sub-opcode 7.
+         *
+         * A comment here used to claim the opposite -- that it was 4, and that
+         * putting it at 7 "mis-decoded two real instructions" -- and that was
+         * wrong. Armored Core's .text contains VFPU0 sub-opcodes 0, 1 and 7
+         * and no 4 at all, so the seven vdiv instructions in the game had been
+         * decoding as unknown-VFPU ever since. Checked against the published
+         * table and against both binaries, not against memory. */
+        case 7: op = A_VDIV; break;
         default: op = A_VFPU_UNKNOWN; break;
         }
         break;
@@ -662,10 +676,25 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
             default:   op = A_VFPU_UNKNOWN; break;
             }
             break;
+        case 0x01:                                  /* VFPU4: rs=1 */
+            switch (RT_F(word)) {
+            case 0x12: op = A_VF2H; break;
+            case 0x13: op = A_VH2F; break;
+            /* Four variants each, selected by the low two bits of rt: the
+             * unpackers at 0x18..0x1B and the packers at 0x1C..0x1F. */
+            case 0x18: case 0x19: case 0x1A: case 0x1B: op = A_VX2I; break;
+            case 0x1C: case 0x1D: case 0x1E: case 0x1F: op = A_VI2X; break;
+            default:   op = A_VFPU_UNKNOWN; break;
+            }
+            break;
         case 0x02:                                  /* VFPU4: rs=2 */
             switch (RT_F(word)) {
             case 0x06: op = A_VFAD;   break;
             case 0x07: op = A_VAVG;   break;
+            /* vsrt1/2, vbfy1/2, vocp, vsrt3/4, vsgn -- all "this vector
+             * against a swizzled copy of itself", so one entry point. */
+            case 0x00: case 0x01: case 0x02: case 0x03: case 0x04:
+            case 0x08: case 0x09: case 0x0A: op = A_VFPU9; break;
             /* The colour packs keep their format in the low two bits of rt. */
             case 0x19: op = A_VT4444; break;
             case 0x1A: op = A_VT5551; break;
@@ -880,15 +909,7 @@ int a_format(const a_insn *in, char *buf, int buflen) {
 /* vfim carries a half-precision float. Expanding it here keeps the runtime
  * dealing only in single precision. Shared by the emitter and the interpreter
  * so both read the same constant out of the same encoding. */
-float a_half_to_float(uint16_t h) {
-    const uint32_t sign = (uint32_t)(h >> 15) << 31;
-    const uint32_t exp  = (h >> 10) & 0x1F;
-    const uint32_t man  = h & 0x3FF;
-    uint32_t bits;
-    if (exp == 0)        bits = sign | (man ? ((127 - 15 + 1) << 23) | (man << 13) : 0);
-    else if (exp == 31)  bits = sign | 0x7F800000u | (man << 13);
-    else                 bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
-    float f;
-    memcpy(&f, &bits, sizeof f);
-    return f;
-}
+/* The conversion itself lives in recomp_rt.h, with the runtime's vh2f. Two
+ * copies would be invisible to the oracle, which runs the same helper on both
+ * sides of its comparison. */
+float a_half_to_float(uint16_t h) { return psp_half_to_f32(h); }

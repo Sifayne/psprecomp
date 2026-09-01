@@ -335,6 +335,289 @@ void psp_vcolor(uint32_t vd, uint32_t vs, int fmt, int size) {
     eat_prefixes();
 }
 
+void psp_vsbn(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    read_src(vs, size, g_prefix[0], sv);
+    read_src(vt, size, g_prefix[1], tv);
+
+    /* vt's first lane is read as an *integer* exponent, biased on the way in. */
+    const uint32_t exp = (uint32_t)(uint8_t)(127 + (int32_t)psp_f32_to_bits(tv[0]));
+
+    float out[4];
+    const uint32_t bits = psp_f32_to_bits(sv[0]);
+    const uint32_t prev = bits & 0x7F800000u;
+    /* Only a normal number gets its exponent replaced: a zero, an infinity or
+     * a NaN is already saying something the exponent field cannot carry. */
+    out[0] = (prev != 0 && prev != 0x7F800000u)
+           ? psp_bits_to_f32((bits & ~0x7F800000u) | (exp << 23))
+           : sv[0];
+    for (int i = 1; i < 4; i++) out[i] = sv[i];
+
+    write_dst(vd, size, out);
+    eat_prefixes();
+}
+
+/* ---- VFPU9: a vector against a swizzled copy of itself --------------------
+ *
+ * The sorts, the butterflies, the one's complement and the sign. Hardware
+ * builds the second operand by forcing a swizzle or a constant into the T
+ * prefix and then running an ordinary min/max/add, which is why none of these
+ * names a second register. Written out directly here: synthesising a prefix in
+ * order to consume it would be a faithful description of the hardware and a
+ * worse description of the arithmetic. */
+void psp_vfpu9(uint32_t vd, uint32_t vs, int kind, int size) {
+    float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const int n = read_src(vs, size, g_prefix[0], s);
+
+    /* The two swizzles the sorts and butterflies use. */
+    const float yxwz[4] = { s[1], s[0], s[3], s[2] };
+    const float wzyx[4] = { s[3], s[2], s[1], s[0] };
+    const float zwxy[4] = { s[2], s[3], s[0], s[1] };
+
+    #define MIN(a,b) ((a) < (b) ? (a) : (b))
+    #define MAX(a,b) ((a) > (b) ? (a) : (b))
+    switch (kind) {
+    case 0:                                              /* vsrt1 */
+        d[0] = MIN(s[0], yxwz[0]); d[1] = MAX(s[1], yxwz[1]);
+        d[2] = MIN(s[2], yxwz[2]); d[3] = MAX(s[3], yxwz[3]);
+        break;
+    case 1:                                              /* vsrt2 */
+        d[0] = MIN(s[0], wzyx[0]); d[1] = MIN(s[1], wzyx[1]);
+        d[2] = MAX(s[2], wzyx[2]); d[3] = MAX(s[3], wzyx[3]);
+        break;
+    case 8:                                              /* vsrt3 */
+        d[0] = MAX(s[0], yxwz[0]); d[1] = MIN(s[1], yxwz[1]);
+        d[2] = MAX(s[2], yxwz[2]); d[3] = MIN(s[3], yxwz[3]);
+        break;
+    case 9:                                              /* vsrt4 */
+        d[0] = MAX(s[0], wzyx[0]); d[1] = MAX(s[1], wzyx[1]);
+        d[2] = MIN(s[2], wzyx[2]); d[3] = MIN(s[3], wzyx[3]);
+        break;
+    case 2:                                              /* vbfy1 */
+        d[0] = s[0] + yxwz[0]; d[1] = -s[1] + yxwz[1];
+        d[2] = s[2] + yxwz[2]; d[3] = -s[3] + yxwz[3];
+        break;
+    case 3:                                              /* vbfy2 */
+        d[0] = s[0] + zwxy[0]; d[1] =  s[1] + zwxy[1];
+        d[2] = -s[2] + zwxy[2]; d[3] = -s[3] + zwxy[3];
+        break;
+    case 4:                                              /* vocp: 1 - s */
+        for (int i = 0; i < 4; i++) d[i] = 1.0f - s[i];
+        break;
+    case 10:                                             /* vsgn */
+        for (int i = 0; i < n; i++) {
+            /* Through the bits, so that a NaN difference does not compare
+             * equal to zero and both zeroes give exactly +0. */
+            const uint32_t b = psp_f32_to_bits(s[i] - 0.0f);
+            d[i] = (b == 0 || b == 0x80000000u) ? 0.0f
+                 : (b >> 31) == 0               ? 1.0f : -1.0f;
+        }
+        break;
+    default:
+        psp_vfpu_unimplemented(psp_cpu.pc, "vfpu9");
+        eat_prefixes();
+        return;
+    }
+    #undef MIN
+    #undef MAX
+
+    write_dst(vd, size, d);
+    eat_prefixes();
+}
+
+static void read_bits(uint32_t vs, int size, uint32_t out[4]);
+
+/* ---- float/integer conversion with a scale -------------------------------
+ *
+ * The scale is a 5-bit exponent in the instruction: vf2i multiplies by 2^n
+ * before rounding and vi2f divides by it after, which is how the VFPU does
+ * fixed point. psp_vunary carried "f2iz" and "i2f" entries that ignored it
+ * entirely -- correct for n = 0, which is what a compiler emits for a plain
+ * cast, and silently wrong for every other n. Those entries are gone. */
+void psp_vf2i(uint32_t vd, uint32_t vs, int mode, int scale, int size) {
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const int n = read_src(vs, size, g_prefix[0], sv);
+    const double mult = (double)(1u << (scale & 0x1F));
+
+    uint32_t d[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < n; i++) {
+        const float f = sv[i];
+        if (f != f) { d[i] = 0x7FFFFFFFu; continue; }      /* NaN -> INT_MAX */
+        const double v = (double)f * mult;
+        /* Compared in double: (float)0x7FFFFFFF rounds up to 0x80000000, so a
+         * float comparison would saturate one value early. */
+        if (v >  2147483647.0)      d[i] = 0x7FFFFFFFu;
+        else if (v <= -2147483648.0) d[i] = 0x80000000u;
+        else {
+            double r;
+            switch (mode) {
+            /* nearbyint, not round: the tie goes to even, not away from
+             * zero. Hardware turns 0.5 into 0 and 2.5 into 2, and `round`
+             * gives 1 and 3 -- four lines of cpu/vfpu/convert. */
+            case 0:  r = nearbyint(v);                        break;  /* nearest */
+            case 1:  r = (f >= 0.0f) ? floor(v) : ceil(v);    break;  /* to zero */
+            case 2:  r = ceil(v);                             break;  /* up */
+            default: r = floor(v);                            break;  /* down */
+            }
+            d[i] = (uint32_t)(int32_t)r;
+        }
+    }
+    /* The destination prefix masks lanes here but does not saturate: the value
+     * is already an integer and clamping it to [0,1] would be nonsense. */
+    int r[4];
+    const int dn = psp_vfpu_regs(vd, size, r);
+    for (int i = 0; i < dn; i++)
+        if (!((g_prefix[2] >> (8 + i)) & 1))
+            psp_cpu.v[r[i]] = psp_bits_to_f32(d[i]);
+    eat_prefixes();
+}
+
+/* Defined with the packed-integer conversions below, which is where it belongs;
+ * declared here because vi2f is the one caller that precedes them. */
+static void read_bits(uint32_t vs, int size, uint32_t out[4]);
+
+void psp_vi2f(uint32_t vd, uint32_t vs, int scale, int size) {
+    uint32_t s[4];
+    read_bits(vs, size, s);
+    const float mult = 1.0f / (float)(1u << (scale & 0x1F));
+    float out[4];
+    for (int i = 0; i < 4; i++) out[i] = (float)(int32_t)s[i] * mult;
+    write_dst(vd, size, out);
+    eat_prefixes();
+}
+
+/* ---- packed-integer conversions ------------------------------------------
+ *
+ * The register file is read as integers here, so these go through the bit view
+ * rather than read_src's float path. Each variant decides its own output width
+ * from the input width -- unpacking widens, packing narrows -- and that is the
+ * part worth checking against hardware rather than assuming, because a wrong
+ * width writes lanes nobody asked for. */
+
+static void read_bits(uint32_t vs, int size, uint32_t out[4]) {
+    int r[4];
+    const int n = psp_vfpu_regs(vs, size, r);
+    for (int i = 0; i < 4; i++) out[i] = 0;
+    for (int i = 0; i < n; i++) out[i] = psp_f32_to_bits(psp_cpu.v[r[i]]);
+}
+
+static void write_bits(uint32_t vd, int size, const uint32_t in[4]) {
+    float f[4];
+    for (int i = 0; i < 4; i++) f[i] = psp_bits_to_f32(in[i]);
+    write_dst(vd, size, f);
+    eat_prefixes();
+}
+
+void psp_vx2i(uint32_t vd, uint32_t vs, int kind, int size) {
+    uint32_t s[4], d[4] = { 0, 0, 0, 0 };
+    read_bits(vs, size, s);
+    int oz = 2;
+
+    switch (kind) {
+    case 0: {                                   /* vuc2i */
+        /* 8-bit unsigned to 31-bit signed: the byte is smeared across all four
+         * bytes so that 0xFF maps to just under INT_MAX rather than to a value
+         * with a hole in it, then shifted down one to leave the sign clear. */
+        uint32_t v = s[0];
+        for (int i = 0; i < 4; i++) { d[i] = (v & 0xFF) * 0x01010101u >> 1; v >>= 8; }
+        oz = 4;
+        break;
+    }
+    case 1:                                     /* vc2i -- signed, so no smear */
+        d[0] = (s[0] & 0x000000FFu) << 24;
+        d[1] = (s[0] & 0x0000FF00u) << 16;
+        d[2] = (s[0] & 0x00FF0000u) <<  8;
+        d[3] = (s[0] & 0xFF000000u);
+        oz = 4;
+        break;
+    case 2:                                     /* vus2i */
+    case 3: {                                   /* vs2i */
+        /* One source lane becomes two, so a pair is the widest input that
+         * fits; triples and quads are treated as pairs. */
+        const int n = size >= 2 ? 2 : 1;
+        oz = n * 2;
+        for (int i = 0; i < n; i++) {
+            const uint32_t v = s[i];
+            if (kind == 2) {                    /* unsigned: shift to 31 bits */
+                d[i * 2]     = (v & 0x0000FFFFu) << 15;
+                d[i * 2 + 1] = (v & 0xFFFF0000u) >> 1;
+            } else {                            /* signed: straight into the top */
+                d[i * 2]     = (v & 0x0000FFFFu) << 16;
+                d[i * 2 + 1] =  v & 0xFFFF0000u;
+            }
+        }
+        break;
+    }
+    default: break;
+    }
+    write_bits(vd, oz, d);
+}
+
+void psp_vi2x(uint32_t vd, uint32_t vs, int kind, int size) {
+    uint32_t s[4], d[4] = { 0, 0, 0, 0 };
+    read_bits(vs, size, s);
+    int oz;
+
+    switch (kind) {
+    case 0:                                     /* vi2uc -- negatives clamp to 0 */
+        for (int i = 0; i < 4; i++) {
+            int32_t v = (int32_t)s[i];
+            if (v < 0) v = 0;
+            d[0] |= ((uint32_t)(v >> 23) & 0xFF) << (i * 8);
+        }
+        oz = 1;
+        break;
+    case 1:                                     /* vi2c -- signed, top byte */
+        for (int i = 0; i < 4; i++) d[0] |= (s[i] >> 24) << (i * 8);
+        oz = 1;
+        break;
+    case 2:                                     /* vi2us */
+    case 3: {                                   /* vi2s */
+        const int elems = (size + 1) / 2;
+        for (int i = 0; i < elems; i++) {
+            if (kind == 2) {
+                int32_t lo = (int32_t)s[i * 2], hi = (int32_t)s[i * 2 + 1];
+                if (lo < 0) lo = 0;
+                if (hi < 0) hi = 0;
+                d[i] = ((uint32_t)(lo >> 15) & 0xFFFFu) | ((uint32_t)(hi >> 15) << 16);
+            } else {
+                d[i] = (s[i * 2] >> 16) | ((s[i * 2 + 1] >> 16) << 16);
+            }
+        }
+        oz = size >= 3 ? 2 : 1;
+        break;
+    }
+    default: oz = 1; break;
+    }
+    write_bits(vd, oz, d);
+}
+
+void psp_vh2f(uint32_t vd, uint32_t vs, int size) {
+    uint32_t s[4];
+    read_bits(vs, size, s);
+    float out[4];
+    /* Every size but single is treated as a pair: two packed halves per lane,
+     * so one lane in gives two out and two give four. */
+    const int oz = (size == 1) ? 2 : 4;
+    for (int i = 0; i < oz / 2; i++) {
+        out[i * 2]     = psp_half_to_f32((uint16_t)(s[i] & 0xFFFF));
+        out[i * 2 + 1] = psp_half_to_f32((uint16_t)(s[i] >> 16));
+    }
+    write_dst(vd, oz, out);
+    eat_prefixes();
+}
+
+void psp_vf2h(uint32_t vd, uint32_t vs, int size) {
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    read_src(vs, size, g_prefix[0], sv);
+    const int oz = (size <= 2) ? 1 : 2;
+    uint32_t d[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < oz; i++)
+        d[i] = (uint32_t)psp_f32_to_half(sv[i * 2]) |
+               ((uint32_t)psp_f32_to_half(sv[i * 2 + 1]) << 16);
+    write_bits(vd, oz, d);
+}
+
 /* ---- arithmetic ---------------------------------------------------------- */
 
 #define BINOP(name, expr)                                                    \
@@ -417,10 +700,6 @@ void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
         case PSP_VU_LOG2: r = logf(a) * 1.4426950408889634f; break;   /* 1/ln2 */
         case PSP_VU_SAT0: r = sat0(a);      break;
         case PSP_VU_SAT1: r = sat1(a);      break;
-        /* Conversions move between the float and integer *interpretations* of
-         * a vector register; the bits are reinterpreted, not just cast. */
-        case PSP_VU_F2IZ: r = psp_bits_to_f32((uint32_t)(int32_t)a); break;
-        case PSP_VU_I2F:  r = (float)(int32_t)psp_f32_to_bits(a);    break;
         default:
             psp_vfpu_unimplemented(psp_cpu.pc, "vunary");
             eat_prefixes();

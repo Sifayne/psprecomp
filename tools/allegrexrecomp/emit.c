@@ -409,10 +409,21 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
      * makes that guard fire at all -- without them the guard is dead code and
      * every prefixed operation silently produces the wrong number. */
     /* VFPU4 unary ops, all through one runtime entry point. */
+    case A_VF2IN:
+        fprintf(f, "%spsp_vf2i(%u, %u, 0, %u, %u);\n", ind, in->vd, in->vs, (in->raw >> 16) & 0x1Fu, in->vsize); return;
+    case A_VF2IZ:
+        fprintf(f, "%spsp_vf2i(%u, %u, 1, %u, %u);\n", ind, in->vd, in->vs, (in->raw >> 16) & 0x1Fu, in->vsize); return;
+    case A_VF2IU:
+        fprintf(f, "%spsp_vf2i(%u, %u, 2, %u, %u);\n", ind, in->vd, in->vs, (in->raw >> 16) & 0x1Fu, in->vsize); return;
+    case A_VF2ID:
+        fprintf(f, "%spsp_vf2i(%u, %u, 3, %u, %u);\n", ind, in->vd, in->vs, (in->raw >> 16) & 0x1Fu, in->vsize); return;
+    case A_VI2F:
+        fprintf(f, "%spsp_vi2f(%u, %u, %u, %u);\n", ind, in->vd, in->vs, (in->raw >> 16) & 0x1Fu, in->vsize); return;
+
     case A_VMOV: case A_VABS: case A_VNEG: case A_VZERO: case A_VONE:
     case A_VRCP: case A_VRSQ: case A_VSQRT: case A_VSIN: case A_VCOS:
     case A_VEXP2: case A_VLOG2: case A_VSAT0: case A_VSAT1:
-    case A_VNRCP: case A_VNSIN: case A_VASIN: case A_VF2IZ: case A_VI2F: {
+    case A_VNRCP: case A_VNSIN: case A_VASIN: case A_VREXP2: {
         static const struct { a_op op; const char *sel; } U[] = {
             { A_VMOV, "PSP_VU_MOV" },   { A_VABS, "PSP_VU_ABS" },
             { A_VNEG, "PSP_VU_NEG" },   { A_VZERO,"PSP_VU_ZERO" },
@@ -422,8 +433,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
             { A_VEXP2,"PSP_VU_EXP2" },  { A_VLOG2,"PSP_VU_LOG2" },
             { A_VSAT0,"PSP_VU_SAT0" },  { A_VSAT1,"PSP_VU_SAT1" },
             { A_VNRCP,"PSP_VU_NRCP" },  { A_VNSIN,"PSP_VU_NSIN" },
-            { A_VASIN,"PSP_VU_ASIN" },  { A_VF2IZ,"PSP_VU_F2IZ" },
-            { A_VI2F, "PSP_VU_I2F" },
+            { A_VASIN,"PSP_VU_ASIN" },  { A_VREXP2,"PSP_VU_REXP2" },
         };
         for (size_t k = 0; k < sizeof U / sizeof U[0]; k++) {
             if (U[k].op != in->op) continue;
@@ -467,6 +477,19 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     }
 
     /* Matrix ops that need no multiply. `vsize` is the matrix order here. */
+    case A_VF2H:
+        fprintf(f, "%spsp_vf2h(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize); return;
+    case A_VH2F:
+        fprintf(f, "%spsp_vh2f(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize); return;
+    case A_VX2I:
+        fprintf(f, "%spsp_vx2i(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->rt & 3u, in->vsize); return;
+    case A_VI2X:
+        fprintf(f, "%spsp_vi2x(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->rt & 3u, in->vsize); return;
+
+    case A_VSBN:
+        fprintf(f, "%spsp_vsbn(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VFPU9:
+        fprintf(f, "%spsp_vfpu9(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->rt, in->vsize); return;
     case A_VFAD:
         fprintf(f, "%spsp_vfad(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize); return;
     case A_VAVG:

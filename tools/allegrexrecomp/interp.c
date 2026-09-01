@@ -355,10 +355,16 @@ static psp_interp_status exec_simple(const a_insn *in) {
 
     /* VFPU4 unary ops, all through one runtime entry point. The selector table
      * mirrors emit.c's; keeping the same order makes them diffable. */
+    case A_VF2IN: psp_vf2i(in->vd, in->vs, 0, (in->raw >> 16) & 0x1F, in->vsize); return I_RUNNING;
+    case A_VF2IZ: psp_vf2i(in->vd, in->vs, 1, (in->raw >> 16) & 0x1F, in->vsize); return I_RUNNING;
+    case A_VF2IU: psp_vf2i(in->vd, in->vs, 2, (in->raw >> 16) & 0x1F, in->vsize); return I_RUNNING;
+    case A_VF2ID: psp_vf2i(in->vd, in->vs, 3, (in->raw >> 16) & 0x1F, in->vsize); return I_RUNNING;
+    case A_VI2F:  psp_vi2f(in->vd, in->vs,    (in->raw >> 16) & 0x1F, in->vsize); return I_RUNNING;
+
     case A_VMOV: case A_VABS: case A_VNEG: case A_VZERO: case A_VONE:
     case A_VRCP: case A_VRSQ: case A_VSQRT: case A_VSIN: case A_VCOS:
     case A_VEXP2: case A_VLOG2: case A_VSAT0: case A_VSAT1:
-    case A_VNRCP: case A_VNSIN: case A_VASIN: case A_VF2IZ: case A_VI2F: {
+    case A_VNRCP: case A_VNSIN: case A_VASIN: case A_VREXP2: {
         static const struct { a_op op; int sel; } U[] = {
             { A_VMOV, PSP_VU_MOV },   { A_VABS, PSP_VU_ABS },
             { A_VNEG, PSP_VU_NEG },   { A_VZERO,PSP_VU_ZERO },
@@ -368,8 +374,7 @@ static psp_interp_status exec_simple(const a_insn *in) {
             { A_VEXP2,PSP_VU_EXP2 },  { A_VLOG2,PSP_VU_LOG2 },
             { A_VSAT0,PSP_VU_SAT0 },  { A_VSAT1,PSP_VU_SAT1 },
             { A_VNRCP,PSP_VU_NRCP },  { A_VNSIN,PSP_VU_NSIN },
-            { A_VASIN,PSP_VU_ASIN },  { A_VF2IZ,PSP_VU_F2IZ },
-            { A_VI2F, PSP_VU_I2F },
+            { A_VASIN,PSP_VU_ASIN },  { A_VREXP2,PSP_VU_REXP2 },
         };
         for (size_t k = 0; k < sizeof U / sizeof U[0]; k++) {
             if (U[k].op != in->op) continue;
@@ -387,6 +392,13 @@ static psp_interp_status exec_simple(const a_insn *in) {
     case A_VIIM: psp_vimm(in->vt, (float)in->imm);       return I_RUNNING;
     case A_VFIM: psp_vimm(in->vt, a_half_to_float((uint16_t)in->imm)); return I_RUNNING;
 
+    case A_VF2H: psp_vf2h(in->vd, in->vs, in->vsize); return I_RUNNING;
+    case A_VH2F: psp_vh2f(in->vd, in->vs, in->vsize); return I_RUNNING;
+    case A_VX2I: psp_vx2i(in->vd, in->vs, in->rt & 3, in->vsize); return I_RUNNING;
+    case A_VI2X: psp_vi2x(in->vd, in->vs, in->rt & 3, in->vsize); return I_RUNNING;
+
+    case A_VSBN: psp_vsbn(in->vd, in->vs, in->vt, in->vsize); return I_RUNNING;
+    case A_VFPU9: psp_vfpu9(in->vd, in->vs, in->rt, in->vsize); return I_RUNNING;
     case A_VFAD: psp_vfad(in->vd, in->vs, in->vsize); return I_RUNNING;
     case A_VAVG: psp_vavg(in->vd, in->vs, in->vsize); return I_RUNNING;
     case A_VT4444: psp_vcolor(in->vd, in->vs, 1, in->vsize); return I_RUNNING;

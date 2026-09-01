@@ -87,6 +87,50 @@ void psp_vavg(uint32_t vd, uint32_t vs, int size);
  * instruction's rt field, which is where the hardware keeps it. */
 void psp_vcolor(uint32_t vd, uint32_t vs, int fmt, int size);
 
+/* vsbn -- replace a float's exponent with 127 + (integer in vt lane 0).
+ * A zero, an infinity or a NaN keeps whatever it already was. */
+void psp_vsbn(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+
+/* VFPU9 (VFPU4 rs=2): ops that combine a vector with a swizzled copy of
+ * itself. The hardware builds the second operand by forcing a swizzle or a
+ * constant into the T prefix, which is why none of them takes a vt.
+ *
+ * `kind`: 0 vsrt1, 1 vsrt2, 2 vbfy1, 3 vbfy2, 4 vocp, 8 vsrt3, 9 vsrt4,
+ * 10 vsgn -- the instruction's rt field. */
+void psp_vfpu9(uint32_t vd, uint32_t vs, int kind, int size);
+
+/* Float/integer conversion with a scale (VFPU4 rs=0x10..0x14).
+ *
+ * Both carry a 5-bit exponent in the instruction: vf2i multiplies by 2^n
+ * before rounding, vi2f divides by it after. That is how the VFPU does fixed
+ * point, and ignoring it -- which the vunary versions of these did -- gives
+ * the right answer only for n = 0 and a silently wrong one otherwise.
+ *
+ * `mode` is the rounding: 0 nearest, 1 toward zero, 2 up, 3 down. The result
+ * of vf2i is an *integer* in the register, saturated to INT_MIN/INT_MAX, with
+ * NaN going to INT_MAX. */
+void psp_vf2i(uint32_t vd, uint32_t vs, int mode, int scale, int size);
+void psp_vi2f(uint32_t vd, uint32_t vs, int scale, int size);
+
+/* Packed-integer conversions (VFPU4 rs=1).
+ *
+ * These read and write the register file as *integers*, and they change the
+ * width of the vector: a quad of 32-bit values packs into a pair of 16-bit
+ * ones, and so on. The output size is a function of the input size and the
+ * variant, not of the instruction's own width field, which is why each of
+ * these decides for itself how many lanes to write.
+ *
+ * `kind` is the low two bits of the instruction's rt field:
+ *   vx2i: 0 vuc2i, 1 vc2i, 2 vus2i, 3 vs2i   -- unpack narrow ints to 32-bit
+ *   vi2x: 0 vi2uc, 1 vi2c, 2 vi2us, 3 vi2s   -- pack 32-bit down to narrow
+ */
+void psp_vx2i(uint32_t vd, uint32_t vs, int kind, int size);
+void psp_vi2x(uint32_t vd, uint32_t vs, int kind, int size);
+
+/* Half-precision conversion, two halves to a lane. */
+void psp_vh2f(uint32_t vd, uint32_t vs, int size);
+void psp_vf2h(uint32_t vd, uint32_t vs, int size);
+
 /* Element-wise arithmetic across `size` lanes. */
 void psp_vadd(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 void psp_vsub(uint32_t vd, uint32_t vs, uint32_t vt, int size);
@@ -108,8 +152,9 @@ enum {
     PSP_VU_MOV = 0, PSP_VU_ABS, PSP_VU_NEG, PSP_VU_ZERO, PSP_VU_ONE,
     PSP_VU_RCP, PSP_VU_RSQ, PSP_VU_SQRT, PSP_VU_SIN, PSP_VU_COS,
     PSP_VU_EXP2, PSP_VU_LOG2, PSP_VU_SAT0, PSP_VU_SAT1,
-    PSP_VU_NRCP, PSP_VU_NSIN, PSP_VU_REXP2, PSP_VU_ASIN,
-    PSP_VU_F2IZ, PSP_VU_I2F
+    PSP_VU_NRCP, PSP_VU_NSIN, PSP_VU_REXP2, PSP_VU_ASIN
+    /* F2IZ and I2F used to live here and ignored the instruction's scale
+     * exponent. They are psp_vf2i/psp_vi2f now; see above. */
 };
 void psp_vunary(int op, uint32_t vd, uint32_t vs, int size);
 

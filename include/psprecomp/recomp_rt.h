@@ -217,6 +217,60 @@ static inline uint32_t psp_f32_to_bits(float v) {
     return c.u;
 }
 
+/* Half precision, both directions.
+ *
+ * Three things need this and they must agree: the decoder, expanding vfim's
+ * immediate at translation time; and vh2f/vf2h, converting at run time. Two
+ * copies of a float conversion is exactly the drift the differential oracle
+ * cannot see -- it runs the same helper on both sides -- so there is one.
+ *
+ * The narrowing is the round-to-nearest-even algorithm the PSP's own toolchain
+ * uses (float_to_half_fast3), including its clamp of anything too large to
+ * infinity rather than to the largest finite half. */
+static inline float psp_half_to_f32(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h >> 15) << 31;
+    const uint32_t exp  = (h >> 10) & 0x1F;
+    const uint32_t man  = h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0)       bits = sign | (man ? ((127 - 15 + 1) << 23) | (man << 13) : 0);
+    /* An exponent of all ones does *not* shift the mantissa up. Hardware ORs
+     * the half's mantissa in at the bottom: vh2f of the half 0x7F80 gives
+     * 0x7F800380, not the 0x7FF00000 a shift would produce. Pinned by
+     * pspautotests cpu/vfpu/convert; the normal and subnormal cases below do
+     * shift, as usual. */
+    else if (exp == 31) bits = sign | 0x7F800000u | man;
+    else                bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+    union { uint32_t u; float f; } c;
+    c.u = bits;
+    return c.f;
+}
+
+static inline uint16_t psp_f32_to_half(float v) {
+    union { uint32_t u; float f; } c;
+    c.f = v;
+    const uint32_t sign = c.u & 0x80000000u;
+    c.u ^= sign;
+
+    uint32_t out;
+    if (c.u >= 0x7F800000u) {
+        /* NaN saturates the mantissa rather than becoming a quiet NaN: the
+         * hardware answer is 0x7FFF, where the software algorithm the PSP
+         * toolchain uses gives 0x7E00. Only the positive case is pinned by
+         * cpu/vfpu/convert; the sign is carried through on the assumption it
+         * behaves like every other path here. */
+        out = (c.u > 0x7F800000u) ? 0x7FFFu : 0x7C00u;
+    } else {
+        union { uint32_t u; float f; } magic;
+        magic.u = 15u << 23;                  /* 2^-112 */
+        c.u &= ~0xFFFu;
+        c.f *= magic.f;
+        c.u -= ~0xFFFu;
+        if (c.u > (31u << 23)) c.u = 31u << 23;   /* clamp to infinity */
+        out = c.u >> 13;
+    }
+    return (uint16_t)(out | (sign >> 16));
+}
+
 static inline float psp_fabs(float v)  { return v < 0.0f ? -v : v; }
 
 /* Newton-Raphson would be faster but the host FPU is exact and this is not the
