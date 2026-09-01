@@ -656,7 +656,12 @@ static void hle_GetThreadCurrentPriority(void) {
 static void hle_TerminateThread(void) {
     psp_thread *t = find_thread(psp_arg(0));
     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+    /* Both models: cancel a spawn the interpreter is holding, *and* stop a real
+     * host thread if there is one. Only the first existed, and it is a no-op
+     * whenever the second is what is needed. */
     psp_sched_cancel_spawn(t->uid);
+    psp_sched_terminate(t->uid);
+    t->state = TH_DORMANT;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

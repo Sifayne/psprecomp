@@ -248,6 +248,25 @@ int  psp_sched_set_dispatch(int on);
  * belongs at the very top of a blocking call, before anything is validated. */
 int  psp_sched_can_wait(void);
 
+/* Stop a thread outright: sceKernelTerminateThread.
+ *
+ * Not a hook and not a cancellation of a pending spawn -- that is what this
+ * used to be, and under real threads it did *nothing at all*, because the hook
+ * is only installed for the model that has no real threads.
+ *
+ * pspautotests' checkpoint helper terminates and restarts one thread on every
+ * line it prints. With terminate inert, each restart spawned another host
+ * thread for the same uid and no slot was ever reclaimed, so a test with a few
+ * hundred checkpoints ran the table out -- and *which* spawns failed depended
+ * on how many earlier host threads had happened to finish. That is where the
+ * suite's nondeterminism came from.
+ *
+ * Does not return when the caller terminates itself. Returns 1 if a thread was
+ * stopped. A thread spinning in guest code cannot be unwound from
+ * outside, the same limit the drain has; it is marked dead and stops being
+ * scheduled, which is as far as anything here can go. */
+int  psp_sched_terminate(uint32_t uid);
+
 #ifdef __cplusplus
 }
 #endif

@@ -369,6 +369,19 @@ int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
 
     pthread_mutex_lock(&g_lock);
 
+    /* A dead slot is *not* reused, and that is deliberate.
+     *
+     * Reusing one looks obviously right -- the table is otherwise a high-water
+     * mark rather than a census -- and it is unsafe without joining the host
+     * thread first. The dead thread's pthread may still be parked in
+     * await_turn_locked, which refuses to proceed only while the slot reads
+     * DEAD; hand that slot to a new thread and the old one's wait *succeeds*,
+     * so two host threads run guest code at once against the single global
+     * psp_cpu. Measured: threads/create went to 131,929,071 bad memory
+     * accesses the moment reuse was allowed.
+     *
+     * Making it safe needs the slot to carry its pthread to a join, which is a
+     * larger change than the leak justifies today. */
     int idx = -1;
     for (int i = 1; i < MAX_SCHED_THREADS; i++) if (!g_slot[i].used) { idx = i; break; }
     if (idx < 0) { pthread_mutex_unlock(&g_lock); return -1; }
@@ -740,6 +753,36 @@ int psp_sched_live(void) {
     const int live = live_locked();
     pthread_mutex_unlock(&g_lock);
     return live;
+}
+
+int psp_sched_terminate(uint32_t uid) {
+    if (!g_threading) return 0;
+    pthread_mutex_lock(&g_lock);
+    const int s = slot_of(uid);
+    if (s < 0 || g_slot[s].state == PSP_SCHED_DEAD) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    const int self = (s == g_self);
+    const int self_is_main = (s == MAIN_SLOT);
+    g_slot[s].state      = PSP_SCHED_DEAD;
+    g_slot[s].waiting_on = NULL;
+    g_slot[s].wake_at    = 0;
+    /* Wake it wherever it is parked. await_turn_locked returns -1 for a slot
+     * that has gone DEAD, and its caller leaves through pthread_exit. */
+    pthread_cond_broadcast(&g_turn);
+    if (self) {
+        (void)handoff_locked();
+        pthread_mutex_unlock(&g_lock);
+        /* The main context is not a guest thread and has nowhere to exit to --
+         * pthread_exit on it ends the thread the process was started on and
+         * leaves the runner waiting for threads that will never finish. The
+         * same guard psp_sched_exit carries, for the same reason. */
+        if (!self_is_main) pthread_exit(NULL);
+        return 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return 1;
 }
 
 int psp_sched_can_wait(void) { return g_dispatch; }
