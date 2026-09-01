@@ -111,7 +111,18 @@ typedef struct {
 static ge_queue g_queue[MAX_QUEUES];
 static uint32_t g_next_id;
 
-static uint64_t g_unsupported;     /* vertices in a format we do not read */
+/* Vertices the draw path declined, split by why.
+ *
+ * These were one counter, reported as "transformed, or no position". Three
+ * causes with three unrelated fixes -- a missing transform pipeline, a vertex
+ * pointer the stream never set, and a layout this does not decode -- summed
+ * into a number that could not tell you which you were looking at. The first
+ * needs T&L, the second is a state-tracking bug, the third is a decoder gap.
+ * Guessing between them is the same mistake as reading one stop reason for
+ * another, so they are counted apart. */
+static uint64_t g_skip_transform;  /* not through-mode: needs a transform we do not have */
+static uint64_t g_skip_noaddr;     /* no vertex address in the stream */
+static uint64_t g_skip_layout;     /* weighted, or no position -- vertex_layout declined */
 
 /* Tracked state, and the counters that make the report worth reading. */
 static struct {
@@ -145,7 +156,7 @@ void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
     memset(&g_ge, 0, sizeof g_ge);
     psp_render_reset_pixels();
-    g_unsupported = 0;
+    g_skip_transform = g_skip_noaddr = g_skip_layout = 0;
     g_next_id = 0x00080000u;
 }
 
@@ -200,9 +211,15 @@ void psp_ge_dump_stats(FILE *out) {
         fprintf(out, "    %llu commands not individually decoded\n",
                 (unsigned long long)g_ge.unknown);
     fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
-    if (g_unsupported)
-        fprintf(out, "    %llu vertices in an unsupported format (transformed, or no position)\n",
-                (unsigned long long)g_unsupported);
+    if (g_skip_transform)
+        fprintf(out, "    %llu vertices needing a transform (not through-mode; no T&L here)\n",
+                (unsigned long long)g_skip_transform);
+    if (g_skip_noaddr)
+        fprintf(out, "    %llu vertices dropped: no vertex address set\n",
+                (unsigned long long)g_skip_noaddr);
+    if (g_skip_layout)
+        fprintf(out, "    %llu vertices dropped: layout not decoded (weighted, or no position)\n",
+                (unsigned long long)g_skip_layout);
 }
 
 uint64_t psp_ge_command_count(void) { return g_ge.commands; }
@@ -389,12 +406,12 @@ static void draw_prim(uint32_t type, uint32_t count) {
      * state command: the GE sets these fields in any order, and only their
      * value at the draw matters. */
 
-    if (!VT_THROUGH(g_ge.vtype)) { g_unsupported += count; return; }
-    if (!g_ge.vaddr) { g_unsupported += count; return; }
+    if (!VT_THROUGH(g_ge.vtype)) { g_skip_transform += count; return; }
+    if (!g_ge.vaddr) { g_skip_noaddr += count; return; }
 
     int col_off = -1, pos_off = 0, tex_off = -1;
     int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off);
-    if (!stride) { g_unsupported += count; return; }
+    if (!stride) { g_skip_layout += count; return; }
 
     /* Bound only when *these* vertices carry coordinates to sample with. The
      * texture state is global and outlives the draw that set it, so geometry
