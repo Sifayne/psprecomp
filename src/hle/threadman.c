@@ -696,6 +696,31 @@ static void hle_TerminateThread(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Terminate-and-delete is not terminate followed by delete: it accepts a thread
+ * terminate would refuse. threads/terminate.expected runs the same ten cases
+ * through both and the two dormant ones are where they part --
+ *
+ *     sceKernelTerminateThread        Created: 800201a2   Finished: 800201a2
+ *     sceKernelTerminateDeleteThread  Created: 00000000   Finished: 00000000
+ *
+ * -- because there is nothing to stop but there is still something to free. The
+ * id checks are terminate's, though, including the one that forbids a thread
+ * from ending itself. */
+static void hle_TerminateDeleteThread(void) {
+    const uint32_t id = psp_arg(0);
+    if (id == 0 || id == psp_sched_current()) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
+        return;
+    }
+    psp_thread *t = find_thread(id);
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    if (t->ever_started && t->state != TH_DORMANT) psp_sched_terminate(t->uid);
+    psp_sched_cancel_spawn(t->uid);
+    if (t->stack_base) psp_sysmem_release(t->stack_base);
+    t->used = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 static void hle_ChangeCurrentThreadAttr(void) {
     psp_thread *c = current_thread();
     if (c) c->attr = (c->attr & ~psp_arg(0)) | psp_arg(1);
@@ -1468,6 +1493,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0xAA73C935, "ThreadManForUser", "sceKernelExitThread",              hle_ExitThread);
     psp_hle_register(0x9FA03CD3, "ThreadManForUser", "sceKernelDeleteThread",            hle_DeleteThread);
     psp_hle_register(0x616403BA, "ThreadManForUser", "sceKernelTerminateThread",         hle_TerminateThread);
+    psp_hle_register(0x383F7BCC, "ThreadManForUser", "sceKernelTerminateDeleteThread",   hle_TerminateDeleteThread);
     psp_hle_register(0xCEADEB47, "ThreadManForUser", "sceKernelDelayThread",             hle_DelayThread);
     psp_hle_register(0x68DA9E36, "ThreadManForUser", "sceKernelDelayThreadCB",           hle_DelayThread);
     psp_hle_register(0x278C0DF5, "ThreadManForUser", "sceKernelWaitThreadEnd",           hle_WaitThreadEnd);
