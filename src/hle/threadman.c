@@ -1276,6 +1276,12 @@ static void hle_WaitSema(void) {
 #define PSP_EVENT_WAITAND   0x00
 #define PSP_EVENT_WAITOR    0x01
 #define PSP_EVENT_WAITCLEAR 0x20
+/* Clears the *whole* pattern on a match, where WAITCLEAR clears only the bits
+ * that were waited for. events/poll shows the pair on consecutive lines
+ * against the same starting pattern of 0xFFFFFFFF and a wait for bit 0:
+ * `Clear/Or` leaves `cur=FFFFFFFE`, `Clear all/Or` leaves `cur=00000000`. The
+ * two together are refused. */
+#define PSP_EVENT_WAITCLEARALL 0x10
 /* The creation attribute that lets more than one thread wait at once. It is
  * also the bit an event flag accepts where a semaphore refuses it -- see the
  * two attribute rules above. */
@@ -1309,6 +1315,22 @@ static void hle_DeleteEventFlag(void) {
     f->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_yield();
+}
+
+/* WAITOR, WAITCLEAR and WAITCLEARALL and nothing else -- 0x02, 0x04, 0x08,
+ * 0x40, 0x80 and 0xFF are each refused in events/wait and events/poll alike.
+ * And not both clear modes at once: `Clear all/Clear/And` is ILLEGAL_MODE
+ * where either on its own is accepted. */
+static int flag_mode_bad(uint32_t mode) {
+    if (mode & ~(uint32_t)(PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR |
+                           PSP_EVENT_WAITCLEARALL)) return 1;
+    return (mode & PSP_EVENT_WAITCLEAR) && (mode & PSP_EVENT_WAITCLEARALL);
+}
+
+/* What a match consumes. */
+static void flag_take(psp_evflag *f, uint32_t bits, uint32_t mode) {
+    if (mode & PSP_EVENT_WAITCLEARALL) f->pattern = 0;
+    else if (mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~bits;
 }
 
 static int flag_satisfied(const psp_evflag *f, uint32_t bits, uint32_t mode) {
@@ -1346,7 +1368,7 @@ static int flag_release(psp_evflag *f) {
         const psp_waiter w = eligible.w[i];
         psp_waitq_drop(&f->q, w.uid);
         if (w.out) psp_write32(w.out, f->pattern);
-        if (w.mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~w.need;
+        flag_take(f, w.need, w.mode);
         urgent |= psp_sched_wake(w.uid);
     }
     return urgent;
@@ -1398,12 +1420,7 @@ static void hle_WaitEventFlag(void) {
      * and a wrong mode on a NULL flag with ILLEGAL_MODE -- so both checks see
      * the arguments before anything has looked the object up. */
     if (bits == 0) { psp_ret(SCE_KERNEL_ERROR_EVF_ILPAT); return; }
-    /* WAITOR and WAITCLEAR and nothing else: 0x02, 0x04, 0x08, 0x40, 0x80 and
-     * 0xFF are each refused in that same file. */
-    if (mode & ~(uint32_t)(PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR)) {
-        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MODE);
-        return;
-    }
+    if (flag_mode_bad(mode)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MODE); return; }
 
     psp_evflag *f = find_flag(id);
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
@@ -1412,7 +1429,7 @@ static void hle_WaitEventFlag(void) {
 
     if (flag_satisfied(f, bits, mode)) {
         if (out) psp_write32(out, f->pattern);
-        if (mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~bits;
+        flag_take(f, bits, mode);
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
@@ -1489,6 +1506,46 @@ static void hle_ReferSemaStatus(void) {
     psp_write32(info + 44, (uint32_t)sm->count);
     psp_write32(info + 48, (uint32_t)sm->max_count);
     psp_write32(info + 52, (uint32_t)psp_waitq_count(&sm->q));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* sceKernelPollEventFlag(id, bits, mode, outBits)
+ *
+ * The wait's immediate path, and nothing else: the same argument checks in the
+ * same order -- pattern, then mode, then the handle -- the same match test and
+ * the same consumption, with EVF_COND instead of parking.
+ *
+ * One thing is its own. A poll that finds the pattern absent still writes the
+ * *current* pattern to the out word:
+ *
+ *     0x0000FFFF & 0xFFFFFFFF: Failed (800201AF, bits=0000FFFF)
+ *
+ * where an argument error leaves the caller's 0xDEADBEEF in place. So "not
+ * yet" is an answer rather than a refusal, and the caller is told what it
+ * would have to wait for. */
+static void hle_PollEventFlag(void) {
+    const uint32_t id   = psp_arg(0);
+    const uint32_t bits = psp_arg(1);
+    const uint32_t mode = psp_arg(2);
+    const uint32_t out  = psp_arg(3);
+
+    if (bits == 0)           { psp_ret(SCE_KERNEL_ERROR_EVF_ILPAT); return; }
+    if (flag_mode_bad(mode)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MODE); return; }
+
+    psp_evflag *f = find_flag(id);
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
+
+    /* A poll is a waiter for the purpose of the single-waiter rule, even
+     * though it never parks: polling a flag somebody is already waiting on
+     * answers EVF_MULTI unless the flag was created to allow more. */
+    if (psp_waitq_count(&f->q) > 0 && !(f->attr & PSP_EVENT_WAITMULTIPLE)) {
+        psp_ret(SCE_KERNEL_ERROR_EVF_MULTI);
+        return;
+    }
+
+    if (out) psp_write32(out, f->pattern);
+    if (!flag_satisfied(f, bits, mode)) { psp_ret(SCE_KERNEL_ERROR_EVF_COND); return; }
+    flag_take(f, bits, mode);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1937,6 +1994,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0x1FB15A32, "ThreadManForUser", "sceKernelSetEventFlag",            hle_SetEventFlag);
     psp_hle_register(0x812346E4, "ThreadManForUser", "sceKernelClearEventFlag",          hle_ClearEventFlag);
     psp_hle_register(0x402FCF22, "ThreadManForUser", "sceKernelWaitEventFlag",           hle_WaitEventFlag);
+    psp_hle_register(0x30FD48F0, "ThreadManForUser", "sceKernelPollEventFlag",           hle_PollEventFlag);
 
     psp_hle_register(0xE81CAF8F, "ThreadManForUser", "sceKernelCreateCallback",          hle_CreateCallback);
     psp_hle_register(0xBC6FEBC5, "ThreadManForUser", "sceKernelReferSemaStatus",         hle_ReferSemaStatus);

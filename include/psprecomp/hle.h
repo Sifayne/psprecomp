@@ -179,6 +179,10 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_WAIT_DELETE     0x800201B5
 
 /* Waiting for no bits at all, and a wait mode outside {WAITOR, WAITCLEAR}. */
+/* A poll whose pattern is simply not there yet. Not an argument error: the
+ * call did everything right and the answer is "no", so the current pattern is
+ * reported through the out word where an argument error leaves it alone. */
+#define SCE_KERNEL_ERROR_EVF_COND        0x800201AF
 #define SCE_KERNEL_ERROR_EVF_ILPAT       0x800201B1
 #define SCE_KERNEL_ERROR_ILLEGAL_MODE    0x80020195
 
