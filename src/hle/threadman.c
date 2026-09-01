@@ -143,6 +143,7 @@ static uint32_t     g_next_uid;
  * and a second copy maintained here would be a second thing to keep in step.
  * Returns NULL on the main context, which is not a guest thread. */
 static psp_thread *current_thread(void);
+static psp_callback *find_cb(uint32_t id);
 static int          g_warned_block;
 
 void psp_threadman_reset(void) {
@@ -1143,7 +1144,14 @@ static void hle_RotateReadyQueue(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-static void hle_DeleteCallback(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* It answered OK and deleted nothing, so a notify on a deleted callback
+ * succeeded where callbacks/notify expects `Deleted: Failed (800201a1)`. */
+static void hle_DeleteCallback(void) {
+    psp_callback *c = find_cb(psp_arg(0));
+    if (!c) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_CBID); return; }
+    c->used = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 /* ---- the shape every kernel wait has ---------------------------------------
  *
@@ -1692,23 +1700,106 @@ static void hle_CreateCallback(void) {
     psp_ret(c->uid);
 }
 
-/* Deliver any callbacks pending for the current thread; the return value is
- * how many ran.
+/* sceKernelNotifyCallback(cb, arg)
  *
- * None ever are: callbacks are raised by things that do not happen here -- a
- * disc being ejected, a power button, a timer expiring. Reporting zero is
- * therefore accurate rather than a stub.
+ * Raising a callback does not run it: it accumulates, and the thread that owns
+ * it collects the whole accumulation the next time it asks. callbacks/notify
+ * fires it 10002 times and the handler is entered *once*, with 0x2712 in its
+ * first argument. */
+static void hle_NotifyCallback(void) {
+    psp_callback *c = find_cb(psp_arg(0));
+    if (!c) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_CBID); return; }
+    c->notify_count++;
+    c->notify_arg = psp_arg(1);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Deliver every callback pending for the current thread.
  *
- * It matters that this exists at all. A game waiting on an event pumps
- * callbacks while it waits, and an unimplemented call still returns zero, so
- * the loop looks identical either way -- except that the surrounding wait never
- * ends, and the whole thing reads as a hang with no cause. */
-static void hle_CheckCallback(void) { psp_ret(0); }
+ * The handler's three arguments are pinned by callbacks/notify, which prints
+ * what arrived -- `cbFunc hit: 00002712, 00000001, 00000000` -- against 10002
+ * notifies whose last argument was 1 and a common pointer of NULL. So they are
+ * the accumulated count, the *last* notify argument, and the common pointer
+ * given at create; the intermediate arguments are not kept.
+ *
+ * Ownership matters: a callback is delivered to the thread that created it and
+ * to no other. callbacks/check has two sleeping threads each waiting on its own
+ * and gets one hit apiece.
+ *
+ * Returns whether anything ran, not how many: callbacks/check answers
+ * `With 2 pending: 00000001` after entering two handlers. */
+static int g_in_callback;
+
+int psp_threadman_run_callbacks(void) {
+    if (g_in_callback) return 0;
+    const uint32_t me = psp_sched_current();
+    int ran = 0;
+    for (int i = 0; i < MAX_CBS; i++) {
+        psp_callback *c = &g_cb[i];
+        if (!c->used || c->thread != me || !c->notify_count) continue;
+
+        const uint32_t func = c->func, common = c->arg;
+        const uint32_t count = c->notify_count, arg = c->notify_arg;
+        /* Cleared before the handler runs, so a handler that notifies itself --
+         * which callbacks/notify does deliberately -- is pending again when it
+         * returns rather than being swallowed or looping here. */
+        c->notify_count = 0;
+
+        /* Guest code, run between two instructions of whichever thread asked.
+         * That thread must not be able to tell, so its registers are put back;
+         * same reasoning as the alarm handler in ktimer.c. */
+        const psp_cpu_state saved = psp_cpu;
+        g_in_callback = 1;
+        psp_cpu.r[PSP_REG_A0] = count;
+        psp_cpu.r[PSP_REG_A1] = arg;
+        psp_cpu.r[PSP_REG_A2] = common;
+        psp_cpu.r[PSP_REG_RA] = 0;
+        psp_dispatch(func);
+        g_in_callback = 0;
+        psp_cpu = saved;
+        ran = 1;
+    }
+    return ran;
+}
+
+static void hle_CheckCallback(void) { psp_ret((uint32_t)psp_threadman_run_callbacks()); }
+
+/* Discard what has accumulated without running the handler. The argument is
+ * left alone -- callbacks/cancel reads the object back afterwards and finds
+ * `notifyCount=00000000,notifyArg=0`, so the count going to zero takes the
+ * argument with it. */
+static void hle_CancelCallback(void) {
+    psp_callback *c = find_cb(psp_arg(0));
+    if (!c) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_CBID); return; }
+    c->notify_count = 0;
+    c->notify_arg   = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* How much has accumulated, without disturbing it. callbacks/count notifies
+ * three times and reads `OK (3)` alongside `notifyCount=00000003`. */
+static void hle_GetCallbackCount(void) {
+    const psp_callback *c = find_cb(psp_arg(0));
+    psp_ret(c ? c->notify_count : SCE_KERNEL_ERROR_UNKNOWN_CBID);
+}
+
+/* The CB suffix on a wait means "and deliver my callbacks while you are at it".
+ * Delivering them first is what the tests measure: threads/threadend prints
+ * ` * cbFunc` *before* the line reporting the wait's result, on a wait that
+ * returns immediately. */
+static void hle_WaitThreadEndCB(void) {
+    psp_threadman_run_callbacks();
+    hle_WaitThreadEnd();
+}
 
 void psp_threadman_register(void) {
     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every
      * pair below. */
     psp_hle_register(0x349D6D6C, "ThreadManForUser", "sceKernelCheckCallback",           hle_CheckCallback);
+    psp_hle_register(0xC11BA8C4, "ThreadManForUser", "sceKernelNotifyCallback",          hle_NotifyCallback);
+    psp_hle_register(0xBA4051D6, "ThreadManForUser", "sceKernelCancelCallback",          hle_CancelCallback);
+    psp_hle_register(0x2A3D44FF, "ThreadManForUser", "sceKernelGetCallbackCount",        hle_GetCallbackCount);
+    psp_hle_register(0x840E8133, "ThreadManForUser", "sceKernelWaitThreadEndCB",         hle_WaitThreadEndCB);
     psp_hle_register(0x446D8DE6, "ThreadManForUser", "sceKernelCreateThread",            hle_CreateThread);
     psp_hle_register(0xF475845D, "ThreadManForUser", "sceKernelStartThread",             hle_StartThread);
     psp_hle_register(0xAA73C935, "ThreadManForUser", "sceKernelExitThread",              hle_ExitThread);

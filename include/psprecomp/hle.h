@@ -141,6 +141,7 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
  * is nothing to report and the kernel says so rather than answering 0.
  * threads/refer.expected reads `exit: 800201a4` for a live thread where
  * threads/create.expected reads `800201a2` for one never started. */
+#define SCE_KERNEL_ERROR_UNKNOWN_CBID    0x800201A1
 #define SCE_KERNEL_ERROR_NOT_DORMANT     0x800201A4
 /* Not a wake code -- the *exit status* a terminated thread is left with.
  * threads/refer reads it back with sceKernelReferThreadStatus (`exit=800201ac`)
@@ -369,6 +370,9 @@ void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples,
  * the scheduler holds nothing. Needed by a spawn hook deciding whether a newly
  * started thread outranks its starter. */
 uint32_t psp_threadman_current_priority(void);
+/* Deliver the current thread's pending callbacks, returning whether any ran.
+ * Every firmware call whose name ends in CB is a wait that does this first. */
+int psp_threadman_run_callbacks(void);
 
 /* Shared with the other kernel object types: one uid space, and one way of
  * writing a name into a SceKernel*Info block. */
