@@ -16,6 +16,7 @@
 #include "psprecomp/mem.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define PSP_SCREEN_W 480
@@ -143,6 +144,45 @@ uint64_t        psp_display_best_score(void) { return g_best_score; }
 uint32_t        psp_display_best_addr(void)  { return g_best_addr; }
 const uint32_t *psp_display_best(void)       { return g_best; }
 
+/* PSPRECOMP_FRAMES=<prefix> writes every Nth presented frame as
+ * <prefix>-NNNN.ppm, N from PSPRECOMP_FRAMES_EVERY (default 30).
+ *
+ * The best-frame capture answers "did anything ever appear". It cannot answer
+ * "is this what the game looks like", because one frame cannot tell a colour
+ * bug from a bright moment or a camera move -- and a washed-out still is
+ * exactly the case where those are indistinguishable. A spread across the run
+ * can. */
+static void dump_frame_seq(uint32_t base) {
+    static const char *prefix; static int looked; static int every, n, written;
+    if (!looked) {
+        looked = 1;
+        prefix = getenv("PSPRECOMP_FRAMES");
+        if (prefix && !*prefix) prefix = NULL;
+        const char *e = getenv("PSPRECOMP_FRAMES_EVERY");
+        every = (e && *e) ? atoi(e) : 30;
+        if (every < 1) every = 1;
+    }
+    if (!prefix || !base || g_fb_format != PSP_DISPLAY_PIXEL_FORMAT_8888) return;
+    if (n++ % every) return;
+    if (written >= 400) return;              /* ~150MB ceiling, stated not silent */
+
+    char path[1024];
+    snprintf(path, sizeof path, "%s-%04d.ppm", prefix, written);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", PSP_SCREEN_W, PSP_SCREEN_H);
+    for (int y = 0; y < PSP_SCREEN_H; y++)
+        for (int x = 0; x < PSP_SCREEN_W; x++) {
+            const uint32_t p =
+                psp_read32(base + (uint32_t)(y * (int)g_fb_width + x) * 4u);
+            const uint8_t rgb[3] = { (uint8_t)(p & 0xFF), (uint8_t)((p >> 8) & 0xFF),
+                                     (uint8_t)((p >> 16) & 0xFF) };
+            fwrite(rgb, 1, 3, f);
+        }
+    fclose(f);
+    written++;
+}
+
 static void score_frame(uint32_t base) {
     if (!base || g_fb_format != PSP_DISPLAY_PIXEL_FORMAT_8888) return;
     g_frames_scored++;
@@ -174,6 +214,7 @@ static void hle_SetFrameBuf(void) {
     g_fb_format = psp_arg(2);
     if (!g_fb_width) g_fb_width = 512;
     score_frame(g_fb_addr);
+    dump_frame_seq(g_fb_addr);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
