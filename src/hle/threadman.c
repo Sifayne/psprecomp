@@ -1447,6 +1447,10 @@ static void hle_WaitEventFlag(void) {
     psp_evflag *f = find_flag(id);
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
 
+    /* Whether the caller asked for *no* wait at all, which is not the same as
+     * asking for a very short one -- see the pattern write-back below. */
+    const int no_wait = tmo_ptr && psp_read32(tmo_ptr) == 0;
+
     const uint64_t deadline = psp_wait_deadline(tmo_ptr);
 
     if (flag_satisfied(f, bits, mode)) {
@@ -1498,7 +1502,11 @@ static void hle_WaitEventFlag(void) {
     }
 
     psp_waitq_drop(&f->q, me);
-    if (out) psp_write32(out, f->pattern);
+    /* A wait that ran out reports the pattern it did not get; a wait that never
+     * started reports nothing. events/wait seeds the word with 0xDEADBEEF and
+     * reads it back untouched from the zero-timeout case, then reads 00000000
+     * from the 5ms one next to it. */
+    if (out && !no_wait) psp_write32(out, f->pattern);
 
     if (rc == PSP_SCHED_EXPIRED) {
         psp_wait_writeback(tmo_ptr, deadline);
