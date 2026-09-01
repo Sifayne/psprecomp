@@ -2,6 +2,8 @@
 
 #include "waitq.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/clock.h"
+#include "psprecomp/mem.h"
 
 #include <string.h>
 
@@ -53,4 +55,25 @@ int psp_waitq_release_all(psp_waitq *q) {
     for (int i = 0; i < q->n; i++) urgent |= psp_sched_wake(q->w[i].uid);
     q->n = 0;
     return urgent;
+}
+
+uint64_t psp_wait_deadline(uint32_t tmo_ptr) {
+    if (!tmo_ptr) return 0;
+    const uint32_t usec = psp_read32(tmo_ptr);
+    if (usec) return psp_clock_peek() + usec;
+    /* A zero timeout is a deadline that has *already* arrived, not the shortest
+     * future one. The difference is observable: a zero-timeout lock that
+     * succeeds immediately reports `0ms left`, and giving it a deadline one
+     * microsecond out reported 1. The handoff promotes a sleeper whose moment
+     * has passed on its very next pass, so this expires through the ordinary
+     * path either way. Guarded against a clock still reading zero, where the
+     * scheduler would read the deadline as "none". */
+    const uint64_t now = psp_clock_peek();
+    return now ? now : 1;
+}
+
+void psp_wait_writeback(uint32_t tmo_ptr, uint64_t deadline) {
+    if (!tmo_ptr) return;
+    const uint64_t now = psp_clock_peek();
+    psp_write32(tmo_ptr, now < deadline ? (uint32_t)(deadline - now) : 0);
 }

@@ -42,6 +42,7 @@ add_library(psprecomp STATIC
     src/hle/sysmem.c
     src/hle/threadman.c
     src/hle/waitq.c
+    src/hle/kernlock.c
     src/hle/sched.c
     src/hle/clock.c
     src/hle/mpeg.c

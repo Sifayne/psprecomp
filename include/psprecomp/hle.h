@@ -166,6 +166,18 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 /* Waiting for zero, a negative amount, or more than a semaphore's maximum. */
 #define SCE_KERNEL_ERROR_ILLEGAL_COUNT   0x800201BD
 
+/* The mutex family. Six codes for what a single "busy" would flatten, because
+ * a mutex has an owner and the mistakes are therefore distinguishable: locking
+ * one you already hold without the recursive attribute is a different error
+ * from unlocking one you do not hold, which is different again from giving back
+ * more than you took. All from threads/mutex/{create,lock,unlock}.expected. */
+#define SCE_KERNEL_ERROR_NOT_FOUND_MUTEX       0x800201C3
+#define SCE_KERNEL_ERROR_MUTEX_LOCKED          0x800201C4
+#define SCE_KERNEL_ERROR_MUTEX_UNLOCKED        0x800201C5
+#define SCE_KERNEL_ERROR_MUTEX_LOCK_OVERFLOW   0x800201C6
+#define SCE_KERNEL_ERROR_MUTEX_UNLOCK_UNDERFLOW 0x800201C7
+#define SCE_KERNEL_ERROR_MUTEX_RECURSIVE       0x800201C8
+
 /* ---- the subsystems ------------------------------------------------------ */
 
 void psp_sysmem_init(void);
@@ -253,6 +265,14 @@ void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples,
  * the scheduler holds nothing. Needed by a spawn hook deciding whether a newly
  * started thread outranks its starter. */
 uint32_t psp_threadman_current_priority(void);
+
+/* Shared with the other kernel object types: one uid space, and one way of
+ * writing a name into a SceKernel*Info block. */
+uint32_t psp_threadman_next_uid(void);
+void     psp_threadman_write_name(uint32_t dst, const char *name);
+
+void psp_kernlock_register(void);
+void psp_kernlock_reset(void);
 
 void psp_threadman_init(void);
 void psp_threadman_register(void);

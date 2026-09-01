@@ -37,6 +37,33 @@
 
 #include <stdint.h>
 
+/* ---- the timeout argument every kernel wait takes --------------------------
+ *
+ * It is a *pointer*, and it is in and out. Hardware reads how long to wait and,
+ * when the wait ends, writes back how much of it was left -- which the tests
+ * print, so it is observable rather than a nicety.
+ * threads/semaphores/wait.expected pins all three cases:
+ *
+ *     Signaled: OK (500ms left)                 immediate, nothing spent
+ *     Wait timeout: ... remaining=4             blocked, woken with 4ms of 5000
+ *     Never signaled: Failed (800201A8, 0ms)    ran out
+ *
+ * and a fourth, which is why the write-back is conditional: a call that fails
+ * on its *arguments* -- `Greater than max: Failed (800201BD, 500ms left)` --
+ * leaves the word alone, because it never waited.
+ *
+ * Here rather than in threadman.c because every object type needs them and the
+ * rule belongs to the wait, not to the thread manager. */
+
+/* The absolute guest-microsecond deadline a wait should park with, or 0 for
+ * "no timeout". A NULL pointer means wait forever; a *zero* timeout is the
+ * shortest real one there is, and gets the earliest deadline that exists so
+ * that it expires through the ordinary path. */
+uint64_t psp_wait_deadline(uint32_t tmo_ptr);
+
+/* What hardware leaves in the timeout word: how much was not used. */
+void     psp_wait_writeback(uint32_t tmo_ptr, uint64_t deadline);
+
 /* The attribute bit that selects most-urgent-first over first-come. */
 #define PSP_WAITQ_PRIORITY 0x100u
 

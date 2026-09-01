@@ -135,6 +135,7 @@ void psp_threadman_reset(void) {
      * it, so resetting time afterwards would leave that stamp in the future. */
     psp_clock_reset();
     psp_sched_reset();
+    psp_kernlock_reset();
 }
 
 static void on_thread_end(uint32_t uid, uint32_t status);
@@ -201,9 +202,7 @@ static void wait_deadlock(const char *what) {
 /* Defined down with the waits, but needed above them: by the signal, and by
  * sceKernelWaitThreadEnd, which is a thread operation that happens to be a
  * wait and so lives with the threads. */
-static int      sema_release(psp_sema *s);
-static uint64_t wait_deadline(uint32_t tmo_ptr);
-static void     wait_writeback(uint32_t tmo_ptr, uint64_t deadline);
+static int sema_release(psp_sema *s);
 
 /* ---- threads ------------------------------------------------------------- */
 
@@ -391,7 +390,7 @@ static void hle_WaitThreadEnd(void) {
      * there: a caller waiting on a thread that sleeps forever has a timeout
      * precisely so that it can give up, and without one the whole run stops.
      * threads/threads/threadend is that test, and it went silent. */
-    const uint64_t deadline = wait_deadline(timeout);
+    const uint64_t deadline = psp_wait_deadline(timeout);
 
     /* Park until it ends. This is what drives a freshly started thread: nothing
      * runs it until the thread holding the token gives it up, and a caller
@@ -402,7 +401,7 @@ static void hle_WaitThreadEnd(void) {
         const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                              "sceKernelWaitThreadEnd", deadline);
         if (rc == PSP_SCHED_EXPIRED) {
-            wait_writeback(timeout, deadline);
+            psp_wait_writeback(timeout, deadline);
             psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
             return;
         }
@@ -415,7 +414,7 @@ static void hle_WaitThreadEnd(void) {
         if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
     }
 
-    wait_writeback(timeout, deadline);
+    psp_wait_writeback(timeout, deadline);
     psp_ret(t->exit_status);
 }
 
@@ -584,6 +583,10 @@ static void hle_ResumeDispatchThread(void) {
  * refuses to run at all when it is wrong. */
 #define PSP_MAIN_THREAD_PRIORITY 0x20
 
+/* The next uid, shared so that every kernel object type draws from one space --
+ * which is what makes a handle of the wrong type resolve to nothing. */
+uint32_t psp_threadman_next_uid(void) { return g_next_uid++; }
+
 uint32_t psp_threadman_current_priority(void) {
     const psp_thread *c = current_thread();
     return c ? c->priority : PSP_MAIN_THREAD_PRIORITY;
@@ -740,7 +743,7 @@ static int flag_attr_ok(uint32_t attr) {
 /* Copy a name into a guest SceKernel*Info block: 32 bytes, truncated to 31
  * characters and NUL-terminated, which is what hardware reports back for the
  * 31-character name the create tests hand it. */
-static void write_info_name(uint32_t dst, const char *name) {
+void psp_threadman_write_name(uint32_t dst, const char *name) {
     char buf[32];
     memset(buf, 0, sizeof buf);
     for (int i = 0; i < 31 && name[i]; i++) buf[i] = name[i];
@@ -843,21 +846,6 @@ static void hle_DeleteCallback(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
  *
  * This was previously read only for its non-NULL-ness, to decide whether a
  * fabricated timeout was allowed. The duration itself was discarded. */
-static uint64_t wait_deadline(uint32_t tmo_ptr) {
-    if (!tmo_ptr) return 0;                       /* wait forever */
-    const uint32_t usec = psp_read32(tmo_ptr);
-    /* A zero timeout is a real timeout, the shortest one there is -- and
-     * hardware answers it with WAIT_TIMEOUT rather than waiting
-     * ("Zero timeout: Failed (800201A8, 0ms left)"). Giving it the earliest
-     * deadline that exists produces exactly that, through the ordinary path. */
-    return psp_clock_peek() + (usec ? usec : 1);
-}
-
-static void wait_writeback(uint32_t tmo_ptr, uint64_t deadline) {
-    if (!tmo_ptr) return;
-    const uint64_t now = psp_clock_peek();
-    psp_write32(tmo_ptr, now < deadline ? (uint32_t)(deadline - now) : 0);
-}
 
 /* Hand the count to whoever is next in line, as far as it will go.
  *
@@ -898,13 +886,13 @@ static void hle_WaitSema(void) {
         return;
     }
 
-    const uint64_t deadline = wait_deadline(tmo_ptr);
+    const uint64_t deadline = psp_wait_deadline(tmo_ptr);
 
     /* Available, and nobody ahead of us. Both conditions: see sema_release. */
     if (psp_waitq_count(&s->q) == 0 && s->count >= need) {
         s->count -= need;
         sema_log(s, "taken", need, 0);
-        wait_writeback(tmo_ptr, deadline);
+        psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
@@ -928,7 +916,7 @@ static void hle_WaitSema(void) {
     if (rc == PSP_SCHED_WOKEN) {
         /* The signaller already took the count on our behalf, so there is
          * nothing to re-test: being woken *is* the semaphore. */
-        wait_writeback(tmo_ptr, deadline);
+        psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
@@ -939,7 +927,7 @@ static void hle_WaitSema(void) {
     const int urgent = sema_release(s);
 
     if (rc == PSP_SCHED_EXPIRED) {
-        wait_writeback(tmo_ptr, deadline);
+        psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
         if (urgent) psp_sched_yield();
         return;
@@ -1088,12 +1076,12 @@ static void hle_WaitEventFlag(void) {
     psp_evflag *f = find_flag(id);
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
 
-    const uint64_t deadline = wait_deadline(tmo_ptr);
+    const uint64_t deadline = psp_wait_deadline(tmo_ptr);
 
     if (flag_satisfied(f, bits, mode)) {
         if (out) psp_write32(out, f->pattern);
         if (mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~bits;
-        wait_writeback(tmo_ptr, deadline);
+        psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
@@ -1125,7 +1113,7 @@ static void hle_WaitEventFlag(void) {
     if (rc == PSP_SCHED_WOKEN) {
         /* flag_release already wrote the pattern we woke on and applied our
          * clear, on our behalf and in the object's order. */
-        wait_writeback(tmo_ptr, deadline);
+        psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
@@ -1134,7 +1122,7 @@ static void hle_WaitEventFlag(void) {
     if (out) psp_write32(out, f->pattern);
 
     if (rc == PSP_SCHED_EXPIRED) {
-        wait_writeback(tmo_ptr, deadline);
+        psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
         return;
     }
@@ -1163,7 +1151,7 @@ static void hle_ReferSemaStatus(void) {
     if (!sm)   { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
     psp_write32(info +  0, 56);
-    write_info_name(info + 4, sm->name);
+    psp_threadman_write_name(info + 4, sm->name);
     psp_write32(info + 36, sm->attr);
     psp_write32(info + 40, (uint32_t)sm->init_count);
     psp_write32(info + 44, (uint32_t)sm->count);
@@ -1178,7 +1166,7 @@ static void hle_ReferEventFlagStatus(void) {
     if (!f)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
     psp_write32(info +  0, 52);
-    write_info_name(info + 4, f->name);
+    psp_threadman_write_name(info + 4, f->name);
     psp_write32(info + 36, f->attr);
     psp_write32(info + 40, f->init_pattern);
     psp_write32(info + 44, f->pattern);
@@ -1199,7 +1187,7 @@ static void hle_ReferCallbackStatus(void) {
     if (!c)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
     psp_write32(info +  0, 56);
-    write_info_name(info + 4, c->name);
+    psp_threadman_write_name(info + 4, c->name);
     psp_write32(info + 36, c->thread);
     psp_write32(info + 40, c->func);
     psp_write32(info + 44, c->arg);
@@ -1223,7 +1211,7 @@ static void hle_ReferThreadStatus(void) {
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
 
     psp_write32(info +  0, 104);
-    write_info_name(info + 4, t->name);
+    psp_threadman_write_name(info + 4, t->name);
     psp_write32(info + 36, t->attr);
     psp_write32(info + 40, (uint32_t)t->state);
     psp_write32(info + 44, t->entry);
