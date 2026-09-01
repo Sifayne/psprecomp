@@ -2,10 +2,10 @@
  *
  * Two things get pinned here. The first is register addressing, because the
  * layout is what makes a matrix row and column alias correctly and everything
- * else is built on it. The second is that a pending prefix makes arithmetic
- * *trap* rather than compute: partial VFPU that ignores prefixes produces
- * silently wrong numbers, which is the one failure mode this project has spent
- * its whole life avoiding.
+ * else is built on it. The second is the operand prefixes, because nothing in
+ * an arithmetic instruction's own encoding says a prefix is rewriting it --
+ * a swizzle or a lane negation applied to the wrong operand, or not at all,
+ * produces numbers that are wrong and entirely plausible.
  */
 
 #include "psprecomp/vfpu.h"
@@ -169,36 +169,104 @@ static void test_arithmetic(void) {
     for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i] + b[i], "vadd into its own source");
 }
 
-static void test_prefix_traps(void) {
+static void test_prefixes(void) {
     psp_vfpu_reset();
 
-    const float a[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    const float a[4] = { 1.0f, -2.0f, 3.0f, -4.0f };
+    const float ones[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float out[4];
+
+    /* The identity prefix is the state after a reset, and after every op. An
+     * implementation that only ever saw 0xE4 would pass everything below this
+     * point, so it is checked first and separately. */
+    CHECK(!psp_vfpu_prefix_pending(), "reset leaves the identity prefix");
+
     set_quad(0x00, a);
-    set_quad(0x04, a);
-
-    uint64_t before = psp_vfpu_trap_count();
-
-    /* With no prefix pending, arithmetic computes. */
+    set_quad(0x04, ones);
     psp_vadd(0x08, 0x00, 0x04, 4);
-    CHECK(psp_vfpu_trap_count() == before, "no prefix, no trap");
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i], "no prefix, no rewrite");
 
-    /* With one pending, it must trap instead of quietly ignoring it. */
-    psp_vfpu_set_prefix(0, 0x00000055);
-    CHECK(psp_vfpu_prefix_pending(), "prefix registers as pending");
+    /* Swizzle. 0x1B is w,z,y,x -- selectors 3,2,1,0 packed two bits per lane,
+     * lane 0 in the low bits -- so this reverses the operand. It also has to
+     * *exchange* rather than duplicate, which is why the source is copied
+     * before any lane is rewritten. */
+    set_quad(0x04, ones);
+    psp_vfpu_set_prefix(0, 0x1B);
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++) CHECK_F(out[i], a[3 - i], "source swizzle reverses");
+    CHECK(!psp_vfpu_prefix_pending(), "the op consumed the prefix");
 
-    float before_out[4];
-    get_quad(0x0C, before_out);
-    psp_vadd(0x0C, 0x00, 0x04, 4);
+    /* And it is one-shot: the same op again must see no prefix. */
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i], "a prefix lasts one instruction");
 
-    CHECK(psp_vfpu_trap_count() == before + 1,
-          "a pending prefix traps rather than computing");
-    CHECK(!psp_vfpu_prefix_pending(), "the prefix is consumed by the attempt");
+    /* Negate lane 1 only -- bits 16..19, one per lane. This is the whole of
+     * what pspgl's glRotatef needs, and ignoring it silently produced an
+     * identity matrix where a rotation belonged. */
+    psp_vfpu_set_prefix(0, 0xE4 | (1u << 17));
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++)
+        CHECK_F(out[i], i == 1 ? -a[i] : a[i], "negate applies per lane");
 
-    float after_out[4];
-    get_quad(0x0C, after_out);
-    CHECK(memcmp(before_out, after_out, sizeof after_out) == 0,
-          "the trapped op wrote nothing -- silently wrong output is the one "
-          "outcome worse than an error");
+    /* Absolute value, bits 8..11. */
+    psp_vfpu_set_prefix(0, 0xE4 | 0xF00u);
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++)
+        CHECK_F(out[i], a[i] < 0 ? -a[i] : a[i], "abs applies per lane");
+
+    /* Constants, bits 12..15: the lane's swizzle selector indexes a table
+     * rather than the operand, and the abs bit picks the upper half of it.
+     * Selector 1 with abs clear is 1.0; selector 1 with abs set is 1/3. */
+    psp_vfpu_set_prefix(0, 0x1000u | 0x1u);          /* lane 0: const, sel 1 */
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    CHECK_F(out[0], 1.0f, "constant 1.0 substitutes for the operand");
+
+    psp_vfpu_set_prefix(0, 0x1000u | 0x100u | 0x1u); /* + abs -> upper half */
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    CHECK_F(out[0], 1.0f / 3.0f, "the abs bit selects the second constant bank");
+
+    /* The T prefix rewrites the second operand, independently of the first. */
+    set_quad(0x04, a);
+    psp_vfpu_set_prefix(1, 0x1B);
+    psp_vsub(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++)
+        CHECK_F(out[i], a[i] - a[3 - i], "the T prefix rewrites vt alone");
+
+    /* Destination saturation, two bits per lane: 1 clamps to [0,1], 3 to
+     * [-1,1], 0 and 2 leave the value alone. */
+    set_quad(0x00, a);
+    set_quad(0x04, ones);
+    psp_vfpu_set_prefix(2, 1u | (3u << 2));
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    CHECK_F(out[0],  1.0f, "lane 0 clamped to [0,1]");
+    CHECK_F(out[1], -1.0f, "lane 1 clamped to [-1,1]");
+    CHECK_F(out[2],  3.0f, "lane 2 unsaturated");
+
+    /* The write mask, bits 8..11: a masked lane keeps what it held. */
+    const float seed[4] = { 100.0f, 200.0f, 300.0f, 400.0f };
+    set_quad(0x08, seed);
+    psp_vfpu_set_prefix(2, 1u << 9);                 /* mask lane 1 */
+    psp_vadd(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    CHECK_F(out[0], a[0],   "unmasked lane is written");
+    CHECK_F(out[1], 200.0f, "masked lane keeps its old value");
+    CHECK_F(out[2], a[2],   "unmasked lane is written");
+
+    /* Every VFPU op consumes the prefixes, including ones that ignore them.
+     * A matrix op that left a swizzle set would apply it to whatever came
+     * next, which is a bug that only shows up two instructions later. */
+    psp_vfpu_set_prefix(0, 0x1B);
+    psp_vmidt(0x00, 4);
+    CHECK(!psp_vfpu_prefix_pending(), "a matrix op consumes prefixes it ignores");
 }
 
 static void test_compare(void) {
@@ -432,7 +500,7 @@ int main(void) {
     test_register_addressing();
     test_load_store();
     test_arithmetic();
-    test_prefix_traps();
+    test_prefixes();
     test_compare();
     test_matrix_ops();
     test_matrix_transform();

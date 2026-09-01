@@ -19,16 +19,22 @@
  * and vscl/vmul/vadd/vdot another 18%. Those, plus the compare/min/max family,
  * are implemented here and unit-tested.
  *
- * The **prefix** instructions are not. `vpfxs`/`vpfxt`/`vpfxd` do not compute
- * anything -- they set a register that rewrites the *operands of the next
- * instruction*, swizzling lanes, negating, forcing constants, masking writes.
- * An arithmetic op executed while a prefix is pending computes something
- * different from the same op without one.
+ * The **prefix** instructions are implemented too, as of the pspautotests
+ * work. `vpfxs`/`vpfxt`/`vpfxd` compute nothing themselves -- they set a
+ * register that rewrites the *operands of the next instruction*, swizzling
+ * lanes, taking absolute values, substituting constants, negating, saturating
+ * and masking lanes out of the write. An arithmetic op executed while a prefix
+ * is pending computes something different from the same op without one, and
+ * nothing in that op's own encoding says so.
  *
- * So a pending prefix makes the next arithmetic op **trap** rather than
- * compute. Implementing the arithmetic while ignoring the prefixes would be
- * worse than not implementing it at all: it would produce numbers that are
- * silently wrong instead of an error that says so. Loud beats plausible.
+ * They were deliberately absent for a long time, and a pending prefix made the
+ * next arithmetic op report and skip rather than compute a number that ignored
+ * it -- loud beats plausible. That policy was right and it was also the last
+ * thing standing between the VFPU and the hardware tests: pspgl's `glRotatef`
+ * is two `vmov.p` under a `vpfxs` whose entire content is a lane negation, so
+ * skipping them leaves the identity behind.
+ *
+ * Anything still missing traps the same way; see psp_vfpu_unimplemented.
  */
 #ifndef PSPRECOMP_VFPU_H
 #define PSPRECOMP_VFPU_H
@@ -120,8 +126,13 @@ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 uint32_t psp_mfv(uint32_t vd);
 void     psp_mtv(uint32_t vd, uint32_t bits);
 
-/* Prefix state. Set by vpfxs/vpfxt/vpfxd; consumed (and cleared) by the next
- * arithmetic instruction. While any is pending, arithmetic traps. */
+/* Prefix state. Set by vpfxs/vpfxt/vpfxd and consumed by the next VFPU
+ * instruction -- every one of them, whether it uses the prefix or not, since a
+ * prefix left set would apply to whatever came after instead.
+ *
+ * `psp_vfpu_prefix_pending` reports whether any prefix differs from its
+ * identity. Nothing in the implementation needs it now; it is kept because it
+ * is the cheap way to ask, from outside, whether the next op will be rewritten. */
 void psp_vfpu_set_prefix(int which, uint32_t value);
 int  psp_vfpu_prefix_pending(void);
 void psp_vfpu_reset(void);
