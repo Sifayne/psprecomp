@@ -1460,7 +1460,14 @@ static void hle_WaitEventFlag(void) {
      * releasing its waiters looks like from in here -- and a different answer
      * from asking about a flag that was already gone before the call. */
     f = find_flag(id);
-    if (!f) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    if (!f) {
+        /* And it still reports a pattern: zero, because there is no longer a
+         * flag to have one. The scheduling harness in every events test reads
+         * that word after deleting the flag under its waiter and prints it. */
+        if (out) psp_write32(out, 0);
+        psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE);
+        return;
+    }
 
     if (rc == PSP_SCHED_WOKEN) {
         /* flag_release already wrote the pattern we woke on and applied our
