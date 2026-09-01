@@ -1509,6 +1509,10 @@ static void hle_ReferSemaStatus(void) {
     const uint32_t info = psp_arg(1);
     if (!sm)   { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    /* A caller offering zero bytes gets zero back and nothing written. See
+     * the same guard on every other Refer*Status: threads/refer measured it
+     * first and each type's own test repeats it. */
+    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
     psp_write32(info +  0, 56);
     psp_threadman_write_name(info + 4, sm->name);
     psp_write32(info + 36, sm->attr);
@@ -1577,6 +1581,10 @@ static void hle_ReferEventFlagStatus(void) {
     const uint32_t info = psp_arg(1);
     if (!f)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    /* A caller offering zero bytes gets zero back and nothing written. See
+     * the same guard on every other Refer*Status: threads/refer measured it
+     * first and each type's own test repeats it. */
+    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
     psp_write32(info +  0, 52);
     psp_threadman_write_name(info + 4, f->name);
     psp_write32(info + 36, f->attr);
@@ -1598,6 +1606,10 @@ static void hle_ReferCallbackStatus(void) {
     const uint32_t info = psp_arg(1);
     if (!c)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    /* A caller offering zero bytes gets zero back and nothing written. See
+     * the same guard on every other Refer*Status: threads/refer measured it
+     * first and each type's own test repeats it. */
+    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
     psp_write32(info +  0, 56);
     psp_threadman_write_name(info + 4, c->name);
     psp_write32(info + 36, c->thread);
