@@ -439,6 +439,96 @@ static void test_texture_wrap(void) {
     CHECK(pixel(52, 40) == ramp_texel(0, 10), "clamp at (12,10): 0x%08X", pixel(52, 40));
 }
 
+/* A 2x1 texture magnified 2x across a 4-pixel span, which puts the four pixel
+ * centres at u = 0.25, 0.75, 1.25, 1.75. Taps are taken around u - 0.5, so the
+ * weights run 0.75/0.25 clamped at the left, then 0.25/0.75, then 0.75/0.25,
+ * then clamped at the right -- four distinct values that pin the tap offset,
+ * the weights and the edge behaviour in one row.
+ *
+ * `lo` and `hi` are the two texels; the caller says which channel to read back,
+ * because the case that matters for this game is alpha rather than colour. */
+static void bilinear_row(uint32_t lo, uint32_t hi, int filter, int wrap_clamp,
+                         uint32_t out[4]) {
+    psp_ge_reset();
+    clear_fb();
+    psp_write32(TEX,     lo);
+    psp_write32(TEX + 4, hi);
+
+    begin_list_vtype(VTYPE_2D_TEX);
+    texture_state(TEX, 2, 1 /* w=2 */, 0 /* h=1 */, 3, 0, filter);
+    cmd(0xC7, wrap_clamp ? (1u | (1u << 8)) : 0u);
+    vertex_uv(0, 40, 30, 0, 0, 0xFFFFFFFFu);
+    vertex_uv(1, 44, 30, 2, 0, 0xFFFFFFFFu);
+    vertex_uv(2, 40, 34, 0, 1, 0xFFFFFFFFu);
+    vertex_uv(3, 44, 34, 2, 1, 0xFFFFFFFFu);
+    cmd(0x04, (4u << 16) | 4);
+    end_list();
+
+    for (int k = 0; k < 4; k++) out[k] = pixel(40 + k, 30);
+}
+
+static void test_texture_bilinear_midpoint(void) {
+    uint32_t row[4];
+
+    /* Colour first: black to red. Clamped at both ends, ramping between. */
+    bilinear_row(0xFF000000u, 0xFF0000FFu, 1, 1, row);
+    static const uint32_t want_r[4] = { 0, 64, 191, 255 };
+    for (int k = 0; k < 4; k++)
+        CHECK((row[k] & 0xFF) == want_r[k],
+              "bilinear red at %d: got %u want %u", k, row[k] & 0xFF, want_r[k]);
+
+    /* Then the shape this game's letterforms actually have: white throughout,
+     * the mask entirely in alpha. Filtering RGB and taking alpha from one tap
+     * passes the check above and fails this one, while leaving every glyph edge
+     * exactly as hard as nearest. */
+    bilinear_row(0x00FFFFFFu, 0xFFFFFFFFu, 1, 1, row);
+    for (int k = 0; k < 4; k++)
+        CHECK(((row[k] >> 24) & 0xFF) == want_r[k],
+              "bilinear alpha at %d: got %u want %u",
+              k, (row[k] >> 24) & 0xFF, want_r[k]);
+}
+
+/* The filter state must be obeyed in both directions. Bilinear applied
+ * unconditionally would pass the test above and blur every UI layer the game
+ * asked to be sharp. */
+static void test_texture_filter_is_honoured(void) {
+    uint32_t row[4];
+    bilinear_row(0xFF000000u, 0xFF0000FFu, 0 /* nearest */, 1, row);
+    static const uint32_t want_r[4] = { 0, 0, 255, 255 };
+    for (int k = 0; k < 4; k++)
+        CHECK((row[k] & 0xFF) == want_r[k],
+              "nearest red at %d: got %u want %u", k, row[k] & 0xFF, want_r[k]);
+}
+
+/* At exactly 1:1 the fractional part is zero, all the weight lands on one tap,
+ * and linear must come out bit-identical to nearest. This is the property that
+ * keeps a UI layer sharp, and it is exact rather than approximate. */
+static void test_bilinear_equals_nearest_at_1to1(void) {
+    psp_ge_reset();
+    clear_fb();
+    upload_ramp_texture(16, 16);
+
+    begin_list_vtype(VTYPE_2D_TEX);
+    texture_state(TEX, 16, 4, 4, 3, 0, 1 /* linear */);
+    vertex_uv(0, 40, 30,  0,  0, 0xFFFFFFFFu);
+    vertex_uv(1, 53, 30, 13,  0, 0xFFFFFFFFu);
+    vertex_uv(2, 40, 41,  0, 11, 0xFFFFFFFFu);
+    vertex_uv(3, 53, 41, 13, 11, 0xFFFFFFFFu);
+    cmd(0x04, (4u << 16) | 4);
+    end_list();
+
+    int bad = 0;
+    for (int j = 0; j < 11 && bad < 4; j++)
+        for (int k = 0; k < 13 && bad < 4; k++) {
+            const uint32_t got = pixel(40 + k, 30 + j);
+            if (got != ramp_texel(k, j)) {
+                bad++;
+                CHECK(0, "linear at 1:1 must equal nearest at (%d,%d):"
+                         " got 0x%08X want 0x%08X", k, j, got, ramp_texel(k, j));
+            }
+        }
+}
+
 /* Depth commands, and a vertex carrying a z. The 16-bit position slot has one
  * and the plain `vertex` helper leaves it at zero, which is invisible until a
  * test actually turns the depth test on. */
@@ -628,6 +718,9 @@ int main(void) {
     test_texture_minified_samples_centre();
     test_sprite_texture_samples_centre();
     test_texture_wrap();
+    test_texture_bilinear_midpoint();
+    test_texture_filter_is_honoured();
+    test_bilinear_equals_nearest_at_1to1();
     test_clear_mode_clears_depth();
     test_depth_test_still_rejects();
     test_ge_reset_clears_depth();

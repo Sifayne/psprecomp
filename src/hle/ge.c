@@ -314,10 +314,17 @@ void psp_ge_dump_stats(FILE *out) {
             static const char *const FI[8] = {
                 "nearest","linear","?","?",
                 "near/mip-near","lin/mip-near","near/mip-lin","lin/mip-lin" };
-            fprintf(out, "    sampling   filter min %s mag %s, wrap s %s t %s\n",
+            fprintf(out, "    sampling   filter min %s mag %s, wrap s %s t %s",
                     FI[g_ge.tex_filter & 7], FI[(g_ge.tex_filter >> 8) & 7],
                     (g_ge.tex_wrap & 1) ? "clamp" : "repeat",
                     ((g_ge.tex_wrap >> 8) & 1) ? "clamp" : "repeat");
+            /* The backend samples with the magnification filter, having no
+             * scale factor to choose with. This is how many primitives that
+             * choice was actually visible on. */
+            if (psp_render_filter_split())
+                fprintf(out, "  (%llu prims where min/mag differ)",
+                        (unsigned long long)psp_render_filter_split());
+            fprintf(out, "\n");
         }
     }
     if (g_ge.drawn_prims)

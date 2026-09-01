@@ -134,6 +134,11 @@ uint64_t psp_render_flat_pixels(void);
 uint64_t psp_render_zfail_pixels(void);
 uint64_t psp_render_blended_pixels(void);
 uint64_t psp_render_alphakill_pixels(void);
+/* Primitives whose minification and magnification filters select *differently*
+ * -- not merely differ, since the mipmap variants encode the same in-level
+ * choice. The backend uses the magnification one, having no scale factor to
+ * choose with; a non-zero count is the evidence that computing one is worth it. */
+uint64_t psp_render_filter_split(void);
 void     psp_render_reset_pixels(void);
 
 /* Return the depth buffer to its start-of-run contents. The game clears depth

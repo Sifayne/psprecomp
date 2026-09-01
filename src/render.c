@@ -30,8 +30,10 @@ uint64_t psp_render_flat_pixels(void) { return g_px_flat; }
 uint64_t psp_render_zfail_pixels(void) { return g_px_zfail; }
 
 uint64_t psp_render_pixels(void) { return g_pixels; }
+static uint64_t g_filter_split;
 void     psp_render_reset_pixels(void) {
     g_pixels = g_px_tex = g_px_flat = g_px_zfail = g_px_blend = g_px_atest = 0;
+    g_filter_split = 0;
 }
 
 /* ---- software backend ---------------------------------------------------- */
@@ -53,12 +55,11 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
  * format arriving that is not handled shows up as flat colour rather than as
  * plausible-looking wrong pixels.
  *
- * Nearest sampling, taken at pixel centres. The claim that used to stand here
- * -- that a 1:1 blit "samples texel centres either way", so the filter state
- * did not matter -- was exactly backwards: at 1:1 a corner sample lands on the
- * texel *boundary*, which is the one place a few ULP of interpolation error
- * changes the answer. See sw_tri. Honouring GE_TEXFILTER is still owed; this
- * game asks for linear. */
+ * Sampled at pixel centres, nearest or bilinear as GE_TEXFILTER asks. The claim
+ * that used to stand here -- that a 1:1 blit "samples texel centres either
+ * way", so the filter state did not matter -- was exactly backwards: at 1:1 a
+ * corner sample lands on the texel *boundary*, which is the one place a few ULP
+ * of interpolation error changes the answer. See sw_tri. */
 static psp_tex_state g_tex;
 
 /* PSPRECOMP_TEXDUMP=<path> writes each distinct texture the game binds, decoded
@@ -249,6 +250,79 @@ static void dump_texture(void) {
             g_tex.swizzled ? " swizzled" : "", g_clut.addr, g_clut.fmt,
             g_clut.shift, g_clut.mask, g_clut.start);
     g_dumped_n++;
+}
+
+/* ---- filtering -----------------------------------------------------------
+ *
+ * GE_TEXFILTER was parsed into the GE's state from the beginning and read by
+ * nothing: set_texture had no filter parameter, so the state could not reach a
+ * backend even in principle. This game asks for linear on both fields.
+ *
+ * Values are GU_NEAREST 0 and GU_LINEAR 1, then 4..7 for the mipmap variants
+ * (2 and 3 are not legal). Bit 0 selects linear *within* the level across all
+ * six, so the mip chain -- which nothing here builds -- does not have to exist
+ * for the in-level choice to be right. */
+
+uint64_t psp_render_filter_split(void) { return g_filter_split; }
+
+static int filter_is_linear(void) {
+    /* Magnification, unconditionally. Choosing properly needs the
+     * pixel-to-texel scale, which needs derivatives this rasterizer does not
+     * compute, and there would be no mip chain to select from if it did. Mag is
+     * the honest default -- it is the one that applies at the scale a UI layer
+     * draws at, and it is what a scale factor of 1 selects anyway.
+     *
+     * The counter asks whether that choice ever *matters*, which is not the
+     * same as whether the two fields differ. This game sets min 5 and mag 1 --
+     * different values that both mean linear within the level -- so comparing
+     * them raw would fire on every primitive and measure nothing. Comparing the
+     * bit that selects the filter is the question actually being asked, and a
+     * non-zero count is the evidence that a per-primitive scale factor is worth
+     * the division it would cost. */
+    if ((g_tex.min_filter & 1) != (g_tex.mag_filter & 1)) g_filter_split++;
+    return g_tex.mag_filter & 1;
+}
+
+/* Bilinear, with the half-texel that makes it agree with nearest at 1:1.
+ *
+ * Texel k covers [k, k+1), so its centre is at k + 0.5 and the four taps belong
+ * around u - 0.5. Dropping that offset is the usual way to get this wrong: it
+ * averages every texel with its neighbour during a 1:1 blit and softens a UI
+ * layer that the hardware leaves sharp. With it, a 1:1 blit lands on frac 0,
+ * puts all the weight on one tap, and comes out bit-identical to nearest.
+ *
+ * All four channels, alpha included. This game's logo is an alpha mask -- white
+ * throughout, the letterforms entirely in the alpha channel -- so filtering
+ * only RGB and taking alpha from a single tap would leave the edges exactly as
+ * hard as nearest and look like the filter had never been implemented. */
+static uint32_t sample_bilinear(float u, float v) {
+    const float fu = u - 0.5f, fv = v - 0.5f;
+    const int   u0 = ifloor(fu), v0 = ifloor(fv);
+    const float au = fu - (float)u0, av = fv - (float)v0;
+
+    const uint32_t t00 = sample_texel(u0,     v0);
+    const uint32_t t10 = sample_texel(u0 + 1, v0);
+    const uint32_t t01 = sample_texel(u0,     v0 + 1);
+    const uint32_t t11 = sample_texel(u0 + 1, v0 + 1);
+
+    const float w00 = (1.0f - au) * (1.0f - av), w10 = au * (1.0f - av);
+    const float w01 = (1.0f - au) * av,          w11 = au * av;
+
+    uint32_t out = 0;
+    for (int i = 0; i < 4; i++) {
+        const float s = w00 * (float)((t00 >> (i * 8)) & 0xFF)
+                      + w10 * (float)((t10 >> (i * 8)) & 0xFF)
+                      + w01 * (float)((t01 >> (i * 8)) & 0xFF)
+                      + w11 * (float)((t11 >> (i * 8)) & 0xFF);
+        const int q = (int)(s + 0.5f);
+        out |= (uint32_t)(q < 0 ? 0 : (q > 255 ? 255 : q)) << (i * 8);
+    }
+    return out;
+}
+
+/* The sampler the rasterizer calls: one texel, filtered as the game asked. */
+static uint32_t sample_filtered(float u, float v, int linear) {
+    return linear ? sample_bilinear(u, v) : sample_texel(ifloor(u), ifloor(v));
 }
 
 /* Modulate: texel times vertex colour, per channel. */
@@ -506,6 +580,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * one it skews the texture. */
     const float inv = 1.0f / (float)((int64_t)SUBPX * area);
     const int textured = texture_usable();
+    const int linear = textured && filter_is_linear();
 
     for (int y = miny; y <= maxy; y++) {
         int64_t w0 = row0, w1 = row1, w2 = row2;
@@ -529,7 +604,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                 if (textured) {
                     const float u = l0 * a->u + l1 * b->u + l2 * c->u;
                     const float v = l0 * a->v + l1 * b->v + l2 * c->v;
-                    col = modulate(sample_texel(ifloor(u), ifloor(v)), col);
+                    col = modulate(sample_filtered(u, v, linear), col);
                     g_px_tex++;
                 } else g_px_flat++;
                 shade_pixel(x, y, z, col);
@@ -553,6 +628,7 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
     if (x1 <= x0 || y1 <= y0) return;
 
     const int textured = texture_usable();
+    const int linear = textured && filter_is_linear();
     /* Against the vertices as submitted, not against the sorted corners. The
      * ramp used to be built from x1 - x0, which is positive by construction, so
      * a sprite whose second corner is left of or above its first mapped its
@@ -571,7 +647,7 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
             const float tu = a->u + du * ((float)x + 0.5f - (float)a->x);
             g_px_tex++;
             shade_pixel(x, y, a->z,
-                        modulate(sample_texel(ifloor(tu), ifloor(tv)), b->rgba));
+                        modulate(sample_filtered(tu, tv, linear), b->rgba));
         }
     }
 }
