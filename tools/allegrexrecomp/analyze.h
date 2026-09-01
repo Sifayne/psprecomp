@@ -118,14 +118,52 @@ typedef struct {
      * whole [addr, end) range instead would pull in a neighbour's code. */
     uint32_t *owner;
     uint32_t  nwords;
+
+    /* Words that were a function entry until the function was merged into
+     * another. They are no longer C functions, so the emitter has to give them
+     * a label and a dispatch thunk: something may still call one, and the call
+     * becomes a dispatch on the address. */
+    uint8_t  *split_entry;
+    int       nmerged;      /* functions folded into another */
+
+    /* Shared blocks that were *not* merged because the target is a known
+     * function entry, and how many of those entries are only soft — a pointer
+     * that happened to land in .text and decode, rather than something the code
+     * demonstrably calls.
+     *
+     * A suppressed merge is a loop back-edge emitted as a C call, so a large
+     * soft count means discovery is inventing function boundaries in the middle
+     * of loops. Reported next to nmerged because the two only mean anything
+     * beside each other. */
+    int       nsuppressed;
+    int       nsuppressed_soft;
 } a_analysis;
+
+/* How an address came to be a function entry.
+ *
+ * The distinction exists because the two kinds carry very different evidence.
+ * A HARD entry is something the module demonstrably enters: its entry point, an
+ * export, a `jal` target, a resolved jump-table target. A SOFT one is a guess —
+ * `a_scan_data_pointers` accepts any word that lands in the code extent and
+ * decodes, which an arbitrary data word pointing into the *middle* of a
+ * function passes just as easily as a real entry does.
+ *
+ * Treating the two alike is what turns a loop into a function: the merge sites
+ * refuse to fold a block that is "a known entry", so a soft entry sitting on a
+ * loop header blocks its own merge and the back-edge ships as a call. */
+#define A_ENTRY_NONE 0
+#define A_ENTRY_SOFT 1
+#define A_ENTRY_HARD 2
 
 #define A_NO_OWNER 0xFFFFFFFFu
 
 /* Run discovery. `seeds` are function entry addresses to start from (the
  * module entry point and its exports). Returns 0 on success.
  * Call a_analysis_free() when done. */
-int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds);
+/* `nhard` is how many of the leading seeds are hard: the caller builds the
+ * array entry-point first, then exports, then pointer-derived guesses, so the
+ * split is a count rather than a parallel array. */
+int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds, int nhard);
 
 /* Scan a data region for words that look like code addresses.
  *

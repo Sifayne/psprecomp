@@ -519,8 +519,21 @@ static void emit_slot_alias(ectx *c, uint32_t a, const a_insn *slot, int falls_t
     const uint32_t after = a + 8;
 
     if (falls_through) {
-        if (owned_by(an, after, owner)) fprintf(c->out, "    goto L_%08X;\n", after);
-        else                            fprintf(c->out, "    return;\n");
+        /* Jumping past the standalone copy needs a label to jump to, and the
+         * main pass prints one only for an address it actually emits -- which
+         * it does not when that address is itself a delay slot, since a slot is
+         * emitted with its branch. That happens when a *branch* sits in a delay
+         * slot, which real code never does; it appears where data is being
+         * decoded as instructions. Dispatching instead of jumping keeps such a
+         * region compiling, and it can only ever be reached by executing the
+         * data, which reports a dispatch miss rather than failing silently. */
+        const uint32_t ai = widx(an, after);
+        if (owned_by(an, after, owner) && c->is_label[ai] && !c->is_slot[ai])
+            fprintf(c->out, "    goto L_%08X;\n", after);
+        else if (owned_by(an, after, owner))
+            fprintf(c->out, "    psp_dispatch(0x%08Xu);\n    return;\n", after);
+        else
+            fprintf(c->out, "    return;\n");
     }
     fprintf(c->out, "L_%08X:\n", a + 4);
     comment(c, slot);
@@ -567,6 +580,18 @@ static void emit_function(ectx *c, const a_func *fn) {
      * be labels. Marking afterwards leaves emission emitting `goto L_<addr+4>`
      * against a label nothing declared. */
     c->is_label[widx(an, fn->addr)] = 1;
+
+    /* An entry that stopped being a function when discovery merged it into
+     * this one. Nothing here need branch to it -- the merge was driven by a
+     * branch to some *other* block of it -- but a `jal` elsewhere still names
+     * the address, and that call is now emitted as a dispatch. Without a label
+     * there is no thunk to dispatch to. */
+    if (an->split_entry) {
+        for (uint32_t a = fn->start; a < fn->end; a += 4) {
+            if (!owned_by(an, a, owner)) continue;
+            if (an->split_entry[widx(an, a)]) c->is_label[widx(an, a)] = 1;
+        }
+    }
 
     /* Any address another function falls through into has to be reachable
      * here, even though nothing in this function branches to it. */
@@ -628,11 +653,37 @@ static void emit_function(ectx *c, const a_func *fn) {
      * invariant directly is far cheaper than tracing the consequences. */
     fprintf(f, "    PSP_SP_ENTER();\n");
 
-    int nlabels = 0;
-    for (uint32_t a = fn->start; a < fn->end; a += 4)
-        if (owned_by(an, a, owner) && c->is_label[widx(an, a)]) nlabels++;
+    int nlabels = 0, ncases = 0;
+    for (uint32_t a = fn->start; a < fn->end; a += 4) {
+        if (!owned_by(an, a, owner) || !c->is_label[widx(an, a)]) continue;
+        nlabels++;
+        if (!c->is_slot[widx(an, a)]) ncases++;
+    }
 
-    if (nlabels > 1 || fn->start != fn->addr) {
+    const int has_entry_switch = (nlabels > 1 || fn->start != fn->addr);
+
+    /* A computed jump landing back inside this same function re-enters the
+     * switch instead of going out through the dispatch table.
+     *
+     * Without this, `jr $rN` whose target is one of *our own* labels resolves
+     * to that label's thunk -- whose whole body is a call to this function --
+     * so the function calls itself rather than jumping. Two host frames per
+     * transfer where the hardware does a jump, and a fresh PSP_SP_ENTER() that
+     * captures $sp with the frame already allocated, which makes the epilogue's
+     * release look like an imbalance. Observed at 0x002B5784: `jr $a2` to
+     * 0x002B57E4, a label in its own switch, 1.8M times a run.
+     *
+     * It is not only noise. The guest returns each time here so the stack
+     * unwinds, but a computed jump used as a loop back-edge would grow the host
+     * stack without bound -- the same failure as a loop back-edge emitted as a
+     * nested call, arriving by a different route.
+     *
+     * Only worth the label when there is a switch to jump back to and something
+     * that might jump; an unused label warns. */
+    const int local_reentry = has_entry_switch && ncases > 0 && fn->has_indirect;
+
+    if (has_entry_switch) {
+        if (local_reentry) fprintf(f, "_reenter_%08X:\n", fn->addr);
         fprintf(f, "    switch (_entry) {\n");
         for (uint32_t a = fn->start; a < fn->end; a += 4) {
             if (!owned_by(an, a, owner) || !c->is_label[widx(an, a)]) continue;
@@ -806,7 +857,24 @@ static void emit_function(ectx *c, const a_func *fn) {
 
         if (in.is_indirect) {                    /* jr $rN — computed jump */
             if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
-            fprintf(f, "    psp_dispatch(%s);\n    return;\n", RN[in.rs]);
+            if (local_reentry) {
+                /* Our own label: jump, as the hardware does. Anything else is a
+                 * genuine cross-function transfer and still goes out through
+                 * the table. */
+                fprintf(f, "    { uint32_t _jt = %s;\n", RN[in.rs]);
+                fprintf(f, "      switch (_jt) {\n");
+                for (uint32_t la = fn->start; la < fn->end; la += 4) {
+                    if (!owned_by(an, la, owner) || !c->is_label[widx(an, la)]) continue;
+                    if (c->is_slot[widx(an, la)]) continue;
+                    fprintf(f, "      case 0x%08Xu:\n", la);
+                }
+                fprintf(f, "        _entry = _jt; goto _reenter_%08X;\n", fn->addr);
+                fprintf(f, "      default: break;\n");
+                fprintf(f, "      }\n");
+                fprintf(f, "      psp_dispatch(_jt); }\n    return;\n");
+            } else {
+                fprintf(f, "    psp_dispatch(%s);\n    return;\n", RN[in.rs]);
+            }
             if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0);
             a += 4;
             continue;

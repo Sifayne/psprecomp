@@ -592,7 +592,9 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
         }
     }
 
-    int rc = a_discover(an, seeds, nseeds);
+    /* The entry point and the exports are hard; everything appended after them
+     * is pointer-derived and therefore a guess. See A_ENTRY_SOFT in analyze.h. */
+    int rc = a_discover(an, seeds, nseeds, 1 + nexports);
     free(seeds);
     if (rc != 0) {
         fprintf(stderr, "discovery failed (out of memory)\n");
@@ -622,7 +624,12 @@ static int cmd_funcs(const char *path, int list) {
            nseeds, e.entry, nexports, nptr,
            scanned ? "scanned data pointers (heuristic)" : "relocation pointers");
     printf("\n");
-    printf("functions:  %d\n", an.nfuncs);
+    printf("functions:  %d  (%d merged away)\n", an.nfuncs, an.nmerged);
+    /* Shared blocks the merge refused because the target was already an entry.
+     * The soft share is the interesting number: those are loops cut in half on
+     * the evidence of a data word that happened to decode. */
+    printf("suppressed: %d shared blocks left unmerged, %d of them on a soft seed\n",
+           an.nsuppressed, an.nsuppressed_soft);
     /* `an.size` is the whole loaded image -- code plus .data plus .bss -- so
      * dividing by it and calling the result "of .text" understates coverage by
      * roughly six times. This module reported 14.18% while actually covering

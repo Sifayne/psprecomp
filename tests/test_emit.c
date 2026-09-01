@@ -128,7 +128,7 @@ static void test_return_delay_slot_not_owned(void) {
     an.size = (uint32_t)sizeof code;
 
     const uint32_t seeds[2] = { DS_BASE, DS_BASE + 4 };
-    CHECK(a_discover(&an, seeds, 2) == 0, "delay slot: discovery runs");
+    CHECK(a_discover(&an, seeds, 2, 2) == 0, "delay slot: discovery runs");
 
     emit_opts o;
     o.outdir = ".";
@@ -205,7 +205,7 @@ static void test_indirect_call_is_not_terminal(void) {
     an.size = (uint32_t)sizeof code;
 
     const uint32_t seeds[2] = { IC_BASE, IC_BASE + 8 };
-    CHECK(a_discover(&an, seeds, 2) == 0, "indirect call: discovery runs");
+    CHECK(a_discover(&an, seeds, 2, 2) == 0, "indirect call: discovery runs");
 
     emit_opts o;
     o.outdir = ".";
@@ -252,7 +252,7 @@ int main(void) {
     an.size = (uint32_t)sizeof code;
 
     uint32_t seed = BASE;
-    CHECK(a_discover(&an, &seed, 1) == 0, "discovery runs");
+    CHECK(a_discover(&an, &seed, 1, 1) == 0, "discovery runs");
     CHECK(an.nfuncs == 1, "one function found, got %d", an.nfuncs);
     if (an.nfuncs != 1) return 1;
     CHECK(an.funcs[0].addr == BASE, "function entry is the seed");

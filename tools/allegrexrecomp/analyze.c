@@ -70,14 +70,30 @@ typedef struct {
     u32list    *func_queue;
     u32list    *imports;
     u32list    *indirects;
-    /* Branch targets already claimed by an earlier walk; promoted to entries
-     * between rounds so they become reachable through dispatch. */
-    u32list    *cross;
+    /* Pairs of function entries that a branch showed to be one function.
+     *
+     * A branch into a block another walk already claimed means both walks are
+     * inside the same original function -- whichever ran first simply took the
+     * block. Recorded here as (this function, the claimant) and reconciled
+     * once all walking is done. */
+    u32list    *merges;
 } walk_ctx;
 
 static int is_known_entry(const walk_ctx *c, uint32_t addr) {
     if (!a_in_range(c->an, addr)) return 0;
-    return c->entry_map[word_index(c->an, addr)] != 0;
+    return c->entry_map[word_index(c->an, addr)] != A_ENTRY_NONE;
+}
+
+/* An entry the module demonstrably enters, as opposed to one a pointer merely
+ * suggests. See A_ENTRY_SOFT in analyze.h for why the difference matters.
+ *
+ * Only the merge sites ask this. Walk boundaries still stop at *any* entry --
+ * splitting on a soft one and letting the merge fold it back is what keeps
+ * ownership non-overlapping, and the merge already records a folded entry in
+ * split_entry so the emitter keeps a label and a dispatch thunk for it. */
+static int is_hard_entry(const walk_ctx *c, uint32_t addr) {
+    if (!a_in_range(c->an, addr)) return 0;
+    return c->entry_map[word_index(c->an, addr)] == A_ENTRY_HARD;
 }
 
 /* Record a call target. Import thunks are boundaries, not functions to walk
@@ -114,14 +130,65 @@ static int trace_function(walk_ctx *c, uint32_t entry, a_func *out) {
 
         while (a_in_range(an, a)) {
             uint32_t idx = word_index(an, a);
-            if (c->seen[idx] & SEEN_CODE) break;    /* already walked */
+            if (c->seen[idx] & SEEN_CODE) {
+                /* Already walked. If somebody *else* walked it, the two walks
+                 * are inside one original function and this is the same shared
+                 * block the branch and backward-jump paths below merge -- it
+                 * just arrived by falling through rather than by a transfer,
+                 * so neither of them ever saw it.
+                 *
+                 * Whether the split is visible here or at the entry test below
+                 * is pure walk order: if the seed was traced first it claimed
+                 * these words and we stop here, and if it was not we stop
+                 * there. Both are the same situation and both have to record
+                 * it, or a shared epilogue stays split depending on which
+                 * order the queue happened to produce.
+                 *
+                 * A hard entry is left alone: falling into one is an ordinary
+                 * function ending without a visible return, which is exactly
+                 * what the split is for. */
+                if (c->owner[idx] != A_NO_OWNER && c->owner[idx] != c->cur_owner &&
+                    !is_hard_entry(c, a)) {
+                    u32_push(c->merges, c->cur_owner);
+                    u32_push(c->merges, c->owner[idx]);
+                }
+                break;
+            }
 
             /* Arriving at a different function's entry means we walked off the
              * end of this one — a tail call, or a function that ends without a
              * visible return. Stop; that address is walked as its own function.
              * Without this a single trace swallows every function that follows
              * it in address order. */
-            if (a != entry && is_known_entry(c, a)) break;
+            if (a != entry && is_known_entry(c, a)) {
+                /* ...unless the only evidence for that entry is a pointer.
+                 *
+                 * Falling through into an address is the plainest possible
+                 * proof that it is not a function: execution reaches it from
+                 * the instruction above, with the caller's frame already set
+                 * up. A stored pointer that happens to land here is a guess,
+                 * and the guess is now contradicted.
+                 *
+                 * This is the same shared-block situation the branch and
+                 * backward-jump paths below handle, but neither of them sees
+                 * it -- both fire on a *transfer* into a claimed block, and a
+                 * fall-through is neither. So it was recorded nowhere and the
+                 * split stood.
+                 *
+                 * That split is what a shared epilogue looks like afterwards:
+                 * the continuation holds `lw $ra` / `jr $ra` / `addiu $sp` but
+                 * not the prologue that reserved the frame, so it releases
+                 * stack it never took and the $sp invariant cannot hold for
+                 * it. Merging is what puts the two halves back together;
+                 * merge_shared records the folded entry in split_entry, so it
+                 * keeps its label and stays reachable through dispatch for the
+                 * pointer that pointed here in the first place. */
+                if (!is_hard_entry(c, a)) {
+                    u32_push(c->merges, c->cur_owner);
+                    u32_push(c->merges, a);
+                }
+                break;
+            }
 
             a_insn in;
             a_decode(fetch(an, a), a, &in);
@@ -205,19 +272,32 @@ static int trace_function(walk_ctx *c, uint32_t entry, a_func *out) {
                  * and execution also falls through past the delay slot. */
                 if (in.has_target && a_in_range(an, in.target)) {
                     uint32_t ti = word_index(an, in.target);
-                    if ((c->seen[ti] & SEEN_CODE) && !c->entry_map[ti]) {
+                    if ((c->seen[ti] & SEEN_CODE) && c->entry_map[ti] != A_ENTRY_HARD) {
                         /* Already claimed by an earlier walk, and not an entry.
                          * Two functions therefore share this block, which is a
                          * walk-order artefact rather than a property of the
                          * code -- whichever was traced first took it.
                          *
-                         * The emitter cannot express a branch into another C
-                         * function's middle; it degrades to a dispatch, which
-                         * then misses because the address is not an entry.
-                         * Promoting it to one makes it reachable. Over-split
-                         * is the safe direction; unreachable is not. */
-                        u32_push(c->cross, in.target);
+                         * These are one function, so they are merged into one.
+                         * Promoting the target to an entry instead makes it
+                         * reachable, but at a price that is only visible at run
+                         * time: the branch becomes a C *call*, and when the two
+                         * blocks form a loop -- which is exactly what a branch
+                         * between them usually means -- every iteration of a
+                         * loop the guest runs in constant stack costs the host
+                         * a frame, until the stack is gone. */
+                        u32_push(c->merges, c->cur_owner);
+                        u32_push(c->merges, c->owner[ti]);
                     } else {
+                        /* Refused because the target is a known entry. If the
+                         * only evidence for that entry is a pointer that
+                         * happened to decode, this is a loop being cut in half
+                         * on a guess -- counted so the cost is visible before
+                         * anything is changed about it. */
+                        if ((c->seen[ti] & SEEN_CODE) && c->owner[ti] != c->cur_owner) {
+                            an->nsuppressed++;
+                            if (c->entry_map[ti] == A_ENTRY_SOFT) an->nsuppressed_soft++;
+                        }
                         u32_push(&blocks, in.target);
                     }
                 }
@@ -246,7 +326,7 @@ static int trace_function(walk_ctx *c, uint32_t entry, a_func *out) {
                  * table, whereas a wrongly merged one has bogus boundaries. */
                 if (in.has_target && a_in_range(an, in.target)) {
                     uint32_t bi = word_index(an, in.target);
-                    if (in.target <= a && a != entry && !is_known_entry(c, in.target)) {
+                    if (in.target <= a && a != entry && !is_hard_entry(c, in.target)) {
                         /* Backward `j` -- a loop back-edge into this function's
                          * own blocks, unless another walk already claimed the
                          * target. Then the two functions share a block, exactly
@@ -263,15 +343,46 @@ static int trace_function(walk_ctx *c, uint32_t entry, a_func *out) {
                          * The branch path above has always promoted these. The
                          * jump path did not, so a whole class of shared block
                          * stayed unreachable. */
-                        if ((c->seen[bi] & SEEN_CODE) && !c->entry_map[bi])
-                            u32_push(c->cross, in.target);
-                        else
+                        if ((c->seen[bi] & SEEN_CODE) && c->entry_map[bi] != A_ENTRY_HARD) {
+                            u32_push(c->merges, c->cur_owner);
+                            u32_push(c->merges, c->owner[bi]);
+                        } else {
                             u32_push(&blocks, in.target);
+                        }
                     } else {
+                        /* A backward `j` lands here only when the target is
+                         * already a known entry -- the same refusal as the
+                         * branch path, so it is counted the same way. A forward
+                         * one is a tail call and is not a shared block at all. */
+                        if (in.target <= a && a != entry &&
+                            (c->seen[bi] & SEEN_CODE) && c->owner[bi] != c->cur_owner) {
+                            an->nsuppressed++;
+                            if (c->entry_map[bi] == A_ENTRY_SOFT) an->nsuppressed_soft++;
+                        }
                         uint32_t ti = word_index(an, in.target);
                         if (!c->entry_map[ti]) {
-                            c->entry_map[ti] = 1;
-                            u32_push(c->func_queue, in.target); /* tail call */
+                            /* A *forward* `j` is a tail call, and its target is
+                             * genuinely another function's entry: hard.
+                             *
+                             * A *backward* one only reaches here because this
+                             * walk began on the jump itself -- the `a != entry`
+                             * test above failed -- which happens when a block
+                             * was split out and its first instruction jumps
+                             * back into the function it came from. That is not
+                             * a tail call and the target is not a function, so
+                             * calling it hard makes it veto its own merge for
+                             * good: the target keeps the epilogue while the
+                             * prologue stays behind in the original, and the
+                             * two can never be put back together.
+                             *
+                             * Soft still makes it an entry -- walked, labelled,
+                             * dispatchable -- it just stops it from blocking
+                             * the merge. Observed at 0x002B60C0, whose only
+                             * reference in the whole module is the backward
+                             * `j` at 0x002B60CC. */
+                            c->entry_map[ti] = (in.target <= a) ? A_ENTRY_SOFT
+                                                                : A_ENTRY_HARD;
+                            u32_push(c->func_queue, in.target);
                         }
                     }
                 }
@@ -458,13 +569,99 @@ static int cmp_func(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
+
+/* ---- reconciling functions that share a block ---------------------------- */
+
+/* Index of the function whose entry is exactly `addr`, or -1. `funcs` sorted. */
+static int func_index(const a_func *funcs, int n, uint32_t addr) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        const int mid = (lo + hi) / 2;
+        if (funcs[mid].addr == addr) return mid;
+        if (funcs[mid].addr < addr) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
+}
+
+static int uf_find(int *parent, int i) {
+    while (parent[i] != i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+    return i;
+}
+
+/* Always keep the lower index -- and so the lower address -- as the
+ * representative, which makes the result independent of the order the merges
+ * were discovered in. */
+static void uf_union(int *parent, int a, int b) {
+    a = uf_find(parent, a);
+    b = uf_find(parent, b);
+    if (a == b) return;
+    if (a < b) parent[b] = a; else parent[a] = b;
+}
+
+/* Collapse each set of functions that share blocks into one.
+ *
+ * Ownership is rewritten to the representative, the a_func records are folded
+ * together, and the entries that stop being functions are recorded so the
+ * emitter still gives them a label -- something may call one, and it has to
+ * remain reachable through dispatch even though it is no longer a C function
+ * of its own.
+ *
+ * Returns the new function count. */
+static int merge_shared(a_analysis *an, a_func *funcs, int nfuncs,
+                        const u32list *merges, uint8_t *split_entry) {
+    if (nfuncs <= 0) return nfuncs;
+
+    int *parent = (int *)malloc((size_t)nfuncs * sizeof *parent);
+    if (!parent) return nfuncs;
+    for (int i = 0; i < nfuncs; i++) parent[i] = i;
+
+    for (int i = 0; i + 1 < merges->n; i += 2) {
+        const int a = func_index(funcs, nfuncs, merges->v[i]);
+        const int b = func_index(funcs, nfuncs, merges->v[i + 1]);
+        if (a >= 0 && b >= 0) uf_union(parent, a, b);
+    }
+
+    /* Fold the members into their representative. */
+    for (int i = 0; i < nfuncs; i++) {
+        const int r = uf_find(parent, i);
+        if (r == i) continue;
+        a_func *rep = &funcs[r], *m = &funcs[i];
+        if (m->start < rep->start) rep->start = m->start;
+        if (m->end   > rep->end)   rep->end   = m->end;
+        rep->insns        += m->insns;
+        rep->has_return   |= m->has_return;
+        rep->has_indirect |= m->has_indirect;
+        rep->has_vfpu     |= m->has_vfpu;
+        if (a_in_range(an, m->addr))
+            split_entry[word_index(an, m->addr)] = 1;
+    }
+
+    /* Rewrite ownership to the representative. */
+    for (uint32_t w = 0; w < an->nwords; w++) {
+        if (an->owner[w] == A_NO_OWNER) continue;
+        const int i = func_index(funcs, nfuncs, an->owner[w]);
+        if (i < 0) continue;
+        an->owner[w] = funcs[uf_find(parent, i)].addr;
+    }
+
+    /* Compact, keeping only the representatives. Order is preserved, so the
+     * result is still sorted by address. */
+    int out = 0;
+    for (int i = 0; i < nfuncs; i++)
+        if (uf_find(parent, i) == i) funcs[out++] = funcs[i];
+
+    free(parent);
+    return out;
+}
+
+int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds, int nhard) {
     an->funcs = NULL; an->nfuncs = 0;
     an->imports = NULL; an->nimports = 0;
     an->indirects = NULL; an->nindirects = 0;
     an->insns = an->vfpu = an->invalid = 0;
     an->ntables = an->ntable_targets = 0;
     an->bytes_reached = 0;
+    an->nsuppressed = an->nsuppressed_soft = 0;
     /* The import stubs sit at the end of .text, so their extent is the best
      * available executable bound when no section header gives one. */
     if (!an->text_size && an->stub_addr && an->stub_size)
@@ -481,9 +678,10 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
     if (!owner) { free(seen); free(entry_map); return -1; }
     for (uint32_t i = 0; i < nwords; i++) owner[i] = A_NO_OWNER;
 
-    u32list queue = { 0 }, imports = { 0 }, indirects = { 0 }, cross = { 0 };
+    u32list queue = { 0 }, imports = { 0 }, indirects = { 0 }, merges = { 0 };
+    u32list jr_sites = { 0 };   /* the `jr` sites of the final walk */
     walk_ctx ctx = { an, seen, entry_map, owner, A_NO_OWNER,
-                     &queue, &imports, &indirects, &cross };
+                     &queue, &imports, &indirects, &merges };
 
     /* Pass 1: establish the complete set of function entries before walking
      * anything. Both the tail-call test and the ran-off-the-end test need to
@@ -491,7 +689,12 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
      * entries are still being discovered as the walk proceeds. */
     for (int i = 0; i < nseeds; i++) {
         if (!a_in_range(an, seeds[i])) continue;
-        entry_map[word_index(an, seeds[i])] = 1;
+        const uint32_t wi = word_index(an, seeds[i]);
+        /* Hard wins wherever the two lists overlap: an address that is both an
+         * export and a stored pointer is an entry on the export's evidence. */
+        const uint8_t kind = (i < nhard) ? A_ENTRY_HARD : A_ENTRY_SOFT;
+        if (entry_map[wi] < kind) entry_map[wi] = kind;
+        /* Pushed unconditionally; a repeat is a no-op once walked. */
         u32_push(&queue, seeds[i]);
     }
 
@@ -513,9 +716,13 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
             if (!a_in_range(an, in.target) || is_import_stub(an, in.target)) continue;
 
             uint32_t ti = word_index(an, in.target);
-            if (entry_map[ti]) continue;
-            entry_map[ti] = 1;
-            u32_push(&queue, in.target);
+            if (entry_map[ti] == A_ENTRY_HARD) continue;
+            /* A `jal` here is the code calling the address, which is the
+             * strongest evidence there is -- it upgrades a soft seed rather
+             * than being skipped by it. Already queued if it was soft. */
+            const int was_soft = (entry_map[ti] == A_ENTRY_SOFT);
+            entry_map[ti] = A_ENTRY_HARD;
+            if (!was_soft) u32_push(&queue, in.target);
         }
     }
 
@@ -535,22 +742,38 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
  * converges in a handful of rounds. */
     for (int round = 0; round < 8; round++) {
     if (round > 0) {
-        if (!an->image && !cross.n && !indirects.n) break;
+        /* Merges no longer drive another round: they change ownership, not the
+         * entry set, so re-walking would produce exactly the same split. Only
+         * jump tables can still reveal new entries. */
+        if (!an->image && !indirects.n) break;
         u32list targets = { 0 };
         for (int i = 0; i < indirects.n; i++) {
             int n = resolve_jump_table(an, indirects.v[i], &targets);
             if (n > 0) { an->ntables++; an->ntable_targets += n; }
         }
-        for (int i = 0; i < cross.n; i++) u32_push(&targets, cross.v[i]);
-        cross.n = 0;
+        /* Keep the sites. They are cleared just below and the round that
+         * finds nothing new exits before any walk refills them, so by the time
+         * ownership is final `indirects` is empty -- and the table targets have
+         * to be reconciled against ownership, which only exists then. */
+        jr_sites.n = 0;
+        for (int i = 0; i < indirects.n; i++) u32_push(&jr_sites, indirects.v[i]);
         indirects.n = 0;
         int added = 0;
         for (int i = 0; i < targets.n; i++) {
             uint32_t t = targets.v[i];
             if (!a_in_range(an, t)) continue;
             uint32_t ti = word_index(an, t);
-            if (entry_map[ti]) continue;
-            entry_map[ti] = 1;
+            if (entry_map[ti] != A_ENTRY_NONE) continue;
+            /* Soft, not hard. A resolved table target is a real destination of
+             * a `jr`, but a switch case is a *block inside* a function, not a
+             * function -- it has no prologue, and reached as an entry it is
+             * exactly the split that leaves an epilogue stranded.
+             *
+             * Making it soft does not make it unreachable: merge_shared records
+             * every folded entry in split_entry, so the emitter still gives it
+             * a label and a dispatch thunk, which is what the `jr` needs. It
+             * only stops the address from *vetoing* a merge. */
+            entry_map[ti] = A_ENTRY_SOFT;
             added++;
         }
         free(targets.v);
@@ -574,6 +797,9 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
          * afterwards is not. */
         memset(seen, 0, nwords);
         for (uint32_t i = 0; i < nwords; i++) owner[i] = A_NO_OWNER;
+        /* Ownership is about to be rebuilt, so merges naming the old owners
+         * mean nothing. Only the final walk's are applied. */
+        merges.n = 0;
         an->insns = an->vfpu = an->invalid = 0;
         nfuncs = 0;
 
@@ -613,6 +839,58 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
 
     qsort(funcs, (size_t)nfuncs, sizeof *funcs, cmp_func);
 
+    an->owner = owner;
+    an->nwords = nwords;
+
+    /* A switch case belongs to the function whose `jr` selects it.
+     *
+     * Nothing else can establish that. The walk stops dead at a computed jump,
+     * so the owning function never reaches its own cases by control flow, and
+     * the cases are only discovered later by resolving the table -- at which
+     * point they are walked as functions in their own right and no branch,
+     * jump or fall-through ever connects them back. Every other merge here is
+     * driven by the walk noticing a collision; this one has to be stated.
+     *
+     * Left unstated, a `jr` through a table calls its own switch case, and the
+     * case runs the function's epilogue on a frame its caller allocated: two
+     * host frames per switch, and a stack-balance report against a prologue
+     * that ran in a different invocation. That is the whole of 0x002B608C,
+     * whose case at 0x002B60B8 holds the epilogue at 0x002B60C0.
+     *
+     * Only soft targets. A table that dispatches to genuine functions -- an
+     * array of handlers rather than a switch -- has `jal` targets in it, and
+     * those are hard and left alone. */
+    for (int i = 0; i < jr_sites.n; i++) {
+        const uint32_t site = jr_sites.v[i];
+        if (!a_in_range(an, site)) continue;
+        const uint32_t site_owner = owner[word_index(an, site)];
+        if (site_owner == A_NO_OWNER) continue;
+
+        u32list t = { 0 };
+        if (resolve_jump_table(an, site, &t) > 0) {
+            for (int k = 0; k < t.n; k++) {
+                if (!a_in_range(an, t.v[k])) continue;
+                const uint32_t ti = word_index(an, t.v[k]);
+                if (entry_map[ti] == A_ENTRY_HARD) continue;
+                if (owner[ti] == A_NO_OWNER || owner[ti] == site_owner) continue;
+                u32_push(&merges, site_owner);
+                u32_push(&merges, owner[ti]);
+            }
+        }
+        free(t.v);
+    }
+
+    /* Ownership has to be final before the emitter sees it, and merging is
+     * what makes a branch between two shared blocks an ordinary `goto` rather
+     * than a call that never returns. Ownership is published first because the
+     * merge rewrites it in place. */
+    an->split_entry = (uint8_t *)calloc(nwords ? nwords : 1, 1);
+    if (an->split_entry) {
+        const int before = nfuncs;
+        nfuncs = merge_shared(an, funcs, nfuncs, &merges, an->split_entry);
+        an->nmerged = before - nfuncs;
+    }
+
     an->funcs = funcs;
     an->nfuncs = nfuncs;
     an->imports = imports.v;
@@ -620,10 +898,8 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
     an->indirects = indirects.v;
     an->nindirects = indirects.n;
 
-    an->owner = owner;
-    an->nwords = nwords;
-
-    free(cross.v);
+    free(jr_sites.v);
+    free(merges.v);
     free(queue.v);
     free(seen);
     free(entry_map);
@@ -657,6 +933,7 @@ void a_analysis_free(a_analysis *an) {
     free(an->imports);
     free(an->indirects);
     free(an->owner);
+    free(an->split_entry);
     an->funcs = NULL;
     an->imports = NULL;
     an->indirects = NULL;
