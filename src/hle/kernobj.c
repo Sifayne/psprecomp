@@ -1793,7 +1793,15 @@ static void hle_GetTlsAddr(void) {
         if (t->owner[i]) continue;
         t->owner[i] = me;
         t->cursor = (i + 1) % t->nblocks;
-        psp_ret(t->base + i * t->stride);
+        const uint32_t at = t->base + i * t->stride;
+        /* Handed out clean. tls/get scribbles 0xCC over a block, frees it and
+         * takes it again: the read comes back zero. Asking a *second* time
+         * without freeing gives the same pointer untouched, still 0xCC -- and
+         * that is the already-ours path above, which is why the clearing
+         * belongs here rather than at the top of the call. */
+        void *p = psp_mem_ptr(at, t->stride);
+        if (p) memset(p, 0, t->stride);
+        psp_ret(at);
         return;
     }
 
