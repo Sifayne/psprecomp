@@ -15,14 +15,35 @@ uint64_t   psp_mem_bad_access;
  * path is the one place that can answer it directly. */
 static uint32_t g_wwatch;
 static int g_whits;
-void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; }
+/* An optional value filter. A hot address is written far more often than it is
+ * written *interestingly* -- a matrix element is cleared to zero every frame by
+ * the identity load -- so an unfiltered watch spends its report budget on the
+ * writes nobody asked about and never reaches the one that matters. */
+static uint32_t g_wvalue;
+static int g_wfilter;
+void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; g_wfilter = 0; }
+void psp_mem_watch_write_value(uint32_t addr, uint32_t val) {
+    g_wwatch = addr; g_whits = 0; g_wvalue = val; g_wfilter = 1;
+}
 int psp_mem_watch_hits(void) { return g_whits; }
 
-static void note_write(uint32_t addr, uint32_t width) {
+/* The value as well as the writer.
+ *
+ * Naming the function that wrote a word is only half an answer, and reporting
+ * the half without the other half is actively misleading: pointed at a matrix
+ * element this caught sceGumLoadIdentity zeroing the slot and read as "here is
+ * your culprit", when the write that mattered was a different one carrying a
+ * different value. A watch that cannot say *what* was written cannot be
+ * filtered, and an unfilterable watch on a hot address reports the wrong
+ * write. */
+static void note_write_val(uint32_t addr, uint32_t width, uint32_t val) {
     if (!g_wwatch || addr + width <= g_wwatch || addr > g_wwatch) return;
-    if (g_whits++ < 8)
-        fprintf(stderr, "write%u to 0x%08X (watch 0x%08X) from fn 0x%08X\n",
-                width * 8, addr, g_wwatch, psp_trace_last());
+    if (g_wfilter && val != g_wvalue) return;
+    if (g_whits++ < 32) {
+        union { uint32_t u; float f; } c; c.u = val;
+        fprintf(stderr, "write%u to 0x%08X = 0x%08X (%.4g) from fn 0x%08X\n",
+                width * 8, addr, val, (double)c.f, psp_trace_last());
+    }
 }
 
 /* Bad accesses were only ever counted, which says an initialiser went wrong
@@ -133,7 +154,8 @@ float    psp_read_f32(uint32_t addr) { READ_BODY(float)  }
 #define WRITE_BODY(TYPE)                             \
     void *p = psp_mem_ptr(addr, (uint32_t)sizeof(TYPE)); \
     if (!p) { bad_access(addr, 1, (int)sizeof(TYPE)); return; }         \
-    note_write(addr, (uint32_t)sizeof(TYPE));                    \
+    { uint32_t _v = 0; memcpy(&_v, &val, sizeof(TYPE) > 4 ? 4 : sizeof(TYPE)); \
+      note_write_val(addr, (uint32_t)sizeof(TYPE), _v); }                       \
     memcpy(p, &val, sizeof(TYPE));
 
 void psp_write8 (uint32_t addr, uint8_t  val) { WRITE_BODY(uint8_t)  }

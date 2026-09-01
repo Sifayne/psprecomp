@@ -69,6 +69,8 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size);
  * telling you the analysis missed something, so it is counted, not ignored. */
 extern uint64_t psp_mem_bad_access;
 void psp_mem_watch_write(uint32_t addr);
+/* As above, but only report writes of this exact value. */
+void psp_mem_watch_write_value(uint32_t addr, uint32_t val);
 int psp_mem_watch_hits(void);
 
 uint8_t  psp_read8 (uint32_t addr);
