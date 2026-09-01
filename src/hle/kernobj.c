@@ -1899,7 +1899,12 @@ static void hle_FreeTlspl(void) {
             if (urgent) psp_sched_yield();
             return;
         }
-    psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_PTR);
+    /* Freeing when the caller holds nothing is not an error. tls/free calls it
+     * twice in a row and gets OK both times, and calls it from a thread that
+     * has never asked while another thread holds the pool's only block -- also
+     * OK, with freeBlocks still zero, so it did not take anyone else's. The
+     * uid is checked; what the caller owns is not. */
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_ReferTlsplStatus(void) {
