@@ -112,6 +112,12 @@
 #define GE_ZTEST             0xDE
 #define GE_ZWRITEDISABLE     0xE7
 #define GE_CLEARMODE         0xD3
+#define GE_ALPHABLENDENABLE  0x21
+#define GE_ALPHATESTENABLE   0x22
+#define GE_BLENDMODE         0xDF
+#define GE_BLENDFIXEDA       0xE0
+#define GE_BLENDFIXEDB       0xE1
+#define GE_ALPHATEST         0xDB
 
 /* VTYPE field extraction. */
 #define VT_TEX(v)     ((v) & 3)
@@ -185,6 +191,7 @@ static struct {
     int   vp_set;
     int   cull_enable, cull_ccw;
     int   ztest_enable, ztest_func, zwrite_off, clear_mode, clear_z;
+    psp_blend_state blend;
     /* Which matrices the stream actually uploaded, and where the result lands.
      * "Geometry is being transformed" and "transformed by the matrices the game
      * meant" are different claims, and a screen-space bounding box separates
@@ -324,6 +331,13 @@ void psp_ge_dump_stats(FILE *out) {
             g_tl.ztest_enable ? "on" : "off", g_tl.ztest_func,
             g_tl.zwrite_off ? "off" : "on",
             (unsigned long long)psp_render_zfail_pixels());
+    fprintf(out, "    blend %s (src %d dst %d eq %d), alpha test %s func %d ref %d: "
+                 "%llu blended, %llu alpha-killed\n",
+            g_tl.blend.enable ? "on" : "off", g_tl.blend.src, g_tl.blend.dst,
+            g_tl.blend.eq, g_tl.blend.alpha_test ? "on" : "off",
+            g_tl.blend.alpha_func, g_tl.blend.alpha_ref,
+            (unsigned long long)psp_render_blended_pixels(),
+            (unsigned long long)psp_render_alphakill_pixels());
     fprintf(out, "    clear-mode draws: %llu (%llu clearing depth)\n",
             (unsigned long long)g_clear_draws, (unsigned long long)g_clear_z_draws);
     if (g_xformed) {
@@ -767,6 +781,14 @@ static void draw_prim(uint32_t type, uint32_t count) {
     if (g_tl.clear_mode) { g_clear_draws++; if (g_tl.clear_z) g_clear_z_draws++; }
     if (VT_THROUGH(g_ge.vtype)) { if (has_uv) g_draw_2d_tex++; else g_draw_2d_flat++; }
     else                        { if (has_uv) g_draw_3d_tex++; else g_draw_3d_flat++; }
+    {
+        /* Clear mode writes the clear values straight through: no blend, no
+         * alpha test, or the clear would be filtered by the state it is
+         * supposed to be resetting. */
+        psp_blend_state b = g_tl.blend;
+        if (g_tl.clear_mode) { b.enable = 0; b.alpha_test = 0; }
+        psp_render_current()->set_blend(&b);
+    }
     psp_render_current()->set_depth(
         g_tl.clear_mode ? 0 : g_tl.ztest_enable,
         g_tl.clear_mode ? 1 : g_tl.ztest_func,
@@ -976,6 +998,20 @@ static void run_list(ge_queue *q) {
 
         case GE_TEXTUREMAPENABLE: g_ge.tex_enable = arg & 1; break;
 
+        case GE_ALPHABLENDENABLE: g_tl.blend.enable     = (int)(arg & 1); break;
+        case GE_ALPHATESTENABLE:  g_tl.blend.alpha_test = (int)(arg & 1); break;
+        case GE_BLENDMODE:
+            g_tl.blend.src = (int)(arg & 0xF);
+            g_tl.blend.dst = (int)((arg >> 4) & 0xF);
+            g_tl.blend.eq  = (int)((arg >> 8) & 7);
+            break;
+        case GE_BLENDFIXEDA: g_tl.blend.fixa = arg & 0xFFFFFFu; break;
+        case GE_BLENDFIXEDB: g_tl.blend.fixb = arg & 0xFFFFFFu; break;
+        case GE_ALPHATEST:
+            g_tl.blend.alpha_func = (int)(arg & 7);
+            g_tl.blend.alpha_ref  = (int)((arg >> 8) & 0xFF);
+            g_tl.blend.alpha_mask = (int)((arg >> 16) & 0xFF);
+            break;
         case GE_ZTESTENABLE:   g_tl.ztest_enable = (int)(arg & 1); break;
         case GE_ZTEST:         g_tl.ztest_func   = (int)(arg & 7); break;
         case GE_ZWRITEDISABLE: g_tl.zwrite_off   = (int)(arg & 1); break;

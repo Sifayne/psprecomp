@@ -30,6 +30,15 @@ typedef struct {
     float    u, v;
 } psp_vertex;
 
+/* Blend and alpha-test state, as the GE encodes it. Factors and the equation
+ * are GEBlendSrcFactor / GEBlendDstFactor / GEBlendMode codes; the alpha-test
+ * function shares the GE's comparison codes with the depth test. */
+typedef struct {
+    int      enable, src, dst, eq;
+    uint32_t fixa, fixb;
+    int      alpha_test, alpha_func, alpha_ref, alpha_mask;
+} psp_blend_state;
+
 /* GE primitive types, from the PRIM argument's type field. */
 enum {
     PSP_PRIM_POINTS = 0,
@@ -66,6 +75,11 @@ typedef struct {
     /* Depth test state. `func` is the GE's own comparison code. */
     void (*set_depth)(int test_enable, int func, int write_enable);
 
+    /* Alpha blending and the alpha test. Without these a fade overlay -- a
+     * quad whose vertices carry a near-zero alpha -- is drawn fully opaque and
+     * covers whatever it was meant to be fading. */
+    void (*set_blend)(const psp_blend_state *b);
+
     /* One assembled primitive. `count` vertices, already in screen space. */
     void (*draw)(int prim, const psp_vertex *v, int count);
 
@@ -92,6 +106,8 @@ uint64_t psp_render_pixels(void);
 uint64_t psp_render_textured_pixels(void);
 uint64_t psp_render_flat_pixels(void);
 uint64_t psp_render_zfail_pixels(void);
+uint64_t psp_render_blended_pixels(void);
+uint64_t psp_render_alphakill_pixels(void);
 void     psp_render_reset_pixels(void);
 
 #endif

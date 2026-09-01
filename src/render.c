@@ -22,13 +22,15 @@ static uint64_t g_pixels;
 /* Textured versus flat, because "the geometry is white" has two causes with
  * nothing in common: a texture that never binds, and vertices that really are
  * white. One counter each is the difference between measuring and guessing. */
-static uint64_t g_px_tex, g_px_flat, g_px_zfail;
+static uint64_t g_px_tex, g_px_flat, g_px_zfail, g_px_blend, g_px_atest;
 uint64_t psp_render_textured_pixels(void) { return g_px_tex; }
 uint64_t psp_render_flat_pixels(void) { return g_px_flat; }
 uint64_t psp_render_zfail_pixels(void) { return g_px_zfail; }
 
 uint64_t psp_render_pixels(void) { return g_pixels; }
-void     psp_render_reset_pixels(void) { g_pixels = g_px_tex = g_px_flat = g_px_zfail = 0; }
+void     psp_render_reset_pixels(void) {
+    g_pixels = g_px_tex = g_px_flat = g_px_zfail = g_px_blend = g_px_atest = 0;
+}
 
 /* ---- software backend ---------------------------------------------------- */
 
@@ -225,10 +227,87 @@ static int depth_pass(int x, int y, float z) {
     }
 }
 
+/* ---- blending ------------------------------------------------------------ */
+
+static psp_blend_state g_bs;
+
+uint64_t psp_render_blended_pixels(void) { return g_px_blend; }
+uint64_t psp_render_alphakill_pixels(void) { return g_px_atest; }
+
+static void sw_blend(const psp_blend_state *b) { g_bs = *b; }
+
+static uint32_t chan(uint32_t c, int i) { return (c >> (i * 8)) & 0xFFu; }
+
+static uint32_t clamp255(int v) { return v < 0 ? 0u : (v > 255 ? 255u : (uint32_t)v); }
+
+/* A blend factor, per channel, on the 0..255 scale the channels use. The
+ * doubling variants are the PSP's way of reaching 2x without a separate
+ * equation, and they saturate rather than wrap. */
+static uint32_t blend_factor(int code, int i, uint32_t src, uint32_t dst, int is_src) {
+    const uint32_t sa = chan(src, 3), da = chan(dst, 3);
+    switch (code) {
+    case 0:  return is_src ? chan(dst, i) : chan(src, i);
+    case 1:  return 255u - (is_src ? chan(dst, i) : chan(src, i));
+    case 2:  return sa;
+    case 3:  return 255u - sa;
+    case 4:  return da;
+    case 5:  return 255u - da;
+    case 6:  return clamp255((int)sa * 2);
+    case 7:  return clamp255(510 - (int)sa * 2);
+    case 8:  return clamp255((int)da * 2);
+    case 9:  return clamp255(510 - (int)da * 2);
+    default: return chan(is_src ? g_bs.fixa : g_bs.fixb, i);
+    }
+}
+
+static uint32_t blend(uint32_t src, uint32_t dst) {
+    uint32_t out = 0;
+    for (int i = 0; i < 4; i++) {
+        const int s = (int)chan(src, i), d = (int)chan(dst, i);
+        const int fs = (int)blend_factor(g_bs.src, i, src, dst, 1);
+        const int fd = (int)blend_factor(g_bs.dst, i, src, dst, 0);
+        const int ss = (s * fs + 127) / 255, dd = (d * fd + 127) / 255;
+        int v;
+        switch (g_bs.eq) {
+        case 1:  v = ss - dd; break;
+        case 2:  v = dd - ss; break;
+        case 3:  v = s < d ? s : d; break;
+        case 4:  v = s > d ? s : d; break;
+        case 5:  v = s > d ? s - d : d - s; break;
+        default: v = ss + dd; break;
+        }
+        out |= clamp255(v) << (i * 8);
+    }
+    return out;
+}
+
+static int alpha_pass(uint32_t rgba) {
+    if (!g_bs.alpha_test) return 1;
+    const int a = (int)(chan(rgba, 3) & (uint32_t)g_bs.alpha_mask);
+    const int r = g_bs.alpha_ref & g_bs.alpha_mask;
+    switch (g_bs.alpha_func) {
+    case 0: return 0;
+    case 2: return a == r;
+    case 3: return a != r;
+    case 4: return a <  r;
+    case 5: return a <= r;
+    case 6: return a >  r;
+    case 7: return a >= r;
+    default: return 1;
+    }
+}
+
+static uint32_t get_pixel(int x, int y) {
+    if (!g_fb_addr || !g_fb_stride) return 0;
+    return psp_read32(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4);
+}
+
 static void shade_pixel(int x, int y, float z, uint32_t rgba) {
     if (x < 0 || y < 0 || x >= 480 || y >= 272) return;
+    if (!alpha_pass(rgba)) { g_px_atest++; return; }
     if (!depth_pass(x, y, z)) { g_px_zfail++; return; }
     if (g_zs.write) g_depth[y * 480 + x] = z;
+    if (g_bs.enable) { rgba = blend(rgba, get_pixel(x, y)); g_px_blend++; }
     put_pixel(x, y, rgba);
 }
 
@@ -356,6 +435,7 @@ const psp_render_backend psp_render_software = {
     .set_texture = sw_texture,
     .set_clut    = sw_clut,
     .set_depth   = sw_depth,
+    .set_blend   = sw_blend,
     .draw        = sw_draw,
     .finish      = sw_noop,
     .present     = sw_present,
@@ -376,6 +456,7 @@ static void null_clut(uint32_t a, int f, int s, int m, int st) {
     (void)a; (void)f; (void)s; (void)m; (void)st;
 }
 static void null_depth(int t, int f, int w) { (void)t; (void)f; (void)w; }
+static void null_blend(const psp_blend_state *b) { (void)b; }
 static void null_draw(int p, const psp_vertex *v, int n) { (void)p; (void)v; (void)n; }
 static void null_noop(void) { }
 
@@ -387,6 +468,7 @@ const psp_render_backend psp_render_null = {
     .set_texture = null_texture,
     .set_clut    = null_clut,
     .set_depth   = null_depth,
+    .set_blend   = null_blend,
     .draw        = null_draw,
     .finish      = null_noop,
     .present     = null_noop,

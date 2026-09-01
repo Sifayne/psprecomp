@@ -147,6 +147,12 @@ void psp_display_reset(void);
 int      psp_display_capture(const char *path);
 uint64_t psp_display_vblanks(void);
 uint32_t psp_display_framebuffer(void);
+/* The fullest frame the run ever presented, and how many non-black pixels it
+ * had. Dumping the buffer at the end samples whichever frame the run stopped
+ * on; this answers whether anything was ever drawn at all. */
+uint64_t        psp_display_best_score(void);
+uint32_t        psp_display_best_addr(void);
+const uint32_t *psp_display_best(void);
 /* The stride in pixels and the pixel format the display is scanning out, so a
  * caller can read the framebuffer without guessing its shape. */
 uint32_t psp_display_stride(void);

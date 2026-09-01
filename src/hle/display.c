@@ -13,6 +13,7 @@
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/hle.h"
+#include "psprecomp/mem.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -33,6 +34,11 @@ static uint32_t g_mode, g_mode_w, g_mode_h;
 static uint64_t g_vblank_count;
 static uint32_t g_vcount;         /* scanline counter; see hle_GetVcount */
 
+static uint32_t g_best[PSP_SCREEN_W * PSP_SCREEN_H];
+static uint64_t g_best_score;
+static uint32_t g_best_addr;
+static uint64_t g_frames_scored;
+
 void psp_display_reset(void) {
     g_fb_addr = 0;
     g_fb_width = 512;
@@ -42,6 +48,9 @@ void psp_display_reset(void) {
     g_mode_h = PSP_SCREEN_H;
     g_vblank_count = 0;
     g_vcount = 0;
+    g_best_score = 0;
+    g_best_addr = 0;
+    g_frames_scored = 0;
 }
 
 void psp_display_init(void) { psp_display_reset(); }
@@ -122,12 +131,49 @@ static void hle_SetMode(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* The most-drawn frame of the run, kept as it goes past.
+ *
+ * Dumping at the end samples whatever the run happened to stop on, and a run
+ * that stops just after a frame-start clear finds an empty buffer -- which
+ * reads as "the renderer drew nothing" when it drew a whole frame and then
+ * cleared for the next. Scoring every presented frame and keeping the fullest
+ * one answers "did anything ever appear" rather than "was anything there at
+ * the instant we looked". */
+uint64_t        psp_display_best_score(void) { return g_best_score; }
+uint32_t        psp_display_best_addr(void)  { return g_best_addr; }
+const uint32_t *psp_display_best(void)       { return g_best; }
+
+static void score_frame(uint32_t base) {
+    if (!base || g_fb_format != PSP_DISPLAY_PIXEL_FORMAT_8888) return;
+    g_frames_scored++;
+    /* Scored by how much the frame *varies*, not by how much of it is lit. A
+     * solid fill -- which a fade is -- scores zero however bright it is, so
+     * this answers "was there ever a picture" rather than "was the screen ever
+     * on". Counting non-black instead ranked a white flash above real
+     * imagery. */
+    const uint32_t first = psp_read32(base) & 0x00FFFFFFu;
+    uint64_t varied = 0;
+    for (int y = 0; y < PSP_SCREEN_H; y++)
+        for (int x = 0; x < PSP_SCREEN_W; x++)
+            if ((psp_read32(base + (uint32_t)(y * (int)g_fb_width + x) * 4u)
+                 & 0x00FFFFFFu) != first)
+                varied++;
+    if (varied <= g_best_score) return;
+    g_best_score = varied;
+    g_best_addr  = base;
+    for (int y = 0; y < PSP_SCREEN_H; y++)
+        for (int x = 0; x < PSP_SCREEN_W; x++)
+            g_best[y * PSP_SCREEN_W + x] =
+                psp_read32(base + (uint32_t)(y * (int)g_fb_width + x) * 4u);
+}
+
 static void hle_SetFrameBuf(void) {
     /* (topaddr, bufferwidth, pixelformat, sync) */
     g_fb_addr   = psp_arg(0);
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);
     if (!g_fb_width) g_fb_width = 512;
+    score_frame(g_fb_addr);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
