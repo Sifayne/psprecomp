@@ -200,7 +200,13 @@ void psp_ktimer_register(void) {
  * alarm does and through the same tick.
  */
 
-#define MAX_VTIMERS 32
+/* Every `Create 1024` case in the suite builds a thousand objects in a loop and
+ * expects the thousandth to succeed, so a cap below that is not a resource
+ * limit being modelled -- it is ours, and it shows up as `Failed at 128`. The
+ * headroom above 1024 is because the process already holds some: callbacks
+ * stopped at 1023 with the cap at exactly 1024. Hardware's real ceiling is
+ * higher and is measured nowhere here. */
+#define MAX_VTIMERS 2048
 
 typedef struct {
     uint32_t uid;
