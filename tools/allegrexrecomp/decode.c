@@ -21,6 +21,19 @@
 #define VD_F(w)    ((w) & 0x7F)
 #define VS_F(w)    (((w) >> 8) & 0x7F)
 #define VT_F(w)    (((w) >> 16) & 0x7F)
+/* VFPU load/store name the same 128 registers, but not with the same field.
+ *
+ * The arithmetic ops carry vt as a contiguous 7 bits at 22..16. lv/sv cannot:
+ * bits 22..21 there are the top of the *base register*, so the encoding puts
+ * vt's low five bits at 20..16 and its top two at 1..0, in the slack left by a
+ * 4-byte-aligned offset.
+ *
+ * Reading it as the contiguous field mixes the base register into the register
+ * number: `lv.q R000, 0($a1)` decodes as 0x60 rather than 0x20, which is the
+ * same matrix and column at row 2 instead of row 0 -- four lanes rotated by
+ * two, and no error anywhere. Which registers were wrong depended on which
+ * base register the compiler happened to pick. */
+#define VT_MEM_F(w) ((((w) >> 16) & 0x1F) | (((w) & 3) << 5))
 /* Vector width is split across two non-adjacent bits: 0..3 -> 1..4 lanes. */
 #define VSIZE(w)   (((((w) >> 7) & 1) | (((w) >> 14) & 2)) + 1)
 
@@ -523,10 +536,10 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
 
     /* VFPU load/store — these use the 7-bit vt field and a 16-byte-aligned
      * offset for the quad forms. */
-    case 0x32: op = A_LV_S; break;
-    case 0x36: op = A_LV_Q; break;
-    case 0x3A: op = A_SV_S; break;
-    case 0x3E: op = A_SV_Q; break;
+    case 0x32: op = A_LV_S; in.vt = (uint8_t)VT_MEM_F(word); break;
+    case 0x36: op = A_LV_Q; in.vt = (uint8_t)VT_MEM_F(word); break;
+    case 0x3A: op = A_SV_S; in.vt = (uint8_t)VT_MEM_F(word); break;
+    case 0x3E: op = A_SV_Q; in.vt = (uint8_t)VT_MEM_F(word); break;
 
     /* VFPU arithmetic families. Sub-opcode lives in bits 25..23. */
     case 0x18:
