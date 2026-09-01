@@ -540,6 +540,25 @@ int psp_collect_pointer_seeds(const uint8_t *d, size_t len, const elf_info *e,
             uint32_t r_offset = rd32(d + off + r);
             uint32_t r_info   = rd32(d + off + r + 4);
 
+            /* r_offset is measured from the segment named by OFS_BASE, not
+             * from a single module-wide base.
+             *
+             * Using one bias for every relocation silently reads the wrong file
+             * offset for anything in the second segment -- which is where a
+             * PRX puts its data. The word fetched is unrelated, fails the
+             * looks-like-code test, and the pointer is dropped. Nothing
+             * reports it: the harvest simply returns fewer seeds.
+             *
+             * Everything a C++ module reaches through stored pointers lives
+             * there. On Armored Core that was all 151 static constructors in
+             * .cplinit and the vtables in .linkonce.d -- 1,856 relocations of
+             * vtable entries alone, none of them harvested, so the functions
+             * they point at were never discovered and never emitted. The boot
+             * failed on an indirect call to a two-instruction accessor. */
+            const uint32_t ofs_base = (r_info >> 8) & 0xFF;
+            if (ofs_base >= (uint32_t)e->nsegments) continue;
+            const elf_segment *ofs_seg = &e->seg[ofs_base];
+
             /* HI16/LO16 pairs are how an address gets *computed in code*
              * rather than stored in a word:
              *
@@ -556,9 +575,13 @@ int psp_collect_pointer_seeds(const uint8_t *d, size_t len, const elf_info *e,
                 uint32_t lo_info = rd32(d + off + r + 12);
                 if ((lo_info & 0xFF) == R_MIPS_LO16) {
                     uint32_t lo_offset = rd32(d + off + r + 8);
-                    size_t hi_at = (uint32_t)(r_offset + load_bias);
-                    size_t lo_at = (uint32_t)(lo_offset + load_bias);
-                    if (hi_at + 4 <= len && lo_at + 4 <= len) {
+                    size_t hi_at, lo_at;
+                    (void)load_bias;
+                    hi_at = (size_t)ofs_seg->offset + r_offset;
+                    lo_at = (size_t)ofs_seg->offset + lo_offset;
+                    if (r_offset + 4 <= ofs_seg->filesz &&
+                        lo_offset + 4 <= ofs_seg->filesz &&
+                        hi_at + 4 <= len && lo_at + 4 <= len) {
                         uint32_t hi_imm = rd32(d + hi_at) & 0xFFFF;
                         int32_t  lo_imm = (int16_t)(rd32(d + lo_at) & 0xFFFF);
                         uint32_t target = (hi_imm << 16) + (uint32_t)lo_imm;
@@ -576,7 +599,8 @@ int psp_collect_pointer_seeds(const uint8_t *d, size_t len, const elf_info *e,
             /* The relocated word holds the address. A PRX links at zero, so
              * the stored value is already the module-relative address and
              * needs no fixing up — only reading. */
-            size_t at = (uint32_t)(r_offset + load_bias);
+            if (r_offset + 4 > ofs_seg->filesz) continue;   /* .bss has no bytes */
+            size_t at = (size_t)ofs_seg->offset + r_offset;
             if (at + 4 > len) continue;
 
             uint32_t target = rd32(d + at);
