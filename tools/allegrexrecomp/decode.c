@@ -271,6 +271,7 @@ static const a_opinfo OPINFO[A_OP_COUNT] = {
     [A_VAVG]     = { "vavg",     F_VD_VS },
     [A_VFPU9]    = { "vfpu9",    F_VD_VS },
     [A_VSBN]     = { "vsbn",     F_VD_VS_VT },
+    [A_VWBN2]    = { "vwbn",     F_VD_VS },
     [A_VF2H]     = { "vf2h",     F_VD_VS },
     [A_VH2F]     = { "vh2f",     F_VD_VS },
     [A_VX2I]     = { "vx2i",     F_VD_VS },
@@ -709,6 +710,10 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         case 0x13: op = A_VF2ID; break;
         case 0x14: op = A_VI2F;  break;
         case 0x15: op = A_VCMOV; break;
+        /* vwbn occupies the whole of rs 0x18..0x1F: the exponent it applies is
+         * in rt, so eight rs values name one instruction. */
+        case 0x18: case 0x19: case 0x1A: case 0x1B:
+        case 0x1C: case 0x1D: case 0x1E: case 0x1F: op = A_VWBN2; break;
         /* VFPU7 (rs=1) and VFPU9 (rs=2) are the conversion and shuffle
          * tables; mapped but not broken out yet. */
         default:   op = A_VFPU_UNKNOWN; break;

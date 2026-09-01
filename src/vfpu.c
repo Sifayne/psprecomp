@@ -191,6 +191,35 @@ static void write_dst(uint32_t vreg, int size, const float in[4]) {
     }
 }
 
+/* ---- VFPU control registers ----------------------------------------------- */
+
+/* Everything past the prefixes and the condition codes: the revision word and
+ * the random-number state. Kept together here because nothing reads them yet
+ * and giving each a home of its own would be inventing structure. */
+static uint32_t g_vfpu_ctrl_rest[16];
+
+uint32_t psp_mfvc(int index) {
+    switch (index) {
+    case 0: case 1: case 2: return g_prefix[index];
+    case 3:                 return psp_cpu.vfpu_cc;
+    default:
+        return (index >= 0 && index < 16) ? g_vfpu_ctrl_rest[index] : 0;
+    }
+}
+
+void psp_mtvc(int index, uint32_t value) {
+    switch (index) {
+    /* Writing a prefix here is the same as executing vpfxs/vpfxt/vpfxd: the
+     * next VFPU op consumes it and clears it. Storing it anywhere else would
+     * make the two views of the same register disagree. */
+    case 0: case 1: case 2: g_prefix[index] = value & 0xFFFFFFu; break;
+    case 3:                 psp_cpu.vfpu_cc = value;            break;
+    default:
+        if (index >= 0 && index < 16) g_vfpu_ctrl_rest[index] = value;
+        break;
+    }
+}
+
 /* ---- integer/vector moves ------------------------------------------------ */
 
 uint32_t psp_mfv(uint32_t vd) {
@@ -332,6 +361,178 @@ void psp_vcolor(uint32_t vd, uint32_t vs, int fmt, int size) {
     /* Half as many lanes come out as went in: a quad of pixels is a pair of
      * words. A single-lane source still writes one. */
     write_dst(vd, size == 1 ? 1 : 2, out);
+    eat_prefixes();
+}
+
+void psp_vcmov(uint32_t vd, uint32_t vs, int cc_sel, int want, int size) {
+    float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const int n = read_src(vs, size, g_prefix[0], s);
+    /* The destination is read as the second operand, T prefix and all: a lane
+     * that is not moved keeps its old value, so this is a read-modify-write. */
+    read_src(vd, size, g_prefix[1], d);
+
+    const uint32_t cc = psp_cpu.vfpu_cc;
+    if (cc_sel < 6) {
+        if ((int)((cc >> cc_sel) & 1) == want)
+            for (int i = 0; i < n; i++) d[i] = s[i];
+    } else if (cc_sel == 6) {
+        /* Selector 6: every lane consults its own condition bit. */
+        for (int i = 0; i < n; i++)
+            if ((int)((cc >> i) & 1) == want) d[i] = s[i];
+    }
+
+    write_dst(vd, size, d);
+    eat_prefixes();
+}
+
+/* One encoding, two operations, told apart by the operand width: a triple is
+ * the cross product and a quad is the quaternion product. Hardware expresses
+ * both as dot products against a forced swizzle-and-negate of t; written out
+ * here as the products themselves, which is what they are. */
+void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+    float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, t[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    read_src(vs, size, g_prefix[0], s);
+    read_src(vt, size, g_prefix[1], t);
+
+    float d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    if (size == 4) {                                     /* vqmul.q */
+        d[0] =  s[0]*t[3] + s[1]*t[2] - s[2]*t[1] + s[3]*t[0];
+        d[1] = -s[0]*t[2] + s[1]*t[3] + s[2]*t[0] + s[3]*t[1];
+        d[2] =  s[0]*t[1] - s[1]*t[0] + s[2]*t[3] + s[3]*t[2];
+        d[3] = -s[0]*t[0] - s[1]*t[1] - s[2]*t[2] + s[3]*t[3];
+    } else {                                             /* vcrsp.t */
+        d[0] = s[1]*t[2] - s[2]*t[1];
+        d[1] = s[2]*t[0] - s[0]*t[2];
+        /* The third lane comes out of the same forced-swizzle dot as the other
+         * two, which for a triple (t[3] and s[3] zero) is the cross term.
+         *
+         * Infinities are flushed to zero first, and only for this lane. That
+         * looks arbitrary and is what the hardware does: inf * 0 in the dot
+         * would be a NaN, and the PSP answers with the finite part instead.
+         * Nine lines of cpu/vfpu/vector turn on it. */
+        float fs[4], ft[4];
+        for (int i = 0; i < 4; i++) {
+            fs[i] = (s[i] >  3.4028235e38f || s[i] < -3.4028235e38f) ? 0.0f : s[i];
+            ft[i] = (t[i] >  3.4028235e38f || t[i] < -3.4028235e38f) ? 0.0f : t[i];
+        }
+        d[2] = fs[0]*ft[1] - fs[1]*ft[0] + fs[2]*ft[3] + fs[3]*ft[2];
+    }
+
+    write_dst(vd, size, d);
+    eat_prefixes();
+}
+
+void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const int n = read_src(vs, size, g_prefix[0], sv);
+    read_src(vt, size, g_prefix[1], tv);
+
+    /* The last lane of the source is a forced 1: that is the whole difference
+     * from vdot, and it is what makes this the homogeneous form. */
+    sv[n - 1] = 1.0f;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += sv[i] * tv[i];
+
+    float out[4] = { sum, 0.0f, 0.0f, 0.0f };
+    write_dst(vd, 1, out);
+    eat_prefixes();
+}
+
+void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    read_src(vs, size, g_prefix[0], sv);
+    read_src(vt, size, g_prefix[1], tv);
+
+    /* s is forced to yzx and t to zxy, then multiplied lane by lane. There is
+     * no subtraction: this is half a cross product, and a full one is two of
+     * these with a vsub between. */
+    float out[4];
+    out[0] = sv[1] * tv[2];
+    out[1] = sv[2] * tv[0];
+    out[2] = sv[0] * tv[1];
+    out[3] = sv[3] * tv[3];
+
+    write_dst(vd, size, out);
+    eat_prefixes();
+}
+
+void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    read_src(vs, size, g_prefix[0], sv);
+    read_src(vt, size, g_prefix[1], tv);
+
+    /* t's first two lanes are forced to yx, so the dot with s negated on lane
+     * 1 is s0*t1 - s1*t0. Lanes beyond the pair contribute as they are, which
+     * is why they are read at all -- normally they are zero. */
+    const float d0 = sv[0] * tv[1] - sv[1] * tv[0] + sv[2] * tv[2] + sv[3] * tv[3];
+    float out[4] = { d0, 0.0f, 0.0f, 0.0f };
+    write_dst(vd, 1, out);
+    eat_prefixes();
+}
+
+/* ---- comparisons that produce values ------------------------------------- */
+
+void psp_vcmp_val(uint32_t vd, uint32_t vs, uint32_t vt, int kind, int size) {
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const int n = read_src(vs, size, g_prefix[0], sv);
+    read_src(vt, size, g_prefix[1], tv);
+
+    float d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (int i = 0; i < n; i++) {
+        if (kind == 0) {                                  /* vscmp: -1, 0, 1 */
+            const float a = sv[i] - tv[i];
+            if (a != a) {
+                /* A NaN difference means at least one side is NaN or the two
+                 * are opposite infinities. The hardware still orders them, by
+                 * signed magnitude -- the same treatment vmin/vmax give. */
+                const int32_t si = (int32_t)psp_f32_to_bits(sv[i]);
+                const int32_t ti = (int32_t)psp_f32_to_bits(tv[i]);
+                const int32_t sm = si & 0x7FFFFFFF, tm = ti & 0x7FFFFFFF;
+                const int32_t b = (si < 0 ? -sm : sm) - (ti < 0 ? -tm : tm);
+                d[i] = (float)((0 < b) - (b < 0));
+            } else {
+                d[i] = (float)((0.0f < a) - (a < 0.0f));
+            }
+        } else {
+            /* A NaN on either side is false, not "unordered": both of these
+             * answer 0.0 rather than propagating it. */
+            const int nan = (sv[i] != sv[i]) || (tv[i] != tv[i]);
+            if (nan)              d[i] = 0.0f;
+            else if (kind == 1)   d[i] = (sv[i] >= tv[i]) ? 1.0f : 0.0f;
+            else                  d[i] = (sv[i] <  tv[i]) ? 1.0f : 0.0f;
+        }
+    }
+    write_dst(vd, size, d);
+    eat_prefixes();
+}
+
+/* vwbn rebases lane 0 onto a given exponent, shifting the mantissa the other
+ * way so the value is as close as it can be. A zero, an infinity or a NaN has
+ * no mantissa to shift, so the exponent is simply ORed in. Lanes above 0 pass
+ * through untouched. */
+void psp_vwbn(uint32_t vd, uint32_t vs, int exp, int size) {
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    read_src(vs, size, g_prefix[0], sv);
+
+    const uint32_t e = (uint32_t)(exp & 0xFF);
+    const uint32_t b = psp_f32_to_bits(sv[0]);
+    const uint32_t sign = b & 0x80000000u;
+    const uint32_t prev = (b & 0x7F800000u) >> 23;
+    uint32_t man = (b & 0x007FFFFFu) | 0x00800000u;
+
+    float out[4];
+    if (prev != 0xFF && prev != 0) {
+        /* The shift wraps at 16: the hardware masks it to four bits, so a very
+         * large exponent change rotates rather than flushing to zero. */
+        if (e > prev) man >>= ((e - prev) & 0xF);
+        else          man <<= ((prev - e) & 0xF);
+        out[0] = psp_bits_to_f32(sign | (man & 0x007FFFFFu) | (e << 23));
+    } else {
+        out[0] = psp_bits_to_f32(b | (e << 23));
+    }
+    for (int i = 1; i < 4; i++) out[i] = sv[i];
+
+    write_dst(vd, size, out);
     eat_prefixes();
 }
 
@@ -1011,6 +1212,12 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
     for (int i = 0; i < n; i++) {
         float a = sv[i], b = tv[i];
         int r;
+        /* The upper eight conditions test the *first* operand's class rather
+         * than comparing the two, and they had all been falling into the
+         * default and answering 0. That is 576 lines of cpu/vfpu/vector, which
+         * exercises every code against every interesting pair. */
+        const int a_nan = (a != a);
+        const int a_inf = !a_nan && (a > 3.4028235e38f || a < -3.4028235e38f);
         switch (cond & 0xF) {
         case 0:  r = 0;              break;   /* FL  */
         case 1:  r = (a == b);       break;   /* EQ  */
@@ -1020,7 +1227,14 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
         case 5:  r = (a != b);       break;   /* NE  */
         case 6:  r = (a >= b);       break;   /* GE  */
         case 7:  r = (a >  b);       break;   /* GT  */
-        default: r = 0;              break;
+        case 8:  r = (a == 0.0f);    break;   /* EZ -- both zeroes count */
+        case 9:  r = a_nan;          break;   /* EN  */
+        case 10: r = a_inf;          break;   /* EI  */
+        case 11: r = (a_nan || a_inf); break; /* ES  */
+        case 12: r = (a != 0.0f);    break;   /* NZ  */
+        case 13: r = !a_nan;         break;   /* NN  */
+        case 14: r = !a_inf;         break;   /* NI  */
+        default: r = !(a_nan || a_inf); break;/* NS  */
         }
         if (r) { cc |= 1u << i; any = 1; } else { all = 0; }
     }

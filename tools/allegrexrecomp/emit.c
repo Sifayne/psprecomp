@@ -364,6 +364,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_MFV:
         if (DEST_ZERO(in->rt)) break;
         fprintf(f, "%s%s = psp_mfv(%u);\n", ind, rt, in->vd); return;
+    case A_MFVC:
+        if (DEST_ZERO(in->rt)) break;
+        fprintf(f, "%s%s = psp_mfvc(%d);\n", ind, rt, (int)(in->raw & 0xFF) - 128); return;
+    case A_MTVC:
+        fprintf(f, "%spsp_mtvc(%d, %s);\n", ind, (int)(in->raw & 0xFF) - 128, rt); return;
     case A_MTV:
         fprintf(f, "%spsp_mtv(%u, %s);\n", ind, in->vd, rt); return;
 
@@ -450,7 +455,8 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         fprintf(f, "%spsp_vidt(%u, %u);\n", ind, in->vd, in->vsize);
         return;
     case A_VCST:
-        fprintf(f, "%spsp_vcst(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize);
+        /* rt, not vs -- see the interpreter. */
+        fprintf(f, "%spsp_vcst(%u, %u, %u);\n", ind, in->vd, (in->raw >> 16) & 0x1Fu, in->vsize);
         return;
 
     /* Immediate loads: the value is in the instruction, not a register.
@@ -486,6 +492,25 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_VI2X:
         fprintf(f, "%spsp_vi2x(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->rt & 3u, in->vsize); return;
 
+    case A_VCMOV:
+        fprintf(f, "%spsp_vcmov(%u, %u, %u, %d, %u);\n", ind, in->vd, in->vs,
+                (in->raw >> 16) & 7u, !((in->raw >> 19) & 1u), in->vsize); return;
+    case A_VCRSP:
+        fprintf(f, "%spsp_vcrsp(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VHDP:
+        fprintf(f, "%spsp_vhdp(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VCRS:
+        fprintf(f, "%spsp_vcrs(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VDET:
+        fprintf(f, "%spsp_vdet(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VSCMP:
+        fprintf(f, "%spsp_vcmp_val(%u, %u, %u, 0, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VSGE:
+        fprintf(f, "%spsp_vcmp_val(%u, %u, %u, 1, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VSLT:
+        fprintf(f, "%spsp_vcmp_val(%u, %u, %u, 2, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+    case A_VWBN2:
+        fprintf(f, "%spsp_vwbn(%u, %u, %u, %u);\n", ind, in->vd, in->vs, (in->raw >> 16) & 0xFFu, in->vsize); return;
     case A_VSBN:
         fprintf(f, "%spsp_vsbn(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VFPU9:

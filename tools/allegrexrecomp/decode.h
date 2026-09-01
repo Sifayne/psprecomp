@@ -98,7 +98,7 @@ typedef enum {
      * these is a hard error rather than a silent wrong answer. */
     A_VIIM,
     A_VFIM,
-    A_VFAD, A_VAVG, A_VFPU9, A_VSBN,
+    A_VFAD, A_VAVG, A_VFPU9, A_VSBN, A_VWBN2,
     A_VF2H, A_VH2F, A_VX2I, A_VI2X,
     A_VT4444, A_VT5551, A_VT5650,
     A_VFPU_UNKNOWN,

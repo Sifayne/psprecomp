@@ -331,6 +331,10 @@ static psp_interp_status exec_simple(const a_insn *in) {
 
     /* --- VFPU: the subset with a real implementation behind it. --- */
     case A_MFV: setr(in->rt, psp_mfv(in->vd));  return I_RUNNING;
+    /* The control-register forms address the same 8-bit field, offset by
+     * 128 -- which is the bit the decoder splits them on. */
+    case A_MFVC: setr(in->rt, psp_mfvc((int)(in->raw & 0xFF) - 128)); return I_RUNNING;
+    case A_MTVC: psp_mtvc((int)(in->raw & 0xFF) - 128, R(in->rt));    return I_RUNNING;
     case A_MTV: psp_mtv(in->vd, R(in->rt));     return I_RUNNING;
 
     case A_LVL_Q: psp_lvl_q(in->vt, R(in->rs) + (in->imm & ~3)); return I_RUNNING;
@@ -385,7 +389,9 @@ static psp_interp_status exec_simple(const a_insn *in) {
     }
 
     case A_VIDT: psp_vidt(in->vd, in->vsize);            return I_RUNNING;
-    case A_VCST: psp_vcst(in->vd, in->vs, in->vsize);    return I_RUNNING;
+    /* The constant number is the rt field, not vs -- passing vs read past
+     * the end of the table and answered 0 for every constant. */
+    case A_VCST: psp_vcst(in->vd, (in->raw >> 16) & 0x1F, in->vsize); return I_RUNNING;
     /* The register is the vt field. The low seven bits, where every other VFPU
      * op keeps vd, are part of the immediate here -- `vfim v84, 1/90` encodes
      * as 0xDFD421B0, and reading vd from it names v48. */
@@ -397,6 +403,18 @@ static psp_interp_status exec_simple(const a_insn *in) {
     case A_VX2I: psp_vx2i(in->vd, in->vs, in->rt & 3, in->vsize); return I_RUNNING;
     case A_VI2X: psp_vi2x(in->vd, in->vs, in->rt & 3, in->vsize); return I_RUNNING;
 
+    /* `want` is the inverted sense bit: the hardware compares the condition
+     * bit against !tf, so a set tf moves when the bit is clear. */
+    case A_VCMOV: psp_vcmov(in->vd, in->vs, (in->raw >> 16) & 7,
+                            !((in->raw >> 19) & 1), in->vsize); return I_RUNNING;
+    case A_VCRSP: psp_vcrsp(in->vd, in->vs, in->vt, in->vsize); return I_RUNNING;
+    case A_VHDP: psp_vhdp(in->vd, in->vs, in->vt, in->vsize); return I_RUNNING;
+    case A_VCRS: psp_vcrs(in->vd, in->vs, in->vt, in->vsize); return I_RUNNING;
+    case A_VDET: psp_vdet(in->vd, in->vs, in->vt, in->vsize); return I_RUNNING;
+    case A_VSCMP: psp_vcmp_val(in->vd, in->vs, in->vt, 0, in->vsize); return I_RUNNING;
+    case A_VSGE:  psp_vcmp_val(in->vd, in->vs, in->vt, 1, in->vsize); return I_RUNNING;
+    case A_VSLT:  psp_vcmp_val(in->vd, in->vs, in->vt, 2, in->vsize); return I_RUNNING;
+    case A_VWBN2: psp_vwbn(in->vd, in->vs, (in->raw >> 16) & 0xFF, in->vsize); return I_RUNNING;
     case A_VSBN: psp_vsbn(in->vd, in->vs, in->vt, in->vsize); return I_RUNNING;
     case A_VFPU9: psp_vfpu9(in->vd, in->vs, in->rt, in->vsize); return I_RUNNING;
     case A_VFAD: psp_vfad(in->vd, in->vs, in->vsize); return I_RUNNING;

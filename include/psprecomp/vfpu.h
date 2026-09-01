@@ -87,6 +87,50 @@ void psp_vavg(uint32_t vd, uint32_t vs, int size);
  * instruction's rt field, which is where the hardware keeps it. */
 void psp_vcolor(uint32_t vd, uint32_t vs, int fmt, int size);
 
+/* The VFPU control registers, as mfvc/mtvc address them: 0..2 are the three
+ * operand prefixes, 3 is the condition-code register, and the rest are the
+ * revision and the random-number state. The first four are kept where the rest
+ * of this file already keeps them rather than duplicated into an array, so a
+ * prefix written through mtvc is the same prefix the next op consumes.
+ *
+ * `index` is the instruction's field minus 128; out of range reads as zero and
+ * writes are dropped, which is what the hardware does for the reserved slots. */
+uint32_t psp_mfvc(int index);
+void     psp_mtvc(int index, uint32_t value);
+
+/* vcmov -- conditional move driven by the VFPU condition codes.
+ *
+ * `cc_sel` is the 3-bit selector: 0..5 name a single condition bit and move
+ * the whole vector, 6 means each lane consults its own bit. `want` is the
+ * sense. The destination is also a source: lanes that are not moved keep what
+ * they had, so the register has to be read before it is written.
+ */
+void psp_vcmov(uint32_t vd, uint32_t vs, int cc_sel, int want, int size);
+
+/* vcrsp.t / vqmul.q -- one encoding, two operations chosen by width: the
+ * three-element cross product, or the quaternion product. */
+void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+
+/* vhdp -- a dot product with the source's last lane forced to 1, which is how
+ * a point is transformed by a plane. vcrs -- the pairwise half of a cross
+ * product: s swizzled yzx times t swizzled zxy, with no subtraction, so a full
+ * cross takes two of them. vdet -- the 2x2 determinant, s0*t1 - s1*t0. */
+void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+
+/* Lane-wise comparisons writing 1.0/0.0 (or -1/0/1 for vscmp) rather than
+ * condition codes. A NaN on either side gives 0.0 for vsge and vslt; vscmp
+ * orders NaN and infinity by magnitude, the way vmin/vmax do.
+ *
+ * `kind`: 0 vscmp, 1 vsge, 2 vslt. */
+void psp_vcmp_val(uint32_t vd, uint32_t vs, uint32_t vt, int kind, int size);
+
+/* vwbn -- rebase lane 0 onto a given exponent, shifting the mantissa to
+ * compensate. `exp` is the byte in the instruction's rt field. Lanes above 0
+ * pass through. */
+void psp_vwbn(uint32_t vd, uint32_t vs, int exp, int size);
+
 /* vsbn -- replace a float's exponent with 127 + (integer in vt lane 0).
  * A zero, an infinity or a NaN keeps whatever it already was. */
 void psp_vsbn(uint32_t vd, uint32_t vs, uint32_t vt, int size);
