@@ -48,8 +48,11 @@ void psp_clock_tick(void);
  * that should not perturb what they measure. */
 uint64_t psp_clock_peek(void);
 
-/* Move the clock on by one frame. Called from the vblank handlers. */
-void psp_clock_frame(void);
+/* The absolute moment of the next vblank, strictly in the future. Every thread
+ * waiting for a frame is waiting for the same one, so the vblank handlers park
+ * on this rather than each adding a frame to the clock. Does not advance it;
+ * psp_clock_advance_to does that once the wait is over. */
+uint64_t psp_clock_next_frame(void);
 
 /* Move the clock forward to `us` if it is not already past it. Never moves it
  * back. The scheduler uses this when every thread is asleep: time here only
@@ -62,7 +65,7 @@ void psp_clock_advance_to(uint64_t us);
  * Off (the default) the clock is the deterministic virtual clock the oracle
  * depends on, and everything above stands. On, the clock anchors to
  * CLOCK_MONOTONIC at the moment this is called: a vblank lasts a frame of
- * wall time (psp_clock_frame sleeps out the remainder), the idle scheduler
+ * wall time (psp_clock_advance_to sleeps out the remainder), the idle scheduler
  * waits out the sleep it would otherwise skip, and a read reports elapsed
  * wall time instead of inventing a tick. Guest time and wall time then track
  * one to one, which is what audio output and a paced frame loop need.

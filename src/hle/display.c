@@ -33,6 +33,9 @@ static uint32_t g_fb_width;      /* in pixels, the stride -- usually 512 */
 static uint32_t g_fb_format;
 static uint32_t g_mode, g_mode_w, g_mode_h;
 static uint64_t g_vblank_count;
+/* The boundary the most recent vblank was counted at, so that several threads
+ * released by one vblank count it once between them. See hle_WaitVblank. */
+static uint64_t g_last_vblank_us;
 static uint32_t g_vcount;         /* scanline counter; see hle_GetVcount */
 
 static uint32_t g_best[PSP_SCREEN_W * PSP_SCREEN_H];
@@ -69,6 +72,7 @@ void psp_display_reset(void) {
     g_mode_w = PSP_SCREEN_W;
     g_mode_h = PSP_SCREEN_H;
     g_vblank_count = 0;
+    g_last_vblank_us = 0;
     g_vcount = 0;
     g_best_score = 0;
     g_best_addr = 0;
@@ -265,20 +269,42 @@ static void hle_GetFrameBuf(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* There is no scanout, so a vblank wait returns immediately and bumps the
- * counter. A game's main loop is usually `render(); WaitVblank();`, which
- * means this counter is the frame number -- the most useful single number to
- * have during bring-up, because it tells you whether the game is looping or
- * stuck. */
+/* A vblank wait is a wait, and one vblank releases everybody waiting on it.
+ *
+ * There is no scanout, so the frame boundary is a moment on the clock's grid
+ * rather than an event -- but it is still a *shared* moment, and both halves of
+ * that matter. Yielding instead of waiting does not deschedule the caller at
+ * all: the handoff picks the most urgent READY thread, which is the caller
+ * again whenever it outranks everything else, so a priority-24 thread looping
+ * `checkpoint(); WaitVblank();` ran its whole loop before its two equals
+ * started theirs. threads/scheduling expects them interleaved one line per
+ * frame, and psp_sched_delay is the operation that expresses it -- the same
+ * reasoning already written out above that function.
+ *
+ * Advancing per caller was the other half. Three threads waiting on one vblank
+ * each added a frame, so the guest saw three frames of time pass for one frame
+ * of scanout. Parking them all on the same absolute moment costs one.
+ *
+ * A game's main loop is usually `render(); WaitVblank();`, so the counter is
+ * still the frame number -- the most useful single number during bring-up,
+ * because it says whether the game is looping or stuck. It is counted per
+ * vblank rather than per waiter, which is what it was always meant to mean. */
 static void hle_WaitVblank(void) {
-    g_vblank_count++;
-    /* A frame of guest time passes here. This is the only place time advances
-     * by a realistic amount rather than a token tick, so a game that paces
-     * itself off the clock paces itself off its own frames. */
-    psp_clock_frame();
-    /* And it is the natural point to let another thread run: a game waiting for
-     * the next frame is not using the CPU, whatever it told the kernel. */
-    psp_sched_yield();
+    const uint64_t target = psp_clock_next_frame();
+
+    psp_sched_delay(target - psp_clock_peek());
+    /* The frame passes whether or not there was anyone to schedule around it:
+     * with threading off -- the oracle's configuration -- the delay above parks
+     * nobody, and the clock has to reach the boundary regardless. Monotonic, so
+     * it does nothing when the wait already arrived there. */
+    psp_clock_advance_to(target);
+
+    /* First one through this boundary counts it; the rest woke on the same
+     * vblank and must not count it again. */
+    if (target > g_last_vblank_us) {
+        g_last_vblank_us = target;
+        g_vblank_count++;
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

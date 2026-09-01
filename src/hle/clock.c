@@ -139,9 +139,18 @@ uint64_t psp_clock_read(void) {
     return now;
 }
 
-void psp_clock_frame(void) {
-    g_us += PSP_FRAME_US;
-    if (g_realtime) wall_sync(g_us);
+/* The next vblank, as an absolute moment rather than a duration.
+ *
+ * Vblanks are a grid the whole machine shares -- one scanout, so every thread
+ * waiting for "the next frame" is waiting for the *same* moment. Returning that
+ * moment is what lets them all park on it and be released together, which a
+ * per-caller duration cannot express: three threads each adding a frame to
+ * their own clock is three frames of guest time for one frame of scanout.
+ *
+ * Strictly future, so a caller already standing exactly on a boundary waits for
+ * the next one rather than returning immediately. */
+uint64_t psp_clock_next_frame(void) {
+    return (g_us / PSP_FRAME_US + 1) * PSP_FRAME_US;
 }
 
 /* One tick, for a caller that is doing work rather than reading the time.
