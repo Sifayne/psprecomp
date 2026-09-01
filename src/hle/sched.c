@@ -491,7 +491,17 @@ int psp_sched_block_until(uint32_t uid, psp_sched_state why, const char *what,
      * asks for a resource that is not there with a timeout of 0 and tags the
      * line `[x]` -- no reschedule happened -- where switching away and coming
      * back tags it `[r]`. There is no time in which anything could change, so
-     * there is nothing to schedule around. */
+     * there is nothing to schedule around.
+     *
+     * It does *not* generalise to short-but-nonzero timeouts, though the
+     * captures look like it should. msgpipe/receive sweeps the timeout by the
+     * microsecond and the column changes between 2us and 3us, which reads as a
+     * threshold -- and refusing to park below it takes forty tests to no output
+     * at all. The reason is that pspautotests' own workers spin on 1us waits at
+     * a priority above the main thread: a wait that never parks never yields,
+     * and the test that was going to release them never runs again. So the
+     * `[x]` at 1us is not "did not park"; it is "parked, and nothing else was
+     * able to use the microsecond". Which of those it is, is not settled here. */
     if (deadline_us && deadline_us <= psp_clock_peek()) return PSP_SCHED_EXPIRED;
     return switch_away(self_slot(uid), why, what, deadline_us);
 }
