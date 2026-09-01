@@ -32,8 +32,17 @@
  * number: `lv.q R000, 0($a1)` decodes as 0x60 rather than 0x20, which is the
  * same matrix and column at row 2 instead of row 0 -- four lanes rotated by
  * two, and no error anywhere. Which registers were wrong depended on which
- * base register the compiler happened to pick. */
-#define VT_MEM_F(w) ((((w) >> 16) & 0x1F) | (((w) & 3) << 5))
+ * base register the compiler happened to pick.
+ *
+ * The single and quad forms then differ again, and this one is easy to miss
+ * because it only shows when bit 1 is set. The single forms take two bits, so
+ * they can name any of the 128 registers. The quad forms take *one*: a quad
+ * always starts at row 0, so it has no use for the row bit, and bit 1 is a
+ * cache write-through hint instead. Reading it as part of the register makes
+ * `sv.q C700` store from row 2 -- pspgl's glGetFloatv does exactly this, and
+ * the matrix comes back transposed and rotated with every value correct. */
+#define VT_MEM_F(w)  ((((w) >> 16) & 0x1F) | (((w) & 3) << 5))
+#define VT_MEMQ_F(w) ((((w) >> 16) & 0x1F) | (((w) & 1) << 5))
 /* Vector width is split across two non-adjacent bits: 0..3 -> 1..4 lanes. */
 #define VSIZE(w)   (((((w) >> 7) & 1) | (((w) >> 14) & 2)) + 1)
 
@@ -541,10 +550,10 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
 
     /* VFPU load/store — these use the 7-bit vt field and a 16-byte-aligned
      * offset for the quad forms. */
-    case 0x32: op = A_LV_S; in.vt = (uint8_t)VT_MEM_F(word); break;
-    case 0x36: op = A_LV_Q; in.vt = (uint8_t)VT_MEM_F(word); break;
-    case 0x3A: op = A_SV_S; in.vt = (uint8_t)VT_MEM_F(word); break;
-    case 0x3E: op = A_SV_Q; in.vt = (uint8_t)VT_MEM_F(word); break;
+    case 0x32: op = A_LV_S; in.vt = (uint8_t)VT_MEM_F(word);  break;
+    case 0x36: op = A_LV_Q; in.vt = (uint8_t)VT_MEMQ_F(word); break;
+    case 0x3A: op = A_SV_S; in.vt = (uint8_t)VT_MEM_F(word);  break;
+    case 0x3E: op = A_SV_Q; in.vt = (uint8_t)VT_MEMQ_F(word); break;
 
     /* VFPU arithmetic families. Sub-opcode lives in bits 25..23. */
     case 0x18:
@@ -718,6 +727,15 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
     switch (op) {
     case A_ANDI: case A_ORI: case A_XORI: case A_LUI:
         in.imm = (int32_t)IMM16(word);
+        break;
+    /* vrot already set imm above, from bits 20..16: its operand is a 5-bit
+     * control field, not an immediate. Falling into the default clobbered it
+     * with the low 16 bits of the instruction, and the caller then masks to
+     * five -- so the field became whatever those bits happened to be. For
+     * pspgl's glRotatef (0xF3A434B4) that turned 0x04 into 0x14, and bit 4 is
+     * "negate the sine": the rotation came out with the right magnitude and
+     * the wrong handedness, which is about as quiet as a bug gets. */
+    case A_VROT:
         break;
     default:
         in.imm = SIMM16(word);
