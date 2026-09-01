@@ -1885,6 +1885,12 @@ static void hle_FreeTlspl(void) {
     for (uint32_t i = 0; i < t->nblocks; i++)
         if (t->owner[i] == me) {
             t->owner[i] = 0;
+            /* Wiped on the way out as well as on the way in. tls/free writes
+             * 0xCC over its block, frees it and reads zero back without
+             * asking for it again -- so the free did it, not the next
+             * allocation. */
+            void *p = psp_mem_ptr(t->base + i * t->stride, t->stride);
+            if (p) memset(p, 0, t->stride);
             /* The block goes straight to the next thread waiting for one,
              * rather than being left free for whoever asks next: the queue's
              * order is the point of having one. */
