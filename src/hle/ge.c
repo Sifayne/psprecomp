@@ -619,6 +619,26 @@ static void enqueue(int head) {
     /* (list, stall, cbid, arg) */
     ge_queue *q = NULL;
     for (int i = 0; i < MAX_QUEUES; i++) if (!g_queue[i].used) { q = &g_queue[i]; break; }
+
+    /* A slot is only worth keeping while its list can still be referred to. A
+     * finished list is kept so that a late sceGeListUpdateStallAddr can still
+     * resolve its id, but it is holding a slot it no longer needs -- so when
+     * the pool is full, the oldest finished list is what to give up. Ids come
+     * from a monotonic counter and are never reused, so a stale id resolves to
+     * "unknown uid" rather than to somebody else's list.
+     *
+     * Without this nothing ever clears `used` and the pool is consumed once,
+     * for the life of the process. The game gets MAX_QUEUES display lists in
+     * total and every enqueue after that is refused with NO_MEMORY: measured
+     * here at 8 accepted and 204 refused during the intro. That is invisible
+     * from the outside -- the GE summary counts lists that *ran*, the call
+     * histogram is a top-N, and a non-zero error escapes the zero-return ring
+     * -- so it reads as "the game submits no geometry" when the truth is that
+     * the geometry was submitted and turned away. */
+    if (!q)
+        for (int i = 0; i < MAX_QUEUES; i++)
+            if (g_queue[i].done && (!q || g_queue[i].id < q->id)) q = &g_queue[i];
+
     if (!q) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     memset(q, 0, sizeof *q);
