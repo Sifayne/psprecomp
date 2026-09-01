@@ -33,9 +33,13 @@ static uint64_t g_traps;
 static float sat0(float v) { return v <= 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 static float sat1(float v) { return v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v); }
 
+static void reset_ctrl(void);
+
 void psp_vfpu_reset(void) {
     g_prefix[0] = g_prefix[1] = PFX_ST_NONE;
     g_prefix[2] = PFX_D_NONE;
+    psp_cpu.vfpu_cc = 0x3Fu;      /* all six condition bits set; see cpu.c */
+    reset_ctrl();
     g_traps = 0;
 }
 
@@ -287,6 +291,22 @@ float psp_vfpu_dot(const float a[4], const float b[4]) {
  * the random-number state. Kept together here because nothing reads them yet
  * and giving each a home of its own would be inventing structure. */
 static uint32_t g_vfpu_ctrl_rest[16];
+
+/* Their power-on values. Index 7 is the revision word and 8..15 are the
+ * random-number generator's state, which is why they are not zero -- each RCX
+ * register holds a 1.0f pattern with a distinct low bit, and vrnd derives its
+ * stream from them. Nothing reads any of this yet; it is set because the
+ * condition codes next door turned out to matter and there is no reason to
+ * think these are the exception. */
+static void reset_ctrl(void) {
+    for (int i = 0; i < 16; i++) g_vfpu_ctrl_rest[i] = 0;
+    g_vfpu_ctrl_rest[7]  = 0x7772CEABu;          /* revision */
+    g_vfpu_ctrl_rest[8]  = 0x3F800001u;          /* RCX0 */
+    g_vfpu_ctrl_rest[9]  = 0x3F800002u;
+    g_vfpu_ctrl_rest[10] = 0x3F800004u;
+    g_vfpu_ctrl_rest[11] = 0x3F800008u;
+    for (int i = 12; i < 16; i++) g_vfpu_ctrl_rest[i] = 0x3F800000u;
+}
 
 uint32_t psp_mfvc(int index) {
     switch (index) {

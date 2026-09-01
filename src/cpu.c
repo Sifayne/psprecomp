@@ -21,6 +21,13 @@ const char *const psp_reg_names[PSP_NUM_GPR] = {
 void psp_cpu_reset_fp(void) {
     for (int i = 0; i < 32; i++)  memcpy(&psp_cpu.f[i], &(uint32_t){PSP_FP_INIT}, 4);
     for (int i = 0; i < 128; i++) memcpy(&psp_cpu.v[i], &(uint32_t){PSP_FP_INIT}, 4);
+    /* The VFPU condition codes come up with all six bits *set*, not clear.
+     *
+     * That is observable and was observed: pspautotests cpu/vfpu/vector does a
+     * `vcmp.t` -- which writes bits 0..2 and the any/all pair, and leaves bit 3
+     * alone -- and then reads bit 3 back as 1, having never written it. From a
+     * zeroed register it reads 0, and 25 of that test's lines turn on it. */
+    psp_cpu.vfpu_cc = 0x3Fu;
 }
 
 void psp_cpu_reset(void) {
