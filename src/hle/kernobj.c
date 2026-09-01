@@ -44,20 +44,47 @@
  * below it. */
 #define VPL_ATTR_KNOWN 0x43FFu
 
-#define MAX_VPL_BLOCKS 64
+/* ## The pool's bookkeeping lives *in the pool*, and the guest can read it
+ *
+ * threads/vpl/order does not check totals. It casts a pointer into the pool and
+ * walks the kernel's own structures, printing every node's address, `next` and
+ * size -- so the layout, the placement and the order of operations are all
+ * observable. Its own header declares them:
+ *
+ *     struct VplBlock      { VplBlock *next; u32 sizeDiv8; };            //  8
+ *     struct VplAccounting { void *start, *start2, *startPlusSeven;      // 12
+ *                            u32 totalSizeMinus8, allocatedInBlocks;     // 20
+ *                            VplBlock *nextFreeBlock;                    // 24
+ *                            VplBlock bottomBlock; };                    // 32
+ *
+ * **That 32-byte accounting struct is the 32 bytes of pool overhead** the
+ * create test reports as `poolSize = round_up(size, 8) - 32`. The two facts
+ * were measured separately and are the same fact.
+ *
+ * The block chain runs from `bottomBlock`, which is *inside* the accounting at
+ * offset 24, to a size-zero terminator in the last eight bytes of the
+ * allocation. Free nodes are linked in a **circular** list through `next`, and
+ * the terminator is permanently one of them.
+ *
+ * The test also pins where the pools *are*: it reaches the middle pool's
+ * accounting as `addr3 + 0x18`, which only resolves if three pools created in
+ * order descend in memory. So a vpl's pool is allocated from the **high** end.
+ */
+#define VPL_ACCT_SIZE  32u
+#define VPL_BOTTOM     24u    /* bottomBlock's offset within the accounting */
 
-typedef struct { uint32_t addr, size; } vpl_block;   /* addr is the header */
+/* Offsets inside the accounting struct. */
+enum { VA_START = 0, VA_START2 = 4, VA_START7 = 8, VA_TOTAL_M8 = 12,
+       VA_ALLOCED = 16, VA_NEXTFREE = 20 };
 
 typedef struct {
     uint32_t  uid;
     char      name[32];
     uint32_t  attr;
-    uint32_t  base;          /* host allocation backing the pool */
-    uint32_t  pool_size;
-    uint32_t  free_size;
+    uint32_t  base;          /* the whole allocation; the accounting is at [0] */
+    uint32_t  total;         /* round_up(requested, 8) */
+    uint32_t  pool_size;     /* total - 32, what ReferVplStatus reports */
     int       used;
-    vpl_block block[MAX_VPL_BLOCKS];   /* live allocations, address order */
-    int       nblocks;
     psp_waitq q;
     char      waitdesc[64];
 } psp_vpl;
@@ -100,6 +127,8 @@ static uint32_t vpl_partition_error(int32_t part) {
     }
 }
 
+static void vpl_init(psp_vpl *v);
+
 static void hle_CreateVpl(void) {
     /* (name, partition, attr, size, option) */
     const uint32_t name = psp_arg(0);
@@ -113,11 +142,15 @@ static void hle_CreateVpl(void) {
     if (attr & ~VPL_ATTR_KNOWN) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
     if (size == 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
 
-    const uint32_t pool = vpl_pool_size(size);
+    const uint32_t total = round_up(size, VPL_ALIGN);
+    const uint32_t pool  = vpl_pool_size(size);
     /* A request the heap cannot meet is NO_MEMORY rather than a bad size --
      * 0x10000000 and 0x02000000 are refused where 0x01800000 succeeds, so the
-     * boundary is what is actually free and not a constant. */
-    const uint32_t base = pool ? psp_sysmem_alloc(pool, 0) : 0;
+     * boundary is what is actually free and not a constant.
+     *
+     * From the high end, which vpl/order pins: it reaches the middle of three
+     * pools as `addr3 + 0x18`, and that only resolves if they descend. */
+    const uint32_t base = pool ? psp_sysmem_alloc(total, 1) : 0;
     if (pool && !base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     psp_vpl *v = NULL;
@@ -129,9 +162,10 @@ static void hle_CreateVpl(void) {
     psp_str(name, v->name, sizeof v->name);
     v->attr      = attr;
     v->base      = base;
+    v->total     = total;
     v->pool_size = pool;
-    v->free_size = pool;
     v->uid       = psp_threadman_next_uid();
+    if (base) vpl_init(v);
     v->used      = 1;
     char nm[sizeof v->name];
     memcpy(nm, v->name, sizeof nm);
@@ -149,28 +183,131 @@ static void hle_DeleteVpl(void) {
     if (urgent) psp_sched_yield();
 }
 
-/* First fit over the gaps between live blocks, which are kept in address
- * order. The *placement* is not observable -- the tests print free sizes and
- * check that a pointer round-trips -- but the accounting is, exactly. */
+/* ---- the block chain, in guest memory ------------------------------------ */
+
+static uint32_t blk_next(uint32_t b)          { return psp_read32(b); }
+static uint32_t blk_size(uint32_t b)          { return psp_read32(b + 4) * 8; }
+static void set_next(uint32_t b, uint32_t n)  { psp_write32(b, n); }
+static void set_size(uint32_t b, uint32_t sz) { psp_write32(b + 4, sz / 8); }
+
+static uint32_t vpl_bottom(const psp_vpl *v) { return v->base + VPL_BOTTOM; }
+static uint32_t vpl_term(const psp_vpl *v)   { return v->base + v->total - 8; }
+static uint32_t vpl_head(const psp_vpl *v)   { return psp_read32(v->base + VA_NEXTFREE); }
+static void set_head(const psp_vpl *v, uint32_t b) { psp_write32(v->base + VA_NEXTFREE, b); }
+
+/* An allocated block's `next` is the pool's own `start`, which is what lets a
+ * free tell one apart from a free block -- and `start` is the accounting plus
+ * eight, because every allocated node in order.expected prints `next->08`. */
+static uint32_t vpl_start(const psp_vpl *v) { return v->base + 8; }
+
+/* One free block spanning the pool, a size-zero terminator, and the two linked
+ * to each other. This is the state the empty-pool lines describe exactly:
+ * `bottom at 0x18, next->0xf8, 0xe0` and `0xf8, next->0x18, 0`. */
+static void vpl_init(psp_vpl *v) {
+    const uint32_t bottom = vpl_bottom(v), term = vpl_term(v);
+    psp_write32(v->base + VA_START,   vpl_start(v));
+    psp_write32(v->base + VA_START2,  vpl_start(v));
+    psp_write32(v->base + VA_START7,  vpl_start(v) + 7);
+    psp_write32(v->base + VA_TOTAL_M8, v->total - 8);
+    psp_write32(v->base + VA_ALLOCED, 0);
+    set_next(bottom, term);  set_size(bottom, term - bottom);
+    set_next(term, bottom);  set_size(term, 0);
+    set_head(v, bottom);
+}
+
+static uint32_t vpl_free_size(const psp_vpl *v) {
+    if (!v->base) return 0;
+    return v->pool_size - psp_read32(v->base + VA_ALLOCED) * 8;
+}
+
+/* Carve from the *top* of the first free block that fits, walking the circular
+ * list from the head.
+ *
+ * Top, not bottom: order.expected has the bottom block shrink from 0xe0 to
+ * 0xc8 while the new allocation appears at 0xe0 -- immediately above what is
+ * left of the free block. And the head advances to that block's `next`
+ * afterwards, which is why a second allocation from the same block leaves the
+ * head where it already was. */
 static uint32_t vpl_alloc(psp_vpl *v, uint32_t bytes) {
+    if (!v->base) return 0;
     const uint32_t need = round_up(bytes, VPL_ALIGN) + VPL_HEADER;
-    if (need > v->free_size || v->nblocks >= MAX_VPL_BLOCKS) return 0;
 
-    uint32_t at = v->base;
-    int i = 0;
-    for (; i < v->nblocks; i++) {
-        if (v->block[i].addr - at >= need) break;
-        at = v->block[i].addr + v->block[i].size;
+    uint32_t b = vpl_head(v), prev = 0;
+    for (uint32_t guard = 0; guard < 4096; guard++) {
+        const uint32_t sz = blk_size(b);
+        if (sz >= need) break;
+        prev = b;
+        b = blk_next(b);
+        if (b == vpl_head(v)) return 0;        /* all the way round */
     }
-    if (at + need > v->base + v->pool_size) return 0;
+    const uint32_t sz = blk_size(b);
+    if (sz < need) return 0;
 
-    memmove(&v->block[i + 1], &v->block[i],
-            (size_t)(v->nblocks - i) * sizeof v->block[0]);
-    v->block[i].addr = at;
-    v->block[i].size = need;
-    v->nblocks++;
-    v->free_size -= need;
+    const uint32_t at = b + (sz - need);       /* the new block's header */
+    if (sz == need) {
+        /* The free block is consumed whole, so it leaves the list. Its
+         * predecessor has to be found the long way round when the head is the
+         * block itself. */
+        if (!prev) { prev = b; while (blk_next(prev) != b) prev = blk_next(prev); }
+        set_next(prev, blk_next(b));
+        set_head(v, blk_next(b));
+    } else {
+        set_size(b, sz - need);
+        set_head(v, blk_next(b));
+    }
+    set_next(at, vpl_start(v));
+    set_size(at, need);
+    psp_write32(v->base + VA_ALLOCED,
+                psp_read32(v->base + VA_ALLOCED) + need / 8);
     return at + VPL_HEADER;
+}
+
+/* Put a block back: into the circular list in address order, coalescing with
+ * the neighbour on each side when it is adjacent *and* free.
+ *
+ * The head ends up at the free node preceding the returned block, which is the
+ * merged block itself whenever a backward merge happened. All three frees in
+ * order.expected agree with that and with nothing simpler. */
+static void vpl_give_back(psp_vpl *v, uint32_t at) {
+    const uint32_t size = blk_size(at);
+    psp_write32(v->base + VA_ALLOCED,
+                psp_read32(v->base + VA_ALLOCED) - size / 8);
+
+    /* The free list is kept in ascending address order and closes on itself
+     * through the terminator, which is always its highest node. So the
+     * predecessor of a returned block is the greatest free node below it -- or
+     * the terminator, when there is none, because that is where the list
+     * wraps.
+     *
+     * Searching only for a node *below* `at` and giving up otherwise is what a
+     * non-circular list would want, and it put every block freed beneath the
+     * whole free list in the wrong place. */
+    uint32_t prev = vpl_term(v);
+    {
+        uint32_t b = vpl_head(v);
+        for (uint32_t guard = 0; guard < 4096; guard++) {
+            if (b < at && (prev == vpl_term(v) || b > prev)) prev = b;
+            b = blk_next(b);
+            if (b == vpl_head(v)) break;
+        }
+    }
+    const uint32_t next = blk_next(prev);
+
+    set_next(at, next);
+    set_next(prev, at);
+
+    uint32_t merged = at;
+    /* Forward first, so a three-way merge lands on the earliest node. */
+    if (at + size == next && blk_size(next) != 0) {
+        set_size(at, size + blk_size(next));
+        set_next(at, blk_next(next));
+    }
+    if (prev + blk_size(prev) == at && blk_size(prev) != 0) {
+        set_size(prev, blk_size(prev) + blk_size(at));
+        set_next(prev, blk_next(at));
+        merged = prev;
+    }
+    set_head(v, merged == at ? prev : merged);
 }
 
 /* Hand the pool to whoever is next in line and can now be satisfied. */
@@ -259,16 +396,20 @@ static void hle_FreeVpl(void) {
      * pool, and another pool's pointer are each ILLEGAL_MEMBLOCK, while a
      * pointer that is not mapped memory at all is ILLEGAL_SIZE. */
     if (ptr && !psp_mem_ptr(ptr, 4)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
-    for (int i = 0; i < v->nblocks; i++) {
-        if (v->block[i].addr + VPL_HEADER != ptr) continue;
-        v->free_size += v->block[i].size;
-        memmove(&v->block[i], &v->block[i + 1],
-                (size_t)(v->nblocks - i - 1) * sizeof v->block[0]);
-        v->nblocks--;
-        const int urgent = vpl_release(v);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        if (urgent) psp_sched_yield();
-        return;
+
+    /* Walk the chain and require an exact hit on an *allocated* node. That
+     * rejects, in one test, all five shapes free.expected tries: a second free
+     * (the node's `next` is a free-list pointer by then, not `start`), a NULL,
+     * a stack address, a pointer part-way into a block, and another pool's. */
+    if (v->base && ptr > v->base && ptr < v->base + v->total) {
+        for (uint32_t b = vpl_bottom(v); blk_size(b); b += blk_size(b))
+            if (b + VPL_HEADER == ptr && blk_next(b) == vpl_start(v)) {
+                vpl_give_back(v, b);
+                const int urgent = vpl_release(v);
+                psp_ret(SCE_KERNEL_ERROR_OK);
+                if (urgent) psp_sched_yield();
+                return;
+            }
     }
     psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_PTR);
 }
@@ -293,7 +434,7 @@ static void hle_ReferVplStatus(void) {
     psp_threadman_write_name(info + 4, v->name);
     psp_write32(info + 36, v->attr);
     psp_write32(info + 40, v->pool_size);
-    psp_write32(info + 44, v->free_size);
+    psp_write32(info + 44, vpl_free_size(v));
     psp_write32(info + 48, (uint32_t)psp_waitq_count(&v->q));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
