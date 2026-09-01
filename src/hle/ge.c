@@ -949,17 +949,25 @@ static void run_list(ge_queue *q) {
          * actually sets -- the PSP offers eleven pixel formats, four palette
          * formats and a swizzle, and building all of that before knowing which
          * are used is how a rasterizer ends up mostly untested code. */
+        /* Texture and palette addresses arrive in two registers, and the
+         * second one carries the high *nibble* -- bits 24..27 -- in its own
+         * bits 16..19, not in its low byte. Both addresses are 16-byte
+         * aligned, so the low four bits of the base are not part of it
+         * either. Taking the low byte instead reads the palette from a
+         * completely different place, which leaves texel *indices* right and
+         * every colour wrong: legible shapes, speckled everywhere. */
         case GE_TEXADDR0:
-            g_ge.tex_addr = (g_ge.tex_addr & 0xFF000000u) | (arg & 0xFFFFFFu);
+            g_ge.tex_addr = (g_ge.tex_addr & 0x0F000000u) | (arg & 0x00FFFFF0u);
             break;
         case GE_TEXBUFWIDTH0:
-            g_ge.tex_stride = arg & 0xFFFF;
-            g_ge.tex_addr   = (g_ge.tex_addr & 0x00FFFFFFu) | ((arg & 0xFF0000u) << 8);
+            g_ge.tex_stride = arg & 0x7FF;
+            g_ge.tex_addr   = (g_ge.tex_addr & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
             break;
         case GE_TEXSIZE0:
-            /* log2 of each dimension, width in the low byte. */
-            g_ge.tex_w = 1u << (arg & 0xFF);
-            g_ge.tex_h = 1u << ((arg >> 8) & 0xFF);
+            /* log2 of each dimension, four bits each. Masking a whole byte
+             * lets a stray high bit ask for a 1 << 200 texture. */
+            g_ge.tex_w = 1u << (arg & 0xF);
+            g_ge.tex_h = 1u << ((arg >> 8) & 0xF);
             break;
         case GE_TEXFORMAT:
             g_ge.tex_format = arg & 0xF;
@@ -977,13 +985,10 @@ static void run_list(ge_queue *q) {
             g_ge.clut_format = arg & 3;
             break;
         case GE_CLUTADDR:
-            g_ge.clut_addr = (g_ge.clut_addr & 0xFF000000u) | (arg & 0xFFFFFFu);
+            g_ge.clut_addr = (g_ge.clut_addr & 0x0F000000u) | (arg & 0x00FFFFF0u);
             break;
-        /* The palette address arrives in two halves and only the low one was
-         * being taken, so every CLUT pointed into the first 16MB regardless of
-         * where the game put it. */
         case GE_CLUTADDRUPPER:
-            g_ge.clut_addr = (g_ge.clut_addr & 0x00FFFFFFu) | ((arg & 0xFFu) << 24);
+            g_ge.clut_addr = (g_ge.clut_addr & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
             break;
         case GE_TEXFUNC:
             g_ge.tex_func = arg & 7;

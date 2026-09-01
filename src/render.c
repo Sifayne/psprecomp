@@ -12,6 +12,8 @@
 #include "psprecomp/render.h"
 #include "psprecomp/mem.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- shared target state ------------------------------------------------- */
@@ -59,11 +61,24 @@ static struct {
     int      w, h, fmt, func, swizzled;
 } g_tex;
 
+/* PSPRECOMP_TEXDUMP=<path> writes each distinct texture the game binds, decoded
+ * through this same sampler, as <path>-NN.ppm.
+ *
+ * "The picture is speckled" has two causes that look identical on screen: the
+ * sampler reading the wrong texels, or the texture in memory not being what we
+ * think. Decoding it standalone separates them -- if the dump is clean and the
+ * frame is not, the fault is downstream of sampling. */
+static uint32_t g_dumped[16];
+static int      g_dumped_n;
+
+static void dump_texture(void);
+
 static void sw_texture(uint32_t addr, uint32_t stride, int w, int h,
                        int fmt, int func, int swizzled) {
     g_tex.addr = addr; g_tex.stride = stride;
     g_tex.w = w; g_tex.h = h;
     g_tex.fmt = fmt; g_tex.func = func; g_tex.swizzled = swizzled;
+    dump_texture();
 }
 
 enum {
@@ -169,6 +184,34 @@ static uint32_t sample_texel(int u, int v) {
     }
     const uint32_t off = swizzled_byte((uint32_t)u * 2u, (uint32_t)v, row_bytes);
     return expand16((uint32_t)psp_read16(g_tex.addr + off), g_tex.fmt);
+}
+
+static void dump_texture(void) {
+    const char *base = getenv("PSPRECOMP_TEXDUMP");
+    if (!base || !*base || g_dumped_n >= 16) return;
+    if (!texture_usable()) return;
+    for (int i = 0; i < g_dumped_n; i++) if (g_dumped[i] == g_tex.addr) return;
+    g_dumped[g_dumped_n] = g_tex.addr;
+
+    char path[1024];
+    snprintf(path, sizeof path, "%s-%02d.ppm", base, g_dumped_n);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", g_tex.w, g_tex.h);
+    for (int v = 0; v < g_tex.h; v++)
+        for (int u = 0; u < g_tex.w; u++) {
+            const uint32_t c = sample_texel(u, v);
+            const uint8_t rgb[3] = { (uint8_t)(c & 0xFF), (uint8_t)((c >> 8) & 0xFF),
+                                     (uint8_t)((c >> 16) & 0xFF) };
+            fwrite(rgb, 1, 3, f);
+        }
+    fclose(f);
+    fprintf(stderr, "tex: %s  0x%08X %dx%d stride %u fmt %d%s clut 0x%08X fmt %d "
+                    "shift %d mask %02X start %d\n",
+            path, g_tex.addr, g_tex.w, g_tex.h, g_tex.stride, g_tex.fmt,
+            g_tex.swizzled ? " swizzled" : "", g_clut.addr, g_clut.fmt,
+            g_clut.shift, g_clut.mask, g_clut.start);
+    g_dumped_n++;
 }
 
 /* Modulate: texel times vertex colour, per channel. */
