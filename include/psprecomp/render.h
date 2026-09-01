@@ -37,6 +37,10 @@ typedef struct {
     int      enable, src, dst, eq;
     uint32_t fixa, fixb;
     int      alpha_test, alpha_func, alpha_ref, alpha_mask;
+    /* Clear mode names which buffers it clears. A depth-only clear must not
+     * touch colour -- otherwise it paints the clear colour over the frame,
+     * which looks like a wrong background rather than like a missing mask. */
+    int      write_colour;
 } psp_blend_state;
 
 /* GE primitive types, from the PRIM argument's type field. */

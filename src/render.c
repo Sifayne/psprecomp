@@ -272,7 +272,7 @@ static int depth_pass(int x, int y, float z) {
 
 /* ---- blending ------------------------------------------------------------ */
 
-static psp_blend_state g_bs;
+static psp_blend_state g_bs = { .write_colour = 1 };
 
 uint64_t psp_render_blended_pixels(void) { return g_px_blend; }
 uint64_t psp_render_alphakill_pixels(void) { return g_px_atest; }
@@ -350,6 +350,7 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
     if (!alpha_pass(rgba)) { g_px_atest++; return; }
     if (!depth_pass(x, y, z)) { g_px_zfail++; return; }
     if (g_zs.write) g_depth[y * 480 + x] = z;
+    if (!g_bs.write_colour) return;
     if (g_bs.enable) { rgba = blend(rgba, get_pixel(x, y)); g_px_blend++; }
     put_pixel(x, y, rgba);
 }

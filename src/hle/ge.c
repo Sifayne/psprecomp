@@ -28,6 +28,7 @@
 #include "psprecomp/render.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Display-list opcodes. Only the ones the walk needs to be correct about are
@@ -190,7 +191,7 @@ static struct {
     float off_x, off_y;
     int   vp_set;
     int   cull_enable, cull_ccw;
-    int   ztest_enable, ztest_func, zwrite_off, clear_mode, clear_z;
+    int   ztest_enable, ztest_func, zwrite_off, clear_mode, clear_colour, clear_z;
     psp_blend_state blend;
     /* Which matrices the stream actually uploaded, and where the result lands.
      * "Geometry is being transformed" and "transformed by the matrices the game
@@ -656,6 +657,19 @@ static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
  * primitives land in submission order. Backface culling is honoured, which
  * removes the half of a closed mesh that would otherwise paint over the half
  * in front of it, but it is not a substitute for a depth test. */
+/* PSPRECOMP_GE_DRAWLOG=<n> narrates the first n primitives: where they landed,
+ * what colour, and whether a texture was bound.
+ *
+ * The summary reports aggregates -- a bounding box over every transformed
+ * vertex, one vertex type, one texture. When one element on screen looks wrong
+ * and the rest looks right, aggregates cannot say which draw is the bad one.
+ * This can. */
+static int drawlog_left(void) {
+    static int n = -1;
+    if (n < 0) { const char *v = getenv("PSPRECOMP_GE_DRAWLOG"); n = (v && *v) ? atoi(v) : 0; }
+    return n > 0 ? n-- : 0;
+}
+
 static void draw_prim_transformed(uint32_t type, uint32_t count,
                                   int col_off, int pos_off, int tex_off, int stride) {
     enum { BATCH = 256 };
@@ -703,6 +717,31 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         }
         if (!decoded) break;
         g_xformed += decoded;
+
+        if (drawlog_left()) {
+            int x0 = v[0].x, x1 = v[0].x, y0 = v[0].y, y1 = v[0].y;
+            for (uint32_t i = 1; i < decoded; i++) {
+                if (v[i].x < x0) x0 = v[i].x;   if (v[i].x > x1) x1 = v[i].x;
+                if (v[i].y < y0) y0 = v[i].y;   if (v[i].y > y1) y1 = v[i].y;
+            }
+            fprintf(stderr, "draw: %-14s %2u verts  x %4d..%-4d y %4d..%-4d  "
+                            "rgba %08X  vtype %06X  tex %s\n",
+                    PRIM_NAME[type & 7], decoded, x0, x1, y0, y1, v[0].rgba,
+                    g_ge.vtype, (g_ge.tex_enable && tex_off >= 0 && g_ge.tex_addr)
+                                ? "yes" : "no");
+            fprintf(stderr, "      world");
+            for (int i = 0; i < 12; i++) fprintf(stderr, " %.2f", g_tl.world[i]);
+            fprintf(stderr, "\n      model v0");
+            {
+                float m[3];
+                for (uint32_t i = 0; i < decoded && i < 4; i++) {
+                    read_pos_model(g_ge.vaddr + (done + i) * (uint32_t)stride,
+                                   g_ge.vtype, pos_off, m);
+                    fprintf(stderr, "  (%.1f,%.1f,%.1f)", m[0], m[1], m[2]);
+                }
+            }
+            fprintf(stderr, "\n");
+        }
 
         /* Emit primitive by primitive rather than handing the backend the
          * batch: near-plane rejection and culling are per-primitive decisions,
@@ -786,7 +825,11 @@ static void draw_prim(uint32_t type, uint32_t count) {
          * alpha test, or the clear would be filtered by the state it is
          * supposed to be resetting. */
         psp_blend_state b = g_tl.blend;
-        if (g_tl.clear_mode) { b.enable = 0; b.alpha_test = 0; }
+        b.write_colour = 1;
+        if (g_tl.clear_mode) {
+            b.enable = 0; b.alpha_test = 0;
+            b.write_colour = g_tl.clear_colour;
+        }
         psp_render_current()->set_blend(&b);
     }
     psp_render_current()->set_depth(
@@ -824,6 +867,24 @@ static void draw_prim(uint32_t type, uint32_t count) {
         }
         if (!decoded) break;
 
+        if (drawlog_left()) {
+            int x0=v[0].x,x1=v[0].x,y0=v[0].y,y1=v[0].y;
+            for (uint32_t i=1;i<decoded;i++){
+                if(v[i].x<x0)x0=v[i].x; if(v[i].x>x1)x1=v[i].x;
+                if(v[i].y<y0)y0=v[i].y; if(v[i].y>y1)y1=v[i].y;
+            }
+            fprintf(stderr, "2d:   %-14s %2u verts  x %4d..%-4d y %4d..%-4d  "
+                            "rgba %08X %08X  vtype %06X  tex %s\n",
+                    PRIM_NAME[type & 7], decoded, x0,x1,y0,y1,
+                    v[0].rgba, v[decoded>1?1:0].rgba, g_ge.vtype,
+                    has_uv ? "yes" : "no");
+            fprintf(stderr, "      clear %s (z %d)  blend %s src %d dst %d  "
+                            "atest %s func %d ref %d\n",
+                    g_tl.clear_mode ? "ON" : "off", g_tl.clear_z,
+                    g_tl.blend.enable ? "on" : "off", g_tl.blend.src, g_tl.blend.dst,
+                    g_tl.blend.alpha_test ? "on" : "off",
+                    g_tl.blend.alpha_func, g_tl.blend.alpha_ref);
+        }
         be->draw((int)type, v, (int)decoded);
 
         if (type == 4 && decoded == BATCH && done + decoded < count)
@@ -912,10 +973,15 @@ static void run_list(ge_queue *q) {
          * NUMBER sets the write cursor, DATA advances it. Writes past the end
          * are dropped: a list can be read while the CPU is still writing it,
          * and wrapping the cursor would scribble over elements already set. */
-        case GE_WORLDMATRIXNUMBER: g_tl.world_n = (int)(arg & 0xF); break;
+        case GE_WORLDMATRIXNUMBER:
+            if (drawlog_left()) fprintf(stderr, "mtx: WORLD NUMBER arg=%06X -> %d\n",
+                                        arg, (int)(arg & 0xF));
+            g_tl.world_n = (int)(arg & 0xF); break;
         case GE_VIEWMATRIXNUMBER:  g_tl.view_n  = (int)(arg & 0xF); break;
         case GE_PROJMATRIXNUMBER:  g_tl.proj_n  = (int)(arg & 0x1F); break;
         case GE_WORLDMATRIXDATA:
+            if (drawlog_left()) fprintf(stderr, "mtx: WORLD DATA  arg=%06X -> [%d] = %.2f\n",
+                                        arg, g_tl.world_n, ge_float(arg));
             if (g_tl.world_n < 12) g_tl.world[g_tl.world_n++] = ge_float(arg);
             g_tl.world_words++;
             break;
@@ -1023,8 +1089,14 @@ static void run_list(ge_queue *q) {
         /* Clear mode turns the draw into a blit of the clear values: the depth
          * test is bypassed and depth is written only when the Z bit is set. */
         case GE_CLEARMODE:
-            g_tl.clear_mode = (int)(arg & 1);
-            g_tl.clear_z    = (int)((arg >> 10) & 1);
+            if (drawlog_left())
+                fprintf(stderr, "clr: CLEARMODE arg=%06X  enable %d  colour %d "
+                                "alpha %d  depth %d\n",
+                        arg, (int)(arg & 1), (int)((arg >> 8) & 1),
+                        (int)((arg >> 9) & 1), (int)((arg >> 10) & 1));
+            g_tl.clear_mode   = (int)(arg & 1);
+            g_tl.clear_colour = (int)((arg >> 8) & 1);
+            g_tl.clear_z      = (int)((arg >> 10) & 1);
             break;
 
         case GE_TRANSFERSRC:    g_ge.xfer_src    = arg; break;
