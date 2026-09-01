@@ -240,6 +240,7 @@ static void wait_deadlock(const char *what) {
  * sceKernelWaitThreadEnd, which is a thread operation that happens to be a
  * wait and so lives with the threads. */
 static int sema_release(psp_sema *s);
+static int32_t sema_would_absorb(const psp_sema *s, int32_t count);
 
 /* ---- threads ------------------------------------------------------------- */
 
@@ -1135,8 +1136,9 @@ static void hle_SignalSema(void) {
     /* Past the maximum is refused, not clamped, and nothing moves.
      * semaphores/signal asks a 0/1 semaphore for +2 and gets SEMA_OVF with the
      * count still reading 0 on the very next line. */
-    const int32_t by = (int32_t)psp_arg(1);
-    if (s->max_count > 0 && s->count + by > s->max_count) {
+    const int32_t by    = (int32_t)psp_arg(1);
+    const int32_t after = s->count + by;
+    if (s->max_count > 0 && after - sema_would_absorb(s, after) > s->max_count) {
         psp_ret(SCE_KERNEL_ERROR_SEMA_OVF);
         return;
     }
@@ -1244,6 +1246,27 @@ static void hle_DeleteCallback(void) {
  *
  * That is also why this runs whenever the queue *changes*, not only on a
  * signal. A waiter leaving on its own timeout can unblock the one behind it. */
+/* How much of `count` the queue would take if it were released now. The
+ * overflow check needs it: a signal that puts the count past the maximum is
+ * refused, but only if it would still be past it once the waiters have had
+ * theirs. semaphores/signal refuses +2 on an idle 0/1 semaphore and allows the
+ * same +2 on one with a thread queued for 1.
+ *
+ * The queue is copied rather than walked in place, because working out the
+ * answer means consuming it and the answer may be "refuse, change nothing". */
+static int32_t sema_would_absorb(const psp_sema *s, int32_t count) {
+    psp_waitq q = s->q;
+    int32_t taken = 0;
+    for (;;) {
+        const int i = psp_waitq_pick(&q, s->attr);
+        if (i < 0 || count < (int32_t)q.w[i].need) break;
+        const psp_waiter w = psp_waitq_take(&q, i);
+        count -= (int32_t)w.need;
+        taken += (int32_t)w.need;
+    }
+    return taken;
+}
+
 static int sema_release(psp_sema *s) {
     int urgent = 0;
     for (;;) {
