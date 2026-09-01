@@ -1,7 +1,8 @@
 /* psprecomp — the smaller firmware libraries.
  *
  * Kernel_Library, UtilsForUser, StdioForUser, sceSuspendForUser,
- * LoadExecForUser, ModuleMgrForUser, sceCtrl and sceAudio. Individually small,
+ * LoadExecForUser, ModuleMgrForUser, sceCtrl, sceAudio and scePower.
+ * Individually small,
  * but collectively they are what a game's C runtime needs before main() gets
  * anywhere -- newlib's reentrancy setup alone wants interrupt masking, a
  * clock, and the standard file descriptors.
@@ -19,6 +20,25 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <time.h>
+
+/* ---- scePower -------------------------------------------------------------
+ *
+ * scePowerRegisterCallback(slot, cb) is the first half of the single most
+ * common idiom in a PSP program: register a callback, then sleep in
+ * sceKernelSleepThreadCB waiting for the home button.
+ *
+ * Registering *fires* it. That is not a detail of ours -- callbacks/notify
+ * says so on the line that calls it, `scePowerRegisterCallback (causes
+ * notify)`, and proves it two lines later by reading the accumulated count
+ * back as 2 after a single manual notify. The guest learns the current power
+ * state without having to ask for it separately.
+ *
+ * The slot argument is ignored: nothing here ever raises a second power event,
+ * so there is no bookkeeping a slot would serve. */
+static void hle_PowerRegisterCallback(void) {
+    const uint32_t cb = psp_arg(1);
+    psp_ret(psp_threadman_notify_callback(cb, 0));
+}
 
 /* ---- Kernel_Library ------------------------------------------------------
  * Interrupt masking. With no interrupts to mask, the pair only has to be
@@ -533,6 +553,8 @@ void psp_misc_init(void) {
 }
 
 void psp_misc_register(void) {
+    psp_hle_register(0x04B7766E, "scePower", "scePowerRegisterCallback", hle_PowerRegisterCallback);
+
     psp_hle_register(0x092968F4, "Kernel_Library", "sceKernelCpuSuspendIntr", hle_CpuSuspendIntr);
     psp_hle_register(0x5F10D406, "Kernel_Library", "sceKernelCpuResumeIntr",  hle_CpuResumeIntr);
 

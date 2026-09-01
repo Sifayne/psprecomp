@@ -1712,11 +1712,11 @@ static void hle_CreateCallback(void) {
  * it collects the whole accumulation the next time it asks. callbacks/notify
  * fires it 10002 times and the handler is entered *once*, with 0x2712 in its
  * first argument. */
-static void hle_NotifyCallback(void) {
-    psp_callback *c = find_cb(psp_arg(0));
-    if (!c) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_CBID); return; }
+uint32_t psp_threadman_notify_callback(uint32_t cbid, uint32_t arg) {
+    psp_callback *c = find_cb(cbid);
+    if (!c) return SCE_KERNEL_ERROR_UNKNOWN_CBID;
     c->notify_count++;
-    c->notify_arg = psp_arg(1);
+    c->notify_arg = arg;
     /* If the owner is parked in a CB wait, this ends it. callbacks/notify has
      * two threads sitting in sceKernelSleepThreadCB that are never woken by
      * name at all -- the handler lines they print are the only evidence they
@@ -1726,7 +1726,11 @@ static void hle_NotifyCallback(void) {
         owner->cb_wake = 1;
         psp_sched_wake(owner->uid);
     }
-    psp_ret(SCE_KERNEL_ERROR_OK);
+    return SCE_KERNEL_ERROR_OK;
+}
+
+static void hle_NotifyCallback(void) {
+    psp_ret(psp_threadman_notify_callback(psp_arg(0), psp_arg(1)));
 }
 
 /* sceKernelGetThreadExitStatus(thid)

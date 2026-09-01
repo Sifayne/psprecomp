@@ -373,6 +373,9 @@ uint32_t psp_threadman_current_priority(void);
 /* Deliver the current thread's pending callbacks, returning whether any ran.
  * Every firmware call whose name ends in CB is a wait that does this first. */
 int psp_threadman_run_callbacks(void);
+/* Raise a callback from outside threadman -- scePowerRegisterCallback fires one
+ * as it registers. Returns what sceKernelNotifyCallback would. */
+uint32_t psp_threadman_notify_callback(uint32_t cbid, uint32_t arg);
 
 /* Shared with the other kernel object types: one uid space, and one way of
  * writing a name into a SceKernel*Info block. */
