@@ -512,6 +512,15 @@ static void hle_TerminateThread(void);
  * terminate-delete and delete, and delete is the only one of the three that
  * answers `800201a4` to a thread that is ready, waiting, suspended or running
  * -- including the caller itself, which is what an id of 0 names here. */
+/* A callback belongs to the thread that created it and does not outlive it.
+ * callbacks/delete terminates and deletes the thread that registered one, then
+ * deletes the callback and gets UNKNOWN_CBID -- so the thread took it with it.
+ * Both delete calls need this, which is why it is not written out twice. */
+static void drop_callbacks_of(uint32_t thread_uid) {
+    for (int i = 0; i < MAX_CBS; i++)
+        if (g_cb[i].used && g_cb[i].thread == thread_uid) g_cb[i].used = 0;
+}
+
 static void hle_DeleteThread(void) {
     const uint32_t id = psp_arg(0) ? psp_arg(0) : psp_sched_current();
     psp_thread *t = find_thread(id);
@@ -525,6 +534,7 @@ static void hle_DeleteThread(void) {
      * is already gone, which is the common case. */
     psp_sched_cancel_spawn(t->uid);
     release_stack(t);
+    drop_callbacks_of(t->uid);
     t->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -913,6 +923,7 @@ static void hle_TerminateDeleteThread(void) {
     }
     psp_sched_cancel_spawn(t->uid);
     release_stack(t);
+    drop_callbacks_of(t->uid);
     t->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
