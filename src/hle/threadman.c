@@ -644,7 +644,14 @@ static void hle_WaitThreadEnd(void) {
     psp_ret(t->exit_status);
 }
 
-static void hle_GetThreadId(void) { psp_ret(psp_sched_current()); }
+static void hle_GetThreadId(void) {
+    /* A handler runs on no thread, so there is no id to give back.
+     * threads/alarm/alarm compares the answer against both threads it created
+     * and prints -1 when it matches neither -- which it will not, since no
+     * thread has uid zero. */
+    if (psp_ktimer_in_handler()) { psp_ret(0); return; }
+    psp_ret(psp_sched_current());
+}
 
 /* ---- the clock ------------------------------------------------------------
  *

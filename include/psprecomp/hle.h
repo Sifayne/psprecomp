@@ -488,6 +488,11 @@ uint32_t psp_sysmem_free(void);
  * is simply wrong for a module that is not in user RAM at all. */
 void psp_sysmem_reserve_module(uint32_t lo, uint32_t hi);
 
+/* Whether an alarm or vtimer handler is running right now. Nonzero means the
+ * caller is on no thread at all -- see the header of src/hle/ktimer.c -- which
+ * sceKernelGetThreadId has to report and cannot work out for itself. */
+int psp_ktimer_in_handler(void);
+
 /* Raw allocation for use by other HLE subsystems (thread stacks, mostly).
  * Returns 0 on failure. These bypass the UID table because nothing in the
  * guest ever refers to them. */

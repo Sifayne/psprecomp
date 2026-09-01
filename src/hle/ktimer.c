@@ -44,6 +44,8 @@ static psp_alarm g_alarm[MAX_ALARMS];
  * is picked up by the next firmware call. */
 static int g_firing;
 
+int psp_ktimer_in_handler(void) { return g_firing; }
+
 /* Both halves of this file are reset and ticked together; the vtimer side is
  * defined below. */
 static void vtimer_reset(void);
