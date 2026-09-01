@@ -35,6 +35,7 @@ static int             g_running = MAIN_SLOT;
 static void          (*g_end_hook)(uint32_t uid, uint32_t status);
 static void          (*g_thread_hook)(void);
 static int             g_threading = 1;
+static const char     *g_stop_reason;
 
 /* Which slot this host thread *is*, as opposed to which slot holds the token.
  *
@@ -73,6 +74,7 @@ void psp_sched_reset(void) {
      * to. Reset is a bring-up convenience between runs in one process, not a
      * teardown. */
     memset(g_slot, 0, sizeof g_slot);
+    g_stop_reason = NULL;
     g_slot[MAIN_SLOT].used     = 1;
     g_slot[MAIN_SLOT].uid      = 0;
     g_slot[MAIN_SLOT].state    = PSP_SCHED_RUNNING;
@@ -524,7 +526,10 @@ static int live_locked(void) {
     return live;
 }
 
-void psp_sched_stop_all(void) {
+void psp_sched_stop_all(const char *why) {
+    /* Recorded before anything is killed: the caller is a guest thread that
+     * will not exist past the pthread_exit below. */
+    g_stop_reason = why;
     pthread_mutex_lock(&g_lock);
     const int me = g_running;
     for (int i = 1; i < MAX_SCHED_THREADS; i++)
@@ -534,6 +539,10 @@ void psp_sched_stop_all(void) {
     pthread_cond_broadcast(&g_turn);
     pthread_mutex_unlock(&g_lock);
     if (me != MAIN_SLOT) pthread_exit(NULL);
+}
+
+const char *psp_sched_stop_reason(void) {
+    return g_stop_reason;
 }
 
 int psp_sched_drain(int timeout_s) {

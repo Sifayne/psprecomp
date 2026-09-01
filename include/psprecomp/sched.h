@@ -135,7 +135,15 @@ void psp_sched_set_end_hook(void (*fn)(uint32_t uid, uint32_t status));
  * discover it, rather than by jumping.
  *
  * Does not return when called from a guest thread. */
-void psp_sched_stop_all(void);
+void psp_sched_stop_all(const char *why);
+
+/* Why the run was force-stopped, or NULL if every thread ended on its own.
+ *
+ * drain answers "how many threads are still alive", and a stopped run answers
+ * zero -- indistinguishable from a run that finished. The boot summary used to
+ * print "all finished" for a run the host had just killed, which read as
+ * success. This is the difference. */
+const char *psp_sched_stop_reason(void);
 
 /* Run until every guest thread is dead, nothing can make progress, or
  * `timeout_s` elapses. Called from the main context once module_start has

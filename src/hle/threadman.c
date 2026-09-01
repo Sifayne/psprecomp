@@ -172,7 +172,9 @@ static void wait_deadlock(const char *what) {
         "  timeout would make the guest act on a falsehood, so the run stops\n"
         "  here instead. Live threads:\n", what);
     psp_sched_dump_threads(stderr);
-    psp_sched_stop_all();
+    /* The reason rides along so the boot summary can tell a stopped run from
+     * one that finished -- both leave zero threads alive. */
+    psp_sched_stop_all(what);
 }
 
 static void warn_block(const char *what) {
