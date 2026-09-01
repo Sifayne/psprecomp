@@ -15,6 +15,7 @@
 #include "waitq.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- vpl: the variable-size pool ------------------------------------------
@@ -1661,7 +1662,6 @@ void psp_kernobj_register_fpl(void) {
  */
 
 #define MAX_TLSPLS 32
-#define MAX_TLS_BLOCKS 64
 #define TLSPL_ATTR_KNOWN 0x41FFu
 
 typedef struct {
@@ -1673,7 +1673,11 @@ typedef struct {
      * option struct's alignment rounds it up. Reported size stays block_size. */
     uint32_t  stride;
     uint32_t  cursor;                  /* where the next search starts */
-    uint32_t  owner[MAX_TLS_BLOCKS];   /* thread uid holding each block, 0 free */
+    /* Thread uid holding each block, 0 free. One entry per block and the
+     * count is the guest's: tls/create asks for 0x1000 blocks of 0x100 bytes
+     * and hardware allocates the megabyte, so what bounds a pool is the memory
+     * it needs and not a bound of ours. */
+    uint32_t *owner;
     int       alive;
     psp_waitq q;
 } psp_tlspl;
@@ -1681,8 +1685,10 @@ typedef struct {
 static psp_tlspl g_tls[MAX_TLSPLS];
 
 static void tls_reset(void) {
-    for (int i = 0; i < MAX_TLSPLS; i++)
+    for (int i = 0; i < MAX_TLSPLS; i++) {
         if (g_tls[i].alive && g_tls[i].base) psp_sysmem_release(g_tls[i].base);
+        free(g_tls[i].owner);
+    }
     memset(g_tls, 0, sizeof g_tls);
 }
 
@@ -1712,7 +1718,6 @@ static void hle_CreateTlspl(void) {
     if (attr & ~TLSPL_ATTR_KNOWN) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
     if (bsize == 0 || (int32_t)bsize < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
     if (count == 0 || (int32_t)count < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
-    if (count > MAX_TLS_BLOCKS) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     /* The option block's second word is an alignment, and it rounds the block
      * up rather than merely placing the pool. tls/get creates one-byte blocks
@@ -1733,6 +1738,11 @@ static void hle_CreateTlspl(void) {
         if (a > align) align = a;
     }
     const uint32_t stride = (bsize + align - 1) & ~(align - 1);
+    /* A pool whose size does not fit in a word is an illegal *size*, where one
+     * that merely does not fit in memory is out of memory: 0x1000 blocks of
+     * 0x100 is a megabyte and succeeds, 0x10000 of them answers NO_MEMORY, and
+     * 0x1000000 -- which is exactly 2^32 bytes -- answers ILLEGAL_MEMSIZE. */
+    if (count > 0xFFFFFFFFu / stride) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
 
     const uint32_t base = psp_sysmem_alloc(stride * count, 0);
     if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
@@ -1752,7 +1762,11 @@ static void hle_CreateTlspl(void) {
     for (int i = 0; i < MAX_TLSPLS; i++) if (!g_tls[i].alive) { t = &g_tls[i]; break; }
     if (!t) { psp_sysmem_release(base); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
+    uint32_t *owner = (uint32_t *)calloc(count, sizeof *owner);
+    if (!owner) { psp_sysmem_release(base); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
     memset(t, 0, sizeof *t);
+    t->owner = owner;
     psp_str(name, t->name, sizeof t->name);
     t->attr = attr; t->index = index;
     t->base = base; t->block_size = bsize; t->nblocks = count;
@@ -1767,6 +1781,8 @@ static void hle_DeleteTlspl(void) {
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_TLSPLID); return; }
     const int urgent = psp_waitq_release_all(&t->q);
     if (t->base) psp_sysmem_release(t->base);
+    free(t->owner);
+    t->owner = NULL;
     t->alive = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_yield();
