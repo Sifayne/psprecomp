@@ -11,6 +11,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
+#include <stdlib.h>
 #include <time.h>
 
 /* ---- Kernel_Library ------------------------------------------------------
@@ -74,6 +76,44 @@ static void hle_Stdout(void) { psp_ret(1); }
 static void hle_Stderr(void) { psp_ret(2); }
 
 /* ---- sceSuspendForUser --------------------------------------------------- */
+
+/* Volatile memory: the 4MB between the kernel area and user RAM.
+ *
+ * It belongs to the UMD cache, and a game may borrow it -- typically as the
+ * scratch buffer it decompresses an archive into. The call reports the block
+ * back through two out-parameters, and a stub that returned "success" while
+ * writing neither left the game holding a null pointer and a length of zero. It
+ * then walked a table through that pointer, which is how this surfaced: an
+ * endless run of bad accesses just past the end of .bss, in a structure whose
+ * two neighbouring fields were the very pointers passed in here.
+ *
+ * Bounds from PPSSPP's Core/MemMap.h:
+ *   PSP_GetVolatileMemoryStart() == 0x08400000
+ *   PSP_GetVolatileMemoryEnd()   == 0x08800000
+ * which is below the user heap, so nothing else hands it out. */
+#define PSP_VOLATILE_BASE 0x08400000u
+#define PSP_VOLATILE_SIZE 0x00400000u
+
+static int g_volatile_held;
+
+static void volatile_grant(void) {
+    const uint32_t ptr_out = psp_arg(1), size_out = psp_arg(2);
+    if (ptr_out)  psp_write32(ptr_out,  PSP_VOLATILE_BASE);
+    if (size_out) psp_write32(size_out, PSP_VOLATILE_SIZE);
+    g_volatile_held = 1;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Lock blocks until the block is free; nothing else here ever takes it, so it
+ * is always free and the two differ only in what they would do under
+ * contention. TryLock is the one games actually call. */
+static void hle_VolatileMemLock(void)    { volatile_grant(); }
+static void hle_VolatileMemTryLock(void) { volatile_grant(); }
+
+static void hle_VolatileMemUnlock(void) {
+    g_volatile_held = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 /* Power management around suspend. Nothing suspends here. */
 static void hle_ok(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
@@ -134,8 +174,53 @@ void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
 
 static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
+/* PSPRECOMP_PAD=start,cross holds those buttons for the whole run.
+ *
+ * There is no window and no gamepad here, so the pad reads neutral and a game
+ * sits on its title screen forever waiting for a press. Being able to hold a
+ * button is what gets bring-up past that -- it is the difference between
+ * "renders a menu" and "renders whatever is behind the menu". Read once, on
+ * the first poll, because a game asks about the pad every frame. */
+static uint32_t parse_pad(void) {
+    static const struct { const char *name; uint32_t bit; } B[] = {
+        { "select",   0x000001 }, { "start",    0x000008 },
+        { "up",       0x000010 }, { "right",    0x000020 },
+        { "down",     0x000040 }, { "left",     0x000080 },
+        { "ltrigger", 0x000100 }, { "rtrigger", 0x000200 },
+        { "l",        0x000100 }, { "r",        0x000200 },
+        { "triangle", 0x001000 }, { "circle",   0x002000 },
+        { "cross",    0x004000 }, { "square",   0x008000 },
+    };
+    const char *v = getenv("PSPRECOMP_PAD");
+    if (!v || !*v) return 0;
+
+    uint32_t held = 0;
+    for (const char *p = v; *p; ) {
+        while (*p == ',' || *p == ' ') p++;
+        if (!*p) break;
+        size_t n = 0;
+        while (p[n] && p[n] != ',' && p[n] != ' ') n++;
+
+        int matched = 0;
+        for (size_t i = 0; i < sizeof B / sizeof B[0]; i++) {
+            if (strlen(B[i].name) == n && !strncasecmp(B[i].name, p, n)) {
+                held |= B[i].bit; matched = 1; break;
+            }
+        }
+        if (!matched)
+            fprintf(stderr, "psprecomp: PSPRECOMP_PAD: unknown button \"%.*s\"\n",
+                    (int)n, p);
+        p += n;
+    }
+    if (held) fprintf(stderr, "psprecomp: holding pad buttons 0x%06X\n", held);
+    return held;
+}
+
 /* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16. */
 static void hle_ReadBufferPositive(void) {
+    static int looked;
+    if (!looked) { looked = 1; g_buttons |= parse_pad(); }
+
     uint32_t buf = psp_arg(0), count = psp_arg(1);
     if (!count) count = 1;
     for (uint32_t i = 0; i < count; i++) {
@@ -220,6 +305,12 @@ void psp_misc_register(void) {
 
     psp_hle_register(0xEADB1BD7, "sceSuspendForUser", "sceKernelPowerLock",   hle_ok);
     psp_hle_register(0x3AEE7261, "sceSuspendForUser", "sceKernelPowerUnlock", hle_ok);
+    psp_hle_register(0x3E0271D3, "sceSuspendForUser", "sceKernelVolatileMemLock",
+                     hle_VolatileMemLock);
+    psp_hle_register(0xA14F40B2, "sceSuspendForUser", "sceKernelVolatileMemTryLock",
+                     hle_VolatileMemTryLock);
+    psp_hle_register(0xA569E425, "sceSuspendForUser", "sceKernelVolatileMemUnlock",
+                     hle_VolatileMemUnlock);
     psp_hle_register(0x090CCB3F, "sceSuspendForUser", "sceKernelPowerTick",   hle_ok);
 
     psp_hle_register(0x05572A5F, "LoadExecForUser", "sceKernelExitGame",             hle_ExitGame);
@@ -240,6 +331,9 @@ void psp_misc_register(void) {
     psp_hle_register(0x1F4011E6, "sceCtrl", "sceCtrlSetSamplingMode",     hle_CtrlSet);
     psp_hle_register(0x6A2774F3, "sceCtrl", "sceCtrlSetSamplingCycle",    hle_CtrlSet);
     psp_hle_register(0x1F803938, "sceCtrl", "sceCtrlReadBufferPositive",  hle_ReadBufferPositive);
+    /* Peek differs only in not waiting for the next sample. Nothing samples
+     * here, so the two are the same call. */
+    psp_hle_register(0x3A622550, "sceCtrl", "sceCtrlPeekBufferPositive",  hle_ReadBufferPositive);
 
     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
