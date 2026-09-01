@@ -363,9 +363,19 @@ static void hle_ExitThread(void) {
 
 static void hle_TerminateThread(void);
 
+/* Delete frees a thread; it does not stop one, and it refuses anything it would
+ * have to stop. threads/terminate runs the same ten cases through terminate,
+ * terminate-delete and delete, and delete is the only one of the three that
+ * answers `800201a4` to a thread that is ready, waiting, suspended or running
+ * -- including the caller itself, which is what an id of 0 names here. */
 static void hle_DeleteThread(void) {
-    psp_thread *t = find_thread(psp_arg(0));
+    const uint32_t id = psp_arg(0) ? psp_arg(0) : psp_sched_current();
+    psp_thread *t = find_thread(id);
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    if (t->ever_started && t->state != TH_DORMANT) {
+        psp_ret(SCE_KERNEL_ERROR_NOT_DORMANT);
+        return;
+    }
     /* Deleting a thread the guest never let start has to un-start it too --
      * sched.h says this happens here and it did not. Harmless when the thread
      * is already gone, which is the common case. */
