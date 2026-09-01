@@ -1414,13 +1414,16 @@ static void hle_WaitEventFlag(void) {
     const uint32_t out     = psp_arg(3);
     const uint32_t tmo_ptr = psp_arg(4);
 
-    /* Arguments before the handle, which is the order hardware uses and is
-     * observable. events/wait/wait.expected answers a wait for *no bits* on a
-     * NULL, invalid or deleted flag with EVF_ILPAT rather than UNKNOWN_EVFID,
-     * and a wrong mode on a NULL flag with ILLEGAL_MODE -- so both checks see
-     * the arguments before anything has looked the object up. */
-    if (bits == 0) { psp_ret(SCE_KERNEL_ERROR_EVF_ILPAT); return; }
+    /* Arguments before the handle, and the mode before the pattern. Both parts
+     * are observable and the second was backwards here.
+     *
+     * events/wait answers a wait for *no bits* on a NULL, invalid or deleted
+     * flag with EVF_ILPAT rather than UNKNOWN_EVFID, so the argument checks run
+     * before the lookup. And with no bits *and* a bad mode --
+     * `Wrong (0x04) 0x00000000` -- it answers ILLEGAL_MODE, not EVF_ILPAT, so
+     * the mode is checked first. events/poll prints the identical pair. */
     if (flag_mode_bad(mode)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MODE); return; }
+    if (bits == 0) { psp_ret(SCE_KERNEL_ERROR_EVF_ILPAT); return; }
 
     psp_evflag *f = find_flag(id);
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
@@ -1529,8 +1532,8 @@ static void hle_PollEventFlag(void) {
     const uint32_t mode = psp_arg(2);
     const uint32_t out  = psp_arg(3);
 
-    if (bits == 0)           { psp_ret(SCE_KERNEL_ERROR_EVF_ILPAT); return; }
     if (flag_mode_bad(mode)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MODE); return; }
+    if (bits == 0)           { psp_ret(SCE_KERNEL_ERROR_EVF_ILPAT); return; }
 
     psp_evflag *f = find_flag(id);
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
