@@ -308,18 +308,25 @@ static psp_interp_status exec_simple(const a_insn *in) {
         psp_write_f32(R(in->rs) + in->imm, psp_cpu.f[in->ft]);
         trace_mem('F', R(in->rs) + in->imm, psp_f32_to_bits(psp_cpu.f[in->ft]));
         return I_RUNNING;
-    case A_ADD_S: psp_cpu.f[in->fd] = psp_cpu.f[in->fs] + psp_cpu.f[in->ft]; return I_RUNNING;
-    case A_SUB_S: psp_cpu.f[in->fd] = psp_cpu.f[in->fs] - psp_cpu.f[in->ft]; return I_RUNNING;
-    case A_MUL_S: psp_cpu.f[in->fd] = psp_cpu.f[in->fs] * psp_cpu.f[in->ft]; return I_RUNNING;
-    case A_DIV_S: psp_cpu.f[in->fd] = psp_cpu.f[in->fs] / psp_cpu.f[in->ft]; return I_RUNNING;
+    /* Through psp_f* rather than the bare operator: FCR31's rounding mode and
+     * flush-to-zero change the result. Default state is a plain float op. */
+    case A_ADD_S:
+        psp_cpu.f[in->fd] = psp_fadd(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
+        return I_RUNNING;
+    case A_SUB_S:
+        psp_cpu.f[in->fd] = psp_fsub(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
+        return I_RUNNING;
+    case A_MUL_S:
+        psp_cpu.f[in->fd] = psp_fmul(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
+        return I_RUNNING;
+    case A_DIV_S:
+        psp_cpu.f[in->fd] = psp_fdiv(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
+        return I_RUNNING;
     case A_MOV_S: psp_cpu.f[in->fd] =  psp_cpu.f[in->fs];                    return I_RUNNING;
     case A_NEG_S: psp_cpu.f[in->fd] = -psp_cpu.f[in->fs];                    return I_RUNNING;
     case A_ABS_S: psp_cpu.f[in->fd] = psp_fabs (psp_cpu.f[in->fs]);          return I_RUNNING;
-    /* psp_fsqrt answers NaN for an infinity, which is right for a rasteriser
-     * -- it is a general helper -- and wrong here: sqrt(+inf) is +inf. */
     case A_SQRT_S:
-        psp_cpu.f[in->fd] = (psp_f32_to_bits(psp_cpu.f[in->fs]) == 0x7F800000u)
-                          ? psp_cpu.f[in->fs] : psp_fsqrt(psp_cpu.f[in->fs]);
+        psp_cpu.f[in->fd] = psp_fsqrt_cop1(psp_cpu.f[in->fs]);
         return I_RUNNING;
     case A_CVT_S_W:
         psp_cpu.f[in->fd] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[in->fs]);

@@ -342,6 +342,163 @@ static inline uint32_t psp_f32_to_i32(float v, int rm) {
     return (uint32_t)(int32_t)r;
 }
 
+/* ---- FCR31's effect on arithmetic ---------------------------------------
+ *
+ * Two fields of the control/status register change what add/sub/mul/div
+ * *produce*, not merely what they record: the rounding mode (RM, bits 0..1)
+ * and flush-to-zero (FS, bit 24). cpu/fpu/fpu measures both -- one multiply
+ * gives four different answers under the four rounding modes, and a denormal
+ * result becomes zero when FS is set.
+ *
+ * The host FPU always rounds to nearest-even, so a directed mode is emulated
+ * rather than delegated. Not with fesetround(): honouring it requires
+ * `#pragma STDC FENV_ACCESS ON`, which GCC does not actually implement, so an
+ * optimiser is free to move arithmetic across the mode change -- and the
+ * generated C is compiled at -O2. Getting a wrong answer from a compiler
+ * reordering is worse than the arithmetic being slightly slower.
+ *
+ * Instead: compute in double, which is wide enough to be *exact* for float
+ * add, sub and mul, then round once to float in the requested direction. For
+ * division the double quotient is not exact, but binary64 carries 53 bits
+ * against the 2p+2 = 50 needed to decide a binary32 quotient, so rounding it
+ * to float still lands on the same value a correctly-rounded float division
+ * would -- there is no double-rounding error for any of the four.
+ *
+ * The default state is RN with FS clear, which is what the PSP boots into and
+ * what every game stays in, so that path stays a plain float operation and
+ * pays nothing. */
+#define PSP_FCR31_FS      (1u << 24)
+#define PSP_FPU_DEFAULT(f) (((f) & (PSP_FCR31_FS | 3u)) == 0u)
+
+/* One ULP along the real line. ±0 steps to the smallest denormal of the
+ * target sign rather than across it, which is why zero is special-cased. */
+static inline float psp_nextup(float v) {
+    const uint32_t b = psp_f32_to_bits(v);
+    if ((b & 0x7FFFFFFFu) == 0u) return psp_bits_to_f32(0x00000001u);
+    return psp_bits_to_f32((b & 0x80000000u) ? b - 1u : b + 1u);
+}
+static inline float psp_nextdown(float v) {
+    const uint32_t b = psp_f32_to_bits(v);
+    if ((b & 0x7FFFFFFFu) == 0u) return psp_bits_to_f32(0x80000001u);
+    return psp_bits_to_f32((b & 0x80000000u) ? b + 1u : b - 1u);
+}
+
+/* Round an exact double to float under an explicit mode.
+ *
+ * Overflow falls out of this rather than needing a case: an exact value past
+ * FLT_MAX rounds to +inf under RN, and stepping one ULP down from +inf is
+ * FLT_MAX -- which is exactly what RZ and RM are supposed to give. NaN
+ * survives because every comparison against it is false. */
+static inline float psp_round_mode(double exact, int rm) {
+    const float n = (float)exact;                  /* nearest, ties to even */
+    if ((rm & 3) == PSP_RM_RN) return n;
+    const double dn = (double)n;
+    if (dn == exact) return n;                     /* representable; no direction to pick */
+    switch (rm & 3) {
+    case PSP_RM_RP: return (dn < exact) ? psp_nextup(n)   : n;
+    case PSP_RM_RM: return (dn > exact) ? psp_nextdown(n) : n;
+    default:                                       /* RZ */
+        if (exact > 0.0 && dn > exact) return psp_nextdown(n);
+        if (exact < 0.0 && dn < exact) return psp_nextup(n);
+        return n;
+    }
+}
+
+static inline float psp_fpu_arith(double exact, uint32_t fcr31) {
+    float r = psp_round_mode(exact, (int)(fcr31 & 3u));
+    if (fcr31 & PSP_FCR31_FS) {                    /* denormal -> zero, sign kept */
+        const uint32_t b = psp_f32_to_bits(r);
+        if ((b & 0x7F800000u) == 0u) r = psp_bits_to_f32(b & 0x80000000u);
+    }
+    return r;
+}
+
+/* The five IEEE exceptions, in the order FCR31 packs them. The same five bits
+ * appear twice: Cause at 12..16, rewritten by every operation, and Flags at
+ * 2..6, sticky until software clears them. That the two fields share an order
+ * is what makes the update one shift each.
+ *
+ * The encoding was not assumed -- it is what cpu/fpu/fcr measures. Each of its
+ * four situations pins it exactly:
+ *
+ *   sqrt(-1), 0/0, NaN*NaN  -> 0x00010040 = V   at cause 16, flag 6
+ *   FLT_MAX * FLT_MAX       -> 0x00005014 = O|I at cause 14,12 flag 4,2
+ *   1.0 / FLT_MAX           -> 0x0000300C = U|I
+ *   1.0 / 3.0               -> 0x00001004 = I
+ */
+#define PSP_FE_I  1u
+#define PSP_FE_U  2u
+#define PSP_FE_O  4u
+#define PSP_FE_Z  8u
+#define PSP_FE_V  16u
+#define PSP_FCR31_CAUSE 0x0001F000u
+
+/* Which exceptions this result raised. `exact` is the infinitely-precise
+ * answer as a double, which for all four operations is either exact or close
+ * enough to decide every one of these. */
+static inline uint32_t psp_fpu_except(double exact, float r, int div_by_zero) {
+    if (r != r) return PSP_FE_V;                    /* any NaN result is invalid */
+    const uint32_t rb = psp_f32_to_bits(r) & 0x7F800000u;
+    if (rb == 0x7F800000u) {                        /* infinite result */
+        if (div_by_zero) return PSP_FE_Z;
+        /* Infinite because the operands were, or because we overflowed? Only
+         * the second is an exception, and `exact` distinguishes them: a double
+         * holds FLT_MAX*FLT_MAX finitely. */
+        return (exact == exact && exact - exact != exact - exact)
+             ? 0u : (PSP_FE_O | PSP_FE_I);
+    }
+    uint32_t c = ((double)r != exact) ? PSP_FE_I : 0u;
+    /* Tiny *and* inexact is underflow. A denormal that is exactly
+     * representable has lost nothing and raises neither. */
+    if (rb == 0u && (c & PSP_FE_I) && exact != 0.0) c |= PSP_FE_U;
+    return c;
+}
+
+static inline void psp_fpu_raise(uint32_t c) {
+    psp_cpu.fcr31 = (psp_cpu.fcr31 & ~PSP_FCR31_CAUSE) | (c << 12) | (c << 2);
+}
+
+/* One operation: round it under the current mode, flush it if FS says so, and
+ * record what it raised. Kept in one place because every caller needs all
+ * three and doing two of them is a subtly wrong FPU. */
+static inline float psp_fpu_op(double exact, int div_by_zero) {
+    const float r = psp_fpu_arith(exact, psp_cpu.fcr31);
+    psp_fpu_raise(psp_fpu_except(exact, r, div_by_zero));
+    return r;
+}
+
+/* sqrt.s. Separate from psp_fsqrt, which is a general helper shared with the
+ * rasteriser and answers 0 for a negative and NaN for an infinity -- right
+ * there, wrong here.
+ *
+ * Exactness is decidable without an exact square root: r is the correctly
+ * rounded result, so r*r is a 24x24-bit product and therefore exact in a
+ * double. If it reproduces the operand, nothing was lost.
+ *
+ * Not modelled: the rounding mode does not reach psp_fsqrt's iteration. No
+ * test covers it and inventing a directed square root to go untested is worse
+ * than the gap. */
+static inline float psp_fsqrt_cop1(float v) {
+    const uint32_t b = psp_f32_to_bits(v);
+    if (v != v)             { psp_fpu_raise(PSP_FE_V); return v; }
+    if (b == 0x7F800000u)   { psp_fpu_raise(0u);       return v; }   /* +inf */
+    if (b & 0x80000000u) {                                           /* any negative, -0 aside */
+        if ((b & 0x7FFFFFFFu) == 0u) { psp_fpu_raise(0u); return v; }
+        psp_fpu_raise(PSP_FE_V);
+        return psp_bits_to_f32(0x7FBFFFFFu);
+    }
+    const float r = psp_fsqrt(v);
+    psp_fpu_raise(((double)r * (double)r != (double)v) ? PSP_FE_I : 0u);
+    return r;
+}
+
+static inline float psp_fadd(float a, float b) { return psp_fpu_op((double)a + (double)b, 0); }
+static inline float psp_fsub(float a, float b) { return psp_fpu_op((double)a - (double)b, 0); }
+static inline float psp_fmul(float a, float b) { return psp_fpu_op((double)a * (double)b, 0); }
+static inline float psp_fdiv(float a, float b) {
+    return psp_fpu_op((double)a / (double)b, b == 0.0f && a == a && a != 0.0f);
+}
+
 /* `c.<cond>.s` condition codes. The distinction that matters is *ordered* vs
  * *unordered*: with a NaN operand the ordered forms are false and the
  * unordered forms are true. Comparisons involving NaN are false in C, so the

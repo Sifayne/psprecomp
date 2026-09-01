@@ -326,24 +326,23 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         fprintf(f, "%spsp_cpu.f[%u] = psp_read_f32(%s + %d);\n", ind, in->ft, rs, in->imm); return;
     case A_SWC1:
         fprintf(f, "%spsp_write_f32(%s + %d, psp_cpu.f[%u]);\n", ind, rs, in->imm, in->ft); return;
-    case A_ADD_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_cpu.f[%u] + psp_cpu.f[%u];\n", ind, in->fd, in->fs, in->ft); return;
-    case A_SUB_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_cpu.f[%u] - psp_cpu.f[%u];\n", ind, in->fd, in->fs, in->ft); return;
-    case A_MUL_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_cpu.f[%u] * psp_cpu.f[%u];\n", ind, in->fd, in->fs, in->ft); return;
-    case A_DIV_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_cpu.f[%u] / psp_cpu.f[%u];\n", ind, in->fd, in->fs, in->ft); return;
+    /* See the interpreter: FCR31's rounding mode and flush-to-zero change the
+     * result, and the helpers keep the default state a plain float op. */
+    case A_ADD_S: case A_SUB_S: case A_MUL_S: case A_DIV_S:
+        fprintf(f, "%spsp_cpu.f[%u] = psp_f%s(psp_cpu.f[%u], psp_cpu.f[%u]);\n",
+                ind, in->fd,
+                in->op == A_ADD_S ? "add" : in->op == A_SUB_S ? "sub" :
+                in->op == A_MUL_S ? "mul" : "div",
+                in->fs, in->ft); return;
     case A_MOV_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_cpu.f[%u];\n", ind, in->fd, in->fs); return;
     case A_NEG_S:
         fprintf(f, "%spsp_cpu.f[%u] = -psp_cpu.f[%u];\n", ind, in->fd, in->fs); return;
     case A_ABS_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_fabs(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); return;
-    case A_SQRT_S:      /* sqrt(+inf) is +inf; psp_fsqrt answers NaN there */
-        fprintf(f, "%spsp_cpu.f[%u] = (psp_f32_to_bits(psp_cpu.f[%u]) == 0x7F800000u)"
-                   " ? psp_cpu.f[%u] : psp_fsqrt(psp_cpu.f[%u]);\n",
-                ind, in->fd, in->fs, in->fs, in->fs); return;
+    case A_SQRT_S:
+        fprintf(f, "%spsp_cpu.f[%u] = psp_fsqrt_cop1(psp_cpu.f[%u]);\n",
+                ind, in->fd, in->fs); return;
     case A_CVT_S_W:
         fprintf(f, "%spsp_cpu.f[%u] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[%u]);\n",
                 ind, in->fd, in->fs); return;
