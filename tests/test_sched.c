@@ -200,7 +200,7 @@ static void test_scheduling_survives_a_refused_wait(void) {
     const int rc = psp_sched_block(0, PSP_SCHED_BLOCKED, "test-nothing-can-wake-this");
     CHECK(rc == -1, "setup: expected a refused wait, got %d", rc);
 
-    CHECK(psp_sched_spawn(UID_TRIVIAL, ENTRY_TRIVIAL, FAKE_SP, 0, 0, 32) == 0,
+    CHECK(psp_sched_spawn(UID_TRIVIAL, ENTRY_TRIVIAL, FAKE_SP, 0, 0, 0, 32) == 0,
           "spawn after a refused wait failed");
 
     const int live = psp_sched_drain(5);
@@ -228,7 +228,7 @@ static void test_thread_inherits_gp(void) {
     const uint32_t gp = 0x08812340u;
     psp_cpu.r[PSP_REG_GP] = gp;
 
-    CHECK(psp_sched_spawn(UID_TRIVIAL, ENTRY_TRIVIAL, FAKE_SP, 0, 0, 32) == 0,
+    CHECK(psp_sched_spawn(UID_TRIVIAL, ENTRY_TRIVIAL, FAKE_SP, 0, 0, 0, 32) == 0,
           "spawning the trivial thread failed");
 
     const int live = psp_sched_drain(5);
@@ -258,7 +258,7 @@ static void test_timed_wait_expires_when_nothing_can_satisfy_it(void) {
     timed_clock_after = 0;
 
     const uint64_t before = psp_clock_peek();
-    CHECK(psp_sched_spawn(UID_TIMED, ENTRY_TIMED, FAKE_SP, 0, 0, 32) == 0,
+    CHECK(psp_sched_spawn(UID_TIMED, ENTRY_TIMED, FAKE_SP, 0, 0, 0, 32) == 0,
           "spawning the timed waiter failed");
 
     const int live = psp_sched_drain(5);
@@ -282,9 +282,9 @@ static void test_timed_wait_prefers_a_signal(void) {
     psp_clock_reset();
     timed_woken_rc = -99;
 
-    CHECK(psp_sched_spawn(UID_TWOKEN, ENTRY_TWOKEN, FAKE_SP, 0, 0, 32) == 0,
+    CHECK(psp_sched_spawn(UID_TWOKEN, ENTRY_TWOKEN, FAKE_SP, 0, 0, 0, 32) == 0,
           "spawning the timed waiter failed");
-    CHECK(psp_sched_spawn(UID_WAKER, ENTRY_TWAKER, FAKE_SP, 0, 0, 32) == 0,
+    CHECK(psp_sched_spawn(UID_WAKER, ENTRY_TWAKER, FAKE_SP, 0, 0, 0, 32) == 0,
           "spawning the waker failed");
 
     const int live = psp_sched_drain(5);
@@ -306,9 +306,9 @@ static void test_block_and_wake_round_trip(void) {
     waiter_block_rc = -99;
     waiter_uid_before = waiter_uid_after = 0;
 
-    CHECK(psp_sched_spawn(UID_WAITER, ENTRY_WAITER, FAKE_SP, 0, 0, 32) == 0,
+    CHECK(psp_sched_spawn(UID_WAITER, ENTRY_WAITER, FAKE_SP, 0, 0, 0, 32) == 0,
           "spawning the waiter failed");
-    CHECK(psp_sched_spawn(UID_WAKER, ENTRY_WAKER, FAKE_SP, 0, 0, 32) == 0,
+    CHECK(psp_sched_spawn(UID_WAKER, ENTRY_WAKER, FAKE_SP, 0, 0, 0, 32) == 0,
           "spawning the waker failed");
 
     const int live = psp_sched_drain(5);
@@ -352,7 +352,7 @@ static void test_guest_thread_unsatisfiable_wait(void) {
     stranded_ran = 0;
     stranded_block_rc = -99;
 
-    CHECK(psp_sched_spawn(UID_STRANDED, ENTRY_STRANDED, FAKE_SP, 0, 0, 32) == 0,
+    CHECK(psp_sched_spawn(UID_STRANDED, ENTRY_STRANDED, FAKE_SP, 0, 0, 0, 32) == 0,
           "spawning the stranded thread failed");
 
     const int live = psp_sched_drain(5);
@@ -376,7 +376,7 @@ static void test_stop_reason_reports_and_resets(void) {
     CHECK(psp_sched_stop_reason() == NULL,
           "a fresh run already has a stop reason");
 
-    CHECK(psp_sched_spawn(UID_TRIVIAL, ENTRY_TRIVIAL, FAKE_SP, 0, 0, 32) == 0,
+    CHECK(psp_sched_spawn(UID_TRIVIAL, ENTRY_TRIVIAL, FAKE_SP, 0, 0, 0, 32) == 0,
           "spawn failed");
     psp_sched_stop_all("test-stop");
     CHECK(psp_sched_live() == 0, "stop_all left threads alive");

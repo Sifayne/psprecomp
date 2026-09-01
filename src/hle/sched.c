@@ -22,7 +22,7 @@
 typedef struct {
     int             used;
     uint32_t        uid;
-    uint32_t        entry, sp, a0, a1;
+    uint32_t        entry, sp, k0, a0, a1;
     uint32_t        gp;            /* the starter's $gp; see psp_sched_spawn */
     int             priority;      /* PSP: lower number is more urgent */
     psp_sched_state state;
@@ -371,6 +371,7 @@ static void thread_main(void *arg) {
     psp_cpu.r[PSP_REG_A0] = t->a0;
     psp_cpu.r[PSP_REG_A1] = t->a1;
     psp_cpu.r[PSP_REG_SP] = t->sp;
+    psp_cpu.r[PSP_REG_K0] = t->k0;
     psp_cpu.r[PSP_REG_GP] = t->gp;
     psp_cpu.r[PSP_REG_RA] = 0;
 
@@ -390,7 +391,7 @@ static void thread_main(void *arg) {
     psp_os_unlock(&g_lock);
 }
 
-int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
+int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp, uint32_t k0,
                     uint32_t a0, uint32_t a1, int priority) {
     /* The spawn hook is consulted first, before threading: an interpreter run
      * that services thread starts wants them synchronously, nested, whatever
@@ -400,7 +401,7 @@ int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
     /* Threading off: the thread exists as far as the guest is concerned and
      * never runs. Reporting failure instead would send a game down its
      * out-of-memory path, which is a different and less useful lie. */
-    if (!g_threading) { (void)uid; (void)entry; (void)sp;
+    if (!g_threading) { (void)uid; (void)entry; (void)sp; (void)k0;
                         (void)a0; (void)a1; (void)priority; return 0; }
 
     psp_os_lock(&g_lock);
@@ -424,7 +425,7 @@ int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
 
     sched_slot *t = &g_slot[idx];
     memset(t, 0, sizeof *t);
-    t->used = 1; t->uid = uid; t->entry = entry; t->sp = sp;
+    t->used = 1; t->uid = uid; t->entry = entry; t->sp = sp; t->k0 = k0;
     t->a0 = a0;  t->a1 = a1;  t->priority = priority;
     t->state = PSP_SCHED_READY;
     /* Captured here rather than passed in, because the caller does not have it

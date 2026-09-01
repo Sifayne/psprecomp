@@ -72,7 +72,13 @@ void psp_sched_set_threading(int on);
 /* Create a host thread for a guest thread and leave it READY. `entry` is the
  * guest address to dispatch, `sp` its stack top, `a0`/`a1` the two arguments
  * the PSP passes (arglen, argp). Returns 0 on success. */
-int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
+/* `k0` is the thread's own control block, which a PSP keeps in the top 0x100
+ * bytes of its stack and leaves addressed by $k0 for the whole of its life.
+ * Guest code reads it directly -- threads/k0/k0 takes $k0 straight out of the
+ * register and walks the structure -- so it is initial register state like sp,
+ * and the scheduler is what installs a thread's initial registers. Zero for a
+ * thread that has no such area. */
+int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp, uint32_t k0,
                     uint32_t a0, uint32_t a1, int priority);
 
 /* Give up the token. `block` parks the caller until something readies it;

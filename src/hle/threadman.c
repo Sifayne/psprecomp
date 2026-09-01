@@ -475,7 +475,10 @@ static void hle_StartThread(void) {
     const int was_state   = t->state;
     t->state = TH_READY;
     t->ever_started = 1;
-    if (psp_sched_spawn(t->uid, t->entry, sp, arglen, argp,
+    /* The control block sits in the 0x100 bytes at the top of the stack, which
+     * is the same reservation the argument block stops below. */
+    const uint32_t k0 = t->stack_base ? t->stack_base + t->stack_size - 0x100u : 0;
+    if (psp_sched_spawn(t->uid, t->entry, sp, k0, arglen, argp,
                         (int)t->priority) != 0) {
         t->state = was_state;
         t->ever_started = was_started;

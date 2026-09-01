@@ -328,7 +328,7 @@ static void hle_dispatch_target(void) {
 }
 
 static void hle_spawn_thread(void) {
-    psp_sched_spawn(0x00040010u, THREAD, THREAD_SP, 7, 8, 32);
+    psp_sched_spawn(0x00040010u, THREAD, THREAD_SP, 0, 7, 8, 32);
 }
 
 static void test_dispatch_serving(void) {
@@ -453,7 +453,7 @@ static void hle_wake_starter(void) {
 }
 
 static void hle_spawn_and_block(void) {
-    psp_sched_spawn(WAKER_UID, THREAD, THREAD_SP, 7, 8, 32);
+    psp_sched_spawn(WAKER_UID, THREAD, THREAD_SP, 0, 7, 8, 32);
     g_starter_blocked = 1;
     /* Parks the caller and hands the token to the thread just started. Returns
      * 0 once something has made this slot runnable again. */
