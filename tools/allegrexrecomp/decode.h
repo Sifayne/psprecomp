@@ -159,6 +159,13 @@ int a_format(const a_insn *in, char *buf, int buflen);
 const char *a_reg_name(unsigned idx);
 const char *a_freg_name(unsigned idx);
 
+/* Expand the half-precision immediate carried by vfim. This lives with the
+ * decoder rather than in one consumer because both the emitter and the
+ * interpreter need it, and two copies of a float conversion is exactly the
+ * kind of drift the oracle exists to detect — it would report a divergence
+ * whose cause was the oracle itself. */
+float a_half_to_float(uint16_t h);
+
 #ifdef __cplusplus
 }
 #endif

@@ -644,7 +644,15 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         case 0x10: op = A_VMSCL; break;
         case 0x14: op = A_VCRSP; break;
         case 0x1C:
-            if (RS_F(word) == 0x1D) { op = A_VROT; break; }
+            if (RS_F(word) == 0x1D) {
+                /* vrot's operand is a 5-bit control field, not a register:
+                 * two lane selectors and a sign bit. It shares its position
+                 * with vt, so name it in `imm` rather than leaving consumers
+                 * to re-derive it. */
+                in.imm = (int32_t)((word >> 16) & 0x1F);
+                op = A_VROT;
+                break;
+            }
             switch ((word >> 16) & 0xF) {   /* VFPUMatrix1 */
             case 0x0: op = A_VMMOV;  break;
             case 0x3: op = A_VMIDT;  break;
@@ -788,4 +796,20 @@ int a_format(const a_insn *in, char *buf, int buflen) {
     default:
         return snprintf(buf, buflen, ".word     0x%08X", in->raw);
     }
+}
+
+/* vfim carries a half-precision float. Expanding it here keeps the runtime
+ * dealing only in single precision. Shared by the emitter and the interpreter
+ * so both read the same constant out of the same encoding. */
+float a_half_to_float(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h >> 15) << 31;
+    const uint32_t exp  = (h >> 10) & 0x1F;
+    const uint32_t man  = h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0)        bits = sign | (man ? ((127 - 15 + 1) << 23) | (man << 13) : 0);
+    else if (exp == 31)  bits = sign | 0x7F800000u | (man << 13);
+    else                 bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
 }

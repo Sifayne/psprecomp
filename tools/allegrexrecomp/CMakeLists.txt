@@ -9,6 +9,8 @@ add_library(allegrex_core STATIC
     container.c
     analyze.c
     emit.c
+    interp.c
+    loader.c
     keys.c
     crypto/aes.c
     crypto/cmac.c
@@ -19,6 +21,11 @@ add_library(allegrex_core STATIC
 target_include_directories(allegrex_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+# interp.c runs on the runtime's CPU state, memory model and semantic helpers —
+# sharing them with the recompiled path is the property that makes it a useful
+# oracle at all. PUBLIC so the tests inherit both.
+target_link_libraries(allegrex_core PUBLIC psprecomp)
 
 add_executable(allegrexrecomp
     main.c
