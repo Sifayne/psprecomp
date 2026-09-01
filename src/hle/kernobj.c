@@ -495,7 +495,10 @@ void psp_kernobj_register(void) {
  * takes what it can. Fifty-two of the file's lines are that sweep.
  */
 
-#define MAX_PIPES 64
+/* msgpipe/create makes 1024 of them in a loop and expects every one to
+ * succeed, so the table is sized for the test rather than for a guess about
+ * what a game needs. */
+#define MAX_PIPES 1024
 #define MPP_MODE_ASAP 1u
 /* Two queues, two attribute bits. Unlike every other object type, a message
  * pipe orders its senders and its receivers separately. */
@@ -568,7 +571,6 @@ static void hle_CreateMsgPipe(void) {
     if (!name) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
     const uint32_t pe = vpl_partition_error(part);
     if (pe) { psp_ret(pe); return; }
-
     const uint32_t base = size ? psp_sysmem_alloc(size, 0) : 0;
     if (size && !base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 

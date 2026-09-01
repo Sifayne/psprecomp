@@ -24,7 +24,10 @@
 #define PSP_SMEM_LowAligned   3
 #define PSP_SMEM_HighAligned  4
 
-#define MAX_BLOCKS 512
+/* A block per allocation, and the ceiling is reached by tests rather than by
+ * games: msgpipe/create makes 1024 pipes in a loop, each with a buffer, and
+ * expects every one to succeed. 512 ran out at 507. */
+#define MAX_BLOCKS 2048
 #define UID_BASE   0x00010000u
 
 typedef struct {
