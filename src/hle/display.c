@@ -40,6 +40,27 @@ static uint64_t g_best_score;
 static uint32_t g_best_addr;
 static uint64_t g_frames_scored;
 
+/* The presentation hook.
+ *
+ * A windowed host wants each frame as it is shown, not a dump after the run
+ * ends. The hook is called from hle_SetFrameBuf -- the moment the game hands
+ * the display a finished buffer -- because that is the only cadence this game
+ * actually keeps: it never calls sceDisplayWaitVblank (four hundred
+ * SetFrameBufs against none in the top twelve of the call histogram), and
+ * paces itself with GetAccumulatedHcount polls and delays instead. Waiting
+ * for a vblank that is never requested publishes nothing, which is a black
+ * window that looks exactly like a broken renderer.
+ *
+ * The callee runs holding the scheduler token, so it must be quick: convert
+ * and hand off, no blocking. SDL stays in the host; the library only learns
+ * that *someone* may want to look. */
+static void (*g_present)(uint32_t addr, uint32_t stride, uint32_t fmt);
+
+void psp_display_set_present(void (*fn)(uint32_t addr, uint32_t stride,
+                                        uint32_t fmt)) {
+    g_present = fn;
+}
+
 void psp_display_reset(void) {
     g_fb_addr = 0;
     g_fb_width = 512;
@@ -215,6 +236,10 @@ static void hle_SetFrameBuf(void) {
     if (!g_fb_width) g_fb_width = 512;
     score_frame(g_fb_addr);
     dump_frame_seq(g_fb_addr);
+    /* The frame flip. What the game hands the display is what a window shows;
+     * with sync==NEXTFRAME this is one vblank early, which for bring-up is
+     * indistinguishable and does not drop anything. */
+    if (g_present && g_fb_addr) g_present(g_fb_addr, g_fb_width, g_fb_format);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

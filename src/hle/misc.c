@@ -8,8 +8,11 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/sched.h"
 
 #include <stdio.h>
+#include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
@@ -162,14 +165,17 @@ static void hle_ModuleOk(void)             { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 /* ---- sceCtrl ------------------------------------------------------------- */
 
-static uint32_t g_buttons;
-static uint8_t  g_analog_x = 128, g_analog_y = 128;
-static uint32_t g_ctrl_frame;
+/* Atomic because the writer is no longer only a guest thread: a windowed host
+ * polls the real gamepad on its own thread and publishes through
+ * psp_ctrl_set, while any number of guest threads read here. */
+static _Atomic uint32_t g_buttons;
+static _Atomic uint8_t  g_analog_x, g_analog_y;
+static uint32_t         g_ctrl_frame;
 
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
-    g_buttons = buttons;
-    g_analog_x = ax;
-    g_analog_y = ay;
+    atomic_store(&g_buttons, buttons);
+    atomic_store(&g_analog_x, ax);
+    atomic_store(&g_analog_y, ay);
 }
 
 static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
@@ -221,14 +227,18 @@ static void hle_ReadBufferPositive(void) {
     static int looked;
     if (!looked) { looked = 1; g_buttons |= parse_pad(); }
 
+    const uint32_t buttons = atomic_load(&g_buttons);
+    const uint8_t  ax      = atomic_load(&g_analog_x);
+    const uint8_t  ay      = atomic_load(&g_analog_y);
+
     uint32_t buf = psp_arg(0), count = psp_arg(1);
     if (!count) count = 1;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t at = buf + i * 16;
         psp_write32(at, g_ctrl_frame++);
-        psp_write32(at + 4, g_buttons);
-        psp_write8(at + 8, g_analog_x);
-        psp_write8(at + 9, g_analog_y);
+        psp_write32(at + 4, buttons);
+        psp_write8(at + 8, ax);
+        psp_write8(at + 9, ay);
         for (int k = 10; k < 16; k++) psp_write8(at + (uint32_t)k, 0);
     }
     psp_ret(count);
@@ -243,6 +253,24 @@ static audio_ch g_audio[AUDIO_CHANNELS];
 static uint64_t g_audio_blocks;
 
 uint64_t psp_audio_blocks(void) { return g_audio_blocks; }
+
+/* The host side of audio output.
+ *
+ * The samples a game passes to sceAudioOutput are real PCM, and until now
+ * they were counted and dropped: with nothing consuming them the output calls
+ * returned immediately, which un-paces the audio thread and shows up
+ * downstream as hundreds of millions of spins. The hook, when a host
+ * registers one, receives the buffer and reports how far the playback queue
+ * is backed up in *microseconds* -- the amount a blocking output would have
+ * waited on hardware. Policy stays here: the blocking calls pay the backlog
+ * with psp_sched_delay, the non-blocking ones never wait. */
+static int64_t (*g_audio_out)(int ch, uint32_t samples, uint32_t fmt,
+                              uint32_t buf);
+
+void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples, uint32_t fmt,
+                                        uint32_t buf)) {
+    g_audio_out = fn;
+}
 
 static void hle_ChReserve(void) {
     /* (channel, samplecount, format) -- channel -1 means "any". */
@@ -265,12 +293,43 @@ static void hle_ChRelease(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Output blocks on hardware until the previous buffer drains, which is what
- * paces a game's audio thread. With nothing consuming samples it returns
- * immediately -- the block count is what tells you audio is flowing. */
-static void hle_Output(void) {
+/* Common body of the four output calls. `buf_arg` is where the sample buffer
+ * sits: the plain pair pass (channel, volume, buffer), the panned pair pass
+ * (channel, leftvol, rightvol, buffer). Returns the playback backlog in
+ * microseconds, zero when there is nothing to wait for. */
+static int64_t audio_output_common(int buf_arg) {
+    const uint32_t ch = psp_arg(0);
     g_audio_blocks++;
-    psp_ret(psp_arg(0) < AUDIO_CHANNELS ? g_audio[psp_arg(0)].samples : 0);
+    if (!g_audio_out || ch >= AUDIO_CHANNELS || !g_audio[ch].reserved ||
+        !g_audio[ch].samples)
+        return 0;
+    return g_audio_out((int)ch, g_audio[ch].samples, g_audio[ch].format,
+                       psp_arg(buf_arg));
+}
+
+static uint32_t audio_ret(void) {
+    const uint32_t ch = psp_arg(0);
+    return ch < AUDIO_CHANNELS ? g_audio[ch].samples : 0;
+}
+
+/* sceAudioOutputBlocking(ch, vol, buf) -- on hardware this blocks until the
+ * previous buffer drains, which is what paces a game's audio thread. The
+ * backlog is that wait, in guest microseconds. */
+static void hle_OutputBlocking(void) {
+    const int64_t backlog = audio_output_common(2);
+    if (backlog > 0) psp_sched_delay((uint64_t)backlog);
+    psp_ret(audio_ret());
+}
+
+static void hle_OutputPanned(void) {
+    (void)audio_output_common(3);
+    psp_ret(audio_ret());
+}
+
+static void hle_OutputPannedBlocking(void) {
+    const int64_t backlog = audio_output_common(3);
+    if (backlog > 0) psp_sched_delay((uint64_t)backlog);
+    psp_ret(audio_ret());
 }
 
 /* Zero remaining means "ready for more", so a game's audio loop keeps going. */
@@ -279,8 +338,9 @@ static void hle_GetChannelRestLength(void) { psp_ret(0); }
 void psp_misc_reset(void) {
     g_intr_enabled = 1;
     g_exit_requested = 0;
-    g_buttons = 0;
-    g_analog_x = g_analog_y = 128;
+    atomic_store(&g_buttons, 0);
+    atomic_store(&g_analog_x, 128);
+    atomic_store(&g_analog_y, 128);
     g_ctrl_frame = 0;
     memset(g_audio, 0, sizeof g_audio);
     g_audio_blocks = 0;
@@ -337,9 +397,9 @@ void psp_misc_register(void) {
 
     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
-    psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_Output);
-    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_Output);
-    psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_Output);
+    psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
+    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_OutputPannedBlocking);
+    psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_OutputPanned);
     psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
     psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_ok);
     psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);

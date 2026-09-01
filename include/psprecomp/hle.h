@@ -201,6 +201,23 @@ int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint64_t psp_audio_blocks(void);
 
+/* ---- host presentation hooks ----------------------------------------------
+ *
+ * A windowed host registers these to receive what the game produces as it
+ * produces it. Both callees run on a guest thread holding the scheduler
+ * token, so they must convert and hand off, never block. Passing NULL
+ * unregisters. */
+/* Each presented frame: the buffer the game last set, as the game supplied
+ * it. Called from sceDisplaySetFrameBuf -- the frame flip, and the only
+ * cadence this game keeps; it never asks for a vblank. */
+void psp_display_set_present(void (*fn)(uint32_t addr, uint32_t stride,
+                                        uint32_t fmt));
+/* Each output buffer: the channel, its reserved shape, and where the PCM
+ * lives in guest memory. Returns the playback backlog in microseconds, which
+ * the blocking output calls pay with a scheduler delay. */
+void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples,
+                                        uint32_t fmt, uint32_t buf));
+
 void psp_threadman_init(void);
 void psp_threadman_register(void);
 void psp_threadman_reset(void);
