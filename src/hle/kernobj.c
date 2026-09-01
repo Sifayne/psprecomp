@@ -669,11 +669,19 @@ static int mpp_satisfied(const psp_waiter *w) {
     return w->done >= w->need || ((w->mode & MPP_MODE_ASAP) && w->done > 0);
 }
 
+/* A waiter released because it got what it asked for, as against one turned out
+ * because the pipe is being destroyed. Both arrive at the waiter as a wake, and
+ * it cannot tell them apart by looking: the queue entry is gone and so is the
+ * pipe. It matters -- msgpipe/tryreceive deletes a pipe immediately after a
+ * poll that satisfied two senders, and hardware answers those senders
+ * `00000000`, not `800201b5`. Bytes already moved are moved. */
+#define MPP_WOKE_SATISFIED 1
+
 /* Done with this waiter: report how much moved, take it out, wake it. */
 static void mpp_release(psp_waitq *q, int i, int *urgent) {
     const psp_waiter w = psp_waitq_take(q, i);
     if (w.nout) psp_write32(w.nout, w.done);
-    *urgent |= psp_sched_wake(w.uid);
+    *urgent |= psp_sched_wake_as(w.uid, MPP_WOKE_SATISFIED);
 }
 
 static uint32_t mpp_send_order(const psp_msgpipe *p) {
@@ -907,14 +915,22 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                          sending ? p->senddesc : p->recvdesc,
                                          deadline);
+    /* Checked before the pipe is looked up again, because a pipe deleted
+     * between our release and our turn on the CPU does not undo the transfer.
+     * The other side moved the bytes on our behalf, took us out of the queue,
+     * and wrote how many -- it is the only one that knew, since an ASAP waiter
+     * can be released with less than it asked for. */
+    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == MPP_WOKE_SATISFIED) {
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+
     p = find_pipe(id);
     if (!p) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
     q = sending ? &p->send_q : &p->recv_q;
 
     if (rc == PSP_SCHED_WOKEN) {
-        /* The other side moved the bytes on our behalf, took us out of the
-         * queue, and wrote how many -- it is the only one that knew, since an
-         * ASAP waiter can be released with less than it asked for. */
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;

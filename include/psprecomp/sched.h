@@ -220,6 +220,21 @@ int      psp_sched_priority(uint32_t uid);
  * no live slot, which covers both "finished" and "never started". */
 psp_sched_state psp_sched_state_of(uint32_t uid);
 
+/* ---- why a wait ended -----------------------------------------------------
+ *
+ * Being woken does not say what happened, and for some objects two different
+ * outcomes both arrive as a wake: "the thing you asked for is yours" and "the
+ * object you were waiting on was destroyed". They need opposite answers, and by
+ * the time the woken thread runs, the queue entry that knew is gone -- and so,
+ * usually, is the object.
+ *
+ * So the waker leaves a small value behind. Zero is the default and means
+ * nothing in particular; an object type gives its own values meaning. */
+/* Returns what psp_sched_wake does: nonzero if the woken thread outranks us. */
+int  psp_sched_wake_as(uint32_t uid, int reason);
+/* The reason the current thread was last woken. */
+int  psp_sched_wake_reason(void);
+
 /* Change a thread's priority. The thread manager owns what a priority *means*;
  * the scheduler owns which thread runs, so it has to be told -- writing the new
  * value only into the thread-manager record left the scheduler ordering threads

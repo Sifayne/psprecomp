@@ -34,6 +34,9 @@ typedef struct {
      * tells "somebody signalled me" from "my time ran out" -- the two need
      * opposite answers and the token alone cannot distinguish them. */
     int             woken;
+    /* What the waker said, for waits that can end more than one way. See
+     * psp_sched_wake_as. */
+    int             wake_reason;
     /* Guest microsecond at which this thread's timeslice runs out. Stamped by
      * the handoff that gave it the token, so a thread is charged for its own
      * time on the CPU and not for anyone else's. */
@@ -618,7 +621,20 @@ void psp_sched_tick(void) {
     if (other) psp_sched_yield();
 }
 
-int psp_sched_wake(uint32_t uid) {
+static int wake_slot(uint32_t uid, int reason);
+
+int psp_sched_wake(uint32_t uid) { return wake_slot(uid, 0); }
+
+int psp_sched_wake_as(uint32_t uid, int reason) { return wake_slot(uid, reason); }
+
+int psp_sched_wake_reason(void) {
+    pthread_mutex_lock(&g_lock);
+    const int r = g_slot[g_self].wake_reason;
+    pthread_mutex_unlock(&g_lock);
+    return r;
+}
+
+static int wake_slot(uint32_t uid, int reason) {
     if (!g_threading) return 0;
     pthread_mutex_lock(&g_lock);
     int urgent = 0;
@@ -631,8 +647,9 @@ int psp_sched_wake(uint32_t uid) {
          * needs to know which. The deadline is dropped with it: the wait is
          * over, and leaving wake_at set would make the next handoff consider
          * this slot's stale moment when it looks for the earliest one. */
-        g_slot[s].woken   = 1;
-        g_slot[s].wake_at = 0;
+        g_slot[s].woken       = 1;
+        g_slot[s].wake_at     = 0;
+        g_slot[s].wake_reason = reason;
         /* The token is not handed over here, because a waker usually has more
          * to do -- it may be releasing several waiters at once, and switching
          * part-way through would leave the rest for later. The caller is told
