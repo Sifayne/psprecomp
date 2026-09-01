@@ -69,6 +69,11 @@ void psp_sched_init(void) { psp_sched_reset(); }
 
 void psp_sched_set_threading(int on) { g_threading = on; }
 
+static void (*g_cancel_hook)(uint32_t uid);
+
+void psp_sched_set_cancel_hook(void (*fn)(uint32_t uid)) { g_cancel_hook = fn; }
+void psp_sched_cancel_spawn(uint32_t uid) { if (g_cancel_hook) g_cancel_hook(uid); }
+
 void psp_sched_set_spawn_hook(int (*fn)(uint32_t uid, uint32_t entry, uint32_t sp,
                                         uint32_t a0, uint32_t a1, int priority)) {
     g_spawn_hook = fn;

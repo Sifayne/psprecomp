@@ -1005,6 +1005,10 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     printf("---\n");
 
     psp_interp_run(&it);
+    /* Threads the guest started but that never outranked their starter. On
+     * hardware they would have run when the starter blocked or exited; here
+     * the top-level run ending is the closest equivalent point. */
+    if (dispatch) psp_interp_drain_pending(budget);
 
     printf("---\n");
     printf("stopped:  %s\n", psp_interp_status_str(it.status));

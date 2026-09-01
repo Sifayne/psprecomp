@@ -571,6 +571,22 @@ static uint64_t    g_nest_refused;
 
 static int spawn_hook(uint32_t uid, uint32_t entry, uint32_t sp,
                       uint32_t a0, uint32_t a1, int priority);
+static void cancel_hook(uint32_t uid);
+
+/* Threads that were started but did not outrank their starter. See spawn_hook. */
+typedef struct {
+    uint32_t uid, entry, sp, a0, a1;
+    int      priority, used;
+} pending_thread;
+
+#define MAX_PENDING 16
+static pending_thread g_pending[MAX_PENDING];
+
+/* Re-entrancy guard: a drained thread that blocks lands back in the drain, and
+ * without this the second call would start pulling threads off the same list
+ * from inside the first one's run. One drain at a time; anything parked while
+ * draining is picked up by the loop that is already running. */
+static int g_draining;
 
 static int dispatch_hook(uint32_t addr) {
     if (!g_active) return 0;              /* not inside an interpreter run */
@@ -629,28 +645,99 @@ void psp_interp_service_dispatch(int enable) {
     g_active = NULL;
     psp_set_dispatch_hook(enable ? dispatch_hook : NULL);
     psp_sched_set_spawn_hook(enable ? spawn_hook : NULL);
+    psp_sched_set_cancel_hook(enable ? cancel_hook : NULL);
+    g_draining = 0;
+    for (int i = 0; i < MAX_PENDING; i++) g_pending[i].used = 0;
 }
 
-/* A started thread runs to completion here, on the interpreter's own stack.
+/* Starting a thread does not mean running it.
  *
- * That is sequential semantics, not scheduling: a thread that blocks part-way
- * has nothing to be resumed into, and a second thread started before the
- * first finishes waits rather than interleaving. It is also exactly what a
- * pspautotests crt needs -- module_start creates and starts main, main runs
- * its checks, prints, and returns -- and it is honest about what it is, which
- * pretending the boot host's scheduler was in play would not be. */
+ * A PSP reschedules at sceKernelStartThread only when the new thread *outranks*
+ * the starter -- lower number, more urgent. An equal or less urgent thread
+ * becomes runnable and waits, and the starter keeps the CPU until it blocks or
+ * exits. Running every started thread immediately is not a conservative
+ * approximation of that; it is the opposite behaviour, and it is observable.
+ *
+ * pspautotests' own checkpoint helper measures exactly this. Between every two
+ * checks it terminates a rescheduler thread, prints, and starts it again; the
+ * thread sets a flag, and each line is tagged `[x]` if the flag is clear and
+ * `[r]` if it is set. The thread is created at the caller's own priority, so
+ * on hardware it never runs and every line reads `[x]`. Running it inside
+ * StartThread made every line in the threads suite read `[r]`.
+ *
+ * So: outranking threads still run nested and to completion, which is what a
+ * pspautotests crt needs when module_start starts main. Everything else is
+ * parked, cancelled if the guest terminates it first, and drained when the
+ * top-level run ends.
+ *
+ * This is still not scheduling -- a parked thread cannot interleave with the
+ * starter, and one that blocks has nothing to be resumed into. It models one
+ * specific rule, "runnable is not running", because that rule is what the
+ * tests can see. */
+static void cancel_hook(uint32_t uid) {
+    for (int i = 0; i < MAX_PENDING; i++)
+        if (g_pending[i].used && g_pending[i].uid == uid) g_pending[i].used = 0;
+}
+
+static int run_thread_now(uint32_t entry, uint32_t sp, uint32_t a0, uint32_t a1);
+
+/* The budget a drained thread gets. The drain happens after the top-level run
+ * has ended, so there is no outer run left to charge against and none to
+ * inherit a limit from -- the caller supplies one, and it is the same cap the
+ * top-level run was given. Without it a parked thread that loops forever would
+ * hang the harness at the point it was reporting results. */
+static uint64_t g_drain_budget;
+
+/* Run everything parked, most urgent first, until nothing is left. Draining
+ * can itself start threads, hence the outer loop. */
+void psp_interp_drain_pending(uint64_t budget) {
+    if (g_draining) return;
+    g_draining = 1;
+    g_drain_budget = budget;
+    for (;;) {
+        int best = -1;
+        for (int i = 0; i < MAX_PENDING; i++)
+            if (g_pending[i].used &&
+                (best < 0 || g_pending[i].priority < g_pending[best].priority)) best = i;
+        if (best < 0) { g_draining = 0; return; }
+        const pending_thread t = g_pending[best];
+        g_pending[best].used = 0;
+        (void)run_thread_now(t.entry, t.sp, t.a0, t.a1);
+    }
+}
+
 static int spawn_hook(uint32_t uid, uint32_t entry, uint32_t sp,
                       uint32_t a0, uint32_t a1, int priority) {
-    (void)uid; (void)priority;
     if (!g_active) return 0;              /* not inside an interpreter run */
     if (g_nest >= MAX_NEST) { g_nest_refused++; return 1; }
 
+    /* Equal or less urgent than whoever is starting it: runnable, not running. */
+    if (priority >= (int)psp_threadman_current_priority()) {
+        for (int i = 0; i < MAX_PENDING; i++) {
+            if (g_pending[i].used) continue;
+            g_pending[i] = (pending_thread){ uid, entry, sp, a0, a1, priority, 1 };
+            return 1;
+        }
+        /* Out of slots. Running it is the old behaviour and still better than
+         * dropping the thread entirely. */
+    }
+    return run_thread_now(entry, sp, a0, a1);
+}
+
+static int run_thread_now(uint32_t entry, uint32_t sp, uint32_t a0, uint32_t a1) {
+    if (g_nest >= MAX_NEST) { g_nest_refused++; return 1; }
+
+    /* NULL when draining: the top-level run has ended and this thread is one
+     * it left runnable. There is then no outer run to charge or to inherit a
+     * budget from, so g_drain_budget stands in for both. */
     psp_interp *outer = g_active;
     const psp_cpu_state saved = psp_cpu;
 
-    uint64_t left = 0;
-    if (outer->budget) {
-        left = outer->budget > outer->executed ? outer->budget - outer->executed : 1;
+    uint64_t left = g_drain_budget;
+    if (outer) {
+        left = 0;
+        if (outer->budget)
+            left = outer->budget > outer->executed ? outer->budget - outer->executed : 1;
     }
 
     /* The thread's own register file: arguments from StartThread, its own
@@ -668,8 +755,8 @@ static int spawn_hook(uint32_t uid, uint32_t entry, uint32_t sp,
 
     psp_interp sub;
     psp_interp_init(&sub, entry, NESTED_RA, left);
-    sub.trace      = outer->trace;
-    sub.trace_regs = outer->trace_regs;
+    sub.trace      = outer ? outer->trace      : 0;
+    sub.trace_regs = outer ? outer->trace_regs : 0;
 
     g_nest++;
     g_active = &sub;
@@ -678,7 +765,7 @@ static int spawn_hook(uint32_t uid, uint32_t entry, uint32_t sp,
     g_nest--;
     note_nested("thread", entry, &sub);
 
-    outer->executed += sub.executed;
+    if (outer) outer->executed += sub.executed;
     psp_cpu = saved;
     return 1;
 }

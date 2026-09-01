@@ -218,6 +218,11 @@ void psp_display_set_present(void (*fn)(uint32_t addr, uint32_t stride,
 void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples,
                                         uint32_t fmt, uint32_t buf));
 
+/* The priority of whatever is running now, or the module entry thread's when
+ * the scheduler holds nothing. Needed by a spawn hook deciding whether a newly
+ * started thread outranks its starter. */
+uint32_t psp_threadman_current_priority(void);
+
 void psp_threadman_init(void);
 void psp_threadman_register(void);
 void psp_threadman_reset(void);

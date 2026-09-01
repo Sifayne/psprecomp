@@ -29,6 +29,20 @@ static int failures;
     } while (0)
 
 /* Invoke a registered firmware call with o32 arguments. */
+/* A NUL-terminated name in guest RAM.
+ *
+ * The create calls reject a null name pointer, as hardware does, so a test
+ * that wants a semaphore has to supply one. Address chosen to sit in user RAM
+ * clear of the stack the harness sets up. */
+static uint32_t guest_name(const char *s) {
+    const uint32_t at = 0x08804000u;
+    for (uint32_t i = 0; ; i++) {
+        psp_write8(at + i, (uint8_t)s[i]);
+        if (!s[i]) break;
+    }
+    return at;
+}
+
 static uint32_t call(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
                      uint32_t a3) {
     psp_cpu.r[PSP_REG_A0] = a0;
@@ -159,7 +173,7 @@ static void test_semaphores(void) {
     const uint32_t SIGNAL = psp_nid("sceKernelSignalSema");
     const uint32_t DELETE = psp_nid("sceKernelDeleteSema");
 
-    uint32_t sem = call5(CREATE, 0, 0, 2 /*init*/, 4 /*max*/, 0);
+    uint32_t sem = call5(CREATE, guest_name("sema"), 0, 2 /*init*/, 4 /*max*/, 0);
     CHECK(sem != 0, "semaphore created");
 
     CHECK(call(WAIT, sem, 1, 0, 0) == 0, "wait succeeds while the count allows");
@@ -194,7 +208,7 @@ static void test_event_flags(void) {
     const uint32_t CLEAR  = psp_nid("sceKernelClearEventFlag");
     const uint32_t WAIT   = psp_nid("sceKernelWaitEventFlag");
 
-    uint32_t ef = call(CREATE, 0, 0, 0x0000, 0);
+    uint32_t ef = call(CREATE, guest_name("evflag"), 0, 0x0000, 0);
     CHECK(ef != 0, "event flag created");
 
     call(SET, ef, 0x0005, 0, 0);

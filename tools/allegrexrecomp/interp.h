@@ -65,6 +65,10 @@ typedef struct {
 
 /* Set up a run: pc = entry, $ra = sentinel, counters cleared. Does not touch
  * memory or any register other than $ra, so the caller controls the arguments. */
+/* Run every thread that was started but parked because it did not outrank its
+ * starter. Call after a top-level run ends; see the note at spawn_hook. */
+void psp_interp_drain_pending(uint64_t budget);
+
 void psp_interp_init(psp_interp *it, uint32_t entry, uint32_t ra_sentinel,
                      uint64_t budget);
 

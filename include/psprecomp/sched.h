@@ -115,6 +115,15 @@ void psp_sched_exit(uint32_t uid);
  * nothing and spawns no host thread. The interpreter uses this to run a
  * started thread synchronously inside the run that started it; a host that
  * wants real threads installs nothing. */
+/* Undo a spawn the hook took but has not run yet.
+ *
+ * A hook that models "runnable, not running" has to be told when the guest
+ * kills a thread it never let start -- otherwise the thread runs later, which
+ * is worse than running early. Called by sceKernelTerminateThread and
+ * sceKernelDeleteThread; a no-op when no hook is installed. */
+void psp_sched_cancel_spawn(uint32_t uid);
+void psp_sched_set_cancel_hook(void (*fn)(uint32_t uid));
+
 void psp_sched_set_spawn_hook(int (*fn)(uint32_t uid, uint32_t entry, uint32_t sp,
                                         uint32_t a0, uint32_t a1, int priority));
 

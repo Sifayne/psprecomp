@@ -396,12 +396,27 @@ static void test_spawn_serving(void) {
 
     psp_interp_service_dispatch(1);
     psp_interp it = run(outer, 4, 1000);
+    /* Sampled before the hooks come down: disabling them resets the pending
+     * list, the same fresh-run guarantee that resets the nesting counter. */
+    const uint32_t data_before_drain = psp_read32(DATA);
+    psp_interp_drain_pending(1000);
     psp_interp_service_dispatch(0);
     psp_interp_free_imports();
 
     CHECK(it.status == I_OK_RETURN, "spawn: %s", psp_interp_status_str(it.status));
+
+    /* Started at priority 32, by a starter also at 32. Equal is not more
+     * urgent, so the thread is runnable and has *not* run: a PSP reschedules
+     * at StartThread only for a thread that outranks the caller. Running it
+     * here is the behaviour pspautotests' checkpoint helper detects, and it
+     * tagged every line of the threads suite `[r]` instead of `[x]`. */
+    CHECK(data_before_drain != 7,
+          "an equal-priority thread does not run at StartThread: DATA=%u",
+          data_before_drain);
+
     CHECK(psp_read32(DATA) == 7,
-          "the started thread ran with StartThread's $a0: DATA=%u", psp_read32(DATA));
+          "and runs when the top-level run drains it, with StartThread's $a0: DATA=%u",
+          psp_read32(DATA));
     CHECK(R(S0) == 99,
           "the starter's registers survived the thread: s0=%u", R(S0));
 }

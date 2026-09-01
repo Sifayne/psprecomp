@@ -67,6 +67,8 @@ typedef struct {
     char     name[32];
     int32_t  count;
     int32_t  max_count;
+    int32_t  init_count;      /* what it was created with; ReferSemaStatus reports it */
+    uint32_t attr;
     int      used;
     /* Who to wake on a signal. A fixed array rather than a list: the count is
      * small, and overflowing it would only cost a wakeup, not correctness --
@@ -87,6 +89,8 @@ typedef struct {
     uint32_t uid;
     char     name[32];
     uint32_t pattern;
+    uint32_t init_pattern;
+    uint32_t attr;
     int      used;
 } psp_evflag;
 
@@ -95,6 +99,9 @@ typedef struct {
     char     name[32];
     uint32_t func;
     uint32_t arg;
+    uint32_t thread;          /* the thread that created it */
+    uint32_t notify_count;
+    uint32_t notify_arg;
     int      used;
 } psp_callback;
 
@@ -271,6 +278,8 @@ static void hle_ExitThread(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static void hle_TerminateThread(void);
+
 static void hle_DeleteThread(void) {
     psp_thread *t = find_thread(psp_arg(0));
     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
@@ -383,9 +392,36 @@ static void hle_ChangeThreadPriority(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-static void hle_GetThreadCurrentPriority(void) {
+/* A module's entry point is not running on "no thread".
+ *
+ * On hardware the loader creates a thread to call module_start and that thread
+ * has a priority like any other -- 0x20 for a user module. Here module_start
+ * is called directly, so psp_sched_current() is zero until the guest creates
+ * threads of its own, and answering 0 says "priority zero", which is a real
+ * and very high priority rather than an absence.
+ *
+ * pspautotests threads/mutex/unlock2 opens by checking exactly this and
+ * refuses to run at all when it is wrong. */
+#define PSP_MAIN_THREAD_PRIORITY 0x20
+
+uint32_t psp_threadman_current_priority(void) {
     const psp_thread *c = current_thread();
-    psp_ret(c ? c->priority : 0);
+    return c ? c->priority : PSP_MAIN_THREAD_PRIORITY;
+}
+
+static void hle_GetThreadCurrentPriority(void) {
+    psp_ret(psp_threadman_current_priority());
+}
+
+/* Terminate stops a thread without freeing it. Unimplemented until now, which
+ * mattered more than it looks: pspautotests' checkpoint helper terminates its
+ * rescheduler thread between every pair of checks, and a terminate that does
+ * nothing leaves that thread to run later. */
+static void hle_TerminateThread(void) {
+    psp_thread *t = find_thread(psp_arg(0));
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+    psp_sched_cancel_spawn(t->uid);
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_ChangeCurrentThreadAttr(void) {
@@ -484,16 +520,44 @@ void psp_threadman_dump_signalled(FILE *out) {
     }
 }
 
+/* A NULL name is rejected, and the attribute word is range-checked.
+ *
+ * Both are observable and neither was done. The pspautotests create tests
+ * pass a null pointer as the name and expect SCE_KERNEL_ERROR_ERROR back;
+ * we accepted it, read a string from guest address 0, and reported success.
+ * The two objects that answer NO_MEMORY instead of ERROR (fpl, msgpipe) are
+ * not implemented here, so the single code is right for everything that is.
+ *
+ * The attribute check is 0x200 and up: hardware takes the low nine bits and
+ * rejects anything above them with ILLEGAL_ATTR. Measured, not guessed --
+ * create.expected accepts 0x1ff and refuses 0x200. */
+static int name_ok(uint32_t name_ptr) { return name_ptr != 0; }
+static int attr_ok(uint32_t attr)     { return attr < 0x200u; }
+
+/* Copy a name into a guest SceKernel*Info block: 32 bytes, truncated to 31
+ * characters and NUL-terminated, which is what hardware reports back for the
+ * 31-character name the create tests hand it. */
+static void write_info_name(uint32_t dst, const char *name) {
+    char buf[32];
+    memset(buf, 0, sizeof buf);
+    for (int i = 0; i < 31 && name[i]; i++) buf[i] = name[i];
+    for (int i = 0; i < 32; i++) psp_write8(dst + (uint32_t)i, (uint8_t)buf[i]);
+}
+
 static void hle_CreateSema(void) {
     /* (name, attr, initVal, maxVal, option) */
+    if (!name_ok(psp_arg(0))) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (!attr_ok(psp_arg(1))) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
     psp_sema *s = NULL;
     for (int i = 0; i < MAX_SEMAS; i++) if (!g_sema[i].used) { s = &g_sema[i]; break; }
     if (!s) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     memset(s, 0, sizeof *s);
     psp_str(psp_arg(0), s->name, sizeof s->name);
-    s->count     = (int32_t)psp_arg(2);
-    s->max_count = (int32_t)psp_arg(3);
+    s->attr       = psp_arg(1);
+    s->count      = (int32_t)psp_arg(2);
+    s->init_count = (int32_t)psp_arg(2);
+    s->max_count  = (int32_t)psp_arg(3);
     s->uid = g_next_uid++;
     s->used = 1;
     /* Through a local: source and destination are both inside g_sema, and the
@@ -600,13 +664,17 @@ static void hle_WaitSema(void) {
 
 static void hle_CreateEventFlag(void) {
     /* (name, attr, bits, option) */
+    if (!name_ok(psp_arg(0))) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (!attr_ok(psp_arg(1))) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
     psp_evflag *f = NULL;
     for (int i = 0; i < MAX_FLAGS; i++) if (!g_flag[i].used) { f = &g_flag[i]; break; }
     if (!f) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     memset(f, 0, sizeof *f);
     psp_str(psp_arg(0), f->name, sizeof f->name);
-    f->pattern = psp_arg(2);
+    f->attr         = psp_arg(1);
+    f->pattern      = psp_arg(2);
+    f->init_pattern = psp_arg(2);
     f->uid = g_next_uid++;
     f->used = 1;
     psp_ret(f->uid);
@@ -668,7 +736,71 @@ static void hle_WaitEventFlag(void) {
 
 /* ---- callbacks ----------------------------------------------------------- */
 
+/* The Refer*Status calls: what an object currently is, written into a struct
+ * the caller supplies.
+ *
+ * None of the three existed. An unregistered firmware call returns without
+ * touching its out-parameter, so the caller prints its own uninitialised
+ * stack -- the create tests reported `attr=167767488, init=1308, cur=43`
+ * where hardware writes zeros. Same failure as the missing
+ * sceDisplayGetFrameBuf: success reported, nothing written.
+ *
+ * `size` is written rather than left alone. A caller sets it before the call
+ * and hardware fills what fits, so echoing the real size is right for the
+ * common case and better than leaving a field the caller may not have set. */
+static void hle_ReferSemaStatus(void) {
+    const psp_sema *sm = find_sema(psp_arg(0));
+    const uint32_t info = psp_arg(1);
+    if (!sm)   { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    psp_write32(info +  0, 56);
+    write_info_name(info + 4, sm->name);
+    psp_write32(info + 36, sm->attr);
+    psp_write32(info + 40, (uint32_t)sm->init_count);
+    psp_write32(info + 44, (uint32_t)sm->count);
+    psp_write32(info + 48, (uint32_t)sm->max_count);
+    psp_write32(info + 52, (uint32_t)sm->nwaiters);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_ReferEventFlagStatus(void) {
+    const psp_evflag *f = find_flag(psp_arg(0));
+    const uint32_t info = psp_arg(1);
+    if (!f)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    psp_write32(info +  0, 52);
+    write_info_name(info + 4, f->name);
+    psp_write32(info + 36, f->attr);
+    psp_write32(info + 40, f->init_pattern);
+    psp_write32(info + 44, f->pattern);
+    psp_write32(info + 48, 0);              /* no waiters are modelled */
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* No lookup existed: callbacks are only ever created here, never resolved. */
+static psp_callback *find_cb(uint32_t id) {
+    for (int i = 0; i < MAX_CBS; i++)
+        if (g_cb[i].used && g_cb[i].uid == id) return &g_cb[i];
+    return NULL;
+}
+
+static void hle_ReferCallbackStatus(void) {
+    const psp_callback *c = find_cb(psp_arg(0));
+    const uint32_t info = psp_arg(1);
+    if (!c)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    psp_write32(info +  0, 56);
+    write_info_name(info + 4, c->name);
+    psp_write32(info + 36, c->thread);
+    psp_write32(info + 40, c->func);
+    psp_write32(info + 44, c->arg);
+    psp_write32(info + 48, c->notify_count);
+    psp_write32(info + 52, c->notify_arg);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 static void hle_CreateCallback(void) {
+    if (!name_ok(psp_arg(0))) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
     psp_callback *c = NULL;
     for (int i = 0; i < MAX_CBS; i++) if (!g_cb[i].used) { c = &g_cb[i]; break; }
     if (!c) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
@@ -677,6 +809,7 @@ static void hle_CreateCallback(void) {
     psp_str(psp_arg(0), c->name, sizeof c->name);
     c->func = psp_arg(1);
     c->arg  = psp_arg(2);
+    c->thread = psp_sched_current();
     c->uid  = g_next_uid++;
     c->used = 1;
     /* Registered but never fired: callbacks are delivered from the scheduler,
@@ -706,6 +839,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0xF475845D, "ThreadManForUser", "sceKernelStartThread",             hle_StartThread);
     psp_hle_register(0xAA73C935, "ThreadManForUser", "sceKernelExitThread",              hle_ExitThread);
     psp_hle_register(0x9FA03CD3, "ThreadManForUser", "sceKernelDeleteThread",            hle_DeleteThread);
+    psp_hle_register(0x616403BA, "ThreadManForUser", "sceKernelTerminateThread",         hle_TerminateThread);
     psp_hle_register(0xCEADEB47, "ThreadManForUser", "sceKernelDelayThread",             hle_DelayThread);
     psp_hle_register(0x68DA9E36, "ThreadManForUser", "sceKernelDelayThreadCB",           hle_DelayThread);
     psp_hle_register(0x278C0DF5, "ThreadManForUser", "sceKernelWaitThreadEnd",           hle_WaitThreadEnd);
@@ -741,4 +875,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0x402FCF22, "ThreadManForUser", "sceKernelWaitEventFlag",           hle_WaitEventFlag);
 
     psp_hle_register(0xE81CAF8F, "ThreadManForUser", "sceKernelCreateCallback",          hle_CreateCallback);
+    psp_hle_register(0xBC6FEBC5, "ThreadManForUser", "sceKernelReferSemaStatus",         hle_ReferSemaStatus);
+    psp_hle_register(0xA66B0120, "ThreadManForUser", "sceKernelReferEventFlagStatus",    hle_ReferEventFlagStatus);
+    psp_hle_register(0x730ED8BC, "ThreadManForUser", "sceKernelReferCallbackStatus",     hle_ReferCallbackStatus);
 }
