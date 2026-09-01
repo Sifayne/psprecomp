@@ -1,6 +1,7 @@
 /* psprecomp — HLE dispatch. See include/psprecomp/hle.h. */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/sched.h"
 #include "psprecomp/dispatch.h"
 
 #include <stdio.h>
@@ -129,15 +130,113 @@ void psp_hle_dump_recent(FILE *out) {
     }
 }
 
+/* How many times each registered function was called, plus the unimplemented
+ * ones lumped together.
+ *
+ * The zero-history above answers "what handed the game a null?". This answers a
+ * different question that comes up just as often: "what is the game *doing*?"
+ * A run that stops making progress has a shape -- a hundred thousand
+ * __sceSasCore and no sceDisplayWaitVblank is an audio loop with no frame loop,
+ * and that is visible here in one line and nowhere else. */
+static uint64_t g_calls[HLE_MAX];
+static uint64_t g_calls_unimpl;
+
+/* An ordered log of every firmware call, enabled by PSPRECOMP_HLE_LOG=1.
+ *
+ * The histogram says what a run did a lot of; this says what it did, in order,
+ * with arguments and results. That is what identifies the call a game gave up
+ * after -- a question the totals cannot answer, because the interesting call
+ * happened exactly once. Off by default: it is one line per call. */
+static int g_log = -1;
+
+static int logging(void);
+
+int psp_hle_logging(void) { return logging(); }
+
+static int logging(void) {
+    if (g_log < 0) {
+        const char *v = getenv("PSPRECOMP_HLE_LOG");
+        g_log = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return g_log;
+}
+
+/* PSPRECOMP_HLE_TRACE=<name> dumps the function trace at every call to that
+ * firmware function.
+ *
+ * Knowing a game called sceIoGetstat is rarely the question; knowing *which* of
+ * its loaders called it, and therefore what it does with the answer, is. The
+ * call is the one moment where guest code is stopped at a known point with its
+ * whole chain still on the trace ring. */
+static const char *trace_name(void) {
+    static const char *n;
+    static int looked;
+    if (!looked) { looked = 1; n = getenv("PSPRECOMP_HLE_TRACE"); if (n && !*n) n = NULL; }
+    return n;
+}
+
+void psp_hle_dump_calls(FILE *out, int top) {
+    /* Selection sort over indices: g_count is a couple of hundred and this runs
+     * once, at exit. */
+    int order[HLE_MAX];
+    int n = 0;
+    for (int i = 0; i < g_count; i++) if (g_calls[i]) order[n++] = i;
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++)
+            if (g_calls[order[b]] > g_calls[order[a]]) {
+                const int t = order[a]; order[a] = order[b]; order[b] = t;
+            }
+
+    if (!n) { fprintf(out, "  (no firmware calls)\n"); return; }
+    if (top > n) top = n;
+    for (int i = 0; i < top; i++) {
+        const int e = order[i];
+        fprintf(out, "  %10llu  %s\n", (unsigned long long)g_calls[e],
+                g_entry[e].name ? g_entry[e].name : "(unnamed)");
+    }
+    if (g_calls_unimpl)
+        fprintf(out, "  %10llu  (unimplemented)\n",
+                (unsigned long long)g_calls_unimpl);
+}
+
 void psp_hle_call(uint32_t nid) {
     for (int i = 0; i < g_count; i++) {
         if (g_entry[i].nid == nid) {
+            g_calls[i]++;
+            /* Logged before the call, not after: sceKernelExitThread and the
+             * exit-the-game calls never return, so a line emitted afterwards
+             * would omit exactly the call that ended the run. The result comes
+             * back on its own line for the calls that do return. */
+            if (logging())
+                fprintf(stderr, "hle: [%05X] %-36s(0x%08X, 0x%08X, 0x%08X, 0x%08X)\n",
+                        psp_sched_current(),
+                        g_entry[i].name ? g_entry[i].name : "(unnamed)",
+                        psp_arg(0), psp_arg(1), psp_arg(2), psp_arg(3));
+            {
+                const char *tn = trace_name();
+                if (tn && g_entry[i].name && !strcmp(tn, g_entry[i].name)) {
+                    fprintf(stderr, "hle: --- trace at %s ---\n", g_entry[i].name);
+                    psp_trace_dump();
+                }
+            }
             g_fn[i]();
+            if (logging())
+                fprintf(stderr, "hle: [%05X] %-36s  = 0x%08X\n",
+                        psp_sched_current(), "", psp_cpu.r[PSP_REG_V0]);
             if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name, 1);
+            /* After the handler, not before: the call has to finish before the
+             * thread can be switched away from, or its result is written into
+             * whoever runs next. */
+            psp_sched_tick();
             return;
         }
     }
     note_zero(nid, NULL, 0);
+    g_calls_unimpl++;
+    if (logging())
+        fprintf(stderr, "hle: [%05X] 0x%08X <unimplemented>(0x%08X, 0x%08X, 0x%08X, 0x%08X)\n",
+                psp_sched_current(), nid,
+                psp_arg(0), psp_arg(1), psp_arg(2), psp_arg(3));
 
     /* Unimplemented. Naming the function is the whole point — bringing a game
      * up is largely the process of watching this message stop appearing, and
@@ -170,7 +269,10 @@ void psp_hle_init(void) {
     psp_set_miss_context(miss_context);
     psp_sysmem_init();
     psp_sysmem_register();
+    psp_sched_init();
     psp_threadman_init();
+    psp_mpeg_register();
+    psp_mpeg_reset();
     psp_threadman_register();
     psp_display_init();
     psp_display_register();

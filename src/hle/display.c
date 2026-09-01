@@ -10,6 +10,8 @@
  * front buffer, and compare it against the same frame from an emulator.
  */
 
+#include "psprecomp/clock.h"
+#include "psprecomp/sched.h"
 #include "psprecomp/hle.h"
 
 #include <stdio.h>
@@ -46,6 +48,8 @@ void psp_display_init(void) { psp_display_reset(); }
 
 uint64_t psp_display_vblanks(void) { return g_vblank_count; }
 uint32_t psp_display_framebuffer(void) { return g_fb_addr; }
+uint32_t psp_display_stride(void)      { return g_fb_width; }
+uint32_t psp_display_format(void)      { return g_fb_format; }
 
 /* Expand one source pixel to RGBA8888. The 16-bit formats replicate their high
  * bits into the low ones on expansion; simply shifting left leaves the maximum
@@ -134,6 +138,13 @@ static void hle_SetFrameBuf(void) {
  * stuck. */
 static void hle_WaitVblank(void) {
     g_vblank_count++;
+    /* A frame of guest time passes here. This is the only place time advances
+     * by a realistic amount rather than a token tick, so a game that paces
+     * itself off the clock paces itself off its own frames. */
+    psp_clock_frame();
+    /* And it is the natural point to let another thread run: a game waiting for
+     * the next frame is not using the CPU, whatever it told the kernel. */
+    psp_sched_yield();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -170,12 +181,35 @@ static void hle_GetAccumulatedHcount(void) {
     g_vcount++;
 }
 
+/* sceDisplayGetFramePerSec(void) -> float
+ *
+ * The refresh rate itself, as a float in $f0 -- not a status code in $v0, which
+ * is the only reason its absence was survivable at all. Unimplemented, the call
+ * returned zero and left $f0 holding whatever the guest had there.
+ *
+ * This game asks 28,470 times in a minute, so it is squarely on the frame path,
+ * and a rate of zero poisons everything derived from it: a frame interval of
+ * 1/fps is a division by zero, and a budget of `fps * seconds` is nothing to do.
+ *
+ * The clock rounds the frame *interval* to whole microseconds for its own
+ * purposes (see PSP_FRAME_US in clock.c); this is the rate, which is what a
+ * caller asking for frames per second wants, and the two should not be derived
+ * from each other. */
+#define PSP_REFRESH_HZ 59.940059f
+
+static void hle_GetFramePerSec(void) {
+    psp_cpu.f[0] = PSP_REFRESH_HZ;
+}
+
 void psp_display_register(void) {
     psp_hle_register(0x0E20F177, "sceDisplay", "sceDisplaySetMode",           hle_SetMode);
     psp_hle_register(0x289D82FE, "sceDisplay", "sceDisplaySetFrameBuf",       hle_SetFrameBuf);
     psp_hle_register(0x36CDFADE, "sceDisplay", "sceDisplayWaitVblank",        hle_WaitVblank);
+    psp_hle_register(0x984C27E7, "sceDisplay", "sceDisplayWaitVblankStart",   hle_WaitVblank);
     psp_hle_register(0x46F186C3, "sceDisplay", "sceDisplayWaitVblankStartCB", hle_WaitVblank);
     psp_hle_register(0x9C6EAAD7, "sceDisplay", "sceDisplayGetVcount",         hle_GetVcount);
     psp_hle_register(0x210EAB3A, "sceDisplay", "sceDisplayGetAccumulatedHcount",
                      hle_GetAccumulatedHcount);
+    psp_hle_register(0xDBA6C4C4, "sceDisplay", "sceDisplayGetFramePerSec",
+                     hle_GetFramePerSec);
 }

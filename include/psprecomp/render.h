@@ -18,6 +18,10 @@
 typedef struct {
     int      x, y;
     uint32_t rgba;
+    /* Texture coordinates in texels, not normalised. Through-mode geometry --
+     * the only kind drawn so far -- gives them that way, and normalising only
+     * to multiply back by the size would lose precision for nothing. */
+    float    u, v;
 } psp_vertex;
 
 /* GE primitive types, from the PRIM argument's type field. */
@@ -39,6 +43,12 @@ typedef struct {
 
     /* GE_FBP / GE_FBW: the framebuffer being drawn into. */
     void (*set_target)(uint32_t addr, uint32_t stride, int fmt);
+
+    /* The texture to sample, or addr 0 for none. `fmt` is the GE's own
+     * TEXFORMAT code and `func` its TEXFUNC; a backend meeting one it does not
+     * implement should draw untextured rather than guess. */
+    void (*set_texture)(uint32_t addr, uint32_t stride, int w, int h,
+                        int fmt, int func, int swizzled);
 
     /* One assembled primitive. `count` vertices, already in screen space. */
     void (*draw)(int prim, const psp_vertex *v, int count);

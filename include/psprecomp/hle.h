@@ -33,6 +33,14 @@ typedef void (*psp_hle_fn)(void);
 /* Register one firmware function. `name` is kept for diagnostics and is what
  * the NID is verified against. */
 void psp_hle_register(uint32_t nid, const char *lib, const char *name, psp_hle_fn fn);
+
+/* Every semaphore, and whether anything ever signalled it. Answers "nobody
+ * signals this" with the whole set rather than with the absence of a log line. */
+void psp_threadman_dump_signalled(FILE *out);
+
+/* Every thread ever created, with what became of it. The scheduler's list only
+ * covers threads that still exist. */
+void psp_threadman_dump_threads(FILE *out);
 void psp_hle_register_unnamed(uint32_t nid, const char *lib, psp_hle_fn fn);
 int psp_hle_is_named(int index);
 
@@ -61,7 +69,18 @@ const psp_hle_entry *psp_hle_entries(int *count);
 /* Print the recent firmware calls that returned zero. Zero is what a game most
  * often mistakes for an address, so this is the first thing to consult when a
  * wild pointer shows up far from its cause. */
+void psp_mpeg_register(void);
+void psp_mpeg_reset(void);
+
 void psp_hle_dump_recent(FILE *out);
+
+/* The `top` most-called firmware functions, most first. Shows what a run spent
+ * its time on -- and, by what is missing, what it never reached. */
+void psp_hle_dump_calls(FILE *out, int top);
+
+/* Whether PSPRECOMP_HLE_LOG is on. Handlers consult this to add detail that is
+ * too verbose to print unconditionally. */
+int psp_hle_logging(void);
 
 /* Register everything the toolkit implements. Call once at startup. */
 void psp_hle_init(void);
@@ -111,6 +130,9 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_UNKNOWN_UID     0x800201A2
 #define SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK 0x800201A9
 #define SCE_KERNEL_ERROR_ILLEGAL_THID    0x80020197
+/* A poll that would have blocked. Distinct from an error: it is the ordinary
+ * answer to "is this free?" when it is not. */
+#define SCE_KERNEL_ERROR_SEMA_ZERO       0x800201AD
 #define SCE_KERNEL_ERROR_WAIT_TIMEOUT    0x800201A8
 
 /* ---- the subsystems ------------------------------------------------------ */
@@ -125,6 +147,10 @@ void psp_display_reset(void);
 int      psp_display_capture(const char *path);
 uint64_t psp_display_vblanks(void);
 uint32_t psp_display_framebuffer(void);
+/* The stride in pixels and the pixel format the display is scanning out, so a
+ * caller can read the framebuffer without guessing its shape. */
+uint32_t psp_display_stride(void);
+uint32_t psp_display_format(void);
 
 void psp_ge_init(void);
 void psp_ge_register(void);
@@ -133,6 +159,8 @@ void psp_ge_dump_stats(FILE *out);
 uint64_t psp_ge_command_count(void);
 uint64_t psp_ge_vertex_count(void);
 uint64_t psp_ge_pixels(void);
+/* The address the GE last rendered into, VRAM base applied. */
+uint32_t psp_ge_target(void);
 
 void psp_sas_init(void);
 void psp_sas_register(void);
