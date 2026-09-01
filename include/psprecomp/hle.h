@@ -442,6 +442,10 @@ void psp_ktimer_reset(void);
  * path, which is the only place guest time is observed to move. */
 void psp_ktimer_tick(void);
 void psp_kernobj_reset(void);
+/* A thread has ended: return anything it still holds. Only thread-local
+ * storage cares -- a pool block or a mutex outlives its owner, a tls block by
+ * definition does not. */
+void psp_kernobj_thread_ended(uint32_t uid);
 void psp_kernlock_reset(void);
 
 void psp_threadman_init(void);

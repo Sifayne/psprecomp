@@ -550,6 +550,7 @@ static void hle_DelayThread(void) {
 static void thread_ended(psp_thread *t, uint32_t status) {
     t->exit_status = status;
     t->state       = TH_DORMANT;
+    psp_kernobj_thread_ended(t->uid);
     for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++)
         psp_sched_wake(t->enders[i]);
     t->nenders = 0;

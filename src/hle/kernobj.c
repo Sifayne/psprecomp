@@ -1774,6 +1774,28 @@ static void hle_GetTlsAddr(void) {
     psp_ret(tls_block_of(t, me));
 }
 
+/* A thread's blocks go back to the pool when the thread ends. That is what
+ * makes the storage thread-local, and tls/priority measures it without ever
+ * calling free successfully: its workers take a block, delay, and then free it
+ * with sceKernelFreeFpl -- the wrong call for the type, which fails with
+ * 8002019d every time. The block still reaches the next waiter, so what
+ * returned it was the worker exiting. */
+void psp_kernobj_thread_ended(uint32_t uid) {
+    for (int i = 0; i < MAX_TLSPLS; i++) {
+        psp_tlspl *t = &g_tls[i];
+        if (!t->alive) continue;
+        for (uint32_t b = 0; b < t->nblocks; b++) {
+            if (t->owner[b] != uid) continue;
+            t->owner[b] = 0;
+            const int wi = psp_waitq_pick(&t->q, t->attr);
+            if (wi < 0) continue;
+            const psp_waiter w = psp_waitq_take(&t->q, wi);
+            t->owner[b] = w.uid;
+            (void)psp_sched_wake(w.uid);
+        }
+    }
+}
+
 static void hle_FreeTlspl(void) {
     psp_tlspl *t = find_tls(psp_arg(0));
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_TLSPLID); return; }
