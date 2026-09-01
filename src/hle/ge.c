@@ -109,6 +109,8 @@
 #define GE_OFFSETY           0x4D
 #define GE_CULLFACEENABLE    0x1D
 #define GE_CULL              0x9B
+#define GE_MASKRGB           0xD8
+#define GE_MASKALPHA         0xD9
 #define GE_ZTESTENABLE       0x23
 #define GE_ZTEST             0xDE
 #define GE_ZWRITEDISABLE     0xE7
@@ -725,12 +727,27 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 if (v[i].y < y0) y0 = v[i].y;   if (v[i].y > y1) y1 = v[i].y;
             }
             fprintf(stderr, "draw: %-14s %2u verts  x %4d..%-4d y %4d..%-4d  "
-                            "rgba %08X  vtype %06X  tex %s\n",
-                    PRIM_NAME[type & 7], decoded, x0, x1, y0, y1, v[0].rgba,
+                            "fbp %08X  rgba %08X  vtype %06X  tex %s\n",
+                    PRIM_NAME[type & 7], decoded, x0, x1, y0, y1,
+                    ge_fb_address(g_ge.fbp), v[0].rgba,
                     g_ge.vtype, (g_ge.tex_enable && tex_off >= 0 && g_ge.tex_addr)
                                 ? "yes" : "no");
-            fprintf(stderr, "      world");
+            fprintf(stderr, "      cols");
+            for (uint32_t i = 0; i < decoded && i < 4; i++)
+                fprintf(stderr, " %08X", v[i].rgba);
+            fprintf(stderr, "   blend %s src %d dst %d eq %d  atest %s func %d ref %d"
+                            "  clear %s\n",
+                    g_tl.blend.enable ? "on" : "off", g_tl.blend.src, g_tl.blend.dst,
+                    g_tl.blend.eq, g_tl.blend.alpha_test ? "on" : "off",
+                    g_tl.blend.alpha_func, g_tl.blend.alpha_ref,
+                    g_tl.clear_mode ? "ON" : "off");
+            fprintf(stderr, "      fbp %08X fbw %u\n      world",
+                    ge_fb_address(g_ge.fbp), g_ge.fbw);
             for (int i = 0; i < 12; i++) fprintf(stderr, " %.2f", g_tl.world[i]);
+            fprintf(stderr, "\n      view ");
+            for (int i = 0; i < 12; i++) fprintf(stderr, " %.2f", g_tl.view[i]);
+            fprintf(stderr, "\n      proj ");
+            for (int i = 0; i < 16; i++) fprintf(stderr, " %.3f", g_tl.proj[i]);
             fprintf(stderr, "\n      model v0");
             {
                 float m[3];
@@ -832,9 +849,13 @@ static void draw_prim(uint32_t type, uint32_t count) {
         }
         psp_render_current()->set_blend(&b);
     }
+    /* Clear mode bypasses texturing, blending and the alpha test, but *not* the
+     * depth test -- the hardware still runs it, and PPSSPP's rasterizer does
+     * too. Bypassing it here let a clear overwrite geometry that should have
+     * rejected it. */
     psp_render_current()->set_depth(
-        g_tl.clear_mode ? 0 : g_tl.ztest_enable,
-        g_tl.clear_mode ? 1 : g_tl.ztest_func,
+        g_tl.ztest_enable,
+        g_tl.ztest_func,
         g_tl.clear_mode ? g_tl.clear_z : !g_tl.zwrite_off);
 
     /* Decode the whole batch, then hand it to the backend in one call.
@@ -874,10 +895,19 @@ static void draw_prim(uint32_t type, uint32_t count) {
                 if(v[i].y<y0)y0=v[i].y; if(v[i].y>y1)y1=v[i].y;
             }
             fprintf(stderr, "2d:   %-14s %2u verts  x %4d..%-4d y %4d..%-4d  "
-                            "rgba %08X %08X  vtype %06X  tex %s\n",
+                            "fbp %08X  rgba %08X %08X  vtype %06X  tex %s\n",
                     PRIM_NAME[type & 7], decoded, x0,x1,y0,y1,
+                    ge_fb_address(g_ge.fbp),
                     v[0].rgba, v[decoded>1?1:0].rgba, g_ge.vtype,
                     has_uv ? "yes" : "no");
+            fprintf(stderr, "      raw");
+            for (uint32_t i = 0; i < decoded && i < 2; i++) {
+                const uint32_t a = g_ge.vaddr + (done + i) * (uint32_t)stride;
+                fprintf(stderr, "  v%u@%08X:", i, a);
+                for (int b = 0; b < stride && b < 16; b++)
+                    fprintf(stderr, "%02X", psp_read8(a + (uint32_t)b));
+            }
+            fprintf(stderr, "  stride %d col_off %d pos_off %d\n", stride, col_off, pos_off);
             fprintf(stderr, "      clear %s (z %d)  blend %s src %d dst %d  "
                             "atest %s func %d ref %d\n",
                     g_tl.clear_mode ? "ON" : "off", g_tl.clear_z,
@@ -1005,6 +1035,12 @@ static void run_list(ge_queue *q) {
         case GE_OFFSETX: g_tl.off_x = (float)(arg & 0xFFFFFu) / 16.0f; break;
         case GE_OFFSETY: g_tl.off_y = (float)(arg & 0xFFFFFu) / 16.0f; break;
 
+        case GE_MASKRGB:
+        case GE_MASKALPHA:
+            if (drawlog_left())
+                fprintf(stderr, "msk: %s arg=%06X\n",
+                        cmd == GE_MASKRGB ? "MASKRGB  " : "MASKALPHA", arg);
+            break;
         case GE_CULLFACEENABLE: g_tl.cull_enable = (int)(arg & 1); break;
         case GE_CULL:           g_tl.cull_ccw    = (int)(arg & 1); break;
         /* ---- texture state -------------------------------------------------
