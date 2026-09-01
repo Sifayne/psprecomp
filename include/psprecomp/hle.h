@@ -247,6 +247,9 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
  * 0x800201C0..C2. The user-side family sits one row down in the same shape, and
  * what pins this member of it is tls/create's seventeenth pool. */
 #define SCE_KERNEL_ERROR_TLSPL_FULL         0x800201D1
+/* Someone else's block is still out. Same row as TLSPL_FULL above and the same
+ * shape as the kernel-side KTLS_BUSY; tls/delete is what pins it. */
+#define SCE_KERNEL_ERROR_TLSPL_BUSY         0x800201D2
 #define SCE_KERNEL_ERROR_UNKNOWN_ALMID      0x8002019F
 #define SCE_KERNEL_ERROR_UNKNOWN_VTID       0x800201BE
 /* A blocking call made while dispatch is suspended. */

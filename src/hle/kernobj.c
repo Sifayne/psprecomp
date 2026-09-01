@@ -1779,9 +1779,22 @@ static void hle_CreateTlspl(void) {
     psp_ret(t->uid);
 }
 
+static uint32_t tls_me(void);
+
 static void hle_DeleteTlspl(void) {
     psp_tlspl *t = find_tls(psp_arg(0));
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_TLSPLID); return; }
+    /* A block still out with another thread refuses the delete. Waiters do
+     * not: tls/delete deletes a one-block pool with two threads queued behind
+     * it and gets OK, then fails on a two- and a three-block pool where the
+     * extra blocks went to threads that had not given them back. So what the
+     * kernel counts is blocks lent, and the caller's own does not count. */
+    const uint32_t me = tls_me();
+    for (uint32_t i = 0; i < t->nblocks; i++)
+        if (t->owner[i] && t->owner[i] != me) {
+            psp_ret(SCE_KERNEL_ERROR_TLSPL_BUSY);
+            return;
+        }
     const int urgent = psp_waitq_release_all(&t->q);
     if (t->base) psp_sysmem_release(t->base);
     free(t->owner);
