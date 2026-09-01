@@ -1729,6 +1729,22 @@ static void hle_NotifyCallback(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* sceKernelGetThreadExitStatus(thid)
+ *
+ * The same value sceKernelReferThreadStatus reports in its exitStatus field,
+ * on its own. Unregistered until now, so it answered zero -- and zero is a
+ * meaningful answer here: the callbacks tests use it to decide whether a
+ * worker is still alive, and a thread that reads as "exited cleanly" is torn
+ * down silently instead of being terminated and announced. Whole lines went
+ * missing from four tests because of it. */
+static void hle_GetThreadExitStatus(void) {
+    const psp_thread *t = find_thread(psp_arg(0));
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    if (!t->ever_started)              { psp_ret(SCE_KERNEL_ERROR_DORMANT); return; }
+    if (t->state != TH_DORMANT)        { psp_ret(SCE_KERNEL_ERROR_NOT_DORMANT); return; }
+    psp_ret(t->exit_status);
+}
+
 /* Deliver every callback pending for the current thread.
  *
  * The handler's three arguments are pinned by callbacks/notify, which prints
@@ -1866,6 +1882,7 @@ void psp_threadman_register(void) {
      * pair below. */
     psp_hle_register(0x349D6D6C, "ThreadManForUser", "sceKernelCheckCallback",           hle_CheckCallback);
     psp_hle_register(0xC11BA8C4, "ThreadManForUser", "sceKernelNotifyCallback",          hle_NotifyCallback);
+    psp_hle_register(0x3B183E26, "ThreadManForUser", "sceKernelGetThreadExitStatus",     hle_GetThreadExitStatus);
     psp_hle_register(0xBA4051D6, "ThreadManForUser", "sceKernelCancelCallback",          hle_CancelCallback);
     psp_hle_register(0x2A3D44FF, "ThreadManForUser", "sceKernelGetCallbackCount",        hle_GetCallbackCount);
     psp_hle_register(0x840E8133, "ThreadManForUser", "sceKernelWaitThreadEndCB",         hle_WaitThreadEndCB);
