@@ -43,6 +43,7 @@
 #define UID_BASE    0x00040000u
 
 enum { TH_DORMANT = 0, TH_READY, TH_RUNNING, TH_SUSPENDED };
+enum { WAIT_NONE = 0, WAIT_SLEEP, WAIT_DELAY };
 
 /* What sceKernelReferThreadStatus reports in its `status` field. These are the
  * kernel's own values, not this file's TH_* -- a created thread reports 16. */
@@ -73,6 +74,11 @@ typedef struct {
     /* Whether it has ever been started. A thread that has not is *dormant*,
      * and that is a different answer from one that has run and stopped. */
     int      ever_started;
+    /* Which call parked it. The scheduler has one SLEEPING state for both a
+     * sceKernelSleepThread and a sceKernelDelayThread, and the id list reports
+     * them as different types -- so the distinction has to be kept here, where
+     * the difference was made. */
+    int      wait_kind;
     /* Threads parked in sceKernelWaitThreadEnd on this one. */
     uint32_t enders[MAX_SEMA_WAITERS];
     int      nenders;
@@ -378,7 +384,11 @@ static void hle_DeleteThread(void) {
  * which is the useful half of the semantics. */
 static void hle_DelayThread(void) {
     if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
+    psp_thread *me = current_thread();
+    if (me) me->wait_kind = WAIT_DELAY;
     psp_sched_delay(psp_arg(0));
+    me = current_thread();
+    if (me) me->wait_kind = WAIT_NONE;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -570,13 +580,16 @@ static void hle_SleepThread(void) {
     if (!t) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
     if (t->wakeup_count > 0) { t->wakeup_count--; psp_ret(SCE_KERNEL_ERROR_OK); return; }
 
+    t->wait_kind = WAIT_SLEEP;
     if (psp_sched_block(t->uid, PSP_SCHED_SLEEPING, "sceKernelSleepThread") != 0) {
+        t->wait_kind = WAIT_NONE;
         wait_deadlock("sceKernelSleepThread");
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
     /* Woken by name, so the wakeup this consumed is spent. */
     t = current_thread();
+    if (t) t->wait_kind = WAIT_NONE;
     if (t && t->wakeup_count > 0) t->wakeup_count--;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1342,6 +1355,78 @@ static void hle_ReferThreadStatus(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* ---- sceKernelGetThreadmanIdList ------------------------------------------ */
+
+#define MAX_LISTERS 8
+static psp_uid_lister g_lister[MAX_LISTERS];
+static int            g_listers;
+
+void psp_threadman_add_lister(psp_uid_lister fn) {
+    if (g_listers < MAX_LISTERS) g_lister[g_listers++] = fn;
+}
+
+/* Append one uid, counting it whether or not there was room for it. */
+static void list_add(uint32_t uid, uint32_t out, int max, int *count) {
+    if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, uid);
+    (*count)++;
+}
+
+static int thread_matches(const psp_thread *t, int type) {
+    const int dormant = !t->ever_started || t->state == TH_DORMANT;
+    switch (type) {
+        case PSP_TMID_THREAD:    return 1;
+        case PSP_TMID_DORMANT:   return dormant;
+        case PSP_TMID_SUSPENDED: return !dormant && t->state == TH_SUSPENDED;
+        case PSP_TMID_SLEEPING:  return !dormant && t->wait_kind == WAIT_SLEEP;
+        case PSP_TMID_DELAYING:  return !dormant && t->wait_kind == WAIT_DELAY;
+        default:                 return 0;
+    }
+}
+
+static void threadman_list(int type, uint32_t out, int max, int *count) {
+    if (type == PSP_TMID_THREAD || (type >= PSP_TMID_SLEEPING && type <= PSP_TMID_DORMANT)) {
+        for (int i = 0; i < MAX_THREADS; i++)
+            if (g_thread[i].used && thread_matches(&g_thread[i], type))
+                list_add(g_thread[i].uid, out, max, count);
+        return;
+    }
+    if (type == PSP_TMID_SEMA)
+        for (int i = 0; i < MAX_SEMAS; i++)
+            if (g_sema[i].used) list_add(g_sema[i].uid, out, max, count);
+    if (type == PSP_TMID_EVENTFLAG)
+        for (int i = 0; i < MAX_FLAGS; i++)
+            if (g_flag[i].used) list_add(g_flag[i].uid, out, max, count);
+    if (type == PSP_TMID_CALLBACK)
+        for (int i = 0; i < MAX_CBS; i++)
+            if (g_cb[i].used) list_add(g_cb[i].uid, out, max, count);
+}
+
+/* (type, buffer, entries, countOut)
+ *
+ * The count it writes is how many objects *exist*, not how many fitted -- the
+ * two differ whenever the buffer is short, and the return value is the number
+ * actually written. threads/threadmanidlist checks all three against each
+ * other, and separately that a bad type or a negative size leaves the caller's
+ * count word alone entirely. */
+static void hle_GetThreadmanIdList(void) {
+    const int      type = (int)psp_arg(0);
+    const uint32_t buf  = psp_arg(1);
+    const int32_t  max  = (int32_t)psp_arg(2);
+    const uint32_t nout = psp_arg(3);
+
+    const int valid = (type >= PSP_TMID_THREAD && type <= PSP_TMID_TLSPL) ||
+                      (type >= PSP_TMID_SLEEPING && type <= PSP_TMID_DORMANT);
+    if (!valid) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_TYPE); return; }
+    if (max < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+
+    int count = 0;
+    threadman_list(type, buf, max, &count);
+    for (int i = 0; i < g_listers; i++) g_lister[i](type, buf, max, &count);
+
+    if (nout) psp_write32(nout, (uint32_t)count);
+    psp_ret((uint32_t)(count < max ? count : max));
+}
+
 static void hle_CreateCallback(void) {
     if (!name_ok(psp_arg(0))) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
     psp_callback *c = NULL;
@@ -1403,6 +1488,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0x3AD58B8C, "ThreadManForUser", "sceKernelSuspendDispatchThread",   hle_SuspendDispatchThread);
     psp_hle_register(0x27E22EC2, "ThreadManForUser", "sceKernelResumeDispatchThread",    hle_ResumeDispatchThread);
     psp_hle_register(0x17C1684E, "ThreadManForUser", "sceKernelReferThreadStatus",       hle_ReferThreadStatus);
+    psp_hle_register(0x94416130, "ThreadManForUser", "sceKernelGetThreadmanIdList",      hle_GetThreadmanIdList);
 
     psp_hle_register(0xD6DA4BA1, "ThreadManForUser", "sceKernelCreateSema",              hle_CreateSema);
     psp_hle_register(0x28B6489C, "ThreadManForUser", "sceKernelDeleteSema",              hle_DeleteSema);

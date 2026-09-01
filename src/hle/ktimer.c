@@ -170,7 +170,17 @@ void psp_ktimer_tick(void) {
     vtimer_tick();
 }
 
+static void alarm_list(int type, uint32_t out, int max, int *count) {
+    if (type != PSP_TMID_ALARM) return;
+    for (int i = 0; i < MAX_ALARMS; i++) {
+        if (!g_alarm[i].alive) continue;
+        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_alarm[i].uid);
+        (*count)++;
+    }
+}
+
 void psp_ktimer_register(void) {
+    psp_threadman_add_lister(alarm_list);
     psp_hle_register(0x6652B8CA, "ThreadManForUser", "sceKernelSetAlarm",         hle_SetAlarm);
     psp_hle_register(0xB2C25152, "ThreadManForUser", "sceKernelSetSysClockAlarm", hle_SetSysClockAlarm);
     psp_hle_register(0x7E65B999, "ThreadManForUser", "sceKernelCancelAlarm",      hle_CancelAlarm);
@@ -408,7 +418,17 @@ static void vtimer_tick(void) {
     }
 }
 
+static void vtimer_list(int type, uint32_t out, int max, int *count) {
+    if (type != PSP_TMID_VTIMER) return;
+    for (int i = 0; i < MAX_VTIMERS; i++) {
+        if (!g_vtimer[i].alive) continue;
+        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_vtimer[i].uid);
+        (*count)++;
+    }
+}
+
 void psp_ktimer_register_vtimer(void) {
+    psp_threadman_add_lister(vtimer_list);
     psp_hle_register(0x20FFF560, "ThreadManForUser", "sceKernelCreateVTimer",        hle_CreateVTimer);
     psp_hle_register(0x328F9E52, "ThreadManForUser", "sceKernelDeleteVTimer",        hle_DeleteVTimer);
     psp_hle_register(0xC68D9437, "ThreadManForUser", "sceKernelStartVTimer",         hle_StartVTimer);

@@ -256,7 +256,17 @@ static void hle_ReferMutexStatus(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static void mutex_list(int type, uint32_t out, int max, int *count) {
+    if (type != PSP_TMID_MUTEX) return;
+    for (int i = 0; i < MAX_MUTEXES; i++) {
+        if (!g_mutex[i].used) continue;
+        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_mutex[i].uid);
+        (*count)++;
+    }
+}
+
 void psp_kernlock_register(void) {
+    psp_threadman_add_lister(mutex_list);
     psp_hle_register(0xB7D098C6, "ThreadManForUser", "sceKernelCreateMutex",      hle_CreateMutex);
     psp_hle_register(0xF8170FBE, "ThreadManForUser", "sceKernelDeleteMutex",      hle_DeleteMutex);
     psp_hle_register(0xB011B11F, "ThreadManForUser", "sceKernelLockMutex",        hle_LockMutex);

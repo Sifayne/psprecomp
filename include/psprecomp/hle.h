@@ -145,6 +145,8 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 /* A thread priority outside 0x08..0x77. Zero is not in that range and is not
  * an error either -- it means "the priority I am running at". */
 #define SCE_KERNEL_ERROR_ILLEGAL_PRIORITY 0x80020193
+/* A sceKernelGetThreadmanIdList type outside 1..14 and 0x40..0x43. */
+#define SCE_KERNEL_ERROR_ILLEGAL_TYPE     0x800201BB
 #define SCE_KERNEL_ERROR_SUSPEND         0x800201A3
 #define SCE_KERNEL_ERROR_NOT_SUSPEND     0x800201A5
 /* A poll that would have blocked. Distinct from an error: it is the ordinary
@@ -366,6 +368,32 @@ uint32_t psp_threadman_current_priority(void);
 /* Shared with the other kernel object types: one uid space, and one way of
  * writing a name into a SceKernel*Info block. */
 uint32_t psp_threadman_next_uid(void);
+
+/* ---- enumerating live kernel objects --------------------------------------
+ *
+ * sceKernelGetThreadmanIdList asks for every uid of one type, and the objects
+ * are spread over four files with their tables private to each. Rather than
+ * export the tables, each module registers a lister and answers for the types
+ * it owns: `count` is the running total across all of them and keeps counting
+ * past `max`, because the call reports how many *exist* while filling only as
+ * much of the buffer as it was given. */
+/* `out` is a *guest* address, or 0 for a caller that wants only the count. */
+typedef void (*psp_uid_lister)(int type, uint32_t out, int max, int *count);
+void psp_threadman_add_lister(psp_uid_lister fn);
+
+/* The types the kernel knows. 1..14 are object kinds; 0x40..0x43 select
+ * threads by what they are doing. Anything else is ILLEGAL_TYPE -- measured,
+ * threads/threadmanidlist sweeps 0, 15..24, 0x44..0x48 and a spread of large
+ * values and refuses every one. */
+enum {
+    PSP_TMID_THREAD = 1, PSP_TMID_SEMA = 2, PSP_TMID_EVENTFLAG = 3,
+    PSP_TMID_MBX = 4, PSP_TMID_VPL = 5, PSP_TMID_FPL = 6, PSP_TMID_MSGPIPE = 7,
+    PSP_TMID_CALLBACK = 8, PSP_TMID_THREVENT = 9, PSP_TMID_UNUSED10 = 10,
+    PSP_TMID_ALARM = 11, PSP_TMID_VTIMER = 12, PSP_TMID_MUTEX = 13,
+    PSP_TMID_TLSPL = 14,
+    PSP_TMID_SLEEPING = 0x40, PSP_TMID_DELAYING = 0x41,
+    PSP_TMID_SUSPENDED = 0x42, PSP_TMID_DORMANT = 0x43,
+};
 void     psp_threadman_write_name(uint32_t dst, const char *name);
 
 void psp_kernlock_register(void);

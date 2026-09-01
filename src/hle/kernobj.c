@@ -457,7 +457,17 @@ void psp_kernobj_reset(void) {
     tls_reset();
 }
 
+static void vpl_list(int type, uint32_t out, int max, int *count) {
+    if (type != PSP_TMID_VPL) return;
+    for (int i = 0; i < MAX_VPLS; i++) {
+        if (!g_vpl[i].used) continue;
+        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_vpl[i].uid);
+        (*count)++;
+    }
+}
+
 void psp_kernobj_register(void) {
+    psp_threadman_add_lister(vpl_list);
     psp_hle_register(0x56C039B5, "ThreadManForUser", "sceKernelCreateVpl",      hle_CreateVpl);
     psp_hle_register(0x89B3D48C, "ThreadManForUser", "sceKernelDeleteVpl",      hle_DeleteVpl);
     psp_hle_register(0xBED27435, "ThreadManForUser", "sceKernelAllocateVpl",    hle_AllocateVpl);
@@ -743,7 +753,17 @@ static void hle_ReferMsgPipeStatus(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static void mpp_list(int type, uint32_t out, int max, int *count) {
+    if (type != PSP_TMID_MSGPIPE) return;
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if (!g_pipe[i].alive) continue;
+        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_pipe[i].uid);
+        (*count)++;
+    }
+}
+
 void psp_kernobj_register_mpp(void) {
+    psp_threadman_add_lister(mpp_list);
     psp_hle_register(0x7C0DC2A0, "ThreadManForUser", "sceKernelCreateMsgPipe",     hle_CreateMsgPipe);
     psp_hle_register(0xF0B7DA1C, "ThreadManForUser", "sceKernelDeleteMsgPipe",     hle_DeleteMsgPipe);
     psp_hle_register(0x876DBFAD, "ThreadManForUser", "sceKernelSendMsgPipe",       hle_SendMsgPipe);
@@ -974,7 +994,17 @@ static void hle_ReferMbxStatus(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static void mbx_list(int type, uint32_t out, int max, int *count) {
+    if (type != PSP_TMID_MBX) return;
+    for (int i = 0; i < MAX_MBXES; i++) {
+        if (!g_mbx[i].alive) continue;
+        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_mbx[i].uid);
+        (*count)++;
+    }
+}
+
 void psp_kernobj_register_mbx(void) {
+    psp_threadman_add_lister(mbx_list);
     psp_hle_register(0x8125221D, "ThreadManForUser", "sceKernelCreateMbx",        hle_CreateMbx);
     psp_hle_register(0x86255ADA, "ThreadManForUser", "sceKernelDeleteMbx",        hle_DeleteMbx);
     psp_hle_register(0xE9B3061E, "ThreadManForUser", "sceKernelSendMbx",          hle_SendMbx);
@@ -1231,7 +1261,17 @@ static void hle_ReferFplStatus(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static void fpl_list(int type, uint32_t out, int max, int *count) {
+    if (type != PSP_TMID_FPL) return;
+    for (int i = 0; i < MAX_FPLS; i++) {
+        if (!g_fpl[i].alive) continue;
+        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_fpl[i].uid);
+        (*count)++;
+    }
+}
+
 void psp_kernobj_register_fpl(void) {
+    psp_threadman_add_lister(fpl_list);
     psp_hle_register(0xC07BB470, "ThreadManForUser", "sceKernelCreateFpl",      hle_CreateFpl);
     psp_hle_register(0xED1410E0, "ThreadManForUser", "sceKernelDeleteFpl",      hle_DeleteFpl);
     psp_hle_register(0xD979E9BF, "ThreadManForUser", "sceKernelAllocateFpl",    hle_AllocateFpl);
@@ -1384,7 +1424,17 @@ static void hle_ReferTlsplStatus(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static void tls_list(int type, uint32_t out, int max, int *count) {
+    if (type != PSP_TMID_TLSPL) return;
+    for (int i = 0; i < MAX_TLSPLS; i++) {
+        if (!g_tls[i].alive) continue;
+        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_tls[i].uid);
+        (*count)++;
+    }
+}
+
 void psp_kernobj_register_tls(void) {
+    psp_threadman_add_lister(tls_list);
     psp_hle_register(0x8DAFF657, "ThreadManForUser", "sceKernelCreateTlspl",      hle_CreateTlspl);
     psp_hle_register(0x32BF938E, "ThreadManForUser", "sceKernelDeleteTlspl",      hle_DeleteTlspl);
     psp_hle_register(0xFA835CDE, "ThreadManForUser", "sceKernelGetTlsAddr",       hle_GetTlsAddr);
