@@ -130,6 +130,9 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_UNKNOWN_UID     0x800201A2
 #define SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK 0x800201A9
 #define SCE_KERNEL_ERROR_ILLEGAL_THID    0x80020197
+/* A thread id that names nothing, as distinct from one that is malformed.
+ * threads/refer.expected answers both a deleted and an invalid id with this. */
+#define SCE_KERNEL_ERROR_UNKNOWN_THID    0x80020198
 /* A poll that would have blocked. Distinct from an error: it is the ordinary
  * answer to "is this free?" when it is not. */
 #define SCE_KERNEL_ERROR_SEMA_ZERO       0x800201AD

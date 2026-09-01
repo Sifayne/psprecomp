@@ -43,8 +43,11 @@ typedef enum {
     PSP_SCHED_READY = 0,
     PSP_SCHED_RUNNING,
     PSP_SCHED_BLOCKED,     /* waiting on a kernel object */
-    PSP_SCHED_SLEEPING,    /* sceKernelSleepThread, until an explicit wakeup */
+    PSP_SCHED_SLEEPING,    /* a deadline, or an explicit wakeup */
     PSP_SCHED_DEAD,
+    /* sceKernelSuspendThread. Distinct from blocked: nothing it is waiting for
+     * can release it, only sceKernelResumeThread, so a signal must not. */
+    PSP_SCHED_SUSPENDED,
 } psp_sched_state;
 
 void psp_sched_init(void);
@@ -210,6 +213,31 @@ uint32_t psp_sched_current(void);
  * and the order has to follow it. An unknown uid sorts last, so a stale entry
  * can never win a release it should not. */
 int      psp_sched_priority(uint32_t uid);
+
+/* Change a thread's priority. The thread manager owns what a priority *means*;
+ * the scheduler owns which thread runs, so it has to be told -- writing the new
+ * value only into the thread-manager record left the scheduler ordering threads
+ * by the priority they were created with forever. */
+void psp_sched_set_priority(uint32_t uid, int priority);
+
+/* Suspend and resume, which are not block and wake.
+ *
+ * A suspended thread is waiting for nothing, so nothing it was parked on may
+ * release it -- only a resume. Suspending the *running* thread gives up the
+ * token, so this does not return until something resumes it.
+ *
+ * Returns 1 if the thread existed. */
+int  psp_sched_suspend(uint32_t uid);
+int  psp_sched_resume(uint32_t uid);
+
+/* sceKernelSuspendDispatchThread: stop switching between threads entirely.
+ *
+ * A guest asks for this around a critical section it needs to finish
+ * uninterrupted, and pspautotests' scheduling/dispatch is an entire test of it.
+ * While off, the timeslice does not fire and a yield does nothing; the current
+ * thread keeps the CPU until it turns dispatch back on. Returns the previous
+ * setting, which is what the guest passes back to restore it. */
+int  psp_sched_set_dispatch(int on);
 
 #ifdef __cplusplus
 }

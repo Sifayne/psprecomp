@@ -50,6 +50,8 @@ static int             g_running = MAIN_SLOT;
 static void          (*g_end_hook)(uint32_t uid, uint32_t status);
 static void          (*g_thread_hook)(void);
 static int             g_threading = 1;
+/* sceKernelSuspendDispatchThread. See psp_sched_set_dispatch. */
+static int             g_dispatch = 1;
 static const char     *g_stop_reason;
 static int           (*g_spawn_hook)(uint32_t uid, uint32_t entry, uint32_t sp,
                                       uint32_t a0, uint32_t a1, int priority);
@@ -445,6 +447,8 @@ int psp_sched_block_until(uint32_t uid, psp_sched_state why, const char *what,
 
 void psp_sched_yield(void) {
     if (!g_threading) return;
+    /* Dispatch suspended: the guest asked not to be switched away from. */
+    if (!g_dispatch) return;
     /* A yield differs from a block only in that the caller stays runnable --
      * so a lone thread that yields simply gets the token straight back. */
     pthread_mutex_lock(&g_lock);
@@ -548,7 +552,7 @@ void psp_sched_delay(uint64_t usec) {
  * its disc reads to a pool of equal-priority workers and then carries on, and
  * without a timeslice the poster keeps the CPU and nothing is ever read. */
 void psp_sched_tick(void) {
-    if (!g_threading) return;
+    if (!g_threading || !g_dispatch) return;
 
     pthread_mutex_lock(&g_lock);
     const int me = g_running;
@@ -687,7 +691,7 @@ int psp_sched_drain(int timeout_s) {
         for (int i = 0; i < MAX_SCHED_THREADS; i++) {
             if (!g_slot[i].used || g_slot[i].state == PSP_SCHED_DEAD) continue;
             static const char *const ST[] = {
-                "ready", "running", "blocked", "sleeping", "dead" };
+                "ready", "running", "blocked", "sleeping", "dead", "suspended" };
             fprintf(stderr, "    uid 0x%08X  entry 0x%08X  prio %d  %s%s%s\n",
                     g_slot[i].uid, g_slot[i].entry, g_slot[i].priority,
                     ST[g_slot[i].state],
@@ -721,7 +725,7 @@ void psp_sched_dump_threads(FILE *out) {
     for (int i = 0; i < MAX_SCHED_THREADS; i++) {
         if (!g_slot[i].used || g_slot[i].state == PSP_SCHED_DEAD) continue;
         static const char *const ST[] = {
-            "ready", "running", "blocked", "sleeping", "dead" };
+            "ready", "running", "blocked", "sleeping", "dead", "suspended" };
         fprintf(out, "    uid 0x%08X  entry 0x%08X  prio %d  %s%s%s\n",
                 g_slot[i].uid, g_slot[i].entry, g_slot[i].priority,
                 ST[g_slot[i].state],
@@ -736,6 +740,52 @@ int psp_sched_live(void) {
     const int live = live_locked();
     pthread_mutex_unlock(&g_lock);
     return live;
+}
+
+int psp_sched_set_dispatch(int on) {
+    const int was = g_dispatch;
+    g_dispatch = on;
+    return was;
+}
+
+void psp_sched_set_priority(uint32_t uid, int priority) {
+    pthread_mutex_lock(&g_lock);
+    const int s = slot_of(uid);
+    if (s >= 0) g_slot[s].priority = priority;
+    pthread_mutex_unlock(&g_lock);
+}
+
+int psp_sched_suspend(uint32_t uid) {
+    if (!g_threading) return 0;
+    pthread_mutex_lock(&g_lock);
+    const int s = slot_of(uid);
+    if (s < 0) { pthread_mutex_unlock(&g_lock); return 0; }
+    const int running = (s == g_running);
+    if (!running) {
+        /* Somebody else: mark it and let it stay off the ready scan. Whatever
+         * it was parked on is forgotten, because a resume is what restarts it
+         * and re-testing the old condition is the resumed thread's business. */
+        g_slot[s].state      = PSP_SCHED_SUSPENDED;
+        g_slot[s].waiting_on = NULL;
+        g_slot[s].wake_at    = 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+    /* Ourselves: give up the token and do not come back until resumed. */
+    if (running) (void)switch_away(s, PSP_SCHED_SUSPENDED, "sceKernelSuspendThread", 0);
+    return 1;
+}
+
+int psp_sched_resume(uint32_t uid) {
+    if (!g_threading) return 0;
+    pthread_mutex_lock(&g_lock);
+    const int s = slot_of(uid);
+    if (s < 0) { pthread_mutex_unlock(&g_lock); return 0; }
+    if (g_slot[s].state == PSP_SCHED_SUSPENDED) {
+        g_slot[s].state = PSP_SCHED_READY;
+        g_slot[s].woken = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return 1;
 }
 
 int psp_sched_priority(uint32_t uid) {

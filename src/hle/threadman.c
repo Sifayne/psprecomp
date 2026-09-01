@@ -56,6 +56,8 @@ typedef struct {
     uint32_t attr;
     int      state;
     uint32_t exit_status;
+    /* Banked sceKernelWakeupThread calls; see hle_SleepThread. */
+    int      wakeup_count;
     /* Threads parked in sceKernelWaitThreadEnd on this one. */
     uint32_t enders[MAX_SEMA_WAITERS];
     int      nenders;
@@ -335,7 +337,11 @@ static void hle_TerminateThread(void);
 
 static void hle_DeleteThread(void) {
     psp_thread *t = find_thread(psp_arg(0));
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    /* Deleting a thread the guest never let start has to un-start it too --
+     * sched.h says this happens here and it did not. Harmless when the thread
+     * is already gone, which is the common case. */
+    psp_sched_cancel_spawn(t->uid);
     if (t->stack_base) psp_sysmem_release(t->stack_base);
     t->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -424,24 +430,102 @@ static void hle_GetSystemTime(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Suspend, resume and priority all have to reach the scheduler.
+ *
+ * Each of these used to write a thread-manager field and stop. That was
+ * invisible while a thread ran to completion at its start point and nothing
+ * was ever scheduled against anything: a suspended thread still ran, and a
+ * reprioritised one was still ordered by the priority it was created with,
+ * forever. With real threads they are the difference between a test passing
+ * and the wrong thread holding the CPU. */
 static void hle_SuspendThread(void) {
     psp_thread *t = find_thread(psp_arg(0));
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
     t->state = TH_SUSPENDED;
+    /* Does not return until something resumes us, when the argument is our own
+     * uid -- which is the ordinary way a thread parks itself. */
+    psp_sched_suspend(t->uid);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_ResumeThread(void) {
     psp_thread *t = find_thread(psp_arg(0));
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
     t->state = TH_READY;
+    psp_sched_resume(t->uid);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_ChangeThreadPriority(void) {
-    psp_thread *t = find_thread(psp_arg(0));
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+    /* A zero thread id means the running thread, which is how a thread lowers
+     * its own priority without asking what it is. */
+    const uint32_t id = psp_arg(0) ? psp_arg(0) : psp_sched_current();
+    psp_thread *t = find_thread(id);
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
     t->priority = psp_arg(1);
+    psp_sched_set_priority(t->uid, (int)t->priority);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    /* Lowering your own priority is a reschedule point: something that was
+     * behind you may now be ahead. threads/change.expected tags that line `[r]`,
+     * so hardware does switch there and it is observable. */
+    if (t->uid == psp_sched_current()) psp_sched_yield();
+}
+
+/* ---- sleep and wakeup ------------------------------------------------------
+ *
+ * Not a timed wait: a sleeping thread stays asleep until somebody wakes it by
+ * name. The counter is what makes the pair race-free, and it is the whole
+ * content of the call -- a wakeup that arrives *before* the sleep is remembered,
+ * so the sleep returns at once rather than missing it and hanging forever. */
+static void hle_SleepThread(void) {
+    psp_thread *t = current_thread();
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+    if (t->wakeup_count > 0) { t->wakeup_count--; psp_ret(SCE_KERNEL_ERROR_OK); return; }
+
+    if (psp_sched_block(t->uid, PSP_SCHED_SLEEPING, "sceKernelSleepThread") != 0) {
+        wait_deadlock("sceKernelSleepThread");
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+    /* Woken by name, so the wakeup this consumed is spent. */
+    t = current_thread();
+    if (t && t->wakeup_count > 0) t->wakeup_count--;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_WakeupThread(void) {
+    psp_thread *t = find_thread(psp_arg(0));
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    t->wakeup_count++;
+    const int urgent = psp_sched_wake(t->uid);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
+}
+
+/* Throw away wakeups that have been banked but not slept on, and say how many
+ * there were -- which is the only way a thread can find out. */
+static void hle_CancelWakeupThread(void) {
+    const uint32_t id = psp_arg(0) ? psp_arg(0) : psp_sched_current();
+    psp_thread *t = find_thread(id);
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    const uint32_t n = (uint32_t)t->wakeup_count;
+    t->wakeup_count = 0;
+    psp_ret(n);
+}
+
+/* Stop switching threads for the duration of a critical section.
+ *
+ * The previous setting comes back so the guest can restore it rather than
+ * assuming it was on -- these nest, and a resume that unconditionally enabled
+ * dispatch would break the outer one. pspautotests' scheduling/dispatch is an
+ * entire test of this, and without it that test deadlocks before it prints
+ * anything at all. */
+static void hle_SuspendDispatchThread(void) {
+    psp_ret((uint32_t)psp_sched_set_dispatch(0));
+}
+
+static void hle_ResumeDispatchThread(void) {
+    psp_sched_set_dispatch(psp_arg(0) != 0);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1081,6 +1165,38 @@ static void hle_ReferCallbackStatus(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* sceKernelReferThreadStatus: the whole of what a thread is, in 104 bytes.
+ *
+ * The size is not a guess -- threads/refer.expected reports `=> 104` for a
+ * caller that asks for more than the structure holds. The layout is the SDK's
+ * SceKernelThreadInfo, and the fields past exitStatus (run clocks, preemption
+ * counts) are written as zero rather than invented: the test itself has them
+ * commented out with the note that getting them right would be slow. */
+static void hle_ReferThreadStatus(void) {
+    const uint32_t id   = psp_arg(0) ? psp_arg(0) : psp_sched_current();
+    const uint32_t info = psp_arg(1);
+    const psp_thread *t = find_thread(id);
+    if (!t)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+
+    psp_write32(info +  0, 104);
+    write_info_name(info + 4, t->name);
+    psp_write32(info + 36, t->attr);
+    psp_write32(info + 40, (uint32_t)t->state);
+    psp_write32(info + 44, t->entry);
+    psp_write32(info + 48, t->stack_base);
+    psp_write32(info + 52, t->stack_size);
+    psp_write32(info + 56, psp_cpu.r[PSP_REG_GP]);
+    psp_write32(info + 60, t->priority);
+    psp_write32(info + 64, (uint32_t)psp_sched_priority(t->uid));
+    psp_write32(info + 68, 0);                       /* waitType */
+    psp_write32(info + 72, 0);                       /* waitId */
+    psp_write32(info + 76, (uint32_t)t->wakeup_count);
+    psp_write32(info + 80, t->exit_status);
+    for (uint32_t off = 84; off < 104; off += 4) psp_write32(info + off, 0);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 static void hle_CreateCallback(void) {
     if (!name_ok(psp_arg(0))) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
     psp_callback *c = NULL;
@@ -1135,6 +1251,13 @@ void psp_threadman_register(void) {
     psp_hle_register(0x94AA61EE, "ThreadManForUser", "sceKernelGetThreadCurrentPriority",hle_GetThreadCurrentPriority);
     psp_hle_register(0xEA748E31, "ThreadManForUser", "sceKernelChangeCurrentThreadAttr", hle_ChangeCurrentThreadAttr);
     psp_hle_register(0x52089CA1, "ThreadManForUser", "sceKernelGetThreadStackFreeSize",  hle_GetThreadStackFreeSize);
+    psp_hle_register(0x9ACE131E, "ThreadManForUser", "sceKernelSleepThread",             hle_SleepThread);
+    psp_hle_register(0x82826F70, "ThreadManForUser", "sceKernelSleepThreadCB",           hle_SleepThread);
+    psp_hle_register(0xD59EAD2F, "ThreadManForUser", "sceKernelWakeupThread",            hle_WakeupThread);
+    psp_hle_register(0xFCCFAD26, "ThreadManForUser", "sceKernelCancelWakeupThread",      hle_CancelWakeupThread);
+    psp_hle_register(0x3AD58B8C, "ThreadManForUser", "sceKernelSuspendDispatchThread",   hle_SuspendDispatchThread);
+    psp_hle_register(0x27E22EC2, "ThreadManForUser", "sceKernelResumeDispatchThread",    hle_ResumeDispatchThread);
+    psp_hle_register(0x17C1684E, "ThreadManForUser", "sceKernelReferThreadStatus",       hle_ReferThreadStatus);
 
     psp_hle_register(0xD6DA4BA1, "ThreadManForUser", "sceKernelCreateSema",              hle_CreateSema);
     psp_hle_register(0x28B6489C, "ThreadManForUser", "sceKernelDeleteSema",              hle_DeleteSema);

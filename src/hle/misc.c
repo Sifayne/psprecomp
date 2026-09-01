@@ -386,14 +386,33 @@ static void hle_ChRelease(void) {
  * sits: the plain pair pass (channel, volume, buffer), the panned pair pass
  * (channel, leftvol, rightvol, buffer). Returns the playback backlog in
  * microseconds, zero when there is nothing to wait for. */
+/* The PSP's audio output rate. A buffer of N samples takes N/44100 seconds to
+ * play, and that is how long a blocking output waits. */
+#define PSP_AUDIO_RATE 44100u
+
 static int64_t audio_output_common(int buf_arg) {
     const uint32_t ch = psp_arg(0);
     g_audio_blocks++;
-    if (!g_audio_out || ch >= AUDIO_CHANNELS || !g_audio[ch].reserved ||
-        !g_audio[ch].samples)
+    if (ch >= AUDIO_CHANNELS || !g_audio[ch].reserved || !g_audio[ch].samples)
         return 0;
-    return g_audio_out((int)ch, g_audio[ch].samples, g_audio[ch].format,
-                       psp_arg(buf_arg));
+    if (g_audio_out)
+        return g_audio_out((int)ch, g_audio[ch].samples, g_audio[ch].format,
+                           psp_arg(buf_arg));
+
+    /* No host sink, but a blocking output still takes the time the samples
+     * take. Returning zero here made a call with "Blocking" in its name return
+     * instantly, so the game's audio thread ran flat out instead of at 44.1kHz
+     * -- 11 million outputs in a 60-second run, against the ~2,600 a paced
+     * thread would make.
+     *
+     * That was survivable only for as long as the audio thread shared its
+     * priority with everything else and the timeslice rotated between equals.
+     * The moment sceKernelChangeThreadPriority became real, the game lowered
+     * its own main thread from 16 to 40, the audio thread outranked it, and a
+     * yield cannot give way to a lower priority -- so it starved the whole game
+     * and the run went from 633 GE lists to 3. A spinning thread is not
+     * harmless just because nothing has outranked it yet. */
+    return (int64_t)g_audio[ch].samples * 1000000 / PSP_AUDIO_RATE;
 }
 
 static uint32_t audio_ret(void) {
