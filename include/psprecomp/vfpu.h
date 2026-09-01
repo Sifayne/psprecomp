@@ -59,6 +59,34 @@ void psp_lv_q(uint32_t vt, uint32_t addr);
 void psp_sv_s(uint32_t vt, uint32_t addr);
 void psp_sv_q(uint32_t vt, uint32_t addr);
 
+/* Unaligned quad load/store.
+ *
+ * A quad is 16-byte aligned, so a vector that straddles two of those blocks
+ * takes two instructions: `lvl.q` fills the lanes at and below the address,
+ * `lvr.q` the lanes at and above, and between them they move an arbitrarily
+ * aligned quad. The lanes each one does not touch keep their old contents,
+ * which is why both read the destination first. The store pair is the mirror.
+ *
+ * The address is *not* masked down: which lanes move is exactly what its low
+ * bits select. */
+void psp_lvl_q(uint32_t vt, uint32_t addr);
+void psp_lvr_q(uint32_t vt, uint32_t addr);
+void psp_svl_q(uint32_t vt, uint32_t addr);
+void psp_svr_q(uint32_t vt, uint32_t addr);
+
+/* Horizontal reductions to a single lane: vfad sums, vavg averages.
+ *
+ * Both are the same dot product against a constant vector on hardware -- ones
+ * for vfad, 1/size for vavg -- which is why a single-lane vavg is zero rather
+ * than the value itself: the constant for size 1 is 0, not 1. */
+void psp_vfad(uint32_t vd, uint32_t vs, int size);
+void psp_vavg(uint32_t vd, uint32_t vs, int size);
+
+/* Pack four 8888 pixels into four 16-bit ones, two per destination lane.
+ * `fmt` is 1 for 4444, 2 for 5551, 3 for 5650 -- the low two bits of the
+ * instruction's rt field, which is where the hardware keeps it. */
+void psp_vcolor(uint32_t vd, uint32_t vs, int fmt, int size);
+
 /* Element-wise arithmetic across `size` lanes. */
 void psp_vadd(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 void psp_vsub(uint32_t vd, uint32_t vs, uint32_t vt, int size);

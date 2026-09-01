@@ -333,6 +333,11 @@ static psp_interp_status exec_simple(const a_insn *in) {
     case A_MFV: setr(in->rt, psp_mfv(in->vd));  return I_RUNNING;
     case A_MTV: psp_mtv(in->vd, R(in->rt));     return I_RUNNING;
 
+    case A_LVL_Q: psp_lvl_q(in->vt, R(in->rs) + (in->imm & ~3)); return I_RUNNING;
+    case A_LVR_Q: psp_lvr_q(in->vt, R(in->rs) + (in->imm & ~3)); return I_RUNNING;
+    case A_SVL_Q: psp_svl_q(in->vt, R(in->rs) + (in->imm & ~3)); return I_RUNNING;
+    case A_SVR_Q: psp_svr_q(in->vt, R(in->rs) + (in->imm & ~3)); return I_RUNNING;
+
     case A_LV_S: psp_lv_s(in->vt, R(in->rs) + (in->imm & ~3)); return I_RUNNING;
     case A_LV_Q: psp_lv_q(in->vt, R(in->rs) + (in->imm & ~3)); return I_RUNNING;
     case A_SV_S: psp_sv_s(in->vt, R(in->rs) + (in->imm & ~3)); return I_RUNNING;
@@ -381,6 +386,12 @@ static psp_interp_status exec_simple(const a_insn *in) {
      * as 0xDFD421B0, and reading vd from it names v48. */
     case A_VIIM: psp_vimm(in->vt, (float)in->imm);       return I_RUNNING;
     case A_VFIM: psp_vimm(in->vt, a_half_to_float((uint16_t)in->imm)); return I_RUNNING;
+
+    case A_VFAD: psp_vfad(in->vd, in->vs, in->vsize); return I_RUNNING;
+    case A_VAVG: psp_vavg(in->vd, in->vs, in->vsize); return I_RUNNING;
+    case A_VT4444: psp_vcolor(in->vd, in->vs, 1, in->vsize); return I_RUNNING;
+    case A_VT5551: psp_vcolor(in->vd, in->vs, 2, in->vsize); return I_RUNNING;
+    case A_VT5650: psp_vcolor(in->vd, in->vs, 3, in->vsize); return I_RUNNING;
 
     case A_VMMUL: psp_vmmul(in->vd, in->vs, in->vt, in->vsize); return I_RUNNING;
     case A_VTFM2: case A_VTFM3: case A_VTFM4: {
@@ -588,6 +599,7 @@ static int spawn_hook(uint32_t uid, uint32_t entry, uint32_t sp,
      * stack, and the sentinel to return to. Everything is restored after, so
      * the starter's registers survive the call. */
     memset(&psp_cpu, 0, sizeof psp_cpu);
+    psp_cpu_reset_fp();
     R(PSP_REG_A0) = a0;
     R(PSP_REG_A1) = a1;
     R(PSP_REG_SP) = sp;

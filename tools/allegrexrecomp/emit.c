@@ -367,6 +367,15 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_MTV:
         fprintf(f, "%spsp_mtv(%u, %s);\n", ind, in->vd, rt); return;
 
+    case A_LVL_Q:
+        fprintf(f, "%spsp_lvl_q(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
+    case A_LVR_Q:
+        fprintf(f, "%spsp_lvr_q(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
+    case A_SVL_Q:
+        fprintf(f, "%spsp_svl_q(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
+    case A_SVR_Q:
+        fprintf(f, "%spsp_svr_q(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
+
     case A_LV_S:
         fprintf(f, "%spsp_lv_s(%u, %s + %d);\n", ind, in->vt, rs, in->imm & ~3); return;
     case A_LV_Q:
@@ -458,6 +467,17 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     }
 
     /* Matrix ops that need no multiply. `vsize` is the matrix order here. */
+    case A_VFAD:
+        fprintf(f, "%spsp_vfad(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize); return;
+    case A_VAVG:
+        fprintf(f, "%spsp_vavg(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize); return;
+    case A_VT4444:
+        fprintf(f, "%spsp_vcolor(%u, %u, 1, %u);\n", ind, in->vd, in->vs, in->vsize); return;
+    case A_VT5551:
+        fprintf(f, "%spsp_vcolor(%u, %u, 2, %u);\n", ind, in->vd, in->vs, in->vsize); return;
+    case A_VT5650:
+        fprintf(f, "%spsp_vcolor(%u, %u, 3, %u);\n", ind, in->vd, in->vs, in->vsize); return;
+
     case A_VMMUL:
         fprintf(f, "%spsp_vmmul(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VTFM2: case A_VTFM3: case A_VTFM4: {

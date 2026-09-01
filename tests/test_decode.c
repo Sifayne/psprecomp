@@ -202,10 +202,32 @@ static void test_vfpu(void) {
      * the assertion outlived the gap it described. */
     dec(0xD0000000, 0x08900000, A_VMOV, "vmov (VFPU4 rs=0 rt=0)");
 
-    /* Something still genuinely unmapped: opcode 0x35 (VFPU6's sibling table).
-     * It must be recognised as VFPU rather than falling through to an integer
-     * op, so the emitter refuses it instead of emitting nonsense. */
-    a_decode(0xD4000000, 0x08900000, &in);
+    /* Opcode 0x35 was the example here, and it has gone the same way: it is
+     * the unaligned quad load, and it is decoded now. Twice in a row this
+     * assertion has outlived the gap it described, which is the argument for
+     * choosing the example by what the dispatch actually leaves unmapped
+     * rather than by what happened to be missing when it was written. */
+    dec(0xD4000000, 0x08900000, A_LVL_Q, "lvl.q");
+    dec(0xD4000002, 0x08900000, A_LVR_Q, "lvr.q (bit 1 picks the right form)");
+    dec(0xF4000000, 0x08900000, A_SVL_Q, "svl.q");
+    dec(0xF4000002, 0x08900000, A_SVR_Q, "svr.q");
+
+    /* The register field of a quad access takes one bit at 0, not two -- bit 1
+     * is the cache hint. Reading both makes `sv.q C700` store from row 2. */
+    a_decode(0xF4000002, 0x08900000, &in);
+    CHECK(in.vt == 0, "bit 1 of a quad access is not part of vt (got %u)", in.vt);
+
+    /* The horizontal reductions and the colour packs, all VFPU4 rs=2. */
+    dec(0xD0460480, 0x08900000, A_VFAD,   "vfad");
+    dec(0xD0470480, 0x08900000, A_VAVG,   "vavg");
+    dec(0xD0590000, 0x08900000, A_VT4444, "vt4444");
+    dec(0xD05A0000, 0x08900000, A_VT5551, "vt5551");
+    dec(0xD05B0000, 0x08900000, A_VT5650, "vt5650");
+
+    /* Something still genuinely unmapped: opcode 0x3F. It must be recognised
+     * as VFPU rather than falling through to an integer op, so the emitter
+     * refuses it instead of emitting nonsense. */
+    a_decode(0xFC000000, 0x08900000, &in);
     CHECK(in.op == A_VFPU_UNKNOWN,
           "an unmapped VFPU encoding stays VFPU-unknown (got %s)", a_mnemonic(in.op));
 

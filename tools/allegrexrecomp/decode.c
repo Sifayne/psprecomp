@@ -265,6 +265,11 @@ static const a_opinfo OPINFO[A_OP_COUNT] = {
     [A_VPFXD]    = { "vpfxd",    F_UNKNOWN },
         [A_VIIM]     = { "viim",     F_UNKNOWN },
     [A_VFIM]     = { "vfim",     F_UNKNOWN },
+    [A_VFAD]     = { "vfad",     F_VD_VS },
+    [A_VAVG]     = { "vavg",     F_VD_VS },
+    [A_VT4444]   = { "vt4444",   F_VD_VS },
+    [A_VT5551]   = { "vt5551",   F_VD_VS },
+    [A_VT5650]   = { "vt5650",   F_VD_VS },
     [A_VFPU_UNKNOWN] = { "vfpu?", F_UNKNOWN },
 };
 
@@ -550,6 +555,17 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
 
     /* VFPU load/store — these use the 7-bit vt field and a 16-byte-aligned
      * offset for the quad forms. */
+    /* Unaligned quad access. Bit 1 selects the right-hand form; the register
+     * field is the quad one, so bit 1 is free to mean that here. */
+    case 0x35:
+        op = (word & 2) ? A_LVR_Q : A_LVL_Q;
+        in.vt = (uint8_t)VT_MEMQ_F(word);
+        break;
+    case 0x3D:
+        op = (word & 2) ? A_SVR_Q : A_SVL_Q;
+        in.vt = (uint8_t)VT_MEMQ_F(word);
+        break;
+
     case 0x32: op = A_LV_S; in.vt = (uint8_t)VT_MEM_F(word);  break;
     case 0x36: op = A_LV_Q; in.vt = (uint8_t)VT_MEMQ_F(word); break;
     case 0x3A: op = A_SV_S; in.vt = (uint8_t)VT_MEM_F(word);  break;
@@ -646,6 +662,17 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
             default:   op = A_VFPU_UNKNOWN; break;
             }
             break;
+        case 0x02:                                  /* VFPU4: rs=2 */
+            switch (RT_F(word)) {
+            case 0x06: op = A_VFAD;   break;
+            case 0x07: op = A_VAVG;   break;
+            /* The colour packs keep their format in the low two bits of rt. */
+            case 0x19: op = A_VT4444; break;
+            case 0x1A: op = A_VT5551; break;
+            case 0x1B: op = A_VT5650; break;
+            default:   op = A_VFPU_UNKNOWN; break;
+            }
+            break;
         case 0x03: op = A_VCST;  break;
         case 0x10: op = A_VF2IN; break;
         case 0x11: op = A_VF2IZ; break;
@@ -709,8 +736,7 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         }
         break;
 
-    case 0x1D: case 0x1E:
-    case 0x35: case 0x3D: case 0x3F:
+    case 0x1D: case 0x1E: case 0x3F:
         op = A_VFPU_UNKNOWN;
         break;
 

@@ -235,6 +235,106 @@ void psp_sv_q(uint32_t vt, uint32_t addr) {
         psp_write_f32(addr + (uint32_t)i * 4, psp_cpu.v[r[i]]);
 }
 
+/* ---- unaligned quad load/store -------------------------------------------
+ *
+ * `offset` is which lane the address lands on, from bits 3:2. lvl fills lanes
+ * 3 down to 3-offset from descending addresses; lvr fills lanes 0 up to
+ * 3-offset from ascending ones. Together they move a quad from any 4-byte
+ * boundary, and each leaves the lanes it does not reach alone -- so both start
+ * by reading the register. */
+void psp_lvl_q(uint32_t vt, uint32_t addr) {
+    int r[4];
+    psp_vfpu_regs(vt, 4, r);
+    const int offset = (int)((addr >> 2) & 3);
+    for (int i = 0; i <= offset; i++)
+        psp_cpu.v[r[3 - i]] = psp_read_f32((addr - (uint32_t)i * 4) & ~3u);
+}
+
+void psp_lvr_q(uint32_t vt, uint32_t addr) {
+    int r[4];
+    psp_vfpu_regs(vt, 4, r);
+    const int offset = (int)((addr >> 2) & 3);
+    for (int i = 0; i <= 3 - offset; i++)
+        psp_cpu.v[r[i]] = psp_read_f32((addr + (uint32_t)i * 4) & ~3u);
+}
+
+void psp_svl_q(uint32_t vt, uint32_t addr) {
+    int r[4];
+    psp_vfpu_regs(vt, 4, r);
+    const int offset = (int)((addr >> 2) & 3);
+    for (int i = 0; i <= offset; i++)
+        psp_write_f32((addr - (uint32_t)i * 4) & ~3u, psp_cpu.v[r[3 - i]]);
+}
+
+void psp_svr_q(uint32_t vt, uint32_t addr) {
+    int r[4];
+    psp_vfpu_regs(vt, 4, r);
+    const int offset = (int)((addr >> 2) & 3);
+    for (int i = 0; i <= 3 - offset; i++)
+        psp_write_f32((addr + (uint32_t)i * 4) & ~3u, psp_cpu.v[r[i]]);
+}
+
+/* ---- horizontal reductions ------------------------------------------------
+ *
+ * On hardware both are a dot product against a constant vector, taken over all
+ * four lanes with the unused ones reading zero. Writing it that way rather
+ * than as a loop over `size` keeps one property that a loop loses: vavg of a
+ * single lane is *zero*, because the constant for size 1 is 0 and not 1. */
+static void reduce(uint32_t vd, uint32_t vs, int size, float k) {
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, out[4];
+    read_src(vs, size, g_prefix[0], sv);
+
+    float sum = 0.0f;
+    for (int i = 0; i < 4; i++) sum += sv[i] * k;
+    out[0] = sum;
+    write_dst(vd, 1, out);
+    eat_prefixes();
+}
+
+void psp_vfad(uint32_t vd, uint32_t vs, int size) {
+    reduce(vd, vs, size, 1.0f);
+}
+
+void psp_vavg(uint32_t vd, uint32_t vs, int size) {
+    static const float K[5] = { 0.0f, 0.0f, 0.5f, 1.0f / 3.0f, 0.25f };
+    reduce(vd, vs, size, K[size >= 1 && size <= 4 ? size : 0]);
+}
+
+/* ---- colour packing -------------------------------------------------------
+ *
+ * Four 8888 pixels in, four 16-bit ones out, packed two per destination lane.
+ * The lanes are read as *integers*: these are the only VFPU ops that treat the
+ * register file as pixels rather than as floats, which is why the source goes
+ * through the bit view and not through read_src's float path. */
+void psp_vcolor(uint32_t vd, uint32_t vs, int fmt, int size) {
+    int r[4];
+    psp_vfpu_regs(vs, 4, r);
+
+    uint16_t col[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < 4; i++) {
+        const uint32_t in = psp_f32_to_bits(psp_cpu.v[r[i]]);
+        const uint32_t a = (in >> 24) & 0xFF, b = (in >> 16) & 0xFF;
+        const uint32_t g = (in >>  8) & 0xFF, rr = in & 0xFF;
+        switch (fmt) {
+        case 1: col[i] = (uint16_t)(((a >> 4) << 12) | ((b >> 4) << 8) |
+                                    ((g >> 4) <<  4) |  (rr >> 4)); break;
+        case 2: col[i] = (uint16_t)(((a >> 7) << 15) | ((b >> 3) << 10) |
+                                    ((g >> 3) <<  5) |  (rr >> 3)); break;
+        case 3: col[i] = (uint16_t)(((b >> 3) << 11) | ((g >> 2) <<  5) |
+                                     (rr >> 3));                    break;
+        default: break;
+        }
+    }
+
+    float out[4];
+    out[0] = psp_bits_to_f32((uint32_t)col[0] | ((uint32_t)col[1] << 16));
+    out[1] = psp_bits_to_f32((uint32_t)col[2] | ((uint32_t)col[3] << 16));
+    /* Half as many lanes come out as went in: a quad of pixels is a pair of
+     * words. A single-lane source still writes one. */
+    write_dst(vd, size == 1 ? 1 : 2, out);
+    eat_prefixes();
+}
+
 /* ---- arithmetic ---------------------------------------------------------- */
 
 #define BINOP(name, expr)                                                    \

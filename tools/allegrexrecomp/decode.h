@@ -98,6 +98,8 @@ typedef enum {
      * these is a hard error rather than a silent wrong answer. */
     A_VIIM,
     A_VFIM,
+    A_VFAD, A_VAVG,
+    A_VT4444, A_VT5551, A_VT5650,
     A_VFPU_UNKNOWN,
 
     A_NOP,          /* canonical: sll $zero, $zero, 0 */

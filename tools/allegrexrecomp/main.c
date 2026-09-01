@@ -982,6 +982,7 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     const uint32_t entry = have_from ? from : e.entry;
 
     memset(&psp_cpu, 0, sizeof psp_cpu);
+    psp_cpu_reset_fp();
     psp_cpu.r[PSP_REG_SP] = INTERP_STACK_TOP;
     /* A module with a small-data area reads it through $gp and never loads the
      * register itself; the value comes from the module info. */
