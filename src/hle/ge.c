@@ -62,6 +62,7 @@
 #define GE_LOADCLUT     0xC4
 #define GE_CLUTFORMAT   0xC5
 #define GE_TEXFILTER    0xC6
+#define GE_TEXWRAP      0xC7
 #define GE_TEXFUNC      0xC9
 
 /* Block transfer -- how a game gets image data into VRAM. */
@@ -219,7 +220,7 @@ static struct {
     /* Texture state, recorded so the sampler can be built against what this
      * game uses rather than against the whole hardware surface. */
     uint32_t tex_addr, tex_stride, tex_w, tex_h, tex_enable;
-    uint32_t tex_format, tex_func, tex_filter, tex_swizzled;
+    uint32_t tex_format, tex_func, tex_filter, tex_wrap, tex_swizzled;
     uint32_t clut_addr, clut_format, clut_raw;
     uint32_t tex_formats_seen, tex_funcs_seen;
     uint32_t xfer_src, xfer_srcw, xfer_dst, xfer_dstw;
@@ -303,6 +304,21 @@ void psp_ge_dump_stats(FILE *out) {
             fprintf(out, "  (%llu clut loads, fmt %u)",
                     (unsigned long long)g_ge.clut_loads, g_ge.clut_format);
         fprintf(out, "\n");
+        /* Sampling state, which the report has never carried. It decides
+         * whether a glyph edge is a hard texel boundary or a ramp, so "the
+         * letters are ragged" cannot be reasoned about without it. Both are
+         * tracked and neither reaches the backend yet; printing them says which
+         * of the two is worth wiring up for this game rather than for the
+         * hardware in general. */
+        {
+            static const char *const FI[8] = {
+                "nearest","linear","?","?",
+                "near/mip-near","lin/mip-near","near/mip-lin","lin/mip-lin" };
+            fprintf(out, "    sampling   filter min %s mag %s, wrap s %s t %s\n",
+                    FI[g_ge.tex_filter & 7], FI[(g_ge.tex_filter >> 8) & 7],
+                    (g_ge.tex_wrap & 1) ? "clamp" : "repeat",
+                    ((g_ge.tex_wrap >> 8) & 1) ? "clamp" : "repeat");
+        }
     }
     if (g_ge.drawn_prims)
         fprintf(out, "    drawn      %llu prims, vertex type 0x%06X"
@@ -1117,6 +1133,9 @@ static void run_list(ge_queue *q) {
             break;
         case GE_TEXFILTER:
             g_ge.tex_filter = arg & 0xFFFF;
+            break;
+        case GE_TEXWRAP:
+            g_ge.tex_wrap = arg & 0xFFFF;
             break;
         case GE_LOADCLUT:
             g_ge.clut_loads++;
