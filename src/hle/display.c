@@ -243,6 +243,28 @@ static void hle_SetFrameBuf(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* The other half of SetFrameBuf, and it was missing entirely.
+ *
+ * An unregistered firmware call returns without touching the caller's
+ * out-parameters, so the caller reads back whatever its stack happened to
+ * hold. That is the failure state.md names as the shape of most bugs here --
+ * a call that looks like it succeeded while writing nothing -- and it is what
+ * nineteen of the gpu autotests were tripping over: pspautotests' screenshot
+ * helper asks for the pixel format, gets stack garbage, and prints
+ * "ERROR: Invalid format 2928" once per scanline where hardware prints
+ * nothing at all.
+ *
+ * `sync` is ignored for the same reason WaitVblank returns immediately:
+ * there is no scanout, so there is no moment to be early or late for. */
+static void hle_GetFrameBuf(void) {
+    /* (topaddr*, bufferwidth*, pixelformat*, sync) */
+    const uint32_t p_addr = psp_arg(0), p_width = psp_arg(1), p_fmt = psp_arg(2);
+    if (p_addr)  psp_write32(p_addr,  g_fb_addr);
+    if (p_width) psp_write32(p_width, g_fb_width);
+    if (p_fmt)   psp_write32(p_fmt,   g_fb_format);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 /* There is no scanout, so a vblank wait returns immediately and bumps the
  * counter. A game's main loop is usually `render(); WaitVblank();`, which
  * means this counter is the frame number -- the most useful single number to
@@ -316,6 +338,7 @@ static void hle_GetFramePerSec(void) {
 void psp_display_register(void) {
     psp_hle_register(0x0E20F177, "sceDisplay", "sceDisplaySetMode",           hle_SetMode);
     psp_hle_register(0x289D82FE, "sceDisplay", "sceDisplaySetFrameBuf",       hle_SetFrameBuf);
+    psp_hle_register(0xEEDA2E54, "sceDisplay", "sceDisplayGetFrameBuf",       hle_GetFrameBuf);
     psp_hle_register(0x36CDFADE, "sceDisplay", "sceDisplayWaitVblank",        hle_WaitVblank);
     psp_hle_register(0x984C27E7, "sceDisplay", "sceDisplayWaitVblankStart",   hle_WaitVblank);
     psp_hle_register(0x46F186C3, "sceDisplay", "sceDisplayWaitVblankStartCB", hle_WaitVblank);
