@@ -30,6 +30,7 @@
 #include "psprecomp/sched.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/cpu.h"
+#include "psprecomp/clock.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -52,11 +53,16 @@ static int failures;
 #define ENTRY_WAITER   0x00002000u
 #define ENTRY_WAKER    0x00003000u
 #define ENTRY_STRANDED 0x00004000u
+#define ENTRY_TIMED    0x00005000u
+#define ENTRY_TWOKEN   0x00006000u
+#define ENTRY_TWAKER   0x00007000u
 
 #define UID_WAITER     0x00040001u
 #define UID_WAKER      0x00040002u
 #define UID_TRIVIAL    0x00040003u
 #define UID_STRANDED   0x00040004u
+#define UID_TIMED      0x00040005u
+#define UID_TWOKEN     0x00040006u
 
 /* A guest stack pointer. Never dereferenced — thread_main only copies it into
  * $sp, and none of these bodies touch memory. */
@@ -121,6 +127,31 @@ static void body_waker(void) {
     waker_ran = 1;
     check_one_running("inside waker");
     psp_sched_wake(UID_WAITER);
+}
+
+static void body_waker_timed(void) {
+    psp_sched_wake(UID_TWOKEN);
+}
+
+/* A timed wait nothing will ever satisfy: released by its own deadline. */
+static int      timed_rc;
+static uint64_t timed_clock_after;
+
+static void body_timed(void) {
+    timed_rc = psp_sched_block_until(psp_sched_current(), PSP_SCHED_BLOCKED,
+                                     "test-timed", psp_clock_peek() + 5000);
+    timed_clock_after = psp_clock_peek();
+    check_one_running("inside timed waiter, after its deadline");
+}
+
+/* A timed wait that a signal reaches first. */
+static int timed_woken_rc;
+
+static void body_timed_woken(void) {
+    timed_woken_rc = psp_sched_block_until(psp_sched_current(), PSP_SCHED_BLOCKED,
+                                           "test-timed-woken",
+                                           psp_clock_peek() + 1000000);
+    check_one_running("inside signalled timed waiter");
 }
 
 /* Blocks on something nothing will ever satisfy. */
@@ -206,6 +237,61 @@ static void test_thread_inherits_gp(void) {
     CHECK(trivial_gp == gp,
           "the thread started with $gp = 0x%08X, expected the starter's 0x%08X",
           trivial_gp, gp);
+}
+
+/* A timed wait expires, and a plain one in the same situation is refused.
+ *
+ * This is the whole difference a deadline makes, and it is not a convenience.
+ * An undated wait with nothing else runnable has to be refused -- nobody could
+ * ever satisfy it, and parking would be a hang. A dated one in exactly the same
+ * situation is satisfiable *by time*: the handoff finds no runnable thread,
+ * looks for the earliest sleeping deadline, moves the virtual clock to it and
+ * releases the sleeper. Guest time only advances because the guest advanced it,
+ * so the moment has to be jumped to rather than waited for.
+ *
+ * Without this, every kernel wait with a timeout is a deadlock report. */
+static void test_timed_wait_expires_when_nothing_can_satisfy_it(void) {
+    psp_sched_reset();
+    psp_sched_set_threading(1);
+    psp_clock_reset();
+    timed_rc = -99;
+    timed_clock_after = 0;
+
+    const uint64_t before = psp_clock_peek();
+    CHECK(psp_sched_spawn(UID_TIMED, ENTRY_TIMED, FAKE_SP, 0, 0, 32) == 0,
+          "spawning the timed waiter failed");
+
+    const int live = psp_sched_drain(5);
+    CHECK(live == 0, "%d thread(s) still alive", live);
+    CHECK(timed_rc == PSP_SCHED_EXPIRED,
+          "a timed wait with nothing to satisfy it returned %d, expected "
+          "PSP_SCHED_EXPIRED (%d)", timed_rc, PSP_SCHED_EXPIRED);
+    CHECK(timed_clock_after >= before + 5000,
+          "the clock moved to the deadline: %llu -> %llu, expected +5000us",
+          (unsigned long long)before, (unsigned long long)timed_clock_after);
+}
+
+/* And a signal that arrives first wins, reported as such.
+ *
+ * The two outcomes need opposite handling by the caller -- one means the wait
+ * succeeded and one means it did not -- so the scheduler has to distinguish
+ * them. Being running again does not: both routes end there. */
+static void test_timed_wait_prefers_a_signal(void) {
+    psp_sched_reset();
+    psp_sched_set_threading(1);
+    psp_clock_reset();
+    timed_woken_rc = -99;
+
+    CHECK(psp_sched_spawn(UID_TWOKEN, ENTRY_TWOKEN, FAKE_SP, 0, 0, 32) == 0,
+          "spawning the timed waiter failed");
+    CHECK(psp_sched_spawn(UID_WAKER, ENTRY_TWAKER, FAKE_SP, 0, 0, 32) == 0,
+          "spawning the waker failed");
+
+    const int live = psp_sched_drain(5);
+    CHECK(live == 0, "%d thread(s) still alive", live);
+    CHECK(timed_woken_rc == PSP_SCHED_WOKEN,
+          "a timed wait released by a signal returned %d, expected "
+          "PSP_SCHED_WOKEN (%d)", timed_woken_rc, PSP_SCHED_WOKEN);
 }
 
 /* A full round trip: block, hand the token over, wake, resume.
@@ -308,12 +394,17 @@ int main(void) {
     psp_register(ENTRY_WAITER,   body_waiter);
     psp_register(ENTRY_WAKER,    body_waker);
     psp_register(ENTRY_STRANDED, body_stranded);
+    psp_register(ENTRY_TIMED,    body_timed);
+    psp_register(ENTRY_TWOKEN,   body_timed_woken);
+    psp_register(ENTRY_TWAKER,   body_waker_timed);
 
     psp_sched_init();
 
     test_unsatisfiable_wait_is_refused();
     test_scheduling_survives_a_refused_wait();
     test_thread_inherits_gp();
+    test_timed_wait_expires_when_nothing_can_satisfy_it();
+    test_timed_wait_prefers_a_signal();
     test_block_and_wake_round_trip();
     test_thread_identity();
     test_guest_thread_unsatisfiable_wait();

@@ -80,6 +80,33 @@ int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
  * wait. Callers must fail the wait in that case rather than retry, or they spin
  * against a scheduler handing the token straight back. */
 int  psp_sched_block(uint32_t uid, psp_sched_state why, const char *what);
+
+/* What ended a timed wait. Distinct answers because they need opposite
+ * handling: a signal means the wait succeeded, a deadline means it did not. */
+#define PSP_SCHED_WOKEN     0
+#define PSP_SCHED_STRANDED (-1)   /* nothing runnable, and no deadline set */
+#define PSP_SCHED_EXPIRED  (-2)
+
+/* Park until woken *or* until `deadline_us` of guest time arrives.
+ *
+ * A deadline is not a convenience over psp_sched_block -- it is what lets a
+ * timed wait expire at all. The machinery is already here: when nothing is
+ * runnable, handoff_locked moves the clock to the earliest sleeping deadline
+ * and releases whoever it belongs to, because guest time only advances when the
+ * guest advances it and a stalled scheduler would otherwise wait forever for a
+ * moment that cannot arrive. So a caller that parks with a deadline is released
+ * at the right guest instant even when it is the last thread alive -- exactly
+ * the case an undated block has to refuse.
+ *
+ * `deadline_us` is absolute guest microseconds, from psp_clock_peek(); 0 means
+ * no deadline, which makes this identical to psp_sched_block. A caller asking
+ * for a zero-length timeout wants the shortest deadline that exists, not the
+ * absence of one, so it should pass `psp_clock_peek() + 1`.
+ *
+ * Returns PSP_SCHED_WOKEN, PSP_SCHED_EXPIRED, or PSP_SCHED_STRANDED. */
+int  psp_sched_block_until(uint32_t uid, psp_sched_state why, const char *what,
+                           uint64_t deadline_us);
+
 void psp_sched_yield(void);
 
 /* Sleep for `usec` of guest time.
