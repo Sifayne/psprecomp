@@ -19,6 +19,7 @@ const char *const psp_reg_names[PSP_NUM_GPR] = {
 #define PSP_FP_INIT 0x7F800001u
 
 void psp_cpu_reset_fp(void) {
+    psp_cpu.fcr31 = PSP_FCR31_RESET;
     for (int i = 0; i < 32; i++)  memcpy(&psp_cpu.f[i], &(uint32_t){PSP_FP_INIT}, 4);
     for (int i = 0; i < 128; i++) memcpy(&psp_cpu.v[i], &(uint32_t){PSP_FP_INIT}, 4);
     /* The VFPU condition codes come up with all six bits *set*, not clear.

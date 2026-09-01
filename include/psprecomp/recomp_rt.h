@@ -273,6 +273,26 @@ static inline uint16_t psp_f32_to_half(float v) {
 
 static inline float psp_fabs(float v)  { return v < 0.0f ? -v : v; }
 
+/* floor/ceil without libm: generated C is compiled and linked on its own and
+ * this header is the whole of its runtime. Values at or beyond 2^23 have no
+ * fractional part in binary32, so the cast round-trip is exact below that and
+ * unnecessary above it. */
+static inline float psp_floorf(float v) {
+    if (!(psp_fabs(v) < 8388608.0f)) return v;         /* >= 2^23, or NaN */
+    const float t = (float)(int32_t)v;                 /* truncates toward 0 */
+    return (t > v) ? t - 1.0f : t;
+}
+static inline float psp_ceilf(float v) {
+    if (!(psp_fabs(v) < 8388608.0f)) return v;
+    const float t = (float)(int32_t)v;
+    return (t < v) ? t + 1.0f : t;
+}
+/* Is this integral value odd? Used only for round-half-to-even. */
+static inline float psp_fmodf2(float v) {
+    if (!(psp_fabs(v) < 8388608.0f)) return 0.0f;      /* all even up there */
+    return (float)(((int32_t)v) & 1);
+}
+
 /* Newton-Raphson would be faster but the host FPU is exact and this is not the
  * hot path in any recompiled game; correctness first. */
 static inline float psp_fsqrt(float v) {
@@ -280,6 +300,46 @@ static inline float psp_fsqrt(float v) {
     float g = v;
     for (int i = 0; i < 24; i++) g = 0.5f * (g + v / g);
     return g;
+}
+
+/* COP1 float-to-integer, with the rounding mode named explicitly.
+ *
+ * MIPS has five of these and they differ only in how they round:
+ *
+ *   round.w.s  RN  to nearest, ties to even
+ *   trunc.w.s  RZ  toward zero
+ *   ceil.w.s   RP  toward +inf
+ *   floor.w.s  RM  toward -inf
+ *   cvt.w.s        whatever FCR31's RM field currently says
+ *
+ * Three of the five were decoded and implemented nowhere, and `cvt.w.s` was
+ * aliased to truncation -- which is right only when the rounding mode happens
+ * to be RZ, and the PSP comes up in RN.
+ *
+ * The saturation is not incidental. A C cast of an out-of-range float to int
+ * is undefined behaviour, and on x86 it yields 0x80000000 for *everything*
+ * out of range including large positives, where MIPS answers 0x7FFFFFFF. The
+ * range test is against 2^31 exactly, done in float, so it does not depend on
+ * the conversion it is guarding. */
+enum { PSP_RM_RN = 0, PSP_RM_RZ = 1, PSP_RM_RP = 2, PSP_RM_RM = 3 };
+
+static inline uint32_t psp_f32_to_i32(float v, int rm) {
+    if (v != v) return 0x7FFFFFFFu;                    /* NaN */
+    float r;
+    switch (rm & 3) {
+    case PSP_RM_RZ: r = (v < 0.0f) ? -psp_floorf(-v) : psp_floorf(v); break;
+    case PSP_RM_RP: r = psp_ceilf(v);                                 break;
+    case PSP_RM_RM: r = psp_floorf(v);                                break;
+    default: {                                         /* RN, ties to even */
+        const float f = psp_floorf(v), d = v - f;
+        if (d > 0.5f)                          r = f + 1.0f;
+        else if (d < 0.5f)                     r = f;
+        else                                   r = (psp_fmodf2(f) != 0.0f) ? f + 1.0f : f;
+        break; }
+    }
+    if (r >=  2147483648.0f) return 0x7FFFFFFFu;
+    if (r <  -2147483648.0f) return 0x80000000u;
+    return (uint32_t)(int32_t)r;
 }
 
 /* `c.<cond>.s` condition codes. The distinction that matters is *ordered* vs

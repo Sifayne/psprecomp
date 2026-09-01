@@ -79,6 +79,41 @@ void psp_cpu_reset(void);
  * copied. */
 void psp_cpu_reset_fp(void);
 
+/* The FPU control registers, as the hardware presents them.
+ *
+ * There are 32 addressable, and exactly two exist: `fcr0` is a read-only
+ * implementation/revision word, and `fcr31` is the control/status register.
+ * The rest -- including 25..28, which MIPS32 defines as FCCR/FEXR/FENR --
+ * read as zero on this part and ignore writes. All of them were aliased to
+ * one variable here, so `cfc1 $t, $0` returned whatever had last been written
+ * to `fcr31`.
+ *
+ * FCR31 is not fully writable either. Measured against hardware with
+ * pspautotests cpu/fpu/fcr, which writes a value and reads it back:
+ *
+ *   RM 0x00000003, flags 0x0000007C, enables 0x00000F80,
+ *   cause 0x0001F000, FCC 0x00800000, FS 0x01000000     -> kept
+ *   FO 0x00400000, FN 0x00200000, FCC1-7 0xFE000000,
+ *   0x001C0000                                          -> read back as zero
+ *
+ * so the writable mask is 0x0181FFFF and the unwritable bits are not merely
+ * ignored, they read zero afterwards -- a plain mask of the incoming value,
+ * with nothing preserved. */
+#define PSP_FCR0_VALUE      0x00003351u
+#define PSP_FCR31_WRITABLE  0x0181FFFFu
+/* Power-on FCR31: the overflow, divide-by-zero and invalid *enables* are set.
+ * Nothing here traps, so this matters only because it is observable. */
+#define PSP_FCR31_RESET     0x00000E00u
+
+static inline uint32_t psp_fcr_read(unsigned n) {
+    if (n == 31) return psp_cpu.fcr31;
+    if (n == 0)  return PSP_FCR0_VALUE;
+    return 0;
+}
+static inline void psp_fcr_write(unsigned n, uint32_t v) {
+    if (n == 31) psp_cpu.fcr31 = v & PSP_FCR31_WRITABLE;
+}
+
 /* FPU condition flag (fcr31 bit 23) — set by c.cond.s, tested by bc1t/bc1f. */
 #define PSP_FCR31_C (1u << 23)
 

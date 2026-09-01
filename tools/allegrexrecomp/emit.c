@@ -317,10 +317,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_MFC1:
         if (DEST_ZERO(in->rt)) break;
         fprintf(f, "%s%s = psp_f32_to_bits(psp_cpu.f[%u]);\n", ind, rt, in->fs); return;
-    case A_CTC1: fprintf(f, "%spsp_cpu.fcr31 = %s;\n", ind, rt); return;
+    /* `fs` names which control register; see psp_fcr_read/write. */
+    case A_CTC1: fprintf(f, "%spsp_fcr_write(%u, %s);\n", ind, in->fs, rt); return;
     case A_CFC1:
         if (DEST_ZERO(in->rt)) break;
-        fprintf(f, "%s%s = psp_cpu.fcr31;\n", ind, rt); return;
+        fprintf(f, "%s%s = psp_fcr_read(%u);\n", ind, rt, in->fs); return;
     case A_LWC1:
         fprintf(f, "%spsp_cpu.f[%u] = psp_read_f32(%s + %d);\n", ind, in->ft, rs, in->imm); return;
     case A_SWC1:
@@ -339,14 +340,24 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         fprintf(f, "%spsp_cpu.f[%u] = -psp_cpu.f[%u];\n", ind, in->fd, in->fs); return;
     case A_ABS_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_fabs(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); return;
-    case A_SQRT_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_fsqrt(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); return;
+    case A_SQRT_S:      /* sqrt(+inf) is +inf; psp_fsqrt answers NaN there */
+        fprintf(f, "%spsp_cpu.f[%u] = (psp_f32_to_bits(psp_cpu.f[%u]) == 0x7F800000u)"
+                   " ? psp_cpu.f[%u] : psp_fsqrt(psp_cpu.f[%u]);\n",
+                ind, in->fd, in->fs, in->fs, in->fs); return;
     case A_CVT_S_W:
         fprintf(f, "%spsp_cpu.f[%u] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[%u]);\n",
                 ind, in->fd, in->fs); return;
-    case A_CVT_W_S: case A_TRUNC_W_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[%u]);\n",
-                ind, in->fd, in->fs); return;
+    /* See the interpreter: the rounding mode is the only difference, and
+     * cvt.w.s reads it from FCR31 at run time rather than at emit time. */
+    case A_CVT_W_S:
+        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[%u], "
+                   "(int)(psp_cpu.fcr31 & 3)));\n", ind, in->fd, in->fs); return;
+    case A_TRUNC_W_S: case A_ROUND_W_S: case A_CEIL_W_S: case A_FLOOR_W_S:
+        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[%u], %s));\n",
+                ind, in->fd, in->fs,
+                in->op == A_TRUNC_W_S ? "PSP_RM_RZ" :
+                in->op == A_ROUND_W_S ? "PSP_RM_RN" :
+                in->op == A_CEIL_W_S  ? "PSP_RM_RP" : "PSP_RM_RM"); return;
     case A_C_COND_S:
         fprintf(f, "%spsp_fpu_set_cond(psp_fcmp(%u, psp_cpu.f[%u], psp_cpu.f[%u]));\n",
                 ind, in->fcond, in->fs, in->ft); return;

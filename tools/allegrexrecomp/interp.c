@@ -300,8 +300,9 @@ static psp_interp_status exec_simple(const a_insn *in) {
     /* --- COP1, single precision only --- */
     case A_MTC1: psp_cpu.f[in->fs] = psp_bits_to_f32(R(in->rt));      return I_RUNNING;
     case A_MFC1: setr(in->rt, psp_f32_to_bits(psp_cpu.f[in->fs]));    return I_RUNNING;
-    case A_CTC1: psp_cpu.fcr31 = R(in->rt);                           return I_RUNNING;
-    case A_CFC1: setr(in->rt, psp_cpu.fcr31);                         return I_RUNNING;
+    /* `fs` names *which* control register -- it was being ignored. */
+    case A_CTC1: psp_fcr_write(in->fs, R(in->rt));                    return I_RUNNING;
+    case A_CFC1: setr(in->rt, psp_fcr_read(in->fs));                  return I_RUNNING;
     case A_LWC1: psp_cpu.f[in->ft] = psp_read_f32(R(in->rs) + in->imm); return I_RUNNING;
     case A_SWC1:
         psp_write_f32(R(in->rs) + in->imm, psp_cpu.f[in->ft]);
@@ -314,12 +315,32 @@ static psp_interp_status exec_simple(const a_insn *in) {
     case A_MOV_S: psp_cpu.f[in->fd] =  psp_cpu.f[in->fs];                    return I_RUNNING;
     case A_NEG_S: psp_cpu.f[in->fd] = -psp_cpu.f[in->fs];                    return I_RUNNING;
     case A_ABS_S: psp_cpu.f[in->fd] = psp_fabs (psp_cpu.f[in->fs]);          return I_RUNNING;
-    case A_SQRT_S:psp_cpu.f[in->fd] = psp_fsqrt(psp_cpu.f[in->fs]);          return I_RUNNING;
+    /* psp_fsqrt answers NaN for an infinity, which is right for a rasteriser
+     * -- it is a general helper -- and wrong here: sqrt(+inf) is +inf. */
+    case A_SQRT_S:
+        psp_cpu.f[in->fd] = (psp_f32_to_bits(psp_cpu.f[in->fs]) == 0x7F800000u)
+                          ? psp_cpu.f[in->fs] : psp_fsqrt(psp_cpu.f[in->fs]);
+        return I_RUNNING;
     case A_CVT_S_W:
         psp_cpu.f[in->fd] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[in->fs]);
         return I_RUNNING;
-    case A_CVT_W_S: case A_TRUNC_W_S:
-        psp_cpu.f[in->fd] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[in->fs]);
+    /* The rounding mode is the only thing separating these. cvt.w.s takes it
+     * from FCR31; the other four name it in the opcode. */
+    case A_CVT_W_S:
+        psp_cpu.f[in->fd] = psp_bits_to_f32(
+            psp_f32_to_i32(psp_cpu.f[in->fs], (int)(psp_cpu.fcr31 & 3)));
+        return I_RUNNING;
+    case A_TRUNC_W_S:
+        psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RZ));
+        return I_RUNNING;
+    case A_ROUND_W_S:
+        psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RN));
+        return I_RUNNING;
+    case A_CEIL_W_S:
+        psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RP));
+        return I_RUNNING;
+    case A_FLOOR_W_S:
+        psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RM));
         return I_RUNNING;
     case A_C_COND_S:
         psp_fpu_set_cond(psp_fcmp(in->fcond, psp_cpu.f[in->fs], psp_cpu.f[in->ft]));
