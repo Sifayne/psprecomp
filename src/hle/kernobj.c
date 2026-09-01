@@ -1725,29 +1725,72 @@ static void hle_DeleteTlspl(void) {
 }
 
 /* The calling thread's block, allocated on first ask and kept thereafter. */
+/* The uid a block is recorded against. The main context's is 0, which is also
+ * "free", so it gets a sentinel. */
+static uint32_t tls_me(void) {
+    const uint32_t me = psp_sched_current();
+    return me ? me : 0xFFFFFFFFu;
+}
+
+static uint32_t tls_block_of(const psp_tlspl *t, uint32_t owner) {
+    for (uint32_t i = 0; i < t->nblocks; i++)
+        if (t->owner[i] == owner) return t->base + i * t->block_size;
+    return 0;
+}
+
+/* sceKernelGetTlsAddr(uid)
+ *
+ * A pool with no free block does not answer NULL -- it *waits*. tls/priority
+ * makes a pool of one block, takes it from the main thread, starts three
+ * threads that ask for one, and reads the pool back: `freeBlocks=00000000,
+ * wait=2`. Two of the three are parked in this call. Returning NULL instead
+ * gave three threads an immediate answer and a queue that was never used.
+ *
+ * The release order is the usual attribute bit, and the same test proves it is
+ * read: with 0x100 set, threads of priority 0x30, 0x34 and 0x31 come back in
+ * the order 1, 3, 2. */
 static void hle_GetTlsAddr(void) {
     psp_tlspl *t = find_tls(psp_arg(0));
     if (!t) { psp_ret(0); return; }
-    const uint32_t me = psp_sched_current();
-    for (uint32_t i = 0; i < t->nblocks; i++)
-        if (t->owner[i] == me) { psp_ret(t->base + i * t->block_size); return; }
+    const uint32_t id = t->uid, me = tls_me();
+
+    const uint32_t mine = tls_block_of(t, me);
+    if (mine) { psp_ret(mine); return; }
     for (uint32_t i = 0; i < t->nblocks; i++)
         if (!t->owner[i]) {
-            t->owner[i] = me ? me : 0xFFFFFFFFu;   /* the main context is uid 0 */
+            t->owner[i] = me;
             psp_ret(t->base + i * t->block_size);
             return;
         }
-    psp_ret(0);
+
+    if (!psp_sched_can_wait()) { psp_ret(0); return; }
+    if (psp_waitq_add(&t->q, me, 0, 0, 0) != 0) { psp_ret(0); return; }
+    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
+                                         "sceKernelGetTlsAddr", 0);
+    t = find_tls(id);
+    if (!t) { psp_ret(0); return; }              /* deleted under us */
+    if (rc != PSP_SCHED_WOKEN) { psp_waitq_drop(&t->q, me); psp_ret(0); return; }
+    /* Whoever released us assigned the block on our behalf. */
+    psp_ret(tls_block_of(t, me));
 }
 
 static void hle_FreeTlspl(void) {
     psp_tlspl *t = find_tls(psp_arg(0));
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_TLSPLID); return; }
-    const uint32_t me = psp_sched_current() ? psp_sched_current() : 0xFFFFFFFFu;
+    const uint32_t me = tls_me();
     for (uint32_t i = 0; i < t->nblocks; i++)
         if (t->owner[i] == me) {
             t->owner[i] = 0;
-            const int urgent = psp_waitq_release_all(&t->q);
+            /* The block goes straight to the next thread waiting for one,
+             * rather than being left free for whoever asks next: the queue's
+             * order is the point of having one. */
+            int urgent = 0;
+            const int wi = psp_waitq_pick(&t->q, t->attr);
+            if (wi >= 0) {
+                const psp_waiter w = psp_waitq_take(&t->q, wi);
+                t->owner[i] = w.uid;
+                urgent = psp_sched_wake(w.uid);
+            }
             psp_ret(SCE_KERNEL_ERROR_OK);
             if (urgent) psp_sched_yield();
             return;
