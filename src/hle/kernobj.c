@@ -683,6 +683,30 @@ static uint32_t mpp_recv_order(const psp_msgpipe *p) {
     return (p->attr & MPP_ATTR_RECV_PRIORITY) ? PSP_WAITQ_PRIORITY : 0;
 }
 
+/* What a transfer could move right now, counting the buffer *and* what the
+ * threads blocked on the other side are holding. A poll moves all-or-nothing
+ * and cannot take bytes back once a waiting thread has been handed them, so it
+ * has to know the answer before it starts rather than by trying.
+ *
+ * The two are not symmetric only because the buffer is not: a receiver takes
+ * what is stored and then reaches past it into the senders, while a sender
+ * hands to receivers first and stores the rest. After a pump either the buffer
+ * is empty or nobody is waiting to receive, so the send side can add the two
+ * without double-counting. */
+static uint32_t mpp_recv_capacity(const psp_msgpipe *p) {
+    uint32_t n = p->used;
+    for (int i = 0; i < p->send_q.n; i++)
+        n += p->send_q.w[i].need - p->send_q.w[i].done;
+    return n;
+}
+
+static uint32_t mpp_send_capacity(const psp_msgpipe *p) {
+    uint32_t n = mpp_free(p);
+    for (int i = 0; i < p->recv_q.n; i++)
+        n += p->recv_q.w[i].need - p->recv_q.w[i].done;
+    return n;
+}
+
 /* Move whatever can move, and keep going until nothing does.
  *
  * `exclude` is the caller's own uid: it is in the queue so that it sits in the
@@ -813,32 +837,47 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
      * takes changes what is left. */
     mpp_pump(p, 0, &urgent);
 
-    /* A poll transfers all-or-nothing and never joins the queue. It must not
-     * half-succeed and then report failure, and once bytes have gone to a
-     * waiting receiver there is no taking them back -- so it decides from the
-     * pipe's state rather than by trying. */
+    const uint32_t me = psp_sched_current();
+
+    /* A poll reaches past the buffer exactly as a blocking call does -- a
+     * try-receive on a pipe with no buffer at all still succeeds when a sender
+     * is blocked on the other side, and msgpipe/tryreceive says so twice:
+     * `Partial packet: OK (bytes=128)` and `Complete packet: OK (bytes=256)`,
+     * both against `buffer=0`.
+     *
+     * What it may not do is half-succeed. So it asks how much could move,
+     * decides, and only then joins the queue -- by which point completing is
+     * certain, and the ordinary pump does the work. */
     if (!may_block) {
-        const uint32_t avail = sending ? mpp_free(p) : p->used;
-        const uint32_t now = (mode & MPP_MODE_ASAP) ? mpp_min(avail, len) : len;
-        if (now && now <= avail) {
-            if (sending) mpp_put(p, buf, now); else mpp_take(p, buf, now);
-            if (out) psp_write32(out, now);
-            mpp_pump(p, 0, &urgent);
-            psp_ret(SCE_KERNEL_ERROR_OK);
+        const uint32_t cap = sending ? mpp_send_capacity(p) : mpp_recv_capacity(p);
+        const uint32_t now = (mode & MPP_MODE_ASAP) ? mpp_min(cap, len) : len;
+        if (!now || now > cap) {
+            /* ASAP moved nothing, and says so: `ASAP: Failed (800201b3,
+             * bytes=0)`. A full-wait failure leaves the word alone, which is
+             * how the tests tell the two apart -- they pre-seed it 0x1337. */
+            if ((mode & MPP_MODE_ASAP) && out) psp_write32(out, 0);
+            psp_ret(sending ? SCE_KERNEL_ERROR_MSGPIPE_FULL
+                            : SCE_KERNEL_ERROR_MSGPIPE_EMPTY);
             if (urgent) psp_sched_yield();
             return;
         }
-        /* ASAP moved nothing, and says so: `ASAP: Failed (800201b3, bytes=0)`.
-         * A full-wait failure leaves the word alone, which is how the tests
-         * tell the two apart -- they pre-seed it with 0x1337. */
-        if ((mode & MPP_MODE_ASAP) && out) psp_write32(out, 0);
-        psp_ret(sending ? SCE_KERNEL_ERROR_MSGPIPE_FULL
-                        : SCE_KERNEL_ERROR_MSGPIPE_EMPTY);
+        psp_waitq *pq = sending ? &p->send_q : &p->recv_q;
+        /* Asking for exactly what is there, as a full-wait: the pump then fills
+         * it precisely rather than stopping at the first byte. */
+        if (psp_waitq_add(pq, me, now, 0, buf) != 0) {
+            psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+            return;
+        }
+        mpp_pump(p, me, &urgent);
+        for (int k = 0; k < pq->n; k++)
+            if (pq->w[k].uid == me) { psp_waitq_take(pq, k); break; }
+        mpp_pump(p, 0, &urgent);
+        if (out) psp_write32(out, now);
+        psp_ret(SCE_KERNEL_ERROR_OK);
         if (urgent) psp_sched_yield();
         return;
     }
 
-    const uint32_t me = psp_sched_current();
     psp_waitq *q = sending ? &p->send_q : &p->recv_q;
     if (psp_waitq_add(q, me, len, mode, buf) != 0) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
