@@ -40,6 +40,7 @@ typedef enum {
     I_TRAP_BREAK,
     I_TRAP_BRANCH_IN_SLOT, /* a control transfer inside a delay slot */
     I_TRAP_BADPC,     /* pc left mapped memory */
+    I_EXIT,           /* the guest called sceKernelExitGame -- a clean finish */
 } psp_interp_status;
 
 /* A run in progress.
@@ -144,6 +145,11 @@ void psp_interp_service_dispatch(int enable);
  * means some guest callback did not run; the result is still bounded, but it is
  * not a faithful execution. */
 uint64_t psp_interp_nest_refused(void);
+
+/* How many nested runs ended on anything other than a clean return. Each one
+ * is reported to stderr as it happens; this is for the end-of-run summary, so
+ * that "returned" at the top level cannot hide a thread that died. */
+unsigned long long psp_interp_nest_failed(void);
 
 /* Human-readable status, for error messages. Never NULL. */
 const char *psp_interp_status_str(psp_interp_status s);

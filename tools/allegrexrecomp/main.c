@@ -981,6 +981,9 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
 
     memset(&psp_cpu, 0, sizeof psp_cpu);
     psp_cpu.r[PSP_REG_SP] = INTERP_STACK_TOP;
+    /* A module with a small-data area reads it through $gp and never loads the
+     * register itself; the value comes from the module info. */
+    psp_cpu.r[PSP_REG_GP] = li.gp;
 
     psp_interp it;
     psp_interp_init(&it, entry, INTERP_RA_DONE, budget);
@@ -991,6 +994,8 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     printf("mapped:   0x%08X + %u bytes (%d segments)\n", lo, hi - lo, e.nsegments);
     printf("relocs:   %d applied%s\n", li.nrelocs,
            li.nreloc_skipped ? " (some skipped -- see loader.c)" : "");
+    printf("gp:       0x%08X%s\n", li.gp,
+           li.gp ? "" : " (module declares none)");
     printf("imports:  %d thunks routed to HLE\n", nimports);
     printf("entry:    0x%08X%s\n", entry, have_from ? " (--from)" : " (module entry)");
     printf("budget:   %llu instructions\n", (unsigned long long)budget);
@@ -1002,13 +1007,14 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     printf("stopped:  %s\n", psp_interp_status_str(it.status));
     printf("executed: %llu instructions\n", (unsigned long long)it.executed);
     if (dispatch)
-        printf("re-entry: served interpreted; nest refused %llu\n",
-               (unsigned long long)psp_interp_nest_refused());
+        printf("re-entry: served interpreted; nest refused %llu, failed %llu\n",
+               (unsigned long long)psp_interp_nest_refused(),
+               psp_interp_nest_failed());
     else if (g_reentry_count)
         printf("re-entry: %llu HLE callbacks into guest code, first 0x%08X\n"
                "          (needs the interpreter to service psp_dispatch)\n",
                (unsigned long long)g_reentry_count, g_reentry_first);
-    if (it.status != I_OK_RETURN && it.status != I_BUDGET) {
+    if (it.status != I_OK_RETURN && it.status != I_BUDGET && it.status != I_EXIT) {
         a_insn in;
         a_decode(psp_read32(it.fault_pc), it.fault_pc, &in);
         char buf[96];
@@ -1021,9 +1027,11 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     free(imports);
     psp_mem_free();
     psp_blob_free(&b);
-    /* A clean return is success. Anything else is a finding, not a crash, so
-     * report it through the exit status without a scary message. */
-    return it.status == I_OK_RETURN ? 0 : 1;
+    /* A clean return is success, and so is the guest asking to exit -- a
+     * program that runs to its own sceKernelExitGame finished, it just had
+     * nowhere to return to. Anything else is a finding, not a crash, so report
+     * it through the exit status without a scary message. */
+    return (it.status == I_OK_RETURN || it.status == I_EXIT) ? 0 : 1;
 
 fail:
     psp_mem_free();

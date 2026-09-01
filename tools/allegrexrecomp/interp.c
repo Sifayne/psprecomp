@@ -466,6 +466,27 @@ static int branch_taken(const a_insn *in) {
 #define NESTED_RA  0x0DEAD100u
 #define MAX_NEST   64
 
+/* A nested run that ends badly is otherwise silent.
+ *
+ * Only the outermost run's status is reported, and it says "returned" whenever
+ * the *outer* context got its $ra back -- which it does even when the thread it
+ * started died on a bad instruction two frames down. That reads as a clean run
+ * that simply printed nothing, and sends you looking at the program instead of
+ * at the interpreter. Say which nested entry point stopped, and why. */
+static unsigned long long g_nest_failed;
+
+static void note_nested(const char *what, uint32_t entry, const psp_interp *sub) {
+    /* I_EXIT is a finish, not a failure: a test's main thread ends by calling
+     * sceKernelExitGame, and reporting that as a dead thread would flag every
+     * healthy run. */
+    if (sub->status == I_OK_RETURN || sub->status == I_EXIT) return;
+    g_nest_failed++;
+    fprintf(stderr, "interp: nested %s 0x%08X stopped: %s at pc 0x%08X\n",
+            what, entry, psp_interp_status_str(sub->status), sub->fault_pc);
+}
+
+unsigned long long psp_interp_nest_failed(void) { return g_nest_failed; }
+
 static psp_interp *g_active;      /* the run currently executing, if any */
 static int         g_nest;
 static uint64_t    g_nest_refused;
@@ -504,6 +525,7 @@ static int dispatch_hook(uint32_t addr) {
     psp_interp_run(&sub);
     g_active = outer;
     g_nest--;
+    note_nested("callback", addr, &sub);
 
     outer->executed += sub.executed;
     psp_cpu.r[PSP_RA_INDEX] = saved_ra;
@@ -560,6 +582,10 @@ static int spawn_hook(uint32_t uid, uint32_t entry, uint32_t sp,
     R(PSP_REG_A0) = a0;
     R(PSP_REG_A1) = a1;
     R(PSP_REG_SP) = sp;
+    /* $gp is per-module, not per-thread, and the starter is in the same module
+     * as the thread it starts -- so inheriting it is both correct and the only
+     * source available here. Zero would point the small-data area at address 0. */
+    R(PSP_REG_GP) = saved.r[PSP_REG_GP];
 
     psp_interp sub;
     psp_interp_init(&sub, entry, NESTED_RA, left);
@@ -571,6 +597,7 @@ static int spawn_hook(uint32_t uid, uint32_t entry, uint32_t sp,
     psp_interp_run(&sub);
     g_active = outer;
     g_nest--;
+    note_nested("thread", entry, &sub);
 
     outer->executed += sub.executed;
     psp_cpu = saved;
@@ -709,7 +736,29 @@ psp_interp_status psp_interp_run(psp_interp *it) {
      * in here. */
     psp_interp *prev = g_active;
     g_active = it;
-    while (psp_interp_step(it) == I_RUNNING) { }
+    uint64_t check_at = 0;
+    while (psp_interp_step(it) == I_RUNNING) {
+        /* A program that calls sceKernelExitGame is done, and the HLE records
+         * that rather than killing the process. Nobody was reading the flag,
+         * so the guest ran on past its own exit until the budget stopped it --
+         * and "instruction budget exhausted" reads as a hang, not as a program
+         * that finished and had nowhere to return to. Checked here so it ends
+         * every nested run too, innermost first.
+         *
+         * Sampled rather than tested every step: this is the hot loop of the
+         * oracle's millions of instructions, and stopping within 4K of the
+         * call is as good as stopping at it for every use this has.
+         *
+         * A threshold, not `executed & 0xFFF`. A step is an instruction *plus
+         * its delay slot*, so the counter advances by one or two, and a spin
+         * loop -- which is exactly what a program sits in after asking to exit
+         * -- advances by two every time. Land on the wrong parity there and no
+         * value of the counter is ever a multiple of 4096, so the check never
+         * fires. It was written as a mask first, and did nothing at all. */
+        if (it->executed < check_at) continue;
+        check_at = it->executed + 4096;
+        if (psp_exit_requested()) { it->status = I_EXIT; break; }
+    }
     g_active = prev;
     return it->status;
 }
@@ -725,6 +774,7 @@ const char *psp_interp_status_str(psp_interp_status s) {
     case I_TRAP_BREAK:   return "break";
     case I_TRAP_BRANCH_IN_SLOT: return "control transfer in a delay slot";
     case I_TRAP_BADPC:   return "pc left mapped memory";
+    case I_EXIT:         return "guest called sceKernelExitGame";
     }
     return "unknown";
 }
