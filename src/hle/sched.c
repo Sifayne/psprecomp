@@ -19,6 +19,7 @@ typedef struct {
     int             used;
     uint32_t        uid;
     uint32_t        entry, sp, a0, a1;
+    uint32_t        gp;            /* the starter's $gp; see psp_sched_spawn */
     int             priority;      /* PSP: lower number is more urgent */
     psp_sched_state state;
     const char     *waiting_on;    /* diagnostics only */
@@ -278,12 +279,19 @@ static void *thread_main(void *arg) {
     /* The register file the thread starts with. $ra is zero: returning from the
      * entry point is how a PSP thread ends when it does not call
      * sceKernelExitThread, and the dispatcher treats a return here as the end
-     * of the thread rather than a jump to address zero. */
+     * of the thread rather than a jump to address zero.
+     *
+     * $gp is not zero, and it is the one register here that cannot be derived
+     * from the thread's own arguments -- it is per *module*, not per thread, and
+     * nothing in the instruction stream ever names it. A module built with a
+     * small-data area addresses that area as an offset from $gp, so a thread
+     * starting with zero sends every such access to around address 0. */
     memset(&psp_cpu, 0, sizeof psp_cpu);
     psp_cpu_reset_fp();      /* a fresh thread's float/vector registers are NaN */
     psp_cpu.r[PSP_REG_A0] = t->a0;
     psp_cpu.r[PSP_REG_A1] = t->a1;
     psp_cpu.r[PSP_REG_SP] = t->sp;
+    psp_cpu.r[PSP_REG_GP] = t->gp;
     psp_cpu.r[PSP_REG_RA] = 0;
 
     psp_dispatch(t->entry);
@@ -327,6 +335,12 @@ int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
     t->used = 1; t->uid = uid; t->entry = entry; t->sp = sp;
     t->a0 = a0;  t->a1 = a1;  t->priority = priority;
     t->state = PSP_SCHED_READY;
+    /* Captured here rather than passed in, because the caller does not have it
+     * to pass: sceKernelStartThread's arguments say nothing about $gp. The
+     * starter is running now and is in the same module as the thread it starts,
+     * so its own $gp is the module's -- which is what hardware gives the new
+     * thread, from the module's entry in the thread control block. */
+    t->gp = psp_cpu.r[PSP_REG_GP];
 
     /* A generous host stack, unrelated to the guest stack size the game asked
      * for. A recompiled frame is much larger than the MIPS one it came from --

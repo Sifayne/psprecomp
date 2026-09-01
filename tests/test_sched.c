@@ -94,10 +94,12 @@ static int  waiter_ran, waiter_resumed, stranded_ran;
 static int  trivial_ran, waker_ran;
 static int  waiter_block_rc, stranded_block_rc;
 static uint32_t waiter_uid_before, waiter_uid_after, trivial_uid;
+static uint32_t trivial_gp;
 
 static void body_trivial(void) {
     trivial_ran = 1;
     trivial_uid = psp_sched_current();
+    trivial_gp  = psp_cpu.r[PSP_REG_GP];
     check_one_running("inside trivial thread");
 }
 
@@ -174,6 +176,36 @@ static void test_scheduling_survives_a_refused_wait(void) {
     CHECK(live == 0, "%d thread(s) still alive after a refused wait", live);
     CHECK(trivial_ran, "the thread spawned after a refused wait never ran");
     check_one_running("after draining a thread spawned post-refusal");
+}
+
+/* A thread inherits its module's $gp, and nothing else can supply it.
+ *
+ * Every other register a fresh thread starts with comes from sceKernelStartThread
+ * -- the two arguments, the stack it was given, the zeroed $ra that ends it. $gp
+ * comes from neither the call nor the instruction stream: it is per *module*,
+ * declared once in the module info, and a module with a small-data area reads
+ * that area as an offset from it. thread_main memset the whole register file and
+ * never put it back, so every such access from a spawned thread went to around
+ * address 0. Armored Core is built -G0 and never names $gp, which is why this
+ * survived the whole bring-up; a pspautotests module names it constantly. */
+static void test_thread_inherits_gp(void) {
+    psp_sched_reset();
+    psp_sched_set_threading(1);
+    trivial_ran = 0;
+    trivial_gp  = 0;
+
+    const uint32_t gp = 0x08812340u;
+    psp_cpu.r[PSP_REG_GP] = gp;
+
+    CHECK(psp_sched_spawn(UID_TRIVIAL, ENTRY_TRIVIAL, FAKE_SP, 0, 0, 32) == 0,
+          "spawning the trivial thread failed");
+
+    const int live = psp_sched_drain(5);
+    CHECK(live == 0, "%d thread(s) still alive", live);
+    CHECK(trivial_ran, "the thread never ran");
+    CHECK(trivial_gp == gp,
+          "the thread started with $gp = 0x%08X, expected the starter's 0x%08X",
+          trivial_gp, gp);
 }
 
 /* A full round trip: block, hand the token over, wake, resume.
@@ -281,6 +313,7 @@ int main(void) {
 
     test_unsatisfiable_wait_is_refused();
     test_scheduling_survives_a_refused_wait();
+    test_thread_inherits_gp();
     test_block_and_wake_round_trip();
     test_thread_identity();
     test_guest_thread_unsatisfiable_wait();
