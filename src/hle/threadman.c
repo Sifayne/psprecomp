@@ -79,6 +79,12 @@ typedef struct {
      * them as different types -- so the distinction has to be kept here, where
      * the difference was made. */
     int      wait_kind;
+    /* Parked in a wait whose name ends in CB, and woken by a notify rather than
+     * by what it was actually waiting for. A CB wait is not "deliver callbacks
+     * on the way in": a notify raised by another thread ends the wait long
+     * enough to run the handler, and the wait then resumes. */
+    int      cb_wait;
+    int      cb_wake;
     /* Threads parked in sceKernelWaitThreadEnd on this one. */
     uint32_t enders[MAX_SEMA_WAITERS];
     int      nenders;
@@ -1711,6 +1717,15 @@ static void hle_NotifyCallback(void) {
     if (!c) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_CBID); return; }
     c->notify_count++;
     c->notify_arg = psp_arg(1);
+    /* If the owner is parked in a CB wait, this ends it. callbacks/notify has
+     * two threads sitting in sceKernelSleepThreadCB that are never woken by
+     * name at all -- the handler lines they print are the only evidence they
+     * ran, and without this they print nothing. */
+    psp_thread *owner = find_thread(c->thread);
+    if (owner && owner->cb_wait) {
+        owner->cb_wake = 1;
+        psp_sched_wake(owner->uid);
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1727,11 +1742,14 @@ static void hle_NotifyCallback(void) {
  * and gets one hit apiece.
  *
  * Returns whether anything ran, not how many: callbacks/check answers
- * `With 2 pending: 00000001` after entering two handlers. */
-static int g_in_callback;
-
+ * `With 2 pending: 00000001` after entering two handlers.
+ *
+ * Re-entrant on purpose. A handler may notify itself and then call a CB wait,
+ * which delivers the notify it just raised -- callbacks/notify does exactly
+ * that and prints both hits. Guarding against re-entry silences the second.
+ * What stops it running away is that the count is cleared before the dispatch,
+ * so a handler that does this once is entered twice and no more. */
 int psp_threadman_run_callbacks(void) {
-    if (g_in_callback) return 0;
     const uint32_t me = psp_sched_current();
     int ran = 0;
     for (int i = 0; i < MAX_CBS; i++) {
@@ -1749,13 +1767,11 @@ int psp_threadman_run_callbacks(void) {
          * That thread must not be able to tell, so its registers are put back;
          * same reasoning as the alarm handler in ktimer.c. */
         const psp_cpu_state saved = psp_cpu;
-        g_in_callback = 1;
         psp_cpu.r[PSP_REG_A0] = count;
         psp_cpu.r[PSP_REG_A1] = arg;
         psp_cpu.r[PSP_REG_A2] = common;
         psp_cpu.r[PSP_REG_RA] = 0;
         psp_dispatch(func);
-        g_in_callback = 0;
         psp_cpu = saved;
         ran = 1;
     }
@@ -1792,6 +1808,47 @@ static void hle_WaitThreadEndCB(void) {
     hle_WaitThreadEnd();
 }
 
+static void hle_DelayThreadCB(void) {
+    psp_threadman_run_callbacks();
+    hle_DelayThread();
+}
+
+static void hle_WaitSemaCB(void) {
+    psp_threadman_run_callbacks();
+    hle_WaitSema();
+}
+
+/* A sleep that a notify can interrupt, and that goes back to sleep afterwards.
+ * The other CB waits above deliver on the way in and are done; this one is the
+ * shape the callback tests are built around, because a thread parked here is
+ * reachable only by a callback. */
+static void hle_SleepThreadCB(void) {
+    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
+    for (;;) {
+        psp_threadman_run_callbacks();
+        psp_thread *t = current_thread();
+        if (!t) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+        if (t->wakeup_count > 0) { t->wakeup_count--; psp_ret(SCE_KERNEL_ERROR_OK); return; }
+
+        t->wait_kind = WAIT_SLEEP;
+        t->cb_wait   = 1;
+        const int rc = psp_sched_block(t->uid, PSP_SCHED_SLEEPING,
+                                       "sceKernelSleepThreadCB");
+        t = current_thread();
+        if (t) { t->wait_kind = WAIT_NONE; t->cb_wait = 0; }
+        if (rc != PSP_SCHED_WOKEN) {
+            wait_deadlock("sceKernelSleepThreadCB");
+            psp_ret(SCE_KERNEL_ERROR_OK);
+            return;
+        }
+        /* Woken to deliver, not woken by name: run the handler and park again. */
+        if (t && t->cb_wake) { t->cb_wake = 0; continue; }
+        if (t && t->wakeup_count > 0) t->wakeup_count--;
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+}
+
 void psp_threadman_register(void) {
     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every
      * pair below. */
@@ -1807,7 +1864,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0x616403BA, "ThreadManForUser", "sceKernelTerminateThread",         hle_TerminateThread);
     psp_hle_register(0x383F7BCC, "ThreadManForUser", "sceKernelTerminateDeleteThread",   hle_TerminateDeleteThread);
     psp_hle_register(0xCEADEB47, "ThreadManForUser", "sceKernelDelayThread",             hle_DelayThread);
-    psp_hle_register(0x68DA9E36, "ThreadManForUser", "sceKernelDelayThreadCB",           hle_DelayThread);
+    psp_hle_register(0x68DA9E36, "ThreadManForUser", "sceKernelDelayThreadCB",           hle_DelayThreadCB);
     psp_hle_register(0x278C0DF5, "ThreadManForUser", "sceKernelWaitThreadEnd",           hle_WaitThreadEnd);
     psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",        hle_GetSystemTimeWide);
     psp_hle_register(0x369ED59D, "ThreadManForUser", "sceKernelGetSystemTimeLow",         hle_GetSystemTimeLow);
@@ -1820,7 +1877,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0xEA748E31, "ThreadManForUser", "sceKernelChangeCurrentThreadAttr", hle_ChangeCurrentThreadAttr);
     psp_hle_register(0x52089CA1, "ThreadManForUser", "sceKernelGetThreadStackFreeSize",  hle_GetThreadStackFreeSize);
     psp_hle_register(0x9ACE131E, "ThreadManForUser", "sceKernelSleepThread",             hle_SleepThread);
-    psp_hle_register(0x82826F70, "ThreadManForUser", "sceKernelSleepThreadCB",           hle_SleepThread);
+    psp_hle_register(0x82826F70, "ThreadManForUser", "sceKernelSleepThreadCB",           hle_SleepThreadCB);
     psp_hle_register(0xD59EAD2F, "ThreadManForUser", "sceKernelWakeupThread",            hle_WakeupThread);
     psp_hle_register(0xFCCFAD26, "ThreadManForUser", "sceKernelCancelWakeupThread",      hle_CancelWakeupThread);
     psp_hle_register(0x3AD58B8C, "ThreadManForUser", "sceKernelSuspendDispatchThread",   hle_SuspendDispatchThread);
@@ -1837,7 +1894,7 @@ void psp_threadman_register(void) {
      * two differ only in that -- and unimplemented was much worse than
      * imperfect: it returned zero, and zero means "you have the semaphore",
      * so a thread carried on holding a lock it had never taken. */
-    psp_hle_register(0x6D212BAC, "ThreadManForUser", "sceKernelWaitSemaCB",              hle_WaitSema);
+    psp_hle_register(0x6D212BAC, "ThreadManForUser", "sceKernelWaitSemaCB",              hle_WaitSemaCB);
     psp_hle_register(0x58B1F937, "ThreadManForUser", "sceKernelPollSema",                hle_PollSema);
     psp_hle_register(0x912354A7, "ThreadManForUser", "sceKernelRotateThreadReadyQueue",  hle_RotateReadyQueue);
     psp_hle_register(0xEDBA5844, "ThreadManForUser", "sceKernelDeleteCallback",          hle_DeleteCallback);
