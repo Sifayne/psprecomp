@@ -198,6 +198,144 @@ static void test_triangle_strip(void) {
     CHECK(pixel(100, 100) == 0xFFFFFFFFu, "strip tri 1: 0x%08X", pixel(100, 100));
 }
 
+/* Depth commands, and a vertex carrying a z. The 16-bit position slot has one
+ * and the plain `vertex` helper leaves it at zero, which is invisible until a
+ * test actually turns the depth test on. */
+#define ZTESTENABLE   0x23
+#define ZTEST         0xDE
+#define ZWRITEDISABLE 0xE7
+#define CLEARMODE     0xD3
+#define GEQUAL        7
+
+static void vertex_z(int idx, int x, int y, int z, uint32_t rgba) {
+    uint32_t a = VERTS + (uint32_t)idx * 12;
+    psp_write32(a, rgba);
+    psp_write16(a + 4, (uint16_t)x);
+    psp_write16(a + 6, (uint16_t)y);
+    psp_write16(a + 8, (uint16_t)z);
+}
+
+/* VADDR does not advance across PRIM: each one reads from the address last set,
+ * so a second prim in the same list needs the pointer moved by hand. */
+static void vaddr_at(int idx) {
+    cmd(0x01, (VERTS + (uint32_t)idx * 12) & 0xFFFFFF);
+}
+
+static void depth_state(int func) {
+    cmd(ZTESTENABLE, 1);
+    cmd(ZTEST, (uint32_t)func);
+    cmd(ZWRITEDISABLE, 0);           /* write enabled */
+}
+
+/* A clear-mode draw with the depth bit set must clear depth, and must do it
+ * without consulting the depth test -- the clear establishes the values that
+ * everything else is tested against, so testing it against the values it is
+ * replacing makes it a no-op exactly when it matters.
+ *
+ * These lists are the shape the game uses: GEQUAL, where the larger z wins and
+ * the clear goes to the near end. Draw far, clear to 0, draw nearer. With the
+ * clear consulting the depth test the clear fails its own GEQUAL (0 >= 1000 is
+ * false), depth stays at 1000, and the third draw is rejected (500 >= 1000 is
+ * false) -- the screen keeps the first sprite and the clear silently did
+ * nothing.
+ *
+ * Split across three lists because a list only runs at end_list(), so a check
+ * between two draws has to be a check between two lists. GE state and the depth
+ * buffer both persist across them; only psp_ge_reset clears either. */
+static void test_clear_mode_clears_depth(void) {
+    psp_ge_reset();
+    clear_fb();
+
+    /* Far geometry first, at z = 1000, into a depth buffer that starts at 0. */
+    begin_list();
+    depth_state(GEQUAL);
+    vertex_z(0, 100, 50, 1000, 0xFF0000FFu);
+    vertex_z(1, 200, 150, 1000, 0xFF0000FFu);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    CHECK(pixel(150, 100) == 0xFF0000FFu, "z=1000 sprite should draw: 0x%08X",
+          pixel(150, 100));
+
+    /* A full-screen clear-mode sprite: colour and depth, z = 0. */
+    begin_list();
+    depth_state(GEQUAL);
+    cmd(CLEARMODE, 1u | (1u << 8) | (1u << 10));   /* on, colour, depth */
+    vertex_z(2, 0, 0, 0, 0xFF000000u);
+    vertex_z(3, 480, 272, 0, 0xFF000000u);
+    vaddr_at(2);
+    cmd(0x04, (6u << 16) | 2);
+    cmd(CLEARMODE, 0);
+    end_list();
+    CHECK(pixel(150, 100) == 0xFF000000u,
+          "the clear should repaint over the sprite: 0x%08X", pixel(150, 100));
+
+    /* Nearer than the buffer's cleared value, farther than what it held before
+     * the clear. It draws only if the clear actually landed. */
+    begin_list();
+    depth_state(GEQUAL);
+    vertex_z(4, 120, 60, 500, 0xFF00FF00u);
+    vertex_z(5, 180, 140, 500, 0xFF00FF00u);
+    vaddr_at(4);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    CHECK(pixel(150, 100) == 0xFF00FF00u,
+          "z=500 after a depth clear should draw: 0x%08X", pixel(150, 100));
+}
+
+/* The other half: outside clear mode the depth test is still obeyed, so the
+ * bypass above is scoped to the clear rather than having disabled depth. Same
+ * two draws, no clear between them. */
+static void test_depth_test_still_rejects(void) {
+    psp_ge_reset();
+    clear_fb();
+
+    begin_list();
+    depth_state(GEQUAL);
+    vertex_z(0, 100, 50, 1000, 0xFF0000FFu);
+    vertex_z(1, 200, 150, 1000, 0xFF0000FFu);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+
+    begin_list();
+    depth_state(GEQUAL);
+    vertex_z(2, 120, 60, 500, 0xFF00FF00u);
+    vertex_z(3, 180, 140, 500, 0xFF00FF00u);
+    vaddr_at(2);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+
+    CHECK(pixel(150, 100) == 0xFF0000FFu,
+          "z=500 behind z=1000 must be rejected under GEQUAL: 0x%08X",
+          pixel(150, 100));
+}
+
+/* psp_ge_reset returns depth to its start-of-run contents. Without that, a
+ * process that runs the GE twice -- this test binary, the oracle -- carries the
+ * first run's depth into the second, and the second silently draws less. */
+static void test_ge_reset_clears_depth(void) {
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    depth_state(GEQUAL);
+    vertex_z(0, 100, 50, 1000, 0xFF0000FFu);
+    vertex_z(1, 200, 150, 1000, 0xFF0000FFu);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+
+    /* Fresh run: the z=1000 left behind above must not reject this. */
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    depth_state(GEQUAL);
+    vertex_z(0, 100, 50, 500, 0xFF00FF00u);
+    vertex_z(1, 200, 150, 500, 0xFF00FF00u);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+
+    CHECK(pixel(150, 100) == 0xFF00FF00u,
+          "depth must not survive psp_ge_reset: 0x%08X", pixel(150, 100));
+}
+
 /* The backend interface itself. The software path is the reference every other
  * backend is diffed against, so selection has to be predictable: an unknown
  * name must not silently leave you rendering into nothing. */
@@ -245,6 +383,9 @@ int main(void) {
     test_clipping();
     test_transformed_is_skipped();
     test_triangle_strip();
+    test_clear_mode_clears_depth();
+    test_depth_test_still_rejects();
+    test_ge_reset_clears_depth();
     test_backend_selection();
 
     psp_mem_free();

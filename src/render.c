@@ -252,13 +252,24 @@ static void put_pixel(int x, int y, uint32_t rgba) {
  * Kept host-side rather than in guest VRAM at ZBP. The game only ever writes
  * it through the GE, so nothing reads back a value we did not put there, and
  * an array of floats avoids the 16-bit quantisation that would otherwise make
- * coplanar surfaces fight. Cleared once a frame at present(): full clear-mode
- * emulation is a separate piece of work, and a game that does not clear every
- * frame would accumulate depth until nothing drew at all -- which fails in a
- * way that looks like a broken test rather than a missing clear. */
-/* The PSP's depth window is 0..65535. Clearing to a value outside it made every
- * GEQUAL test fail, which is most of them in this game. */
-#define DEPTH_FAR 65535.0f
+ * coplanar surfaces fight.
+ *
+ * The *game* clears it, not us. A clear-mode draw with the depth bit set writes
+ * its own z across the rectangle it covers, which is what the hardware does and
+ * what ge.c now asks for. There is deliberately no host-side "clear to far":
+ * "far" is whichever end of the 0..65535 window the game's comparison treats as
+ * farthest, and only the game knows which. This one runs GEQUAL, where farthest
+ * is 0 -- a buffer cleared to 65535 would fail every one of those tests and draw
+ * nothing at all. That is the trap an earlier `#define DEPTH_FAR 1.0e30f` fell
+ * into, and lowering it to 65535 did not climb out: for GEQUAL both values
+ * reject everything.
+ *
+ * The reset value below is therefore the one that rejects nothing under the
+ * comparison this game uses, so the frames before its first clear draw rather
+ * than vanish. It is a placeholder for a real per-title depth convention, not a
+ * claim about hardware; a LEQUAL title needs the other end and will need this
+ * revisited. */
+#define DEPTH_RESET 0.0f
 static float g_depth[480 * 272];
 static struct { int test, func, write; } g_zs = { 0, 1 /* always */, 0 };
 
@@ -266,8 +277,15 @@ static void sw_depth(int test_enable, int func, int write_enable) {
     g_zs.test = test_enable; g_zs.func = func; g_zs.write = write_enable;
 }
 
-static void depth_clear(void) {
-    for (int i = 0; i < 480 * 272; i++) g_depth[i] = DEPTH_FAR;
+/* Called from psp_ge_reset, so a second run in the same process -- the test
+ * suite does exactly that -- does not inherit the previous run's depth.
+ *
+ * Deliberately *not* hung off the backend's init() hook, which looks like the
+ * natural home and is never called; neither is shutdown() or present(). Putting
+ * the reset there would reproduce the bug this replaces, where the only call to
+ * the depth clear sat in an unwired vtable slot. */
+void psp_render_reset_depth(void) {
+    for (int i = 0; i < 480 * 272; i++) g_depth[i] = DEPTH_RESET;
 }
 
 /* GE comparison codes: 0 never, 1 always, 2 equal, 3 notequal, 4 less,
@@ -483,10 +501,15 @@ static void sw_draw(int prim, const psp_vertex *v, int count) {
 
 static void sw_noop(void) { }
 
-/* Depth is cleared here rather than on a clear-mode draw: one clear a frame is
- * what a game does anyway, and it fails safe. Accumulating depth across frames
- * would progressively reject everything, which looks like a broken test. */
-static void sw_present(void) { depth_clear(); }
+/* init(), shutdown() and present() are all unwired: nothing in the runtime or
+ * the host calls any of them. They stay because a windowed backend will need
+ * them, but check that before hanging behaviour off one. This slot used to hold
+ * the depth clear, and a clear that is never called is a buffer that is never
+ * cleared -- the depth buffer spent the whole run at its initial contents and
+ * the comment above it described a per-frame clear that did not happen. Depth is
+ * now cleared where the game asks for it, in ge.c's clear-mode path; per-frame
+ * work lives in hle_SetFrameBuf until something actually drives present(). */
+static void sw_present(void) { }
 
 const psp_render_backend psp_render_software = {
     .name        = "software",

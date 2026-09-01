@@ -267,6 +267,7 @@ void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
     memset(&g_ge, 0, sizeof g_ge);
     psp_render_reset_pixels();
+    psp_render_reset_depth();
     g_skip_noaddr = g_skip_layout = g_skip_nearplane = 0;
     g_culled = g_xformed = 0;
     g_draw_2d_tex = g_draw_2d_flat = g_draw_3d_tex = g_draw_3d_flat = 0;
@@ -857,13 +858,23 @@ static void draw_prim(uint32_t type, uint32_t count) {
         }
         psp_render_current()->set_blend(&b);
     }
-    /* Clear mode bypasses texturing, blending and the alpha test, but *not* the
-     * depth test -- the hardware still runs it, and PPSSPP's rasterizer does
-     * too. Bypassing it here let a clear overwrite geometry that should have
-     * rejected it. */
+    /* Clear mode bypasses the depth test as well as texturing, blending and the
+     * alpha test. It is a blit of the clear values, so the comparison is forced
+     * to ALWAYS and depth write comes from the clear-mode depth bit rather than
+     * ZMSK. PPSSPP's software rasterizer does exactly this -- FuncId.cpp sets
+     * `depthTestFunc = GE_COMP_ALWAYS` and `depthWrite = isClearModeDepthMask()`
+     * under clearMode.
+     *
+     * An earlier revision ran the game's own test here instead, on the reasoning
+     * that a clear should not overwrite geometry that rejected it. That gets the
+     * dependency backwards: a clear is what *establishes* the value everything
+     * else is tested against, so testing it against the values it is replacing
+     * makes it a no-op exactly when it matters. This game runs GEQUAL and clears
+     * to the near end, so every clear failed its own test and the depth buffer
+     * was never cleared at all. */
     psp_render_current()->set_depth(
-        g_tl.ztest_enable,
-        g_tl.ztest_func,
+        g_tl.clear_mode ? 0 : g_tl.ztest_enable,
+        g_tl.clear_mode ? 1 : g_tl.ztest_func,
         g_tl.clear_mode ? g_tl.clear_z : !g_tl.zwrite_off);
 
     /* Decode the whole batch, then hand it to the backend in one call.

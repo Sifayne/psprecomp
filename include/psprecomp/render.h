@@ -114,4 +114,10 @@ uint64_t psp_render_blended_pixels(void);
 uint64_t psp_render_alphakill_pixels(void);
 void     psp_render_reset_pixels(void);
 
+/* Return the depth buffer to its start-of-run contents. The game clears depth
+ * itself through the GE -- a clear-mode draw with the depth bit set -- so this
+ * is only the value in place before its first such draw, not a per-frame clear.
+ * psp_ge_reset calls it. */
+void     psp_render_reset_depth(void);
+
 #endif
