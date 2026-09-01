@@ -595,10 +595,11 @@ void psp_sched_delay(uint64_t usec) {
  *
  * The length is chosen against that: it has to exceed the guest time a thread
  * spends in an uninterruptible sequence of kernel calls. A firmware call costs
- * PSP_READ_TICK_US of guest time (clock.c), a checkpoint makes three of them,
- * and a test's work between two reschedule points is a few times that. Five
- * milliseconds clears it with room, and is the same order as a real PSP
- * quantum. It is a measured-against-output number, not a datasheet one, which
+ * PSP_CALL_TICK_US of guest time (clock.c), a checkpoint makes a handful of
+ * them, and a test's work between two reschedule points is a few times that.
+ * Five milliseconds clears it with room, and is the same order as a real PSP
+ * quantum -- with more room than it had, since a clock read no longer costs a
+ * hundred times a call. It is a measured-against-output number, not a datasheet one, which
  * is the same trade clock.h already makes for the clock itself.
  *
  * The slice still exists, and still for its original reason: Armored Core posts

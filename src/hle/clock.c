@@ -8,18 +8,9 @@
 /* 59.94Hz, the PSP's refresh rate, rounded to whole microseconds. */
 #define PSP_FRAME_US 16667u
 
-/* How far a *read* moves the clock.
+/* How far a firmware call moves the clock.
  *
- * Big enough that a poll loop counting microseconds finishes in a sane number
- * of iterations, small enough that a game measuring a real interval does not
- * see it pass instantly. At 100us a millisecond costs ten reads. */
-#define PSP_READ_TICK_US 100u
-
-/* How far any other firmware call moves it, which is a different question and
- * had the same answer only because nobody had asked it separately.
- *
- * The read tick is sized against a loop that *counts* microseconds. This one
- * exists only so that time cannot stop: a thread spinning on calls that neither
+ * It exists only so that time cannot stop: a thread spinning on calls that neither
  * read the clock nor wait for a vblank keeps something runnable forever, so the
  * scheduler's idle jump never fires, and any thread sleeping on a deadline
  * would sleep through the rest of the run. Any non-zero value does that.
@@ -37,7 +28,25 @@
  * One microsecond is both small enough to stay out of the way and closer to
  * what a PSP kernel call actually costs, so this is a fidelity fix rather than
  * a fudge. It still cannot stop: a million calls is a second, and the decode
- * loop this was introduced for makes 562 million of them in a run. */
+ * loop this was introduced for makes 562 million of them in a run.
+ *
+ * ## And a clock read is a firmware call like any other
+ *
+ * Reads used to charge a hundred times this, on the argument that a guest
+ * polling the clock in a loop should finish in a sane number of iterations.
+ * That argument was about *our* throughput, and it was paid for in fidelity:
+ * pspautotests' checkpoint() reads the clock once, so a checkpoint cost 100us
+ * of guest time, and a test that delays 200us and prints two lines had its
+ * delay expire inside the printing. threads/terminate, threads/threadmanidlist
+ * and msgpipe/create each sat two lines from matching on that alone.
+ *
+ * The throughput it was protecting turns out not to need protecting. With
+ * reads charging one microsecond the game's output is *byte-identical* --
+ * same 633 GE lists, same 93,354,668 pixels -- so nothing it does polls the
+ * clock in a loop long enough to notice, and no test in the suite started
+ * timing out. So the separate read tick is gone rather than retuned: the two
+ * questions had different answers only for as long as one of them was
+ * unmeasured. */
 #define PSP_CALL_TICK_US 1u
 
 static uint64_t g_us;
@@ -117,7 +126,7 @@ uint64_t psp_clock_read(void) {
         return g_us;
     }
     const uint64_t now = g_us;
-    g_us += PSP_READ_TICK_US;
+    g_us += PSP_CALL_TICK_US;
     return now;
 }
 
