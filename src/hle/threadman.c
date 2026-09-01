@@ -410,11 +410,29 @@ static void hle_StartThread(void) {
     }
 
     uint32_t arglen = psp_arg(1);
-    const uint32_t argp = start_arg_block(&arglen, psp_arg(2));
+    uint32_t argp   = start_arg_block(&arglen, psp_arg(2));
 
-    /* Stack pointer starts at the top of the allocation, 16-byte aligned, with
-     * a little headroom so a callee storing below $sp cannot run off the end. */
-    const uint32_t sp = (t->stack_base + t->stack_size - 64) & ~15u;
+    /* The block is *copied* onto the thread's own stack, and the thread is
+     * handed the copy. threads/start measures where it lands, for a 0x800
+     * stack:
+     *
+     *     1..8 bytes  -> stack+0x6f0      80 bytes -> stack+0x6b0
+     *     90 bytes    -> stack+0x6a0      0x600    -> stack+0x100
+     *
+     * which is `top - 0x100 - roundup(len, 16)` in every case. The 0x100 is the
+     * k0 area reserved above, so the two measurements agree with each other.
+     *
+     * $sp then starts below the copy rather than at a fixed offset from the top
+     * -- the argument block is on the stack, so it has to be out of reach of
+     * the frames. */
+    const uint32_t stack_top = t->stack_base + t->stack_size - 0x100u;
+    uint32_t sp = stack_top;
+    if (arglen) {
+        sp = stack_top - ((arglen + 15u) & ~15u);
+        void *dst = psp_mem_ptr(sp, arglen);
+        void *src = psp_mem_ptr(argp, arglen);
+        if (dst && src) { memcpy(dst, src, arglen); argp = sp; }
+    }
 
     /* The thread becomes runnable; it does not run here.
      *

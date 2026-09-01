@@ -387,6 +387,22 @@ static void test_thread_argument_block(void) {
               cases[i].what, g_thread_argp, cases[i].want_argp ? "non-NULL" : "NULL");
     }
 
+    /* The block is copied onto the thread's own stack and the thread is handed
+     * the copy, so the pointer it sees is not the one the caller passed and the
+     * bytes behind it are the same. Held back until now because it took the
+     * game from 633 GE lists to 3; see the comment in threadman.c. */
+    psp_write32(SRC, 0x00004567);
+    const uint32_t cid = call5(CREATE, guest_name("copy"), ENTRY, 32, 0x4000, 0);
+    g_thread_argp = 0xDEAD;
+    CHECK(call(START, cid, 4, SRC, 0) == 0, "copy: start");
+    call(WAITEND, cid, 0, 0, 0);
+    CHECK(g_thread_argp != SRC && g_thread_argp != 0,
+          "the thread is handed a copy, not the caller's pointer (0x%08X)",
+          g_thread_argp);
+    CHECK(psp_read32(g_thread_argp) == 0x00004567,
+          "the copy holds the caller's bytes, got 0x%08X",
+          psp_read32(g_thread_argp));
+
     /* And the stack the thread ran on is 0xFF, not whatever was there. Read
      * below the thread's own $sp, which it never wrote. */
     CHECK(psp_read32(g_thread_sp - 64) == 0xFFFFFFFFu,
