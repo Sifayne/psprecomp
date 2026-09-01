@@ -220,6 +220,15 @@ static void hle_UnlockMutex(void) {
     /* Not held at all, and holding it fewer times than is being given back:
      * two different mistakes with two different codes, both measured. */
     if (m->count == 0)     { psp_ret(SCE_KERNEL_ERROR_MUTEX_UNLOCKED); return; }
+    /* And held by somebody else, which reads as the same mistake: you do not
+     * have it. mutex/unlock has one thread lock a free mutex and then unlocks
+     * it from main -- `Locked 0 => 1: ... main=800201C5` -- against the line
+     * above it where main created the mutex locked and unlocking works. Same
+     * call, same count, and only the owner differs. */
+    if (m->owner != psp_sched_current()) {
+        psp_ret(SCE_KERNEL_ERROR_MUTEX_UNLOCKED);
+        return;
+    }
     if (count > m->count)  { psp_ret(SCE_KERNEL_ERROR_MUTEX_UNLOCK_UNDERFLOW); return; }
 
     m->count -= count;
