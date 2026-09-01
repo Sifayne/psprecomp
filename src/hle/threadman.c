@@ -825,7 +825,7 @@ static void hle_WakeupThread(void) {
     t->wakeup_count++;
     const int urgent = psp_sched_wake(t->uid);
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 /* Throw away wakeups that have been banked but not slept on, and say how many
@@ -1150,7 +1150,7 @@ static void hle_DeleteSema(void) {
     const int urgent = psp_waitq_release_all(&s->q);
     s->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 static void hle_SignalSema(void) {
@@ -1179,7 +1179,7 @@ static void hle_SignalSema(void) {
 
     psp_ret(SCE_KERNEL_ERROR_OK);
     /* Released a thread that outranks us, so it runs now. */
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 /* Take the semaphore if it can be taken, and never block. The distinction from
@@ -1363,7 +1363,7 @@ static void hle_WaitSema(void) {
     if (rc == PSP_SCHED_EXPIRED) {
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
-        if (urgent) psp_sched_yield();
+        if (urgent) psp_sched_preempt();
         return;
     }
 
@@ -1419,7 +1419,7 @@ static void hle_DeleteEventFlag(void) {
     const int urgent = psp_waitq_release_all(&f->q);
     f->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 /* WAITOR, WAITCLEAR and WAITCLEARALL and nothing else -- 0x02, 0x04, 0x08,
@@ -1485,7 +1485,7 @@ static void hle_SetEventFlag(void) {
     f->pattern |= psp_arg(1);
     const int urgent = flag_release(f);
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 static void hle_ClearEventFlag(void) {

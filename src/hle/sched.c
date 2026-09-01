@@ -509,7 +509,19 @@ int psp_sched_block_until(uint32_t uid, psp_sched_state why, const char *what,
 static void yield_as(int displaced);
 
 /* Give way to a thread that outranks us, staying at the head of our own
- * priority queue. Everything else about it is a yield. */
+ * priority queue. Everything else about it is a yield.
+ *
+ * Both ways a thread comes to outrank the running one arrive here: starting it,
+ * just above, and waking it -- which is what the `urgent` return from
+ * psp_sched_wake means, since it is set on a strict `priority <` and on nothing
+ * else. The wake sites called psp_sched_yield until they were measured, which
+ * sent the *caller* to the tail of its own priority queue for a switch it never
+ * asked for; an equal-priority thread already waiting there then overtook it on
+ * the way back. pspautotests creates its resched thread at exactly the main
+ * thread's priority, so that overtaking is precisely what its checkpoints
+ * report, and it reported it as `[r]` where hardware says `[x]`.
+ * threads/mutex/unlock2 is the whole difference in one line, `Unlocked, ran: 4`,
+ * and matches with this. */
 void psp_sched_preempt(void) { yield_as(1); }
 
 void psp_sched_yield(void) { yield_as(0); }

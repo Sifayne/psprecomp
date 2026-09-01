@@ -46,20 +46,24 @@
  * questions had different answers only for as long as one of them was
  * unmeasured.
  *
- * ## Before changing this number
+ * ## It is not the checkpoint column, and cannot be
  *
- * It is the open suspect for the checkpoint column. Ten of the twelve `[x]`
- * against `[r]` differences left in the threads suite are ours rescheduling
- * where hardware does not, and if a firmware call really costs two or three
- * microseconds of guest time then msgpipe's `1us:` and `2us:` waits would find
- * their deadline already passed and take the no-wait path in sched.c, which is
- * `[x]` without a switch.
+ * It was the open suspect for the `[x]`/`[r]` differences in the threads suite,
+ * on the theory that a call costing two or three microseconds would leave
+ * msgpipe's `1us:` and `2us:` waits with a deadline already passed, taking the
+ * no-wait path in sched.c -- `[x]` without a switch. No value of this number
+ * does that, and the reason is the order the two happen in. The tick is charged
+ * here at *call entry*; the handler then computes its deadline as
+ * `psp_clock_peek() + usec` from the already-advanced clock, and compares it
+ * against that same unchanged value. Raising the cost moves the deadline and
+ * the comparison point together. It is a relative offset, so the guard cannot
+ * fire for a nonzero timeout however expensive a call is made.
  *
- * Read the long comment at that guard (search sched.c for "already arrived")
- * first. The same observation has been implemented once before as a *rule* --
- * "do not park below 3us" -- and it matched one test while taking forty others
- * to no output at all. The reframing is that this is a cost, not a threshold.
- * Change it alone, and sweep with and without it. */
+ * The column was the wake path handing the CPU over as a yield rather than a
+ * preemption; see psp_sched_preempt in sched.c. Left here because the theory is
+ * a natural one to arrive at twice, and because a *rule* of the same shape --
+ * "do not park below 3us" -- was implemented once and took forty tests to no
+ * output at all while matching one. */
 #define PSP_CALL_TICK_US 1u
 
 static uint64_t g_us;

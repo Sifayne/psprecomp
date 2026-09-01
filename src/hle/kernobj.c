@@ -195,7 +195,7 @@ static void hle_DeleteVpl(void) {
     if (v->base) psp_sysmem_release(v->base);
     v->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 /* ---- the block chain, in guest memory ------------------------------------ */
@@ -447,7 +447,7 @@ static void hle_FreeVpl(void) {
                 vpl_give_back(v, b);
                 const int urgent = vpl_release(v);
                 psp_ret(SCE_KERNEL_ERROR_OK);
-                if (urgent) psp_sched_yield();
+                if (urgent) psp_sched_preempt();
                 return;
             }
     }
@@ -461,7 +461,7 @@ static void hle_CancelVpl(void) {
     if (out) psp_write32(out, (uint32_t)psp_waitq_count(&v->q));
     const int urgent = psp_waitq_cancel_all(&v->q);
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 static void hle_ReferVplStatus(void) {
@@ -664,7 +664,7 @@ static void hle_DeleteMsgPipe(void) {
     if (p->base) psp_sysmem_release(p->base);
     p->alive = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 /* ---- moving bytes through the pipe ----------------------------------------
@@ -908,7 +908,7 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
             if ((mode & MPP_MODE_ASAP) && out) psp_write32(out, 0);
             psp_ret(sending ? SCE_KERNEL_ERROR_MSGPIPE_FULL
                             : SCE_KERNEL_ERROR_MSGPIPE_EMPTY);
-            if (urgent) psp_sched_yield();
+            if (urgent) psp_sched_preempt();
             return;
         }
         psp_waitq *pq = sending ? &p->send_q : &p->recv_q;
@@ -924,7 +924,7 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
         mpp_pump(p, 0, &urgent);
         if (out) psp_write32(out, now);
         psp_ret(SCE_KERNEL_ERROR_OK);
-        if (urgent) psp_sched_yield();
+        if (urgent) psp_sched_preempt();
         return;
     }
 
@@ -949,11 +949,11 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
         if (out) psp_write32(out, done);
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
-        if (urgent) psp_sched_yield();
+        if (urgent) psp_sched_preempt();
         return;
     }
 
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                          sending ? p->senddesc : p->recvdesc,
                                          deadline);
@@ -1013,7 +1013,7 @@ static void hle_CancelMsgPipe(void) {
     urgent |= mpp_abandon(&p->recv_q, PSP_WAIT_WOKE_CANCELLED);
     p->head = p->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 static void hle_ReferMsgPipeStatus(void) {
@@ -1233,7 +1233,7 @@ static void hle_DeleteMbx(void) {
     const int urgent = psp_waitq_release_all(&m->q);
     m->alive = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 static void hle_SendMbx(void) {
@@ -1264,7 +1264,7 @@ static void hle_SendMbx(void) {
         if (w.out) psp_write32(w.out, msg);
         const int urgent = psp_sched_wake(w.uid);
         psp_ret(SCE_KERNEL_ERROR_OK);
-        if (urgent) psp_sched_yield();
+        if (urgent) psp_sched_preempt();
         return;
     }
     mbx_insert(m, msg);
@@ -1347,7 +1347,7 @@ static void hle_CancelReceiveMbx(void) {
     if (out) psp_write32(out, (uint32_t)psp_waitq_count(&m->q));
     const int urgent = psp_waitq_cancel_all(&m->q);
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 static void hle_ReferMbxStatus(void) {
@@ -1526,7 +1526,7 @@ static void hle_DeleteFpl(void) {
     if (f->base) psp_sysmem_release(f->base);
     f->alive = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 /* Lowest free block first, which the test checks by address: `Alloc #2 is 16
@@ -1643,7 +1643,7 @@ static void hle_FreeFpl(void) {
             f->free_blocks++;
             const int urgent = fpl_release(f);
             psp_ret(SCE_KERNEL_ERROR_OK);
-            if (urgent) psp_sched_yield();
+            if (urgent) psp_sched_preempt();
             return;
         }
     }
@@ -1657,7 +1657,7 @@ static void hle_CancelFpl(void) {
     if (out) psp_write32(out, (uint32_t)psp_waitq_count(&f->q));
     const int urgent = psp_waitq_cancel_all(&f->q);
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 static void hle_ReferFplStatus(void) {
@@ -1855,7 +1855,7 @@ static void hle_DeleteTlspl(void) {
     t->owner = NULL;
     t->alive = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 /* The calling thread's block, allocated on first ask and kept thereafter. */
@@ -1982,7 +1982,7 @@ static void hle_FreeTlspl(void) {
                 urgent = psp_sched_wake(w.uid);
             }
             psp_ret(SCE_KERNEL_ERROR_OK);
-            if (urgent) psp_sched_yield();
+            if (urgent) psp_sched_preempt();
             return;
         }
     /* Freeing when the caller holds nothing is not an error. tls/free calls it

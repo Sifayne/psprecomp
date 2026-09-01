@@ -117,7 +117,7 @@ static void hle_DeleteMutex(void) {
     const int urgent = psp_waitq_release_all(&m->q);
     m->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 /* Hand the mutex to the next in line once it is free. Only one waiter can be
@@ -254,7 +254,7 @@ static void hle_UnlockMutex(void) {
     if (m->count == 0) m->owner = 0;
     const int urgent = mutex_release(m);
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 /* Free it outright and report how many were waiting, which is the only way a
@@ -293,7 +293,7 @@ static void hle_CancelMutex(void) {
     m->owner = m->count > 0 ? psp_sched_current() : 0;
     const int urgent = psp_waitq_cancel_all(&m->q);
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 static void hle_ReferMutexStatus(void) {
@@ -501,7 +501,7 @@ static void hle_DeleteLwMutex(void) {
      * lwmutex distinguishable from a never-registered one, and the two get
      * different answers to everything afterwards. */
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 /* The count rules, applied to the workarea's own attr and count so that a
@@ -645,7 +645,7 @@ static void hle_UnlockLwMutex(void) {
         }
     }
     psp_ret(SCE_KERNEL_ERROR_OK);
-    if (urgent) psp_sched_yield();
+    if (urgent) psp_sched_preempt();
 }
 
 /* 64 bytes, from create.expected's own `size=64`. `lockThread` is -1 when the
