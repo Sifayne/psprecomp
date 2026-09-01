@@ -1208,6 +1208,11 @@ static void hle_SendMbx(void) {
     /* A packet belongs to one queue at a time. mbx/send sends the same one
      * twice and the second is refused with the count left at 1. */
     if (mbx_holds(m, msg)) { psp_ret(SCE_KERNEL_ERROR_MBX_CORRUPT); return; }
+    /* And nothing is appended to a ring the guest has already broken. Where a
+     * *receive* from such a mailbox has two distinguishable failures, a send
+     * has one observable effect: mbx/refer breaks the ring, sends another
+     * message, and reads the count back unchanged. */
+    if (m->count && !mbx_first(m)) { psp_ret(SCE_KERNEL_ERROR_MBX_CORRUPT); return; }
 
     /* A waiting receiver takes it without it ever joining the queue -- and
      * "never joining" is observable, because the packet's `next` is the
@@ -1312,6 +1317,11 @@ static void hle_ReferMbxStatus(void) {
     const uint32_t info = psp_arg(1);
     if (!m)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MBXID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    /* A caller offering zero bytes gets zero back and nothing written -- the
+     * rule the other Refer calls already follow, which this one did not.
+     * mbx/refer sweeps the size field: `Size 00000000 => 00000000`, against
+     * `=> 00000034` for every other value it tries, including -1. */
+    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
     psp_write32(info +  0, 52);
     psp_threadman_write_name(info + 4, m->name);
     psp_write32(info + 36, m->attr);
