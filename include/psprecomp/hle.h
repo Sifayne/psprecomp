@@ -142,6 +142,11 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
  * threads/refer.expected reads `exit: 800201a4` for a live thread where
  * threads/create.expected reads `800201a2` for one never started. */
 #define SCE_KERNEL_ERROR_NOT_DORMANT     0x800201A4
+/* Not a wake code -- the *exit status* a terminated thread is left with.
+ * threads/refer reads it back with sceKernelReferThreadStatus (`exit=800201ac`)
+ * and threads/threadend gets the same value out of sceKernelWaitThreadEnd,
+ * which returns the exit status. Two observations, one value. */
+#define SCE_KERNEL_ERROR_THREAD_TERMINATED 0x800201AC
 /* A thread priority outside 0x08..0x77. Zero is not in that range and is not
  * an error either -- it means "the priority I am running at". */
 #define SCE_KERNEL_ERROR_ILLEGAL_PRIORITY 0x80020193

@@ -162,6 +162,7 @@ void psp_threadman_reset(void) {
 }
 
 static void on_thread_end(uint32_t uid, uint32_t status);
+static void thread_ended(psp_thread *t, uint32_t status);
 
 void psp_threadman_init(void) {
     psp_sched_set_end_hook(on_thread_end);
@@ -356,13 +357,7 @@ static void hle_ExitThread(void) {
         psp_trace_dump();
     }
     psp_thread *t = find_thread(psp_sched_current());
-    if (t) {
-        t->exit_status = status;
-        t->state       = TH_DORMANT;
-        for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++)
-            psp_sched_wake(t->enders[i]);
-        t->nenders = 0;
-    }
+    if (t) thread_ended(t, status);
     /* Does not return when called from a guest thread: the scheduler ends the
      * host thread underneath it. From the main context there is nothing to
      * unwind, so it falls through. */
@@ -413,14 +408,23 @@ static void hle_DelayThread(void) {
 
 /* A thread died by returning from its entry point. Records what it returned and
  * releases anyone waiting for it. */
-static void on_thread_end(uint32_t uid, uint32_t status) {
-    psp_thread *t = find_thread(uid);
-    if (!t) return;
+/* One end for all the ways a thread reaches one: falling off its entry point,
+ * sceKernelExitThread, and being terminated. They differ only in the status
+ * left behind, and every one of them releases whatever was waiting for this
+ * thread to end -- which terminate did not do, so a waiter parked on a thread
+ * that was killed under it stayed parked for the rest of the run. */
+static void thread_ended(psp_thread *t, uint32_t status) {
     t->exit_status = status;
     t->state       = TH_DORMANT;
     for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++)
         psp_sched_wake(t->enders[i]);
     t->nenders = 0;
+}
+
+static void on_thread_end(uint32_t uid, uint32_t status) {
+    psp_thread *t = find_thread(uid);
+    if (!t) return;
+    thread_ended(t, status);
 }
 
 /* sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout)
@@ -460,8 +464,12 @@ static void hle_WaitThreadEnd(void) {
             psp_ret(SCE_KERNEL_ERROR_OK);
             return;
         }
+        /* Woken, and the thread is gone: terminate-and-delete freed it out from
+         * under this wait. Vanishing *during* the wait is not the same as never
+         * having been there -- threads/threadend answers `800201ac` to the
+         * first and `80020198` to the second, on consecutive lines. */
         t = find_thread(thid);
-        if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+        if (!t) { psp_ret(SCE_KERNEL_ERROR_THREAD_TERMINATED); return; }
     }
 
     psp_wait_writeback(timeout, deadline);
@@ -711,7 +719,7 @@ static void hle_TerminateThread(void) {
      * whenever the second is what is needed. */
     psp_sched_cancel_spawn(t->uid);
     psp_sched_terminate(t->uid);
-    t->state = TH_DORMANT;
+    thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -733,7 +741,10 @@ static void hle_TerminateDeleteThread(void) {
     }
     psp_thread *t = find_thread(id);
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
-    if (t->ever_started && t->state != TH_DORMANT) psp_sched_terminate(t->uid);
+    if (t->ever_started && t->state != TH_DORMANT) {
+        psp_sched_terminate(t->uid);
+        thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
+    }
     psp_sched_cancel_spawn(t->uid);
     if (t->stack_base) psp_sysmem_release(t->stack_base);
     t->used = 0;
