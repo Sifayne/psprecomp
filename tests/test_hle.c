@@ -396,6 +396,26 @@ static void test_sas_adpcm(void) {
     CHECK((ended & ~1u) != 0, "unused voices report ended, got 0x%08X", ended);
 }
 
+/* stdout and stderr are not in the descriptor table, and an async write to
+ * them used to return BADF -- which dropped the message a panic path writes
+ * right before abort(). The synchronous path handled those fds; this pins the
+ * async one to the same behaviour. */
+static void test_stdio_async(void) {
+    const uint32_t NID = psp_nid("sceIoWriteAsync");
+
+    const uint32_t MSG = 0x08840000u;
+    const char *text = "panic: test message\n";
+    for (size_t i = 0; i <= strlen(text); i++) psp_write8(MSG + i, text[i]);
+
+    CHECK(call(NID, 1, MSG, (uint32_t)strlen(text), 0) == SCE_KERNEL_ERROR_OK,
+          "async write to stdout succeeds, not BADF");
+    CHECK(call(NID, 2, MSG, (uint32_t)strlen(text), 0) == SCE_KERNEL_ERROR_OK,
+          "async write to stderr succeeds, not BADF");
+    /* A real descriptor still behaves as before. */
+    CHECK(call(NID, 0x3F, MSG, (uint32_t)strlen(text), 0) == 0x80020323,
+          "async write to an unopened fd is still BADF");
+}
+
 static void test_display(void) {
     psp_display_reset();
 
@@ -430,6 +450,7 @@ int main(void) {
     test_ge_display_list();
     test_ge_infinite_list();
     test_sas_adpcm();
+    test_stdio_async();
     test_display();
 
     psp_mem_free();

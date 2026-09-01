@@ -741,6 +741,20 @@ static void hle_ReadAsync(void) {
 }
 
 static void hle_WriteAsync(void) {
+    /* stdout and stderr have no descriptor-table slot, so fd_arg() answers
+     * NULL for them and the fall-through below returns BADF. The synchronous
+     * hle_Write handles those two fds itself, and the async variant must too:
+     * a game's panic path is "get the stdout fd, write the message, abort",
+     * and when the write goes through the async variant the message is lost
+     * exactly where it matters most -- the one write most worth seeing. There
+     * is no slot to record an async result into, but the path that writes here
+     * aborts without polling, so the text arriving is the part that matters. */
+    const int32_t fd = (int32_t)psp_arg(0);
+    if (fd == 1 || fd == 2) {
+        hle_Write();
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
     io_file *h = fd_arg();
     if (!h) { psp_ret(SCE_ERROR_BADF); return; }
     hle_Write();
