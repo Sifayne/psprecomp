@@ -231,6 +231,10 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_MSGPIPE_EMPTY      0x800201B4
 #define SCE_KERNEL_ERROR_ILLEGAL_SIZE_MPP   0x800201BC
 #define SCE_KERNEL_ERROR_UNKNOWN_MBXID      0x8002019B
+/* The queue is not what the mailbox thinks it is: a message sent twice, or a
+ * ring the guest edited into disagreeing with the count. mbx/send produces
+ * both on purpose. */
+#define SCE_KERNEL_ERROR_MBX_CORRUPT        0x800201C9
 #define SCE_KERNEL_ERROR_MBOX_NOMSG         0x800201B2
 #define SCE_KERNEL_ERROR_UNKNOWN_FPLID      0x8002019D
 /* Freeing a pointer that is real but is not the start of one of this pool's

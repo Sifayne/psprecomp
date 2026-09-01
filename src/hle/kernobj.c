@@ -1085,7 +1085,23 @@ static psp_mbx *find_mbx(uint32_t id) {
  * Neither is possible if the kernel kept a head pointer -- the guest cannot
  * reach it. Both fall out of `first = last->next`. */
 static uint32_t mbx_first(const psp_mbx *m) {
-    return m->count ? psp_read32(m->last + MSG_NEXT) : 0;
+    /* Not gated on the count. mbx/send drains a tampered box to zero and still
+     * reads `count=0, first=OTHER` with a walkable message behind it, so the
+     * head is whatever the last one points at and nothing else. */
+    return m->last ? psp_read32(m->last + MSG_NEXT) : 0;
+}
+
+/* Is this packet already in the ring? A message may be in one queue at a time,
+ * and mbx/send sends the same packet twice to find out what happens: the second
+ * send is refused and the count stays at 1. Bounded by the count, because the
+ * ring being walked may be one the guest has edited. */
+static int mbx_holds(const psp_mbx *m, uint32_t msg) {
+    uint32_t at = mbx_first(m);
+    for (uint32_t i = 0; i < m->count && at; i++) {
+        if (at == msg) return 1;
+        at = psp_read32(at + MSG_NEXT);
+    }
+    return 0;
 }
 
 static void mbx_insert(psp_mbx *m, uint32_t msg) {
@@ -1127,7 +1143,12 @@ static void mbx_insert(psp_mbx *m, uint32_t msg) {
 static uint32_t mbx_pop(psp_mbx *m) {
     if (!m->count) return 0;
     const uint32_t head = mbx_first(m);
-    if (m->count == 1) { m->last = 0; m->count = 0; }
+    /* The box is empty when the message leaving *is* the last one -- which is
+     * not the same as the count reaching zero, and mbx/send separates them. Its
+     * "evil" case leaves a ring whose head is not the last, and draining that
+     * to a count of zero still leaves a last behind, which the status then
+     * reports as a non-null first. */
+    if (head == m->last) { m->last = 0; m->count = 0; }
     else {
         /* The last one closes the ring over the head that is leaving. */
         psp_write32(m->last + MSG_NEXT, psp_read32(head + MSG_NEXT));
@@ -1184,6 +1205,9 @@ static void hle_SendMbx(void) {
     psp_mbx *m = find_mbx(id);
     if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MBXID); return; }
     if (!msg || !psp_mem_ptr(msg, 8)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    /* A packet belongs to one queue at a time. mbx/send sends the same one
+     * twice and the second is refused with the count left at 1. */
+    if (mbx_holds(m, msg)) { psp_ret(SCE_KERNEL_ERROR_MBX_CORRUPT); return; }
 
     /* A waiting receiver takes it without it ever joining the queue. */
     const int i = psp_waitq_pick(&m->q, m->attr);
@@ -1214,6 +1238,22 @@ static void mbx_receive(int may_block, int has_timeout) {
     const uint64_t deadline = psp_wait_deadline(tmo_ptr);
 
     if (m->count) {
+        /* Two ways the guest can have broken the ring since the send, both
+         * measured by mbx/send tampering with a packet it already handed over,
+         * and each with its own code:
+         *
+         *   next = NULL    ->  there is no head to take        800200D3
+         *   count says more than one, and the head *is* the last, so taking it
+         *   would empty a box holding two                      800201C9
+         *
+         * Its third case -- a two-node ring where the head is not the last --
+         * is left alone, because that one hardware simply serves. */
+        const uint32_t head = mbx_first(m);
+        if (!head) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+        if (m->count > 1 && head == m->last) {
+            psp_ret(SCE_KERNEL_ERROR_MBX_CORRUPT);
+            return;
+        }
         const uint32_t got = mbx_pop(m);
         if (out) psp_write32(out, got);
         psp_wait_writeback(tmo_ptr, deadline);
