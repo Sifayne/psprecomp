@@ -1406,6 +1406,9 @@ typedef struct {
     char      name[32];
     uint32_t  attr;
     uint32_t  base, block_size, nblocks;
+    /* What a block costs, which is what it holds rounded up to the option
+     * struct's alignment. Reported blockSize stays what was asked for. */
+    uint32_t  stride;
     /* The free list is a *queue*, not a lowest-first search.
      *
      * threads/fpl/allocate says so in words: after freeing the first block, the
@@ -1461,15 +1464,22 @@ static void hle_CreateFpl(void) {
      * -1, 3, 5, 6 and 7 are refused -- and refused with the *partition* code,
      * which is the one thing about it that could not have been guessed. */
     const uint32_t opt = psp_arg(5);
+    uint32_t align = 4;
     if (opt && psp_mem_ptr(opt, 8)) {
-        const uint32_t align = psp_read32(opt + 4);
-        if (align && (align & (align - 1))) {
+        const uint32_t a = psp_read32(opt + 4);
+        if (a && (a & (a - 1))) {
             psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
             return;
         }
+        if (a > align) align = a;
     }
+    /* And having been checked, it spaces the blocks out, the same way a
+     * tlspl's does. fpl/tryallocate creates 0x10-byte blocks with alignment 32
+     * and measures 32 bytes between two of them; every other section of that
+     * test leaves the options null and measures 16. */
+    const uint32_t stride = (bsize + align - 1) & ~(align - 1);
 
-    const uint32_t base = psp_sysmem_alloc(bsize * count, 0);
+    const uint32_t base = psp_sysmem_alloc(stride * count, 0);
     if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     psp_fpl *f = NULL;
@@ -1479,6 +1489,7 @@ static void hle_CreateFpl(void) {
     memset(f, 0, sizeof *f);
     psp_str(name, f->name, sizeof f->name);
     f->attr = attr; f->base = base; f->block_size = bsize; f->nblocks = count;
+    f->stride = stride;
     f->free_blocks = count;
     for (uint32_t i = 0; i < count; i++) f->freelist[i] = (uint16_t)i;
     f->uid   = psp_threadman_next_uid();
@@ -1506,7 +1517,7 @@ static uint32_t fpl_take(psp_fpl *f) {
     const uint32_t i = f->freelist[f->head];
     f->head = (f->head + 1) % f->nblocks;
     f->free_blocks--;
-    return f->base + i * f->block_size;
+    return f->base + i * f->stride;
 }
 
 /* Is this block index currently handed out? The queue holds the free ones from
@@ -1592,9 +1603,9 @@ static void hle_FreeFpl(void) {
      * at all is ILLEGAL_SIZE, while one that is real but is not the start of a
      * live block of *this* pool is ILLEGAL_MEMBLOCK. */
     if (ptr && !psp_mem_ptr(ptr, 1)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
-    if (ptr >= f->base && ptr < f->base + f->nblocks * f->block_size) {
-        const uint32_t i = (ptr - f->base) / f->block_size;
-        if (f->base + i * f->block_size == ptr && fpl_is_taken(f, i)) {
+    if (ptr >= f->base && ptr < f->base + f->nblocks * f->stride) {
+        const uint32_t i = (ptr - f->base) / f->stride;
+        if (f->base + i * f->stride == ptr && fpl_is_taken(f, i)) {
             f->freelist[(f->head + f->free_blocks) % f->nblocks] = (uint16_t)i;
             f->free_blocks++;
             const int urgent = fpl_release(f);
