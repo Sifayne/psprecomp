@@ -434,9 +434,13 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         fprintf(f, "%spsp_vcst(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize);
         return;
 
-    /* Immediate loads: the value is in the instruction, not a register. */
+    /* Immediate loads: the value is in the instruction, not a register.
+     *
+     * The destination is the vt field. The low seven bits, where every other
+     * VFPU op keeps vd, are part of the immediate here -- `vfim v84, 1/90`
+     * encodes as 0xDFD421B0, and reading vd from it names v48 instead. */
     case A_VIIM:
-        fprintf(f, "%spsp_vimm(%u, %.1ff);\n", ind, in->vd, (double)in->imm);
+        fprintf(f, "%spsp_vimm(%u, %.1ff);\n", ind, in->vt, (double)in->imm);
         return;
     /* `%g` drops the decimal point on whole values, so the `f` suffix lands on
      * what C then reads as an integer constant -- `-1f` is not a literal and
@@ -445,11 +449,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_VFIM: {
         float v = a_half_to_float((uint16_t)in->imm);
         if (isinf(v))
-            fprintf(f, "%spsp_vimm(%u, %sHUGE_VALF);\n", ind, in->vd, v < 0 ? "-" : "");
+            fprintf(f, "%spsp_vimm(%u, %sHUGE_VALF);\n", ind, in->vt, v < 0 ? "-" : "");
         else if (isnan(v))
-            fprintf(f, "%spsp_vimm(%u, (float)NAN);\n", ind, in->vd);
+            fprintf(f, "%spsp_vimm(%u, (float)NAN);\n", ind, in->vt);
         else
-            fprintf(f, "%spsp_vimm(%u, %#.9gf);\n", ind, in->vd, (double)v);
+            fprintf(f, "%spsp_vimm(%u, %#.9gf);\n", ind, in->vt, (double)v);
         return;
     }
 

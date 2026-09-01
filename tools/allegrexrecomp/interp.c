@@ -376,8 +376,11 @@ static psp_interp_status exec_simple(const a_insn *in) {
 
     case A_VIDT: psp_vidt(in->vd, in->vsize);            return I_RUNNING;
     case A_VCST: psp_vcst(in->vd, in->vs, in->vsize);    return I_RUNNING;
-    case A_VIIM: psp_vimm(in->vd, (float)in->imm);       return I_RUNNING;
-    case A_VFIM: psp_vimm(in->vd, a_half_to_float((uint16_t)in->imm)); return I_RUNNING;
+    /* The register is the vt field. The low seven bits, where every other VFPU
+     * op keeps vd, are part of the immediate here -- `vfim v84, 1/90` encodes
+     * as 0xDFD421B0, and reading vd from it names v48. */
+    case A_VIIM: psp_vimm(in->vt, (float)in->imm);       return I_RUNNING;
+    case A_VFIM: psp_vimm(in->vt, a_half_to_float((uint16_t)in->imm)); return I_RUNNING;
 
     case A_VMMUL: psp_vmmul(in->vd, in->vs, in->vt, in->vsize); return I_RUNNING;
     case A_VTFM2: case A_VTFM3: case A_VTFM4: {
