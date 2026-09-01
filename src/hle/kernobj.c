@@ -504,6 +504,7 @@ void psp_kernobj_register(void) {
  * pipe orders its senders and its receivers separately. */
 #define MPP_ATTR_SEND_PRIORITY 0x0100u
 #define MPP_ATTR_RECV_PRIORITY 0x1000u
+#define MPP_ATTR_MASK          0x51FFu
 
 typedef struct {
     uint32_t  uid;
@@ -571,6 +572,12 @@ static void hle_CreateMsgPipe(void) {
     if (!name) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
     const uint32_t pe = vpl_partition_error(part);
     if (pe) { psp_ret(pe); return; }
+    /* The seventh attribute mask among seven object types, and msgpipe/create's
+     * sweep settles it in two lines: 0x3FF is refused and 0x51FF is accepted,
+     * so the legal set is the low nine bits plus the two queue-order bits --
+     * 0x1FF | 0x1000 | 0x4000, which is 0x51FF exactly. */
+    if (attr & ~MPP_ATTR_MASK) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+
     const uint32_t base = size ? psp_sysmem_alloc(size, 0) : 0;
     if (size && !base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
