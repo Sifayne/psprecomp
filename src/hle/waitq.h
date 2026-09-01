@@ -90,6 +90,20 @@ void     psp_wait_writeback(uint32_t tmo_ptr, uint64_t deadline);
 #define PSP_WAIT_WOKE_SATISFIED 1
 #define PSP_WAIT_WOKE_CANCELLED 2
 
+/* SATISFIED is under-used and that is a live bug, not a style choice.
+ *
+ * A type that wakes a satisfied waiter with plain psp_sched_wake -- NORMAL --
+ * leaves that waiter unable to tell "I was handed what I asked for" from "the
+ * object was deleted under me", so it works the difference out by looking the
+ * object up again. That is wrong whenever the object is deleted between the
+ * release and the waiter's next turn on the CPU: the resource was still
+ * handed over. threads/fpl/allocate does exactly that and hardware answers OK.
+ *
+ * Message pipes and fixed pools get this right. Mutexes, lwmutexes, vpl, mbx,
+ * tlspl, semaphores and event flags still do not, and no test in the suite
+ * currently catches them -- so the gate for fixing one is that nothing
+ * regresses, not that something improves. */
+
 /* The attribute bit that selects most-urgent-first over first-come. */
 #define PSP_WAITQ_PRIORITY 0x100u
 

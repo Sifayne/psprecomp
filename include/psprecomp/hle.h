@@ -210,6 +210,13 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 /* And the lwmutex family, which has its own set rather than sharing the
  * mutex's -- threads/lwmutex/{lock,unlock,delete}.expected. A null workarea is
  * ILLEGAL_SIZE, which is the odd one and is what delete.expected reports. */
+/* MISNAMED, and the value is the part that is right. PSPSDK calls 0x800200D3
+ * ILLEGAL_ADDR; the real ILLEGAL_SIZE is 0x800201BC, which is in this header
+ * below under the invented name ILLEGAL_SIZE_MPP. Renaming is a separate audit
+ * (see docs/findings/autotests.md) -- but do NOT add a correct constant for
+ * either number under its proper name until that audit happens, because two
+ * #defines of one name do not warn, the later one wins, and that has already
+ * produced one silent wrong answer here (ILLEGAL_CONTEXT vs CPUDI). */
 #define SCE_KERNEL_ERROR_ILLEGAL_SIZE            0x800200D3
 #define SCE_KERNEL_ERROR_NOT_FOUND_LWMUTEX       0x800201CA
 #define SCE_KERNEL_ERROR_LWMUTEX_LOCKED          0x800201CB
@@ -226,6 +233,8 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
  * permission check in the usual order -- threads/vpl/create.expected refuses
  * partition 7 as out-of-range while 8 and 9 are merely forbidden. */
 #define SCE_KERNEL_ERROR_ILLEGAL_PERM       0x800200D1
+/* Also misnamed: PSPSDK calls 0x800200D2 ILLEGAL_ARGUMENT and puts
+ * ILLEGAL_PARTITION at 0x800200D6. Same caution as above. */
 #define SCE_KERNEL_ERROR_ILLEGAL_PARTITION  0x800200D2
 #define SCE_KERNEL_ERROR_UNKNOWN_VPLID      0x8002019C
 #define SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE    0x800201B7

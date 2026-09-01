@@ -44,7 +44,22 @@
  * clock in a loop long enough to notice, and no test in the suite started
  * timing out. So the separate read tick is gone rather than retuned: the two
  * questions had different answers only for as long as one of them was
- * unmeasured. */
+ * unmeasured.
+ *
+ * ## Before changing this number
+ *
+ * It is the open suspect for the checkpoint column. Ten of the twelve `[x]`
+ * against `[r]` differences left in the threads suite are ours rescheduling
+ * where hardware does not, and if a firmware call really costs two or three
+ * microseconds of guest time then msgpipe's `1us:` and `2us:` waits would find
+ * their deadline already passed and take the no-wait path in sched.c, which is
+ * `[x]` without a switch.
+ *
+ * Read the long comment at that guard (search sched.c for "already arrived")
+ * first. The same observation has been implemented once before as a *rule* --
+ * "do not park below 3us" -- and it matched one test while taking forty others
+ * to no output at all. The reframing is that this is a cost, not a threshold.
+ * Change it alone, and sweep with and without it. */
 #define PSP_CALL_TICK_US 1u
 
 static uint64_t g_us;

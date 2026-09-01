@@ -243,6 +243,16 @@ static uint32_t vpl_free_size(const psp_vpl *v) {
  * left of the free block. And the head advances to that block's `next`
  * afterwards, which is why a second allocation from the same block leaves the
  * head where it already was. */
+/* Open, and the last line threads/vpl/free differs by. That test allocates
+ * three adjacent blocks, frees all three, and allocates again: hardware reuses
+ * the merged hole where the first one was, and we take the other free region
+ * instead. The reason is the head this search starts from -- vpl_give_back
+ * leaves it at the free node *preceding* the returned block, which after a
+ * forward merge is the low block rather than the merged one.
+ *
+ * Do not change the head rule on that one observation. order.expected matches
+ * today and is what pins it, and its three frees agree with the current rule
+ * and with nothing simpler. Whatever replaces it has to satisfy both tests. */
 static uint32_t vpl_alloc(psp_vpl *v, uint32_t bytes) {
     if (!v->base) return 0;
     const uint32_t need = round_up(bytes, VPL_ALIGN) + VPL_HEADER;
@@ -1880,6 +1890,19 @@ static void hle_GetTlsAddr(void) {
 
     const uint32_t mine = tls_block_of(t, me);
     if (mine) { psp_ret(mine); return; }
+    /* The six lines threads/tls/get still differs by are here, and are left
+     * alone on purpose: hardware does not validate this uid at all. It indexes
+     * the object table by `uid >> 3`, so with two pools alive at slots 0 and 1,
+     * uid 0 and uid 1 both answer the first pool's base and 0xF answers the
+     * second's, while 0x10 and above fail. sceKernelReferTlsplStatus on the
+     * same uids answers 800201D0, so the laxity is this one call's.
+     *
+     * Reproducing it needs uids that encode their slot in a shared object
+     * table, which is a change to every object type at once. A fallback that
+     * tries `index == uid >> 3` when the exact match misses would fit this
+     * test and is not the mechanism -- it would be dead code the moment uids
+     * did encode a slot. Worth doing for a better reason than six lines. */
+
     /* The search starts where the last one stopped rather than at block zero,
      * so a block that has just been freed is not the one handed straight back.
      * tls/get takes and frees a block from a pool of three, four times over,
