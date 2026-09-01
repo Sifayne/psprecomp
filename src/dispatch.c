@@ -99,7 +99,14 @@ psp_fn_t psp_lookup(uint32_t addr) {
 
 /* ---- function-entry trace ------------------------------------------------ */
 
-#define TRACE_DEPTH 32
+/* Deep enough that a failure still has its cause in the ring.
+ *
+ * 32 was too short to be useful for the question it kept being asked: when a
+ * game prints a diagnostic, the printf and its string handling alone fill the
+ * ring, so the code that decided to print has already been pushed out. The
+ * cost is one array; the whole point of the instrument is to reach past the
+ * reporting and into the deciding. */
+#define TRACE_DEPTH 512
 static uint32_t g_trace[TRACE_DEPTH];
 static uint64_t g_trace_n;
 
@@ -248,9 +255,17 @@ int psp_log_indirect;
  * indistinguishable from a real one. That flaw produced a confidently wrong
  * conclusion about an allocation failing.
  *
- * Marking every label closes it: any address the emitter gave a label to can
- * now be watched, and psp_trace_watch_ok() says up front whether an address is
- * observable at all. */
+ * Marking every label closes it for any address the emitter gave a label to --
+ * branch and jump targets, function entries, split entries, fall-through
+ * targets.
+ *
+ * It does not close it for anything else, and the distinction is not visible
+ * from in here. psp_trace_was_marked returns -1 only for an address outside the
+ * marked range; an in-module address that never got a label returns 0, which
+ * reads as "not reached" when it means "cannot be seen". Observability is a
+ * property of the emitted C, and this layer holds no label table to check it
+ * against, so the caller has to map an address to its covering label first --
+ * see PSPRECOMP_REACHED in the boot host, which documents the grep. */
 static uint32_t g_mark_addr;
 static void (*g_mark_fn)(uint32_t);
 static uint8_t *g_marked;
@@ -289,27 +304,89 @@ int psp_trace_was_marked(uint32_t addr) {
  *
  * Checking the invariant at every return finds the culprit directly. */
 static uint64_t g_sp_bad;
+static uint64_t g_sp_leak;      /* the negative-delta subset */
 static uint32_t g_sp_first;
 static int32_t  g_sp_delta;
 
+/* Per-site tallies.
+ *
+ * The raw total is a poor measure on its own: it counts *returns*, so one hot
+ * function in a frame loop contributes millions and buries everything else.
+ * Two runs whose structure differs substantially can still report nearly the
+ * same total. What distinguishes them is which sites are involved and how many
+ * there are, so the sites are aggregated rather than merely counted.
+ *
+ * A fixed open-addressed table, no growth and no allocation: this runs on the
+ * return path of every recompiled function in a TRACE build, and a table that
+ * reallocated there would change the thing it is measuring. Sites beyond
+ * capacity are dropped and reported as such -- an undercount that says so is
+ * worth more than a number that quietly stops being true. */
+#define SP_SITES 4096
+typedef struct { uint32_t fn; int32_t delta; uint64_t hits; } sp_site;
+static sp_site  g_sp_site[SP_SITES];
+static unsigned g_sp_nsites;
+static uint64_t g_sp_dropped;
+
+static void sp_record(uint32_t fn, int32_t delta) {
+    unsigned h = (unsigned)((fn * 2654435761u) >> 13) & (SP_SITES - 1);
+    for (unsigned n = 0; n < SP_SITES; n++) {
+        sp_site *s = &g_sp_site[(h + n) & (SP_SITES - 1)];
+        if (s->hits && s->fn != fn) continue;
+        if (!s->hits) { s->fn = fn; s->delta = delta; g_sp_nsites++; }
+        s->hits++;
+        return;
+    }
+    g_sp_dropped++;
+}
+
 void psp_trace_sp(uint32_t fn, uint32_t sp_in, uint32_t sp_out) {
     if (sp_in == sp_out) return;
-    /* Print them all. A *positive* delta usually means a split continuation
-     * that contains an epilogue but not its matching prologue -- discovery
-     * makes those separate bodies, so the invariant does not hold for them and
-     * they are noise. A *negative* delta is the dangerous case: stack consumed
-     * and never returned. */
+    const int32_t delta = (int32_t)(sp_out - sp_in);
+    /* A *positive* delta usually means a split continuation that contains an
+     * epilogue but not its matching prologue -- discovery makes those separate
+     * bodies, so the invariant does not hold for them and they are noise. A
+     * *negative* delta is the dangerous case: stack consumed and never
+     * returned. Counted apart, because lumping them together makes a run full
+     * of harmless splits look identical to one that is leaking. */
+    if (delta < 0) g_sp_leak++;
     if (g_sp_bad < 24)
-        fprintf(stderr, "sp UNBALANCED in 0x%08X: %+d%s\n", fn,
-                (int)(sp_out - sp_in),
-                (int32_t)(sp_out - sp_in) < 0 ? "   <-- leak" : "");
-    if (!g_sp_bad) { g_sp_first = fn; g_sp_delta = (int32_t)(sp_out - sp_in); }
+        fprintf(stderr, "sp UNBALANCED in 0x%08X: %+d%s\n", fn, (int)delta,
+                delta < 0 ? "   <-- leak" : "");
+    if (!g_sp_bad) { g_sp_first = fn; g_sp_delta = delta; }
     g_sp_bad++;
+    sp_record(fn, delta);
 }
 
 uint64_t psp_sp_violations(void) { return g_sp_bad; }
+uint64_t psp_sp_leaks(void)      { return g_sp_leak; }
+unsigned psp_sp_sites(void)      { return g_sp_nsites; }
 uint32_t psp_sp_first_bad(void)  { return g_sp_first; }
 int32_t  psp_sp_first_delta(void){ return g_sp_delta; }
+
+/* The busiest offenders, worst first. `top` is how many to print. */
+void psp_sp_dump(FILE *out, int top) {
+    if (!g_sp_nsites) return;
+    fprintf(out, "  %u distinct site(s), %llu leak(s) of %llu unbalanced return(s)%s\n",
+            g_sp_nsites, (unsigned long long)g_sp_leak,
+            (unsigned long long)g_sp_bad,
+            g_sp_dropped ? "  (site table full; some sites dropped)" : "");
+
+    /* Selection sort over the top few. The table is small, this runs once at
+     * exit, and sorting 4096 entries to show 12 is not worth the code. */
+    for (int rank = 0; rank < top; rank++) {
+        sp_site *best = NULL;
+        for (unsigned i = 0; i < SP_SITES; i++) {
+            sp_site *s = &g_sp_site[i];
+            if (!s->hits) continue;
+            if (!best || s->hits > best->hits) best = s;
+        }
+        if (!best) break;
+        fprintf(out, "    %12llu  0x%08X  %+d%s\n",
+                (unsigned long long)best->hits, best->fn, (int)best->delta,
+                best->delta < 0 ? "   <-- leak" : "");
+        best->hits = 0;   /* consumed */
+    }
+}
 
 /* Stack imbalance observed across a call. Complements psp_trace_sp: that one
  * checks a body against its own entry and is blind to leaks that straddle a

@@ -15,6 +15,7 @@
 #define PSPRECOMP_DISPATCH_H
 
 #include <stdint.h>
+#include <stdio.h>   /* psp_sp_dump reports to a stream */
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,8 +61,17 @@ void psp_trace_sp(uint32_t fn, uint32_t sp_in, uint32_t sp_out);
 void psp_trace_sp_call(uint32_t callee, uint32_t sp_before, uint32_t sp_after);
 uint64_t psp_sp_call_violations(void);
 uint64_t psp_sp_violations(void);
+/* The negative-delta subset -- stack consumed and never returned. The total
+ * alone cannot be read as a defect count: a positive delta is usually a split
+ * continuation holding an epilogue without its prologue, which is an artifact
+ * of discovery rather than a bug. */
+uint64_t psp_sp_leaks(void);
+/* Distinct functions involved, as opposed to returns counted. The total is
+ * dominated by whatever sits in the frame loop. */
+unsigned psp_sp_sites(void);
 uint32_t psp_sp_first_bad(void);
 int32_t  psp_sp_first_delta(void);
+void     psp_sp_dump(FILE *out, int top);
 void psp_trace_watch_label(uint32_t addr, void (*fn)(uint32_t));
 void psp_trace_marks_init(uint32_t lo, uint32_t words);
 int psp_trace_was_marked(uint32_t addr);
