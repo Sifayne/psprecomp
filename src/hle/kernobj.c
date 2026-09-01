@@ -1655,6 +1655,7 @@ typedef struct {
     char      name[32];
     uint32_t  attr, index;
     uint32_t  base, block_size, nblocks;
+    uint32_t  cursor;                  /* where the next search starts */
     uint32_t  owner[MAX_TLS_BLOCKS];   /* thread uid holding each block, 0 free */
     int       alive;
     psp_waitq q;
@@ -1765,12 +1766,19 @@ static void hle_GetTlsAddr(void) {
 
     const uint32_t mine = tls_block_of(t, me);
     if (mine) { psp_ret(mine); return; }
-    for (uint32_t i = 0; i < t->nblocks; i++)
-        if (!t->owner[i]) {
-            t->owner[i] = me;
-            psp_ret(t->base + i * t->block_size);
-            return;
-        }
+    /* The search starts where the last one stopped rather than at block zero,
+     * so a block that has just been freed is not the one handed straight back.
+     * tls/get takes and frees a block from a pool of three, four times over,
+     * and reads the offsets: +0000, +0010, +0020, +0000. First-free would have
+     * answered +0000 every time. */
+    for (uint32_t n = 0; n < t->nblocks; n++) {
+        const uint32_t i = (t->cursor + n) % t->nblocks;
+        if (t->owner[i]) continue;
+        t->owner[i] = me;
+        t->cursor = (i + 1) % t->nblocks;
+        psp_ret(t->base + i * t->block_size);
+        return;
+    }
 
     if (!psp_sched_can_wait()) { psp_ret(0); return; }
     if (psp_waitq_add(&t->q, me, 0, 0, 0) != 0) { psp_ret(0); return; }
