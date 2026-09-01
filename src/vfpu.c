@@ -971,6 +971,12 @@ void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
      * going through the one unit is what makes the rounding match. */
     float out[4] = { psp_vfpu_dot(sv, tv), 0.0f, 0.0f, 0.0f };
     write_dst(vd, 1, out);
+    /* Recorded beside the comparisons: a clip test reading NaN is only half a
+     * finding, because the dot product that fed it is where the NaN either
+     * came from or was passed along, and telling those apart needs its inputs.
+     * Recorded after write_dst, so a destination that never gets written shows
+     * as a result the file does not contain. */
+    psp_vfpu_note_dot(vd, vs, vt, sv, tv, out[0]);
     eat_prefixes();
 }
 
@@ -1350,6 +1356,122 @@ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 /* Compare, writing one condition bit per lane plus the any/all summary bits
  * that vcmov and the bvt/bvf branches read. */
+/* ---- the comparison ring ------------------------------------------------- */
+
+#define VCMP_RING 24
+
+typedef struct {
+    int      is_dot;                 /* a vdot record rather than a vcmp     */
+    uint32_t cond, vs, vt, vd, cc_before, cc_after;
+    int      size, lanes;
+    float    s[4], t[4], result;
+    uint64_t seq;
+} vcmp_rec;
+
+static vcmp_rec g_vcmp[VCMP_RING];
+static uint64_t g_vcmp_n;
+static int      g_vcmp_on;
+
+void psp_vfpu_cmp_record(int enable) { g_vcmp_on = enable; }
+
+void psp_vfpu_note_dot(uint32_t vd, uint32_t vs, uint32_t vt,
+                       const float *sv, const float *tv, float result) {
+    if (!g_vcmp_on) return;
+    vcmp_rec *r = &g_vcmp[g_vcmp_n % VCMP_RING];
+    memset(r, 0, sizeof *r);
+    r->seq = g_vcmp_n++;
+    r->is_dot = 1;
+    r->vd = vd; r->vs = vs; r->vt = vt; r->lanes = 4;
+    r->result = result;
+    for (int i = 0; i < 4; i++) { r->s[i] = sv[i]; r->t[i] = tv[i]; }
+}
+
+static const char *VCMP_NAME[16] = {
+    "FL","EQ","LT","LE","TR","NE","GE","GT",
+    "EZ","EN","EI","ES","NZ","NN","NI","NS"
+};
+
+void psp_vfpu_dump_cmps(FILE *out) {
+    if (!g_vcmp_on) return;
+
+    /* How much of the register file nothing has written.
+     *
+     * psp_cpu_reset_fp fills the VFPU with 0x7F800001, which is what the
+     * hardware powers on holding, and arithmetic quiets it to 0x7FC00001. A
+     * register still carrying either has never been written this run -- so a
+     * NaN reaching a comparison is not necessarily a NaN the game computed,
+     * and the difference decides whether to look at the arithmetic or at
+     * whatever was supposed to load the register. */
+    int untouched = 0;
+    for (int i = 0; i < 128; i++) {
+        const uint32_t b = psp_f32_to_bits(psp_cpu.v[i]);
+        if (b == 0x7F800001u || b == 0x7FC00001u) untouched++;
+    }
+    fprintf(out, "  vfpu file: %d of 128 registers still hold the power-on "
+                 "NaN (0x7F800001, quieted 0x7FC00001)\n", untouched);
+
+    /* The whole file, in the layout vfpu.h describes -- eight 4x4 matrices,
+     * element (m, row, col) at v[m*4 + col*32 + row].
+     *
+     * This is what PSPRECOMP_VDUMP gives, except that VDUMP hangs off the
+     * interpreter's step loop and so cannot see a recompiled run -- and a bug
+     * that only appears several minutes into real gameplay is not reachable by
+     * the interpreter. Printed once, at the fault: the next instruction
+     * destroys it.
+     *
+     * Printed as matrices rather than as a flat array on purpose. A flat dump
+     * indexed 0..127 invites reading slot 107 as "register v107", and the two
+     * are not the same thing -- that mistake turns a register nothing wrote
+     * into a wrong-destination bug that was never there. */
+    for (int m = 0; m < 8; m++) {
+        fprintf(out, "    M%d ", m);
+        for (int row = 0; row < 4; row++) {
+            fprintf(out, "[");
+            for (int col = 0; col < 4; col++)
+                fprintf(out, "%s%08X", col ? " " : "",
+                        psp_f32_to_bits(psp_cpu.v[m * 4 + col * 32 + row]));
+            fprintf(out, "]");
+        }
+        fprintf(out, "\n");
+    }
+
+    if (!g_vcmp_n) { fprintf(out, "  (no VFPU comparison recorded)\n"); return; }
+
+    const uint64_t n = g_vcmp_n < VCMP_RING ? g_vcmp_n : VCMP_RING;
+    fprintf(out, "  last %llu VFPU comparison(s), newest first "
+                 "(cc bits: 0-3 per lane, 4 any, 5 all):\n",
+            (unsigned long long)n);
+    for (uint64_t i = 0; i < n; i++) {
+        const vcmp_rec *r = &g_vcmp[(g_vcmp_n - 1 - i) % VCMP_RING];
+        if (r->is_dot) {
+            fprintf(out, "    #%llu vdot v%u <- v%u,v%u  = %.7g [%08X]\n",
+                    (unsigned long long)r->seq, r->vd, r->vs, r->vt,
+                    (double)r->result, psp_f32_to_bits(r->result));
+            for (int k = 0; k < 4; k++)
+                fprintf(out, "        lane %d:  %-14.7g [%08X] . %-14.7g [%08X]\n",
+                        k, (double)r->s[k], psp_f32_to_bits(r->s[k]),
+                        (double)r->t[k], psp_f32_to_bits(r->t[k]));
+            continue;
+        }
+        fprintf(out, "    #%llu vcmp.%s %-2s v%u,v%u  cc %02X -> %02X\n",
+                (unsigned long long)r->seq,
+                r->size == 1 ? "s" : r->size == 2 ? "p" : r->size == 3 ? "t" : "q",
+                VCMP_NAME[r->cond & 0xF], r->vs, r->vt,
+                r->cc_before, r->cc_after);
+        for (int k = 0; k < r->lanes; k++) {
+            /* Bits as well as the value. "nan" is not one answer: the VFPU
+             * powers on filled with 0x7F800001, and arithmetic quiets that to
+             * 0x7FC00001 -- so those two patterns mean "a register nothing
+             * ever wrote", while 0x7FC00000 means a real 0/0 or inf-inf. The
+             * decimal rendering collapses all three into the same word. */
+            fprintf(out, "        lane %d:  %-14.7g [%08X] vs %-14.7g [%08X]  -> %d\n",
+                    k, (double)r->s[k], psp_f32_to_bits(r->s[k]),
+                    (double)r->t[k], psp_f32_to_bits(r->t[k]),
+                    (r->cc_after >> k) & 1);
+        }
+    }
+}
+
 void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
     float sv[4], tv[4];
     const int n = read_src(vs, size, g_prefix[0], sv);
@@ -1395,7 +1517,26 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
      * compare and then reads it back after a triple one. Overwriting the whole
      * register cleared it, which cost 25 lines and looked like a vcmov bug. */
     const uint32_t affected = (1u << 4) | (1u << 5) | ((1u << n) - 1u);
+    const uint32_t before = psp_cpu.vfpu_cc;
     psp_cpu.vfpu_cc = (psp_cpu.vfpu_cc & ~affected) | (cc & affected);
+
+    /* Recorded after the write, so the operands and the codes they produced
+     * are one record rather than two things to line up by hand. The prefixes
+     * are already applied to sv/tv here, which is the point: what the compare
+     * saw, not what the instruction named. */
+    if (g_vcmp_on) {
+        vcmp_rec *r = &g_vcmp[g_vcmp_n % VCMP_RING];
+        /* Cleared, not just assigned: the ring is shared with vdot, and a slot
+         * that still said is_dot printed this comparison's operands beside the
+         * previous dot product's result. That read as a dot of two zero
+         * vectors returning -1.997, which is impossible and cost a detour. */
+        memset(r, 0, sizeof *r);
+        r->seq = g_vcmp_n++;
+        r->cond = cond; r->vs = vs; r->vt = vt; r->size = size; r->lanes = n;
+        r->cc_before = before; r->cc_after = psp_cpu.vfpu_cc;
+        for (int i = 0; i < 4; i++) { r->s[i] = i < n ? sv[i] : 0.0f;
+                                      r->t[i] = i < n ? tv[i] : 0.0f; }
+    }
     eat_prefixes();
 }
 

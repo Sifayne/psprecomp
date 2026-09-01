@@ -43,6 +43,7 @@
 #include "mem.h"
 
 #include <stdint.h>
+#include <stdio.h>      /* psp_vfpu_dump_cmps reports to a caller's stream */
 
 #ifdef __cplusplus
 extern "C" {
@@ -204,6 +205,28 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 
 /* Comparison, writing the VFPU condition codes. */
 void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size);
+
+/* A ring of the last few comparisons: condition, operands, resulting codes.
+ *
+ * PSPRECOMP_VDUMP reads the register file at an address, which only the
+ * interpreter can do -- it hangs off the interpreter's step loop, so it cannot
+ * see a recompiled run at all. That is the wrong half of the codebase for a
+ * bug that only appears after several minutes of real gameplay.
+ *
+ * A comparison is also the wrong thing to read *after the fact*: by the time
+ * anything notices, the registers have been moved, multiplied and stored, and
+ * the condition codes overwritten by the next compare. What settles whether a
+ * compare was right is the pair of numbers that went in and the bits that came
+ * out, recorded together at the moment.
+ *
+ * Recording is off unless enabled -- psp_vcmp is hot enough that an
+ * unconditional ring write would be paid for on every frame of every run. */
+void psp_vfpu_cmp_record(int enable);
+void psp_vfpu_dump_cmps(FILE *out);
+/* Dot products go in the same ring: a clip test reading NaN does not say
+ * whether the dot product produced it or merely carried it. */
+void psp_vfpu_note_dot(uint32_t vd, uint32_t vs, uint32_t vt,
+                       const float *sv, const float *tv, float result);
 
 /* Unary element-wise ops (VFPU4). One entry point rather than eighteen, since
  * they differ only in the scalar function applied per lane. */
