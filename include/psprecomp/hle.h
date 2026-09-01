@@ -252,6 +252,12 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_TLSPL_BUSY         0x800201D2
 #define SCE_KERNEL_ERROR_UNKNOWN_ALMID      0x8002019F
 #define SCE_KERNEL_ERROR_UNKNOWN_VTID       0x800201BE
+/* A uid of zero, which is not the same as one that names nothing. PSPSDK's
+ * pspkerror.h has both names in this order. Which of the two a call answers is
+ * per-call and the tests disagree deliberately: start, stop, sethandler and
+ * cancelhandler answer ILLEGAL for a null uid where delete, gettime, getbase,
+ * refer and settime answer UNKNOWN. */
+#define SCE_KERNEL_ERROR_ILLEGAL_VTID       0x800201BF
 /* A blocking call made while dispatch is suspended. */
 #define SCE_KERNEL_ERROR_CAN_NOT_WAIT       0x800201A7
 /* Suspending dispatch when it is already suspended, or resuming it with

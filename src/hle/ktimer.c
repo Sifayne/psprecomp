@@ -268,6 +268,7 @@ static void hle_DeleteVTimer(void) {
 /* Start and stop report whether they *changed* anything, not whether they
  * succeeded: starting an already-running timer answers 1. */
 static void hle_StartVTimer(void) {
+    if (!psp_arg(0)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_VTID); return; }
     psp_vtimer *v = find_vtimer(psp_arg(0));
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
     const int was = v->active;
@@ -276,6 +277,7 @@ static void hle_StartVTimer(void) {
 }
 
 static void hle_StopVTimer(void) {
+    if (!psp_arg(0)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_VTID); return; }
     psp_vtimer *v = find_vtimer(psp_arg(0));
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
     const int was = v->active;
