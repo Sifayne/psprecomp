@@ -885,7 +885,22 @@ static int looks_like_cmd1_meta(const uint8_t *m, size_t avail, uint32_t file_si
  * is that running from the module entry does not get far: real bring-up starts
  * at a single leaf function, not at _start. */
 
-#define INTERP_STACK_TOP  (PSP_RAM_BASE + PSP_RAM_SIZE - 0x100)
+/* The main context's guest stack, taken from the allocator rather than picked.
+ *
+ * It used to be the top of RAM, and the allocator's high end is *also* the top
+ * of RAM -- so the first `psp_sysmem_alloc(size, from_high)` returned a block
+ * containing it. Every guest thread's stack comes from exactly that call, so
+ * the module entry and the first thread it started shared their stacks.
+ *
+ * That was invisible for as long as nothing wrote a whole stack at once. It
+ * stopped being invisible when sceKernelStartThread began painting a fresh
+ * stack with 0xFF: 125 of the 127 threads tests went from "returned" to
+ * "invalid instruction" in one step, because starting a thread wiped the
+ * context that had started it.
+ *
+ * Asking the allocator removes the overlap by construction instead of moving
+ * the collision somewhere else. */
+#define INTERP_STACK_SIZE 0x10000u
 #define INTERP_RA_DONE    0x0DEAD000u
 
 /* Guest re-entry attempted from inside an HLE handler. Recorded rather than
@@ -992,7 +1007,9 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
 
     memset(&psp_cpu, 0, sizeof psp_cpu);
     psp_cpu_reset_fp();
-    psp_cpu.r[PSP_REG_SP] = INTERP_STACK_TOP;
+    const uint32_t stack = psp_sysmem_alloc(INTERP_STACK_SIZE, 1);
+    if (!stack) { fprintf(stderr, "cannot allocate a guest stack\n"); goto fail; }
+    psp_cpu.r[PSP_REG_SP] = (stack + INTERP_STACK_SIZE - 64) & ~15u;
     /* A module with a small-data area reads it through $gp and never loads the
      * register itself; the value comes from the module info. */
     psp_cpu.r[PSP_REG_GP] = li.gp;

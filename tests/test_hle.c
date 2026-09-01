@@ -203,8 +203,20 @@ static void test_semaphores(void) {
           "and no more than max");
 
     CHECK(call(DELETE, sem, 0, 0, 0) == 0, "delete succeeds");
-    CHECK(call(WAIT, sem, 1, 0, 0) == SCE_KERNEL_ERROR_UNKNOWN_UID,
+    /* The semaphore's own code, not the allocator's. A wrong-typed handle is
+     * refused with the *asking* type's error -- semaphores/wait.expected
+     * answers NULL, invalid and deleted alike with 0x80020199. */
+    CHECK(call(WAIT, sem, 1, 0, 0) == SCE_KERNEL_ERROR_UNKNOWN_SEMID,
           "a deleted semaphore is gone");
+
+    /* And the count is range-checked before anything waits. */
+    const uint32_t s2 = call5(CREATE, guest_name("counts"), 0, 0, 2, 0);
+    CHECK(call(WAIT, s2, 3, TMO, 0) == SCE_KERNEL_ERROR_ILLEGAL_COUNT,
+          "waiting for more than the maximum is refused");
+    CHECK(call(WAIT, s2, 0, TMO, 0) == SCE_KERNEL_ERROR_ILLEGAL_COUNT,
+          "waiting for zero is refused");
+    CHECK(call(WAIT, s2, 0xFFFFFFFFu, TMO, 0) == SCE_KERNEL_ERROR_ILLEGAL_COUNT,
+          "waiting for a negative amount is refused");
 }
 
 /* The attribute rules, one object type at a time.

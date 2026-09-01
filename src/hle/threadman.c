@@ -647,7 +647,7 @@ static void hle_CreateSema(void) {
 
 static void hle_DeleteSema(void) {
     psp_sema *s = find_sema(psp_arg(0));
-    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
     /* Everyone parked on it has to be let go, not left parked on an object that
      * no longer exists -- each discovers for itself that its lookup now fails. */
     const int urgent = psp_waitq_release_all(&s->q);
@@ -658,7 +658,7 @@ static void hle_DeleteSema(void) {
 
 static void hle_SignalSema(void) {
     psp_sema *s = find_sema(psp_arg(0));
-    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
     s->count += (int32_t)psp_arg(1);
     if (s->max_count > 0 && s->count > s->max_count) s->count = s->max_count;
     note_signalled(s->uid);
@@ -682,7 +682,7 @@ static void hle_SignalSema(void) {
  * it has something else to do when the answer is no. */
 static void hle_PollSema(void) {
     psp_sema *s = find_sema(psp_arg(0));
-    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
     const int32_t need = (int32_t)psp_arg(1);
     if (s->count < need) { psp_ret(SCE_KERNEL_ERROR_SEMA_ZERO); return; }
     s->count -= need;
@@ -760,8 +760,16 @@ static void hle_WaitSema(void) {
     const uint32_t id      = psp_arg(0);
     const int32_t  need    = (int32_t)psp_arg(1);
     const uint32_t tmo_ptr = psp_arg(2);
+    /* Zero, negative, or more than the semaphore could ever hold. Answered
+     * before the count is consulted and without touching the timeout word --
+     * semaphores/wait.expected reports `Greater than max: Failed (800201BD,
+     * 500ms left)`, so the call never waited. */
     psp_sema *s = find_sema(id);
-    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
+    if (need <= 0 || (s->max_count > 0 && need > s->max_count)) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
+        return;
+    }
 
     const uint64_t deadline = wait_deadline(tmo_ptr);
 
@@ -784,10 +792,11 @@ static void hle_WaitSema(void) {
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, s->waitdesc,
                                          deadline);
 
-    /* The semaphore may have gone while we were parked, which is what
-     * sceKernelDeleteSema releasing its waiters looks like from in here. */
+    /* Gone while we were parked, which is what sceKernelDeleteSema releasing
+     * its waiters looks like from in here -- and a different answer from asking
+     * about a semaphore that was already gone before the call. */
     s = find_sema(id);
-    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!s) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
 
     if (rc == PSP_SCHED_WOKEN) {
         /* The signaller already took the count on our behalf, so there is
@@ -821,6 +830,10 @@ static void hle_WaitSema(void) {
 #define PSP_EVENT_WAITAND   0x00
 #define PSP_EVENT_WAITOR    0x01
 #define PSP_EVENT_WAITCLEAR 0x20
+/* The creation attribute that lets more than one thread wait at once. It is
+ * also the bit an event flag accepts where a semaphore refuses it -- see the
+ * two attribute rules above. */
+#define PSP_EVENT_WAITMULTIPLE 0x200
 
 static void hle_CreateEventFlag(void) {
     /* (name, attr, bits, option) */
@@ -845,7 +858,7 @@ static void hle_CreateEventFlag(void) {
 
 static void hle_DeleteEventFlag(void) {
     psp_evflag *f = find_flag(psp_arg(0));
-    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
     const int urgent = psp_waitq_release_all(&f->q);
     f->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -895,7 +908,7 @@ static int flag_release(psp_evflag *f) {
 
 static void hle_SetEventFlag(void) {
     psp_evflag *f = find_flag(psp_arg(0));
-    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
     f->pattern |= psp_arg(1);
     const int urgent = flag_release(f);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -904,7 +917,7 @@ static void hle_SetEventFlag(void) {
 
 static void hle_ClearEventFlag(void) {
     psp_evflag *f = find_flag(psp_arg(0));
-    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
     /* The argument is a mask of bits to KEEP, not bits to clear. Getting this
      * backwards leaves a game waiting on a flag that never clears. */
     f->pattern &= psp_arg(1);
@@ -932,8 +945,21 @@ static void hle_WaitEventFlag(void) {
     const uint32_t out     = psp_arg(3);
     const uint32_t tmo_ptr = psp_arg(4);
 
+    /* Arguments before the handle, which is the order hardware uses and is
+     * observable. events/wait/wait.expected answers a wait for *no bits* on a
+     * NULL, invalid or deleted flag with EVF_ILPAT rather than UNKNOWN_EVFID,
+     * and a wrong mode on a NULL flag with ILLEGAL_MODE -- so both checks see
+     * the arguments before anything has looked the object up. */
+    if (bits == 0) { psp_ret(SCE_KERNEL_ERROR_EVF_ILPAT); return; }
+    /* WAITOR and WAITCLEAR and nothing else: 0x02, 0x04, 0x08, 0x40, 0x80 and
+     * 0xFF are each refused in that same file. */
+    if (mode & ~(uint32_t)(PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR)) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MODE);
+        return;
+    }
+
     psp_evflag *f = find_flag(id);
-    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
 
     const uint64_t deadline = wait_deadline(tmo_ptr);
 
@@ -942,6 +968,15 @@ static void hle_WaitEventFlag(void) {
         if (mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~bits;
         wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+
+    /* One waiter, unless the flag was created to allow more. That is what
+     * attribute 0x200 is -- PSP_EVENT_WAITMULTIPLE -- and it is the same bit
+     * the create test showed an event flag accepting where a semaphore refuses
+     * it. A second waiter without it is refused rather than queued. */
+    if (psp_waitq_count(&f->q) > 0 && !(f->attr & PSP_EVENT_WAITMULTIPLE)) {
+        psp_ret(SCE_KERNEL_ERROR_EVF_MULTI);
         return;
     }
 
@@ -954,8 +989,11 @@ static void hle_WaitEventFlag(void) {
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, f->waitdesc,
                                          deadline);
 
+    /* Gone while we were parked, which is what sceKernelDeleteEventFlag
+     * releasing its waiters looks like from in here -- and a different answer
+     * from asking about a flag that was already gone before the call. */
     f = find_flag(id);
-    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
 
     if (rc == PSP_SCHED_WOKEN) {
         /* flag_release already wrote the pattern we woke on and applied our
@@ -995,7 +1033,7 @@ static void hle_WaitEventFlag(void) {
 static void hle_ReferSemaStatus(void) {
     const psp_sema *sm = find_sema(psp_arg(0));
     const uint32_t info = psp_arg(1);
-    if (!sm)   { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!sm)   { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
     psp_write32(info +  0, 56);
     write_info_name(info + 4, sm->name);
@@ -1010,7 +1048,7 @@ static void hle_ReferSemaStatus(void) {
 static void hle_ReferEventFlagStatus(void) {
     const psp_evflag *f = find_flag(psp_arg(0));
     const uint32_t info = psp_arg(1);
-    if (!f)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (!f)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
     psp_write32(info +  0, 52);
     write_info_name(info + 4, f->name);

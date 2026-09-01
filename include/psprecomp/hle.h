@@ -135,6 +135,28 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_SEMA_ZERO       0x800201AD
 #define SCE_KERNEL_ERROR_WAIT_TIMEOUT    0x800201A8
 
+/* The uid space is per object type, and a wrong-typed handle is refused with
+ * the *asking* type's code. UNKNOWN_UID above is the allocator's; a semaphore
+ * call is answered with UNKNOWN_SEMID whatever the handle really was.
+ * Transcribed from the hardware captures that name them:
+ * semaphores/wait.expected, events/wait/wait.expected. */
+#define SCE_KERNEL_ERROR_UNKNOWN_SEMID   0x80020199
+#define SCE_KERNEL_ERROR_UNKNOWN_EVFID   0x8002019A
+
+/* A wait ended because the object was deleted underneath it -- distinct from
+ * asking about an object that was already gone. */
+#define SCE_KERNEL_ERROR_WAIT_DELETE     0x800201B5
+
+/* Waiting for no bits at all, and a wait mode outside {WAITOR, WAITCLEAR}. */
+#define SCE_KERNEL_ERROR_EVF_ILPAT       0x800201B1
+#define SCE_KERNEL_ERROR_ILLEGAL_MODE    0x80020195
+
+/* A second thread waiting on an event flag created without WAITMULTIPLE. */
+#define SCE_KERNEL_ERROR_EVF_MULTI       0x800201B0
+
+/* Waiting for zero, a negative amount, or more than a semaphore's maximum. */
+#define SCE_KERNEL_ERROR_ILLEGAL_COUNT   0x800201BD
+
 /* ---- the subsystems ------------------------------------------------------ */
 
 void psp_sysmem_init(void);
