@@ -702,6 +702,17 @@ int psp_sched_live(void) {
     return live;
 }
 
+int psp_sched_priority(uint32_t uid) {
+    pthread_mutex_lock(&g_lock);
+    const int s = slot_of(uid);
+    /* PSP priorities run 0..0x7F with 0 the most urgent, so anything past the
+     * range sorts last. An unknown uid is a waiter whose thread no longer
+     * exists, and it must never be picked ahead of one that does. */
+    const int pri = s >= 0 ? g_slot[s].priority : 0x7FFFFFFF;
+    pthread_mutex_unlock(&g_lock);
+    return pri;
+}
+
 uint32_t psp_sched_current(void) {
     /* From this host thread's own slot, not from whoever holds the token. The
      * two agree while a thread is running, which is why reading g_running here

@@ -202,6 +202,15 @@ void psp_sched_dump_threads(FILE *out);
 int      psp_sched_live(void);
 uint32_t psp_sched_current(void);
 
+/* A thread's priority, or the least urgent value there is when it has no slot.
+ *
+ * Asked by the waiter queue, which releases most-urgent-first for objects
+ * created with that attribute. Read from the scheduler rather than kept
+ * alongside the waiter, because a thread's priority can change while it waits
+ * and the order has to follow it. An unknown uid sorts last, so a stale entry
+ * can never win a release it should not. */
+int      psp_sched_priority(uint32_t uid);
+
 #ifdef __cplusplus
 }
 #endif

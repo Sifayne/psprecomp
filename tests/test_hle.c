@@ -53,10 +53,17 @@ static uint32_t call(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
     return psp_cpu.r[PSP_REG_V0];
 }
 
-/* Stack arguments live at $sp+16 onward. */
+/* The fifth argument goes in $t0, not at $sp+16.
+ *
+ * This wrote it to the stack, which is plain o32 and not what a PSP firmware
+ * stub does -- they load $t0-$t3 and branch, and hle.h carries the disassembly
+ * and the bug that established it. So every call5 here was putting the argument
+ * somewhere psp_arg(4) does not read, and it went unnoticed because the only
+ * value ever passed was 0 and $t0 happens to start at 0 too. The first caller
+ * to pass something else found it immediately. */
 static uint32_t call5(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
                       uint32_t a3, uint32_t a4) {
-    psp_write32(psp_cpu.r[PSP_REG_SP] + 16, a4);
+    psp_cpu.r[PSP_REG_T0] = a4;
     return call(nid, a0, a1, a2, a3);
 }
 
@@ -262,20 +269,47 @@ static void test_event_flags(void) {
 
     call(SET, ef, 0x0005, 0, 0);
 
+    /* A timeout pointer, because an unsatisfiable wait now *blocks*.
+     *
+     * It used to return a fabricated WAIT_TIMEOUT to everyone, so these checks
+     * could pass NULL and still get an answer. They now have to say what a
+     * caller on hardware says: with no timeout the wait is indefinite, and with
+     * nothing else runnable that stops the run rather than inventing a result.
+     * The timeout is the fifth argument -- $t0, see hle.h -- so call5. */
+    const uint32_t TMO = 0x08802000u;
+    psp_write32(TMO, 1000);
+
     /* WAITOR is satisfied by any bit; WAITAND needs all of them. */
-    CHECK(call5(WAIT, ef, 0x0004, 0x01 /*OR*/, 0, 0) == 0, "OR wait on a set bit");
-    CHECK(call5(WAIT, ef, 0x0003, 0x00 /*AND*/, 0, 0) == SCE_KERNEL_ERROR_WAIT_TIMEOUT,
+    CHECK(call5(WAIT, ef, 0x0004, 0x01 /*OR*/, 0, TMO) == 0, "OR wait on a set bit");
+    psp_write32(TMO, 1000);
+    CHECK(call5(WAIT, ef, 0x0003, 0x00 /*AND*/, 0, TMO) == SCE_KERNEL_ERROR_WAIT_TIMEOUT,
           "AND wait fails when only some bits are set");
-    CHECK(call5(WAIT, ef, 0x0005, 0x00 /*AND*/, 0, 0) == 0,
+    CHECK(psp_read32(TMO) == 0, "and the timeout word is spent, got %u",
+          psp_read32(TMO));
+    psp_write32(TMO, 1000);
+    CHECK(call5(WAIT, ef, 0x0005, 0x00 /*AND*/, 0, TMO) == 0,
           "AND wait succeeds when all bits are set");
+    CHECK(psp_read32(TMO) == 1000,
+          "an immediate success spends none of the timeout, got %u",
+          psp_read32(TMO));
 
     /* clear takes a mask of bits to KEEP. Getting that backwards leaves a game
      * waiting on a flag that never clears, so it is pinned explicitly. */
     call(CLEAR, ef, ~0x0004u, 0, 0);
-    CHECK(call5(WAIT, ef, 0x0004, 0x01, 0, 0) == SCE_KERNEL_ERROR_WAIT_TIMEOUT,
+    psp_write32(TMO, 1000);
+    CHECK(call5(WAIT, ef, 0x0004, 0x01, 0, TMO) == SCE_KERNEL_ERROR_WAIT_TIMEOUT,
           "the cleared bit is gone");
-    CHECK(call5(WAIT, ef, 0x0001, 0x01, 0, 0) == 0,
+    psp_write32(TMO, 1000);
+    CHECK(call5(WAIT, ef, 0x0001, 0x01, 0, TMO) == 0,
           "the kept bit survives");
+
+    /* And the out-parameter: the pattern the wait woke on. */
+    const uint32_t OUT = 0x08802010u;
+    psp_write32(OUT, 0xDEADBEEF);
+    psp_write32(TMO, 1000);
+    CHECK(call5(WAIT, ef, 0x0001, 0x01, OUT, TMO) == 0, "wait with an out pointer");
+    CHECK(psp_read32(OUT) == 0x0001,
+          "the pattern is reported: got 0x%08X", psp_read32(OUT));
 }
 
 /* A recompiled thread entry: writes a marker so the test can prove it ran on

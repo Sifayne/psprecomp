@@ -28,6 +28,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
+#include "waitq.h"
 
 #include <setjmp.h>
 #include <stdio.h>
@@ -70,11 +71,11 @@ typedef struct {
     int32_t  init_count;      /* what it was created with; ReferSemaStatus reports it */
     uint32_t attr;
     int      used;
-    /* Who to wake on a signal. A fixed array rather than a list: the count is
-     * small, and overflowing it would only cost a wakeup, not correctness --
-     * every waiter re-tests the count after being woken. */
-    uint32_t waiters[MAX_SEMA_WAITERS];
-    int      nwaiters;
+    /* Who is parked on it, in the order the attribute says to release them.
+     * The signaller deducts the count on a waiter's behalf and wakes only the
+     * ones it satisfied -- see waitq.h for why waking everyone to re-test is
+     * not a conservative version of that but a different, measurable rule. */
+    psp_waitq q;
     /* "sceKernelWaitSema(<name>)", built once at creation.
      *
      * The scheduler stores the string it is handed and prints it for every
@@ -86,12 +87,14 @@ typedef struct {
 } psp_sema;
 
 typedef struct {
-    uint32_t uid;
-    char     name[32];
-    uint32_t pattern;
-    uint32_t init_pattern;
-    uint32_t attr;
-    int      used;
+    uint32_t  uid;
+    char      name[32];
+    uint32_t  pattern;
+    uint32_t  init_pattern;
+    uint32_t  attr;
+    int       used;
+    psp_waitq q;
+    char      waitdesc[64];
 } psp_evflag;
 
 typedef struct {
@@ -184,15 +187,14 @@ static void wait_deadlock(const char *what) {
     psp_sched_stop_all(what);
 }
 
-static void warn_block(const char *what) {
-    if (g_warned_block) return;
-    g_warned_block = 1;
-    fprintf(stderr,
-        "psprecomp: %s would block with no runnable thread, returning timeout.\n"
-        "  Nothing else can run, so nothing could ever signal it -- waiting would\n"
-        "  hang. Further occurrences are not reported.\n",
-        what);
-}
+/* warn_block used to sit here: a wait that could not block reported a timeout
+ * and said so once. Nothing reaches it now. A caller that supplies a timeout
+ * gets a real one -- the wait parks with a deadline and the scheduler moves the
+ * clock to it -- and a caller that supplies none is not lied to, it stops the
+ * run through wait_deadlock. There is no third case left to warn about. */
+
+/* Defined down with the waits, but needed by the signal above them. */
+static int sema_release(psp_sema *s);
 
 /* ---- threads ------------------------------------------------------------- */
 
@@ -595,8 +597,12 @@ static void hle_CreateSema(void) {
 static void hle_DeleteSema(void) {
     psp_sema *s = find_sema(psp_arg(0));
     if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    /* Everyone parked on it has to be let go, not left parked on an object that
+     * no longer exists -- each discovers for itself that its lookup now fails. */
+    const int urgent = psp_waitq_release_all(&s->q);
     s->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
 }
 
 static void hle_SignalSema(void) {
@@ -607,14 +613,13 @@ static void hle_SignalSema(void) {
     note_signalled(s->uid);
     sema_log(s, "signal", (int32_t)psp_arg(1), 1);
 
-    /* Wake everyone parked on this semaphore and let them re-test. Waking only
-     * as many as the count allows would be tighter, but the count can be
-     * consumed by a thread that never waited, so the waiters have to re-check
-     * regardless -- and a missed wakeup is a hang. */
-    int urgent = 0;
-    for (int i = 0; i < s->nwaiters && i < MAX_SEMA_WAITERS; i++)
-        urgent |= psp_sched_wake(s->waiters[i]);
-    s->nwaiters = 0;
+    /* Release in the object's own order, deducting on each waiter's behalf.
+     *
+     * This used to wake everyone and let them re-test, which is not a
+     * conservative version of the same thing: the winner was then whichever
+     * thread the *scheduler* picked, always the most urgent, so a FIFO
+     * semaphore behaved like a priority one. See waitq.h. */
+    const int urgent = sema_release(s);
 
     psp_ret(SCE_KERNEL_ERROR_OK);
     /* Released a thread that outranks us, so it runs now. */
@@ -643,40 +648,121 @@ static void hle_RotateReadyQueue(void) {
 
 static void hle_DeleteCallback(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
-static void hle_WaitSema(void) {
-    psp_sema *s = find_sema(psp_arg(0));
-    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
-    const int32_t need = (int32_t)psp_arg(1);
+/* ---- the shape every kernel wait has ---------------------------------------
+ *
+ * The timeout argument is a *pointer*, and it is in and out. Hardware reads how
+ * long to wait and, when the wait ends, writes back how much of it was left --
+ * which the tests print, so it is observable rather than a nicety.
+ * semaphores/wait.expected pins all three cases:
+ *
+ *     Signaled: OK (500ms left)                 immediate, nothing spent
+ *     Wait timeout: ... remaining=4             blocked, woken with 4ms of 5000 left
+ *     Never signaled: Failed (800201A8, 0ms)    ran out
+ *
+ * and a fourth, which is why the write-back is conditional: a call that fails
+ * on its *arguments* -- `Greater than max: Failed (800201BD, 500ms left)` --
+ * leaves the word alone, because it never waited.
+ *
+ * This was previously read only for its non-NULL-ness, to decide whether a
+ * fabricated timeout was allowed. The duration itself was discarded. */
+static uint64_t wait_deadline(uint32_t tmo_ptr) {
+    if (!tmo_ptr) return 0;                       /* wait forever */
+    const uint32_t usec = psp_read32(tmo_ptr);
+    /* A zero timeout is a real timeout, the shortest one there is -- and
+     * hardware answers it with WAIT_TIMEOUT rather than waiting
+     * ("Zero timeout: Failed (800201A8, 0ms left)"). Giving it the earliest
+     * deadline that exists produces exactly that, through the ordinary path. */
+    return psp_clock_peek() + (usec ? usec : 1);
+}
 
-    /* Block until the count can satisfy the request, rather than reporting a
-     * timeout. The retry loop matters: being woken means the count *changed*,
-     * not that it is now sufficient, and several waiters may be released by one
-     * signal. */
+static void wait_writeback(uint32_t tmo_ptr, uint64_t deadline) {
+    if (!tmo_ptr) return;
+    const uint64_t now = psp_clock_peek();
+    psp_write32(tmo_ptr, now < deadline ? (uint32_t)(deadline - now) : 0);
+}
+
+/* Hand the count to whoever is next in line, as far as it will go.
+ *
+ * The head blocks the queue -- a waiter the count cannot satisfy is not skipped
+ * over, and a *later* caller does not take what it is waiting for.
+ * threads/semaphores/fifo measures both halves in eight lines: with a count of
+ * 1, a thread asking for 5 parks; a second thread asking for 1 parks behind it
+ * rather than taking what is there; and only when the first times out and
+ * leaves the queue does the second get it.
+ *
+ * That is also why this runs whenever the queue *changes*, not only on a
+ * signal. A waiter leaving on its own timeout can unblock the one behind it. */
+static int sema_release(psp_sema *s) {
+    int urgent = 0;
     for (;;) {
-        if (s->count >= need) {
-            s->count -= need;
-            sema_log(s, "taken", need, 0);
-            psp_ret(SCE_KERNEL_ERROR_OK);
-            return;
-        }
-        sema_log(s, "park", need, 0);
-        const uint32_t me = psp_sched_current();
-        s->waiters[s->nwaiters++ % MAX_SEMA_WAITERS] = me;
-        if (psp_sched_block(me, PSP_SCHED_BLOCKED, s->waitdesc) != 0) {
-            /* Only a caller that asked for a timeout may be told it timed out. */
-            if (psp_arg(2)) {
-                warn_block("sceKernelWaitSema");
-                psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
-                return;
-            }
-            wait_deadlock("sceKernelWaitSema");
-            psp_ret(SCE_KERNEL_ERROR_OK);
-            return;
-        }
-        /* The semaphore may have been deleted while we were parked. */
-        s = find_sema(psp_arg(0));
-        if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+        const int i = psp_waitq_pick(&s->q, s->attr);
+        if (i < 0 || s->count < (int32_t)s->q.w[i].need) break;
+        const psp_waiter w = psp_waitq_take(&s->q, i);
+        s->count -= (int32_t)w.need;
+        sema_log(s, "taken", (int32_t)w.need, 0);
+        urgent |= psp_sched_wake(w.uid);
     }
+    return urgent;
+}
+
+static void hle_WaitSema(void) {
+    const uint32_t id      = psp_arg(0);
+    const int32_t  need    = (int32_t)psp_arg(1);
+    const uint32_t tmo_ptr = psp_arg(2);
+    psp_sema *s = find_sema(id);
+    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+
+    const uint64_t deadline = wait_deadline(tmo_ptr);
+
+    /* Available, and nobody ahead of us. Both conditions: see sema_release. */
+    if (psp_waitq_count(&s->q) == 0 && s->count >= need) {
+        s->count -= need;
+        sema_log(s, "taken", need, 0);
+        wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+
+    sema_log(s, "park", need, 0);
+    const uint32_t me = psp_sched_current();
+    if (psp_waitq_add(&s->q, me, (uint32_t)need, 0, 0) != 0) {
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+
+    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, s->waitdesc,
+                                         deadline);
+
+    /* The semaphore may have gone while we were parked, which is what
+     * sceKernelDeleteSema releasing its waiters looks like from in here. */
+    s = find_sema(id);
+    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+
+    if (rc == PSP_SCHED_WOKEN) {
+        /* The signaller already took the count on our behalf, so there is
+         * nothing to re-test: being woken *is* the semaphore. */
+        wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+
+    /* Not released, so we are still queued. Leaving may unblock the thread
+     * behind us -- that is the second half of what fifo.expected measures. */
+    psp_waitq_drop(&s->q, me);
+    const int urgent = sema_release(s);
+
+    if (rc == PSP_SCHED_EXPIRED) {
+        wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+        if (urgent) psp_sched_yield();
+        return;
+    }
+
+    /* Stranded: nothing is runnable and no deadline can release us, so nobody
+     * could ever signal this. A caller that asked for no timeout is not told
+     * one elapsed -- a fabricated timeout is something a game acts on. */
+    wait_deadlock("sceKernelWaitSema");
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* ---- event flags --------------------------------------------------------- */
@@ -700,21 +786,69 @@ static void hle_CreateEventFlag(void) {
     f->init_pattern = psp_arg(2);
     f->uid = g_next_uid++;
     f->used = 1;
+    char nm[sizeof f->name];
+    memcpy(nm, f->name, sizeof nm);
+    snprintf(f->waitdesc, sizeof f->waitdesc, "sceKernelWaitEventFlag(%s)", nm);
     psp_ret(f->uid);
 }
 
 static void hle_DeleteEventFlag(void) {
     psp_evflag *f = find_flag(psp_arg(0));
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    const int urgent = psp_waitq_release_all(&f->q);
     f->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
+}
+
+static int flag_satisfied(const psp_evflag *f, uint32_t bits, uint32_t mode) {
+    return (mode & PSP_EVENT_WAITOR) ? (f->pattern & bits) != 0
+                                     : (f->pattern & bits) == bits;
+}
+
+/* Release every waiter the pattern now satisfies, in the object's order.
+ *
+ * Unlike a semaphore there is no head-of-line blocking here: waiters ask for
+ * different bit patterns, so one that cannot be satisfied says nothing about
+ * the next. What does have to stay ordered is WAITCLEAR -- a released waiter
+ * consumes the bits it woke on, so who is considered first decides who gets
+ * them, and that is the whole content of the attribute.
+ *
+ * The pattern each waiter woke on goes to the address it supplied, which is why
+ * the queue carries that address: by the time the release happens the waiter's
+ * own frame is not reachable from here. */
+static int flag_release(psp_evflag *f) {
+    int urgent = 0;
+    for (;;) {
+        /* The satisfiable waiters, in the queue's own arrival order, so that
+         * psp_waitq_pick stays the single place that knows what the attribute
+         * means. Copying them out is what lets an unsatisfiable waiter be
+         * passed over without being removed. */
+        psp_waitq eligible = { 0 };
+        for (int i = 0; i < psp_waitq_count(&f->q); i++) {
+            const psp_waiter *w = &f->q.w[i];
+            if (flag_satisfied(f, w->need, w->mode))
+                psp_waitq_add(&eligible, w->uid, w->need, w->mode, w->out);
+        }
+        const int i = psp_waitq_pick(&eligible, f->attr);
+        if (i < 0) break;
+
+        const psp_waiter w = eligible.w[i];
+        psp_waitq_drop(&f->q, w.uid);
+        if (w.out) psp_write32(w.out, f->pattern);
+        if (w.mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~w.need;
+        urgent |= psp_sched_wake(w.uid);
+    }
+    return urgent;
 }
 
 static void hle_SetEventFlag(void) {
     psp_evflag *f = find_flag(psp_arg(0));
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
     f->pattern |= psp_arg(1);
+    const int urgent = flag_release(f);
     psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
 }
 
 static void hle_ClearEventFlag(void) {
@@ -726,34 +860,70 @@ static void hle_ClearEventFlag(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* sceKernelWaitEventFlag(evfid, bits, mode, outBits, timeout)
+ *
+ * The fifth argument is psp_arg(4), and that question is settled rather than
+ * open. A previous version of this function returned a fabricated timeout
+ * instead of blocking, on the grounds that o32 spills argument five to sp+16
+ * while psp_arg(4) reads $t0 -- so which one the guest used was unknown, and
+ * guessing had already been wrong once.
+ *
+ * hle.h answers it, with a disassembly and a bug that turned on it: PSP
+ * firmware stubs do *not* spill. They load $t0-$t3 and branch, visible in the
+ * delay slot of every such call, and reading sp+16 instead returned whatever
+ * the stack happened to hold -- which is what once made the allocator refuse a
+ * 15.9 MB request. So the fifth argument is $t0, the ordinary rule applies, and
+ * this can block like every other wait. */
 static void hle_WaitEventFlag(void) {
-    /* (evfid, bits, wait mode, outBits, timeout) */
-    psp_evflag *f = find_flag(psp_arg(0));
+    const uint32_t id      = psp_arg(0);
+    const uint32_t bits    = psp_arg(1);
+    const uint32_t mode    = psp_arg(2);
+    const uint32_t out     = psp_arg(3);
+    const uint32_t tmo_ptr = psp_arg(4);
+
+    psp_evflag *f = find_flag(id);
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
 
-    uint32_t bits = psp_arg(1);
-    uint32_t mode = psp_arg(2);
-    uint32_t out  = psp_arg(3);
+    const uint64_t deadline = wait_deadline(tmo_ptr);
 
-    int satisfied = (mode & PSP_EVENT_WAITOR)
-                  ? (f->pattern & bits) != 0
-                  : (f->pattern & bits) == bits;
+    if (flag_satisfied(f, bits, mode)) {
+        if (out) psp_write32(out, f->pattern);
+        if (mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~bits;
+        wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
 
+    const uint32_t me = psp_sched_current();
+    if (psp_waitq_add(&f->q, me, bits, mode, out) != 0) {
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+
+    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, f->waitdesc,
+                                         deadline);
+
+    f = find_flag(id);
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+
+    if (rc == PSP_SCHED_WOKEN) {
+        /* flag_release already wrote the pattern we woke on and applied our
+         * clear, on our behalf and in the object's order. */
+        wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+
+    psp_waitq_drop(&f->q, me);
     if (out) psp_write32(out, f->pattern);
 
-    if (!satisfied) {
-        /* The same rule should apply here -- only a caller that supplied a
-         * timeout may be told one elapsed -- but this call takes its timeout as
-         * the *fifth* argument, and o32 passes that on the stack while
-         * psp_arg(4) reads $t0. Until which of the two the guest actually uses
-         * is established, the old behaviour stands: guessing is what made the
-         * previous version of this wrong. WaitSema and WaitThreadEnd take
-         * theirs in $a2 and $a1, where there is nothing to establish. */
-        warn_block("sceKernelWaitEventFlag");
+    if (rc == PSP_SCHED_EXPIRED) {
+        wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
         return;
     }
-    if (mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~bits;
+
+    wait_deadlock("sceKernelWaitEventFlag");
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -782,7 +952,7 @@ static void hle_ReferSemaStatus(void) {
     psp_write32(info + 40, (uint32_t)sm->init_count);
     psp_write32(info + 44, (uint32_t)sm->count);
     psp_write32(info + 48, (uint32_t)sm->max_count);
-    psp_write32(info + 52, (uint32_t)sm->nwaiters);
+    psp_write32(info + 52, (uint32_t)psp_waitq_count(&sm->q));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -796,7 +966,7 @@ static void hle_ReferEventFlagStatus(void) {
     psp_write32(info + 36, f->attr);
     psp_write32(info + 40, f->init_pattern);
     psp_write32(info + 44, f->pattern);
-    psp_write32(info + 48, 0);              /* no waiters are modelled */
+    psp_write32(info + 48, (uint32_t)psp_waitq_count(&f->q));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
