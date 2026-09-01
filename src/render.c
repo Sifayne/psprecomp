@@ -241,7 +241,9 @@ static void put_pixel(int x, int y, uint32_t rgba) {
  * emulation is a separate piece of work, and a game that does not clear every
  * frame would accumulate depth until nothing drew at all -- which fails in a
  * way that looks like a broken test rather than a missing clear. */
-#define DEPTH_FAR 1.0e30f
+/* The PSP's depth window is 0..65535. Clearing to a value outside it made every
+ * GEQUAL test fail, which is most of them in this game. */
+#define DEPTH_FAR 65535.0f
 static float g_depth[480 * 272];
 static struct { int test, func, write; } g_zs = { 0, 1 /* always */, 0 };
 
