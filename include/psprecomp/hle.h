@@ -204,6 +204,8 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_MSGPIPE_FULL       0x800201B3
 #define SCE_KERNEL_ERROR_MSGPIPE_EMPTY      0x800201B4
 #define SCE_KERNEL_ERROR_ILLEGAL_SIZE_MPP   0x800201BC
+#define SCE_KERNEL_ERROR_UNKNOWN_MBXID      0x8002019B
+#define SCE_KERNEL_ERROR_MBOX_NOMSG         0x800201B2
 
 /* ---- the subsystems ------------------------------------------------------ */
 
@@ -349,6 +351,7 @@ void psp_kernlock_register(void);
 void psp_kernlock_register_lw(void);
 void psp_kernobj_register(void);
 void psp_kernobj_register_mpp(void);
+void psp_kernobj_register_mbx(void);
 void psp_kernobj_reset(void);
 void psp_kernlock_reset(void);
 

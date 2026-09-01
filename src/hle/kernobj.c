@@ -299,12 +299,14 @@ static void hle_ReferVplStatus(void) {
 }
 
 static void mpp_reset(void);
+static void mbx_reset(void);
 
 void psp_kernobj_reset(void) {
     for (int i = 0; i < MAX_VPLS; i++)
         if (g_vpl[i].used && g_vpl[i].base) psp_sysmem_release(g_vpl[i].base);
     memset(g_vpl, 0, sizeof g_vpl);
     mpp_reset();
+    mbx_reset();
 }
 
 void psp_kernobj_register(void) {
@@ -317,6 +319,7 @@ void psp_kernobj_register(void) {
     psp_hle_register(0x1D371B8A, "ThreadManForUser", "sceKernelCancelVpl",      hle_CancelVpl);
     psp_hle_register(0x39810265, "ThreadManForUser", "sceKernelReferVplStatus", hle_ReferVplStatus);
     psp_kernobj_register_mpp();
+    psp_kernobj_register_mbx();
 }
 
 /* ---- msgpipe: a byte ring, not a message queue -----------------------------
@@ -598,4 +601,230 @@ void psp_kernobj_register_mpp(void) {
     psp_hle_register(0xDF52098F, "ThreadManForUser", "sceKernelTryReceiveMsgPipe", hle_TryReceiveMsgPipe);
     psp_hle_register(0x349B864D, "ThreadManForUser", "sceKernelCancelMsgPipe",     hle_CancelMsgPipe);
     psp_hle_register(0x33BE4024, "ThreadManForUser", "sceKernelReferMsgPipeStatus",hle_ReferMsgPipeStatus);
+}
+
+/* ---- mbx: a message box whose queue lives in the guest's own messages -------
+ *
+ * The kernel stores no copy of anything. A message is a guest structure whose
+ * first eight bytes are a `SceKernelMsgPacket` header, and the queue is a
+ * **circular** singly-linked list threaded through those headers -- so the
+ * topology is user-visible and the tests check it directly. They poison
+ * `header.next` with 0xDEADBEEF before sending and then classify whatever the
+ * kernel wrote as NULL / DEAD / ITSELF / FIRST / OTHER.
+ *
+ * Circular, not NULL-terminated: one message reports `next=ITSELF`, and with
+ * two the first reports `next=OTHER` and the second `next=FIRST`. sub_shared.h
+ * carries the observation as a comment -- "Seems they loop" -- and this
+ * implements it, because a NULL-terminated list would print DEAD or NULL there
+ * and every line would differ.
+ */
+
+#define MAX_MBXES 64
+#define MBX_ATTR_KNOWN    0x5FFu   /* sixth object type, sixth rule */
+#define MBX_ATTR_MSG_PRIO 0x400u
+
+enum { MSG_NEXT = 0, MSG_PRIO = 4 };   /* offsets in SceKernelMsgPacket */
+
+typedef struct {
+    uint32_t  uid;
+    char      name[32];
+    uint32_t  attr;
+    uint32_t  first;       /* guest address of the head message, 0 when empty */
+    uint32_t  count;
+    int       alive;
+    psp_waitq q;
+    char      waitdesc[64];
+} psp_mbx;
+
+static psp_mbx g_mbx[MAX_MBXES];
+
+static void mbx_reset(void) { memset(g_mbx, 0, sizeof g_mbx); }
+
+static psp_mbx *find_mbx(uint32_t id) {
+    for (int i = 0; i < MAX_MBXES; i++)
+        if (g_mbx[i].alive && g_mbx[i].uid == id) return &g_mbx[i];
+    return NULL;
+}
+
+/* Walk to the message before `first` -- the tail, since the list closes on
+ * itself. Bounded by the count so a corrupt `next` cannot spin forever. */
+static uint32_t mbx_tail(const psp_mbx *m) {
+    uint32_t at = m->first;
+    for (uint32_t i = 1; i < m->count; i++) at = psp_read32(at + MSG_NEXT);
+    return at;
+}
+
+static void mbx_insert(psp_mbx *m, uint32_t msg) {
+    if (!m->count) {
+        psp_write32(msg + MSG_NEXT, msg);     /* ITSELF */
+        m->first = msg;
+        m->count = 1;
+        return;
+    }
+    if (m->attr & MBX_ATTR_MSG_PRIO) {
+        /* Ordered by the packet's own priority byte, ahead of equals. */
+        const uint32_t pri = psp_read8(msg + MSG_PRIO);
+        uint32_t prev = mbx_tail(m), at = m->first;
+        for (uint32_t i = 0; i < m->count; i++) {
+            if (psp_read8(at + MSG_PRIO) > pri) break;
+            prev = at;
+            at = psp_read32(at + MSG_NEXT);
+        }
+        psp_write32(msg + MSG_NEXT, at);
+        psp_write32(prev + MSG_NEXT, msg);
+        if (at == m->first && prev == mbx_tail(m)) { /* new head */ }
+        if (psp_read8(m->first + MSG_PRIO) > pri) m->first = msg;
+        m->count++;
+        return;
+    }
+    const uint32_t tail = mbx_tail(m);
+    psp_write32(tail + MSG_NEXT, msg);
+    psp_write32(msg + MSG_NEXT, m->first);
+    m->count++;
+}
+
+static uint32_t mbx_pop(psp_mbx *m) {
+    if (!m->count) return 0;
+    const uint32_t head = m->first;
+    if (m->count == 1) { m->first = 0; m->count = 0; }
+    else {
+        const uint32_t next = psp_read32(head + MSG_NEXT);
+        psp_write32(mbx_tail(m) + MSG_NEXT, next);
+        m->first = next;
+        m->count--;
+    }
+    /* The message leaves pointing at itself, which is what a receiver sees:
+     * `GOT: "hi 0" (next=ITSELF)`. */
+    psp_write32(head + MSG_NEXT, head);
+    return head;
+}
+
+static void hle_CreateMbx(void) {
+    /* (name, attr, option) -- no partition, unlike the pools. */
+    const uint32_t name = psp_arg(0);
+    const uint32_t attr = psp_arg(1);
+    if (!name) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (attr & ~MBX_ATTR_KNOWN) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+
+    psp_mbx *m = NULL;
+    for (int i = 0; i < MAX_MBXES; i++) if (!g_mbx[i].alive) { m = &g_mbx[i]; break; }
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    memset(m, 0, sizeof *m);
+    psp_str(name, m->name, sizeof m->name);
+    m->attr  = attr;
+    m->uid   = psp_threadman_next_uid();
+    m->alive = 1;
+    char nm[sizeof m->name];
+    memcpy(nm, m->name, sizeof nm);
+    snprintf(m->waitdesc, sizeof m->waitdesc, "sceKernelReceiveMbx(%s)", nm);
+    psp_ret(m->uid);
+}
+
+static void hle_DeleteMbx(void) {
+    psp_mbx *m = find_mbx(psp_arg(0));
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MBXID); return; }
+    const int urgent = psp_waitq_release_all(&m->q);
+    m->alive = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
+}
+
+static void hle_SendMbx(void) {
+    const uint32_t id  = psp_arg(0);
+    const uint32_t msg = psp_arg(1);
+    psp_mbx *m = find_mbx(id);
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MBXID); return; }
+    if (!msg || !psp_mem_ptr(msg, 8)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+
+    /* A waiting receiver takes it without it ever joining the queue. */
+    const int i = psp_waitq_pick(&m->q, m->attr);
+    if (i >= 0) {
+        const psp_waiter w = psp_waitq_take(&m->q, i);
+        psp_write32(msg + MSG_NEXT, msg);
+        if (w.out) psp_write32(w.out, msg);
+        const int urgent = psp_sched_wake(w.uid);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        if (urgent) psp_sched_yield();
+        return;
+    }
+    mbx_insert(m, msg);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void mbx_receive(int may_block, int has_timeout) {
+    const uint32_t id      = psp_arg(0);
+    const uint32_t out     = psp_arg(1);
+    const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
+
+    psp_mbx *m = find_mbx(id);
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MBXID); return; }
+
+    const uint64_t deadline = psp_wait_deadline(tmo_ptr);
+
+    if (m->count) {
+        const uint32_t got = mbx_pop(m);
+        if (out) psp_write32(out, got);
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+    if (!may_block) { psp_ret(SCE_KERNEL_ERROR_MBOX_NOMSG); return; }
+
+    const uint32_t me = psp_sched_current();
+    if (psp_waitq_add(&m->q, me, 0, 0, out) != 0) {
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, m->waitdesc,
+                                         deadline);
+    m = find_mbx(id);
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+
+    if (rc == PSP_SCHED_WOKEN) {
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+    psp_waitq_drop(&m->q, me);
+    psp_wait_writeback(tmo_ptr, deadline);
+    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+}
+
+static void hle_ReceiveMbx(void) { mbx_receive(1, 1); }
+static void hle_PollMbx(void)    { mbx_receive(0, 0); }
+
+static void hle_CancelReceiveMbx(void) {
+    psp_mbx *m = find_mbx(psp_arg(0));
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MBXID); return; }
+    const uint32_t out = psp_arg(1);
+    if (out) psp_write32(out, (uint32_t)psp_waitq_count(&m->q));
+    const int urgent = psp_waitq_release_all(&m->q);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
+}
+
+static void hle_ReferMbxStatus(void) {
+    const psp_mbx *m = find_mbx(psp_arg(0));
+    const uint32_t info = psp_arg(1);
+    if (!m)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MBXID); return; }
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    psp_write32(info +  0, 52);
+    psp_threadman_write_name(info + 4, m->name);
+    psp_write32(info + 36, m->attr);
+    psp_write32(info + 40, (uint32_t)psp_waitq_count(&m->q));
+    psp_write32(info + 44, m->count);
+    psp_write32(info + 48, m->first);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+void psp_kernobj_register_mbx(void) {
+    psp_hle_register(0x8125221D, "ThreadManForUser", "sceKernelCreateMbx",        hle_CreateMbx);
+    psp_hle_register(0x86255ADA, "ThreadManForUser", "sceKernelDeleteMbx",        hle_DeleteMbx);
+    psp_hle_register(0xE9B3061E, "ThreadManForUser", "sceKernelSendMbx",          hle_SendMbx);
+    psp_hle_register(0x18260574, "ThreadManForUser", "sceKernelReceiveMbx",       hle_ReceiveMbx);
+    psp_hle_register(0xF3986382, "ThreadManForUser", "sceKernelReceiveMbxCB",     hle_ReceiveMbx);
+    psp_hle_register(0x0D81716A, "ThreadManForUser", "sceKernelPollMbx",          hle_PollMbx);
+    psp_hle_register(0x87D4DD36, "ThreadManForUser", "sceKernelCancelReceiveMbx", hle_CancelReceiveMbx);
+    psp_hle_register(0xA8E8C846, "ThreadManForUser", "sceKernelReferMbxStatus",   hle_ReferMbxStatus);
 }
