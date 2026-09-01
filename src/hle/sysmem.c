@@ -66,16 +66,26 @@ void psp_sysmem_reserve_module(uint32_t lo, uint32_t hi) {
     if (hi <= PSP_USER_BASE || lo >= DEFAULT_HEAP_HI) {
         /* The module is nowhere near user RAM. A PRX linked at address 0 --
          * which is what every pspautotests binary is -- lands outside the
-         * partition entirely, so there is nothing to step around and the whole
-         * 24 MB is available.
+         * partition entirely, so there is nothing here to step around.
          *
-         * The default floor cost one megabyte of it, and that megabyte was the
+         * Hardware's loader still puts it in the partition, though, and where
+         * the *rest* of user memory begins is therefore observable. Three tls
+         * tests print a block address, and each one says the same thing: the
+         * bottom of the partition holds the module's memory image rounded to a
+         * granule, plus 0x4000. delete.prx and priority.prx have images of
+         * 0x31700 and answer 0x09D35700; free.prx's is 0x319C0 and it answers
+         * 0x09D35A00. The 16K is the loader's own bookkeeping, and it is the
+         * same 16K in all three.
+         *
+         * What must *not* happen is rounding this up to something comfortable.
+         * The old floor here was a flat megabyte and that megabyte was the
          * difference: gum.prx asks for a single 0x01500000 block, the heap was
          * 0x01400000 wide, and the allocation failed. The guest does not check
          * -- it formats into the null it got back, over its own code at address
          * zero -- so it presented as a wild pointer rather than as an
          * out-of-memory, which is a long way from the cause. */
-        g_heap_lo = PSP_USER_BASE;
+        const uint32_t image = hi > lo ? ((hi - lo) + 0xFFu) & ~0xFFu : 0;
+        g_heap_lo = PSP_USER_BASE + image + 0x4000u;
         return;
     }
 
