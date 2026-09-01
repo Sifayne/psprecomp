@@ -64,6 +64,21 @@ static inline void psp_set_reg(uint32_t idx, uint32_t val) {
 
 void psp_cpu_reset(void);
 
+/* Put the float and vector registers into the state a fresh PSP thread gets.
+ *
+ * The hardware does not hand out a zeroed register file. A new thread context
+ * starts with every COP1 and VFPU register holding 0x7F800001 -- a signalling
+ * NaN -- and that is observable: a test that writes one lane of a vector and
+ * stores all four prints `nan` for the other three, where a zeroed file prints
+ * 0.000000. pspautotests cpu/vfpu/vavg is exactly that shape.
+ *
+ * The general-purpose registers get 0xDEADBEEF on hardware. That is *not* done
+ * here: nothing measured needs it, and seeding every GPR with a value that
+ * looks like a plausible pointer would turn "the guest used an uninitialised
+ * register" from a zero-page fault into a wild write. Recorded rather than
+ * copied. */
+void psp_cpu_reset_fp(void);
+
 /* FPU condition flag (fcr31 bit 23) — set by c.cond.s, tested by bc1t/bc1f. */
 #define PSP_FCR31_C (1u << 23)
 

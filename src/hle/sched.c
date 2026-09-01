@@ -275,6 +275,7 @@ static void *thread_main(void *arg) {
      * sceKernelExitThread, and the dispatcher treats a return here as the end
      * of the thread rather than a jump to address zero. */
     memset(&psp_cpu, 0, sizeof psp_cpu);
+    psp_cpu_reset_fp();      /* a fresh thread's float/vector registers are NaN */
     psp_cpu.r[PSP_REG_A0] = t->a0;
     psp_cpu.r[PSP_REG_A1] = t->a1;
     psp_cpu.r[PSP_REG_SP] = t->sp;

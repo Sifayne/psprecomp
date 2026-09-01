@@ -13,6 +13,16 @@ const char *const psp_reg_names[PSP_NUM_GPR] = {
     "t8","t9","k0","k1","gp","sp","fp","ra"
 };
 
+/* 0x7F800001 is what the PSP fills a new thread's float and vector registers
+ * with -- an exponent of all ones with a non-zero mantissa, so it is a NaN
+ * rather than an infinity, and it is signalling rather than quiet. */
+#define PSP_FP_INIT 0x7F800001u
+
+void psp_cpu_reset_fp(void) {
+    for (int i = 0; i < 32; i++)  memcpy(&psp_cpu.f[i], &(uint32_t){PSP_FP_INIT}, 4);
+    for (int i = 0; i < 128; i++) memcpy(&psp_cpu.v[i], &(uint32_t){PSP_FP_INIT}, 4);
+}
+
 void psp_cpu_reset(void) {
     memset(&psp_cpu, 0, sizeof psp_cpu);
     /* $sp is set by the loader from the module's stack allocation, not here —
