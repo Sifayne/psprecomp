@@ -248,6 +248,29 @@ static void test_guest_thread_unsatisfiable_wait(void) {
     check_one_running("after a guest thread's wait was refused");
 }
 
+/* A force-stopped run and a finished run both leave zero live threads —
+ * stop_all marks every slot dead — so the stop reason is what tells the boot
+ * summary apart. It has to survive until read, and reset has to clear it, or
+ * the next run inherits the last run's ending. */
+static void test_stop_reason_reports_and_resets(void) {
+    psp_sched_reset();
+    psp_sched_set_threading(1);
+    CHECK(psp_sched_stop_reason() == NULL,
+          "a fresh run already has a stop reason");
+
+    CHECK(psp_sched_spawn(UID_TRIVIAL, ENTRY_TRIVIAL, FAKE_SP, 0, 0, 32) == 0,
+          "spawn failed");
+    psp_sched_stop_all("test-stop");
+    CHECK(psp_sched_live() == 0, "stop_all left threads alive");
+    CHECK(psp_sched_stop_reason() != NULL &&
+          strcmp(psp_sched_stop_reason(), "test-stop") == 0,
+          "stop reason came back as \"%s\"",
+          psp_sched_stop_reason() ? psp_sched_stop_reason() : "(null)");
+
+    psp_sched_reset();
+    CHECK(psp_sched_stop_reason() == NULL, "reset did not clear the stop reason");
+}
+
 int main(void) {
     psp_register(ENTRY_TRIVIAL,  body_trivial);
     psp_register(ENTRY_WAITER,   body_waiter);
@@ -261,6 +284,7 @@ int main(void) {
     test_block_and_wake_round_trip();
     test_thread_identity();
     test_guest_thread_unsatisfiable_wait();
+    test_stop_reason_reports_and_resets();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);
