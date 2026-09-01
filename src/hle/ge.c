@@ -741,13 +741,21 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                     g_tl.blend.eq, g_tl.blend.alpha_test ? "on" : "off",
                     g_tl.blend.alpha_func, g_tl.blend.alpha_ref,
                     g_tl.clear_mode ? "ON" : "off");
-            fprintf(stderr, "      fbp %08X fbw %u\n      world",
-                    ge_fb_address(g_ge.fbp), g_ge.fbw);
+            fprintf(stderr, "      fbp %08X fbw %u  vp scale %.1f,%.1f centre %.1f,%.1f"
+                            "  offset %.1f,%.1f%s\n      world",
+                    ge_fb_address(g_ge.fbp), g_ge.fbw,
+                    g_tl.vp_xs, g_tl.vp_ys, g_tl.vp_xc, g_tl.vp_yc,
+                    g_tl.off_x, g_tl.off_y, g_tl.vp_set ? "" : " (defaulted)");
             for (int i = 0; i < 12; i++) fprintf(stderr, " %.2f", g_tl.world[i]);
             fprintf(stderr, "\n      view ");
             for (int i = 0; i < 12; i++) fprintf(stderr, " %.2f", g_tl.view[i]);
             fprintf(stderr, "\n      proj ");
             for (int i = 0; i < 16; i++) fprintf(stderr, " %.3f", g_tl.proj[i]);
+            fprintf(stderr, "\n      raw v0@%08X:", g_ge.vaddr + done * (uint32_t)stride);
+            for (int b = 0; b < stride && b < 32; b++)
+                fprintf(stderr, "%02X", psp_read8(g_ge.vaddr + done * (uint32_t)stride + (uint32_t)b));
+            fprintf(stderr, "  stride %d tex_off %d col_off %d pos_off %d",
+                    stride, tex_off, col_off, pos_off);
             fprintf(stderr, "\n      model v0");
             {
                 float m[3];
