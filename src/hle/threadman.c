@@ -829,13 +829,13 @@ static void hle_CancelWakeupThread(void) {
  * returned -- which is how the second failure in dispatch.expected arises, the
  * test handing the failed suspend's error code straight to resume. */
 static void hle_SuspendDispatchThread(void) {
-    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT); return; }
+    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CPUDI); return; }
     psp_ret((uint32_t)psp_sched_set_dispatch(0));
 }
 
 static void hle_ResumeDispatchThread(void) {
     const uint32_t state = psp_arg(0);
-    if (state > 1) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT); return; }
+    if (state > 1) { psp_ret(SCE_KERNEL_ERROR_CPUDI); return; }
     psp_sched_set_dispatch((int)state);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }

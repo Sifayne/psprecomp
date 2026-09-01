@@ -259,6 +259,12 @@ static void hle_CreateVTimer(void) {
 }
 
 static void hle_DeleteVTimer(void) {
+    /* Not from inside a handler. vtimers/delete has a handler delete the very
+     * timer it is running for and gets ILLEGAL_CONTEXT -- which is the code
+     * for a call made where it is not allowed to be made, so the context is
+     * what disqualifies it rather than the target. Deleting some *other*
+     * vtimer from a handler is not measured anywhere. */
+    if (g_firing) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT); return; }
     psp_vtimer *v = find_vtimer(psp_arg(0));
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
     v->alive = 0;

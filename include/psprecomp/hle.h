@@ -261,11 +261,18 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
  * cancelhandler answer ILLEGAL for a null uid where delete, gettime, getbase,
  * refer and settime answer UNKNOWN. */
 #define SCE_KERNEL_ERROR_ILLEGAL_VTID       0x800201BF
+/* Called from somewhere the call is not allowed to be made -- a handler, an
+ * interrupt. PSPSDK names it and vtimers/delete is where it shows up here. */
+#define SCE_KERNEL_ERROR_ILLEGAL_CONTEXT    0x80020064
 /* A blocking call made while dispatch is suspended. */
 #define SCE_KERNEL_ERROR_CAN_NOT_WAIT       0x800201A7
 /* Suspending dispatch when it is already suspended, or resuming it with
- * something that is not a state this returned. */
-#define SCE_KERNEL_ERROR_ILLEGAL_CONTEXT    0x80020066
+ * something that is not a state this returned. PSPSDK names 0x80020066 CPUDI
+ * -- interrupts disabled -- and this used to carry the name ILLEGAL_CONTEXT,
+ * which belongs to 0x80020064 two lines up. Defining both under one name meant
+ * the second definition quietly won and a vtimer handler's refused delete
+ * answered the dispatch code. */
+#define SCE_KERNEL_ERROR_CPUDI              0x80020066
 
 /* ---- the subsystems ------------------------------------------------------ */
 
