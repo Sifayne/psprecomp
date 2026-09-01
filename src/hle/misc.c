@@ -112,10 +112,14 @@ static void hle_Stderr(void) { psp_ret(2); }
  * endless run of bad accesses just past the end of .bss, in a structure whose
  * two neighbouring fields were the very pointers passed in here.
  *
- * Bounds from PPSSPP's Core/MemMap.h:
- *   PSP_GetVolatileMemoryStart() == 0x08400000
- *   PSP_GetVolatileMemoryEnd()   == 0x08800000
- * which is below the user heap, so nothing else hands it out. */
+ * Where the block sits is this file's choice rather than a fact to look up:
+ * the call reports address and size through out-parameters and the guest uses
+ * what it is handed. Two things constrain the choice. It has to be mapped,
+ * which it is -- PSP_RAM_BASE is 0x08000000 and the RAM is 32MB -- and it has
+ * to sit below the user heap so that psp_sysmem_alloc can never hand the same
+ * bytes out twice. User memory begins at 0x08800000 (uofw documents the map),
+ * so the 4MB immediately under it is free for this and is where hardware keeps
+ * the UMD cache the call is borrowing. */
 #define PSP_VOLATILE_BASE 0x08400000u
 #define PSP_VOLATILE_SIZE 0x00400000u
 

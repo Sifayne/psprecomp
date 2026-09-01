@@ -47,8 +47,12 @@
  * and gives up on the movie, which is the desired outcome and says out loud
  * what happened rather than pretending a stream ended.
  *
- * Constants and structure layouts are PPSSPP's (Core/HLE/sceMpeg.cpp and
- * sceMpeg.h), which is the closest thing to a specification these have.
+ * sceMpeg has no published specification. The constants below are the ones the
+ * community's reverse engineering settled on, and what validates them here is
+ * end to end rather than by citation: the game queries a size, allocates it,
+ * hands back a ring buffer built to it, and the movie plays. A wrong value
+ * does not misbehave subtly -- the allocation is the wrong size and playback
+ * never starts.
  *
  * ## What the decode path does not do
  *
@@ -87,14 +91,16 @@
 
 /* ---- constants ------------------------------------------------------------
  *
- * From PPSSPP Core/HLE/sceMpeg.cpp unless noted. */
+ * Two of these are derivations rather than lookups, and are marked. The rest
+ * are reverse-engineered values validated by the movie playing; see the header
+ * comment. */
 #define MPEG_MEMSIZE            0x10000u    /* MPEG_MEMSIZE_0105: what Create needs */
 #define MPEG_AVC_ES_SIZE        2048
 #define MPEG_ATRAC_ES_SIZE      2112
 #define MPEG_ATRAC_ES_OUT_SIZE  8192
 /* 90000 * 2048 / 44100: one ATRAC3+ frame, in PSP's 90kHz timestamp units. */
 #define MPEG_ATRAC_PTS_STEP     4180u
-#define MPEG_RINGBUFFER_PACKET  (104 + 2048)  /* __MpegRingbufferQueryMemSize */
+#define MPEG_RINGBUFFER_PACKET  (104 + 2048)  /* a 2048-byte sector plus a 104-byte header */
 
 #define PSMF_MAGIC              0x464D5350u  /* "PSMF" */
 #define PSMF_STREAM_OFFSET_OFF  0x08         /* big-endian u32 */
@@ -192,9 +198,8 @@ void psp_mpeg_reset(void) {
  * on its own stdout, sceMpegRegistStream() is failed..., which is what a
  * returned handle of zero means to it.
  *
- * PPSSPP dereferences the same way in getMpegCtx. The raw value is still
- * accepted, because it costs nothing and a caller that kept the handle itself
- * would otherwise be turned away for no reason. */
+ * The raw value is still accepted too, because it costs nothing and a caller
+ * that kept the handle itself would otherwise be turned away for no reason. */
 static mpeg_ctx *ctx_of(uint32_t mpeg_addr) {
     if (!mpeg_addr) return NULL;
 

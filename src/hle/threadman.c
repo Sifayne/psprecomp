@@ -566,7 +566,9 @@ static void on_thread_end(uint32_t uid, uint32_t status) {
  *
  * The second argument is a *timeout pointer*, not somewhere to put the exit
  * status -- writing the status there corrupted whatever the guest kept at that
- * address. The status is the return value, as PPSSPP's implementation shows. */
+ * address. The status is the *return value*, which threads/threadend prints:
+ * a thread whose body returns 5 is waited on, and the wait answers
+ * `Already ended: 00000005`. */
 static void hle_WaitThreadEnd(void) {
     if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
     const uint32_t thid    = psp_arg(0);

@@ -320,12 +320,13 @@ void psp_sysmem_register(void) {
      * what it was built against. This module's ~PSP header reports devkit
      * 0x05050010, and this is the NID it imports.
      *
-     * Registered *unnamed* on purpose. PPSSPP's NID database calls this
-     * `sceKernelSetCompiledSdkVersion500_505`, but SHA-1 of that string is
-     * 0xC28A2329, not 0x91DE343C -- so that label is a human-readable
-     * disambiguator rather than the exported symbol, and the real name is not
-     * known. Registering it as named would put a false name in the diagnostics
-     * and break the SHA-1 check in test_hle.c, which is right to reject it. */
+     * Registered *unnamed* on purpose, and the reason is checkable rather than
+     * a matter of taste. The circulating label for this NID is
+     * `sceKernelSetCompiledSdkVersion500_505`, and SHA-1 of that string is
+     * 0xC28A2329, not 0x91DE343C -- so whatever that label is, it is not the
+     * exported symbol, and the real name is not known. Registering it as named
+     * would put a false name in the diagnostics and fail the SHA-1 check in
+     * test_hle.c, which is right to reject it. */
     psp_hle_register_unnamed(0x91DE343C, "SysMemUserForUser", hle_SetCompiledSdkVersion);
     psp_hle_register(0xF77D77CB, "SysMemUserForUser", "sceKernelSetCompilerVersion",   hle_SetCompilerVersion);
     psp_hle_register(0x13A5ABEF, "SysMemUserForUser", "sceKernelPrintf",               hle_Printf);

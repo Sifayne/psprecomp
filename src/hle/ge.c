@@ -51,7 +51,10 @@
 #define GE_VTYPE        0x12
 #define GE_OFFSET_ADDR  0x13
 #define GE_ORIGIN_ADDR  0x14
-/* Texture state. Numbers from PPSSPP's GPU/ge_constants.h. */
+/* Texture state. The command numbers here and above are PSPSDK's, from
+ * src/gu/guInternal.h -- BSD, and the SDK that emits them, so it is the
+ * definition rather than a reading of one. Names differ (TEX_ADDR0,
+ * TEX_BUF_WIDTH0, CLUT_BUF_PTR); the values do not. */
 #define GE_TEXADDR0     0xA0
 #define GE_TEXBUFWIDTH0 0xA8
 #define GE_CLUTADDR     0xB0
@@ -449,8 +452,10 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  * texture sampler reads whatever VRAM happened to contain, which is zeros --
  * a correctly sampled empty texture.
  *
- * Field extraction follows PPSSPP's GPUState.h getters exactly. The parts
- * worth naming, because each is a way to be quietly wrong:
+ * The commands are PSPSDK's TRANSFER_* group (guInternal.h): SRC 0xb2, SRC_W
+ * 0xb3, DST 0xb4, DST_W 0xb5, START 0xea, SRC_OFFSET 0xeb, DST_OFFSET 0xec,
+ * SIZE 0xee. How the fields sit inside them is what sceGuCopyImage writes, and
+ * the parts worth naming are the ways to be quietly wrong:
  *   - address low bits come from SRC/DST masked to 0xFFFFF0, and bits 24-31
  *     from the *stride* register's high byte -- the same split as FBP/FBW.
  *   - width and height are stored as n-1.
@@ -908,9 +913,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
     /* Clear mode bypasses the depth test as well as texturing, blending and the
      * alpha test. It is a blit of the clear values, so the comparison is forced
      * to ALWAYS and depth write comes from the clear-mode depth bit rather than
-     * ZMSK. PPSSPP's software rasterizer does exactly this -- FuncId.cpp sets
-     * `depthTestFunc = GE_COMP_ALWAYS` and `depthWrite = isClearModeDepthMask()`
-     * under clearMode.
+     * ZMSK.
      *
      * An earlier revision ran the game's own test here instead, on the reasoning
      * that a clear should not overwrite geometry that rejected it. That gets the

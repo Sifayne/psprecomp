@@ -53,9 +53,9 @@ typedef struct {
      * sectors from sector 58144 -- a plausible-looking read of entirely the
      * wrong thing.
      *
-     * PPSSPP marks the same distinction, in Core/FileSystems/ISOFileSystem.cpp:
-     *   "when open as umd1:... the param in sceIoLseek and sceIoRead is lba
-     *    mode. we must mark it." */
+     * So the mode is a property of the *handle*, set at open by which device
+     * name was used, and not something a read can work out from its arguments.
+     */
     int      sector_mode;
 } io_file;
 
@@ -413,8 +413,8 @@ static void write_stat(uint32_t out, int is_dir, uint64_t size, uint32_t lba) {
      * zero, so it never reads anything meaningful -- which is exactly what this
      * one did, opening umd1: and then never issuing a read.
      *
-     * PPSSPP does the same, in Core/HLE/sceIo.cpp __IoGetStat:
-     *     stat->st_private[0] = info.startSector; */
+     * So st_private[0] carries the file's starting sector, which is the one
+     * field of the stat block this game reads. */
     psp_write32(out + 64, lba);
 
     /* The three timestamps stay zero. Nothing in a game's load path reads them,
@@ -722,10 +722,13 @@ static void hle_Dclose(void) {
  * a way to be wrong. So every operation stores its result immediately and poll
  * reports it on the first ask.
  *
- * Behaviour follows PPSSPP's Core/HLE/sceIo.cpp:
+ * The three states an async handle can be in:
  *   - an operation still running    -> poll returns 1, wait blocks
  *   - a result waiting              -> written as a 64-bit value, poll returns 0
  *   - nothing outstanding           -> SCE_KERNEL_ERROR_NOASYNC
+ * pspautotests does not cover the async calls, so unlike most rules in this
+ * tree these three are not pinned by a capture -- they are the shape the API
+ * has to have for its own return codes to mean anything.
  * The first case cannot arise here, which is the one place this differs from
  * hardware: a game that depends on a read *not* having finished yet sees it
  * finished. That is the safe direction -- the data is there either way.
