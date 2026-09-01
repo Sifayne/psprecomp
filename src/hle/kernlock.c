@@ -283,7 +283,13 @@ static void hle_ReferMutexStatus(void) {
     psp_write32(info + 36, m->attr);
     psp_write32(info + 40, (uint32_t)m->init_count);
     psp_write32(info + 44, (uint32_t)m->count);
-    psp_write32(info + 48, m->owner);
+    /* "Nobody holds it" is **-1**, not zero, and the tests read that field
+     * through `info.lockThread == -1 ? 0 : 1` -- so a zero we wrote for an
+     * unlocked mutex printed as *locked*. Which also means the owner cannot be
+     * derived from the uid alone here: the main context's uid is 0, so a mutex
+     * it holds would be indistinguishable from a free one. The count is what
+     * says whether it is held. */
+    psp_write32(info + 48, m->count > 0 ? m->owner : 0xFFFFFFFFu);
     psp_write32(info + 52, (uint32_t)psp_waitq_count(&m->q));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
