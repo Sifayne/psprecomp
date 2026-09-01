@@ -206,6 +206,11 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_ILLEGAL_SIZE_MPP   0x800201BC
 #define SCE_KERNEL_ERROR_UNKNOWN_MBXID      0x8002019B
 #define SCE_KERNEL_ERROR_MBOX_NOMSG         0x800201B2
+#define SCE_KERNEL_ERROR_UNKNOWN_FPLID      0x8002019D
+/* Freeing a pointer that is real but is not the start of one of this pool's
+ * live blocks. Distinct from the allocator's ILLEGAL_MEMBLOCK above, which is
+ * a different number for a different question. Both pools use this one. */
+#define SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_PTR 0x800201B6
 
 /* ---- the subsystems ------------------------------------------------------ */
 
@@ -352,6 +357,7 @@ void psp_kernlock_register_lw(void);
 void psp_kernobj_register(void);
 void psp_kernobj_register_mpp(void);
 void psp_kernobj_register_mbx(void);
+void psp_kernobj_register_fpl(void);
 void psp_kernobj_reset(void);
 void psp_kernlock_reset(void);
 

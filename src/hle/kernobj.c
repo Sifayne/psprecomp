@@ -270,7 +270,7 @@ static void hle_FreeVpl(void) {
         if (urgent) psp_sched_yield();
         return;
     }
-    psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK);
+    psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_PTR);
 }
 
 static void hle_CancelVpl(void) {
@@ -300,6 +300,7 @@ static void hle_ReferVplStatus(void) {
 
 static void mpp_reset(void);
 static void mbx_reset(void);
+static void fpl_reset(void);
 
 void psp_kernobj_reset(void) {
     for (int i = 0; i < MAX_VPLS; i++)
@@ -307,6 +308,7 @@ void psp_kernobj_reset(void) {
     memset(g_vpl, 0, sizeof g_vpl);
     mpp_reset();
     mbx_reset();
+    fpl_reset();
 }
 
 void psp_kernobj_register(void) {
@@ -320,6 +322,7 @@ void psp_kernobj_register(void) {
     psp_hle_register(0x39810265, "ThreadManForUser", "sceKernelReferVplStatus", hle_ReferVplStatus);
     psp_kernobj_register_mpp();
     psp_kernobj_register_mbx();
+    psp_kernobj_register_fpl();
 }
 
 /* ---- msgpipe: a byte ring, not a message queue -----------------------------
@@ -827,4 +830,258 @@ void psp_kernobj_register_mbx(void) {
     psp_hle_register(0x0D81716A, "ThreadManForUser", "sceKernelPollMbx",          hle_PollMbx);
     psp_hle_register(0x87D4DD36, "ThreadManForUser", "sceKernelCancelReceiveMbx", hle_CancelReceiveMbx);
     psp_hle_register(0xA8E8C846, "ThreadManForUser", "sceKernelReferMbxStatus",   hle_ReferMbxStatus);
+}
+
+/* ---- fpl: the fixed-size block pool ---------------------------------------
+ *
+ * The simple one, and simple in a way worth stating: **nothing is rounded and
+ * nothing is reserved**. A pool created with a block size of 0x2F reports
+ * `blockSize=0000002f`, a count of 0x2F reports `numBlocks=0000002f`, and
+ * consecutive allocations from a 16-byte pool are exactly 16 bytes apart --
+ * the test says so in words, `Alloc #2 is 16 bytes after #1`. So there is no
+ * per-block header and no per-pool overhead, which is the opposite of the vpl
+ * above and had to be checked rather than assumed from the neighbour.
+ */
+
+#define MAX_FPLS 64
+/* create.expected creates pools of 0x131, 0x136 and 0x139 blocks and expects
+ * each to succeed. A count of 0x04000000 is refused, but for want of memory
+ * rather than a table limit. */
+#define MAX_FPL_BLOCKS 1024
+
+/* Seventh object type, seventh attribute rule: 0x41FF. create.expected accepts
+ * 0x1, 0x100, 0x4000 and 0x41FF and refuses 0x200, 0x300, 0x400, 0x800,
+ * 0x1000, 0x2000, 0x8000, 0x10000, 0x20000, 0x40000 and 0x80000 -- so bit 9 is
+ * illegal here where a vpl takes it, and the two differ by exactly that bit. */
+#define FPL_ATTR_KNOWN 0x41FFu
+
+typedef struct {
+    uint32_t  uid;
+    char      name[32];
+    uint32_t  attr;
+    uint32_t  base, block_size, nblocks;
+    /* The free list is a *queue*, not a lowest-first search.
+     *
+     * threads/fpl/allocate says so in words: after freeing the first block, the
+     * next allocation lands *above* the second rather than back in the hole --
+     * `Alloc #2 is 16 bytes before #3`, where reusing the lowest free block
+     * would put #3 below #2 and print "after". A freed block goes to the back
+     * of the queue and allocations keep climbing. */
+    uint16_t  freelist[MAX_FPL_BLOCKS];
+    uint32_t  head, free_blocks;
+    int       alive;
+    psp_waitq q;
+    char      waitdesc[64];
+} psp_fpl;
+
+static psp_fpl g_fpl[MAX_FPLS];
+
+static void fpl_reset(void) {
+    for (int i = 0; i < MAX_FPLS; i++)
+        if (g_fpl[i].alive && g_fpl[i].base) psp_sysmem_release(g_fpl[i].base);
+    memset(g_fpl, 0, sizeof g_fpl);
+}
+
+static psp_fpl *find_fpl(uint32_t id) {
+    for (int i = 0; i < MAX_FPLS; i++)
+        if (g_fpl[i].alive && g_fpl[i].uid == id) return &g_fpl[i];
+    return NULL;
+}
+
+static void hle_CreateFpl(void) {
+    /* (name, partition, attr, blockSize, numBlocks, option) */
+    const uint32_t name  = psp_arg(0);
+    const int32_t  part  = (int32_t)psp_arg(1);
+    const uint32_t attr  = psp_arg(2);
+    const uint32_t bsize = psp_arg(3);
+    const uint32_t count = psp_arg(4);
+
+    /* NO_MEMORY for a null name, as for a message pipe and unlike everything
+     * else -- the two threadman.c predicted before either type existed. */
+    if (!name) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    const uint32_t pe = vpl_partition_error(part);
+    if (pe) { psp_ret(pe); return; }
+    if (attr & ~FPL_ATTR_KNOWN) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+    if (bsize == 0 || (int32_t)bsize < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
+    if (count == 0 || (int32_t)count < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
+    /* A pool whose blocks would not fit in an address space is a *size* error,
+     * not a memory one: `Count 0x04000000` with a 0x100 block is refused with
+     * ILLEGAL_MEMSIZE where merely asking for too much answers NO_MEMORY. */
+    if (count > 0xFFFFFFFFu / bsize) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
+    if (count > MAX_FPL_BLOCKS) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    /* The option block's second word is an alignment, and it must be zero or a
+     * power of two. create.expected sweeps it: 0, 1, 2, 4 and 8 are accepted;
+     * -1, 3, 5, 6 and 7 are refused -- and refused with the *partition* code,
+     * which is the one thing about it that could not have been guessed. */
+    const uint32_t opt = psp_arg(5);
+    if (opt && psp_mem_ptr(opt, 8)) {
+        const uint32_t align = psp_read32(opt + 4);
+        if (align && (align & (align - 1))) {
+            psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
+            return;
+        }
+    }
+
+    const uint32_t base = psp_sysmem_alloc(bsize * count, 0);
+    if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    psp_fpl *f = NULL;
+    for (int i = 0; i < MAX_FPLS; i++) if (!g_fpl[i].alive) { f = &g_fpl[i]; break; }
+    if (!f) { psp_sysmem_release(base); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    memset(f, 0, sizeof *f);
+    psp_str(name, f->name, sizeof f->name);
+    f->attr = attr; f->base = base; f->block_size = bsize; f->nblocks = count;
+    f->free_blocks = count;
+    for (uint32_t i = 0; i < count; i++) f->freelist[i] = (uint16_t)i;
+    f->uid   = psp_threadman_next_uid();
+    f->alive = 1;
+    char nm[sizeof f->name];
+    memcpy(nm, f->name, sizeof nm);
+    snprintf(f->waitdesc, sizeof f->waitdesc, "sceKernelAllocateFpl(%s)", nm);
+    psp_ret(f->uid);
+}
+
+static void hle_DeleteFpl(void) {
+    psp_fpl *f = find_fpl(psp_arg(0));
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_FPLID); return; }
+    const int urgent = psp_waitq_release_all(&f->q);
+    if (f->base) psp_sysmem_release(f->base);
+    f->alive = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
+}
+
+/* Lowest free block first, which the test checks by address: `Alloc #2 is 16
+ * bytes after #1`. */
+static uint32_t fpl_take(psp_fpl *f) {
+    if (!f->free_blocks) return 0;
+    const uint32_t i = f->freelist[f->head];
+    f->head = (f->head + 1) % f->nblocks;
+    f->free_blocks--;
+    return f->base + i * f->block_size;
+}
+
+/* Is this block index currently handed out? The queue holds the free ones from
+ * `head` for `free_blocks` entries, so anything not in that window is live. */
+static int fpl_is_taken(const psp_fpl *f, uint32_t idx) {
+    for (uint32_t k = 0; k < f->free_blocks; k++)
+        if (f->freelist[(f->head + k) % f->nblocks] == idx) return 0;
+    return 1;
+}
+
+static int fpl_release(psp_fpl *f) {
+    int urgent = 0;
+    for (;;) {
+        const int i = psp_waitq_pick(&f->q, f->attr);
+        if (i < 0 || !f->free_blocks) break;
+        const psp_waiter w = psp_waitq_take(&f->q, i);
+        const uint32_t got = fpl_take(f);
+        if (w.out) psp_write32(w.out, got);
+        urgent |= psp_sched_wake(w.uid);
+    }
+    return urgent;
+}
+
+static void fpl_allocate(int may_block, int has_timeout) {
+    const uint32_t id      = psp_arg(0);
+    const uint32_t out     = psp_arg(1);
+    const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
+
+    psp_fpl *f = find_fpl(id);
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_FPLID); return; }
+
+    const uint64_t deadline = psp_wait_deadline(tmo_ptr);
+
+    if (f->free_blocks && psp_waitq_count(&f->q) == 0) {
+        const uint32_t got = fpl_take(f);
+        if (out) psp_write32(out, got);
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+    if (!may_block) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    const uint32_t me = psp_sched_current();
+    if (psp_waitq_add(&f->q, me, 0, 0, out) != 0) {
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, f->waitdesc,
+                                         deadline);
+    f = find_fpl(id);
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    if (rc == PSP_SCHED_WOKEN) {
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+    psp_waitq_drop(&f->q, me);
+    psp_wait_writeback(tmo_ptr, deadline);
+    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+}
+
+static void hle_AllocateFpl(void)    { fpl_allocate(1, 1); }
+static void hle_TryAllocateFpl(void) { fpl_allocate(0, 0); }
+
+static void hle_FreeFpl(void) {
+    const uint32_t id  = psp_arg(0);
+    const uint32_t ptr = psp_arg(1);
+    psp_fpl *f = find_fpl(id);
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_FPLID); return; }
+
+    /* The same two-way split the vpl has: a pointer that is not mapped memory
+     * at all is ILLEGAL_SIZE, while one that is real but is not the start of a
+     * live block of *this* pool is ILLEGAL_MEMBLOCK. */
+    if (ptr && !psp_mem_ptr(ptr, 1)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+    if (ptr >= f->base && ptr < f->base + f->nblocks * f->block_size) {
+        const uint32_t i = (ptr - f->base) / f->block_size;
+        if (f->base + i * f->block_size == ptr && fpl_is_taken(f, i)) {
+            f->freelist[(f->head + f->free_blocks) % f->nblocks] = (uint16_t)i;
+            f->free_blocks++;
+            const int urgent = fpl_release(f);
+            psp_ret(SCE_KERNEL_ERROR_OK);
+            if (urgent) psp_sched_yield();
+            return;
+        }
+    }
+    psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_PTR);
+}
+
+static void hle_CancelFpl(void) {
+    psp_fpl *f = find_fpl(psp_arg(0));
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_FPLID); return; }
+    const uint32_t out = psp_arg(1);
+    if (out) psp_write32(out, (uint32_t)psp_waitq_count(&f->q));
+    const int urgent = psp_waitq_release_all(&f->q);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
+}
+
+static void hle_ReferFplStatus(void) {
+    const psp_fpl *f = find_fpl(psp_arg(0));
+    const uint32_t info = psp_arg(1);
+    if (!f)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_FPLID); return; }
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+    psp_write32(info +  0, 56);
+    psp_threadman_write_name(info + 4, f->name);
+    psp_write32(info + 36, f->attr);
+    psp_write32(info + 40, f->block_size);
+    psp_write32(info + 44, f->nblocks);
+    psp_write32(info + 48, f->free_blocks);
+    psp_write32(info + 52, (uint32_t)psp_waitq_count(&f->q));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+void psp_kernobj_register_fpl(void) {
+    psp_hle_register(0xC07BB470, "ThreadManForUser", "sceKernelCreateFpl",      hle_CreateFpl);
+    psp_hle_register(0xED1410E0, "ThreadManForUser", "sceKernelDeleteFpl",      hle_DeleteFpl);
+    psp_hle_register(0xD979E9BF, "ThreadManForUser", "sceKernelAllocateFpl",    hle_AllocateFpl);
+    psp_hle_register(0xE7282CB6, "ThreadManForUser", "sceKernelAllocateFplCB",  hle_AllocateFpl);
+    psp_hle_register(0x623AE665, "ThreadManForUser", "sceKernelTryAllocateFpl", hle_TryAllocateFpl);
+    psp_hle_register(0xF6414A71, "ThreadManForUser", "sceKernelFreeFpl",        hle_FreeFpl);
+    psp_hle_register(0xA8AA591F, "ThreadManForUser", "sceKernelCancelFpl",      hle_CancelFpl);
+    psp_hle_register(0xD8199E4C, "ThreadManForUser", "sceKernelReferFplStatus", hle_ReferFplStatus);
 }
