@@ -14,8 +14,17 @@
 #include "decode.h"
 #include "analyze.h"
 #include "emit.h"
+#include "interp.h"
+#include "loader.h"
 #include "keys.h"
 #include "crypto/kirk.h"
+
+/* The `interp` verb runs guest code, so the CLI reaches into the runtime the
+ * recompiled game also links against — same CPU state, same memory model. */
+#include "psprecomp/cpu.h"
+#include "psprecomp/dispatch.h"
+#include "psprecomp/hle.h"
+#include "psprecomp/mem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +43,7 @@ static int usage(void) {
         "  allegrexrecomp cover   <file>\n"
         "  allegrexrecomp funcs   <file> [--list]\n"
         "  allegrexrecomp emit    <file> <outdir> [prefix]\n"
+        "  allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs]\n"
         "  allegrexrecomp decrypt <file> [--keys <path>]\n"
         "  allegrexrecomp kirk1   <file> [out] [--keys <path>]\n"
         "\n"
@@ -470,6 +480,32 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
         return -1;
     }
 
+    /* Relocate before anything reads the code.
+     *
+     * A PRX stores cross-segment addresses relative to the segment they point
+     * into, so an unrelocated pointer into .data reads as a small number --
+     * usually zero. Code that builds one with a lui/addiu pair then computes
+     * address 0 and walks into .text, and a table scan started there never
+     * finds its terminator.
+     *
+     * It has to happen here rather than at load time. The interpreter fetches
+     * instructions from memory, so patching memory would fix it; the emitter
+     * bakes address literals in when it reads the file, so patching memory
+     * would not. Relocating the image up front is what keeps the two agreeing.
+     *
+     * Both segments stay at their linked addresses, so no code address moves. */
+    {
+        psp_load_info li;
+        if (psp_relocate_image(b->data, b->size, e, &li) != 0) {
+            fprintf(stderr, "cannot apply relocations to %s\n", path);
+            psp_blob_free(b);
+            return -1;
+        }
+        if (li.nrelocs)
+            fprintf(stderr, "relocs:     %d applied%s\n", li.nrelocs,
+                    li.nreloc_skipped ? " (some skipped -- see loader.c)" : "");
+    }
+
     memset(an, 0, sizeof *an);
     /* Walk the whole loaded image, not just .text: a module can place
      * executable code outside it (C++ static initialisers, notably), and
@@ -825,6 +861,156 @@ static int looks_like_cmd1_meta(const uint8_t *m, size_t avail, uint32_t file_si
     return 1;
 }
 
+/* ---- interp ---------------------------------------------------------------
+ *
+ * Run a module under the interpreter oracle. See docs/ORACLE.md and interp.h.
+ *
+ * The module is mapped at the address it was *linked* at, not somewhere inside
+ * the console's RAM window. A PRX links at 0, and the recompiled C has those
+ * addresses baked in as literals, so the oracle has to use the same address
+ * space as the code it is meant to be compared against. psp_mem_map_module()
+ * exists for exactly this.
+ *
+ * Relocations are deliberately not applied. Doing so would move every address
+ * away from the ones the emitter used and make traces from the two sides
+ * incomparable — which is the only thing this command is for. The consequence
+ * is that running from the module entry does not get far: real bring-up starts
+ * at a single leaf function, not at _start. */
+
+#define INTERP_STACK_TOP  (PSP_RAM_BASE + PSP_RAM_SIZE - 0x100)
+#define INTERP_RA_DONE    0x0DEAD000u
+
+/* Guest re-entry attempted from inside an HLE handler. Recorded rather than
+ * fatal — see where this is installed. */
+static uint64_t g_reentry_count;
+static uint32_t g_reentry_first;
+
+static void interp_note_reentry(uint32_t addr) {
+    if (!g_reentry_count) g_reentry_first = addr;
+    g_reentry_count++;
+}
+
+/* Hand the interpreter the thunk-to-NID map, so firmware calls reach HLE
+ * instead of running the unlinked `jr $ra` the linker left in the module.
+ * Returns the number of thunks registered; the table is owned by the caller
+ * and must outlive the run, so it is returned through `out_tbl`. */
+static int interp_bind_imports(const psp_blob *b, const elf_info *e,
+                               psp_interp_import **out_tbl) {
+    *out_tbl = NULL;
+    if (!e->modinfo_size) return 0;
+
+    psp_module_info mi;
+    if (psp_modinfo_parse(b->data, b->size, e->modinfo_offset, &mi) != 0) return 0;
+
+    const uint32_t bias = e->nsegments ? e->seg[0].offset - e->seg[0].addr : 0;
+    int n = psp_collect_imports(b->data, b->size, &mi, bias, NULL, 0);
+    if (n <= 0) return 0;
+
+    psp_import_entry *imp = (psp_import_entry *)malloc((size_t)n * sizeof *imp);
+    if (!imp) return 0;
+    n = psp_collect_imports(b->data, b->size, &mi, bias, imp, n);
+
+    psp_interp_import *tbl = (psp_interp_import *)malloc((size_t)n * sizeof *tbl);
+    if (!tbl) { free(imp); return 0; }
+    for (int i = 0; i < n; i++) {
+        tbl[i].addr = imp[i].addr;
+        tbl[i].nid  = imp[i].nid;
+    }
+    free(imp);
+
+    const int bound = psp_interp_set_imports(tbl, n);
+    if (bound <= 0) { free(tbl); return 0; }
+    *out_tbl = tbl;
+    return bound;
+}   /* never mapped: the run stops here */
+
+static int cmd_interp(const char *path, uint32_t from, int have_from,
+                      uint64_t budget, int trace, int trace_regs) {
+    psp_blob b;
+    if (psp_blob_read(path, &b) != 0) { fprintf(stderr, "cannot read %s\n", path); return 1; }
+
+    elf_info e;
+    if (elf_parse(b.data, b.size, &e) != 0) {
+        fprintf(stderr, "not an ELF/PRX: %s\n"
+                        "  interp needs a decrypted module — run `decrypt` first\n", path);
+        psp_blob_free(&b);
+        return 1;
+    }
+
+    if (psp_mem_init() != 0) {
+        fprintf(stderr, "cannot allocate guest memory\n");
+        psp_blob_free(&b); return 1;
+    }
+
+    psp_load_info li;
+    if (psp_load_module(&b, &e, &li) != 0) {
+        fprintf(stderr, "cannot load module image\n"); goto fail;
+    }
+    const uint32_t lo = li.lo, hi = li.hi;
+
+    psp_hle_init();
+    psp_interp_import *imports = NULL;
+    const int nimports = interp_bind_imports(&b, &e, &imports);
+
+    /* Some HLE handlers call back into guest code — a thread entry point, a
+     * registered callback — and they do it through psp_dispatch(), which only
+     * knows about *recompiled* functions. Under the interpreter nothing is
+     * registered, so every such re-entry is a miss, and the default handler
+     * aborts. Counting them and carrying on says how much of the module is out
+     * of reach this way, which is the useful answer; crashing says nothing. */
+    psp_set_miss_handler(interp_note_reentry);
+
+    const uint32_t entry = have_from ? from : e.entry;
+
+    memset(&psp_cpu, 0, sizeof psp_cpu);
+    psp_cpu.r[PSP_REG_SP] = INTERP_STACK_TOP;
+
+    psp_interp it;
+    psp_interp_init(&it, entry, INTERP_RA_DONE, budget);
+    it.trace      = trace ? stdout : NULL;
+    it.trace_regs = trace_regs;
+
+    printf("module:   %s\n", path);
+    printf("mapped:   0x%08X + %u bytes (%d segments)\n", lo, hi - lo, e.nsegments);
+    printf("relocs:   %d applied%s\n", li.nrelocs,
+           li.nreloc_skipped ? " (some skipped -- see loader.c)" : "");
+    printf("imports:  %d thunks routed to HLE\n", nimports);
+    printf("entry:    0x%08X%s\n", entry, have_from ? " (--from)" : " (module entry)");
+    printf("budget:   %llu instructions\n", (unsigned long long)budget);
+    printf("---\n");
+
+    psp_interp_run(&it);
+
+    printf("---\n");
+    printf("stopped:  %s\n", psp_interp_status_str(it.status));
+    printf("executed: %llu instructions\n", (unsigned long long)it.executed);
+    if (g_reentry_count)
+        printf("re-entry: %llu HLE callbacks into guest code, first 0x%08X\n"
+               "          (needs the interpreter to service psp_dispatch)\n",
+               (unsigned long long)g_reentry_count, g_reentry_first);
+    if (it.status != I_OK_RETURN && it.status != I_BUDGET) {
+        a_insn in;
+        a_decode(psp_read32(it.fault_pc), it.fault_pc, &in);
+        char buf[96];
+        a_format(&in, buf, sizeof buf);
+        printf("at:       0x%08X  %s\n", it.fault_pc, buf);
+    }
+    printf("bad mem:  %llu accesses\n", (unsigned long long)psp_mem_bad_access);
+
+    psp_interp_free_imports();
+    free(imports);
+    psp_mem_free();
+    psp_blob_free(&b);
+    /* A clean return is success. Anything else is a finding, not a crash, so
+     * report it through the exit status without a scary message. */
+    return it.status == I_OK_RETURN ? 0 : 1;
+
+fail:
+    psp_mem_free();
+    psp_blob_free(&b);
+    return 1;
+}
+
 static int cmd_decrypt(const char *path, const char *keypath) {
     psp_blob b;
     if (psp_blob_read(path, &b) != 0) { fprintf(stderr, "cannot read %s\n", path); return 1; }
@@ -988,6 +1174,25 @@ int main(int argc, char **argv) {
     for (int i = 3; i + 1 < argc; i++)
         if (!strcmp(argv[i], "--keys")) keypath = argv[i + 1];
 
+    if (!strcmp(cmd, "interp")) {
+        uint32_t from = 0; int have_from = 0, trace = 0, regs = 0;
+        uint64_t budget = 1000000;
+        for (int i = 3; i < argc; i++) {
+            if (!strcmp(argv[i], "--from") && i + 1 < argc) {
+                from = (uint32_t)strtoul(argv[++i], NULL, 0); have_from = 1;
+            } else if (!strcmp(argv[i], "--budget") && i + 1 < argc) {
+                budget = strtoull(argv[++i], NULL, 0);
+            } else if (!strcmp(argv[i], "--trace")) {
+                trace = 1;
+            } else if (!strcmp(argv[i], "--regs")) {
+                trace = 1; regs = 1;   /* --regs implies --trace */
+            } else {
+                fprintf(stderr, "interp: unknown option %s\n", argv[i]);
+                return usage();
+            }
+        }
+        return cmd_interp(argv[2], from, have_from, budget, trace, regs);
+    }
     if (!strcmp(cmd, "decrypt")) return cmd_decrypt(argv[2], keypath);
     if (!strcmp(cmd, "kirk1")) {
         const char *out = (argc > 3 && strcmp(argv[3], "--keys")) ? argv[3] : NULL;
