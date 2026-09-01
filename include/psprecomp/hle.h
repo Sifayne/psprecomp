@@ -211,6 +211,7 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
  * live blocks. Distinct from the allocator's ILLEGAL_MEMBLOCK above, which is
  * a different number for a different question. Both pools use this one. */
 #define SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_PTR 0x800201B6
+#define SCE_KERNEL_ERROR_UNKNOWN_TLSPLID    0x800201D0
 
 /* ---- the subsystems ------------------------------------------------------ */
 
@@ -358,6 +359,7 @@ void psp_kernobj_register(void);
 void psp_kernobj_register_mpp(void);
 void psp_kernobj_register_mbx(void);
 void psp_kernobj_register_fpl(void);
+void psp_kernobj_register_tls(void);
 void psp_kernobj_reset(void);
 void psp_kernlock_reset(void);
 

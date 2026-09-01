@@ -301,6 +301,7 @@ static void hle_ReferVplStatus(void) {
 static void mpp_reset(void);
 static void mbx_reset(void);
 static void fpl_reset(void);
+static void tls_reset(void);
 
 void psp_kernobj_reset(void) {
     for (int i = 0; i < MAX_VPLS; i++)
@@ -309,6 +310,7 @@ void psp_kernobj_reset(void) {
     mpp_reset();
     mbx_reset();
     fpl_reset();
+    tls_reset();
 }
 
 void psp_kernobj_register(void) {
@@ -323,6 +325,7 @@ void psp_kernobj_register(void) {
     psp_kernobj_register_mpp();
     psp_kernobj_register_mbx();
     psp_kernobj_register_fpl();
+    psp_kernobj_register_tls();
 }
 
 /* ---- msgpipe: a byte ring, not a message queue -----------------------------
@@ -1084,4 +1087,154 @@ void psp_kernobj_register_fpl(void) {
     psp_hle_register(0xF6414A71, "ThreadManForUser", "sceKernelFreeFpl",        hle_FreeFpl);
     psp_hle_register(0xA8AA591F, "ThreadManForUser", "sceKernelCancelFpl",      hle_CancelFpl);
     psp_hle_register(0xD8199E4C, "ThreadManForUser", "sceKernelReferFplStatus", hle_ReferFplStatus);
+}
+
+/* ---- tlspl: a block pool indexed by thread --------------------------------
+ *
+ * A fixed pool again, but the caller never names a block: `sceKernelGetTlsAddr`
+ * hands the calling thread *its* block, allocating one the first time and
+ * returning the same address on every later call. threads/tls/get measures both
+ * halves -- `Twice: OK (+0000)` with `freeBlocks` unchanged.
+ *
+ * A tlspl also carries an **index**, assigned at creation and reported in its
+ * status, which is what a thread control block would key on. The second pool
+ * created reports `index=1`.
+ *
+ * Its attribute mask is 0x41FF, which is the first one in seven object types
+ * that agrees with another -- fpl's. Checked rather than assumed: this was the
+ * seventh capture read and the first that could have been guessed.
+ */
+
+#define MAX_TLSPLS 32
+#define MAX_TLS_BLOCKS 64
+#define TLSPL_ATTR_KNOWN 0x41FFu
+
+typedef struct {
+    uint32_t  uid;
+    char      name[32];
+    uint32_t  attr, index;
+    uint32_t  base, block_size, nblocks;
+    uint32_t  owner[MAX_TLS_BLOCKS];   /* thread uid holding each block, 0 free */
+    int       alive;
+    psp_waitq q;
+} psp_tlspl;
+
+static psp_tlspl g_tls[MAX_TLSPLS];
+
+static void tls_reset(void) {
+    for (int i = 0; i < MAX_TLSPLS; i++)
+        if (g_tls[i].alive && g_tls[i].base) psp_sysmem_release(g_tls[i].base);
+    memset(g_tls, 0, sizeof g_tls);
+}
+
+static psp_tlspl *find_tls(uint32_t id) {
+    for (int i = 0; i < MAX_TLSPLS; i++)
+        if (g_tls[i].alive && g_tls[i].uid == id) return &g_tls[i];
+    return NULL;
+}
+
+static uint32_t tls_free_blocks(const psp_tlspl *t) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < t->nblocks; i++) if (!t->owner[i]) n++;
+    return n;
+}
+
+static void hle_CreateTlspl(void) {
+    /* (name, partition, attr, blockSize, count, option) */
+    const uint32_t name  = psp_arg(0);
+    const int32_t  part  = (int32_t)psp_arg(1);
+    const uint32_t attr  = psp_arg(2);
+    const uint32_t bsize = psp_arg(3);
+    const uint32_t count = psp_arg(4);
+
+    if (!name) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    const uint32_t pe = vpl_partition_error(part);
+    if (pe) { psp_ret(pe); return; }
+    if (attr & ~TLSPL_ATTR_KNOWN) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+    if (bsize == 0 || (int32_t)bsize < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
+    if (count == 0 || (int32_t)count < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
+    if (count > MAX_TLS_BLOCKS) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    const uint32_t base = psp_sysmem_alloc(bsize * count, 0);
+    if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    psp_tlspl *t = NULL;
+    uint32_t index = 0;
+    for (int i = 0; i < MAX_TLSPLS; i++) if (g_tls[i].alive) index++;
+    for (int i = 0; i < MAX_TLSPLS; i++) if (!g_tls[i].alive) { t = &g_tls[i]; break; }
+    if (!t) { psp_sysmem_release(base); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    memset(t, 0, sizeof *t);
+    psp_str(name, t->name, sizeof t->name);
+    t->attr = attr; t->index = index;
+    t->base = base; t->block_size = bsize; t->nblocks = count;
+    t->uid   = psp_threadman_next_uid();
+    t->alive = 1;
+    psp_ret(t->uid);
+}
+
+static void hle_DeleteTlspl(void) {
+    psp_tlspl *t = find_tls(psp_arg(0));
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_TLSPLID); return; }
+    const int urgent = psp_waitq_release_all(&t->q);
+    if (t->base) psp_sysmem_release(t->base);
+    t->alive = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
+}
+
+/* The calling thread's block, allocated on first ask and kept thereafter. */
+static void hle_GetTlsAddr(void) {
+    psp_tlspl *t = find_tls(psp_arg(0));
+    if (!t) { psp_ret(0); return; }
+    const uint32_t me = psp_sched_current();
+    for (uint32_t i = 0; i < t->nblocks; i++)
+        if (t->owner[i] == me) { psp_ret(t->base + i * t->block_size); return; }
+    for (uint32_t i = 0; i < t->nblocks; i++)
+        if (!t->owner[i]) {
+            t->owner[i] = me ? me : 0xFFFFFFFFu;   /* the main context is uid 0 */
+            psp_ret(t->base + i * t->block_size);
+            return;
+        }
+    psp_ret(0);
+}
+
+static void hle_FreeTlspl(void) {
+    psp_tlspl *t = find_tls(psp_arg(0));
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_TLSPLID); return; }
+    const uint32_t me = psp_sched_current() ? psp_sched_current() : 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < t->nblocks; i++)
+        if (t->owner[i] == me) {
+            t->owner[i] = 0;
+            const int urgent = psp_waitq_release_all(&t->q);
+            psp_ret(SCE_KERNEL_ERROR_OK);
+            if (urgent) psp_sched_yield();
+            return;
+        }
+    psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_PTR);
+}
+
+static void hle_ReferTlsplStatus(void) {
+    const psp_tlspl *t = find_tls(psp_arg(0));
+    const uint32_t info = psp_arg(1);
+    if (!t)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_TLSPLID); return; }
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+    psp_write32(info +  0, 60);
+    psp_threadman_write_name(info + 4, t->name);
+    psp_write32(info + 36, t->attr);
+    psp_write32(info + 40, t->index);
+    psp_write32(info + 44, t->block_size);
+    psp_write32(info + 48, t->nblocks);
+    psp_write32(info + 52, tls_free_blocks(t));
+    psp_write32(info + 56, (uint32_t)psp_waitq_count(&t->q));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+void psp_kernobj_register_tls(void) {
+    psp_hle_register(0x8DAFF657, "ThreadManForUser", "sceKernelCreateTlspl",      hle_CreateTlspl);
+    psp_hle_register(0x32BF938E, "ThreadManForUser", "sceKernelDeleteTlspl",      hle_DeleteTlspl);
+    psp_hle_register(0xFA835CDE, "ThreadManForUser", "sceKernelGetTlsAddr",       hle_GetTlsAddr);
+    psp_hle_register(0x4A719FB2, "ThreadManForUser", "sceKernelFreeTlspl",        hle_FreeTlspl);
+    psp_hle_register(0x721067F3, "ThreadManForUser", "sceKernelReferTlsplStatus", hle_ReferTlsplStatus);
 }

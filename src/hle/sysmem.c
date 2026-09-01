@@ -285,6 +285,19 @@ static void hle_Printf(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* How much of the user partition is left.
+ *
+ * Unimplemented until now, which meant it returned zero -- and a *pair* of
+ * zeros is a delta of zero, so a test measuring what a call consumed measured
+ * nothing. threads/tls/create prints `(allocated N bytes)` around every one of
+ * its creates and read 0 for all of them.
+ *
+ * The two differ only in fragmentation: total is everything free, max is the
+ * largest single block. This allocator hands out from both ends of one span,
+ * so the largest contiguous run is the whole of it. */
+static void hle_TotalFreeMemSize(void) { psp_ret(psp_sysmem_free()); }
+static void hle_MaxFreeMemSize(void)   { psp_ret(psp_sysmem_free()); }
+
 void psp_sysmem_register(void) {
     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every
      * pair below, so a mistyped NID cannot survive. */
@@ -306,4 +319,6 @@ void psp_sysmem_register(void) {
     psp_hle_register_unnamed(0x91DE343C, "SysMemUserForUser", hle_SetCompiledSdkVersion);
     psp_hle_register(0xF77D77CB, "SysMemUserForUser", "sceKernelSetCompilerVersion",   hle_SetCompilerVersion);
     psp_hle_register(0x13A5ABEF, "SysMemUserForUser", "sceKernelPrintf",               hle_Printf);
+    psp_hle_register(0xF919F628, "SysMemUserForUser", "sceKernelTotalFreeMemSize",     hle_TotalFreeMemSize);
+    psp_hle_register(0xA291F107, "SysMemUserForUser", "sceKernelMaxFreeMemSize",       hle_MaxFreeMemSize);
 }
