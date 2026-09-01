@@ -1766,14 +1766,26 @@ int psp_threadman_run_callbacks(void) {
         /* Guest code, run between two instructions of whichever thread asked.
          * That thread must not be able to tell, so its registers are put back;
          * same reasoning as the alarm handler in ktimer.c. */
+        const uint32_t uid = c->uid;
         const psp_cpu_state saved = psp_cpu;
         psp_cpu.r[PSP_REG_A0] = count;
         psp_cpu.r[PSP_REG_A1] = arg;
         psp_cpu.r[PSP_REG_A2] = common;
         psp_cpu.r[PSP_REG_RA] = 0;
         psp_dispatch(func);
+        const uint32_t handler_result = psp_cpu.r[PSP_REG_V0];
         psp_cpu = saved;
         ran = 1;
+
+        /* A handler that returns non-zero is saying it is finished, and the
+         * callback is deleted. callbacks/notify measures it from the outside:
+         * a sleeper whose handler returns 0x1337 answers `Notify #1: OK` and
+         * then `Notify #2: Failed (800201a1)`, with nothing between the two but
+         * the handler running. */
+        if (handler_result) {
+            psp_callback *again = find_cb(uid);
+            if (again) again->used = 0;
+        }
     }
     return ran;
 }
