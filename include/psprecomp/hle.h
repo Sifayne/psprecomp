@@ -137,6 +137,11 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
  * value with UNKNOWN_UID above -- the uid space is one space, and the kernel
  * spends its codes on the *situation* rather than on the object. */
 #define SCE_KERNEL_ERROR_DORMANT         0x800201A2
+/* The exit status of a thread that is *running*: it has not exited, so there
+ * is nothing to report and the kernel says so rather than answering 0.
+ * threads/refer.expected reads `exit: 800201a4` for a live thread where
+ * threads/create.expected reads `800201a2` for one never started. */
+#define SCE_KERNEL_ERROR_NOT_DORMANT     0x800201A4
 #define SCE_KERNEL_ERROR_SUSPEND         0x800201A3
 #define SCE_KERNEL_ERROR_NOT_SUSPEND     0x800201A5
 /* A poll that would have blocked. Distinct from an error: it is the ordinary
@@ -214,6 +219,11 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_UNKNOWN_TLSPLID    0x800201D0
 #define SCE_KERNEL_ERROR_UNKNOWN_ALMID      0x8002019F
 #define SCE_KERNEL_ERROR_UNKNOWN_VTID       0x800201BE
+/* A blocking call made while dispatch is suspended. */
+#define SCE_KERNEL_ERROR_CAN_NOT_WAIT       0x800201A7
+/* Suspending dispatch when it is already suspended, or resuming it with
+ * something that is not a state this returned. */
+#define SCE_KERNEL_ERROR_ILLEGAL_CONTEXT    0x80020066
 
 /* ---- the subsystems ------------------------------------------------------ */
 

@@ -239,6 +239,15 @@ int  psp_sched_resume(uint32_t uid);
  * setting, which is what the guest passes back to restore it. */
 int  psp_sched_set_dispatch(int on);
 
+/* Whether a thread may block at all right now.
+ *
+ * It may not while dispatch is suspended, and the refusal is total: a wait that
+ * *would* have succeeded is refused too, and so is one whose arguments are
+ * illegal -- threads/scheduling/dispatch answers CAN_NOT_WAIT for a semaphore
+ * that has been signalled and for a count above the maximum alike. So the check
+ * belongs at the very top of a blocking call, before anything is validated. */
+int  psp_sched_can_wait(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -326,6 +326,9 @@ static int vpl_release(psp_vpl *v) {
 }
 
 static void vpl_allocate(int may_block, int has_timeout) {
+    if (may_block && !psp_sched_can_wait()) {
+        psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
+    }
     const uint32_t id      = psp_arg(0);
     const uint32_t bytes   = psp_arg(1);
     const uint32_t out     = psp_arg(2);
@@ -626,6 +629,9 @@ static int mpp_wake_senders(psp_msgpipe *p) {
  * share a body: `sending` picks which queue is ours and which is theirs, which
  * error a full-or-empty poll gives, and which way the bytes go. */
 static void mpp_transfer(int sending, int may_block, int has_timeout) {
+    if (may_block && !psp_sched_can_wait()) {
+        psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
+    }
     const uint32_t id      = psp_arg(0);
     const uint32_t buf     = psp_arg(1);
     const uint32_t len     = psp_arg(2);
@@ -900,6 +906,9 @@ static void hle_SendMbx(void) {
 }
 
 static void mbx_receive(int may_block, int has_timeout) {
+    if (may_block && !psp_sched_can_wait()) {
+        psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
+    }
     const uint32_t id      = psp_arg(0);
     const uint32_t out     = psp_arg(1);
     const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
@@ -1129,6 +1138,9 @@ static int fpl_release(psp_fpl *f) {
 }
 
 static void fpl_allocate(int may_block, int has_timeout) {
+    if (may_block && !psp_sched_can_wait()) {
+        psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
+    }
     const uint32_t id      = psp_arg(0);
     const uint32_t out     = psp_arg(1);
     const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;

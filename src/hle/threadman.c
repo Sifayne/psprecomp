@@ -44,6 +44,14 @@
 
 enum { TH_DORMANT = 0, TH_READY, TH_RUNNING, TH_SUSPENDED };
 
+/* What sceKernelReferThreadStatus reports in its `status` field. These are the
+ * kernel's own values, not this file's TH_* -- a created thread reports 16. */
+#define PSP_THREAD_STATUS_RUNNING 1
+#define PSP_THREAD_STATUS_READY   2
+#define PSP_THREAD_STATUS_WAITING 4
+#define PSP_THREAD_STATUS_SUSPEND 8
+#define PSP_THREAD_STATUS_STOPPED 16
+
 #define MAX_SEMA_WAITERS 32
 
 typedef struct {
@@ -58,6 +66,9 @@ typedef struct {
     uint32_t exit_status;
     /* Banked sceKernelWakeupThread calls; see hle_SleepThread. */
     int      wakeup_count;
+    /* Whether it has ever been started. A thread that has not is *dormant*,
+     * and that is a different answer from one that has run and stopped. */
+    int      ever_started;
     /* Threads parked in sceKernelWaitThreadEnd on this one. */
     uint32_t enders[MAX_SEMA_WAITERS];
     int      nenders;
@@ -308,6 +319,7 @@ static void hle_StartThread(void) {
         return;
     }
     t->state = TH_READY;
+    t->ever_started = 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -360,6 +372,7 @@ static void hle_DeleteThread(void) {
  * game whose main loop delays. Yielding gives the other threads the token,
  * which is the useful half of the semantics. */
 static void hle_DelayThread(void) {
+    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
     psp_sched_delay(psp_arg(0));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -382,6 +395,7 @@ static void on_thread_end(uint32_t uid, uint32_t status) {
  * status -- writing the status there corrupted whatever the guest kept at that
  * address. The status is the return value, as PPSSPP's implementation shows. */
 static void hle_WaitThreadEnd(void) {
+    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
     const uint32_t thid    = psp_arg(0);
     const uint32_t timeout = psp_arg(1);
     psp_thread *t = find_thread(thid);
@@ -506,6 +520,13 @@ static void hle_ChangeThreadPriority(void) {
     const uint32_t id = psp_arg(0) ? psp_arg(0) : psp_sched_current();
     psp_thread *t = find_thread(id);
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    /* A thread that has never run, or has finished, has no priority to change:
+     * threads/change.expected answers DORMANT for `Created` and `Finished`
+     * where it answers 0 for `Ready`, `Suspended` and `Waiting`. */
+    if (!t->ever_started || t->state == TH_DORMANT) {
+        psp_ret(SCE_KERNEL_ERROR_DORMANT);
+        return;
+    }
     t->priority = psp_arg(1);
     psp_sched_set_priority(t->uid, (int)t->priority);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -522,6 +543,7 @@ static void hle_ChangeThreadPriority(void) {
  * content of the call -- a wakeup that arrives *before* the sleep is remembered,
  * so the sleep returns at once rather than missing it and hanging forever. */
 static void hle_SleepThread(void) {
+    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
     psp_thread *t = current_thread();
     if (!t) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
     if (t->wakeup_count > 0) { t->wakeup_count--; psp_ret(SCE_KERNEL_ERROR_OK); return; }
@@ -564,12 +586,19 @@ static void hle_CancelWakeupThread(void) {
  * dispatch would break the outer one. pspautotests' scheduling/dispatch is an
  * entire test of this, and without it that test deadlocks before it prints
  * anything at all. */
+/* These do *not* nest. Suspending dispatch that is already suspended is an
+ * error, and so is resuming with anything that is not a state a suspend
+ * returned -- which is how the second failure in dispatch.expected arises, the
+ * test handing the failed suspend's error code straight to resume. */
 static void hle_SuspendDispatchThread(void) {
+    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT); return; }
     psp_ret((uint32_t)psp_sched_set_dispatch(0));
 }
 
 static void hle_ResumeDispatchThread(void) {
-    psp_sched_set_dispatch(psp_arg(0) != 0);
+    const uint32_t state = psp_arg(0);
+    if (state > 1) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT); return; }
+    psp_sched_set_dispatch((int)state);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -874,6 +903,7 @@ static int sema_release(psp_sema *s) {
 }
 
 static void hle_WaitSema(void) {
+    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
     const uint32_t id      = psp_arg(0);
     const int32_t  need    = (int32_t)psp_arg(1);
     const uint32_t tmo_ptr = psp_arg(2);
@@ -1056,6 +1086,7 @@ static void hle_ClearEventFlag(void) {
  * 15.9 MB request. So the fifth argument is $t0, the ordinary rule applies, and
  * this can block like every other wait. */
 static void hle_WaitEventFlag(void) {
+    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
     const uint32_t id      = psp_arg(0);
     const uint32_t bits    = psp_arg(1);
     const uint32_t mode    = psp_arg(2);
@@ -1212,21 +1243,57 @@ static void hle_ReferThreadStatus(void) {
     if (!t)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
 
-    psp_write32(info +  0, 104);
-    psp_threadman_write_name(info + 4, t->name);
-    psp_write32(info + 36, t->attr);
-    psp_write32(info + 40, (uint32_t)t->state);
-    psp_write32(info + 44, t->entry);
-    psp_write32(info + 48, t->stack_base);
-    psp_write32(info + 52, t->stack_size);
-    psp_write32(info + 56, psp_cpu.r[PSP_REG_GP]);
-    psp_write32(info + 60, t->priority);
-    psp_write32(info + 64, (uint32_t)psp_sched_priority(t->uid));
-    psp_write32(info + 68, 0);                       /* waitType */
-    psp_write32(info + 72, 0);                       /* waitId */
-    psp_write32(info + 76, (uint32_t)t->wakeup_count);
-    psp_write32(info + 80, t->exit_status);
-    for (uint32_t off = 84; off < 104; off += 4) psp_write32(info + off, 0);
+    /* The reported attribute is not the one the caller passed: hardware ORs in
+     * 0x800000FF. create.expected reports `attr=800000ff` for a thread created
+     * with 0 and `attr=807000ff` for one created with 0x700000 -- twenty-eight
+     * rows, one rule. */
+    const uint32_t attr = 0x800000FFu | t->attr;
+
+    /* `status` is the kernel's own enumeration, not this file's TH_*, and a
+     * thread that has never been started reports STOPPED (16). */
+    const int dormant = !t->ever_started || t->state == TH_DORMANT;
+    uint32_t status = PSP_THREAD_STATUS_STOPPED;
+    if (!dormant) {
+        if      (t->state == TH_RUNNING)   status = PSP_THREAD_STATUS_RUNNING;
+        else if (t->state == TH_READY)     status = PSP_THREAD_STATUS_READY;
+        else if (t->state == TH_SUSPENDED) status = PSP_THREAD_STATUS_SUSPEND;
+    }
+
+    /* Three different answers for `exitStatus`, and none of them is zero:
+     * DORMANT for a thread never started, NOT_DORMANT for one still running --
+     * it has not exited, so there is nothing to report -- and what it returned
+     * for one that has finished. create.expected reads 800201a2 throughout,
+     * refer.expected 800201a4. */
+    const uint32_t exit_status = !t->ever_started ? SCE_KERNEL_ERROR_DORMANT
+                               : dormant          ? t->exit_status
+                                                  : SCE_KERNEL_ERROR_NOT_DORMANT;
+
+    /* Its current priority is its initial one until the scheduler has a slot
+     * for it; psp_sched_priority answers with a sort-last sentinel otherwise,
+     * and that is not a priority. */
+    const int slot_pri = psp_sched_priority(t->uid);
+
+    const uint32_t words[26] = {
+        104, 0,0,0,0,0,0,0,0,                        /* size, then name[32] */
+        attr, status, t->entry, t->stack_base, t->stack_size,
+        psp_cpu.r[PSP_REG_GP], t->priority,
+        slot_pri > 0x7F ? t->priority : (uint32_t)slot_pri,
+        0 /*waitType*/, 0 /*waitId*/, (uint32_t)t->wakeup_count, exit_status,
+        0,0,0,0,0,          /* run clocks and preemption counts, left at zero */
+    };
+    uint8_t buf[104];
+    for (int w = 0; w < 26; w++)
+        for (int b = 0; b < 4; b++) buf[w * 4 + b] = (uint8_t)(words[w] >> (b * 8));
+    for (int i = 0; i < 31 && t->name[i]; i++) buf[4 + i] = (uint8_t)t->name[i];
+
+    /* Only as many bytes as the caller says it has room for. refer.expected
+     * sweeps the size field and watches the exit word, which starts at offset
+     * 80: untouched at 80, half written at 82 (`ffff01a4`), whole at 108. A
+     * refer that wrote all 104 regardless differs on every row of that sweep,
+     * and one asked for zero bytes writes none at all. */
+    uint32_t room = psp_read32(info);
+    if (room > sizeof buf) room = sizeof buf;
+    for (uint32_t i = 0; i < room; i++) psp_write8(info + i, buf[i]);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

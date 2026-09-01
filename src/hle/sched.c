@@ -742,6 +742,8 @@ int psp_sched_live(void) {
     return live;
 }
 
+int psp_sched_can_wait(void) { return g_dispatch; }
+
 int psp_sched_set_dispatch(int on) {
     const int was = g_dispatch;
     g_dispatch = on;

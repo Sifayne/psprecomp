@@ -128,6 +128,9 @@ static int mutex_release(psp_mutex *m) {
 
 /* The common body of the two blocking locks and the non-blocking one. */
 static void mutex_lock(int may_block, int has_timeout) {
+    if (may_block && !psp_sched_can_wait()) {
+        psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
+    }
     const uint32_t id      = psp_arg(0);
     const int32_t  count   = (int32_t)psp_arg(1);
     const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
@@ -441,6 +444,9 @@ static uint32_t lw_count_error(uint32_t wa, int32_t count, int locking) {
  * revision that made the error vocabulary specific, and both exports are still
  * present with their own NIDs. */
 static void lw_lock(int may_block, int has_timeout, int flatten) {
+    if (may_block && !psp_sched_can_wait()) {
+        psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
+    }
     const uint32_t wa      = psp_arg(0);
     const int32_t  count   = (int32_t)psp_arg(1);
     const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
