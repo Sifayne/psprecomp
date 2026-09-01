@@ -141,8 +141,22 @@ static void mutex_lock(int may_block, int has_timeout) {
     const uint32_t bad = lock_count_error(m, count);
     if (bad) { psp_ret(bad); return; }
 
-    const uint64_t deadline = psp_wait_deadline(tmo_ptr);
     const uint32_t me = psp_sched_current();
+
+    /* Relocking a mutex we already hold is what the recursive attribute is
+     * for, and without it hardware refuses rather than blocking -- a thread
+     * waiting for a lock it already holds would never be released.
+     *
+     * Checked before the deadline is taken, which is not cosmetic: a CB lock
+     * delivers callbacks only if it got as far as its wait, and
+     * callbacks/callbacks shows this refusal delivering nothing. So the
+     * refusal has to sit with the other argument checks above. */
+    if (m->owner == me && !(m->attr & MUTEX_ATTR_RECURSE)) {
+        psp_ret(SCE_KERNEL_ERROR_MUTEX_RECURSIVE);
+        return;
+    }
+
+    const uint64_t deadline = psp_wait_deadline(tmo_ptr);
 
     /* Free, and nobody ahead of us. */
     if (m->count == 0 && psp_waitq_count(&m->q) == 0) {
@@ -153,14 +167,7 @@ static void mutex_lock(int may_block, int has_timeout) {
         return;
     }
 
-    /* Ours already. Relocking is what the recursive attribute is for, and
-     * without it hardware refuses rather than blocking -- a thread waiting for
-     * a lock it already holds would never be released. */
     if (m->owner == me) {
-        if (!(m->attr & MUTEX_ATTR_RECURSE)) {
-            psp_ret(SCE_KERNEL_ERROR_MUTEX_RECURSIVE);
-            return;
-        }
         m->count += count;
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
