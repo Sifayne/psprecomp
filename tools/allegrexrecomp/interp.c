@@ -641,10 +641,49 @@ void psp_interp_init(psp_interp *it, uint32_t entry, uint32_t ra_sentinel,
     psp_cpu.r[PSP_RA_INDEX] = ra_sentinel;
 }
 
+/* PSPRECOMP_VDUMP=<hex pc>[,...] prints the VFPU register file each time
+ * execution reaches one of those addresses, as eight 4x4 matrices in the
+ * layout vfpu.h describes.
+ *
+ * `--regs` covers the GPRs and nothing else, so a wrong VFPU result has had to
+ * be reasoned about from what a run eventually printed -- and reasoning from a
+ * matrix that has been multiplied, moved and stored is how a correct op gets
+ * blamed. Reading the file at the instruction is the shorter route. */
+static void vdump_check(uint32_t pc) {
+    static uint32_t want[8];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        const char *v = getenv("PSPRECOMP_VDUMP");
+        for (; v && *v && n < 8; ) {
+            want[n++] = (uint32_t)strtoul(v, (char **)&v, 16);
+            while (*v == ',' || *v == ' ') v++;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (want[i] != pc) continue;
+        fprintf(stderr, "vfpu at 0x%08X:\n", pc);
+        for (int m = 0; m < 8; m++) {
+            fprintf(stderr, "  M%d ", m);
+            for (int row = 0; row < 4; row++) {
+                fprintf(stderr, "[");
+                for (int col = 0; col < 4; col++)
+                    fprintf(stderr, "%s%.6g", col ? " " : "",
+                            (double)psp_cpu.v[m * 4 + col * 32 + row]);
+                fprintf(stderr, "]");
+            }
+            fprintf(stderr, "\n");
+        }
+        return;
+    }
+}
+
 psp_interp_status psp_interp_step(psp_interp *it) {
     uint32_t before[PSP_NUM_GPR];
     a_insn in, slot;
     const uint32_t pc = it->pc;
+
+    vdump_check(pc);
 
     if (it->budget && it->executed >= it->budget)
         return it->status = I_BUDGET;
