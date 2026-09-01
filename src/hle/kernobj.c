@@ -34,7 +34,7 @@
  *     `round_up(n, 8) + 8` and nothing else fits all three.
  */
 
-#define MAX_VPLS 128
+#define MAX_VPLS 2048
 #define VPL_ALIGN     8u
 #define VPL_HEADER    8u
 #define VPL_OVERHEAD 32u
@@ -1389,7 +1389,12 @@ void psp_kernobj_register_mbx(void) {
  * above and had to be checked rather than assumed from the neighbour.
  */
 
-#define MAX_FPLS 64
+/* Same reasoning as the caps in threadman.c: the tests build a thousand and
+ * expect the thousandth to work, with headroom for what the process already
+ * holds. Missing this one showed up as `Failed at 0` -- the earlier sections
+ * of fpl/create leave their pools alive, so the loop had no slot to start
+ * from and the failure looked like memory rather than bookkeeping. */
+#define MAX_FPLS 2048
 /* create.expected creates pools of 0x131, 0x136 and 0x139 blocks and expects
  * each to succeed. A count of 0x04000000 is refused, but for want of memory
  * rather than a table limit. */
