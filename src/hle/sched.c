@@ -875,6 +875,14 @@ int psp_sched_resume(uint32_t uid) {
     return 1;
 }
 
+psp_sched_state psp_sched_state_of(uint32_t uid) {
+    pthread_mutex_lock(&g_lock);
+    const int s = slot_of(uid);
+    const psp_sched_state st = s >= 0 ? g_slot[s].state : PSP_SCHED_DEAD;
+    pthread_mutex_unlock(&g_lock);
+    return st;
+}
+
 int psp_sched_priority(uint32_t uid) {
     pthread_mutex_lock(&g_lock);
     const int s = slot_of(uid);

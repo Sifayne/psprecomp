@@ -216,6 +216,9 @@ uint32_t psp_sched_current(void);
  * and the order has to follow it. An unknown uid sorts last, so a stale entry
  * can never win a release it should not. */
 int      psp_sched_priority(uint32_t uid);
+/* What the scheduler thinks this thread is doing. PSP_SCHED_DEAD when it has
+ * no live slot, which covers both "finished" and "never started". */
+psp_sched_state psp_sched_state_of(uint32_t uid);
 
 /* Change a thread's priority. The thread manager owns what a priority *means*;
  * the scheduler owns which thread runs, so it has to be told -- writing the new

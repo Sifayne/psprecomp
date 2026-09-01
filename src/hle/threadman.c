@@ -1535,13 +1535,32 @@ static void hle_ReferThreadStatus(void) {
     const uint32_t attr = 0x800000FFu | t->attr;
 
     /* `status` is the kernel's own enumeration, not this file's TH_*, and a
-     * thread that has never been started reports STOPPED (16). */
+     * thread that has never been started reports STOPPED (16).
+     *
+     * For a live thread the scheduler is the authority, not the TH_* field:
+     * this file records that a thread was started and never that it parked, so
+     * a thread sitting in sceKernelSleepThread read back as READY. It is
+     * WAITING, and threads/threadend puts the two next to each other --
+     * `before start status=00000010`, `after start status=00000004` -- with
+     * nothing between them but the start of a thread whose whole body is a
+     * sleep. */
     const int dormant = !t->ever_started || t->state == TH_DORMANT;
     uint32_t status = PSP_THREAD_STATUS_STOPPED;
     if (!dormant) {
-        if      (t->state == TH_RUNNING)   status = PSP_THREAD_STATUS_RUNNING;
-        else if (t->state == TH_READY)     status = PSP_THREAD_STATUS_READY;
-        else if (t->state == TH_SUSPENDED) status = PSP_THREAD_STATUS_SUSPEND;
+        switch (psp_sched_state_of(t->uid)) {
+            case PSP_SCHED_RUNNING:   status = PSP_THREAD_STATUS_RUNNING; break;
+            case PSP_SCHED_READY:     status = PSP_THREAD_STATUS_READY;   break;
+            case PSP_SCHED_BLOCKED:
+            case PSP_SCHED_SLEEPING:  status = PSP_THREAD_STATUS_WAITING; break;
+            case PSP_SCHED_SUSPENDED: status = PSP_THREAD_STATUS_SUSPEND; break;
+            /* No live slot: threading is off, or it was never spawned. Fall
+             * back to what this file knows. */
+            case PSP_SCHED_DEAD:
+                status = t->state == TH_RUNNING   ? PSP_THREAD_STATUS_RUNNING
+                       : t->state == TH_SUSPENDED ? PSP_THREAD_STATUS_SUSPEND
+                                                  : PSP_THREAD_STATUS_READY;
+                break;
+        }
     }
 
     /* Three different answers for `exitStatus`, and none of them is zero:
