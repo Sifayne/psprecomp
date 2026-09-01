@@ -1155,6 +1155,15 @@ static void hle_PollSema(void) {
  * plain yield already does exactly that, and the priority argument only
  * selects a level we would reach anyway. */
 static void hle_RotateReadyQueue(void) {
+    /* Zero means "my own level" and is always allowed. Anything else has to be
+     * a priority a user thread could actually have: threads/rotate sweeps it
+     * and draws the line at 0x08 and 0x77, refusing 0x07 and 0x78 either side
+     * along with negatives. */
+    const int32_t prio = (int32_t)psp_arg(0);
+    if (prio != 0 && (prio < 0x08 || prio > 0x77)) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
+        return;
+    }
     psp_sched_yield();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
