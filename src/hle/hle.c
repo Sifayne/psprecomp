@@ -69,12 +69,37 @@ const psp_hle_entry *psp_hle_entries(int *count) {
  * long gone. Keeping the last few makes the answer immediate instead of
  * requiring a second run with different instrumentation. */
 #define ZERO_HISTORY 16
-static struct { uint32_t nid; const char *name; } g_zero[ZERO_HISTORY];
+static struct { uint32_t nid; const char *name; int handled; } g_zero[ZERO_HISTORY];
 static int g_zero_n;
 
-static void note_zero(uint32_t nid, const char *name) {
+/* Suppresses the unimplemented-call message. Two reasons a batch caller wants
+ * this, and the second one matters more than it looks:
+ *
+ *   Volume. A differential run makes millions of firmware calls. One line of
+ *   stderr each is slower than the work being measured.
+ *
+ *   Deadlock. A harness that puts a wall-clock watchdog around recompiled code
+ *   has to longjmp out of a signal handler. If that handler interrupts an
+ *   fprintf, stdio's stream lock is still held, and the next fprintf blocks on
+ *   it forever -- a hang no timeout escapes, because the timeout is the thing
+ *   that caused it.
+ *
+ * The history behind psp_hle_dump_recent() is still recorded either way, so
+ * quiet mode loses the noise and keeps the diagnosis. */
+static int g_quiet;
+
+void psp_hle_set_quiet(int quiet) { g_quiet = quiet; }
+
+/* `handled` distinguishes "we ran a handler that returned zero" from "no
+ * handler existed". A NULL name used to stand for both, so a function
+ * registered without a known name -- psp_hle_register_unnamed, for the NIDs
+ * whose exported symbol is not known -- was reported as unimplemented. That is
+ * actively misleading during bring-up: it sends you looking for a handler that
+ * is already there. */
+static void note_zero(uint32_t nid, const char *name, int handled) {
     g_zero[g_zero_n % ZERO_HISTORY].nid = nid;
     g_zero[g_zero_n % ZERO_HISTORY].name = name;
+    g_zero[g_zero_n % ZERO_HISTORY].handled = handled;
     g_zero_n++;
 }
 
@@ -98,21 +123,21 @@ void psp_hle_dump_recent(FILE *out) {
     for (int i = 1; i <= n; i++) {
         int k = (g_zero_n - i) % ZERO_HISTORY;
         fprintf(out, "    0x%08X  %s\n", g_zero[k].nid,
-                g_zero[k].name ? g_zero[k].name : "(unimplemented)");
+                g_zero[k].name ? g_zero[k].name
+                               : (g_zero[k].handled ? "(handled, name unknown)"
+                                                    : "(unimplemented)"));
     }
 }
 
 void psp_hle_call(uint32_t nid) {
-    if (nid == 0x237DBD4Fu)
-        fprintf(stderr, "psp_hle_call ENTERED for 0x237DBD4F (%d entries registered)\n", g_count);
     for (int i = 0; i < g_count; i++) {
         if (g_entry[i].nid == nid) {
             g_fn[i]();
-            if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name);
+            if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name, 1);
             return;
         }
     }
-    note_zero(nid, NULL);
+    note_zero(nid, NULL, 0);
 
     /* Unimplemented. Naming the function is the whole point — bringing a game
      * up is largely the process of watching this message stop appearing, and
@@ -122,7 +147,8 @@ void psp_hle_call(uint32_t nid) {
      * advisory (version reporting, profiling hooks) and a game will run past
      * them happily. One that genuinely needed the result will fail visibly
      * soon after, with this line already in the log. */
-    fprintf(stderr, "psprecomp: unimplemented firmware call 0x%08X\n", nid);
+    if (!g_quiet)
+        fprintf(stderr, "psprecomp: unimplemented firmware call 0x%08X\n", nid);
     psp_ret(0);
 }
 
@@ -156,4 +182,6 @@ void psp_hle_init(void) {
     psp_io_register();
     psp_misc_init();
     psp_misc_register();
+    psp_umd_init();
+    psp_umd_register();
 }

@@ -40,6 +40,10 @@ int psp_hle_is_named(int index);
  * where possible and by number otherwise, rather than failing silently. */
 void psp_hle_call(uint32_t nid);
 
+/* Silence the per-call "unimplemented firmware call" message. Intended for
+ * batch callers making millions of calls; see the note in hle.c. */
+void psp_hle_set_quiet(int quiet);
+
 /* Look up what is registered, for reporting. Returns NULL if absent. */
 const char *psp_hle_name(uint32_t nid);
 int         psp_hle_count(void);
@@ -140,11 +144,25 @@ void psp_io_init(void);
 void psp_io_register(void);
 void psp_io_reset(void);
 void psp_io_set_root(const char *root);
+
+/* Back the raw UMD block device with a disc image.
+ *
+ * `disc0:` is the ISO9660 filesystem and maps to a directory; `umd0:` and
+ * `umd1:` are the block device underneath it, and a game opens those by bare
+ * name to read sectors -- which is how a PSP title reaches its own data when it
+ * does not want the filesystem. With no image set those opens fail, and a game
+ * that retries on failure never gets past its first read. */
+void psp_io_set_umd_image(const char *path);
 uint64_t psp_io_bytes_read(void);
 
 void psp_misc_init(void);
 void psp_misc_register(void);
 void psp_misc_reset(void);
+
+/* ---- sceUmdUser ---------------------------------------------------------- */
+void psp_umd_init(void);
+void psp_umd_register(void);
+void psp_umd_reset(void);
 int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint64_t psp_audio_blocks(void);
