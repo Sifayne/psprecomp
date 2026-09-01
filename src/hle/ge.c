@@ -54,6 +54,7 @@
 #define GE_TEXADDR0     0xA0
 #define GE_TEXBUFWIDTH0 0xA8
 #define GE_CLUTADDR     0xB0
+#define GE_CLUTADDRUPPER 0xB1
 #define GE_TEXSIZE0     0xB8
 #define GE_TEXMODE      0xC2
 #define GE_TEXFORMAT    0xC3
@@ -107,6 +108,10 @@
 #define GE_OFFSETY           0x4D
 #define GE_CULLFACEENABLE    0x1D
 #define GE_CULL              0x9B
+#define GE_ZTESTENABLE       0x23
+#define GE_ZTEST             0xDE
+#define GE_ZWRITEDISABLE     0xE7
+#define GE_CLEARMODE         0xD3
 
 /* VTYPE field extraction. */
 #define VT_TEX(v)     ((v) & 3)
@@ -153,6 +158,17 @@ static uint64_t g_skip_layout;     /* weighted, or no position -- vertex_layout 
 static uint64_t g_skip_nearplane;  /* transformed behind the eye; no clipper yet */
 static uint64_t g_culled;          /* backfacing, by the game's own winding rule */
 static uint64_t g_xformed;         /* vertices that went through the pipeline */
+/* Draws by path and by whether a texture was bound. "Most pixels are flat" has
+ * two very different readings depending on which path they came from. */
+static uint64_t g_draw_2d_tex, g_draw_2d_flat, g_draw_3d_tex, g_draw_3d_flat;
+/* The distinct vertex colours the transform path reads. "Everything is white"
+ * needs to distinguish a white model from a colour that is not being read. */
+static uint32_t g_col_seen[8]; static int g_col_n;
+static uint64_t g_clear_draws, g_clear_z_draws;
+static void note_colour(uint32_t c) {
+    for (int i = 0; i < g_col_n; i++) if (g_col_seen[i] == c) return;
+    if (g_col_n < 8) g_col_seen[g_col_n++] = c;
+}
 
 /* The transform pipeline's state.
  *
@@ -168,6 +184,7 @@ static struct {
     float off_x, off_y;
     int   vp_set;
     int   cull_enable, cull_ccw;
+    int   ztest_enable, ztest_func, zwrite_off, clear_mode, clear_z;
     /* Which matrices the stream actually uploaded, and where the result lands.
      * "Geometry is being transformed" and "transformed by the matrices the game
      * meant" are different claims, and a screen-space bounding box separates
@@ -193,7 +210,7 @@ static struct {
      * game uses rather than against the whole hardware surface. */
     uint32_t tex_addr, tex_stride, tex_w, tex_h, tex_enable;
     uint32_t tex_format, tex_func, tex_filter, tex_swizzled;
-    uint32_t clut_addr, clut_format;
+    uint32_t clut_addr, clut_format, clut_raw;
     uint32_t tex_formats_seen, tex_funcs_seen;
     uint32_t xfer_src, xfer_srcw, xfer_dst, xfer_dstw;
     uint32_t xfer_srcpos, xfer_dstpos, xfer_size, xfer_start;
@@ -242,6 +259,9 @@ void psp_ge_reset(void) {
     psp_render_reset_pixels();
     g_skip_noaddr = g_skip_layout = g_skip_nearplane = 0;
     g_culled = g_xformed = 0;
+    g_draw_2d_tex = g_draw_2d_flat = g_draw_3d_tex = g_draw_3d_flat = 0;
+    g_col_n = 0;
+    g_clear_draws = g_clear_z_draws = 0;
     memset(&g_tl, 0, sizeof g_tl);
     g_next_id = 0x00080000u;
 }
@@ -296,7 +316,16 @@ void psp_ge_dump_stats(FILE *out) {
     if (g_ge.unknown)
         fprintf(out, "    %llu commands not individually decoded\n",
                 (unsigned long long)g_ge.unknown);
-    fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
+    fprintf(out, "    pixels written: %llu (%llu textured, %llu flat)\n",
+            (unsigned long long)psp_render_pixels(),
+            (unsigned long long)psp_render_textured_pixels(),
+            (unsigned long long)psp_render_flat_pixels());
+    fprintf(out, "    depth: test %s func %d, write %s, %llu pixels rejected\n",
+            g_tl.ztest_enable ? "on" : "off", g_tl.ztest_func,
+            g_tl.zwrite_off ? "off" : "on",
+            (unsigned long long)psp_render_zfail_pixels());
+    fprintf(out, "    clear-mode draws: %llu (%llu clearing depth)\n",
+            (unsigned long long)g_clear_draws, (unsigned long long)g_clear_z_draws);
     if (g_xformed) {
         fprintf(out, "    transformed %llu vertices; viewport %s",
                 (unsigned long long)g_xformed,
@@ -306,6 +335,12 @@ void psp_ge_dump_stats(FILE *out) {
                     g_tl.vp_xs, g_tl.vp_ys, g_tl.vp_xc, g_tl.vp_yc,
                     g_tl.off_x, g_tl.off_y);
         fprintf(out, ", cull %s\n", g_tl.cull_enable ? (g_tl.cull_ccw ? "ccw" : "cw") : "off");
+        fprintf(out, "    draws: 2d %llu textured / %llu flat, 3d %llu textured / %llu flat\n",
+                (unsigned long long)g_draw_2d_tex, (unsigned long long)g_draw_2d_flat,
+                (unsigned long long)g_draw_3d_tex, (unsigned long long)g_draw_3d_flat);
+        fprintf(out, "    vertex colours seen (first %d):", g_col_n);
+        for (int i = 0; i < g_col_n; i++) fprintf(out, " %08X", g_col_seen[i]);
+        fprintf(out, "\n");
         fprintf(out, "    matrix words: world %u, view %u, proj %u\n",
                 g_tl.world_words, g_tl.view_words, g_tl.proj_words);
         if (g_tl.bb_seen)
@@ -494,10 +529,14 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
     case 2:   /* 16-bit */
         out->x = (int16_t)psp_read16(addr + (uint32_t)pos_off);
         out->y = (int16_t)psp_read16(addr + (uint32_t)pos_off + 2);
+        /* Through-mode depth is already a window value, and unsigned: the
+         * screen z range is 0..65535, not -32768..32767. */
+        out->z = (float)(uint16_t)psp_read16(addr + (uint32_t)pos_off + 4);
         return 1;
     case 3: { /* float */
         out->x = (int)psp_read_f32(addr + (uint32_t)pos_off);
         out->y = (int)psp_read_f32(addr + (uint32_t)pos_off + 4);
+        out->z = psp_read_f32(addr + (uint32_t)pos_off + 8);
         return 1;
     }
     default:
@@ -576,9 +615,9 @@ static void mul_4x4(const float m[16], const float in[3], float out[4]) {
 /* Clip space to screen. The viewport is the game's if it set one; the fallback
  * is the standard 480x272 arrangement, with y scaled negative because screen y
  * grows downward and clip y grows up. */
-static void to_screen(const float clip[4], float *sx, float *sy) {
+static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
     const float inv = 1.0f / clip[3];
-    const float nx = clip[0] * inv, ny = clip[1] * inv;
+    const float nx = clip[0] * inv, ny = clip[1] * inv, nz = clip[2] * inv;
     if (g_tl.vp_set) {
         *sx = nx * g_tl.vp_xs + g_tl.vp_xc - g_tl.off_x;
         *sy = ny * g_tl.vp_ys + g_tl.vp_yc - g_tl.off_y;
@@ -586,6 +625,11 @@ static void to_screen(const float clip[4], float *sx, float *sy) {
         *sx = nx * 240.0f + 240.0f;
         *sy = ny * -136.0f + 136.0f;
     }
+    /* The z terms are set independently of the x/y ones, so a game can leave
+     * them at zero; that would collapse every depth to one value and make the
+     * test meaningless, so fall back to the full 0..65535 window range. */
+    *sz = (g_tl.vp_zs != 0.0f) ? nz * g_tl.vp_zs + g_tl.vp_zc
+                               : (nz * 0.5f + 0.5f) * 65535.0f;
 }
 
 /* Transformed geometry, one primitive at a time.
@@ -624,14 +668,16 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             o->rgba = 0xFFFFFFFFu;
             if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7)
                 o->rgba = psp_read32(a + (uint32_t)col_off);
+            note_colour(o->rgba);
             read_uv_model(a, g_ge.vtype, tex_off, o);
 
             w[decoded] = clip[3];
-            float sx, sy;
-            if (clip[3] > 1e-6f) to_screen(clip, &sx, &sy);
-            else                 sx = sy = 0.0f;
+            float sx, sy, sz;
+            if (clip[3] > 1e-6f) to_screen(clip, &sx, &sy, &sz);
+            else                 sx = sy = sz = 0.0f;
             o->x = (int)sx;
             o->y = (int)sy;
+            o->z = sz;
             if (clip[3] > 1e-6f) {
                 if (!g_tl.bb_seen) { g_tl.bb_x0 = g_tl.bb_x1 = sx;
                                      g_tl.bb_y0 = g_tl.bb_y1 = sy; g_tl.bb_seen = 1; }
@@ -710,10 +756,21 @@ static void draw_prim(uint32_t type, uint32_t count) {
     g_ge.drawn_prims++;
 
     const int has_uv = g_ge.tex_enable && tex_off >= 0 && g_ge.tex_addr;
+    psp_render_current()->set_clut(g_ge.clut_addr, (int)(g_ge.clut_raw & 3),
+                                   (int)((g_ge.clut_raw >> 2) & 0x1F),
+                                   (int)((g_ge.clut_raw >> 8) & 0xFF),
+                                   (int)(((g_ge.clut_raw >> 16) & 0x1F) << 4));
     psp_render_current()->set_texture(
         has_uv ? g_ge.tex_addr : 0,
         g_ge.tex_stride, (int)g_ge.tex_w, (int)g_ge.tex_h,
         (int)g_ge.tex_format, (int)g_ge.tex_func, (int)g_ge.tex_swizzled);
+    if (g_tl.clear_mode) { g_clear_draws++; if (g_tl.clear_z) g_clear_z_draws++; }
+    if (VT_THROUGH(g_ge.vtype)) { if (has_uv) g_draw_2d_tex++; else g_draw_2d_flat++; }
+    else                        { if (has_uv) g_draw_3d_tex++; else g_draw_3d_flat++; }
+    psp_render_current()->set_depth(
+        g_tl.clear_mode ? 0 : g_tl.ztest_enable,
+        g_tl.clear_mode ? 1 : g_tl.ztest_func,
+        g_tl.clear_mode ? g_tl.clear_z : !g_tl.zwrite_off);
 
     /* Decode the whole batch, then hand it to the backend in one call.
      *
@@ -890,10 +947,21 @@ static void run_list(ge_queue *q) {
             g_ge.tex_swizzled = arg & 1;        /* bit 0 selects swizzled */
             break;
         case GE_CLUTFORMAT:
+            /* The low two bits are the palette format; the rest is how a texel
+             * indexes it -- shift, mask and a start offset. Keeping only the
+             * format, which is what this did, samples entry (texel & 0xFF) of
+             * whichever palette page happens to be first. */
+            g_ge.clut_raw    = arg;
             g_ge.clut_format = arg & 3;
             break;
         case GE_CLUTADDR:
             g_ge.clut_addr = (g_ge.clut_addr & 0xFF000000u) | (arg & 0xFFFFFFu);
+            break;
+        /* The palette address arrives in two halves and only the low one was
+         * being taken, so every CLUT pointed into the first 16MB regardless of
+         * where the game put it. */
+        case GE_CLUTADDRUPPER:
+            g_ge.clut_addr = (g_ge.clut_addr & 0x00FFFFFFu) | ((arg & 0xFFu) << 24);
             break;
         case GE_TEXFUNC:
             g_ge.tex_func = arg & 7;
@@ -907,6 +975,16 @@ static void run_list(ge_queue *q) {
             break;
 
         case GE_TEXTUREMAPENABLE: g_ge.tex_enable = arg & 1; break;
+
+        case GE_ZTESTENABLE:   g_tl.ztest_enable = (int)(arg & 1); break;
+        case GE_ZTEST:         g_tl.ztest_func   = (int)(arg & 7); break;
+        case GE_ZWRITEDISABLE: g_tl.zwrite_off   = (int)(arg & 1); break;
+        /* Clear mode turns the draw into a blit of the clear values: the depth
+         * test is bypassed and depth is written only when the Z bit is set. */
+        case GE_CLEARMODE:
+            g_tl.clear_mode = (int)(arg & 1);
+            g_tl.clear_z    = (int)((arg >> 10) & 1);
+            break;
 
         case GE_TRANSFERSRC:    g_ge.xfer_src    = arg; break;
         case GE_TRANSFERSRCW:   g_ge.xfer_srcw   = arg; break;

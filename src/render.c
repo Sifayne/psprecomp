@@ -19,8 +19,16 @@
 static uint32_t g_fb_addr, g_fb_stride;
 static uint64_t g_pixels;
 
+/* Textured versus flat, because "the geometry is white" has two causes with
+ * nothing in common: a texture that never binds, and vertices that really are
+ * white. One counter each is the difference between measuring and guessing. */
+static uint64_t g_px_tex, g_px_flat, g_px_zfail;
+uint64_t psp_render_textured_pixels(void) { return g_px_tex; }
+uint64_t psp_render_flat_pixels(void) { return g_px_flat; }
+uint64_t psp_render_zfail_pixels(void) { return g_px_zfail; }
+
 uint64_t psp_render_pixels(void) { return g_pixels; }
-void     psp_render_reset_pixels(void) { g_pixels = 0; }
+void     psp_render_reset_pixels(void) { g_pixels = g_px_tex = g_px_flat = g_px_zfail = 0; }
 
 /* ---- software backend ---------------------------------------------------- */
 
@@ -56,27 +64,109 @@ static void sw_texture(uint32_t addr, uint32_t stride, int w, int h,
     g_tex.fmt = fmt; g_tex.func = func; g_tex.swizzled = swizzled;
 }
 
-#define GE_TFMT_5650 0
+enum {
+    GE_TFMT_5650 = 0, GE_TFMT_5551 = 1, GE_TFMT_4444 = 2, GE_TFMT_8888 = 3,
+    GE_TFMT_CLUT4 = 4, GE_TFMT_CLUT8 = 5
+};
 
-static int texture_usable(void) {
-    return g_tex.addr && g_tex.w > 0 && g_tex.h > 0 &&
-           g_tex.fmt == GE_TFMT_5650 && !g_tex.swizzled;
+static struct {
+    uint32_t addr;
+    int      fmt, shift, mask, start;
+} g_clut;
+
+static void sw_clut(uint32_t addr, int format, int shift, int mask, int start) {
+    g_clut.addr = addr; g_clut.fmt = format;
+    g_clut.shift = shift; g_clut.mask = mask; g_clut.start = start;
 }
 
-/* One texel, expanded to eight bits a channel. 5650 packs red in the low bits;
- * green is six wide, which is why it shifts by two where the others shift by
- * three. Replicating the high bits down keeps white at 0xFF, not 0xF8. */
-static uint32_t sample_5650(int u, int v) {
+/* Bytes per texel, doubled, so the 4-bit format can be expressed as 1. */
+static int tex_halfbytes(int fmt) {
+    switch (fmt) {
+    case GE_TFMT_CLUT4:                     return 1;
+    case GE_TFMT_CLUT8:                     return 2;
+    case GE_TFMT_5650: case GE_TFMT_5551:
+    case GE_TFMT_4444:                      return 4;
+    case GE_TFMT_8888:                      return 8;
+    default:                                return 0;
+    }
+}
+
+static int texture_usable(void) {
+    if (!g_tex.addr || g_tex.w <= 0 || g_tex.h <= 0) return 0;
+    if (!tex_halfbytes(g_tex.fmt)) return 0;
+    if ((g_tex.fmt == GE_TFMT_CLUT4 || g_tex.fmt == GE_TFMT_CLUT8) && !g_clut.addr)
+        return 0;
+    return 1;
+}
+
+/* Swizzled textures are stored as blocks 16 bytes wide and 8 rows tall. The
+ * swizzle is on *bytes*, not texels, so one mapping serves every format --
+ * which is why this takes a byte offset rather than a texel coordinate. */
+static uint32_t swizzled_byte(uint32_t byte_x, uint32_t y, uint32_t row_bytes) {
+    if (!g_tex.swizzled || row_bytes < 16) return y * row_bytes + byte_x;
+    const uint32_t rowblocks = row_bytes / 16;
+    const uint32_t block = ((y / 8) * rowblocks + (byte_x / 16)) * (16 * 8);
+    return block + (y % 8) * 16 + (byte_x % 16);
+}
+
+/* 16-bit palette and texel formats, expanded to eight bits a channel with the
+ * high bits replicated down so full-scale stays 0xFF rather than 0xF8. */
+static uint32_t expand16(uint32_t p, int fmt) {
+    uint32_t r, g, b, a;
+    switch (fmt) {
+    case GE_TFMT_5650:
+        r = p & 0x1F;         r = (r << 3) | (r >> 2);
+        g = (p >> 5)  & 0x3F; g = (g << 2) | (g >> 4);
+        b = (p >> 11) & 0x1F; b = (b << 3) | (b >> 2);
+        a = 0xFF; break;
+    case GE_TFMT_5551:
+        r = p & 0x1F;         r = (r << 3) | (r >> 2);
+        g = (p >> 5)  & 0x1F; g = (g << 3) | (g >> 2);
+        b = (p >> 10) & 0x1F; b = (b << 3) | (b >> 2);
+        a = (p >> 15) ? 0xFF : 0x00; break;
+    default: /* 4444 */
+        r = p & 0xF;          r = (r << 4) | r;
+        g = (p >> 4)  & 0xF;  g = (g << 4) | g;
+        b = (p >> 8)  & 0xF;  b = (b << 4) | b;
+        a = (p >> 12) & 0xF;  a = (a << 4) | a; break;
+    }
+    return (a << 24) | (b << 16) | (g << 8) | r;
+}
+
+static uint32_t clut_entry(uint32_t raw) {
+    const uint32_t idx =
+        (uint32_t)((((int)raw >> g_clut.shift) & g_clut.mask) | g_clut.start);
+    if (g_clut.fmt == 3) return psp_read32(g_clut.addr + idx * 4u);
+    return expand16((uint32_t)psp_read16(g_clut.addr + idx * 2u),
+                    g_clut.fmt == 0 ? GE_TFMT_5650 :
+                    g_clut.fmt == 1 ? GE_TFMT_5551 : GE_TFMT_4444);
+}
+
+/* One texel, clamped. Stride is in texels, as the GE reports it, so the byte
+ * pitch a swizzle block is measured against has to be derived per format. */
+static uint32_t sample_texel(int u, int v) {
     if (u < 0) u = 0; else if (u >= g_tex.w) u = g_tex.w - 1;
     if (v < 0) v = 0; else if (v >= g_tex.h) v = g_tex.h - 1;
 
-    const uint32_t at = g_tex.addr + (uint32_t)(v * (int)g_tex.stride + u) * 2u;
-    const uint16_t p  = (uint16_t)psp_read16(at);
+    const int hb = tex_halfbytes(g_tex.fmt);
+    const uint32_t row_bytes = ((uint32_t)g_tex.stride * (uint32_t)hb) / 2u;
 
-    uint32_t r = (uint32_t)( p        & 0x1F); r = (r << 3) | (r >> 2);
-    uint32_t g = (uint32_t)((p >>  5) & 0x3F); g = (g << 2) | (g >> 4);
-    uint32_t b = (uint32_t)((p >> 11) & 0x1F); b = (b << 3) | (b >> 2);
-    return 0xFF000000u | (b << 16) | (g << 8) | r;
+    if (g_tex.fmt == GE_TFMT_CLUT4) {
+        const uint32_t bx = (uint32_t)u / 2u;
+        const uint32_t off = swizzled_byte(bx, (uint32_t)v, row_bytes);
+        const uint32_t byte = psp_read8(g_tex.addr + off);
+        return clut_entry((u & 1) ? (byte >> 4) : (byte & 0xF));
+    }
+    if (g_tex.fmt == GE_TFMT_CLUT8) {
+        const uint32_t off = swizzled_byte((uint32_t)u, (uint32_t)v, row_bytes);
+        return clut_entry(psp_read8(g_tex.addr + off));
+    }
+    if (g_tex.fmt == GE_TFMT_8888) {
+        const uint32_t off = swizzled_byte((uint32_t)u * 4u, (uint32_t)v, row_bytes);
+        return psp_read32(g_tex.addr + off);
+    }
+    const uint32_t off = swizzled_byte((uint32_t)u * 2u, (uint32_t)v, row_bytes);
+    return expand16((uint32_t)psp_read16(g_tex.addr + off), g_tex.fmt);
 }
 
 /* Modulate: texel times vertex colour, per channel. */
@@ -97,6 +187,51 @@ static void put_pixel(int x, int y, uint32_t rgba) {
     g_pixels++;
 }
 
+/* The depth buffer.
+ *
+ * Kept host-side rather than in guest VRAM at ZBP. The game only ever writes
+ * it through the GE, so nothing reads back a value we did not put there, and
+ * an array of floats avoids the 16-bit quantisation that would otherwise make
+ * coplanar surfaces fight. Cleared once a frame at present(): full clear-mode
+ * emulation is a separate piece of work, and a game that does not clear every
+ * frame would accumulate depth until nothing drew at all -- which fails in a
+ * way that looks like a broken test rather than a missing clear. */
+#define DEPTH_FAR 1.0e30f
+static float g_depth[480 * 272];
+static struct { int test, func, write; } g_zs = { 0, 1 /* always */, 0 };
+
+static void sw_depth(int test_enable, int func, int write_enable) {
+    g_zs.test = test_enable; g_zs.func = func; g_zs.write = write_enable;
+}
+
+static void depth_clear(void) {
+    for (int i = 0; i < 480 * 272; i++) g_depth[i] = DEPTH_FAR;
+}
+
+/* GE comparison codes: 0 never, 1 always, 2 equal, 3 notequal, 4 less,
+ * 5 lequal, 6 greater, 7 gequal. */
+static int depth_pass(int x, int y, float z) {
+    if (!g_zs.test) return 1;
+    const float d = g_depth[y * 480 + x];
+    switch (g_zs.func) {
+    case 0: return 0;
+    case 2: return z == d;
+    case 3: return z != d;
+    case 4: return z <  d;
+    case 5: return z <= d;
+    case 6: return z >  d;
+    case 7: return z >= d;
+    default: return 1;
+    }
+}
+
+static void shade_pixel(int x, int y, float z, uint32_t rgba) {
+    if (x < 0 || y < 0 || x >= 480 || y >= 272) return;
+    if (!depth_pass(x, y, z)) { g_px_zfail++; return; }
+    if (g_zs.write) g_depth[y * 480 + x] = z;
+    put_pixel(x, y, rgba);
+}
+
 /* Barycentric fill with integer edge functions, so a shared edge belongs to
  * exactly one triangle: adjacent geometry neither double-draws nor leaves
  * seams. Both windings are accepted — back-face culling is not implemented, and
@@ -115,13 +250,49 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     const int area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
     if (area == 0) return;
 
+    /* The edge functions are already the barycentric numerators, so colour,
+     * depth and texture coordinates come out of the same three values the
+     * coverage test computes. Filling with a->rgba instead -- which is what
+     * this did -- paints every triangle one flat colour and ignores the
+     * texture entirely, which reads as "the geometry is not arriving" when the
+     * geometry is arriving and being shaded wrong.
+     *
+     * Interpolation is affine, not perspective-correct: there is no w here to
+     * divide by. On a fullscreen quad that is exact, and on a steeply oblique
+     * one it skews the texture. */
+    const float inv = 1.0f / (float)area;
+    const int textured = texture_usable();
+
     for (int y = miny; y <= maxy; y++) {
         for (int x = minx; x <= maxx; x++) {
-            int w0 = (b->x - a->x) * (y - a->y) - (b->y - a->y) * (x - a->x);
-            int w1 = (c->x - b->x) * (y - b->y) - (c->y - b->y) * (x - b->x);
-            int w2 = (a->x - c->x) * (y - c->y) - (a->y - c->y) * (x - c->x);
-            if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0))
-                put_pixel(x, y, a->rgba);
+            const int w0 = (c->x - b->x) * (y - b->y) - (c->y - b->y) * (x - b->x);
+            const int w1 = (a->x - c->x) * (y - c->y) - (a->y - c->y) * (x - c->x);
+            const int w2 = (b->x - a->x) * (y - a->y) - (b->y - a->y) * (x - a->x);
+            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                continue;
+
+            const float l0 = (float)w0 * inv;
+            const float l1 = (float)w1 * inv;
+            const float l2 = (float)w2 * inv;
+
+            const float z = l0 * a->z + l1 * b->z + l2 * c->z;
+
+            uint32_t col = 0;
+            for (int i = 0; i < 4; i++) {
+                float ch = l0 * (float)((a->rgba >> (i * 8)) & 0xFF)
+                         + l1 * (float)((b->rgba >> (i * 8)) & 0xFF)
+                         + l2 * (float)((c->rgba >> (i * 8)) & 0xFF);
+                if (ch < 0.0f) ch = 0.0f; else if (ch > 255.0f) ch = 255.0f;
+                col |= (uint32_t)(ch + 0.5f) << (i * 8);
+            }
+
+            if (textured) {
+                const float u = l0 * a->u + l1 * b->u + l2 * c->u;
+                const float v = l0 * a->v + l1 * b->v + l2 * c->v;
+                col = modulate(sample_texel((int)u, (int)v), col);
+                g_px_tex++;
+            } else g_px_flat++;
+            shade_pixel(x, y, z, col);
         }
     }
 }
@@ -145,9 +316,11 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
     for (int y = y0; y < y1; y++) {
         const float tv = a->v + dv * (float)(y - y0);
         for (int x = x0; x < x1; x++) {
-            if (!textured) { put_pixel(x, y, b->rgba); continue; }
+            if (!textured) { g_px_flat++; shade_pixel(x, y, a->z, b->rgba); continue; }
             const float tu = a->u + du * (float)(x - x0);
-            put_pixel(x, y, modulate(sample_5650((int)tu, (int)tv), b->rgba));
+            g_px_tex++;
+            shade_pixel(x, y, a->z,
+                        modulate(sample_texel((int)tu, (int)tv), b->rgba));
         }
     }
 }
@@ -170,8 +343,22 @@ static void sw_draw(int prim, const psp_vertex *v, int count) {
 
 static void sw_noop(void) { }
 
+/* Depth is cleared here rather than on a clear-mode draw: one clear a frame is
+ * what a game does anyway, and it fails safe. Accumulating depth across frames
+ * would progressively reject everything, which looks like a broken test. */
+static void sw_present(void) { depth_clear(); }
+
 const psp_render_backend psp_render_software = {
-    "software", sw_init, sw_shutdown, sw_target, sw_texture, sw_draw, sw_noop, sw_noop
+    .name        = "software",
+    .init        = sw_init,
+    .shutdown    = sw_shutdown,
+    .set_target  = sw_target,
+    .set_texture = sw_texture,
+    .set_clut    = sw_clut,
+    .set_depth   = sw_depth,
+    .draw        = sw_draw,
+    .finish      = sw_noop,
+    .present     = sw_present,
 };
 
 /* ---- null backend -------------------------------------------------------- */
@@ -185,11 +372,24 @@ static void null_target(uint32_t a, uint32_t s, int f) { (void)a; (void)s; (void
 static void null_texture(uint32_t a, uint32_t s, int w, int h, int f, int fn, int z) {
     (void)a; (void)s; (void)w; (void)h; (void)f; (void)fn; (void)z;
 }
+static void null_clut(uint32_t a, int f, int s, int m, int st) {
+    (void)a; (void)f; (void)s; (void)m; (void)st;
+}
+static void null_depth(int t, int f, int w) { (void)t; (void)f; (void)w; }
 static void null_draw(int p, const psp_vertex *v, int n) { (void)p; (void)v; (void)n; }
 static void null_noop(void) { }
 
 const psp_render_backend psp_render_null = {
-    "null", null_init, null_noop, null_target, null_texture, null_draw, null_noop, null_noop
+    .name        = "null",
+    .init        = null_init,
+    .shutdown    = null_noop,
+    .set_target  = null_target,
+    .set_texture = null_texture,
+    .set_clut    = null_clut,
+    .set_depth   = null_depth,
+    .draw        = null_draw,
+    .finish      = null_noop,
+    .present     = null_noop,
 };
 
 /* ---- selection ----------------------------------------------------------- */
