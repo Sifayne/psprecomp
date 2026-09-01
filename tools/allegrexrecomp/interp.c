@@ -14,6 +14,7 @@
  */
 
 #include "interp.h"
+#include "psprecomp/os.h"
 
 #include "decode.h"
 
@@ -579,8 +580,8 @@ unsigned long long psp_interp_nest_failed(void) { return g_nest_failed; }
  * reason worth stating rather than assuming: the handoff token means exactly one
  * thread ever executes guest code at a time, and every handoff passes through
  * the scheduler's mutex, which orders the increments. */
-static _Thread_local psp_interp *g_active;   /* the run executing on this thread */
-static _Thread_local int         g_nest;
+static PSP_THREAD_LOCAL psp_interp *g_active;   /* the run executing on this thread */
+static PSP_THREAD_LOCAL int         g_nest;
 static uint64_t    g_nest_refused;
 
 /* Whether guest threads get host threads of their own. Off is the model

@@ -1,9 +1,7 @@
 /* psprecomp — the guest clock. See include/psprecomp/clock.h. */
 
 #include "psprecomp/clock.h"
-
-#include <errno.h>
-#include <time.h>
+#include "psprecomp/os.h"
 
 /* 59.94Hz, the PSP's refresh rate, rounded to whole microseconds. */
 #define PSP_FRAME_US 16667u
@@ -79,11 +77,7 @@ static uint64_t g_us;
 static int      g_realtime;
 static uint64_t g_origin_ns;
 
-static uint64_t wall_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
-}
+static uint64_t wall_ns(void) { return psp_os_mono_ns(); }
 
 /* Sleep until wall moment `origin + us`. Returns immediately when the run is
  * already there or past it. The 2us slack keeps a sync that lands on the
@@ -91,11 +85,7 @@ static uint64_t wall_ns(void) {
 static void wall_sync(uint64_t us) {
     const uint64_t target = g_origin_ns + us * 1000u;
     if (wall_ns() + 2000u >= target) return;
-    const struct timespec t = {
-        .tv_sec  = (time_t)(target / 1000000000u),
-        .tv_nsec = (long)(target % 1000000000u),
-    };
-    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL) == EINTR) {}
+    psp_os_sleep_until_ns(target);
 }
 
 void psp_clock_realtime(int enable) {

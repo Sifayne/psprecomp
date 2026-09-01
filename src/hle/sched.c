@@ -5,11 +5,10 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/clock.h"
 
-#include <errno.h>
-#include <pthread.h>
+#include "psprecomp/os.h"
+
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 
 #define MAX_SCHED_THREADS 130      /* the kernel's 128, plus the main context */
 #define MAIN_SLOT         0        /* the context module_start runs on */
@@ -50,13 +49,13 @@ typedef struct {
      * given the token back. */
     int             preempted;
     psp_cpu_state   ctx;           /* valid whenever this slot is not running */
-    pthread_t       host;
+    psp_os_thread   host;
     int             started;
 } sched_slot;
 
 static sched_slot      g_slot[MAX_SCHED_THREADS];
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_turn = PTHREAD_COND_INITIALIZER;
+static psp_os_mutex g_lock = PSP_OS_MUTEX_INIT;
+static psp_os_cond  g_turn = PSP_OS_COND_INIT;
 static int             g_running = MAIN_SLOT;
 static void          (*g_end_hook)(uint32_t uid, uint32_t status);
 static void          (*g_thread_hook)(void);
@@ -76,7 +75,7 @@ static int           (*g_spawn_hook)(uint32_t uid, uint32_t entry, uint32_t sp,
  * than its own, and the main context sat marked RUNNING with no token.
  *
  * MAIN_SLOT is 0, so the main context needs no initialisation. */
-static _Thread_local int g_self = MAIN_SLOT;
+static PSP_THREAD_LOCAL int g_self = MAIN_SLOT;
 
 /* ---- slots ---------------------------------------------------------------- */
 
@@ -108,7 +107,14 @@ static int self_slot(uint32_t uid) {
     return s >= 0 ? s : g_self;
 }
 
-void psp_sched_init(void) { psp_sched_reset(); }
+void psp_sched_init(void) {
+    /* The drain's timed wait is armed against psp_os_mono_ns, so the condition
+     * variable has to be measuring the same clock. Here rather than in
+     * psp_sched_reset: it re-initialises the variable, which is only safe
+     * before anything can be waiting on it. */
+    psp_os_cond_use_monotonic(&g_turn);
+    psp_sched_reset();
+}
 
 void psp_sched_set_threading(int on) { g_threading = on; }
 
@@ -123,7 +129,7 @@ void psp_sched_set_spawn_hook(int (*fn)(uint32_t uid, uint32_t entry, uint32_t s
 }
 
 void psp_sched_reset(void) {
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     /* Threads from a previous run are not joined: they are parked inside guest
      * code that will never be resumed, and there is nowhere for them to return
      * to. Reset is a bring-up convenience between runs in one process, not a
@@ -140,7 +146,7 @@ void psp_sched_reset(void) {
      * yield on every single firmware call. */
     g_slot[MAIN_SLOT].slice_end = psp_clock_peek() + PSP_SCHED_SLICE_US;
     g_running    = MAIN_SLOT;
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
 }
 
 /* ---- handing the token over ------------------------------------------------
@@ -240,7 +246,7 @@ static int handoff_locked(void) {
          * a guest thread that wakes here finds g_running still not its own and
          * goes back to waiting, which is the point. */
         g_running = -1;
-        pthread_cond_broadcast(&g_turn);
+        psp_os_cond_broadcast(&g_turn);
         return -1;
     }
 
@@ -251,7 +257,7 @@ static int handoff_locked(void) {
      * the queue, which is exactly what a timeslice is for. */
     g_slot[best].slice_end = psp_clock_peek() + PSP_SCHED_SLICE_US;
     g_running = best;
-    pthread_cond_broadcast(&g_turn);
+    psp_os_cond_broadcast(&g_turn);
     return best;
 }
 
@@ -269,7 +275,7 @@ static int handoff_locked(void) {
 static int await_turn_locked(int me) {
     while (g_running != me) {
         if (g_slot[me].state == PSP_SCHED_DEAD) return -1;
-        pthread_cond_wait(&g_turn, &g_lock);
+        psp_os_cond_wait(&g_turn, &g_lock);
     }
     g_slot[me].preempted = 0;      /* running again: no longer displaced */
     psp_cpu = g_slot[me].ctx;
@@ -289,7 +295,7 @@ static int await_turn_locked(int me) {
  * it instead. */
 static int switch_away(int me, psp_sched_state why, const char *what,
                        uint64_t deadline_us) {
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     g_slot[me].ctx        = psp_cpu;
     /* With a deadline the wait *is* a sleep as far as the handoff is concerned:
      * SLEEPING plus wake_at is the state it already knows how to expire, and
@@ -313,20 +319,20 @@ static int switch_away(int me, psp_sched_state why, const char *what,
         g_slot[me].waiting_on = NULL;
         g_slot[me].wake_at    = 0;
         g_running             = me;
-        pthread_mutex_unlock(&g_lock);
+        psp_os_unlock(&g_lock);
         return PSP_SCHED_STRANDED;
     }
 
     if (await_turn_locked(me) != 0) {          /* killed by psp_sched_stop_all */
         g_slot[me].waiting_on = NULL;
-        pthread_mutex_unlock(&g_lock);
-        if (me != MAIN_SLOT) pthread_exit(NULL);
+        psp_os_unlock(&g_lock);
+        if (me != MAIN_SLOT) psp_os_thread_exit();
         return PSP_SCHED_STRANDED;
     }
     const int woken = g_slot[me].woken;
     g_slot[me].waiting_on = NULL;
     g_slot[me].wake_at    = 0;
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     /* Running again, and only the flag says why. A signal that arrived after
      * the deadline still counts as a signal: it was delivered. */
     if (woken || !deadline_us) return PSP_SCHED_WOKEN;
@@ -335,7 +341,7 @@ static int switch_away(int me, psp_sched_state why, const char *what,
 
 /* ---- guest thread bodies --------------------------------------------------- */
 
-static void *thread_main(void *arg) {
+static void thread_main(void *arg) {
     sched_slot *t = (sched_slot *)arg;
     const int me = (int)(t - g_slot);
 
@@ -346,9 +352,9 @@ static void *thread_main(void *arg) {
 
     if (g_thread_hook) g_thread_hook();
 
-    pthread_mutex_lock(&g_lock);
-    if (await_turn_locked(me) != 0) { pthread_mutex_unlock(&g_lock); return NULL; }
-    pthread_mutex_unlock(&g_lock);
+    psp_os_lock(&g_lock);
+    if (await_turn_locked(me) != 0) { psp_os_unlock(&g_lock); return; }
+    psp_os_unlock(&g_lock);
 
     /* The register file the thread starts with. $ra is zero: returning from the
      * entry point is how a PSP thread ends when it does not call
@@ -375,14 +381,13 @@ static void *thread_main(void *arg) {
      * still holds the token, so nothing else can be running. */
     if (g_end_hook) g_end_hook(t->uid, psp_cpu.r[PSP_REG_V0]);
 
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     t->state = PSP_SCHED_DEAD;
     /* A failed handoff here means this was the last thread that could run. The
      * token is left with nobody and the main context's drain reports it; there
      * is nothing for a dead thread to do about it. */
     (void)handoff_locked();
-    pthread_mutex_unlock(&g_lock);
-    return NULL;
+    psp_os_unlock(&g_lock);
 }
 
 int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
@@ -398,24 +403,24 @@ int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
     if (!g_threading) { (void)uid; (void)entry; (void)sp;
                         (void)a0; (void)a1; (void)priority; return 0; }
 
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
 
     /* A dead slot is *not* reused, and that is deliberate.
      *
      * Reusing one looks obviously right -- the table is otherwise a high-water
      * mark rather than a census -- and it is unsafe without joining the host
-     * thread first. The dead thread's pthread may still be parked in
+     * thread first. The dead thread's host thread may still be parked in
      * await_turn_locked, which refuses to proceed only while the slot reads
      * DEAD; hand that slot to a new thread and the old one's wait *succeeds*,
      * so two host threads run guest code at once against the single global
      * psp_cpu. Measured: threads/create went to 131,929,071 bad memory
      * accesses the moment reuse was allowed.
      *
-     * Making it safe needs the slot to carry its pthread to a join, which is a
+     * Making it safe needs the slot to carry its host thread to a join, which is a
      * larger change than the leak justifies today. */
     int idx = -1;
     for (int i = 1; i < MAX_SCHED_THREADS; i++) if (!g_slot[i].used) { idx = i; break; }
-    if (idx < 0) { pthread_mutex_unlock(&g_lock); return -1; }
+    if (idx < 0) { psp_os_unlock(&g_lock); return -1; }
 
     sched_slot *t = &g_slot[idx];
     memset(t, 0, sizeof *t);
@@ -439,17 +444,11 @@ int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
      * It is headroom, not a fix. A guest loop emitted as recursion exhausts any
      * stack; raising this to 64MB did not save MovieReadThread, which is how
      * that was ruled out as the cause. */
-    pthread_attr_t attr;
-    pthread_attr_t *attrp = NULL;
-    if (pthread_attr_init(&attr) == 0) {
-        pthread_attr_setstacksize(&attr, PSP_HOST_STACK_SIZE);
-        attrp = &attr;
-    }
-    const int rc = pthread_create(&t->host, attrp, thread_main, t);
-    if (attrp) pthread_attr_destroy(attrp);
+    const int rc = psp_os_thread_start(&t->host, thread_main, t,
+                                       PSP_HOST_STACK_SIZE);
     if (rc != 0) {
         t->used = 0;
-        pthread_mutex_unlock(&g_lock);
+        psp_os_unlock(&g_lock);
         return -1;
     }
     t->started = 1;
@@ -468,7 +467,7 @@ int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
      * Strictly more urgent, not equal: threads of equal priority run in the
      * order they became ready, so a starter is not displaced by its own equal. */
     const int preempts = g_running >= 0 && priority < g_slot[g_running].priority;
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     if (preempts) psp_sched_preempt();
     return 0;
 }
@@ -520,9 +519,9 @@ static void yield_as(int displaced) {
     if (!g_dispatch) return;
     /* A yield differs from a block only in that the caller stays runnable --
      * so a lone thread that yields simply gets the token straight back. */
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int me = g_running;
-    if (me < 0) { pthread_mutex_unlock(&g_lock); return; }
+    if (me < 0) { psp_os_unlock(&g_lock); return; }
     g_slot[me].ctx       = psp_cpu;
     g_slot[me].state     = PSP_SCHED_READY;
     g_slot[me].preempted = displaced;
@@ -534,16 +533,16 @@ static void yield_as(int displaced) {
     if (handoff_locked() < 0) {
         g_slot[me].state = PSP_SCHED_RUNNING;
         g_running        = me;
-        pthread_mutex_unlock(&g_lock);
+        psp_os_unlock(&g_lock);
         return;
     }
 
     if (await_turn_locked(me) != 0) {          /* killed by psp_sched_stop_all */
-        pthread_mutex_unlock(&g_lock);
-        if (me != MAIN_SLOT) pthread_exit(NULL);
+        psp_os_unlock(&g_lock);
+        if (me != MAIN_SLOT) psp_os_thread_exit();
         return;
     }
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
 }
 
 /* Give up the CPU for one scheduling round, to a thread of *any* priority.
@@ -562,7 +561,7 @@ static void yield_as(int displaced) {
  * That is the half of the semantics that matters. */
 void psp_sched_delay(uint64_t usec) {
     if (!g_threading) return;
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int me = g_self;
 
     g_slot[me].ctx     = psp_cpu;
@@ -576,16 +575,16 @@ void psp_sched_delay(uint64_t usec) {
         g_slot[me].state   = PSP_SCHED_RUNNING;
         g_slot[me].wake_at = 0;
         g_running          = me;
-        pthread_mutex_unlock(&g_lock);
+        psp_os_unlock(&g_lock);
         return;
     }
 
     if (await_turn_locked(me) != 0) {
-        pthread_mutex_unlock(&g_lock);
-        if (me != MAIN_SLOT) pthread_exit(NULL);
+        psp_os_unlock(&g_lock);
+        if (me != MAIN_SLOT) psp_os_thread_exit();
         return;
     }
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
 }
 
 /* The timeslice, in guest microseconds and charged per thread.
@@ -625,7 +624,7 @@ void psp_sched_delay(uint64_t usec) {
 void psp_sched_tick(void) {
     if (!g_threading || !g_dispatch) return;
 
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int me = g_running;
     int other = 0;
     if (me >= 0 && psp_clock_peek() >= g_slot[me].slice_end) {
@@ -634,7 +633,7 @@ void psp_sched_tick(void) {
             if (i != me && g_slot[i].used && g_slot[i].state == PSP_SCHED_READY)
                 { other = 1; break; }
     }
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
 
     if (other) psp_sched_yield();
 }
@@ -646,15 +645,15 @@ int psp_sched_wake(uint32_t uid) { return wake_slot(uid, 0); }
 int psp_sched_wake_as(uint32_t uid, int reason) { return wake_slot(uid, reason); }
 
 int psp_sched_wake_reason(void) {
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int r = g_slot[g_self].wake_reason;
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     return r;
 }
 
 static int wake_slot(uint32_t uid, int reason) {
     if (!g_threading) return 0;
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     int urgent = 0;
     const int s = slot_of(uid);
     if (s >= 0 && (g_slot[s].state == PSP_SCHED_BLOCKED ||
@@ -674,7 +673,7 @@ static int wake_slot(uint32_t uid, int reason) {
          * instead, and switches when it is finished. */
         urgent = g_running >= 0 && g_slot[s].priority < g_slot[g_running].priority;
     }
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     return urgent;
 }
 
@@ -685,13 +684,13 @@ void psp_sched_set_end_hook(void (*fn)(uint32_t uid, uint32_t status)) { g_end_h
 void psp_sched_exit(uint32_t uid) {
     if (!g_threading) return;         /* returns to the caller, as it used to */
     const int me = self_slot(uid);
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     g_slot[me].state = PSP_SCHED_DEAD;
     /* As in thread_main: a failed handoff leaves the token with nobody, which
      * is the drain's to report. This thread is leaving either way. */
     (void)handoff_locked();
-    pthread_mutex_unlock(&g_lock);
-    if (me != MAIN_SLOT) pthread_exit(NULL);
+    psp_os_unlock(&g_lock);
+    if (me != MAIN_SLOT) psp_os_thread_exit();
 }
 
 /* Called with the lock held. Like await_turn_locked, but gives up at `deadline`.
@@ -703,10 +702,10 @@ void psp_sched_exit(uint32_t uid) {
  * unwinding a host thread from outside means longjmp-ing across threads, which
  * is undefined. So the main context stops waiting for it instead, reports it,
  * and the process ends with the thread still running. */
-static int await_turn_deadline_locked(int me, const struct timespec *deadline) {
+static int await_turn_deadline_locked(int me, uint64_t deadline_ns) {
     while (g_running != me) {
         if (g_running < 0) return -2;
-        if (pthread_cond_timedwait(&g_turn, &g_lock, deadline) == ETIMEDOUT &&
+        if (psp_os_cond_wait_until(&g_turn, &g_lock, deadline_ns) &&
             g_running != me)
             return g_running < 0 ? -2 : -1;
     }
@@ -723,17 +722,17 @@ static int live_locked(void) {
 
 void psp_sched_stop_all(const char *why) {
     /* Recorded before anything is killed: the caller is a guest thread that
-     * will not exist past the pthread_exit below. */
+     * will not exist past the thread exit below. */
     g_stop_reason = why;
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int me = g_running;
     for (int i = 1; i < MAX_SCHED_THREADS; i++)
         if (g_slot[i].used) g_slot[i].state = PSP_SCHED_DEAD;
     g_slot[MAIN_SLOT].state = PSP_SCHED_RUNNING;
     g_running    = MAIN_SLOT;
-    pthread_cond_broadcast(&g_turn);
-    pthread_mutex_unlock(&g_lock);
-    if (me != MAIN_SLOT) pthread_exit(NULL);
+    psp_os_cond_broadcast(&g_turn);
+    psp_os_unlock(&g_lock);
+    if (me != MAIN_SLOT) psp_os_thread_exit();
 }
 
 const char *psp_sched_stop_reason(void) {
@@ -743,20 +742,19 @@ const char *psp_sched_stop_reason(void) {
 int psp_sched_drain(int timeout_s) {
     if (!g_threading) return 0;
 
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += timeout_s;
+    const uint64_t deadline_ns =
+        psp_os_mono_ns() + (uint64_t)timeout_s * 1000000000ull;
 
     /* The main context steps aside so the guest threads can run. It becomes
      * runnable again only when they are all finished -- or when none of them
      * can proceed, which handoff_locked reports as a deadlock. */
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     int timed_out = 0, stalled = 0;
     while (live_locked()) {
         g_slot[MAIN_SLOT].ctx   = psp_cpu;
         g_slot[MAIN_SLOT].state = PSP_SCHED_BLOCKED;
         if (handoff_locked() < 0) { stalled = 1; break; }
-        const int rc = await_turn_deadline_locked(MAIN_SLOT, &deadline);
+        const int rc = await_turn_deadline_locked(MAIN_SLOT, deadline_ns);
         if (rc == -2) { stalled = 1; break; }
         if (rc != 0)  { timed_out = 1; break; }
     }
@@ -797,7 +795,7 @@ int psp_sched_drain(int timeout_s) {
 
     g_slot[MAIN_SLOT].state = PSP_SCHED_RUNNING;
     g_running = MAIN_SLOT;
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     return live;
 }
 
@@ -806,7 +804,7 @@ int psp_sched_drain(int timeout_s) {
  * printing it there is the difference between "deadlock" and knowing which
  * semaphore nobody is going to signal. */
 void psp_sched_dump_threads(FILE *out) {
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     for (int i = 0; i < MAX_SCHED_THREADS; i++) {
         if (!g_slot[i].used || g_slot[i].state == PSP_SCHED_DEAD) continue;
         static const char *const ST[] = {
@@ -817,22 +815,22 @@ void psp_sched_dump_threads(FILE *out) {
                 g_slot[i].waiting_on ? " on " : "",
                 g_slot[i].waiting_on ? g_slot[i].waiting_on : "");
     }
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
 }
 
 int psp_sched_live(void) {
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int live = live_locked();
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     return live;
 }
 
 int psp_sched_terminate(uint32_t uid) {
     if (!g_threading) return 0;
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int s = slot_of(uid);
     if (s < 0 || g_slot[s].state == PSP_SCHED_DEAD) {
-        pthread_mutex_unlock(&g_lock);
+        psp_os_unlock(&g_lock);
         return 0;
     }
     const int self = (s == g_self);
@@ -841,19 +839,19 @@ int psp_sched_terminate(uint32_t uid) {
     g_slot[s].waiting_on = NULL;
     g_slot[s].wake_at    = 0;
     /* Wake it wherever it is parked. await_turn_locked returns -1 for a slot
-     * that has gone DEAD, and its caller leaves through pthread_exit. */
-    pthread_cond_broadcast(&g_turn);
+     * that has gone DEAD, and its caller leaves through psp_os_thread_exit. */
+    psp_os_cond_broadcast(&g_turn);
     if (self) {
         (void)handoff_locked();
-        pthread_mutex_unlock(&g_lock);
+        psp_os_unlock(&g_lock);
         /* The main context is not a guest thread and has nowhere to exit to --
-         * pthread_exit on it ends the thread the process was started on and
+         * exiting it ends the thread the process was started on and
          * leaves the runner waiting for threads that will never finish. The
          * same guard psp_sched_exit carries, for the same reason. */
-        if (!self_is_main) pthread_exit(NULL);
+        if (!self_is_main) psp_os_thread_exit();
         return 1;
     }
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     return 1;
 }
 
@@ -866,22 +864,22 @@ int psp_sched_set_dispatch(int on) {
 }
 
 void psp_sched_set_priority(uint32_t uid, int priority) {
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int s = slot_of(uid);
     if (s >= 0) g_slot[s].priority = priority;
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
 }
 
 int psp_sched_suspend(uint32_t uid) {
     if (!g_threading) return 0;
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int s = slot_of(uid);
-    if (s < 0) { pthread_mutex_unlock(&g_lock); return 0; }
+    if (s < 0) { psp_os_unlock(&g_lock); return 0; }
     /* A thread that has finished stays finished. Marking a dead slot SUSPENDED
      * puts it back in the live count, where nothing can ever clear it -- the
      * drain then waits out its whole deadline for a thread that ended long ago,
      * and the test it belongs to never flushes its output. */
-    if (g_slot[s].state == PSP_SCHED_DEAD) { pthread_mutex_unlock(&g_lock); return 1; }
+    if (g_slot[s].state == PSP_SCHED_DEAD) { psp_os_unlock(&g_lock); return 1; }
     const int running = (s == g_running);
     if (!running) {
         /* Somebody else: mark it and let it stay off the ready scan. Whatever
@@ -891,7 +889,7 @@ int psp_sched_suspend(uint32_t uid) {
         g_slot[s].waiting_on = NULL;
         g_slot[s].wake_at    = 0;
     }
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     /* Ourselves: give up the token and do not come back until resumed. */
     if (running) (void)switch_away(s, PSP_SCHED_SUSPENDED, "sceKernelSuspendThread", 0);
     return 1;
@@ -899,33 +897,33 @@ int psp_sched_suspend(uint32_t uid) {
 
 int psp_sched_resume(uint32_t uid) {
     if (!g_threading) return 0;
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int s = slot_of(uid);
-    if (s < 0) { pthread_mutex_unlock(&g_lock); return 0; }
+    if (s < 0) { psp_os_unlock(&g_lock); return 0; }
     if (g_slot[s].state == PSP_SCHED_SUSPENDED) {
         g_slot[s].state = PSP_SCHED_READY;
         g_slot[s].woken = 1;
     }
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     return 1;
 }
 
 psp_sched_state psp_sched_state_of(uint32_t uid) {
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int s = slot_of(uid);
     const psp_sched_state st = s >= 0 ? g_slot[s].state : PSP_SCHED_DEAD;
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     return st;
 }
 
 int psp_sched_priority(uint32_t uid) {
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const int s = slot_of(uid);
     /* PSP priorities run 0..0x7F with 0 the most urgent, so anything past the
      * range sorts last. An unknown uid is a waiter whose thread no longer
      * exists, and it must never be picked ahead of one that does. */
     const int pri = s >= 0 ? g_slot[s].priority : 0x7FFFFFFF;
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     return pri;
 }
 
@@ -936,8 +934,8 @@ uint32_t psp_sched_current(void) {
      * nobody, and 0 is the main context's uid. Callers pass the result straight
      * back to psp_sched_block, so a guest thread parked the main context's slot
      * and left its own marked RUNNING. */
-    pthread_mutex_lock(&g_lock);
+    psp_os_lock(&g_lock);
     const uint32_t uid = g_slot[g_self].uid;
-    pthread_mutex_unlock(&g_lock);
+    psp_os_unlock(&g_lock);
     return uid;
 }

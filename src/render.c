@@ -11,6 +11,7 @@
 
 #include "psprecomp/render.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/os.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -670,11 +671,7 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
  * CLOCK_MONOTONIC, not CLOCK_PROCESS_CPUTIME_ID -- the guest is paced in real
  * time and the interesting quantity is how much of a frame's 16.7ms budget
  * this consumes, not how many cycles it retires. */
-static uint64_t now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
+static uint64_t now_ns(void) { return psp_os_mono_ns(); }
 
 uint64_t psp_render_raster_ns(void) { return g_raster_ns; }
 
