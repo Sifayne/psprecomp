@@ -242,6 +242,11 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
  * a different number for a different question. Both pools use this one. */
 #define SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_PTR 0x800201B6
 #define SCE_KERNEL_ERROR_UNKNOWN_TLSPLID    0x800201D0
+/* No slot left for another pool. Not in PSPSDK's pspkerror.h, whose TLS entries
+ * stop at the kernel-side trio -- ILLEGAL_KTLSID, KTLS_FULL and KTLS_BUSY at
+ * 0x800201C0..C2. The user-side family sits one row down in the same shape, and
+ * what pins this member of it is tls/create's seventeenth pool. */
+#define SCE_KERNEL_ERROR_TLSPL_FULL         0x800201D1
 #define SCE_KERNEL_ERROR_UNKNOWN_ALMID      0x8002019F
 #define SCE_KERNEL_ERROR_UNKNOWN_VTID       0x800201BE
 /* A blocking call made while dispatch is suspended. */

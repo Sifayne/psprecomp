@@ -1661,7 +1661,10 @@ void psp_kernobj_register_fpl(void) {
  * seventh capture read and the first that could have been guessed.
  */
 
-#define MAX_TLSPLS 32
+/* Sixteen, because that is how many hardware has: tls/create makes them in a
+ * loop and the seventeenth fails. The index a pool reports is its slot here,
+ * so the cap is observable twice over -- the last success reports index 15. */
+#define MAX_TLSPLS 16
 #define TLSPL_ATTR_KNOWN 0x41FFu
 
 typedef struct {
@@ -1760,7 +1763,7 @@ static void hle_CreateTlspl(void) {
         if (!taken) break;
     }
     for (int i = 0; i < MAX_TLSPLS; i++) if (!g_tls[i].alive) { t = &g_tls[i]; break; }
-    if (!t) { psp_sysmem_release(base); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    if (!t) { psp_sysmem_release(base); psp_ret(SCE_KERNEL_ERROR_TLSPL_FULL); return; }
 
     uint32_t *owner = (uint32_t *)calloc(count, sizeof *owner);
     if (!owner) { psp_sysmem_release(base); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
