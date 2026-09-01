@@ -212,6 +212,7 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
  * a different number for a different question. Both pools use this one. */
 #define SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_PTR 0x800201B6
 #define SCE_KERNEL_ERROR_UNKNOWN_TLSPLID    0x800201D0
+#define SCE_KERNEL_ERROR_UNKNOWN_ALMID      0x8002019F
 
 /* ---- the subsystems ------------------------------------------------------ */
 
@@ -360,6 +361,11 @@ void psp_kernobj_register_mpp(void);
 void psp_kernobj_register_mbx(void);
 void psp_kernobj_register_fpl(void);
 void psp_kernobj_register_tls(void);
+void psp_ktimer_register(void);
+void psp_ktimer_reset(void);
+/* Fire any timer object whose moment has passed. Called from the firmware-call
+ * path, which is the only place guest time is observed to move. */
+void psp_ktimer_tick(void);
 void psp_kernobj_reset(void);
 void psp_kernlock_reset(void);
 

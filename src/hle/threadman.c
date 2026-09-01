@@ -137,6 +137,7 @@ void psp_threadman_reset(void) {
     psp_sched_reset();
     psp_kernlock_reset();
     psp_kernobj_reset();
+    psp_ktimer_reset();
 }
 
 static void on_thread_end(uint32_t uid, uint32_t status);

@@ -251,6 +251,10 @@ void psp_hle_call(uint32_t nid) {
              * thread can be switched away from, or its result is written into
              * whoever runs next. */
             psp_sched_tick();
+            /* After the handler and after the reschedule: a timer handler is
+             * guest code, and running it before the call it interrupted has
+             * finished would write its result into the caller's $v0. */
+            psp_ktimer_tick();
             return;
         }
     }
@@ -296,11 +300,13 @@ void psp_hle_init(void) {
     psp_threadman_init();
     psp_kernlock_reset();
     psp_kernobj_reset();
+    psp_ktimer_reset();
     psp_mpeg_register();
     psp_mpeg_reset();
     psp_threadman_register();
     psp_kernlock_register();
     psp_kernobj_register();
+    psp_ktimer_register();
     psp_display_init();
     psp_display_register();
     psp_ge_init();
