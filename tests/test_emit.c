@@ -71,6 +71,171 @@ static void expect_contains(const char *hay, const char *needle, const char *why
     }
 }
 
+
+/* NOTE: the fall-through-into-a-label bug that the differential oracle found in
+ * memset (see the comment at the fix site in emit.c) has no test here.
+ *
+ * Reproducing it needs discovery to leave the fall-through target as a *label*
+ * inside a neighbouring function. Several synthetic shapes were tried and
+ * discovery promoted the target to its own entry every time, which exercises
+ * the path that always worked -- a test that passes both before and after the
+ * fix, which is worse than no test because it implies coverage that is not
+ * there. Building one needs a_discover's ownership rules pinned down first.
+ *
+ * The fix is verified against the real module instead: memset returned $v0 = 0
+ * before and $v0 = $a0 after, and corpus divergences fell from 17 to 8 over the
+ * same 400 functions. */
+
+
+/* ---- a return's delay slot must be emitted even when another function owns it
+ *
+ * Regression test for the third bug the differential oracle found.
+ *
+ * The delay slot used to be emitted only when discovery had assigned that word
+ * to the same function. But a delay slot executes because the hardware
+ * executes it; ownership is an artifact of the analysis. Where the two
+ * disagreed the instruction was silently dropped.
+ *
+ * Which instruction that is matters: a MIPS compiler puts the stack restore in
+ * the delay slot of `jr $ra`, so the dropped instruction is typically
+ * `addiu $sp, $sp, N` and the function returns without releasing its frame.
+ *
+ * Two seeds, the second landing on the delay slot itself, is enough to make
+ * ownership and execution disagree. */
+
+#define DS_BASE 0x08820000u
+
+static const uint32_t DS_CODE[] = {
+    0x03E00008,  /* +00  jr    $ra              function A                     */
+    0x27BD0010,  /* +04  addiu $sp, $sp, 16     A's delay slot -- and B's entry */
+    0x03E00008,  /* +08  jr    $ra              B returns                      */
+    0x00000000,  /* +0C  nop                                                   */
+};
+
+static void test_return_delay_slot_not_owned(void) {
+    uint8_t code[sizeof DS_CODE];
+    for (size_t i = 0; i < sizeof DS_CODE / sizeof DS_CODE[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(DS_CODE[i]);
+        code[i * 4 + 1] = (uint8_t)(DS_CODE[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(DS_CODE[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(DS_CODE[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = DS_BASE;
+    an.size = (uint32_t)sizeof code;
+
+    const uint32_t seeds[2] = { DS_BASE, DS_BASE + 4 };
+    CHECK(a_discover(&an, seeds, 2) == 0, "delay slot: discovery runs");
+
+    emit_opts o;
+    o.outdir = ".";
+    o.prefix = "t_ds";
+    o.module = "synthetic";
+    CHECK(a_emit(&an, &o) == 0, "delay slot: emission succeeds");
+
+    char *src = slurp("./t_ds_funcs.c", NULL);
+    CHECK(src != NULL, "delay slot: generated .c is readable");
+    if (!src) { a_analysis_free(&an); return; }
+
+    const char *body = strstr(src, "psp_body_08820000");
+    CHECK(body != NULL, "delay slot: function A was emitted");
+    if (body) {
+        const char *end = strstr(body, "\n}\n");
+        if (end) {
+            char *tail = strndup(body, (size_t)(end - body));
+            CHECK(tail && strstr(tail, "r_sp = r_sp + 16;"),
+                  "delay slot: `jr $ra` must emit its delay slot even when\n"
+                  "  another function owns that word -- dropping it returns\n"
+                  "  without releasing the frame");
+            free(tail);
+        }
+    }
+    free(src);
+    a_analysis_free(&an);
+}
+
+
+/* ---- an indirect call is not the end of a function ------------------------
+ *
+ * Regression test for the fourth bug the oracle found.
+ *
+ * The emitter decided a block was terminal with
+ *
+ *     last_terminal = in.is_return || in.is_indirect || (is_jump && !is_call)
+ *
+ * but `is_indirect` covers `jr` and `jalr` alike, and only one of them ends
+ * anything. `jalr` is a call: it returns, and execution continues after its
+ * delay slot. Marking it terminal suppressed the end-of-function continuation,
+ * so when a function's extent ended right after an indirect call -- which is
+ * where discovery routinely splits -- whatever followed was never reached.
+ *
+ * What followed was usually the epilogue, so the function returned without
+ * releasing its frame. The oracle found it as clusters of $sp disagreements.
+ *
+ * The decoder already draws the distinction: it sets ends_block for `jr` and
+ * not for `jalr`. Two seeds put the continuation in a separate function so the
+ * extent ends exactly at the point that used to be dropped. */
+
+#define IC_BASE 0x08830000u
+
+static const uint32_t IC_CODE[] = {
+    0x0320F809,  /* +00  jalr  $ra, $t9      indirect call -- returns here     */
+    0x00000000,  /* +04  nop                 delay slot; A's extent ends after */
+    0x27BD0010,  /* +08  addiu $sp, $sp, 16  the continuation -- B's entry     */
+    0x03E00008,  /* +0C  jr    $ra                                             */
+    0x00000000,  /* +10  nop                                                   */
+};
+
+static void test_indirect_call_is_not_terminal(void) {
+    uint8_t code[sizeof IC_CODE];
+    for (size_t i = 0; i < sizeof IC_CODE / sizeof IC_CODE[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(IC_CODE[i]);
+        code[i * 4 + 1] = (uint8_t)(IC_CODE[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(IC_CODE[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(IC_CODE[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = IC_BASE;
+    an.size = (uint32_t)sizeof code;
+
+    const uint32_t seeds[2] = { IC_BASE, IC_BASE + 8 };
+    CHECK(a_discover(&an, seeds, 2) == 0, "indirect call: discovery runs");
+
+    emit_opts o;
+    o.outdir = ".";
+    o.prefix = "t_ic";
+    o.module = "synthetic";
+    CHECK(a_emit(&an, &o) == 0, "indirect call: emission succeeds");
+
+    char *src = slurp("./t_ic_funcs.c", NULL);
+    CHECK(src != NULL, "indirect call: generated .c is readable");
+    if (!src) { a_analysis_free(&an); return; }
+
+    const char *body = strstr(src, "psp_body_08830000");
+    CHECK(body != NULL, "indirect call: function A was emitted");
+    if (body) {
+        const char *end = strstr(body, "\n}\n");
+        if (end) {
+            char *tail = strndup(body, (size_t)(end - body));
+            CHECK(tail && strstr(tail, "psp_dispatch(r_t9)"),
+                  "indirect call: the call itself must be emitted");
+            CHECK(tail && (strstr(tail, "psp_func_08830008()") ||
+                           strstr(tail, "psp_dispatch(0x08830008u)")),
+                  "indirect call: execution must continue after `jalr` --\n"
+                  "  a call returns, so the following code is still reached");
+            free(tail);
+        }
+    }
+    free(src);
+    a_analysis_free(&an);
+}
+
 int main(void) {
     uint8_t code[sizeof CODE];
     for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
@@ -163,6 +328,9 @@ int main(void) {
     }
 
     a_analysis_free(&an);
+
+    test_return_delay_slot_not_owned();
+    test_indirect_call_is_not_terminal();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);
