@@ -44,8 +44,14 @@ static psp_alarm g_alarm[MAX_ALARMS];
  * is picked up by the next firmware call. */
 static int g_firing;
 
+/* Both halves of this file are reset and ticked together; the vtimer side is
+ * defined below. */
+static void vtimer_reset(void);
+static void vtimer_tick(void);
+
 void psp_ktimer_reset(void) {
     memset(g_alarm, 0, sizeof g_alarm);
+    vtimer_reset();
     g_firing = 0;
 }
 
@@ -161,6 +167,7 @@ void psp_ktimer_tick(void) {
         if (again) a->schedule = psp_clock_peek() + again;
         else       a->alive = 0;
     }
+    vtimer_tick();
 }
 
 void psp_ktimer_register(void) {
@@ -168,4 +175,252 @@ void psp_ktimer_register(void) {
     psp_hle_register(0xB2C25152, "ThreadManForUser", "sceKernelSetSysClockAlarm", hle_SetSysClockAlarm);
     psp_hle_register(0x7E65B999, "ThreadManForUser", "sceKernelCancelAlarm",      hle_CancelAlarm);
     psp_hle_register(0xDAA3F564, "ThreadManForUser", "sceKernelReferAlarmStatus", hle_ReferAlarmStatus);
+    psp_ktimer_register_vtimer();
+}
+
+/* ---- vtimer: a stopwatch that can also fire ---------------------------------
+ *
+ * A vtimer counts guest microseconds, but only while it is *running*, and the
+ * count is the guest's to set. So there are two quantities and they are not the
+ * same one twice: `base` is the system time the timer was last started or had
+ * its value set from, and `current` is the value it reads now -- base plus the
+ * time since, or a frozen number while stopped.
+ *
+ * It can also carry a handler with a schedule, which fires the same way an
+ * alarm does and through the same tick.
+ */
+
+#define MAX_VTIMERS 32
+
+typedef struct {
+    uint32_t uid;
+    char     name[32];
+    int      active;
+    uint64_t value;        /* the count as of `since` */
+    uint64_t since;        /* guest time the count was last anchored */
+    /* What `base` reports, which is *not* the anchor. A timer that has never
+     * been started reports 0 -- create.expected and sethandler.expected both
+     * print `base=0` for one -- so this is the timer's own zero point rather
+     * than a reading of the system clock. */
+    uint64_t base;
+    uint64_t schedule;     /* timer value at which the handler fires, 0 = none */
+    uint32_t handler, common;
+    int      alive;
+} psp_vtimer;
+
+static psp_vtimer g_vtimer[MAX_VTIMERS];
+
+static void vtimer_reset(void) { memset(g_vtimer, 0, sizeof g_vtimer); }
+
+static psp_vtimer *find_vtimer(uint32_t uid) {
+    for (int i = 0; i < MAX_VTIMERS; i++)
+        if (g_vtimer[i].alive && g_vtimer[i].uid == uid) return &g_vtimer[i];
+    return NULL;
+}
+
+/* What the timer reads now: frozen while stopped, running on otherwise. */
+static uint64_t vtimer_now(const psp_vtimer *v) {
+    return v->active ? v->value + (psp_clock_peek() - v->since) : v->value;
+}
+
+static void vtimer_set(psp_vtimer *v, uint64_t to) {
+    v->value = to;
+    v->since = psp_clock_peek();
+    v->base  = v->since;
+}
+
+static void hle_CreateVTimer(void) {
+    if (!psp_arg(0)) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    psp_vtimer *v = NULL;
+    for (int i = 0; i < MAX_VTIMERS; i++) if (!g_vtimer[i].alive) { v = &g_vtimer[i]; break; }
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    memset(v, 0, sizeof *v);
+    psp_str(psp_arg(0), v->name, sizeof v->name);
+    v->uid   = psp_threadman_next_uid();
+    v->alive = 1;
+    v->since = psp_clock_peek();
+    psp_ret(v->uid);
+}
+
+static void hle_DeleteVTimer(void) {
+    psp_vtimer *v = find_vtimer(psp_arg(0));
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
+    v->alive = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Start and stop report whether they *changed* anything, not whether they
+ * succeeded: starting an already-running timer answers 1. */
+static void hle_StartVTimer(void) {
+    psp_vtimer *v = find_vtimer(psp_arg(0));
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
+    const int was = v->active;
+    if (!was) { v->since = psp_clock_peek(); v->base = v->since; v->active = 1; }
+    psp_ret((uint32_t)was);
+}
+
+static void hle_StopVTimer(void) {
+    psp_vtimer *v = find_vtimer(psp_arg(0));
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
+    const int was = v->active;
+    if (was) { v->value = vtimer_now(v); v->active = 0; }
+    psp_ret((uint32_t)was);
+}
+
+/* The 64-bit reads come back in $v0:$v1, low word first -- the o32 convention
+ * the caller was compiled against, the same as sceKernelGetSystemTimeWide. */
+static void ret64(uint64_t v) {
+    psp_cpu.r[PSP_REG_V0] = (uint32_t)v;
+    psp_cpu.r[PSP_REG_V1] = (uint32_t)(v >> 32);
+}
+
+/* The wide reads have no room for an error code -- their whole return value is
+ * the number -- so failure is all-ones. getbase.expected prints
+ * `Wrong value - ffffffffffffffff` for a NULL timer, where returning the
+ * ordinary 0x800201BE in the low word reads as a plausible time. */
+#define VTIMER_WIDE_FAIL 0xFFFFFFFFFFFFFFFFull
+
+static void hle_GetVTimerTimeWide(void) {
+    const psp_vtimer *v = find_vtimer(psp_arg(0));
+    if (!v) { ret64(VTIMER_WIDE_FAIL); return; }
+    ret64(vtimer_now(v));
+}
+
+static void hle_GetVTimerTime(void) {
+    const psp_vtimer *v = find_vtimer(psp_arg(0));
+    const uint32_t out = psp_arg(1);
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
+    const uint64_t t = vtimer_now(v);
+    if (out) { psp_write32(out, (uint32_t)t); psp_write32(out + 4, (uint32_t)(t >> 32)); }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* base is where the count was last anchored, which start and set both move. */
+static void hle_GetVTimerBaseWide(void) {
+    const psp_vtimer *v = find_vtimer(psp_arg(0));
+    if (!v) { ret64(VTIMER_WIDE_FAIL); return; }
+    ret64(v->base);
+}
+
+static void hle_GetVTimerBase(void) {
+    const psp_vtimer *v = find_vtimer(psp_arg(0));
+    const uint32_t out = psp_arg(1);
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
+    if (out) { psp_write32(out, (uint32_t)v->base);
+               psp_write32(out + 4, (uint32_t)(v->base >> 32)); }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_SetVTimerTimeWide(void) {
+    psp_vtimer *v = find_vtimer(psp_arg(0));
+    if (!v) { ret64(VTIMER_WIDE_FAIL); return; }
+    const uint64_t was = vtimer_now(v);
+    /* The 64-bit argument arrives in the pair $a2:$a3, not $a1: an o32 long
+     * long is aligned to an even register, so $a1 is skipped. */
+    vtimer_set(v, (uint64_t)psp_arg(2) | ((uint64_t)psp_arg(3) << 32));
+    ret64(was);
+}
+
+static void hle_SetVTimerTime(void) {
+    psp_vtimer *v = find_vtimer(psp_arg(0));
+    const uint32_t in = psp_arg(1);
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
+    if (!in) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    vtimer_set(v, (uint64_t)psp_read32(in) | ((uint64_t)psp_read32(in + 4) << 32));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_SetVTimerHandler(void) {
+    psp_vtimer *v = find_vtimer(psp_arg(0));
+    const uint32_t sched = psp_arg(1);
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
+    v->schedule = sched ? ((uint64_t)psp_read32(sched) |
+                           ((uint64_t)psp_read32(sched + 4) << 32)) : 0;
+    v->handler  = psp_arg(2);
+    v->common   = psp_arg(3);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_SetVTimerHandlerWide(void) {
+    psp_vtimer *v = find_vtimer(psp_arg(0));
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
+    v->schedule = (uint64_t)psp_arg(2) | ((uint64_t)psp_arg(3) << 32);
+    v->handler  = psp_arg(4);
+    v->common   = psp_arg(5);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_CancelVTimerHandler(void) {
+    psp_vtimer *v = find_vtimer(psp_arg(0));
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
+    v->handler = v->common = 0;
+    v->schedule = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_ReferVTimerStatus(void) {
+    const psp_vtimer *v = find_vtimer(psp_arg(0));
+    const uint32_t info = psp_arg(1);
+    if (!v)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+    const uint64_t cur = vtimer_now(v);
+    psp_write32(info +  0, 72);
+    psp_threadman_write_name(info + 4, v->name);
+    psp_write32(info + 36, (uint32_t)v->active);
+    psp_write32(info + 40, (uint32_t)v->base);
+    psp_write32(info + 44, (uint32_t)(v->base >> 32));
+    psp_write32(info + 48, (uint32_t)cur);
+    psp_write32(info + 52, (uint32_t)(cur >> 32));
+    psp_write32(info + 56, (uint32_t)v->schedule);
+    psp_write32(info + 60, (uint32_t)(v->schedule >> 32));
+    psp_write32(info + 64, v->handler);
+    psp_write32(info + 68, v->common);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Fire any vtimer whose count has reached its schedule. Same contract as an
+ * alarm's: the handler's return value re-arms it, zero retires it. */
+static void vtimer_tick(void) {
+    for (int i = 0; i < MAX_VTIMERS; i++) {
+        psp_vtimer *v = &g_vtimer[i];
+        if (!v->alive || !v->active || !v->handler || !v->schedule) continue;
+        if (vtimer_now(v) < v->schedule) continue;
+
+        const uint32_t uid = v->uid, handler = v->handler, common = v->common;
+        const uint64_t sched = v->schedule;
+        g_firing = 1;
+        const psp_cpu_state saved = psp_cpu;
+        psp_cpu.r[PSP_REG_A0] = uid;
+        psp_cpu.r[PSP_REG_A1] = (uint32_t)sched;
+        psp_cpu.r[PSP_REG_A2] = (uint32_t)(sched >> 32);
+        psp_cpu.r[PSP_REG_A3] = common;
+        psp_cpu.r[PSP_REG_RA] = 0;
+        psp_dispatch(handler);
+        const uint32_t again = psp_cpu.r[PSP_REG_V0];
+        psp_cpu = saved;
+        g_firing = 0;
+
+        v = find_vtimer(uid);
+        if (!v) continue;
+        if (again) v->schedule = sched + again;
+        else       v->schedule = 0;
+    }
+}
+
+void psp_ktimer_register_vtimer(void) {
+    psp_hle_register(0x20FFF560, "ThreadManForUser", "sceKernelCreateVTimer",        hle_CreateVTimer);
+    psp_hle_register(0x328F9E52, "ThreadManForUser", "sceKernelDeleteVTimer",        hle_DeleteVTimer);
+    psp_hle_register(0xC68D9437, "ThreadManForUser", "sceKernelStartVTimer",         hle_StartVTimer);
+    psp_hle_register(0xD0AEEE87, "ThreadManForUser", "sceKernelStopVTimer",          hle_StopVTimer);
+    psp_hle_register(0xB3A59970, "ThreadManForUser", "sceKernelGetVTimerBase",       hle_GetVTimerBase);
+    psp_hle_register(0xB7C18B77, "ThreadManForUser", "sceKernelGetVTimerBaseWide",   hle_GetVTimerBaseWide);
+    psp_hle_register(0x034A921F, "ThreadManForUser", "sceKernelGetVTimerTime",       hle_GetVTimerTime);
+    psp_hle_register(0xC0B3FFD2, "ThreadManForUser", "sceKernelGetVTimerTimeWide",   hle_GetVTimerTimeWide);
+    psp_hle_register(0x542AD630, "ThreadManForUser", "sceKernelSetVTimerTime",       hle_SetVTimerTime);
+    psp_hle_register(0xFB6425C3, "ThreadManForUser", "sceKernelSetVTimerTimeWide",   hle_SetVTimerTimeWide);
+    psp_hle_register(0xD8B299AE, "ThreadManForUser", "sceKernelSetVTimerHandler",    hle_SetVTimerHandler);
+    psp_hle_register(0x53B00E9A, "ThreadManForUser", "sceKernelSetVTimerHandlerWide",hle_SetVTimerHandlerWide);
+    psp_hle_register(0xD2D615EF, "ThreadManForUser", "sceKernelCancelVTimerHandler", hle_CancelVTimerHandler);
+    psp_hle_register(0x5F32BEAA, "ThreadManForUser", "sceKernelReferVTimerStatus",   hle_ReferVTimerStatus);
 }
