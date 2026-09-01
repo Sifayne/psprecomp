@@ -983,8 +983,39 @@ void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
         case PSP_VU_ONE:  r = 1.0f;         break;
         case PSP_VU_RCP:  r = 1.0f / a;     break;
         case PSP_VU_NRCP: r = -1.0f / a;    break;
-        case PSP_VU_RSQ:  r = 1.0f / psp_fsqrt(a); break;
-        case PSP_VU_SQRT: r = psp_fsqrt(a); break;
+
+        /* The square roots classify their argument before computing anything,
+         * and the classes are not what the C library would do. psp_fsqrt is a
+         * general helper -- it answers 0 for a negative and NaN for an
+         * infinity, which is fine for a rasteriser and wrong for this unit --
+         * so the rules live here rather than in it.
+         *
+         * Ordinary values already agree to the last bit; only the edges did
+         * not, and they were 28 lines of cpu/vfpu/vector. */
+        case PSP_VU_SQRT: {
+            const uint32_t b = psp_f32_to_bits(a);
+            if ((b & 0x7FFFFFFFu) <= 0x007FFFFFu)
+                r = 0.0f;                                   /* zero, denormal, either sign */
+            else if (b >> 31)
+                r = psp_bits_to_f32(0x7F800001u);           /* negative -> NaN */
+            else if ((b >> 23) == 255u)
+                r = psp_bits_to_f32(0x7F800000u + ((b & 0x007FFFFFu) != 0u));
+            else
+                r = psp_fsqrt(a);
+            break;
+        }
+        case PSP_VU_RSQ: {
+            const uint32_t b = psp_f32_to_bits(a);
+            if ((b & 0x7FFFFFFFu) <= 0x007FFFFFu)
+                r = psp_bits_to_f32(0x7F800000u | (b & 0x80000000u)); /* +-0 -> +-inf */
+            else if (b >> 31)
+                r = psp_bits_to_f32(0xFF800001u);           /* negative -> negative NaN */
+            else if ((b >> 23) == 255u)
+                r = psp_bits_to_f32((b & 0x007FFFFFu) ? 0x7F800001u : 0u); /* inf -> 0 */
+            else
+                r = 1.0f / psp_fsqrt(a);
+            break;
+        }
         /* The PSP's trig takes its argument in *quarter turns*: vsin(x) is
          * sin(x * pi/2), not sin(x). Treating it as radians gives a result
          * that is smooth, plausible, and wrong -- rotations end up at the
