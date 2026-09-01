@@ -281,7 +281,11 @@ static void hle_StopVTimer(void) {
     psp_vtimer *v = find_vtimer(psp_arg(0));
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
     const int was = v->active;
-    if (was) { v->value = vtimer_now(v); v->active = 0; }
+    /* Stopping clears the base. It is set at the start and only means anything
+     * while the timer runs: sethandler prints `base=0` beside every `active=0`
+     * and a real reading beside every `active=1`, and vtimers/stop starts and
+     * stops three times and then reads a base of 0. */
+    if (was) { v->value = vtimer_now(v); v->base = 0; v->active = 0; }
     psp_ret((uint32_t)was);
 }
 
