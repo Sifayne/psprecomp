@@ -89,6 +89,15 @@ void psp_vmzero(uint32_t vd, int size);
 void psp_vmone(uint32_t vd, int size);
 void psp_vmmov(uint32_t vd, uint32_t vs, int size);
 
+/* vrot -- one row of a rotation matrix.
+ *
+ * Takes a single angle in rs[0] and spreads its sine and cosine across the
+ * destination according to a 5-bit control field: bits 0-1 pick the lane that
+ * receives the cosine, bits 2-3 the lane that receives the sine, bit 4 negates
+ * the sine. Lanes named by neither get zero -- except when the two selectors
+ * are equal, where every lane but that one gets the sine. */
+void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm, int size);
+
 /* Matrix multiply, transform and scale. See the note in vfpu.c: the operand
  * orientation of vmmul is not independently verified. */
 void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);

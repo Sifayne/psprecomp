@@ -337,6 +337,46 @@ void psp_vmmov(uint32_t vd, uint32_t vs, int size) {
 
 /* Scale every element of a matrix by a scalar. Orientation-independent, so
  * this one is unambiguous. */
+/* vrot -- a row of a rotation matrix from one angle.
+ *
+ * Transcribed from the reference description in pspdev/vfpu-docs
+ * (inst-vfpu-desc.yaml, auxiliary function `ivrot`), not from memory: the
+ * lane rules are easy to state wrongly and the equal-selector case is a
+ * genuine special case rather than a degenerate one.
+ *
+ *   cl = imm & 3          the lane that receives cos
+ *   sl = (imm >> 2) & 3   the lane that receives sin
+ *   imm & 0x10            negate the sine
+ *
+ * When cl != sl, every other lane is zero. When cl == sl, the named lane gets
+ * the cosine and *all* the others get the sine -- not zero, which is the
+ * mistake this comment exists to prevent.
+ *
+ * The angle is in quarter-turns, matching psp_vunary's sin/cos above: a value
+ * of 1.0 is a right angle.
+ *
+ * The hardware requires vd and vs not to overlap (the docs mark this
+ * `no-overlap`). Reading the angle once, before writing anything, means an
+ * overlapping pair still produces a defined result here rather than depending
+ * on lane order. */
+void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm, int size) {
+    const float arg = psp_cpu.v[vs & 127];
+    const unsigned cl = imm & 3;
+    const unsigned sl = (imm >> 2) & 3;
+
+    float s = sinf(arg * 1.5707963267948966f);
+    const float c = cosf(arg * 1.5707963267948966f);
+    if (imm & 0x10) s = -s;
+
+    for (int i = 0; i < size; i++) {
+        float r;
+        if (cl == sl) r = ((unsigned)i == cl) ? c : s;
+        else          r = ((unsigned)i == cl) ? c
+                        : ((unsigned)i == sl) ? s : 0.0f;
+        psp_cpu.v[(vd + i) & 127] = r;
+    }
+}
+
 void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     if (!take_prefixes(psp_cpu.pc, "vmscl")) return;
     float m[4][4];

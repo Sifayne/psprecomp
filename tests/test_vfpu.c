@@ -343,6 +343,67 @@ static void test_matrix_transform(void) {
                 "vmmul and vtfm agree: (A*B)x == A(Bx)");
 }
 
+
+/* ---- vrot -----------------------------------------------------------------
+ *
+ * Transcribed from pspdev/vfpu-docs (auxiliary function `ivrot`) rather than
+ * from an emulator's behaviour, so this checks the specification and not
+ * another implementation's reading of it.
+ *
+ * The lane rules are the whole content of the instruction, and the
+ * equal-selector case is the one that reads like a degenerate case and is not:
+ * every lane *except* the named one receives the sine. */
+static void test_vrot(void) {
+    psp_vfpu_reset();
+
+    const float quarter = 1.0f;          /* angles are in quarter-turns */
+    const float s90 = 1.0f, c90 = 0.0f;  /* sin(pi/2), cos(pi/2) */
+
+    /* cos in lane 0, sin in lane 1, the rest zero. */
+    psp_cpu.v[0] = quarter;
+    psp_vrot(8, 0, /* sl=1, cl=0 */ (1u << 2) | 0u, 4);
+    CHECK_F(psp_cpu.v[8],  c90, "vrot: cosine lane");
+    CHECK_F(psp_cpu.v[9],  s90, "vrot: sine lane");
+    CHECK_F(psp_cpu.v[10], 0.0f, "vrot: unnamed lane is zero");
+    CHECK_F(psp_cpu.v[11], 0.0f, "vrot: unnamed lane is zero");
+
+    /* Bit 4 negates the sine and nothing else. */
+    psp_vrot(8, 0, 0x10u | (1u << 2) | 0u, 4);
+    CHECK_F(psp_cpu.v[8],  c90,  "vrot: negation leaves cosine alone");
+    CHECK_F(psp_cpu.v[9], -s90,  "vrot: bit 4 negates the sine");
+
+    /* Equal selectors: the named lane takes the cosine and every *other* lane
+     * takes the sine -- not zero. Getting this wrong yields a rotation row
+     * that is right in two lanes and silently wrong in the rest. */
+    psp_vrot(8, 0, /* sl == cl == 2 */ (2u << 2) | 2u, 4);
+    CHECK_F(psp_cpu.v[8],  s90, "vrot: equal selectors, lane 0 is sine");
+    CHECK_F(psp_cpu.v[9],  s90, "vrot: equal selectors, lane 1 is sine");
+    CHECK_F(psp_cpu.v[10], c90, "vrot: equal selectors, named lane is cosine");
+    CHECK_F(psp_cpu.v[11], s90, "vrot: equal selectors, lane 3 is sine");
+
+    /* A zero angle gives cos = 1, sin = 0 -- the identity row, and a check that
+     * the quarter-turn scaling is applied rather than radians. */
+    psp_cpu.v[0] = 0.0f;
+    psp_vrot(8, 0, (1u << 2) | 0u, 4);
+    CHECK_F(psp_cpu.v[8], 1.0f, "vrot: angle 0 gives cos = 1");
+    CHECK_F(psp_cpu.v[9], 0.0f, "vrot: angle 0 gives sin = 0");
+
+    /* Half a quarter-turn is 45 degrees; both halves equal sqrt(2)/2. If the
+     * scaling were radians this would be sin(0.5) = 0.479. */
+    psp_cpu.v[0] = 0.5f;
+    psp_vrot(8, 0, (1u << 2) | 0u, 4);
+    CHECK_F(psp_cpu.v[8], 0.70710678f, "vrot: angle is in quarter-turns");
+    CHECK_F(psp_cpu.v[9], 0.70710678f, "vrot: angle is in quarter-turns");
+
+    /* Pairs write two lanes and leave the rest untouched. */
+    psp_cpu.v[12] = psp_cpu.v[13] = psp_cpu.v[14] = -1.0f;
+    psp_cpu.v[0] = 0.0f;
+    psp_vrot(12, 0, (1u << 2) | 0u, 2);
+    CHECK_F(psp_cpu.v[12],  1.0f, "vrot.p: lane 0");
+    CHECK_F(psp_cpu.v[13],  0.0f, "vrot.p: lane 1");
+    CHECK_F(psp_cpu.v[14], -1.0f, "vrot.p: writes only two lanes");
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -355,6 +416,7 @@ int main(void) {
     test_compare();
     test_matrix_ops();
     test_matrix_transform();
+    test_vrot();
 
     psp_mem_free();
 
