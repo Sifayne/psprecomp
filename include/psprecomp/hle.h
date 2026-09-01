@@ -193,6 +193,14 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
  * specific code for the same inputs. */
 #define SCE_KERNEL_ERROR_LWMUTEX_TRY_FAILED      0x800201C4
 
+/* The memory-pool family. The two partition codes are not a range check and a
+ * permission check in the usual order -- threads/vpl/create.expected refuses
+ * partition 7 as out-of-range while 8 and 9 are merely forbidden. */
+#define SCE_KERNEL_ERROR_ILLEGAL_PERM       0x800200D1
+#define SCE_KERNEL_ERROR_ILLEGAL_PARTITION  0x800200D2
+#define SCE_KERNEL_ERROR_UNKNOWN_VPLID      0x8002019C
+#define SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE    0x800201B7
+
 /* ---- the subsystems ------------------------------------------------------ */
 
 void psp_sysmem_init(void);
@@ -335,6 +343,8 @@ void     psp_threadman_write_name(uint32_t dst, const char *name);
 
 void psp_kernlock_register(void);
 void psp_kernlock_register_lw(void);
+void psp_kernobj_register(void);
+void psp_kernobj_reset(void);
 void psp_kernlock_reset(void);
 
 void psp_threadman_init(void);
