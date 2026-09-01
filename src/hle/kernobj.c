@@ -1209,11 +1209,16 @@ static void hle_SendMbx(void) {
      * twice and the second is refused with the count left at 1. */
     if (mbx_holds(m, msg)) { psp_ret(SCE_KERNEL_ERROR_MBX_CORRUPT); return; }
 
-    /* A waiting receiver takes it without it ever joining the queue. */
+    /* A waiting receiver takes it without it ever joining the queue -- and
+     * "never joining" is observable, because the packet's `next` is the
+     * guest's own memory and it is left exactly as the guest left it.
+     * mbx/priority poisons every packet with 0xDEADBEEF before sending and
+     * reads that value back out of the delivered message: `GOT: "hi 2"
+     * (next=DEAD)`. Writing a ring of one over it, which is what a message
+     * that had been queued would carry, reports ITSELF instead. */
     const int i = psp_waitq_pick(&m->q, m->attr);
     if (i >= 0) {
         const psp_waiter w = psp_waitq_take(&m->q, i);
-        psp_write32(msg + MSG_NEXT, msg);
         if (w.out) psp_write32(w.out, msg);
         const int urgent = psp_sched_wake(w.uid);
         psp_ret(SCE_KERNEL_ERROR_OK);
