@@ -290,9 +290,26 @@ static uint32_t start_arg_block(uint32_t *arglen, uint32_t argp) {
 }
 
 static void hle_StartThread(void) {
-    /* (thid, arglen, argp) */
+    /* (thid, arglen, argp)
+     *
+     * Three ids, three answers, and threads/start.expected keeps them apart:
+     * `NULL: 80020197` for zero, `Deleted`/`Invalid: 80020198` for an id that
+     * names nothing, and `Twice`/`Current: 800201a4` for a thread that is
+     * already running. Only the first was implemented, for all three. */
+    if (psp_arg(0) == 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
     psp_thread *t = find_thread(psp_arg(0));
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    if (t->ever_started && t->state != TH_DORMANT) {
+        psp_ret(SCE_KERNEL_ERROR_NOT_DORMANT);
+        return;
+    }
+
+    /* Starting forgets whatever sceKernelChangeThreadPriority did: the thread
+     * comes back at the priority it was created with. threads/change restarts
+     * one after every successful change and reads it back --
+     * `0x08 priority: 00000000` / `After restart: Current=30, init=30` -- so
+     * the 0x08 is gone by the time the thread runs. */
+    t->priority = t->init_priority;
 
     /* A fresh thread's stack is filled with 0xFF, not left as it was found.
      *

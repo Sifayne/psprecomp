@@ -444,8 +444,14 @@ static void test_threads(void) {
     CHECK(call(DELETE, thid, 0, 0, 0) == 0, "delete succeeds");
     CHECK(psp_sysmem_free() > before_delete, "deleting a thread frees its stack");
 
-    CHECK(call(START, 0xDEADBEEF, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_THID,
+    /* An id that names nothing is UNKNOWN_THID, not ILLEGAL_THID -- that one is
+     * reserved for an id of zero. This asserted the wrong code, which is what
+     * threads/start.expected keeps apart on consecutive lines:
+     * `NULL: 80020197`, `Deleted: 80020198`, `Invalid: 80020198`. */
+    CHECK(call(START, 0xDEADBEEF, 0, 0, 0) == SCE_KERNEL_ERROR_UNKNOWN_THID,
           "starting an unknown thread is refused");
+    CHECK(call(START, 0, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_THID,
+          "starting thread id zero is refused differently");
     CHECK(call(GETID, 0, 0, 0, 0) == 0, "no current thread outside one");
 }
 
