@@ -1526,6 +1526,22 @@ static void hle_ReferSemaStatus(void) {
  * where an argument error leaves the caller's 0xDEADBEEF in place. So "not
  * yet" is an answer rather than a refusal, and the caller is told what it
  * would have to wait for. */
+/* Deliver the calling thread's callbacks, then wait exactly as the plain call
+ * does. This one was not registered at all, which is why it mattered more than
+ * the rest: an unimplemented call returns zero, and zero is what a *successful*
+ * wait returns. pspautotests' scheduling harness spins
+ *
+ *     while (result == 0x800201A8)
+ *         result = sceKernelWaitEventFlagCB(flag, ..., &timeout);
+ *
+ * on a flag that is never signalled, so the loop is meant to run until the
+ * flag is deleted under it. Answering zero ended it on the first iteration,
+ * and every test built on that harness recorded a thread that never waited. */
+static void hle_WaitEventFlagCB(void) {
+    psp_threadman_run_callbacks();
+    hle_WaitEventFlag();
+}
+
 static void hle_PollEventFlag(void) {
     const uint32_t id   = psp_arg(0);
     const uint32_t bits = psp_arg(1);
@@ -1998,6 +2014,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0x812346E4, "ThreadManForUser", "sceKernelClearEventFlag",          hle_ClearEventFlag);
     psp_hle_register(0x402FCF22, "ThreadManForUser", "sceKernelWaitEventFlag",           hle_WaitEventFlag);
     psp_hle_register(0x30FD48F0, "ThreadManForUser", "sceKernelPollEventFlag",           hle_PollEventFlag);
+    psp_hle_register(0x328C546A, "ThreadManForUser", "sceKernelWaitEventFlagCB",         hle_WaitEventFlagCB);
 
     psp_hle_register(0xE81CAF8F, "ThreadManForUser", "sceKernelCreateCallback",          hle_CreateCallback);
     psp_hle_register(0xBC6FEBC5, "ThreadManForUser", "sceKernelReferSemaStatus",         hle_ReferSemaStatus);
