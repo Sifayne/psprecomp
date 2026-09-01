@@ -680,6 +680,23 @@ static void hle_Dread(void) {
     psp_ret(1);                       /* more entries may follow */
 }
 
+/* sceIoDevctl(dev, cmd, indata, inlen, outdata, outlen).
+ *
+ * Answering "no such device" is not a stub here, it is the answer. Homebrew
+ * and test binaries probe for emulators by devctl'ing a name only an emulator
+ * claims -- pspautotests uses "kemulator:" -- and a real PSP fails the call.
+ * Failing it is how the caller learns it is on hardware, which is the mode we
+ * are trying to be faithful to. Claiming success would opt every such program
+ * into an emulator-specific path we do not implement.
+ *
+ * Left unimplemented it printed once per call and the caller kept asking. */
+/* 0x80010000 | errno, with ENODEV = 19. */
+#define SCE_ERROR_ENODEV   0x80010013u
+
+static void hle_Devctl(void) {
+    psp_ret(SCE_ERROR_ENODEV);
+}
+
 static void hle_Dclose(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
     if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(0x80020323); return; }
@@ -829,4 +846,5 @@ void psp_io_register(void) {
     psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",  hle_Dopen);
     psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",  hle_Dread);
     psp_hle_register(0xEB092469, "IoFileMgrForUser", "sceIoDclose", hle_Dclose);
+    psp_hle_register(0x54F5FB11, "IoFileMgrForUser", "sceIoDevctl", hle_Devctl);
 }
