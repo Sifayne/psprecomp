@@ -563,8 +563,22 @@ static void hle_WaitThreadEnd(void) {
     if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
     const uint32_t thid    = psp_arg(0);
     const uint32_t timeout = psp_arg(1);
+    /* You cannot wait for yourself to end, and zero does not mean "me" here the
+     * way it does for a priority change -- both are ILLEGAL_THID.
+     * threads/threadend prints them next to an id that names nothing, which is
+     * the different code: `Zero: 80020197`, `Self: 80020197`,
+     * `Invalid: 80020198`. */
+    if (thid == 0 || thid == psp_sched_current()) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
+        return;
+    }
     psp_thread *t = find_thread(thid);
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    /* A thread that was never started will never end, so there is nothing to
+     * wait for -- DORMANT, immediately, rather than the timeout. One that has
+     * *finished* is also dormant and returns its exit status, so the test is
+     * "was it ever started", not "is it stopped now". */
+    if (!t->ever_started) { psp_ret(SCE_KERNEL_ERROR_DORMANT); return; }
 
     /* The same deadline the other waits use. This one was left on the untimed
      * path when they were converted, and it is not a wait that can be left
