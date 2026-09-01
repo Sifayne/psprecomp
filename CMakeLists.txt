@@ -46,11 +46,22 @@ add_library(psprecomp STATIC
     src/hle/sascore.c
     src/hle/iofilemgr.c
     src/hle/misc.c
+    src/hle/umd.c
 )
 
 target_include_directories(psprecomp PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+# vfpu.c calls sinf/cosf/powf/logf/asinf. MSVC keeps those in the CRT, but on
+# Unix they live in libm and need an explicit link. PUBLIC so that consumers —
+# the test binaries, and any game host linking this runtime — inherit it too.
+if(NOT MSVC)
+    find_library(PSPRECOMP_LIBM m)
+    if(PSPRECOMP_LIBM)
+        target_link_libraries(psprecomp PUBLIC ${PSPRECOMP_LIBM})
+    endif()
+endif()
 
 # --- the recompiler -----------------------------------------------------------
 
