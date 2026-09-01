@@ -59,6 +59,10 @@ typedef struct {
     char     name[32];
     uint32_t entry;
     uint32_t priority;
+    /* What it was created with, which sceKernelReferThreadStatus reports
+     * separately and which a priority change must not touch: a thread created
+     * at 0x30 and changed to 0x21 still reports `init=30`. */
+    uint32_t init_priority;
     uint32_t stack_size;
     uint32_t stack_base;   /* low address of the allocation */
     uint32_t attr;
@@ -228,7 +232,8 @@ static void hle_CreateThread(void) {
     memset(t, 0, sizeof *t);
     psp_str(psp_arg(0), t->name, sizeof t->name);
     t->entry      = psp_arg(1);
-    t->priority   = psp_arg(2);
+    t->priority      = psp_arg(2);
+    t->init_priority = psp_arg(2);
     t->stack_size = psp_arg(3);
     t->attr       = psp_arg(4);
 
@@ -527,7 +532,24 @@ static void hle_ChangeThreadPriority(void) {
         psp_ret(SCE_KERNEL_ERROR_DORMANT);
         return;
     }
-    t->priority = psp_arg(1);
+
+    /* Priority zero is not a priority, it is "the one I am running at".
+     * threads/change.expected shows a thread created at 0x30 being set to 0
+     * and reading back **0x18**, which is what the caller had set itself to
+     * two lines earlier -- so it is the *caller's* priority, not the target's
+     * initial one, and neither is guessable from the other.
+     *
+     * Everything outside 0x08..0x77 is refused. The same file sweeps it: -2,
+     * -1, 0x01 through 0x07, 0x78 and 0x79 all answer ILLEGAL_PRIORITY, and
+     * 0x08 through 0x77 all succeed. The negative cases need no separate test
+     * because the comparison is unsigned. */
+    uint32_t prio = psp_arg(1);
+    if (prio == 0) prio = psp_threadman_current_priority();
+    else if (prio < 0x08u || prio > 0x77u) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
+        return;
+    }
+    t->priority = prio;
     psp_sched_set_priority(t->uid, (int)t->priority);
     psp_ret(SCE_KERNEL_ERROR_OK);
     /* Lowering your own priority is a reschedule point: something that was
@@ -1276,7 +1298,7 @@ static void hle_ReferThreadStatus(void) {
     const uint32_t words[26] = {
         104, 0,0,0,0,0,0,0,0,                        /* size, then name[32] */
         attr, status, t->entry, t->stack_base, t->stack_size,
-        psp_cpu.r[PSP_REG_GP], t->priority,
+        psp_cpu.r[PSP_REG_GP], t->init_priority,
         slot_pri > 0x7F ? t->priority : (uint32_t)slot_pri,
         0 /*waitType*/, 0 /*waitId*/, (uint32_t)t->wakeup_count, exit_status,
         0,0,0,0,0,          /* run clocks and preemption counts, left at zero */

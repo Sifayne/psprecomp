@@ -142,6 +142,9 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
  * threads/refer.expected reads `exit: 800201a4` for a live thread where
  * threads/create.expected reads `800201a2` for one never started. */
 #define SCE_KERNEL_ERROR_NOT_DORMANT     0x800201A4
+/* A thread priority outside 0x08..0x77. Zero is not in that range and is not
+ * an error either -- it means "the priority I am running at". */
+#define SCE_KERNEL_ERROR_ILLEGAL_PRIORITY 0x80020193
 #define SCE_KERNEL_ERROR_SUSPEND         0x800201A3
 #define SCE_KERNEL_ERROR_NOT_SUSPEND     0x800201A5
 /* A poll that would have blocked. Distinct from an error: it is the ordinary
