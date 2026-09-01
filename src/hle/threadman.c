@@ -128,8 +128,10 @@ void psp_threadman_reset(void) {
     memset(g_cb, 0, sizeof g_cb);
     g_next_uid = UID_BASE;
     g_warned_block = 0;
-    psp_sched_reset();
+    /* The clock first: the scheduler stamps the main context's timeslice from
+     * it, so resetting time afterwards would leave that stamp in the future. */
     psp_clock_reset();
+    psp_sched_reset();
 }
 
 static void on_thread_end(uint32_t uid, uint32_t status);

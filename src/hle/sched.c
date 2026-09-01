@@ -15,6 +15,11 @@
 #define MAIN_SLOT         0        /* the context module_start runs on */
 #define PSP_HOST_STACK_SIZE (16u * 1024u * 1024u)
 
+/* How long a thread holds the CPU before giving way to an equal, in guest
+ * microseconds. Stamped by the handoff; spent by psp_sched_tick, where the
+ * reasoning for both the unit and the length lives. */
+#define PSP_SCHED_SLICE_US (5000u)
+
 typedef struct {
     int             used;
     uint32_t        uid;
@@ -29,6 +34,10 @@ typedef struct {
      * tells "somebody signalled me" from "my time ran out" -- the two need
      * opposite answers and the token alone cannot distinguish them. */
     int             woken;
+    /* Guest microsecond at which this thread's timeslice runs out. Stamped by
+     * the handoff that gave it the token, so a thread is charged for its own
+     * time on the CPU and not for anyone else's. */
+    uint64_t        slice_end;
     psp_cpu_state   ctx;           /* valid whenever this slot is not running */
     pthread_t       host;
     int             started;
@@ -97,6 +106,11 @@ void psp_sched_reset(void) {
     g_slot[MAIN_SLOT].uid      = 0;
     g_slot[MAIN_SLOT].state    = PSP_SCHED_RUNNING;
     g_slot[MAIN_SLOT].priority = 32;
+    /* The main context takes the token here rather than through a handoff, so
+     * it is the one slot that would otherwise start with no slice -- and a
+     * slice_end of zero is already in the past, which makes psp_sched_tick
+     * yield on every single firmware call. */
+    g_slot[MAIN_SLOT].slice_end = psp_clock_peek() + PSP_SCHED_SLICE_US;
     g_running    = MAIN_SLOT;
     pthread_mutex_unlock(&g_lock);
 }
@@ -199,6 +213,11 @@ static int handoff_locked(void) {
     }
 
     g_slot[best].state = PSP_SCHED_RUNNING;
+    /* A fresh slice starts here, which is what makes it the thread's own rather
+     * than a share of a global one. Re-stamped even when the same slot is
+     * picked again -- a thread that yielded and was reselected has been round
+     * the queue, which is exactly what a timeslice is for. */
+    g_slot[best].slice_end = psp_clock_peek() + PSP_SCHED_SLICE_US;
     g_running = best;
     pthread_cond_broadcast(&g_turn);
     return best;
@@ -495,34 +514,51 @@ void psp_sched_delay(uint64_t usec) {
     pthread_mutex_unlock(&g_lock);
 }
 
-/* The timeslice, counted in firmware calls rather than microseconds.
+/* The timeslice, in guest microseconds and charged per thread.
  *
  * A PSP preempts on a timer, so a thread that never blocks still gives way to
  * its equals. Nothing here can interrupt recompiled C part-way -- it is an
- * ordinary host call stack -- so the closest honest approximation is to
- * reschedule every so many kernel calls. Every firmware call is already a point
- * where the guest is between instructions and its register file is coherent,
- * which is exactly what a switch needs.
+ * ordinary host call stack -- so the switch happens at a firmware call, which is
+ * already a point where the guest is between instructions and its register file
+ * is coherent. That much has always been true.
  *
- * This is what stops one thread starving the rest. Armored Core posts its disc
- * reads to a pool of equal-priority workers and then carries on; without a
- * timeslice the poster keeps the CPU, the workers never run, and nothing is
- * ever read from the disc. */
-#define PSP_SCHED_SLICE 64
-
-static unsigned g_slice;
-
+ * What was wrong was the unit and the scope. The slice counted *calls*, and the
+ * counter was one global, so a switch happened every 64 firmware calls made by
+ * anybody -- unrelated to how long the running thread had actually had the CPU.
+ *
+ * That is measurable, and it is measured against hardware. pspautotests'
+ * checkpoint helper writes its text, restarts a thread, and then writes its
+ * newline; a reschedule in that window puts another thread's line inside the
+ * first one's. threads/semaphores/fifo differs from hardware in exactly that
+ * way and in no other -- right characters, wrong line breaks -- and about 2,900
+ * lines across the suite carry an [x]/[r] flag that says whether the kernel
+ * rescheduled during the operation just performed. A slice that fires on
+ * somebody else's call count gets those wrong for a reason that has nothing to
+ * do with the code under test.
+ *
+ * The length is chosen against that: it has to exceed the guest time a thread
+ * spends in an uninterruptible sequence of kernel calls. A firmware call costs
+ * PSP_READ_TICK_US of guest time (clock.c), a checkpoint makes three of them,
+ * and a test's work between two reschedule points is a few times that. Five
+ * milliseconds clears it with room, and is the same order as a real PSP
+ * quantum. It is a measured-against-output number, not a datasheet one, which
+ * is the same trade clock.h already makes for the clock itself.
+ *
+ * The slice still exists, and still for its original reason: Armored Core posts
+ * its disc reads to a pool of equal-priority workers and then carries on, and
+ * without a timeslice the poster keeps the CPU and nothing is ever read. */
 void psp_sched_tick(void) {
     if (!g_threading) return;
-    if (++g_slice < PSP_SCHED_SLICE) return;
-    g_slice = 0;
 
-    /* Only worth a switch if somebody else could actually run. */
     pthread_mutex_lock(&g_lock);
+    const int me = g_running;
     int other = 0;
-    for (int i = 0; i < MAX_SCHED_THREADS; i++)
-        if (i != g_running && g_slot[i].used && g_slot[i].state == PSP_SCHED_READY)
-            { other = 1; break; }
+    if (me >= 0 && psp_clock_peek() >= g_slot[me].slice_end) {
+        /* Only worth a switch if somebody else could actually run. */
+        for (int i = 0; i < MAX_SCHED_THREADS; i++)
+            if (i != me && g_slot[i].used && g_slot[i].state == PSP_SCHED_READY)
+                { other = 1; break; }
+    }
     pthread_mutex_unlock(&g_lock);
 
     if (other) psp_sched_yield();

@@ -8,12 +8,37 @@
 /* 59.94Hz, the PSP's refresh rate, rounded to whole microseconds. */
 #define PSP_FRAME_US 16667u
 
-/* How far a read moves the clock.
+/* How far a *read* moves the clock.
  *
  * Big enough that a poll loop counting microseconds finishes in a sane number
  * of iterations, small enough that a game measuring a real interval does not
  * see it pass instantly. At 100us a millisecond costs ten reads. */
 #define PSP_READ_TICK_US 100u
+
+/* How far any other firmware call moves it, which is a different question and
+ * had the same answer only because nobody had asked it separately.
+ *
+ * The read tick is sized against a loop that *counts* microseconds. This one
+ * exists only so that time cannot stop: a thread spinning on calls that neither
+ * read the clock nor wait for a vblank keeps something runnable forever, so the
+ * scheduler's idle jump never fires, and any thread sleeping on a deadline
+ * would sleep through the rest of the run. Any non-zero value does that.
+ *
+ * Its size, though, decides how much guest time a piece of ordinary kernel work
+ * appears to take -- and at 100us a *kernel call* cost as much as a hundred
+ * microseconds of computation, which is roughly two orders of magnitude more
+ * than one takes. That is not a harmless overestimate. pspautotests asks for
+ * timeouts of a few hundred microseconds and then does three or four kernel
+ * calls, and every one of those timeouts expired part-way through the work it
+ * was meant to outlast. threads/semaphores/fifo shows it directly: hardware
+ * finishes a checkpoint and *then* sees a 200us wait expire, where this saw the
+ * expiry arrive between a line's text and its newline.
+ *
+ * One microsecond is both small enough to stay out of the way and closer to
+ * what a PSP kernel call actually costs, so this is a fidelity fix rather than
+ * a fudge. It still cannot stop: a million calls is a second, and the decode
+ * loop this was introduced for makes 562 million of them in a run. */
+#define PSP_CALL_TICK_US 1u
 
 static uint64_t g_us;
 
@@ -120,7 +145,7 @@ void psp_clock_tick(void) {
         if (wall > g_us) g_us = wall;
         return;
     }
-    g_us += PSP_READ_TICK_US;
+    g_us += PSP_CALL_TICK_US;
 }
 
 void psp_clock_advance_to(uint64_t us) {
