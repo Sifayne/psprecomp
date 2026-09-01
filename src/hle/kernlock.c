@@ -176,6 +176,13 @@ static void mutex_lock(int may_block, int has_timeout) {
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, m->waitdesc,
                                          deadline);
 
+    /* Cancelled rather than deleted: the object is still there, so looking it
+     * up says nothing, and only the waker knew. */
+    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
+        return;
+    }
     m = find_mutex(id);
     if (!m) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
 
@@ -231,7 +238,7 @@ static void hle_CancelMutex(void) {
     if (out) psp_write32(out, (uint32_t)psp_waitq_count(&m->q));
     m->count = (int32_t)psp_arg(1);
     m->owner = 0;
-    const int urgent = psp_waitq_release_all(&m->q);
+    const int urgent = psp_waitq_cancel_all(&m->q);
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_yield();
 }

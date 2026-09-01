@@ -369,6 +369,13 @@ static void vpl_allocate(int may_block, int has_timeout) {
     }
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, v->waitdesc,
                                          deadline);
+    /* Cancelled rather than deleted: the object is still there, so looking it
+     * up says nothing, and only the waker knew. */
+    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
+        return;
+    }
     v = find_vpl(id);
     if (!v) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
 
@@ -422,7 +429,7 @@ static void hle_CancelVpl(void) {
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VPLID); return; }
     const uint32_t out = psp_arg(1);
     if (out) psp_write32(out, (uint32_t)psp_waitq_count(&v->q));
-    const int urgent = psp_waitq_release_all(&v->q);
+    const int urgent = psp_waitq_cancel_all(&v->q);
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_yield();
 }
@@ -679,16 +686,11 @@ static int mpp_satisfied(const psp_waiter *w) {
  * pipe. It matters -- msgpipe/tryreceive deletes a pipe immediately after a
  * poll that satisfied two senders, and hardware answers those senders
  * `00000000`, not `800201b5`. Bytes already moved are moved. */
-#define MPP_WOKE_SATISFIED 1
-/* And turned out by sceKernelCancelMsgPipe, which is not the same as turned out
- * by a delete: `800201a9` against `800201b5`, four lines of msgpipe/cancel. */
-#define MPP_WOKE_CANCELLED 2
-
 /* Done with this waiter: report how much moved, take it out, wake it. */
 static void mpp_release(psp_waitq *q, int i, int *urgent) {
     const psp_waiter w = psp_waitq_take(q, i);
     if (w.nout) psp_write32(w.nout, w.done);
-    *urgent |= psp_sched_wake_as(w.uid, MPP_WOKE_SATISFIED);
+    *urgent |= psp_sched_wake_as(w.uid, PSP_WAIT_WOKE_SATISFIED);
 }
 
 static uint32_t mpp_send_order(const psp_msgpipe *p) {
@@ -929,14 +931,14 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
      * can be released with less than it asked for. */
     if (rc == PSP_SCHED_WOKEN) {
         const int why = psp_sched_wake_reason();
-        if (why == MPP_WOKE_SATISFIED) {
+        if (why == PSP_WAIT_WOKE_SATISFIED) {
             psp_wait_writeback(tmo_ptr, deadline);
             psp_ret(SCE_KERNEL_ERROR_OK);
             return;
         }
         /* Cancelled rather than deleted. The pipe is still there, so looking it
          * up would say nothing; only the waker knew. */
-        if (why == MPP_WOKE_CANCELLED) {
+        if (why == PSP_WAIT_WOKE_CANCELLED) {
             psp_wait_writeback(tmo_ptr, deadline);
             psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
             return;
@@ -973,8 +975,8 @@ static void hle_CancelMsgPipe(void) {
     const uint32_t nsend = psp_arg(1), nrecv = psp_arg(2);
     if (nsend) psp_write32(nsend, (uint32_t)psp_waitq_count(&p->send_q));
     if (nrecv) psp_write32(nrecv, (uint32_t)psp_waitq_count(&p->recv_q));
-    int urgent = mpp_abandon(&p->send_q, MPP_WOKE_CANCELLED);
-    urgent |= mpp_abandon(&p->recv_q, MPP_WOKE_CANCELLED);
+    int urgent = mpp_abandon(&p->send_q, PSP_WAIT_WOKE_CANCELLED);
+    urgent |= mpp_abandon(&p->recv_q, PSP_WAIT_WOKE_CANCELLED);
     p->head = p->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_yield();
@@ -1197,6 +1199,13 @@ static void mbx_receive(int may_block, int has_timeout) {
     }
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, m->waitdesc,
                                          deadline);
+    /* Cancelled rather than deleted: the object is still there, so looking it
+     * up says nothing, and only the waker knew. */
+    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
+        return;
+    }
     m = find_mbx(id);
     if (!m) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
 
@@ -1218,7 +1227,7 @@ static void hle_CancelReceiveMbx(void) {
     if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MBXID); return; }
     const uint32_t out = psp_arg(1);
     if (out) psp_write32(out, (uint32_t)psp_waitq_count(&m->q));
-    const int urgent = psp_waitq_release_all(&m->q);
+    const int urgent = psp_waitq_cancel_all(&m->q);
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_yield();
 }
@@ -1439,6 +1448,13 @@ static void fpl_allocate(int may_block, int has_timeout) {
     }
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, f->waitdesc,
                                          deadline);
+    /* Cancelled rather than deleted: the object is still there, so looking it
+     * up says nothing, and only the waker knew. */
+    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
+        return;
+    }
     f = find_fpl(id);
     if (!f) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
     if (rc == PSP_SCHED_WOKEN) {
@@ -1483,7 +1499,7 @@ static void hle_CancelFpl(void) {
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_FPLID); return; }
     const uint32_t out = psp_arg(1);
     if (out) psp_write32(out, (uint32_t)psp_waitq_count(&f->q));
-    const int urgent = psp_waitq_release_all(&f->q);
+    const int urgent = psp_waitq_cancel_all(&f->q);
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_yield();
 }

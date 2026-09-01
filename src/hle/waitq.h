@@ -64,6 +64,20 @@ uint64_t psp_wait_deadline(uint32_t tmo_ptr);
 /* What hardware leaves in the timeout word: how much was not used. */
 void     psp_wait_writeback(uint32_t tmo_ptr, uint64_t deadline);
 
+/* ---- why a wait ended ------------------------------------------------------
+ *
+ * Left by whoever released the waiter, read by the woken thread through
+ * psp_sched_wake_reason(). Two of these mean opposite things and cannot be told
+ * apart any other way: by the time the thread runs, the queue entry that knew
+ * is gone, and so -- if it was a delete -- is the object.
+ *
+ * Cancel and delete are the pair that matters. Every object type with a Cancel
+ * call answers `0x800201A9` to the waiters it turns out, where a delete answers
+ * `0x800201B5`, and the tests print them side by side. */
+#define PSP_WAIT_WOKE_NORMAL    0
+#define PSP_WAIT_WOKE_SATISFIED 1
+#define PSP_WAIT_WOKE_CANCELLED 2
+
 /* The attribute bit that selects most-urgent-first over first-come. */
 #define PSP_WAITQ_PRIORITY 0x100u
 
@@ -116,5 +130,9 @@ int  psp_waitq_count(const psp_waitq *q);
  * is being *satisfied* and each has to discover for itself that its object is
  * gone. Returns nonzero if any of them outranks the caller. */
 int  psp_waitq_release_all(psp_waitq *q);
+
+/* The same, for a cancel rather than a delete: the object survives, so the
+ * waiters cannot work out what happened by looking at it. */
+int  psp_waitq_cancel_all(psp_waitq *q);
 
 #endif /* PSPRECOMP_WAITQ_H */

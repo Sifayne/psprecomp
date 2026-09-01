@@ -50,11 +50,19 @@ psp_waiter psp_waitq_take(psp_waitq *q, int i) {
 
 int psp_waitq_count(const psp_waitq *q) { return q->n; }
 
-int psp_waitq_release_all(psp_waitq *q) {
+static int release_all_as(psp_waitq *q, int reason) {
     int urgent = 0;
-    for (int i = 0; i < q->n; i++) urgent |= psp_sched_wake(q->w[i].uid);
+    for (int i = 0; i < q->n; i++) urgent |= psp_sched_wake_as(q->w[i].uid, reason);
     q->n = 0;
     return urgent;
+}
+
+int psp_waitq_release_all(psp_waitq *q) {
+    return release_all_as(q, PSP_WAIT_WOKE_NORMAL);
+}
+
+int psp_waitq_cancel_all(psp_waitq *q) {
+    return release_all_as(q, PSP_WAIT_WOKE_CANCELLED);
 }
 
 uint64_t psp_wait_deadline(uint32_t tmo_ptr) {
