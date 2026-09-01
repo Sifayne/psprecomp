@@ -157,6 +157,9 @@ static void default_miss(uint32_t addr) {
 
 void psp_set_miss_handler(psp_miss_fn_t fn) { g_miss = fn; }
 
+static psp_dispatch_hook_t g_hook;
+void psp_set_dispatch_hook(psp_dispatch_hook_t fn) { g_hook = fn; }
+
 /* A budget on dispatched calls.
  *
  * A game's main loop does not return, and during bring-up it is just as likely
@@ -182,6 +185,9 @@ void psp_dispatch(uint32_t addr) {
         g_budget = 0;                 /* fire once */
         if (g_over) g_over();
     }
+    /* Before the table: a hook may want to run this itself. */
+    if (g_hook && g_hook(addr)) return;
+
     psp_fn_t fn = psp_lookup(addr);
     if (fn) {
         /* Log the first few *successful* indirect calls. Every session so far

@@ -79,6 +79,21 @@ void psp_miss_context(void);
 typedef void (*psp_miss_fn_t)(uint32_t addr);
 void psp_set_miss_handler(psp_miss_fn_t fn);
 
+/* Intercept *every* dispatched call, not only the ones that miss.
+ *
+ * The miss handler is the wrong tool for this: an address that resolves is
+ * exactly the case a caller may want to take over. The interpreter installs a
+ * hook so that guest re-entry from an HLE handler -- a thread entry point, a
+ * registered callback -- keeps running interpreted instead of jumping into
+ * recompiled code. Without it the two are mixed inside one run, which both
+ * destroys a differential comparison and removes the interpreter's instruction
+ * budget, so a callee that does not return simply hangs.
+ *
+ * Return nonzero if the call was handled; zero falls through to the normal
+ * lookup. NULL clears it. */
+typedef int (*psp_dispatch_hook_t)(uint32_t addr);
+void psp_set_dispatch_hook(psp_dispatch_hook_t fn);
+
 /* Number of registered functions, and how many misses have occurred — the
  * latter is a direct measure of how much the analysis is still missing. */
 uint32_t psp_dispatch_count(void);
