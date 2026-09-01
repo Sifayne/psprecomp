@@ -1053,7 +1053,9 @@ typedef struct {
     uint32_t  uid;
     char      name[32];
     uint32_t  attr;
-    uint32_t  first;       /* guest address of the head message, 0 when empty */
+    /* Guest address of the *last* message, 0 when empty. The head is derived
+     * from it -- see mbx_first for why that is not an internal choice. */
+    uint32_t  last;
     uint32_t  count;
     int       alive;
     psp_waitq q;
@@ -1070,51 +1072,65 @@ static psp_mbx *find_mbx(uint32_t id) {
     return NULL;
 }
 
-/* Walk to the message before `first` -- the tail, since the list closes on
- * itself. Bounded by the count so a corrupt `next` cannot spin forever. */
-static uint32_t mbx_tail(const psp_mbx *m) {
-    uint32_t at = m->first;
-    for (uint32_t i = 1; i < m->count; i++) at = psp_read32(at + MSG_NEXT);
-    return at;
+/* The queue is circular and the mailbox holds its **last** message, not its
+ * first. `firstMessage` is derived: it is whatever the last one points at.
+ *
+ * That is not an implementation choice, it is what mbx/send measures. The test
+ * sends two messages, then reaches into the guest-owned packet header of the
+ * *second* one and rewrites its `next`, and reads the mailbox back:
+ *
+ *     next = itself   ->  first=OTHER, and the walk starts at that message
+ *     next = NULL     ->  first=NULL, with count still 2
+ *
+ * Neither is possible if the kernel kept a head pointer -- the guest cannot
+ * reach it. Both fall out of `first = last->next`. */
+static uint32_t mbx_first(const psp_mbx *m) {
+    return m->count ? psp_read32(m->last + MSG_NEXT) : 0;
 }
 
 static void mbx_insert(psp_mbx *m, uint32_t msg) {
     if (!m->count) {
-        psp_write32(msg + MSG_NEXT, msg);     /* ITSELF */
-        m->first = msg;
+        psp_write32(msg + MSG_NEXT, msg);     /* a ring of one */
+        m->last  = msg;
         m->count = 1;
         return;
     }
     if (m->attr & MBX_ATTR_MSG_PRIO) {
         /* Ordered by the packet's own priority byte, ahead of equals. */
         const uint32_t pri = psp_read8(msg + MSG_PRIO);
-        uint32_t prev = mbx_tail(m), at = m->first;
-        for (uint32_t i = 0; i < m->count; i++) {
+        const uint32_t head = mbx_first(m);
+        uint32_t prev = m->last, at = head, i = 0;
+        for (; i < m->count; i++) {
             if (psp_read8(at + MSG_PRIO) > pri) break;
             prev = at;
             at = psp_read32(at + MSG_NEXT);
         }
         psp_write32(msg + MSG_NEXT, at);
         psp_write32(prev + MSG_NEXT, msg);
-        if (at == m->first && prev == mbx_tail(m)) { /* new head */ }
-        if (psp_read8(m->first + MSG_PRIO) > pri) m->first = msg;
+        /* Going in front of the head and going after the last produce the same
+         * two links -- in a ring, `last -> msg -> head` is both -- so the links
+         * cannot say which happened and the walk has to. Only a search that ran
+         * out of messages appended. */
+        if (i == m->count) m->last = msg;
         m->count++;
         return;
     }
-    const uint32_t tail = mbx_tail(m);
-    psp_write32(tail + MSG_NEXT, msg);
-    psp_write32(msg + MSG_NEXT, m->first);
+    /* The head is read before the link it is derived from is overwritten:
+     * `first` is `last->next`, so appending destroys it. */
+    const uint32_t head = mbx_first(m);
+    psp_write32(m->last + MSG_NEXT, msg);
+    psp_write32(msg + MSG_NEXT, head);
+    m->last = msg;
     m->count++;
 }
 
 static uint32_t mbx_pop(psp_mbx *m) {
     if (!m->count) return 0;
-    const uint32_t head = m->first;
-    if (m->count == 1) { m->first = 0; m->count = 0; }
+    const uint32_t head = mbx_first(m);
+    if (m->count == 1) { m->last = 0; m->count = 0; }
     else {
-        const uint32_t next = psp_read32(head + MSG_NEXT);
-        psp_write32(mbx_tail(m) + MSG_NEXT, next);
-        m->first = next;
+        /* The last one closes the ring over the head that is leaving. */
+        psp_write32(m->last + MSG_NEXT, psp_read32(head + MSG_NEXT));
         m->count--;
     }
     /* And its `next` is left exactly as it was. A received packet keeps
@@ -1256,7 +1272,7 @@ static void hle_ReferMbxStatus(void) {
     psp_write32(info + 36, m->attr);
     psp_write32(info + 40, (uint32_t)psp_waitq_count(&m->q));
     psp_write32(info + 44, m->count);
-    psp_write32(info + 48, m->first);
+    psp_write32(info + 48, mbx_first(m));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
