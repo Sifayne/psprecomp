@@ -53,9 +53,12 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
  * format arriving that is not handled shows up as flat colour rather than as
  * plausible-looking wrong pixels.
  *
- * Nearest sampling. Bilinear would need the filter state honoured, and a
- * through-mode blit at 1:1 -- which is what a UI layer is -- samples texel
- * centres either way. */
+ * Nearest sampling, taken at pixel centres. The claim that used to stand here
+ * -- that a 1:1 blit "samples texel centres either way", so the filter state
+ * did not matter -- was exactly backwards: at 1:1 a corner sample lands on the
+ * texel *boundary*, which is the one place a few ULP of interpolation error
+ * changes the answer. See sw_tri. Honouring GE_TEXFILTER is still owed; this
+ * game asks for linear. */
 static struct {
     uint32_t addr, stride;
     int      w, h, fmt, func, swizzled;
@@ -158,6 +161,15 @@ static uint32_t clut_entry(uint32_t raw) {
                     g_clut.fmt == 0 ? GE_TFMT_5650 :
                     g_clut.fmt == 1 ? GE_TFMT_5551 : GE_TFMT_4444);
 }
+
+/* Floor, not truncate.
+ *
+ * (int) rounds toward zero, so a u in (-1, 0) lands on texel 0 rather than -1:
+ * invisible while the sampler clamps, half a texture out the moment one
+ * repeats, and an inverted fractional part for anything that wants the weights.
+ * floorf would do it, but this file has no <math.h> and on the SSE2 baseline
+ * that is a libm call in a per-pixel loop. */
+static int ifloor(float f) { const int i = (int)f; return i - (f < (float)i); }
 
 /* One texel, clamped. Stride is in texels, as the GE reports it, so the byte
  * pitch a swizzle block is measured against has to be derived per format. */
@@ -390,10 +402,40 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
     put_pixel(x, y, rgba);
 }
 
-/* Barycentric fill with integer edge functions, so a shared edge belongs to
- * exactly one triangle: adjacent geometry neither double-draws nor leaves
- * seams. Both windings are accepted — back-face culling is not implemented, and
- * rejecting one winding would silently drop half of any real model. */
+/* Sample positions per pixel edge. Two is enough to express the pixel centre
+ * as an integer -- 2*(x + 0.5) is 2x + 1 -- which is all this needs today.
+ *
+ * Named rather than written as literal 2s because sub-pixel vertex precision
+ * is the same substitution: the hardware rasterizes at sixteenths, so SUBPX 16
+ * with positions snapped to 28.4 turns this function into that one without
+ * touching its structure. */
+#define SUBPX      2
+#define SUBPX_HALF 1
+
+/* A directed edge owns the pixels lying exactly on it if it is a top or a left
+ * edge of the triangle. Screen y grows downward, and the caller has normalised
+ * the winding so the interior is where every edge function is non-negative;
+ * under that convention a top edge runs left-to-right and a left edge runs
+ * upward. Two triangles sharing an edge traverse it in opposite directions, so
+ * exactly one of them satisfies this and the shared pixels are drawn once. */
+static int edge_is_top_left(int64_t dx, int64_t dy) {
+    return (dy == 0 && dx > 0) || dy < 0;
+}
+
+/* Barycentric fill with integer edge functions, evaluated at pixel centres.
+ *
+ * Sampling at the pixel *corner* -- which is what this did -- puts the sample
+ * point exactly on a texel boundary whenever the blit is 1:1, which is what a
+ * UI layer is. The barycentric reconstruction carries a few ULP of error, so
+ * (int)u came back as N or N-1 pseudo-randomly, per pixel. Inside a glyph both
+ * texels are the same and nothing shows; on its outline the neighbour is
+ * background, so the letters came out with texel-sized holes punched along
+ * every edge. Half a pixel across is half a texel from that discontinuity, and
+ * the error stops deciding anything.
+ *
+ * Coverage and attributes move together. Testing coverage at the corner and
+ * interpolating at the centre would let the weights go slightly negative on a
+ * silhouette pixel, running u and v up to half a texel past the geometry. */
 static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c) {
     int minx = a->x < b->x ? (a->x < c->x ? a->x : c->x) : (b->x < c->x ? b->x : c->x);
     int maxx = a->x > b->x ? (a->x > c->x ? a->x : c->x) : (b->x > c->x ? b->x : c->x);
@@ -405,8 +447,42 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     if (maxx > 479) maxx = 479;
     if (maxy > 271) maxy = 271;
 
-    const int area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
+    /* 64-bit because through-mode positions are s16: a coordinate difference
+     * reaches 65535 and the product 2.2e9, which overflowed the int this used
+     * and inverted coverage for the whole triangle. */
+    int64_t area = (int64_t)(b->x - a->x) * (c->y - a->y)
+                 - (int64_t)(b->y - a->y) * (c->x - a->x);
     if (area == 0) return;
+
+    /* Normalise the winding rather than accepting both. The fill rule below is
+     * a tie-break between two triangles that disagree about a pixel, and it can
+     * only be one if both are asked the same question -- applied to a mixed
+     * pair it drops the shared edge instead of assigning it. Swapping two
+     * vertices flips the sign and reverses every edge; the weights follow,
+     * because the pointers moved with them. */
+    if (area < 0) { const psp_vertex *t = b; b = c; c = t; area = -area; }
+
+    const int64_t d0x = c->x - b->x, d0y = c->y - b->y;
+    const int64_t d1x = a->x - c->x, d1y = a->y - c->y;
+    const int64_t d2x = b->x - a->x, d2y = b->y - a->y;
+
+    /* Accept w > 0 always, w == 0 only on a top-left edge. As a bias that is
+     * -1 for the edges that do not own their boundary, which is exact against
+     * these values because the only tie is exact zero. */
+    const int64_t bias0 = edge_is_top_left(d0x, d0y) ? 0 : -1;
+    const int64_t bias1 = edge_is_top_left(d1x, d1y) ? 0 : -1;
+    const int64_t bias2 = edge_is_top_left(d2x, d2y) ? 0 : -1;
+
+    /* The three edge functions at the centre of the first pixel, scaled by
+     * SUBPX. They still sum to SUBPX * area, so they are still the barycentric
+     * numerators -- only the denominator changes. Stepping them by their own
+     * derivatives keeps every value exact and takes the six multiplies out of
+     * the inner loop. */
+    const int64_t px = (int64_t)SUBPX * minx + SUBPX_HALF;
+    const int64_t py = (int64_t)SUBPX * miny + SUBPX_HALF;
+    int64_t row0 = d0x * (py - (int64_t)SUBPX * c->y) - d0y * (px - (int64_t)SUBPX * c->x);
+    int64_t row1 = d1x * (py - (int64_t)SUBPX * a->y) - d1y * (px - (int64_t)SUBPX * a->x);
+    int64_t row2 = d2x * (py - (int64_t)SUBPX * b->y) - d2y * (px - (int64_t)SUBPX * b->x);
 
     /* The edge functions are already the barycentric numerators, so colour,
      * depth and texture coordinates come out of the same three values the
@@ -418,40 +494,39 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * Interpolation is affine, not perspective-correct: there is no w here to
      * divide by. On a fullscreen quad that is exact, and on a steeply oblique
      * one it skews the texture. */
-    const float inv = 1.0f / (float)area;
+    const float inv = 1.0f / (float)((int64_t)SUBPX * area);
     const int textured = texture_usable();
 
     for (int y = miny; y <= maxy; y++) {
+        int64_t w0 = row0, w1 = row1, w2 = row2;
         for (int x = minx; x <= maxx; x++) {
-            const int w0 = (c->x - b->x) * (y - b->y) - (c->y - b->y) * (x - b->x);
-            const int w1 = (a->x - c->x) * (y - c->y) - (a->y - c->y) * (x - c->x);
-            const int w2 = (b->x - a->x) * (y - a->y) - (b->y - a->y) * (x - a->x);
-            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
-                continue;
+            if (w0 + bias0 >= 0 && w1 + bias1 >= 0 && w2 + bias2 >= 0) {
+                const float l0 = (float)w0 * inv;
+                const float l1 = (float)w1 * inv;
+                const float l2 = (float)w2 * inv;
 
-            const float l0 = (float)w0 * inv;
-            const float l1 = (float)w1 * inv;
-            const float l2 = (float)w2 * inv;
+                const float z = l0 * a->z + l1 * b->z + l2 * c->z;
 
-            const float z = l0 * a->z + l1 * b->z + l2 * c->z;
+                uint32_t col = 0;
+                for (int i = 0; i < 4; i++) {
+                    float ch = l0 * (float)((a->rgba >> (i * 8)) & 0xFF)
+                             + l1 * (float)((b->rgba >> (i * 8)) & 0xFF)
+                             + l2 * (float)((c->rgba >> (i * 8)) & 0xFF);
+                    if (ch < 0.0f) ch = 0.0f; else if (ch > 255.0f) ch = 255.0f;
+                    col |= (uint32_t)(ch + 0.5f) << (i * 8);
+                }
 
-            uint32_t col = 0;
-            for (int i = 0; i < 4; i++) {
-                float ch = l0 * (float)((a->rgba >> (i * 8)) & 0xFF)
-                         + l1 * (float)((b->rgba >> (i * 8)) & 0xFF)
-                         + l2 * (float)((c->rgba >> (i * 8)) & 0xFF);
-                if (ch < 0.0f) ch = 0.0f; else if (ch > 255.0f) ch = 255.0f;
-                col |= (uint32_t)(ch + 0.5f) << (i * 8);
+                if (textured) {
+                    const float u = l0 * a->u + l1 * b->u + l2 * c->u;
+                    const float v = l0 * a->v + l1 * b->v + l2 * c->v;
+                    col = modulate(sample_texel(ifloor(u), ifloor(v)), col);
+                    g_px_tex++;
+                } else g_px_flat++;
+                shade_pixel(x, y, z, col);
             }
-
-            if (textured) {
-                const float u = l0 * a->u + l1 * b->u + l2 * c->u;
-                const float v = l0 * a->v + l1 * b->v + l2 * c->v;
-                col = modulate(sample_texel((int)u, (int)v), col);
-                g_px_tex++;
-            } else g_px_flat++;
-            shade_pixel(x, y, z, col);
+            w0 -= d0y * SUBPX; w1 -= d1y * SUBPX; w2 -= d2y * SUBPX;
         }
+        row0 += d0x * SUBPX; row1 += d1x * SUBPX; row2 += d2x * SUBPX;
     }
 }
 
@@ -468,17 +543,25 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
     if (x1 <= x0 || y1 <= y0) return;
 
     const int textured = texture_usable();
-    const float du = (b->u - a->u) / (float)(x1 - x0);
-    const float dv = (b->v - a->v) / (float)(y1 - y0);
+    /* Against the vertices as submitted, not against the sorted corners. The
+     * ramp used to be built from x1 - x0, which is positive by construction, so
+     * a sprite whose second corner is left of or above its first mapped its
+     * texture backwards. The guard above is what makes these divisions safe:
+     * the corners can only coincide if the extents are empty. */
+    const float du = (b->u - a->u) / (float)(b->x - a->x);
+    const float dv = (b->v - a->v) / (float)(b->y - a->y);
 
     for (int y = y0; y < y1; y++) {
-        const float tv = a->v + dv * (float)(y - y0);
+        /* Pixel centres, for the same reason sw_tri uses them: at 1:1 a corner
+         * lands exactly on a texel boundary and the rounding decides which side
+         * of it to read. */
+        const float tv = a->v + dv * ((float)y + 0.5f - (float)a->y);
         for (int x = x0; x < x1; x++) {
             if (!textured) { g_px_flat++; shade_pixel(x, y, a->z, b->rgba); continue; }
-            const float tu = a->u + du * (float)(x - x0);
+            const float tu = a->u + du * ((float)x + 0.5f - (float)a->x);
             g_px_tex++;
             shade_pixel(x, y, a->z,
-                        modulate(sample_texel((int)tu, (int)tv), b->rgba));
+                        modulate(sample_texel(ifloor(tu), ifloor(tv)), b->rgba));
         }
     }
 }

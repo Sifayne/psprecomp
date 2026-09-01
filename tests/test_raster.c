@@ -55,7 +55,7 @@ static void cmd(uint8_t op, uint32_t arg) {
     g_pc += 4;
 }
 
-static void begin_list(void) {
+static void begin_list_vtype(uint32_t vtype) {
     g_pc = 0;
     (void)g_list;
     /* Addresses do not fit in a 24-bit argument. FBP carries the low 24 bits
@@ -65,9 +65,11 @@ static void begin_list(void) {
     cmd(0x10, (VERTS >> 8) & 0xFF0000);            /* BASE */
     cmd(0x9C, FB & 0xFFFFFF);                      /* FBP */
     cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);       /* FBW + address high byte */
-    cmd(0x12, VTYPE_2D);                           /* VTYPE */
+    cmd(0x12, vtype);                              /* VTYPE */
     cmd(0x01, VERTS & 0xFFFFFF);                   /* VADDR */
 }
+
+static void begin_list(void) { begin_list_vtype(VTYPE_2D); }
 
 static void end_list(void) {
     cmd(0x0F, 0);                    /* FINISH */
@@ -196,6 +198,173 @@ static void test_triangle_strip(void) {
     /* Two triangles sharing an edge tile the square without a seam. */
     CHECK(pixel(20, 20) == 0xFFFFFFFFu, "strip tri 0: 0x%08X", pixel(20, 20));
     CHECK(pixel(100, 100) == 0xFFFFFFFFu, "strip tri 1: 0x%08X", pixel(100, 100));
+}
+
+/* ---- texturing -----------------------------------------------------------
+ *
+ * None of the tests above binds a texture, so until these the whole sampling
+ * path -- texel addressing, u/v interpolation, the CLUT, the swizzle -- was
+ * unmeasured, and the bug these were written for lived in it for the life of
+ * the file.
+ *
+ * Exact assertions are possible because two things are identities: modulate
+ * with a vertex colour of 0xFFFFFFFF returns the texel unchanged, and the 8888
+ * sampler returns the stored word verbatim. So a texel written here arrives at
+ * pixel() bit for bit, and a test can name the texel it expects rather than
+ * settling for "something was drawn". */
+
+#define TEX 0x08820000u
+
+/* 16-bit texcoords, 8888 colour, 16-bit position, through mode. The GE's field
+ * order is fixed -- texcoord, colour, normal, position -- and each field is
+ * aligned to its own size, which puts texcoords at 0, colour at 4, position at
+ * 8, and rounds the stride up to 16. */
+#define VTYPE_2D_TEX (2u | (7u << 2) | (2u << 7) | (1u << 23))
+
+static void vertex_uv(int idx, int x, int y, int u, int v, uint32_t rgba) {
+    uint32_t a = VERTS + (uint32_t)idx * 16;
+    psp_write16(a,      (uint16_t)u);
+    psp_write16(a + 2,  (uint16_t)v);
+    psp_write32(a + 4,  rgba);
+    psp_write16(a + 8,  (uint16_t)x);
+    psp_write16(a + 10, (uint16_t)y);
+    psp_write16(a + 12, 0);
+}
+
+/* Texel (u,v) carries its own coordinates: u in the red channel, v in green.
+ * Any sampling error is then legible as the offset it is, rather than as a
+ * colour that happens to be wrong. */
+static void upload_ramp_texture(int w, int h) {
+    for (int v = 0; v < h; v++)
+        for (int u = 0; u < w; u++)
+            psp_write32(TEX + (uint32_t)(v * w + u) * 4,
+                        0xFF000000u | ((uint32_t)v << 8) | (uint32_t)u);
+}
+
+static uint32_t ramp_texel(int u, int v) {
+    return 0xFF000000u | ((uint32_t)v << 8) | (uint32_t)u;
+}
+
+/* TEXSIZE takes log2 of each dimension. The texture address arrives split
+ * across two registers, and its high nibble rides in bits 16-19 of TEXBUFWIDTH
+ * rather than in that register's low byte -- the trap that put the palette
+ * inside the loaded module and speckled the logo once already. */
+static void texture_state(uint32_t addr, int stride, int log2w, int log2h,
+                          int fmt, int swizzled, int filter) {
+    cmd(0x1E, 1);                                              /* TEXTUREMAPENABLE */
+    cmd(0xA0, addr & 0x00FFFFF0u);                             /* TEXADDR0 */
+    cmd(0xA8, ((addr >> 8) & 0x000F0000u) | (uint32_t)stride); /* TEXBUFWIDTH0 */
+    cmd(0xB8, (uint32_t)log2w | ((uint32_t)log2h << 8));       /* TEXSIZE0 */
+    cmd(0xC3, (uint32_t)fmt);                                  /* TEXFORMAT */
+    cmd(0xC2, (uint32_t)swizzled);                             /* TEXMODE */
+    cmd(0xC9, 0);                                              /* TEXFUNC: modulate */
+    cmd(0xC6, (uint32_t)filter | ((uint32_t)filter << 8));     /* TEXFILTER */
+}
+
+/* A 1:1 blit must map texel k to pixel k, and must write each pixel once.
+ *
+ * 13x11 rather than a power of two on purpose: the reciprocal of the doubled
+ * area is then inexact, which is the condition the old corner-sampling code
+ * needed to go wrong. It put the sample point exactly on a texel boundary, so a
+ * few ULP of error in the barycentric reconstruction chose texel k or k-1 at
+ * random, per pixel.
+ *
+ * The pixel count is the other half. Two triangles of a strip share a diagonal,
+ * and without a fill rule a pixel lying exactly on it satisfies both -- drawn
+ * twice, which is invisible on opaque geometry and double-composites the moment
+ * anything blends. */
+static void test_texture_1to1(void) {
+    psp_ge_reset();
+    clear_fb();
+    upload_ramp_texture(16, 16);
+
+    begin_list_vtype(VTYPE_2D_TEX);
+    texture_state(TEX, 16, 4, 4, 3 /* 8888 */, 0, 0 /* nearest */);
+    vertex_uv(0, 40, 30,  0,  0, 0xFFFFFFFFu);
+    vertex_uv(1, 53, 30, 13,  0, 0xFFFFFFFFu);
+    vertex_uv(2, 40, 41,  0, 11, 0xFFFFFFFFu);
+    vertex_uv(3, 53, 41, 13, 11, 0xFFFFFFFFu);
+    cmd(0x04, (4u << 16) | 4);       /* PRIM triangle strip */
+    end_list();
+
+    CHECK(psp_ge_pixels() == 13 * 11,
+          "1:1 quad must write each pixel once: %llu (want 143)",
+          (unsigned long long)psp_ge_pixels());
+
+    int bad = 0;
+    for (int j = 0; j < 11 && bad < 4; j++)
+        for (int k = 0; k < 13 && bad < 4; k++) {
+            const uint32_t got = pixel(40 + k, 30 + j);
+            if (got != ramp_texel(k, j)) {
+                bad++;
+                CHECK(0, "1:1 texel at (%d,%d): got 0x%08X want 0x%08X",
+                      k, j, got, ramp_texel(k, j));
+            }
+        }
+}
+
+/* Minified 3:1, which separates corner sampling from centre sampling
+ * deterministically rather than by luck.
+ *
+ * The scale has to be odd. At 2:1 the pixel centre lands exactly on a texel
+ * boundary -- the same knife edge, one texel over -- and at 1:1 corner and
+ * centre differ only by accumulated float error. At 3:1 the centre lands at
+ * 3k + 1.5, a texel and a half in, while the corner lands at 3k. The arithmetic
+ * is exact in both cases: the doubled area is 512, a power of two.
+ */
+static void test_texture_minified_samples_centre(void) {
+    psp_ge_reset();
+    clear_fb();
+    upload_ramp_texture(64, 64);
+
+    begin_list_vtype(VTYPE_2D_TEX);
+    texture_state(TEX, 64, 6, 6, 3, 0, 0);
+    vertex_uv(0, 40, 30,  0,  0, 0xFFFFFFFFu);
+    vertex_uv(1, 56, 30, 48,  0, 0xFFFFFFFFu);
+    vertex_uv(2, 40, 46,  0, 48, 0xFFFFFFFFu);
+    vertex_uv(3, 56, 46, 48, 48, 0xFFFFFFFFu);
+    cmd(0x04, (4u << 16) | 4);
+    end_list();
+
+    int bad = 0;
+    for (int j = 0; j < 16 && bad < 4; j++)
+        for (int k = 0; k < 16 && bad < 4; k++) {
+            const uint32_t got  = pixel(40 + k, 30 + j);
+            const uint32_t want = ramp_texel(3 * k + 1, 3 * j + 1);
+            if (got != want) {
+                bad++;
+                CHECK(0, "minified texel at (%d,%d): got 0x%08X want 0x%08X"
+                         " (corner sampling would give 0x%08X)",
+                      k, j, got, want, ramp_texel(3 * k, 3 * j));
+            }
+        }
+}
+
+/* The sprite path has the same defect and shares none of the code, so it needs
+ * its own check: two corners, a linear ramp, no barycentric weights. */
+static void test_sprite_texture_samples_centre(void) {
+    psp_ge_reset();
+    clear_fb();
+    upload_ramp_texture(64, 64);
+
+    begin_list_vtype(VTYPE_2D_TEX);
+    texture_state(TEX, 64, 6, 6, 3, 0, 0);
+    vertex_uv(0, 40, 30,  0,  0, 0xFFFFFFFFu);
+    vertex_uv(1, 56, 46, 48, 48, 0xFFFFFFFFu);
+    cmd(0x04, (6u << 16) | 2);       /* PRIM sprites */
+    end_list();
+
+    int bad = 0;
+    for (int j = 0; j < 16 && bad < 4; j++)
+        for (int k = 0; k < 16 && bad < 4; k++) {
+            const uint32_t got  = pixel(40 + k, 30 + j);
+            const uint32_t want = ramp_texel(3 * k + 1, 3 * j + 1);
+            if (got != want) {
+                bad++;
+                CHECK(0, "sprite texel at (%d,%d): got 0x%08X want 0x%08X",
+                      k, j, got, want);
+            }
+        }
 }
 
 /* Depth commands, and a vertex carrying a z. The 16-bit position slot has one
@@ -383,6 +552,9 @@ int main(void) {
     test_clipping();
     test_transformed_is_skipped();
     test_triangle_strip();
+    test_texture_1to1();
+    test_texture_minified_samples_centre();
+    test_sprite_texture_samples_centre();
     test_clear_mode_clears_depth();
     test_depth_test_still_rejects();
     test_ge_reset_clears_depth();
