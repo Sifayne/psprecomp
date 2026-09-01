@@ -98,10 +98,13 @@ void psp_vmmov(uint32_t vd, uint32_t vs, int size);
  * are equal, where every lane but that one gets the sine. */
 void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm, int size);
 
-/* Matrix multiply, transform and scale. See the note in vfpu.c: the operand
- * orientation of vmmul is not independently verified. */
+/* Matrix multiply, transform and scale. Operand orientation is checked against
+ * real-hardware output (pspautotests cpu/vfpu/matrix); see vfpu.c.
+ *
+ * `size` is the matrix order. vtfm's `homogeneous` selects the vhtfm form,
+ * which has no opcode of its own -- see vfpu.c for how to tell them apart. */
 void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
-void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size, int homogeneous);
 void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 
 /* Prefix state. Set by vpfxs/vpfxt/vpfxd; consumed (and cleared) by the next

@@ -377,8 +377,11 @@ static psp_interp_status exec_simple(const a_insn *in) {
     case A_VFIM: psp_vimm(in->vd, a_half_to_float((uint16_t)in->imm)); return I_RUNNING;
 
     case A_VMMUL: psp_vmmul(in->vd, in->vs, in->vt, in->vsize); return I_RUNNING;
-    case A_VTFM2: case A_VTFM3: case A_VTFM4:
-        psp_vtfm(in->vd, in->vs, in->vt, in->vsize); return I_RUNNING;
+    case A_VTFM2: case A_VTFM3: case A_VTFM4: {
+        int hom;
+        const int n = a_vtfm_order(in->op, in->vsize, &hom);
+        psp_vtfm(in->vd, in->vs, in->vt, n, hom); return I_RUNNING;
+    }
     case A_VMSCL: psp_vmscl(in->vd, in->vs, in->vt, in->vsize); return I_RUNNING;
     case A_VROT:  psp_vrot(in->vd, in->vs, (uint32_t)in->imm & 0x1F, in->vsize); return I_RUNNING;
     case A_VMMOV: psp_vmmov(in->vd, in->vs, in->vsize);  return I_RUNNING;

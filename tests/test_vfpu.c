@@ -10,6 +10,7 @@
 
 #include "psprecomp/vfpu.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,8 +26,16 @@ static int failures;
         }                                                      \
     } while (0)
 
+/* Relative tolerance, and not a strict inequality.
+ *
+ * An absolute 1e-5 is far below one ULP once past a few thousand, so
+ * `want - 1e-5f` is just `want` and `got > want - 1e-5f` then *rejects*
+ * exactly-equal values. Every check here used small numbers, so it went
+ * unnoticed until the hardware-pinned vmmul values, which run to five digits,
+ * failed while printing "got 1585.000000, want 1585.000000". */
 #define CHECK_F(got, want, label)                                            \
-    CHECK((got) > (want) - 1e-5f && (got) < (want) + 1e-5f,                   \
+    CHECK(fabsf((float)(got) - (float)(want))                                \
+              <= 1e-5f * (1.0f + fabsf((float)(want))),                      \
           "%s: got %f, want %f", (label), (double)(got), (double)(want))
 
 static void test_register_addressing(void) {
@@ -271,76 +280,87 @@ static void test_matrix_ops(void) {
 
 static void test_matrix_transform(void) {
     psp_vfpu_reset();
-    float m[4][4], v[4];
 
-    /* Transforming a basis vector must yield the corresponding matrix column.
-     * That is the property which distinguishes this convention from its
-     * transpose -- an identity test would pass either way. */
+    /* Pinned to real hardware: pspautotests cpu/vfpu/matrix, `vmmul.q 1`.
+     *
+     * The inputs are that test's m1 and m2 as they sit in memory, and the
+     * result is what a PSP prints. This is the check the old geometric
+     * properties could not be: an identity test, and even a "vmmul and vtfm
+     * agree" test, passes just as happily with both operands transposed. Those
+     * held here for a long time while the orientation was wrong.
+     *
+     * vs carries the transpose bit because the assembler puts it there --
+     * `vmmul.q M200, M000, M100` encodes vs as 0x20, not 0x00 -- and vmmul
+     * then indexes that operand transposed again. Passing 0x08 here instead of
+     * 0x28 would test something the hardware never executes. */
+    static const float m1[4][4] = {   /* [row][col], as declared in memory */
+        {  2,  3,  5,  7 }, { 11, 13, 17, 19 },
+        { 23, 29, 31, 37 }, { 41, 43, 47, 53 },
+    };
+    static const float m2[4][4] = {
+        {  59,  61,  67,  71 }, {  73,  79,  83,  89 },
+        {  97, 101, 103, 107 }, { 109, 113, 127, 131 },
+    };
+    static const float want[4][4] = {
+        {  1585,  1655,  1787,  1861 }, {  5318,  5562,  5980,  6246 },
+        { 10514, 11006, 11840, 12378 }, { 15894, 16634, 17888, 18710 },
+    };
+
+    float a[4][4], b[4][4], out[4][4];
     for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++) m[c][r] = (float)(c * 4 + r + 1);
-    set_matrix(0x08, 4, m);
+        for (int r = 0; r < 4; r++) { a[c][r] = m1[r][c]; b[c][r] = m2[r][c]; }
+    set_matrix(0x08, 4, a);               /* matrix 2 */
+    set_matrix(0x10, 4, b);               /* matrix 4 */
 
+    psp_vmmul(0x14, 0x28, 0x10, 4);       /* matrix 5 = 2 * 4, vs transposed */
+    get_matrix(0x14, 4, out);
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            CHECK_F(out[c][r], want[r][c], "vmmul matches hardware");
+
+    /* vtfm of a basis vector is the matrix ROW, not the column: output lane i
+     * reads m[i][k], so e_b selects element (col i, row b) across i. The
+     * previous convention here claimed the column, which is its transpose. */
     for (int basis = 0; basis < 4; basis++) {
         int t[4], d[4];
         psp_vfpu_regs(0x40, 4, t);
         for (int i = 0; i < 4; i++) psp_cpu.v[t[i]] = (i == basis) ? 1.0f : 0.0f;
 
-        psp_vtfm(0x44, 0x08, 0x40, 4);
+        psp_vtfm(0x44, 0x08, 0x40, 4, 0);
         psp_vfpu_regs(0x44, 4, d);
-        for (int r = 0; r < 4; r++)
-            CHECK_F(psp_cpu.v[d[r]], m[basis][r], "vtfm of a basis vector is that column");
+        for (int i = 0; i < 4; i++)
+            CHECK_F(psp_cpu.v[d[i]], a[i][basis], "vtfm of a basis vector is that row");
     }
 
-    /* Multiplying by the identity must be a no-op, in both operand positions. */
-    psp_vmidt(0x00, 4);
-    psp_vmmul(0x0C, 0x08, 0x00, 4);
-    float out[4][4];
+    /* Multiplying by the identity is a no-op in both positions. Weak on its
+     * own -- kept because it still catches a mis-addressed operand. */
+    psp_vmidt(0x00, 4);                   /* matrix 0 = I */
+    psp_vmmul(0x0C, 0x28, 0x00, 4);       /* matrix 3 = A * I, vs transposed */
     get_matrix(0x0C, 4, out);
     for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++) CHECK_F(out[c][r], m[c][r], "M * I == M");
+        for (int r = 0; r < 4; r++) CHECK_F(out[c][r], a[c][r], "M * I == M");
 
-    psp_vmmul(0x0C, 0x00, 0x08, 4);
-    get_matrix(0x0C, 4, out);
-    for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++) CHECK_F(out[c][r], m[c][r], "I * M == M");
-
-    /* vmmul and vtfm must agree: transforming by a product is the same as
-     * transforming twice. This is the strongest check available without an
-     * external oracle -- it pins the two against each other, though it still
-     * cannot detect a consistent transpose of both. */
-    float a[4][4], b[4][4];
-    for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++) {
-            a[c][r] = (float)((c + 1) * (r + 2) % 7) - 3.0f;
-            b[c][r] = (float)((c + 3) * (r + 1) % 5) - 2.0f;
-        }
-    /* Every operand needs its OWN matrix. A register's matrix is (vreg>>2)&7,
-     * so 0x08 and 0x48 are both matrix 2 -- an earlier version of this test
-     * used both and quietly overwrote A while computing B*x, then blamed the
-     * implementation. Matrices here: A=2, B=4, AB=5, x=6, results in 7/0/1. */
-    set_matrix(0x08, 4, a);   /* matrix 2 */
-    set_matrix(0x10, 4, b);   /* matrix 4 */
-
-    int t[4];
-    psp_vfpu_regs(0x18, 4, t);            /* matrix 6 */
+    /* vmmul and vtfm agree. vtfm applies the transpose of its matrix, so a
+     * product must be undone in the opposite order: (AB)^T = B^T A^T, hence
+     * A first and then B. Getting this order backwards is exactly the bug the
+     * hardware comparison above found, so the order is the assertion. */
+    int t[4], d[4];
+    psp_vfpu_regs(0x18, 4, t);            /* matrix 6 holds x */
     const float in[4] = { 1.0f, -2.0f, 0.5f, 3.0f };
     for (int i = 0; i < 4; i++) psp_cpu.v[t[i]] = in[i];
 
-    /* (A*B) * x */
-    psp_vmmul(0x14, 0x08, 0x10, 4);       /* matrix 5 */
-    psp_vtfm(0x1C, 0x14, 0x18, 4);        /* matrix 7 */
+    psp_vmmul(0x14, 0x28, 0x10, 4);       /* matrix 5 = A * B */
+    psp_vtfm(0x1C, 0x14, 0x18, 4, 0);     /* matrix 7 = (AB) x */
     float combined[4];
-    int d[4];
     psp_vfpu_regs(0x1C, 4, d);
     for (int i = 0; i < 4; i++) combined[i] = psp_cpu.v[d[i]];
 
-    /* A * (B * x) */
-    psp_vtfm(0x00, 0x10, 0x18, 4);        /* matrix 0 */
-    psp_vtfm(0x04, 0x08, 0x00, 4);        /* matrix 1 */
+    psp_vtfm(0x00, 0x08, 0x18, 4, 0);     /* matrix 0 = A x */
+    psp_vtfm(0x04, 0x10, 0x00, 4, 0);     /* matrix 1 = B (A x) */
     psp_vfpu_regs(0x04, 4, d);
     for (int i = 0; i < 4; i++)
         CHECK_F(psp_cpu.v[d[i]], combined[i],
-                "vmmul and vtfm agree: (A*B)x == A(Bx)");
+                "vmmul and vtfm agree: (AB)x == B(Ax)");
 }
 
 

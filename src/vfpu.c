@@ -217,16 +217,37 @@ void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
  * ops use keeps the two consistent -- which matters because a game builds a
  * matrix with these and then transforms with vtfm. */
 static void matrix_cols(uint32_t vd, int size, int cols[4][4]) {
-    /* Build a fresh vector register per column: matrix, column index, row 0.
-     * An earlier version modified bits 6:5 of the incoming register, which
-     * varies the *row* field and so walked rows while claiming to walk
-     * columns -- every matrix op addressed the wrong elements. */
-    const uint32_t mtx       = (vd >> 2) & 7;
-    const uint32_t transpose = (vd >> 5) & 1;
-    for (int c = 0; c < size; c++) {
-        uint32_t vreg = (mtx << 2) | (uint32_t)c | (transpose << 5);
-        psp_vfpu_regs(vreg, size, cols[c]);
-    }
+    /* A matrix register names a *sub-matrix*, not just a matrix.
+     *
+     * `M022` is the 2x2 at column 2, row 2 -- the bottom-right quarter -- and
+     * `vmidt.p M022` writes an identity there while leaving the rest alone.
+     * The base column is bits 1:0 and the base row is bit 6, exactly as for a
+     * vector register, and both indices wrap within the 4x4.
+     *
+     * An earlier version built a fresh register per column from the matrix and
+     * transpose bits only, which forced both offsets to zero: every op wrote
+     * the top-left corner whatever register it was given. Before that, one
+     * modified bits 6:5 of the incoming register, which varies the *row* field
+     * and so walked rows while claiming to walk columns. Third time: derive
+     * the indices directly, so there is no synthetic register to get wrong.
+     *
+     * `cols[c][r]` is the element at column c, row r of the operand as the
+     * instruction sees it -- so the transpose bit swaps which storage axis
+     * each index lands on, and callers never have to know. */
+    const int mtx       = (int)((vd >> 2) & 7);
+    const int col       = (int)(vd & 3);
+    const int transpose = (int)((vd >> 5) & 1);
+    const int row       = (size == 3) ? (int)((vd >> 6) & 1)
+                                      : (int)((vd >> 5) & 2);
+
+    for (int c = 0; c < size; c++)
+        for (int r = 0; r < size; r++) {
+            const int cc = (col + c) & 3;
+            const int rr = (row + r) & 3;
+            /* Storage is v[matrix*4 + column*32 + row]; see vfpu.h. */
+            cols[c][r] = transpose ? mtx * 4 + rr * 32 + cc
+                                   : mtx * 4 + cc * 32 + rr;
+        }
 }
 
 /* Read a whole matrix out into [col][row] order. */
@@ -389,13 +410,20 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     matrix_write(vd, size, m);
 }
 
-/* Transform a vector by a matrix: vd[r] = sum over c of M[c][r] * v[c].
+/* Transform a vector by a matrix: vd[i] = sum over k of M[i][k] * v[k].
  *
- * This is the column-major product a graphics pipeline wants -- the matrix
- * columns are the transformed basis vectors, so transforming (1,0,0,0) yields
- * column 0. That property is what the test pins, and it is the one that
- * distinguishes this from its transpose. */
-void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+ * Output lane i selects the matrix *column* i, so the result is the transpose
+ * of the column-major product this used to compute. Unlike vmmul the encoding
+ * does not set the transpose bit here -- vtfm's vs comes through as 0x1C, not
+ * 0x3C -- so there is nothing to cancel it, and the two ops end up indexing
+ * their matrix operand the same way for different reasons.
+ *
+ * `homogeneous` is the vhtfm form: the vector supplies one element fewer than
+ * the matrix order and an implicit 1 fills the last, which is how a 4x4 with
+ * translation applies to a 3-vector. There is no separate opcode for it -- it
+ * is vtfm with the vector one size smaller than the instruction's own, so the
+ * caller has to work it out from both and cannot recover it from `size`. */
+void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size, int homogeneous) {
     if (!take_prefixes(psp_cpu.pc, "vtfm")) return;
     float m[4][4];
     int d[4], t[4];
@@ -405,9 +433,12 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
     float in[4], out[4];
     for (int i = 0; i < size; i++) in[i] = psp_cpu.v[t[i]];
+
+    const int n = homogeneous ? size - 1 : size;
     for (int r = 0; r < size; r++) {
         float sum = 0.0f;
-        for (int c = 0; c < size; c++) sum += m[c][r] * in[c];
+        for (int c = 0; c < n; c++) sum += m[r][c] * in[c];
+        if (homogeneous) sum += m[r][size - 1];
         out[r] = sum;
     }
     /* vd may be one of the sources, so write only after the whole result is
@@ -415,16 +446,20 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     for (int r = 0; r < size; r++) psp_cpu.v[d[r]] = out[r];
 }
 
-/* Matrix product, composed from the same transform used above so the two
- * cannot disagree: each column of the result is a column of vt transformed by
- * vs.
+/* Matrix product. `out[c][r] = sum over k of vs[r][k] * vt[c][k]`.
  *
- * NOTE: the operand ORIENTATION here is not independently verified. The maths
- * is right for the convention stated above, and the identity/composition tests
- * hold, but those hold for the transposed convention too -- they cannot tell
- * the two apart. If recompiled geometry comes out scrambled rather than
- * absent, this is the first thing to check against an oracle. Recorded rather
- * than glossed, because a wrong orientation produces plausible output. */
+ * The vs index looks transposed and is. vmmul reads its first operand *twice*
+ * transposed and the two cancel: the assembler sets the transpose bit in the
+ * encoding -- `vmmul.q M200, M000, M100` encodes vs as 0x20, not 0x00 -- and
+ * the hardware then indexes that operand by [output row][summation] rather
+ * than [summation][output row]. Honour only the encoded bit, as this did, and
+ * the result is the product of the *transpose* of vs: for the pspautotests
+ * matrix case, 7621 where hardware gives 1585.
+ *
+ * Verified against cpu/vfpu/matrix.expected, which is real-hardware output.
+ * It replaces a note here saying the orientation was unverified because the
+ * identity and composition tests hold for the transposed convention too. They
+ * do; that is exactly why it needed a test that does not. */
 void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     if (!take_prefixes(psp_cpu.pc, "vmmul")) return;
     float a[4][4], b[4][4], out[4][4];
@@ -434,7 +469,7 @@ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     for (int c = 0; c < size; c++)
         for (int r = 0; r < size; r++) {
             float sum = 0.0f;
-            for (int k = 0; k < size; k++) sum += a[k][r] * b[c][k];
+            for (int k = 0; k < size; k++) sum += a[r][k] * b[c][k];
             out[c][r] = sum;
         }
     matrix_write(vd, size, out);

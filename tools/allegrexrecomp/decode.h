@@ -166,6 +166,23 @@ const char *a_freg_name(unsigned idx);
  * whose cause was the oracle itself. */
 float a_half_to_float(uint16_t h);
 
+/* vtfm or vhtfm, and the order to compute at.
+ *
+ * There is no vhtfm opcode. The instruction names an order -- vtfm2/3/4 -- and
+ * separately carries a vector size, and when the vector is one element short
+ * of the order that *is* the homogeneous form: the missing element is an
+ * implicit 1, which is how a 4x4 with a translation column applies to a
+ * 3-vector. `vhtfm4.q` and `vtfm4.q` differ only in that size field.
+ *
+ * Shared rather than duplicated for the same reason as a_half_to_float: the
+ * emitter and the interpreter must agree, and a divergence caused by two
+ * copies of this rule would be reported by the oracle as a codegen bug. */
+static inline int a_vtfm_order(a_op op, int vsize, int *homogeneous) {
+    const int order = (op == A_VTFM2) ? 2 : (op == A_VTFM3) ? 3 : 4;
+    *homogeneous = (vsize == order - 1);
+    return *homogeneous ? vsize + 1 : vsize;
+}
+
 #ifdef __cplusplus
 }
 #endif
