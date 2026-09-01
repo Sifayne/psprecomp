@@ -80,6 +80,34 @@
 #define GE_FBP          0x9C
 #define GE_FBW          0x9D
 
+/* Transform and lighting state.
+ *
+ * Matrix uploads are two commands: a NUMBER that sets the write index, then a
+ * run of DATA words each carrying one element. World, view and texgen are 4
+ * columns of 3 rows -- the bottom row is implied (0,0,0,1) and never sent --
+ * so twelve elements; projection is a full 4x4, so sixteen. That asymmetry is
+ * the SDK's, not a guess: sceGuSetMatrix sends 12 for GU_MODEL/GU_VIEW and 16
+ * for GU_PROJECTION.
+ *
+ * DATA carries 24 bits where a float needs 32. The hardware takes the low
+ * eight off the mantissa, so the word reassembles as arg << 8. */
+#define GE_WORLDMATRIXNUMBER 0x3A
+#define GE_WORLDMATRIXDATA   0x3B
+#define GE_VIEWMATRIXNUMBER  0x3C
+#define GE_VIEWMATRIXDATA    0x3D
+#define GE_PROJMATRIXNUMBER  0x3E
+#define GE_PROJMATRIXDATA    0x3F
+#define GE_VIEWPORTXSCALE    0x42
+#define GE_VIEWPORTYSCALE    0x43
+#define GE_VIEWPORTZSCALE    0x44
+#define GE_VIEWPORTXCENTER   0x45
+#define GE_VIEWPORTYCENTER   0x46
+#define GE_VIEWPORTZCENTER   0x47
+#define GE_OFFSETX           0x4C
+#define GE_OFFSETY           0x4D
+#define GE_CULLFACEENABLE    0x1D
+#define GE_CULL              0x9B
+
 /* VTYPE field extraction. */
 #define VT_TEX(v)     ((v) & 3)
 #define VT_COLOR(v)   (((v) >> 2) & 7)
@@ -120,9 +148,43 @@ static uint32_t g_next_id;
  * needs T&L, the second is a state-tracking bug, the third is a decoder gap.
  * Guessing between them is the same mistake as reading one stop reason for
  * another, so they are counted apart. */
-static uint64_t g_skip_transform;  /* not through-mode: needs a transform we do not have */
 static uint64_t g_skip_noaddr;     /* no vertex address in the stream */
 static uint64_t g_skip_layout;     /* weighted, or no position -- vertex_layout declined */
+static uint64_t g_skip_nearplane;  /* transformed behind the eye; no clipper yet */
+static uint64_t g_culled;          /* backfacing, by the game's own winding rule */
+static uint64_t g_xformed;         /* vertices that went through the pipeline */
+
+/* The transform pipeline's state.
+ *
+ * Kept apart from g_ge because it resets differently: matrices persist across
+ * lists, and a NUMBER command sets a cursor that the following DATA words walk
+ * forward. Out-of-range writes are dropped rather than wrapped -- a list still
+ * being built by the CPU can be read mid-write, and wrapping would corrupt the
+ * matrix rather than skip a word of it. */
+static struct {
+    float world[12], view[12], proj[16];
+    int   world_n, view_n, proj_n;
+    float vp_xs, vp_ys, vp_zs, vp_xc, vp_yc, vp_zc;
+    float off_x, off_y;
+    int   vp_set;
+    int   cull_enable, cull_ccw;
+    /* Which matrices the stream actually uploaded, and where the result lands.
+     * "Geometry is being transformed" and "transformed by the matrices the game
+     * meant" are different claims, and a screen-space bounding box separates
+     * them: a plausible scene sits inside the frame, an identity-by-omission
+     * pipeline piles everything at one point, and a wrong matrix throws it to
+     * coordinates with no relation to a 480x272 screen. */
+    uint32_t world_words, view_words, proj_words;
+    float bb_x0, bb_y0, bb_x1, bb_y1;
+    int   bb_seen;
+} g_tl;
+
+/* A GE float argument: 24 bits of mantissa-truncated float, in the low bits. */
+static float ge_float(uint32_t arg) {
+    union { uint32_t u; float f; } c;
+    c.u = arg << 8;
+    return c.f;
+}
 
 /* Tracked state, and the counters that make the report worth reading. */
 static struct {
@@ -152,11 +214,35 @@ static struct {
     uint64_t finishes;
 } g_ge;
 
+/* The texel range the draws actually sample.
+ *
+ * u_lo/u_hi were declared and printed from the first version of this file and
+ * never once assigned, so the summary reported "u 0.0..0.0" for every run ever
+ * made -- a reading that looks like a measurement and is a fixed constant. It
+ * is what tells "the texture is sampled at one corner" apart from "the texture
+ * is sampled across its whole surface", which is the question that comes up
+ * every time the frame is one flat colour. */
+static void note_uv(float u, float v) {
+    if (!g_ge.uv_seen) {
+        g_ge.u_lo = g_ge.u_hi = u;
+        g_ge.v_lo = g_ge.v_hi = v;
+        g_ge.uv_seen = 1;
+        return;
+    }
+    if (u < g_ge.u_lo) g_ge.u_lo = u;
+    if (u > g_ge.u_hi) g_ge.u_hi = u;
+    if (v < g_ge.v_lo) g_ge.v_lo = v;
+    if (v > g_ge.v_hi) g_ge.v_hi = v;
+}
+
+
 void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
     memset(&g_ge, 0, sizeof g_ge);
     psp_render_reset_pixels();
-    g_skip_transform = g_skip_noaddr = g_skip_layout = 0;
+    g_skip_noaddr = g_skip_layout = g_skip_nearplane = 0;
+    g_culled = g_xformed = 0;
+    memset(&g_tl, 0, sizeof g_tl);
     g_next_id = 0x00080000u;
 }
 
@@ -211,9 +297,27 @@ void psp_ge_dump_stats(FILE *out) {
         fprintf(out, "    %llu commands not individually decoded\n",
                 (unsigned long long)g_ge.unknown);
     fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
-    if (g_skip_transform)
-        fprintf(out, "    %llu vertices needing a transform (not through-mode; no T&L here)\n",
-                (unsigned long long)g_skip_transform);
+    if (g_xformed) {
+        fprintf(out, "    transformed %llu vertices; viewport %s",
+                (unsigned long long)g_xformed,
+                g_tl.vp_set ? "set" : "defaulted");
+        if (g_tl.vp_set)
+            fprintf(out, " (scale %.1f,%.1f centre %.1f,%.1f offset %.1f,%.1f)",
+                    g_tl.vp_xs, g_tl.vp_ys, g_tl.vp_xc, g_tl.vp_yc,
+                    g_tl.off_x, g_tl.off_y);
+        fprintf(out, ", cull %s\n", g_tl.cull_enable ? (g_tl.cull_ccw ? "ccw" : "cw") : "off");
+        fprintf(out, "    matrix words: world %u, view %u, proj %u\n",
+                g_tl.world_words, g_tl.view_words, g_tl.proj_words);
+        if (g_tl.bb_seen)
+            fprintf(out, "    screen bounds: x %.1f..%.1f  y %.1f..%.1f\n",
+                    g_tl.bb_x0, g_tl.bb_x1, g_tl.bb_y0, g_tl.bb_y1);
+        if (g_skip_nearplane)
+            fprintf(out, "    %llu vertices dropped at the near plane (no clipper)\n",
+                    (unsigned long long)g_skip_nearplane);
+        if (g_culled)
+            fprintf(out, "    %llu vertices culled as backfacing\n",
+                    (unsigned long long)g_culled);
+    }
     if (g_skip_noaddr)
         fprintf(out, "    %llu vertices dropped: no vertex address set\n",
                 (unsigned long long)g_skip_noaddr);
@@ -382,6 +486,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
     default:
         break;
     }
+    if (tex_off >= 0) note_uv(out->u, out->v);
     if (col_off >= 0 && VT_COLOR(vtype) == 7)
         out->rgba = psp_read32(addr + (uint32_t)col_off);
 
@@ -401,12 +506,190 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
 }
 
 
+/* Model-space position, for transformed geometry.
+ *
+ * Narrow components are normalised here and raw in through-mode: an s16 is a
+ * signed fraction of 32768, an s8 of 128. Reading them raw instead puts a unit
+ * cube 32768 units across, which projects to nothing recognisable and looks
+ * like a broken matrix rather than a scaling mistake. */
+static int read_pos_model(uint32_t addr, uint32_t vtype, int pos_off, float p[3]) {
+    const uint32_t a = addr + (uint32_t)pos_off;
+    switch (VT_POS(vtype)) {
+    case 1:
+        p[0] = (float)(int8_t)psp_read8(a)       / 128.0f;
+        p[1] = (float)(int8_t)psp_read8(a + 1)   / 128.0f;
+        p[2] = (float)(int8_t)psp_read8(a + 2)   / 128.0f;
+        return 1;
+    case 2:
+        p[0] = (float)(int16_t)psp_read16(a)     / 32768.0f;
+        p[1] = (float)(int16_t)psp_read16(a + 2) / 32768.0f;
+        p[2] = (float)(int16_t)psp_read16(a + 4) / 32768.0f;
+        return 1;
+    case 3:
+        p[0] = psp_read_f32(a);
+        p[1] = psp_read_f32(a + 4);
+        p[2] = psp_read_f32(a + 8);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Texture coordinates for transformed geometry are normalised, not texels, so
+ * they scale by the texture size. Through-mode gives texels directly, which is
+ * why the two paths read them differently. */
+static void read_uv_model(uint32_t addr, uint32_t vtype, int tex_off, psp_vertex *out) {
+    out->u = out->v = 0.0f;
+    if (tex_off < 0) return;
+    const uint32_t a = addr + (uint32_t)tex_off;
+    float u = 0.0f, v = 0.0f;
+    switch (VT_TEX(vtype)) {
+    case 1: u = (float)(int8_t)psp_read8(a)       / 128.0f;
+            v = (float)(int8_t)psp_read8(a + 1)   / 128.0f;   break;
+    case 2: u = (float)(int16_t)psp_read16(a)     / 32768.0f;
+            v = (float)(int16_t)psp_read16(a + 2) / 32768.0f; break;
+    case 3: u = psp_read_f32(a); v = psp_read_f32(a + 4);     break;
+    default: return;
+    }
+    out->u = u * (float)g_ge.tex_w;
+    out->v = v * (float)g_ge.tex_h;
+    note_uv(out->u, out->v);
+}
+
+/* World and view are 4 columns of 3 rows; the implied bottom row makes the
+ * fourth column a translation. */
+static void mul_4x3(const float m[12], const float in[3], float out[3]) {
+    out[0] = m[0]*in[0] + m[3]*in[1] + m[6]*in[2] + m[9];
+    out[1] = m[1]*in[0] + m[4]*in[1] + m[7]*in[2] + m[10];
+    out[2] = m[2]*in[0] + m[5]*in[1] + m[8]*in[2] + m[11];
+}
+
+/* Projection is a full 4x4, column-major, and produces the w that the divide
+ * needs -- which is the whole reason it is not folded into the 4x3 above. */
+static void mul_4x4(const float m[16], const float in[3], float out[4]) {
+    out[0] = m[0]*in[0] + m[4]*in[1] + m[8] *in[2] + m[12];
+    out[1] = m[1]*in[0] + m[5]*in[1] + m[9] *in[2] + m[13];
+    out[2] = m[2]*in[0] + m[6]*in[1] + m[10]*in[2] + m[14];
+    out[3] = m[3]*in[0] + m[7]*in[1] + m[11]*in[2] + m[15];
+}
+
+/* Clip space to screen. The viewport is the game's if it set one; the fallback
+ * is the standard 480x272 arrangement, with y scaled negative because screen y
+ * grows downward and clip y grows up. */
+static void to_screen(const float clip[4], float *sx, float *sy) {
+    const float inv = 1.0f / clip[3];
+    const float nx = clip[0] * inv, ny = clip[1] * inv;
+    if (g_tl.vp_set) {
+        *sx = nx * g_tl.vp_xs + g_tl.vp_xc - g_tl.off_x;
+        *sy = ny * g_tl.vp_ys + g_tl.vp_yc - g_tl.off_y;
+    } else {
+        *sx = nx * 240.0f + 240.0f;
+        *sy = ny * -136.0f + 136.0f;
+    }
+}
+
+/* Transformed geometry, one primitive at a time.
+ *
+ * Two things are missing and both are stated rather than hidden. There is no
+ * clipper: a primitive with any vertex at or behind the eye is dropped whole,
+ * because the perspective divide is meaningless there and the alternative --
+ * dividing anyway -- projects the vertex to the wrong side of the screen and
+ * draws a triangle across the whole frame. And there is no depth buffer, so
+ * primitives land in submission order. Backface culling is honoured, which
+ * removes the half of a closed mesh that would otherwise paint over the half
+ * in front of it, but it is not a substitute for a depth test. */
+static void draw_prim_transformed(uint32_t type, uint32_t count,
+                                  int col_off, int pos_off, int tex_off, int stride) {
+    enum { BATCH = 256 };
+    psp_vertex v[BATCH];
+    float      w[BATCH];
+    const psp_render_backend *be = psp_render_current();
+
+    uint32_t done = 0;
+    while (done < count) {
+        uint32_t n = count - done;
+        if (n > BATCH) n = BATCH;
+
+        uint32_t decoded = 0;
+        for (; decoded < n; decoded++) {
+            const uint32_t a = g_ge.vaddr + (done + decoded) * (uint32_t)stride;
+            float model[3], world[3], eye[3], clip[4];
+            if (!read_pos_model(a, g_ge.vtype, pos_off, model)) break;
+
+            mul_4x3(g_tl.world, model, world);
+            mul_4x3(g_tl.view,  world, eye);
+            mul_4x4(g_tl.proj,  eye,   clip);
+
+            psp_vertex *o = &v[decoded];
+            o->rgba = 0xFFFFFFFFu;
+            if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7)
+                o->rgba = psp_read32(a + (uint32_t)col_off);
+            read_uv_model(a, g_ge.vtype, tex_off, o);
+
+            w[decoded] = clip[3];
+            float sx, sy;
+            if (clip[3] > 1e-6f) to_screen(clip, &sx, &sy);
+            else                 sx = sy = 0.0f;
+            o->x = (int)sx;
+            o->y = (int)sy;
+            if (clip[3] > 1e-6f) {
+                if (!g_tl.bb_seen) { g_tl.bb_x0 = g_tl.bb_x1 = sx;
+                                     g_tl.bb_y0 = g_tl.bb_y1 = sy; g_tl.bb_seen = 1; }
+                if (sx < g_tl.bb_x0) g_tl.bb_x0 = sx;
+                if (sx > g_tl.bb_x1) g_tl.bb_x1 = sx;
+                if (sy < g_tl.bb_y0) g_tl.bb_y0 = sy;
+                if (sy > g_tl.bb_y1) g_tl.bb_y1 = sy;
+            }
+        }
+        if (!decoded) break;
+        g_xformed += decoded;
+
+        /* Emit primitive by primitive rather than handing the backend the
+         * batch: near-plane rejection and culling are per-primitive decisions,
+         * and a batch cannot express "all but this one". */
+        const int step = (type == PSP_PRIM_TRIANGLE_STRIP ||
+                          type == PSP_PRIM_TRIANGLE_FAN) ? 1 : 3;
+        if (type == PSP_PRIM_TRIANGLES || type == PSP_PRIM_TRIANGLE_STRIP ||
+            type == PSP_PRIM_TRIANGLE_FAN) {
+            for (uint32_t i = 2; i < decoded; i += (uint32_t)step) {
+                uint32_t i0 = (type == PSP_PRIM_TRIANGLE_FAN) ? 0 : i - 2;
+                uint32_t i1 = i - 1, i2 = i;
+                if (type == PSP_PRIM_TRIANGLES) { i0 = i - 2; i1 = i - 1; i2 = i; }
+
+                if (w[i0] <= 1e-6f || w[i1] <= 1e-6f || w[i2] <= 1e-6f) {
+                    g_skip_nearplane += 3;
+                    continue;
+                }
+                /* Signed area in screen space. A strip alternates winding, so
+                 * every second triangle flips -- ignoring that culls exactly
+                 * half of every strip and leaves a mesh full of holes. */
+                const long ax = v[i1].x - v[i0].x, ay = v[i1].y - v[i0].y;
+                const long bx = v[i2].x - v[i0].x, by = v[i2].y - v[i0].y;
+                long area = ax * by - ay * bx;
+                if (type == PSP_PRIM_TRIANGLE_STRIP && ((i - 2) & 1)) area = -area;
+                if (g_tl.cull_enable && area != 0 &&
+                    ((area < 0) == (g_tl.cull_ccw != 0))) { g_culled += 3; continue; }
+
+                const psp_vertex tri[3] = { v[i0], v[i1], v[i2] };
+                be->draw(PSP_PRIM_TRIANGLES, tri, 3);
+            }
+        } else {
+            be->draw((int)type, v, (int)decoded);
+        }
+
+        if ((type == PSP_PRIM_TRIANGLE_STRIP || type == PSP_PRIM_TRIANGLE_FAN) &&
+            decoded == BATCH && done + decoded < count)
+            done += decoded - 2;
+        else
+            done += decoded;
+    }
+}
+
 static void draw_prim(uint32_t type, uint32_t count) {
     /* The sampler is told the current texture at draw time rather than on every
      * state command: the GE sets these fields in any order, and only their
      * value at the draw matters. */
 
-    if (!VT_THROUGH(g_ge.vtype)) { g_skip_transform += count; return; }
     if (!g_ge.vaddr) { g_skip_noaddr += count; return; }
 
     int col_off = -1, pos_off = 0, tex_off = -1;
@@ -438,6 +721,11 @@ static void draw_prim(uint32_t type, uint32_t count) {
      * arithmetic and component alignment are fiddly, and duplicating them per
      * backend means every backend is wrong in its own way. Wrong once,
      * centrally, is at least diagnosable. */
+    if (!VT_THROUGH(g_ge.vtype)) {
+        draw_prim_transformed(type, count, col_off, pos_off, tex_off, stride);
+        return;
+    }
+
     enum { BATCH = 256 };
     psp_vertex v[BATCH];
     const psp_render_backend *be = psp_render_current();
@@ -539,6 +827,41 @@ static void run_list(ge_queue *q) {
         case GE_OFFSET_ADDR: q->base = arg << 8; break;
 
         case GE_VTYPE: g_ge.vtype = arg; break;
+
+        /* ---- transform state ----------------------------------------------
+         *
+         * NUMBER sets the write cursor, DATA advances it. Writes past the end
+         * are dropped: a list can be read while the CPU is still writing it,
+         * and wrapping the cursor would scribble over elements already set. */
+        case GE_WORLDMATRIXNUMBER: g_tl.world_n = (int)(arg & 0xF); break;
+        case GE_VIEWMATRIXNUMBER:  g_tl.view_n  = (int)(arg & 0xF); break;
+        case GE_PROJMATRIXNUMBER:  g_tl.proj_n  = (int)(arg & 0x1F); break;
+        case GE_WORLDMATRIXDATA:
+            if (g_tl.world_n < 12) g_tl.world[g_tl.world_n++] = ge_float(arg);
+            g_tl.world_words++;
+            break;
+        case GE_VIEWMATRIXDATA:
+            if (g_tl.view_n < 12) g_tl.view[g_tl.view_n++] = ge_float(arg);
+            g_tl.view_words++;
+            break;
+        case GE_PROJMATRIXDATA:
+            if (g_tl.proj_n < 16) g_tl.proj[g_tl.proj_n++] = ge_float(arg);
+            g_tl.proj_words++;
+            break;
+
+        case GE_VIEWPORTXSCALE:  g_tl.vp_xs = ge_float(arg); g_tl.vp_set = 1; break;
+        case GE_VIEWPORTYSCALE:  g_tl.vp_ys = ge_float(arg); g_tl.vp_set = 1; break;
+        case GE_VIEWPORTZSCALE:  g_tl.vp_zs = ge_float(arg); break;
+        case GE_VIEWPORTXCENTER: g_tl.vp_xc = ge_float(arg); break;
+        case GE_VIEWPORTYCENTER: g_tl.vp_yc = ge_float(arg); break;
+        case GE_VIEWPORTZCENTER: g_tl.vp_zc = ge_float(arg); break;
+
+        /* Offsets are in sixteenths of a pixel: sceGuOffset sends x << 4. */
+        case GE_OFFSETX: g_tl.off_x = (float)(arg & 0xFFFFFu) / 16.0f; break;
+        case GE_OFFSETY: g_tl.off_y = (float)(arg & 0xFFFFFu) / 16.0f; break;
+
+        case GE_CULLFACEENABLE: g_tl.cull_enable = (int)(arg & 1); break;
+        case GE_CULL:           g_tl.cull_ccw    = (int)(arg & 1); break;
         /* ---- texture state -------------------------------------------------
          *
          * Recorded, not yet sampled. What the sampler has to support is a
