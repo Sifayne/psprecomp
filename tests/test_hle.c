@@ -416,7 +416,9 @@ static void test_threads(void) {
     uint32_t caller_sp = psp_cpu.r[PSP_REG_SP];
 
     g_thread_ran = 0;
-    uint32_t rc = call(START, thid, 7 /*arglen*/, 0xAAAA, 0);
+    /* A real address: the argument block is copied out of it, so it has to be
+     * memory that exists. This passed 0xAAAA, which the start now refuses. */
+    uint32_t rc = call(START, thid, 7 /*arglen*/, 0x08802100u, 0);
     CHECK(rc == 0, "start succeeds");
 
     /* Starting a thread makes it runnable; it does not run it. The PSP is

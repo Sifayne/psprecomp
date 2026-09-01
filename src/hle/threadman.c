@@ -315,6 +315,29 @@ static uint32_t start_arg_block(uint32_t *arglen, uint32_t argp) {
     return argp;
 }
 
+/* Whether the block can be delivered at all. Two refusals, both `800200d3`,
+ * both leaving the thread unstarted -- threads/start proves the second half by
+ * clearing the thread's out-parameters first and finding them still clear:
+ *
+ *     -1 arg length:    800200d3 (-1, NULL)
+ *     arg ptr #1:       800200d3 (-1, NULL)      argp = 0xDEADBEEF
+ *     arg ptr #2:       800200d3 (-1, NULL)      argp = 0x80000000
+ *
+ * A negative length is checked before the NULL-pointer rule, which is why
+ * `With NULL ptr` succeeds with a length of 8 but `-1 arg length` does not
+ * succeed with a real pointer. */
+static int start_args_ok(uint32_t arglen, uint32_t argp) {
+    if ((int32_t)arglen < 0) return 0;
+    if (!argp || !arglen) return 1;
+    /* Checked before the address is masked, because masking is what loses the
+     * distinction: 0x80000000 is kernel space, and PSP_ADDR_MASK folds it onto
+     * address zero, where a module linked at 0 makes it look mapped. A user
+     * thread cannot be handed a kernel pointer, and 0xDEADBEEF (which does not
+     * fold onto anything) is refused by the mapping check below. */
+    if (argp >= 0x80000000u) return 0;
+    return psp_mem_ptr(argp, arglen) != NULL;
+}
+
 static void hle_StartThread(void) {
     /* (thid, arglen, argp)
      *
@@ -327,6 +350,11 @@ static void hle_StartThread(void) {
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
     if (t->ever_started && t->state != TH_DORMANT) {
         psp_ret(SCE_KERNEL_ERROR_NOT_DORMANT);
+        return;
+    }
+
+    if (!start_args_ok(psp_arg(1), psp_arg(2))) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE);
         return;
     }
 
