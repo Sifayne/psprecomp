@@ -206,6 +206,21 @@ static void dump_texture(void) {
             fwrite(rgb, 1, 3, f);
         }
     fclose(f);
+    /* And the alpha channel, as greyscale. The colour dump of an alpha-mask
+     * texture is uniformly white and says nothing; the shape is entirely in
+     * alpha, and so is any question about how it composites. */
+    snprintf(path, sizeof path, "%s-%02d-alpha.ppm", base, g_dumped_n);
+    f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", g_tex.w, g_tex.h);
+        for (int v = 0; v < g_tex.h; v++)
+            for (int u = 0; u < g_tex.w; u++) {
+                const uint8_t a = (uint8_t)((sample_texel(u, v) >> 24) & 0xFF);
+                const uint8_t rgb[3] = { a, a, a };
+                fwrite(rgb, 1, 3, f);
+            }
+        fclose(f);
+    }
     fprintf(stderr, "tex: %s  0x%08X %dx%d stride %u fmt %d%s clut 0x%08X fmt %d "
                     "shift %d mask %02X start %d\n",
             path, g_tex.addr, g_tex.w, g_tex.h, g_tex.stride, g_tex.fmt,
