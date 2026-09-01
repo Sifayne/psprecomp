@@ -262,6 +262,18 @@ void psp_sysmem_register(void) {
     psp_hle_register(0xB6D61D02, "SysMemUserForUser", "sceKernelFreePartitionMemory",  hle_FreePartitionMemory);
     psp_hle_register(0x9D9A5BA1, "SysMemUserForUser", "sceKernelGetBlockHeadAddr",     hle_GetBlockHeadAddr);
     psp_hle_register(0x7591C7DB, "SysMemUserForUser", "sceKernelSetCompiledSdkVersion",hle_SetCompiledSdkVersion);
+    /* A firmware-specific variant of the call above: same effect, different
+     * NID per SDK generation, and a module imports exactly the one matching
+     * what it was built against. This module's ~PSP header reports devkit
+     * 0x05050010, and this is the NID it imports.
+     *
+     * Registered *unnamed* on purpose. PPSSPP's NID database calls this
+     * `sceKernelSetCompiledSdkVersion500_505`, but SHA-1 of that string is
+     * 0xC28A2329, not 0x91DE343C -- so that label is a human-readable
+     * disambiguator rather than the exported symbol, and the real name is not
+     * known. Registering it as named would put a false name in the diagnostics
+     * and break the SHA-1 check in test_hle.c, which is right to reject it. */
+    psp_hle_register_unnamed(0x91DE343C, "SysMemUserForUser", hle_SetCompiledSdkVersion);
     psp_hle_register(0xF77D77CB, "SysMemUserForUser", "sceKernelSetCompilerVersion",   hle_SetCompilerVersion);
     psp_hle_register(0x13A5ABEF, "SysMemUserForUser", "sceKernelPrintf",               hle_Printf);
 }

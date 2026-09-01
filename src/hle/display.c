@@ -29,6 +29,7 @@ static uint32_t g_fb_width;      /* in pixels, the stride -- usually 512 */
 static uint32_t g_fb_format;
 static uint32_t g_mode, g_mode_w, g_mode_h;
 static uint64_t g_vblank_count;
+static uint32_t g_vcount;         /* scanline counter; see hle_GetVcount */
 
 void psp_display_reset(void) {
     g_fb_addr = 0;
@@ -38,6 +39,7 @@ void psp_display_reset(void) {
     g_mode_w = PSP_SCREEN_W;
     g_mode_h = PSP_SCREEN_H;
     g_vblank_count = 0;
+    g_vcount = 0;
 }
 
 void psp_display_init(void) { psp_display_reset(); }
@@ -135,9 +137,45 @@ static void hle_WaitVblank(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Scanline counters.
+ *
+ * On hardware these advance with the beam whether or not anyone is looking.
+ * Here nothing advances on its own -- there is no scanout and no clock -- so a
+ * counter that only moved when something else moved it would sit still, and
+ * code of the form
+ *
+ *     start = sceDisplayGetVcount();
+ *     while (sceDisplayGetVcount() == start) { }
+ *
+ * would never leave the loop. Reading the counter therefore advances it. That
+ * is not faithful -- a caller timing itself against vcount sees time run fast
+ * -- but the alternative is a hang, and the same trade is already made by
+ * hle_WaitVblank above.
+ *
+ * The two counters are kept consistent with each other rather than invented
+ * separately, because a caller that reads both and compares them would
+ * otherwise see nonsense. PSP_HLINES_PER_FRAME is the total scanline count
+ * including blanking; the absolute figure matters far less here than the
+ * ratio between the two counters staying fixed. */
+#define PSP_HLINES_PER_FRAME 286u
+
+static void hle_GetVcount(void) {
+    psp_ret(g_vcount++);
+}
+
+static void hle_GetAccumulatedHcount(void) {
+    /* Derived, not independent: hcount is vcount's worth of scanlines plus
+     * however far into the current frame we pretend to be. */
+    psp_ret(g_vcount * PSP_HLINES_PER_FRAME);
+    g_vcount++;
+}
+
 void psp_display_register(void) {
     psp_hle_register(0x0E20F177, "sceDisplay", "sceDisplaySetMode",           hle_SetMode);
     psp_hle_register(0x289D82FE, "sceDisplay", "sceDisplaySetFrameBuf",       hle_SetFrameBuf);
     psp_hle_register(0x36CDFADE, "sceDisplay", "sceDisplayWaitVblank",        hle_WaitVblank);
     psp_hle_register(0x46F186C3, "sceDisplay", "sceDisplayWaitVblankStartCB", hle_WaitVblank);
+    psp_hle_register(0x9C6EAAD7, "sceDisplay", "sceDisplayGetVcount",         hle_GetVcount);
+    psp_hle_register(0x210EAB3A, "sceDisplay", "sceDisplayGetAccumulatedHcount",
+                     hle_GetAccumulatedHcount);
 }
