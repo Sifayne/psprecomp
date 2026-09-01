@@ -1655,6 +1655,9 @@ typedef struct {
     char      name[32];
     uint32_t  attr, index;
     uint32_t  base, block_size, nblocks;
+    /* What one block costs in the pool, which is not what it holds: the
+     * option struct's alignment rounds it up. Reported size stays block_size. */
+    uint32_t  stride;
     uint32_t  cursor;                  /* where the next search starts */
     uint32_t  owner[MAX_TLS_BLOCKS];   /* thread uid holding each block, 0 free */
     int       alive;
@@ -1697,7 +1700,20 @@ static void hle_CreateTlspl(void) {
     if (count == 0 || (int32_t)count < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
     if (count > MAX_TLS_BLOCKS) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
-    const uint32_t base = psp_sysmem_alloc(bsize * count, 0);
+    /* The option block's second word is an alignment, and it rounds the block
+     * up rather than merely placing the pool. tls/get creates one-byte blocks
+     * three times over, with alignment 0x100, 1 and 0, and reads the spacing
+     * back as 0x100, 4 and 4 -- so anything below four is four, which is also
+     * what a pool created without options gets. */
+    const uint32_t opt = psp_arg(5);
+    uint32_t align = 4;
+    if (opt && psp_mem_ptr(opt, 8)) {
+        const uint32_t a = psp_read32(opt + 4);
+        if (a > align) align = a;
+    }
+    const uint32_t stride = (bsize + align - 1) & ~(align - 1);
+
+    const uint32_t base = psp_sysmem_alloc(stride * count, 0);
     if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     psp_tlspl *t = NULL;
@@ -1719,6 +1735,7 @@ static void hle_CreateTlspl(void) {
     psp_str(name, t->name, sizeof t->name);
     t->attr = attr; t->index = index;
     t->base = base; t->block_size = bsize; t->nblocks = count;
+    t->stride = stride;
     t->uid   = psp_threadman_next_uid();
     t->alive = 1;
     psp_ret(t->uid);
@@ -1744,7 +1761,7 @@ static uint32_t tls_me(void) {
 
 static uint32_t tls_block_of(const psp_tlspl *t, uint32_t owner) {
     for (uint32_t i = 0; i < t->nblocks; i++)
-        if (t->owner[i] == owner) return t->base + i * t->block_size;
+        if (t->owner[i] == owner) return t->base + i * t->stride;
     return 0;
 }
 
@@ -1776,7 +1793,7 @@ static void hle_GetTlsAddr(void) {
         if (t->owner[i]) continue;
         t->owner[i] = me;
         t->cursor = (i + 1) % t->nblocks;
-        psp_ret(t->base + i * t->block_size);
+        psp_ret(t->base + i * t->stride);
         return;
     }
 
