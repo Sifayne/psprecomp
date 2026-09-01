@@ -49,10 +49,30 @@ typedef struct {
 static io_file g_file[MAX_FILES];
 static io_dir  g_dir[MAX_DIRS];
 static char    g_root[512];
+static char    g_umd_image[512];
 static uint64_t g_bytes_read;
 
 void psp_io_set_root(const char *root) {
     snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
+}
+
+void psp_io_set_umd_image(const char *path) {
+    snprintf(g_umd_image, sizeof g_umd_image, "%s", path ? path : "");
+}
+
+/* Is this the raw block device rather than a path on the filesystem?
+ *
+ * `umd0:` and `umd1:` name the device itself. Anything after the colon makes it
+ * a path again, and `disc0:` is always the filesystem view, so neither is
+ * treated as raw. Getting that distinction wrong would turn every asset load
+ * into an attempt to open the whole disc. */
+static int is_raw_umd(const char *guest) {
+    const char *p;
+    if      (!strncmp(guest, "umd0:", 5)) p = guest + 5;
+    else if (!strncmp(guest, "umd1:", 5)) p = guest + 5;
+    else return 0;
+    while (*p == '/' || *p == '\\') p++;
+    return *p == '\0';
 }
 
 void psp_io_reset(void) {
@@ -82,6 +102,12 @@ static void map_path(const char *guest, char *out, size_t cap) {
     else if (!strncmp(p, "ms0:",   4)) { p += 4; sub = "ms";   }
     else if (!strncmp(p, "flash0:",7)) { p += 7; sub = "flash";}
     else if (!strncmp(p, "host0:", 6)) { p += 6; sub = "host"; }
+    /* Seen from real titles and previously unmapped, which left the colon in
+     * the host path and made every such open fail in a way that looked like a
+     * missing file rather than a missing prefix. */
+    else if (!strncmp(p, "umd1:",  5)) { p += 5; sub = "disc"; }
+    else if (!strncmp(p, "msstor0p1:", 10)) { p += 10; sub = "ms"; }
+    else if (!strncmp(p, "msstor0:",   8)) { p += 8;  sub = "ms"; }
 
     while (*p == '/' || *p == '\\') p++;
     snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
@@ -91,6 +117,34 @@ static void hle_Open(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     uint32_t flags = psp_arg(1);
+
+    if (is_raw_umd(guest)) {
+        if (!g_umd_image[0]) {
+            static int complained;
+            if (!complained++)
+                fprintf(stderr, "psprecomp: %s opened as a raw device, but no disc "
+                                "image is set (psp_io_set_umd_image)\n", guest);
+            psp_ret(0x80010002);
+            return;
+        }
+        FILE *f = fopen(g_umd_image, "rb");
+        if (!f) {
+            fprintf(stderr, "psprecomp: cannot open disc image %s\n", g_umd_image);
+            psp_ret(0x80010002);
+            return;
+        }
+        for (int i = 0; i < MAX_FILES; i++) {
+            if (g_file[i].used) continue;
+            g_file[i].f = f;
+            g_file[i].used = 1;
+            psp_ret((uint32_t)(i + 3));
+            return;
+        }
+        fclose(f);
+        psp_ret(0x80010018);
+        return;
+    }
+
     map_path(guest, host, sizeof host);
 
     const char *mode = "rb";
@@ -102,9 +156,16 @@ static void hle_Open(void) {
     FILE *f = fopen(host, mode);
     if (!f && (flags & PSP_O_CREAT)) f = fopen(host, "w+b");
     if (!f) {
-        /* A failed open is normal (a game probing for a save file) and is not
-         * worth a warning, but the mapped path is worth knowing when a game
-         * cannot find assets it expects. */
+        /* A failed open is often normal -- a game probing for a save file --
+         * so this is rate-limited rather than loud. But a game that cannot find
+         * its assets retries forever, and then the *first* few failures are the
+         * whole story: they name the file it wanted and the host path that was
+         * searched, which is usually a root that was never configured. */
+        static int complained;
+        if (complained < 8) {
+            complained++;
+            fprintf(stderr, "psprecomp: sceIoOpen failed: \"%s\" -> \"%s\"\n", guest, host);
+        }
         psp_ret(0x80010002);          /* ENOENT */
         return;
     }
@@ -169,7 +230,29 @@ static void hle_Write(void) {
         psp_ret(size);
         return;
     }
-    if (!h) { psp_ret(0x80020323); return; }
+    if (!h) {
+        /* A write to a descriptor nothing opened. Returning the error silently
+         * is right for a shipped port and wrong during bring-up: a game's panic
+         * path is usually "get the stdout fd, write the message, abort", so the
+         * one write most worth seeing is exactly the one most likely to land on
+         * a descriptor this layer does not know about. Dropping it costs the
+         * message that would have named the failure.
+         *
+         * Rate-limited, because a game that logs in a loop should not drown
+         * the run it is trying to explain. */
+        static int complained;
+        if (complained < 8) {
+            complained++;
+            fprintf(stderr, "psprecomp: sceIoWrite to unopened fd %d, %u bytes: \"", fd, size);
+            for (uint32_t i = 0; i < size && i < 200; i++) {
+                const int c = psp_read8(src + i);
+                fputc((c >= 32 && c < 127) ? c : '.', stderr);
+            }
+            fprintf(stderr, "%s\"\n", size > 200 ? "..." : "");
+        }
+        psp_ret(0x80020323);
+        return;
+    }
 
     uint8_t *tmp = (uint8_t *)malloc(size ? size : 1);
     if (!tmp) { psp_ret(0x80020190); return; }
