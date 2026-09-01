@@ -653,9 +653,27 @@ static void hle_GetThreadCurrentPriority(void) {
  * mattered more than it looks: pspautotests' checkpoint helper terminates its
  * rescheduler thread between every pair of checks, and a terminate that does
  * nothing leaves that thread to run later. */
+/* **A thread cannot terminate itself**, exactly as it cannot suspend itself,
+ * and with the same code: threads/terminate.expected answers
+ * `Current: 80020197`.
+ *
+ * That is not a detail either. The test terminates its own thread on one line
+ * of every block, and once terminate actually worked, obeying it killed the
+ * thread that was going to flush the checkpoint buffer -- so the whole file
+ * emitted nothing at all. A rule that reads like a nicety, silencing a test. */
 static void hle_TerminateThread(void) {
-    psp_thread *t = find_thread(psp_arg(0));
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+    const uint32_t id = psp_arg(0);
+    if (id == 0 || id == psp_sched_current()) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
+        return;
+    }
+    psp_thread *t = find_thread(id);
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    /* Never started, or already finished: there is nothing to terminate. */
+    if (!t->ever_started || t->state == TH_DORMANT) {
+        psp_ret(SCE_KERNEL_ERROR_DORMANT);
+        return;
+    }
     /* Both models: cancel a spawn the interpreter is holding, *and* stop a real
      * host thread if there is one. Only the first existed, and it is a no-op
      * whenever the second is what is needed. */
