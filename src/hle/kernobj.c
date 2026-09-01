@@ -1700,8 +1700,17 @@ static void hle_CreateTlspl(void) {
     if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     psp_tlspl *t = NULL;
+    /* The index is a *slot*, not a count of what is alive. tls/get creates two
+     * pools (indices 0 and 1), deletes the first and creates a third: hardware
+     * gives it index 0, reusing the slot the deleted one vacated. Counting the
+     * survivors would have said 1. */
     uint32_t index = 0;
-    for (int i = 0; i < MAX_TLSPLS; i++) if (g_tls[i].alive) index++;
+    for (;; index++) {
+        int taken = 0;
+        for (int i = 0; i < MAX_TLSPLS; i++)
+            if (g_tls[i].alive && g_tls[i].index == index) { taken = 1; break; }
+        if (!taken) break;
+    }
     for (int i = 0; i < MAX_TLSPLS; i++) if (!g_tls[i].alive) { t = &g_tls[i]; break; }
     if (!t) { psp_sysmem_release(base); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
