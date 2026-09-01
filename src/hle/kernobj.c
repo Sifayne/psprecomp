@@ -497,6 +497,10 @@ void psp_kernobj_register(void) {
 
 #define MAX_PIPES 64
 #define MPP_MODE_ASAP 1u
+/* Two queues, two attribute bits. Unlike every other object type, a message
+ * pipe orders its senders and its receivers separately. */
+#define MPP_ATTR_SEND_PRIORITY 0x0100u
+#define MPP_ATTR_RECV_PRIORITY 0x1000u
 
 typedef struct {
     uint32_t  uid;
@@ -588,56 +592,174 @@ static void hle_CreateMsgPipe(void) {
     psp_ret(p->uid);
 }
 
+/* Turning a queue out because the pipe is going away. Each waiter still gets
+ * told how many bytes it moved before it was abandoned -- msgpipe/data deletes
+ * a pipe under a receiver that got nothing and reads back
+ * `received = 00000000`, where an untouched word would still hold the 0x1337
+ * the test seeded. */
+static int mpp_abandon(psp_waitq *q) {
+    for (int i = 0; i < q->n; i++)
+        if (q->w[i].nout) psp_write32(q->w[i].nout, q->w[i].done);
+    return psp_waitq_release_all(q);
+}
+
 static void hle_DeleteMsgPipe(void) {
     psp_msgpipe *p = find_pipe(psp_arg(0));
     if (!p) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MPPID); return; }
-    int urgent = psp_waitq_release_all(&p->send_q);
-    urgent |= psp_waitq_release_all(&p->recv_q);
+    int urgent = mpp_abandon(&p->send_q);
+    urgent |= mpp_abandon(&p->recv_q);
     if (p->base) psp_sysmem_release(p->base);
     p->alive = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_yield();
 }
 
-/* Whoever is waiting on the other side may now be able to move. Each waiter
- * carries the buffer it was given and how much it wanted; `mode` says whether
- * a partial transfer will do. */
-static int mpp_wake_receivers(psp_msgpipe *p) {
-    int urgent = 0;
-    for (;;) {
-        const int i = psp_waitq_pick(&p->recv_q, p->attr);
-        if (i < 0) break;
-        const psp_waiter w = p->recv_q.w[i];
-        const uint32_t want = (w.mode & MPP_MODE_ASAP)
-                            ? (p->used < w.need ? p->used : w.need) : w.need;
-        if (!want || want > p->used) break;
-        psp_waitq_take(&p->recv_q, i);
-        mpp_take(p, w.out, want);
-        urgent |= psp_sched_wake(w.uid);
-    }
-    return urgent;
+/* ---- moving bytes through the pipe ----------------------------------------
+ *
+ * A message pipe is a byte stream, not a queue of messages, and threads/msgpipe
+ * measures that distinction directly. Three rules follow from it, and none of
+ * them survives an all-or-nothing transfer:
+ *
+ *   - **A waiting receiver is filled in pieces.** msgpipe/data has three
+ *     receivers wanting four bytes each and senders offering three at a time;
+ *     the partial bytes land in the *receiver's own buffer* and it keeps
+ *     waiting for the rest. There is nowhere else for them to go, and the test
+ *     proves they went somewhere by printing what each receiver finally read:
+ *     `msg1`, `msg2`, `msg3`, assembled across separate sends.
+ *
+ *   - **With the buffer empty, a sender hands bytes straight to a receiver.**
+ *     That is the only path on a pipe created with no buffer, and the same
+ *     test runs the whole scenario twice -- once with 0x100 bytes of buffer and
+ *     once with none -- and gets identical output.
+ *
+ *   - **Blocked senders top the buffer up as it drains.** A receiver that
+ *     empties the buffer pulls the next sender's bytes into it.
+ *
+ * The three are one loop, run after any change: senders fill, the buffer feeds
+ * receivers, repeat while anything moved.
+ *
+ * The two queues also take their release order from *different* attribute bits.
+ * 0x100 orders senders and 0x1000 orders receivers, and msgpipe/data pins the
+ * second on its own: a pipe created with attr 0x1000 serves three receivers at
+ * priorities 0x33, 0x32 and 0x31 in the order 0x31, 0x32, 0x33 while its
+ * senders stay first-come. Passing the raw attribute to both queues gave
+ * receivers the sender's rule. */
+
+static uint32_t mpp_min(uint32_t a, uint32_t b) { return a < b ? a : b; }
+
+/* Copy between two guest addresses a byte at a time; the pipe never moves
+ * enough at once for anything cleverer to matter. */
+static void mpp_copy(uint32_t dst, uint32_t src, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        psp_write8(dst + i, src ? psp_read8(src + i) : 0);
 }
 
-static int mpp_wake_senders(psp_msgpipe *p) {
-    int urgent = 0;
-    for (;;) {
-        const int i = psp_waitq_pick(&p->send_q, p->attr);
-        if (i < 0) break;
-        const psp_waiter w = p->send_q.w[i];
-        const uint32_t room = mpp_free(p);
-        const uint32_t give = (w.mode & MPP_MODE_ASAP)
-                            ? (room < w.need ? room : w.need) : w.need;
-        if (!give || give > room) break;
-        psp_waitq_take(&p->send_q, i);
-        mpp_put(p, w.out, give);
-        urgent |= psp_sched_wake(w.uid);
+/* A waiter is finished when it has all it asked for -- or, in ASAP mode, as
+ * soon as it has anything at all. */
+static int mpp_satisfied(const psp_waiter *w) {
+    return w->done >= w->need || ((w->mode & MPP_MODE_ASAP) && w->done > 0);
+}
+
+/* Done with this waiter: report how much moved, take it out, wake it. */
+static void mpp_release(psp_waitq *q, int i, int *urgent) {
+    const psp_waiter w = psp_waitq_take(q, i);
+    if (w.nout) psp_write32(w.nout, w.done);
+    *urgent |= psp_sched_wake(w.uid);
+}
+
+static uint32_t mpp_send_order(const psp_msgpipe *p) {
+    return (p->attr & MPP_ATTR_SEND_PRIORITY) ? PSP_WAITQ_PRIORITY : 0;
+}
+static uint32_t mpp_recv_order(const psp_msgpipe *p) {
+    return (p->attr & MPP_ATTR_RECV_PRIORITY) ? PSP_WAITQ_PRIORITY : 0;
+}
+
+/* Move whatever can move, and keep going until nothing does.
+ *
+ * `exclude` is the caller's own uid: it is in the queue so that it sits in the
+ * right place in the release order, but it is not blocked yet, so it must not
+ * be woken or removed here. Its caller reads its progress out of the queue
+ * afterwards.
+ *
+ * Receiver-driven, which is the part that took measuring. A receiver takes from
+ * the buffer and then reaches into the blocked senders for the rest; a sender
+ * only *stores* when its whole remainder fits, or when it is in ASAP mode and
+ * will settle for whatever room there is. That asymmetry is what
+ * msgpipe/data's send-priority block reads back: a full-wait sender arriving at
+ * a pipe with one byte free does not leave that byte behind it, so the receiver
+ * that comes next gets the byte from a *different*, more urgent sender --
+ * `msgs`, not `msg1`. */
+static void mpp_pump(psp_msgpipe *p, uint32_t exclude, int *urgent) {
+    for (int spinning = 1; spinning; ) {
+        spinning = 0;
+
+        /* Receivers pull: the buffer first, then straight from blocked senders,
+         * which is the only path on a pipe with no buffer at all. */
+        for (;;) {
+            const int ri = psp_waitq_pick(&p->recv_q, mpp_recv_order(p));
+            if (ri < 0) break;
+            psp_waiter *r = &p->recv_q.w[ri];
+            const uint32_t fromBuf = mpp_min(p->used, r->need - r->done);
+            if (fromBuf) {
+                mpp_take(p, r->out + r->done, fromBuf);
+                r->done += fromBuf;
+                spinning = 1;
+            }
+
+            /* Direct handoff only with the buffer drained: bytes still in it
+             * came first and must be delivered first. */
+            while (!p->used && r->done < r->need) {
+                const int si = psp_waitq_pick(&p->send_q, mpp_send_order(p));
+                if (si < 0) break;
+                psp_waiter *s = &p->send_q.w[si];
+                const uint32_t n = mpp_min(s->need - s->done, r->need - r->done);
+                if (!n) break;
+                mpp_copy(r->out + r->done, s->out + s->done, n);
+                s->done += n; r->done += n;
+                spinning = 1;
+                if (!mpp_satisfied(s) || s->uid == exclude) break;
+                mpp_release(&p->send_q, si, urgent);
+            }
+
+            if (!mpp_satisfied(r)) break;
+            /* The caller is in the queue for its position in the order, not to
+             * be woken: it is still running. It also stops the scan, because
+             * anyone behind it is behind it. Its own code takes it out and
+             * pumps again. */
+            if (r->uid == exclude) break;
+            mpp_release(&p->recv_q, ri, urgent);
+        }
+
+        /* Senders store what the buffer will hold. */
+        for (;;) {
+            const uint32_t room = mpp_free(p);
+            if (!room) break;
+            const int si = psp_waitq_pick(&p->send_q, mpp_send_order(p));
+            if (si < 0) break;
+            psp_waiter *s = &p->send_q.w[si];
+            const uint32_t left = s->need - s->done;
+            if (!left) break;
+            /* All of it, or nothing -- unless ASAP, which takes what there is. */
+            if (left > room && !(s->mode & MPP_MODE_ASAP)) break;
+            const uint32_t n = mpp_min(room, left);
+            mpp_put(p, s->out + s->done, n);
+            s->done += n;
+            spinning = 1;
+            if (!mpp_satisfied(s)) break;
+            if (s->uid == exclude) break;
+            mpp_release(&p->send_q, si, urgent);
+        }
     }
-    return urgent;
 }
 
 /* send and receive are the same shape with the direction reversed, so they
  * share a body: `sending` picks which queue is ours and which is theirs, which
- * error a full-or-empty poll gives, and which way the bytes go. */
+ * error a full-or-empty poll gives, and which way the bytes go.
+ *
+ * The caller joins its own queue before anything moves, rather than trying the
+ * transfer first and queueing only on failure. That is what puts it in the
+ * right place in the order relative to threads already waiting, and it means
+ * the immediate case and the blocking case are the same code. */
 static void mpp_transfer(int sending, int may_block, int has_timeout) {
     if (may_block && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
@@ -666,29 +788,44 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
     }
 
     const uint64_t deadline = psp_wait_deadline(tmo_ptr);
-    const uint32_t avail = sending ? mpp_free(p) : p->used;
-    uint32_t now = (mode & MPP_MODE_ASAP) ? (avail < len ? avail : len) : len;
 
     /* Nothing asked for is nothing to wait for: a zero-length transfer
      * succeeds even on a pipe with no buffer at all. */
-    if (len == 0 || (now && now <= avail)) {
-        if (sending) { mpp_put(p, buf, now); }
-        else         { mpp_take(p, buf, now); }
-        if (out) psp_write32(out, now);
-        const int urgent = sending ? mpp_wake_receivers(p) : mpp_wake_senders(p);
+    if (len == 0) {
+        if (out) psp_write32(out, 0);
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
-        if (urgent) psp_sched_yield();
         return;
     }
 
+    int urgent = 0;
+    /* Settle whoever is already waiting before looking at our own request: a
+     * thread that arrived earlier is ahead of us in the order, and what it
+     * takes changes what is left. */
+    mpp_pump(p, 0, &urgent);
+
+    /* A poll transfers all-or-nothing and never joins the queue. It must not
+     * half-succeed and then report failure, and once bytes have gone to a
+     * waiting receiver there is no taking them back -- so it decides from the
+     * pipe's state rather than by trying. */
     if (!may_block) {
+        const uint32_t avail = sending ? mpp_free(p) : p->used;
+        const uint32_t now = (mode & MPP_MODE_ASAP) ? mpp_min(avail, len) : len;
+        if (now && now <= avail) {
+            if (sending) mpp_put(p, buf, now); else mpp_take(p, buf, now);
+            if (out) psp_write32(out, now);
+            mpp_pump(p, 0, &urgent);
+            psp_ret(SCE_KERNEL_ERROR_OK);
+            if (urgent) psp_sched_yield();
+            return;
+        }
         /* ASAP moved nothing, and says so: `ASAP: Failed (800201b3, bytes=0)`.
          * A full-wait failure leaves the word alone, which is how the tests
          * tell the two apart -- they pre-seed it with 0x1337. */
         if ((mode & MPP_MODE_ASAP) && out) psp_write32(out, 0);
         psp_ret(sending ? SCE_KERNEL_ERROR_MSGPIPE_FULL
                         : SCE_KERNEL_ERROR_MSGPIPE_EMPTY);
+        if (urgent) psp_sched_yield();
         return;
     }
 
@@ -698,23 +835,48 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
         return;
     }
+    q->w[q->n - 1].nout = out;
+    mpp_pump(p, me, &urgent);
+
+    int i = -1;
+    for (int k = 0; k < q->n; k++) if (q->w[k].uid == me) { i = k; break; }
+    const uint32_t done = i >= 0 ? q->w[i].done : len;
+
+    if (i < 0 || mpp_satisfied(&q->w[i])) {
+        if (i >= 0) {
+            psp_waitq_take(q, i);
+            /* Out of the way: whoever was behind us can move now. */
+            mpp_pump(p, 0, &urgent);
+        }
+        if (out) psp_write32(out, done);
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        if (urgent) psp_sched_yield();
+        return;
+    }
+
+    if (urgent) psp_sched_yield();
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                          sending ? p->senddesc : p->recvdesc,
                                          deadline);
     p = find_pipe(id);
     if (!p) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    q = sending ? &p->send_q : &p->recv_q;
 
     if (rc == PSP_SCHED_WOKEN) {
-        /* The other side moved the bytes on our behalf. */
-        if (out) psp_write32(out, len);
+        /* The other side moved the bytes on our behalf, took us out of the
+         * queue, and wrote how many -- it is the only one that knew, since an
+         * ASAP waiter can be released with less than it asked for. */
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
-    psp_waitq_drop(sending ? &p->send_q : &p->recv_q, me);
-    /* A wait that ran out moved nothing, and reports that: `bytes=0`, where an
-     * argument failure leaves the caller's 0x1337 in place. */
-    if (out) psp_write32(out, 0);
+    /* A wait that ran out reports what it did get, which for a full-wait is
+     * nothing: `bytes=0`, where an *argument* failure leaves the caller's
+     * 0x1337 in place because it never waited. */
+    for (int k = 0; k < q->n; k++)
+        if (q->w[k].uid == me && out) { psp_write32(out, q->w[k].done); break; }
+    psp_waitq_drop(q, me);
     psp_wait_writeback(tmo_ptr, deadline);
     psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
 }
@@ -730,8 +892,8 @@ static void hle_CancelMsgPipe(void) {
     const uint32_t nsend = psp_arg(1), nrecv = psp_arg(2);
     if (nsend) psp_write32(nsend, (uint32_t)psp_waitq_count(&p->send_q));
     if (nrecv) psp_write32(nrecv, (uint32_t)psp_waitq_count(&p->recv_q));
-    int urgent = psp_waitq_release_all(&p->send_q);
-    urgent |= psp_waitq_release_all(&p->recv_q);
+    int urgent = mpp_abandon(&p->send_q);
+    urgent |= mpp_abandon(&p->recv_q);
     p->head = p->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_yield();

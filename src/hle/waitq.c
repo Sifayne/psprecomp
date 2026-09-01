@@ -10,7 +10,7 @@
 int psp_waitq_add(psp_waitq *q, uint32_t uid, uint32_t need, uint32_t mode,
                   uint32_t out) {
     if (q->n >= PSP_WAITQ_MAX) return -1;
-    q->w[q->n++] = (psp_waiter){ uid, need, mode, out };
+    q->w[q->n++] = (psp_waiter){ uid, need, mode, out, 0, 0 };
     return 0;
 }
 

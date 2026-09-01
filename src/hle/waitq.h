@@ -75,6 +75,17 @@ void     psp_wait_writeback(uint32_t tmo_ptr, uint64_t deadline);
 typedef struct {
     uint32_t uid;
     uint32_t need, mode, out;
+    /* How much of `need` has already been handed over. Only a byte-stream
+     * object uses it: a message pipe satisfies a waiter in pieces, and the
+     * pieces land in the waiter's own buffer as they arrive rather than being
+     * held anywhere else. Every other object type moves all-or-nothing and
+     * leaves this zero. */
+    uint32_t done;
+    /* Where to report `done` when the waiter is released. A message pipe's
+     * transfer calls have a second out-parameter -- how many bytes moved -- and
+     * whoever satisfies a waiter is the only one that knows the answer, so it
+     * writes it. Zero when the object has no such parameter. */
+    uint32_t nout;
 } psp_waiter;
 
 typedef struct {
