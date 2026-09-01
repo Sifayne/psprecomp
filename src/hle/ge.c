@@ -354,6 +354,14 @@ void psp_ge_dump_stats(FILE *out) {
             (unsigned long long)psp_render_pixels(),
             (unsigned long long)psp_render_textured_pixels(),
             (unsigned long long)psp_render_flat_pixels());
+    {   /* What the rasterizer cost, and the only comparison that matters:
+         * a PSP frame is 16.7ms, so a per-frame figure near that says the
+         * software path cannot carry the scene in real time. */
+        const uint64_t ns = psp_render_raster_ns();
+        const uint64_t px = psp_render_pixels();
+        fprintf(out, "    raster time: %.3f s (%.1f ns/pixel)\n",
+                (double)ns / 1e9, px ? (double)ns / (double)px : 0.0);
+    }
     fprintf(out, "    depth: test %s func %d, write %s, %llu pixels rejected\n",
             g_tl.ztest_enable ? "on" : "off", g_tl.ztest_func,
             g_tl.zwrite_off ? "off" : "on",

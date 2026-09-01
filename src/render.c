@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ---- shared target state ------------------------------------------------- */
 
@@ -31,9 +32,11 @@ uint64_t psp_render_zfail_pixels(void) { return g_px_zfail; }
 
 uint64_t psp_render_pixels(void) { return g_pixels; }
 static uint64_t g_filter_split;
+static uint64_t g_raster_ns;         /* see sw_draw */
 void     psp_render_reset_pixels(void) {
     g_pixels = g_px_tex = g_px_flat = g_px_zfail = g_px_blend = g_px_atest = 0;
     g_filter_split = 0;
+    g_raster_ns = 0;
 }
 
 /* ---- software backend ---------------------------------------------------- */
@@ -652,7 +655,31 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
     }
 }
 
+/* Wall-clock nanoseconds spent inside the rasterizer.
+ *
+ * The question this exists to answer is whether a software rasterizer is the
+ * architecture or a placeholder: everything since the transform pipeline is
+ * built on it, and if a real frame costs tens of milliseconds then the GE
+ * wants GPU-backed display-list translation instead. That is a decision, and
+ * it should be made against a number rather than an impression.
+ *
+ * Timed around sw_draw rather than around the pixel loop: what matters is the
+ * cost of a primitive as the GE hands it over, setup and clipping included. A
+ * per-pixel timer would also cost more than the work it measures.
+ *
+ * CLOCK_MONOTONIC, not CLOCK_PROCESS_CPUTIME_ID -- the guest is paced in real
+ * time and the interesting quantity is how much of a frame's 16.7ms budget
+ * this consumes, not how many cycles it retires. */
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t psp_render_raster_ns(void) { return g_raster_ns; }
+
 static void sw_draw(int prim, const psp_vertex *v, int count) {
+    const uint64_t t0 = now_ns();
     switch (prim) {
     case PSP_PRIM_SPRITES:
         for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1]);
@@ -666,6 +693,7 @@ static void sw_draw(int prim, const psp_vertex *v, int count) {
     default:
         break;                       /* points, lines, fans: not yet */
     }
+    g_raster_ns += now_ns() - t0;
 }
 
 static void sw_noop(void) { }

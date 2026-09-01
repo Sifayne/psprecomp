@@ -139,6 +139,10 @@ uint64_t psp_render_alphakill_pixels(void);
  * choice. The backend uses the magnification one, having no scale factor to
  * choose with; a non-zero count is the evidence that computing one is worth it. */
 uint64_t psp_render_filter_split(void);
+/* Wall-clock nanoseconds spent inside the rasterizer, cumulative. Answers
+ * whether the software rasterizer can carry a real scene or is a placeholder
+ * for GPU-backed display-list translation -- see the note at sw_draw. */
+uint64_t psp_render_raster_ns(void);
 void     psp_render_reset_pixels(void);
 
 /* Return the depth buffer to its start-of-run contents. The game clears depth
