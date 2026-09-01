@@ -149,6 +149,16 @@ typedef struct {
                            * stream has now been fed, and whatever is still
                            * undecoded in `es` is the tail of the file */
     size_t   es_pos;       /* how far the decoder has consumed */
+    /* A video PES is routinely larger than one ring-buffer put -- an IDR can
+     * be fifty times the packet -- so payload bytes of the current PES that
+     * have not arrived yet are counted here and consumed as payload, not
+     * parsed as structure, when they come in. */
+    size_t   es_pes_left;
+    /* A PES or pack header that spanned the end of the previous chunk is held
+     * here until its second half arrives. Small by construction: structure,
+     * never payload. */
+    uint8_t  es_pend[64];
+    size_t   es_pend_len;
 
     void    *dec;          /* ISVCDecoder*, opaque here so the header stays out */
     int      dec_failed;
@@ -431,41 +441,93 @@ static int es_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
     return 0;
 }
 
-/* Pull the video payload out of one contiguous run of program stream bytes.
- * Anything not understood is skipped rather than guessed at. */
+/* Pull the video payload out of a run of program stream bytes, carrying
+ * across chunk boundaries whatever does not fit.
+ *
+ * A video PES is routinely larger than one ring-buffer put, so the parse
+ * cannot treat each put as complete: payload that runs past the end is
+ * counted and consumed as payload by the next calls, and a header that spans
+ * the end is held until its second half arrives. Doing neither was invisible
+ * for the first frames -- the first puts are large enough to hold the IDR --
+ * and ruinous later: one spanning PES lost up to a whole frame of slices, the
+ * decoder's references went stale, and every frame smeared until the next
+ * IDR, which read as horizontal streaking in a decode whose early frames were
+ * byte-perfect. */
 static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
+    /* Continue a payload that did not fit in the previous chunk. */
+    if (c->es_pes_left) {
+        const size_t n = c->es_pes_left < len ? c->es_pes_left : len;
+        es_append(c, buf, n);
+        c->es_pes_left -= n;
+        buf += n;
+        len -= n;
+        if (c->es_pes_left) return;
+    }
+
+    /* Work over whatever a previous chunk left held, if anything. */
+    const uint8_t *p = buf;
+    size_t plen_all = len;
+    uint8_t *work = NULL;
+    if (c->es_pend_len) {
+        work = malloc(c->es_pend_len + len);
+        if (!work) return;
+        memcpy(work, c->es_pend, c->es_pend_len);
+        memcpy(work + c->es_pend_len, buf, len);
+        plen_all = c->es_pend_len + len;
+        c->es_pend_len = 0;
+        p = work;
+    }
+
     size_t i = 0;
-    while (i + 4 <= len) {
-        if (!(buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 1)) { i++; continue; }
-        const uint8_t id = buf[i+3];
+    while (i + 4 <= plen_all) {
+        if (!(p[i] == 0 && p[i+1] == 0 && p[i+2] == 1)) { i++; continue; }
+        const uint8_t id = p[i+3];
 
         if (id == PS_PACK_START) {
             /* 14 fixed bytes, then however many stuffing bytes the low three
              * bits of the last one claim. */
-            if (i + 14 > len) break;
-            i += 14 + (size_t)(buf[i+13] & 7);
+            if (i + 14 > plen_all) break;
+            i += 14 + (size_t)(p[i+13] & 7);
             continue;
         }
         if (id == PS_PROGRAM_END) { i += 4; continue; }
-        if (i + 6 > len) break;
+        if (i + 6 > plen_all) break;
 
-        const size_t plen = ((size_t)buf[i+4] << 8) | buf[i+5];
+        const size_t plen = ((size_t)p[i+4] << 8) | p[i+5];
         if (id == PS_SYSTEM_HDR) { i += 6 + plen; continue; }
 
         if (id == PS_VIDEO_STREAM) {
-            if (i + 9 > len) break;
-            const size_t hdrlen = buf[i+8];
+            if (i + 9 > plen_all) break;
+            const size_t hdrlen = p[i+8];
             const size_t off    = i + 9 + hdrlen;
             /* plen counts from just after itself, so the payload is what is
              * left of it once the PES header is taken off. */
-            if (plen >= 3 + hdrlen && off <= len) {
-                size_t n = plen - 3 - hdrlen;
-                if (off + n > len) n = len - off;
-                es_append(c, buf + off, n);
+            if (plen >= 3 + hdrlen) {
+                if (off > plen_all) break;   /* even the header extension spans */
+                const size_t pay = plen - 3 - hdrlen;
+                size_t n = pay;
+                if (off + n > plen_all) n = plen_all - off;
+                es_append(c, p + off, n);
+                if (n < pay) {
+                    /* Everything from off to the end is payload; the rest of
+                     * it arrives in later chunks and must not be parsed. */
+                    c->es_pes_left = pay - n;
+                    free(work);
+                    return;
+                }
             }
         }
         i += 6 + plen;
     }
+
+    /* Hold whatever did not parse for the next put. Larger than a header can
+     * be means it was not a header; the next start code resyncs, which is
+     * what the byte-scan is for. */
+    if (i < plen_all && plen_all - i <= sizeof c->es_pend) {
+        memcpy(c->es_pend, p + i, plen_all - i);
+        c->es_pend_len = plen_all - i;
+    }
+    free(work);
 }
 
 /* ---- H.264 decode ----------------------------------------------------------
