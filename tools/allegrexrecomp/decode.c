@@ -665,7 +665,24 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         }
         break;
 
-    case 0x1C: case 0x1D: case 0x1E:
+    /* Opcode 0x1C is SPECIAL2, not a VFPU family, and it is where Allegrex
+     * puts mfic/mtic: 0x70000024 and 0x70000026 under mask 0xFFE007FF, with
+     * the register in rt. Taken from a published table rather than inferred.
+     *
+     * Only these two are claimed. The rest of the range keeps its old answer,
+     * because "unknown" is the honest label for an encoding nobody checked --
+     * and mislabelling it is what hid this one: a test binary calling mfic
+     * reported "unimplemented VFPU instruction", which sends you looking at
+     * the vector unit for an interrupt-controller op. */
+    case 0x1C:
+        switch (FUNCT(word)) {
+        case 0x24: op = A_MFIC; break;
+        case 0x26: op = A_MTIC; break;
+        default:   op = A_VFPU_UNKNOWN; break;
+        }
+        break;
+
+    case 0x1D: case 0x1E:
     case 0x35: case 0x3D: case 0x3F:
         op = A_VFPU_UNKNOWN;
         break;
