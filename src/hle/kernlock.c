@@ -197,7 +197,13 @@ static void mutex_lock(int may_block, int has_timeout) {
         return;
     }
     m = find_mutex(id);
-    if (!m) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    /* A wait ended by the object's deletion still reports how much of the
+     * timeout was left. It is easy to miss because the object is gone and the
+     * early return reads as a clean bail-out, but the caller's timeout word is
+     * the caller's, not the object's: eight tests across fpl and msgpipe print
+     * `timeout = 8ms remaining` where the unwritten word still said 10. */
+    if (!m) { psp_wait_writeback(tmo_ptr, deadline);
+              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
 
     if (rc == PSP_SCHED_WOKEN) {
         /* mutex_release took it on our behalf. */
@@ -578,7 +584,8 @@ static void lw_lock(int may_block, int has_timeout, int flatten) {
                                          deadline);
 
     m = find_lw(uid);
-    if (!m) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    if (!m) { psp_wait_writeback(tmo_ptr, deadline);
+              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
 
     if (rc == PSP_SCHED_WOKEN) {
         psp_wait_writeback(tmo_ptr, deadline);

@@ -1251,7 +1251,8 @@ static void hle_WaitSema(void) {
      * its waiters looks like from in here -- and a different answer from asking
      * about a semaphore that was already gone before the call. */
     s = find_sema(id);
-    if (!s) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    if (!s) { psp_wait_writeback(tmo_ptr, deadline);
+              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
 
     if (rc == PSP_SCHED_WOKEN) {
         /* The signaller already took the count on our behalf, so there is
@@ -1474,6 +1475,7 @@ static void hle_WaitEventFlag(void) {
          * flag to have one. The scheduling harness in every events test reads
          * that word after deleting the flag under its waiter and prints it. */
         if (out) psp_write32(out, 0);
+        psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE);
         return;
     }

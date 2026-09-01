@@ -392,7 +392,8 @@ static void vpl_allocate(int may_block, int has_timeout) {
         return;
     }
     v = find_vpl(id);
-    if (!v) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    if (!v) { psp_wait_writeback(tmo_ptr, deadline);
+              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
 
     if (rc == PSP_SCHED_WOKEN) {
         /* vpl_release allocated for us and wrote the pointer. */
@@ -964,7 +965,8 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
     }
 
     p = find_pipe(id);
-    if (!p) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    if (!p) { psp_wait_writeback(tmo_ptr, deadline);
+              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
     q = sending ? &p->send_q : &p->recv_q;
 
     if (rc == PSP_SCHED_WOKEN) {
@@ -1308,7 +1310,8 @@ static void mbx_receive(int may_block, int has_timeout) {
         return;
     }
     m = find_mbx(id);
-    if (!m) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    if (!m) { psp_wait_writeback(tmo_ptr, deadline);
+              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
 
     if (rc == PSP_SCHED_WOKEN) {
         psp_wait_writeback(tmo_ptr, deadline);
@@ -1564,7 +1567,8 @@ static void fpl_allocate(int may_block, int has_timeout) {
         return;
     }
     f = find_fpl(id);
-    if (!f) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    if (!f) { psp_wait_writeback(tmo_ptr, deadline);
+              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
     if (rc == PSP_SCHED_WOKEN) {
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
