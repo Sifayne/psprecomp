@@ -128,7 +128,13 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_NO_MEMORY       0x80020190
 #define SCE_KERNEL_ERROR_ILLEGAL_ATTR    0x80020191
 #define SCE_KERNEL_ERROR_UNKNOWN_UID     0x800201A2
-#define SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK 0x800201A9
+/* Named ILLEGAL_MEMBLOCK here on a guess, and never used: when the pools were
+ * written the captures said their "not a live block of mine" code is
+ * 0x800201B6, which is SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_PTR below. This value
+ * is what a wait returns when the object it was parked on was *cancelled* --
+ * msgpipe/cancel prints it four times against a delete's 0x800201B5 in the
+ * neighbouring test. */
+#define SCE_KERNEL_ERROR_WAIT_CANCEL     0x800201A9
 #define SCE_KERNEL_ERROR_ILLEGAL_THID    0x80020197
 /* A thread id that names nothing, as distinct from one that is malformed.
  * threads/refer.expected answers both a deleted and an invalid id with this. */

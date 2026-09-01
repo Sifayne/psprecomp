@@ -606,17 +606,21 @@ static void hle_CreateMsgPipe(void) {
  * a pipe under a receiver that got nothing and reads back
  * `received = 00000000`, where an untouched word would still hold the 0x1337
  * the test seeded. */
-static int mpp_abandon(psp_waitq *q) {
-    for (int i = 0; i < q->n; i++)
-        if (q->w[i].nout) psp_write32(q->w[i].nout, q->w[i].done);
-    return psp_waitq_release_all(q);
+static int mpp_abandon(psp_waitq *q, int reason) {
+    int urgent = 0;
+    while (q->n > 0) {
+        const psp_waiter w = psp_waitq_take(q, 0);
+        if (w.nout) psp_write32(w.nout, w.done);
+        urgent |= psp_sched_wake_as(w.uid, reason);
+    }
+    return urgent;
 }
 
 static void hle_DeleteMsgPipe(void) {
     psp_msgpipe *p = find_pipe(psp_arg(0));
     if (!p) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MPPID); return; }
-    int urgent = mpp_abandon(&p->send_q);
-    urgent |= mpp_abandon(&p->recv_q);
+    int urgent = mpp_abandon(&p->send_q, 0);
+    urgent |= mpp_abandon(&p->recv_q, 0);
     if (p->base) psp_sysmem_release(p->base);
     p->alive = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -676,6 +680,9 @@ static int mpp_satisfied(const psp_waiter *w) {
  * poll that satisfied two senders, and hardware answers those senders
  * `00000000`, not `800201b5`. Bytes already moved are moved. */
 #define MPP_WOKE_SATISFIED 1
+/* And turned out by sceKernelCancelMsgPipe, which is not the same as turned out
+ * by a delete: `800201a9` against `800201b5`, four lines of msgpipe/cancel. */
+#define MPP_WOKE_CANCELLED 2
 
 /* Done with this waiter: report how much moved, take it out, wake it. */
 static void mpp_release(psp_waitq *q, int i, int *urgent) {
@@ -920,10 +927,20 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
      * The other side moved the bytes on our behalf, took us out of the queue,
      * and wrote how many -- it is the only one that knew, since an ASAP waiter
      * can be released with less than it asked for. */
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == MPP_WOKE_SATISFIED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
+    if (rc == PSP_SCHED_WOKEN) {
+        const int why = psp_sched_wake_reason();
+        if (why == MPP_WOKE_SATISFIED) {
+            psp_wait_writeback(tmo_ptr, deadline);
+            psp_ret(SCE_KERNEL_ERROR_OK);
+            return;
+        }
+        /* Cancelled rather than deleted. The pipe is still there, so looking it
+         * up would say nothing; only the waker knew. */
+        if (why == MPP_WOKE_CANCELLED) {
+            psp_wait_writeback(tmo_ptr, deadline);
+            psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
+            return;
+        }
     }
 
     p = find_pipe(id);
@@ -956,8 +973,8 @@ static void hle_CancelMsgPipe(void) {
     const uint32_t nsend = psp_arg(1), nrecv = psp_arg(2);
     if (nsend) psp_write32(nsend, (uint32_t)psp_waitq_count(&p->send_q));
     if (nrecv) psp_write32(nrecv, (uint32_t)psp_waitq_count(&p->recv_q));
-    int urgent = mpp_abandon(&p->send_q);
-    urgent |= mpp_abandon(&p->recv_q);
+    int urgent = mpp_abandon(&p->send_q, MPP_WOKE_CANCELLED);
+    urgent |= mpp_abandon(&p->recv_q, MPP_WOKE_CANCELLED);
     p->head = p->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_yield();
