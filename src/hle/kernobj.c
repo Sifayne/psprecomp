@@ -1117,9 +1117,17 @@ static uint32_t mbx_pop(psp_mbx *m) {
         m->first = next;
         m->count--;
     }
-    /* The message leaves pointing at itself, which is what a receiver sees:
-     * `GOT: "hi 0" (next=ITSELF)`. */
-    psp_write32(head + MSG_NEXT, head);
+    /* And its `next` is left exactly as it was. A received packet keeps
+     * pointing wherever it pointed in the ring, which mbx/receive reads back
+     * for every case in turn:
+     *
+     *     Single standard:      next=ITSELF     ring of one
+     *     Multiple standard #1: next=FIRST      the other message, now first
+     *     Multiple standard #2: next=ITSELF     ring of one again
+     *
+     * Overwriting it with the packet's own address gets the single-message
+     * cases right for the wrong reason -- a ring of one already points at
+     * itself -- and the middle case wrong, which is what it did. */
     return head;
 }
 
