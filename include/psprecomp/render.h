@@ -30,6 +30,31 @@ typedef struct {
     float    u, v;
 } psp_vertex;
 
+/* The bound texture, as the GE describes it.
+ *
+ * A struct rather than more arguments: set_texture already took seven, and the
+ * sampling state the GE tracks -- filter and wrap, at least -- would have made
+ * eleven. set_blend already takes its state this way, and everything still owed
+ * here (texenv colour, mip levels, the texture matrix) then costs a field
+ * instead of a signature change across every backend. */
+typedef struct {
+    uint32_t addr, stride;
+    int      w, h;
+    /* The GE's own TEXFORMAT and TEXFUNC codes: a backend meeting one it does
+     * not implement should draw untextured rather than guess. */
+    int      fmt, func, swizzled;
+    /* GE_TEXFILTER's two three-bit fields, raw. Bit 0 selects linear within the
+     * level; 4..7 are the mipmap variants, and 2 and 3 are not legal values.
+     * Which of the two applies needs a pixel-to-texel scale, so the choice is
+     * the backend's to make and not the interpreter's to guess. */
+    int      min_filter, mag_filter;
+    /* GE_TEXWRAP, per axis: 0 repeat, 1 clamp. Sampling outside [0,size) is
+     * ordinary -- a scrolling background does it every frame -- and clamping
+     * where the game asked to repeat smears the edge texel across whatever
+     * should have wrapped. */
+    int      wrap_s, wrap_t;
+} psp_tex_state;
+
 /* Blend and alpha-test state, as the GE encodes it. Factors and the equation
  * are GEBlendSrcFactor / GEBlendDstFactor / GEBlendMode codes; the alpha-test
  * function shares the GE's comparison codes with the depth test. */
@@ -63,11 +88,8 @@ typedef struct {
     /* GE_FBP / GE_FBW: the framebuffer being drawn into. */
     void (*set_target)(uint32_t addr, uint32_t stride, int fmt);
 
-    /* The texture to sample, or addr 0 for none. `fmt` is the GE's own
-     * TEXFORMAT code and `func` its TEXFUNC; a backend meeting one it does not
-     * implement should draw untextured rather than guess. */
-    void (*set_texture)(uint32_t addr, uint32_t stride, int w, int h,
-                        int fmt, int func, int swizzled);
+    /* The texture to sample, or addr 0 for none. */
+    void (*set_texture)(const psp_tex_state *t);
 
     /* The palette for the CLUT formats, and how a texel byte indexes it.
      * `shift`, `mask` and `start` come from CLUTFORMAT and are applied as

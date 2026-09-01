@@ -59,10 +59,7 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
  * texel *boundary*, which is the one place a few ULP of interpolation error
  * changes the answer. See sw_tri. Honouring GE_TEXFILTER is still owed; this
  * game asks for linear. */
-static struct {
-    uint32_t addr, stride;
-    int      w, h, fmt, func, swizzled;
-} g_tex;
+static psp_tex_state g_tex;
 
 /* PSPRECOMP_TEXDUMP=<path> writes each distinct texture the game binds, decoded
  * through this same sampler, as <path>-NN.ppm.
@@ -76,11 +73,8 @@ static int      g_dumped_n;
 
 static void dump_texture(void);
 
-static void sw_texture(uint32_t addr, uint32_t stride, int w, int h,
-                       int fmt, int func, int swizzled) {
-    g_tex.addr = addr; g_tex.stride = stride;
-    g_tex.w = w; g_tex.h = h;
-    g_tex.fmt = fmt; g_tex.func = func; g_tex.swizzled = swizzled;
+static void sw_texture(const psp_tex_state *t) {
+    g_tex = *t;
     dump_texture();
 }
 
@@ -171,11 +165,27 @@ static uint32_t clut_entry(uint32_t raw) {
  * that is a libm call in a per-pixel loop. */
 static int ifloor(float f) { const int i = (int)f; return i - (f < (float)i); }
 
-/* One texel, clamped. Stride is in texels, as the GE reports it, so the byte
- * pitch a swizzle block is measured against has to be derived per format. */
+/* One axis of a texel coordinate, wrapped the way the game asked.
+ *
+ * Every PSP texture dimension is a power of two -- TEXSIZE gives log2 of each,
+ * so it cannot express anything else -- which makes repeat a mask, and the mask
+ * is already right for negative coordinates: -1 & 511 is 511, which is what
+ * flooring and then wrapping means. A size that is somehow not a power of two
+ * degrades to clamping rather than to garbage.
+ *
+ * This clamped unconditionally, which is not a neutral default. It is the
+ * opposite of what this game sets on both axes, and it turns geometry that
+ * should have tiled into one smeared edge texel. */
+static int wrap_axis(int t, int size, int clamp) {
+    if (!clamp && size > 0 && (size & (size - 1)) == 0) return t & (size - 1);
+    return t < 0 ? 0 : (t >= size ? size - 1 : t);
+}
+
+/* One texel. Stride is in texels, as the GE reports it, so the byte pitch a
+ * swizzle block is measured against has to be derived per format. */
 static uint32_t sample_texel(int u, int v) {
-    if (u < 0) u = 0; else if (u >= g_tex.w) u = g_tex.w - 1;
-    if (v < 0) v = 0; else if (v >= g_tex.h) v = g_tex.h - 1;
+    u = wrap_axis(u, g_tex.w, g_tex.wrap_s);
+    v = wrap_axis(v, g_tex.h, g_tex.wrap_t);
 
     const int hb = tex_halfbytes(g_tex.fmt);
     const uint32_t row_bytes = ((uint32_t)g_tex.stride * (uint32_t)hb) / 2u;
@@ -616,9 +626,7 @@ const psp_render_backend psp_render_software = {
 
 static int null_init(int w, int h) { (void)w; (void)h; return 0; }
 static void null_target(uint32_t a, uint32_t s, int f) { (void)a; (void)s; (void)f; }
-static void null_texture(uint32_t a, uint32_t s, int w, int h, int f, int fn, int z) {
-    (void)a; (void)s; (void)w; (void)h; (void)f; (void)fn; (void)z;
-}
+static void null_texture(const psp_tex_state *t) { (void)t; }
 static void null_clut(uint32_t a, int f, int s, int m, int st) {
     (void)a; (void)f; (void)s; (void)m; (void)st;
 }

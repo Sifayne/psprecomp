@@ -855,10 +855,26 @@ static void draw_prim(uint32_t type, uint32_t count) {
                                    (int)((g_ge.clut_raw >> 2) & 0x1F),
                                    (int)((g_ge.clut_raw >> 8) & 0xFF),
                                    (int)(((g_ge.clut_raw >> 16) & 0x1F) << 4));
-    psp_render_current()->set_texture(
-        has_uv ? g_ge.tex_addr : 0,
-        g_ge.tex_stride, (int)g_ge.tex_w, (int)g_ge.tex_h,
-        (int)g_ge.tex_format, (int)g_ge.tex_func, (int)g_ge.tex_swizzled);
+    {
+        /* The two filter fields are handed over raw. Which one applies depends
+         * on the pixel-to-texel scale, which only the rasterizer can work out,
+         * so picking one here would be the interpreter guessing at a decision
+         * that is not its to make. */
+        const psp_tex_state t = {
+            .addr       = has_uv ? g_ge.tex_addr : 0,
+            .stride     = g_ge.tex_stride,
+            .w          = (int)g_ge.tex_w,
+            .h          = (int)g_ge.tex_h,
+            .fmt        = (int)g_ge.tex_format,
+            .func       = (int)g_ge.tex_func,
+            .swizzled   = (int)g_ge.tex_swizzled,
+            .min_filter = (int)(g_ge.tex_filter & 7),
+            .mag_filter = (int)((g_ge.tex_filter >> 8) & 7),
+            .wrap_s     = (int)(g_ge.tex_wrap & 1),
+            .wrap_t     = (int)((g_ge.tex_wrap >> 8) & 1),
+        };
+        psp_render_current()->set_texture(&t);
+    }
     if (g_tl.clear_mode) { g_clear_draws++; if (g_tl.clear_z) g_clear_z_draws++; }
     if (VT_THROUGH(g_ge.vtype)) { if (has_uv) g_draw_2d_tex++; else g_draw_2d_flat++; }
     else                        { if (has_uv) g_draw_3d_tex++; else g_draw_3d_flat++; }

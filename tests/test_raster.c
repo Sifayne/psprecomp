@@ -367,6 +367,78 @@ static void test_sprite_texture_samples_centre(void) {
         }
 }
 
+/* Float texcoords, 8888 colour, 16-bit position, through mode: tex at 0 (8
+ * bytes), colour at 8, position at 12, stride 20. The only way to express a
+ * negative u -- 16-bit through-mode texcoords are read unsigned, so -16 in that
+ * form arrives as 65520. */
+#define VTYPE_2D_TEXF (3u | (7u << 2) | (2u << 7) | (1u << 23))
+
+static void vertex_uvf(int idx, int x, int y, float u, float v, uint32_t rgba) {
+    uint32_t a = VERTS + (uint32_t)idx * 20;
+    psp_write_f32(a,      u);
+    psp_write_f32(a + 4,  v);
+    psp_write32(a + 8,    rgba);
+    psp_write16(a + 12,   (uint16_t)x);
+    psp_write16(a + 14,   (uint16_t)y);
+    psp_write16(a + 16,   0);
+}
+
+/* Sampling outside [0,size) is ordinary, and what happens there is the game's
+ * choice, not the sampler's. The two modes are checked against each other over
+ * the same geometry: under repeat a u range one whole texture to the left must
+ * render exactly as the unshifted one does, and under clamp it must collapse to
+ * the edge texel.
+ *
+ * Negative coordinates are the half that a mask gets right and a `%` gets
+ * wrong: -16 % 16 is 0 in C, but -16 wrapped is texel 0 only by luck, and -1
+ * must land on 15 rather than on -1 % 16 == -1.
+ */
+static void test_texture_wrap(void) {
+    psp_ge_reset();
+    clear_fb();
+    upload_ramp_texture(16, 16);
+
+    /* Repeat, sampling a full texture width to the left of the origin. */
+    begin_list_vtype(VTYPE_2D_TEXF);
+    texture_state(TEX, 16, 4, 4, 3, 0, 0);
+    cmd(0xC7, 0);                                  /* TEXWRAP: repeat, repeat */
+    vertex_uvf(0, 40, 30, -16.0f,  0.0f, 0xFFFFFFFFu);
+    vertex_uvf(1, 53, 30,  -3.0f,  0.0f, 0xFFFFFFFFu);
+    vertex_uvf(2, 40, 41, -16.0f, 11.0f, 0xFFFFFFFFu);
+    vertex_uvf(3, 53, 41,  -3.0f, 11.0f, 0xFFFFFFFFu);
+    cmd(0x04, (4u << 16) | 4);
+    end_list();
+
+    int bad = 0;
+    for (int j = 0; j < 11 && bad < 4; j++)
+        for (int k = 0; k < 13 && bad < 4; k++) {
+            const uint32_t got = pixel(40 + k, 30 + j);
+            if (got != ramp_texel(k, j)) {
+                bad++;
+                CHECK(0, "repeat at (%d,%d): got 0x%08X want 0x%08X",
+                      k, j, got, ramp_texel(k, j));
+            }
+        }
+
+    /* The same list under clamp must instead read the left edge texel
+     * everywhere, which is what the sampler used to do unconditionally. */
+    psp_ge_reset();
+    clear_fb();
+    begin_list_vtype(VTYPE_2D_TEXF);
+    texture_state(TEX, 16, 4, 4, 3, 0, 0);
+    cmd(0xC7, 1u | (1u << 8));                     /* TEXWRAP: clamp, clamp */
+    vertex_uvf(0, 40, 30, -16.0f,  0.0f, 0xFFFFFFFFu);
+    vertex_uvf(1, 53, 30,  -3.0f,  0.0f, 0xFFFFFFFFu);
+    vertex_uvf(2, 40, 41, -16.0f, 11.0f, 0xFFFFFFFFu);
+    vertex_uvf(3, 53, 41,  -3.0f, 11.0f, 0xFFFFFFFFu);
+    cmd(0x04, (4u << 16) | 4);
+    end_list();
+
+    CHECK(pixel(40, 30) == ramp_texel(0, 0), "clamp at (0,0): 0x%08X", pixel(40, 30));
+    CHECK(pixel(52, 30) == ramp_texel(0, 0), "clamp at (12,0): 0x%08X", pixel(52, 30));
+    CHECK(pixel(52, 40) == ramp_texel(0, 10), "clamp at (12,10): 0x%08X", pixel(52, 40));
+}
+
 /* Depth commands, and a vertex carrying a z. The 16-bit position slot has one
  * and the plain `vertex` helper leaves it at zero, which is invisible until a
  * test actually turns the depth test on. */
@@ -555,6 +627,7 @@ int main(void) {
     test_texture_1to1();
     test_texture_minified_samples_centre();
     test_sprite_texture_samples_centre();
+    test_texture_wrap();
     test_clear_mode_clears_depth();
     test_depth_test_still_rejects();
     test_ge_reset_clears_depth();
