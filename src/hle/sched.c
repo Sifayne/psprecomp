@@ -486,6 +486,13 @@ int psp_sched_block_until(uint32_t uid, psp_sched_state why, const char *what,
      * deadline either. Stranded is the honest answer and the one callers
      * already handle. */
     if (!g_threading) return PSP_SCHED_STRANDED;
+    /* A deadline that has already arrived is not a wait, and must not become a
+     * handoff. The zero-timeout case is the one that shows it: pspautotests
+     * asks for a resource that is not there with a timeout of 0 and tags the
+     * line `[x]` -- no reschedule happened -- where switching away and coming
+     * back tags it `[r]`. There is no time in which anything could change, so
+     * there is nothing to schedule around. */
+    if (deadline_us && deadline_us <= psp_clock_peek()) return PSP_SCHED_EXPIRED;
     return switch_away(self_slot(uid), why, what, deadline_us);
 }
 
