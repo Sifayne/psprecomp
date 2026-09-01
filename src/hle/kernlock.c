@@ -14,6 +14,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/mem.h"
 #include "waitq.h"
 
 #include <stdio.h>
@@ -45,7 +46,9 @@ typedef struct {
 
 static psp_mutex g_mutex[MAX_MUTEXES];
 
-void psp_kernlock_reset(void) { memset(g_mutex, 0, sizeof g_mutex); }
+static void lw_reset(void);
+
+void psp_kernlock_reset(void) { memset(g_mutex, 0, sizeof g_mutex); lw_reset(); }
 
 static psp_mutex *find_mutex(uint32_t id) {
     for (int i = 0; i < MAX_MUTEXES; i++)
@@ -262,4 +265,350 @@ void psp_kernlock_register(void) {
     psp_hle_register(0x6B30100F, "ThreadManForUser", "sceKernelUnlockMutex",      hle_UnlockMutex);
     psp_hle_register(0x87D9223C, "ThreadManForUser", "sceKernelCancelMutex",      hle_CancelMutex);
     psp_hle_register(0xA9C2CB9A, "ThreadManForUser", "sceKernelReferMutexStatus", hle_ReferMutexStatus);
+    psp_kernlock_register_lw();
+}
+
+/* ---- lwmutex ---------------------------------------------------------------
+ *
+ * The "lightweight" in the name is not about size, it is about *where the state
+ * lives*: an lwmutex keeps its count, owner and attributes in a 32-byte
+ * workarea the **guest** owns, and the uncontended lock and unlock are done
+ * there without the kernel being involved at all. Only blocking, and only
+ * asking about the object by name, needs a kernel record.
+ *
+ * That is not an inference. threads/lwmutex/{lock,unlock}.expected run every
+ * case twice, once against a real workarea and once against a hand-forged one
+ * whose uid is zero and whose pad words are 0xDEADBEEF -- and the forged one
+ * *locks and unlocks successfully* while `sceKernelReferLwMutexStatus` on it
+ * answers NOT_FOUND. So the arithmetic reads and writes guest memory and the
+ * lookup is a separate question, which is what the code below does.
+ *
+ * Two conventions inside one object, both measured, and neither derivable from
+ * the other: the workarea's `thread` field is **0** when the mutex is free,
+ * while the info block's `lockThread` is **-1**.
+ */
+
+/* Fourth object type, fourth attribute rule: 0x3FF here against the mutex's
+ * 0xBFF, so bit 11 is legal for one and not the other. Measured from
+ * create.expected, which accepts 0x300 and 0x3FF and refuses 0x400 and 0x800. */
+#define LWMUTEX_ATTR_KNOWN   0x3FFu
+#define LWMUTEX_ATTR_RECURSE 0x200u
+
+/* Offsets into the guest's SceLwMutexWorkarea. */
+enum { LW_COUNT = 0, LW_THREAD = 4, LW_ATTR = 8, LW_WAITING = 12, LW_UID = 16 };
+
+/* create.expected creates 1024 in a row *after* the ones its earlier sections
+ * made, and expects every one to succeed -- so this is a measured floor with
+ * headroom rather than a guess at what is reasonable. */
+#define MAX_LWMUTEXES 2048
+
+/* What the kernel keeps, which is only what the workarea cannot hold: the name,
+ * what it was created with, and the queue of threads parked on it. */
+typedef struct {
+    uint32_t  uid;
+    char      name[32];
+    uint32_t  workarea;
+    int32_t   init_count;
+    int       used;
+    psp_waitq q;
+    char      waitdesc[64];
+} psp_lwmutex;
+
+static psp_lwmutex g_lw[MAX_LWMUTEXES];
+
+static void lw_reset(void) { memset(g_lw, 0, sizeof g_lw); }
+
+static psp_lwmutex *find_lw(uint32_t uid) {
+    for (int i = 0; i < MAX_LWMUTEXES; i++)
+        if (g_lw[i].used && g_lw[i].uid == uid) return &g_lw[i];
+    return NULL;
+}
+
+/* Resolving a workarea has three answers, not two, and the tests separate them.
+ *
+ *   uid == 0            no kernel object at all, and that is legal -- the
+ *                       hand-forged workarea locks and unlocks perfectly well
+ *                       on its own fields. *out is NULL and this returns 0.
+ *   uid names a record  the ordinary case, provided the record was made for
+ *                       *this* address: a memcpy of a live workarea answers
+ *                       NOT_FOUND, so the address is part of the identity.
+ *   anything else       deleted, or never valid. NOT_FOUND.
+ *
+ * Collapsing the first and third -- both "no record" -- is what made a lock on
+ * a deleted workarea report RECURSIVE instead. */
+static uint32_t lw_resolve(uint32_t wa, psp_lwmutex **out, int by_address) {
+    *out = NULL;
+    const uint32_t uid = psp_read32(wa + LW_UID);
+    if (uid == 0) return SCE_KERNEL_ERROR_OK;
+    psp_lwmutex *m = find_lw(uid);
+    if (!m) return SCE_KERNEL_ERROR_NOT_FOUND_LWMUTEX;
+    /* A *copy* of a live workarea carries a uid that still resolves, and the
+     * two callers want opposite answers about it. Locking one succeeds -- the
+     * arithmetic is on the copy's own fields and never reaches the kernel --
+     * while deleting or asking about one answers NOT_FOUND, because those are
+     * questions about the registered object and the address is part of its
+     * identity. `Lock copy #2: OK` against `Copy: Failed (800201CA)`. */
+    if (by_address && m->workarea != wa) return SCE_KERNEL_ERROR_NOT_FOUND_LWMUTEX;
+    *out = m;
+    return SCE_KERNEL_ERROR_OK;
+}
+
+/* A workarea pointer that does not name 32 readable bytes. Distinct from a
+ * *deleted* one, and reported as ILLEGAL_SIZE -- delete.expected's `Invalid`
+ * case, which passes a garbage pointer rather than a stale one. */
+static int lw_bad_pointer(uint32_t wa) {
+    return wa == 0 || psp_mem_ptr(wa, 32) == NULL;
+}
+
+static void hle_CreateLwMutex(void) {
+    /* (workarea, name, attr, count, options) -- workarea first, unlike every
+     * other create in the kernel. */
+    const uint32_t wa   = psp_arg(0);
+    const uint32_t name = psp_arg(1);
+    const uint32_t attr = psp_arg(2);
+    const int32_t  init = (int32_t)psp_arg(3);
+
+    if (!name) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (attr & ~LWMUTEX_ATTR_KNOWN) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+    if (init < 0 || (init > 1 && !(attr & LWMUTEX_ATTR_RECURSE))) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
+        return;
+    }
+
+    psp_lwmutex *m = NULL;
+    for (int i = 0; i < MAX_LWMUTEXES; i++) if (!g_lw[i].used) { m = &g_lw[i]; break; }
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    memset(m, 0, sizeof *m);
+    psp_str(name, m->name, sizeof m->name);
+    m->workarea   = wa;
+    m->init_count = init;
+    m->uid        = psp_threadman_next_uid();
+    m->used       = 1;
+    char nm[sizeof m->name];
+    memcpy(nm, m->name, sizeof nm);
+    snprintf(m->waitdesc, sizeof m->waitdesc, "sceKernelLockLwMutex(%s)", nm);
+
+    /* The workarea is the object. Everything the guest can see about the lock
+     * is written here, including the three pad words -- the tests print them,
+     * so leaving them as they were found is observable. */
+    psp_write32(wa + LW_COUNT,   (uint32_t)init);
+    psp_write32(wa + LW_THREAD,  init > 0 ? psp_sched_current() : 0);
+    psp_write32(wa + LW_ATTR,    attr);
+    psp_write32(wa + LW_WAITING, 0);
+    psp_write32(wa + LW_UID,     m->uid);
+    psp_write32(wa + 20, 0);
+    psp_write32(wa + 24, 0);
+    psp_write32(wa + 28, 0);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_DeleteLwMutex(void) {
+    const uint32_t wa = psp_arg(0);
+    if (lw_bad_pointer(wa)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+    psp_lwmutex *m = NULL;
+    if (lw_resolve(wa, &m, 1) != SCE_KERNEL_ERROR_OK || !m) {
+        psp_ret(SCE_KERNEL_ERROR_NOT_FOUND_LWMUTEX);
+        return;
+    }
+    const int urgent = psp_waitq_release_all(&m->q);
+    m->used = 0;
+    /* The uid is left in the workarea on purpose. It is what makes a *deleted*
+     * lwmutex distinguishable from a never-registered one, and the two get
+     * different answers to everything afterwards. */
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
+}
+
+/* The count rules, applied to the workarea's own attr and count so that a
+ * workarea the kernel never made is judged by exactly the same arithmetic. */
+static uint32_t lw_count_error(uint32_t wa, int32_t count, int locking) {
+    const uint32_t attr = psp_read32(wa + LW_ATTR);
+    const int32_t  cur  = (int32_t)psp_read32(wa + LW_COUNT);
+    if (count <= 0) return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
+    if (count > 1 && !(attr & LWMUTEX_ATTR_RECURSE))
+        return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
+    if (locking && cur > INT32_MAX - count)
+        return SCE_KERNEL_ERROR_LWMUTEX_LOCK_OVERFLOW;
+    return SCE_KERNEL_ERROR_OK;
+}
+
+/* The pre-6.00 sceKernelTryLockLwMutex reports one code for every failure.
+ *
+ * Not a simplification on our part: try.expected has fifteen failing cases and
+ * every one of them answers 0x800201C4, where try600.expected gives the precise
+ * code for the same call on the same inputs. The `_600` suffix is a firmware
+ * revision that made the error vocabulary specific, and both exports are still
+ * present with their own NIDs. */
+static void lw_lock(int may_block, int has_timeout, int flatten) {
+    const uint32_t wa      = psp_arg(0);
+    const int32_t  count   = (int32_t)psp_arg(1);
+    const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
+
+#define LW_FAIL(code) do { \
+        psp_ret(flatten ? SCE_KERNEL_ERROR_LWMUTEX_TRY_FAILED : (code)); \
+        return; \
+    } while (0)
+
+    if (lw_bad_pointer(wa)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+    const uint32_t bad = lw_count_error(wa, count, 1);
+    if (bad) LW_FAIL(bad);
+
+    psp_lwmutex *rec = NULL;
+    const uint32_t gone = lw_resolve(wa, &rec, 0);
+    if (gone) LW_FAIL(gone);
+
+    const uint64_t deadline = psp_wait_deadline(tmo_ptr);
+    const uint32_t me   = psp_sched_current();
+    const int32_t  cur  = (int32_t)psp_read32(wa + LW_COUNT);
+    const uint32_t attr = psp_read32(wa + LW_ATTR);
+
+    if (cur == 0) {
+        psp_write32(wa + LW_COUNT,  (uint32_t)count);
+        psp_write32(wa + LW_THREAD, me);
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+
+    if (psp_read32(wa + LW_THREAD) == me) {
+        if (!(attr & LWMUTEX_ATTR_RECURSE)) LW_FAIL(SCE_KERNEL_ERROR_LWMUTEX_RECURSIVE);
+        psp_write32(wa + LW_COUNT, (uint32_t)(cur + count));
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+
+    if (!may_block) LW_FAIL(SCE_KERNEL_ERROR_LWMUTEX_LOCKED);
+
+    /* Only here does the kernel need to exist: a thread cannot be parked
+     * against a workarea alone. */
+    psp_lwmutex *m = rec;
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_NOT_FOUND_LWMUTEX); return; }
+    const uint32_t uid = m->uid;
+
+    if (psp_waitq_add(&m->q, me, (uint32_t)count, 0, 0) != 0) {
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+    psp_write32(wa + LW_WAITING, (uint32_t)psp_waitq_count(&m->q));
+
+    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, m->waitdesc,
+                                         deadline);
+
+    m = find_lw(uid);
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+
+    if (rc == PSP_SCHED_WOKEN) {
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+    psp_waitq_drop(&m->q, me);
+    psp_write32(wa + LW_WAITING, (uint32_t)psp_waitq_count(&m->q));
+    psp_wait_writeback(tmo_ptr, deadline);
+    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+#undef LW_FAIL
+}
+
+static void hle_LockLwMutex(void)        { lw_lock(1, 1, 0); }
+static void hle_TryLockLwMutex(void)     { lw_lock(0, 0, 1); }
+static void hle_TryLockLwMutex600(void)  { lw_lock(0, 0, 0); }
+
+static void hle_UnlockLwMutex(void) {
+    const uint32_t wa    = psp_arg(0);
+    const int32_t  count = (int32_t)psp_arg(1);
+
+    if (lw_bad_pointer(wa)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+    const uint32_t bad = lw_count_error(wa, count, 0);
+    if (bad) { psp_ret(bad); return; }
+
+    psp_lwmutex *rec = NULL;
+    const uint32_t gone = lw_resolve(wa, &rec, 0);
+    if (gone) { psp_ret(gone); return; }
+
+    /* Not held, *or held by somebody else*: both are UNLOCKED. The second half
+     * is the one that is not obvious -- `Locked 0 => 1` has one thread lock it
+     * and another give it back, and hardware refuses rather than transferring
+     * ownership. A mutex you do not own is, to you, unlocked. */
+    const int32_t cur = (int32_t)psp_read32(wa + LW_COUNT);
+    if (cur == 0 || psp_read32(wa + LW_THREAD) != psp_sched_current()) {
+        psp_ret(SCE_KERNEL_ERROR_LWMUTEX_UNLOCKED);
+        return;
+    }
+    if (count > cur) { psp_ret(SCE_KERNEL_ERROR_LWMUTEX_UNLOCK_UNDERFLOW); return; }
+
+    psp_write32(wa + LW_COUNT, (uint32_t)(cur - count));
+    if (cur - count > 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+    psp_write32(wa + LW_THREAD, 0);
+
+    /* Free now, so whoever is next in line takes it -- if there is a kernel
+     * record to hold a queue at all. */
+    int urgent = 0;
+    psp_lwmutex *m = rec;
+    if (m) {
+        const int i = psp_waitq_pick(&m->q, psp_read32(wa + LW_ATTR));
+        if (i >= 0) {
+            const psp_waiter w = psp_waitq_take(&m->q, i);
+            psp_write32(wa + LW_COUNT,   w.need);
+            psp_write32(wa + LW_THREAD,  w.uid);
+            psp_write32(wa + LW_WAITING, (uint32_t)psp_waitq_count(&m->q));
+            urgent = psp_sched_wake(w.uid);
+        }
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_yield();
+}
+
+/* 64 bytes, from create.expected's own `size=64`. `lockThread` is -1 when the
+ * mutex is free, where the workarea says 0 for the same state. */
+static void lw_write_info(const psp_lwmutex *m, uint32_t info) {
+    const uint32_t wa  = m->workarea;
+    const uint32_t thr = psp_read32(wa + LW_THREAD);
+    psp_write32(info +  0, 64);
+    psp_threadman_write_name(info + 4, m->name);
+    psp_write32(info + 36, psp_read32(wa + LW_ATTR));
+    psp_write32(info + 40, m->uid);
+    psp_write32(info + 44, wa);
+    psp_write32(info + 48, (uint32_t)m->init_count);
+    psp_write32(info + 52, psp_read32(wa + LW_COUNT));
+    psp_write32(info + 56, thr ? thr : 0xFFFFFFFFu);
+    psp_write32(info + 60, (uint32_t)psp_waitq_count(&m->q));
+}
+
+static void lw_refer(const psp_lwmutex *m, uint32_t info) {
+    if (!m)    { psp_ret(SCE_KERNEL_ERROR_NOT_FOUND_LWMUTEX); return; }
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+    lw_write_info(m, info);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_ReferLwMutexStatus(void) {
+    const uint32_t wa = psp_arg(0);
+    if (!wa) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+    psp_lwmutex *m = NULL;
+    (void)lw_resolve(wa, &m, 1);
+    lw_refer(m, psp_arg(1));
+}
+
+/* By uid rather than by workarea, and the tests memcmp the two results against
+ * each other -- so they have to agree field for field, which is why both go
+ * through one writer. */
+static void hle_ReferLwMutexStatusByID(void) {
+    lw_refer(find_lw(psp_arg(0)), psp_arg(1));
+}
+
+void psp_kernlock_register_lw(void) {
+    psp_hle_register(0x19CFF145, "ThreadManForUser", "sceKernelCreateLwMutex",   hle_CreateLwMutex);
+    psp_hle_register(0x60107536, "ThreadManForUser", "sceKernelDeleteLwMutex",   hle_DeleteLwMutex);
+    psp_hle_register(0xBEA46419, "ThreadManForUser", "sceKernelLockLwMutex",     hle_LockLwMutex);
+    psp_hle_register(0x1FC64E09, "ThreadManForUser", "sceKernelLockLwMutexCB",   hle_LockLwMutex);
+    psp_hle_register(0xDC692EE3, "ThreadManForUser", "sceKernelTryLockLwMutex",  hle_TryLockLwMutex);
+    /* The _600 suffix is part of the exported name, not a version we choose;
+     * it hashes to its own NID and the tests import both. */
+    psp_hle_register(0x37431849, "ThreadManForUser", "sceKernelTryLockLwMutex_600", hle_TryLockLwMutex600);
+    psp_hle_register(0x15B6446B, "ThreadManForUser", "sceKernelUnlockLwMutex",   hle_UnlockLwMutex);
+    psp_hle_register(0xC1734599, "ThreadManForUser", "sceKernelReferLwMutexStatus", hle_ReferLwMutexStatus);
+    psp_hle_register(0x4C145944, "ThreadManForUser", "sceKernelReferLwMutexStatusByID", hle_ReferLwMutexStatusByID);
 }

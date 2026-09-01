@@ -178,6 +178,21 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_MUTEX_UNLOCK_UNDERFLOW 0x800201C7
 #define SCE_KERNEL_ERROR_MUTEX_RECURSIVE       0x800201C8
 
+/* And the lwmutex family, which has its own set rather than sharing the
+ * mutex's -- threads/lwmutex/{lock,unlock,delete}.expected. A null workarea is
+ * ILLEGAL_SIZE, which is the odd one and is what delete.expected reports. */
+#define SCE_KERNEL_ERROR_ILLEGAL_SIZE            0x800200D3
+#define SCE_KERNEL_ERROR_NOT_FOUND_LWMUTEX       0x800201CA
+#define SCE_KERNEL_ERROR_LWMUTEX_LOCKED          0x800201CB
+#define SCE_KERNEL_ERROR_LWMUTEX_UNLOCKED        0x800201CC
+#define SCE_KERNEL_ERROR_LWMUTEX_LOCK_OVERFLOW   0x800201CD
+#define SCE_KERNEL_ERROR_LWMUTEX_UNLOCK_UNDERFLOW 0x800201CE
+#define SCE_KERNEL_ERROR_LWMUTEX_RECURSIVE       0x800201CF
+/* What the *pre-6.00* sceKernelTryLockLwMutex answers for every failure it can
+ * have -- all fifteen of try.expected's, where try600.expected gives the
+ * specific code for the same inputs. */
+#define SCE_KERNEL_ERROR_LWMUTEX_TRY_FAILED      0x800201C4
+
 /* ---- the subsystems ------------------------------------------------------ */
 
 void psp_sysmem_init(void);
@@ -319,6 +334,7 @@ uint32_t psp_threadman_next_uid(void);
 void     psp_threadman_write_name(uint32_t dst, const char *name);
 
 void psp_kernlock_register(void);
+void psp_kernlock_register_lw(void);
 void psp_kernlock_reset(void);
 
 void psp_threadman_init(void);
