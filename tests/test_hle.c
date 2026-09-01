@@ -200,6 +200,55 @@ static void test_semaphores(void) {
           "a deleted semaphore is gone");
 }
 
+/* The attribute rules, one object type at a time.
+ *
+ * These two disagree with each other, and the whole reason this test exists is
+ * that one of them was measured and then applied to both. A semaphore takes the
+ * low nine bits; an event flag refuses bit 0x100 and accepts bit 0x200, which is
+ * PSP_EVENT_WAITMULTIPLE and entirely ordinary. Armored Core creates one with
+ * exactly 0x200, was refused, and the run went to 0 GE lists and 123,606 bad
+ * memory accesses.
+ *
+ * Both tables below are transcribed from the pspautotests hardware captures,
+ * semaphores/create.expected and events/create/create.expected. */
+static void test_create_attributes(void) {
+    psp_threadman_reset();
+
+    const uint32_t SEMA = psp_nid("sceKernelCreateSema");
+    const uint32_t FLAG = psp_nid("sceKernelCreateEventFlag");
+    const uint32_t nm   = guest_name("create");
+
+    static const struct { uint32_t attr; int ok; } sema[] = {
+        { 0x00001, 1 }, { 0x00100, 1 }, { 0x001FF, 1 },
+        { 0x00200, 0 }, { 0x00400, 0 }, { 0x00800, 0 }, { 0x00900, 0 },
+        { 0x01000, 0 }, { 0x02000, 0 }, { 0x04000, 0 }, { 0x08000, 0 },
+        { 0x10000, 0 },
+    };
+    for (unsigned i = 0; i < sizeof sema / sizeof *sema; i++) {
+        const uint32_t r = call5(SEMA, nm, sema[i].attr, 0, 2, 0);
+        const int accepted = r != SCE_KERNEL_ERROR_ILLEGAL_ATTR;
+        CHECK(accepted == sema[i].ok,
+              "sema attr 0x%X: %s, hardware %s it (got 0x%08X)",
+              sema[i].attr, accepted ? "accepted" : "refused",
+              sema[i].ok ? "accepts" : "refuses", r);
+    }
+
+    static const struct { uint32_t attr; int ok; } flag[] = {
+        { 0x0000, 1 }, { 0x0001, 1 }, { 0x0010, 1 },
+        { 0x0100, 0 }, { 0x0122, 0 },
+        { 0x0200, 1 }, { 0x0222, 1 },
+        { 0x0300, 0 }, { 0x0900, 0 }, { 0x1200, 0 },
+    };
+    for (unsigned i = 0; i < sizeof flag / sizeof *flag; i++) {
+        const uint32_t r = call(FLAG, nm, flag[i].attr, 0, 0);
+        const int accepted = r != SCE_KERNEL_ERROR_ILLEGAL_ATTR;
+        CHECK(accepted == flag[i].ok,
+              "event flag attr 0x%X: %s, hardware %s it (got 0x%08X)",
+              flag[i].attr, accepted ? "accepted" : "refused",
+              flag[i].ok ? "accepts" : "refuses", r);
+    }
+}
+
 static void test_event_flags(void) {
     psp_threadman_reset();
 
@@ -458,6 +507,7 @@ int main(void) {
     test_nids_match_names();
     test_sysmem();
     test_semaphores();
+    test_create_attributes();
     test_event_flags();
     test_threads();
     test_guest_strings();

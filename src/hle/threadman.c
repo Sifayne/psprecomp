@@ -528,11 +528,34 @@ void psp_threadman_dump_signalled(FILE *out) {
  * The two objects that answer NO_MEMORY instead of ERROR (fpl, msgpipe) are
  * not implemented here, so the single code is right for everything that is.
  *
- * The attribute check is 0x200 and up: hardware takes the low nine bits and
- * rejects anything above them with ILLEGAL_ATTR. Measured, not guessed --
- * create.expected accepts 0x1ff and refuses 0x200. */
+ * **The attribute rule is per object type, and sharing one check broke the
+ * game.** A semaphore takes the low nine bits and refuses anything above them;
+ * that was measured from semaphores/create.expected, and then applied to event
+ * flags too, where it is simply false. Armored Core creates an event flag with
+ * attribute 0x200 -- PSP_EVENT_WAITMULTIPLE, an ordinary and documented flag
+ * attribute -- was told ILLEGAL_ATTR, used the error code as a uid, and the run
+ * went from 633 GE lists to 0 with 123,606 bad memory accesses.
+ *
+ * The lesson is the one state.md keeps recording in other forms: a measurement
+ * about one object is not a fact about its neighbours. Both rules below come
+ * from a hardware capture, and the two capture files disagree with each other. */
 static int name_ok(uint32_t name_ptr) { return name_ptr != 0; }
-static int attr_ok(uint32_t attr)     { return attr < 0x200u; }
+
+/* semaphores/create.expected: 1, 0x100 and 0x1ff are accepted; 0x200, 0x400,
+ * 0x800, 0x900, 0x1000, 0x2000, 0x4000, 0x8000 and 0x10000 are all refused. */
+static int sema_attr_ok(uint32_t attr) { return attr < 0x200u; }
+
+/* events/create/create.expected, all ten of its cases:
+ *
+ *     0x000 ok   0x001 ok   0x010 ok   0x100 FAIL  0x122 FAIL
+ *     0x200 ok   0x222 ok   0x300 FAIL 0x900 FAIL  0x1200 FAIL
+ *
+ * So bit 0x100 is illegal here where it is legal for a semaphore, bit 0x200 is
+ * legal here where it is illegal for a semaphore, and nothing above 0x2FF is
+ * allowed at all. Every one of the ten fits this and nothing narrower does. */
+static int flag_attr_ok(uint32_t attr) {
+    return (attr & ~0x2FFu) == 0 && (attr & 0x100u) == 0;
+}
 
 /* Copy a name into a guest SceKernel*Info block: 32 bytes, truncated to 31
  * characters and NUL-terminated, which is what hardware reports back for the
@@ -547,7 +570,7 @@ static void write_info_name(uint32_t dst, const char *name) {
 static void hle_CreateSema(void) {
     /* (name, attr, initVal, maxVal, option) */
     if (!name_ok(psp_arg(0))) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
-    if (!attr_ok(psp_arg(1))) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+    if (!sema_attr_ok(psp_arg(1))) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
     psp_sema *s = NULL;
     for (int i = 0; i < MAX_SEMAS; i++) if (!g_sema[i].used) { s = &g_sema[i]; break; }
     if (!s) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
@@ -665,7 +688,7 @@ static void hle_WaitSema(void) {
 static void hle_CreateEventFlag(void) {
     /* (name, attr, bits, option) */
     if (!name_ok(psp_arg(0))) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
-    if (!attr_ok(psp_arg(1))) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+    if (!flag_attr_ok(psp_arg(1))) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
     psp_evflag *f = NULL;
     for (int i = 0; i < MAX_FLAGS; i++) if (!g_flag[i].used) { f = &g_flag[i]; break; }
     if (!f) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
