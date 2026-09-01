@@ -778,9 +778,31 @@ static void hle_TerminateDeleteThread(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* sceKernelChangeCurrentThreadAttr(clear, set)
+ *
+ * One bit of the attribute word is the thread's own business, and it is
+ * PSP_THREAD_ATTR_VFPU. Every other bit belongs to the kernel and naming one is
+ * an error, not a no-op -- which is what this was, applying whatever it was
+ * handed.
+ *
+ * threads/change sweeps all thirty-two bits through both arguments and gets
+ * `80020191` for thirty-one of them in each direction, twice:
+ *
+ *     add:     4000: 00000000, attr=800040ff     (already set, so unchanged)
+ *     remove:  4000: 00000000, attr=800000ff
+ *
+ * -- and the attribute readback on the next line proves the refused calls
+ * changed nothing, because it holds still across the whole sweep. */
+#define PSP_THREAD_ATTR_VFPU 0x00004000u
+
 static void hle_ChangeCurrentThreadAttr(void) {
+    const uint32_t clear = psp_arg(0), set = psp_arg(1);
+    if ((clear | set) & ~PSP_THREAD_ATTR_VFPU) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR);
+        return;
+    }
     psp_thread *c = current_thread();
-    if (c) c->attr = (c->attr & ~psp_arg(0)) | psp_arg(1);
+    if (c) c->attr = (c->attr & ~clear) | set;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
