@@ -1533,10 +1533,10 @@ static void hle_ReferSemaStatus(void) {
  * where an argument error leaves the caller's 0xDEADBEEF in place. So "not
  * yet" is an answer rather than a refusal, and the caller is told what it
  * would have to wait for. */
-/* Deliver the calling thread's callbacks, then wait exactly as the plain call
- * does. This one was not registered at all, which is why it mattered more than
- * the rest: an unimplemented call returns zero, and zero is what a *successful*
- * wait returns. pspautotests' scheduling harness spins
+/* Wait exactly as the plain call does, then deliver. This one was not
+ * registered at all, which is why it mattered more than the rest: an
+ * unimplemented call returns zero, and zero is what a *successful* wait
+ * returns. pspautotests' scheduling harness spins
  *
  *     while (result == 0x800201A8)
  *         result = sceKernelWaitEventFlagCB(flag, ..., &timeout);
@@ -1544,10 +1544,7 @@ static void hle_ReferSemaStatus(void) {
  * on a flag that is never signalled, so the loop is meant to run until the
  * flag is deleted under it. Answering zero ended it on the first iteration,
  * and every test built on that harness recorded a thread that never waited. */
-static void hle_WaitEventFlagCB(void) {
-    psp_threadman_run_callbacks();
-    hle_WaitEventFlag();
-}
+static void hle_WaitEventFlagCB(void) { psp_threadman_cb_begin(); hle_WaitEventFlag(); psp_threadman_cb_end(); }
 
 static void hle_PollEventFlag(void) {
     const uint32_t id   = psp_arg(0);
@@ -1893,6 +1890,31 @@ int psp_threadman_run_callbacks(void) {
     return ran;
 }
 
+/* A CB wait delivers on the way *out*, and only if the call succeeded.
+ *
+ * callbacks/callbacks settles both halves in three consecutive lines. It
+ * notifies cb1 and then calls sceKernelLockMutexCB, three times over:
+ *
+ *     Lock 0 => 5: 800201BD                        illegal count, no delivery
+ *     cbHandler called: 00000002, ...              <- then two arrive at once
+ *     Lock 0 => 1: 00000000                        succeeded
+ *     Lock 1 => 1: 800201C8                        already held, no delivery
+ *
+ * The count of *two* is the proof: the first call's notify was not consumed,
+ * so a call that fails on its arguments delivers nothing, and the second call
+ * hands over both. Delivering on the way in -- which is what these did -- gives
+ * three deliveries of one each, and empties the queue before the calls that
+ * should not have touched it.
+ *
+ * "Succeeded" is the wrong test, though, and threads/threadend says so twice:
+ * a CB wait that *times out* delivers, and sceKernelWaitThreadEndCB returns
+ * the awaited thread's exit status, which was 5. So the question is whether
+ * the call reached its wait, and psp_wait_deadline is the one place that
+ * knows -- every waiting call computes a deadline there, after validating and
+ * before operating. */
+void psp_threadman_cb_begin(void) { psp_wait_cb_pending(1); }
+void psp_threadman_cb_end(void)   { psp_wait_cb_pending(0); }
+
 static void hle_CheckCallback(void) { psp_ret((uint32_t)psp_threadman_run_callbacks()); }
 
 /* Discard what has accumulated without running the handler. The argument is
@@ -1918,20 +1940,40 @@ static void hle_GetCallbackCount(void) {
  * Delivering them first is what the tests measure: threads/threadend prints
  * ` * cbFunc` *before* the line reporting the wait's result, on a wait that
  * returns immediately. */
-static void hle_WaitThreadEndCB(void) {
-    psp_threadman_run_callbacks();
-    hle_WaitThreadEnd();
-}
+static void hle_WaitThreadEndCB(void) { psp_threadman_cb_begin(); hle_WaitThreadEnd(); psp_threadman_cb_end(); }
 
+/* A delay that a notify can interrupt, and that goes back to sleeping out the
+ * rest of it afterwards -- the same shape sceKernelSleepThreadCB has, and for
+ * the same reason: a thread parked here is reachable only by a callback.
+ *
+ * callbacks/callbacks leaves a worker in sceKernelDelayThreadCB(100000) and
+ * notifies its callback three times from the main thread. Hardware runs the
+ * handler *during* that delay -- `thread3 cbHandler called: 00000003` lands
+ * between two of main's own lines -- where a delay that cannot be interrupted
+ * runs it 100ms later, after everything else the test prints. */
 static void hle_DelayThreadCB(void) {
-    psp_threadman_run_callbacks();
-    hle_DelayThread();
+    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
+    const uint64_t until = psp_clock_peek() + psp_arg(0);
+    for (;;) {
+        psp_threadman_run_callbacks();
+        psp_thread *t = current_thread();
+        const uint64_t now = psp_clock_peek();
+        if (!t || now >= until) break;
+
+        t->wait_kind = WAIT_DELAY;
+        t->cb_wait   = 1;
+        psp_sched_delay(until - now);
+        t = current_thread();
+        if (t) { t->wait_kind = WAIT_NONE; t->cb_wait = 0; }
+        if (!t || !t->cb_wake) break;
+        /* Woken to deliver rather than by the deadline: hand the handler over
+         * and then sleep out what is left. */
+        t->cb_wake = 0;
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-static void hle_WaitSemaCB(void) {
-    psp_threadman_run_callbacks();
-    hle_WaitSema();
-}
+static void hle_WaitSemaCB(void) { psp_threadman_cb_begin(); hle_WaitSema(); psp_threadman_cb_end(); }
 
 /* A sleep that a notify can interrupt, and that goes back to sleep afterwards.
  * The other CB waits above deliver on the way in and are done; this one is the

@@ -1,6 +1,7 @@
 /* psprecomp — the queue of threads parked on a kernel object. See waitq.h. */
 
 #include "waitq.h"
+#include "psprecomp/hle.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/mem.h"
@@ -65,7 +66,15 @@ int psp_waitq_cancel_all(psp_waitq *q) {
     return release_all_as(q, PSP_WAIT_WOKE_CANCELLED);
 }
 
+static int g_cb_call;
+
+void psp_wait_cb_pending(int on) { g_cb_call = on; }
+
 uint64_t psp_wait_deadline(uint32_t tmo_ptr) {
+    /* Past the caller's argument checks and not yet blocked: the one moment a
+     * CB wait delivers. Cleared first, so a handler that itself waits does not
+     * recurse here. */
+    if (g_cb_call) { g_cb_call = 0; psp_threadman_run_callbacks(); }
     if (!tmo_ptr) return 0;
     const uint32_t usec = psp_read32(tmo_ptr);
     if (usec) return psp_clock_peek() + usec;

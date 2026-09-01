@@ -315,7 +315,7 @@ static void mutex_list(int type, uint32_t out, int max, int *count) {
 /* A CB wait delivers the calling thread's callbacks and then does exactly what
  * its plain counterpart does. These were registered straight to those
  * counterparts, which waits correctly and delivers nothing. */
-static void hle_LockMutexCB(void) { psp_threadman_run_callbacks(); hle_LockMutex(); }
+static void hle_LockMutexCB(void) { psp_threadman_cb_begin(); hle_LockMutex(); psp_threadman_cb_end(); }
 
 void psp_kernlock_register(void) {
     psp_threadman_add_lister(mutex_list);
@@ -667,7 +667,7 @@ static void hle_ReferLwMutexStatusByID(void) {
     lw_refer(find_lw(psp_arg(0)), psp_arg(1));
 }
 
-static void hle_LockLwMutexCB(void) { psp_threadman_run_callbacks(); hle_LockLwMutex(); }
+static void hle_LockLwMutexCB(void) { psp_threadman_cb_begin(); hle_LockLwMutex(); psp_threadman_cb_end(); }
 
 void psp_kernlock_register_lw(void) {
     psp_hle_register(0x19CFF145, "ThreadManForUser", "sceKernelCreateLwMutex",   hle_CreateLwMutex);

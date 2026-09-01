@@ -474,7 +474,7 @@ static void vpl_list(int type, uint32_t out, int max, int *count) {
 }
 
 /* Same for the pools and the queues: deliver, then do the ordinary thing. */
-static void hle_AllocateVplCB(void) { psp_threadman_run_callbacks(); hle_AllocateVpl(); }
+static void hle_AllocateVplCB(void) { psp_threadman_cb_begin(); hle_AllocateVpl(); psp_threadman_cb_end(); }
 
 void psp_kernobj_register(void) {
     psp_threadman_add_lister(vpl_list);
@@ -1010,8 +1010,8 @@ static void mpp_list(int type, uint32_t out, int max, int *count) {
     }
 }
 
-static void hle_SendMsgPipeCB(void)    { psp_threadman_run_callbacks(); hle_SendMsgPipe(); }
-static void hle_ReceiveMsgPipeCB(void) { psp_threadman_run_callbacks(); hle_ReceiveMsgPipe(); }
+static void hle_SendMsgPipeCB(void)    { psp_threadman_cb_begin(); hle_SendMsgPipe(); psp_threadman_cb_end(); }
+static void hle_ReceiveMsgPipeCB(void) { psp_threadman_cb_begin(); hle_ReceiveMsgPipe(); psp_threadman_cb_end(); }
 
 void psp_kernobj_register_mpp(void) {
     psp_threadman_add_lister(mpp_list);
@@ -1261,7 +1261,7 @@ static void mbx_list(int type, uint32_t out, int max, int *count) {
     }
 }
 
-static void hle_ReceiveMbxCB(void) { psp_threadman_run_callbacks(); hle_ReceiveMbx(); }
+static void hle_ReceiveMbxCB(void) { psp_threadman_cb_begin(); hle_ReceiveMbx(); psp_threadman_cb_end(); }
 
 void psp_kernobj_register_mbx(void) {
     psp_threadman_add_lister(mbx_list);
@@ -1537,7 +1537,7 @@ static void fpl_list(int type, uint32_t out, int max, int *count) {
     }
 }
 
-static void hle_AllocateFplCB(void) { psp_threadman_run_callbacks(); hle_AllocateFpl(); }
+static void hle_AllocateFplCB(void) { psp_threadman_cb_begin(); hle_AllocateFpl(); psp_threadman_cb_end(); }
 
 void psp_kernobj_register_fpl(void) {
     psp_threadman_add_lister(fpl_list);

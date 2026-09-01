@@ -61,6 +61,18 @@
  * that it expires through the ordinary path. */
 uint64_t psp_wait_deadline(uint32_t tmo_ptr);
 
+/* Mark the call in progress as one whose name ends in CB, so that the wait it
+ * is about to perform delivers the caller's callbacks first.
+ *
+ * The delivery point is *here*, at the deadline, and not at either end of the
+ * call. Two tests fix it between them. callbacks/callbacks refuses a
+ * sceKernelLockMutexCB for an illegal count and delivers nothing, so it is
+ * after the argument checks. threads/threadend runs a CB wait that times out
+ * and tags the handler's line `[x]` and the wait's result `[r]` -- the
+ * reschedule falls between them -- so it is before the wait blocks. Every
+ * waiting call computes its deadline in exactly that gap, once. */
+void     psp_wait_cb_pending(int on);
+
 /* What hardware leaves in the timeout word: how much was not used. */
 void     psp_wait_writeback(uint32_t tmo_ptr, uint64_t deadline);
 
