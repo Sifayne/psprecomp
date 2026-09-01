@@ -16,6 +16,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <time.h>
 
 /* ---- Kernel_Library ------------------------------------------------------
@@ -222,6 +223,94 @@ static uint32_t parse_pad(void) {
     return held;
 }
 
+/* PSPRECOMP_PAD_PRESS=<button>,<delay>[,<duration>]
+ *
+ * PSPRECOMP_PAD cannot express a press. A game reads "pressed" as a
+ * transition -- down where it was up at the previous poll -- and a button
+ * held from before the first poll never transitions: it is a button that was
+ * already down, forever. So holding start at a title screen does nothing,
+ * while a player tapping it skips.
+ *
+ * This presses at a wall-clock moment instead: down `delay` seconds into the
+ * run, up `duration` seconds later (default half a second). Headless only --
+ * in a windowed run the SDL layer owns the pad and publishes over it.
+ *
+ * A thread because the run does not pause for the button, and the HLE has no
+ * tick of its own to poll from; the scheduler's threads are the guest's, and
+ * a guest thread cannot be borrowed for host timing. */
+#include <pthread.h>
+
+typedef struct { uint32_t bit; double delay, duration; } pad_press;
+
+/* Sleep `seconds` of wall time, surviving signals. */
+static void sleep_wall(double seconds) {
+    const struct timespec t = {
+        .tv_sec  = (time_t)seconds,
+        .tv_nsec = (long)((seconds - (double)(time_t)seconds) * 1e9),
+    };
+    while (nanosleep(&t, NULL) == -1 && errno == EINTR) {}
+}
+
+static void *pad_press_thread(void *arg) {
+    pad_press p = *(pad_press *)arg;
+    free(arg);
+
+    sleep_wall(p.delay);
+    atomic_fetch_or(&g_buttons, p.bit);
+    fprintf(stderr, "psprecomp: pad press 0x%06X down\n", p.bit);
+    sleep_wall(p.duration);
+    atomic_fetch_and(&g_buttons, ~p.bit);
+    fprintf(stderr, "psprecomp: pad press 0x%06X up\n", p.bit);
+    return NULL;
+}
+
+static void parse_pad_press(void) {
+    const char *v = getenv("PSPRECOMP_PAD_PRESS");
+    if (!v || !*v) return;
+
+    char spec[256];
+    snprintf(spec, sizeof spec, "%s", v);
+    char *save = NULL;
+    char *name     = strtok_r(spec, ",", &save);
+    char *delay_s  = strtok_r(NULL, ",", &save);
+    char *dur_s    = strtok_r(NULL, ",", &save);
+    if (!name || !delay_s) {
+        fprintf(stderr, "psprecomp: PSPRECOMP_PAD_PRESS: want <button>,<delay>[,<duration>]\n");
+        return;
+    }
+
+    static const struct { const char *name; uint32_t bit; } B[] = {
+        { "select",   0x000001 }, { "start",    0x000008 },
+        { "up",       0x000010 }, { "right",    0x000020 },
+        { "down",     0x000040 }, { "left",     0x000080 },
+        { "ltrigger", 0x000100 }, { "rtrigger", 0x000200 },
+        { "l",        0x000100 }, { "r",        0x000200 },
+        { "triangle", 0x001000 }, { "circle",   0x002000 },
+        { "cross",    0x004000 }, { "square",   0x008000 },
+    };
+    uint32_t bit = 0;
+    for (size_t i = 0; i < sizeof B / sizeof B[0]; i++)
+        if (!strcasecmp(B[i].name, name)) { bit = B[i].bit; break; }
+    if (!bit) {
+        fprintf(stderr, "psprecomp: PSPRECOMP_PAD_PRESS: unknown button \"%s\"\n", name);
+        return;
+    }
+
+    pad_press *p = malloc(sizeof *p);
+    if (!p) return;
+    p->bit      = bit;
+    p->delay    = atof(delay_s);
+    p->duration = dur_s ? atof(dur_s) : 0.5;
+    if (p->delay < 0) p->delay = 0;
+    if (p->duration <= 0) p->duration = 0.5;
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, pad_press_thread, p) == 0)
+        pthread_detach(t);
+    else
+        free(p);
+}
+
 /* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16. */
 static void hle_ReadBufferPositive(void) {
     static int looked;
@@ -346,7 +435,10 @@ void psp_misc_reset(void) {
     g_audio_blocks = 0;
 }
 
-void psp_misc_init(void) { psp_misc_reset(); }
+void psp_misc_init(void) {
+    psp_misc_reset();
+    parse_pad_press();
+}
 
 void psp_misc_register(void) {
     psp_hle_register(0x092968F4, "Kernel_Library", "sceKernelCpuSuspendIntr", hle_CpuSuspendIntr);
