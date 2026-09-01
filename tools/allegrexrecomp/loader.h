@@ -33,6 +33,7 @@ extern "C" {
 
 typedef struct {
     uint32_t lo, hi;        /* extent mapped, in guest addresses */
+    uint32_t gp;            /* $gp for this module, 0 if it declares none */
     int      nsegments;
     int      nrelocs;       /* relocations applied */
     int      nreloc_skipped;/* entries with a type or base we do not handle */

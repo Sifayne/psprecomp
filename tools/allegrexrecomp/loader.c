@@ -18,6 +18,7 @@
 #define R_MIPS_26    4
 #define R_MIPS_HI16  5
 #define R_MIPS_LO16  6
+#define R_MIPS_GPREL16 7
 
 /* r_info packs the MIPS type with two program-header selectors:
  *
@@ -161,6 +162,18 @@ static int apply_section(const image *im,
             out->nrelocs++;
             break;
 
+        case R_MIPS_GPREL16:
+            /* Nothing to patch. The field holds `target - gp`, and a module is
+             * relocated as a unit, so both move by the same delta and the
+             * difference is already right. What it does need is for $gp to
+             * actually be loaded -- see module_gp() below.
+             *
+             * Named rather than left to the default arm: counting these as
+             * "skipped" says the loader mis-loaded something when it did the
+             * correct thing, and that reading cost real time. */
+            out->nrelocs++;
+            break;
+
         default:
             /* R_MIPS_16 and REL32 do not appear in PSP modules in practice.
              * Counted rather than ignored: a module that needs one would
@@ -238,8 +251,31 @@ int psp_find_section(const psp_blob *b, const elf_info *e, const char *name,
     return -1;
 }
 
+/* $gp, from the module info the PRX carries in `.rodata.sceModuleInfo`.
+ *
+ * A module built with a small-data area addresses it as an offset from $gp,
+ * and nothing in the instruction stream says what $gp should be -- the value
+ * lives only in this header. Leave it zero and every such access reads from
+ * around address 0 instead: an `lw -0x7FF4($gp)` lands at 0xFFFF800C, which
+ * looks like a wild pointer and is really a register nobody set.
+ *
+ * Armored Core is built -G0 and never names $gp, so this stayed invisible; the
+ * first module that used it was a test binary, and the oracle could not have
+ * caught it either, since it excludes $gp from comparison.
+ *
+ * Read after relocation, not before: gp_value is one of the five relocated
+ * words in this header, so the image already holds the final address. */
+static uint32_t module_gp(const psp_blob *b, const elf_info *e) {
+    psp_section mi;
+    if (psp_find_section(b, e, ".rodata.sceModuleInfo", &mi) != 0) return 0;
+    /* flags(4) + name(28) puts gp_value at 0x20. */
+    if (mi.size < 0x24 || (size_t)mi.offset + 0x24 > b->size) return 0;
+    return rd32(b->data + mi.offset + 0x20);
+}
+
 int psp_load_module(psp_blob *b, const elf_info *e, psp_load_info *out) {
     if (psp_relocate_image(b->data, b->size, e, out) != 0) return -1;
+    out->gp = module_gp(b, e);
 
     if (psp_mem_map_module(out->lo, out->hi - out->lo) != 0) return -1;
     for (int i = 0; i < e->nsegments; i++) {
