@@ -14,9 +14,13 @@
 
 #include "interp.h"
 #include "decode.h"
+#include "crypto/sha1.h"
 
 #include "psprecomp/cpu.h"
+#include "psprecomp/dispatch.h"
+#include "psprecomp/hle.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/sched.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -37,6 +41,10 @@ static int failures;
 #define CODE  0x08900000u
 #define DATA  0x08910000u
 #define DONE  0x0DEAD000u   /* $ra sentinel: never mapped to code */
+#define THUNK 0x08920000u   /* a stand-in .sceStub.text entry */
+#define TARGET 0x08930000u  /* what a firmware callback dispatches into */
+#define THREAD 0x08931000u  /* a thread body */
+#define THREAD_SP 0x08980000u
 
 static void load(uint32_t addr, const uint32_t *words, unsigned n) {
     for (unsigned i = 0; i < n; i++) psp_write32(addr + i * 4, words[i]);
@@ -304,6 +312,100 @@ static void test_no_drift_from_emitter(void) {
     psp_mem_free();
 }
 
+/* ---- HLE re-entry: --dispatch ---------------------------------------------- */
+
+/* The two handlers below are what a firmware function looks like to the
+ * interpreter: C, running outside the instruction stream, that reaches back
+ * into guest code. The first via psp_dispatch (a registered callback), the
+ * second by starting a thread. With psp_interp_service_dispatch enabled both
+ * run interpreted and nested; without it, a program run stops at the first
+ * one -- which is exactly why pspautotests need the flag. */
+
+static uint32_t g_dispatch_target;
+
+static void hle_dispatch_target(void) {
+    psp_dispatch(g_dispatch_target);
+}
+
+static void hle_spawn_thread(void) {
+    psp_sched_spawn(0x00040010u, THREAD, THREAD_SP, 7, 8, 32);
+}
+
+static void test_dispatch_serving(void) {
+    psp_hle_init();
+    g_dispatch_target = TARGET;
+
+    const uint32_t nid = psp_nid("testDispatchTarget");
+    psp_hle_register(nid, "test", "testDispatchTarget", hle_dispatch_target);
+    psp_interp_import imp = { THUNK, nid };
+    CHECK(psp_interp_set_imports(&imp, 1) == 1, "import table");
+
+    /* The stub itself: an import entry is jr $ra with a slot, and the
+     * interpreter runs it after the HLE call to get back to the caller.
+     * Leaving the address zeroed means the run falls through nops instead. */
+    static const uint32_t stub[] = { 0x03E00008, 0x00000000 };
+    load(THUNK, stub, 2);
+
+    /* The dispatched target: addiu $v0,$zero,42 ; jr $ra ; nop */
+    static const uint32_t tgt[] = { 0x2402002A, 0x03E00008, 0x00000000 };
+    load(TARGET, tgt, 3);
+
+    /* The caller: lui $t9,THUNK ; jr $t9 ; nop. Reaching the thunk with a
+     * non-linking jump leaves $ra holding the run sentinel, so the run ends
+     * the moment the thunk's handler returns -- a jal would overwrite $ra
+     * with its own link and jr $ra would then jump to itself forever. */
+    static const uint32_t outer[] = {
+        0x3C190892,             /* lui  $t9,0x0892      */
+        0x03200008, 0x00000000, /* jr   $t9 ; slot      */
+    };
+
+    psp_interp_service_dispatch(1);
+    psp_interp it = run(outer, 4, 1000);
+    psp_interp_service_dispatch(0);
+    psp_interp_free_imports();
+
+    CHECK(it.status == I_OK_RETURN, "dispatch: %s", psp_interp_status_str(it.status));
+    CHECK(R(V0) == 42, "nested dispatch left its $v0 for the caller: got %u", R(V0));
+    CHECK(psp_interp_nest_refused() == 0, "nothing should be refused here");
+}
+
+/* A thread started inside a run executes to completion, nested, on its own
+ * register file -- and the starter's registers survive it. */
+static void test_spawn_serving(void) {
+    psp_hle_init();
+
+    const uint32_t nid = psp_nid("testSpawnHost");
+    psp_hle_register(nid, "test", "testSpawnHost", hle_spawn_thread);
+    psp_interp_import imp = { THUNK, nid };
+    CHECK(psp_interp_set_imports(&imp, 1) == 1, "import table");
+
+    static const uint32_t stub[] = { 0x03E00008, 0x00000000 };
+    load(THUNK, stub, 2);
+
+    /* Thread body: lui $t0,0x0891 ; sw $a0,0($t0) ; jr $ra ; nop */
+    static const uint32_t body[] = { 0x3C080891, 0xAD040000, 0x03E00008, 0x00000000 };
+    load(THREAD, body, 4);
+
+    /* The starter: addiu $s0,$zero,99 ; lui $t9,THUNK ; jr $t9 ; nop -- the
+     * same non-linking jump, so $ra keeps the sentinel. */
+    static const uint32_t outer[] = {
+        0x24100063,             /* addiu $s0,$zero,99   */
+        0x3C190892,             /* lui   $t9,0x0892     */
+        0x03200008, 0x00000000, /* jr    $t9 ; slot     */
+    };
+
+    psp_interp_service_dispatch(1);
+    psp_interp it = run(outer, 4, 1000);
+    psp_interp_service_dispatch(0);
+    psp_interp_free_imports();
+
+    CHECK(it.status == I_OK_RETURN, "spawn: %s", psp_interp_status_str(it.status));
+    CHECK(psp_read32(DATA) == 7,
+          "the started thread ran with StartThread's $a0: DATA=%u", psp_read32(DATA));
+    CHECK(R(S0) == 99,
+          "the starter's registers survived the thread: s0=%u", R(S0));
+}
+
 /* -------------------------------------------------------------------------- */
 
 int main(void) {
@@ -326,6 +428,8 @@ int main(void) {
 
     test_budget_stops_infinite_loop();
     test_syscall_traps();
+    test_dispatch_serving();
+    test_spawn_serving();
 
     psp_mem_free();
     test_no_drift_from_emitter();

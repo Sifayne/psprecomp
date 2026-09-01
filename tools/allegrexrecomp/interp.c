@@ -22,6 +22,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/recomp_rt.h"
+#include "psprecomp/sched.h"
 #include "psprecomp/vfpu.h"
 
 #include <stdlib.h>
@@ -469,6 +470,9 @@ static psp_interp *g_active;      /* the run currently executing, if any */
 static int         g_nest;
 static uint64_t    g_nest_refused;
 
+static int spawn_hook(uint32_t uid, uint32_t entry, uint32_t sp,
+                      uint32_t a0, uint32_t a1, int priority);
+
 static int dispatch_hook(uint32_t addr) {
     if (!g_active) return 0;              /* not inside an interpreter run */
 
@@ -524,6 +528,53 @@ void psp_interp_service_dispatch(int enable) {
     g_nest = 0;
     g_active = NULL;
     psp_set_dispatch_hook(enable ? dispatch_hook : NULL);
+    psp_sched_set_spawn_hook(enable ? spawn_hook : NULL);
+}
+
+/* A started thread runs to completion here, on the interpreter's own stack.
+ *
+ * That is sequential semantics, not scheduling: a thread that blocks part-way
+ * has nothing to be resumed into, and a second thread started before the
+ * first finishes waits rather than interleaving. It is also exactly what a
+ * pspautotests crt needs -- module_start creates and starts main, main runs
+ * its checks, prints, and returns -- and it is honest about what it is, which
+ * pretending the boot host's scheduler was in play would not be. */
+static int spawn_hook(uint32_t uid, uint32_t entry, uint32_t sp,
+                      uint32_t a0, uint32_t a1, int priority) {
+    (void)uid; (void)priority;
+    if (!g_active) return 0;              /* not inside an interpreter run */
+    if (g_nest >= MAX_NEST) { g_nest_refused++; return 1; }
+
+    psp_interp *outer = g_active;
+    const psp_cpu_state saved = psp_cpu;
+
+    uint64_t left = 0;
+    if (outer->budget) {
+        left = outer->budget > outer->executed ? outer->budget - outer->executed : 1;
+    }
+
+    /* The thread's own register file: arguments from StartThread, its own
+     * stack, and the sentinel to return to. Everything is restored after, so
+     * the starter's registers survive the call. */
+    memset(&psp_cpu, 0, sizeof psp_cpu);
+    R(PSP_REG_A0) = a0;
+    R(PSP_REG_A1) = a1;
+    R(PSP_REG_SP) = sp;
+
+    psp_interp sub;
+    psp_interp_init(&sub, entry, NESTED_RA, left);
+    sub.trace      = outer->trace;
+    sub.trace_regs = outer->trace_regs;
+
+    g_nest++;
+    g_active = &sub;
+    psp_interp_run(&sub);
+    g_active = outer;
+    g_nest--;
+
+    outer->executed += sub.executed;
+    psp_cpu = saved;
+    return 1;
 }
 
 uint64_t psp_interp_nest_refused(void) { return g_nest_refused; }

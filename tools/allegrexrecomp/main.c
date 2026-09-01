@@ -43,7 +43,7 @@ static int usage(void) {
         "  allegrexrecomp cover   <file>\n"
         "  allegrexrecomp funcs   <file> [--list]\n"
         "  allegrexrecomp emit    <file> <outdir> [prefix]\n"
-        "  allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs]\n"
+        "  allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs] [--dispatch]\n"
         "  allegrexrecomp decrypt <file> [--keys <path>]\n"
         "  allegrexrecomp kirk1   <file> [out] [--keys <path>]\n"
         "\n"
@@ -932,7 +932,7 @@ static int interp_bind_imports(const psp_blob *b, const elf_info *e,
 }   /* never mapped: the run stops here */
 
 static int cmd_interp(const char *path, uint32_t from, int have_from,
-                      uint64_t budget, int trace, int trace_regs) {
+                      uint64_t budget, int trace, int trace_regs, int dispatch) {
     psp_blob b;
     if (psp_blob_read(path, &b) != 0) { fprintf(stderr, "cannot read %s\n", path); return 1; }
 
@@ -967,6 +967,16 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
      * of reach this way, which is the useful answer; crashing says nothing. */
     psp_set_miss_handler(interp_note_reentry);
 
+    /* --dispatch: serve re-entries instead of counting them.
+     *
+     * The counting handler above answers the oracle's question -- which
+     * functions reach firmware callbacks, and so are uncomparable -- and is
+     * the right default for a differential run. Running a *program* is the
+     * other use: its thread starts and callbacks have to happen for anything
+     * after the first instruction to execute at all. Serving them runs the
+     * target interpreted, nested, charged against this run's budget. */
+    if (dispatch) psp_interp_service_dispatch(1);
+
     const uint32_t entry = have_from ? from : e.entry;
 
     memset(&psp_cpu, 0, sizeof psp_cpu);
@@ -991,7 +1001,10 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     printf("---\n");
     printf("stopped:  %s\n", psp_interp_status_str(it.status));
     printf("executed: %llu instructions\n", (unsigned long long)it.executed);
-    if (g_reentry_count)
+    if (dispatch)
+        printf("re-entry: served interpreted; nest refused %llu\n",
+               (unsigned long long)psp_interp_nest_refused());
+    else if (g_reentry_count)
         printf("re-entry: %llu HLE callbacks into guest code, first 0x%08X\n"
                "          (needs the interpreter to service psp_dispatch)\n",
                (unsigned long long)g_reentry_count, g_reentry_first);
@@ -1182,7 +1195,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--keys")) keypath = argv[i + 1];
 
     if (!strcmp(cmd, "interp")) {
-        uint32_t from = 0; int have_from = 0, trace = 0, regs = 0;
+        uint32_t from = 0; int have_from = 0, trace = 0, regs = 0, dispatch = 0;
         uint64_t budget = 1000000;
         for (int i = 3; i < argc; i++) {
             if (!strcmp(argv[i], "--from") && i + 1 < argc) {
@@ -1193,12 +1206,14 @@ int main(int argc, char **argv) {
                 trace = 1;
             } else if (!strcmp(argv[i], "--regs")) {
                 trace = 1; regs = 1;   /* --regs implies --trace */
+            } else if (!strcmp(argv[i], "--dispatch")) {
+                dispatch = 1;
             } else {
                 fprintf(stderr, "interp: unknown option %s\n", argv[i]);
                 return usage();
             }
         }
-        return cmd_interp(argv[2], from, have_from, budget, trace, regs);
+        return cmd_interp(argv[2], from, have_from, budget, trace, regs, dispatch);
     }
     if (!strcmp(cmd, "decrypt")) return cmd_decrypt(argv[2], keypath);
     if (!strcmp(cmd, "kirk1")) {

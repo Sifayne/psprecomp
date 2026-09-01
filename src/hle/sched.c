@@ -36,6 +36,8 @@ static void          (*g_end_hook)(uint32_t uid, uint32_t status);
 static void          (*g_thread_hook)(void);
 static int             g_threading = 1;
 static const char     *g_stop_reason;
+static int           (*g_spawn_hook)(uint32_t uid, uint32_t entry, uint32_t sp,
+                                      uint32_t a0, uint32_t a1, int priority);
 
 /* Which slot this host thread *is*, as opposed to which slot holds the token.
  *
@@ -66,6 +68,11 @@ static int self_slot(uint32_t uid) {
 void psp_sched_init(void) { psp_sched_reset(); }
 
 void psp_sched_set_threading(int on) { g_threading = on; }
+
+void psp_sched_set_spawn_hook(int (*fn)(uint32_t uid, uint32_t entry, uint32_t sp,
+                                        uint32_t a0, uint32_t a1, int priority)) {
+    g_spawn_hook = fn;
+}
 
 void psp_sched_reset(void) {
     pthread_mutex_lock(&g_lock);
@@ -292,6 +299,11 @@ static void *thread_main(void *arg) {
 
 int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
                     uint32_t a0, uint32_t a1, int priority) {
+    /* The spawn hook is consulted first, before threading: an interpreter run
+     * that services thread starts wants them synchronously, nested, whatever
+     * the host's threading setting is. */
+    if (g_spawn_hook && g_spawn_hook(uid, entry, sp, a0, a1, priority)) return 0;
+
     /* Threading off: the thread exists as far as the guest is concerned and
      * never runs. Reporting failure instead would send a game down its
      * out-of-memory path, which is a different and less useful lie. */

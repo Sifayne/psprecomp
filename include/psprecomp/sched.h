@@ -110,6 +110,14 @@ int psp_sched_wake(uint32_t uid);
 /* The calling guest thread has finished. Does not return. */
 void psp_sched_exit(uint32_t uid);
 
+/* Consulted before a thread is spawned, before any other spawn logic.
+ * Returning nonzero means the hook took the thread: the scheduler records
+ * nothing and spawns no host thread. The interpreter uses this to run a
+ * started thread synchronously inside the run that started it; a host that
+ * wants real threads installs nothing. */
+void psp_sched_set_spawn_hook(int (*fn)(uint32_t uid, uint32_t entry, uint32_t sp,
+                                        uint32_t a0, uint32_t a1, int priority));
+
 /* Called at the top of every guest thread's host thread, before it runs any
  * guest code. The boot host uses it to give each thread its own alternate
  * signal stack: sigaltstack is per-thread, and a thread that faults by
