@@ -312,6 +312,11 @@ static void mutex_list(int type, uint32_t out, int max, int *count) {
     }
 }
 
+/* A CB wait delivers the calling thread's callbacks and then does exactly what
+ * its plain counterpart does. These were registered straight to those
+ * counterparts, which waits correctly and delivers nothing. */
+static void hle_LockMutexCB(void) { psp_threadman_run_callbacks(); hle_LockMutex(); }
+
 void psp_kernlock_register(void) {
     psp_threadman_add_lister(mutex_list);
     psp_hle_register(0xB7D098C6, "ThreadManForUser", "sceKernelCreateMutex",      hle_CreateMutex);
@@ -320,7 +325,7 @@ void psp_kernlock_register(void) {
     /* The CB form additionally pumps the thread's callbacks while it waits, and
      * callbacks are delivered by sceKernelCheckCallback here, so the two differ
      * only in that -- the same split sceKernelWaitSemaCB already has. */
-    psp_hle_register(0x5BF4DD27, "ThreadManForUser", "sceKernelLockMutexCB",      hle_LockMutex);
+    psp_hle_register(0x5BF4DD27, "ThreadManForUser", "sceKernelLockMutexCB",      hle_LockMutexCB);
     psp_hle_register(0x0DDCD2C9, "ThreadManForUser", "sceKernelTryLockMutex",     hle_TryLockMutex);
     psp_hle_register(0x6B30100F, "ThreadManForUser", "sceKernelUnlockMutex",      hle_UnlockMutex);
     psp_hle_register(0x87D9223C, "ThreadManForUser", "sceKernelCancelMutex",      hle_CancelMutex);
@@ -662,11 +667,13 @@ static void hle_ReferLwMutexStatusByID(void) {
     lw_refer(find_lw(psp_arg(0)), psp_arg(1));
 }
 
+static void hle_LockLwMutexCB(void) { psp_threadman_run_callbacks(); hle_LockLwMutex(); }
+
 void psp_kernlock_register_lw(void) {
     psp_hle_register(0x19CFF145, "ThreadManForUser", "sceKernelCreateLwMutex",   hle_CreateLwMutex);
     psp_hle_register(0x60107536, "ThreadManForUser", "sceKernelDeleteLwMutex",   hle_DeleteLwMutex);
     psp_hle_register(0xBEA46419, "ThreadManForUser", "sceKernelLockLwMutex",     hle_LockLwMutex);
-    psp_hle_register(0x1FC64E09, "ThreadManForUser", "sceKernelLockLwMutexCB",   hle_LockLwMutex);
+    psp_hle_register(0x1FC64E09, "ThreadManForUser", "sceKernelLockLwMutexCB",   hle_LockLwMutexCB);
     psp_hle_register(0xDC692EE3, "ThreadManForUser", "sceKernelTryLockLwMutex",  hle_TryLockLwMutex);
     /* The _600 suffix is part of the exported name, not a version we choose;
      * it hashes to its own NID and the tests import both. */

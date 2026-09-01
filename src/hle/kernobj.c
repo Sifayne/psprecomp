@@ -473,12 +473,15 @@ static void vpl_list(int type, uint32_t out, int max, int *count) {
     }
 }
 
+/* Same for the pools and the queues: deliver, then do the ordinary thing. */
+static void hle_AllocateVplCB(void) { psp_threadman_run_callbacks(); hle_AllocateVpl(); }
+
 void psp_kernobj_register(void) {
     psp_threadman_add_lister(vpl_list);
     psp_hle_register(0x56C039B5, "ThreadManForUser", "sceKernelCreateVpl",      hle_CreateVpl);
     psp_hle_register(0x89B3D48C, "ThreadManForUser", "sceKernelDeleteVpl",      hle_DeleteVpl);
     psp_hle_register(0xBED27435, "ThreadManForUser", "sceKernelAllocateVpl",    hle_AllocateVpl);
-    psp_hle_register(0xEC0A693F, "ThreadManForUser", "sceKernelAllocateVplCB",  hle_AllocateVpl);
+    psp_hle_register(0xEC0A693F, "ThreadManForUser", "sceKernelAllocateVplCB",  hle_AllocateVplCB);
     psp_hle_register(0xAF36D708, "ThreadManForUser", "sceKernelTryAllocateVpl", hle_TryAllocateVpl);
     psp_hle_register(0xB736E9FF, "ThreadManForUser", "sceKernelFreeVpl",        hle_FreeVpl);
     psp_hle_register(0x1D371B8A, "ThreadManForUser", "sceKernelCancelVpl",      hle_CancelVpl);
@@ -1007,15 +1010,18 @@ static void mpp_list(int type, uint32_t out, int max, int *count) {
     }
 }
 
+static void hle_SendMsgPipeCB(void)    { psp_threadman_run_callbacks(); hle_SendMsgPipe(); }
+static void hle_ReceiveMsgPipeCB(void) { psp_threadman_run_callbacks(); hle_ReceiveMsgPipe(); }
+
 void psp_kernobj_register_mpp(void) {
     psp_threadman_add_lister(mpp_list);
     psp_hle_register(0x7C0DC2A0, "ThreadManForUser", "sceKernelCreateMsgPipe",     hle_CreateMsgPipe);
     psp_hle_register(0xF0B7DA1C, "ThreadManForUser", "sceKernelDeleteMsgPipe",     hle_DeleteMsgPipe);
     psp_hle_register(0x876DBFAD, "ThreadManForUser", "sceKernelSendMsgPipe",       hle_SendMsgPipe);
-    psp_hle_register(0x7C41F2C2, "ThreadManForUser", "sceKernelSendMsgPipeCB",     hle_SendMsgPipe);
+    psp_hle_register(0x7C41F2C2, "ThreadManForUser", "sceKernelSendMsgPipeCB",     hle_SendMsgPipeCB);
     psp_hle_register(0x884C9F90, "ThreadManForUser", "sceKernelTrySendMsgPipe",    hle_TrySendMsgPipe);
     psp_hle_register(0x74829B76, "ThreadManForUser", "sceKernelReceiveMsgPipe",    hle_ReceiveMsgPipe);
-    psp_hle_register(0xFBFA697D, "ThreadManForUser", "sceKernelReceiveMsgPipeCB",  hle_ReceiveMsgPipe);
+    psp_hle_register(0xFBFA697D, "ThreadManForUser", "sceKernelReceiveMsgPipeCB",  hle_ReceiveMsgPipeCB);
     psp_hle_register(0xDF52098F, "ThreadManForUser", "sceKernelTryReceiveMsgPipe", hle_TryReceiveMsgPipe);
     psp_hle_register(0x349B864D, "ThreadManForUser", "sceKernelCancelMsgPipe",     hle_CancelMsgPipe);
     psp_hle_register(0x33BE4024, "ThreadManForUser", "sceKernelReferMsgPipeStatus",hle_ReferMsgPipeStatus);
@@ -1255,13 +1261,15 @@ static void mbx_list(int type, uint32_t out, int max, int *count) {
     }
 }
 
+static void hle_ReceiveMbxCB(void) { psp_threadman_run_callbacks(); hle_ReceiveMbx(); }
+
 void psp_kernobj_register_mbx(void) {
     psp_threadman_add_lister(mbx_list);
     psp_hle_register(0x8125221D, "ThreadManForUser", "sceKernelCreateMbx",        hle_CreateMbx);
     psp_hle_register(0x86255ADA, "ThreadManForUser", "sceKernelDeleteMbx",        hle_DeleteMbx);
     psp_hle_register(0xE9B3061E, "ThreadManForUser", "sceKernelSendMbx",          hle_SendMbx);
     psp_hle_register(0x18260574, "ThreadManForUser", "sceKernelReceiveMbx",       hle_ReceiveMbx);
-    psp_hle_register(0xF3986382, "ThreadManForUser", "sceKernelReceiveMbxCB",     hle_ReceiveMbx);
+    psp_hle_register(0xF3986382, "ThreadManForUser", "sceKernelReceiveMbxCB",     hle_ReceiveMbxCB);
     psp_hle_register(0x0D81716A, "ThreadManForUser", "sceKernelPollMbx",          hle_PollMbx);
     psp_hle_register(0x87D4DD36, "ThreadManForUser", "sceKernelCancelReceiveMbx", hle_CancelReceiveMbx);
     psp_hle_register(0xA8E8C846, "ThreadManForUser", "sceKernelReferMbxStatus",   hle_ReferMbxStatus);
@@ -1529,12 +1537,14 @@ static void fpl_list(int type, uint32_t out, int max, int *count) {
     }
 }
 
+static void hle_AllocateFplCB(void) { psp_threadman_run_callbacks(); hle_AllocateFpl(); }
+
 void psp_kernobj_register_fpl(void) {
     psp_threadman_add_lister(fpl_list);
     psp_hle_register(0xC07BB470, "ThreadManForUser", "sceKernelCreateFpl",      hle_CreateFpl);
     psp_hle_register(0xED1410E0, "ThreadManForUser", "sceKernelDeleteFpl",      hle_DeleteFpl);
     psp_hle_register(0xD979E9BF, "ThreadManForUser", "sceKernelAllocateFpl",    hle_AllocateFpl);
-    psp_hle_register(0xE7282CB6, "ThreadManForUser", "sceKernelAllocateFplCB",  hle_AllocateFpl);
+    psp_hle_register(0xE7282CB6, "ThreadManForUser", "sceKernelAllocateFplCB",  hle_AllocateFplCB);
     psp_hle_register(0x623AE665, "ThreadManForUser", "sceKernelTryAllocateFpl", hle_TryAllocateFpl);
     psp_hle_register(0xF6414A71, "ThreadManForUser", "sceKernelFreeFpl",        hle_FreeFpl);
     psp_hle_register(0xA8AA591F, "ThreadManForUser", "sceKernelCancelFpl",      hle_CancelFpl);
