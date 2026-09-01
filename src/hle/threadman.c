@@ -407,9 +407,23 @@ static void hle_CreateCallback(void) {
     psp_ret(c->uid);
 }
 
+/* Deliver any callbacks pending for the current thread; the return value is
+ * how many ran.
+ *
+ * None ever are: callbacks are raised by things that do not happen here -- a
+ * disc being ejected, a power button, a timer expiring. Reporting zero is
+ * therefore accurate rather than a stub.
+ *
+ * It matters that this exists at all. A game waiting on an event pumps
+ * callbacks while it waits, and an unimplemented call still returns zero, so
+ * the loop looks identical either way -- except that the surrounding wait never
+ * ends, and the whole thing reads as a hang with no cause. */
+static void hle_CheckCallback(void) { psp_ret(0); }
+
 void psp_threadman_register(void) {
     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every
      * pair below. */
+    psp_hle_register(0x349D6D6C, "ThreadManForUser", "sceKernelCheckCallback",           hle_CheckCallback);
     psp_hle_register(0x446D8DE6, "ThreadManForUser", "sceKernelCreateThread",            hle_CreateThread);
     psp_hle_register(0xF475845D, "ThreadManForUser", "sceKernelStartThread",             hle_StartThread);
     psp_hle_register(0xAA73C935, "ThreadManForUser", "sceKernelExitThread",              hle_ExitThread);
