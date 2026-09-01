@@ -413,15 +413,19 @@ static void hle_FreeVpl(void) {
     const uint32_t id  = psp_arg(0);
     const uint32_t ptr = psp_arg(1);
 
-    psp_vpl *v = find_vpl(id);
-    if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VPLID); return; }
-
     /* A pointer that is not exactly the start of one of *this* pool's live
      * blocks is refused, and the tests are thorough about which is which:
      * freeing twice, a NULL, a stack address, a pointer one block into the
      * pool, and another pool's pointer are each ILLEGAL_MEMBLOCK, while a
-     * pointer that is not mapped memory at all is ILLEGAL_SIZE. */
+     * pointer that is not mapped memory at all is 0x800200D3.
+     *
+     * And that one is decided before the uid is. vpl/free refuses a null uid
+     * with a good pointer as UNKNOWN_VPLID and a null uid with 0xDEADBEEF as
+     * 0x800200D3, so the pointer is what the kernel objects to first. */
     if (ptr && !psp_mem_ptr(ptr, 4)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+
+    psp_vpl *v = find_vpl(id);
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VPLID); return; }
 
     /* Walk the chain and require an exact hit on an *allocated* node. That
      * rejects, in one test, all five shapes free.expected tries: a second free
