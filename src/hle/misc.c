@@ -368,12 +368,21 @@ static void hle_ReadBufferPositive(void) {
     const uint64_t us = psp_clock_peek();
     g_ctrl_polls++;
     pad_press_step(us);
+    psp_ctrl_replay_step(g_ctrl_polls, us);
 
     /* The merge. Buttons OR; the stick belongs to whoever last claimed it. */
-    const uint32_t buttons = g_hold_buttons | g_script_buttons |
-                             atomic_load(&g_host_buttons);
-    const uint8_t  ax = g_script_analog ? g_script_ax : atomic_load(&g_host_ax);
-    const uint8_t  ay = g_script_analog ? g_script_ay : atomic_load(&g_host_ay);
+    const uint32_t host = atomic_load(&g_host_buttons);
+    const uint8_t  hax  = atomic_load(&g_host_ax);
+    const uint8_t  hay  = atomic_load(&g_host_ay);
+    const uint32_t buttons = g_hold_buttons | g_script_buttons | host;
+    const uint8_t  ax = g_script_analog ? g_script_ax : hax;
+    const uint8_t  ay = g_script_analog ? g_script_ay : hay;
+
+    /* A scenario driving a run that also has a hand on the pad is still a
+     * useful run -- it is how you take over one that is stuck -- but it is no
+     * longer the scenario's run, and that has to be impossible to miss. */
+    if (host || hax != 128 || hay != 128) psp_ctrl_replay_taint(g_ctrl_polls);
+    psp_ctrl_replay_record(g_ctrl_polls, us, buttons, ax, ay);
 
     uint32_t buf = psp_arg(0), count = psp_arg(1);
     if (!count) count = 1;
@@ -513,12 +522,14 @@ void psp_misc_reset(void) {
     memset(&g_press, 0, sizeof g_press);
     memset(g_audio, 0, sizeof g_audio);
     g_audio_blocks = 0;
+    psp_ctrl_replay_reset();
 }
 
 void psp_misc_init(void) {
     psp_misc_reset();
     g_hold_buttons = parse_pad();
     parse_pad_press();
+    psp_ctrl_replay_init();
 }
 
 void psp_misc_register(void) {

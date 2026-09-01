@@ -56,3 +56,7 @@ add_test(NAME raster COMMAND test_raster)
 add_executable(test_interp test_interp.c)
 target_link_libraries(test_interp PRIVATE allegrex_core)
 add_test(NAME interp COMMAND test_interp)
+
+add_executable(test_ctrl_replay test_ctrl_replay.c)
+target_link_libraries(test_ctrl_replay PRIVATE psprecomp)
+add_test(NAME ctrl_replay COMMAND test_ctrl_replay)

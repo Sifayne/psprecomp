@@ -269,6 +269,28 @@ void psp_ctrl_script_set(uint32_t buttons, int analog_owned,
  * length, so a caller can pass a slice of a larger string without copying. */
 uint32_t psp_pad_bit(const char *s, size_t n);
 
+/* ---- scripted pad input (src/hle/ctrl_replay.c) ---------------------------
+ *
+ * PSPRECOMP_REPLAY=<file> drives the script lane from a scenario;
+ * PSPRECOMP_REPLAY_REC=<file> writes one out from what the guest saw. Both
+ * are driven from the guest's pad read so that they share one timebase --
+ * see the header comment in ctrl_replay.c for why that is the whole design. */
+void psp_ctrl_replay_init(void);
+void psp_ctrl_replay_reset(void);
+/* Advance the scenario to (polls, us), applying at most one visible edge. */
+void psp_ctrl_replay_step(uint32_t polls, uint64_t us);
+/* Record the composed pad state; writes a line only when it changes. */
+void psp_ctrl_replay_record(uint32_t polls, uint64_t us,
+                            uint32_t buttons, uint8_t ax, uint8_t ay);
+/* Live input arrived while a scenario was driving. Reported once. */
+void psp_ctrl_replay_taint(uint32_t polls);
+/* Close the recording and report. `summary` may be NULL. */
+void psp_ctrl_replay_finish(FILE *summary);
+int  psp_ctrl_replay_active(void);
+/* The scenario's own `drain <s>`, or 0 if it did not say. A host may use it
+ * as the default so a scenario carries the run length it needs. */
+int  psp_ctrl_replay_drain(void);
+
 /* ---- host presentation hooks ----------------------------------------------
  *
  * A windowed host registers these to receive what the game produces as it
