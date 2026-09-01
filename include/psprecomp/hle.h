@@ -244,6 +244,31 @@ int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint64_t psp_audio_blocks(void);
 
+/* ---- the pad, for scripted input ------------------------------------------
+ *
+ * Three lanes reach the guest's pad read and are OR'd there: a hold
+ * (PSPRECOMP_PAD), a script, and the host's live gamepad (psp_ctrl_set).
+ * They are separate so that they compose -- one shared word meant the SDL
+ * thread's store erased the hold, and the timed press's clear released it.
+ *
+ * psp_ctrl_polls counts *calls* to sceCtrlPeek/ReadBufferPositive, which is
+ * the timebase a scripted input is keyed on: it is one thing the guest did,
+ * and it does not move when a game changes its buffer depth. psp_ctrl_samples
+ * counts SceCtrlData entries written, which is the guest-visible timestamp
+ * and counts what it always counted. */
+uint32_t psp_ctrl_polls(void);
+uint32_t psp_ctrl_samples(void);
+
+/* Publish into the script lane. `analog_owned` non-zero takes the stick away
+ * from live input until a later call hands it back. */
+void psp_ctrl_script_set(uint32_t buttons, int analog_owned,
+                         uint8_t ax, uint8_t ay);
+
+/* A button name from the shared table ("cross", "ltrigger", case-insensitive),
+ * or 0x<hex> for a bit the table does not name. 0 if unrecognised. `n` is the
+ * length, so a caller can pass a slice of a larger string without copying. */
+uint32_t psp_pad_bit(const char *s, size_t n);
+
 /* ---- host presentation hooks ----------------------------------------------
  *
  * A windowed host registers these to receive what the game produces as it

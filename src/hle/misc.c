@@ -9,6 +9,7 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/clock.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -166,38 +167,103 @@ static void hle_ModuleOk(void)             { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 /* ---- sceCtrl ------------------------------------------------------------- */
 
-/* Atomic because the writer is no longer only a guest thread: a windowed host
- * polls the real gamepad on its own thread and publishes through
- * psp_ctrl_set, while any number of guest threads read here. */
-static _Atomic uint32_t g_buttons;
-static _Atomic uint8_t  g_analog_x, g_analog_y;
+/* Three lanes, merged only at the guest's read.
+ *
+ * One shared word had four writers fighting over it, and they did not compose:
+ * psp_ctrl_set stores, so a windowed host erased whatever else was set between
+ * two SDL events; the timed press cleared its bit with fetch_and, so pressing
+ * a button PSPRECOMP_PAD was holding *released* the hold. Each writer was
+ * correct alone and wrong beside another.
+ *
+ * Separating them makes the merge explicit and each lane single-writer:
+ *
+ *   hold    PSPRECOMP_PAD. Written once at init, read-only thereafter.
+ *   script  the timed press, and later the replay player. Guest threads only,
+ *           and only one guest thread runs at a time, so it needs no atomics.
+ *   host    psp_ctrl_set, from the SDL thread. Atomic; genuinely concurrent.
+ *
+ * Buttons OR together, which is what a player pressing a second button while
+ * holding the first does. The stick cannot OR, so the script takes ownership
+ * of it when it sets it and hands it back on `neutral`. */
+static uint32_t         g_hold_buttons;
+static uint32_t         g_script_buttons;
+static uint8_t          g_script_ax, g_script_ay;
+static int              g_script_analog;
+static _Atomic uint32_t g_host_buttons;
+static _Atomic uint8_t  g_host_ax, g_host_ay;
+
+/* The SceCtrlData timestamp field, one per *sample* written. Games do
+ * arithmetic on it, so it counts what it has always counted. */
 static uint32_t         g_ctrl_frame;
+/* One per *call*, which is the unit a scripted input has to be keyed on: it
+ * is "one thing the guest did", and unlike g_ctrl_frame it does not move when
+ * a game changes how many samples it asks for per poll. */
+static uint32_t         g_ctrl_polls;
+
+uint32_t psp_ctrl_polls(void)   { return g_ctrl_polls; }
+uint32_t psp_ctrl_samples(void) { return g_ctrl_frame; }
 
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
-    atomic_store(&g_buttons, buttons);
-    atomic_store(&g_analog_x, ax);
-    atomic_store(&g_analog_y, ay);
+    atomic_store(&g_host_buttons, buttons);
+    atomic_store(&g_host_ax, ax);
+    atomic_store(&g_host_ay, ay);
+}
+
+/* Set by the script lane's owner; read here so the composed value can say so.
+ * Defined in this file so the lane stays private to it. */
+void psp_ctrl_script_set(uint32_t buttons, int analog_owned,
+                         uint8_t ax, uint8_t ay) {
+    g_script_buttons = buttons;
+    g_script_analog  = analog_owned;
+    if (analog_owned) { g_script_ax = ax; g_script_ay = ay; }
 }
 
 static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
+/* One button table, three callers.
+ *
+ * PSPRECOMP_PAD and PSPRECOMP_PAD_PRESS each carried their own copy, and a
+ * scenario file would have made three. Two copies of a name table drift, and
+ * the drift is silent: a name one of them accepts and another rejects reads
+ * as "that button does nothing" rather than as a typo. */
+static const struct { const char *name; uint32_t bit; } PSP_PAD_NAMES[] = {
+    { "select",   0x000001 }, { "start",    0x000008 },
+    { "up",       0x000010 }, { "right",    0x000020 },
+    { "down",     0x000040 }, { "left",     0x000080 },
+    { "ltrigger", 0x000100 }, { "rtrigger", 0x000200 },
+    { "l",        0x000100 }, { "r",        0x000200 },
+    { "triangle", 0x001000 }, { "circle",   0x002000 },
+    { "cross",    0x004000 }, { "square",   0x008000 },
+};
+
+/* A button name, or 0x<hex> for a bit the table does not name -- the PSP has
+ * bits here that no game maps to a face button (hold, note, screen, disc) and
+ * a scenario should be able to reach them without this table growing names
+ * nobody checked. Returns 0 for anything unrecognised; the caller reports. */
+uint32_t psp_pad_bit(const char *s, size_t n) {
+    if (n > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        char buf[16];
+        if (n >= sizeof buf) return 0;
+        memcpy(buf, s, n); buf[n] = 0;
+        return (uint32_t)strtoul(buf, NULL, 16);
+    }
+    for (size_t i = 0; i < sizeof PSP_PAD_NAMES / sizeof PSP_PAD_NAMES[0]; i++)
+        if (strlen(PSP_PAD_NAMES[i].name) == n &&
+            !strncasecmp(PSP_PAD_NAMES[i].name, s, n))
+            return PSP_PAD_NAMES[i].bit;
+    return 0;
+}
 
 /* PSPRECOMP_PAD=start,cross holds those buttons for the whole run.
  *
  * There is no window and no gamepad here, so the pad reads neutral and a game
  * sits on its title screen forever waiting for a press. Being able to hold a
  * button is what gets bring-up past that -- it is the difference between
- * "renders a menu" and "renders whatever is behind the menu". Read once, on
- * the first poll, because a game asks about the pad every frame. */
+ * "renders a menu" and "renders whatever is behind the menu".
+ *
+ * Read at init rather than on the first poll: it is a constant for the run,
+ * and reading it once here means the read point does not need a guard. */
 static uint32_t parse_pad(void) {
-    static const struct { const char *name; uint32_t bit; } B[] = {
-        { "select",   0x000001 }, { "start",    0x000008 },
-        { "up",       0x000010 }, { "right",    0x000020 },
-        { "down",     0x000040 }, { "left",     0x000080 },
-        { "ltrigger", 0x000100 }, { "rtrigger", 0x000200 },
-        { "l",        0x000100 }, { "r",        0x000200 },
-        { "triangle", 0x001000 }, { "circle",   0x002000 },
-        { "cross",    0x004000 }, { "square",   0x008000 },
-    };
     const char *v = getenv("PSPRECOMP_PAD");
     if (!v || !*v) return 0;
 
@@ -208,15 +274,10 @@ static uint32_t parse_pad(void) {
         size_t n = 0;
         while (p[n] && p[n] != ',' && p[n] != ' ') n++;
 
-        int matched = 0;
-        for (size_t i = 0; i < sizeof B / sizeof B[0]; i++) {
-            if (strlen(B[i].name) == n && !strncasecmp(B[i].name, p, n)) {
-                held |= B[i].bit; matched = 1; break;
-            }
-        }
-        if (!matched)
-            fprintf(stderr, "psprecomp: PSPRECOMP_PAD: unknown button \"%.*s\"\n",
-                    (int)n, p);
+        uint32_t bit = psp_pad_bit(p, n);
+        if (bit) held |= bit;
+        else fprintf(stderr, "psprecomp: PSPRECOMP_PAD: unknown button \"%.*s\"\n",
+                     (int)n, p);
         p += n;
     }
     if (held) fprintf(stderr, "psprecomp: holding pad buttons 0x%06X\n", held);
@@ -231,38 +292,22 @@ static uint32_t parse_pad(void) {
  * already down, forever. So holding start at a title screen does nothing,
  * while a player tapping it skips.
  *
- * This presses at a wall-clock moment instead: down `delay` seconds into the
- * run, up `duration` seconds later (default half a second). Headless only --
- * in a windowed run the SDL layer owns the pad and publishes over it.
+ * BEHAVIOUR CHANGE: `delay` and `duration` were wall-clock seconds, slept out
+ * on a detached pthread. They are now *guest* seconds, evaluated at the read
+ * point. On the virtual clock those are different quantities, and the same
+ * command line will land the press somewhere else.
  *
- * A thread because the run does not pause for the button, and the HLE has no
- * tick of its own to poll from; the scheduler's threads are the guest's, and
- * a guest thread cannot be borrowed for host timing. */
-#include <pthread.h>
+ * The thread had to go. It raced the guest, so where the press landed in the
+ * instruction stream depended on how fast the host was that minute, which
+ * makes a run that reproduces a bug not reproduce it again. Guest time is a
+ * quantity the run owns; wall time is a quantity the machine owns. */
+typedef struct {
+    uint32_t bit;
+    uint64_t down_us, up_us;
+    int      armed, down_done, up_done;
+} pad_press;
 
-typedef struct { uint32_t bit; double delay, duration; } pad_press;
-
-/* Sleep `seconds` of wall time, surviving signals. */
-static void sleep_wall(double seconds) {
-    const struct timespec t = {
-        .tv_sec  = (time_t)seconds,
-        .tv_nsec = (long)((seconds - (double)(time_t)seconds) * 1e9),
-    };
-    while (nanosleep(&t, NULL) == -1 && errno == EINTR) {}
-}
-
-static void *pad_press_thread(void *arg) {
-    pad_press p = *(pad_press *)arg;
-    free(arg);
-
-    sleep_wall(p.delay);
-    atomic_fetch_or(&g_buttons, p.bit);
-    fprintf(stderr, "psprecomp: pad press 0x%06X down\n", p.bit);
-    sleep_wall(p.duration);
-    atomic_fetch_and(&g_buttons, ~p.bit);
-    fprintf(stderr, "psprecomp: pad press 0x%06X up\n", p.bit);
-    return NULL;
-}
+static pad_press g_press;
 
 static void parse_pad_press(void) {
     const char *v = getenv("PSPRECOMP_PAD_PRESS");
@@ -279,46 +324,56 @@ static void parse_pad_press(void) {
         return;
     }
 
-    static const struct { const char *name; uint32_t bit; } B[] = {
-        { "select",   0x000001 }, { "start",    0x000008 },
-        { "up",       0x000010 }, { "right",    0x000020 },
-        { "down",     0x000040 }, { "left",     0x000080 },
-        { "ltrigger", 0x000100 }, { "rtrigger", 0x000200 },
-        { "l",        0x000100 }, { "r",        0x000200 },
-        { "triangle", 0x001000 }, { "circle",   0x002000 },
-        { "cross",    0x004000 }, { "square",   0x008000 },
-    };
-    uint32_t bit = 0;
-    for (size_t i = 0; i < sizeof B / sizeof B[0]; i++)
-        if (!strcasecmp(B[i].name, name)) { bit = B[i].bit; break; }
+    uint32_t bit = psp_pad_bit(name, strlen(name));
     if (!bit) {
         fprintf(stderr, "psprecomp: PSPRECOMP_PAD_PRESS: unknown button \"%s\"\n", name);
         return;
     }
 
-    pad_press *p = malloc(sizeof *p);
-    if (!p) return;
-    p->bit      = bit;
-    p->delay    = atof(delay_s);
-    p->duration = dur_s ? atof(dur_s) : 0.5;
-    if (p->delay < 0) p->delay = 0;
-    if (p->duration <= 0) p->duration = 0.5;
+    double delay = atof(delay_s);
+    double dur   = dur_s ? atof(dur_s) : 0.5;
+    if (delay < 0) delay = 0;
+    if (dur <= 0)  dur   = 0.5;
 
-    pthread_t t;
-    if (pthread_create(&t, NULL, pad_press_thread, p) == 0)
-        pthread_detach(t);
-    else
-        free(p);
+    g_press.bit     = bit;
+    g_press.down_us = (uint64_t)(delay * 1e6);
+    g_press.up_us   = (uint64_t)((delay + dur) * 1e6);
+    g_press.armed   = 1;
+    fprintf(stderr, "psprecomp: pad press 0x%06X at %.3fs for %.3fs of guest time\n",
+            bit, delay, dur);
+}
+
+/* One edge per poll, for the same reason the replay player obeys that rule:
+ * applying down and up in the same poll shows the guest no transition at all,
+ * and a press the guest could not observe is a press that did not happen. */
+static void pad_press_step(uint64_t us) {
+    if (!g_press.armed) return;
+    if (!g_press.down_done && us >= g_press.down_us) {
+        g_press.down_done = 1;
+        g_script_buttons |= g_press.bit;
+        fprintf(stderr, "psprecomp: pad press 0x%06X down (poll %u, t=%.3fs)\n",
+                g_press.bit, g_ctrl_polls, (double)us / 1e6);
+        return;
+    }
+    if (g_press.down_done && !g_press.up_done && us >= g_press.up_us) {
+        g_press.up_done = 1;
+        g_script_buttons &= ~g_press.bit;
+        fprintf(stderr, "psprecomp: pad press 0x%06X up (poll %u, t=%.3fs)\n",
+                g_press.bit, g_ctrl_polls, (double)us / 1e6);
+    }
 }
 
 /* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16. */
 static void hle_ReadBufferPositive(void) {
-    static int looked;
-    if (!looked) { looked = 1; g_buttons |= parse_pad(); }
+    const uint64_t us = psp_clock_peek();
+    g_ctrl_polls++;
+    pad_press_step(us);
 
-    const uint32_t buttons = atomic_load(&g_buttons);
-    const uint8_t  ax      = atomic_load(&g_analog_x);
-    const uint8_t  ay      = atomic_load(&g_analog_y);
+    /* The merge. Buttons OR; the stick belongs to whoever last claimed it. */
+    const uint32_t buttons = g_hold_buttons | g_script_buttons |
+                             atomic_load(&g_host_buttons);
+    const uint8_t  ax = g_script_analog ? g_script_ax : atomic_load(&g_host_ax);
+    const uint8_t  ay = g_script_analog ? g_script_ay : atomic_load(&g_host_ay);
 
     uint32_t buf = psp_arg(0), count = psp_arg(1);
     if (!count) count = 1;
@@ -446,16 +501,23 @@ static void hle_GetChannelRestLength(void) { psp_ret(0); }
 void psp_misc_reset(void) {
     g_intr_enabled = 1;
     g_exit_requested = 0;
-    atomic_store(&g_buttons, 0);
-    atomic_store(&g_analog_x, 128);
-    atomic_store(&g_analog_y, 128);
+    g_hold_buttons   = 0;
+    g_script_buttons = 0;
+    g_script_analog  = 0;
+    g_script_ax = g_script_ay = 128;
+    atomic_store(&g_host_buttons, 0);
+    atomic_store(&g_host_ax, 128);
+    atomic_store(&g_host_ay, 128);
     g_ctrl_frame = 0;
+    g_ctrl_polls = 0;
+    memset(&g_press, 0, sizeof g_press);
     memset(g_audio, 0, sizeof g_audio);
     g_audio_blocks = 0;
 }
 
 void psp_misc_init(void) {
     psp_misc_reset();
+    g_hold_buttons = parse_pad();
     parse_pad_press();
 }
 
