@@ -320,17 +320,26 @@ static void hle_StartThread(void) {
      * to stop and let another run, and its position in the host call stack is
      * its state -- so it needs a stack of its own. See sched.c.
      *
-     * Starting a thread does not hand it the token. A PSP thread of higher
-     * priority would preempt its starter, which cannot happen without
-     * preemption; what does happen is that it runs as soon as the starter
-     * blocks or yields. */
+     * Starting a thread does not hand it the token, but psp_sched_spawn may:
+     * a thread that outranks its starter is switched to inside that call, and
+     * a short one can be finished before it returns.
+     *
+     * So the bookkeeping happens *first*. Marking the thread READY afterwards
+     * overwrote the DORMANT that its own end hook had just written, and left a
+     * finished thread looking runnable for the rest of the run --
+     * threads/terminate asks four calls later and hardware answers
+     * `Finished: 800201a2` where we answered `00000000`. */
+    const int was_started = t->ever_started;
+    const int was_state   = t->state;
+    t->state = TH_READY;
+    t->ever_started = 1;
     if (psp_sched_spawn(t->uid, t->entry, sp, arglen, argp,
                         (int)t->priority) != 0) {
+        t->state = was_state;
+        t->ever_started = was_started;
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
         return;
     }
-    t->state = TH_READY;
-    t->ever_started = 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
