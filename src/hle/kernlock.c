@@ -231,13 +231,38 @@ static void hle_UnlockMutex(void) {
 
 /* Free it outright and report how many were waiting, which is the only way a
  * caller can find that out. */
+/* sceKernelCancelMutex(uid, count, waitThreadsOut)
+ *
+ * It does not merely release the waiters: it re-arms the mutex at a count of
+ * the caller's choosing, and mutex/cancel sweeps that count.
+ *
+ *     Normal (1):           OK          current=1, lockThread=1
+ *     Greater than max (3): 800201BD    current=1, lockThread=1   (unchanged)
+ *     Zero (0):             OK          current=0, lockThread=0
+ *     Negative -3, -1:      OK          current=0, lockThread=0
+ *
+ * Three rules in four lines. The ceiling is the one a lock obeys -- one, for a
+ * mutex that is not recursive -- and exceeding it leaves the object *and* the
+ * caller's wait-count word untouched, which the second half of the file checks
+ * by pre-seeding that word with 99 and finding it still there. A negative count
+ * is not a count at all; it means unlocked, exactly as zero does. We assigned
+ * whatever we were handed, so the mutex read back `current=-3`. */
 static void hle_CancelMutex(void) {
     psp_mutex *m = find_mutex(psp_arg(0));
     if (!m) { psp_ret(SCE_KERNEL_ERROR_NOT_FOUND_MUTEX); return; }
-    const uint32_t out = psp_arg(2);
+    const int32_t  count = (int32_t)psp_arg(1);
+    const uint32_t out   = psp_arg(2);
+
+    /* Only the non-recursive ceiling is measured here; a recursive mutex is
+     * left unbounded rather than given a number no capture supports. */
+    if (!(m->attr & MUTEX_ATTR_RECURSE) && count > 1) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
+        return;
+    }
+
     if (out) psp_write32(out, (uint32_t)psp_waitq_count(&m->q));
-    m->count = (int32_t)psp_arg(1);
-    m->owner = 0;
+    m->count = count > 0 ? count : 0;
+    m->owner = m->count > 0 ? psp_sched_current() : 0;
     const int urgent = psp_waitq_cancel_all(&m->q);
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_yield();
