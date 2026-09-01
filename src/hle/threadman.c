@@ -1604,7 +1604,10 @@ static psp_callback *find_cb(uint32_t id) {
 static void hle_ReferCallbackStatus(void) {
     const psp_callback *c = find_cb(psp_arg(0));
     const uint32_t info = psp_arg(1);
-    if (!c)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    /* A callback has its own "no such id", the same one notify and cancel
+     * answer -- not the generic UNKNOWN_UID. callbacks/refer prints it for
+     * NULL, invalid and deleted alike. */
+    if (!c)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_CBID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
     /* A caller offering zero bytes gets zero back and nothing written. See
      * the same guard on every other Refer*Status: threads/refer measured it
