@@ -230,6 +230,27 @@ static int sema_release(psp_sema *s);
 
 /* ---- threads ------------------------------------------------------------- */
 
+/* Two attribute bits about the stack that the kernel acts on rather than merely
+ * records, and one about where it comes from. All three are measured by
+ * threads/start, which creates a thread with each and reports what the memory
+ * looked like afterwards. */
+#define PSP_THREAD_ATTR_NO_FILLSTACK 0x00100000u
+#define PSP_THREAD_ATTR_CLEAR_STACK  0x00200000u
+#define PSP_THREAD_ATTR_LOW_STACK    0x00400000u
+
+/* Freeing a thread's stack, zeroing it first if it was created asking for that.
+ * The guest can still read the memory afterwards -- threads/start does exactly
+ * that, writing a marker into the freed stack and checking whether it survived
+ * -- so "cleared" is observable and not merely tidy. */
+static void release_stack(psp_thread *t) {
+    if (!t->stack_base) return;
+    if (t->attr & PSP_THREAD_ATTR_CLEAR_STACK) {
+        void *p = psp_mem_ptr(t->stack_base, t->stack_size);
+        if (p) memset(p, 0, t->stack_size);
+    }
+    psp_sysmem_release(t->stack_base);
+}
+
 static void hle_CreateThread(void) {
     /* (name, entry, priority, stackSize, attr, option) */
     psp_thread *t = NULL;
@@ -246,8 +267,13 @@ static void hle_CreateThread(void) {
 
     if (t->stack_size < 0x1000) t->stack_size = 0x1000;
     /* Stacks grow down, so allocate from the top of the heap: a stack that
-     * overflows then runs into free space rather than into another block. */
-    t->stack_base = psp_sysmem_alloc(t->stack_size, 1);
+     * overflows then runs into free space rather than into another block --
+     * unless the guest asked for the other end. threads/start creates a thread
+     * with PSP_THREAD_ATTR_LOW_STACK and reports `WARNING: stack allocated
+     * low`, which is the test noticing that the stack came out below a block
+     * allocated with PSP_SMEM_Low. */
+    t->stack_base = psp_sysmem_alloc(t->stack_size,
+                                     !(t->attr & PSP_THREAD_ATTR_LOW_STACK));
     if (!t->stack_base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     t->uid = g_next_uid++;
@@ -317,10 +343,42 @@ static void hle_StartThread(void) {
      * this file already noted that we do not paint one -- and it is directly
      * observable: a short argument block on hardware reads back with 0xFF above
      * it. Verified against the game before shipping, which is not idle: filling
-     * a stack changes what every uninitialised local reads. */
+     * a stack changes what every uninitialised local reads.
+     *
+     * PSP_THREAD_ATTR_NO_FILLSTACK turns it off, and threads/start proves the
+     * attribute is honoured rather than ignored: it scribbles 0xCC over the
+     * stack area first and then reports `stack not set to FF, instead:
+     * cccccccc` -- a line that only appears because the fill did *not* happen.
+     *
+     * Then the kernel's own two words at the very top and one at the very
+     * bottom, which the same test reads back through sceKernelReferThreadStatus
+     * and checks by hand:
+     *
+     *     stack[0]        == thread id
+     *     stackEnd[-16]   == thread id
+     *     stackEnd[-14]   == stack base
+     *     stackEnd[-2..-1] == 0xFFFFFFFF
+     *
+     * The last pair look like the fill and are not: they are still there when
+     * PSP_THREAD_ATTR_NO_FILLSTACK suppressed it, which is how that test
+     * distinguishes them -- so they are written here rather than left to the
+     * memset.
+     *
+     * That is the k0 area a PSP keeps at the top of every thread stack, and the
+     * top 0x100 bytes of the stack are reserved for it -- which is also where
+     * the argument block stops, so the two facts check each other. */
     if (t->stack_base) {
         void *p = psp_mem_ptr(t->stack_base, t->stack_size);
-        if (p) memset(p, 0xFF, t->stack_size);
+        if (p && !(t->attr & PSP_THREAD_ATTR_NO_FILLSTACK))
+            memset(p, 0xFF, t->stack_size);
+        if (p) {
+            const uint32_t top = t->stack_base + t->stack_size;
+            psp_write32(t->stack_base, t->uid);
+            psp_write32(top - 16 * 4, t->uid);
+            psp_write32(top - 14 * 4, t->stack_base);
+            psp_write32(top -  2 * 4, 0xFFFFFFFFu);
+            psp_write32(top -  1 * 4, 0xFFFFFFFFu);
+        }
     }
 
     uint32_t arglen = psp_arg(1);
@@ -401,7 +459,7 @@ static void hle_DeleteThread(void) {
      * sched.h says this happens here and it did not. Harmless when the thread
      * is already gone, which is the common case. */
     psp_sched_cancel_spawn(t->uid);
-    if (t->stack_base) psp_sysmem_release(t->stack_base);
+    release_stack(t);
     t->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -772,7 +830,7 @@ static void hle_TerminateDeleteThread(void) {
         thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
     }
     psp_sched_cancel_spawn(t->uid);
-    if (t->stack_base) psp_sysmem_release(t->stack_base);
+    release_stack(t);
     t->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
