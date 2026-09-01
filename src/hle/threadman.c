@@ -28,6 +28,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/mem.h"
 #include "waitq.h"
 
 #include <setjmp.h>
@@ -225,10 +226,58 @@ static void hle_CreateThread(void) {
     psp_ret(t->uid);
 }
 
+/* What a thread is started with, and the one part of it that is held back.
+ *
+ * threads/semaphores/semaphores measures three rules and this implements two.
+ *
+ * The two: a NULL pointer with a non-zero length arrives as length **0**, and a
+ * zero length with a real pointer arrives as a **NULL pointer**. Each cancels
+ * the other out, in both directions, and neither is what passing the arguments
+ * straight through gives.
+ *
+ * The third is that the block is *copied* onto the thread's own stack, and the
+ * evidence for it is not in doubt. A one-byte start of the global 0x4567 reads
+ * back on hardware as **0xFFFFFF67** -- one byte of data with this stack's 0xFF
+ * fill above it -- which no reading of the original address can produce. A
+ * variable holding 7, handed to a thread that writes 3 through the pointer,
+ * still reads 7 afterwards.
+ *
+ * **It is not implemented, because it takes Armored Core from 633 GE lists to
+ * 3.** Measured directly, and narrowed: performing the copy is harmless, and
+ * handing the thread the copy's *address* is what breaks it. Copying 256 bytes
+ * instead of four does not help, so the game is not merely reading past the
+ * length it declared. What it does do is start three workers in a row from one
+ * shared slot, rewriting the word between each -- so with the original pointer
+ * all three read the last value, and with copies each reads its own, which is
+ * the correct behaviour and the one the game does not survive.
+ *
+ * That points at something else being wrong upstream rather than at the rule,
+ * and shipping a rule that is right in principle and breaks the only real
+ * program available is the wrong trade. See docs/findings/autotests.md. */
+static uint32_t start_arg_block(uint32_t *arglen, uint32_t argp) {
+    if (!argp || !*arglen) { *arglen = 0; return 0; }
+    return argp;
+}
+
 static void hle_StartThread(void) {
     /* (thid, arglen, argp) */
     psp_thread *t = find_thread(psp_arg(0));
     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+
+    /* A fresh thread's stack is filled with 0xFF, not left as it was found.
+     *
+     * That is the pattern sceKernelGetThreadStackFreeSize walks looking for --
+     * this file already noted that we do not paint one -- and it is directly
+     * observable: a short argument block on hardware reads back with 0xFF above
+     * it. Verified against the game before shipping, which is not idle: filling
+     * a stack changes what every uninitialised local reads. */
+    if (t->stack_base) {
+        void *p = psp_mem_ptr(t->stack_base, t->stack_size);
+        if (p) memset(p, 0xFF, t->stack_size);
+    }
+
+    uint32_t arglen = psp_arg(1);
+    const uint32_t argp = start_arg_block(&arglen, psp_arg(2));
 
     /* Stack pointer starts at the top of the allocation, 16-byte aligned, with
      * a little headroom so a callee storing below $sp cannot run off the end. */
@@ -246,7 +295,7 @@ static void hle_StartThread(void) {
      * priority would preempt its starter, which cannot happen without
      * preemption; what does happen is that it runs as soon as the starter
      * blocks or yields. */
-    if (psp_sched_spawn(t->uid, t->entry, sp, psp_arg(1), psp_arg(2),
+    if (psp_sched_spawn(t->uid, t->entry, sp, arglen, argp,
                         (int)t->priority) != 0) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
         return;

@@ -316,13 +316,70 @@ static void test_event_flags(void) {
  * the stack the thread manager gave it. */
 static uint32_t g_thread_sp;
 static uint32_t g_thread_arg;
+static uint32_t g_thread_argp, g_thread_argword;
 static int      g_thread_ran;
 
 static void fake_thread_entry(void) {
     g_thread_ran++;
-    g_thread_sp  = psp_cpu.r[PSP_REG_SP];
-    g_thread_arg = psp_cpu.r[PSP_REG_A0];
+    g_thread_sp   = psp_cpu.r[PSP_REG_SP];
+    g_thread_arg  = psp_cpu.r[PSP_REG_A0];
+    g_thread_argp = psp_cpu.r[PSP_REG_A1];
+    g_thread_argword = g_thread_argp ? psp_read32(g_thread_argp) : 0;
     psp_cpu.r[PSP_REG_V0] = 0x1234;      /* exit status */
+}
+
+/* What a thread is started with: the length and the pointer cancel each other.
+ *
+ * threads/semaphores/semaphores measures both directions. A NULL pointer with a
+ * non-zero length arrives as length 0, and a zero length with a real pointer
+ * arrives as a NULL pointer -- neither is what passing them through gives.
+ *
+ * The third rule that file measures, that the block is copied onto the thread's
+ * own stack, is deliberately *not* implemented; threadman.c says why and what
+ * it costs. There is no test for it here, because a test for behaviour that was
+ * knowingly left out is a test that has to be wrong. */
+static void test_thread_argument_block(void) {
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_dispatch_reset();
+
+    const uint32_t CREATE  = psp_nid("sceKernelCreateThread");
+    const uint32_t START   = psp_nid("sceKernelStartThread");
+    const uint32_t WAITEND = psp_nid("sceKernelWaitThreadEnd");
+
+    const uint32_t ENTRY = 0x08801000u;
+    const uint32_t SRC   = 0x08802100u;
+    psp_register(ENTRY, fake_thread_entry);
+
+    struct { uint32_t len, argp, want_len; int want_argp; const char *what; } cases[] = {
+        { 4, SRC, 4, 1, "a length and a pointer arrive as given" },
+        { 2, 0,   0, 0, "a NULL pointer zeroes the length" },
+        { 0, SRC, 0, 0, "a zero length nulls the pointer" },
+    };
+
+    for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
+        psp_write32(SRC, 0x00004567);
+        const uint32_t thid = call5(CREATE, guest_name("arg"), ENTRY, 32, 0x4000, 0);
+        g_thread_ran = 0; g_thread_arg = 0xDEAD; g_thread_argp = 0xDEAD;
+
+        CHECK(call(START, thid, cases[i].len, cases[i].argp, 0) == 0,
+              "%s: start", cases[i].what);
+        call(WAITEND, thid, 0, 0, 0);
+
+        CHECK(g_thread_ran == 1, "%s: the thread ran", cases[i].what);
+        CHECK(g_thread_arg == cases[i].want_len,
+              "%s: arglen %u, expected %u",
+              cases[i].what, g_thread_arg, cases[i].want_len);
+        CHECK((g_thread_argp != 0) == cases[i].want_argp,
+              "%s: argp 0x%08X, expected %s",
+              cases[i].what, g_thread_argp, cases[i].want_argp ? "non-NULL" : "NULL");
+    }
+
+    /* And the stack the thread ran on is 0xFF, not whatever was there. Read
+     * below the thread's own $sp, which it never wrote. */
+    CHECK(psp_read32(g_thread_sp - 64) == 0xFFFFFFFFu,
+          "a fresh thread's stack is filled with 0xFF, got 0x%08X",
+          psp_read32(g_thread_sp - 64));
 }
 
 static void test_threads(void) {
@@ -544,6 +601,7 @@ int main(void) {
     test_create_attributes();
     test_event_flags();
     test_threads();
+    test_thread_argument_block();
     test_guest_strings();
     test_ge_display_list();
     test_ge_infinite_list();
