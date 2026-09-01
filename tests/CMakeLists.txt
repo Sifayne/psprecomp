@@ -40,6 +40,12 @@ add_executable(test_ctors test_ctors.c)
 target_link_libraries(test_ctors PRIVATE psprecomp)
 add_test(NAME ctors COMMAND test_ctors)
 
+# The handoff token. Guest thread bodies are plain C functions registered in
+# the dispatch table, so no module and no game data is involved.
+add_executable(test_sched test_sched.c)
+target_link_libraries(test_sched PRIVATE psprecomp)
+add_test(NAME sched COMMAND test_sched)
+
 add_executable(test_raster test_raster.c)
 target_link_libraries(test_raster PRIVATE psprecomp)
 add_test(NAME raster COMMAND test_raster)

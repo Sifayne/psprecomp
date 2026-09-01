@@ -164,8 +164,13 @@ static void test_semaphores(void) {
 
     CHECK(call(WAIT, sem, 1, 0, 0) == 0, "wait succeeds while the count allows");
     CHECK(call(WAIT, sem, 1, 0, 0) == 0, "and again, down to zero");
-    CHECK(call(WAIT, sem, 1, 0, 0) == SCE_KERNEL_ERROR_WAIT_TIMEOUT,
-          "a wait that would block reports a timeout rather than hanging");
+    /* The third argument is the timeout pointer. Only a caller that supplies
+     * one may be told a timeout elapsed: fabricating one for a caller that
+     * asked to wait indefinitely is something a game acts on -- Armored Core
+     * deletes the thread it was waiting for and quits. */
+    const uint32_t TMO = 0x08802000u;
+    CHECK(call(WAIT, sem, 1, TMO, 0) == SCE_KERNEL_ERROR_WAIT_TIMEOUT,
+          "a wait that would block reports a timeout when one was asked for");
 
     CHECK(call(SIGNAL, sem, 1, 0, 0) == 0, "signal succeeds");
     CHECK(call(WAIT, sem, 1, 0, 0) == 0, "and the signalled count is available");
@@ -173,7 +178,7 @@ static void test_semaphores(void) {
     /* The count must saturate at max, not run away. */
     call(SIGNAL, sem, 100, 0, 0);
     CHECK(call(WAIT, sem, 4, 0, 0) == 0, "count saturates at max (4 available)");
-    CHECK(call(WAIT, sem, 1, 0, 0) == SCE_KERNEL_ERROR_WAIT_TIMEOUT,
+    CHECK(call(WAIT, sem, 1, TMO, 0) == SCE_KERNEL_ERROR_WAIT_TIMEOUT,
           "and no more than max");
 
     CHECK(call(DELETE, sem, 0, 0, 0) == 0, "delete succeeds");
@@ -247,7 +252,17 @@ static void test_threads(void) {
     g_thread_ran = 0;
     uint32_t rc = call(START, thid, 7 /*arglen*/, 0xAAAA, 0);
     CHECK(rc == 0, "start succeeds");
-    CHECK(g_thread_ran == 1, "the thread entry actually ran");
+
+    /* Starting a thread makes it runnable; it does not run it. The PSP is
+     * single-core, and the caller keeps the CPU until it gives it up. */
+    CHECK(g_thread_ran == 0, "start does not run the thread inline");
+
+    /* Waiting for it is the caller giving the CPU up, so the thread runs here.
+     * sceKernelWaitThreadEnd *returns* the exit status -- its second argument
+     * is a timeout pointer, not somewhere to write the status. */
+    CHECK(call(WAITEND, thid, 0, 0, 0) == 0x1234,
+          "wait-for-end returns the thread's exit status");
+    CHECK(g_thread_ran == 1, "the thread ran once the caller waited on it");
     CHECK(g_thread_arg == 7, "argument reached the thread, got %u", g_thread_arg);
     CHECK(g_thread_sp != caller_sp && g_thread_sp != 0,
           "the thread ran on its own stack (0x%08X vs caller 0x%08X)",
@@ -257,10 +272,6 @@ static void test_threads(void) {
     CHECK(psp_cpu.r[PSP_REG_S0] == 0xC0FFEE, "caller's registers restored");
     CHECK(psp_cpu.r[PSP_REG_SP] == caller_sp, "caller's stack pointer restored");
 
-    /* The exit status the thread returned is what a waiter sees. */
-    uint32_t out = 0x08802000u;
-    CHECK(call(WAITEND, thid, out, 0, 0) == 0, "wait-for-end succeeds");
-    CHECK(psp_read32(out) == 0x1234, "exit status recorded, got 0x%X", psp_read32(out));
 
     /* Deleting frees the stack. */
     uint32_t before_delete = psp_sysmem_free();

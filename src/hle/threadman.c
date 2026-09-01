@@ -5,38 +5,33 @@
  * start it, and return — so until this works, a recompiled module runs about
  * forty instructions and stops.
  *
- * ## The execution model, and its ceiling
+ * ## The execution model
  *
- * Recompiled functions are ordinary C functions sharing one global register
- * file (`psp_cpu`). That makes true concurrent threads a much bigger change
- * than it looks: each PSP thread would need its own register context, and the
- * host would need to switch between them.
+ * Threads are real: each guest thread gets a host thread, and a handoff token
+ * keeps exactly one of them running at a time, the way a single-core PSP does.
+ * The scheduler is src/hle/sched.c; the header there explains why saving the
+ * register file is not enough to park a thread.
  *
- * So this implements the model that covers the overwhelmingly common case
- * exactly, and is honest about the rest:
+ * What this module owns is what a thread *is* -- its stack, priority, exit
+ * status, and the kernel objects it waits on. Waits park the caller and signals
+ * release it.
  *
- *   - `sceKernelStartThread` **runs the thread to completion inline**, with the
- *     caller's register state saved and restored around it. For the standard
- *     `module_start` → create → start → return shape, this is not an
- *     approximation: it is what happens.
- *   - `sceKernelExitThread` unwinds to the matching start via longjmp, which is
- *     how a thread ends without returning normally.
- *   - A wait that *would block* returns a timeout instead of hanging, and says
- *     so once. With no preemption there is nothing to wait for, and a silent
- *     hang is the worst possible failure during bring-up.
- *
- * ponytail: single-threaded, run-to-completion. Real scheduling needs
- * per-thread register contexts (a `_Thread_local psp_cpu` plus a handoff lock,
- * since the PSP is single-core and never runs two threads at once anyway) —
- * worth doing when a game actually needs concurrent threads, and the thread
- * objects here are already shaped for it.
+ * The one place the model still shows through: with no preemption and no clock,
+ * a wait that nothing could ever satisfy -- because no other thread is runnable
+ * -- cannot be waited out. A caller that supplied a timeout is told it elapsed;
+ * one that did not is not lied to, because a fabricated timeout is something a
+ * game acts on. See wait_deadlock. sceKernelDelayThread yields rather than
+ * sleeping, for the same want of a clock.
  */
 
 #include "psprecomp/hle.h"
 #include "psprecomp/dispatch.h"
+#include "psprecomp/clock.h"
+#include "psprecomp/sched.h"
 
 #include <setjmp.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define MAX_THREADS 128
@@ -46,6 +41,8 @@
 #define UID_BASE    0x00040000u
 
 enum { TH_DORMANT = 0, TH_READY, TH_RUNNING, TH_SUSPENDED };
+
+#define MAX_SEMA_WAITERS 32
 
 typedef struct {
     uint32_t uid;
@@ -57,6 +54,9 @@ typedef struct {
     uint32_t attr;
     int      state;
     uint32_t exit_status;
+    /* Threads parked in sceKernelWaitThreadEnd on this one. */
+    uint32_t enders[MAX_SEMA_WAITERS];
+    int      nenders;
     int      used;
     jmp_buf  unwind;       /* where sceKernelExitThread returns to */
     int      unwind_set;
@@ -68,6 +68,19 @@ typedef struct {
     int32_t  count;
     int32_t  max_count;
     int      used;
+    /* Who to wake on a signal. A fixed array rather than a list: the count is
+     * small, and overflowing it would only cost a wakeup, not correctness --
+     * every waiter re-tests the count after being woken. */
+    uint32_t waiters[MAX_SEMA_WAITERS];
+    int      nwaiters;
+    /* "sceKernelWaitSema(<name>)", built once at creation.
+     *
+     * The scheduler stores the string it is handed and prints it for every
+     * parked thread, so naming the *object* here is the difference between
+     * knowing a thread waits on a semaphore and knowing which one nobody is
+     * signalling. Held in the semaphore because the slot only keeps a pointer,
+     * and it has to outlive the call that blocked. */
+    char     waitdesc[64];
 } psp_sema;
 
 typedef struct {
@@ -90,7 +103,12 @@ static psp_sema     g_sema[MAX_SEMAS];
 static psp_evflag   g_flag[MAX_FLAGS];
 static psp_callback g_cb[MAX_CBS];
 static uint32_t     g_next_uid;
-static psp_thread  *g_current;
+/* The thread the scheduler says is running, as a thread-manager object.
+ *
+ * There is no separate notion of "current" any more: the scheduler owns that,
+ * and a second copy maintained here would be a second thing to keep in step.
+ * Returns NULL on the main context, which is not a guest thread. */
+static psp_thread *current_thread(void);
 static int          g_warned_block;
 
 void psp_threadman_reset(void) {
@@ -99,11 +117,17 @@ void psp_threadman_reset(void) {
     memset(g_flag, 0, sizeof g_flag);
     memset(g_cb, 0, sizeof g_cb);
     g_next_uid = UID_BASE;
-    g_current = NULL;
     g_warned_block = 0;
+    psp_sched_reset();
+    psp_clock_reset();
 }
 
-void psp_threadman_init(void) { psp_threadman_reset(); }
+static void on_thread_end(uint32_t uid, uint32_t status);
+
+void psp_threadman_init(void) {
+    psp_sched_set_end_hook(on_thread_end);
+    psp_threadman_reset();
+}
 
 /* Typed lookups rather than one generic macro. A macro taking a parameter
  * named `uid` also rewrites every `.uid` member access it expands around,
@@ -114,6 +138,11 @@ static psp_thread *find_thread(uint32_t id) {
         if (g_thread[i].used && g_thread[i].uid == id) return &g_thread[i];
     return NULL;
 }
+static psp_thread *current_thread(void) {
+    const uint32_t uid = psp_sched_current();
+    return uid ? find_thread(uid) : NULL;
+}
+
 static psp_sema *find_sema(uint32_t id) {
     for (int i = 0; i < MAX_SEMAS; i++)
         if (g_sema[i].used && g_sema[i].uid == id) return &g_sema[i];
@@ -125,15 +154,34 @@ static psp_evflag *find_flag(uint32_t id) {
     return NULL;
 }
 
-/* Report a would-block exactly once. Repeating it for every frame of a game
- * that polls a semaphore drowns out everything else in the log. */
+/* Report a wait that nothing could satisfy, exactly once. Repeating it for
+ * every frame of a game that polls a semaphore drowns out everything else. */
+/* A wait that can never complete, made by a caller that asked for no timeout.
+ *
+ * Reporting a timeout here is a lie, and a load-bearing one: this game's
+ * user_main waits on its game thread with no timeout, and on being told the
+ * wait timed out it deletes that thread -- still live, mid-frame -- and quits.
+ * The whole run ended in a screen clear because of it.
+ *
+ * So the run stops and says why. A caller that *did* pass a timeout still gets
+ * one, because for that caller a timeout is a true answer. */
+static void wait_deadlock(const char *what) {
+    fprintf(stderr,
+        "psprecomp: %s cannot be satisfied -- no thread is runnable, so nothing\n"
+        "  can ever signal it, and the caller passed no timeout. Reporting a\n"
+        "  timeout would make the guest act on a falsehood, so the run stops\n"
+        "  here instead. Live threads:\n", what);
+    psp_sched_dump_threads(stderr);
+    psp_sched_stop_all();
+}
+
 static void warn_block(const char *what) {
     if (g_warned_block) return;
     g_warned_block = 1;
     fprintf(stderr,
-        "psprecomp: %s would block, returning timeout.\n"
-        "  The thread model runs one thread to completion (see src/hle/threadman.c);\n"
-        "  there is no other thread to yield to. Further blocks are not reported.\n",
+        "psprecomp: %s would block with no runnable thread, returning timeout.\n"
+        "  Nothing else can run, so nothing could ever signal it -- waiting would\n"
+        "  hang. Further occurrences are not reported.\n",
         what);
 }
 
@@ -169,47 +217,55 @@ static void hle_StartThread(void) {
     psp_thread *t = find_thread(psp_arg(0));
     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
 
-    uint32_t arglen = psp_arg(1);
-    uint32_t argp   = psp_arg(2);
-
-    /* Save the caller's whole context. The thread runs on the same register
-     * file, so this *is* the context switch. */
-    psp_cpu_state saved = psp_cpu;
-    psp_thread   *prev  = g_current;
-
-    psp_cpu.r[PSP_REG_A0] = arglen;
-    psp_cpu.r[PSP_REG_A1] = argp;
     /* Stack pointer starts at the top of the allocation, 16-byte aligned, with
      * a little headroom so a callee storing below $sp cannot run off the end. */
-    psp_cpu.r[PSP_REG_SP] = (t->stack_base + t->stack_size - 64) & ~15u;
-    psp_cpu.r[PSP_REG_RA] = 0;
+    const uint32_t sp = (t->stack_base + t->stack_size - 64) & ~15u;
 
-    t->state = TH_RUNNING;
-    g_current = t;
-
-    if (setjmp(t->unwind) == 0) {
-        t->unwind_set = 1;
-        psp_dispatch(t->entry);          /* runs to completion */
-        t->exit_status = psp_cpu.r[PSP_REG_V0];
+    /* The thread becomes runnable; it does not run here.
+     *
+     * It used to run to completion inside this call, on the caller's register
+     * file, which worked for the module_start -> create -> start -> return
+     * shape and for nothing else. A thread that blocks part-way has to be able
+     * to stop and let another run, and its position in the host call stack is
+     * its state -- so it needs a stack of its own. See sched.c.
+     *
+     * Starting a thread does not hand it the token. A PSP thread of higher
+     * priority would preempt its starter, which cannot happen without
+     * preemption; what does happen is that it runs as soon as the starter
+     * blocks or yields. */
+    if (psp_sched_spawn(t->uid, t->entry, sp, psp_arg(1), psp_arg(2),
+                        (int)t->priority) != 0) {
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
     }
-    /* Landing here with a nonzero setjmp result means sceKernelExitThread
-     * unwound out of the thread; exit_status was recorded there. */
-    t->unwind_set = 0;
-    t->state = TH_DORMANT;
-
-    g_current = prev;
-    psp_cpu = saved;
+    t->state = TH_READY;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_ExitThread(void) {
-    uint32_t status = psp_arg(0);
-    if (g_current && g_current->unwind_set) {
-        g_current->exit_status = status;
-        longjmp(g_current->unwind, 1);
+    const uint32_t status = psp_arg(0);
+
+    /* A thread ending is the last chance to see how it got there, and a thread
+     * that ends with a nonzero status is usually reporting a failure its caller
+     * will act on -- by which point the code that decided is long gone. Costs
+     * nothing unless the generated code was built with PSPRECOMP_TRACE. */
+    if (psp_hle_logging()) {
+        fprintf(stderr, "hle: thread 0x%08X exiting with status %u\n",
+                psp_sched_current(), status);
+        psp_trace_dump();
     }
-    /* Nothing to unwind to: the module called ExitThread from its entry rather
-     * than from a started thread. Nothing further can run. */
+    psp_thread *t = find_thread(psp_sched_current());
+    if (t) {
+        t->exit_status = status;
+        t->state       = TH_DORMANT;
+        for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++)
+            psp_sched_wake(t->enders[i]);
+        t->nenders = 0;
+    }
+    /* Does not return when called from a guest thread: the scheduler ends the
+     * host thread underneath it. From the main context there is nothing to
+     * unwind, so it falls through. */
+    psp_sched_exit(psp_sched_current());
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -224,19 +280,85 @@ static void hle_DeleteThread(void) {
 /* With one thread running to completion there is nothing to schedule during a
  * delay, so it returns immediately. Time still advances for anything reading
  * the clock. */
-static void hle_DelayThread(void)   { psp_ret(SCE_KERNEL_ERROR_OK); }
-
-static void hle_WaitThreadEnd(void) {
-    /* The thread already ran to completion inside StartThread, so by the time
-     * anyone waits on it, it has ended. */
-    psp_thread *t = find_thread(psp_arg(0));
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
-    uint32_t out = psp_arg(1);
-    if (out) psp_write32(out, t->exit_status);
+/* There is no clock, so a delay cannot be timed -- but it is nearly always a
+ * thread being polite, and returning immediately starves everything else in a
+ * game whose main loop delays. Yielding gives the other threads the token,
+ * which is the useful half of the semantics. */
+static void hle_DelayThread(void) {
+    psp_sched_delay(psp_arg(0));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-static void hle_GetThreadId(void) { psp_ret(g_current ? g_current->uid : 0); }
+/* A thread died by returning from its entry point. Records what it returned and
+ * releases anyone waiting for it. */
+static void on_thread_end(uint32_t uid, uint32_t status) {
+    psp_thread *t = find_thread(uid);
+    if (!t) return;
+    t->exit_status = status;
+    t->state       = TH_DORMANT;
+    for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++)
+        psp_sched_wake(t->enders[i]);
+    t->nenders = 0;
+}
+
+/* sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout)
+ *
+ * The second argument is a *timeout pointer*, not somewhere to put the exit
+ * status -- writing the status there corrupted whatever the guest kept at that
+ * address. The status is the return value, as PPSSPP's implementation shows. */
+static void hle_WaitThreadEnd(void) {
+    const uint32_t thid    = psp_arg(0);
+    const uint32_t timeout = psp_arg(1);
+    psp_thread *t = find_thread(thid);
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+
+    /* Park until it ends. This is what drives a freshly started thread: nothing
+     * runs it until the thread holding the token gives it up, and a caller
+     * waiting for its result is the usual moment that happens. */
+    while (t->state != TH_DORMANT) {
+        const uint32_t me = psp_sched_current();
+        t->enders[t->nenders++ % MAX_SEMA_WAITERS] = me;
+        if (psp_sched_block(me, PSP_SCHED_BLOCKED, "sceKernelWaitThreadEnd") != 0) {
+            if (timeout) { psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT); return; }
+            wait_deadlock("sceKernelWaitThreadEnd");
+            psp_ret(SCE_KERNEL_ERROR_OK);
+            return;
+        }
+        t = find_thread(thid);
+        if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+    }
+
+    psp_ret(t->exit_status);
+}
+
+static void hle_GetThreadId(void) { psp_ret(psp_sched_current()); }
+
+/* ---- the clock ------------------------------------------------------------
+ *
+ * Microseconds since the module started. See include/psprecomp/clock.h for why
+ * it is virtual rather than the host's. A 64-bit result comes back in $v0:$v1,
+ * low word first, which is the o32 convention the compiler emitted the caller
+ * against. */
+static void hle_GetSystemTimeWide(void) {
+    const uint64_t us = psp_clock_read();
+    psp_cpu.r[PSP_REG_V0] = (uint32_t)us;
+    psp_cpu.r[PSP_REG_V1] = (uint32_t)(us >> 32);
+}
+
+static void hle_GetSystemTimeLow(void) {
+    psp_ret((uint32_t)psp_clock_read());
+}
+
+/* Takes a SceKernelSysClock * to fill in rather than returning the value. */
+static void hle_GetSystemTime(void) {
+    const uint32_t out = psp_arg(0);
+    const uint64_t us  = psp_clock_read();
+    if (out) {
+        psp_write32(out,     (uint32_t)us);
+        psp_write32(out + 4, (uint32_t)(us >> 32));
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 static void hle_SuspendThread(void) {
     psp_thread *t = find_thread(psp_arg(0));
@@ -260,11 +382,13 @@ static void hle_ChangeThreadPriority(void) {
 }
 
 static void hle_GetThreadCurrentPriority(void) {
-    psp_ret(g_current ? g_current->priority : 0);
+    const psp_thread *c = current_thread();
+    psp_ret(c ? c->priority : 0);
 }
 
 static void hle_ChangeCurrentThreadAttr(void) {
-    if (g_current) g_current->attr = (g_current->attr & ~psp_arg(0)) | psp_arg(1);
+    psp_thread *c = current_thread();
+    if (c) c->attr = (c->attr & ~psp_arg(0)) | psp_arg(1);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -273,10 +397,90 @@ static void hle_GetThreadStackFreeSize(void) {
      * paint one, so report the whole stack: it is used for "am I close to
      * overflowing", and claiming plenty of room is the safe direction. */
     psp_thread *t = find_thread(psp_arg(0));
-    psp_ret(t ? t->stack_size : (g_current ? g_current->stack_size : 0));
+    const psp_thread *c = current_thread();
+    psp_ret(t ? t->stack_size : (c ? c->stack_size : 0));
 }
 
 /* ---- semaphores ---------------------------------------------------------- */
+
+/* PSPRECOMP_SEMA=<substring> narrates the traffic on the semaphores whose name
+ * contains it -- who waits, who signals, and what the count was each time.
+ *
+ * "Nobody signals this semaphore" is the shape of several bugs here, and the
+ * thread dump can only say a thread is parked on one. It cannot say whether
+ * the signal never came or came too early, and those need opposite fixes. A
+ * signal also dumps the guest function trace, which names the code that sent
+ * it; a wait does not, because waits are the common case and the trace is long.
+ *
+ * Off unless the variable is set, and matched by substring so PSPRECOMP_SEMA=Movie
+ * covers a whole subsystem at once. */
+static const char *sema_watch(void) {
+    static int done;
+    static const char *v;
+    if (!done) { v = getenv("PSPRECOMP_SEMA"); done = 1; }
+    return v;
+}
+
+static int sema_watched(const psp_sema *s) {
+    const char *w = sema_watch();
+    return w && *w && strstr(s->name, w) != NULL;
+}
+
+static void sema_log(const psp_sema *s, const char *op, int32_t arg, int trace) {
+    if (!sema_watched(s)) return;
+    fprintf(stderr, "sema: thread 0x%08X  %-7s uid 0x%08X %-20s count=%d arg=%d\n",
+            psp_sched_current(), op, s->uid, s->name, s->count, arg);
+    if (trace) psp_trace_dump();
+}
+
+/* Every distinct semaphore uid ever handed to sceKernelSignalSema.
+ *
+ * "Nobody signals this one" is a claim about code that was never executed, and
+ * the watch above can only report signals that happened. This records the whole
+ * set instead, so the claim can be checked against it rather than inferred from
+ * silence -- including the case where the name the watch matches on is not the
+ * object the waiter is actually parked on. */
+#define MAX_SIGNALLED_UIDS 64
+static uint32_t g_sig_uid[MAX_SIGNALLED_UIDS];
+static int      g_sig_uids;
+
+static void note_signalled(uint32_t uid) {
+    for (int i = 0; i < g_sig_uids; i++) if (g_sig_uid[i] == uid) return;
+    if (g_sig_uids < MAX_SIGNALLED_UIDS) g_sig_uid[g_sig_uids++] = uid;
+}
+
+/* Every thread the game ever created, alive or not.
+ *
+ * The scheduler's list is of threads that still exist, which cannot answer what
+ * became of one that is missing -- created and never started looks identical to
+ * never created at all, and both look identical to started and long since
+ * finished. This keeps the record instead. */
+void psp_threadman_dump_threads(FILE *out) {
+    static const char *const ST[] = { "dormant", "ready", "running", "suspended" };
+    fprintf(out, "  threads created:\n");
+    for (int i = 0; i < MAX_THREADS; i++) {
+        const psp_thread *t = &g_thread[i];
+        if (!t->uid) continue;          /* never allocated */
+        fprintf(out, "    uid 0x%08X  entry 0x%08X  prio %-3u  %-9s  exit %u  %s%s\n",
+                t->uid, t->entry, t->priority,
+                (unsigned)t->state < 4 ? ST[t->state] : "?",
+                t->exit_status, t->name,
+                t->used ? "" : "  (deleted)");
+    }
+}
+
+void psp_threadman_dump_signalled(FILE *out) {
+    fprintf(out, "  semaphore uids ever signalled (%d):", g_sig_uids);
+    for (int i = 0; i < g_sig_uids; i++) fprintf(out, " 0x%08X", g_sig_uid[i]);
+    fprintf(out, "\n");
+    for (int i = 0; i < MAX_SEMAS; i++) {
+        if (!g_sema[i].used) continue;
+        int seen = 0;
+        for (int k = 0; k < g_sig_uids; k++) if (g_sig_uid[k] == g_sema[i].uid) seen = 1;
+        fprintf(out, "    uid 0x%08X  %-24s %s\n", g_sema[i].uid, g_sema[i].name,
+                seen ? "signalled" : "NEVER SIGNALLED");
+    }
+}
 
 static void hle_CreateSema(void) {
     /* (name, attr, initVal, maxVal, option) */
@@ -290,6 +494,12 @@ static void hle_CreateSema(void) {
     s->max_count = (int32_t)psp_arg(3);
     s->uid = g_next_uid++;
     s->used = 1;
+    /* Through a local: source and destination are both inside g_sema, and the
+     * compiler cannot see that two distinct members never overlap. */
+    char nm[sizeof s->name];
+    memcpy(nm, s->name, sizeof nm);
+    snprintf(s->waitdesc, sizeof s->waitdesc, "sceKernelWaitSema(%s)", nm);
+    sema_log(s, "create", s->count, 0);
     psp_ret(s->uid);
 }
 
@@ -305,20 +515,79 @@ static void hle_SignalSema(void) {
     if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
     s->count += (int32_t)psp_arg(1);
     if (s->max_count > 0 && s->count > s->max_count) s->count = s->max_count;
+    note_signalled(s->uid);
+    sema_log(s, "signal", (int32_t)psp_arg(1), 1);
+
+    /* Wake everyone parked on this semaphore and let them re-test. Waking only
+     * as many as the count allows would be tighter, but the count can be
+     * consumed by a thread that never waited, so the waiters have to re-check
+     * regardless -- and a missed wakeup is a hang. */
+    int urgent = 0;
+    for (int i = 0; i < s->nwaiters && i < MAX_SEMA_WAITERS; i++)
+        urgent |= psp_sched_wake(s->waiters[i]);
+    s->nwaiters = 0;
+
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    /* Released a thread that outranks us, so it runs now. */
+    if (urgent) psp_sched_yield();
+}
+
+/* Take the semaphore if it can be taken, and never block. The distinction from
+ * WaitSema is the whole point of the call: a caller uses it precisely because
+ * it has something else to do when the answer is no. */
+static void hle_PollSema(void) {
+    psp_sema *s = find_sema(psp_arg(0));
+    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    const int32_t need = (int32_t)psp_arg(1);
+    if (s->count < need) { psp_ret(SCE_KERNEL_ERROR_SEMA_ZERO); return; }
+    s->count -= need;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
+
+/* Give the rest of this priority level a turn. With round-robin handoff a
+ * plain yield already does exactly that, and the priority argument only
+ * selects a level we would reach anyway. */
+static void hle_RotateReadyQueue(void) {
+    psp_sched_yield();
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_DeleteCallback(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 static void hle_WaitSema(void) {
     psp_sema *s = find_sema(psp_arg(0));
     if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
-    int32_t need = (int32_t)psp_arg(1);
-    if (s->count >= need) {
-        s->count -= need;
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
+    const int32_t need = (int32_t)psp_arg(1);
+
+    /* Block until the count can satisfy the request, rather than reporting a
+     * timeout. The retry loop matters: being woken means the count *changed*,
+     * not that it is now sufficient, and several waiters may be released by one
+     * signal. */
+    for (;;) {
+        if (s->count >= need) {
+            s->count -= need;
+            sema_log(s, "taken", need, 0);
+            psp_ret(SCE_KERNEL_ERROR_OK);
+            return;
+        }
+        sema_log(s, "park", need, 0);
+        const uint32_t me = psp_sched_current();
+        s->waiters[s->nwaiters++ % MAX_SEMA_WAITERS] = me;
+        if (psp_sched_block(me, PSP_SCHED_BLOCKED, s->waitdesc) != 0) {
+            /* Only a caller that asked for a timeout may be told it timed out. */
+            if (psp_arg(2)) {
+                warn_block("sceKernelWaitSema");
+                psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+                return;
+            }
+            wait_deadlock("sceKernelWaitSema");
+            psp_ret(SCE_KERNEL_ERROR_OK);
+            return;
+        }
+        /* The semaphore may have been deleted while we were parked. */
+        s = find_sema(psp_arg(0));
+        if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
     }
-    warn_block("sceKernelWaitSema");
-    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
 }
 
 /* ---- event flags --------------------------------------------------------- */
@@ -380,6 +649,13 @@ static void hle_WaitEventFlag(void) {
     if (out) psp_write32(out, f->pattern);
 
     if (!satisfied) {
+        /* The same rule should apply here -- only a caller that supplied a
+         * timeout may be told one elapsed -- but this call takes its timeout as
+         * the *fifth* argument, and o32 passes that on the stack while
+         * psp_arg(4) reads $t0. Until which of the two the guest actually uses
+         * is established, the old behaviour stands: guessing is what made the
+         * previous version of this wrong. WaitSema and WaitThreadEnd take
+         * theirs in $a2 and $a1, where there is nothing to establish. */
         warn_block("sceKernelWaitEventFlag");
         psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
         return;
@@ -431,6 +707,9 @@ void psp_threadman_register(void) {
     psp_hle_register(0xCEADEB47, "ThreadManForUser", "sceKernelDelayThread",             hle_DelayThread);
     psp_hle_register(0x68DA9E36, "ThreadManForUser", "sceKernelDelayThreadCB",           hle_DelayThread);
     psp_hle_register(0x278C0DF5, "ThreadManForUser", "sceKernelWaitThreadEnd",           hle_WaitThreadEnd);
+    psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",        hle_GetSystemTimeWide);
+    psp_hle_register(0x369ED59D, "ThreadManForUser", "sceKernelGetSystemTimeLow",         hle_GetSystemTimeLow);
+    psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",            hle_GetSystemTime);
     psp_hle_register(0x293B45B8, "ThreadManForUser", "sceKernelGetThreadId",             hle_GetThreadId);
     psp_hle_register(0x9944F31F, "ThreadManForUser", "sceKernelSuspendThread",           hle_SuspendThread);
     psp_hle_register(0x75156E8F, "ThreadManForUser", "sceKernelResumeThread",            hle_ResumeThread);
@@ -443,6 +722,15 @@ void psp_threadman_register(void) {
     psp_hle_register(0x28B6489C, "ThreadManForUser", "sceKernelDeleteSema",              hle_DeleteSema);
     psp_hle_register(0x3F53E640, "ThreadManForUser", "sceKernelSignalSema",              hle_SignalSema);
     psp_hle_register(0x4E3A1105, "ThreadManForUser", "sceKernelWaitSema",                hle_WaitSema);
+    /* The CB form additionally runs the thread's pending callbacks while it
+     * waits. Callbacks are delivered by sceKernelCheckCallback here, so the
+     * two differ only in that -- and unimplemented was much worse than
+     * imperfect: it returned zero, and zero means "you have the semaphore",
+     * so a thread carried on holding a lock it had never taken. */
+    psp_hle_register(0x6D212BAC, "ThreadManForUser", "sceKernelWaitSemaCB",              hle_WaitSema);
+    psp_hle_register(0x58B1F937, "ThreadManForUser", "sceKernelPollSema",                hle_PollSema);
+    psp_hle_register(0x912354A7, "ThreadManForUser", "sceKernelRotateThreadReadyQueue",  hle_RotateReadyQueue);
+    psp_hle_register(0xEDBA5844, "ThreadManForUser", "sceKernelDeleteCallback",          hle_DeleteCallback);
 
     psp_hle_register(0x55C20A00, "ThreadManForUser", "sceKernelCreateEventFlag",         hle_CreateEventFlag);
     psp_hle_register(0xEF9E4C70, "ThreadManForUser", "sceKernelDeleteEventFlag",         hle_DeleteEventFlag);

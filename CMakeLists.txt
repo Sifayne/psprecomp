@@ -41,6 +41,9 @@ add_library(psprecomp STATIC
     src/hle/hle.c
     src/hle/sysmem.c
     src/hle/threadman.c
+    src/hle/sched.c
+    src/hle/clock.c
+    src/hle/mpeg.c
     src/hle/display.c
     src/hle/ge.c
     src/hle/sascore.c
@@ -56,6 +59,31 @@ target_include_directories(psprecomp PUBLIC
 # vfpu.c calls sinf/cosf/powf/logf/asinf. MSVC keeps those in the CRT, but on
 # Unix they live in libm and need an explicit link. PUBLIC so that consumers —
 # the test binaries, and any game host linking this runtime — inherit it too.
+# The scheduler gives each guest thread a host thread; see src/hle/sched.c for
+# why saved registers are not enough.
+find_package(Threads REQUIRED)
+target_link_libraries(psprecomp PUBLIC Threads::Threads)
+
+# --- optional: H.264 decoding for sceMpeg -------------------------------------
+#
+# openh264 is BSD, so it can be linked into an MIT project without changing what
+# anything downstream may do with it. That is why it is here and FFmpeg is not:
+# a distro FFmpeg is usually built --enable-gpl, and linking that would relicense
+# every consumer of this library.
+#
+# Optional on purpose. Without it sceMpeg keeps its bookkeeping-only behaviour
+# and refuses playback, which is what it did before this existed.
+find_path(OPENH264_INCLUDE_DIR wels/codec_api.h)
+find_library(OPENH264_LIBRARY openh264)
+if(OPENH264_INCLUDE_DIR AND OPENH264_LIBRARY)
+    target_compile_definitions(psprecomp PRIVATE PSPRECOMP_HAVE_OPENH264=1)
+    target_include_directories(psprecomp PRIVATE ${OPENH264_INCLUDE_DIR})
+    target_link_libraries(psprecomp PUBLIC ${OPENH264_LIBRARY})
+    message(STATUS "sceMpeg: H.264 decoding via openh264")
+else()
+    message(STATUS "sceMpeg: no openh264; playback stays refused")
+endif()
+
 if(NOT MSVC)
     find_library(PSPRECOMP_LIBM m)
     if(PSPRECOMP_LIBM)
