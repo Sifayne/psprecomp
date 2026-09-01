@@ -111,6 +111,9 @@ int  psp_sched_block_until(uint32_t uid, psp_sched_state why, const char *what,
                            uint64_t deadline_us);
 
 void psp_sched_yield(void);
+/* Give way to a thread that outranks the caller. Unlike a yield, the caller
+ * stays at the head of its own priority queue: it was displaced, not done. */
+void psp_sched_preempt(void);
 
 /* Sleep for `usec` of guest time.
  *

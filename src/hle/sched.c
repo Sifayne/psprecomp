@@ -38,6 +38,14 @@ typedef struct {
      * the handoff that gave it the token, so a thread is charged for its own
      * time on the CPU and not for anyone else's. */
     uint64_t        slice_end;
+    /* Displaced by a more urgent thread rather than having given way. A PSP
+     * puts such a thread at the *head* of its priority queue -- it never
+     * stopped being the one that should run at that priority -- where a thread
+     * that yields goes to the tail. Without the distinction a starter is
+     * overtaken by an equal-priority thread that was already waiting, which
+     * threads/change sees as a rescheduled checkpoint. Cleared when the slot is
+     * given the token back. */
+    int             preempted;
     psp_cpu_state   ctx;           /* valid whenever this slot is not running */
     pthread_t       host;
     int             started;
@@ -185,7 +193,11 @@ static int handoff_locked(void) {
     for (int k = 1; k <= MAX_SCHED_THREADS; k++) {
         const int i = (start + k) % MAX_SCHED_THREADS;
         if (!g_slot[i].used || g_slot[i].state != PSP_SCHED_READY) continue;
-        if (best < 0 || g_slot[i].priority < g_slot[best].priority) best = i;
+        if (best < 0 || g_slot[i].priority < g_slot[best].priority) { best = i; continue; }
+        /* Equal priority: a displaced thread is still ahead of one that was
+         * merely waiting its turn. */
+        if (g_slot[i].priority == g_slot[best].priority &&
+            g_slot[i].preempted && !g_slot[best].preempted) best = i;
     }
 
     if (best < 0) {
@@ -256,6 +268,7 @@ static int await_turn_locked(int me) {
         if (g_slot[me].state == PSP_SCHED_DEAD) return -1;
         pthread_cond_wait(&g_turn, &g_lock);
     }
+    g_slot[me].preempted = 0;      /* running again: no longer displaced */
     psp_cpu = g_slot[me].ctx;
     return 0;
 }
@@ -453,7 +466,7 @@ int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp,
      * order they became ready, so a starter is not displaced by its own equal. */
     const int preempts = g_running >= 0 && priority < g_slot[g_running].priority;
     pthread_mutex_unlock(&g_lock);
-    if (preempts) psp_sched_yield();
+    if (preempts) psp_sched_preempt();
     return 0;
 }
 
@@ -473,7 +486,15 @@ int psp_sched_block_until(uint32_t uid, psp_sched_state why, const char *what,
     return switch_away(self_slot(uid), why, what, deadline_us);
 }
 
-void psp_sched_yield(void) {
+static void yield_as(int displaced);
+
+/* Give way to a thread that outranks us, staying at the head of our own
+ * priority queue. Everything else about it is a yield. */
+void psp_sched_preempt(void) { yield_as(1); }
+
+void psp_sched_yield(void) { yield_as(0); }
+
+static void yield_as(int displaced) {
     if (!g_threading) return;
     /* Dispatch suspended: the guest asked not to be switched away from. */
     if (!g_dispatch) return;
@@ -482,8 +503,9 @@ void psp_sched_yield(void) {
     pthread_mutex_lock(&g_lock);
     const int me = g_running;
     if (me < 0) { pthread_mutex_unlock(&g_lock); return; }
-    g_slot[me].ctx   = psp_cpu;
-    g_slot[me].state = PSP_SCHED_READY;
+    g_slot[me].ctx       = psp_cpu;
+    g_slot[me].state     = PSP_SCHED_READY;
+    g_slot[me].preempted = displaced;
 
     /* This handoff cannot fail: the caller was just marked READY, so the scan
      * finds at least the caller. Handled rather than assumed, because the cost

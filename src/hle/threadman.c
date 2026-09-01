@@ -617,9 +617,8 @@ static void hle_ChangeThreadPriority(void) {
      * priority, and the four values higher than the caller's are exactly the
      * four where ` - testThread` appears *before* the line reporting the change
      * that caused it: the thread ran to completion inside the call. */
-    if (t->uid == psp_sched_current() ||
-        (int)prio < (int)psp_threadman_current_priority())
-        psp_sched_yield();
+    if (t->uid == psp_sched_current()) psp_sched_yield();
+    else if ((int)prio < (int)psp_threadman_current_priority()) psp_sched_preempt();
 }
 
 /* ---- sleep and wakeup ------------------------------------------------------
