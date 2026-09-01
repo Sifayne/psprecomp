@@ -209,6 +209,14 @@ void psp_threadman_reset(void);
  * the allocator is behaving. */
 uint32_t psp_sysmem_free(void);
 
+/* Tell the allocator where the loaded module sits, so the user heap can be
+ * everything else. Call after psp_hle_init(), which resets the allocator.
+ *
+ * Without this the heap floor is a guess -- "modules load around 0x08800000
+ * and are a few megabytes" -- which costs a megabyte of a 24 MB partition and
+ * is simply wrong for a module that is not in user RAM at all. */
+void psp_sysmem_reserve_module(uint32_t lo, uint32_t hi);
+
 /* Raw allocation for use by other HLE subsystems (thread stacks, mostly).
  * Returns 0 on failure. These bypass the UID table because nothing in the
  * guest ever refers to them. */

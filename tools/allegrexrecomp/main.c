@@ -956,6 +956,8 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     const uint32_t lo = li.lo, hi = li.hi;
 
     psp_hle_init();
+    /* After psp_hle_init, which resets the allocator. */
+    psp_sysmem_reserve_module(li.lo, li.hi);
     psp_interp_import *imports = NULL;
     const int nimports = interp_bind_imports(&b, &e, &imports);
 

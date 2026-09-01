@@ -45,6 +45,9 @@ static uint32_t  g_heap_lo, g_heap_hi;
 #define DEFAULT_HEAP_LO 0x08C00000u
 #define DEFAULT_HEAP_HI (PSP_RAM_BASE + PSP_RAM_SIZE)
 
+/* User memory starts here; below it belongs to the kernel. */
+#define PSP_USER_BASE   0x08800000u
+
 void psp_sysmem_reset(void) {
     memset(g_block, 0, sizeof g_block);
     g_next_uid = UID_BASE;
@@ -53,6 +56,33 @@ void psp_sysmem_reset(void) {
 }
 
 void psp_sysmem_init(void) { psp_sysmem_reset(); }
+
+void psp_sysmem_reserve_module(uint32_t lo, uint32_t hi) {
+    g_heap_hi = DEFAULT_HEAP_HI;
+
+    if (hi <= PSP_USER_BASE || lo >= DEFAULT_HEAP_HI) {
+        /* The module is nowhere near user RAM. A PRX linked at address 0 --
+         * which is what every pspautotests binary is -- lands outside the
+         * partition entirely, so there is nothing to step around and the whole
+         * 24 MB is available.
+         *
+         * The default floor cost one megabyte of it, and that megabyte was the
+         * difference: gum.prx asks for a single 0x01500000 block, the heap was
+         * 0x01400000 wide, and the allocation failed. The guest does not check
+         * -- it formats into the null it got back, over its own code at address
+         * zero -- so it presented as a wild pointer rather than as an
+         * out-of-memory, which is a long way from the cause. */
+        g_heap_lo = PSP_USER_BASE;
+        return;
+    }
+
+    /* The module *is* in user RAM. Start above it, rounded up, but never below
+     * the old default: the game's measurements are taken against that floor and
+     * moving it would shift every address the guest allocates for no gain
+     * here. */
+    const uint32_t end = (hi + 0xFFFFu) & ~0xFFFFu;
+    g_heap_lo = end > DEFAULT_HEAP_LO ? end : DEFAULT_HEAP_LO;
+}
 
 static mem_block *find_uid(uint32_t uid) {
     for (int i = 0; i < MAX_BLOCKS; i++)
