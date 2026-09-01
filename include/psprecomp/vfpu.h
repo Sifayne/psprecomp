@@ -87,6 +87,21 @@ void psp_vavg(uint32_t vd, uint32_t vs, int size);
  * instruction's rt field, which is where the hardware keeps it. */
 void psp_vcolor(uint32_t vd, uint32_t vs, int fmt, int size);
 
+/* The dot-product unit, over four lanes with the unused ones zero.
+ *
+ * Not a sum of products. The hardware computes all four products into a fixed
+ * point format with two extra bits and round-to-odd, aligns them to the largest
+ * exponent by truncation, sums those *exactly* as integers, and rounds once at
+ * the end. A plain `a[0]*b[0] + a[1]*b[1] + ...` rounds four times and in a
+ * different order, so it differs in the last bits -- and differs completely on
+ * infinities, which the hardware resolves before summing rather than letting
+ * them propagate through an intermediate.
+ *
+ * Everything that reduces a pair of vectors to one number goes through this:
+ * vdot, vhdp, vdet, vcrsp/vqmul, vfad and vavg are all this unit with a
+ * different second operand, which is how the hardware builds them too. */
+float psp_vfpu_dot(const float a[4], const float b[4]);
+
 /* The VFPU control registers, as mfvc/mtvc address them: 0..2 are the three
  * operand prefixes, 3 is the condition-code register, and the rest are the
  * revision and the random-number state. The first four are kept where the rest

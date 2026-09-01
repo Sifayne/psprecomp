@@ -191,6 +191,96 @@ static void write_dst(uint32_t vreg, int size, const float in[4]) {
     }
 }
 
+/* ---- the dot-product unit -------------------------------------------------
+ *
+ * Reproduced rather than approximated, because every reduction in the VFPU is
+ * this one circuit and a sum of products is not it. The shape:
+ *
+ *   - each product is computed to 24+2 bits with round-to-odd, so that the
+ *     later truncation cannot round twice in the same direction;
+ *   - all four are aligned to the largest exponent by *truncation*, and the
+ *     sum of the aligned integers is exact;
+ *   - the single rounding happens at the end, to nearest, ties to even;
+ *   - infinities are resolved before any of that. inf * 0 and inf - inf are
+ *     NaN; anything else with an infinity in it is that infinity, regardless
+ *     of what the finite terms would have contributed.
+ *
+ * The constants are the hardware's: two extra bits, and an alignment shift
+ * clamped at 28 because past that the term cannot reach the result anyway. */
+float psp_vfpu_dot(const float a[4], const float b[4]) {
+    enum { EXTRA_BITS = 2 };
+    const uint32_t I = 1u << 23, J = 1u << (23 - EXTRA_BITS);
+
+    int32_t  s[4], e[4], ehi = -2 * 127;
+    uint32_t p[4];
+    int      has_inf = 0;
+
+    for (int i = 0; i < 4; i++) {
+        const uint32_t x = psp_f32_to_bits(a[i]), y = psp_f32_to_bits(b[i]);
+        const int32_t  ex = (int32_t)((x >> 23) & 255), ey = (int32_t)((y >> 23) & 255);
+        const uint32_t mx = x & (I - 1), my = y & (I - 1);
+
+        if (ex == 255 || ey == 255) {
+            const int sgn = ((x ^ y) >> 31) ? -1 : +1;
+            /* A quiet NaN with the low bit set -- the pattern the VFPU
+             * produces, not the host's. */
+            if ((ex == 255 && mx != 0) ||          /* x is NaN            */
+                (ey == 255 && my != 0) ||          /* y is NaN            */
+                (ex == 255 && ey == 0) ||          /* inf * 0             */
+                (ey == 255 && ex == 0) ||          /* 0 * inf             */
+                (has_inf && has_inf != sgn))       /* inf - inf           */
+                return psp_bits_to_f32(0x7F800001u);
+            has_inf = sgn;
+        }
+
+        s[i] = (int32_t)((x ^ y) >> 31);
+        e[i] = ex + ey - 2 * 127;
+        /* The implicit ones are put back before multiplying: this is the full
+         * 24x24 product, kept to 26 bits with the discarded tail folded into
+         * the low bit (round-to-odd) so the alignment below cannot lose it. */
+        const uint64_t v = (uint64_t)(I + mx) * (uint64_t)(I + my);
+        p[i] = (uint32_t)(v >> (23 - EXTRA_BITS));
+        if (v & (J - 1)) p[i] |= 1;
+        if (!(ex && ey)) { e[i] = -2 * 127; p[i] = 0; }   /* subnormals are zero */
+        if (e[i] > ehi) ehi = e[i];
+    }
+
+    if (has_inf) return psp_bits_to_f32(has_inf < 0 ? 0xFF800000u : 0x7F800000u);
+
+    int32_t val = 0;
+    for (int i = 0; i < 4; i++) {
+        int32_t d = ehi - e[i];
+        if (d > 28) d = 28;
+        val += (s[i] ? -1 : +1) * (int32_t)(p[i] >> d);
+    }
+
+    uint32_t m = (uint32_t)(val < 0 ? -val : val);
+    m >>= EXTRA_BITS;
+
+    if (m != 0) {
+        /* Normalise to 2^23 <= m < 2^24, rounding to nearest with ties to
+         * even -- the only rounding in the whole operation. */
+        const int shift = 8 - (int)psp_clz(m);
+        ehi += shift;
+        if (shift > 0) {
+            const uint32_t r = 1u << (shift - 1);
+            m = (m >> shift) + ((m & (2 * r - 1)) + ((m >> shift) & 1) > r);
+            if (m >= 2 * I) { m >>= 1; ehi += 1; }
+        } else if (shift < 0) {
+            m <<= -shift;
+        }
+    } else {
+        ehi = -128;
+    }
+
+    if (ehi <= -127) { ehi = -127; m = 0; }    /* underflow flushes to zero */
+    if (ehi >= +128) { ehi = +128; m = 0; }    /* overflow is an infinity   */
+
+    return psp_bits_to_f32(((uint32_t)(val < 0) << 31) |
+                           ((uint32_t)(ehi + 127) << 23) |
+                           (m & 0x007FFFFFu));
+}
+
 /* ---- VFPU control registers ----------------------------------------------- */
 
 /* Everything past the prefixes and the condition codes: the revision word and
@@ -310,12 +400,14 @@ void psp_svr_q(uint32_t vt, uint32_t addr) {
  * than as a loop over `size` keeps one property that a loop loses: vavg of a
  * single lane is *zero*, because the constant for size 1 is 0 and not 1. */
 static void reduce(uint32_t vd, uint32_t vs, int size, float k) {
-    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, out[4];
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     read_src(vs, size, g_prefix[0], sv);
 
-    float sum = 0.0f;
-    for (int i = 0; i < 4; i++) sum += sv[i] * k;
-    out[0] = sum;
+    /* A dot against a constant vector, which is literally what the hardware
+     * does -- and the reason a single-lane vavg is zero, since the constant
+     * for size 1 is 0 rather than 1. */
+    const float kv[4] = { k, k, k, k };
+    float out[4] = { psp_vfpu_dot(sv, kv), 0.0f, 0.0f, 0.0f };
     write_dst(vd, 1, out);
     eat_prefixes();
 }
@@ -396,13 +488,19 @@ void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
     float d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     if (size == 4) {                                     /* vqmul.q */
-        d[0] =  s[0]*t[3] + s[1]*t[2] - s[2]*t[1] + s[3]*t[0];
-        d[1] = -s[0]*t[2] + s[1]*t[3] + s[2]*t[0] + s[3]*t[1];
-        d[2] =  s[0]*t[1] - s[1]*t[0] + s[2]*t[3] + s[3]*t[2];
-        d[3] = -s[0]*t[0] - s[1]*t[1] - s[2]*t[2] + s[3]*t[3];
+        const float t0[4] = {  t[3], t[2], -t[1], t[0] };
+        const float t1[4] = { -t[2], t[3],  t[0], t[1] };
+        const float t2[4] = {  t[1], -t[0], t[3], t[2] };
+        const float t3[4] = { -t[0], -t[1], -t[2], t[3] };
+        d[0] = psp_vfpu_dot(s, t0);
+        d[1] = psp_vfpu_dot(s, t1);
+        d[2] = psp_vfpu_dot(s, t2);
+        d[3] = psp_vfpu_dot(s, t3);
     } else {                                             /* vcrsp.t */
-        d[0] = s[1]*t[2] - s[2]*t[1];
-        d[1] = s[2]*t[0] - s[0]*t[2];
+        const float t0[4] = { 0.0f,  t[2], -t[1], 0.0f };
+        const float t1[4] = { -t[2], 0.0f,  t[0], 0.0f };
+        d[0] = psp_vfpu_dot(s, t0);
+        d[1] = psp_vfpu_dot(s, t1);
         /* The third lane comes out of the same forced-swizzle dot as the other
          * two, which for a triple (t[3] and s[3] zero) is the cross term.
          *
@@ -410,12 +508,13 @@ void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
          * looks arbitrary and is what the hardware does: inf * 0 in the dot
          * would be a NaN, and the PSP answers with the finite part instead.
          * Nine lines of cpu/vfpu/vector turn on it. */
+        const float ts[4] = { t[1], -t[0], t[3], t[2] };
         float fs[4], ft[4];
         for (int i = 0; i < 4; i++) {
-            fs[i] = (s[i] >  3.4028235e38f || s[i] < -3.4028235e38f) ? 0.0f : s[i];
-            ft[i] = (t[i] >  3.4028235e38f || t[i] < -3.4028235e38f) ? 0.0f : t[i];
+            fs[i] = (s[i]  >  3.4028235e38f || s[i]  < -3.4028235e38f) ? 0.0f : s[i];
+            ft[i] = (ts[i] >  3.4028235e38f || ts[i] < -3.4028235e38f) ? 0.0f : ts[i];
         }
-        d[2] = fs[0]*ft[1] - fs[1]*ft[0] + fs[2]*ft[3] + fs[3]*ft[2];
+        d[2] = psp_vfpu_dot(fs, ft);
     }
 
     write_dst(vd, size, d);
@@ -430,10 +529,7 @@ void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     /* The last lane of the source is a forced 1: that is the whole difference
      * from vdot, and it is what makes this the homogeneous form. */
     sv[n - 1] = 1.0f;
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) sum += sv[i] * tv[i];
-
-    float out[4] = { sum, 0.0f, 0.0f, 0.0f };
+    float out[4] = { psp_vfpu_dot(sv, tv), 0.0f, 0.0f, 0.0f };
     write_dst(vd, 1, out);
     eat_prefixes();
 }
@@ -461,11 +557,12 @@ void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     read_src(vs, size, g_prefix[0], sv);
     read_src(vt, size, g_prefix[1], tv);
 
-    /* t's first two lanes are forced to yx, so the dot with s negated on lane
-     * 1 is s0*t1 - s1*t0. Lanes beyond the pair contribute as they are, which
-     * is why they are read at all -- normally they are zero. */
-    const float d0 = sv[0] * tv[1] - sv[1] * tv[0] + sv[2] * tv[2] + sv[3] * tv[3];
-    float out[4] = { d0, 0.0f, 0.0f, 0.0f };
+    /* t's first two lanes are forced to yx and s's second is negated, so the
+     * dot comes out as s0*t1 - s1*t0. Lanes beyond the pair contribute as they
+     * are, which is why they are read at all -- normally they are zero. */
+    const float sn[4] = { sv[0], -sv[1], sv[2], sv[3] };
+    const float ts[4] = { tv[1],  tv[0], tv[2], tv[3] };
+    float out[4] = { psp_vfpu_dot(sn, ts), 0.0f, 0.0f, 0.0f };
     write_dst(vd, 1, out);
     eat_prefixes();
 }
@@ -846,13 +943,13 @@ BINOP(vmax, a > b ? a : b)
 
 /* Dot product: sums all lanes into a single destination lane. */
 void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
-    float sv[4], tv[4], out[4];
-    const int n = read_src(vs, size, g_prefix[0], sv);
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    read_src(vs, size, g_prefix[0], sv);
     read_src(vt, size, g_prefix[1], tv);
 
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) sum += sv[i] * tv[i];
-    out[0] = sum;
+    /* Four lanes always: the unused ones are zero and contribute nothing, and
+     * going through the one unit is what makes the rounding match. */
+    float out[4] = { psp_vfpu_dot(sv, tv), 0.0f, 0.0f, 0.0f };
     write_dst(vd, 1, out);
     eat_prefixes();
 }
@@ -1240,7 +1337,14 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
     }
     if (any) cc |= 1u << 4;
     if (all) cc |= 1u << 5;
-    psp_cpu.vfpu_cc = cc;
+
+    /* Only the bits this comparison is about are written: one per lane it
+     * actually compared, plus the any/all pair. A `vcmp.t` leaves bit 3 alone,
+     * and a program can rely on that -- cpu/vfpu/vector sets it with a quad
+     * compare and then reads it back after a triple one. Overwriting the whole
+     * register cleared it, which cost 25 lines and looked like a vcmov bug. */
+    const uint32_t affected = (1u << 4) | (1u << 5) | ((1u << n) - 1u);
+    psp_cpu.vfpu_cc = (psp_cpu.vfpu_cc & ~affected) | (cc & affected);
     eat_prefixes();
 }
 
