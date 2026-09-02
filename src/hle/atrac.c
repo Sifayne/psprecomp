@@ -1,5 +1,5 @@
-/* psprecomp — sceAtrac3plus without a decoder: a stream that opens and then
- * refuses to decode.
+/* psprecomp — sceAtrac3plus without a decoder: a stream that opens and is
+ * over at once.
  *
  * Why not simply refuse everything. An unimplemented firmware call returns
  * zero and writes nothing to its out-parameters (see psp_hle_call), and for
@@ -19,12 +19,24 @@
  * same state. On hardware neither ever fails, so the game has no working
  * failure path for either.
  *
- * What the game does handle is a decoder that opens and then cannot decode: a
- * negative return from sceAtracDecodeData takes its stop path, which reads the
- * internal error, releases the ID and idles the player. So that is what this
- * is. Everything up to the decode is real -- the RIFF header is parsed, IDs
- * are handed out and taken back, remainFrame is what hardware reports for the
- * bytes present -- and the decode itself says, truthfully, that it failed.
+ * What the game does handle is a track that ends: a negative return from
+ * sceAtracDecodeData takes its stop path, which reads the internal error,
+ * releases the ID and idles the player. So that is what this is. Everything
+ * up to the decode is real -- the RIFF header is parsed, IDs are handed out
+ * and taken back, remainFrame is what hardware reports for the bytes present
+ * -- and the first decode answers what hardware answers when a stream has
+ * nothing left: ALLDATA_WAS_DECODED, with zero samples, the end flag set and
+ * the drained remainFrame written back.
+ *
+ * Written back matters. A first version returned a bare error and wrote
+ * nothing, and the game reads the sample count *before* it looks at the
+ * return code -- it adds it to a buffered-PCM counter, and that counter is
+ * one of the two conditions its shutdown waits on. Handed the stack's
+ * leftovers it read 0x23B43080 bytes buffered, and NEW GAME waited forever
+ * for a track to drain that had never played. Hardware writes all three
+ * out-parameters on this error (stream.expected: "80630024=sceAtracDecodeData
+ * error: samples: 00000000, finish: 00000001, remainFrame: -2"), and on a bad
+ * ID writes none (decode.expected: count=1337 stays 1337); both are kept.
  *
  * What is measured and what is not is marked at each handler. Every error code
  * is PSPSDK's pspatrac3.h (BSD), by name:
@@ -51,6 +63,7 @@
 #define PSP_ATRAC_ERROR_READSIZE_IS_TOO_SMALL 0x80630011u
 #define PSP_ATRAC_ERROR_ADD_DATA_IS_TOO_BIG   0x80630018u
 #define PSP_ATRAC_ERROR_UNSET_PARAM           0x80630021u
+#define PSP_ATRAC_ERROR_ALLDATA_WAS_DECODED   0x80630024u
 
 #define PSP_ATRAC_AT3PLUS 0x1000u
 #define PSP_ATRAC_AT3     0x1001u
@@ -92,9 +105,9 @@ static void no_decoder(void) {
     if (!said++)
         fprintf(stderr,
             "psprecomp: sceAtrac3plus has no decoder. The stream opens and its\n"
-            "  header is read; sceAtracDecodeData then fails, which is the path\n"
-            "  this game's player handles (it stops the track). Music is silent;\n"
-            "  everything else continues.\n");
+            "  header is read; the first sceAtracDecodeData then reports the\n"
+            "  stream fully decoded, so the game runs the track out at once.\n"
+            "  Music is silent; everything else continues.\n");
 }
 
 static atrac_ctx *ctx_arg(void) {
@@ -301,24 +314,30 @@ static void hle_AddStreamData(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* (id, u16 *pcm, int *samples, int *end, int *remainFrame). This is the refusal.
- * There is no decoder, so decoding fails -- API_FAIL is the header's name for
- * the codec call failing -- and nothing is written back, so the caller's
- * sample count, end flag and remain stay whatever it set them to. The error is
- * kept for GetInternalErrorInfo, which this game reads next. */
+/* (id, u16 *pcm, int *samples, int *end, int *remainFrame). The stream is over
+ * at once: hardware's answer to a decode with nothing left, with the three
+ * out-parameters hardware writes for it -- no samples, the end flag, and the
+ * drained remainFrame: -1 for a file held whole, -2 streamed without loop
+ * information, -3 streamed with it (getremainframe.expected, "Drained remain
+ * values"; stream.expected line 1108 for the -2 case). Nothing is written to
+ * the PCM buffer. See the header for why writing these back is the whole
+ * point. */
 static void hle_DecodeData(void) {
     atrac_ctx *c = ctx_arg();
     if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
     if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
     no_decoder();
-    c->internal_error = PSP_ATRAC_ERROR_API_FAIL;
-    psp_ret(PSP_ATRAC_ERROR_API_FAIL);
+    const int32_t remain = all_in_memory(c) ? -1 : (c->has_loop ? -3 : -2);
+    put32(psp_arg(2), 0);
+    put32(psp_arg(3), 1);
+    put32(psp_arg(4), (uint32_t)remain);
+    psp_ret(PSP_ATRAC_ERROR_ALLDATA_WAS_DECODED);
 }
 
-/* (id, int *error). The codec's own last error; zero until a decode has
- * failed. Hardware reports a codec-internal code there -- stream.expected
- * shows 0x20B after a failed decode -- and this has no codec, so the API
- * failure code stands in. What this game does with it is print it and stop. */
+/* (id, int *error). The codec's own last error -- stream.expected shows a
+ * codec-internal 0x20B after a failed decode. Nothing here fails inside a
+ * codec, so this stays zero; a seek refusal records API_FAIL. What this game
+ * does with it is print it and stop. */
 static void hle_GetInternalErrorInfo(void) {
     atrac_ctx *c = ctx_arg();
     if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
