@@ -345,6 +345,11 @@ void psp_misc_reset(void);
 void psp_umd_init(void);
 void psp_umd_register(void);
 void psp_umd_reset(void);
+
+/* The utility dialogs. Registered but not implemented: a dialog that is absent
+ * has to say so, because a caller polls a pending one forever. See utility.c. */
+void psp_utility_init(void);
+void psp_utility_register(void);
 int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint64_t psp_audio_blocks(void);

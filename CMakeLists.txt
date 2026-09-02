@@ -56,6 +56,7 @@ add_library(psprecomp STATIC
     src/hle/misc.c
     src/hle/ctrl_replay.c
     src/hle/umd.c
+    src/hle/utility.c
 )
 
 target_include_directories(psprecomp PUBLIC

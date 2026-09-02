@@ -319,4 +319,6 @@ void psp_hle_init(void) {
     psp_misc_register();
     psp_umd_init();
     psp_umd_register();
+    psp_utility_init();
+    psp_utility_register();
 }
