@@ -597,6 +597,16 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
     case A_BGEZAL: case A_BGEZALL: snprintf(buf, n, "(int32_t)%s >= 0", rs); break;
     case A_BC1T: case A_BC1TL: snprintf(buf, n, "psp_fpu_cond()"); break;
     case A_BC1F: case A_BC1FL: snprintf(buf, n, "!psp_fpu_cond()"); break;
+    /* The VFPU branches test one of six condition codes, indexed by bits
+     * 18..20 of the word. These fell into the default below and were emitted
+     * as a branch never taken -- no trap, no diagnostic, a program that runs
+     * and is quietly wrong. Armored Core's polygon clipper skips a store with
+     * bvf; never skipping it doubled the vertex count at every clip plane and
+     * ran over the caller's frame. Fifteen sites in that module. */
+    case A_BVT: case A_BVTL:
+        snprintf(buf, n, "psp_vfpu_cond(%u)", (unsigned)((in->raw >> 18) & 7u)); break;
+    case A_BVF: case A_BVFL:
+        snprintf(buf, n, "!psp_vfpu_cond(%u)", (unsigned)((in->raw >> 18) & 7u)); break;
     default:                   snprintf(buf, n, "0 /* unhandled branch */"); break;
     }
 }

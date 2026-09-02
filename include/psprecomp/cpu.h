@@ -118,6 +118,11 @@ static inline void psp_fcr_write(unsigned n, uint32_t v) {
 #define PSP_FCR31_C (1u << 23)
 
 static inline int  psp_fpu_cond(void)      { return (psp_cpu.fcr31 & PSP_FCR31_C) != 0; }
+
+/* VFPU condition code `cc` (0..5: one per lane, then any, then all) -- set by
+ * vcmp, tested by bvt/bvf and their likely forms. The code index is the
+ * instruction's bits 18..20. */
+static inline int  psp_vfpu_cond(unsigned cc) { return (psp_cpu.vfpu_cc >> (cc & 7u)) & 1u; }
 static inline void psp_fpu_set_cond(int c) {
     psp_cpu.fcr31 = c ? (psp_cpu.fcr31 | PSP_FCR31_C) : (psp_cpu.fcr31 & ~PSP_FCR31_C);
 }

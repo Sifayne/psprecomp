@@ -236,6 +236,72 @@ static void test_indirect_call_is_not_terminal(void) {
     a_analysis_free(&an);
 }
 
+/* ---- the VFPU branches have a condition ------------------------------------
+ *
+ * Regression test for the branch the emitter did not translate.
+ *
+ * bvt/bvf and their likely forms test one of the six VFPU condition codes,
+ * indexed by bits 18..20 of the word. branch_cond() had no case for them and
+ * fell to its default, which emits a condition of `0` with a comment -- a
+ * branch never taken, with no trap and no diagnostic, in a program that runs.
+ * Armored Core's polygon clipper skips a store with bvf; never skipping it
+ * doubled the vertex count at every clip plane and ran over the caller's
+ * frame. The interpreter had the same gap, so the oracle saw two translations
+ * agreeing.
+ *
+ * Both senses, two different code indices, so a mix-up between them fails. */
+
+#define BV_BASE 0x08840000u
+
+static const uint32_t BV_CODE[] = {
+    0x49090002,  /* +00  bvt   2, +2          cc 2, true  -> +0C            */
+    0x00000000,  /* +04  nop                  delay slot                    */
+    0x24420001,  /* +08  addiu $v0, $v0, 1    skipped when taken            */
+    0x49000002,  /* +0C  bvf   0, +2          cc 0, false -> +18            */
+    0x00000000,  /* +10  nop                                                */
+    0x24420002,  /* +14  addiu $v0, $v0, 2                                  */
+    0x03E00008,  /* +18  jr    $ra                                          */
+    0x00000000,  /* +1C  nop                                                */
+};
+
+static void test_vfpu_branch_condition(void) {
+    uint8_t code[sizeof BV_CODE];
+    for (size_t i = 0; i < sizeof BV_CODE / sizeof BV_CODE[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(BV_CODE[i]);
+        code[i * 4 + 1] = (uint8_t)(BV_CODE[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(BV_CODE[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(BV_CODE[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = BV_BASE;
+    an.size = (uint32_t)sizeof code;
+
+    const uint32_t seed = BV_BASE;
+    CHECK(a_discover(&an, &seed, 1, 1) == 0, "vfpu branch: discovery runs");
+
+    emit_opts o;
+    o.outdir = ".";
+    o.prefix = "t_bv";
+    o.module = "synthetic";
+    CHECK(a_emit(&an, &o) == 0, "vfpu branch: emission succeeds");
+
+    char *src = slurp("./t_bv_funcs.c", NULL);
+    CHECK(src != NULL, "vfpu branch: generated .c is readable");
+    if (!src) { a_analysis_free(&an); return; }
+
+    CHECK(strstr(src, "psp_vfpu_cond(2)") != NULL,
+          "vfpu branch: bvt tests the condition code its word names");
+    CHECK(strstr(src, "!psp_vfpu_cond(0)") != NULL,
+          "vfpu branch: bvf tests the negation of its condition code");
+    CHECK(strstr(src, "unhandled branch") == NULL,
+          "vfpu branch: no branch in this function is emitted as never taken");
+    free(src);
+    a_analysis_free(&an);
+}
+
 int main(void) {
     uint8_t code[sizeof CODE];
     for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
@@ -331,6 +397,7 @@ int main(void) {
 
     test_return_delay_slot_not_owned();
     test_indirect_call_is_not_terminal();
+    test_vfpu_branch_condition();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

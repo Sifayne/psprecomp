@@ -485,6 +485,7 @@ static psp_interp_status exec_simple(const a_insn *in) {
     case A_BLTZ: case A_BGEZ: case A_BLTZL: case A_BGEZL:
     case A_BLTZAL: case A_BGEZAL: case A_BLTZALL: case A_BGEZALL:
     case A_BC1F: case A_BC1T: case A_BC1FL: case A_BC1TL:
+    case A_BVF: case A_BVT: case A_BVFL: case A_BVTL:
         return I_TRAP_BRANCH_IN_SLOT;
 
     case A_SYSCALL: return I_TRAP_SYSCALL;
@@ -517,6 +518,11 @@ static int branch_taken(const a_insn *in) {
     case A_BGEZAL: case A_BGEZALL: return (int32_t)R(in->rs) >= 0;
     case A_BC1T: case A_BC1TL: return  psp_fpu_cond();
     case A_BC1F: case A_BC1FL: return !psp_fpu_cond();
+    /* Mirrors emit.c: the VFPU branches were missing on both sides, so the
+     * two translations agreed on never taking them and the oracle could not
+     * see it. */
+    case A_BVT: case A_BVTL:   return  psp_vfpu_cond((in->raw >> 18) & 7u);
+    case A_BVF: case A_BVFL:   return !psp_vfpu_cond((in->raw >> 18) & 7u);
     default:                   return 0;
     }
 }
