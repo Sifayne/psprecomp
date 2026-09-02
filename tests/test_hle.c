@@ -559,7 +559,11 @@ static void test_sas_adpcm(void) {
     for (uint32_t i = 0; i < 14; i++)
         psp_write8(VAG + 2 + i, 0x7Fu);   /* nibbles 0xF and 0x7 */
 
-    CHECK(call5(psp_nid("__sceSasInit"), 0, 64 /*grain*/, 32, 0, 44100) == 0,
+    /* A real, 64-byte-aligned core: hardware refuses a null or unaligned one
+     * with 80420005 (audio/sascore/sascore.expected, "NULL" and "Unaligned"),
+     * and so does hle_Init now. */
+    const uint32_t CORE = 0x08860000u;
+    CHECK(call5(psp_nid("__sceSasInit"), CORE, 64 /*grain*/, 32, 0, 44100) == 0,
           "SAS init");
 
     /* sceSasSetVoice(core, voice, addr, size, loop) */

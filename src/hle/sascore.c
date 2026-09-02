@@ -17,7 +17,25 @@
 #include <string.h>
 
 #define SAS_VOICES     32
-#define SAS_MAX_GRAIN  1024
+#define SAS_MAX_GRAIN  2048
+
+/* The library's own error codes, each measured in audio/sascore: sascore.expected
+ * refuses a grain outside 64..2048 or off a multiple of 32 with 80420001, a
+ * voice count outside 1..32 with 80420002, an output mode other than 0 or 1 with
+ * 80420003, a sample rate it does not list with 80420004, and a null or
+ * unaligned core with 80420005; vag.expected refuses a voice index outside 0..31
+ * with 80420010 and a sample size that is zero or not a multiple of 16 with
+ * 80420014 (negative multiples of 16 are accepted, so the check is on the low
+ * bits, not the sign). Named here by what they refuse. */
+#define SAS_ERROR_GRAIN        0x80420001u
+#define SAS_ERROR_MAX_VOICES   0x80420002u
+#define SAS_ERROR_OUTPUT_MODE  0x80420003u
+#define SAS_ERROR_SAMPLE_RATE  0x80420004u
+#define SAS_ERROR_CORE         0x80420005u
+#define SAS_ERROR_VOICE        0x80420010u
+#define SAS_ERROR_SIZE         0x80420014u
+
+static int grain_ok(uint32_t g) { return g >= 64 && g <= SAS_MAX_GRAIN && (g % 32) == 0; }
 
 /* VAG ADPCM predictor coefficients. Each 16-byte block picks one of five
  * filters; the decoded sample is the shifted nibble plus a weighted sum of the
@@ -30,7 +48,9 @@ enum { ENV_OFF = 0, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 typedef struct {
     uint32_t vag_addr;      /* guest address of the sample data */
     uint32_t vag_size;
-    int      loop;
+    int      loop;          /* loop mode: a block flagged 3 jumps back */
+    uint32_t loop_start;    /* byte offset of the block flagged 6, else 0 */
+    int      last_block;    /* the block just decoded ended the sample */
     uint32_t pos;           /* byte offset of the current 16-byte block */
     int      sample_idx;    /* 0..27 within the block */
     int      hist1, hist2;  /* ADPCM history */
@@ -85,13 +105,30 @@ static int clamp16(int v) {
 }
 
 /* Decode the 16-byte ADPCM block at the voice's current position into its
- * 28-sample buffer. Returns 0 when the voice has run off the end. */
+ * 28-sample buffer. Returns 0 when the voice has ended.
+ *
+ * Where a voice ends is measured where the corpus reaches, and conventional
+ * where it does not. audio/sascore/vag.expected plays a 16-block sample in
+ * loop mode 1 with every block after the first carrying one flag value, and
+ * 16 blocks are 448 samples, inside its one 512-sample grain -- so with flags
+ * 0, 1, 7, 0x41 and 0x87 the voice reports ended, and the only thing that is
+ * measured by that is that **the buffer end ends a voice whatever the loop
+ * mode**, and that the flagged block is decoded (its samples are printed).
+ * Two flag facts are measured: exactly 3 keeps the voice playing -- a loop
+ * end that jumps back -- and 0x41 does not end it: the same test plays
+ * music.vag with its file header still in front, so block 0's flag byte is
+ * the 'A' of "VAGp", and the voice is still playing a grain later. So the
+ * check is on exact values, not bit 0. Exactly 1 and exactly 7 ending the
+ * voice after their block, and 6 marking the loop start, are the format's
+ * convention and not reached by any test here.
+ *
+ * This used to restart from byte 0 at both the buffer end and flag 7 whenever
+ * loop mode was set. Armored Core starts its menu sounds with loop mode set,
+ * so its "decide" sound played forever, and the game waits for that sound to
+ * finish before it leaves the title screen: NEW GAME hung on a sound effect. */
 static int decode_block(sas_voice *v) {
-    if (v->pos + 16 > v->vag_size) {
-        if (!v->loop) return 0;
-        v->pos = 0;
-        v->hist1 = v->hist2 = 0;
-    }
+    if (v->last_block) return 0;
+    if (v->pos + 16 > v->vag_size) return 0;
 
     uint32_t at = v->vag_addr + v->pos;
     uint8_t hdr   = psp_read8(at);
@@ -100,13 +137,6 @@ static int decode_block(sas_voice *v) {
     int shift  = hdr & 0x0F;
     int filter = (hdr >> 4) & 0x0F;
     if (filter > 4) filter = 0;          /* out of range: treat as no prediction */
-
-    /* Flag 7 marks the end of the sample. */
-    if (flags == 7) {
-        if (!v->loop) return 0;
-        v->pos = 0;
-        return decode_block(v);
-    }
 
     for (int i = 0; i < 28; i++) {
         uint8_t byte = psp_read8(at + 2 + (uint32_t)(i / 2));
@@ -123,7 +153,10 @@ static int decode_block(sas_voice *v) {
         v->hist1 = s;
     }
 
+    if (flags == 6) v->loop_start = v->pos;
     v->pos += 16;
+    if (flags == 3 && v->loop) v->pos = v->loop_start;
+    else if (flags == 1 || flags == 3 || flags == 7) v->last_block = 1;
     v->decoded_valid = 1;
     return 1;
 }
@@ -198,24 +231,57 @@ static sas_voice *voice_arg(void) {
 }
 
 static void hle_Init(void) {
-    /* (sasCore, grain, maxVoices, outputMode, sampleRate) */
-    g_grain       = psp_arg(1);
-    g_max_voices  = psp_arg(2);
-    g_output_mode = psp_arg(3);
-    g_sample_rate = psp_arg(4);
-    if (!g_grain || g_grain > SAS_MAX_GRAIN) g_grain = 256;
-    if (!g_max_voices || g_max_voices > SAS_VOICES) g_max_voices = SAS_VOICES;
+    /* (sasCore, grain, maxVoices, outputMode, sampleRate). Checked in the order
+     * sascore.expected reports them; the sample rate is only checked for the
+     * two rates this library renders at, since the test's accepted list runs
+     * past what was read of it. */
+    const uint32_t core = psp_arg(0), grain = psp_arg(1), voices = psp_arg(2),
+                   mode = psp_arg(3), rate = psp_arg(4);
+    if (!core || (core & 63))          { psp_ret(SAS_ERROR_CORE); return; }
+    if (!grain_ok(grain))              { psp_ret(SAS_ERROR_GRAIN); return; }
+    if (voices < 1 || voices > SAS_VOICES) { psp_ret(SAS_ERROR_MAX_VOICES); return; }
+    if (mode > 1)                      { psp_ret(SAS_ERROR_OUTPUT_MODE); return; }
+    if (rate != 44100 && rate != 48000) { psp_ret(SAS_ERROR_SAMPLE_RATE); return; }
+    g_grain       = grain;
+    g_max_voices  = voices;
+    g_output_mode = mode;
+    g_sample_rate = rate;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
+
+static void hle_SetGrain(void) {
+    const uint32_t grain = psp_arg(1);
+    if (!grain_ok(grain)) { psp_ret(SAS_ERROR_GRAIN); return; }
+    g_grain = grain;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_GetGrain(void) { psp_ret(g_grain); }
+
+/* outputmode.expected: 0 and 1 accepted, everything else 80420003, and
+ * GetOutputmode answers the mode set. What the mode changes about the mix
+ * is not modelled here. */
+static void hle_SetOutputmode(void) {
+    const uint32_t mode = psp_arg(1);
+    if (mode > 1) { psp_ret(SAS_ERROR_OUTPUT_MODE); return; }
+    g_output_mode = mode;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_GetOutputmode(void) { psp_ret(g_output_mode); }
 
 static void hle_SetVoice(void) {
     /* (sasCore, voice, vagAddr, size, loopmode) */
     sas_voice *v = voice_arg();
-    if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    const uint32_t size = psp_arg(3);
+    if (size == 0 || (size & 15)) { psp_ret(SAS_ERROR_SIZE); return; }
     v->vag_addr = psp_arg(2);
-    v->vag_size = psp_arg(3);
+    v->vag_size = size;
     v->loop     = (int)psp_arg(4);
     v->pos = 0;
+    v->loop_start = 0;
+    v->last_block = 0;
     v->sample_idx = 0;
     v->hist1 = v->hist2 = 0;
     v->decoded_valid = 0;
@@ -224,7 +290,7 @@ static void hle_SetVoice(void) {
 
 static void hle_SetPitch(void) {
     sas_voice *v = voice_arg();
-    if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     v->pitch = psp_arg(2);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -232,7 +298,7 @@ static void hle_SetPitch(void) {
 static void hle_SetVolume(void) {
     /* (sasCore, voice, l, r, el, er) -- the last two are the reverb sends. */
     sas_voice *v = voice_arg();
-    if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     v->vol_l = (int32_t)psp_arg(2);
     v->vol_r = (int32_t)psp_arg(3);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -241,7 +307,7 @@ static void hle_SetVolume(void) {
 static void hle_SetADSR(void) {
     /* (sasCore, voice, flags, attack, decay, sustain, release) */
     sas_voice *v = voice_arg();
-    if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     uint32_t flags = psp_arg(2);
     if (flags & 1) v->attack_rate  = (int32_t)psp_arg(3);
     if (flags & 2) v->decay_rate   = (int32_t)psp_arg(4);
@@ -252,7 +318,7 @@ static void hle_SetADSR(void) {
 
 static void hle_SetSimpleADSR(void) {
     sas_voice *v = voice_arg();
-    if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     /* The packed form encodes rates in two 16-bit words. Without the exact
      * curve tables this is an approximation: fast attack, slow release. Audio
      * plays at the right pitch and duration; envelope shape is not exact. */
@@ -265,11 +331,12 @@ static void hle_SetSimpleADSR(void) {
 
 static void hle_SetKeyOn(void) {
     sas_voice *v = voice_arg();
-    if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     v->playing = 1;
     v->ended = 0;
     v->paused = 0;
     v->pos = 0;
+    v->last_block = 0;
     v->sample_idx = 0;
     v->frac = 0;
     v->hist1 = v->hist2 = 0;
@@ -282,7 +349,7 @@ static void hle_SetKeyOn(void) {
 
 static void hle_SetKeyOff(void) {
     sas_voice *v = voice_arg();
-    if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     v->env_state = ENV_RELEASE;
     if (!v->release_rate) v->release_rate = 0x40000000 / 256;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -354,6 +421,10 @@ static void hle_accept(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 void psp_sas_register(void) {
     psp_hle_register(0x42778A9F, "sceSasCore", "__sceSasInit",              hle_Init);
+    psp_hle_register(0xD1E0A01E, "sceSasCore", "__sceSasSetGrain",          hle_SetGrain);
+    psp_hle_register(0xBD11B7C2, "sceSasCore", "__sceSasGetGrain",          hle_GetGrain);
+    psp_hle_register(0xE855BF76, "sceSasCore", "__sceSasSetOutputmode",     hle_SetOutputmode);
+    psp_hle_register(0xE175EF66, "sceSasCore", "__sceSasGetOutputmode",     hle_GetOutputmode);
     psp_hle_register(0x99944089, "sceSasCore", "__sceSasSetVoice",          hle_SetVoice);
     psp_hle_register(0xAD84D37F, "sceSasCore", "__sceSasSetPitch",          hle_SetPitch);
     psp_hle_register(0x440CA7D8, "sceSasCore", "__sceSasSetVolume",         hle_SetVolume);
