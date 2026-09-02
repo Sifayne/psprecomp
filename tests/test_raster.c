@@ -488,7 +488,10 @@ static void test_texture_bilinear_midpoint(void) {
 
     /* Colour first: black to red. Clamped at both ends, ramping between. */
     bilinear_row(0xFF000000u, 0xFF0000FFu, 1, 1, 0, row);
-    static const uint32_t want_r[4] = { 0, 64, 191, 255 };
+    /* Truncated, as hardware does: a quarter of the way between 00 and ff is
+     * 63.75, and gpu/filtering/precisionlinear2d shows hardware answering the
+     * lower value at every step. */
+    static const uint32_t want_r[4] = { 0, 63, 191, 255 };
     for (int k = 0; k < 4; k++)
         CHECK((row[k] & 0xFF) == want_r[k],
               "bilinear red at %d: got %u want %u", k, row[k] & 0xFF, want_r[k]);

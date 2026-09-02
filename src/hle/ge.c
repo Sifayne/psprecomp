@@ -31,6 +31,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* A screen coordinate onto the rasterizer's 1/16-pixel grid, floored. Written
+ * out rather than calling floorf: this file has no <math.h>, and a cast rounds
+ * toward zero, which puts -0.0625 on the wrong side of pixel 0. */
+static int fx16_floor(float f) {
+    const float s = f * (float)PSP_SUBPX;
+    const int i = (int)s;
+    return i - (s < (float)i);
+}
+
 /* Display-list opcodes. Only the ones the walk needs to be correct about are
  * named; everything else is counted rather than guessed at, because a
  * misidentified state command silently changes rendering. */
@@ -66,6 +75,13 @@
 #define GE_CLUTFORMAT   0xC5
 #define GE_TEXFILTER    0xC6
 #define GE_TEXWRAP      0xC7
+#define GE_TGENMATRIXNUMBER 0x40
+#define GE_TGENMATRIXDATA   0x41
+#define GE_TEXMAPMODE   0xC0
+#define GE_TEXSCALEU    0x48
+#define GE_TEXSCALEV    0x49
+#define GE_TEXOFFSETU   0x4A
+#define GE_TEXOFFSETV   0x4B
 #define GE_TEXFUNC      0xC9
 #define GE_TEXENVCOLOR  0xCA
 
@@ -193,6 +209,22 @@ static void note_colour(uint32_t c) {
  * matrix rather than skip a word of it. */
 static struct {
     float world[12], view[12], proj[16];
+    /* Texture coordinate generation. TEX_MAP_MODE's low two bits choose where
+     * texture coordinates come from -- 0 the vertex's own, 1 the generation
+     * matrix, 2 the environment map -- and bits 8..9 choose what that matrix is
+     * applied to: the model position, the vertex UV, or the normal. The matrix
+     * is uploaded like the others, 12 elements, 4 columns of 3.
+     *
+     * Unimplemented, mode 1 read the vertex's texture-coordinate field anyway,
+     * and a game using generation leaves that field uninitialised: Armored
+     * Core's menu background draws a full-screen quad this way and the field
+     * held -512 and NaN, which is where the GE summary's "u -inf..inf" and the
+     * hatched sheet over the settings panel came from. Numbers from PSPSDK's
+     * guInternal.h (BSD): TEX_MAP_MODE 0xC0, TGEN_MATRIX_NUMBER 0x40,
+     * TGEN_MATRIX_DATA 0x41. */
+    float tgen[12];
+    int   tgen_n;
+    int   tex_map_mode, tex_proj_mode;
     int   world_n, view_n, proj_n;
     float vp_xs, vp_ys, vp_zs, vp_xc, vp_yc, vp_zc;
     float off_x, off_y;
@@ -225,6 +257,10 @@ static struct {
      * game uses rather than against the whole hardware surface. */
     uint32_t tex_addr, tex_stride, tex_w, tex_h, tex_enable;
     uint32_t tex_format, tex_func, tex_tcc, tex_double, tex_env, tex_filter, tex_wrap, tex_swizzled;
+    /* GE_TEXSCALE / GE_TEXOFFSET: applied to transformed geometry's texture
+     * coordinates before they are scaled by the texture size. Through-mode
+     * coordinates are texels already and are not touched. */
+    float    tex_scale_u, tex_scale_v, tex_offset_u, tex_offset_v;
     uint32_t clut_addr, clut_format, clut_raw;
     uint32_t tex_formats_seen, tex_funcs_seen;
     uint32_t xfer_src, xfer_srcw, xfer_dst, xfer_dstw;
@@ -271,6 +307,7 @@ static void note_uv(float u, float v) {
 void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
     memset(&g_ge, 0, sizeof g_ge);
+    g_ge.tex_scale_u = g_ge.tex_scale_v = 1.0f;
     psp_render_reset_pixels();
     psp_render_reset_depth();
     g_skip_noaddr = g_skip_layout = g_skip_nearplane = 0;
@@ -581,16 +618,16 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
         out->rgba = psp_read32(addr + (uint32_t)col_off);
 
     switch (VT_POS(vtype)) {
-    case 2:   /* 16-bit */
-        out->x = (int16_t)psp_read16(addr + (uint32_t)pos_off);
-        out->y = (int16_t)psp_read16(addr + (uint32_t)pos_off + 2);
+    case 2:   /* 16-bit: whole pixels, onto the 1/16 grid */
+        out->x = (int)(int16_t)psp_read16(addr + (uint32_t)pos_off) * PSP_SUBPX;
+        out->y = (int)(int16_t)psp_read16(addr + (uint32_t)pos_off + 2) * PSP_SUBPX;
         /* Through-mode depth is already a window value, and unsigned: the
          * screen z range is 0..65535, not -32768..32767. */
         out->z = (float)(uint16_t)psp_read16(addr + (uint32_t)pos_off + 4);
         return 1;
-    case 3: { /* float */
-        out->x = (int)psp_read_f32(addr + (uint32_t)pos_off);
-        out->y = (int)psp_read_f32(addr + (uint32_t)pos_off + 4);
+    case 3: { /* float: floored onto the 1/16 grid, fraction kept */
+        out->x = fx16_floor(psp_read_f32(addr + (uint32_t)pos_off));
+        out->y = fx16_floor(psp_read_f32(addr + (uint32_t)pos_off + 4));
         out->z = psp_read_f32(addr + (uint32_t)pos_off + 8);
         return 1;
     }
@@ -629,22 +666,32 @@ static int read_pos_model(uint32_t addr, uint32_t vtype, int pos_off, float p[3]
     }
 }
 
-/* Texture coordinates for transformed geometry are normalised, not texels, so
- * they scale by the texture size. Through-mode gives texels directly, which is
- * why the two paths read them differently. */
+/* Texture coordinates for transformed geometry are normalised, not texels: the
+ * texture scale and offset registers apply first, then the texture size.
+ * Through-mode gives texels directly, which is why the two paths read them
+ * differently.
+ *
+ * The narrow formats are unsigned. gpu/textures/size draws a 3D sprite with
+ * 16-bit coordinates from 0 to 32768 and hardware reads texel 0 at the left
+ * and the last texel at the right; read as a signed 16-bit value, 32768 is
+ * -1.0 and the right edge came out texel 0. Neither TEXSCALE nor TEXOFFSET was
+ * decoded before: gpu/filtering/precisionnearest3d scales by 0.5, and its texel
+ * boundary landed at a quarter of the sprite instead of the middle. */
 static void read_uv_model(uint32_t addr, uint32_t vtype, int tex_off, psp_vertex *out) {
     out->u = out->v = 0.0f;
     if (tex_off < 0) return;
     const uint32_t a = addr + (uint32_t)tex_off;
     float u = 0.0f, v = 0.0f;
     switch (VT_TEX(vtype)) {
-    case 1: u = (float)(int8_t)psp_read8(a)       / 128.0f;
-            v = (float)(int8_t)psp_read8(a + 1)   / 128.0f;   break;
-    case 2: u = (float)(int16_t)psp_read16(a)     / 32768.0f;
-            v = (float)(int16_t)psp_read16(a + 2) / 32768.0f; break;
-    case 3: u = psp_read_f32(a); v = psp_read_f32(a + 4);     break;
+    case 1: u = (float)psp_read8(a)       / 128.0f;
+            v = (float)psp_read8(a + 1)   / 128.0f;   break;
+    case 2: u = (float)psp_read16(a)      / 32768.0f;
+            v = (float)psp_read16(a + 2)  / 32768.0f; break;
+    case 3: u = psp_read_f32(a); v = psp_read_f32(a + 4); break;
     default: return;
     }
+    u = u * g_ge.tex_scale_u + g_ge.tex_offset_u;
+    v = v * g_ge.tex_scale_v + g_ge.tex_offset_v;
     out->u = u * (float)g_ge.tex_w;
     out->v = v * (float)g_ge.tex_h;
     note_uv(out->u, out->v);
@@ -704,6 +751,36 @@ static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
  * vertex, one vertex type, one texture. When one element on screen looks wrong
  * and the rest looks right, aggregates cannot say which draw is the bad one.
  * This can. */
+/* PSPRECOMP_GE_TEXDRAW=<hex> logs every draw that binds one particular texture,
+ * with each vertex's position and texture coordinates.
+ *
+ * The plain draw log counts down from the first draws of the run, which is the
+ * wrong end for a question about a menu three screens in -- by then its budget
+ * is long spent. Naming the texture asks the question the other way round:
+ * "show me the draws that use this", which is how a glyph atlas's quads are
+ * found among a million primitives. */
+static int texdraw_hit(void) {
+    static uint32_t want = 1;
+    if (want == 1) {
+        const char *v = getenv("PSPRECOMP_GE_TEXDRAW");
+        want = (v && *v) ? (uint32_t)strtoul(v, NULL, 0) : 0;
+    }
+    return want && g_ge.tex_addr == want;
+}
+
+static void texdraw_dump(const char *tag, const psp_vertex *v, uint32_t n) {
+    static int left = 24;
+    if (left <= 0) return;
+    left--;
+    fprintf(stderr, "texdraw: %s %u verts  tex %ux%u fmt %u", tag, n,
+            g_ge.tex_w, g_ge.tex_h, g_ge.tex_format);
+    for (uint32_t i = 0; i < n && i < 4; i++)
+        fprintf(stderr, "  | x %.3f y %.3f u %.3f v %.3f",
+                (double)v[i].x / 16.0, (double)v[i].y / 16.0,
+                (double)v[i].u, (double)v[i].v);
+    fprintf(stderr, "\n");
+}
+
 static int drawlog_left(void) {
     static int n = -1;
     if (n < 0) { const char *v = getenv("PSPRECOMP_GE_DRAWLOG"); n = (v && *v) ? atoi(v) : 0; }
@@ -738,13 +815,36 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 o->rgba = psp_read32(a + (uint32_t)col_off);
             note_colour(o->rgba);
             read_uv_model(a, g_ge.vtype, tex_off, o);
+            if (g_tl.tex_map_mode == 1) {
+                /* The source row the matrix is applied to. GU_POSITION is the
+                 * model-space position, GU_UV the vertex's own coordinates,
+                 * and the two normal modes the normal -- which this decoder
+                 * does not read, so they fall back to the position rather than
+                 * to nothing. */
+                float src[3];
+                if (g_tl.tex_proj_mode == 1) {
+                    src[0] = o->u / (float)(g_ge.tex_w ? g_ge.tex_w : 1);
+                    src[1] = o->v / (float)(g_ge.tex_h ? g_ge.tex_h : 1);
+                    src[2] = 0.0f;
+                } else {
+                    src[0] = model[0]; src[1] = model[1]; src[2] = model[2];
+                }
+                float gen[3];
+                mul_4x3(g_tl.tgen, src, gen);
+                o->u = gen[0] * (float)g_ge.tex_w;
+                o->v = gen[1] * (float)g_ge.tex_h;
+                note_uv(o->u, o->v);
+            }
 
             w[decoded] = clip[3];
             float sx, sy, sz;
             if (clip[3] > 1e-6f) to_screen(clip, &sx, &sy, &sz);
             else                 sx = sy = sz = 0.0f;
-            o->x = (int)sx;
-            o->y = (int)sy;
+            /* Rounded to the nearest 1/16. Hardware's exact rule past the
+             * fourth bit is unmeasured here; what gpu/textures/size measures
+             * is that the far edge lands on the pixel it should. */
+            o->x = fx16_floor(sx + 1.0f / (2 * PSP_SUBPX));
+            o->y = fx16_floor(sy + 1.0f / (2 * PSP_SUBPX));
             o->z = sz;
             if (clip[3] > 1e-6f) {
                 if (!g_tl.bb_seen) { g_tl.bb_x0 = g_tl.bb_x1 = sx;
@@ -758,15 +858,18 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         if (!decoded) break;
         g_xformed += decoded;
 
+        if (texdraw_hit()) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
+
         if (drawlog_left()) {
             int x0 = v[0].x, x1 = v[0].x, y0 = v[0].y, y1 = v[0].y;
             for (uint32_t i = 1; i < decoded; i++) {
                 if (v[i].x < x0) x0 = v[i].x;   if (v[i].x > x1) x1 = v[i].x;
                 if (v[i].y < y0) y0 = v[i].y;   if (v[i].y > y1) y1 = v[i].y;
             }
+            if (texdraw_hit()) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
             fprintf(stderr, "draw: %-14s %2u verts  x %4d..%-4d y %4d..%-4d  "
                             "fbp %08X  rgba %08X  vtype %06X  tex %s\n",
-                    PRIM_NAME[type & 7], decoded, x0, x1, y0, y1,
+                    PRIM_NAME[type & 7], decoded, x0 >> 4, x1 >> 4, y0 >> 4, y1 >> 4,
                     ge_fb_address(g_ge.fbp), v[0].rgba,
                     g_ge.vtype, (g_ge.tex_enable && tex_off >= 0 && g_ge.tex_addr)
                                 ? "yes" : "no");
@@ -965,15 +1068,18 @@ static void draw_prim(uint32_t type, uint32_t count) {
         }
         if (!decoded) break;
 
+        if (texdraw_hit()) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
+
         if (drawlog_left()) {
             int x0=v[0].x,x1=v[0].x,y0=v[0].y,y1=v[0].y;
             for (uint32_t i=1;i<decoded;i++){
                 if(v[i].x<x0)x0=v[i].x; if(v[i].x>x1)x1=v[i].x;
                 if(v[i].y<y0)y0=v[i].y; if(v[i].y>y1)y1=v[i].y;
             }
+            if (texdraw_hit()) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
             fprintf(stderr, "2d:   %-14s %2u verts  x %4d..%-4d y %4d..%-4d  "
                             "fbp %08X  rgba %08X %08X  vtype %06X  tex %s\n",
-                    PRIM_NAME[type & 7], decoded, x0,x1,y0,y1,
+                    PRIM_NAME[type & 7], decoded, x0 >> 4, x1 >> 4, y0 >> 4, y1 >> 4,
                     ge_fb_address(g_ge.fbp),
                     v[0].rgba, v[decoded>1?1:0].rgba, g_ge.vtype,
                     has_uv ? "yes" : "no");
@@ -1145,8 +1251,14 @@ static void run_list(ge_queue *q) {
         case GE_TEXSIZE0:
             /* log2 of each dimension, four bits each. Masking a whole byte
              * lets a stray high bit ask for a 1 << 200 texture. */
+            /* 512 is the largest texture the hardware samples, whatever the
+             * size field says. gpu/textures/size asks for 1024 up to 8192 and
+             * every one of them reads texel 511 at its far edge -- so the
+             * dimension saturates rather than wrapping or scaling. */
             g_ge.tex_w = 1u << (arg & 0xF);
             g_ge.tex_h = 1u << ((arg >> 8) & 0xF);
+            if (g_ge.tex_w > 512) g_ge.tex_w = 512;
+            if (g_ge.tex_h > 512) g_ge.tex_h = 512;
             break;
         case GE_TEXFORMAT:
             g_ge.tex_format = arg & 0xF;
@@ -1181,6 +1293,18 @@ static void run_list(ge_queue *q) {
         case GE_TEXFILTER:
             g_ge.tex_filter = arg & 0xFFFF;
             break;
+        case GE_TEXMAPMODE:
+            g_tl.tex_map_mode  = (int)(arg & 3);
+            g_tl.tex_proj_mode = (int)((arg >> 8) & 3);
+            break;
+        case GE_TGENMATRIXNUMBER: g_tl.tgen_n = (int)(arg & 0xF); break;
+        case GE_TGENMATRIXDATA:
+            if (g_tl.tgen_n < 12) g_tl.tgen[g_tl.tgen_n++] = ge_float(arg);
+            break;
+        case GE_TEXSCALEU:  g_ge.tex_scale_u  = ge_float(arg); break;
+        case GE_TEXSCALEV:  g_ge.tex_scale_v  = ge_float(arg); break;
+        case GE_TEXOFFSETU: g_ge.tex_offset_u = ge_float(arg); break;
+        case GE_TEXOFFSETV: g_ge.tex_offset_v = ge_float(arg); break;
         case GE_TEXWRAP:
             g_ge.tex_wrap = arg & 0xFFFF;
             break;

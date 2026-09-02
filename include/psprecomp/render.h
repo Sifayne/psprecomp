@@ -13,10 +13,18 @@
 
 #include <stdint.h>
 
+/* Screen positions carry four fractional bits: PSP_SUBPX units per pixel, the
+ * precision the hardware rasterizes at. Truncating to whole pixels moved every
+ * edge and every texel boundary by up to a pixel -- gpu/filtering's
+ * precision tests place a two-pixel sprite at x = -i/16 and hardware covers
+ * pixels 0 and 1 with texels 0 and 1; whole pixels covered one with the wrong
+ * texel. A pixel's centre is at 16*x + 8 in these units. */
+#define PSP_SUBPX 16
+
 /* A vertex after format decoding: screen space, colour resolved.
  * Texture coordinates extend this rather than replacing it. */
 typedef struct {
-    int      x, y;
+    int      x, y;             /* 12.4 fixed point: PSP_SUBPX units per pixel */
     /* Window depth, on the PSP's 0..65535 scale. Transformed geometry gets it
      * from the projection and the viewport's z terms; through-mode geometry
      * carries it in the third position component. Without it primitives can

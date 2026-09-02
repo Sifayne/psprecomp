@@ -73,7 +73,12 @@ static psp_tex_state g_tex;
  * sampler reading the wrong texels, or the texture in memory not being what we
  * think. Decoding it standalone separates them -- if the dump is clean and the
  * frame is not, the fault is downstream of sampling. */
-static uint32_t g_dumped[16];
+/* Sixteen was not enough to reach past the first screen: the title alone binds
+ * that many, so a dump taken to look at a later menu's glyphs contained the
+ * title's textures and nothing else -- an instrument that answers, plausibly,
+ * about the wrong thing. */
+#define TEXDUMP_MAX 256
+static uint32_t g_dumped[TEXDUMP_MAX];
 static int      g_dumped_n;
 
 static void dump_texture(void);
@@ -228,13 +233,18 @@ static uint32_t sample_texel(int u, int v) {
 
 static void dump_texture(void) {
     const char *base = getenv("PSPRECOMP_TEXDUMP");
-    if (!base || !*base || g_dumped_n >= 16) return;
+    if (!base || !*base || g_dumped_n >= TEXDUMP_MAX) return;
     if (!texture_usable()) return;
     for (int i = 0; i < g_dumped_n; i++) if (g_dumped[i] == g_tex.addr) return;
     g_dumped[g_dumped_n] = g_tex.addr;
 
+    /* The filename carries the texture's identity, not just its ordinal: with
+     * a hundred of them the question is always "which of these is the one the
+     * GE summary named", and an index alone cannot answer it. */
+    static const char *FMT[8] = { "5650","5551","4444","8888","clut4","clut8","clut16","clut32" };
     char path[1024];
-    snprintf(path, sizeof path, "%s-%02d.ppm", base, g_dumped_n);
+    snprintf(path, sizeof path, "%s-%03d-%08X-%dx%d-%s.ppm", base, g_dumped_n,
+             g_tex.addr, g_tex.w, g_tex.h, FMT[g_tex.fmt & 7]);
     FILE *f = fopen(path, "wb");
     if (!f) return;
     fprintf(f, "P6\n%d %d\n255\n", g_tex.w, g_tex.h);
@@ -249,7 +259,8 @@ static void dump_texture(void) {
     /* And the alpha channel, as greyscale. The colour dump of an alpha-mask
      * texture is uniformly white and says nothing; the shape is entirely in
      * alpha, and so is any question about how it composites. */
-    snprintf(path, sizeof path, "%s-%02d-alpha.ppm", base, g_dumped_n);
+    snprintf(path, sizeof path, "%s-%03d-%08X-%dx%d-%s-alpha.ppm", base, g_dumped_n,
+             g_tex.addr, g_tex.w, g_tex.h, FMT[g_tex.fmt & 7]);
     f = fopen(path, "wb");
     if (f) {
         fprintf(f, "P6\n%d %d\n255\n", g_tex.w, g_tex.h);
@@ -312,10 +323,31 @@ static int filter_is_linear(void) {
  * throughout, the letterforms entirely in the alpha channel -- so filtering
  * only RGB and taking alpha from a single tap would leave the edges exactly as
  * hard as nearest and look like the filter had never been implemented. */
+/* Bilinear, with the weights hardware uses: the fraction of a texel is kept to
+ * four bits, floored. gpu/filtering/precisionlinear2d stretches two texels over
+ * 256 pixels, so a continuous filter would start changing the colour at pixel
+ * 64, by one step; hardware first changes it at pixel 72 -- one sixteenth of a
+ * texel in -- and by 0x10 (ff -> ef), and on the reversed sprite starts at 64,
+ * where the fraction is already fifteen sixteenths. Sixteen levels, floored. */
 static uint32_t sample_bilinear(float u, float v) {
-    const float fu = u - 0.5f, fv = v - 0.5f;
-    const int   u0 = ifloor(fu), v0 = ifloor(fv);
-    const float au = fu - (float)u0, av = fv - (float)v0;
+    /* The coordinate is quantised to sixteenths, floored, and split into the
+     * texel and the weight. Floored, not rounded: gpu/filtering's linear tests
+     * stretch two texels over 256 pixels and hardware holds the first colour
+     * until a full sixteenth of a texel has accumulated -- rounding starts the
+     * ramp a pixel early, everywhere.
+     *
+     * The epsilon is for our own arithmetic, not hardware's. The interpolated
+     * coordinate carries a few ULP of error, and at a 1:1 blit that puts it
+     * just below a texel boundary: the weight becomes fifteen sixteenths on
+     * the texel below, and truncation then drops a whole texel, so linear
+     * stopped agreeing with nearest at the one scale where they must agree.
+     * A thousandth of a texel is four orders of magnitude below the sixteenth
+     * being measured and cannot move a weight hardware would place elsewhere. */
+    const int fu = ifloor((u - 0.5f) * 16.0f + 1.0e-3f);
+    const int fv = ifloor((v - 0.5f) * 16.0f + 1.0e-3f);
+    const int   u0 = fu >> 4, v0 = fv >> 4;
+    const float au = (float)(fu & 15) / 16.0f;
+    const float av = (float)(fv & 15) / 16.0f;
 
     const uint32_t t00 = sample_texel(u0,     v0);
     const uint32_t t10 = sample_texel(u0 + 1, v0);
@@ -331,7 +363,12 @@ static uint32_t sample_bilinear(float u, float v) {
                       + w10 * (float)((t10 >> (i * 8)) & 0xFF)
                       + w01 * (float)((t01 >> (i * 8)) & 0xFF)
                       + w11 * (float)((t11 >> (i * 8)) & 0xFF);
-        const int q = (int)(s + 0.5f);
+        /* Truncated, not rounded. gpu/filtering/precisionlinear2d blends 00
+         * and ff one sixteenth of the way across and hardware answers 0f, not
+         * the 10 that rounding gives; at the halfway point it answers 7f, not
+         * 80. Every one of this test's 35 remaining value differences was this
+         * half-step. */
+        const int q = (int)s;
         out |= (uint32_t)(q < 0 ? 0 : (q > 255 ? 255 : q)) << (i * 8);
     }
     return out;
@@ -543,8 +580,8 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
  * is the same substitution: the hardware rasterizes at sixteenths, so SUBPX 16
  * with positions snapped to 28.4 turns this function into that one without
  * touching its structure. */
-#define SUBPX      2
-#define SUBPX_HALF 1
+#define SUBPX      PSP_SUBPX
+#define SUBPX_HALF (PSP_SUBPX / 2)
 
 /* A directed edge owns the pixels lying exactly on it if it is a top or a left
  * edge of the triangle. Screen y grows downward, and the caller has normalised
@@ -571,19 +608,25 @@ static int edge_is_top_left(int64_t dx, int64_t dy) {
  * interpolating at the centre would let the weights go slightly negative on a
  * silhouette pixel, running u and v up to half a texel past the geometry. */
 static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c) {
+    /* Positions arrive in 1/16 pixel; the pixel box that can contain a centre
+     * inside them is floor(min/16) .. floor((max + 15)/16), and the shifts
+     * floor for negatives where a division would not. */
     int minx = a->x < b->x ? (a->x < c->x ? a->x : c->x) : (b->x < c->x ? b->x : c->x);
     int maxx = a->x > b->x ? (a->x > c->x ? a->x : c->x) : (b->x > c->x ? b->x : c->x);
     int miny = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
     int maxy = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
+    minx >>= 4; miny >>= 4;
+    maxx = (maxx + 15) >> 4; maxy = (maxy + 15) >> 4;
 
     if (minx < 0) minx = 0;
     if (miny < 0) miny = 0;
     if (maxx > 479) maxx = 479;
     if (maxy > 271) maxy = 271;
 
-    /* 64-bit because through-mode positions are s16: a coordinate difference
-     * reaches 65535 and the product 2.2e9, which overflowed the int this used
-     * and inverted coverage for the whole triangle. */
+    /* 64-bit because through-mode positions are s16 in 1/16 units: a
+     * coordinate difference reaches a million and the product 1e12, which
+     * overflowed the int this used and inverted coverage for the whole
+     * triangle. */
     int64_t area = (int64_t)(b->x - a->x) * (c->y - a->y)
                  - (int64_t)(b->y - a->y) * (c->x - a->x);
     if (area == 0) return;
@@ -607,16 +650,15 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     const int64_t bias1 = edge_is_top_left(d1x, d1y) ? 0 : -1;
     const int64_t bias2 = edge_is_top_left(d2x, d2y) ? 0 : -1;
 
-    /* The three edge functions at the centre of the first pixel, scaled by
-     * SUBPX. They still sum to SUBPX * area, so they are still the barycentric
-     * numerators -- only the denominator changes. Stepping them by their own
-     * derivatives keeps every value exact and takes the six multiplies out of
-     * the inner loop. */
+    /* The three edge functions at the centre of the first pixel, in the same
+     * 1/16 units the positions came in. They sum to area, so they are the
+     * barycentric numerators. Stepping them by their own derivatives keeps
+     * every value exact and takes the six multiplies out of the inner loop. */
     const int64_t px = (int64_t)SUBPX * minx + SUBPX_HALF;
     const int64_t py = (int64_t)SUBPX * miny + SUBPX_HALF;
-    int64_t row0 = d0x * (py - (int64_t)SUBPX * c->y) - d0y * (px - (int64_t)SUBPX * c->x);
-    int64_t row1 = d1x * (py - (int64_t)SUBPX * a->y) - d1y * (px - (int64_t)SUBPX * a->x);
-    int64_t row2 = d2x * (py - (int64_t)SUBPX * b->y) - d2y * (px - (int64_t)SUBPX * b->x);
+    int64_t row0 = d0x * (py - c->y) - d0y * (px - c->x);
+    int64_t row1 = d1x * (py - a->y) - d1y * (px - a->x);
+    int64_t row2 = d2x * (py - b->y) - d2y * (px - b->x);
 
     /* The edge functions are already the barycentric numerators, so colour,
      * depth and texture coordinates come out of the same three values the
@@ -628,7 +670,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * Interpolation is affine, not perspective-correct: there is no w here to
      * divide by. On a fullscreen quad that is exact, and on a steeply oblique
      * one it skews the texture. */
-    const float inv = 1.0f / (float)((int64_t)SUBPX * area);
+    const float inv = 1.0f / (float)area;
     const int textured = texture_usable();
     const int linear = textured && filter_is_linear();
 
@@ -673,9 +715,18 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
  * perspective. The colour comes from the second vertex, which is where the GE
  * takes it from. */
 static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
+    /* Corners in 1/16 pixel. A pixel is covered when its centre, 16*i + 8,
+     * lies in [x0, x1): the first such pixel is ceil((x0 - 8) / 16) and the
+     * one past the last is ceil((x1 - 8) / 16), both written as (v + 7) >> 4
+     * so that negative corners floor rather than round toward zero. This is
+     * what puts gpu/filtering's sprite at x = -1/16 onto pixels 0 and 1. */
     const int x0 = a->x < b->x ? a->x : b->x, x1 = a->x > b->x ? a->x : b->x;
     const int y0 = a->y < b->y ? a->y : b->y, y1 = a->y > b->y ? a->y : b->y;
     if (x1 <= x0 || y1 <= y0) return;
+    int px0 = (x0 + 7) >> 4, px1 = (x1 + 7) >> 4;
+    int py0 = (y0 + 7) >> 4, py1 = (y1 + 7) >> 4;
+    if (px0 < 0) px0 = 0; if (py0 < 0) py0 = 0;
+    if (px1 > 480) px1 = 480; if (py1 > 272) py1 = 272;
 
     const int textured = texture_usable();
     const int linear = textured && filter_is_linear();
@@ -697,16 +748,16 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
     const float du = (b->u - a->u) / (float)(transposed ? (b->y - a->y) : (b->x - a->x));
     const float dv = (b->v - a->v) / (float)(transposed ? (b->x - a->x) : (b->y - a->y));
 
-    for (int y = y0; y < y1; y++) {
-        /* Pixel centres, for the same reason sw_tri uses them: at 1:1 a corner
-         * lands exactly on a texel boundary and the rounding decides which side
-         * of it to read. */
-        const float ty = (float)y + 0.5f - (float)a->y;
+    for (int y = py0; y < py1; y++) {
+        /* Pixel centres, in 1/16 units, against the exact corner: at 1:1 a
+         * corner lands exactly on a texel boundary and the rounding decides
+         * which side of it to read. */
+        const float ty = (float)(y * SUBPX + SUBPX_HALF - a->y);
         const float tv_row = transposed ? 0.0f : a->v + dv * ty;
         const float tu_row = transposed ? a->u + du * ty : 0.0f;
-        for (int x = x0; x < x1; x++) {
+        for (int x = px0; x < px1; x++) {
             if (!textured) { g_px_flat++; shade_pixel(x, y, a->z, b->rgba); continue; }
-            const float tx = (float)x + 0.5f - (float)a->x;
+            const float tx = (float)(x * SUBPX + SUBPX_HALF - a->x);
             const float tu = transposed ? tu_row : a->u + du * tx;
             const float tv = transposed ? a->v + dv * tx : tv_row;
             g_px_tex++;
