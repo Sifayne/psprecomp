@@ -9,6 +9,7 @@
  * game's.
  */
 
+#include <math.h>
 #include "psprecomp/render.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/os.h"
@@ -45,10 +46,37 @@ void     psp_render_reset_pixels(void) {
 static int sw_init(int w, int h) { (void)w; (void)h; return 0; }
 static void sw_shutdown(void) { }
 
+/* The scissor, inclusive corners; the raster bound everywhere below. */
+static int g_sc_x0 = 0, g_sc_y0 = 0, g_sc_x1 = 479, g_sc_y1 = 271;
+enum { DEPTH_STRIDE = 512, DEPTH_ROWS = 272 };
+
+static void sw_scissor(int x0, int y0, int x1, int y1) {
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > DEPTH_STRIDE - 1) x1 = DEPTH_STRIDE - 1;
+    if (y1 > DEPTH_ROWS - 1)   y1 = DEPTH_ROWS - 1;
+    g_sc_x0 = x0; g_sc_y0 = y0; g_sc_x1 = x1; g_sc_y1 = y1;
+}
+
+/* FRAMEBUF_PIX_FORMAT (0xD2): 0 5650, 1 5551, 2 4444, 3 8888. Until this
+ * was honoured every target was written as 8888 -- four bytes a pixel into a
+ * buffer laid out for two -- so a scene rendered into a 16-bit target and
+ * read back as a texture came back as noise. */
+static int g_fb_fmt = 3;
+
 static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
-    (void)fmt;
     g_fb_addr = addr;
     g_fb_stride = stride;
+    g_fb_fmt = fmt & 3;
+}
+
+static uint32_t pack16(uint32_t rgba, int fmt) {
+    const uint32_t r = rgba & 0xFF, g = (rgba >> 8) & 0xFF, b = (rgba >> 16) & 0xFF, a = rgba >> 24;
+    switch (fmt) {
+    case 0:  return (r >> 3) | ((g >> 2) << 5) | ((b >> 3) << 11);
+    case 1:  return (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >> 7) << 15);
+    default: return (r >> 4) | ((g >> 4) << 4) | ((b >> 4) << 8) | ((a >> 4) << 12);
+    }
 }
 
 /* ---- texture sampling -----------------------------------------------------
@@ -293,23 +321,6 @@ static void dump_texture(void) {
 
 uint64_t psp_render_filter_split(void) { return g_filter_split; }
 
-static int filter_is_linear(void) {
-    /* Magnification, unconditionally. Choosing properly needs the
-     * pixel-to-texel scale, which needs derivatives this rasterizer does not
-     * compute, and there would be no mip chain to select from if it did. Mag is
-     * the honest default -- it is the one that applies at the scale a UI layer
-     * draws at, and it is what a scale factor of 1 selects anyway.
-     *
-     * The counter asks whether that choice ever *matters*, which is not the
-     * same as whether the two fields differ. This game sets min 5 and mag 1 --
-     * different values that both mean linear within the level -- so comparing
-     * them raw would fire on every primitive and measure nothing. Comparing the
-     * bit that selects the filter is the question actually being asked, and a
-     * non-zero count is the evidence that a per-primitive scale factor is worth
-     * the division it would cost. */
-    if ((g_tex.min_filter & 1) != (g_tex.mag_filter & 1)) g_filter_split++;
-    return g_tex.mag_filter & 1;
-}
 
 /* Bilinear, with the half-texel that makes it agree with nearest at 1:1.
  *
@@ -379,6 +390,69 @@ static uint32_t sample_filtered(float u, float v, int linear) {
     return linear ? sample_bilinear(u, v) : sample_texel(ifloor(u), ifloor(v));
 }
 
+/* Mipmapping, to gpu/textures/mipmap's numbers.
+ *
+ * The level of detail is a count of sixteenths. In AUTO mode it is log2 of
+ * the texel-per-pixel ratio -- the larger of the two axes: the test's
+ * "Minify 4x W", which shrinks only the width, lands on level 2 -- plus the
+ * bias; CONST is the bias alone; SLOPE is the slope register plus the bias
+ * (the test sets a slope of 2.0 and reads level 2 with no bias, which this
+ * fits and log2 would not); the undefined mode 3 measures exactly like
+ * CONST. The level is the floor, capped at TEX_MODE's top
+ * level, and below zero is zero. With a mip-linear minification filter the
+ * next level is blended in by the fraction, exact to the sixteenth: bias
+ * +07 at 1:1 reads 07 between levels coloured 00 and 10, and +87 (-7 9/16)
+ * at 256x reads 07 again. A filter without mipmapping stays on level 0
+ * whatever the ratio. Mip-nearest's rounding is not measured by the test as
+ * built -- it was compiled with the linear variant -- so it rounds half up.
+ *
+ * The level is chosen once per primitive, from the primitive's own texture
+ * gradient, not per pixel. Within a level the filter is the min filter when
+ * minifying and the mag filter when magnifying. */
+static int lod_sixteenths(float rho) {
+    int lod;
+    switch (g_tex.lod_mode) {
+    case 0:  lod = (rho > 0.0f) ? (int)floorf(log2f(rho) * 16.0f) : -4096; break;
+    case 2:  lod = (int)floorf(g_tex.lod_slope * 16.0f); break;
+    default: lod = 0; break;   /* CONST; and the undefined mode 3 measures the same */
+    }
+    return lod + g_tex.lod_bias16;
+}
+
+static uint32_t sample_level(float u, float v, int L, int linear) {
+    const uint32_t a = g_tex.addr, s = g_tex.stride; const int w = g_tex.w, h = g_tex.h;
+    g_tex.addr = g_tex.lv_addr[L]; g_tex.stride = g_tex.lv_stride[L];
+    g_tex.w = g_tex.lv_w[L] > 0 ? g_tex.lv_w[L] : 1;
+    g_tex.h = g_tex.lv_h[L] > 0 ? g_tex.lv_h[L] : 1;
+    const float su = (float)g_tex.w / (float)(w > 0 ? w : 1);
+    const float sv = (float)g_tex.h / (float)(h > 0 ? h : 1);
+    const uint32_t c = sample_filtered(u * su, v * sv, linear);
+    g_tex.addr = a; g_tex.stride = s; g_tex.w = w; g_tex.h = h;
+    return c;
+}
+
+static uint32_t sample_mip(float u, float v, int lod16) {
+    const int minifying = lod16 > 0;
+    const int linear = (minifying ? g_tex.min_filter : g_tex.mag_filter) & 1;
+    if (g_tex.min_filter < 4 || g_tex.max_level <= 0) return sample_filtered(u, v, linear);
+
+    const int top = g_tex.max_level > 7 ? 7 : g_tex.max_level;
+    if (lod16 < 0) lod16 = 0;
+    if (lod16 > top * 16) lod16 = top * 16;
+    if (!(g_tex.min_filter & 2)) return sample_level(u, v, (lod16 + 8) >> 4 > top ? top : (lod16 + 8) >> 4, linear);
+
+    const int L = lod16 >> 4, f = lod16 & 15;
+    const uint32_t c0 = sample_level(u, v, L, linear);
+    if (f == 0 || L >= top) return c0;
+    const uint32_t c1 = sample_level(u, v, L + 1, linear);
+    uint32_t out = 0;
+    for (int i = 0; i < 4; i++) {
+        const int a = (int)((c0 >> (i * 8)) & 0xFF), b = (int)((c1 >> (i * 8)) & 0xFF);
+        out |= (uint32_t)(a + ((b - a) * f) / 16) << (i * 8);
+    }
+    return out;
+}
+
 static uint32_t chan(uint32_t c, int i);
 static psp_blend_state g_bs;
 
@@ -423,7 +497,12 @@ static uint32_t apply_texfunc(uint32_t tex, uint32_t col) {
  * modelled), writes it. */
 static void put_pixel(int x, int y, uint32_t rgba) {
     if (!g_fb_addr || !g_fb_stride) return;
-    if (x < 0 || y < 0 || x >= 480 || y >= 272) return;
+    if (x < g_sc_x0 || y < g_sc_y0 || x > g_sc_x1 || y > g_sc_y1) return;
+    if (g_fb_fmt != 3) {
+        psp_write16(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2, (uint16_t)pack16(rgba, g_fb_fmt));
+        g_pixels++;
+        return;
+    }
     const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4;
     if (!g_bs.write_alpha) rgba = (rgba & 0x00FFFFFFu) | (psp_read32(at) & 0xFF000000u);
     psp_write32(at, rgba);
@@ -453,7 +532,7 @@ static void put_pixel(int x, int y, uint32_t rgba) {
  * claim about hardware; a LEQUAL title needs the other end and will need this
  * revisited. */
 #define DEPTH_RESET 0.0f
-static float g_depth[480 * 272];
+static float g_depth[DEPTH_STRIDE * DEPTH_ROWS];
 static struct { int test, func, write; } g_zs = { 0, 1 /* always */, 0 };
 
 static void sw_depth(int test_enable, int func, int write_enable) {
@@ -468,14 +547,14 @@ static void sw_depth(int test_enable, int func, int write_enable) {
  * the reset there would reproduce the bug this replaces, where the only call to
  * the depth clear sat in an unwired vtable slot. */
 void psp_render_reset_depth(void) {
-    for (int i = 0; i < 480 * 272; i++) g_depth[i] = DEPTH_RESET;
+    for (int i = 0; i < DEPTH_STRIDE * DEPTH_ROWS; i++) g_depth[i] = DEPTH_RESET;
 }
 
 /* GE comparison codes: 0 never, 1 always, 2 equal, 3 notequal, 4 less,
  * 5 lequal, 6 greater, 7 gequal. */
 static int depth_pass(int x, int y, float z) {
     if (!g_zs.test) return 1;
-    const float d = g_depth[y * 480 + x];
+    const float d = g_depth[y * DEPTH_STRIDE + x];
     switch (g_zs.func) {
     case 0: return 0;
     case 2: return z == d;
@@ -560,16 +639,48 @@ static int alpha_pass(uint32_t rgba) {
 
 static uint32_t get_pixel(int x, int y) {
     if (!g_fb_addr || !g_fb_stride) return 0;
+    if (g_fb_fmt != 3)
+        return expand16((uint32_t)psp_read16(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2), g_fb_fmt);
     return psp_read32(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4);
 }
 
+/* PSPRECOMP_PIXWATCH=x,y logs every write to one pixel: the colour that
+ * arrived, what it became, and the texture bound at the time. "Which draw
+ * painted this?" is the question a wrong pixel raises, and the draw log
+ * answers it only by elimination. */
+static int g_pw_x = -1, g_pw_y = -1, g_pw_left = 64, g_pw_skip = 0;
+static int g_cur_prim = -1;   /* what sw_draw is drawing, for the watch */
+static void pixwatch_init(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    const char *e = getenv("PSPRECOMP_PIXWATCH");
+    if (e && *e && sscanf(e, "%d,%d", &g_pw_x, &g_pw_y) != 2) g_pw_x = g_pw_y = -1;
+    /* PSPRECOMP_PIXWATCH_SKIP=<n> skips the first n writes, so the watch can
+     * be aimed at the end of a run like the draw log. */
+    const char *k = getenv("PSPRECOMP_PIXWATCH_SKIP");
+    g_pw_skip = (k && *k) ? atoi(k) : 0;
+    const char *m = getenv("PSPRECOMP_PIXWATCH_MAX");
+    if (m && *m) g_pw_left = atoi(m);
+}
+
 static void shade_pixel(int x, int y, float z, uint32_t rgba) {
-    if (x < 0 || y < 0 || x >= 480 || y >= 272) return;
+    if (x < g_sc_x0 || y < g_sc_y0 || x > g_sc_x1 || y > g_sc_y1) return;
+    pixwatch_init();
+    int watched = (x == g_pw_x && y == g_pw_y && g_pw_left > 0);
+    if (watched && g_pw_skip > 0) { g_pw_skip--; watched = 0; }
+    const uint32_t arrived = rgba;
     if (!alpha_pass(rgba)) { g_px_atest++; return; }
     if (!depth_pass(x, y, z)) { g_px_zfail++; return; }
-    if (g_zs.write) g_depth[y * 480 + x] = z;
+    if (g_zs.write) g_depth[y * DEPTH_STRIDE + x] = z;
     if (!g_bs.write_colour) return;
     if (g_bs.enable) { rgba = blend(rgba, get_pixel(x, y)); g_px_blend++; }
+    if (watched) {
+        g_pw_left--;
+        fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d arrived %08X wrote %08X  z %.0f  blend %d src %d dst %d eq %d fix %06X/%06X  tex %08X %dx%d fmt %d func %d tcc %d  pixels so far %llu\n",
+                x, y, g_fb_addr, g_cur_prim, arrived, rgba, (double)z, g_bs.enable, g_bs.src, g_bs.dst, g_bs.eq, g_bs.fixa, g_bs.fixb,
+                g_tex.addr, g_tex.w, g_tex.h, g_tex.fmt, g_tex.func, g_tex.tcc_rgba, (unsigned long long)g_pixels);
+    }
     put_pixel(x, y, rgba);
 }
 
@@ -618,10 +729,10 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     minx >>= 4; miny >>= 4;
     maxx = (maxx + 15) >> 4; maxy = (maxy + 15) >> 4;
 
-    if (minx < 0) minx = 0;
-    if (miny < 0) miny = 0;
-    if (maxx > 479) maxx = 479;
-    if (maxy > 271) maxy = 271;
+    if (minx < g_sc_x0) minx = g_sc_x0;
+    if (miny < g_sc_y0) miny = g_sc_y0;
+    if (maxx > g_sc_x1) maxx = g_sc_x1;
+    if (maxy > g_sc_y1) maxy = g_sc_y1;
 
     /* 64-bit because through-mode positions are s16 in 1/16 units: a
      * coordinate difference reaches a million and the product 1e12, which
@@ -672,7 +783,21 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * one it skews the texture. */
     const float inv = 1.0f / (float)area;
     const int textured = texture_usable();
-    const int linear = textured && filter_is_linear();
+    int lod16 = 0;
+    if (textured) {
+        /* The texture gradient across the triangle: solve the affine map from
+         * pixels to texels on the two edges from a. */
+        const float e1x = (float)(b->x - a->x) / 16.0f, e1y = (float)(b->y - a->y) / 16.0f;
+        const float e2x = (float)(c->x - a->x) / 16.0f, e2y = (float)(c->y - a->y) / 16.0f;
+        const float det = e1x * e2y - e1y * e2x;
+        if (det != 0.0f) {
+            const float du1 = b->u - a->u, du2 = c->u - a->u, dv1 = b->v - a->v, dv2 = c->v - a->v;
+            const float dudx = (du1 * e2y - du2 * e1y) / det, dudy = (du2 * e1x - du1 * e2x) / det;
+            const float dvdx = (dv1 * e2y - dv2 * e1y) / det, dvdy = (dv2 * e1x - dv1 * e2x) / det;
+            const float rx = sqrtf(dudx * dudx + dvdx * dvdx), ry = sqrtf(dudy * dudy + dvdy * dvdy);
+            lod16 = lod_sixteenths(rx > ry ? rx : ry);
+        }
+    }
 
     for (int y = miny; y <= maxy; y++) {
         int64_t w0 = row0, w1 = row1, w2 = row2;
@@ -696,7 +821,16 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                 if (textured) {
                     const float u = l0 * a->u + l1 * b->u + l2 * c->u;
                     const float v = l0 * a->v + l1 * b->v + l2 * c->v;
-                    col = apply_texfunc(sample_filtered(u, v, linear), col);
+                    const uint32_t texel = sample_mip(u, v, lod16);
+                    /* The watched pixel's two inputs, separately: which of the
+                     * texel and the shaded vertex colour is the dark one is
+                     * not a question the final colour can answer. */
+                    if (x == g_pw_x && y == g_pw_y)
+                        fprintf(stderr, "pixsrc: (%d,%d) vcol %08X texel %08X uv %.1f,%.1f "
+                                        "func %d tcc %d tex %08X %dx%d fmt %d lod %d\n",
+                                x, y, col, texel, (double)u, (double)v, g_tex.func,
+                                g_tex.tcc_rgba, g_tex.addr, g_tex.w, g_tex.h, g_tex.fmt, lod16);
+                    col = apply_texfunc(texel, col);
                     g_px_tex++;
                 } else g_px_flat++;
                 shade_pixel(x, y, z, col);
@@ -725,11 +859,12 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
     if (x1 <= x0 || y1 <= y0) return;
     int px0 = (x0 + 7) >> 4, px1 = (x1 + 7) >> 4;
     int py0 = (y0 + 7) >> 4, py1 = (y1 + 7) >> 4;
-    if (px0 < 0) px0 = 0; if (py0 < 0) py0 = 0;
-    if (px1 > 480) px1 = 480; if (py1 > 272) py1 = 272;
+    if (px0 < g_sc_x0) px0 = g_sc_x0;
+    if (py0 < g_sc_y0) py0 = g_sc_y0;
+    if (px1 > g_sc_x1 + 1) px1 = g_sc_x1 + 1;
+    if (py1 > g_sc_y1 + 1) py1 = g_sc_y1 + 1;
 
     const int textured = texture_usable();
-    const int linear = textured && filter_is_linear();
     /* Against the vertices as submitted, not against the sorted corners. The
      * ramp used to be built from x1 - x0, which is positive by construction, so
      * a sprite whose second corner is left of or above its first mapped its
@@ -747,6 +882,12 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
     const int transposed = (b->x < a->x) != (b->y < a->y);
     const float du = (b->u - a->u) / (float)(transposed ? (b->y - a->y) : (b->x - a->x));
     const float dv = (b->v - a->v) / (float)(transposed ? (b->x - a->x) : (b->y - a->y));
+    /* du and dv are texels per sixteenth of a pixel. */
+    int lod16 = 0;
+    if (textured) {
+        const float rx = fabsf(du) * 16.0f, ry = fabsf(dv) * 16.0f;
+        lod16 = lod_sixteenths(rx > ry ? rx : ry);
+    }
 
     for (int y = py0; y < py1; y++) {
         /* Pixel centres, in 1/16 units, against the exact corner: at 1:1 a
@@ -762,7 +903,7 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
             const float tv = transposed ? a->v + dv * tx : tv_row;
             g_px_tex++;
             shade_pixel(x, y, a->z,
-                        apply_texfunc(sample_filtered(tu, tv, linear), b->rgba));
+                        apply_texfunc(sample_mip(tu, tv, lod16), b->rgba));
         }
     }
 }
@@ -787,6 +928,7 @@ static uint64_t now_ns(void) { return psp_os_mono_ns(); }
 uint64_t psp_render_raster_ns(void) { return g_raster_ns; }
 
 static void sw_draw(int prim, const psp_vertex *v, int count) {
+    g_cur_prim = prim;
     const uint64_t t0 = now_ns();
     switch (prim) {
     case PSP_PRIM_SPRITES:
@@ -821,6 +963,7 @@ const psp_render_backend psp_render_software = {
     .init        = sw_init,
     .shutdown    = sw_shutdown,
     .set_target  = sw_target,
+    .set_scissor = sw_scissor,
     .set_texture = sw_texture,
     .set_clut    = sw_clut,
     .set_depth   = sw_depth,
@@ -838,6 +981,7 @@ const psp_render_backend psp_render_software = {
 
 static int null_init(int w, int h) { (void)w; (void)h; return 0; }
 static void null_target(uint32_t a, uint32_t s, int f) { (void)a; (void)s; (void)f; }
+static void null_scissor(int a, int b, int c, int d) { (void)a; (void)b; (void)c; (void)d; }
 static void null_texture(const psp_tex_state *t) { (void)t; }
 static void null_clut(uint32_t a, int f, int s, int m, int st) {
     (void)a; (void)f; (void)s; (void)m; (void)st;
@@ -852,6 +996,7 @@ const psp_render_backend psp_render_null = {
     .init        = null_init,
     .shutdown    = null_noop,
     .set_target  = null_target,
+    .set_scissor = null_scissor,
     .set_texture = null_texture,
     .set_clut    = null_clut,
     .set_depth   = null_depth,

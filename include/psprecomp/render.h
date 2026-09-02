@@ -68,6 +68,19 @@ typedef struct {
      * Half" saturates, and every line keeps the vertex alpha under RGB. */
     int      tcc_rgba, color_double;
     uint32_t env;
+
+    /* The mip chain. Level 0 repeats addr/stride/w/h; levels 1..7 come from
+     * TEX_ADDR/BUF_WIDTH/SIZE 1..7 and are only meaningful up to max_level,
+     * TEX_MODE's bits 16..18. lod_mode and lod_bias16 are TEX_LEVEL (0xC8):
+     * mode 0 computes the level from the texel-per-pixel ratio, 1 takes the
+     * bias alone, 2 the slope register (0xD0) plus the bias; the bias is a
+     * signed count of sixteenths. Rules and numbers: gpu/textures/mipmap. */
+    uint32_t lv_addr[8], lv_stride[8];
+    int      lv_w[8], lv_h[8];
+    int      max_level;
+    int      lod_mode;
+    int      lod_bias16;
+    float    lod_slope;
 } psp_tex_state;
 
 /* Blend and alpha-test state, as the GE encodes it. Factors and the equation
@@ -107,6 +120,15 @@ typedef struct {
 
     /* GE_FBP / GE_FBW: the framebuffer being drawn into. */
     void (*set_target)(uint32_t addr, uint32_t stride, int fmt);
+
+    /* SCISSOR1 / SCISSOR2: the pixel rectangle draws are confined to, both
+     * corners inclusive. On the PSP the scissor is always in force -- the GU
+     * library's "disable" sets it to the whole target -- so the rasterizer's
+     * bounds are this rectangle and nothing else. Before it was decoded the
+     * bounds were a hardcoded 480x272, and gpu/clipping/homogeneous, which
+     * draws into a 512-wide target with a 512-wide scissor, lost its last 32
+     * columns. */
+    void (*set_scissor)(int x0, int y0, int x1, int y1);
 
     /* The texture to sample, or addr 0 for none. */
     void (*set_texture)(const psp_tex_state *t);
