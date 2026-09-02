@@ -387,8 +387,38 @@ static void pad_press_step(uint64_t us) {
     }
 }
 
+/* The controller is sampled once per vblank, and Read is the call that waits
+ * for a sample it has not already been given. That is the whole difference
+ * between Read and Peek, and it is measurable: ctrl/ctrl times five calls of
+ * each and asks whether more than 5000us went by. Five reads span four vblanks
+ * -- about 67ms -- so hardware answers 1, 0, 1 for Read, ReadLatch and Peek.
+ *
+ * Waiting unconditionally would be wrong in the direction that matters most. A
+ * frame loop is `WaitVblank(); ReadBufferPositive();`, and the sample it wants
+ * arrived at the vblank it just waited out -- charging it another frame would
+ * halve the frame rate of every game that reads the pad. So what is tracked is
+ * when the *next* unread sample appears: a read that has one takes it and does
+ * not wait.
+ *
+ * `g_sample_due` starts at zero, which is "a sample is available now" -- the
+ * first read of a run does not wait, because the pad has a position before
+ * anyone asks. */
+static uint64_t g_sample_due;
+
+static void ctrl_wait_sample(void) {
+    const uint64_t now = psp_clock_peek();
+    if (now < g_sample_due) {
+        psp_sched_delay(g_sample_due - now);
+        /* As in hle_WaitVblank: with threading off nothing parks, and the
+         * sample still has to become due. Monotonic, so it is a no-op when the
+         * wait already arrived. */
+        psp_clock_advance_to(g_sample_due);
+    }
+    g_sample_due = psp_clock_next_frame();
+}
+
 /* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16. */
-static void hle_ReadBufferPositive(void) {
+static void ctrl_fill(void) {
     const uint64_t us = psp_clock_peek();
     g_ctrl_polls++;
     pad_press_step(us);
@@ -420,6 +450,9 @@ static void hle_ReadBufferPositive(void) {
     }
     psp_ret(count);
 }
+
+static void hle_ReadBufferPositive(void) { ctrl_wait_sample(); ctrl_fill(); }
+static void hle_PeekBufferPositive(void) { ctrl_fill(); }
 
 /* ---- sceRtc, the two calls that are a clock ------------------------------
  *
@@ -627,9 +660,9 @@ void psp_misc_register(void) {
     psp_hle_register(0x1F4011E6, "sceCtrl", "sceCtrlSetSamplingMode",     hle_CtrlSet);
     psp_hle_register(0x6A2774F3, "sceCtrl", "sceCtrlSetSamplingCycle",    hle_CtrlSet);
     psp_hle_register(0x1F803938, "sceCtrl", "sceCtrlReadBufferPositive",  hle_ReadBufferPositive);
-    /* Peek differs only in not waiting for the next sample. Nothing samples
-     * here, so the two are the same call. */
-    psp_hle_register(0x3A622550, "sceCtrl", "sceCtrlPeekBufferPositive",  hle_ReadBufferPositive);
+    /* Peek differs in not waiting for the next sample, which is a real
+     * difference now that the vblank grid exists to sample against. */
+    psp_hle_register(0x3A622550, "sceCtrl", "sceCtrlPeekBufferPositive",  hle_PeekBufferPositive);
 
     psp_hle_register(0x3F7AD767, "sceRtc", "sceRtcGetCurrentTick",         hle_RtcGetCurrentTick);
     psp_hle_register(0xC41C2853, "sceRtc", "sceRtcGetTickResolution",      hle_RtcGetTickResolution);
