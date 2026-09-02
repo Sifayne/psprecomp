@@ -87,7 +87,11 @@ static void vertex(int idx, int x, int y, uint32_t rgba) {
 }
 
 static uint32_t pixel(int x, int y) {
-    return psp_read32(FB + (uint32_t)(y * 480 + x) * 4);
+    /* Colour only. The framebuffer's alpha byte is the stencil buffer and an
+     * ordinary draw does not write it -- gpu/texfunc reads 44ffffff back from
+     * a 44444444 fill after every draw -- so what a draw is judged on here is
+     * the three channels it does write. */
+    return psp_read32(FB + (uint32_t)(y * 480 + x) * 4) & 0x00FFFFFFu;
 }
 
 static void clear_fb(void) {
@@ -108,7 +112,7 @@ static void test_sprite(void) {
 
     CHECK(psp_ge_pixels() == 100 * 100, "sprite pixel count: %llu (want 10000)",
           (unsigned long long)psp_ge_pixels());
-    CHECK(pixel(150, 100) == 0xFF0000FFu, "sprite interior: 0x%08X", pixel(150, 100));
+    CHECK(pixel(150, 100) == 0x000000FFu, "sprite interior: 0x%08X", pixel(150, 100));
     CHECK(pixel(99, 100) == 0, "left of sprite should be untouched: 0x%08X", pixel(99, 100));
     CHECK(pixel(150, 49) == 0, "above sprite should be untouched: 0x%08X", pixel(150, 49));
     /* Half-open on the far edge, so adjacent sprites tile without overlapping. */
@@ -127,7 +131,7 @@ static void test_triangle(void) {
 
     CHECK(psp_ge_pixels() > 4000, "triangle should cover ~5000 px, got %llu",
           (unsigned long long)psp_ge_pixels());
-    CHECK(pixel(20, 20) == 0xFF00FF00u, "inside triangle: 0x%08X", pixel(20, 20));
+    CHECK(pixel(20, 20) == 0x0000FF00u, "inside triangle: 0x%08X", pixel(20, 20));
     /* The hypotenuse runs from (110,10) to (10,110); (100,100) is well past it. */
     CHECK(pixel(100, 100) == 0, "outside hypotenuse: 0x%08X", pixel(100, 100));
 }
@@ -143,7 +147,7 @@ static void test_winding(void) {
     vertex(2, 110, 10, 0xFFFFFFFFu);
     cmd(0x04, (3u << 16) | 3);
     end_list();
-    CHECK(pixel(20, 20) == 0xFFFFFFFFu, "reversed winding still fills: 0x%08X",
+    CHECK(pixel(20, 20) == 0x00FFFFFFu, "reversed winding still fills: 0x%08X",
           pixel(20, 20));
 }
 
@@ -160,7 +164,7 @@ static void test_clipping(void) {
 
     CHECK(psp_ge_pixels() == 50 * 50, "clipped sprite: %llu (want 2500)",
           (unsigned long long)psp_ge_pixels());
-    CHECK(pixel(0, 0) == 0xFFFF0000u, "clipped sprite covers origin");
+    CHECK(pixel(0, 0) == 0x00FF0000u, "clipped sprite covers origin");
     CHECK(pixel(479, 271) == 0, "far corner untouched: 0x%08X", pixel(479, 271));
 }
 
@@ -196,8 +200,8 @@ static void test_triangle_strip(void) {
     end_list();
 
     /* Two triangles sharing an edge tile the square without a seam. */
-    CHECK(pixel(20, 20) == 0xFFFFFFFFu, "strip tri 0: 0x%08X", pixel(20, 20));
-    CHECK(pixel(100, 100) == 0xFFFFFFFFu, "strip tri 1: 0x%08X", pixel(100, 100));
+    CHECK(pixel(20, 20) == 0x00FFFFFFu, "strip tri 0: 0x%08X", pixel(20, 20));
+    CHECK(pixel(100, 100) == 0x00FFFFFFu, "strip tri 1: 0x%08X", pixel(100, 100));
 }
 
 /* ---- texturing -----------------------------------------------------------
@@ -242,7 +246,7 @@ static void upload_ramp_texture(int w, int h) {
 }
 
 static uint32_t ramp_texel(int u, int v) {
-    return 0xFF000000u | ((uint32_t)v << 8) | (uint32_t)u;
+    return 0x00000000u | ((uint32_t)v << 8) | (uint32_t)u;
 }
 
 /* TEXSIZE takes log2 of each dimension. The texture address arrives split
@@ -448,7 +452,7 @@ static void test_texture_wrap(void) {
  * `lo` and `hi` are the two texels; the caller says which channel to read back,
  * because the case that matters for this game is alpha rather than colour. */
 static void bilinear_row(uint32_t lo, uint32_t hi, int filter, int wrap_clamp,
-                         uint32_t out[4]) {
+                         int via_blend, uint32_t out[4]) {
     psp_ge_reset();
     clear_fb();
     psp_write32(TEX,     lo);
@@ -461,6 +465,18 @@ static void bilinear_row(uint32_t lo, uint32_t hi, int filter, int wrap_clamp,
     vertex_uv(1, 44, 30, 2, 0, 0xFFFFFFFFu);
     vertex_uv(2, 40, 34, 0, 1, 0xFFFFFFFFu);
     vertex_uv(3, 44, 34, 2, 1, 0xFFFFFFFFu);
+    /* The framebuffer's alpha byte is the stencil and an ordinary draw leaves
+     * it alone, so a sampled alpha cannot be read back directly. Blending the
+     * fragment over black by its own alpha puts that alpha in the colour:
+     * red = 255 * a / 255. Source SRC_ALPHA (2), destination
+     * ONE_MINUS_SRC_ALPHA (3), equation ADD (0), as the game itself blends. */
+    /* TEXFUNC modulate with the RGBA flag: the texture's alpha takes part. At
+     * the reset default (RGB) the fragment alpha is the vertex's, which is
+     * what hardware does -- gpu/texfunc's blended "(RGB)" lines -- and what
+     * a game undoes with sceGuTexFunc(..., GU_TCC_RGBA) before drawing an
+     * alpha-masked texture. */
+    cmd(0xC9, 1u << 8);
+    if (via_blend) { cmd(0x21, 1); cmd(0xDF, 2u | (3u << 4)); }
     cmd(0x04, (4u << 16) | 4);
     end_list();
 
@@ -471,7 +487,7 @@ static void test_texture_bilinear_midpoint(void) {
     uint32_t row[4];
 
     /* Colour first: black to red. Clamped at both ends, ramping between. */
-    bilinear_row(0xFF000000u, 0xFF0000FFu, 1, 1, row);
+    bilinear_row(0xFF000000u, 0xFF0000FFu, 1, 1, 0, row);
     static const uint32_t want_r[4] = { 0, 64, 191, 255 };
     for (int k = 0; k < 4; k++)
         CHECK((row[k] & 0xFF) == want_r[k],
@@ -481,11 +497,11 @@ static void test_texture_bilinear_midpoint(void) {
      * the mask entirely in alpha. Filtering RGB and taking alpha from one tap
      * passes the check above and fails this one, while leaving every glyph edge
      * exactly as hard as nearest. */
-    bilinear_row(0x00FFFFFFu, 0xFFFFFFFFu, 1, 1, row);
+    bilinear_row(0x00FFFFFFu, 0xFFFFFFFFu, 1, 1, 1, row);
     for (int k = 0; k < 4; k++)
-        CHECK(((row[k] >> 24) & 0xFF) == want_r[k],
-              "bilinear alpha at %d: got %u want %u",
-              k, (row[k] >> 24) & 0xFF, want_r[k]);
+        CHECK((row[k] & 0xFF) == want_r[k],
+              "bilinear alpha at %d (seen through the blend): got %u want %u",
+              k, row[k] & 0xFF, want_r[k]);
 }
 
 /* The filter state must be obeyed in both directions. Bilinear applied
@@ -493,7 +509,7 @@ static void test_texture_bilinear_midpoint(void) {
  * asked to be sharp. */
 static void test_texture_filter_is_honoured(void) {
     uint32_t row[4];
-    bilinear_row(0xFF000000u, 0xFF0000FFu, 0 /* nearest */, 1, row);
+    bilinear_row(0xFF000000u, 0xFF0000FFu, 0 /* nearest */, 1, 0, row);
     static const uint32_t want_r[4] = { 0, 0, 255, 255 };
     for (int k = 0; k < 4; k++)
         CHECK((row[k] & 0xFF) == want_r[k],
@@ -584,7 +600,7 @@ static void test_clear_mode_clears_depth(void) {
     vertex_z(1, 200, 150, 1000, 0xFF0000FFu);
     cmd(0x04, (6u << 16) | 2);
     end_list();
-    CHECK(pixel(150, 100) == 0xFF0000FFu, "z=1000 sprite should draw: 0x%08X",
+    CHECK(pixel(150, 100) == 0x000000FFu, "z=1000 sprite should draw: 0x%08X",
           pixel(150, 100));
 
     /* A full-screen clear-mode sprite: colour and depth, z = 0. */
@@ -597,7 +613,7 @@ static void test_clear_mode_clears_depth(void) {
     cmd(0x04, (6u << 16) | 2);
     cmd(CLEARMODE, 0);
     end_list();
-    CHECK(pixel(150, 100) == 0xFF000000u,
+    CHECK(pixel(150, 100) == 0x00000000u,
           "the clear should repaint over the sprite: 0x%08X", pixel(150, 100));
 
     /* Nearer than the buffer's cleared value, farther than what it held before
@@ -609,7 +625,7 @@ static void test_clear_mode_clears_depth(void) {
     vaddr_at(4);
     cmd(0x04, (6u << 16) | 2);
     end_list();
-    CHECK(pixel(150, 100) == 0xFF00FF00u,
+    CHECK(pixel(150, 100) == 0x0000FF00u,
           "z=500 after a depth clear should draw: 0x%08X", pixel(150, 100));
 }
 
@@ -635,7 +651,7 @@ static void test_depth_test_still_rejects(void) {
     cmd(0x04, (6u << 16) | 2);
     end_list();
 
-    CHECK(pixel(150, 100) == 0xFF0000FFu,
+    CHECK(pixel(150, 100) == 0x000000FFu,
           "z=500 behind z=1000 must be rejected under GEQUAL: 0x%08X",
           pixel(150, 100));
 }
@@ -663,7 +679,7 @@ static void test_ge_reset_clears_depth(void) {
     cmd(0x04, (6u << 16) | 2);
     end_list();
 
-    CHECK(pixel(150, 100) == 0xFF00FF00u,
+    CHECK(pixel(150, 100) == 0x0000FF00u,
           "depth must not survive psp_ge_reset: 0x%08X", pixel(150, 100));
 }
 

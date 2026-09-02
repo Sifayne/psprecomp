@@ -67,6 +67,7 @@
 #define GE_TEXFILTER    0xC6
 #define GE_TEXWRAP      0xC7
 #define GE_TEXFUNC      0xC9
+#define GE_TEXENVCOLOR  0xCA
 
 /* Block transfer -- how a game gets image data into VRAM. */
 /* Whether texturing applies at all. Distinct from whether a texture is bound:
@@ -197,7 +198,7 @@ static struct {
     float off_x, off_y;
     int   vp_set;
     int   cull_enable, cull_ccw;
-    int   ztest_enable, ztest_func, zwrite_off, clear_mode, clear_colour, clear_z;
+    int   ztest_enable, ztest_func, zwrite_off, clear_mode, clear_colour, clear_z, clear_stencil;
     psp_blend_state blend;
     /* Which matrices the stream actually uploaded, and where the result lands.
      * "Geometry is being transformed" and "transformed by the matrices the game
@@ -223,7 +224,7 @@ static struct {
     /* Texture state, recorded so the sampler can be built against what this
      * game uses rather than against the whole hardware surface. */
     uint32_t tex_addr, tex_stride, tex_w, tex_h, tex_enable;
-    uint32_t tex_format, tex_func, tex_filter, tex_wrap, tex_swizzled;
+    uint32_t tex_format, tex_func, tex_tcc, tex_double, tex_env, tex_filter, tex_wrap, tex_swizzled;
     uint32_t clut_addr, clut_format, clut_raw;
     uint32_t tex_formats_seen, tex_funcs_seen;
     uint32_t xfer_src, xfer_srcw, xfer_dst, xfer_dstw;
@@ -857,12 +858,15 @@ static void draw_prim(uint32_t type, uint32_t count) {
     int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off);
     if (!stride) { g_skip_layout += count; return; }
 
-    /* Bound only when *these* vertices carry coordinates to sample with. The
-     * texture state is global and outlives the draw that set it, so geometry
-     * with no texcoords would otherwise be painted with whatever texture was
-     * last bound, sampled at texel zero -- a whole screen of one colour, which
-     * looks like a working renderer having a bad day rather than like
-     * untextured geometry. */
+    /* Bound whenever texture mapping is enabled and a texture is set --
+     * whether or not these vertices carry coordinates. A previous version also
+     * required texcoords in the vertex type, reasoning that geometry without
+     * them would otherwise be painted with a stale texture sampled at texel
+     * zero. That is exactly what hardware does: gpu/texfunc draws sprites with
+     * GU_COLOR_8888 | GU_VERTEX_32BITF, no texcoords, over a solid 4x4
+     * texture, and reads the texture's colour back. read_uv_model already
+     * answers (0,0) for a vertex without them. A game that wants flat geometry
+     * disables texturing, and this one does. */
     /* The texture address is complete as decoded -- unlike FBP, which is a
      * VRAM offset with the base implied. A texture may legitimately live in
      * main RAM, and forcing it into the VRAM window would send those reads
@@ -870,7 +874,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
     g_ge.drawn_vtype = g_ge.vtype;
     g_ge.drawn_prims++;
 
-    const int has_uv = g_ge.tex_enable && tex_off >= 0 && g_ge.tex_addr;
+    const int has_uv = g_ge.tex_enable && g_ge.tex_addr;
     psp_render_current()->set_clut(g_ge.clut_addr, (int)(g_ge.clut_raw & 3),
                                    (int)((g_ge.clut_raw >> 2) & 0x1F),
                                    (int)((g_ge.clut_raw >> 8) & 0xFF),
@@ -892,6 +896,9 @@ static void draw_prim(uint32_t type, uint32_t count) {
             .mag_filter = (int)((g_ge.tex_filter >> 8) & 7),
             .wrap_s     = (int)(g_ge.tex_wrap & 1),
             .wrap_t     = (int)((g_ge.tex_wrap >> 8) & 1),
+            .tcc_rgba   = (int)g_ge.tex_tcc,
+            .color_double = (int)g_ge.tex_double,
+            .env        = g_ge.tex_env,
         };
         psp_render_current()->set_texture(&t);
     }
@@ -904,6 +911,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
          * supposed to be resetting. */
         psp_blend_state b = g_tl.blend;
         b.write_colour = 1;
+        b.write_alpha  = g_tl.clear_mode ? g_tl.clear_stencil : 0;
         if (g_tl.clear_mode) {
             b.enable = 0; b.alpha_test = 0;
             b.write_colour = g_tl.clear_colour;
@@ -1162,8 +1170,13 @@ static void run_list(ge_queue *q) {
             g_ge.clut_addr = (g_ge.clut_addr & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
             break;
         case GE_TEXFUNC:
-            g_ge.tex_func = arg & 7;
+            g_ge.tex_func   = arg & 7;
+            g_ge.tex_tcc    = (arg >> 8) & 1;     /* RGBA: the texel's alpha takes part */
+            g_ge.tex_double = (arg >> 16) & 1;    /* colour doubling */
             g_ge.tex_funcs_seen |= 1u << (arg & 7);
+            break;
+        case GE_TEXENVCOLOR:
+            g_ge.tex_env = arg & 0xFFFFFFu;
             break;
         case GE_TEXFILTER:
             g_ge.tex_filter = arg & 0xFFFF;
@@ -1203,6 +1216,7 @@ static void run_list(ge_queue *q) {
                         arg, (int)(arg & 1), (int)((arg >> 8) & 1),
                         (int)((arg >> 9) & 1), (int)((arg >> 10) & 1));
             g_tl.clear_mode   = (int)(arg & 1);
+            g_tl.clear_stencil = (int)((arg >> 9) & 1);
             g_tl.clear_colour = (int)((arg >> 8) & 1);
             g_tl.clear_z      = (int)((arg >> 10) & 1);
             break;

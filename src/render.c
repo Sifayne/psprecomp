@@ -85,7 +85,7 @@ static void sw_texture(const psp_tex_state *t) {
 
 enum {
     GE_TFMT_5650 = 0, GE_TFMT_5551 = 1, GE_TFMT_4444 = 2, GE_TFMT_8888 = 3,
-    GE_TFMT_CLUT4 = 4, GE_TFMT_CLUT8 = 5
+    GE_TFMT_CLUT4 = 4, GE_TFMT_CLUT8 = 5, GE_TFMT_CLUT16 = 6, GE_TFMT_CLUT32 = 7
 };
 
 static struct {
@@ -104,8 +104,8 @@ static int tex_halfbytes(int fmt) {
     case GE_TFMT_CLUT4:                     return 1;
     case GE_TFMT_CLUT8:                     return 2;
     case GE_TFMT_5650: case GE_TFMT_5551:
-    case GE_TFMT_4444:                      return 4;
-    case GE_TFMT_8888:                      return 8;
+    case GE_TFMT_4444: case GE_TFMT_CLUT16: return 4;
+    case GE_TFMT_8888: case GE_TFMT_CLUT32: return 8;
     default:                                return 0;
     }
 }
@@ -113,8 +113,7 @@ static int tex_halfbytes(int fmt) {
 static int texture_usable(void) {
     if (!g_tex.addr || g_tex.w <= 0 || g_tex.h <= 0) return 0;
     if (!tex_halfbytes(g_tex.fmt)) return 0;
-    if ((g_tex.fmt == GE_TFMT_CLUT4 || g_tex.fmt == GE_TFMT_CLUT8) && !g_clut.addr)
-        return 0;
+    if (g_tex.fmt >= GE_TFMT_CLUT4 && !g_clut.addr) return 0;
     return 1;
 }
 
@@ -204,6 +203,20 @@ static uint32_t sample_texel(int u, int v) {
     if (g_tex.fmt == GE_TFMT_CLUT8) {
         const uint32_t off = swizzled_byte((uint32_t)u, (uint32_t)v, row_bytes);
         return clut_entry(psp_read8(g_tex.addr + off));
+    }
+    /* Wide indices: the whole 16- or 32-bit texel is the raw index, and the
+     * palette mode's shift and mask pick the bits that count. gpu/clut/shifts
+     * and masks are written against these -- a texel of 12345678 shifted 4 and
+     * masked ff indexes entry 67 -- and they drew flat white while the formats
+     * were refused. This game's census has never named either; the tests are
+     * the reason they exist. */
+    if (g_tex.fmt == GE_TFMT_CLUT16) {
+        const uint32_t off = swizzled_byte((uint32_t)u * 2u, (uint32_t)v, row_bytes);
+        return clut_entry(psp_read16(g_tex.addr + off));
+    }
+    if (g_tex.fmt == GE_TFMT_CLUT32) {
+        const uint32_t off = swizzled_byte((uint32_t)u * 4u, (uint32_t)v, row_bytes);
+        return clut_entry(psp_read32(g_tex.addr + off));
     }
     if (g_tex.fmt == GE_TFMT_8888) {
         const uint32_t off = swizzled_byte((uint32_t)u * 4u, (uint32_t)v, row_bytes);
@@ -329,21 +342,54 @@ static uint32_t sample_filtered(float u, float v, int linear) {
     return linear ? sample_bilinear(u, v) : sample_texel(ifloor(u), ifloor(v));
 }
 
-/* Modulate: texel times vertex colour, per channel. */
-static uint32_t modulate(uint32_t tex, uint32_t col) {
+static uint32_t chan(uint32_t c, int i);
+static psp_blend_state g_bs;
+
+/* The texture function: how a texel and the vertex colour become the fragment.
+ *
+ * The five GE_TEXFUNC codes, the RGB/RGBA flag that says whether the texel's
+ * alpha takes part, and the colour-doubling flag. Measured in gpu/texfunc,
+ * one test per function: under ADD "One + Zero" is white and "Half + Half"
+ * is 0xFE, "Half x2 + Half" saturates to white, and under RGB the fragment
+ * alpha is the vertex's. Only MODULATE was implemented before, hardcoded at
+ * both call sites, so the other four drew as MODULATE. Codes 5..7 are not
+ * defined; they are treated as MODULATE rather than refused, because a
+ * refusal draws untextured and that has been the harder thing to notice. */
+static uint32_t apply_texfunc(uint32_t tex, uint32_t col) {
+    const uint32_t ta = chan(tex, 3), ca = chan(col, 3);
     uint32_t out = 0;
-    for (int i = 0; i < 4; i++) {
-        const uint32_t t = (tex >> (i * 8)) & 0xFF;
-        const uint32_t c = (col >> (i * 8)) & 0xFF;
-        out |= ((t * c + 127u) / 255u) << (i * 8);
+    for (int i = 0; i < 3; i++) {
+        const uint32_t t = chan(tex, i), c = chan(col, i), e = chan(g_tex.env, i);
+        uint32_t o;
+        switch (g_tex.func) {
+        case 1:  o = g_tex.tcc_rgba ? (t * ta + c * (255u - ta) + 127u) / 255u : t; break;  /* DECAL   */
+        case 2:  o = (c * (255u - t) + e * t + 127u) / 255u;                          break;  /* BLEND   */
+        case 3:  o = t;                                                                break;  /* REPLACE */
+        case 4:  o = t + c; if (o > 255u) o = 255u;                                    break;  /* ADD     */
+        default: o = (t * c + 127u) / 255u;                                            break;  /* MODULATE */
+        }
+        if (g_tex.color_double) { o *= 2u; if (o > 255u) o = 255u; }
+        out |= o << (i * 8);
     }
-    return out;
+    uint32_t a;
+    switch (g_tex.func) {
+    case 1:  a = ca;                                                  break;  /* DECAL keeps the vertex alpha */
+    case 3:  a = g_tex.tcc_rgba ? ta : ca;                            break;  /* REPLACE */
+    default: a = g_tex.tcc_rgba ? (ta * ca + 127u) / 255u : ca;       break;  /* MODULATE, BLEND, ADD */
+    }
+    return out | (a << 24);
 }
 
+/* The framebuffer's alpha byte is the stencil buffer. An ordinary draw leaves
+ * it as it was -- gpu/texfunc fills 44444444, draws, and reads 44ffffff back
+ * -- and only a clear that asks for the stencil, or a stencil operation (not
+ * modelled), writes it. */
 static void put_pixel(int x, int y, uint32_t rgba) {
     if (!g_fb_addr || !g_fb_stride) return;
     if (x < 0 || y < 0 || x >= 480 || y >= 272) return;
-    psp_write32(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4, rgba);
+    const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4;
+    if (!g_bs.write_alpha) rgba = (rgba & 0x00FFFFFFu) | (psp_read32(at) & 0xFF000000u);
+    psp_write32(at, rgba);
     g_pixels++;
 }
 
@@ -608,7 +654,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                 if (textured) {
                     const float u = l0 * a->u + l1 * b->u + l2 * c->u;
                     const float v = l0 * a->v + l1 * b->v + l2 * c->v;
-                    col = modulate(sample_filtered(u, v, linear), col);
+                    col = apply_texfunc(sample_filtered(u, v, linear), col);
                     g_px_tex++;
                 } else g_px_flat++;
                 shade_pixel(x, y, z, col);
@@ -638,20 +684,34 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
      * a sprite whose second corner is left of or above its first mapped its
      * texture backwards. The guard above is what makes these divisions safe:
      * the corners can only coincide if the extents are empty. */
-    const float du = (b->u - a->u) / (float)(b->x - a->x);
-    const float dv = (b->v - a->v) / (float)(b->y - a->y);
+    /* Which screen axis each texture axis runs along. With both corners in
+     * order, or both flipped, u follows x and v follows y. With exactly one
+     * axis flipped hardware runs u along y and v along x: the two corners the
+     * GE generates take u from the vertex that gave them their y and v from the
+     * one that gave them their x. Measured in gpu/filtering/precisionnearest2d
+     * on a 2x2 texture: TR->BL reads texel (0,1) at the top-left pixel, (0,0)
+     * to its right and (1,1) below it; BL->TR reads (1,0), (1,1) and (0,0). The
+     * standard mapping answers those with (1,0) and (0,1) at the top-left and
+     * was one line wrong on every orientation with one flip. */
+    const int transposed = (b->x < a->x) != (b->y < a->y);
+    const float du = (b->u - a->u) / (float)(transposed ? (b->y - a->y) : (b->x - a->x));
+    const float dv = (b->v - a->v) / (float)(transposed ? (b->x - a->x) : (b->y - a->y));
 
     for (int y = y0; y < y1; y++) {
         /* Pixel centres, for the same reason sw_tri uses them: at 1:1 a corner
          * lands exactly on a texel boundary and the rounding decides which side
          * of it to read. */
-        const float tv = a->v + dv * ((float)y + 0.5f - (float)a->y);
+        const float ty = (float)y + 0.5f - (float)a->y;
+        const float tv_row = transposed ? 0.0f : a->v + dv * ty;
+        const float tu_row = transposed ? a->u + du * ty : 0.0f;
         for (int x = x0; x < x1; x++) {
             if (!textured) { g_px_flat++; shade_pixel(x, y, a->z, b->rgba); continue; }
-            const float tu = a->u + du * ((float)x + 0.5f - (float)a->x);
+            const float tx = (float)x + 0.5f - (float)a->x;
+            const float tu = transposed ? tu_row : a->u + du * tx;
+            const float tv = transposed ? a->v + dv * tx : tv_row;
             g_px_tex++;
             shade_pixel(x, y, a->z,
-                        modulate(sample_filtered(tu, tv, linear), b->rgba));
+                        apply_texfunc(sample_filtered(tu, tv, linear), b->rgba));
         }
     }
 }

@@ -9,6 +9,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/mem.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/clock.h"
 
@@ -65,6 +66,40 @@ static void hle_CpuResumeIntr(void) {
  * and the GE share one flat backing store -- so these are genuinely no-ops
  * rather than unimplemented. */
 static void hle_CacheOp(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
+/* sceDmacMemcpy(dst, src, size) -- the DMA engine as a memcpy. It is what
+ * pspautotests' GPU tests read the framebuffer back with, so while it was
+ * unimplemented -- returning zero and copying nothing -- every textured test in
+ * the corpus reported its own preset fill at every pixel, whatever the GE had
+ * drawn: 44444444 on all of gpu/texfunc, texcolors, filtering, clut, texmtx.
+ * The suite was blind to texturing by the readback, not by the rasterizer.
+ *
+ * The contract is dmac/dmactest.expected: the size is checked before the
+ * pointers (zero size is 80000104 even with null pointers), a null pointer
+ * with a length is 80000103, and a copy answers 0. The try variant is the same
+ * call that refuses with 80000021 while another copy is in flight; copies here
+ * are synchronous, so nothing is ever in flight and it never refuses -- one
+ * line of that test, and an honest one. */
+#define SCE_ERROR_INVALID_POINTER 0x80000103u
+#define SCE_ERROR_INVALID_SIZE    0x80000104u
+
+static void dmac_copy(void) {
+    const uint32_t dst = psp_arg(0), src = psp_arg(1), size = psp_arg(2);
+    if (!size)       { psp_ret(SCE_ERROR_INVALID_SIZE); return; }
+    if (!dst || !src){ psp_ret(SCE_ERROR_INVALID_POINTER); return; }
+    void *d = psp_mem_ptr(dst, size);
+    const void *sp = psp_mem_ptr(src, size);
+    if (d && sp) {
+        memmove(d, sp, size);
+    } else {
+        /* A range the flat map cannot hand over whole: byte by byte, so what is
+         * mapped is copied and the bad-access counter records the rest. */
+        for (uint32_t i = 0; i < size; i++) psp_write8(dst + i, psp_read8(src + i));
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+static void hle_DmacMemcpy(void)    { dmac_copy(); }
+static void hle_DmacTryMemcpy(void) { dmac_copy(); }
 
 static void hle_LibcTime(void) {
     time_t t = time(NULL);
@@ -623,6 +658,11 @@ void psp_misc_register(void) {
 
     psp_hle_register(0x79D1C3FA, "UtilsForUser", "sceKernelDcacheWritebackAll",           hle_CacheOp);
     psp_hle_register(0xB435DEC5, "UtilsForUser", "sceKernelDcacheWritebackInvalidateAll", hle_CacheOp);
+    psp_hle_register(0x34B9FA9E, "UtilsForUser", "sceKernelDcacheWritebackInvalidateRange", hle_CacheOp);
+    psp_hle_register(0x3EE30821, "UtilsForUser", "sceKernelDcacheWritebackRange",         hle_CacheOp);
+    psp_hle_register(0xBFA98062, "UtilsForUser", "sceKernelDcacheInvalidateRange",        hle_CacheOp);
+    psp_hle_register(0x617F3FE6, "sceDmac", "sceDmacMemcpy",    hle_DmacMemcpy);
+    psp_hle_register(0xD97F94D8, "sceDmac", "sceDmacTryMemcpy", hle_DmacTryMemcpy);
     psp_hle_register(0x27CC57F0, "UtilsForUser", "sceKernelLibcTime",         hle_LibcTime);
     psp_hle_register(0x91E4F6A7, "UtilsForUser", "sceKernelLibcClock",        hle_LibcClock);
     psp_hle_register(0x71EC4271, "UtilsForUser", "sceKernelLibcGettimeofday", hle_LibcGettimeofday);

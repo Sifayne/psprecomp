@@ -53,6 +53,13 @@ typedef struct {
      * where the game asked to repeat smears the edge texel across whatever
      * should have wrapped. */
     int      wrap_s, wrap_t;
+    /* GE_TEXFUNC's other two fields: bit 8 says the texture's alpha takes part
+     * (RGBA) rather than only its colour (RGB), bit 16 doubles the result's
+     * colour. GE_TEXENVCOLOR is the constant the BLEND function mixes toward.
+     * Measured in gpu/texfunc: "One + Zero" under ADD is white, "Half x2 +
+     * Half" saturates, and every line keeps the vertex alpha under RGB. */
+    int      tcc_rgba, color_double;
+    uint32_t env;
 } psp_tex_state;
 
 /* Blend and alpha-test state, as the GE encodes it. Factors and the equation
@@ -66,6 +73,11 @@ typedef struct {
      * touch colour -- otherwise it paints the clear colour over the frame,
      * which looks like a wrong background rather than like a missing mask. */
     int      write_colour;
+    /* The framebuffer's alpha byte is the stencil buffer, and an ordinary draw
+     * does not write it -- gpu/texfunc reads 44ffffff back from a 44444444
+     * fill after every draw. A clear-mode draw writes it when its stencil bit
+     * is set. Stencil operations themselves are not modelled. */
+    int      write_alpha;
 } psp_blend_state;
 
 /* GE primitive types, from the PRIM argument's type field. */
