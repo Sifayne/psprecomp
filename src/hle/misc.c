@@ -421,6 +421,32 @@ static void hle_ReadBufferPositive(void) {
     psp_ret(count);
 }
 
+/* ---- sceRtc, the two calls that are a clock ------------------------------
+ *
+ * Only the tick counter. The rest of sceRtc is calendar work -- converting
+ * ticks to a pspTime, timezone arithmetic, day-of-week lookup -- and none of it
+ * is here; rtc/arithmetic alone differs by more than a thousand lines. These
+ * two are separable because they are not calendar at all, they are the clock
+ * this runtime already keeps.
+ *
+ * A tick is a microsecond, which the tests state rather than assert in a
+ * header: rtc/rtc delays 2000us between two reads and checks the difference is
+ * at least 2000, and ctrl/ctrl times five pad reads against a 5000us threshold.
+ * Both are differences, so the epoch does not enter into it -- which is
+ * fortunate, because ours is "since the module started" and a PSP's is not. */
+static void hle_RtcGetCurrentTick(void) {
+    const uint32_t out = psp_arg(0);
+    const uint64_t us = psp_clock_read();
+    if (out) {
+        psp_write32(out, (uint32_t)us);
+        psp_write32(out + 4, (uint32_t)(us >> 32));
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Ticks per second, and the unit above is what makes it this number. */
+static void hle_RtcGetTickResolution(void) { psp_ret(1000000u); }
+
 /* ---- sceAudio ------------------------------------------------------------ */
 
 #define AUDIO_CHANNELS 8
@@ -604,6 +630,9 @@ void psp_misc_register(void) {
     /* Peek differs only in not waiting for the next sample. Nothing samples
      * here, so the two are the same call. */
     psp_hle_register(0x3A622550, "sceCtrl", "sceCtrlPeekBufferPositive",  hle_ReadBufferPositive);
+
+    psp_hle_register(0x3F7AD767, "sceRtc", "sceRtcGetCurrentTick",         hle_RtcGetCurrentTick);
+    psp_hle_register(0xC41C2853, "sceRtc", "sceRtcGetTickResolution",      hle_RtcGetTickResolution);
 
     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
