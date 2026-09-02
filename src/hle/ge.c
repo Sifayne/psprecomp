@@ -252,7 +252,7 @@ static float ge_float(uint32_t arg) {
 
 /* Tracked state, and the counters that make the report worth reading. */
 static struct {
-    uint32_t fbp, fbw, vtype, vaddr;
+    uint32_t fbp, fbw, vtype, vaddr, iaddr;
     /* Texture state, recorded so the sampler can be built against what this
      * game uses rather than against the whole hardware surface. */
     uint32_t tex_addr, tex_stride, tex_w, tex_h, tex_enable;
@@ -291,6 +291,12 @@ static struct {
  * is sampled across its whole surface", which is the question that comes up
  * every time the frame is one flat colour. */
 static void note_uv(float u, float v) {
+    /* A draw with texturing off never reads its coordinates, so they do not
+     * belong in the summary's range. The game's fade overlay is such a draw,
+     * and its field held NaN; letting it in reported "u -inf..inf" for a run
+     * whose textured draws were all sane -- an instrument pointing at the
+     * wrong thing. */
+    if (!g_ge.tex_enable) return;
     if (!g_ge.uv_seen) {
         g_ge.u_lo = g_ge.u_hi = u;
         g_ge.v_lo = g_ge.v_hi = v;
@@ -588,6 +594,29 @@ static int vertex_layout(uint32_t vtype, int *col_off, int *pos_off, int *tex_of
     return (off + align - 1) & ~(align - 1);  /* stride */
 }
 
+/* The address of element i of the current draw. Bits 11..12 of the vertex
+ * type say whether PRIM's count is vertices or indices: 0 reads the vertex
+ * array in order, 1 and 2 read an 8- or 16-bit index list at IADDR and fetch
+ * each vertex by it.
+ *
+ * Until this was written, IADDR was decoded and dropped and every indexed
+ * draw read the vertex array in order, as if the index list were 0,1,2,3...
+ * For a quad drawn as 0,1,2,0,2,3 that is right for the first three indices
+ * and wrong for everything after, and the error grows with each quad until
+ * the read runs off the end of the vertex array into whatever follows. The
+ * game's text is drawn this way -- 25 glyphs, 150 indices, 100 vertices --
+ * and that is where the fragmentary glyphs came from: the first glyph whole,
+ * the rest progressively misassembled, and the tail a single huge triangle
+ * with coordinates read from unrelated memory, painted as diagonal stripes
+ * across the lower half of the screen. */
+static uint32_t vertex_addr(uint32_t i, int stride) {
+    switch (VT_INDEX(g_ge.vtype)) {
+    case 1:  return g_ge.vaddr + (uint32_t)psp_read8(g_ge.iaddr + i) * (uint32_t)stride;
+    case 2:  return g_ge.vaddr + (uint32_t)psp_read16(g_ge.iaddr + 2u * i) * (uint32_t)stride;
+    default: return g_ge.vaddr + i * (uint32_t)stride;
+    }
+}
+
 static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
                        int tex_off, psp_vertex *out) {
     out->rgba = 0xFFFFFFFFu;
@@ -768,12 +797,30 @@ static int texdraw_hit(void) {
     return want && g_ge.tex_addr == want;
 }
 
+/* PSPRECOMP_GE_WILDUV=1 logs textured draws whose coordinates land far outside
+ * the texture, or are not finite. A texture that repeats hundreds of times
+ * across one triangle paints stripes, and a draw like that is found by its
+ * coordinates, not by which texture it bound. */
+static int wilduv_hit(const psp_vertex *v, uint32_t n) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("PSPRECOMP_GE_WILDUV"); on = (e && *e) ? 1 : 0; }
+    if (!on || !g_ge.tex_enable || !g_ge.tex_addr) return 0;
+    const float lu = 8.0f * (float)(g_ge.tex_w ? g_ge.tex_w : 1);
+    const float lv = 8.0f * (float)(g_ge.tex_h ? g_ge.tex_h : 1);
+    for (uint32_t i = 0; i < n; i++) {
+        if (!(v[i].u == v[i].u) || !(v[i].v == v[i].v)) return 1;
+        if (v[i].u < -lu || v[i].u > lu || v[i].v < -lv || v[i].v > lv) return 1;
+    }
+    return 0;
+}
+
 static void texdraw_dump(const char *tag, const psp_vertex *v, uint32_t n) {
     static int left = 24;
     if (left <= 0) return;
     left--;
-    fprintf(stderr, "texdraw: %s %u verts  tex %ux%u fmt %u", tag, n,
-            g_ge.tex_w, g_ge.tex_h, g_ge.tex_format);
+    fprintf(stderr, "texdraw: %s %u verts  tex %08X %ux%u fmt %u  texen %u map %u/%u vtype %06X rgba %08X",
+            tag, n, g_ge.tex_addr, g_ge.tex_w, g_ge.tex_h, g_ge.tex_format, g_ge.tex_enable,
+            g_tl.tex_map_mode, g_tl.tex_proj_mode, g_ge.vtype, v[0].rgba);
     for (uint32_t i = 0; i < n && i < 4; i++)
         fprintf(stderr, "  | x %.3f y %.3f u %.3f v %.3f",
                 (double)v[i].x / 16.0, (double)v[i].y / 16.0,
@@ -801,7 +848,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
 
         uint32_t decoded = 0;
         for (; decoded < n; decoded++) {
-            const uint32_t a = g_ge.vaddr + (done + decoded) * (uint32_t)stride;
+            const uint32_t a = vertex_addr(done + decoded, stride);
             float model[3], world[3], eye[3], clip[4];
             if (!read_pos_model(a, g_ge.vtype, pos_off, model)) break;
 
@@ -858,7 +905,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         if (!decoded) break;
         g_xformed += decoded;
 
-        if (texdraw_hit()) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
+        if (texdraw_hit() || wilduv_hit(v, decoded)) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
 
         if (drawlog_left()) {
             int x0 = v[0].x, x1 = v[0].x, y0 = v[0].y, y1 = v[0].y;
@@ -866,7 +913,6 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 if (v[i].x < x0) x0 = v[i].x;   if (v[i].x > x1) x1 = v[i].x;
                 if (v[i].y < y0) y0 = v[i].y;   if (v[i].y > y1) y1 = v[i].y;
             }
-            if (texdraw_hit()) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
             fprintf(stderr, "draw: %-14s %2u verts  x %4d..%-4d y %4d..%-4d  "
                             "fbp %08X  rgba %08X  vtype %06X  tex %s\n",
                     PRIM_NAME[type & 7], decoded, x0 >> 4, x1 >> 4, y0 >> 4, y1 >> 4,
@@ -1062,13 +1108,13 @@ static void draw_prim(uint32_t type, uint32_t count) {
          * vertices or the triangle spanning it is lost. */
         uint32_t decoded = 0;
         for (; decoded < n; decoded++) {
-            if (!read_vertex(g_ge.vaddr + (done + decoded) * (uint32_t)stride,
+            if (!read_vertex(vertex_addr(done + decoded, stride),
                              g_ge.vtype, col_off, pos_off, tex_off, &v[decoded]))
                 break;
         }
         if (!decoded) break;
 
-        if (texdraw_hit()) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
+        if (texdraw_hit() || wilduv_hit(v, decoded)) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
 
         if (drawlog_left()) {
             int x0=v[0].x,x1=v[0].x,y0=v[0].y,y1=v[0].y;
@@ -1076,7 +1122,6 @@ static void draw_prim(uint32_t type, uint32_t count) {
                 if(v[i].x<x0)x0=v[i].x; if(v[i].x>x1)x1=v[i].x;
                 if(v[i].y<y0)y0=v[i].y; if(v[i].y>y1)y1=v[i].y;
             }
-            if (texdraw_hit()) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
             fprintf(stderr, "2d:   %-14s %2u verts  x %4d..%-4d y %4d..%-4d  "
                             "fbp %08X  rgba %08X %08X  vtype %06X  tex %s\n",
                     PRIM_NAME[type & 7], decoded, x0 >> 4, x1 >> 4, y0 >> 4, y1 >> 4,
@@ -1368,7 +1413,7 @@ static void run_list(ge_queue *q) {
             break;
 
         case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
-        case GE_IADDR: break;
+        case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)); break;
 
         default:
             /* A real state command we do not decode individually. Counted --
