@@ -350,6 +350,12 @@ void psp_umd_reset(void);
  * has to say so, because a caller polls a pending one forever. See utility.c. */
 void psp_utility_init(void);
 void psp_utility_register(void);
+
+/* sceAtrac3plus without a decoder: the stream opens and its header is read,
+ * and the decode itself fails -- the one failure this game's player handles.
+ * A decoder that returns zero and writes nothing is the worse lie. See atrac.c. */
+void psp_atrac_init(void);
+void psp_atrac_register(void);
 int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint64_t psp_audio_blocks(void);
