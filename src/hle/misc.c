@@ -12,6 +12,7 @@
 #include "psprecomp/mem.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/clock.h"
+#include "psprecomp/os.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -598,11 +599,41 @@ static void hle_ChRelease(void) {
  * play, and that is how long a blocking output waits. */
 #define PSP_AUDIO_RATE 44100u
 
+/* Host-clock gaps between a channel's outputs, for the summary. A speaker
+ * drains at 44.1kHz whatever the host does, so an output that arrives later
+ * than the previous buffer's length is a gap in the sound; this counts them
+ * per channel and keeps the longest, which is the number a windowed run's
+ * popping comes down to. Only meaningful when the run is paced against the
+ * wall clock -- a window, or PSPRECOMP_REALTIME -- and reported then. */
+typedef struct { uint64_t first_ns, last_ns, max_gap_ns; uint32_t late, outputs; } audio_gap;
+static audio_gap g_audio_gap[AUDIO_CHANNELS];
+static void audio_note_gap(uint32_t ch, uint32_t samples) {
+    audio_gap *g = &g_audio_gap[ch];
+    const uint64_t now = psp_os_mono_ns();
+    if (g->first_ns) {
+        const uint64_t gap = now - g->last_ns;
+        const uint64_t buf = (uint64_t)samples * 1000000000ull / PSP_AUDIO_RATE;
+        if (gap > g->max_gap_ns) g->max_gap_ns = gap;
+        if (gap > buf + buf / 2) g->late++;
+    } else g->first_ns = now;
+    g->last_ns = now;
+    g->outputs++;
+}
+void psp_audio_dump_gaps(FILE *out) {
+    for (uint32_t ch = 0; ch < AUDIO_CHANNELS; ch++) {
+        const audio_gap *g = &g_audio_gap[ch];
+        if (g->outputs < 2) continue;
+        fprintf(out, "    audio ch %u: %u outputs over %.1f s, longest wait %.0f ms, %u arrived later than 1.5 buffers\n",
+                ch, g->outputs, (g->last_ns - g->first_ns) / 1e9, g->max_gap_ns / 1e6, g->late);
+    }
+}
+
 static int64_t audio_output_common(int buf_arg, int lvol_arg, int rvol_arg) {
     const uint32_t ch = psp_arg(0);
     g_audio_blocks++;
     if (ch >= AUDIO_CHANNELS || !g_audio[ch].reserved || !g_audio[ch].samples)
         return 0;
+    audio_note_gap(ch, g_audio[ch].samples);
     audio_dump(ch, g_audio[ch].samples, g_audio[ch].format, psp_arg(buf_arg));
     if (g_audio_out)
         return g_audio_out((int)ch, g_audio[ch].samples, g_audio[ch].format,
@@ -686,6 +717,7 @@ void psp_misc_reset(void) {
     g_ctrl_polls = 0;
     memset(&g_press, 0, sizeof g_press);
     memset(g_audio, 0, sizeof g_audio);
+    memset(g_audio_gap, 0, sizeof g_audio_gap);
     g_audio_blocks = 0;
     psp_ctrl_replay_reset();
 }

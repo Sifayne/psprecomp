@@ -429,6 +429,8 @@ void psp_display_set_present(void (*fn)(uint32_t addr, uint32_t stride,
 void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples,
                                         uint32_t fmt, uint32_t buf,
                                         uint32_t lvol, uint32_t rvol));
+/* The host-clock gaps between each channel's outputs; see audio_note_gap. */
+void psp_audio_dump_gaps(FILE *out);
 
 /* ---- the ATRAC3 / ATRAC3+ decoder, shared -----------------------------------
  *

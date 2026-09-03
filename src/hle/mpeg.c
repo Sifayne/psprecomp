@@ -176,6 +176,12 @@ typedef struct {
     size_t   aes_skip;     /* private-header bytes still to drop from the in-flight audio PES */
     void    *adec;         /* psp_at3_dec*, opened from the first frame's header */
     uint32_t adec_block;   /* the payload size it was opened for */
+    /* What each ring-buffer put produced, so consumption of the elementary
+     * streams maps back to ring packets: after put k the ring has taken
+     * put_bytes bytes in all and the two streams stood at these lengths. */
+    struct mpeg_put { uint64_t put_bytes; size_t es_len, aes_len; } *puts;
+    size_t   nputs, puts_cap, put_iv, put_ia;
+    uint64_t put_total;
 
     void    *dec;          /* ISVCDecoder*, opaque here so the header stays out */
     int      dec_failed;
@@ -199,6 +205,7 @@ void psp_mpeg_reset(void) {
     for (int i = 0; i < MAX_MPEG; i++) {
         psp_at3_close((psp_at3_dec *)g_mpeg[i].adec);
         free(g_mpeg[i].aes);
+        free(g_mpeg[i].puts);
     }
     memset(g_mpeg, 0, sizeof g_mpeg);
     g_inited = 0;
@@ -334,10 +341,18 @@ static mpeg_ctx *ctx_for_ringbuffer(uint32_t rb);
  * ends the movie just as surely as never freeing anything did, by the opposite
  * route.
  *
- * So it is derived from the elementary stream instead: whatever the demuxer has
- * produced but the decoder has not yet consumed is still notionally sitting in
- * the buffer. That keeps the number moving the way the game expects while
- * staying true to what has actually been dealt with. */
+ * So it is derived from consumption instead: a packet is still in the ring
+ * until what it carried has been taken by a decoder. Which decoder matters.
+ * This used to count only the video's unconsumed bytes, and the audio is
+ * interleaved ahead of the video in the file: whenever the video fell behind
+ * real time the ring read as full, the game's reader stopped putting, the
+ * sound thread ran out of frames and spun on NO_DATA -- 85 million
+ * sceMpegGetAtracAu calls and 232 million of these in one 75-second run,
+ * and a pop at every refill. A packet is freed once its *faster* consumer is
+ * past it, which is what keeps both streams fed; the slower stream's backlog
+ * lives in host memory, which is where the elementary streams live anyway.
+ * One packet stays held until the stream is over, so the ring never reads as
+ * entirely free before it is. */
 static void hle_RingbufferAvailableSize(void) {
     const uint32_t rb = psp_arg(0);
     if (mpeg_decoding() && rb) {
@@ -345,17 +360,17 @@ static void hle_RingbufferAvailableSize(void) {
         const uint32_t packets  = psp_read32(rb + RB_PACKETS);
         const uint32_t pkt_size = psp_read32(rb + RB_PACKET_SIZE);
         if (c && packets && pkt_size) {
-            const size_t pending = c->es_len > c->es_pos ? c->es_len - c->es_pos : 0;
-            uint32_t held = (uint32_t)(pending / pkt_size);
+            /* The last put each decoder has wholly consumed, in ring bytes. */
+            while (c->put_iv < c->nputs && c->puts[c->put_iv].es_len  <= c->es_pos)  c->put_iv++;
+            while (c->put_ia < c->nputs && c->puts[c->put_ia].aes_len <= c->aes_pos) c->put_ia++;
+            const uint64_t pv = c->put_iv ? c->puts[c->put_iv - 1].put_bytes : 0;
+            const uint64_t pa = c->put_ia ? c->puts[c->put_ia - 1].put_bytes : 0;
+            const uint64_t consumed = pv > pa ? pv : pa;
+            uint64_t held = (c->put_total - consumed + pkt_size - 1) / pkt_size;
+            const int over = c->es_eof && c->es_pos >= c->es_len && c->aes_pos >= c->aes_len;
+            if (held == 0 && !over) held = 1;
             if (held > packets) held = packets;
-            if (mpeg_logging()) {
-                static int said;
-                if (held == 0 && said++ < 5)
-                    fprintf(stderr, "mpeg: AvailableSize reports ALL %u free "
-                            "(es_len=%zu es_pos=%zu pending=%zu pkt=%u)\n",
-                            packets, c->es_len, c->es_pos, pending, pkt_size);
-            }
-            psp_ret(packets - held);
+            psp_ret(packets - (uint32_t)held);
             return;
         }
     }
@@ -812,6 +827,18 @@ static void hle_RingbufferPut(void) {
                  * buffer is. Decoding eagerly here empties the buffer as fast
                  * as it fills and the game concludes nothing was ever put. */
                 ps_demux(c, host, bytes);
+                c->put_total += bytes;
+                if (c->nputs == c->puts_cap) {
+                    const size_t cap = c->puts_cap ? c->puts_cap * 2 : 1024;
+                    struct mpeg_put *np = (struct mpeg_put *)realloc(c->puts, cap * sizeof *np);
+                    if (np) { c->puts = np; c->puts_cap = cap; }
+                }
+                if (c->nputs < c->puts_cap) {
+                    c->puts[c->nputs].put_bytes = c->put_total;
+                    c->puts[c->nputs].es_len    = c->es_len;
+                    c->puts[c->nputs].aes_len   = c->aes_len;
+                    c->nputs++;
+                }
             }
             /* PSPRECOMP_MPEG_DUMP=<path> writes the demuxed elementary stream
              * once it is big enough to be worth looking at, so it can be
@@ -1060,12 +1087,6 @@ static void hle_GetAtracAu(void) {
         psp_write32(au + AU_ES_SIZE, (uint32_t)total);
     }
     c->aes_pos += total;
-    /* Consumed frames need not be kept: slide the buffer down now and then. */
-    if (c->aes_pos > 1u << 20) {
-        memmove(c->aes, c->aes + c->aes_pos, c->aes_len - c->aes_pos);
-        c->aes_len -= c->aes_pos;
-        c->aes_pos = 0;
-    }
     c->atrac_pts += MPEG_ATRAC_PTS_STEP;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
