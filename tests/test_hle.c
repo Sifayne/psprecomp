@@ -72,6 +72,13 @@ static uint32_t call5(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
     return call(nid, a0, a1, a2, a3);
 }
 
+static uint32_t call7(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
+                      uint32_t a3, uint32_t a4, uint32_t a5, uint32_t a6) {
+    psp_cpu.r[PSP_REG_T1] = a5;
+    psp_cpu.r[PSP_REG_T2] = a6;
+    return call5(nid, a0, a1, a2, a3, a4);
+}
+
 static void test_sha1_vectors(void) {
     /* FIPS 180-4 examples, so the hash itself is trusted before anything is
      * built on it. */
@@ -742,6 +749,14 @@ static void test_sas_adpcm(void) {
     for (uint32_t i = 0; i < 64 * 4; i += 4) psp_write32(OUT + i, 0);
     call(psp_nid("__sceSasCore"), 0, OUT, 0, 0);
     CHECK(psp_sas_nonzero() == 0, "silence before key-on");
+
+    /* An envelope, explicitly. A voice with no attack rate stays at zero
+     * height and is silent, on hardware as here -- this used to lean on a
+     * default rate invented by the key-on, which adsrcurve's rate-0 sweeps
+     * showed was not hardware's (findings item 45). */
+    CHECK(call7(psp_nid("__sceSasSetADSR"), 0, 0, 15,
+                0x40000000 / 64, 0x40000000 / 512, 0x30000000, 0x40000000 / 256) == 0,
+          "adsr set");
 
     CHECK(call(psp_nid("__sceSasSetKeyOn"), 0, 0, 0, 0) == 0, "key on");
     call(psp_nid("__sceSasCore"), 0, OUT, 0, 0);

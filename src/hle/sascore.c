@@ -110,6 +110,22 @@ typedef struct {
     int32_t  attack_rate, decay_rate, sustain_level, release_rate;
     uint32_t mode_attack, mode_decay, mode_sustain, mode_release;
 
+    /* The key is not the sound.
+     *
+     * `on` is the key. A key-on is refused while it is down (0x80420016),
+     * and a key-off does not lift it by itself: keyon.expected still refuses
+     * a key-on issued after a key-off and a pause, and accepts one issued
+     * after a key-off and a *core*. So the key lifts when a core processes
+     * the key-off, which is also when the envelope enters its release, and
+     * `playing` outlives it -- the release is still audible after the key is
+     * up, and a fresh key-on may arrive while it still is. adsrcurve needs
+     * exactly that: it starts each of its 53 sweeps with a key-off and one
+     * core, and a release that has not finished must not stop the next
+     * sweep from keying on. Tying the refusal to `playing` instead left the
+     * old envelope running and the sweep measured the previous section's
+     * curve. */
+    int      on;
+    int      keyoff_pending;
     int      playing;
     int      ended;
     int      paused;
@@ -228,20 +244,68 @@ static int decode_block(sas_voice *v) {
     return 1;
 }
 
+/* One sample of one phase, by the phase's curve.
+ *
+ * The shapes are adsrcurve.expected's, and findings item 45 records how far
+ * each is pinned. The linear pair is exactly plus or minus the rate. Bent is
+ * the rate below three-quarter height and a quarter above, which is every
+ * core of its sweep but the one where it crosses. Exponent falling is the
+ * height scaled by the rate with a floor of one. Exponent rising approaches
+ * the top geometrically and behaves as though bit 16 of the rate were set,
+ * which is within a hundredth of a percent and no closer. Direct jumps to
+ * where the phase ends. Exponent-rev is refused by attack and driven by
+ * nothing else in the corpus, so it falls back to the linear decrease it
+ * sits beside. */
+static int32_t curve_step(uint32_t mode, int32_t h, int32_t rate, int32_t target, int rising) {
+    switch (mode & 7u) {
+    case CURVE_LINEAR_INC:  return h + rate;
+    case CURVE_LINEAR_DEC:  return h - rate;
+    case CURVE_LINEAR_BENT: return h + ((h < (ENV_MAX / 4) * 3) ? rate : (rate >> 2));
+    case CURVE_EXP_REV: {
+        /* The falling exponential. The parity rule names which is which: the
+         * odd curves are the falling shapes, so a decay or a release takes
+         * mode 3 and an attack takes mode 4. The step is the height scaled by
+         * the rate, rounded *up* -- from the top at rate 9 hardware steps 3 a
+         * sample where truncation would step 2, a product that is exact keeps
+         * its value, and rounding up is what stops a small height from never
+         * falling at all. Exact on twelve of adsrcurve's fourteen decay
+         * sweeps; the two others differ only where the height meets the
+         * sustain level. */
+        const int64_t step = (((int64_t)h * (uint32_t)rate) + 0xFFFFFFFFll) >> 32;
+        return h - (int32_t)step;
+    }
+    case CURVE_EXP:
+        if (rising) {
+            /* A fixed 0x4000 a sample plus the room left, scaled by the rate.
+             * The fixed part is why a small rate climbs in a straight line --
+             * rate 0 and rate 1 both step exactly 0x4000, with no curvature
+             * anywhere in their sweeps -- and the scaled part is what bends
+             * the large ones. Exact on all twelve attack sweeps. */
+            const int64_t room = (int64_t)ENV_MAX - h;
+            return h + 0x4000 + (int32_t)((room * (uint32_t)rate) >> 32);
+        }
+        /* Even curves are the rising shapes and a falling phase will not
+         * accept one; if one arrives anyway, fall back rather than climb. */
+        return h - rate;
+    case CURVE_DIRECT:      return target;
+    default:                return rising ? h + rate : h - rate;
+    }
+}
+
 /* Advance the envelope by one sample and return its current level, 0..0x40000000. */
 static int32_t step_envelope(sas_voice *v) {
     switch (v->env_state) {
     case ENV_ATTACK:
-        v->env += v->attack_rate;
+        v->env = curve_step(v->mode_attack, v->env, v->attack_rate, ENV_MAX, 1);
         if (v->env >= ENV_MAX) { v->env = ENV_MAX; v->env_state = ENV_DECAY; }
         break;
     case ENV_DECAY:
-        v->env -= v->decay_rate;
+        v->env = curve_step(v->mode_decay, v->env, v->decay_rate, v->sustain_level, 0);
         if (v->env <= v->sustain_level) { v->env = v->sustain_level; v->env_state = ENV_SUSTAIN; }
         break;
     case ENV_RELEASE:
-        v->env -= v->release_rate;
-        if (v->env <= 0) { v->env = 0; v->env_state = ENV_OFF; v->playing = 0; v->ended = 1; }
+        v->env = curve_step(v->mode_release, v->env, v->release_rate, 0, 0);
+        if (v->env <= 0) { v->env = 0; v->env_state = ENV_OFF; v->playing = 0; v->on = 0; v->ended = 1; }
         break;
     case ENV_SUSTAIN:
     default:
@@ -257,6 +321,13 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
 
     for (uint32_t vi = 0; vi < g_max_voices; vi++) {
         sas_voice *v = &g_voice[vi];
+        if (v->keyoff_pending) {
+            v->keyoff_pending = 0;
+            v->on = 0;
+            if (v->playing) {
+                v->env_state = ENV_RELEASE;
+            }
+        }
         if (!v->playing || v->paused) continue;
         if (!v->is_pcm && !v->vag_addr) continue;
 
@@ -274,7 +345,7 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
             } else {
                 if (!v->decoded_valid || v->sample_idx >= 28) {
                     v->sample_idx = 0;
-                    if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+                    if (!decode_block(v)) { v->playing = 0; v->on = 0; v->ended = 1; break; }
                 }
                 s = v->decoded[v->sample_idx];
             }
@@ -296,13 +367,13 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
                     v->pcm_pos++;
                     if (v->pcm_pos >= v->pcm_size) {
                         if (v->pcm_loop >= 0 && v->pcm_loop < v->pcm_size) v->pcm_pos = v->pcm_loop;
-                        else { v->playing = 0; v->ended = 1; break; }
+                        else { v->playing = 0; v->on = 0; v->ended = 1; break; }
                     }
                 } else {
                     v->sample_idx++;
                     if (v->sample_idx >= 28) {
                         v->sample_idx = 0;
-                        if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+                        if (!decode_block(v)) { v->playing = 0; v->on = 0; v->ended = 1; break; }
                     }
                 }
             }
@@ -478,7 +549,9 @@ static void hle_SetKeyOn(void) {
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     /* Keying on a voice that is already on is refused, whether or not it is
      * paused -- keyon.expected, "Key on twice" and "While paused". */
-    if (v->playing) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
+    if (v->on) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
+    v->on = 1;
+    v->keyoff_pending = 0;
     v->playing = 1;
     v->ended = 0;
     v->paused = 0;
@@ -492,15 +565,14 @@ static void hle_SetKeyOn(void) {
     v->start_delay = 32;
     v->env = 0;
     v->env_state = ENV_ATTACK;
-    if (!v->attack_rate) v->attack_rate = 0x40000000 / 64;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Raised here, taken at the next core: see the note on `on`. */
 static void hle_SetKeyOff(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
-    v->env_state = ENV_RELEASE;
-    if (!v->release_rate) v->release_rate = ENV_MAX / 256;
+    v->keyoff_pending = 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
