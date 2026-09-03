@@ -52,14 +52,39 @@
  * all four -- the two channel volumes and the two reverb sends -- are
  * checked. */
 #define SAS_ERROR_VOLUME       0x80420018u
+/* Not a sascore code at all: mixing in output mode 1 comes back as a plain
+ * "not supported" from the layer below. */
+#define SAS_ERROR_MIX_MODE     0x80000004u
 
 static int grain_ok(uint32_t g) { return g >= 64 && g <= SAS_MAX_GRAIN && (g % 32) == 0; }
 
-/* VAG ADPCM predictor coefficients. Each 16-byte block picks one of five
- * filters; the decoded sample is the shifted nibble plus a weighted sum of the
- * previous two outputs. The weights are /64. */
-static const int VAG_F0[5] = { 0, 60, 115,  98, 122 };
-static const int VAG_F1[5] = { 0,  0, -52, -55, -60 };
+/* VAG ADPCM predictor coefficients. Each 16-byte block names a filter in the
+ * top nibble of its header; the decoded sample is the shifted nibble plus a
+ * weighted sum of the previous two outputs, the weights being /64.
+ *
+ * Five filters are documented, and a block may name sixteen. What hardware
+ * does with the other eleven is not a special case: it reads past the end of
+ * its table. The two coefficients live as contiguous runs of five int16, the
+ * first weight then the second, and index i takes `W[i]` and `W[i + 5]` --
+ * so filter 7's first weight is 52, which is filter 2's second weight, and
+ * filter 9's second weight is 125, which is filter 14's first. vag.expected
+ * sweeps all sixteen and every one of those coincidences holds, which is what
+ * says the shape of the overrun is right rather than eleven numbers that
+ * happen to fit.
+ *
+ * The second weight is stored positive and subtracted, which is why the
+ * documented pairs read (115, 52) here and (115, -52) elsewhere.
+ *
+ * Entries past the ninth are measured rather than derived -- they are the
+ * module's own data, whatever sits after the table. W[19] is the one value
+ * the corpus underdetermines: filter 14 clamps, so anything from 82 to 85
+ * gives its output. Nothing an encoder emits reaches past filter 4. */
+static const int VAG_W[21] = {
+    /* first  weights, 0..4 */    0, 60, 115,  98, 122,
+    /* second weights, 0..4 */    0,  0,  52,  55,  60,
+    /* past the table          */ 0,  0,   0,   2, 125,
+                                  0, 91,   0, 216,  85, 151,
+};
 
 enum { ENV_OFF = 0, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 
@@ -151,6 +176,7 @@ typedef struct {
      * sample the voice starts from at output index 32, with the loop
      * arriving 32 late to match. */
     int32_t  start_delay;
+    int32_t  src_delay;   /* extra samples before the first source sample */
 } sas_voice;
 
 static sas_voice g_voice[SAS_VOICES];
@@ -228,8 +254,7 @@ static int decode_block(sas_voice *v) {
     uint8_t flags = psp_read8(at + 1);
 
     int shift  = hdr & 0x0F;
-    int filter = (hdr >> 4) & 0x0F;
-    if (filter > 4) filter = 0;          /* out of range: treat as no prediction */
+    int filter = (hdr >> 4) & 0x0F;      /* all sixteen are real; see VAG_W */
 
     for (int i = 0; i < 28; i++) {
         uint8_t byte = psp_read8(at + 2 + (uint32_t)(i / 2));
@@ -238,7 +263,7 @@ static int decode_block(sas_voice *v) {
         /* Sign-extend the 4-bit sample into the top of a 16-bit word, then
          * shift down. Shifting the nibble directly loses the sign. */
         int s = (int)((int16_t)(nib << 12)) >> shift;
-        s += (VAG_F0[filter] * v->hist1 + VAG_F1[filter] * v->hist2) >> 6;
+        s += (VAG_W[filter] * v->hist1 - VAG_W[filter + 5] * v->hist2) >> 6;
         s = clamp16(s);
 
         v->decoded[i] = (int16_t)s;
@@ -345,7 +370,12 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
             if (v->start_delay > 0) { v->start_delay--; continue; }
 
             int32_t s;
-            if (v->is_pcm) {
+            int fetched = 1;
+            if (v->src_delay > 0) {
+                v->src_delay--;
+                fetched = 0;
+                s = 0;
+            } else if (v->is_pcm) {
                 /* A PCM voice whose address is zero is accepted by hardware
                  * (pcm.expected, "Zero: OK"); it plays silence here rather
                  * than reading whatever is at address zero. */
@@ -360,16 +390,24 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
                 s = v->decoded[v->sample_idx];
             }
 
-            int32_t env = step_envelope(v);
-            /* Envelope is 30-bit; bring it down to a 12-bit multiplier before
+            /* Read the envelope, then step it -- in that order. The first
+             * sample of a voice is multiplied by a height of zero and comes
+             * out silent however loud the source is, which is what pcm and
+             * vag show at [020]: a full-scale sample reading 0000. Stepping
+             * first shifted every voice one sample earlier than hardware.
+             *
+             * Envelope is 30-bit; bring it down to a 12-bit multiplier before
              * applying, so the product stays inside 32 bits. */
+            const int32_t env = v->env;
             s = (s * (env >> 18)) >> 12;
 
             mix_l[i] += (s * v->vol_l) >> 12;
             mix_r[i] += (s * v->vol_r) >> 12;
+            step_envelope(v);
 
             /* Pitch is a 12-bit fixed-point step: 0x1000 plays at the source
              * rate, 0x2000 an octave up. */
+            if (!fetched) continue;   /* nothing read, so nothing to advance */
             v->frac += v->pitch;
             while (v->frac >= 0x1000) {
                 v->frac -= 0x1000;
@@ -583,14 +621,16 @@ static void hle_SetSL(void) {
 static void hle_SetKeyOn(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
-    /* Keying on a voice that is already on is refused, whether or not it is
-     * paused -- keyon.expected, "Key on twice" and "While paused". */
-    if (v->on) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
+    /* Keying on a voice that is already on is refused, and so is keying on a
+     * voice that is paused, with the same code -- keyon.expected's "Key on
+     * twice" and "While paused". The paused case is not the already-on one
+     * wearing a different hat: the test keys the voice *off* before pausing
+     * it, and hardware still refuses. A paused voice takes no key. */
+    if (v->on || v->paused) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
     v->on = 1;
     v->keyoff_pending = 0;
     v->playing = 1;
     v->ended = 0;
-    v->paused = 0;
     v->pos = 0;
     v->last_block = 0;
     v->sample_idx = 0;
@@ -598,19 +638,41 @@ static void hle_SetKeyOn(void) {
     v->hist1 = v->hist2 = 0;
     v->decoded_valid = 0;
     v->pcm_pos = 0;
+    /* 32 samples before the first one is heard (item 44) -- and 33 for a
+     * VAG, whose first decoded sample lands at output 33 where a PCM voice's
+     * lands at 32. vag.expected's data sweeps are the whole of the evidence:
+     * the sample values match from the first nibble, one output sample later
+     * than this used to place them. Reading a block header costs the ADPCM
+     * path a sample that the PCM path does not spend. */
+    /* Two delays, not one. The voice goes live 32 samples after the key-on
+     * (item 44) and its envelope starts running there whatever it is playing.
+     * A VAG's first decoded sample then lands one sample later still, at 33
+     * where a PCM voice's lands at 32 -- vag.expected's data sweeps match
+     * from the first nibble at that offset, and the sample at 33 comes out at
+     * full scale, which is only possible if the envelope had already taken
+     * its first step during the sample the ADPCM path spends on the block
+     * header. */
     v->start_delay = 32;
+    v->src_delay   = v->is_pcm ? 0 : 1;
     v->env = 0;
     v->env_state = ENV_ATTACK;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Raised here, taken at the next core: see the note on `on`. A voice whose
- * key is not down has nothing to lift, and keyoff.expected refuses that with
- * the same code an already-on key-on gets -- including while paused. */
+/* A voice whose key is not down has nothing to lift, and keyoff.expected
+ * refuses that with the same code an already-on key-on gets -- including
+ * while paused.
+ *
+ * The key comes up here and now. Only the *release* waits for the next core:
+ * pcm.expected and vag.expected both key a voice off and straight back on
+ * without a core between, and hardware restarts it, which it could not do if
+ * the key were still down. Holding `on` until the core made the second
+ * key-on fail and left the voice playing the previous section's sound. */
 static void hle_SetKeyOff(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     if (!v->on) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
+    v->on = 0;
     v->keyoff_pending = 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -657,7 +719,13 @@ static void hle_GetAllEnvelopeHeights(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-static void mix_to_guest(uint32_t out_addr, int add) {
+/* `mix_l`/`mix_r` scale what is already in the buffer, not what is rendered
+ * into it: outputmode.expected's mix sections pass 0 for both and get the
+ * rendered samples back unchanged, which is only possible if the zero applies
+ * to the other side. Zero is the only pair the corpus passes, so the scale
+ * itself -- 12-bit, as everywhere else here -- is by analogy with the voice
+ * volumes rather than measured. */
+static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_r) {
     int32_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN];
     uint32_t n = g_grain;
     render(l, r, n);
@@ -665,8 +733,8 @@ static void mix_to_guest(uint32_t out_addr, int add) {
     for (uint32_t i = 0; i < n; i++) {
         int32_t sl = clamp16(l[i]), sr = clamp16(r[i]);
         if (add) {
-            sl = clamp16(sl + (int16_t)psp_read16(out_addr + i * 4));
-            sr = clamp16(sr + (int16_t)psp_read16(out_addr + i * 4 + 2));
+            sl = clamp16(sl + (((int16_t)psp_read16(out_addr + i * 4)     * mix_l) >> 12));
+            sr = clamp16(sr + (((int16_t)psp_read16(out_addr + i * 4 + 2) * mix_r) >> 12));
         }
         psp_write16(out_addr + i * 4,     (uint16_t)(int16_t)sl);
         psp_write16(out_addr + i * 4 + 2, (uint16_t)(int16_t)sr);
@@ -678,13 +746,17 @@ static void mix_to_guest(uint32_t out_addr, int add) {
 static void hle_Core(void) {
     /* (sasCore, sampleBuffer) */
     uint32_t out = psp_arg(1);
-    if (out) mix_to_guest(out, 0);
+    if (out) mix_to_guest(out, 0, 0, 0);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* (sasCore, sampleBuffer, leftMix, rightMix). Refused outright in output mode
+ * 1 -- outputmode.expected's last section gets 0x80000004 and a buffer
+ * nothing has touched. */
 static void hle_CoreWithMix(void) {
     uint32_t out = psp_arg(1);
-    if (out) mix_to_guest(out, 1);
+    if (g_output_mode != 0) { psp_ret(SAS_ERROR_MIX_MODE); return; }
+    if (out) mix_to_guest(out, 1, (int32_t)psp_arg(2), (int32_t)psp_arg(3));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

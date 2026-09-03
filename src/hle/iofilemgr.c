@@ -417,6 +417,28 @@ static void hle_Lseek(void) {
     psp_cpu.r[PSP_REG_V1] = (uint32_t)(shown >> 32);
 }
 
+/* sceIoLseek32 is the same seek with a 32-bit offset and a 32-bit result, so
+ * its arguments are *not* register-aligned: the offset is $a1 and the whence
+ * $a2. It had never been registered, which meant a call to it returned
+ * whatever was in $v0 -- zero, in practice. A test that seeks to the end to
+ * size a file then read it got a length of zero and went on to decode an
+ * empty buffer, which is why sascore's vag output was silence with no error
+ * anywhere to explain it. */
+static void hle_Lseek32(void) {
+    io_file *h = fd_arg();
+    if (!h) { psp_ret(0x80020323); return; }
+    const int64_t off = (int32_t)psp_arg(1);
+    const uint32_t whence = psp_arg(2);
+    /* Reuse the 64-bit seek so the window, sector mode and clamping stay in
+     * one place: put the offset where that one looks for it. */
+    psp_cpu.r[PSP_REG_A2] = (uint32_t)(uint64_t)off;
+    psp_cpu.r[PSP_REG_A3] = (uint32_t)((uint64_t)off >> 32);
+    psp_cpu.r[PSP_REG_T0] = whence;
+    hle_Lseek();
+    /* 32-bit result: $v1 is not part of it. */
+    psp_cpu.r[PSP_REG_V1] = 0;
+}
+
 /* SceIoStat, laid out exactly as pspiofilemgr_stat.h declares it:
  *
  *    0  SceMode        st_mode
@@ -1007,6 +1029,14 @@ static void hle_WriteAsync(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static void hle_Lseek32Async(void) {
+    io_file *h = fd_arg();
+    if (!h) { psp_ret(SCE_ERROR_BADF); return; }
+    hle_Lseek32();
+    async_done(h, (int64_t)(int32_t)psp_cpu.r[PSP_REG_V0]);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 static void hle_LseekAsync(void) {
     io_file *h = fd_arg();
     if (!h) { psp_ret(SCE_ERROR_BADF); return; }
@@ -1067,6 +1097,8 @@ void psp_io_register(void) {
     psp_hle_register(0xA0B5A7C2, "IoFileMgrForUser", "sceIoReadAsync",   hle_ReadAsync);
     psp_hle_register(0x0FACAB19, "IoFileMgrForUser", "sceIoWriteAsync",  hle_WriteAsync);
     psp_hle_register(0x71B19E77, "IoFileMgrForUser", "sceIoLseekAsync",  hle_LseekAsync);
+    psp_hle_register(0x68963324, "IoFileMgrForUser", "sceIoLseek32",  hle_Lseek32);
+    psp_hle_register(0x1B385D8F, "IoFileMgrForUser", "sceIoLseek32Async", hle_Lseek32Async);
     psp_hle_register(0xFF5940B6, "IoFileMgrForUser", "sceIoCloseAsync",  hle_CloseAsync);
     psp_hle_register(0x3251EA56, "IoFileMgrForUser", "sceIoPollAsync",   hle_PollAsync);
     psp_hle_register(0xE23EEC33, "IoFileMgrForUser", "sceIoWaitAsync",   hle_WaitAsync);
