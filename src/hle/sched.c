@@ -755,8 +755,18 @@ const char *psp_sched_stop_reason(void) {
 int psp_sched_drain(int timeout_s) {
     if (!g_threading) return 0;
 
-    const uint64_t deadline_ns =
-        psp_os_mono_ns() + (uint64_t)timeout_s * 1000000000ull;
+    /* A timeout of zero or less means no limit -- someone is at the window
+     * and will decide when to stop. It is expressed as a deadline a year out
+     * rather than as a special case inside the wait: psp_os_cond_wait_until
+     * takes an absolute time, and a saturated one is not portably safe --
+     * pthread_cond_timedwait may reject an out-of-range timespec with EINVAL,
+     * which reports as "not a timeout" and would turn waiting forever into a
+     * busy loop against the lock. A year is not forever, and is long enough
+     * to be. */
+    const uint64_t span_ns = timeout_s > 0
+        ? (uint64_t)timeout_s * 1000000000ull
+        : 365ull * 24 * 3600 * 1000000000ull;
+    const uint64_t deadline_ns = psp_os_mono_ns() + span_ns;
 
     /* The main context steps aside so the guest threads can run. It becomes
      * runnable again only when they are all finished -- or when none of them
