@@ -517,9 +517,11 @@ static void test_ge_display_list(void) {
     for (uint32_t i = 0; i < n; i++) psp_write32(LIST + i * 4, w[i]);
 
     uint64_t before = psp_ge_command_count();
-    /* sceGeListEnQueue(list, stall=0, cbid, arg) */
+    /* sceGeListEnQueue(list, stall=0, cbid, arg), then DrawSync(WAIT):
+     * the GE is deferred, so nothing executes until the sync drains it. */
     uint32_t qid = call(psp_nid("sceGeListEnQueue"), LIST, 0, 0, 0);
     CHECK(qid != 0, "list enqueued, got 0x%08X", qid);
+    CHECK(call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0) == 0, "draw sync drains");
 
     uint64_t executed = psp_ge_command_count() - before;
     CHECK(executed == 6, "walked BASE,VTYPE,PRIM,JUMP,PRIM,FINISH = 6, got %llu",

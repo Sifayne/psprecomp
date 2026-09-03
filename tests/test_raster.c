@@ -75,6 +75,7 @@ static void end_list(void) {
     cmd(0x0F, 0);                    /* FINISH */
     cmd(0x0C, 0);                    /* END */
     call(0xAB49E76A, LIST, 0, 0, 0); /* sceGeListEnQueue */
+    call(0xB287BD61, 0, 0, 0, 0);    /* sceGeDrawSync(WAIT): deferred GE drains here */
 }
 
 /* One 16-bit-position, 8888-colour vertex. Colour precedes position. */

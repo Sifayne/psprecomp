@@ -27,6 +27,7 @@
 #include <math.h>
 #include "psprecomp/hle.h"
 #include "psprecomp/render.h"
+#include "psprecomp/sched.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1763,7 +1764,10 @@ static void run_list(ge_queue *q) {
     int sp = 0;
     uint64_t budget = 1u << 22;
 
-    g_ge.lists++;
+    /* NB: lists are counted at enqueue (submitted), not here: a
+     * stall-streamed list resumes here several times but was submitted
+     * once. Counting runs made the total depend on how many stall updates
+     * the CPU interleaved. */
 
     while (budget--) {
         if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
@@ -2288,25 +2292,36 @@ static void enqueue(int head) {
     q->used  = 1;
     (void)head;
 
-    /* Hardware runs the list asynchronously; Sync(WAIT) blocks until it is
-     * done. We run it here and finish before returning, so every Sync then
-     * reports completion immediately.
+    /* Deferred: EnQueue queues without running; the work drains on
+     * Sync(WAIT)/DrawSync(WAIT) in id order, or earlier as UpdateStallAddr
+     * releases words (below). Previously the list ran inside EnQueue, which
+     * is observably wrong: on hardware it is still pending at Sync time.
      *
-     * Indistinguishable for Finish->Sync, which is all Last Raven and the
-     * gpu tests' pixel checks use -- but not hardware-correct, and visibly
-     * so: pspautotests' checkpoint prints [r] when its equal-priority helper
-     * ran while blocked in Sync, so blend/blend565 differ by 128/140 lines
-     * of prefix only, with identical COLOR values.
+     * UpdateStallAddr resumes a stalled list immediately, like the hardware
+     * consuming newly-released words while the CPU builds. This half is
+     * load-bearing, not an optimisation: pspgu reuses one list buffer
+     * across tests, so executing the tail only at Sync would run the new
+     * list's words under the old id (simple.prx's 8 grey pixels).
      *
-     * Intended next step is deferred, not concurrent: EnQueue queues without
-     * running; ListSync(WAIT)/DrawSync(WAIT) block (psp_sched_block) and
-     * drain to FINISH/stall, NOWAIT only polls, UpdateStallAddr resumes, and
-     * EDRAM reads drain first. Same observable blocking without inventing GE
-     * timing or breaking the scheduler's one-token determinism. A bare yield
-     * in Sync would fake the [r] while lying about WAIT vs NOWAIT and
-     * already-done lists. Full worker thread only when something streams via
-     * stall and needs real overlap -- nothing measured does yet. */
-    run_list(q);
+     * Sync(WAIT) on a still-pending list yields once -- an equal-priority
+     * thread runs there on hardware, which is pspautotests' checkpoint [r]
+     * -- then completes; an already-done list returns immediately ([x]).
+     * In practice pspgu's Finish releases the stall before Sync, so tiny
+     * DIRECT lists are already done at Sync and read [x] here. Hardware
+     * reads [r] for blend and [x] for fog on the identical GE pattern; the
+     * split correlates with the checkpoint window's DMA/cache traffic
+     * (557KB vs 128B per test), not with GE state, so no GE-Sync model
+     * reproduces both and none is attempted -- that prefix is timing noise
+     * (strip it for gpu verdicts) while WAIT/NOWAIT blocking is honoured.
+     * NOWAIT reports DONE even when pending (the pre-existing lie, kept:
+     * pspgu's helpers poll it on tiny internal lists that have finished on
+     * hardware by the time anyone asks).
+     *
+     * Not yet modelled: head-vs-tail ordering, BREAK/pause state 4,
+     * DeQueue, GetCmd/GetMtx/GetStack (unimplemented, read 0), and the
+     * queue-full code (hardware 0x80000022). Full worker thread only when
+     * something streams via stall and needs real overlap. */
+    g_ge.lists++;
     psp_ret(q->id);
 }
 
@@ -2317,15 +2332,100 @@ static void hle_ListUpdateStallAddr(void) {
     ge_queue *q = find_queue(psp_arg(0));
     if (!q) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
     q->stall = psp_arg(1) & ~3u;
-    if (!q->done) run_list(q);          /* the new stall released more commands */
+    /* Resume immediately: the hardware consumes newly-released words while
+     * the CPU builds, and the buffer may be reused by the next list as soon
+     * as this one is Sync'd -- executing the tail only at Sync would run
+     * the new list's words under the old id. Stall==0 (no stall) lists have
+     * nothing released yet and stay fully deferred to Sync. */
+    if (!q->done) run_list(q);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Synchronous today, so every sync succeeds immediately -- which is why our
- * gpu checkpoints read [x] where hardware blocks and reads [r]. See the
- * note on enqueue: WAIT must eventually block and drain, NOWAIT must not. */
-static void hle_ListSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
-static void hle_DrawSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* List/Draw status, as pspautotests' status_str reads it: 0 DONE, 1 QUEUED,
+ * 2 DRAWING, 3 STALL. BREAK/pause (4) is not modelled and reports DRAWING. */
+#define GE_SYNC_DONE 0
+#define GE_SYNC_WAIT 0
+static ge_queue *oldest_pending(void) {
+    ge_queue *best = NULL;
+    for (int i = 0; i < MAX_QUEUES; i++)
+        if (g_queue[i].used && !g_queue[i].done &&
+            (!best || g_queue[i].id < best->id)) best = &g_queue[i];
+    return best;
+}
+
+static int list_status(ge_queue *q) {
+    if (!q || !q->used) return 0x80000100;
+    if (q->done) return GE_SYNC_DONE;
+    if (q != oldest_pending()) return 1;                       /* QUEUED */
+    if (q->stall && q->list == q->stall) return 3;              /* STALL */
+    return 2;                                                  /* DRAWING */
+}
+
+/* Drain one list as far as its stall allows. run_list stops at the stall
+ * (still pending) or at FINISH/END (done). */
+static void drain_one(ge_queue *q) {
+    if (!q || !q->used || q->done) return;
+    run_list(q);
+}
+
+/* Drain every pending list up to and including the target, in id order --
+ * the order hardware executes them. */
+static void drain_through(uint32_t id) {
+    for (;;) {
+        ge_queue *q = oldest_pending();
+        if (!q || q->id > id) break;
+        drain_one(q);
+        if (!q->done) break;      /* stalled: later lists stay queued */
+        if (q->id == id) break;
+    }
+}
+
+static void drain_all(void) {
+    for (;;) {
+        ge_queue *q = oldest_pending();
+        if (!q) break;
+        drain_one(q);
+        if (!q->done) break;      /* stalled head blocks the rest */
+    }
+}
+
+/* Flush for paths that present or inspect pixels without going through Sync
+ * -- SetFrameBuf's present hook and the unit tests. No yield: this is not a
+ * wait, and it must be safe where no thread holds the token. */
+void psp_ge_drain_all(void) { drain_all(); }
+
+static void hle_ListSync(void) {
+    ge_queue *q = find_queue(psp_arg(0));
+    if (!q) { psp_ret(0x80000100); return; }
+    if (q->done) { psp_ret(GE_SYNC_DONE); return; }
+    /* NOWAIT reports DONE even when pending. That is the pre-existing lie,
+     * kept deliberately: pspgu's own helpers (ClutLoad and friends) poll
+     * NOWAIT on their tiny internal lists, which on hardware have already
+     * finished by the time anyone asks. Reporting them pending steers pspgu
+     * down paths it never takes on hardware and moves pixels (simple.prx).
+     * True pending-aware NOWAIT needs BREAK-aware states plus real GE
+     * timing; until then only WAIT tells the truth. */
+    if (psp_arg(1) != GE_SYNC_WAIT) { psp_ret(GE_SYNC_DONE); return; }
+    /* WAIT on a pending list: give up the CPU once -- an equal-priority
+     * thread runs here on hardware, which is the checkpoint [r] -- then
+     * complete synchronously. A lone thread yields to itself and carries
+     * on, so the game is unaffected. */
+    psp_sched_yield();
+    drain_through(q->id);
+    psp_ret(q->done ? GE_SYNC_DONE : list_status(q));
+}
+
+static void hle_DrawSync(void) {
+    /* NOWAIT: same standing lie as ListSync -- DONE, see above. */
+    if (psp_arg(0) != GE_SYNC_WAIT) { psp_ret(GE_SYNC_DONE); return; }
+    if (!oldest_pending()) { psp_ret(GE_SYNC_DONE); return; }
+    psp_sched_yield();
+    drain_all();
+    /* DONE even if a stalled list remains: Break is still a stub that reports
+     * success without clearing anything, so reporting busy afterwards would
+     * contradict our own Break. Revisit with real BREAK state. */
+    psp_ret(GE_SYNC_DONE);
+}
 
 static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_Continue(void) { psp_ret(SCE_KERNEL_ERROR_OK); }

@@ -238,6 +238,9 @@ static void hle_SetFrameBuf(void) {
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);
     if (!g_fb_width) g_fb_width = 512;
+    /* Present finished pixels: a flip without a preceding Sync still shows
+     * what the GE has been given, on hardware as tearing, here as drained. */
+    psp_ge_drain_all();
     score_frame(g_fb_addr);
     dump_frame_seq(g_fb_addr);
     /* The frame flip. What the game hands the display is what a window shows;
