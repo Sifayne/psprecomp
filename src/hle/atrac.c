@@ -167,60 +167,52 @@ static atrac_ctx g_id[ATRAC_IDS];
 /* ---- the decoder ---------------------------------------------------------- */
 
 #if PSPRECOMP_HAVE_FFMPEG
-typedef struct { AVCodecContext *cc; AVPacket *pkt; AVFrame *fr; } atrac_dec;
+struct psp_at3_dec { AVCodecContext *cc; AVPacket *pkt; AVFrame *fr; uint32_t block_align; };
 
-static void dec_close(atrac_ctx *c) {
-    atrac_dec *d = (atrac_dec *)c->dec;
+void psp_at3_close(psp_at3_dec *d) {
     if (!d) return;
     av_frame_free(&d->fr);
     av_packet_free(&d->pkt);
     avcodec_free_context(&d->cc);
     free(d);
-    c->dec = NULL;
 }
 
 /* libavcodec's contract, read from atrac3plusdec.c and atrac3.c: ATRAC3+
  * wants block_align and the channel count and no extradata; ATRAC3 wants the
  * 14 bytes that follow the WAVE fmt chunk's cbSize as extradata, and a
  * block_align of 96, 152 or 192 per channel. Both answer planar float. */
-static int dec_open(atrac_ctx *c) {
-    dec_close(c);
-    const AVCodec *codec = avcodec_find_decoder(
-        c->codec == PSP_ATRAC_AT3PLUS ? AV_CODEC_ID_ATRAC3P : AV_CODEC_ID_ATRAC3);
-    if (!codec) return -1;
-    atrac_dec *d = (atrac_dec *)calloc(1, sizeof *d);
-    if (!d) return -1;
-    d->cc = avcodec_alloc_context3(codec);
+psp_at3_dec *psp_at3_open(uint32_t codec, uint32_t block_align, uint32_t channels,
+                          uint32_t sample_rate, const uint8_t *extradata, uint32_t extradata_size) {
+    const AVCodec *avc = avcodec_find_decoder(
+        codec == PSP_ATRAC_AT3PLUS ? AV_CODEC_ID_ATRAC3P : AV_CODEC_ID_ATRAC3);
+    if (!avc || !block_align || !channels) return NULL;
+    psp_at3_dec *d = (psp_at3_dec *)calloc(1, sizeof *d);
+    if (!d) return NULL;
+    d->block_align = block_align;
+    d->cc  = avcodec_alloc_context3(avc);
     d->pkt = av_packet_alloc();
     d->fr  = av_frame_alloc();
-    if (!d->cc || !d->pkt || !d->fr) { c->dec = d; dec_close(c); return -1; }
-    d->cc->block_align = (int)c->block_align;
-    d->cc->sample_rate = (int)c->sample_rate;
-    av_channel_layout_default(&d->cc->ch_layout, (int)c->channels);
-    if (c->extradata_size) {
-        d->cc->extradata = (uint8_t *)av_mallocz(c->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!d->cc || !d->pkt || !d->fr) { psp_at3_close(d); return NULL; }
+    d->cc->block_align = (int)block_align;
+    d->cc->sample_rate = (int)sample_rate;
+    av_channel_layout_default(&d->cc->ch_layout, (int)channels);
+    if (extradata && extradata_size) {
+        d->cc->extradata = (uint8_t *)av_mallocz(extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
         if (d->cc->extradata) {
-            memcpy(d->cc->extradata, c->extradata, c->extradata_size);
-            d->cc->extradata_size = (int)c->extradata_size;
+            memcpy(d->cc->extradata, extradata, extradata_size);
+            d->cc->extradata_size = (int)extradata_size;
         }
     }
-    if (avcodec_open2(d->cc, codec, NULL) < 0) { c->dec = d; dec_close(c); return -1; }
-    c->dec = d;
-    return 0;
+    if (avcodec_open2(d->cc, avc, NULL) < 0) { psp_at3_close(d); return NULL; }
+    return d;
 }
 
-static void dec_flush(atrac_ctx *c) {
-    atrac_dec *d = (atrac_dec *)c->dec;
-    if (d) avcodec_flush_buffers(d->cc);
-}
+void psp_at3_flush(psp_at3_dec *d) { if (d) avcodec_flush_buffers(d->cc); }
 
-/* One frame in, up to `cap` interleaved stereo samples out. A mono stream
- * plays on both sides, which is what hardware's fixed two output channels
- * do with it. Returns the sample count, or -1. */
-static int dec_frame(atrac_ctx *c, const uint8_t *in, int16_t *out, uint32_t cap) {
-    atrac_dec *d = (atrac_dec *)c->dec;
-    if (av_new_packet(d->pkt, (int)c->block_align) < 0) return -1;
-    memcpy(d->pkt->data, in, c->block_align);
+int psp_at3_decode(psp_at3_dec *d, const uint8_t *in, uint32_t len, int16_t *out, uint32_t cap) {
+    if (!d) return -1;
+    if (av_new_packet(d->pkt, (int)len) < 0) return -1;
+    memcpy(d->pkt->data, in, len);
     int rc = avcodec_send_packet(d->cc, d->pkt);
     av_packet_unref(d->pkt);
     if (rc < 0) return -1;
@@ -242,13 +234,31 @@ static int dec_frame(atrac_ctx *c, const uint8_t *in, int16_t *out, uint32_t cap
     return (int)n;
 }
 #else
-static void dec_close(atrac_ctx *c) { (void)c; }
-static int  dec_open(atrac_ctx *c) { (void)c; return -1; }
-static void dec_flush(atrac_ctx *c) { (void)c; }
-static int  dec_frame(atrac_ctx *c, const uint8_t *in, int16_t *out, uint32_t cap) {
-    (void)c; (void)in; (void)out; (void)cap; return -1;
+struct psp_at3_dec { int unused; };
+psp_at3_dec *psp_at3_open(uint32_t codec, uint32_t block_align, uint32_t channels,
+                          uint32_t sample_rate, const uint8_t *extradata, uint32_t extradata_size) {
+    (void)codec; (void)block_align; (void)channels; (void)sample_rate; (void)extradata; (void)extradata_size;
+    return NULL;
 }
+int  psp_at3_decode(psp_at3_dec *d, const uint8_t *in, uint32_t len, int16_t *out, uint32_t cap) {
+    (void)d; (void)in; (void)len; (void)out; (void)cap; return -1;
+}
+void psp_at3_flush(psp_at3_dec *d) { (void)d; }
+void psp_at3_close(psp_at3_dec *d) { (void)d; }
 #endif
+
+/* The stream's own decoder, on the context. */
+static void dec_close(atrac_ctx *c) { psp_at3_close((psp_at3_dec *)c->dec); c->dec = NULL; }
+static int dec_open(atrac_ctx *c) {
+    dec_close(c);
+    c->dec = psp_at3_open(c->codec, c->block_align, c->channels, c->sample_rate,
+                          c->extradata_size ? c->extradata : NULL, c->extradata_size);
+    return c->dec ? 0 : -1;
+}
+static void dec_flush(atrac_ctx *c) { psp_at3_flush((psp_at3_dec *)c->dec); }
+static int dec_frame(atrac_ctx *c, const uint8_t *in, int16_t *out, uint32_t cap) {
+    return psp_at3_decode((psp_at3_dec *)c->dec, in, c->block_align, out, cap);
+}
 
 void psp_atrac_init(void) {
     for (int i = 0; i < ATRAC_IDS; i++) { dec_close(&g_id[i]); free(g_id[i].frame); }

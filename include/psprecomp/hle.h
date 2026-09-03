@@ -430,6 +430,21 @@ void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples,
                                         uint32_t fmt, uint32_t buf,
                                         uint32_t lvol, uint32_t rvol));
 
+/* ---- the ATRAC3 / ATRAC3+ decoder, shared -----------------------------------
+ *
+ * libavcodec behind an opaque handle, owned by atrac.c and used by mpeg.c for
+ * a movie's audio too. Without libavcodec open fails and the rest are inert.
+ * `codec` is PSP_ATRAC_AT3PLUS (0x1000) or PSP_ATRAC_AT3 (0x1001);
+ * `block_align` the bytes per frame the decoder is handed; `extradata` the
+ * ATRAC3 WAVE fmt tail or NULL. A frame decodes to interleaved stereo S16,
+ * mono played on both sides; returns the sample count or -1. */
+typedef struct psp_at3_dec psp_at3_dec;
+psp_at3_dec *psp_at3_open(uint32_t codec, uint32_t block_align, uint32_t channels,
+                          uint32_t sample_rate, const uint8_t *extradata, uint32_t extradata_size);
+int  psp_at3_decode(psp_at3_dec *d, const uint8_t *in, uint32_t len, int16_t *out, uint32_t cap);
+void psp_at3_flush(psp_at3_dec *d);
+void psp_at3_close(psp_at3_dec *d);
+
 /* The priority of whatever is running now, or the module entry thread's when
  * the scheduler holds nothing. Needed by a spawn hook deciding whether a newly
  * started thread outranks its starter. */

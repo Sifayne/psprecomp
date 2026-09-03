@@ -6,8 +6,9 @@
  * buffer, stream registration, and the PSMF header queries. By default it is
  * **not** a decoder: no video frame is produced and no audio is decoded.
  *
- * PSPRECOMP_MPEG_DECODE=1 turns on the other half -- a PSMF demuxer and an
- * openh264 video path, below -- which does produce frames and hand them back.
+ * PSPRECOMP_MPEG_DECODE=1 turns on the other half -- a PSMF demuxer, an
+ * openh264 video path and, through atrac.c's libavcodec wrapper, the ATRAC3+
+ * audio -- which does produce frames and samples and hand them back.
  * It is opt-in because it does not yet get the game further; see "What the
  * decode path does not do" at the end of this block.
  *
@@ -165,6 +166,16 @@ typedef struct {
      * never payload. */
     uint8_t  es_pend[64];
     size_t   es_pend_len;
+    /* Which substream the in-flight PES belongs to: 0 video, 1 audio. */
+    int      es_pes_audio;
+    /* The audio elementary stream, the same way: ATRAC3+ frames back to back,
+     * each an 8-byte 0F D0 header and its payload, with the 4-byte private
+     * header every audio PES starts with taken off. */
+    uint8_t *aes;
+    size_t   aes_len, aes_cap, aes_pos;
+    size_t   aes_skip;     /* private-header bytes still to drop from the in-flight audio PES */
+    void    *adec;         /* psp_at3_dec*, opened from the first frame's header */
+    uint32_t adec_block;   /* the payload size it was opened for */
 
     void    *dec;          /* ISVCDecoder*, opaque here so the header stays out */
     int      dec_failed;
@@ -185,6 +196,10 @@ static mpeg_ctx g_mpeg[MAX_MPEG];
 static int      g_inited;
 
 void psp_mpeg_reset(void) {
+    for (int i = 0; i < MAX_MPEG; i++) {
+        psp_at3_close((psp_at3_dec *)g_mpeg[i].adec);
+        free(g_mpeg[i].aes);
+    }
     memset(g_mpeg, 0, sizeof g_mpeg);
     g_inited = 0;
 }
@@ -421,6 +436,7 @@ static int mpeg_logging(void) {
 #define PS_SYSTEM_HDR   0xBBu
 #define PS_PROGRAM_END  0xB9u
 #define PS_VIDEO_STREAM 0xE0u
+#define PS_PRIVATE_1    0xBDu  /* the audio: ATRAC3+ frames behind a 4-byte private header */
 
 static mpeg_ctx *ctx_for_ringbuffer(uint32_t rb) {
     for (int i = 0; i < MAX_MPEG; i++)
@@ -432,18 +448,32 @@ static mpeg_ctx *ctx_for_ringbuffer(uint32_t rb) {
     return NULL;
 }
 
-static int es_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
-    if (c->es_len + n > c->es_cap) {
-        size_t cap = c->es_cap ? c->es_cap : 65536;
-        while (cap < c->es_len + n) cap *= 2;
-        uint8_t *ne = (uint8_t *)realloc(c->es, cap);
+static int buf_append(uint8_t **buf, size_t *len, size_t *cap, const uint8_t *p, size_t n) {
+    if (*len + n > *cap) {
+        size_t c = *cap ? *cap : 65536;
+        while (c < *len + n) c *= 2;
+        uint8_t *ne = (uint8_t *)realloc(*buf, c);
         if (!ne) return -1;
-        c->es = ne;
-        c->es_cap = cap;
+        *buf = ne;
+        *cap = c;
     }
-    memcpy(c->es + c->es_len, p, n);
-    c->es_len += n;
+    memcpy(*buf + *len, p, n);
+    *len += n;
     return 0;
+}
+static int es_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
+    return buf_append(&c->es, &c->es_len, &c->es_cap, p, n);
+}
+/* Audio payload, less whatever of the PES's 4-byte private header is still
+ * owed: the first byte is the substream number, the fourth the offset of the
+ * first frame header in the payload, and neither is needed once frames are
+ * being walked by their own headers. */
+static int aes_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
+    if (c->aes_skip) {
+        const size_t k = c->aes_skip < n ? c->aes_skip : n;
+        c->aes_skip -= k; p += k; n -= k;
+    }
+    return n ? buf_append(&c->aes, &c->aes_len, &c->aes_cap, p, n) : 0;
 }
 
 /* Pull the video payload out of a run of program stream bytes, carrying
@@ -462,7 +492,7 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
     /* Continue a payload that did not fit in the previous chunk. */
     if (c->es_pes_left) {
         const size_t n = c->es_pes_left < len ? c->es_pes_left : len;
-        es_append(c, buf, n);
+        if (c->es_pes_audio) aes_append(c, buf, n); else es_append(c, buf, n);
         c->es_pes_left -= n;
         buf += n;
         len -= n;
@@ -501,7 +531,8 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
         const size_t plen = ((size_t)p[i+4] << 8) | p[i+5];
         if (id == PS_SYSTEM_HDR) { i += 6 + plen; continue; }
 
-        if (id == PS_VIDEO_STREAM) {
+        if (id == PS_VIDEO_STREAM || id == PS_PRIVATE_1) {
+            const int audio = id == PS_PRIVATE_1;
             if (i + 9 > plen_all) break;
             const size_t hdrlen = p[i+8];
             const size_t off    = i + 9 + hdrlen;
@@ -512,11 +543,13 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
                 const size_t pay = plen - 3 - hdrlen;
                 size_t n = pay;
                 if (off + n > plen_all) n = plen_all - off;
-                es_append(c, p + off, n);
+                if (audio) { c->aes_skip = 4; aes_append(c, p + off, n); }
+                else       es_append(c, p + off, n);
                 if (n < pay) {
                     /* Everything from off to the end is payload; the rest of
                      * it arrives in later chunks and must not be parsed. */
-                    c->es_pes_left = pay - n;
+                    c->es_pes_left  = pay - n;
+                    c->es_pes_audio = audio;
                     free(work);
                     return;
                 }
@@ -965,18 +998,43 @@ static void hle_GetAvcAu(void) {
         fprintf(stderr, "mpeg: GetAvcAu -> frame %d, pts %u\n", c->frames, c->pts);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
-/* The audio access unit.
+/* The audio access unit: the next ATRAC3+ frame of the movie.
  *
- * ATRAC3+ has no permissively licensed decoder, so this cannot produce sound --
- * but the player fetches a video AU and an audio AU on every pass and will not
- * advance without both. Refusing here stops the movie just as surely as
- * refusing video did: measured at ten million calls a minute.
+ * The audio substream is ATRAC3+ frames back to back, each behind an 8-byte
+ * header -- 0F D0, then two bytes of parameters (sample rate index, channel
+ * configuration, and the payload size in 8-byte units less one), then four
+ * zero bytes -- read off this game's intro: `0F D0 28 5C` is 44.1kHz, stereo,
+ * 744 bytes of payload, and the frame after it starts exactly 752 bytes on.
+ * The whole frame, header and all, is copied into the caller's ES buffer
+ * (2112 bytes, sceMpegQueryAtracEsSize) and sceMpegAtracDecode reads it back
+ * from there.
  *
- * So the AU is reported, timed to the video, and sceMpegAtracDecode fills its
- * buffer with silence. That is a substitution, not a claim -- the audio really
- * is in the stream and we really cannot decode it, and what the game gets is a
- * correctly shaped, audible-as-nothing result rather than a success with
- * nothing written behind it. The movie plays; it plays silent. */
+ * Timestamps advance by one frame -- 90000 * 2048 / 44100 ticks -- per access
+ * unit rather than being read off the PES, which is what the video does too;
+ * the thread parked on Movie Sync is called SoundThread, so this is the clock
+ * it waits on and it has to run. A frame that has not arrived yet is NO_DATA,
+ * which the player treats as "go round again" (see the header) and now means
+ * exactly that: the ring buffer feeds the stream in the game's own order and
+ * the audio can be a put or two ahead. Once the ring has short-delivered and
+ * the frames are gone, the stream is over. */
+#define AT3P_SYNC0 0x0Fu
+#define AT3P_SYNC1 0xD0u
+#define AT3P_HDR   8u
+
+/* The frame at aes_pos: its total size with the header, or 0 if there is not
+ * a whole one yet. Resyncs on the 0F D0 pair if the position has drifted. */
+static size_t aes_frame(mpeg_ctx *c) {
+    while (c->aes_pos + AT3P_HDR <= c->aes_len) {
+        const uint8_t *h = c->aes + c->aes_pos;
+        if (h[0] == AT3P_SYNC0 && h[1] == AT3P_SYNC1) {
+            const size_t payload = ((((size_t)h[2] & 3u) << 8) | h[3]) * 8u + 8u;
+            return c->aes_pos + AT3P_HDR + payload <= c->aes_len ? AT3P_HDR + payload : 0;
+        }
+        c->aes_pos++;
+    }
+    return 0;
+}
+
 static void hle_GetAtracAu(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
     if (!mpeg_decoding() || !c) {
@@ -984,33 +1042,29 @@ static void hle_GetAtracAu(void) {
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
         return;
     }
-    /* The audio timestamp has to move on its own.
-     *
-     * It was pinned to the video frame, which makes it stand still whenever no
-     * picture was produced -- and a player that syncs video to an audio clock
-     * then has a clock that does not run. The thread parked on Movie Sync is
-     * called SoundThread, so this is the clock it is waiting on.
-     *
-     * One ATRAC3+ frame is 2048 samples at 44.1kHz and PSP timestamps are
-     * 90kHz, so each access unit is worth 90000 * 2048 / 44100 ticks. Advancing
-     * by that is what the audio would do if it were really being decoded, which
-     * is the part that has to be true even though the samples are silence. */
     const uint32_t au = psp_arg(2);
+    const size_t total = aes_frame(c);
+    if (!total) {
+        if (c->es_eof) { psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }
+        psp_ret(SCE_MPEG_ERROR_NO_DATA);
+        return;
+    }
     if (au) {
+        const uint32_t esbuf = psp_read32(au + AU_ES_BUFFER);
+        if (esbuf && total <= MPEG_ATRAC_ES_SIZE)
+            psp_mem_write_block(esbuf, c->aes + c->aes_pos, (uint32_t)total);
         psp_write32(au + AU_PTS,     c->atrac_pts);
         psp_write32(au + AU_PTS + 4, 0);
         psp_write32(au + AU_DTS,     c->atrac_pts);
         psp_write32(au + AU_DTS + 4, 0);
-        psp_write32(au + AU_ES_SIZE, MPEG_ATRAC_ES_SIZE);
+        psp_write32(au + AU_ES_SIZE, (uint32_t)total);
     }
-    /* The audio stream ends when the video's does: both are substreams of the
-     * one file, and the ring callback's short delivery says so for both.
-     * Answering AUs forever would have SoundThread pumping silence down a
-     * channel long after the movie stopped -- measured at 179 thousand calls
-     * and climbing at the end of a four-minute run. */
-    if (c->es_eof && c->es_pos >= c->es_len && !c->pic_ready) {
-        psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
-        return;
+    c->aes_pos += total;
+    /* Consumed frames need not be kept: slide the buffer down now and then. */
+    if (c->aes_pos > 1u << 20) {
+        memmove(c->aes, c->aes + c->aes_pos, c->aes_len - c->aes_pos);
+        c->aes_len -= c->aes_pos;
+        c->aes_pos = 0;
     }
     c->atrac_pts += MPEG_ATRAC_PTS_STEP;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -1092,7 +1146,12 @@ static void hle_AvcDecode(void) {
     if (init_ptr) psp_write32(init_ptr, got ? 1u : 0u);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
-/* Silence, in the shape the caller asked for. See hle_GetAtracAu. */
+/* sceMpegAtracDecode(mpeg, au, buffer, init): the frame the access unit
+ * holds, decoded to 2048 stereo samples in the caller's buffer
+ * (sceMpegQueryAtracEsSize's second answer, 8192 bytes). The decoder is
+ * opened from the first frame's own header and flushed when `init` says a
+ * new stream starts. A frame it refuses, or a build with no libavcodec, is
+ * silence of the same length -- the movie keeps its clock either way. */
 static void hle_AtracDecode(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
     if (!mpeg_decoding() || !c) {
@@ -1100,10 +1159,48 @@ static void hle_AtracDecode(void) {
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
         return;
     }
-    const uint32_t dst = psp_arg(2);
+    const uint32_t au = psp_arg(1), dst = psp_arg(2), init = psp_arg(3);
+    int16_t pcm[2048 * 2];
+    int n = -1;
+    if (au) {
+        const uint32_t esbuf = psp_read32(au + AU_ES_BUFFER);
+        const uint32_t essz  = psp_read32(au + AU_ES_SIZE);
+        uint8_t frame[MPEG_ATRAC_ES_SIZE];
+        if (esbuf && essz >= AT3P_HDR && essz <= sizeof frame &&
+            psp_mem_read_block(frame, esbuf, essz) == 0 &&
+            frame[0] == AT3P_SYNC0 && frame[1] == AT3P_SYNC1) {
+            const uint32_t payload = ((((uint32_t)frame[2] & 3u) << 8) | frame[3]) * 8u + 8u;
+            /* Sample rate index and channel configuration, as the OMA/AA3
+             * container spells them: rates 32000, 44100, 48000, 88200, 96000;
+             * channel configuration 1 is mono and 2 stereo. */
+            static const uint32_t rates[8] = { 32000, 44100, 48000, 88200, 96000, 44100, 44100, 44100 };
+            const uint32_t rate = rates[(frame[2] >> 5) & 7];
+            const uint32_t chan = ((frame[2] >> 2) & 7) == 1 ? 1u : 2u;
+            if (payload + AT3P_HDR <= essz) {
+                if (c->adec && c->adec_block != payload) { psp_at3_close((psp_at3_dec *)c->adec); c->adec = NULL; }
+                if (!c->adec) {
+                    c->adec = psp_at3_open(0x1000u, payload, chan, rate, NULL, 0);
+                    c->adec_block = payload;
+                    if (!c->adec) {
+                        static int said;
+                        if (!said++)
+                            fprintf(stderr, "psprecomp: sceMpegAtracDecode has no decoder for the movie's "
+                                            "audio; it plays silent.\n");
+                    }
+                } else if (init) psp_at3_flush((psp_at3_dec *)c->adec);
+                n = psp_at3_decode((psp_at3_dec *)c->adec, frame + AT3P_HDR, payload, pcm, 2048);
+            }
+        }
+    }
+    if (n < 0) { memset(pcm, 0, sizeof pcm); n = 2048; }
     if (dst) {
-        void *p = psp_mem_ptr(dst, MPEG_ATRAC_ES_OUT_SIZE);
-        if (p) memset(p, 0, MPEG_ATRAC_ES_OUT_SIZE);
+        const uint32_t bytes = (uint32_t)n * 4u;
+        if (psp_mem_write_block(dst, pcm, bytes) != 0)
+            for (uint32_t i = 0; i < (uint32_t)n * 2u; i++) psp_write16(dst + i * 2u, (uint16_t)pcm[i]);
+        if (bytes < MPEG_ATRAC_ES_OUT_SIZE) {
+            void *p = psp_mem_ptr(dst + bytes, MPEG_ATRAC_ES_OUT_SIZE - bytes);
+            if (p) memset(p, 0, MPEG_ATRAC_ES_OUT_SIZE - bytes);
+        }
     }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
