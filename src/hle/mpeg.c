@@ -208,6 +208,13 @@ typedef struct {
     int32_t  sync_base;       /* the lead at the first picture: the movie's own offset */
     int      sync_based;
     uint32_t dropped;         /* pictures decoded and not shown, to catch up */
+    int      es_drained, aes_drained;   /* each stream has given up its last unit */
+    /* What the player did after the file was fully delivered, for the report:
+     * the ring polls, the puts, and each fetch and decode. The end of a movie
+     * is where a player's own logic takes over, and this says which calls it
+     * is still making when it does. */
+    uint64_t post_avail, post_put, post_getavc, post_getatrac, post_avcdec, post_atracdec;
+    int      es_probe;        /* unused; kept so the probe can be re-armed cheaply */
     /* The PES timestamps, kept this time, anchored to where in the video
      * elementary stream their PES began. Only some pictures' PES carry one
      * -- one in ten through this game's intro -- so a picture whose data
@@ -261,6 +268,12 @@ void psp_mpeg_dump_sync(FILE *out) {
             fprintf(out, "    movie: audio  %u AUs fetched, stamps %u..%u (%.1f s of sound) over %.1f s of wall clock\n",
                     c->a_fetched, c->a_first_pts, c->a_last_pts,
                     (c->a_last_pts - c->a_first_pts) / 90000.0, (c->a_last_ns - c->a_first_ns) / 1e9);
+        if (c->post_avail || c->post_put)
+            fprintf(out, "    movie: after the file ended -- ring polls %llu, puts %llu, "
+                         "video fetch %llu decode %llu, audio fetch %llu decode %llu\n",
+                    (unsigned long long)c->post_avail, (unsigned long long)c->post_put,
+                    (unsigned long long)c->post_getavc, (unsigned long long)c->post_avcdec,
+                    (unsigned long long)c->post_getatrac, (unsigned long long)c->post_atracdec);
         fprintf(out, "    movie: host time  H.264 decode %.1f s, picture copy %.1f s, ATRAC3+ decode %.1f s\n",
                 c->dec_ns / 1e9, c->copy_ns / 1e9, c->adec_ns / 1e9);
     }
@@ -396,6 +409,13 @@ static void hle_RingbufferDestruct(void) {
 
 static int mpeg_decoding(void);
 static int mpeg_logging(void);
+/* PSPRECOMP_MPEG_NODROP=1 keeps every picture, drift and all: the control for
+ * any question of the form "is the dropping doing this?" */
+static int mpeg_nodrop(void) {
+    static int done, on;
+    if (!done) { const char *v = getenv("PSPRECOMP_MPEG_NODROP"); on = v && *v && *v != '0'; done = 1; }
+    return on;
+}
 static mpeg_ctx *ctx_for_ringbuffer(uint32_t rb);
 
 /* Free packets.
@@ -423,6 +443,7 @@ static void hle_RingbufferAvailableSize(void) {
     const uint32_t rb = psp_arg(0);
     if (mpeg_decoding() && rb) {
         mpeg_ctx *c = ctx_for_ringbuffer(rb);
+        if (c && c->es_eof) c->post_avail++;
         const uint32_t packets  = psp_read32(rb + RB_PACKETS);
         const uint32_t pkt_size = psp_read32(rb + RB_PACKET_SIZE);
         if (c && packets && pkt_size) {
@@ -433,8 +454,39 @@ static void hle_RingbufferAvailableSize(void) {
             const uint64_t pa = c->put_ia ? c->puts[c->put_ia - 1].put_bytes : 0;
             const uint64_t consumed = pv > pa ? pv : pa;
             uint64_t held = (c->put_total - consumed + pkt_size - 1) / pkt_size;
-            const int over = c->es_eof && c->es_pos >= c->es_len && c->aes_pos >= c->aes_len;
-            if (held == 0 && !over) held = 1;
+            /* The floor of one packet is for playback, not for the end.
+             *
+             * It is there because the game reads an entirely free ring as
+             * nothing having been buffered; what it does at the *end* is the
+             * mirror of that, and it is what the movie waits on -- its reader
+             * thread stops putting and polls this until the ring reads empty,
+             * 759 million times in one run when the answer never came. So the
+             * floor lifts once the file has been fully delivered: everything
+             * the ring ever held is on our side by then, and an empty ring is
+             * the truth as well as the signal.
+             *
+             * Consumption still governs the count, with one correction. The
+             * video's read position stops at the start of the last NAL it
+             * decoded and so never reaches the end of its stream, which would
+             * leave a put forever unaccounted; the audio's does reach the end
+             * of its own, exactly, since frames are walked whole. So when the
+             * audio has taken everything, or either stream has said it is
+             * drained, the ring is empty. */
+            /* Until the file has been fully delivered, hold what the
+             * decoders have not taken -- the game reads an entirely free ring
+             * as nothing having been buffered, and gives up. Once it has been
+             * delivered, the ring is empty, and saying so is both true and
+             * necessary: the ring is a transport, everything it ever carried
+             * is on our side by then, and the player waits for exactly this
+             * to finish a movie. Waiting for the decoders instead deadlocks
+             * it, because it stops fetching about three seconds before the
+             * data ends -- the stream's tail is padding it does not want --
+             * so the last packets are never accounted consumed. Its drain
+             * thread then spins for a frame buffer that its display side,
+             * finished, will never return: 850 million ring polls in a run
+             * that never left the movie. */
+            if (c->es_eof) held = 0;
+            else if (held == 0) held = 1;
             if (held > packets) held = packets;
             /* The game's reader polls this in a hot loop while the ring is
              * full -- 284 million calls in a 75-second run. A packet frees when
@@ -859,7 +911,20 @@ static int avc_pump(mpeg_ctx *c) {
                         info.UsrData.sSystemBuffer.iHeight, fp);
             }
         }
-        pos = start;
+        /* Past the NAL just decoded, not back to its start.
+         *
+         * This used to leave the read position at the NAL's first byte. The
+         * next scan still found the following start code -- a start code
+         * cannot occur inside a NAL -- so decoding was right, and the
+         * position was a whole NAL short of the truth for the life of the
+         * stream. Two things read it: the end-of-stream test, which asks
+         * whether the position has reached the end and so could never say
+         * yes; and the ring's free count, which maps consumption back to
+         * packets and so held the last ones forever. The movie's reader
+         * thread stops putting at the end of the file and polls that count
+         * until the ring reads empty -- 753 million times in one run, the
+         * game never finishing the movie. */
+        pos = nal_end;
         c->es_pos = pos;
         if (produced) break;          /* one picture per call */
     }
@@ -892,6 +957,7 @@ static uint32_t call_guest(uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2) {
  * actually supplied, which is not always what was asked for -- at the end of
  * the file it is fewer, and that is how the stream ends. */
 static void hle_RingbufferPut(void) {
+    { mpeg_ctx *pc = ctx_for_ringbuffer(psp_arg(0)); if (pc && pc->es_eof) pc->post_put++; }
     const uint32_t rb    = psp_arg(0);
     const int32_t  want  = (int32_t)psp_arg(1);
     const int32_t  avail = (int32_t)psp_arg(2);
@@ -1114,6 +1180,7 @@ static void no_decoder(const char *what) {
  * picture, honest behaviour, and no hang. */
 static void hle_GetAvcAu(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
+    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_getavc++; }
     if (!mpeg_decoding()) {
         no_decoder("sceMpegGetAvcAu");
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
@@ -1136,7 +1203,18 @@ static void hle_GetAvcAu(void) {
      *     ...                                  ; anything else -> stop
      */
     if (!c || (!c->pic_ready && avc_pump(c) == 0)) {
-        if (c && c->es_eof && c->es_pos >= c->es_len && !c->pic_ready) {
+        /* Over when no more bytes are coming and none of the ones here make a
+         * picture. The test used to be that the decoder's read position had
+         * reached the end of the elementary stream, and that position can
+         * never get there: the scan leaves it at the *start* of the last NAL
+         * it decoded, a NAL's length short of the end, forever. So this
+         * answered "not yet" for the rest of time and the player, which reads
+         * that as go round again, span. Nothing had reached the end of a
+         * stream before to notice -- until pictures began to be dropped,
+         * which walks the elementary stream a few percent ahead of the
+         * player and arrives there while it is still asking. */
+        if (c && c->es_eof && !c->pic_ready) {
+            c->es_drained = 1;
             psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
             return;
         }
@@ -1165,7 +1243,12 @@ static void hle_GetAvcAu(void) {
      * rather than a frozen one. Only when the run is paced against a clock:
      * an unpaced headless replay has no real time to be late against, and
      * dropping there would make replays depend on how fast the host is. */
-    if (psp_clock_is_realtime() && c->sync_based) {
+    /* Not once the file has been fully delivered. Dropping walks the
+     * elementary stream ahead of the player, and at the end of a movie that
+     * means running out of pictures while it is still asking for them --
+     * which is its own affair, not ours to provoke. The last seconds keep
+     * whatever drift they accrue; it is a frame or two. */
+    if (psp_clock_is_realtime() && c->sync_based && !c->es_eof && !mpeg_nodrop()) {
         for (int drop = 0; drop < 2; drop++) {
             if ((int32_t)(c->atrac_pts - c->pts) - c->sync_base <= 2 * (int32_t)c->frame_dur) break;
             const uint32_t kept = c->pts;
@@ -1234,6 +1317,7 @@ static size_t aes_frame(mpeg_ctx *c) {
 
 static void hle_GetAtracAu(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
+    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_getatrac++; }
     if (!mpeg_decoding() || !c) {
         no_decoder("sceMpegGetAtracAu");
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
@@ -1242,7 +1326,7 @@ static void hle_GetAtracAu(void) {
     const uint32_t au = psp_arg(2);
     const size_t total = aes_frame(c);
     if (!total) {
-        if (c->es_eof) { psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }
+        if (c->es_eof) { c->aes_drained = 1; psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }
         psp_ret(SCE_MPEG_ERROR_NO_DATA);
         return;
     }
@@ -1301,6 +1385,7 @@ static void write_picture(mpeg_ctx *c, uint32_t dst, uint32_t stride) {
 
 static void hle_AvcDecode(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
+    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_avcdec++; }
     if (!mpeg_decoding() || !c) {
         no_decoder("sceMpegAvcDecode");
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
@@ -1358,6 +1443,7 @@ static void hle_AvcDecode(void) {
  * silence of the same length -- the movie keeps its clock either way. */
 static void hle_AtracDecode(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
+    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_atracdec++; }
     if (!mpeg_decoding() || !c) {
         no_decoder("sceMpegAtracDecode");
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
