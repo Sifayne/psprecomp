@@ -315,6 +315,9 @@ uint64_t psp_ge_vertex_count(void);
 uint64_t psp_ge_pixels(void);
 /* The address the GE last rendered into, VRAM base applied. */
 uint32_t psp_ge_target(void);
+/* Run every queued list to FINISH/stall, in order. For present paths and
+ * tests that must see finished pixels without going through Sync. */
+void psp_ge_drain_all(void);
 
 void psp_sas_init(void);
 void psp_sas_register(void);
@@ -418,11 +421,14 @@ int  psp_ctrl_replay_drain(void);
  * cadence this game keeps; it never asks for a vblank. */
 void psp_display_set_present(void (*fn)(uint32_t addr, uint32_t stride,
                                         uint32_t fmt));
-/* Each output buffer: the channel, its reserved shape, and where the PCM
- * lives in guest memory. Returns the playback backlog in microseconds, which
- * the blocking output calls pay with a scheduler delay. */
+/* Each output buffer: the channel, its reserved shape (sample count per call
+ * and PSP_AUDIO_FORMAT_STEREO 0 / MONO 0x10), where the PCM lives in guest
+ * memory, and the left and right volumes on the 0..0x8000 scale the call was
+ * given. Returns the playback backlog in microseconds, which the blocking
+ * output calls pay with a scheduler delay. */
 void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples,
-                                        uint32_t fmt, uint32_t buf));
+                                        uint32_t fmt, uint32_t buf,
+                                        uint32_t lvol, uint32_t rvol));
 
 /* The priority of whatever is running now, or the module entry thread's when
  * the scheduler holds nothing. Needed by a spawn hook deciding whether a newly

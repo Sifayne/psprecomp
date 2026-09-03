@@ -536,11 +536,37 @@ uint64_t psp_audio_blocks(void) { return g_audio_blocks; }
  * waited on hardware. Policy stays here: the blocking calls pay the backlog
  * with psp_sched_delay, the non-blocking ones never wait. */
 static int64_t (*g_audio_out)(int ch, uint32_t samples, uint32_t fmt,
-                              uint32_t buf);
+                              uint32_t buf, uint32_t lvol, uint32_t rvol);
 
 void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples, uint32_t fmt,
-                                        uint32_t buf)) {
+                                        uint32_t buf, uint32_t lvol, uint32_t rvol)) {
     g_audio_out = fn;
+}
+
+/* PSPRECOMP_AUDIO_DUMP=<prefix> appends every output buffer, raw signed
+ * 16-bit as the game wrote it, to <prefix>.chN.raw -- one file per channel,
+ * with a line on stderr naming its shape. A headless run has no speaker, and
+ * "is there sound" is otherwise a question only a windowed run can answer. */
+static FILE *g_audio_dump[AUDIO_CHANNELS];
+static const char *audio_dump_prefix(void) {
+    static const char *p; static int looked;
+    if (!looked) { looked = 1; p = getenv("PSPRECOMP_AUDIO_DUMP"); if (p && !*p) p = NULL; }
+    return p;
+}
+static void audio_dump(uint32_t ch, uint32_t samples, uint32_t fmt, uint32_t buf) {
+    const char *prefix = audio_dump_prefix();
+    if (!prefix) return;
+    if (!g_audio_dump[ch]) {
+        char path[512];
+        snprintf(path, sizeof path, "%s.ch%u.raw", prefix, ch);
+        g_audio_dump[ch] = fopen(path, "wb");
+        if (!g_audio_dump[ch]) return;
+        fprintf(stderr, "audio dump: ch %u  %s  %u samples per call  -> %s\n",
+                ch, (fmt & 0x10) ? "mono" : "stereo", samples, path);
+    }
+    const uint32_t bytes = samples * ((fmt & 0x10) ? 2u : 4u);
+    const void *p = psp_mem_ptr(buf, bytes);
+    if (p) fwrite(p, 1, bytes, g_audio_dump[ch]);
 }
 
 static void hle_ChReserve(void) {
@@ -572,14 +598,15 @@ static void hle_ChRelease(void) {
  * play, and that is how long a blocking output waits. */
 #define PSP_AUDIO_RATE 44100u
 
-static int64_t audio_output_common(int buf_arg) {
+static int64_t audio_output_common(int buf_arg, int lvol_arg, int rvol_arg) {
     const uint32_t ch = psp_arg(0);
     g_audio_blocks++;
     if (ch >= AUDIO_CHANNELS || !g_audio[ch].reserved || !g_audio[ch].samples)
         return 0;
+    audio_dump(ch, g_audio[ch].samples, g_audio[ch].format, psp_arg(buf_arg));
     if (g_audio_out)
         return g_audio_out((int)ch, g_audio[ch].samples, g_audio[ch].format,
-                           psp_arg(buf_arg));
+                           psp_arg(buf_arg), psp_arg(lvol_arg), psp_arg(rvol_arg));
 
     /* No host sink, but a blocking output still takes the time the samples
      * take. Returning zero here made a call with "Blocking" in its name return
@@ -606,24 +633,44 @@ static uint32_t audio_ret(void) {
  * previous buffer drains, which is what paces a game's audio thread. The
  * backlog is that wait, in guest microseconds. */
 static void hle_OutputBlocking(void) {
-    const int64_t backlog = audio_output_common(2);
+    const int64_t backlog = audio_output_common(2, 1, 1);
     if (backlog > 0) psp_sched_delay((uint64_t)backlog);
     psp_ret(audio_ret());
 }
 
 static void hle_OutputPanned(void) {
-    (void)audio_output_common(3);
+    (void)audio_output_common(3, 1, 2);
     psp_ret(audio_ret());
 }
 
 static void hle_OutputPannedBlocking(void) {
-    const int64_t backlog = audio_output_common(3);
+    const int64_t backlog = audio_output_common(3, 1, 2);
     if (backlog > 0) psp_sched_delay((uint64_t)backlog);
     psp_ret(audio_ret());
 }
 
 /* Zero remaining means "ready for more", so a game's audio loop keeps going. */
 static void hle_GetChannelRestLength(void) { psp_ret(0); }
+
+/* (channel, samplecount): the per-call sample count, changed after the
+ * reserve. This game calls it thousands of times a run, and it used to be
+ * accepted and ignored -- so a channel whose count the game had changed was
+ * read at its original length, the wrong number of bytes from every buffer. */
+static void hle_SetChannelDataLen(void) {
+    const uint32_t ch = psp_arg(0), n = psp_arg(1);
+    if (ch >= AUDIO_CHANNELS || !g_audio[ch].reserved) { psp_ret(0x80260008); return; }  /* NOT_RESERVED */
+    if (n == 0 || n > 65472 || (n & 63)) { psp_ret(0x80260006); return; }                 /* INVALID_SIZE */
+    g_audio[ch].samples = n;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* (channel, samplecount, format): both at once. */
+static void hle_ChangeChannelConfig(void) {
+    const uint32_t ch = psp_arg(0);
+    if (ch >= AUDIO_CHANNELS || !g_audio[ch].reserved) { psp_ret(0x80260008); return; }
+    g_audio[ch].format = psp_arg(1);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 void psp_misc_reset(void) {
     g_intr_enabled = 1;
@@ -713,7 +760,7 @@ void psp_misc_register(void) {
     psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_OutputPannedBlocking);
     psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_OutputPanned);
     psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
-    psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_ok);
-    psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
+    psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
+    psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ChangeChannelConfig);
     psp_hle_register(0xB7E1D8E7, "sceAudio", "sceAudioChangeChannelVolume",  hle_ok);
 }

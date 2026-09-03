@@ -92,6 +92,28 @@ else()
     message(STATUS "sceMpeg: no openh264; playback stays refused")
 endif()
 
+# --- optional: ATRAC3 / ATRAC3+ decoding for sceAtrac3plus ---------------------
+#
+# FFmpeg's libavcodec has the only complete open ATRAC3+ decoder, and it is
+# LGPL-2.1 -- fine to link dynamically from an MIT project. The caveat is the
+# distro build: an FFmpeg configured with --enable-gpl (most are) makes the
+# whole library GPL, and a binary linked against it inherits that. So it is
+# optional, dynamic, and never required: without it sceAtrac3plus keeps the
+# bookkeeping and every track ends at its first frame, which is what it did
+# before this existed. Only avcodec and avutil; the float-to-PCM conversion
+# is done in atrac.c rather than pulling in swresample.
+find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h)
+find_library(AVCODEC_LIBRARY avcodec)
+find_library(AVUTIL_LIBRARY avutil)
+if(FFMPEG_INCLUDE_DIR AND AVCODEC_LIBRARY AND AVUTIL_LIBRARY)
+    target_compile_definitions(psprecomp PRIVATE PSPRECOMP_HAVE_FFMPEG=1)
+    target_include_directories(psprecomp PRIVATE ${FFMPEG_INCLUDE_DIR})
+    target_link_libraries(psprecomp PUBLIC ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY})
+    message(STATUS "sceAtrac3plus: ATRAC3/ATRAC3+ decoding via FFmpeg libavcodec")
+else()
+    message(STATUS "sceAtrac3plus: no libavcodec; tracks end at their first frame")
+endif()
+
 if(NOT MSVC)
     find_library(PSPRECOMP_LIBM m)
     if(PSPRECOMP_LIBM)
