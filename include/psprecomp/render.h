@@ -36,6 +36,12 @@ typedef struct {
      * gives them that way, and transformed geometry is scaled by the texture
      * size on the way in, so both arrive in the same units. */
     float    u, v;
+    /* Fog coefficient, 0..255: 255 is unfogged and 0 the fog colour, the
+     * hardware's own byte. Transformed geometry gets it from its eye-space
+     * depth against FOG1/FOG2; through-mode and clear-mode geometry are never
+     * fogged and carry 255. Interpolated like a colour channel, applied after
+     * the texture function and before blending. */
+    int      fog;
 } psp_vertex;
 
 /* The bound texture, as the GE describes it.
@@ -147,6 +153,10 @@ typedef struct {
      * quad whose vertices carry a near-zero alpha -- is drawn fully opaque and
      * covers whatever it was meant to be fading. */
     void (*set_blend)(const psp_blend_state *b);
+    /* GE_FOGENABLE and GE_FOGCOLOR, raw 0xBBGGRR. The coefficient itself
+     * travels in the vertex; this is the colour it blends toward, and whether
+     * to. */
+    void (*set_fog)(int enable, uint32_t colour);
 
     /* One assembled primitive. `count` vertices, already in screen space. */
     void (*draw)(int prim, const psp_vertex *v, int count);

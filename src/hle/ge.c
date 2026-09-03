@@ -85,6 +85,17 @@ static int fx16_floor(float f) {
 #define GE_FOG1             0xCD
 #define GE_FOG2             0xCE
 #define GE_FOGCOLOR         0xCF
+/* Immediate-mode vertices: one register per component and 0xF7 to commit. */
+#define GE_IMM_VSCX         0xF0
+#define GE_IMM_VSCY         0xF1
+#define GE_IMM_VSCZ         0xF2
+#define GE_IMM_VTCS         0xF3
+#define GE_IMM_VTCT         0xF4
+#define GE_IMM_VTCQ         0xF5
+#define GE_IMM_CV           0xF6
+#define GE_IMM_AP           0xF7
+#define GE_IMM_FC           0xF8
+#define GE_IMM_SCV          0xF9
 #define GE_LIGHTENABLE0     0x18
 #define GE_MATERIALUPDATE   0x53
 #define GE_MATERIALEMISSIVE 0x54
@@ -219,7 +230,8 @@ static uint64_t g_skip_nearplane;  /* lines and points behind the eye (triangles
 static uint64_t g_clip_eye, g_clip_z, g_clip_guard, g_clip_split;
 static uint64_t g_draw_mip;
 static uint64_t g_lit_verts;  /* transformed with LIGHTING_ENABLE set */
-static uint64_t g_fog_verts;  /* transformed with FOG_ENABLE set (fog is not yet applied) */  /* textured draws with a mip chain (TEX_MODE top level > 0) */  /* the clipper's decisions, in vertices */
+static uint64_t g_fog_verts;  /* transformed with FOG_ENABLE set */
+static uint64_t g_imm_draws;  /* primitives assembled from immediate-mode vertices */  /* textured draws with a mip chain (TEX_MODE top level > 0) */  /* the clipper's decisions, in vertices */
 static uint64_t g_culled;          /* backfacing, by the game's own winding rule */
 static uint64_t g_xformed;         /* vertices that went through the pipeline */
 /* Draws by path and by whether a texture was bound. "Most pixels are flat" has
@@ -293,6 +305,7 @@ static struct {
     int   fog_enable;
     float fog_end, fog_range;
     float fog_colour[3];
+    uint32_t fog_colour_raw;   /* the register as written, 0xBBGGRR, for the backend */
     float mat_emissive[3], mat_ambient[3], mat_diffuse[3], mat_specular[3];
     float mat_spec_coef;
     float global_amb[3];
@@ -397,6 +410,7 @@ void psp_ge_reset(void) {
     g_draw_mip = 0;
     g_lit_verts = 0;
     g_fog_verts = 0;
+    g_imm_draws = 0;
     g_culled = g_xformed = 0;
     g_draw_2d_tex = g_draw_2d_flat = g_draw_3d_tex = g_draw_3d_flat = 0;
     g_col_n = 0;
@@ -502,6 +516,8 @@ void psp_ge_dump_stats(FILE *out) {
             (unsigned long long)psp_render_alphakill_pixels());
     fprintf(out, "    clear-mode draws: %llu (%llu clearing depth)\n",
             (unsigned long long)g_clear_draws, (unsigned long long)g_clear_z_draws);
+    if (g_imm_draws)
+        fprintf(out, "    immediate-mode draws: %llu (untextured)\n", (unsigned long long)g_imm_draws);
     if (g_xformed) {
         fprintf(out, "    transformed %llu vertices; viewport %s",
                 (unsigned long long)g_xformed,
@@ -523,7 +539,7 @@ void psp_ge_dump_stats(FILE *out) {
             fprintf(out, "    screen bounds: x %.1f..%.1f  y %.1f..%.1f\n",
                     g_tl.bb_x0, g_tl.bb_x1, g_tl.bb_y0, g_tl.bb_y1);
         if (g_fog_verts)
-            fprintf(out, "    fogged     %llu vertices transformed with fog on -- NOT applied; colour %02X%02X%02X end %.1f range %.4f\n",
+            fprintf(out, "    fogged     %llu vertices transformed with fog on; colour %02X%02X%02X end %.1f range %.4f\n",
                     (unsigned long long)g_fog_verts,
                     (unsigned)(g_tl.fog_colour[0] * 255.0f + 0.5f), (unsigned)(g_tl.fog_colour[1] * 255.0f + 0.5f),
                     (unsigned)(g_tl.fog_colour[2] * 255.0f + 0.5f), (double)g_tl.fog_end, (double)g_tl.fog_range);
@@ -742,6 +758,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
                        int tex_off, psp_vertex *out) {
     out->rgba = current_colour();
     out->u = out->v = 0.0f;
+    out->fog = 255;              /* through-mode geometry is never fogged */
 
     /* Through-mode texture coordinates are in texels, whatever their width, so
      * every form is taken as it comes. Leaving the narrow ones at zero -- which
@@ -1108,6 +1125,10 @@ static void lerp_clip(const clipvert *a, const clipvert *b, float t, clipvert *o
         r |= (uint32_t)q << (8 * k);
     }
     o->v.rgba = r;
+    int fg = (int)((float)a->v.fog + ((float)b->v.fog - (float)a->v.fog) * t + 0.5f);
+    if (fg < 0) fg = 0;
+    if (fg > 255) fg = 255;
+    o->v.fog = fg;
 }
 
 /* The near plane in clip space, Sutherland-Hodgman: keeps z + w >= 0. */
@@ -1340,7 +1361,21 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             o->rgba = current_colour();
             if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7)
                 o->rgba = psp_read32(a + (uint32_t)col_off);
-            if (g_tl.fog_enable) g_fog_verts++;
+            /* Fog. The coefficient is (end - depth) * range with depth the
+             * eye-space distance -- w of the clip position for a standard
+             * projection, -z of the eye position here -- clamped to 0..1 and
+             * quantised to the hardware's byte, 255 unfogged. gpu/commands/fog
+             * fixes the rest: near == far makes sceGuFog's range 1/0, and the
+             * hardware reads the infinite product as fully fogged, whichever
+             * sign ("Basic" and "Both neg" both read the fog colour); "Near
+             * neg" at depth 0 with end 1 and range 0.5 reads half. */
+            o->fog = 255;
+            if (g_tl.fog_enable) {
+                const float f = (g_tl.fog_end + eye[2]) * g_tl.fog_range;
+                if (!isfinite(f) || f <= 0.0f) o->fog = 0;
+                else if (f < 1.0f)             o->fog = (int)(f * 255.0f + 0.5f);
+                g_fog_verts++;
+            }
             if (g_tl.lighting) {
                 float nm[3], nw[3], ne[3];
                 read_normal_model(a, g_ge.vtype, norm_off, nm);
@@ -1476,35 +1511,11 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
     }
 }
 
-static void draw_prim(uint32_t type, uint32_t count) {
-    /* The sampler is told the current texture at draw time rather than on every
-     * state command: the GE sets these fields in any order, and only their
-     * value at the draw matters. */
-
-    if (!g_ge.vaddr) { g_skip_noaddr += count; return; }
-
-    int col_off = -1, pos_off = 0, tex_off = -1;
-    int norm_off;
-    int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
-    if (!stride) { g_skip_layout += count; return; }
-
-    /* Bound whenever texture mapping is enabled and a texture is set --
-     * whether or not these vertices carry coordinates. A previous version also
-     * required texcoords in the vertex type, reasoning that geometry without
-     * them would otherwise be painted with a stale texture sampled at texel
-     * zero. That is exactly what hardware does: gpu/texfunc draws sprites with
-     * GU_COLOR_8888 | GU_VERTEX_32BITF, no texcoords, over a solid 4x4
-     * texture, and reads the texture's colour back. read_uv_model already
-     * answers (0,0) for a vertex without them. A game that wants flat geometry
-     * disables texturing, and this one does. */
-    /* The texture address is complete as decoded -- unlike FBP, which is a
-     * VRAM offset with the base implied. A texture may legitimately live in
-     * main RAM, and forcing it into the VRAM window would send those reads
-     * somewhere unrelated. */
-    g_ge.drawn_vtype = g_ge.vtype;
-    g_ge.drawn_prims++;
-
-    const int has_uv = g_ge.tex_enable && g_ge.tex_addr;
+/* The backend state a draw depends on, pushed at draw time rather than on
+ * every register write: the GE sets these in any order and only their value
+ * at the draw matters. Shared by the vertex-array draws and the immediate
+ * ones. */
+static void push_texture_state(int has_uv) {
     psp_render_current()->set_clut(g_ge.clut_addr, (int)(g_ge.clut_raw & 3),
                                    (int)((g_ge.clut_raw >> 2) & 0x1F),
                                    (int)((g_ge.clut_raw >> 8) & 0xFF),
@@ -1543,9 +1554,9 @@ static void draw_prim(uint32_t type, uint32_t count) {
         if (has_uv && g_ge.tex_max_level > 0) g_draw_mip++;
         psp_render_current()->set_texture(&t);
     }
-    if (g_tl.clear_mode) { g_clear_draws++; if (g_tl.clear_z) g_clear_z_draws++; }
-    if (VT_THROUGH(g_ge.vtype)) { if (has_uv) g_draw_2d_tex++; else g_draw_2d_flat++; }
-    else                        { if (has_uv) g_draw_3d_tex++; else g_draw_3d_flat++; }
+}
+
+static void push_pixel_state(void) {
     {
         /* Clear mode writes the clear values straight through: no blend, no
          * alpha test, or the clear would be filtered by the state it is
@@ -1575,6 +1586,101 @@ static void draw_prim(uint32_t type, uint32_t count) {
         g_tl.clear_mode ? 0 : g_tl.ztest_enable,
         g_tl.clear_mode ? 1 : g_tl.ztest_func,
         g_tl.clear_mode ? g_tl.clear_z : !g_tl.zwrite_off);
+    psp_render_current()->set_fog(g_tl.fog_enable, g_tl.fog_colour_raw);
+}
+
+/* Immediate-mode vertices.
+ *
+ * Ten registers, one per component, and 0xF7 commits a vertex: its low byte
+ * is the alpha, bits 8..10 the primitive type -- 7 meaning "the one already
+ * in progress" -- and bit 22 says the fog coefficient in 0xF8 applies.
+ * Positions are screen space in 12.4 fixed point on the 4096 grid, like
+ * OFFSET_X/Y, so the offset is subtracted; depth is the 16-bit window value.
+ * gpu/commands/fog uses this path for its 256-row rounding table and nothing
+ * in the game has, so texture coordinates (0xF3..0xF5) and the specular
+ * colour (0xF9) are accepted and not applied: immediate draws are untextured
+ * here. Strips and fans are emitted a triangle or line at a time. */
+static struct {
+    uint32_t   x, y, z, rgb, fog;
+    int        type, count;
+    psp_vertex v[3];
+} g_imm = { .type = -1 };
+
+static void imm_vertex(uint32_t arg) {
+    const int type = (int)((arg >> 8) & 7);
+    if (type != 7) { g_imm.type = type; g_imm.count = 0; }
+    if (g_imm.type < 0 || g_imm.type == 7) return;
+
+    psp_vertex o;
+    memset(&o, 0, sizeof o);
+    o.x    = (int)g_imm.x - (int)(g_tl.off_x * 16.0f);
+    o.y    = (int)g_imm.y - (int)(g_tl.off_y * 16.0f);
+    o.z    = (float)(g_imm.z & 0xFFFFu);
+    o.rgba = (g_imm.rgb & 0xFFFFFFu) | ((arg & 0xFFu) << 24);
+    o.fog  = (arg & 0x400000u) ? (int)(g_imm.fog & 0xFFu) : 255;
+
+    int need, out_type = g_imm.type;
+    switch (g_imm.type) {
+    case PSP_PRIM_POINTS:         need = 1; break;
+    case PSP_PRIM_LINES:          need = 2; break;
+    case PSP_PRIM_LINE_STRIP:     need = 2; out_type = PSP_PRIM_LINES;     break;
+    case PSP_PRIM_TRIANGLES:      need = 3; break;
+    case PSP_PRIM_TRIANGLE_STRIP:
+    case PSP_PRIM_TRIANGLE_FAN:   need = 3; out_type = PSP_PRIM_TRIANGLES; break;
+    default:                      need = 2; break;   /* sprites */
+    }
+    if (g_imm.count < need) g_imm.v[g_imm.count++] = o;
+    else {
+        /* A strip or fan already full: slide the window. */
+        if (g_imm.type == PSP_PRIM_TRIANGLE_FAN) { g_imm.v[1] = g_imm.v[2]; g_imm.v[2] = o; }
+        else { for (int i = 1; i < need; i++) g_imm.v[i - 1] = g_imm.v[i]; g_imm.v[need - 1] = o; }
+    }
+    if (g_imm.count < need) return;
+
+    push_texture_state(0);
+    push_pixel_state();
+    g_imm_draws++;
+    psp_render_current()->draw(out_type, g_imm.v, need);
+    /* Lists start over; strips and fans keep their window for the next one. */
+    if (g_imm.type == PSP_PRIM_POINTS || g_imm.type == PSP_PRIM_LINES ||
+        g_imm.type == PSP_PRIM_TRIANGLES || g_imm.type == PSP_PRIM_SPRITES)
+        g_imm.count = 0;
+}
+
+static void draw_prim(uint32_t type, uint32_t count) {
+    /* The sampler is told the current texture at draw time rather than on every
+     * state command: the GE sets these fields in any order, and only their
+     * value at the draw matters. */
+
+    if (!g_ge.vaddr) { g_skip_noaddr += count; return; }
+
+    int col_off = -1, pos_off = 0, tex_off = -1;
+    int norm_off;
+    int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
+    if (!stride) { g_skip_layout += count; return; }
+
+    /* Bound whenever texture mapping is enabled and a texture is set --
+     * whether or not these vertices carry coordinates. A previous version also
+     * required texcoords in the vertex type, reasoning that geometry without
+     * them would otherwise be painted with a stale texture sampled at texel
+     * zero. That is exactly what hardware does: gpu/texfunc draws sprites with
+     * GU_COLOR_8888 | GU_VERTEX_32BITF, no texcoords, over a solid 4x4
+     * texture, and reads the texture's colour back. read_uv_model already
+     * answers (0,0) for a vertex without them. A game that wants flat geometry
+     * disables texturing, and this one does. */
+    /* The texture address is complete as decoded -- unlike FBP, which is a
+     * VRAM offset with the base implied. A texture may legitimately live in
+     * main RAM, and forcing it into the VRAM window would send those reads
+     * somewhere unrelated. */
+    g_ge.drawn_vtype = g_ge.vtype;
+    g_ge.drawn_prims++;
+
+    const int has_uv = g_ge.tex_enable && g_ge.tex_addr;
+    push_texture_state(has_uv);
+    if (g_tl.clear_mode) { g_clear_draws++; if (g_tl.clear_z) g_clear_z_draws++; }
+    if (VT_THROUGH(g_ge.vtype)) { if (has_uv) g_draw_2d_tex++; else g_draw_2d_flat++; }
+    else                        { if (has_uv) g_draw_3d_tex++; else g_draw_3d_flat++; }
+    push_pixel_state();
 
     /* Decode the whole batch, then hand it to the backend in one call.
      *
@@ -1936,7 +2042,14 @@ static void run_list(ge_queue *q) {
         case GE_FOGENABLE: g_tl.fog_enable = (int)(arg & 1); break;
         case GE_FOG1:      g_tl.fog_end   = ge_float(arg); break;
         case GE_FOG2:      g_tl.fog_range = ge_float(arg); break;
-        case GE_FOGCOLOR:  ge_colour3(arg, g_tl.fog_colour); break;
+        case GE_FOGCOLOR:  ge_colour3(arg, g_tl.fog_colour); g_tl.fog_colour_raw = arg & 0xFFFFFFu; break;
+        case GE_IMM_VSCX: g_imm.x   = arg & 0xFFFFFFu; break;
+        case GE_IMM_VSCY: g_imm.y   = arg & 0xFFFFFFu; break;
+        case GE_IMM_VSCZ: g_imm.z   = arg & 0xFFFFu;   break;
+        case GE_IMM_VTCS: case GE_IMM_VTCT: case GE_IMM_VTCQ: case GE_IMM_SCV: break;
+        case GE_IMM_CV:   g_imm.rgb = arg & 0xFFFFFFu; break;
+        case GE_IMM_FC:   g_imm.fog = arg & 0xFFu;     break;
+        case GE_IMM_AP:   imm_vertex(arg);             break;
         case GE_LIGHTMODE:      g_tl.light_mode = (int)(arg & 1); break;
         case GE_MATERIALUPDATE: g_tl.mat_update = (int)(arg & 7); break;
         case GE_MATERIALEMISSIVE: ge_colour3(arg, g_tl.mat_emissive); break;

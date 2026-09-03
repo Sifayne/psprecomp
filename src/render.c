@@ -576,6 +576,34 @@ uint64_t psp_render_alphakill_pixels(void) { return g_px_atest; }
 
 static void sw_blend(const psp_blend_state *b) { g_bs = *b; }
 
+static int      g_fog_enable;
+static uint32_t g_fog_colour;
+static void sw_fog(int enable, uint32_t colour) { g_fog_enable = enable; g_fog_colour = colour; }
+
+/* Fog: the textured colour toward the fog colour by the vertex coefficient.
+ *
+ * gpu/commands/fog draws a box under every coefficient 0..255 with the
+ * vertex at 0x881100 and the fog at 0xFF33FF and reads the pixel back, 768
+ * channel values. Exactly one arithmetic reproduces all of them:
+ *
+ *     out = (c * f + fog * (255 - f) + 255) >> 8
+ *
+ * A divide by 255 in any rounding fails -- blue wants 254 at f = 1 where
+ * exact is 254.53, green wants 51 at f = 6 where exact is 50.2, and no single
+ * rounding of the exact value gives both. Divide by 256 with the +255 bias
+ * gives both, and every other row. Alpha is untouched: the readback's stencil
+ * byte is the 0x44 the test filled. */
+static uint32_t apply_fog(uint32_t col, int f) {
+    if (!g_fog_enable || f >= 255) return col;
+    if (f < 0) f = 0;
+    uint32_t out = col & 0xFF000000u;
+    for (int i = 0; i < 3; i++) {
+        const uint32_t c = chan(col, i), fc = chan(g_fog_colour, i);
+        out |= ((c * (uint32_t)f + fc * (255u - (uint32_t)f) + 255u) >> 8) << (i * 8);
+    }
+    return out;
+}
+
 static uint32_t chan(uint32_t c, int i) { return (c >> (i * 8)) & 0xFFu; }
 
 static uint32_t clamp255(int v) { return v < 0 ? 0u : (v > 255 ? 255u : (uint32_t)v); }
@@ -823,6 +851,10 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
 
                 const float z = l0 * a->z + l1 * b->z + l2 * c->z;
 
+                float fgf = l0 * (float)a->fog + l1 * (float)b->fog + l2 * (float)c->fog;
+                if (fgf < 0.0f) fgf = 0.0f; else if (fgf > 255.0f) fgf = 255.0f;
+                const int fg = (int)(fgf + 0.5f);
+
                 uint32_t col = 0;
                 for (int i = 0; i < 4; i++) {
                     float ch = l0 * (float)((a->rgba >> (i * 8)) & 0xFF)
@@ -847,6 +879,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                     col = apply_texfunc(texel, col);
                     g_px_tex++;
                 } else g_px_flat++;
+                col = apply_fog(col, fg);
                 shade_pixel(x, y, z, col);
             }
             w0 -= d0y * SUBPX; w1 -= d1y * SUBPX; w2 -= d2y * SUBPX;
@@ -911,13 +944,13 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
         const float tv_row = transposed ? 0.0f : a->v + dv * ty;
         const float tu_row = transposed ? a->u + du * ty : 0.0f;
         for (int x = px0; x < px1; x++) {
-            if (!textured) { g_px_flat++; shade_pixel(x, y, a->z, b->rgba); continue; }
+            if (!textured) { g_px_flat++; shade_pixel(x, y, a->z, apply_fog(b->rgba, b->fog)); continue; }
             const float tx = (float)(x * SUBPX + SUBPX_HALF - a->x);
             const float tu = transposed ? tu_row : a->u + du * tx;
             const float tv = transposed ? a->v + dv * tx : tv_row;
             g_px_tex++;
             shade_pixel(x, y, a->z,
-                        apply_texfunc(sample_mip(tu, tv, lod16), b->rgba));
+                        apply_fog(apply_texfunc(sample_mip(tu, tv, lod16), b->rgba), b->fog));
         }
     }
 }
@@ -982,6 +1015,7 @@ const psp_render_backend psp_render_software = {
     .set_clut    = sw_clut,
     .set_depth   = sw_depth,
     .set_blend   = sw_blend,
+    .set_fog     = sw_fog,
     .draw        = sw_draw,
     .finish      = sw_noop,
     .present     = sw_present,
@@ -1002,6 +1036,7 @@ static void null_clut(uint32_t a, int f, int s, int m, int st) {
 }
 static void null_depth(int t, int f, int w) { (void)t; (void)f; (void)w; }
 static void null_blend(const psp_blend_state *b) { (void)b; }
+static void null_fog(int enable, uint32_t colour) { (void)enable; (void)colour; }
 static void null_draw(int p, const psp_vertex *v, int n) { (void)p; (void)v; (void)n; }
 static void null_noop(void) { }
 
@@ -1015,6 +1050,7 @@ const psp_render_backend psp_render_null = {
     .set_clut    = null_clut,
     .set_depth   = null_depth,
     .set_blend   = null_blend,
+    .set_fog     = null_fog,
     .draw        = null_draw,
     .finish      = null_noop,
     .present     = null_noop,
