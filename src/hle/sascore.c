@@ -42,6 +42,16 @@
 #define SAS_ERROR_LOOP_POS     0x80420015u
 #define SAS_ERROR_ALREADY_ON   0x80420016u
 #define SAS_ERROR_PCM_SIZE     0x8042001Au
+/* pitch.expected: a pitch above 0x4000 is refused with 12, and the check is
+ * unsigned -- 0xFFFFFFFF and 0x80000001 are refused alongside 0x4001.
+ * noise.expected: a noise frequency outside 0..63 is refused with 11, on the
+ * same unsigned footing. */
+#define SAS_ERROR_PITCH        0x80420012u
+#define SAS_ERROR_NOISE_FREQ   0x80420011u
+/* sascore.expected: a volume outside -0x1000..0x1000 is refused with 18, and
+ * all four -- the two channel volumes and the two reverb sends -- are
+ * checked. */
+#define SAS_ERROR_VOLUME       0x80420018u
 
 static int grain_ok(uint32_t g) { return g >= 64 && g <= SAS_MAX_GRAIN && (g % 32) == 0; }
 
@@ -400,7 +410,10 @@ static void hle_Init(void) {
     if (!grain_ok(grain))              { psp_ret(SAS_ERROR_GRAIN); return; }
     if (voices < 1 || voices > SAS_VOICES) { psp_ret(SAS_ERROR_MAX_VOICES); return; }
     if (mode > 1)                      { psp_ret(SAS_ERROR_OUTPUT_MODE); return; }
-    if (rate != 44100 && rate != 48000) { psp_ret(SAS_ERROR_SAMPLE_RATE); return; }
+    /* 44100 and nothing else. The accepted list this once read as "the two
+     * rates this renders at" is not hardware's: sascore.expected refuses
+     * 48000 along with every other rate it tries. */
+    if (rate != 44100) { psp_ret(SAS_ERROR_SAMPLE_RATE); return; }
     g_grain       = grain;
     g_max_voices  = voices;
     g_output_mode = mode;
@@ -435,6 +448,11 @@ static void hle_SetVoice(void) {
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     const uint32_t size = psp_arg(3);
     if (size == 0 || (size & 15)) { psp_ret(SAS_ERROR_SIZE); return; }
+    /* The fifth argument is a loop *mode* here, not the sample position
+     * __sceSasSetVoicePCM takes: vag.expected accepts 0 and 1 and refuses
+     * everything else, -1 included, with the same code that call uses for a
+     * bad position. */
+    if (psp_arg(4) > 1u) { psp_ret(SAS_ERROR_LOOP_POS); return; }
     v->is_pcm   = 0;
     v->vag_addr = psp_arg(2);
     v->vag_size = size;
@@ -477,14 +495,32 @@ static void hle_SetVoicePCM(void) {
 static void hle_SetPitch(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    if (psp_arg(2) > 0x4000u) { psp_ret(SAS_ERROR_PITCH); return; }
     v->pitch = psp_arg(2);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-static void hle_SetVolume(void) {
-    /* (sasCore, voice, l, r, el, er) -- the last two are the reverb sends. */
+/* __sceSasSetNoise(sasCore, voice, freq): the voice plays noise instead of
+ * its sample. The frequency is checked here -- 0..63 -- and the generator
+ * itself is not implemented, so the setting is accepted and the voice keeps
+ * playing what it was given. */
+static void hle_SetNoise(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    if (psp_arg(2) > 63u) { psp_ret(SAS_ERROR_NOISE_FREQ); return; }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_SetVolume(void) {
+    /* (sasCore, voice, l, r, el, er) -- the last two are the reverb sends.
+     * All four are bounded at plus or minus unity and all four are checked,
+     * whether or not this renderer uses them. */
+    sas_voice *v = voice_arg();
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    for (int i = 2; i <= 5; i++) {
+        const int32_t vol = (int32_t)psp_arg(i);
+        if (vol < -0x1000 || vol > 0x1000) { psp_ret(SAS_ERROR_VOLUME); return; }
+    }
     v->vol_l = (int32_t)psp_arg(2);
     v->vol_r = (int32_t)psp_arg(3);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -568,10 +604,13 @@ static void hle_SetKeyOn(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Raised here, taken at the next core: see the note on `on`. */
+/* Raised here, taken at the next core: see the note on `on`. A voice whose
+ * key is not down has nothing to lift, and keyoff.expected refuses that with
+ * the same code an already-on key-on gets -- including while paused. */
 static void hle_SetKeyOff(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    if (!v->on) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
     v->keyoff_pending = 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -677,7 +716,7 @@ void psp_sas_register(void) {
     psp_hle_register(0x07F58C24, "sceSasCore", "__sceSasGetAllEnvelopeHeights",
                      hle_GetAllEnvelopeHeights);
     psp_hle_register(0xE1CD9561, "sceSasCore", "__sceSasSetVoicePCM",      hle_SetVoicePCM);
-    psp_hle_register(0xB7660A23, "sceSasCore", "__sceSasSetNoise",          hle_accept);
+    psp_hle_register(0xB7660A23, "sceSasCore", "__sceSasSetNoise",          hle_SetNoise);
     psp_hle_register(0x33D4AB37, "sceSasCore", "__sceSasRevType",           hle_accept);
     psp_hle_register(0x267A6DD2, "sceSasCore", "__sceSasRevParam",          hle_accept);
     psp_hle_register(0xD5A229C9, "sceSasCore", "__sceSasRevEVOL",           hle_accept);
