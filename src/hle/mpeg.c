@@ -86,6 +86,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/os.h"
+#include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
 
 #include <stdio.h>
@@ -204,6 +205,9 @@ typedef struct {
     int32_t  sync_min, sync_max;
     int      sync_seen;
     int32_t  sync_trend[8];   /* the lead every 250 pictures, for the shape of the drift */
+    int32_t  sync_base;       /* the lead at the first picture: the movie's own offset */
+    int      sync_based;
+    uint32_t dropped;         /* pictures decoded and not shown, to catch up */
     /* The PES timestamps, kept this time, anchored to where in the video
      * elementary stream their PES began. Only some pictures' PES carry one
      * -- one in ten through this game's intro -- so a picture whose data
@@ -243,6 +247,9 @@ void psp_mpeg_dump_sync(FILE *out) {
                      " frame %.2f ms; PES video %u (%u stamped) audio %u (%u stamped), first audio stamp %u\n",
                 c->sync_min / 90.0, c->sync_max / 90.0, c->frames, c->frame_dur / 90.0,
                 c->npes_v, c->npes_v_pts, c->npes_a, c->npes_a_pts, c->apts0);
+        if (c->dropped)
+            fprintf(out, "    movie: %u of %u pictures decoded and dropped to hold the sound\n",
+                    c->dropped, c->frames);
         fprintf(out, "    movie: lead every 250 pictures, ms:");
         for (int k = 0; k < 8 && k * 250 < c->frames; k++) fprintf(out, " %.0f", c->sync_trend[k] / 90.0);
         fprintf(out, "\n");
@@ -1137,6 +1144,37 @@ static void hle_GetAvcAu(void) {
         return;
     }
 
+    /* Catching up, by not showing a picture.
+     *
+     * The sound plays at its own rate whatever the host is doing -- a speaker
+     * drains at 44.1kHz -- and the picture goes as fast as this machine
+     * decodes and draws it, which here is 98.5% of real time. The difference
+     * is small and it only accumulates: Sif watched the whole intro and the
+     * sound ran away from the picture, a second by the end.
+     *
+     * So a picture that is already late is decoded and dropped rather than
+     * handed over, and the game draws the next one instead. That trade is
+     * lopsided in our favour: the decode of a 480x272 frame costs about 2 ms
+     * and its drawing about 6, so a drop buys back most of a frame's time,
+     * and 6% of the intro's pictures is enough to hold the sound.
+     *
+     * Measured against the lead at the first picture rather than zero, since
+     * a movie may legitimately start with its audio ahead; two frames of
+     * slack so ordinary jitter does not drop anything; and at most two in a
+     * row, so a machine that cannot keep up at all shows a slow picture
+     * rather than a frozen one. Only when the run is paced against a clock:
+     * an unpaced headless replay has no real time to be late against, and
+     * dropping there would make replays depend on how fast the host is. */
+    if (psp_clock_is_realtime() && c->sync_based) {
+        for (int drop = 0; drop < 2; drop++) {
+            if ((int32_t)(c->atrac_pts - c->pts) - c->sync_base <= 2 * (int32_t)c->frame_dur) break;
+            const uint32_t kept = c->pts;
+            c->pic_ready = 0;
+            if (!avc_pump(c)) { c->pic_ready = 1; c->pts = kept; break; }
+            c->dropped++;
+        }
+    }
+
     const uint32_t au = psp_arg(2);
     if (au) {
         /* The timestamps are what the player paces itself on. The elementary
@@ -1287,6 +1325,7 @@ static void hle_AvcDecode(void) {
         c->copy_ns += psp_os_mono_ns() - t0;
         c->pic_ready = 0;
         const int32_t d = (int32_t)(c->atrac_pts - c->pts);
+        if (!c->sync_based) { c->sync_base = d; c->sync_based = 1; }
         if (!c->sync_seen) { c->sync_min = c->sync_max = d; c->sync_seen = 1; }
         if (d < c->sync_min) c->sync_min = d;
         if (d > c->sync_max) c->sync_max = d;
