@@ -41,8 +41,19 @@ static void note_write_val(uint32_t addr, uint32_t width, uint32_t val) {
     if (g_wfilter && val != g_wvalue) return;
     if (g_whits++ < 32) {
         union { uint32_t u; float f; } c; c.u = val;
-        fprintf(stderr, "write%u to 0x%08X = 0x%08X (%.4g) from fn 0x%08X\n",
-                width * 8, addr, val, (double)c.f, psp_trace_last());
+        /* The registers too: for a memcpy-like writer the entry arguments
+         * are long gone (reused as loop cursors), but survivors like a
+         * saved dst/end-marker name the call. Which register matters is
+         * specific to the writer; printing all of the plausibly-useful
+         * ones beats a second run per hypothesis. */
+        fprintf(stderr, "write%u to 0x%08X = 0x%08X (%.4g) from fn 0x%08X\n"
+                        "        a0=%08X a1=%08X a2=%08X a3=%08X t0=%08X t1=%08X t2=%08X t3=%08X sp=%08X ra=%08X\n",
+                width * 8, addr, val, (double)c.f, psp_trace_last(),
+                psp_cpu.r[PSP_REG_A0], psp_cpu.r[PSP_REG_A1],
+                psp_cpu.r[PSP_REG_A2], psp_cpu.r[PSP_REG_A3],
+                psp_cpu.r[PSP_REG_T0], psp_cpu.r[PSP_REG_T1],
+                psp_cpu.r[PSP_REG_T2], psp_cpu.r[PSP_REG_T3],
+                psp_cpu.r[PSP_REG_SP], psp_cpu.r[PSP_REG_RA]);
     }
 }
 

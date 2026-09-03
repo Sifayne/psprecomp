@@ -1132,16 +1132,26 @@ void psp_vmidt(uint32_t vd, int size) {
 
 /* vidt -- an identity *vector*: all zeroes but for a single 1.0.
  *
- * Which element gets the 1 is encoded in the destination register number
- * rather than given as an operand, which is how one instruction builds any
- * basis vector. Bits 6-7 of vd select the position.
+ * Which element gets the 1 is the destination's own lane -- vd & 3, the same
+ * element field every vector op in this file addresses by -- rather than
+ * given as an operand, which is how one instruction builds any basis vector.
+ *
+ * This used to take bits 6-7, which names row 0 for every quad lane register
+ * the rotation builders use (v0..v3 all read lane 0), so each of the three
+ * builders wrote (1,0,0,0) for two of its four rows. Their outputs feed
+ * vmmul directly, and a rotation with two identical rows collapses the
+ * geometry it transforms: every per-object world matrix in the hangar came
+ * out rank-1 ([X,X,X,T]), the room folded onto a line, and the scene rendered
+ * nearly black. The builders are the oracle here -- with lane = vd & 3 they
+ * produce orthonormal X/Y/Z rotations, with anything else they cannot -- and
+ * no pspautotests suite covers vidt, so only the game could say it.
  *
  * This is matrix-setup code. Trapping it to a no-op leaves whatever was in the
  * register, so downstream geometry is built on a basis that is not a basis. */
 void psp_vidt(uint32_t vd, int size) {
     int r[4];
     const int n = psp_vfpu_regs(vd, size, r);
-    const int one = (int)((vd >> 6) & 3);
+    const int one = (int)(vd & 3);
     float out[4];
     for (int i = 0; i < n; i++) out[i] = (i == one) ? 1.0f : 0.0f;
     write_dst(vd, size, out);

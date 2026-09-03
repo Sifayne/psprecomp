@@ -670,8 +670,22 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
     int watched = (x == g_pw_x && y == g_pw_y && g_pw_left > 0);
     if (watched && g_pw_skip > 0) { g_pw_skip--; watched = 0; }
     const uint32_t arrived = rgba;
-    if (!alpha_pass(rgba)) { g_px_atest++; return; }
-    if (!depth_pass(x, y, z)) { g_px_zfail++; return; }
+    /* A rejection is as much a write as a write is, for the question "why is
+     * this pixel not what it should be": the object that should be here may
+     * have arrived and been turned away. */
+    if (!alpha_pass(rgba)) {
+        g_px_atest++;
+        if (watched) fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d ALPHA-KILLED %08X  tex %08X %dx%d fmt %d  pixels so far %llu\n",
+                             x, y, g_fb_addr, g_cur_prim, rgba, g_tex.addr, g_tex.w, g_tex.h, g_tex.fmt, (unsigned long long)g_pixels);
+        return;
+    }
+    if (!depth_pass(x, y, z)) {
+        g_px_zfail++;
+        if (watched) fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d DEPTH-FAILED %08X  z %.0f against %.0f func %d  tex %08X  pixels so far %llu\n",
+                             x, y, g_fb_addr, g_cur_prim, rgba, (double)z, (double)g_depth[y * DEPTH_STRIDE + x], g_zs.func,
+                             g_tex.addr, (unsigned long long)g_pixels);
+        return;
+    }
     if (g_zs.write) g_depth[y * DEPTH_STRIDE + x] = z;
     if (!g_bs.write_colour) return;
     if (g_bs.enable) { rgba = blend(rgba, get_pixel(x, y)); g_px_blend++; }

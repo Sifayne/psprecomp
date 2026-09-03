@@ -81,6 +81,10 @@ static int fx16_floor(float f) {
 #define GE_TGENMATRIXNUMBER 0x40
 #define GE_TGENMATRIXDATA   0x41
 #define GE_LIGHTINGENABLE   0x17
+#define GE_FOGENABLE        0x1F
+#define GE_FOG1             0xCD
+#define GE_FOG2             0xCE
+#define GE_FOGCOLOR         0xCF
 #define GE_LIGHTENABLE0     0x18
 #define GE_MATERIALUPDATE   0x53
 #define GE_MATERIALEMISSIVE 0x54
@@ -214,7 +218,8 @@ static uint64_t g_skip_layout;     /* weighted, or no position -- vertex_layout 
 static uint64_t g_skip_nearplane;  /* lines and points behind the eye (triangles go to the clipper) */
 static uint64_t g_clip_eye, g_clip_z, g_clip_guard, g_clip_split;
 static uint64_t g_draw_mip;
-static uint64_t g_lit_verts;  /* transformed with LIGHTING_ENABLE set */  /* textured draws with a mip chain (TEX_MODE top level > 0) */  /* the clipper's decisions, in vertices */
+static uint64_t g_lit_verts;  /* transformed with LIGHTING_ENABLE set */
+static uint64_t g_fog_verts;  /* transformed with FOG_ENABLE set (fog is not yet applied) */  /* textured draws with a mip chain (TEX_MODE top level > 0) */  /* the clipper's decisions, in vertices */
 static uint64_t g_culled;          /* backfacing, by the game's own winding rule */
 static uint64_t g_xformed;         /* vertices that went through the pipeline */
 /* Draws by path and by whether a texture was bound. "Most pixels are flat" has
@@ -281,6 +286,13 @@ static struct {
         float amb[3], dif[3], spec[3];
     } light[4];
     int   lighting, light_mode, mat_update, mat_alpha;
+    /* Fog: FOG_ENABLE 0x1F, FOG1 0xCD (end), FOG2 0xCE (1/range), FOG_COLOR
+     * 0xCF. Decoded for the census before it is applied: gpu/commands/fog is
+     * 264 of 272 values off, and every 3D scene the game has reached is dark
+     * against the reference, so the first question is whether fog is on. */
+    int   fog_enable;
+    float fog_end, fog_range;
+    float fog_colour[3];
     float mat_emissive[3], mat_ambient[3], mat_diffuse[3], mat_specular[3];
     float mat_spec_coef;
     float global_amb[3];
@@ -384,6 +396,7 @@ void psp_ge_reset(void) {
     g_clip_eye = g_clip_z = g_clip_guard = g_clip_split = 0;
     g_draw_mip = 0;
     g_lit_verts = 0;
+    g_fog_verts = 0;
     g_culled = g_xformed = 0;
     g_draw_2d_tex = g_draw_2d_flat = g_draw_3d_tex = g_draw_3d_flat = 0;
     g_col_n = 0;
@@ -509,6 +522,11 @@ void psp_ge_dump_stats(FILE *out) {
         if (g_tl.bb_seen)
             fprintf(out, "    screen bounds: x %.1f..%.1f  y %.1f..%.1f\n",
                     g_tl.bb_x0, g_tl.bb_x1, g_tl.bb_y0, g_tl.bb_y1);
+        if (g_fog_verts)
+            fprintf(out, "    fogged     %llu vertices transformed with fog on -- NOT applied; colour %02X%02X%02X end %.1f range %.4f\n",
+                    (unsigned long long)g_fog_verts,
+                    (unsigned)(g_tl.fog_colour[0] * 255.0f + 0.5f), (unsigned)(g_tl.fog_colour[1] * 255.0f + 0.5f),
+                    (unsigned)(g_tl.fog_colour[2] * 255.0f + 0.5f), (double)g_tl.fog_end, (double)g_tl.fog_range);
         if (g_lit_verts)
         {
             int nlights = 0;
@@ -699,9 +717,30 @@ static uint32_t vertex_addr(uint32_t i, int stride) {
     }
 }
 
+/* The colour of a vertex that carries none.
+ *
+ * It is not white. It is the material ambient colour and alpha, registers
+ * 0x55 and 0x58 -- what PSPSDK's sceGuColor writes (it is sceGuMaterial with
+ * every component selected) -- and that is how a game animates a fade
+ * without touching a vertex: one register write per frame, then a quad with
+ * no colour field. Armored Core's missions open on exactly such a quad, a
+ * full-screen white sprite of vertex type 0x800102, and with the old
+ * 0xFFFFFFFF default its alpha read as opaque in all 1,103 frames it was
+ * drawn. The scene underneath was rendered correctly the entire time. */
+static uint32_t current_colour(void) {
+    uint32_t c = (uint32_t)(g_tl.mat_alpha & 0xFF) << 24;
+    for (int k = 0; k < 3; k++) {
+        float f = g_tl.mat_ambient[k];
+        if (f < 0.0f) f = 0.0f;
+        if (f > 1.0f) f = 1.0f;
+        c |= (uint32_t)(int)(f * 255.0f + 0.5f) << (8 * k);
+    }
+    return c;
+}
+
 static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
                        int tex_off, psp_vertex *out) {
-    out->rgba = 0xFFFFFFFFu;
+    out->rgba = current_colour();
     out->u = out->v = 0.0f;
 
     /* Through-mode texture coordinates are in texels, whatever their width, so
@@ -891,14 +930,10 @@ static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
 
 /* Transformed geometry, one primitive at a time.
  *
- * Two things are missing and both are stated rather than hidden. There is no
- * clipper: a primitive with any vertex at or behind the eye is dropped whole,
- * because the perspective divide is meaningless there and the alternative --
- * dividing anyway -- projects the vertex to the wrong side of the screen and
- * draws a triangle across the whole frame. And there is no depth buffer, so
- * primitives land in submission order. Backface culling is honoured, which
- * removes the half of a closed mesh that would otherwise paint over the half
- * in front of it, but it is not a substitute for a depth test. */
+ * Triangles go through emit_tri below -- the near-plane clip, the guard band
+ * and the cull are per-triangle decisions -- and everything else is handed to
+ * the backend as decoded, with vertices at or behind the eye projected to
+ * (0,0), since there is no clipper for points, lines or sprites. */
 /* PSPRECOMP_GE_DRAWLOG=<n> narrates the first n primitives: where they landed,
  * what colour, and whether a texture was bound.
  *
@@ -1009,26 +1044,39 @@ static int drawlog_aux(void) {
  * slivers those triangles left across the frame were the "white pixels in
  * lines" Sif saw in the background. Hardware never rasterizes such a vertex.
  *
- * What it does instead is read off gpu/clipping, forty data points that fit
- * one model: the hardware divides by w first, whatever its sign, and applies
- * its rules in NDC.
+ * The rules are read off gpu/clipping, forty data points, plus the one case
+ * those tests cannot pose and the game does: a vertex behind the eye.
  *  - A triangle with every vertex at w <= 0 draws nothing ("Flat W=0: 0",
- *    "Flat W=-1: 0", "Linear W -1->-1->-1: 0"). Mixed signs just divide:
- *    "Linear W 1->-1->-1" lights the same 16,384 pixels as "1->1->2",
- *    because (-w,-w,-w,w) lands on the same NDC point for either sign. There
- *    is no eye-plane clip.
+ *    "Flat W=-1: 0", "Linear W -1->-1->-1: 0").
  *  - With DEPTH_CLIP_ENABLE clear, near and far *reject*: any vertex with
  *    z/w outside -1..1 drops the triangle whole. guardband's
  *    TRIANGLE_OUT_NEG_Z has one vertex at -1.2 and two inside and is DRAW=0;
  *    "Z outside near (noclamp)" lights 0 pixels; "Flat W=0.001 (noclamp)" is
  *    0 because its other two vertices sit at z/w = 499.
- *  - With the flag set the hardware clamps rather than rejects, and it clips
- *    the near plane geometrically, in NDC, and the far plane not at all:
- *    "Z outside near" (one vertex at z = -2) lights 171 of the 255 pixels on
- *    the wide edge, the cut at t = 1/3; "Z outside both" (the others at 2)
- *    192, the cut at t = 1/4; "Z outside far" alone keeps all 255. "Flat
- *    W=-1", all three behind the eye, is caught by the first rule. Depth is
- *    pinned to the range after projection.
+ *  - With the flag set the hardware clamps rather than rejects, clips the
+ *    near plane geometrically and the far plane not at all: "Z outside near"
+ *    (one vertex at z = -2) lights 171 of the 255 pixels on the wide edge,
+ *    the cut at t = 1/3; "Z outside both" (the others at 2) 192, the cut at
+ *    t = 1/4; "Z outside far" alone keeps all 255. Depth is pinned to the
+ *    range after projection.
+ *  - The near plane is z + w = 0 in *clip* space and the cut is made there,
+ *    before the divide. This used to divide first and clip z/w >= -1 in NDC,
+ *    and the two tests cannot tell the difference: every vertex they pose
+ *    sits at z = -w exactly, so "Linear W 1->-1->-1" lights the same 16,384
+ *    pixels either way -- (-w,-w,-w,w)/w is one point whatever the sign of
+ *    w. The hangar can tell. Its wall pieces are drawn with the camera
+ *    inside them, so vertices behind the eye reach the GE at w < 0 with no
+ *    clipping by the game. Divided, such a vertex lands mirrored through the
+ *    screen centre with z/w inside -1..1 (the game's projection puts it at
+ *    1.4), the NDC clip keeps it, and the triangle is either a shard across
+ *    the frame or, for most of them, dropped by the guard band: 117,000
+ *    vertices a run "behind the eye", 73,000 "outside the guard band", and
+ *    a floor that was black. In clip space z + w is, for any standard
+ *    projection, an affine function of eye z that is positive in front of
+ *    the near plane and negative behind the eye, so one cut handles both and
+ *    the divide only sees what survives it. A vertex that passes the test
+ *    with w < 0 is still divided, as hardware does -- that is what the
+ *    "1->-1->-1" row measures.
  *  - The guard band. Screen positions are 12 bits, a 4096-square box placed
  *    by OFFSET_X/Y, and a triangle with **any** vertex outside it is not
  *    drawn, whatever the depth flag. guardband is precise about this: its
@@ -1039,14 +1087,14 @@ static int drawlog_aux(void) {
  *    regression on this test, and the walls turned out to be dark for
  *    reasons in the compositing passes instead.
  *
- * Attributes interpolate linearly along the cut edge, in NDC, like the
- * position; colour rounds to the nearest channel value. The clip preserves
- * orientation, so the cull test runs on the first clipped triangle. */
+ * Attributes interpolate linearly along the cut edge in clip space, which is
+ * exact for the cut vertex; colour rounds to the nearest channel value. The
+ * clip preserves orientation, so the cull test runs on the first clipped
+ * triangle. */
 typedef struct { float c[4]; psp_vertex v; } clipvert;
-typedef struct { float n[3]; psp_vertex v; } ndcvert;
 
-static void lerp_ndc(const ndcvert *a, const ndcvert *b, float t, ndcvert *o) {
-    for (int k = 0; k < 3; k++) o->n[k] = a->n[k] + (b->n[k] - a->n[k]) * t;
+static void lerp_clip(const clipvert *a, const clipvert *b, float t, clipvert *o) {
+    for (int k = 0; k < 4; k++) o->c[k] = a->c[k] + (b->c[k] - a->c[k]) * t;
     o->v = a->v;
     o->v.u = a->v.u + (b->v.u - a->v.u) * t;
     o->v.v = a->v.v + (b->v.v - a->v.v) * t;
@@ -1062,14 +1110,14 @@ static void lerp_ndc(const ndcvert *a, const ndcvert *b, float t, ndcvert *o) {
     o->v.rgba = r;
 }
 
-/* The near plane in NDC, Sutherland-Hodgman: keeps z >= -1. */
-static int clip_near_ndc(const ndcvert *in, int n, ndcvert *out) {
+/* The near plane in clip space, Sutherland-Hodgman: keeps z + w >= 0. */
+static int clip_near(const clipvert *in, int n, clipvert *out) {
     int m = 0;
     for (int i = 0; i < n; i++) {
-        const ndcvert *a = &in[i], *b = &in[(i + 1) % n];
-        const float da = a->n[2] + 1.0f, db = b->n[2] + 1.0f;
+        const clipvert *a = &in[i], *b = &in[(i + 1) % n];
+        const float da = a->c[2] + a->c[3], db = b->c[2] + b->c[3];
         if (da >= 0.0f) out[m++] = *a;
-        if ((da >= 0.0f) != (db >= 0.0f)) lerp_ndc(a, b, da / (da - db), &out[m++]);
+        if ((da >= 0.0f) != (db >= 0.0f)) lerp_clip(a, b, da / (da - db), &out[m++]);
     }
     return m;
 }
@@ -1078,34 +1126,33 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
     int behind = 0;
     for (int i = 0; i < 3; i++) if (tri[i].c[3] <= 0.0f) behind++;
     if (behind == 3) { g_clip_eye += 3; return; }
-    for (int i = 0; i < 3; i++) if (tri[i].c[3] == 0.0f) { g_clip_eye += 3; return; }
 
-    ndcvert a[3], b[9];
-    for (int i = 0; i < 3; i++) {
-        const float inv = 1.0f / tri[i].c[3];
-        a[i].n[0] = tri[i].c[0] * inv; a[i].n[1] = tri[i].c[1] * inv; a[i].n[2] = tri[i].c[2] * inv;
-        a[i].v = tri[i].v;
-    }
-
-    const ndcvert *poly = a; int n = 3;
+    clipvert b[9];
+    const clipvert *poly = tri; int n = 3;
     if (!g_tl.depth_clamp) {
-        for (int i = 0; i < 3; i++)
-            if (!(a[i].n[2] >= -1.0f && a[i].n[2] <= 1.0f)) { g_clip_z += 3; return; }
+        for (int i = 0; i < 3; i++) {
+            if (tri[i].c[3] == 0.0f) { g_clip_eye += 3; return; }
+            const float nz = tri[i].c[2] / tri[i].c[3];
+            if (!(nz >= -1.0f && nz <= 1.0f)) { g_clip_z += 3; return; }
+        }
     } else {
-        n = clip_near_ndc(a, 3, b);
+        n = clip_near(tri, 3, b);
         if (n < 3) { g_clip_z += 3; return; }
         poly = b;
         if (n > 3) g_clip_split += (uint64_t)(n - 3);
     }
 
-    /* Project, then the guard band. */
+    /* Divide, project, then the guard band. A vertex at w = 0 exactly has no
+     * projection, and hardware draws nothing for it ("Flat W=0"). */
     const float ox = g_tl.vp_set ? g_tl.off_x : 1808.0f;
     const float oy = g_tl.vp_set ? g_tl.off_y : 1912.0f;
     psp_vertex p[9];
     unsigned any_out = 0;
     for (int i = 0; i < n; i++) {
+        if (poly[i].c[3] == 0.0f) { g_clip_eye += 3; return; }
+        const float inv = 1.0f / poly[i].c[3];
         float sx, sy, sz;
-        ndc_to_screen(poly[i].n[0], poly[i].n[1], poly[i].n[2], &sx, &sy, &sz);
+        ndc_to_screen(poly[i].c[0] * inv, poly[i].c[1] * inv, poly[i].c[2] * inv, &sx, &sy, &sz);
         if (g_tl.depth_clamp) {
             if (sz < 0.0f) sz = 0.0f;
             if (sz > 65535.0f) sz = 65535.0f;
@@ -1290,9 +1337,10 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             mul_4x4(g_tl.proj,  eye,   clip);
 
             psp_vertex *o = &v[decoded];
-            o->rgba = 0xFFFFFFFFu;
+            o->rgba = current_colour();
             if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7)
                 o->rgba = psp_read32(a + (uint32_t)col_off);
+            if (g_tl.fog_enable) g_fog_verts++;
             if (g_tl.lighting) {
                 float nm[3], nw[3], ne[3];
                 read_normal_model(a, g_ge.vtype, norm_off, nm);
@@ -1355,10 +1403,10 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 if (v[i].y < y0) y0 = v[i].y;   if (v[i].y > y1) y1 = v[i].y;
             }
             fprintf(stderr, "draw: %-14s %2u verts  x %4d..%-4d y %4d..%-4d  "
-                            "fbp %08X  rgba %08X  vtype %06X  tex %s %08X %ux%u fmt %u filt %u/%u uv %.1f,%.1f..%.1f,%.1f\n",
+                            "fbp %08X  vaddr %08X  rgba %08X  vtype %06X  z %d/%d/%d clr %d  tex %s %08X %ux%u fmt %u filt %u/%u uv %.1f,%.1f..%.1f,%.1f\n",
                     PRIM_NAME[type & 7], decoded, x0 >> 4, x1 >> 4, y0 >> 4, y1 >> 4,
-                    ge_fb_address(g_ge.fbp), v[0].rgba,
-                    g_ge.vtype, (g_ge.tex_enable && tex_off >= 0 && g_ge.tex_addr)
+                    ge_fb_address(g_ge.fbp), g_ge.vaddr, v[0].rgba,
+                    g_ge.vtype, g_tl.ztest_enable, g_tl.ztest_func, !g_tl.zwrite_off, g_tl.clear_mode, (g_ge.tex_enable && tex_off >= 0 && g_ge.tex_addr)
                                 ? "yes" : "no", g_ge.tex_addr, g_ge.tex_w, g_ge.tex_h, g_ge.tex_format, (unsigned)(g_ge.tex_filter & 7), (unsigned)((g_ge.tex_filter >> 8) & 1), (double)v[0].u, (double)v[0].v, (double)v[decoded-1].u, (double)v[decoded-1].v);
             fprintf(stderr, "      cols");
             for (uint32_t i = 0; i < decoded && i < 4; i++)
@@ -1567,10 +1615,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
                 if(v[i].y<y0)y0=v[i].y; if(v[i].y>y1)y1=v[i].y;
             }
             fprintf(stderr, "2d:   %-14s %2u verts  x %4d..%-4d y %4d..%-4d  "
-                            "fbp %08X  rgba %08X %08X  vtype %06X  tex %s\n",
+                            "fbp %08X  vaddr %08X  rgba %08X %08X  vtype %06X  z %d/%d/%d clr %d  tex %s\n",
                     PRIM_NAME[type & 7], decoded, x0 >> 4, x1 >> 4, y0 >> 4, y1 >> 4,
-                    ge_fb_address(g_ge.fbp),
-                    v[0].rgba, v[decoded>1?1:0].rgba, g_ge.vtype,
+                    ge_fb_address(g_ge.fbp), g_ge.vaddr,
+                    v[0].rgba, v[decoded>1?1:0].rgba, g_ge.vtype, g_tl.ztest_enable, g_tl.ztest_func, !g_tl.zwrite_off, g_tl.clear_mode,
                     has_uv ? "yes" : "no");
             fprintf(stderr, "      raw");
             for (uint32_t i = 0; i < decoded && i < 2; i++) {
@@ -1885,6 +1933,10 @@ static void run_list(ge_queue *q) {
             break;
         case GE_DEPTHCLIPENABLE: g_tl.depth_clamp = (int)(arg & 1); break;
         case GE_LIGHTINGENABLE: g_tl.lighting = (int)(arg & 1); break;
+        case GE_FOGENABLE: g_tl.fog_enable = (int)(arg & 1); break;
+        case GE_FOG1:      g_tl.fog_end   = ge_float(arg); break;
+        case GE_FOG2:      g_tl.fog_range = ge_float(arg); break;
+        case GE_FOGCOLOR:  ge_colour3(arg, g_tl.fog_colour); break;
         case GE_LIGHTMODE:      g_tl.light_mode = (int)(arg & 1); break;
         case GE_MATERIALUPDATE: g_tl.mat_update = (int)(arg & 7); break;
         case GE_MATERIALEMISSIVE: ge_colour3(arg, g_tl.mat_emissive); break;
