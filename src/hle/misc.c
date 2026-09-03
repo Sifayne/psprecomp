@@ -520,7 +520,7 @@ static void hle_RtcGetTickResolution(void) { psp_ret(1000000u); }
 
 #define AUDIO_CHANNELS 8
 
-typedef struct { int reserved; uint32_t samples; uint32_t format; } audio_ch;
+typedef struct { int reserved; uint32_t samples; uint32_t format; uint64_t play_until_ns; } audio_ch;
 static audio_ch g_audio[AUDIO_CHANNELS];
 static uint64_t g_audio_blocks;
 
@@ -651,8 +651,21 @@ static int64_t audio_output_common(int buf_arg, int lvol_arg, int rvol_arg) {
      * its own main thread from 16 to 40, the audio thread outranked it, and a
      * yield cannot give way to a lower priority -- so it starved the whole game
      * and the run went from 633 GE lists to 3. A spinning thread is not
-     * harmless just because nothing has outranked it yet. */
-    return (int64_t)g_audio[ch].samples * 1000000 / PSP_AUDIO_RATE;
+     * harmless just because nothing has outranked it yet.
+     *
+     * The wait is hardware's, not a buffer's length: a virtual speaker drains
+     * what has been queued at 44.1kHz, and the call waits only for the excess
+     * over two buffers in flight -- the one playing and the one queued. A flat
+     * wait of one buffer per call ran the audio at 91% of real time under
+     * real-time pacing (the wait plus the time to get the token), which read
+     * as the picture running away from the sound. */
+    audio_ch *a = &g_audio[ch];
+    const uint64_t now = psp_clock_peek() * 1000ull;   /* guest microseconds; wall time when paced */
+    const uint64_t buf_ns = (uint64_t)a->samples * 1000000000ull / PSP_AUDIO_RATE;
+    if (a->play_until_ns < now) a->play_until_ns = now;
+    a->play_until_ns += buf_ns;
+    const uint64_t ahead = a->play_until_ns - now;
+    return ahead > 2 * buf_ns ? (int64_t)((ahead - 2 * buf_ns) / 1000) : 0;
 }
 
 static uint32_t audio_ret(void) {

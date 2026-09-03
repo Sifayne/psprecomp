@@ -431,6 +431,8 @@ void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples,
                                         uint32_t lvol, uint32_t rvol));
 /* The host-clock gaps between each channel's outputs; see audio_note_gap. */
 void psp_audio_dump_gaps(FILE *out);
+/* A movie's audio clock against its picture; see mpeg.c. */
+void psp_mpeg_dump_sync(FILE *out);
 
 /* ---- the ATRAC3 / ATRAC3+ decoder, shared -----------------------------------
  *

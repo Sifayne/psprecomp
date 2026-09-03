@@ -85,6 +85,8 @@
 #include "psprecomp/cpu.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/os.h"
+#include "psprecomp/sched.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -196,16 +198,73 @@ typedef struct {
     int      pic_ready;
     uint32_t pts;          /* 90kHz, derived from the frame number */
     uint32_t atrac_pts;    /* 90kHz, advancing at the audio rate -- see below */
+    /* The audio clock against the video's at each picture, extremes kept: how
+     * far the sound thread has fetched ahead of (or behind) the frame being
+     * shown, in 90kHz ticks. Reported when the run is paced. */
+    int32_t  sync_min, sync_max;
+    int      sync_seen;
+    int32_t  sync_trend[8];   /* the lead every 250 pictures, for the shape of the drift */
+    /* The PES timestamps, kept this time, anchored to where in the video
+     * elementary stream their PES began. Only some pictures' PES carry one
+     * -- one in ten through this game's intro -- so a picture whose data
+     * holds an anchor takes it, and the pictures between anchors are spaced
+     * by the duration the last two anchors measured. The audio's first one
+     * seeds the audio clock, which then advances a frame at a time, exactly,
+     * since every ATRAC3+ frame is 2048 samples. */
+    struct mpeg_vpts { size_t es_off; uint32_t pts; } *vpts;
+    size_t    nvpts, vpts_cap, vpts_next;
+    uint32_t  frame_dur;      /* 90kHz ticks between pictures, measured */
+    uint32_t  anchor_pts;     /* the last anchored picture's timestamp */
+    int       anchor_frame;   /* and its frame number; 0 = none yet */
+    uint32_t  anchor0_pts;    /* the first anchor, for the duration measured over the run */
+    int       anchor0_frame;
+    uint32_t  apts0;
+    int       apts_seen;
+    uint32_t  npes_v, npes_v_pts, npes_a, npes_a_pts;
+    /* Each stream's clock against the wall clock: when its first and last
+     * access units were fetched and what they were stamped. A stream fetched
+     * at real time advances its stamps as fast as the wall; slower means the
+     * decoder cannot keep up, and the other stream runs away from it. */
+    uint64_t v_first_ns, v_last_ns, a_first_ns, a_last_ns;
+    uint32_t v_first_pts, v_last_pts, a_first_pts, a_last_pts;
+    uint32_t v_fetched, a_fetched;
+    uint64_t dec_ns, copy_ns, adec_ns;   /* host time in the H.264 decoder, the picture copy, the audio decoder */
 } mpeg_ctx;
 
 static mpeg_ctx g_mpeg[MAX_MPEG];
 static int      g_inited;
+
+/* The audio clock's lead over the picture, in milliseconds, over the run. */
+void psp_mpeg_dump_sync(FILE *out) {
+    for (int i = 0; i < MAX_MPEG; i++) {
+        const mpeg_ctx *c = &g_mpeg[i];
+        if (!c->sync_seen) continue;
+        fprintf(out, "    movie: audio clock led the picture by %.0f..%.0f ms across %d frames;"
+                     " frame %.2f ms; PES video %u (%u stamped) audio %u (%u stamped), first audio stamp %u\n",
+                c->sync_min / 90.0, c->sync_max / 90.0, c->frames, c->frame_dur / 90.0,
+                c->npes_v, c->npes_v_pts, c->npes_a, c->npes_a_pts, c->apts0);
+        fprintf(out, "    movie: lead every 250 pictures, ms:");
+        for (int k = 0; k < 8 && k * 250 < c->frames; k++) fprintf(out, " %.0f", c->sync_trend[k] / 90.0);
+        fprintf(out, "\n");
+        if (c->v_fetched > 1)
+            fprintf(out, "    movie: video  %u AUs fetched, stamps %u..%u (%.1f s of picture) over %.1f s of wall clock\n",
+                    c->v_fetched, c->v_first_pts, c->v_last_pts,
+                    (c->v_last_pts - c->v_first_pts) / 90000.0, (c->v_last_ns - c->v_first_ns) / 1e9);
+        if (c->a_fetched > 1)
+            fprintf(out, "    movie: audio  %u AUs fetched, stamps %u..%u (%.1f s of sound) over %.1f s of wall clock\n",
+                    c->a_fetched, c->a_first_pts, c->a_last_pts,
+                    (c->a_last_pts - c->a_first_pts) / 90000.0, (c->a_last_ns - c->a_first_ns) / 1e9);
+        fprintf(out, "    movie: host time  H.264 decode %.1f s, picture copy %.1f s, ATRAC3+ decode %.1f s\n",
+                c->dec_ns / 1e9, c->copy_ns / 1e9, c->adec_ns / 1e9);
+    }
+}
 
 void psp_mpeg_reset(void) {
     for (int i = 0; i < MAX_MPEG; i++) {
         psp_at3_close((psp_at3_dec *)g_mpeg[i].adec);
         free(g_mpeg[i].aes);
         free(g_mpeg[i].puts);
+        free(g_mpeg[i].vpts);
     }
     memset(g_mpeg, 0, sizeof g_mpeg);
     g_inited = 0;
@@ -370,6 +429,17 @@ static void hle_RingbufferAvailableSize(void) {
             const int over = c->es_eof && c->es_pos >= c->es_len && c->aes_pos >= c->aes_len;
             if (held == 0 && !over) held = 1;
             if (held > packets) held = packets;
+            /* The game's reader polls this in a hot loop while the ring is
+             * full -- 284 million calls in a 75-second run. A packet frees when
+             * a decoder consumes one, never sooner than a frame later, so a
+             * poll that finds the ring full sleeps a quarter of a frame of
+             * guest time: the same answer, later, and the host's time back
+             * for the decoders. A millisecond was tried first, and a thousand
+             * wakes a second -- each a handoff between host threads -- still
+             * cost the picture 1.5% of real time. Whole-ring size is not a
+             * fair test of "full" -- the reader wants room for a read's
+             * worth -- so an eighth is. */
+            if (held * 8 >= (uint64_t)packets * 7) psp_sched_delay(8000);
             psp_ret(packets - (uint32_t)held);
             return;
         }
@@ -551,6 +621,32 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
             if (i + 9 > plen_all) break;
             const size_t hdrlen = p[i+8];
             const size_t off    = i + 9 + hdrlen;
+            /* The MPEG-2 PES header: flags at +7, and when bit 7 is set a
+             * 33-bit PTS in the five bytes from +9, the marker bits between
+             * its three pieces. The low 32 bits are what the PSP keeps. */
+            if (audio) c->npes_a++; else c->npes_v++;
+            if ((p[i+7] & 0x80) && hdrlen >= 5 && i + 14 <= plen_all) {
+                const uint8_t *t = p + i + 9;
+                const uint32_t pts = ((uint32_t)(t[0] & 0x0E) << 29) | ((uint32_t)t[1] << 22) |
+                                     ((uint32_t)(t[2] & 0xFE) << 14) | ((uint32_t)t[3] << 7) |
+                                     ((uint32_t)t[4] >> 1);
+                if (audio) {
+                    c->npes_a_pts++;
+                    if (!c->apts_seen) { c->apts0 = pts; c->apts_seen = 1; c->atrac_pts = pts; }
+                } else {
+                    c->npes_v_pts++;
+                    if (c->nvpts == c->vpts_cap) {
+                        const size_t cap = c->vpts_cap ? c->vpts_cap * 2 : 4096;
+                        struct mpeg_vpts *nv = (struct mpeg_vpts *)realloc(c->vpts, cap * sizeof *nv);
+                        if (nv) { c->vpts = nv; c->vpts_cap = cap; }
+                    }
+                    if (c->nvpts < c->vpts_cap) {
+                        c->vpts[c->nvpts].es_off = c->es_len;
+                        c->vpts[c->nvpts].pts    = pts;
+                        c->nvpts++;
+                    }
+                }
+            }
             /* plen counts from just after itself, so the payload is what is
              * left of it once the PES header is taken off. */
             if (plen >= 3 + hdrlen) {
@@ -687,8 +783,10 @@ static int avc_pump(mpeg_ctx *c) {
         unsigned char *planes[3] = { 0, 0, 0 };
         SBufferInfo info;
         memset(&info, 0, sizeof info);
+        const uint64_t t0 = psp_os_mono_ns();
         (*d)->DecodeFrameNoDelay(d, c->es + start - 3, (int)(nal_end - (start - 3)),
                                  planes, &info);
+        c->dec_ns += psp_os_mono_ns() - t0;
         if (info.iBufferStatus == 1 && planes[0]) {
             c->frames++;
             produced++;
@@ -709,8 +807,37 @@ static int avc_pump(mpeg_ctx *c) {
                         for (int y = 0; y < b->iHeight / 2; y++, d += b->iWidth / 2)
                             memcpy(d, planes[pl] + (size_t)y * b->iStride[1], (size_t)b->iWidth / 2);
                     c->pic_ready = 1;
-                    /* 90kHz at 25fps, which is what the stream declares. */
-                    c->pts = (uint32_t)c->frames * (90000u / 25u);
+                    /* The picture's own timestamp, from its PES; 25fps from
+                     * the frame count only if the stream carried none -- which
+                     * this game's intro does not do, and which ran its picture
+                     * 20% slow against the sound. */
+                    {
+                        /* An anchor inside this picture's data takes it; any
+                         * earlier unused anchor is stale and dropped. */
+                        int anchored = 0;
+                        while (c->vpts_next < c->nvpts && c->vpts[c->vpts_next].es_off < nal_end) {
+                            c->pts = c->vpts[c->vpts_next].pts;
+                            anchored = 1;
+                            c->vpts_next++;
+                        }
+                        if (!c->frame_dur) c->frame_dur = 3003;   /* 29.97fps until measured */
+                        if (anchored) {
+                            /* Measured over the whole run, first anchor to
+                             * this one: two adjacent anchors a dozen frames
+                             * apart gave 35.6 ms for a 33.4 ms stream. */
+                            if (!c->anchor0_frame) { c->anchor0_pts = c->pts; c->anchor0_frame = c->frames; }
+                            else if (c->frames > c->anchor0_frame) {
+                                const uint32_t d = (c->pts - c->anchor0_pts) / (uint32_t)(c->frames - c->anchor0_frame);
+                                if (d >= 1500 && d <= 7200) c->frame_dur = d;
+                            }
+                            c->anchor_pts   = c->pts;
+                            c->anchor_frame = c->frames;
+                        } else if (c->anchor_frame) {
+                            c->pts = c->anchor_pts + c->frame_dur * (uint32_t)(c->frames - c->anchor_frame);
+                        } else {
+                            c->pts = c->frame_dur * (uint32_t)c->frames;
+                        }
+                    }
                 }
             }
             if (mpeg_logging() && (c->frames == 1 || c->frames % 50 == 0))
@@ -1023,6 +1150,11 @@ static void hle_GetAvcAu(void) {
     }
     if (mpeg_logging() && c->frames <= 3)
         fprintf(stderr, "mpeg: GetAvcAu -> frame %d, pts %u\n", c->frames, c->pts);
+    {
+        const uint64_t now = psp_os_mono_ns();
+        if (!c->v_fetched) { c->v_first_ns = now; c->v_first_pts = c->pts; }
+        c->v_last_ns = now; c->v_last_pts = c->pts; c->v_fetched++;
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 /* The audio access unit: the next ATRAC3+ frame of the movie.
@@ -1087,6 +1219,11 @@ static void hle_GetAtracAu(void) {
         psp_write32(au + AU_ES_SIZE, (uint32_t)total);
     }
     c->aes_pos += total;
+    {
+        const uint64_t now = psp_os_mono_ns();
+        if (!c->a_fetched) { c->a_first_ns = now; c->a_first_pts = c->atrac_pts; }
+        c->a_last_ns = now; c->a_last_pts = c->atrac_pts; c->a_fetched++;
+    }
     c->atrac_pts += MPEG_ATRAC_PTS_STEP;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1145,8 +1282,15 @@ static void hle_AvcDecode(void) {
 
     const int got = c->pic_ready;
     if (got) {
+        const uint64_t t0 = psp_os_mono_ns();
         write_picture(c, dst, stride ? stride : 512);
+        c->copy_ns += psp_os_mono_ns() - t0;
         c->pic_ready = 0;
+        const int32_t d = (int32_t)(c->atrac_pts - c->pts);
+        if (!c->sync_seen) { c->sync_min = c->sync_max = d; c->sync_seen = 1; }
+        if (d < c->sync_min) c->sync_min = d;
+        if (d > c->sync_max) c->sync_max = d;
+        if (c->frames % 250 == 1 && c->frames / 250 < 8) c->sync_trend[c->frames / 250] = d;
     }
 
     /* The fifth argument is where the caller learns a picture was produced, and
@@ -1209,7 +1353,9 @@ static void hle_AtracDecode(void) {
                                             "audio; it plays silent.\n");
                     }
                 } else if (init) psp_at3_flush((psp_at3_dec *)c->adec);
+                const uint64_t t0 = psp_os_mono_ns();
                 n = psp_at3_decode((psp_at3_dec *)c->adec, frame + AT3P_HDR, payload, pcm, 2048);
+                c->adec_ns += psp_os_mono_ns() - t0;
             }
         }
     }
