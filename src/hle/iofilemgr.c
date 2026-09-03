@@ -17,8 +17,11 @@
 
 #ifdef _WIN32
 #  include <io.h>
+#  include <direct.h>
 #else
 #  include <dirent.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
 #endif
 
 #define MAX_FILES 64
@@ -74,6 +77,7 @@ typedef struct {
 static io_file g_file[MAX_FILES];
 static io_dir  g_dir[MAX_DIRS];
 static char    g_root[512];
+static char    g_cwd[512];
 static char    g_umd_image[512];
 static uint64_t g_bytes_read;
 
@@ -111,6 +115,7 @@ void psp_io_reset(void) {
         g_file[i].sector_mode = 0;
     }
     memset(g_dir, 0, sizeof g_dir);
+    g_cwd[0] = '\0';
     g_bytes_read = 0;
     if (!g_root[0]) psp_io_set_root(".");
 }
@@ -121,10 +126,12 @@ uint64_t psp_io_bytes_read(void) { return g_bytes_read; }
 
 /* Rewrite a PSP path into a host path. The device prefix becomes a
  * subdirectory so a disc image and a memory-stick image can coexist under one
- * root without colliding. */
+ * root without colliding. A path without a device goes through the current
+ * directory, which starts as the root. */
 static void map_path(const char *guest, char *out, size_t cap) {
     const char *p = guest;
     const char *sub = "disc";
+    int have_dev = 1;
 
     if      (!strncmp(p, "disc0:", 6)) { p += 6; sub = "disc"; }
     else if (!strncmp(p, "umd0:",  5)) { p += 5; sub = "disc"; }
@@ -137,14 +144,22 @@ static void map_path(const char *guest, char *out, size_t cap) {
     else if (!strncmp(p, "umd1:",  5)) { p += 5; sub = "disc"; }
     else if (!strncmp(p, "msstor0p1:", 10)) { p += 10; sub = "ms"; }
     else if (!strncmp(p, "msstor0:",   8)) { p += 8;  sub = "ms"; }
+    else if (strchr(p, ':') == NULL) have_dev = 0;
+    else { p = guest; sub = "disc"; }
 
     while (*p == '/' || *p == '\\') p++;
-    snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
+    if (have_dev) snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
+    else if (g_cwd[0]) snprintf(out, cap, "%s/%s", g_cwd, p);
+    else snprintf(out, cap, "%s/%s", g_root, p);
 }
 
 /* One ISO 9660 sector. Up here rather than with the reader below because
  * sceIoGetstat reports a file's start sector and needs it too. */
 #define ISO_SECTOR 2048u
+
+/* Defined with the directories below; declared here because CREAT opens
+ * make their parents. */
+static void mkdir_parents(const char *host);
 
 /* Defined with the rest of the ISO 9660 reader below; declared here because
  * opening and stat-ing both consult the disc image before the host tree. */
@@ -209,6 +224,34 @@ static void hle_Open(void) {
     }
 
     map_path(guest, host, sizeof host);
+
+    /* FAT-illegal names fail at open with INVALID_ARG (the savedata suite's
+     * A?C probe): ? * < > | " and controls never name a real file. Only the
+     * host branch -- disc names are fixed. Checked on the guest subpath so
+     * no host root can smuggle a character in. */
+    {
+        const char *colon = strchr(guest, ':');
+        const char *sub = colon ? colon + 1 : guest;
+        for (const char *c = sub; *c; c++) {
+            unsigned char u = (unsigned char)*c;
+            if (u < 32 || u == '?' || u == '*' || u == '<' || u == '>' ||
+                u == '|' || u == '"') {
+                psp_ret(0x80010016);
+                return;
+            }
+        }
+    }
+
+    /* Creating a file creates its parents: a save flow makes
+     * ms0:/PSP/SAVEDATA/<id> under a tree that starts empty, and failing on
+     * the absent middle is the same empty-tree deviation mkdir_parents
+     * documents. */
+    if (flags & PSP_O_CREAT) {
+        char dir[1024];
+        snprintf(dir, sizeof dir, "%s", host);
+        char *slash = strrchr(dir, '/');
+        if (slash) { *slash = '\0'; mkdir_parents(dir); }
+    }
 
     const char *mode = "rb";
     if (flags & PSP_O_TRUNC)                  mode = (flags & PSP_O_RDWR) == PSP_O_RDWR ? "w+b" : "wb";
@@ -619,6 +662,37 @@ static void hle_Rename(void) {
 
 /* ---- directories --------------------------------------------------------- */
 
+#ifdef _WIN32
+#include <direct.h>
+#define MKDIR_ONE(p) _mkdir(p)
+#define RMDIR_ONE(p) _rmdir(p)
+#define UNLINK_ONE(p) _unlink(p)
+#define STAT_ISDIR(st) (((st).st_mode & _S_IFDIR) != 0)
+#else
+#define MKDIR_ONE(p) mkdir(p, 0777)
+#define RMDIR_ONE(p) rmdir(p)
+#define UNLINK_ONE(p) unlink(p)
+#define STAT_ISDIR(st) S_ISDIR((st).st_mode)
+#endif
+
+/* Create every missing level of `host`. Hardware Mkdir is single-level, but
+ * the host tree starts empty -- hardware always has PSP/SAVEDATA/ -- so a
+ * save flow that makes ms0:/PSP/SAVEDATA/<id> would fail on the absent
+ * parents rather than on anything the game did. The deviation is this
+ * function, in one place, not spread across callers. */
+static void mkdir_parents(const char *host) {
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s", host);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            MKDIR_ONE(tmp);
+            *p = '/';
+        }
+    }
+    MKDIR_ONE(tmp);
+}
+
 static void hle_Dopen(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
@@ -707,6 +781,157 @@ static void hle_Dclose(void) {
 #endif
     g_dir[id].used = 0;
     psp_ret(0);
+}
+
+/* The five directory calls M1 named and M4 needs. The game stats
+ * ms0:/PSP/SAVEDATA/<id> to probe for saves and makes the tree when it
+ * writes; nothing on a measured path calls these yet, so they are shaped
+ * by PPSSPP's documented behaviour (Core/HLE/sceIo.cpp) rather than by a
+ * capture. */
+
+/* The process-wide current directory for paths without a device prefix.
+ * The game only ever passes absolute device paths (no measured open names
+ * anything else), so this starts as the root and is recorded, not resolved,
+ * until something relative arrives. */
+static void hle_Mkdir(void) {
+    char guest[512], host[1024];
+    psp_str(psp_arg(0), guest, sizeof guest);
+    map_path(guest, host, sizeof host);
+
+    struct stat st;
+    if (stat(host, &st) == 0) { psp_ret(0x80010011); return; }  /* EEXIST */
+    mkdir_parents(host);
+    psp_ret(stat(host, &st) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
+}
+
+static void hle_Rmdir(void) {
+    char guest[512], host[1024];
+    psp_str(psp_arg(0), guest, sizeof guest);
+    map_path(guest, host, sizeof host);
+    psp_ret(RMDIR_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
+}
+
+static void hle_Remove(void) {
+    char guest[512], host[1024];
+    psp_str(psp_arg(0), guest, sizeof guest);
+    map_path(guest, host, sizeof host);
+    psp_ret(UNLINK_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
+}
+
+static void hle_Chdir(void) {
+    char guest[512], host[1024];
+    psp_str(psp_arg(0), guest, sizeof guest);
+    map_path(guest, host, sizeof host);
+    struct stat st;
+    if (stat(host, &st) != 0 || !STAT_ISDIR(st)) { psp_ret(0x80010002); return; }
+    snprintf(g_cwd, sizeof g_cwd, "%s", host);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Attribute changes have no observable consumer -- nothing reads back modes
+ * or times -- so this validates the path and reports success, the way
+ * PPSSPP leaves it unimplemented-but-zero. Mapping chmod bits onto host
+ * bits would be a second attributes model to keep correct. */
+static void hle_Chstat(void) {
+    char guest[512], host[1024];
+    psp_str(psp_arg(0), guest, sizeof guest);
+    map_path(guest, host, sizeof host);
+    struct stat st;
+    if (stat(host, &st) != 0) { psp_ret(0x80010002); return; }
+    (void)st;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+void psp_io_host_path(const char *guest, char *out, size_t cap) {
+    map_path(guest, out, cap);
+}
+
+void psp_io_mkdir_all(const char *guest) {
+    char host[1024];
+    map_path(guest, host, sizeof host);
+    mkdir_parents(host);
+}
+
+int psp_io_path_info(const char *guest, uint64_t *size, int *is_dir) {
+    char host[1024];
+    map_path(guest, host, sizeof host);
+    struct stat st;
+    if (stat(host, &st) != 0) return -1;
+    if (size) *size = STAT_ISDIR(st) ? 0 : (uint64_t)st.st_size;
+    if (is_dir) *is_dir = STAT_ISDIR(st) ? 1 : 0;
+    return 0;
+}
+
+int psp_io_list_names(const char *guest, char names[][64], int cap) {
+    char host[1024];
+    map_path(guest, host, sizeof host);
+    int n = 0;
+#ifdef _WIN32
+    char pattern[1088];
+    snprintf(pattern, sizeof pattern, "%s/*", host);
+    struct _finddata_t data;
+    intptr_t h = _findfirst(pattern, &data);
+    if (h == -1) return -1;
+    do {
+        if (!strcmp(data.name, ".") || !strcmp(data.name, "..")) continue;
+        if (n < cap) {
+            snprintf(names[n], 64, "%s", data.name);
+            n++;
+        }
+    } while (_findnext(h, &data) == 0);
+    _findclose(h);
+    return n;
+#else
+    DIR *d = opendir(host);
+    if (!d) return -1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (n < cap) {
+            snprintf(names[n], 64, "%s", de->d_name);
+            n++;
+        }
+    }
+    closedir(d);
+    return n;
+#endif
+}
+
+int psp_io_remove_tree(const char *guest) {
+    char host[1024];
+    map_path(guest, host, sizeof host);
+    struct stat st;
+    if (stat(host, &st) != 0) return -1;
+    if (!STAT_ISDIR(st)) return UNLINK_ONE(host) == 0 ? 0 : -1;
+#ifdef _WIN32
+    char pattern[1088];
+    snprintf(pattern, sizeof pattern, "%s/*", host);
+    struct _finddata_t data;
+    intptr_t h = _findfirst(pattern, &data);
+    if (h != -1) {
+        do {
+            if (!strcmp(data.name, ".") || !strcmp(data.name, "..")) continue;
+            char gchild[1024];
+            snprintf(gchild, sizeof gchild, "%s/%s", guest, data.name);
+            psp_io_remove_tree(gchild);
+        } while (_findnext(h, &data) == 0);
+        _findclose(h);
+    }
+    return RMDIR_ONE(host) == 0 ? 0 : -1;
+#else
+    DIR *d = opendir(host);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            char gchild[1024];
+            snprintf(gchild, sizeof gchild, "%s/%s", guest, de->d_name);
+            psp_io_remove_tree(gchild);
+        }
+        closedir(d);
+    }
+    return RMDIR_ONE(host) == 0 ? 0 : -1;
+#endif
 }
 
 /* ---- asynchronous I/O -------------------------------------------------------
@@ -850,4 +1075,9 @@ void psp_io_register(void) {
     psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",  hle_Dread);
     psp_hle_register(0xEB092469, "IoFileMgrForUser", "sceIoDclose", hle_Dclose);
     psp_hle_register(0x54F5FB11, "IoFileMgrForUser", "sceIoDevctl", hle_Devctl);
+    psp_hle_register(0x06A70004, "IoFileMgrForUser", "sceIoMkdir",  hle_Mkdir);
+    psp_hle_register(0x1117C65F, "IoFileMgrForUser", "sceIoRmdir",  hle_Rmdir);
+    psp_hle_register(0xF27A9C51, "IoFileMgrForUser", "sceIoRemove", hle_Remove);
+    psp_hle_register(0x55F4717D, "IoFileMgrForUser", "sceIoChdir",  hle_Chdir);
+    psp_hle_register(0xB8A740F4, "IoFileMgrForUser", "sceIoChstat", hle_Chstat);
 }

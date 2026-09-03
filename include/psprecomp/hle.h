@@ -339,6 +339,20 @@ void psp_io_set_root(const char *root);
  * that retries on failure never gets past its first read. */
 void psp_io_set_umd_image(const char *path);
 uint64_t psp_io_bytes_read(void);
+/* Map a guest path to its host path (same rewriting opens use). For layers
+ * like the savedata utility that do their own host file I/O. */
+void psp_io_host_path(const char *guest, char *out, size_t cap);
+/* Make a guest directory and every missing level above it (same empty-tree
+ * deviation hle_Mkdir documents). */
+void psp_io_mkdir_all(const char *guest);
+/* Remove a guest file or, recursively, a directory tree. Returns 0, or -1
+ * when nothing was there. */
+int psp_io_remove_tree(const char *guest);
+/* Size and kind of a host-side guest path. Returns 0, or -1 when missing. */
+int psp_io_path_info(const char *guest, uint64_t *size, int *is_dir);
+/* Names directly under a guest directory: up to cap entries of 63 chars.
+ * Returns the count, or -1 when not a directory. */
+int psp_io_list_names(const char *guest, char names[][64], int cap);
 
 void psp_misc_init(void);
 void psp_misc_register(void);

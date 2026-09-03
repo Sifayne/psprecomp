@@ -15,6 +15,11 @@
 
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <unistd.h>
+#endif
 
 static int failures;
 
@@ -560,6 +565,94 @@ static void test_net(void) {
           "the WLAN switch reads off");
 }
 
+/* M4's directory calls, under a root of their own. A save flow makes
+ * ms0:/PSP/SAVEDATA/<id> and enumerates it back; the tree starts empty, so
+ * the parents have to come from somewhere. Ends with the root restored and
+ * the scratch tree removed. */
+static void test_io_dirs(void) {
+    psp_io_set_root("test-io-root");
+    const uint32_t MKDIR  = psp_nid("sceIoMkdir");
+    const uint32_t RMDIR  = psp_nid("sceIoRmdir");
+    const uint32_t REMOVE = psp_nid("sceIoRemove");
+    const uint32_t CHDIR  = psp_nid("sceIoChdir");
+    const uint32_t CHSTAT = psp_nid("sceIoChstat");
+    const uint32_t OPEN   = psp_nid("sceIoOpen");
+    const uint32_t CLOSE  = psp_nid("sceIoClose");
+    const uint32_t WRITE  = psp_nid("sceIoWrite");
+    const uint32_t READ   = psp_nid("sceIoRead");
+    const uint32_t GETSTAT= psp_nid("sceIoGetstat");
+    const uint32_t DOPEN  = psp_nid("sceIoDopen");
+    const uint32_t DREAD  = psp_nid("sceIoDread");
+    const uint32_t DCLOSE = psp_nid("sceIoDclose");
+
+    /* Start clean no matter how the last run ended. */
+    call(REMOVE, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0, 0, 0);
+    call(RMDIR, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0, 0, 0);
+    call(RMDIR, guest_name("ms0:/PSP/SAVEDATA"), 0, 0, 0);
+    call(RMDIR, guest_name("ms0:/PSP"), 0, 0, 0);
+
+    CHECK(call(MKDIR, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0777, 0, 0) == 0,
+          "mkdir makes the whole chain");
+    CHECK(call(MKDIR, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0777, 0, 0) == 0x80010011,
+          "mkdir of an existing dir says EEXIST");
+    CHECK(call(CHDIR, guest_name("ms0:/PSP"), 0, 0, 0) == 0, "chdir in");
+    CHECK(call(CHDIR, guest_name("ms0:/NOPE"), 0, 0, 0) == 0x80010002,
+          "chdir to a missing dir fails");
+    CHECK(call(CHSTAT, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0, 0, 0) == 0,
+          "chstat of a dir succeeds");
+    CHECK(call(CHSTAT, guest_name("ms0:/PSP/NOPE"), 0, 0, 0) == 0x80010002,
+          "chstat of a missing path fails");
+
+    /* A file round trip through a CREAT open, which makes parents too. */
+    const uint32_t SRC = 0x08805000u, DST = 0x08806000u, DIR = 0x08807000u;
+    for (uint32_t i = 0; i < 64; i++) psp_write8(SRC + i, (uint8_t)(i * 3 + 1));
+    uint32_t fd = call(OPEN, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"),
+                       0x602, 0777, 0);
+    CHECK((int32_t)fd >= 3, "creat open hands a descriptor, got 0x%08X", fd);
+    CHECK(call(WRITE, fd, SRC, 64, 0) == 64, "short write writes short");
+    CHECK(call(CLOSE, fd, 0, 0, 0) == 0, "close succeeds");
+    CHECK(call(GETSTAT, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), DST, 0, 0) == 0,
+          "stat succeeds");
+    CHECK(psp_read32(DST + 8) == 64, "stat reports the size, got %u", psp_read32(DST + 8));
+    fd = call(OPEN, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0x0001, 0, 0);
+    CHECK((int32_t)fd >= 3, "reopen reads");
+    for (uint32_t i = 0; i < 64; i++) psp_write8(DST + i, 0);
+    CHECK(call(READ, fd, DST, 64, 0) == 64, "read back what was written");
+    int same = 1;
+    for (uint32_t i = 0; i < 64; i++) same &= psp_read8(DST + i) == (uint8_t)(i * 3 + 1);
+    CHECK(same, "round trip is byte-exact");
+    CHECK(call(CLOSE, fd, 0, 0, 0) == 0, "close succeeds");
+
+    /* Enumeration finds the file by name. */
+    uint32_t dd = call(DOPEN, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0, 0, 0);
+    CHECK((int32_t)dd >= 1, "dopen succeeds");
+    int found = 0;
+    while (call(DREAD, dd, DIR, 0, 0) == 1) {
+        char name[260];
+        psp_str(DIR + 52, name, sizeof name);
+        if (!strcmp(name, "DATA.BIN")) found = 1;
+    }
+    CHECK(found, "dread enumerates DATA.BIN");
+    CHECK(call(DCLOSE, dd, 0, 0, 0) == 0, "dclose succeeds");
+
+    CHECK(call(REMOVE, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0, 0, 0) == 0,
+          "remove deletes");
+    CHECK(call(REMOVE, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0, 0, 0) == 0x80010002,
+          "remove of a missing file fails");
+    CHECK(call(RMDIR, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0, 0, 0) == 0, "rmdir leaf");
+    CHECK(call(RMDIR, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0, 0, 0) == 0x80010002,
+          "rmdir of a missing dir fails");
+    CHECK(call(RMDIR, guest_name("ms0:/PSP/SAVEDATA"), 0, 0, 0) == 0, "rmdir middle");
+    CHECK(call(RMDIR, guest_name("ms0:/PSP"), 0, 0, 0) == 0, "rmdir top");
+    CHECK(call(RMDIR, guest_name("ms0:/"), 0, 0, 0) == 0, "rmdir ms itself");
+#ifdef _WIN32
+    _rmdir("test-io-root");
+#else
+    rmdir("test-io-root");
+#endif
+    psp_io_set_root(".");
+}
+
 /* Build a display list in guest memory and check the walk follows control flow
  * rather than merely counting words. The list deliberately contains a PRIM
  * that a JUMP skips over: if it gets counted, the walk is not following jumps. */
@@ -716,6 +809,7 @@ int main(void) {
     test_threads();
     test_thread_argument_block();
     test_guest_strings();
+    test_io_dirs();
     test_net();
     test_ge_display_list();
     test_ge_infinite_list();
