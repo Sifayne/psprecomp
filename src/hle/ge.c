@@ -2288,10 +2288,24 @@ static void enqueue(int head) {
     q->used  = 1;
     (void)head;
 
-    /* Hardware runs the list asynchronously. We run it here and finish before
-     * returning, which is indistinguishable from the game's point of view
-     * because every way it can observe progress -- ListSync, DrawSync -- then
-     * reports completion. */
+    /* Hardware runs the list asynchronously; Sync(WAIT) blocks until it is
+     * done. We run it here and finish before returning, so every Sync then
+     * reports completion immediately.
+     *
+     * Indistinguishable for Finish->Sync, which is all Last Raven and the
+     * gpu tests' pixel checks use -- but not hardware-correct, and visibly
+     * so: pspautotests' checkpoint prints [r] when its equal-priority helper
+     * ran while blocked in Sync, so blend/blend565 differ by 128/140 lines
+     * of prefix only, with identical COLOR values.
+     *
+     * Intended next step is deferred, not concurrent: EnQueue queues without
+     * running; ListSync(WAIT)/DrawSync(WAIT) block (psp_sched_block) and
+     * drain to FINISH/stall, NOWAIT only polls, UpdateStallAddr resumes, and
+     * EDRAM reads drain first. Same observable blocking without inventing GE
+     * timing or breaking the scheduler's one-token determinism. A bare yield
+     * in Sync would fake the [r] while lying about WAIT vs NOWAIT and
+     * already-done lists. Full worker thread only when something streams via
+     * stall and needs real overlap -- nothing measured does yet. */
     run_list(q);
     psp_ret(q->id);
 }
@@ -2307,8 +2321,9 @@ static void hle_ListUpdateStallAddr(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Lists are complete by the time they are enqueued, so every sync succeeds
- * immediately. */
+/* Synchronous today, so every sync succeeds immediately -- which is why our
+ * gpu checkpoints read [x] where hardware blocks and reads [r]. See the
+ * note on enqueue: WAIT must eventually block and drain, NOWAIT must not. */
 static void hle_ListSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_DrawSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
