@@ -1074,6 +1074,20 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     }
     printf("bad mem:  %llu accesses\n", (unsigned long long)psp_mem_bad_access);
 
+    /* No guest thread may outlive this point. The drain that gives up on its
+     * deadline leaves the token holder running -- between firmware calls it
+     * never looks at the token -- and the free below would pull the RAM out
+     * from under it: cpu/vfpu/vector and utility/msgdialog both died in
+     * psp_read32 that way, the first with its output cut mid-line at 4452 of
+     * 5329 and reported for a week as an unimplemented instruction. Stop
+     * everything and wait for the host threads to actually exit; the
+     * interpreter polls the stop flag, so the wait is one instruction long.
+     * After the summary, so the thread list above still names who was alive. */
+    if (dispatch) {
+        if (live) psp_sched_stop_all("drain deadline");
+        psp_sched_join_all();
+    }
+
     psp_interp_free_imports();
     free(imports);
     psp_mem_free();

@@ -104,10 +104,11 @@ void psp_os_cond_use_monotonic(psp_os_cond *c);
 
 /* ---- threads ---------------------------------------------------------------
  *
- * Start-and-forget: nothing here joins. The scheduler's threads end by running
- * out of guest code or by being told to stop, and the process outlives them
- * either way -- see the comment on slot reuse in src/hle/sched.c for why they
- * are never reaped.
+ * Start, and join only at the end. The scheduler's threads end by running out
+ * of guest code or by being told to stop; they are never reaped mid-run -- see
+ * the comment on slot reuse in src/hle/sched.c -- but a host that is about to
+ * free the memory they execute from must wait for them, which is what
+ * psp_os_thread_join and psp_sched_join_all are for.
  *
  * `stack_bytes` is a request, not a guarantee, and the reason it is a parameter
  * is in psp_sched_spawn: a recompiled frame is much larger than the MIPS one it
@@ -127,5 +128,9 @@ int  psp_os_thread_start(psp_os_thread *t, void (*fn)(void *), void *arg,
 /* End the calling thread. Does not return. Only ever called on a thread this
  * module started. */
 void psp_os_thread_exit(void);
+
+/* Wait for a thread this module started to end, and release its handle. Once
+ * per thread. */
+void psp_os_thread_join(psp_os_thread *t);
 
 #endif /* PSPRECOMP_OS_H */

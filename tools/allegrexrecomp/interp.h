@@ -41,6 +41,7 @@ typedef enum {
     I_TRAP_BRANCH_IN_SLOT, /* a control transfer inside a delay slot */
     I_TRAP_BADPC,     /* pc left mapped memory */
     I_EXIT,           /* the guest called sceKernelExitGame -- a clean finish */
+    I_STOPPED,        /* the scheduler was stopped from outside: the drain gave up */
 } psp_interp_status;
 
 /* A run in progress.

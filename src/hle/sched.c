@@ -51,6 +51,7 @@ typedef struct {
     psp_cpu_state   ctx;           /* valid whenever this slot is not running */
     psp_os_thread   host;
     int             started;
+    int             joined;        /* host thread reaped by psp_sched_join_all */
 } sched_slot;
 
 static sched_slot      g_slot[MAX_SCHED_THREADS];
@@ -63,6 +64,9 @@ static int             g_threading = 1;
 /* sceKernelSuspendDispatchThread. See psp_sched_set_dispatch. */
 static int             g_dispatch = 1;
 static const char     *g_stop_reason;
+/* Set by psp_sched_stop_all and read without the lock by whoever is running
+ * guest code: a plain flag is all a poll needs. */
+static volatile int    g_stopping;
 static int           (*g_spawn_hook)(uint32_t uid, uint32_t entry, uint32_t sp,
                                       uint32_t a0, uint32_t a1, int priority);
 
@@ -136,6 +140,7 @@ void psp_sched_reset(void) {
      * teardown. */
     memset(g_slot, 0, sizeof g_slot);
     g_stop_reason = NULL;
+    g_stopping    = 0;
     g_slot[MAIN_SLOT].used     = 1;
     g_slot[MAIN_SLOT].uid      = 0;
     g_slot[MAIN_SLOT].state    = PSP_SCHED_RUNNING;
@@ -737,6 +742,7 @@ void psp_sched_stop_all(const char *why) {
     /* Recorded before anything is killed: the caller is a guest thread that
      * will not exist past the thread exit below. */
     g_stop_reason = why;
+    g_stopping    = 1;
     psp_os_lock(&g_lock);
     const int me = g_running;
     for (int i = 1; i < MAX_SCHED_THREADS; i++)
@@ -750,6 +756,22 @@ void psp_sched_stop_all(const char *why) {
 
 const char *psp_sched_stop_reason(void) {
     return g_stop_reason;
+}
+
+int psp_sched_stopping(void) { return g_stopping; }
+
+/* Not under the lock: the threads take it on their way out, and a join that
+ * held it would deadlock against every one of them. `started` is set once,
+ * before the thread exists, and never cleared while it does, so it is safe to
+ * read here. Slots are walked whether or not they are still `used`: a
+ * cancelled thread's slot may have been released while its host thread is
+ * still parked, and it still has to be waited for. */
+void psp_sched_join_all(void) {
+    for (int i = 1; i < MAX_SCHED_THREADS; i++) {
+        if (!g_slot[i].started || g_slot[i].joined) continue;
+        psp_os_thread_join(&g_slot[i].host);
+        g_slot[i].joined = 1;
+    }
 }
 
 int psp_sched_drain(int timeout_s) {

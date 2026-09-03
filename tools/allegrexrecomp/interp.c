@@ -564,7 +564,8 @@ static void note_nested(const char *what, uint32_t entry, const psp_interp *sub)
     /* I_EXIT is a finish, not a failure: a test's main thread ends by calling
      * sceKernelExitGame, and reporting that as a dead thread would flag every
      * healthy run. */
-    if (sub->status == I_OK_RETURN || sub->status == I_EXIT) return;
+    if (sub->status == I_OK_RETURN || sub->status == I_EXIT ||
+        sub->status == I_STOPPED) return;
     g_nest_failed++;
     fprintf(stderr, "interp: nested %s 0x%08X stopped: %s at pc 0x%08X\n",
             what, entry, psp_interp_status_str(sub->status), sub->fault_pc);
@@ -950,6 +951,15 @@ psp_interp_status psp_interp_step(psp_interp *it) {
     if (it->budget && it->executed >= it->budget)
         return it->status = I_BUDGET;
 
+    /* The scheduler has been stopped from outside -- the main context's drain
+     * gave up on its deadline, or another thread called sceKernelExitGame.
+     * Nothing here would notice until the next firmware call, and a test's
+     * vector loop has none for seconds; meanwhile the main context prints its
+     * summary and frees the RAM this is reading. Stop within the instruction.
+     * An exit the guest asked for keeps its own name. */
+    if (psp_sched_stopping())
+        return it->status = psp_exit_requested() ? I_EXIT : I_STOPPED;
+
     /* A firmware thunk is intercepted rather than executed. Running it would
      * follow the unlinked `jr $ra` the linker left behind and return without
      * doing anything, while the recompiled C calls into HLE — so the two would
@@ -1085,6 +1095,7 @@ const char *psp_interp_status_str(psp_interp_status s) {
     case I_TRAP_BRANCH_IN_SLOT: return "control transfer in a delay slot";
     case I_TRAP_BADPC:   return "pc left mapped memory";
     case I_EXIT:         return "guest called sceKernelExitGame";
+    case I_STOPPED:      return "stopped by the scheduler";
     }
     return "unknown";
 }

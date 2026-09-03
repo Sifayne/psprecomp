@@ -201,6 +201,23 @@ void psp_sched_stop_all(const char *why);
  * success. This is the difference. */
 const char *psp_sched_stop_reason(void);
 
+/* Whether psp_sched_stop_all has been called. A thread running guest code
+ * between firmware calls never looks at the token, so a stop only reaches it
+ * at its next scheduling point -- which pure computation may not have for
+ * seconds. The interpreter polls this once per instruction instead. */
+int psp_sched_stopping(void);
+
+/* Wait for every host thread the scheduler started to exit. Call from the main
+ * context after psp_sched_stop_all, and before anything that tears down memory
+ * the threads execute from: the drain that gives up on its deadline leaves the
+ * token holder running, and psp_mem_free then pulls the RAM out from under it
+ * -- a segfault in psp_read32, which is how cpu/vfpu/vector and
+ * utility/msgdialog used to end. Every thread has to be able to reach a stop:
+ * parked ones wake on the broadcast and exit; a running one needs a scheduling
+ * point or the psp_sched_stopping poll. The interpreter has the poll. Native
+ * recompiled code does not, and the boot host does not call this. */
+void psp_sched_join_all(void);
+
 /* Run until every guest thread is dead, nothing can make progress, or
  * `timeout_s` elapses. Called from the main context once module_start has
  * returned. Returns the number of threads still alive; nonzero means a deadlock

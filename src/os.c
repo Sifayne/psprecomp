@@ -90,6 +90,11 @@ int psp_os_thread_start(psp_os_thread *t, void (*fn)(void *), void *arg,
 
 void psp_os_thread_exit(void) { _endthreadex(0); }
 
+void psp_os_thread_join(psp_os_thread *t) {
+    WaitForSingleObject(*t, INFINITE);
+    CloseHandle(*t);
+}
+
 #else /* POSIX */
 
 #include <errno.h>
@@ -173,5 +178,7 @@ int psp_os_thread_start(psp_os_thread *t, void (*fn)(void *), void *arg,
 }
 
 void psp_os_thread_exit(void) { pthread_exit(NULL); }
+
+void psp_os_thread_join(psp_os_thread *t) { pthread_join(*t, NULL); }
 
 #endif
