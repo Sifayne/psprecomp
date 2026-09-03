@@ -179,6 +179,9 @@ static int fx16_floor(float f) {
 #define GE_CLEARMODE         0xD3
 #define GE_ALPHABLENDENABLE  0x21
 #define GE_ALPHATESTENABLE   0x22
+#define GE_STENCILTESTENABLE 0x24
+#define GE_STENCILTEST       0xDC
+#define GE_STENCILOP         0xDD
 #define GE_BLENDMODE         0xDF
 #define GE_BLENDFIXEDA       0xE0
 #define GE_BLENDFIXEDB       0xE1
@@ -1565,7 +1568,7 @@ static void push_pixel_state(void) {
         b.write_colour = 1;
         b.write_alpha  = g_tl.clear_mode ? g_tl.clear_stencil : 0;
         if (g_tl.clear_mode) {
-            b.enable = 0; b.alpha_test = 0;
+            b.enable = 0; b.alpha_test = 0; b.stencil_test = 0;
             b.write_colour = g_tl.clear_colour;
         }
         psp_render_current()->set_blend(&b);
@@ -2165,6 +2168,17 @@ static void run_list(ge_queue *q) {
 
         case GE_ALPHABLENDENABLE: g_tl.blend.enable     = (int)(arg & 1); break;
         case GE_ALPHATESTENABLE:  g_tl.blend.alpha_test = (int)(arg & 1); break;
+        case GE_STENCILTESTENABLE: g_tl.blend.stencil_test = (int)(arg & 1); break;
+        case GE_STENCILTEST:
+            g_tl.blend.stencil_func = (int)(arg & 7);
+            g_tl.blend.stencil_ref  = (int)((arg >> 8) & 0xFF);
+            g_tl.blend.stencil_mask = (int)((arg >> 16) & 0xFF);
+            break;
+        case GE_STENCILOP:
+            g_tl.blend.op_sfail = (int)(arg & 7);
+            g_tl.blend.op_zfail = (int)((arg >> 8) & 7);
+            g_tl.blend.op_zpass = (int)((arg >> 16) & 7);
+            break;
         case GE_BLENDMODE:
             g_tl.blend.src = (int)(arg & 0xF);
             g_tl.blend.dst = (int)((arg >> 4) & 0xF);

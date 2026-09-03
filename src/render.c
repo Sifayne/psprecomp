@@ -495,16 +495,22 @@ static uint32_t apply_texfunc(uint32_t tex, uint32_t col) {
  * it as it was -- gpu/texfunc fills 44444444, draws, and reads 44ffffff back
  * -- and only a clear that asks for the stencil, or a stencil operation (not
  * modelled), writes it. */
-static void put_pixel(int x, int y, uint32_t rgba) {
+static void put_pixel(int x, int y, uint32_t rgba, int stencil) {
     if (!g_fb_addr || !g_fb_stride) return;
     if (x < g_sc_x0 || y < g_sc_y0 || x > g_sc_x1 || y > g_sc_y1) return;
     if (g_fb_fmt != 3) {
+        if (stencil >= 0) rgba = (rgba & 0x00FFFFFFu) | ((uint32_t)stencil << 24);
+        else if (!g_bs.write_alpha && g_fb_fmt != 0) {
+            const uint32_t at16 = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
+            rgba = (rgba & 0x00FFFFFFu) | (expand16((uint32_t)psp_read16(at16), g_fb_fmt) & 0xFF000000u);
+        }
         psp_write16(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2, (uint16_t)pack16(rgba, g_fb_fmt));
         g_pixels++;
         return;
     }
     const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4;
-    if (!g_bs.write_alpha) rgba = (rgba & 0x00FFFFFFu) | (psp_read32(at) & 0xFF000000u);
+    if (stencil >= 0)           rgba = (rgba & 0x00FFFFFFu) | ((uint32_t)stencil << 24);
+    else if (!g_bs.write_alpha) rgba = (rgba & 0x00FFFFFFu) | (psp_read32(at) & 0xFF000000u);
     psp_write32(at, rgba);
     g_pixels++;
 }
@@ -608,23 +614,40 @@ static uint32_t chan(uint32_t c, int i) { return (c >> (i * 8)) & 0xFFu; }
 
 static uint32_t clamp255(int v) { return v < 0 ? 0u : (v > 255 ? 255u : (uint32_t)v); }
 
-/* A blend factor, per channel, on the 0..255 scale the channels use. The
- * doubling variants are the PSP's way of reaching 2x without a separate
- * equation, and they saturate rather than wrap. */
-static uint32_t blend_factor(int code, int i, uint32_t src, uint32_t dst, int is_src) {
+/* One blend term: a channel scaled by its factor.
+ *
+ * gpu/commands/blend draws 64 boxes -- every factor against a fixed zero,
+ * the doubling variants over a spread of alphas, every equation -- and reads
+ * the pixel back. The arithmetic that reproduces all 192 channel values is
+ *
+ *     term = ((c + 1) * f) >> 8
+ *
+ * and no divide by 255 does: "Zero + Inverse src alpha" wants 28 from 64 x 111
+ * (exact 27.86) while "Inverse src alpha + Zero" wants 55 from 128 x 111
+ * (exact 55.72), which no single rounding of c*f/255 gives and this does.
+ * The doubling factors are twice the plain term, clamped -- 0xFF707070 under
+ * double source alpha reads 0xE0, exactly 2x, so the factor is not saturated
+ * at 255 as this used to do -- and the inverse-doubling ones take 255 - 2a,
+ * clamped at zero, as an ordinary factor: 0x40808080 reads 0x3F, 0x7FFFFFFF
+ * reads 0x01, and anything with alpha at 0x80 or above reads black. */
+static uint32_t blend_term(uint32_t c, uint32_t f) { return ((c + 1u) * f) >> 8; }
+
+static uint32_t blend_scaled(int code, int i, uint32_t src, uint32_t dst, int is_src) {
+    const uint32_t c = is_src ? chan(src, i) : chan(dst, i);
     const uint32_t sa = chan(src, 3), da = chan(dst, 3);
+    uint32_t v;
     switch (code) {
-    case 0:  return is_src ? chan(dst, i) : chan(src, i);
-    case 1:  return 255u - (is_src ? chan(dst, i) : chan(src, i));
-    case 2:  return sa;
-    case 3:  return 255u - sa;
-    case 4:  return da;
-    case 5:  return 255u - da;
-    case 6:  return clamp255((int)sa * 2);
-    case 7:  return clamp255(510 - (int)sa * 2);
-    case 8:  return clamp255((int)da * 2);
-    case 9:  return clamp255(510 - (int)da * 2);
-    default: return chan(is_src ? g_bs.fixa : g_bs.fixb, i);
+    case 0:  return blend_term(c, is_src ? chan(dst, i) : chan(src, i));
+    case 1:  return blend_term(c, 255u - (is_src ? chan(dst, i) : chan(src, i)));
+    case 2:  return blend_term(c, sa);
+    case 3:  return blend_term(c, 255u - sa);
+    case 4:  return blend_term(c, da);
+    case 5:  return blend_term(c, 255u - da);
+    case 6:  v = 2u * blend_term(c, sa); return v > 255u ? 255u : v;
+    case 7:  return blend_term(c, sa >= 128u ? 0u : 255u - 2u * sa);
+    case 8:  v = 2u * blend_term(c, da); return v > 255u ? 255u : v;
+    case 9:  return blend_term(c, da >= 128u ? 0u : 255u - 2u * da);
+    default: return blend_term(c, chan(is_src ? g_bs.fixa : g_bs.fixb, i));
     }
 }
 
@@ -632,9 +655,8 @@ static uint32_t blend(uint32_t src, uint32_t dst) {
     uint32_t out = 0;
     for (int i = 0; i < 4; i++) {
         const int s = (int)chan(src, i), d = (int)chan(dst, i);
-        const int fs = (int)blend_factor(g_bs.src, i, src, dst, 1);
-        const int fd = (int)blend_factor(g_bs.dst, i, src, dst, 0);
-        const int ss = (s * fs + 127) / 255, dd = (d * fd + 127) / 255;
+        const int ss = (int)blend_scaled(g_bs.src, i, src, dst, 1);
+        const int dd = (int)blend_scaled(g_bs.dst, i, src, dst, 0);
         int v;
         switch (g_bs.eq) {
         case 1:  v = ss - dd; break;
@@ -647,6 +669,48 @@ static uint32_t blend(uint32_t src, uint32_t dst) {
         out |= clamp255(v) << (i * 8);
     }
     return out;
+}
+
+/* The stencil test, against the framebuffer's alpha byte. Same function codes
+ * as the depth and alpha tests. */
+static int stencil_pass(uint32_t cur) {
+    const int a = (int)(cur & (uint32_t)g_bs.stencil_mask);
+    const int r = g_bs.stencil_ref & g_bs.stencil_mask;
+    switch (g_bs.stencil_func) {
+    case 0: return 0;
+    case 2: return a == r;
+    case 3: return a != r;
+    case 4: return a <  r;
+    case 5: return a <= r;
+    case 6: return a >  r;
+    case 7: return a >= r;
+    default: return 1;
+    }
+}
+
+static uint32_t stencil_op(int op, uint32_t cur) {
+    switch (op) {
+    case 1:  return 0u;                                  /* ZERO    */
+    case 2:  return (uint32_t)g_bs.stencil_ref & 0xFFu;  /* REPLACE */
+    case 3:  return ~cur & 0xFFu;                        /* INVERT  */
+    case 4:  return cur < 255u ? cur + 1u : 255u;        /* INCR    */
+    case 5:  return cur > 0u ? cur - 1u : 0u;            /* DECR    */
+    default: return cur;                                 /* KEEP    */
+    }
+}
+
+/* A stencil operation on a pixel whose colour is not written: only the alpha
+ * byte changes. A 5650 target has no stencil and the write is dropped. */
+static void write_stencil_only(int x, int y, uint32_t value) {
+    if (!g_fb_addr || !g_fb_stride || g_fb_fmt == 0) return;
+    if (g_fb_fmt != 3) {
+        const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
+        const uint32_t px = expand16((uint32_t)psp_read16(at), g_fb_fmt) & 0x00FFFFFFu;
+        psp_write16(at, (uint16_t)pack16(px | (value << 24), g_fb_fmt));
+        return;
+    }
+    const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4;
+    psp_write32(at, (psp_read32(at) & 0x00FFFFFFu) | (value << 24));
 }
 
 static int alpha_pass(uint32_t rgba) {
@@ -667,8 +731,15 @@ static int alpha_pass(uint32_t rgba) {
 
 static uint32_t get_pixel(int x, int y) {
     if (!g_fb_addr || !g_fb_stride) return 0;
-    if (g_fb_fmt != 3)
-        return expand16((uint32_t)psp_read16(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2), g_fb_fmt);
+    if (g_fb_fmt != 3) {
+        const uint32_t px = expand16((uint32_t)psp_read16(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2), g_fb_fmt);
+        /* A 5650 target has no alpha and no stencil, and the blend reads its
+         * destination alpha as zero: gpu/commands/blend565's "Double dest
+         * alpha" rows are black and its "Inverse double dest alpha" rows are
+         * the source colour whole. The texture sampler's 5650 is opaque, which
+         * is why this is not in expand16. */
+        return g_fb_fmt == 0 ? (px & 0x00FFFFFFu) : px;
+    }
     return psp_read32(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4);
 }
 
@@ -707,15 +778,30 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
                              x, y, g_fb_addr, g_cur_prim, rgba, g_tex.addr, g_tex.w, g_tex.h, g_tex.fmt, (unsigned long long)g_pixels);
         return;
     }
+    /* The stencil test runs before the depth test, and each outcome has its
+     * operation: fail, pass-but-depth-fails, pass. Only the last writes colour,
+     * all three may write the stencil. gpu/commands/blend runs REPLACE with
+     * ref 0xAA on ALWAYS and reads 0xAA in every blended pixel's alpha. */
+    int stencil = -1;
+    uint32_t cur_stencil = 0;
+    if (g_bs.stencil_test) {
+        cur_stencil = chan(get_pixel(x, y), 3);
+        if (!stencil_pass(cur_stencil)) {
+            write_stencil_only(x, y, stencil_op(g_bs.op_sfail, cur_stencil));
+            return;
+        }
+    }
     if (!depth_pass(x, y, z)) {
         g_px_zfail++;
         if (watched) fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d DEPTH-FAILED %08X  z %.0f against %.0f func %d  tex %08X  pixels so far %llu\n",
                              x, y, g_fb_addr, g_cur_prim, rgba, (double)z, (double)g_depth[y * DEPTH_STRIDE + x], g_zs.func,
                              g_tex.addr, (unsigned long long)g_pixels);
+        if (g_bs.stencil_test) write_stencil_only(x, y, stencil_op(g_bs.op_zfail, cur_stencil));
         return;
     }
     if (g_zs.write) g_depth[y * DEPTH_STRIDE + x] = z;
-    if (!g_bs.write_colour) return;
+    if (g_bs.stencil_test) stencil = (int)stencil_op(g_bs.op_zpass, cur_stencil);
+    if (!g_bs.write_colour) { if (stencil >= 0) write_stencil_only(x, y, (uint32_t)stencil); return; }
     if (g_bs.enable) { rgba = blend(rgba, get_pixel(x, y)); g_px_blend++; }
     if (watched) {
         g_pw_left--;
@@ -723,7 +809,7 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
                 x, y, g_fb_addr, g_cur_prim, arrived, rgba, (double)z, g_bs.enable, g_bs.src, g_bs.dst, g_bs.eq, g_bs.fixa, g_bs.fixb,
                 g_tex.addr, g_tex.w, g_tex.h, g_tex.fmt, g_tex.func, g_tex.tcc_rgba, (unsigned long long)g_pixels);
     }
-    put_pixel(x, y, rgba);
+    put_pixel(x, y, rgba, stencil);
 }
 
 /* Sample positions per pixel edge. Two is enough to express the pixel centre

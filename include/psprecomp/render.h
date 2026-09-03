@@ -103,8 +103,15 @@ typedef struct {
     /* The framebuffer's alpha byte is the stencil buffer, and an ordinary draw
      * does not write it -- gpu/texfunc reads 44ffffff back from a 44444444
      * fill after every draw. A clear-mode draw writes it when its stencil bit
-     * is set. Stencil operations themselves are not modelled. */
+     * is set. */
     int      write_alpha;
+    /* The stencil test and its operations, GE_STENCILTEST and GE_STENCILOP:
+     * the comparison shares the depth test's function codes, the operations
+     * are KEEP, ZERO, REPLACE, INVERT, INCR, DECR. The stencil value is the
+     * framebuffer's alpha byte, and a passing pixel's zpass operation is what
+     * writes it. With the test off the byte is left alone. */
+    int      stencil_test, stencil_func, stencil_ref, stencil_mask;
+    int      op_sfail, op_zfail, op_zpass;
 } psp_blend_state;
 
 /* GE primitive types, from the PRIM argument's type field. */
