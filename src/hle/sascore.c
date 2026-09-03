@@ -53,6 +53,31 @@ static const int VAG_F1[5] = { 0,  0, -52, -55, -60 };
 
 enum { ENV_OFF = 0, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 
+/* The envelope's shape, per phase. __sceSasSetADSRmode names one curve for
+ * each of attack, decay, sustain and release.
+ *
+ * Which curve a phase will accept is decided by the curve's parity, and
+ * setadsr.expected pins the whole matrix: the even ones -- linear increase,
+ * bent, exponent -- are the rising shapes and are taken by attack and
+ * sustain; the odd ones -- linear decrease, exponent-rev, direct -- are the
+ * falling shapes and are taken by decay, sustain and release. Sustain takes
+ * either, since it may rise or fall. Anything above 5 is refused, and so is
+ * any bit outside the low three and the sign: 0x80000001 is accepted as
+ * mode 1 while 0x40000001 is not. */
+enum { CURVE_LINEAR_INC = 0, CURVE_LINEAR_DEC = 1, CURVE_LINEAR_BENT = 2,
+       CURVE_EXP_REV = 3, CURVE_EXP = 4, CURVE_DIRECT = 5 };
+#define SAS_ERROR_ADSR_MODE 0x80420013u
+#define ENV_MAX 0x40000000
+
+static int curve_ok(uint32_t mode, int phase_is_attack, int phase_is_sustain) {
+    if (mode & ~0x80000007u) return 0;
+    const uint32_t m = mode & 7u;
+    if (m > CURVE_DIRECT) return 0;
+    if (phase_is_sustain) return 1;
+    return phase_is_attack ? ((m & 1u) == 0u) : ((m & 1u) == 1u);
+}
+
+
 typedef struct {
     /* A voice plays one of two things. __sceSasSetVoice hands it VAG ADPCM,
      * which is decoded a 16-byte block at a time; __sceSasSetVoicePCM hands
@@ -83,6 +108,7 @@ typedef struct {
     int      env_state;
     int32_t  env;           /* 0 .. 0x40000000 */
     int32_t  attack_rate, decay_rate, sustain_level, release_rate;
+    uint32_t mode_attack, mode_decay, mode_sustain, mode_release;
 
     int      playing;
     int      ended;
@@ -111,6 +137,16 @@ static uint64_t  g_samples_nonzero;
 
 void psp_sas_reset(void) {
     memset(g_voice, 0, sizeof g_voice);
+    /* A game that never calls __sceSasSetADSRmode gets the shapes this file
+     * had before there were modes: a rising attack and falling everything
+     * else. Zero would mean linear *increase* for all four, which would make
+     * a decay climb. */
+    for (int i = 0; i < SAS_VOICES; i++) {
+        g_voice[i].mode_attack  = CURVE_LINEAR_INC;
+        g_voice[i].mode_decay   = CURVE_LINEAR_DEC;
+        g_voice[i].mode_sustain = CURVE_LINEAR_DEC;
+        g_voice[i].mode_release = CURVE_LINEAR_DEC;
+    }
     for (int i = 0; i < SAS_VOICES; i++) {
         g_voice[i].pitch = 0x1000;
         g_voice[i].vol_l = 0x1000;
@@ -197,7 +233,7 @@ static int32_t step_envelope(sas_voice *v) {
     switch (v->env_state) {
     case ENV_ATTACK:
         v->env += v->attack_rate;
-        if (v->env >= 0x40000000) { v->env = 0x40000000; v->env_state = ENV_DECAY; }
+        if (v->env >= ENV_MAX) { v->env = ENV_MAX; v->env_state = ENV_DECAY; }
         break;
     case ENV_DECAY:
         v->env -= v->decay_rate;
@@ -390,8 +426,28 @@ static void hle_SetADSR(void) {
     uint32_t flags = psp_arg(2);
     if (flags & 1) v->attack_rate  = (int32_t)psp_arg(3);
     if (flags & 2) v->decay_rate   = (int32_t)psp_arg(4);
-    if (flags & 4) v->sustain_level= (int32_t)psp_arg(5);
+    if (flags & 4) v->sustain_level = (int32_t)psp_arg(5);
     if (flags & 8) v->release_rate = (int32_t)psp_arg(6);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* __sceSasSetADSRmode(sasCore, voice, flags, attack, decay, sustain, release)
+ * -- the same flag mask __sceSasSetADSR uses, selecting which of the four to
+ * set. Every named curve is checked before anything is stored, which is what
+ * setadsr.expected's matrix reads back. */
+static void hle_SetADSRmode(void) {
+    sas_voice *v = voice_arg();
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    const uint32_t flags = psp_arg(2);
+    const uint32_t a = psp_arg(3), d = psp_arg(4), su = psp_arg(5), r = psp_arg(6);
+    if ((flags & 1) && !curve_ok(a,  1, 0)) { psp_ret(SAS_ERROR_ADSR_MODE); return; }
+    if ((flags & 2) && !curve_ok(d,  0, 0)) { psp_ret(SAS_ERROR_ADSR_MODE); return; }
+    if ((flags & 4) && !curve_ok(su, 0, 1)) { psp_ret(SAS_ERROR_ADSR_MODE); return; }
+    if ((flags & 8) && !curve_ok(r,  0, 0)) { psp_ret(SAS_ERROR_ADSR_MODE); return; }
+    if (flags & 1) v->mode_attack  = a & 7u;
+    if (flags & 2) v->mode_decay   = d & 7u;
+    if (flags & 4) v->mode_sustain = su & 7u;   /* stored; the shapes are findings item 45 */
+    if (flags & 8) v->mode_release = r & 7u;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -444,7 +500,7 @@ static void hle_SetKeyOff(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     v->env_state = ENV_RELEASE;
-    if (!v->release_rate) v->release_rate = 0x40000000 / 256;
+    if (!v->release_rate) v->release_rate = ENV_MAX / 256;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -535,7 +591,7 @@ void psp_sas_register(void) {
     psp_hle_register(0xAD84D37F, "sceSasCore", "__sceSasSetPitch",          hle_SetPitch);
     psp_hle_register(0x440CA7D8, "sceSasCore", "__sceSasSetVolume",         hle_SetVolume);
     psp_hle_register(0x019B25EB, "sceSasCore", "__sceSasSetADSR",           hle_SetADSR);
-    psp_hle_register(0x9EC3676A, "sceSasCore", "__sceSasSetADSRmode",       hle_accept);
+    psp_hle_register(0x9EC3676A, "sceSasCore", "__sceSasSetADSRmode",       hle_SetADSRmode);
     psp_hle_register(0xCBCD4F79, "sceSasCore", "__sceSasSetSimpleADSR",     hle_SetSimpleADSR);
     psp_hle_register(0x5F9529F6, "sceSasCore", "__sceSasSetSL",             hle_SetSL);
     psp_hle_register(0x76F01ACA, "sceSasCore", "__sceSasSetKeyOn",          hle_SetKeyOn);
