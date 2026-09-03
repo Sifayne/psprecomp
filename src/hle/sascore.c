@@ -34,6 +34,14 @@
 #define SAS_ERROR_CORE         0x80420005u
 #define SAS_ERROR_VOICE        0x80420010u
 #define SAS_ERROR_SIZE         0x80420014u
+/* pcm.expected: a PCM loop position at or past the sample count is refused
+ * with 15, and a PCM size outside 1..0x10000 with 1A. Both comparisons are
+ * signed -- a loop position of -1, or of 0x80000001, is accepted, while
+ * 0x40000001 is not. keyon.expected: keying on a voice that is already on
+ * is refused with 16. */
+#define SAS_ERROR_LOOP_POS     0x80420015u
+#define SAS_ERROR_ALREADY_ON   0x80420016u
+#define SAS_ERROR_PCM_SIZE     0x8042001Au
 
 static int grain_ok(uint32_t g) { return g >= 64 && g <= SAS_MAX_GRAIN && (g % 32) == 0; }
 
@@ -46,6 +54,17 @@ static const int VAG_F1[5] = { 0,  0, -52, -55, -60 };
 enum { ENV_OFF = 0, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 
 typedef struct {
+    /* A voice plays one of two things. __sceSasSetVoice hands it VAG ADPCM,
+     * which is decoded a 16-byte block at a time; __sceSasSetVoicePCM hands
+     * it raw signed 16-bit samples, which are read as they are. The game uses
+     * both -- its menu sounds are VAG and its voice clips PCM -- and the PCM
+     * path was missing entirely, so those voices were silent. */
+    int      is_pcm;
+    uint32_t pcm_addr;
+    int32_t  pcm_size;      /* samples */
+    int32_t  pcm_loop;      /* first sample of the loop; negative means none */
+    int32_t  pcm_pos;       /* the sample about to be played */
+
     uint32_t vag_addr;      /* guest address of the sample data */
     uint32_t vag_size;
     int      loop;          /* loop mode: a block flagged 3 jumps back */
@@ -68,6 +87,18 @@ typedef struct {
     int      playing;
     int      ended;
     int      paused;
+    /* Samples still to wait before this voice starts. Keying on does not
+     * take effect at once: hardware holds the voice for 32 samples, and
+     * both the sound and the envelope begin together at the end of it.
+     *
+     * Two measurements pin it. keyon.expected reads the envelope 0 before a
+     * core and 0x60000 after one, which at rate 0x1000 is 96 steps in a
+     * 128-sample grain -- 32 short; getheight.expected reads 0x1e0000 after
+     * four such cores, which is 96 + 128 + 128 + 128, the same 32 missing
+     * once rather than per core. And pcm.expected's rendered output puts the
+     * sample the voice starts from at output index 32, with the loop
+     * arriving 32 late to match. */
+    int32_t  start_delay;
 } sas_voice;
 
 static sas_voice g_voice[SAS_VOICES];
@@ -190,15 +221,28 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
 
     for (uint32_t vi = 0; vi < g_max_voices; vi++) {
         sas_voice *v = &g_voice[vi];
-        if (!v->playing || v->paused || !v->vag_addr) continue;
+        if (!v->playing || v->paused) continue;
+        if (!v->is_pcm && !v->vag_addr) continue;
 
         for (uint32_t i = 0; i < samples; i++) {
-            if (!v->decoded_valid || v->sample_idx >= 28) {
-                v->sample_idx = 0;
-                if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+            if (v->start_delay > 0) { v->start_delay--; continue; }
+
+            int32_t s;
+            if (v->is_pcm) {
+                /* A PCM voice whose address is zero is accepted by hardware
+                 * (pcm.expected, "Zero: OK"); it plays silence here rather
+                 * than reading whatever is at address zero. */
+                s = (v->pcm_addr && v->pcm_pos < v->pcm_size)
+                        ? (int16_t)psp_read16(v->pcm_addr + (uint32_t)v->pcm_pos * 2u)
+                        : 0;
+            } else {
+                if (!v->decoded_valid || v->sample_idx >= 28) {
+                    v->sample_idx = 0;
+                    if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+                }
+                s = v->decoded[v->sample_idx];
             }
 
-            int32_t s = v->decoded[v->sample_idx];
             int32_t env = step_envelope(v);
             /* Envelope is 30-bit; bring it down to a 12-bit multiplier before
              * applying, so the product stays inside 32 bits. */
@@ -212,10 +256,18 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
             v->frac += v->pitch;
             while (v->frac >= 0x1000) {
                 v->frac -= 0x1000;
-                v->sample_idx++;
-                if (v->sample_idx >= 28) {
-                    v->sample_idx = 0;
-                    if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+                if (v->is_pcm) {
+                    v->pcm_pos++;
+                    if (v->pcm_pos >= v->pcm_size) {
+                        if (v->pcm_loop >= 0 && v->pcm_loop < v->pcm_size) v->pcm_pos = v->pcm_loop;
+                        else { v->playing = 0; v->ended = 1; break; }
+                    }
+                } else {
+                    v->sample_idx++;
+                    if (v->sample_idx >= 28) {
+                        v->sample_idx = 0;
+                        if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+                    }
                 }
             }
             if (!v->playing) break;
@@ -276,6 +328,7 @@ static void hle_SetVoice(void) {
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     const uint32_t size = psp_arg(3);
     if (size == 0 || (size & 15)) { psp_ret(SAS_ERROR_SIZE); return; }
+    v->is_pcm   = 0;
     v->vag_addr = psp_arg(2);
     v->vag_size = size;
     v->loop     = (int)psp_arg(4);
@@ -284,6 +337,32 @@ static void hle_SetVoice(void) {
     v->last_block = 0;
     v->sample_idx = 0;
     v->hist1 = v->hist2 = 0;
+    v->decoded_valid = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* __sceSasSetVoicePCM(sasCore, voice, addr, size, loopPos): raw signed 16-bit
+ * samples rather than ADPCM. The game uses it and it was missing, so those
+ * voices played nothing at all.
+ *
+ * The refusals are pcm.expected's, and each comparison there is signed. A
+ * size of zero or below, or above 0x10000 samples, is refused; a loop
+ * position at or past the size is refused, which lets -1 (no loop) and even
+ * 0x80000001 through while 0x40000001 is turned away. A null address is
+ * accepted. */
+static void hle_SetVoicePCM(void) {
+    sas_voice *v = voice_arg();
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    const int32_t size = (int32_t)psp_arg(3);
+    const int32_t loop = (int32_t)psp_arg(4);
+    if (size <= 0 || size > 0x10000) { psp_ret(SAS_ERROR_PCM_SIZE); return; }
+    if (loop >= size) { psp_ret(SAS_ERROR_LOOP_POS); return; }
+    v->is_pcm   = 1;
+    v->pcm_addr = psp_arg(2);
+    v->pcm_size = size;
+    v->pcm_loop = loop;
+    v->pcm_pos  = 0;
+    v->vag_addr = 0;
     v->decoded_valid = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -329,9 +408,21 @@ static void hle_SetSimpleADSR(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* __sceSasSetSL(sasCore, voice, level): the sustain level on its own, the
+ * same field __sceSasSetADSR's fourth argument carries. */
+static void hle_SetSL(void) {
+    sas_voice *v = voice_arg();
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    v->sustain_level = (int32_t)psp_arg(2);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 static void hle_SetKeyOn(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    /* Keying on a voice that is already on is refused, whether or not it is
+     * paused -- keyon.expected, "Key on twice" and "While paused". */
+    if (v->playing) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
     v->playing = 1;
     v->ended = 0;
     v->paused = 0;
@@ -341,6 +432,8 @@ static void hle_SetKeyOn(void) {
     v->frac = 0;
     v->hist1 = v->hist2 = 0;
     v->decoded_valid = 0;
+    v->pcm_pos = 0;
+    v->start_delay = 32;
     v->env = 0;
     v->env_state = ENV_ATTACK;
     if (!v->attack_rate) v->attack_rate = 0x40000000 / 64;
@@ -381,7 +474,20 @@ static void hle_GetEndFlag(void) {
 
 static void hle_GetEnvelopeHeight(void) {
     sas_voice *v = voice_arg();
-    psp_ret(v ? (uint32_t)v->env : 0);
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    psp_ret((uint32_t)v->env);
+}
+
+/* __sceSasGetAllEnvelopeHeights(sasCore, out): the whole bank at once, one
+ * int per voice. Exactly 32 are written -- getheight.expected reads the
+ * 33rd back as the 0xCCCCCCCC it seeded -- and the game calls this rather
+ * than asking voice by voice. */
+static void hle_GetAllEnvelopeHeights(void) {
+    const uint32_t out = psp_arg(1);
+    if (!out) { psp_ret(SAS_ERROR_CORE); return; }
+    for (int i = 0; i < SAS_VOICES; i++)
+        psp_write32(out + (uint32_t)i * 4u, (uint32_t)g_voice[i].env);
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void mix_to_guest(uint32_t out_addr, int add) {
@@ -431,7 +537,7 @@ void psp_sas_register(void) {
     psp_hle_register(0x019B25EB, "sceSasCore", "__sceSasSetADSR",           hle_SetADSR);
     psp_hle_register(0x9EC3676A, "sceSasCore", "__sceSasSetADSRmode",       hle_accept);
     psp_hle_register(0xCBCD4F79, "sceSasCore", "__sceSasSetSimpleADSR",     hle_SetSimpleADSR);
-    psp_hle_register(0x5F9529F6, "sceSasCore", "__sceSasSetSL",             hle_accept);
+    psp_hle_register(0x5F9529F6, "sceSasCore", "__sceSasSetSL",             hle_SetSL);
     psp_hle_register(0x76F01ACA, "sceSasCore", "__sceSasSetKeyOn",          hle_SetKeyOn);
     psp_hle_register(0xA0CF2FA4, "sceSasCore", "__sceSasSetKeyOff",         hle_SetKeyOff);
     psp_hle_register(0xA3589D81, "sceSasCore", "__sceSasCore",              hle_Core);
@@ -440,6 +546,9 @@ void psp_sas_register(void) {
     psp_hle_register(0x787D04D5, "sceSasCore", "__sceSasSetPause",          hle_SetPause);
     psp_hle_register(0x2C8E6AB3, "sceSasCore", "__sceSasGetPauseFlag",      hle_GetPauseFlag);
     psp_hle_register(0x74AE582A, "sceSasCore", "__sceSasGetEnvelopeHeight", hle_GetEnvelopeHeight);
+    psp_hle_register(0x07F58C24, "sceSasCore", "__sceSasGetAllEnvelopeHeights",
+                     hle_GetAllEnvelopeHeights);
+    psp_hle_register(0xE1CD9561, "sceSasCore", "__sceSasSetVoicePCM",      hle_SetVoicePCM);
     psp_hle_register(0xB7660A23, "sceSasCore", "__sceSasSetNoise",          hle_accept);
     psp_hle_register(0x33D4AB37, "sceSasCore", "__sceSasRevType",           hle_accept);
     psp_hle_register(0x267A6DD2, "sceSasCore", "__sceSasRevParam",          hle_accept);
