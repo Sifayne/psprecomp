@@ -489,6 +489,77 @@ static void test_guest_strings(void) {
           "an over-long string is truncated, not overflowed: \"%s\"", small);
 }
 
+/* The 27 networking imports fail instead of answering 0 (M6). A 0 here
+ * would read as "multiplayer is up" and send the menu down a flow whose
+ * wakeups never arrive -- the success-lie. Out-parameters stay untouched on
+ * the failure paths, the Refer*Status rule. */
+static void test_net(void) {
+    static const struct { const char *name; uint32_t want; } refused[] = {
+        { "sceNetAdhocInit",         SCE_KERNEL_ERROR_NOTIMPLEMENTED  },
+        { "sceNetAdhocctlInit",      SCE_KERNEL_ERROR_NOTIMPLEMENTED  },
+        { "sceNetAdhocTerm",         SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPdpCreate",    SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPdpSend",      SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPdpRecv",      SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPdpDelete",    SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPtpClose",     SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPtpSend",      SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPtpOpen",      SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPtpRecv",      SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPtpAccept",    SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPtpListen",    SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPtpConnect",   SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocPtpFlush",     SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
+        { "sceNetAdhocctlTerm",      SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
+        { "sceNetAdhocctlAddHandler",SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
+        { "sceNetAdhocctlDelHandler",SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
+        { "sceNetAdhocctlDisconnect",SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
+        { "sceNetAdhocctlConnect",   SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
+        { "sceNetAdhocctlGetState",  SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
+        { "sceNetAdhocctlGetPeerList", SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
+        { "sceNetGetLocalEtherAddr", SCE_NET_ERROR_NO_ADDRESS },
+    };
+    for (size_t i = 0; i < sizeof refused / sizeof refused[0]; i++) {
+        uint32_t got = call(psp_nid(refused[i].name), 0, 0, 0, 0);
+        CHECK(got == refused[i].want, "%s: got 0x%08X, want 0x%08X",
+              refused[i].name, got, refused[i].want);
+    }
+
+    /* sceNetInit manages a pool, not the radio: real argument validation,
+     * then vacuous success -- the two rules PPSSPP pins against hardware. */
+    CHECK(call(psp_nid("sceNetInit"), 65536, 30, 0x1000, 30) == 0,
+          "net init succeeds");
+    CHECK(call(psp_nid("sceNetInit"), 0, 30, 0x1000, 30) == SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE,
+          "net init refuses a zero pool");
+    CHECK(call(psp_nid("sceNetInit"), 65536, 0x07, 0x1000, 30) == SCE_KERNEL_ERROR_ILLEGAL_PRIORITY,
+          "net init refuses a bad callout priority");
+    CHECK(call(psp_nid("sceNetInit"), 65536, 30, 0x1000, 0x78) == SCE_KERNEL_ERROR_ILLEGAL_PRIORITY,
+          "net init refuses a bad netintr priority");
+    CHECK(call(psp_nid("sceNetTerm"), 0, 0, 0, 0) == 0, "net term succeeds");
+
+    /* Failure writes nothing: seed guards around the two calls that take
+     * out-parameters. */
+    const uint32_t OUT = 0x08830000u;
+    psp_write32(OUT, 0x13371337u);
+    call(psp_nid("sceNetAdhocctlGetState"), OUT, 0, 0, 0);
+    CHECK(psp_read32(OUT) == 0x13371337u, "getstate leaves its out-param alone");
+    call(psp_nid("sceNetGetLocalEtherAddr"), OUT, 0, 0, 0);
+    CHECK(psp_read32(OUT) == 0x13371337u, "getether leaves its out-param alone");
+
+    /* The two value-returning calls. Ntostr is void: only the string is
+     * checked, not $v0. An invalid pointer is skipped, not faulted. */
+    const uint32_t MAC = 0x08830100u, BUF = 0x08830200u;
+    call(psp_nid("sceNetEtherNtostr"), MAC, BUF, 0, 0);
+    char got[32];
+    CHECK(strcmp(psp_str(BUF, got, sizeof got), "00:00:00:00:00:00") == 0,
+          "ntostr formats the zero MAC, got \"%s\"", got);
+    call(psp_nid("sceNetEtherNtostr"), 0xDEADBEEFu, BUF, 0, 0);
+    CHECK(strcmp(psp_str(BUF, got, sizeof got), "00:00:00:00:00:00") == 0,
+          "ntostr with a bad source leaves the buffer");
+    CHECK(call(psp_nid("sceWlanGetSwitchState"), 0, 0, 0, 0) == 0,
+          "the WLAN switch reads off");
+}
+
 /* Build a display list in guest memory and check the walk follows control flow
  * rather than merely counting words. The list deliberately contains a PRIM
  * that a JUMP skips over: if it gets counted, the walk is not following jumps. */
@@ -645,6 +716,7 @@ int main(void) {
     test_threads();
     test_thread_argument_block();
     test_guest_strings();
+    test_net();
     test_ge_display_list();
     test_ge_infinite_list();
     test_sas_adpcm();

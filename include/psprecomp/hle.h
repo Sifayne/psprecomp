@@ -344,6 +344,16 @@ void psp_misc_init(void);
 void psp_misc_register(void);
 void psp_misc_reset(void);
 
+/* ---- sceNet / sceNetAdhoc / sceNetAdhocctl / sceWlanDrv ------------------ */
+/* Only the codes these stubs can return. Values from PPSSPP's ErrorCodes.h;
+ * the game never calls them on a measured path, so they are preventive. */
+#define SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    0x80410712
+#define SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED 0x80410b08
+/* What hardware answers when no address is available (PPSSPP notes the code
+ * with exactly that reading on the not-connected path). */
+#define SCE_NET_ERROR_NO_ADDRESS               0x80410180
+void psp_net_register(void);
+
 /* ---- sceUmdUser ---------------------------------------------------------- */
 void psp_umd_init(void);
 void psp_umd_register(void);
