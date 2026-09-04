@@ -339,8 +339,23 @@ static float ge_float(uint32_t arg) {
 }
 
 /* Tracked state, and the counters that make the report worth reading. */
+/* A census of render targets, for one question a GPU backend has to answer
+ * before it is designed: does this game ever draw anywhere other than the two
+ * buffers it displays? If it does not, a GL backend can own its own colour
+ * buffer and read back lazily; if it renders to texture, targets have to be
+ * tracked and reconciled, which is the expensive machinery. The end-of-run
+ * summary only ever reported the *last* FBP, which cannot answer it. */
+enum { GE_MAX_TARGETS = 16 };
+typedef struct {
+    uint32_t addr, stride, fmt;
+    uint64_t sets, prims;
+} ge_target;
+
 static struct {
     uint32_t fbp, fbw, fbfmt, vtype, vaddr, iaddr;
+    ge_target targets[GE_MAX_TARGETS];
+    int       n_targets, cur_target;
+    uint64_t  target_overflow;
     int      sc_x0, sc_y0, sc_x1, sc_y1;
     /* Texture state, recorded so the sampler can be built against what this
      * game uses rather than against the whole hardware surface. */
@@ -488,6 +503,27 @@ void psp_ge_dump_stats(FILE *out) {
                 (unsigned long long)g_ge.xfer_rejected);
     fprintf(out, "    framebuffer 0x%08X stride %u, vertex type 0x%06X\n",
             g_ge.fbp, g_ge.fbw, g_ge.vtype);
+    /* Distinct render targets. Two of these (the display pair) means a GPU
+     * backend can own its colour buffer; more means render-to-texture, and
+     * targets have to be tracked. Primitives are attributed to the target
+     * current when they were drawn, which is the number that matters -- a
+     * target set once and never drawn into is noise. */
+    int drawn_into = 0;
+    for (int i = 0; i < g_ge.n_targets; i++)
+        if (g_ge.targets[i].prims) drawn_into++;
+    /* Two counts, because the first one alone misleads: FBP, FBW and the pixel
+     * format arrive as three separate commands, so every combination seen
+     * while they are half-updated registers as its own target and draws
+     * nothing. The number that matters is how many were actually drawn into. */
+    fprintf(out, "    render targets: %d seen, %d drawn into%s\n",
+            g_ge.n_targets, drawn_into,
+            g_ge.target_overflow ? " (more than the census holds)" : "");
+    for (int i = 0; i < g_ge.n_targets; i++)
+        fprintf(out, "      0x%08X stride %-4u fmt %u  %llu set(s), %llu primitive(s)%s\n",
+                g_ge.targets[i].addr, g_ge.targets[i].stride, g_ge.targets[i].fmt,
+                (unsigned long long)g_ge.targets[i].sets,
+                (unsigned long long)g_ge.targets[i].prims,
+                (g_ge.targets[i].addr & 0xFF000000u) == PSP_VRAM_BASE ? "" : "  <- not VRAM");
     fprintf(out, "    vertices submitted: %llu\n", (unsigned long long)g_ge.vertices);
     for (int i = 0; i < 8; i++)
         if (g_ge.prims[i])
@@ -666,6 +702,28 @@ static void do_block_transfer(void) {
 
     g_ge.xfers++;
     g_ge.xfer_bytes += (uint64_t)w * h * bpp;
+}
+
+/* Record the target being switched to, and make it current. Linear scan: the
+ * expectation this measures is that there are two or three of these, and if
+ * that expectation is wrong the overflow counter says so rather than the
+ * scan getting slow. */
+static void ge_note_target(uint32_t addr, uint32_t stride, uint32_t fmt) {
+    for (int i = 0; i < g_ge.n_targets; i++) {
+        if (g_ge.targets[i].addr == addr && g_ge.targets[i].stride == stride &&
+            g_ge.targets[i].fmt == fmt) {
+            g_ge.targets[i].sets++;
+            g_ge.cur_target = i;
+            return;
+        }
+    }
+    if (g_ge.n_targets >= GE_MAX_TARGETS) { g_ge.target_overflow++; return; }
+    const int i = g_ge.n_targets++;
+    g_ge.targets[i].addr = addr;
+    g_ge.targets[i].stride = stride;
+    g_ge.targets[i].fmt = fmt;
+    g_ge.targets[i].sets = 1;
+    g_ge.cur_target = i;
 }
 
 static uint32_t ge_fb_address(uint32_t fbp) {
@@ -1786,6 +1844,11 @@ static void run_list(ge_queue *q) {
             uint32_t type  = (arg >> 16) & 7;
             uint32_t count = arg & 0xFFFF;
             g_ge.prims[type]++;
+            /* A game that never writes FBP still draws somewhere -- register
+             * the default target lazily so the census is never empty. */
+            if (g_ge.n_targets == 0)
+                ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
+            g_ge.targets[g_ge.cur_target].prims++;
             g_ge.vertices += count;
             draw_prim(type, count);
             break;
@@ -2146,6 +2209,7 @@ static void run_list(ge_queue *q) {
 
         case GE_FRAMEBUFPIXFORMAT:
             g_ge.fbfmt = arg & 3;
+            ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
             psp_render_current()->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
             break;
         case GE_SCISSOR1: g_ge.sc_x0 = (int)(arg & 0x3FF); g_ge.sc_y0 = (int)((arg >> 10) & 0x3FF); break;
@@ -2226,11 +2290,13 @@ static void run_list(ge_queue *q) {
 
         case GE_FBP:
             g_ge.fbp = (g_ge.fbp & 0xFF000000u) | arg;
+            ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
             psp_render_current()->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
             break;
         case GE_FBW:
             g_ge.fbw = arg & 0xFFFF;
             g_ge.fbp = (g_ge.fbp & 0x00FFFFFFu) | ((arg & 0xFF0000) << 8);
+            ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
             psp_render_current()->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
             break;
 
