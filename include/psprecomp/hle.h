@@ -335,6 +335,11 @@ size_t psp_ge_state_size(void);
 void   psp_ge_state_save(void *buf);
 void   psp_ge_state_load(const void *buf);
 
+/* Push the restored registers at the backend. Loading state tells the GE what
+ * it believes; only a register write tells the backend, so a replay has to do
+ * this explicitly or its pixels land wherever the backend was last pointed. */
+void   psp_ge_sync_backend(void);
+
 void psp_sas_init(void);
 void psp_sas_register(void);
 void psp_sas_reset(void);

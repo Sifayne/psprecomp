@@ -222,6 +222,12 @@ typedef struct {
 } ge_queue;
 
 static ge_queue g_queue[MAX_QUEUES];
+
+/* Display-list capture, defined at the end of the file with the rest of it;
+ * declared here because both the list runner and the enqueue path call into
+ * it and they come first. */
+static void cap_note_list(const ge_queue *q);
+static void cap_snapshot_memory(void);
 static uint32_t g_next_id;
 
 /* Vertices the draw path declined, split by why.
@@ -1915,6 +1921,7 @@ static void run_list(ge_queue *q) {
         case GE_FINISH:
             if (cmd == GE_FINISH) g_ge.finishes++;
             q->done = 1;
+            cap_snapshot_memory();
             /* The end of a list is what finish() means, and until now nothing
              * called it -- the interface has documented it as "a good point to
              * flush batched work" since it was written, and the software path
@@ -2366,7 +2373,6 @@ static ge_queue *find_queue(uint32_t id) {
     return NULL;
 }
 
-static void cap_note_list(const ge_queue *q);
 
 static void enqueue(int head) {
     /* (list, stall, cbid, arg) */
@@ -2552,6 +2558,9 @@ static int      g_cap_n;
 static int      g_cap_frame = -1;    /* frame to capture, -1 = off */
 static int      g_cap_seen;          /* frames elapsed */
 static int      g_cap_arming;        /* recording this frame */
+static int      g_cap_snapped;       /* memory image taken */
+static uint64_t g_cap_cmd0;          /* commands executed when arming */
+static uint64_t g_cap_min_cmds;      /* skip frames smaller than this */
 static uint8_t *g_cap_state;         /* state as of the frame's start */
 static uint8_t *g_cap_ram, *g_cap_vram, *g_cap_mod;
 static uint32_t g_cap_mod_base, g_cap_mod_size;
@@ -2562,6 +2571,19 @@ size_t psp_ge_state_size(void) { return sizeof g_tl + sizeof g_ge; }
 void psp_ge_state_save(void *buf) {
     memcpy(buf, &g_tl, sizeof g_tl);
     memcpy((uint8_t *)buf + sizeof g_tl, &g_ge, sizeof g_ge);
+}
+
+/* Push the current registers at the backend.
+ *
+ * Loading state restores what the GE believes; it does not tell the backend,
+ * which learns the target and the scissor only when a register is *written*.
+ * A replay that skips this draws its pixels into whatever the backend still
+ * had -- for a fresh one, address zero -- and reports a million pixels written
+ * while every buffer reads black, which is precisely what it did. */
+void psp_ge_sync_backend(void) {
+    const psp_render_backend *be = psp_render_current();
+    be->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
+    be->set_scissor(g_ge.sc_x0, g_ge.sc_y0, g_ge.sc_x1, g_ge.sc_y1);
 }
 
 void psp_ge_state_load(const void *buf) {
@@ -2582,6 +2604,13 @@ static void cap_init(void) {
     if (g_cap_path && !*g_cap_path) g_cap_path = NULL;
     const char *f = getenv("PSPRECOMP_GE_CAPTURE_FRAME");
     g_cap_frame = (g_cap_path && f && *f) ? atoi(f) : (g_cap_path ? 1 : -1);
+    /* Frames are not equal: this game's compositing frames run a few hundred
+     * commands and the ones that draw the room run thousands, and picking by
+     * number lands on whichever happens to be there. This says "the first
+     * frame at or after the number that is actually big", which is how you ask
+     * for a frame with a scene in it. */
+    const char *m = getenv("PSPRECOMP_GE_CAPTURE_MINCMDS");
+    g_cap_min_cmds = (m && *m) ? strtoull(m, NULL, 0) : 0;
 }
 
 static void cap_note_list(const ge_queue *q) {
@@ -2595,32 +2624,35 @@ static void cap_note_list(const ge_queue *q) {
     g_cap_lists[g_cap_n].stall = 0;
     g_cap_lists[g_cap_n].base  = q->base;
 
-    /* Memory is snapshotted at the frame's FIRST submission, not at its end.
-     * A list is only guaranteed to be intact in memory at the moment it is
-     * handed over -- this game reuses one list buffer, so by the end of the
-     * frame the words have been overwritten and a replay runs off into
-     * whatever followed. Its vertices and textures are written before the
-     * submission too, for the same reason: the GE is about to read them.
-     *
-     * The limitation this leaves: a frame that submits several lists and
-     * rewrites data between them is captured as of the first. Frames here
-     * carry one list, and the replay reporting a different command count from
-     * the run is the signal that a scene has stopped being like that. */
-    if (g_cap_n == 0) {
-        if (!g_cap_ram)  g_cap_ram  = malloc(PSP_RAM_SIZE);
-        if (!g_cap_vram) g_cap_vram = malloc(PSP_VRAM_SIZE);
-        const void *r = psp_mem_ptr(PSP_RAM_BASE,  PSP_RAM_SIZE);
-        const void *v = psp_mem_ptr(PSP_VRAM_BASE, PSP_VRAM_SIZE);
-        if (g_cap_ram  && r) memcpy(g_cap_ram,  r, PSP_RAM_SIZE);
-        if (g_cap_vram && v) memcpy(g_cap_vram, v, PSP_VRAM_SIZE);
-        psp_mem_module_region(&g_cap_mod_base, &g_cap_mod_size);
-        if (g_cap_mod_size) {
-            if (!g_cap_mod) g_cap_mod = malloc(g_cap_mod_size);
-            const void *m = psp_mem_ptr(g_cap_mod_base, g_cap_mod_size);
-            if (g_cap_mod && m) memcpy(g_cap_mod, m, g_cap_mod_size);
-        }
-    }
     g_cap_n++;
+}
+
+/* The moment a list is worth snapshotting memory at: when it has just run to
+ * its own END.
+ *
+ * Neither obvious moment works. At submission the list is usually incomplete,
+ * because the GE is stall-streamed -- the CPU releases words as it writes them,
+ * so a snapshot then holds a few hundred commands of a frame that will run ten
+ * thousand, which is exactly what the first attempt captured. At the end of the
+ * frame the list is complete but this game has reused the buffer for the next
+ * one. Completion is the only point where the words are all present and none
+ * has been overwritten, and it is where the vertices and textures the list
+ * names are guaranteed to be live too, because the GE has just read them. */
+static void cap_snapshot_memory(void) {
+    if (!g_cap_arming || g_cap_snapped || g_cap_n == 0) return;
+    g_cap_snapped = 1;
+    if (!g_cap_ram)  g_cap_ram  = malloc(PSP_RAM_SIZE);
+    if (!g_cap_vram) g_cap_vram = malloc(PSP_VRAM_SIZE);
+    const void *r = psp_mem_ptr(PSP_RAM_BASE,  PSP_RAM_SIZE);
+    const void *v = psp_mem_ptr(PSP_VRAM_BASE, PSP_VRAM_SIZE);
+    if (g_cap_ram  && r) memcpy(g_cap_ram,  r, PSP_RAM_SIZE);
+    if (g_cap_vram && v) memcpy(g_cap_vram, v, PSP_VRAM_SIZE);
+    psp_mem_module_region(&g_cap_mod_base, &g_cap_mod_size);
+    if (g_cap_mod_size) {
+        if (!g_cap_mod) g_cap_mod = malloc(g_cap_mod_size);
+        const void *m = psp_mem_ptr(g_cap_mod_base, g_cap_mod_size);
+        if (g_cap_mod && m) memcpy(g_cap_mod, m, g_cap_mod_size);
+    }
 }
 
 static void cap_write(void) {
@@ -2637,8 +2669,8 @@ static void cap_write(void) {
     if (g_cap_vram) fwrite(g_cap_vram, PSP_VRAM_SIZE, 1, f);
     if (g_cap_mod && g_cap_mod_size) fwrite(g_cap_mod, g_cap_mod_size, 1, f);
     fclose(f);
-    fprintf(stderr, "ge: captured frame %d -- %d list(s) -> %s\n",
-            g_cap_frame, g_cap_n, g_cap_path);
+    fprintf(stderr, "ge: captured %d list(s), %llu command(s) -> %s\n",
+            g_cap_n, (unsigned long long)(g_ge.commands - g_cap_cmd0), g_cap_path);
 }
 
 /* Called at every frame boundary, which is what drain_all marks. */
@@ -2652,7 +2684,14 @@ static void cap_frame_boundary(void) {
          * one of those is a file with nothing in it. Keep waiting until a
          * frame actually submits work, and re-snapshot the state each time so
          * it still belongs to the frame that gets captured. */
-        if (g_cap_n == 0) { psp_ge_state_save(g_cap_state); return; }
+        const uint64_t ran = g_ge.commands - g_cap_cmd0;
+        if (g_cap_n == 0 || ran < g_cap_min_cmds) {
+            psp_ge_state_save(g_cap_state);
+            g_cap_cmd0 = g_ge.commands;
+            g_cap_n = 0;
+            g_cap_snapped = 0;
+            return;
+        }
         cap_write();
         g_cap_arming = 0;
         g_cap_frame = -1;          /* once */
@@ -2663,7 +2702,9 @@ static void cap_frame_boundary(void) {
         if (!g_cap_state) g_cap_state = malloc(psp_ge_state_size());
         if (!g_cap_state) return;
         psp_ge_state_save(g_cap_state);   /* before the frame's commands run */
+        g_cap_cmd0 = g_ge.commands;
         g_cap_n = 0;
+        g_cap_snapped = 0;
         g_cap_arming = 1;
     }
 }
