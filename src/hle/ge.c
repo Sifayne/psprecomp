@@ -2571,6 +2571,8 @@ static int      g_cap_arming;        /* recording this frame */
 static int      g_cap_snapped;       /* memory image taken */
 static uint64_t g_cap_cmd0;          /* commands executed when arming */
 static uint64_t g_cap_min_cmds;      /* skip frames smaller than this */
+static uint64_t g_cap_min_mean;      /* skip dark display buffers, 0..255 RGB */
+static uint64_t g_cap_fb_sum, g_cap_fb_samples; /* accepted candidate */
 static uint8_t *g_cap_state;         /* state as of the frame's start */
 static uint8_t *g_cap_ram, *g_cap_vram, *g_cap_mod;
 static uint32_t g_cap_mod_base, g_cap_mod_size;
@@ -2621,6 +2623,14 @@ static void cap_init(void) {
      * for a frame with a scene in it. */
     const char *m = getenv("PSPRECOMP_GE_CAPTURE_MINCMDS");
     g_cap_min_cmds = (m && *m) ? strtoull(m, NULL, 0) : 0;
+    /* A large frame at a scene transition can still be the wrong specimen.
+     * This game's first 10k-command hangar frame starts from two deliberately
+     * black display buffers and ends in a destination-colour doubling pass;
+     * replaying it from black is therefore correctly black. Let a capture ask
+     * for an already-populated display buffer as well as a command budget. */
+    const char *p = getenv("PSPRECOMP_GE_CAPTURE_MINMEAN");
+    g_cap_min_mean = (p && *p) ? strtoull(p, NULL, 0) : 0;
+    if (g_cap_min_mean > 255) g_cap_min_mean = 255;
 }
 
 static void cap_note_list(const ge_queue *q) {
@@ -2665,6 +2675,69 @@ static void cap_snapshot_memory(void) {
     }
 }
 
+/* Measure mean visible RGB in the display-sized targets already seen by the
+ * GE. Texture data elsewhere in VRAM must not satisfy this filter: it was
+ * exactly why a capture with a black framebuffer looked populated. Counting
+ * merely non-zero bytes is not enough either -- a nearly-black fade can have
+ * every pixel populated. Target addresses are de-duplicated because the
+ * census keeps distinct stride/format combinations for the same storage. */
+static uint64_t cap_framebuffer_rgb_sum(uint64_t *samples) {
+    if (samples) *samples = 0;
+    if (!g_cap_vram) return 0;
+    uint32_t seen[GE_MAX_TARGETS];
+    int n_seen = 0;
+    uint64_t sum = 0, n = 0;
+    for (int i = 0; i < g_ge.n_targets; i++) {
+        const ge_target *t = &g_ge.targets[i];
+        if (!t->prims || t->stride < 480 || t->fmt > 3 ||
+            t->addr < PSP_VRAM_BASE)
+            continue;
+        int duplicate = 0;
+        for (int j = 0; j < n_seen; j++)
+            if (seen[j] == t->addr) duplicate = 1;
+        if (duplicate) continue;
+        const uint32_t bpp = t->fmt == 3 ? 4u : 2u;
+        const uint64_t off = (uint64_t)t->addr - PSP_VRAM_BASE;
+        const uint64_t last = off + ((uint64_t)271 * t->stride + 480u) * bpp;
+        if (last > PSP_VRAM_SIZE) continue;
+        seen[n_seen++] = t->addr;
+        for (uint32_t y = 0; y < 272; y++) {
+            const uint8_t *row =
+                g_cap_vram + off + (uint64_t)y * t->stride * bpp;
+            for (uint32_t x = 0; x < 480; x++) {
+                if (t->fmt == 3) {
+                    sum += row[x * 4u] + row[x * 4u + 1u] +
+                           row[x * 4u + 2u];
+                } else {
+                    const uint16_t px = (uint16_t)row[x * 2u] |
+                        (uint16_t)((uint16_t)row[x * 2u + 1u] << 8);
+                    if (t->fmt == 0) {
+                        const uint32_t r = px & 31u;
+                        const uint32_t g = (px >> 5) & 63u;
+                        const uint32_t b = (px >> 11) & 31u;
+                        sum += (r << 3 | r >> 2) + (g << 2 | g >> 4) +
+                               (b << 3 | b >> 2);
+                    } else if (t->fmt == 1) {
+                        const uint32_t r = px & 31u;
+                        const uint32_t g = (px >> 5) & 31u;
+                        const uint32_t b = (px >> 10) & 31u;
+                        sum += (r << 3 | r >> 2) + (g << 3 | g >> 2) +
+                               (b << 3 | b >> 2);
+                    } else {
+                        const uint32_t r = px & 15u;
+                        const uint32_t g = (px >> 4) & 15u;
+                        const uint32_t b = (px >> 8) & 15u;
+                        sum += (r << 4 | r) + (g << 4 | g) + (b << 4 | b);
+                    }
+                }
+                n += 3;
+            }
+        }
+    }
+    if (samples) *samples = n;
+    return sum;
+}
+
 static void cap_write(void) {
     FILE *f = fopen(g_cap_path, "wb");
     if (!f) { fprintf(stderr, "ge: cannot write capture %s\n", g_cap_path); return; }
@@ -2679,8 +2752,12 @@ static void cap_write(void) {
     if (g_cap_vram) fwrite(g_cap_vram, PSP_VRAM_SIZE, 1, f);
     if (g_cap_mod && g_cap_mod_size) fwrite(g_cap_mod, g_cap_mod_size, 1, f);
     fclose(f);
-    fprintf(stderr, "ge: captured %d list(s), %llu command(s) -> %s\n",
-            g_cap_n, (unsigned long long)(g_ge.commands - g_cap_cmd0), g_cap_path);
+    fprintf(stderr, "ge: captured %d list(s), %llu command(s)",
+            g_cap_n, (unsigned long long)(g_ge.commands - g_cap_cmd0));
+    if (g_cap_min_mean && g_cap_fb_samples)
+        fprintf(stderr, ", framebuffer RGB mean %.2f",
+                (double)g_cap_fb_sum / (double)g_cap_fb_samples);
+    fprintf(stderr, " -> %s\n", g_cap_path);
 }
 
 /* Called at every frame boundary, which is what drain_all marks. */
@@ -2695,7 +2772,20 @@ static void cap_frame_boundary(void) {
          * frame actually submits work, and re-snapshot the state each time so
          * it still belongs to the frame that gets captured. */
         const uint64_t ran = g_ge.commands - g_cap_cmd0;
-        if (g_cap_n == 0 || ran < g_cap_min_cmds) {
+        uint64_t fb_sum = 0, fb_samples = 0;
+        int reject_fb = 0;
+        if (g_cap_n != 0 && ran >= g_cap_min_cmds && g_cap_min_mean) {
+            fb_sum = cap_framebuffer_rgb_sum(&fb_samples);
+            g_cap_fb_sum = fb_sum;
+            g_cap_fb_samples = fb_samples;
+            reject_fb = !fb_samples || fb_sum < g_cap_min_mean * fb_samples;
+            if (reject_fb)
+                fprintf(stderr, "ge: capture candidate has %llu command(s) but "
+                                "framebuffer RGB mean %.2f; continuing\n",
+                        (unsigned long long)ran,
+                        fb_samples ? (double)fb_sum / (double)fb_samples : 0.0);
+        }
+        if (g_cap_n == 0 || ran < g_cap_min_cmds || reject_fb) {
             psp_ge_state_save(g_cap_state);
             g_cap_cmd0 = g_ge.commands;
             g_cap_n = 0;

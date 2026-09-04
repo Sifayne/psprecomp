@@ -218,9 +218,12 @@ does not matter until a game is already drawing:
   median, p95 and maximum intervals. `psp_render_raster_ns()` remains the
   software backend's cumulative CPU cost.
 - ~~Display-list capture and replay~~ **done 4 Sep**, through GE capture files
-  and `host/gereplay.c`. The remaining capture defect is narrower: the saved
-  display framebuffer arrives empty, so fixed-list numeric diffs work but the
-  replayed image is not yet readable as the original scene.
+  and `host/gereplay.c`, including readable scene selection. The apparently
+  empty saved framebuffer was a correctly copied black transition frame, not
+  corruption: `PSPRECOMP_GE_CAPTURE_MINCMDS` selects substantial work and
+  `PSPRECOMP_GE_CAPTURE_MINMEAN` additionally rejects a dark starting buffer.
+  Hangar thresholds 5000 and 8 select a readable 14,806-command fixed list;
+  software and GL reproduce the same geometry at normalized RMSE 0.00572.
 - The pixel and depth counters in `ge.c` are software-backend concepts
   (`psp_render_reset_depth` has no GPU meaning) and read zero under any other
   backend; put them behind an optional query first
@@ -322,9 +325,8 @@ summary now prints those two clocks directly.
 - The framebuffer-alpha stencil, doubled blend factors and absolute-difference
   blend equation; these are shader work and are counted when encountered.
 - Dithering and the point/line primitive paths.
-- GPU timer queries (the present report currently has CPU-side texture and
-  readback costs) and a readable fixed-list image after the capture's
-  empty-framebuffer defect is fixed.
+- GPU timer queries; the present report currently has CPU-side texture and
+  readback costs only.
 
 ## Validation
 
