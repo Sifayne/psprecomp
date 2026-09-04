@@ -182,6 +182,29 @@ typedef struct {
  * something else, so check it. */
 int psp_render_select(const char *name);
 
+/* Decode one mip level of a texture into `out` as RGBA8, through the same
+ * sampler the software backend draws with -- five formats, both CLUT widths
+ * with their shift/mask/start paging, and the byte swizzle. A GPU backend must
+ * hand its API decoded texels, and doing that decode per backend is what this
+ * interface exists to prevent. Wrapping is the caller's: the grid comes back
+ * unwrapped so GL's or Vulkan's own wrap modes can apply it.
+ *
+ * Returns texels written (w*h), or 0 if the level is empty or `cap` is too
+ * small. Safe to call between draws; the sampler's state is restored. */
+/* The palette a CLUT-format texture decodes through. Passed explicitly rather
+ * than read from wherever set_clut last left it: only the software backend's
+ * set_clut writes that, so any other backend would decode through a stale
+ * palette -- silently, and only for the CLUT formats. */
+typedef struct {
+    uint32_t addr;
+    int      fmt, shift, mask, start;
+} psp_clut_state;
+
+size_t psp_render_decode_level(const psp_tex_state *t, int level,
+                               const psp_clut_state *clut,
+                               uint32_t *out, size_t cap,
+                               int *out_w, int *out_h);
+
 /* Add a backend the runtime does not carry. Anything needing a window or a GL
  * context lives in the host -- the core has no external dependencies and SDL2
  * is the host's -- so the host builds one and registers it here, after which

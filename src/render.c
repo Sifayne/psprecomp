@@ -340,6 +340,68 @@ uint64_t psp_render_filter_split(void) { return g_filter_split; }
  * 64, by one step; hardware first changes it at pixel 72 -- one sixteenth of a
  * texel in -- and by 0x10 (ff -> ef), and on the reversed sprite starts at 64,
  * where the fraction is already fifteen sixteenths. Sixteen levels, floored. */
+/* Decode one mip level into a caller's RGBA8 buffer, through the same sampler
+ * the software path draws with.
+ *
+ * A GPU backend has to hand GL or Vulkan decoded texels, and the decode is the
+ * fiddly part -- five formats, two CLUT widths with their shift/mask/start
+ * paging, and a byte-level swizzle. Reimplementing it per backend is exactly
+ * what the interface exists to prevent (see docs/RENDERER.md): get it wrong
+ * once, centrally, and every backend is wrong the same way, which is at least
+ * diagnosable. Wrapping is left to the caller, so the texel grid comes back
+ * unwrapped and GL's own wrap modes can do that job.
+ *
+ * Returns the number of texels written, or 0 if the level is empty or the
+ * buffer is too small. g_tex is saved and restored: this can be called between
+ * draws without disturbing what the rasterizer is in the middle of. */
+size_t psp_render_decode_level(const psp_tex_state *t, int level,
+                               const psp_clut_state *clut,
+                               uint32_t *out, size_t cap, int *out_w, int *out_h) {
+    if (!t || !out || level < 0 || level > 7) return 0;
+    const psp_tex_state saved = g_tex;
+    /* The palette travels with the call rather than being read from wherever
+     * set_clut last left it. Only the *software* backend's set_clut writes
+     * that state, so a GPU backend decoding through here would have found a
+     * stale palette -- silently, and only for the CLUT formats, which is the
+     * kind of wrongness that looks like a sampler bug for a day. */
+    const struct { uint32_t addr; int fmt, shift, mask, start; } saved_clut = {
+        g_clut.addr, g_clut.fmt, g_clut.shift, g_clut.mask, g_clut.start
+    };
+    if (clut) {
+        g_clut.addr = clut->addr; g_clut.fmt = clut->fmt;
+        g_clut.shift = clut->shift; g_clut.mask = clut->mask;
+        g_clut.start = clut->start;
+    }
+    g_tex = *t;
+    if (level > 0) {
+        g_tex.addr   = t->lv_addr[level];
+        g_tex.stride = t->lv_stride[level];
+        g_tex.w      = t->lv_w[level];
+        g_tex.h      = t->lv_h[level];
+    }
+    /* Clamp both axes: the sampler wraps, and a decode that wrapped would fold
+     * the texture onto itself rather than reporting its own grid. */
+    g_tex.wrap_s = g_tex.wrap_t = 1;
+    const int w = g_tex.w, h = g_tex.h;
+    if (w <= 0 || h <= 0 || (size_t)w * (size_t)h > cap) {
+        g_tex = saved;
+        g_clut.addr = saved_clut.addr; g_clut.fmt = saved_clut.fmt;
+        g_clut.shift = saved_clut.shift; g_clut.mask = saved_clut.mask;
+        g_clut.start = saved_clut.start;
+        return 0;
+    }
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            out[(size_t)y * (size_t)w + (size_t)x] = sample_texel(x, y);
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    g_tex = saved;
+    g_clut.addr = saved_clut.addr; g_clut.fmt = saved_clut.fmt;
+    g_clut.shift = saved_clut.shift; g_clut.mask = saved_clut.mask;
+    g_clut.start = saved_clut.start;
+    return (size_t)w * (size_t)h;
+}
+
 static uint32_t sample_bilinear(float u, float v) {
     /* The coordinate is quantised to sixteenths, floored, and split into the
      * texel and the weight. Floored, not rounded: gpu/filtering's linear tests
