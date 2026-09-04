@@ -1,7 +1,12 @@
 # Rendering
 
-How the GE gets to a window, and why the backend is an interface rather than a
-Vulkan file.
+How the GE gets to a window, and why the backend is an interface rather than
+one API's file.
+
+**The API is decided: OpenGL 3.3 core, on the SDL2 the host already links.**
+Recorded 3 Sep; the reasoning is under *Choosing the API* below. This file said
+SDL3 + Vulkan until then, which the roadmap had already superseded on 1 Sep
+without anyone coming back here.
 
 ## The shape of the problem
 
@@ -39,10 +44,15 @@ Three reasons, in order of how much they cost to get wrong:
    backend boundary lets the answer be recorded (command counts, primitive
    counts, vertex counts) independently of whether anything was presented.
 
-3. **Portability is the point of the project.** Vulkan is one answer. It should
-   not be the only place the GE's semantics are written down.
+3. **Portability is the point of the project.** Any one API is one answer. No
+   single one should be the only place the GE's semantics are written down —
+   which is also why choosing GL below costs little if it is later replaced.
 
 ## The interface
+
+Twelve entry points. `include/psprecomp/render.h` carries the full comments,
+including what each register means and which oracle measured it; this is the
+shape.
 
 ```c
 typedef struct {
@@ -51,21 +61,40 @@ typedef struct {
     int  (*init)(int width, int height);
     void (*shutdown)(void);
 
-    /* Framebuffer target changed (GE_FBP/GE_FBW). */
+    /* GE_FBP / GE_FBW: the framebuffer being drawn into. */
     void (*set_target)(uint32_t addr, uint32_t stride, int fmt);
+    /* SCISSOR1 / SCISSOR2, both corners inclusive. Always in force on the
+     * PSP, so this is the rasterizer's only bound. */
+    void (*set_scissor)(int x0, int y0, int x1, int y1);
+    /* The texture to sample, or addr 0 for none. Carries format, size, the
+     * mip chain and its LOD mode, filters, wrap and the texture function. */
+    void (*set_texture)(const psp_tex_state *t);
+    /* The palette for the CLUT formats, indexed ((texel >> shift) & mask)
+     * | start -- a game can page one palette through a larger CLUT. */
+    void (*set_clut)(uint32_t addr, int format, int shift, int mask, int start);
+    void (*set_depth)(int test_enable, int func, int write_enable);
+    /* Blending, the alpha test, and the stencil -- which on the PSP is the
+     * framebuffer's alpha byte. */
+    void (*set_blend)(const psp_blend_state *b);
+    /* GE_FOGENABLE / GE_FOGCOLOR (0xBBGGRR). The coefficient rides in the
+     * vertex; this is the colour it blends toward. */
+    void (*set_fog)(int enable, uint32_t colour);
 
-    /* One assembled primitive, in screen space, already clipped to the
-     * viewport by the interpreter. Vertices carry position and colour;
-     * texture support extends this struct rather than replacing it. */
+    /* One assembled primitive. `count` vertices, already in screen space. */
     void (*draw)(int prim, const psp_vertex *v, int count);
-
-    /* End of a display list; a good point to flush batched work. */
+    /* End of a display list -- a natural point to flush batched work. */
     void (*finish)(void);
-
-    /* Present whatever has accumulated (sceDisplaySetFrameBuf). */
+    /* sceDisplaySetFrameBuf -- show what has accumulated. */
     void (*present)(void);
 } psp_render_backend;
 ```
+
+The three structs a backend has to read are where the hardware's rules
+actually live: `psp_vertex` (12.4 fixed-point screen position, window depth on
+the 0..65535 scale, colour, texel-unit UVs, the fog byte), `psp_tex_state`
+(format, the eight mip levels and `TEX_LEVEL`'s modes, both filters, wrap, the
+texture function with its RGBA and doubling bits) and `psp_blend_state`
+(blend, alpha test, stencil).
 
 `draw` takes *assembled* primitives rather than raw display-list words on
 purpose. Vertex format decoding — the stride arithmetic, the component
@@ -77,34 +106,85 @@ backend is wrong the same way, which is at least diagnosable.
 
 | Backend | State | Notes |
 |---|---|---|
-| **software** | Working | The reference. Triangles, strips, sprites in through-mode; six tests assert pixel positions. No GPU, no dependencies, runs in CI. |
+| **software** | Working | The reference. Triangles, strips and sprites; points, lines and fans are not drawn. 17 tests in `test_raster.c` assert pixel positions -- texturing, filtering, wrap, depth and clear mode among them. No GPU, no dependencies, runs in CI. |
 | **null** | Working | Counts primitives, draws nothing. What the bring-up host uses when the question is "did it ask to draw". |
-| **sdl3-vulkan** | Not started | The intended presentation path. See below. |
+| **gl33-sdl2** | Not started | The intended presentation path. See below. |
 
-## The SDL3 + Vulkan backend, when it happens
+Selection is `psp_render_select(name)` (`src/render.c`), and **nothing in the
+host calls it** — only `tests/test_raster.c` does, so `g_backend` is the
+software one in every real run. Wiring it to an environment variable in
+`host/boot.c` is the first prerequisite below, not part of the backend.
+
+## Choosing the API
+
+**OpenGL 3.3 core, on SDL2.** Decided 3 Sep, after this file and
+`docs/ROADMAP.md` were found to disagree — the roadmap said GL 3.3 on 1 Sep,
+this file still said SDL3 + Vulkan from 20 Jul, and the older text was the one
+being read. Three reasons, all specific to this codebase rather than to the
+APIs in general:
+
+1. **The interface above is a state machine, and so is GL.** Nine of the twelve
+   entry points are per-draw state setters. Vulkan wants that state baked into
+   pipeline objects ahead of time, so the same interface would need a state-hash
+   to pipeline cache before it could draw at all — reworking the interface to
+   suit the API, having already built the interface.
+2. **The first increment was already done, in SDL2.** This file's earlier plan
+   opened with "upload the emulated framebuffer as a texture, blit, present"
+   and called it a milestone with no ambiguity about whether it worked.
+   `host/present.c` has done exactly that for some time, with a streaming
+   ABGR8888 texture. Choosing SDL3 would have meant redoing working code to
+   reach a milestone already met, which is why the increments below now start
+   at geometry.
+3. **SDL3 would land on the audio path.** SDL3 replaces SDL2's audio callback
+   with `SDL_AudioStream`s bound to devices; `present.c` uses the callback, and
+   M3's gate rests on it. That is unrelated risk on freshly gated work.
+
+The sizing settles the rest: the software rasterizer is about **2.8x** over a
+16.7 ms frame on `mission-1.pad` (84.6 s of raster over 1,793 GE finishes).
+A GL 3.3 backend clears that by an order of magnitude, so throughput is not
+the binding constraint — iterating against the software oracle is, and that is
+where GL's shorter path to a first triangle is worth more than Vulkan's
+ceiling.
+
+**What would overturn it:** wanting macOS (GL caps at 4.1 and is deprecated
+there; M6 names Windows and a CI matrix, not macOS), or profiling a working GL
+backend and finding draw-call submission rather than rasterizing is the wall.
+Both are cheap to act on later, because `ge.c` reaches the backend through
+`psp_render_current()` and nowhere else. SDL2 is in maintenance and a move to
+SDL3 will come — on its own schedule, not bundled into a renderer.
+
+## The GL 3.3 backend, when it happens
 
 Scope it deliberately, because the GE has a large state space and most of it
 does not matter until a game is already drawing:
 
-**First increment** — enough to see the software path's output in a window:
-- SDL3 window + swapchain
-- Upload the emulated framebuffer as a texture, blit, present
+**Prerequisites** — none of these are the backend, and all of them are missing:
+- `psp_render_select` wired to an environment variable in `host/boot.c`, so a
+  backend can be chosen without recompiling
+- A per-frame timer. `psp_render_raster_ns()` is cumulative and printed once at
+  the end of a run, which cannot demonstrate the 60 fps the M5 gate asks for
+- Display-list capture and replay. The gate wants "pixel-comparable on a fixed
+  set of display lists"; `09-replay.sh` replays *controller input*, and
+  `PSPRECOMP_FRAMES` dumps final images. Recording GE lists to a file and
+  replaying them into an arbitrary backend does not exist
+- The pixel and depth counters in `ge.c` are software-backend concepts
+  (`psp_render_reset_depth` has no GPU meaning) and read zero under any other
+  backend; put them behind an optional query first
 
-That is not really a GPU backend — it is a *presenter* for the software
-rasterizer. It is worth doing first anyway, because it makes everything after it
-visible, and because "the software renderer's output, on screen" is a milestone
-with no ambiguity about whether it worked.
-
-**Second increment** — geometry on the GPU:
+**First increment** — geometry on the GPU:
+- `SDL_GL_CreateContext` on the window `present.c` already owns
 - Vertex buffer per display list, one draw per primitive batch
 - Through-mode only, matching what the software path already does
 - Diff against the software path on the same list: same pixels, or the backend
   is wrong
 
-**Third increment** — the parts that need real work:
+**Second increment** — the parts that need real work:
 - Texture cache keyed on the GE's texture state (address, format, size, CLUT)
 - The transform pipeline, which needs the VFPU matrices to be correct first
 - Blending, depth, scissor — each is a small addition once the above holds
+- The awkward ones, which no API makes easy: the stencil living in the
+  framebuffer's alpha byte, and the texture function's colour doubling. Both
+  are shader work either way and are not an argument for or against GL.
 
 ## Validation
 
@@ -122,7 +202,10 @@ link.
 
 [sal063/PSP-recompilation-project](https://github.com/sal063/PSP-recompilation-project)
 independently built an SDL3 + Vulkan GE backend, validated against PPSSPP's
-software renderer. It demonstrates the approach is sound.
+software renderer. It demonstrates the approach is sound. That it chose a
+different API is not an argument against the choice above: what it evidences
+is that display-list translation validated against a software reference works,
+which is the part both plans share.
 
 This design was written from the GE's documented behaviour and the shape of our
 existing interpreter, not from reading theirs — deliberately, because that
