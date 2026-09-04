@@ -321,12 +321,21 @@ the hangar settled; after the barrier the null and GL paths reach the same
 guest time over 56.639 s of wall time (0.018 ms drift), and every paced boot
 summary now prints those two clocks directly.
 
+GPU timer queries separate that cadence from rendering cost. Eight query
+objects rotate without blocking; a result is consumed only after GL reports it
+available, and the report counts any frame it could not measure rather than
+stalling for one. The query covers native-resolution draws through the final
+window blit, while the existing CPU timers continue to name texture binding and
+readback separately. On the full mission, 1,791 GPU samples average 0.80 ms,
+with 0.8 ms p50, 2.1 ms p95 and 2.67 ms maximum, and no full-ring drops. The
+fixed hangar capture costs 1.27 ms and remains byte-identical before and after
+instrumentation. The measured ~30 fps cadence is therefore not GPU saturation;
+even a 16.7 ms budget has substantial headroom on this host.
+
 **Remaining renderer work:**
 - The framebuffer-alpha stencil, doubled blend factors and absolute-difference
   blend equation; these are shader work and are counted when encountered.
 - Dithering and the point/line primitive paths.
-- GPU timer queries; the present report currently has CPU-side texture and
-  readback costs only.
 
 ## Validation
 
