@@ -1081,9 +1081,13 @@ static void sw_draw(int prim, const psp_vertex *v, int count) {
 
 static void sw_noop(void) { }
 
-/* init(), shutdown() and present() are all unwired: nothing in the runtime or
- * the host calls any of them. They stay because a windowed backend will need
- * them, but check that before hanging behaviour off one. This slot used to hold
+/* init() is called by the host once the backend is chosen (boot.c, from
+ * PSPRECOMP_RENDER); shutdown() and present() are still unwired -- nothing in
+ * the runtime or the host calls either. They stay because a windowed backend
+ * will need them, but check that before hanging behaviour off one. Note that
+ * boot.c's teardown is skipped whenever a guest thread is still live, which is
+ * the common case, so shutdown() would not run reliably even if it were wired.
+ * This slot used to hold
  * the depth clear, and a clear that is never called is a buffer that is never
  * cleared -- the depth buffer spent the whole run at its initial contents and
  * the comment above it described a per-frame clear that did not happen. Depth is
@@ -1144,17 +1148,23 @@ const psp_render_backend psp_render_null = {
 
 /* ---- selection ----------------------------------------------------------- */
 
+static const psp_render_backend *const g_all[] = {
+    &psp_render_software, &psp_render_null
+};
+enum { N_BACKENDS = sizeof g_all / sizeof g_all[0] };
+
 static const psp_render_backend *g_backend = &psp_render_software;
 
 const psp_render_backend *psp_render_current(void) { return g_backend; }
 
 int psp_render_select(const char *name) {
-    static const psp_render_backend *const all[] = {
-        &psp_render_software, &psp_render_null
-    };
     if (!name) return -1;
-    for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
-        if (strcmp(all[i]->name, name) == 0) { g_backend = all[i]; return 0; }
+    for (size_t i = 0; i < N_BACKENDS; i++) {
+        if (strcmp(g_all[i]->name, name) == 0) { g_backend = g_all[i]; return 0; }
     }
     return -1;                       /* unknown: keep the current backend */
+}
+
+const char *psp_render_backend_name(size_t i) {
+    return i < N_BACKENDS ? g_all[i]->name : NULL;
 }

@@ -110,10 +110,24 @@ backend is wrong the same way, which is at least diagnosable.
 | **null** | Working | Counts primitives, draws nothing. What the bring-up host uses when the question is "did it ask to draw". |
 | **gl33-sdl2** | Not started | The intended presentation path. See below. |
 
-Selection is `psp_render_select(name)` (`src/render.c`), and **nothing in the
-host calls it** — only `tests/test_raster.c` does, so `g_backend` is the
-software one in every real run. Wiring it to an environment variable in
-`host/boot.c` is the first prerequisite below, not part of the backend.
+Selection is `psp_render_select(name)` (`src/render.c`), wired to
+**`PSPRECOMP_RENDER`** in `host/boot.c` (3 Sep). Before that nothing outside
+`tests/test_raster.c` called it, so the software backend was the only one a
+real run could have had, and "chosen at run time" above was an aspiration.
+
+An unknown name is **fatal** — `psp_render_select` leaves the current backend
+in place and returns -1, so continuing would run the software rasterizer while
+the operator believed otherwise and attribute every number to the wrong
+backend. The host prints the names it would have taken, which it reads from
+`psp_render_backend_name(i)` rather than keeping a second copy of the list.
+A set-but-empty value means unset, as `PSPRECOMP_AUDIO_DUMP` has it. Every run
+now prints which backend it used.
+
+`init()` is called once the backend is chosen; both current backends return 0
+without doing anything. `shutdown()` and `present()` remain unwired, and
+`shutdown()` is not merely an oversight: boot.c skips its teardown whenever a
+guest thread is still live, which is the common case, so it would not run
+reliably even if it were called.
 
 ## Choosing the API
 
@@ -158,9 +172,9 @@ SDL3 will come — on its own schedule, not bundled into a renderer.
 Scope it deliberately, because the GE has a large state space and most of it
 does not matter until a game is already drawing:
 
-**Prerequisites** — none of these are the backend, and all of them are missing:
-- `psp_render_select` wired to an environment variable in `host/boot.c`, so a
-  backend can be chosen without recompiling
+**Prerequisites** — none of these are the backend:
+- ~~`psp_render_select` wired to an environment variable in `host/boot.c`, so a
+  backend can be chosen without recompiling~~ **done 3 Sep**, `PSPRECOMP_RENDER`
 - A per-frame timer. `psp_render_raster_ns()` is cumulative and printed once at
   the end of a run, which cannot demonstrate the 60 fps the M5 gate asks for
 - Display-list capture and replay. The gate wants "pixel-comparable on a fixed

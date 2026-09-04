@@ -12,6 +12,7 @@
 #define PSPRECOMP_RENDER_H
 
 #include <stdint.h>
+#include <stddef.h>          /* size_t, for the backend enumeration */
 
 /* Screen positions carry four fractional bits: PSP_SUBPX units per pixel, the
  * precision the hardware rasterizes at. Truncating to whole pixels moved every
@@ -176,8 +177,15 @@ typedef struct {
 } psp_render_backend;
 
 /* Select a backend by name ("software", "null", ...). Returns 0 on success,
- * -1 if the name is unknown, leaving the current backend in place. */
+ * -1 if the name is unknown, leaving the current backend in place. A caller
+ * that ignores the -1 gets the software backend while believing it asked for
+ * something else, so check it. */
 int psp_render_select(const char *name);
+
+/* The i'th backend's name, or NULL once past the end -- so a caller can say
+ * which names it would have accepted without keeping its own copy of the list
+ * for that list to drift from. */
+const char *psp_render_backend_name(size_t i);
 
 /* The active backend. Never NULL � defaults to software. */
 const psp_render_backend *psp_render_current(void);
