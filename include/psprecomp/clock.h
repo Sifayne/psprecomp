@@ -25,6 +25,10 @@
 
 #include <stdint.h>
 
+/* 59.94 Hz, rounded to whole microseconds.  Display counters and vblank waits
+ * must share the same grid or a game comparing them observes two clocks. */
+#define PSP_CLOCK_FRAME_US 16667u
+
 #ifdef __cplusplus
 extern "C" {
 #endif

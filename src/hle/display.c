@@ -325,7 +325,7 @@ static void hle_WaitVblank(void) {
 /* Scanline counters.
  *
  * On hardware these advance with the beam whether or not anyone is looking.
- * Here nothing advances on its own -- there is no scanout and no clock -- so a
+ * Under the deterministic virtual clock nothing advances on its own, so a
  * counter that only moved when something else moved it would sit still, and
  * code of the form
  *
@@ -337,6 +337,12 @@ static void hle_WaitVblank(void) {
  * -- but the alternative is a hang, and the same trade is already made by
  * hle_WaitVblank above.
  *
+ * A windowed run is different: its clock already follows monotonic wall time.
+ * Advancing once per read there makes a light scene run as fast as the host can
+ * poll and a heavy scene run in slow motion.  Derive both counters from that
+ * clock instead, while retaining the read-advance fallback for deterministic
+ * headless runs and their busy loops.
+ *
  * The two counters are kept consistent with each other rather than invented
  * separately, because a caller that reads both and compares them would
  * otherwise see nonsense. PSP_HLINES_PER_FRAME is the total scanline count
@@ -345,10 +351,20 @@ static void hle_WaitVblank(void) {
 #define PSP_HLINES_PER_FRAME 286u
 
 static void hle_GetVcount(void) {
+    if (psp_clock_is_realtime()) {
+        psp_ret((uint32_t)(psp_clock_read() / PSP_CLOCK_FRAME_US));
+        return;
+    }
     psp_ret(g_vcount++);
 }
 
 static void hle_GetAccumulatedHcount(void) {
+    if (psp_clock_is_realtime()) {
+        const uint64_t us = psp_clock_read();
+        psp_ret((uint32_t)((us * PSP_HLINES_PER_FRAME) /
+                           PSP_CLOCK_FRAME_US));
+        return;
+    }
     /* Derived, not independent: hcount is vcount's worth of scanlines plus
      * however far into the current frame we pretend to be. */
     psp_ret(g_vcount * PSP_HLINES_PER_FRAME);
@@ -366,7 +382,7 @@ static void hle_GetAccumulatedHcount(void) {
  * 1/fps is a division by zero, and a budget of `fps * seconds` is nothing to do.
  *
  * The clock rounds the frame *interval* to whole microseconds for its own
- * purposes (see PSP_FRAME_US in clock.c); this is the rate, which is what a
+ * purposes (see PSP_CLOCK_FRAME_US in clock.h); this is the rate, which is what a
  * caller asking for frames per second wants, and the two should not be derived
  * from each other. */
 #define PSP_REFRESH_HZ 59.940059f

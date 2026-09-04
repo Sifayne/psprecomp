@@ -3,9 +3,6 @@
 #include "psprecomp/clock.h"
 #include "psprecomp/os.h"
 
-/* 59.94Hz, the PSP's refresh rate, rounded to whole microseconds. */
-#define PSP_FRAME_US 16667u
-
 /* How far a firmware call moves the clock.
  *
  * It exists only so that time cannot stop: a thread spinning on calls that neither
@@ -150,7 +147,7 @@ uint64_t psp_clock_read(void) {
  * Strictly future, so a caller already standing exactly on a boundary waits for
  * the next one rather than returning immediately. */
 uint64_t psp_clock_next_frame(void) {
-    return (g_us / PSP_FRAME_US + 1) * PSP_FRAME_US;
+    return (g_us / PSP_CLOCK_FRAME_US + 1) * PSP_CLOCK_FRAME_US;
 }
 
 /* One tick, for a caller that is doing work rather than reading the time.

@@ -11,6 +11,7 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/dispatch.h"
+#include "psprecomp/clock.h"
 #include "crypto/sha1.h"
 
 #include <stdio.h>
@@ -792,7 +793,19 @@ static void test_stdio_async(void) {
 }
 
 static void test_display(void) {
+    psp_clock_realtime(0);
     psp_display_reset();
+
+    /* Headless runs retain the advancing-counter fallback: without a real
+     * scanout clock, a guest busy-waiting on either value must still make
+     * progress.  Windowed runs exercise the wall-time branch in the replay
+     * integration tests. */
+    CHECK(call(psp_nid("sceDisplayGetVcount"), 0, 0, 0, 0) == 0,
+          "virtual vcount starts at zero");
+    CHECK(call(psp_nid("sceDisplayGetAccumulatedHcount"), 0, 0, 0, 0) == 286,
+          "virtual hcount shares vcount's 286-line grid");
+    CHECK(call(psp_nid("sceDisplayGetVcount"), 0, 0, 0, 0) == 2,
+          "virtual counter reads continue to advance");
 
     CHECK(call(psp_nid("sceDisplaySetMode"), 0, 480, 272, 0) == 0, "set mode");
     /* (topaddr, bufferwidth, pixelformat, sync) */
