@@ -332,6 +332,25 @@ fixed hangar capture costs 1.27 ms and remains byte-identical before and after
 instrumentation. The measured ~30 fps cadence is therefore not GPU saturation;
 even a 16.7 ms budget has substantial headroom on this host.
 
+The fixed-list oracle also pins the small arithmetic details that a plausible
+GL image can hide. Interpolated colour and texture-function output are
+quantized at the software path's RGBA8 boundaries; fog and masked alpha tests
+operate on those byte values. For source-alpha blends whose framebuffer alpha
+is the masked stencil byte, the shader computes the GE's separately truncated
+source term before fixed-function blending and biases the inverse-alpha
+destination term so GL's final round reproduces the GE floor. Draws that write
+alpha and equations where that transformation is invalid retain the ordinary
+path. A 1/256-pixel vertical bias converts GL's lower-left half-open edge rule
+to the PSP's top-edge ownership after Y is flipped, removing missing rows from
+half-pixel UI rectangles. Host-default dithering is explicitly disabled while
+GE dither state remains unimplemented.
+
+On the selected 14,806-command hangar capture these rules raise exact pixels
+from 62,870 to 122,818 of 130,560 and reduce normalized RMSE from 0.005718 to
+0.001168. Only seven pixels differ by more than two channel levels. The full
+mission still completes at zero bad accesses and normal pacing; its measured
+draw-plus-blit cost is 0.81 ms mean, 2.1 ms p95 and 2.85 ms maximum.
+
 **Remaining renderer work:**
 - The framebuffer-alpha stencil, doubled blend factors and absolute-difference
   blend equation; these are shader work and are counted when encountered.
