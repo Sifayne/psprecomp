@@ -307,6 +307,17 @@ frame; reporting API calls as frames would falsely claim about 63 fps. Both
 measured paths are steadily following the game's ~30 fps cadence rather than
 the GL renderer slowing down only in the mission.
 
+That cadence is now tied to one clock rather than to the speed of the caller.
+In a real-time run, display vcount and accumulated hcount are derived from the
+monotonic-backed guest clock; deterministic headless runs keep the synthetic
+read advance they need to escape a counter busy-loop. The host also waits for
+SDL window, GL-context and audio setup before it anchors real time. Previously
+that asynchronous setup appeared as about 435 ms of elapsed game time before
+the hangar settled; after the barrier the null and GL paths reach the same
+430th update at 14.769 s and 14.787 s. The full GL mission records 56.639 s of
+guest time over 56.639 s of wall time (0.018 ms drift), and every paced boot
+summary now prints those two clocks directly.
+
 **Remaining renderer work:**
 - The framebuffer-alpha stencil, doubled blend factors and absolute-difference
   blend equation; these are shader work and are counted when encountered.

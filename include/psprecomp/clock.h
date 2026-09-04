@@ -81,6 +81,13 @@ void psp_clock_advance_to(uint64_t us);
 void psp_clock_realtime(int enable);
 int  psp_clock_is_realtime(void);
 
+/* A non-perturbing end-of-run measurement of the real-time mapping. Returns
+ * zero while the deterministic virtual clock is selected. `guest_us` is the
+ * latest time adopted by guest execution and `wall_us` is elapsed monotonic
+ * time since the real-time origin; their difference exposes pacing drift
+ * without making a clock read change the value being measured. */
+int psp_clock_realtime_stats(uint64_t *guest_us, uint64_t *wall_us);
+
 #ifdef __cplusplus
 }
 #endif

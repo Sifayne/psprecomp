@@ -111,6 +111,13 @@ void psp_clock_realtime(int enable) {
 
 int psp_clock_is_realtime(void) { return g_realtime; }
 
+int psp_clock_realtime_stats(uint64_t *guest_us, uint64_t *wall_us) {
+    if (!g_realtime) return 0;
+    if (guest_us) *guest_us = g_us;
+    if (wall_us) *wall_us = (wall_ns() - g_origin_ns) / 1000u;
+    return 1;
+}
+
 void psp_clock_reset(void) {
     g_us = 0;
     /* Re-anchor if the mode is already on: reset means a new run, and the

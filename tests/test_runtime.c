@@ -7,6 +7,7 @@
  */
 
 #include "psprecomp/recomp_rt.h"
+#include "psprecomp/clock.h"
 
 #include <stdio.h>
 
@@ -35,6 +36,22 @@ static void test_zero_register(void) {
 
     psp_set_reg(PSP_REG_A0, 0xDEADBEEF);
     CHECK_EQ(psp_cpu.r[PSP_REG_A0], 0xDEADBEEFu, "$a0 is writable");
+}
+
+static void test_clock_mode_report(void) {
+    uint64_t guest = UINT64_MAX, wall = UINT64_MAX;
+    psp_clock_realtime(0);
+    psp_clock_reset();
+    CHECK(psp_clock_realtime_stats(&guest, &wall) == 0,
+          "virtual clock does not report a wall-time mapping");
+
+    psp_clock_realtime(1);
+    psp_clock_reset();
+    CHECK(psp_clock_realtime_stats(&guest, &wall) == 1,
+          "real-time clock reports its wall-time mapping");
+    CHECK(guest == 0, "fresh real-time guest clock starts at zero");
+    CHECK(wall < 1000000u, "fresh real-time wall clock has a sane origin");
+    psp_clock_realtime(0);
 }
 
 static void test_division(void) {
@@ -259,6 +276,7 @@ static void test_unaligned(void) {
 
 int main(void) {
     test_zero_register();
+    test_clock_mode_report();
     test_division();
     test_multiply();
     test_shifts();
