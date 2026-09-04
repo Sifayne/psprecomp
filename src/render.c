@@ -1148,23 +1148,45 @@ const psp_render_backend psp_render_null = {
 
 /* ---- selection ----------------------------------------------------------- */
 
-static const psp_render_backend *const g_all[] = {
+/* The table is seeded with the backends the runtime carries and grows by
+ * registration, because anything needing a window or a GL context cannot live
+ * here: the core has no external dependencies on purpose and SDL2 is the
+ * host's. So the host implements such a backend and hands it over, and every
+ * caller keeps selecting by name without knowing which side it came from. */
+enum { PSP_RENDER_MAX = 8 };
+static const psp_render_backend *g_all[PSP_RENDER_MAX] = {
     &psp_render_software, &psp_render_null
 };
-enum { N_BACKENDS = sizeof g_all / sizeof g_all[0] };
+static size_t g_n_all = 2;
 
 static const psp_render_backend *g_backend = &psp_render_software;
 
 const psp_render_backend *psp_render_current(void) { return g_backend; }
 
+int psp_render_register(const psp_render_backend *b) {
+    if (!b || !b->name || !*b->name) return -1;
+    if (g_n_all >= PSP_RENDER_MAX) return -1;
+    /* Every entry point must be present. A half-filled backend would pass
+     * registration and crash at whichever call it forgot, arbitrarily far
+     * from here -- and the interface is twelve calls precisely so that a
+     * backend cannot quietly not implement one of them. */
+    if (!b->init || !b->shutdown || !b->set_target || !b->set_scissor ||
+        !b->set_texture || !b->set_clut || !b->set_depth || !b->set_blend ||
+        !b->set_fog || !b->draw || !b->finish || !b->present) return -1;
+    for (size_t i = 0; i < g_n_all; i++)
+        if (strcmp(g_all[i]->name, b->name) == 0) return -1;   /* name taken */
+    g_all[g_n_all++] = b;
+    return 0;
+}
+
 int psp_render_select(const char *name) {
     if (!name) return -1;
-    for (size_t i = 0; i < N_BACKENDS; i++) {
+    for (size_t i = 0; i < g_n_all; i++) {
         if (strcmp(g_all[i]->name, name) == 0) { g_backend = g_all[i]; return 0; }
     }
     return -1;                       /* unknown: keep the current backend */
 }
 
 const char *psp_render_backend_name(size_t i) {
-    return i < N_BACKENDS ? g_all[i]->name : NULL;
+    return i < g_n_all ? g_all[i]->name : NULL;
 }

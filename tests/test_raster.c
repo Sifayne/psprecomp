@@ -722,6 +722,70 @@ static void test_backend_selection(void) {
     CHECK(psp_render_select("software") == 0, "software reselectable");
 }
 
+/* Registration, which is how a backend that cannot live in the runtime gets
+ * in. A GL backend needs a window and a GL context, and the core has no
+ * external dependencies on purpose, so the host builds one and hands it over.
+ * Nothing here needs a GPU: what is being tested is the seam. */
+static int probe_init(int w, int h) { (void)w; (void)h; return 0; }
+static void probe_target(uint32_t a, uint32_t s, int f) { (void)a; (void)s; (void)f; }
+static void probe_scissor(int a, int b, int c, int d) { (void)a;(void)b;(void)c;(void)d; }
+static void probe_texture(const psp_tex_state *t) { (void)t; }
+static void probe_clut(uint32_t a, int f, int sh, int m, int st) {
+    (void)a; (void)f; (void)sh; (void)m; (void)st;
+}
+static void probe_depth(int t, int f, int w) { (void)t; (void)f; (void)w; }
+static void probe_blend(const psp_blend_state *b) { (void)b; }
+static void probe_fog(int e, uint32_t c) { (void)e; (void)c; }
+static unsigned g_probe_draws;
+static void probe_draw(int p, const psp_vertex *v, int n) {
+    (void)p; (void)v; (void)n; g_probe_draws++;
+}
+static void probe_noop(void) { }
+
+static const psp_render_backend probe_backend = {
+    .name = "probe", .init = probe_init, .shutdown = probe_noop,
+    .set_target = probe_target, .set_scissor = probe_scissor,
+    .set_texture = probe_texture, .set_clut = probe_clut,
+    .set_depth = probe_depth, .set_blend = probe_blend, .set_fog = probe_fog,
+    .draw = probe_draw, .finish = probe_noop, .present = probe_noop,
+};
+
+static void test_backend_registration(void) {
+    CHECK(psp_render_register(&probe_backend) == 0, "a backend can be registered");
+    CHECK(psp_render_register(&probe_backend) != 0, "the same name twice is refused");
+    CHECK(psp_render_register(NULL) != 0, "NULL backend refused");
+
+    /* A backend missing an entry point would pass registration and then crash
+     * at whichever call it forgot, arbitrarily far from the mistake. */
+    psp_render_backend gap = probe_backend;
+    gap.name = "gap"; gap.set_fog = NULL;
+    CHECK(psp_render_register(&gap) != 0, "a backend missing an entry point is refused");
+
+    /* It shows up in the enumeration, which is what the host prints when it
+     * refuses an unknown name -- so the list cannot drift from the table. */
+    int listed = 0;
+    for (size_t i = 0; psp_render_backend_name(i); i++)
+        if (strcmp(psp_render_backend_name(i), "probe") == 0) listed = 1;
+    CHECK(listed, "a registered backend is enumerated");
+
+    /* And it is selectable and actually driven by the GE, which is the whole
+     * point: the interpreter must not care which side a backend came from. */
+    CHECK(psp_render_select("probe") == 0, "registered backend selectable");
+    psp_ge_reset();
+    clear_fb();
+    g_probe_draws = 0;
+    begin_list();
+    vertex(0, 10, 10, 0xFFFFFFFFu);
+    vertex(1, 60, 60, 0xFFFFFFFFu);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    CHECK(g_probe_draws == 1, "the GE drove the registered backend, %u draw(s)",
+          g_probe_draws);
+    CHECK(psp_ge_pixels() == 0, "a backend that draws nothing writes no pixels");
+
+    CHECK(psp_render_select("software") == 0, "software reselectable after");
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -745,6 +809,7 @@ int main(void) {
     test_depth_test_still_rejects();
     test_ge_reset_clears_depth();
     test_backend_selection();
+    test_backend_registration();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

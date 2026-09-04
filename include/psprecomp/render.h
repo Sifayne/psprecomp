@@ -182,6 +182,15 @@ typedef struct {
  * something else, so check it. */
 int psp_render_select(const char *name);
 
+/* Add a backend the runtime does not carry. Anything needing a window or a GL
+ * context lives in the host -- the core has no external dependencies and SDL2
+ * is the host's -- so the host builds one and registers it here, after which
+ * it is selectable by name like any other. The pointer is kept, not copied, so
+ * it must outlive the run. Returns 0, or -1 if the name is empty, already
+ * taken, the table is full, or any of the twelve entry points is missing.
+ * Registration is the only place that missing one can be caught cheaply. */
+int psp_render_register(const psp_render_backend *b);
+
 /* The i'th backend's name, or NULL once past the end -- so a caller can say
  * which names it would have accepted without keeping its own copy of the list
  * for that list to drift from. */
