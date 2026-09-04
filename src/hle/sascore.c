@@ -55,8 +55,25 @@
 /* Not a sascore code at all: mixing in output mode 1 comes back as a plain
  * "not supported" from the layer below. */
 #define SAS_ERROR_MIX_MODE     0x80000004u
+/* A negative ADSR rate -- setadsr.expected's "Value ffffffff". */
+#define SAS_ERROR_ADSR_VALUE   0x80420019u
 
 static int grain_ok(uint32_t g) { return g >= 64 && g <= SAS_MAX_GRAIN && (g % 32) == 0; }
+
+/* The guest's SasCore, which is not just a handle: hardware keeps the caller's
+ * struct up to date and a game -- or a test -- may read fields straight out of
+ * it rather than through a getter. setadsr.expected does exactly that, which
+ * is why every value it prints used to be zero here.
+ *
+ * The layout is pspautotests' sascore.h: a 20-byte header, then 56-byte
+ * voices. Only the ADSR block is mirrored, because that is the part the
+ * corpus reads and the part a setter is expected to have written by the time
+ * it returns. */
+#define SAS_G_HEADER          20u
+#define SAS_G_VOICE           56u
+#define SAS_G_ATTACK_RATE     24u   /* four int rates: attack, decay, sustain, release */
+#define SAS_G_SUSTAIN_LEVEL   40u
+#define SAS_G_ATTACK_TYPE     44u   /* four bytes, same order */
 
 /* VAG ADPCM predictor coefficients. Each 16-byte block names a filter in the
  * top nibble of its header; the decoded sample is the shifted nibble plus a
@@ -139,26 +156,33 @@ typedef struct {
     uint32_t pitch;         /* 0x1000 == 1.0 */
     uint32_t frac;          /* resampling accumulator, 12-bit fraction */
 
-    int32_t  vol_l, vol_r;  /* 0x1000 == unity */
+    int32_t  vol_l, vol_r;      /* 0x1000 == unity */
+    int32_t  vol_el, vol_er;    /* the two reverb sends, same scale */
     int      env_state;
     int32_t  env;           /* 0 .. 0x40000000 */
     int32_t  attack_rate, decay_rate, sustain_level, release_rate;
+    /* The sustain *rate* is stored and mirrored but does not drive anything
+     * here: this renderer's sustain phase holds. __sceSasSetADSR's fourth
+     * value is filed under it by hardware -- setadsr.expected reads it back
+     * from sustainRate, not sustainLevel -- while the same value is what this
+     * envelope needs as the decay's target for pcm and vag to come out
+     * exact. Item 45's four unresolved decay sweeps sit on that seam. */
+    int32_t  sustain_rate;
     uint32_t mode_attack, mode_decay, mode_sustain, mode_release;
 
     /* The key is not the sound.
      *
-     * `on` is the key. A key-on is refused while it is down (0x80420016),
-     * and a key-off does not lift it by itself: keyon.expected still refuses
-     * a key-on issued after a key-off and a pause, and accepts one issued
-     * after a key-off and a *core*. So the key lifts when a core processes
-     * the key-off, which is also when the envelope enters its release, and
-     * `playing` outlives it -- the release is still audible after the key is
-     * up, and a fresh key-on may arrive while it still is. adsrcurve needs
-     * exactly that: it starts each of its 53 sweeps with a key-off and one
-     * core, and a release that has not finished must not stop the next
-     * sweep from keying on. Tying the refusal to `playing` instead left the
-     * old envelope running and the sweep measured the previous section's
-     * curve. */
+     * `on` is the key, and a key-on is refused while it is down (0x80420016).
+     * A key-off lifts it immediately -- pcm and vag key a voice off and
+     * straight back on with no core between and hardware restarts it -- while
+     * the *release* it schedules waits for the next core, which is what
+     * `keyoff_pending` carries. `playing` outlives the key either way: the
+     * release is still audible after the key is up, and a fresh key-on may
+     * arrive while it still is. adsrcurve needs exactly that: it starts each
+     * of its 53 sweeps with a key-off and one core, and a release that has
+     * not finished must not stop the next sweep from keying on. Tying the
+     * refusal to `playing` instead left the old envelope running and the
+     * sweep measured the previous section's curve. */
     int      on;
     int      keyoff_pending;
     int      playing;
@@ -201,8 +225,10 @@ void psp_sas_reset(void) {
     }
     for (int i = 0; i < SAS_VOICES; i++) {
         g_voice[i].pitch = 0x1000;
-        g_voice[i].vol_l = 0x1000;
-        g_voice[i].vol_r = 0x1000;
+        g_voice[i].vol_l  = 0x1000;
+        g_voice[i].vol_r  = 0x1000;
+        g_voice[i].vol_el = 0x1000;
+        g_voice[i].vol_er = 0x1000;
     }
     g_grain = 256;
     g_max_voices = SAS_VOICES;
@@ -295,7 +321,13 @@ static int32_t curve_step(uint32_t mode, int32_t h, int32_t rate, int32_t target
     switch (mode & 7u) {
     case CURVE_LINEAR_INC:  return h + rate;
     case CURVE_LINEAR_DEC:  return h - rate;
-    case CURVE_LINEAR_BENT: return h + ((h < (ENV_MAX / 4) * 3) ? rate : (rate >> 2));
+    /* At three-quarter height exactly the step is still the full rate: the
+      * bend is on the way *past* the knee, not at it. adsrcurve's crossing
+      * core moves 0x028C0000 where a full core moves 0x02800000, which is 33
+      * full steps and 31 quarter ones -- one more full step than a strict
+      * comparison gives, and the only split of 64 that lands on hardware's
+      * number. */
+    case CURVE_LINEAR_BENT: return h + ((h <= (ENV_MAX / 4) * 3) ? rate : (rate >> 2));
     case CURVE_EXP_REV: {
         /* The falling exponential. The parity rule names which is which: the
          * odd curves are the falling shapes, so a decay or a release takes
@@ -335,6 +367,12 @@ static int32_t step_envelope(sas_voice *v) {
         if (v->env >= ENV_MAX) { v->env = ENV_MAX; v->env_state = ENV_DECAY; }
         break;
     case ENV_DECAY:
+        /* Direct is instant: the phase is over, and the height it was going
+         * to ramp towards is the height it already has. That is what lets a
+         * voice with a full-rate attack and a direct decay hold at the top --
+         * pcm and vag both do exactly that and stay at full scale -- while a
+         * decay with a real curve runs all the way to the sustain level. */
+        if (v->mode_decay == CURVE_DIRECT) { v->env_state = ENV_SUSTAIN; break; }
         v->env = curve_step(v->mode_decay, v->env, v->decay_rate, v->sustain_level, 0);
         if (v->env <= v->sustain_level) { v->env = v->sustain_level; v->env_state = ENV_SUSTAIN; }
         break;
@@ -350,9 +388,12 @@ static int32_t step_envelope(sas_voice *v) {
 }
 
 /* Render `samples` stereo frames, summing every active voice. */
-static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
-    memset(mix_l, 0, samples * sizeof *mix_l);
-    memset(mix_r, 0, samples * sizeof *mix_r);
+static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix_er,
+                   uint32_t samples) {
+    memset(mix_l,  0, samples * sizeof *mix_l);
+    memset(mix_r,  0, samples * sizeof *mix_r);
+    memset(mix_el, 0, samples * sizeof *mix_el);
+    memset(mix_er, 0, samples * sizeof *mix_er);
 
     for (uint32_t vi = 0; vi < g_max_voices; vi++) {
         sas_voice *v = &g_voice[vi];
@@ -401,8 +442,10 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
             const int32_t env = v->env;
             s = (s * (env >> 18)) >> 12;
 
-            mix_l[i] += (s * v->vol_l) >> 12;
-            mix_r[i] += (s * v->vol_r) >> 12;
+            mix_l[i]  += (s * v->vol_l)  >> 12;
+            mix_r[i]  += (s * v->vol_r)  >> 12;
+            mix_el[i] += (s * v->vol_el) >> 12;
+            mix_er[i] += (s * v->vol_er) >> 12;
             step_envelope(v);
 
             /* Pitch is a 12-bit fixed-point step: 0x1000 plays at the source
@@ -559,20 +602,49 @@ static void hle_SetVolume(void) {
         const int32_t vol = (int32_t)psp_arg(i);
         if (vol < -0x1000 || vol > 0x1000) { psp_ret(SAS_ERROR_VOLUME); return; }
     }
-    v->vol_l = (int32_t)psp_arg(2);
-    v->vol_r = (int32_t)psp_arg(3);
+    v->vol_l  = (int32_t)psp_arg(2);
+    v->vol_r  = (int32_t)psp_arg(3);
+    v->vol_el = (int32_t)psp_arg(4);
+    v->vol_er = (int32_t)psp_arg(5);
     psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Write the voice's ADSR block back into the caller's struct, so a read
+ * straight after a setter sees what hardware would have left there. */
+static void mirror_adsr(const sas_voice *v) {
+    const uint32_t core = psp_arg(0);
+    const uint32_t vi   = psp_arg(1);
+    if (!core || vi >= SAS_VOICES) return;
+    const uint32_t a = core + SAS_G_HEADER + vi * SAS_G_VOICE;
+    psp_write32(a + SAS_G_ATTACK_RATE,      (uint32_t)v->attack_rate);
+    psp_write32(a + SAS_G_ATTACK_RATE + 4,  (uint32_t)v->decay_rate);
+    psp_write32(a + SAS_G_ATTACK_RATE + 8,  (uint32_t)v->sustain_rate);
+    psp_write32(a + SAS_G_ATTACK_RATE + 12, (uint32_t)v->release_rate);
+    psp_write32(a + SAS_G_SUSTAIN_LEVEL,    (uint32_t)v->sustain_level);
+    psp_write8 (a + SAS_G_ATTACK_TYPE,      (uint8_t)v->mode_attack);
+    psp_write8 (a + SAS_G_ATTACK_TYPE + 1,  (uint8_t)v->mode_decay);
+    psp_write8 (a + SAS_G_ATTACK_TYPE + 2,  (uint8_t)v->mode_sustain);
+    psp_write8 (a + SAS_G_ATTACK_TYPE + 3,  (uint8_t)v->mode_release);
 }
 
 static void hle_SetADSR(void) {
     /* (sasCore, voice, flags, attack, decay, sustain, release) */
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
-    uint32_t flags = psp_arg(2);
+    const uint32_t flags = psp_arg(2);
+    /* A rate is not signed: 0x7FFFFFFF is accepted and anything with the top
+     * bit set is refused, -1 included. Checked before anything is stored, and
+     * only for the fields the flags select -- setadsr.expected passes -1 for
+     * all four with no flag set and gets OK with the old values intact. */
+    for (int i = 0; i < 4; i++)
+        if ((flags & (1u << i)) && (int32_t)psp_arg(3 + i) < 0) {
+            psp_ret(SAS_ERROR_ADSR_VALUE); return;
+        }
     if (flags & 1) v->attack_rate  = (int32_t)psp_arg(3);
     if (flags & 2) v->decay_rate   = (int32_t)psp_arg(4);
-    if (flags & 4) v->sustain_level = (int32_t)psp_arg(5);
+    if (flags & 4) v->sustain_rate  = (int32_t)psp_arg(5);
     if (flags & 8) v->release_rate = (int32_t)psp_arg(6);
+    mirror_adsr(v);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -593,19 +665,78 @@ static void hle_SetADSRmode(void) {
     if (flags & 2) v->mode_decay   = d & 7u;
     if (flags & 4) v->mode_sustain = su & 7u;   /* stored; the shapes are findings item 45 */
     if (flags & 8) v->mode_release = r & 7u;
+    mirror_adsr(v);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* The seven-bit rate the attack and sustain fields carry: a three-bit step
+ * placed at bit 26 and shifted down by the exponent above it. All ones is
+ * zero -- silence, not the slowest rate -- and anything that shifts away to
+ * nothing is one, since a rate of zero would mean an envelope that never
+ * moves at all. */
+static uint32_t simple_rate7(uint32_t r) {
+    if (r == 0x7Fu) return 0;
+    const uint32_t v = ((7u - (r & 3u)) << 26) >> (r >> 2);
+    return v ? v : 1u;
+}
+static uint32_t simple_sat(uint32_t v) { return v > 0x7FFFFFFFu ? 0x7FFFFFFFu : v; }
+
+/* __sceSasSetSimpleADSR(sasCore, voice, adsr1, adsr2) -- the packed PSX-style
+ * envelope, two 16-bit words:
+ *
+ *   adsr1  15 attack type | 14..8 attack rate | 7..4 decay rate | 3..0 level
+ *   adsr2  15..14 sustain type | 13 reserved | 12..6 sustain rate |
+ *           5 release type | 4..0 release rate
+ *
+ * Every field's decode is read off setadsr.expected, which sweeps all of them
+ * and prints the 32-bit values the struct ends up holding -- 106 rows, all
+ * reproduced. The four decodes are not one formula:
+ *
+ *   - attack and sustain use the seven-bit form above; sustain type 3 takes a
+ *     further quarter of it
+ *   - decay is 0x80000000 shifted down by its four bits, saturated, so a rate
+ *     of 0 reads back as INT_MAX rather than a negative number
+ *   - release is 0x80000000 >> rate for the exponential type and 0x40000000
+ *     >> (rate + 2) for the linear one -- and that second shift is a MIPS
+ *     shift, taken modulo 32, which is why release rate 30 comes back as
+ *     0x40000000 instead of the 0 the arithmetic would give. All ones is
+ *     zero for both.
+ *
+ * The types are not the raw bits either: attack picks between linear-increase
+ * and bent, release between linear-decrease and exponent-rev, decay is always
+ * exponent-rev, and only sustain passes its two bits through.
+ *
+ * What stood here before was an invented approximation -- a fast attack and a
+ * slow release, chosen to sound plausible. */
 static void hle_SetSimpleADSR(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
-    /* The packed form encodes rates in two 16-bit words. Without the exact
-     * curve tables this is an approximation: fast attack, slow release. Audio
-     * plays at the right pitch and duration; envelope shape is not exact. */
-    v->attack_rate   = 0x40000000 / 64;
-    v->decay_rate    = 0x40000000 / 512;
-    v->sustain_level = 0x30000000;
-    v->release_rate  = 0x40000000 / 256;
+    const uint32_t a1 = psp_arg(2) & 0xFFFFu, a2 = psp_arg(3) & 0xFFFFu;
+    /* Bit 13 of the second word is reserved, and setting it is refused. */
+    if (a2 & (1u << 13)) { psp_ret(SAS_ERROR_ADSR_MODE); return; }
+
+    const uint32_t ar = (a1 >> 8) & 0x7Fu, dr = (a1 >> 4) & 0xFu, sl = a1 & 0xFu;
+    const uint32_t st = (a2 >> 14) & 3u,   sr = (a2 >> 6) & 0x7Fu;
+    const uint32_t rt = (a2 >> 5) & 1u,    rr = a2 & 0x1Fu;
+
+    uint32_t sus = simple_rate7(sr);
+    if (st == 3u && sr != 0x7Fu) { sus >>= 2; if (!sus) sus = 1u; }
+
+    uint32_t rel;
+    if (rr == 0x1Fu)  rel = 0;
+    else if (rt)      rel = simple_sat(0x80000000u >> rr);
+    else            { rel = 0x40000000u >> ((rr + 2u) & 31u); if (!rel) rel = 1u; }
+
+    v->mode_attack  = ((a1 >> 15) & 1u) ? CURVE_LINEAR_BENT : CURVE_LINEAR_INC;
+    v->mode_decay   = CURVE_EXP_REV;
+    v->mode_sustain = st;
+    v->mode_release = rt ? CURVE_EXP_REV : CURVE_LINEAR_DEC;
+    v->attack_rate   = (int32_t)simple_rate7(ar);
+    v->decay_rate    = (int32_t)simple_sat(0x80000000u >> dr);
+    v->sustain_rate  = (int32_t)sus;
+    v->release_rate  = (int32_t)rel;
+    v->sustain_level = (int32_t)((sl + 1u) << 26);
+    mirror_adsr(v);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -615,6 +746,7 @@ static void hle_SetSL(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     v->sustain_level = (int32_t)psp_arg(2);
+    mirror_adsr(v);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -726,9 +858,31 @@ static void hle_GetAllEnvelopeHeights(void) {
  * itself -- 12-bit, as everywhere else here -- is by analogy with the voice
  * volumes rather than measured. */
 static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_r) {
-    int32_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN];
-    uint32_t n = g_grain;
-    render(l, r, n);
+    int32_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN], el[SAS_MAX_GRAIN], er[SAS_MAX_GRAIN];
+    const uint32_t n = g_grain;
+    render(l, r, el, er, n);
+
+    /* Output mode 1 is not a different mix, it is a different *shape*: four
+     * mono blocks of `grain` samples, one after another -- dry left, dry
+     * right, then the two reverb sends -- where mode 0 writes one block of
+     * interleaved stereo. outputmode.expected reads the same three positions
+     * out of each block and finds the same samples at four volumes: a value
+     * of -33 in the first block reads -25, -17 and -9 in the others, which is
+     * the voice's 0x1000, 0x0C00, 0x0800 and 0x0400 with the product shifted
+     * down rather than rounded. */
+    if (g_output_mode == 1) {
+        const int32_t *block[4] = { l, r, el, er };
+        for (int b = 0; b < 4; b++) {
+            const uint32_t base = out_addr + (uint32_t)b * n * 2u;
+            for (uint32_t i = 0; i < n; i++) {
+                const int32_t v = clamp16(block[b][i]);
+                psp_write16(base + i * 2u, (uint16_t)(int16_t)v);
+                if (v) g_samples_nonzero++;
+            }
+        }
+        g_frames_rendered++;
+        return;
+    }
 
     for (uint32_t i = 0; i < n; i++) {
         int32_t sl = clamp16(l[i]), sr = clamp16(r[i]);
