@@ -167,6 +167,41 @@ Both are cheap to act on later, because `ge.c` reaches the backend through
 `psp_render_current()` and nowhere else. SDL2 is in maintenance and a move to
 SDL3 will come — on its own schedule, not bundled into a renderer.
 
+## Where a GL backend lives, and on which thread
+
+Two facts settled this, both measured rather than assumed.
+
+**It lives in the host.** The core has no external dependencies on purpose and
+SDL2 is the host's, so a backend needing a window and a GL context cannot live
+in the runtime. `psp_render_register()` is the seam: the host builds a backend
+and hands the pointer over, after which it is selectable by name like any
+other and the interpreter cannot tell which side it came from. Registration
+refuses a backend missing any of the twelve entry points, because the
+alternative is a crash at whichever call it forgot, arbitrarily far from the
+mistake. `tests/test_raster.c` covers the seam with a probe backend and needs
+no GPU to do it.
+
+**The context belongs on the GE thread.** SDL runs on its own thread here
+(`host/present.c`), which owns the window and the event loop, while display
+lists execute on whichever guest thread submitted them -- and a GL context
+belongs to exactly one thread. Measured: **the GE is driven by exactly one
+host thread**, 864 lists in the hangar and 3,584 in the mission, all from one.
+So the SDL thread creates the window and the context and then releases it with
+`SDL_GL_MakeCurrent(win, NULL)`; the GE thread claims it on first use and
+keeps it; `present()` swaps from there. No command queue and no cross-thread
+marshalling, which is the design a second GE thread would have forced.
+
+That assumption is load-bearing, so a GL backend must **fail loudly** if the
+thread it is called on ever changes, rather than issuing GL calls against a
+context that is not current. The census in `psp_ge_dump_stats` reports the
+thread count in every run, so the assumption is checked continuously rather
+than once.
+
+**Headless is the limit of this.** A GL backend needs a window, hidden or
+otherwise, so the software-versus-GL comparison runs on a desktop rather than
+in CI. That does not weaken the arrangement in *Validation* below: the
+software backend is what must keep working with no GPU, and it does.
+
 ## The GL 3.3 backend, when it happens
 
 Scope it deliberately, because the GE has a large state space and most of it
@@ -175,6 +210,8 @@ does not matter until a game is already drawing:
 **Prerequisites** — none of these are the backend:
 - ~~`psp_render_select` wired to an environment variable in `host/boot.c`, so a
   backend can be chosen without recompiling~~ **done 3 Sep**, `PSPRECOMP_RENDER`
+- ~~A seam for a backend the runtime cannot carry~~ **done 3 Sep**,
+  `psp_render_register()`
 - A per-frame timer. `psp_render_raster_ns()` is cumulative and printed once at
   the end of a run, which cannot demonstrate the 60 fps the M5 gate asks for
 - Display-list capture and replay. The gate wants "pixel-comparable on a fixed

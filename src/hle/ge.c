@@ -25,6 +25,11 @@
  */
 
 #include <math.h>
+#ifndef _WIN32
+#include <pthread.h>          /* the GE thread census; see ge_note_thread */
+#else
+#include <windows.h>
+#endif
 #include "psprecomp/hle.h"
 #include "psprecomp/render.h"
 #include "psprecomp/sched.h"
@@ -417,6 +422,29 @@ static void note_uv(float u, float v) {
 }
 
 
+/* Which host threads execute display lists. A GL context belongs to exactly
+ * one thread, and the GE runs on whichever guest thread submitted the list --
+ * so before a GL backend can be designed this has to be a number, not an
+ * assumption. Census only; nothing depends on it yet. */
+enum { GE_MAX_THREADS = 8 };
+static struct { unsigned long id; uint64_t lists; } g_ge_threads[GE_MAX_THREADS];
+static int g_ge_nthreads;
+static uint64_t g_ge_thread_overflow;
+
+static void ge_note_thread(void) {
+#ifndef _WIN32
+    const unsigned long id = (unsigned long)pthread_self();
+#else
+    const unsigned long id = (unsigned long)GetCurrentThreadId();
+#endif
+    for (int i = 0; i < g_ge_nthreads; i++)
+        if (g_ge_threads[i].id == id) { g_ge_threads[i].lists++; return; }
+    if (g_ge_nthreads >= GE_MAX_THREADS) { g_ge_thread_overflow++; return; }
+    g_ge_threads[g_ge_nthreads].id = id;
+    g_ge_threads[g_ge_nthreads].lists = 1;
+    g_ge_nthreads++;
+}
+
 void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
     memset(&g_ge, 0, sizeof g_ge);
@@ -508,6 +536,11 @@ void psp_ge_dump_stats(FILE *out) {
      * targets have to be tracked. Primitives are attributed to the target
      * current when they were drawn, which is the number that matters -- a
      * target set once and never drawn into is noise. */
+    fprintf(out, "    GE driven by %d host thread(s)%s\n", g_ge_nthreads,
+            g_ge_thread_overflow ? " (more than the census holds)" : "");
+    for (int i = 0; i < g_ge_nthreads; i++)
+        fprintf(out, "      thread %lu: %llu list(s)\n", g_ge_threads[i].id,
+                (unsigned long long)g_ge_threads[i].lists);
     int drawn_into = 0;
     for (int i = 0; i < g_ge.n_targets; i++)
         if (g_ge.targets[i].prims) drawn_into++;
@@ -1818,6 +1851,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
  * intermediate state while the CPU is still writing, and without a bound a
  * malformed or partially-written list hangs the host with no diagnostic. */
 static void run_list(ge_queue *q) {
+    ge_note_thread();
     uint32_t stack[GE_STACK];
     int sp = 0;
     uint64_t budget = 1u << 22;
