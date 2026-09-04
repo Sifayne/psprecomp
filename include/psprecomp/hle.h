@@ -319,6 +319,22 @@ uint32_t psp_ge_target(void);
  * tests that must see finished pixels without going through Sync. */
 void psp_ge_drain_all(void);
 
+/* The GE's register state, for capture and replay. Commands are differential,
+ * so a frame only means anything against the state it started from -- a replay
+ * that begins from a reset draws something the run never did. Save before the
+ * frame's commands, load before replaying them. */
+/* Replay one list, by address, without the firmware call around it -- what a
+ * capture holds is addresses, since the words themselves live in the guest
+ * memory the capture carries. */
+void psp_ge_replay_list(uint32_t list, uint32_t stall, uint32_t base);
+
+/* What the GE is currently drawing into. */
+void psp_ge_current_target(uint32_t *addr, uint32_t *stride, int *fmt);
+
+size_t psp_ge_state_size(void);
+void   psp_ge_state_save(void *buf);
+void   psp_ge_state_load(const void *buf);
+
 void psp_sas_init(void);
 void psp_sas_register(void);
 void psp_sas_reset(void);

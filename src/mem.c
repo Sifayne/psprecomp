@@ -247,6 +247,15 @@ int psp_mem_map_module(uint32_t base, uint32_t size) {
     return 0;
 }
 
+/* Where the module image is mapped, for anything that has to snapshot guest
+ * memory: this region is checked before RAM and VRAM and is not part of
+ * either, so a snapshot that omits it is missing whatever the module holds --
+ * for this game, its display lists. */
+void psp_mem_module_region(uint32_t *base, uint32_t *size) {
+    if (base) *base = g_module_base;
+    if (size) *size = g_module_size;
+}
+
 void *psp_mem_ptr(uint32_t addr, uint32_t size) {
     /* Collapse the three cache-behaviour mirrors onto one backing store. */
     const uint32_t a = addr & PSP_ADDR_MASK;

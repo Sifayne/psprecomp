@@ -2366,6 +2366,8 @@ static ge_queue *find_queue(uint32_t id) {
     return NULL;
 }
 
+static void cap_note_list(const ge_queue *q);
+
 static void enqueue(int head) {
     /* (list, stall, cbid, arg) */
     ge_queue *q = NULL;
@@ -2396,6 +2398,12 @@ static void enqueue(int head) {
     q->id    = g_next_id++;
     q->list  = psp_arg(0) & ~3u;
     q->stall = psp_arg(1) & ~3u;
+    /* Recorded here, at submission, and not after the queue has been serviced:
+     * the deferred GE runs a list as words are released, so by the end of
+     * enqueue q->list has advanced and pointing a replay at it runs off into
+     * whatever follows -- which is what produced a capture that executed
+     * 2^23 commands and never found an END. */
+    cap_note_list(q);
     q->used  = 1;
     (void)head;
 
@@ -2499,7 +2507,195 @@ static void drain_all(void) {
 /* Flush for paths that present or inspect pixels without going through Sync
  * -- SetFrameBuf's present hook and the unit tests. No yield: this is not a
  * wait, and it must be safe where no thread holds the token. */
-void psp_ge_drain_all(void) { drain_all(); }
+/* ---- display-list capture ---------------------------------------------------
+ *
+ * One frame of GE work, written to a file so it can be replayed into any
+ * backend. It exists because comparing backends on a running game does not
+ * work: a windowed GL run is paced in real time and a headless software run is
+ * not, so their frame numbering drifts and "the same frame" stops meaning
+ * anything (findings item 56). A capture removes time from the comparison --
+ * the same lists, the same memory, the same starting state, twice.
+ *
+ * What has to be in it: the GE's register state as it stood at the *start* of
+ * the frame, because commands are differential and a frame inherits what came
+ * before; guest memory, because the lists are pointers into it and so are the
+ * vertices, textures and palettes they name; and the lists themselves, which
+ * are only addresses since their words live in that memory.
+ *
+ * Memory is snapshotted at the END of the frame rather than the start. Vertex
+ * data a frame builds is still there when it ends, whereas at the start it is
+ * the previous frame's. A game that overwrote its own vertex buffer within one
+ * frame would defeat this, which is a real thing to look for if a replay ever
+ * disagrees with the run it came from. */
+
+#define GE_CAP_MAGIC  0x50414347u    /* "GCAP" */
+#define GE_CAP_VER    2
+
+typedef struct {
+    uint32_t magic, version;
+    uint32_t state_bytes, n_lists;
+    uint32_t ram_base, ram_bytes;
+    uint32_t vram_base, vram_bytes;
+    /* The module image is a third region and not an optional one: this game's
+     * display lists live *inside* it. psp_mem_ptr checks the module before RAM
+     * or VRAM, and a capture without it replays a list address that resolves
+     * to nothing -- which read as a list that never reached its END and ran
+     * to the interpreter's command budget. */
+    uint32_t mod_base, mod_bytes;
+} ge_cap_header;
+
+typedef struct { uint32_t list, stall, base; } ge_cap_list;
+
+enum { GE_CAP_MAX_LISTS = 4096 };
+static ge_cap_list g_cap_lists[GE_CAP_MAX_LISTS];
+static int      g_cap_n;
+static int      g_cap_frame = -1;    /* frame to capture, -1 = off */
+static int      g_cap_seen;          /* frames elapsed */
+static int      g_cap_arming;        /* recording this frame */
+static uint8_t *g_cap_state;         /* state as of the frame's start */
+static uint8_t *g_cap_ram, *g_cap_vram, *g_cap_mod;
+static uint32_t g_cap_mod_base, g_cap_mod_size;
+static const char *g_cap_path;
+
+size_t psp_ge_state_size(void) { return sizeof g_tl + sizeof g_ge; }
+
+void psp_ge_state_save(void *buf) {
+    memcpy(buf, &g_tl, sizeof g_tl);
+    memcpy((uint8_t *)buf + sizeof g_tl, &g_ge, sizeof g_ge);
+}
+
+void psp_ge_state_load(const void *buf) {
+    memcpy(&g_tl, buf, sizeof g_tl);
+    memcpy(&g_ge, (const uint8_t *)buf + sizeof g_tl, sizeof g_ge);
+    /* The counters travel with the registers because they share a struct;
+     * a replay should report what *it* drew, not what the capture did. */
+    g_ge.prims[0] = g_ge.prims[1] = g_ge.prims[2] = g_ge.prims[3] = 0;
+    g_ge.prims[4] = g_ge.prims[5] = g_ge.prims[6] = g_ge.prims[7] = 0;
+    g_ge.vertices = g_ge.lists = g_ge.finishes = g_ge.commands = 0;
+}
+
+static void cap_init(void) {
+    static int looked;
+    if (looked) return;
+    looked = 1;
+    g_cap_path = getenv("PSPRECOMP_GE_CAPTURE");
+    if (g_cap_path && !*g_cap_path) g_cap_path = NULL;
+    const char *f = getenv("PSPRECOMP_GE_CAPTURE_FRAME");
+    g_cap_frame = (g_cap_path && f && *f) ? atoi(f) : (g_cap_path ? 1 : -1);
+}
+
+static void cap_note_list(const ge_queue *q) {
+    if (!g_cap_arming || g_cap_n >= GE_CAP_MAX_LISTS) return;
+    g_cap_lists[g_cap_n].list  = q->list;
+    /* Deliberately no stall. At enqueue the game has usually released nothing
+     * yet, so the stall equals the start and a replay of it executes zero
+     * words -- which is exactly what the first capture produced. By the time
+     * the memory snapshot is taken, at the end of the frame, the list is
+     * complete in that memory, so the replay should run it to its own END. */
+    g_cap_lists[g_cap_n].stall = 0;
+    g_cap_lists[g_cap_n].base  = q->base;
+
+    /* Memory is snapshotted at the frame's FIRST submission, not at its end.
+     * A list is only guaranteed to be intact in memory at the moment it is
+     * handed over -- this game reuses one list buffer, so by the end of the
+     * frame the words have been overwritten and a replay runs off into
+     * whatever followed. Its vertices and textures are written before the
+     * submission too, for the same reason: the GE is about to read them.
+     *
+     * The limitation this leaves: a frame that submits several lists and
+     * rewrites data between them is captured as of the first. Frames here
+     * carry one list, and the replay reporting a different command count from
+     * the run is the signal that a scene has stopped being like that. */
+    if (g_cap_n == 0) {
+        if (!g_cap_ram)  g_cap_ram  = malloc(PSP_RAM_SIZE);
+        if (!g_cap_vram) g_cap_vram = malloc(PSP_VRAM_SIZE);
+        const void *r = psp_mem_ptr(PSP_RAM_BASE,  PSP_RAM_SIZE);
+        const void *v = psp_mem_ptr(PSP_VRAM_BASE, PSP_VRAM_SIZE);
+        if (g_cap_ram  && r) memcpy(g_cap_ram,  r, PSP_RAM_SIZE);
+        if (g_cap_vram && v) memcpy(g_cap_vram, v, PSP_VRAM_SIZE);
+        psp_mem_module_region(&g_cap_mod_base, &g_cap_mod_size);
+        if (g_cap_mod_size) {
+            if (!g_cap_mod) g_cap_mod = malloc(g_cap_mod_size);
+            const void *m = psp_mem_ptr(g_cap_mod_base, g_cap_mod_size);
+            if (g_cap_mod && m) memcpy(g_cap_mod, m, g_cap_mod_size);
+        }
+    }
+    g_cap_n++;
+}
+
+static void cap_write(void) {
+    FILE *f = fopen(g_cap_path, "wb");
+    if (!f) { fprintf(stderr, "ge: cannot write capture %s\n", g_cap_path); return; }
+    ge_cap_header h = { GE_CAP_MAGIC, GE_CAP_VER, (uint32_t)psp_ge_state_size(),
+                        (uint32_t)g_cap_n, PSP_RAM_BASE, PSP_RAM_SIZE,
+                        PSP_VRAM_BASE, PSP_VRAM_SIZE,
+                        g_cap_mod_base, g_cap_mod_size };
+    fwrite(&h, sizeof h, 1, f);
+    fwrite(g_cap_state, h.state_bytes, 1, f);
+    fwrite(g_cap_lists, sizeof g_cap_lists[0], (size_t)g_cap_n, f);
+    if (g_cap_ram)  fwrite(g_cap_ram,  PSP_RAM_SIZE,  1, f);
+    if (g_cap_vram) fwrite(g_cap_vram, PSP_VRAM_SIZE, 1, f);
+    if (g_cap_mod && g_cap_mod_size) fwrite(g_cap_mod, g_cap_mod_size, 1, f);
+    fclose(f);
+    fprintf(stderr, "ge: captured frame %d -- %d list(s) -> %s\n",
+            g_cap_frame, g_cap_n, g_cap_path);
+}
+
+/* Called at every frame boundary, which is what drain_all marks. */
+static void cap_frame_boundary(void) {
+    cap_init();
+    if (!g_cap_path || g_cap_frame < 0) return;
+
+    if (g_cap_arming) {
+        /* Half of this game's presents carry no lists at all -- it sets the
+         * frame buffer twice a frame (findings item 56) -- and a capture of
+         * one of those is a file with nothing in it. Keep waiting until a
+         * frame actually submits work, and re-snapshot the state each time so
+         * it still belongs to the frame that gets captured. */
+        if (g_cap_n == 0) { psp_ge_state_save(g_cap_state); return; }
+        cap_write();
+        g_cap_arming = 0;
+        g_cap_frame = -1;          /* once */
+        return;
+    }
+    g_cap_seen++;
+    if (g_cap_seen == g_cap_frame) {
+        if (!g_cap_state) g_cap_state = malloc(psp_ge_state_size());
+        if (!g_cap_state) return;
+        psp_ge_state_save(g_cap_state);   /* before the frame's commands run */
+        g_cap_n = 0;
+        g_cap_arming = 1;
+    }
+}
+
+void psp_ge_drain_all(void) { drain_all(); cap_frame_boundary(); }
+
+/* Replay one captured list. Deliberately not sceGeListEnQueue: that reads its
+ * arguments from guest registers and hands back an id nobody here has any use
+ * for. This is the same machinery underneath -- a queue slot, then run it --
+ * without the firmware call wrapped round it. */
+void psp_ge_replay_list(uint32_t list, uint32_t stall, uint32_t base) {
+    ge_queue *q = NULL;
+    for (int i = 0; i < MAX_QUEUES; i++) if (!g_queue[i].used) { q = &g_queue[i]; break; }
+    if (!q) { for (int i = 0; i < MAX_QUEUES; i++) if (g_queue[i].done) { q = &g_queue[i]; break; } }
+    if (!q) return;
+    memset(q, 0, sizeof *q);
+    q->used = 1; q->id = 0x10000u + (uint32_t)(q - g_queue);
+    q->list = list & ~3u;
+    q->stall = stall & ~3u;
+    q->base = base;
+    q->origin = list & ~3u;
+    g_ge.lists++;
+    run_list(q);
+}
+
+/* What the GE is drawing into, for a caller that has to read the result back
+ * out of guest memory afterwards. */
+void psp_ge_current_target(uint32_t *addr, uint32_t *stride, int *fmt) {
+    if (addr)   *addr   = ge_fb_address(g_ge.fbp);
+    if (stride) *stride = g_ge.fbw;
+    if (fmt)    *fmt    = (int)g_ge.fbfmt;
+}
 
 static void hle_ListSync(void) {
     ge_queue *q = find_queue(psp_arg(0));

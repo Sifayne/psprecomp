@@ -59,6 +59,11 @@ void psp_mem_free(void);
  * Call once, before loading segments. Returns 0 on success. */
 int psp_mem_map_module(uint32_t base, uint32_t size);
 
+/* Where that mapping currently is, for callers that snapshot guest memory.
+ * Reports 0 size when the module lives inside the RAM window and needs no
+ * mapping of its own. */
+void psp_mem_module_region(uint32_t *base, uint32_t *size);
+
 /* Resolve a guest address to a host pointer, or NULL if unmapped.
  * `size` is the access width; a read straddling the end of a region is
  * rejected rather than silently truncated. */
