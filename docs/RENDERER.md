@@ -247,15 +247,36 @@ work since it was written, and `ge.c` called only `draw()`. The software path
 never noticed, because it rasterizes each primitive immediately and has
 nothing to batch -- so the gap only appears the moment a backend accumulates.
 
-**Second increment** — the state that makes the frame right:
-- Depth test and depth writes, which is what stops submission order deciding
-  the picture
-- Alpha blending and the alpha test
-- The scissor, and clear-mode draws
-- Diff against the software path on the same list: same pixels, or the backend
-  is wrong
+**Second increment — done 3 Sep.** Depth test and depth writes, the scissor,
+the colour and alpha write masks, alpha blending, and the alpha test as a
+fragment discard (GL 3.3 core removed the fixed-function one). Every state
+setter flushes the pending batch before recording, because a state change
+would otherwise apply retroactively to geometry already in the buffer. The
+hangar goes from one colour to 105 and from mean 255 to 49.7.
 
-**Third increment** — the parts that need real work:
+Two things this does **not** represent, counted in the run summary rather than
+approximated -- a wrong factor renders a plausible picture, a counted one is a
+number:
+- The doubled blend factors (GE codes 6-9) and the absolute-difference
+  equation (code 5) have no GL equivalent and need the shader.
+- The stencil. On the PSP it *is* the framebuffer's alpha byte, which GL's own
+  stencil buffer is not, so it needs the shader too.
+
+**A limit worth knowing before comparing.** The software path's blend term is
+`((c+1)*f) >> 8`, measured from `gpu/commands/blend` and exact. GL's is
+`c*f/255`. They differ by up to one level per channel, so a GL backend cannot
+be bit-identical to the oracle through a blend however correct it otherwise
+is. Compare structure and brightness, and reserve exactness for the paths that
+can have it.
+
+**Third increment** — texturing, which is what the frame is still missing:
+- The texture cache keyed on the GE's texture state (address, format, size,
+  CLUT), and the five texture functions
+- Diff against the software path on the same list: at 1x, same structure and
+  the same colour count within reach -- the hangar is 1,893 colours in
+  software against 105 here, and all of that gap is texturing
+
+**Fourth increment** — the parts that need real work:
 - Texture cache keyed on the GE's texture state (address, format, size, CLUT)
 - The transform pipeline, which needs the VFPU matrices to be correct first
 - Blending, depth, scissor — each is a small addition once the above holds
