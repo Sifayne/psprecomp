@@ -10,6 +10,88 @@
 psp_memory psp_mem;
 uint64_t   psp_mem_bad_access;
 
+/* A relocatable module can live outside all three fixed memory windows. Keep
+ * its backing and write-generation table beside the fixed regions so the
+ * cache contract below covers every address psp_mem_ptr can return. */
+static uint8_t *g_module;
+static uint32_t g_module_base, g_module_size;
+static uint64_t *g_module_write;
+
+/* ---- write generations ---------------------------------------------------
+ *
+ * A GPU texture cache cannot use an address as the identity of its contents:
+ * games overwrite VRAM in place, both with CPU stores and GE transfers. Keep
+ * one timestamp per small guest-memory granule so a cache can ask whether the
+ * bytes it decoded have changed since its upload. 256 bytes is fine enough not
+ * to tie neighbouring PSP textures together, while the complete RAM + VRAM +
+ * scratch tables cost a little over one MiB of zero-filled static storage.
+ *
+ * Guest execution is serialised by the scheduler's run token. The GE renderer
+ * runs under that same token, so ordinary integers are sufficient here; making
+ * every recompiled store atomic would buy no additional ordering and charge
+ * the hottest path in the runtime for it. */
+enum { WRITE_GRANULE_SHIFT = 8, WRITE_GRANULE = 1 << WRITE_GRANULE_SHIFT };
+static uint64_t g_ram_write[(PSP_RAM_SIZE + WRITE_GRANULE - 1) / WRITE_GRANULE];
+static uint64_t g_vram_write[(PSP_VRAM_SIZE + WRITE_GRANULE - 1) / WRITE_GRANULE];
+static uint64_t g_scratch_write[(PSP_SCRATCH_SIZE + WRITE_GRANULE - 1) / WRITE_GRANULE];
+static uint64_t g_write_serial;
+
+static uint64_t *write_table(uint32_t addr, uint32_t size, uint32_t *off) {
+    const uint32_t a = addr & PSP_ADDR_MASK;
+    const uint64_t end = (uint64_t)a + size;
+    if (g_module_size && g_module_write && a >= g_module_base &&
+        end <= (uint64_t)g_module_base + g_module_size) {
+        if (off) *off = a - g_module_base;
+        return g_module_write;
+    }
+    if (a >= PSP_RAM_BASE && end <= (uint64_t)PSP_RAM_BASE + PSP_RAM_SIZE) {
+        if (off) *off = a - PSP_RAM_BASE;
+        return g_ram_write;
+    }
+    if (a >= PSP_VRAM_BASE && end <= (uint64_t)PSP_VRAM_BASE + PSP_VRAM_SIZE) {
+        if (off) *off = a - PSP_VRAM_BASE;
+        return g_vram_write;
+    }
+    if (a >= PSP_SCRATCH_BASE &&
+        end <= (uint64_t)PSP_SCRATCH_BASE + PSP_SCRATCH_SIZE) {
+        if (off) *off = a - PSP_SCRATCH_BASE;
+        return g_scratch_write;
+    }
+    return NULL;
+}
+
+uint64_t psp_mem_write_serial(void) { return g_write_serial; }
+
+uint64_t psp_mem_range_generation(uint32_t addr, uint32_t size) {
+    if (!size) return 0;
+    uint32_t off = 0;
+    uint64_t *table = write_table(addr, size, &off);
+    if (!table) return 0;
+    const uint32_t first = off >> WRITE_GRANULE_SHIFT;
+    const uint32_t last = (uint32_t)(((uint64_t)off + size - 1u) >>
+                                     WRITE_GRANULE_SHIFT);
+    uint64_t newest = 0;
+    for (uint32_t i = first; i <= last; i++)
+        if (table[i] > newest) newest = table[i];
+    return newest;
+}
+
+void psp_mem_mark_write(uint32_t addr, uint32_t size) {
+    if (!size) return;
+    uint32_t off = 0;
+    uint64_t *table = write_table(addr, size, &off);
+    if (!table) return;
+    uint64_t stamp = ++g_write_serial;
+    /* Zero is the pristine-memory generation. In practice wrapping a 64-bit
+     * write count is unreachable; retaining the invariant still costs one
+     * branch and keeps the API honest. */
+    if (!stamp) stamp = ++g_write_serial;
+    const uint32_t first = off >> WRITE_GRANULE_SHIFT;
+    const uint32_t last = (uint32_t)(((uint64_t)off + size - 1u) >>
+                                     WRITE_GRANULE_SHIFT);
+    for (uint32_t i = first; i <= last; i++) table[i] = stamp;
+}
+
 /* Watch writes to one address. "Which code writes this word" is a question
  * that came up repeatedly and could only be answered by guessing; the write
  * path is the one place that can answer it directly. */
@@ -224,6 +306,13 @@ int psp_mem_init(void) {
     memset(g_bad_site, 0, sizeof g_bad_site);
     g_bad_addr_n = g_bad_site_n = 0;
     g_bad_addr_lost = g_bad_site_lost = 0;
+    memset(g_ram_write, 0, sizeof g_ram_write);
+    memset(g_vram_write, 0, sizeof g_vram_write);
+    memset(g_scratch_write, 0, sizeof g_scratch_write);
+    /* A host may reuse the runtime in one process. Force any external cache
+     * that survived the old allocation to revalidate against the now-pristine
+     * page tables rather than taking its global-serial fast path. */
+    if (++g_write_serial == 0) g_write_serial++;
     return 0;
 }
 
@@ -231,19 +320,31 @@ void psp_mem_free(void) {
     free(psp_mem.ram);
     free(psp_mem.vram);
     free(psp_mem.scratch);
+    free(g_module);
+    free(g_module_write);
     psp_mem.ram = psp_mem.vram = psp_mem.scratch = NULL;
+    g_module = NULL;
+    g_module_write = NULL;
+    g_module_base = g_module_size = 0;
 }
-
-/* The loaded module image, for a PRX linked outside the RAM window. */
-static uint8_t *g_module;
-static uint32_t g_module_base, g_module_size;
 
 int psp_mem_map_module(uint32_t base, uint32_t size) {
     free(g_module);
+    free(g_module_write);
     g_module = (uint8_t *)calloc(1, size ? size : 1);
-    if (!g_module) { g_module_size = 0; return -1; }
+    const size_t pages = ((size_t)size + WRITE_GRANULE - 1) / WRITE_GRANULE;
+    g_module_write = (uint64_t *)calloc(pages ? pages : 1, sizeof(uint64_t));
+    if (!g_module || !g_module_write) {
+        free(g_module);
+        free(g_module_write);
+        g_module = NULL;
+        g_module_write = NULL;
+        g_module_size = 0;
+        return -1;
+    }
     g_module_base = base;
     g_module_size = size;
+    if (++g_write_serial == 0) g_write_serial++;
     return 0;
 }
 
@@ -306,7 +407,8 @@ float    psp_read_f32(uint32_t addr) { READ_BODY(float)  }
     if (!p) { bad_access(addr, 1, (int)sizeof(TYPE)); return; }         \
     { uint32_t _v = 0; memcpy(&_v, &val, sizeof(TYPE) > 4 ? 4 : sizeof(TYPE)); \
       note_write_val(addr, (uint32_t)sizeof(TYPE), _v); }                       \
-    memcpy(p, &val, sizeof(TYPE));
+    memcpy(p, &val, sizeof(TYPE));                   \
+    psp_mem_mark_write(addr, (uint32_t)sizeof(TYPE));
 
 void psp_write8 (uint32_t addr, uint8_t  val) { WRITE_BODY(uint8_t)  }
 void psp_write16(uint32_t addr, uint16_t val) { WRITE_BODY(uint16_t) }
@@ -317,6 +419,7 @@ int psp_mem_write_block(uint32_t addr, const void *src, uint32_t len) {
     void *p = psp_mem_ptr(addr, len);
     if (!p) return -1;
     memcpy(p, src, len);
+    psp_mem_mark_write(addr, len);
     return 0;
 }
 

@@ -73,6 +73,7 @@ static void hle_EtherNtostr(void) {
     void *dst = psp_mem_ptr(psp_arg(1), (uint32_t)sizeof zero);
     if (!dst) return;
     memcpy(dst, zero, sizeof zero);
+    psp_mem_mark_write(psp_arg(1), (uint32_t)sizeof zero);
 }
 
 /* There is no switch. Off is the honest reading, and it is what sends a

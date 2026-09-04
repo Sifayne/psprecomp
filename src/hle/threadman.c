@@ -271,7 +271,10 @@ static void release_stack(psp_thread *t) {
     if (!t->stack_base) return;
     if (t->attr & PSP_THREAD_ATTR_CLEAR_STACK) {
         void *p = psp_mem_ptr(t->stack_base, t->stack_size);
-        if (p) memset(p, 0, t->stack_size);
+        if (p) {
+            memset(p, 0, t->stack_size);
+            psp_mem_mark_write(t->stack_base, t->stack_size);
+        }
     }
     psp_sysmem_release(t->stack_base);
 }
@@ -428,8 +431,10 @@ static void hle_StartThread(void) {
      * the argument block stops, so the two facts check each other. */
     if (t->stack_base) {
         void *p = psp_mem_ptr(t->stack_base, t->stack_size);
-        if (p && !(t->attr & PSP_THREAD_ATTR_NO_FILLSTACK))
+        if (p && !(t->attr & PSP_THREAD_ATTR_NO_FILLSTACK)) {
             memset(p, 0xFF, t->stack_size);
+            psp_mem_mark_write(t->stack_base, t->stack_size);
+        }
         if (p) {
             const uint32_t top = t->stack_base + t->stack_size;
             psp_write32(t->stack_base, t->uid);
@@ -462,7 +467,11 @@ static void hle_StartThread(void) {
         sp = stack_top - ((arglen + 15u) & ~15u);
         void *dst = psp_mem_ptr(sp, arglen);
         void *src = psp_mem_ptr(argp, arglen);
-        if (dst && src) { memcpy(dst, src, arglen); argp = sp; }
+        if (dst && src) {
+            memcpy(dst, src, arglen);
+            psp_mem_mark_write(sp, arglen);
+            argp = sp;
+        }
     }
 
     /* The thread becomes runnable; it does not run here.

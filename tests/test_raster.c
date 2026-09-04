@@ -345,6 +345,65 @@ static void test_texture_minified_samples_centre(void) {
         }
 }
 
+/* World geometry must not use the through-mode affine UV rule.  These three
+ * triangles have identical screen-space coordinates and texcoords.  The first
+ * has its far edge at four times the clip-space W, so the sample a quarter of
+ * the way across lands near texel 1 rather than the affine texel 4.  The
+ * second pins the control (all homogeneous terms one), and the third checks
+ * texture-matrix projection's separate Q denominator.
+ *
+ * This drives the backend contract directly.  Matrix decoding and clipping
+ * have their own tests; the failure this guards is losing W at the seam
+ * between the GE and a rasterizer, which made floors and roads visibly pull
+ * toward the camera. */
+static void test_texture_perspective_interpolation(void) {
+    psp_ge_reset();
+    clear_fb();
+    upload_ramp_texture(16, 16);
+
+    const psp_render_backend *be = psp_render_current();
+    psp_tex_state tex = {
+        .addr = TEX, .stride = 16, .w = 16, .h = 16,
+        .fmt = 3, .func = 0, .min_filter = 0, .mag_filter = 0,
+    };
+    psp_blend_state blend = { .write_colour = 1 };
+    be->set_target(FB, 480, 3);
+    be->set_scissor(0, 0, 479, 271);
+    be->set_texture(&tex);
+    be->set_depth(0, 1, 0);
+    be->set_blend(&blend);
+    be->set_fog(0, 0);
+
+    psp_vertex tri[3] = {
+        { .x =  40 * PSP_SUBPX, .y =  30 * PSP_SUBPX, .rgba = 0xFFFFFFFFu,
+          .u =  0.0f, .v =  0.0f, .inv_w = 1.00f, .tex_q = 1.0f, .fog = 255 },
+        { .x = 140 * PSP_SUBPX, .y =  30 * PSP_SUBPX, .rgba = 0xFFFFFFFFu,
+          .u = 16.0f, .v =  0.0f, .inv_w = 0.25f, .tex_q = 1.0f, .fog = 255 },
+        { .x =  40 * PSP_SUBPX, .y = 130 * PSP_SUBPX, .rgba = 0xFFFFFFFFu,
+          .u =  0.0f, .v = 16.0f, .inv_w = 0.25f, .tex_q = 1.0f, .fog = 255 },
+    };
+    be->draw(PSP_PRIM_TRIANGLES, tri, 3);
+    CHECK(pixel(65, 55) == ramp_texel(1, 1),
+          "perspective UV at (65,55): got 0x%08X want texel (1,1)",
+          pixel(65, 55));
+
+    for (int i = 0; i < 3; i++) {
+        tri[i].x += 140 * PSP_SUBPX;
+        tri[i].inv_w = 1.0f;
+    }
+    be->draw(PSP_PRIM_TRIANGLES, tri, 3);
+    CHECK(pixel(205, 55) == ramp_texel(4, 4),
+          "affine control at (205,55): got 0x%08X want texel (4,4)",
+          pixel(205, 55));
+
+    for (int i = 0; i < 3; i++) tri[i].x += 140 * PSP_SUBPX;
+    tri[1].tex_q = tri[2].tex_q = 4.0f;
+    be->draw(PSP_PRIM_TRIANGLES, tri, 3);
+    CHECK(pixel(345, 55) == ramp_texel(1, 1),
+          "projective Q at (345,55): got 0x%08X want texel (1,1)",
+          pixel(345, 55));
+}
+
 /* The sprite path has the same defect and shares none of the code, so it needs
  * its own check: two corners, a linear ramp, no barycentric weights. */
 static void test_sprite_texture_samples_centre(void) {
@@ -518,6 +577,83 @@ static void test_texture_filter_is_honoured(void) {
     for (int k = 0; k < 4; k++)
         CHECK((row[k] & 0xFF) == want_r[k],
               "nearest red at %d: got %u want %u", k, row[k] & 0xFF, want_r[k]);
+}
+
+/* LOD is backend-independent GE arithmetic. A GPU backend must not let its
+ * driver recompute this from derivatives: CONST and SLOPE do not use them,
+ * AUTO is floored to a sixteenth before the signed bias is added, and mode 3
+ * was measured to behave like CONST. */
+static void test_texture_lod_rules(void) {
+    psp_tex_state t = { 0 };
+
+    t.lod_mode = 0;                              /* AUTO */
+    CHECK(psp_render_lod16(&t, 4.0f) == 32,
+          "auto LOD at 4 texels/pixel: %d", psp_render_lod16(&t, 4.0f));
+    CHECK(psp_render_lod16(&t, 0.5f) == -16,
+          "auto LOD at half a texel/pixel: %d", psp_render_lod16(&t, 0.5f));
+    t.lod_bias16 = -7;
+    CHECK(psp_render_lod16(&t, 4.0f) == 25,
+          "auto LOD applies signed bias after quantising: %d",
+          psp_render_lod16(&t, 4.0f));
+
+    t.lod_mode = 1;                              /* CONST */
+    CHECK(psp_render_lod16(&t, 123.0f) == -7,
+          "constant LOD ignores the gradient: %d", psp_render_lod16(&t, 123.0f));
+    t.lod_mode = 3;                              /* undefined, measured as CONST */
+    CHECK(psp_render_lod16(&t, 123.0f) == -7,
+          "mode 3 follows constant LOD: %d", psp_render_lod16(&t, 123.0f));
+
+    t.lod_mode = 2;                              /* SLOPE */
+    t.lod_bias16 = -3;
+    t.lod_slope = 2.25f;
+    CHECK(psp_render_lod16(&t, 123.0f) == 33,
+          "slope LOD plus bias: %d", psp_render_lod16(&t, 123.0f));
+    t.lod_bias16 = 0;
+    t.lod_slope = -0.1f;
+    CHECK(psp_render_lod16(&t, 1.0f) == -2,
+          "negative slope LOD floors rather than truncates: %d",
+          psp_render_lod16(&t, 1.0f));
+}
+
+/* A real two-level chain, not just the LOD arithmetic. Level zero is black,
+ * level one red=240, and mip-linear at +8/16 must land exactly halfway. This
+ * pins the independent addresses/sizes and the fractional level blend that
+ * the GL cache and shader now consume through the same backend contract. */
+static void test_texture_mip_chain(void) {
+    enum { MIP1 = TEX + 0x1000 };
+    psp_ge_reset();
+    clear_fb();
+    for (int i = 0; i < 16; i++) psp_write32(TEX + (uint32_t)i * 4, 0xFF000000u);
+    for (int i = 0; i < 4; i++) psp_write32(MIP1 + (uint32_t)i * 4, 0xFF0000F0u);
+
+    const psp_render_backend *be = psp_render_current();
+    psp_tex_state tex = {
+        .addr = TEX, .stride = 4, .w = 4, .h = 4,
+        .fmt = 3, .func = 0, .min_filter = 6, .mag_filter = 0,
+        .wrap_s = 1, .wrap_t = 1, .max_level = 1,
+        .lod_mode = 1, .lod_bias16 = 8,
+    };
+    tex.lv_addr[0] = TEX;  tex.lv_stride[0] = 4;
+    tex.lv_w[0] = 4;       tex.lv_h[0] = 4;
+    tex.lv_addr[1] = MIP1; tex.lv_stride[1] = 2;
+    tex.lv_w[1] = 2;       tex.lv_h[1] = 2;
+    psp_blend_state blend = { .write_colour = 1 };
+    psp_vertex sprite[2] = {
+        { .x = 40 * PSP_SUBPX, .y = 30 * PSP_SUBPX, .rgba = 0xFFFFFFFFu,
+          .u = 0.0f, .v = 0.0f, .inv_w = 1.0f, .tex_q = 1.0f, .fog = 255 },
+        { .x = 44 * PSP_SUBPX, .y = 34 * PSP_SUBPX, .rgba = 0xFFFFFFFFu,
+          .u = 4.0f, .v = 4.0f, .inv_w = 1.0f, .tex_q = 1.0f, .fog = 255 },
+    };
+    be->set_target(FB, 480, 3);
+    be->set_scissor(0, 0, 479, 271);
+    be->set_texture(&tex);
+    be->set_depth(0, 1, 0);
+    be->set_blend(&blend);
+    be->set_fog(0, 0);
+    be->draw(PSP_PRIM_SPRITES, sprite, 2);
+
+    CHECK((pixel(41, 31) & 0xFFu) == 120,
+          "halfway between mip levels: red=%u want 120", pixel(41, 31) & 0xFFu);
 }
 
 /* At exactly 1:1 the fractional part is zero, all the weight lands on one tap,
@@ -800,10 +936,13 @@ int main(void) {
     test_triangle_strip();
     test_texture_1to1();
     test_texture_minified_samples_centre();
+    test_texture_perspective_interpolation();
     test_sprite_texture_samples_centre();
     test_texture_wrap();
     test_texture_bilinear_midpoint();
     test_texture_filter_is_honoured();
+    test_texture_lod_rules();
+    test_texture_mip_chain();
     test_bilinear_equals_nearest_at_1to1();
     test_clear_mode_clears_depth();
     test_depth_test_still_rejects();

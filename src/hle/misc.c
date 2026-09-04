@@ -92,6 +92,7 @@ static void dmac_copy(void) {
     const void *sp = psp_mem_ptr(src, size);
     if (d && sp) {
         memmove(d, sp, size);
+        psp_mem_mark_write(dst, size);
     } else {
         /* A range the flat map cannot hand over whole: byte by byte, so what is
          * mapped is copied and the bad-access counter records the rest. */

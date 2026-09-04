@@ -859,6 +859,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
                        int tex_off, psp_vertex *out) {
     out->rgba = current_colour();
     out->u = out->v = 0.0f;
+    out->inv_w = out->tex_q = 1.0f; /* through mode is affine in screen space */
     out->fog = 255;              /* through-mode geometry is never fogged */
 
     /* Through-mode texture coordinates are in texels, whatever their width, so
@@ -1216,6 +1217,7 @@ static void lerp_clip(const clipvert *a, const clipvert *b, float t, clipvert *o
     o->v = a->v;
     o->v.u = a->v.u + (b->v.u - a->v.u) * t;
     o->v.v = a->v.v + (b->v.v - a->v.v) * t;
+    o->v.tex_q = a->v.tex_q + (b->v.tex_q - a->v.tex_q) * t;
     uint32_t r = 0;
     for (int k = 0; k < 4; k++) {
         const float ca = (float)((a->v.rgba >> (8 * k)) & 0xFFu);
@@ -1284,6 +1286,10 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
         p[i].x = fx16_floor(sx + 1.0f / (2 * PSP_SUBPX));
         p[i].y = fx16_floor(sy + 1.0f / (2 * PSP_SUBPX));
         p[i].z = sz;
+        /* Keep the divide's missing term with the screen-space vertex.  UVs
+         * are the one interpolant the PSP corrects for perspective; colour
+         * and fog remain affine in the rasterizer. */
+        p[i].inv_w = inv;
         if (!g_tl.bb_seen) { g_tl.bb_x0 = g_tl.bb_x1 = sx; g_tl.bb_y0 = g_tl.bb_y1 = sy; g_tl.bb_seen = 1; }
         if (sx < g_tl.bb_x0) g_tl.bb_x0 = sx;
         if (sx > g_tl.bb_x1) g_tl.bb_x1 = sx;
@@ -1460,6 +1466,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
 
             psp_vertex *o = &v[decoded];
             o->rgba = current_colour();
+            o->tex_q = 1.0f;
             if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7)
                 o->rgba = psp_read32(a + (uint32_t)col_off);
             /* Fog. The coefficient is (end - depth) * range with depth the
@@ -1505,6 +1512,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 mul_4x3(g_tl.tgen, src, gen);
                 o->u = gen[0] * (float)g_ge.tex_w;
                 o->v = gen[1] * (float)g_ge.tex_h;
+                o->tex_q = gen[2];
                 note_uv(o->u, o->v);
             }
 
@@ -1518,6 +1526,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             o->x = fx16_floor(sx + 1.0f / (2 * PSP_SUBPX));
             o->y = fx16_floor(sy + 1.0f / (2 * PSP_SUBPX));
             o->z = sz;
+            o->inv_w = clip[3] > 1e-6f ? 1.0f / clip[3] : 1.0f;
             if (clip[3] > 1e-6f) {
                 if (!g_tl.bb_seen) { g_tl.bb_x0 = g_tl.bb_x1 = sx;
                                      g_tl.bb_y0 = g_tl.bb_y1 = sy; g_tl.bb_seen = 1; }
@@ -1718,6 +1727,7 @@ static void imm_vertex(uint32_t arg) {
     o.y    = (int)g_imm.y - (int)(g_tl.off_y * 16.0f);
     o.z    = (float)(g_imm.z & 0xFFFFu);
     o.rgba = (g_imm.rgb & 0xFFFFFFu) | ((arg & 0xFFu) << 24);
+    o.inv_w = o.tex_q = 1.0f;
     o.fog  = (arg & 0x400000u) ? (int)(g_imm.fog & 0xFFu) : 255;
 
     int need, out_type = g_imm.type;

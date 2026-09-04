@@ -1920,7 +1920,10 @@ static void hle_GetTlsAddr(void) {
          * that is the already-ours path above, which is why the clearing
          * belongs here rather than at the top of the call. */
         void *p = psp_mem_ptr(at, t->stride);
-        if (p) memset(p, 0, t->stride);
+        if (p) {
+            memset(p, 0, t->stride);
+            psp_mem_mark_write(at, t->stride);
+        }
         psp_ret(at);
         return;
     }
@@ -1970,7 +1973,10 @@ static void hle_FreeTlspl(void) {
              * asking for it again -- so the free did it, not the next
              * allocation. */
             void *p = psp_mem_ptr(t->base + i * t->stride, t->stride);
-            if (p) memset(p, 0, t->stride);
+            if (p) {
+                memset(p, 0, t->stride);
+                psp_mem_mark_write(t->base + i * t->stride, t->stride);
+            }
             /* The block goes straight to the next thread waiting for one,
              * rather than being left free for whoever asks next: the queue's
              * order is the point of having one. */

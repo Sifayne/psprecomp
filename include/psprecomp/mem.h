@@ -69,6 +69,19 @@ void psp_mem_module_region(uint32_t *base, uint32_t *size);
  * rejected rather than silently truncated. */
 void *psp_mem_ptr(uint32_t addr, uint32_t size);
 
+/* Guest-memory write generations, for caches whose contents depend on bytes
+ * behind psp_mem_ptr(). Every psp_write* and psp_mem_write_block call marks its
+ * destination automatically. A caller that writes through a raw pointer from
+ * psp_mem_ptr() must call psp_mem_mark_write() after the write.
+ *
+ * The global serial changes after every tracked write. A range generation is
+ * the newest write touching any 256-byte granule in that range; it may change
+ * for a nearby write in the same granule, which causes a harmless conservative
+ * cache miss rather than stale data. Unmapped ranges return zero. */
+uint64_t psp_mem_write_serial(void);
+uint64_t psp_mem_range_generation(uint32_t addr, uint32_t size);
+void     psp_mem_mark_write(uint32_t addr, uint32_t size);
+
 /* The PSP is little-endian and so is every host we target, so these are plain
  * loads once the address is resolved. Unmapped accesses return 0 / are dropped
  * and bump psp_mem_bad_access — a recompiled game that starts faulting here is

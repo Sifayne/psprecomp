@@ -127,6 +127,62 @@ static void test_bitops(void) {
 static void test_memory(void) {
     CHECK(psp_mem_init() == 0, "memory init");
 
+    const uint32_t tracked = PSP_VRAM_BASE + 0x1000u;
+    const uint32_t nearby  = tracked + 0x80u;
+    const uint32_t remote  = tracked + 0x1000u;
+    const uint64_t initial_serial = psp_mem_write_serial();
+    CHECK(initial_serial != 0, "memory reset has a cache-visible serial");
+    CHECK(psp_mem_range_generation(tracked, 4) == 0,
+          "fresh range has generation zero");
+
+    psp_write32(tracked, 0xAABBCCDDu);
+    const uint64_t first_generation = psp_mem_range_generation(tracked, 4);
+    CHECK(first_generation > initial_serial, "scalar store marks its range");
+    CHECK(psp_mem_range_generation(nearby, 4) == first_generation,
+          "nearby bytes conservatively share a dirty granule");
+    CHECK(psp_mem_range_generation(remote, 4) == 0,
+          "a remote range stays clean");
+    CHECK(psp_mem_range_generation(0x44001000u, 4) == first_generation,
+          "cache mirror shares the write generation");
+
+    const uint8_t block[4] = { 1, 2, 3, 4 };
+    CHECK(psp_mem_write_block(remote, block, sizeof block) == 0,
+          "block write succeeds");
+    CHECK(psp_mem_range_generation(remote, sizeof block) > first_generation,
+          "block write marks its destination");
+
+    const uint32_t edge = tracked + 0xFFu;
+    psp_write16(edge, 0x7788u);
+    const uint64_t edge_generation = psp_mem_range_generation(edge, 2);
+    CHECK(edge_generation == psp_mem_range_generation(edge, 1) &&
+          edge_generation == psp_mem_range_generation(edge + 1, 1),
+          "a write crossing a granule marks both sides");
+
+    const uint64_t before_raw = psp_mem_write_serial();
+    void *raw = psp_mem_ptr(remote + 0x1000u, 16);
+    CHECK(raw != NULL, "raw write destination maps");
+    if (raw) {
+        memset(raw, 0x5A, 16);
+        CHECK(psp_mem_write_serial() == before_raw,
+              "raw pointer write is invisible until explicitly marked");
+        psp_mem_mark_write(remote + 0x1000u, 16);
+        CHECK(psp_mem_write_serial() > before_raw,
+              "explicit mark advances the write serial");
+    }
+
+    const uint64_t before_read = psp_mem_write_serial();
+    (void)psp_read32(tracked);
+    CHECK(psp_mem_write_serial() == before_read,
+          "reads do not change the write serial");
+    CHECK(psp_mem_range_generation(0x01000000u, 4) == 0,
+          "unmapped ranges have no generation");
+
+    CHECK(psp_mem_map_module(0x00100000u, 0x1000u) == 0,
+          "module region maps for generation test");
+    psp_write8(0x00100100u, 0x42u);
+    CHECK(psp_mem_range_generation(0x00100100u, 1) != 0,
+          "module image writes carry generations too");
+
     psp_write32(0x08800000u, 0x12345678u);
     CHECK_EQ(psp_read32(0x08800000u), 0x12345678u, "round-trip a word");
     CHECK_EQ(psp_read8 (0x08800000u), 0x78u, "little-endian byte 0");
@@ -149,6 +205,13 @@ static void test_memory(void) {
     (void)psp_read32(PSP_VRAM_BASE + PSP_VRAM_SIZE - 2);
     CHECK(psp_mem_bad_access == before + 1, "straddling read is rejected");
 
+    const uint64_t before_reset = psp_mem_write_serial();
+    psp_mem_free();
+    CHECK(psp_mem_init() == 0, "memory reinitialises");
+    CHECK(psp_mem_write_serial() > before_reset,
+          "memory reset invalidates surviving external caches");
+    CHECK(psp_mem_range_generation(tracked, 4) == 0,
+          "memory reset restores pristine range generations");
     psp_mem_free();
 }
 

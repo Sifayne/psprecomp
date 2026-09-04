@@ -1491,7 +1491,10 @@ static void hle_AtracDecode(void) {
             for (uint32_t i = 0; i < (uint32_t)n * 2u; i++) psp_write16(dst + i * 2u, (uint16_t)pcm[i]);
         if (bytes < MPEG_ATRAC_ES_OUT_SIZE) {
             void *p = psp_mem_ptr(dst + bytes, MPEG_ATRAC_ES_OUT_SIZE - bytes);
-            if (p) memset(p, 0, MPEG_ATRAC_ES_OUT_SIZE - bytes);
+            if (p) {
+                memset(p, 0, MPEG_ATRAC_ES_OUT_SIZE - bytes);
+                psp_mem_mark_write(dst + bytes, MPEG_ATRAC_ES_OUT_SIZE - bytes);
+            }
         }
     }
     psp_ret(SCE_KERNEL_ERROR_OK);

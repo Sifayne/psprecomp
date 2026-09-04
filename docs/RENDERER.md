@@ -91,7 +91,8 @@ typedef struct {
 
 The three structs a backend has to read are where the hardware's rules
 actually live: `psp_vertex` (12.4 fixed-point screen position, window depth on
-the 0..65535 scale, colour, texel-unit UVs, the fog byte), `psp_tex_state`
+the 0..65535 scale, colour, texel-unit UVs, reciprocal clip W, texture-projective
+Q, and the fog byte), `psp_tex_state`
 (format, the eight mip levels and `TEX_LEVEL`'s modes, both filters, wrap, the
 texture function with its RGBA and doubling bits) and `psp_blend_state`
 (blend, alpha test, stencil).
@@ -106,9 +107,9 @@ backend is wrong the same way, which is at least diagnosable.
 
 | Backend | State | Notes |
 |---|---|---|
-| **software** | Working | The reference. Triangles, strips and sprites; points, lines and fans are not drawn. 17 tests in `test_raster.c` assert pixel positions -- texturing, filtering, wrap, depth and clear mode among them. No GPU, no dependencies, runs in CI. |
+| **software** | Working | The reference. Triangles, strips and sprites; points, lines and fans are not drawn. 21 tests in `test_raster.c` assert pixel positions and sampling rules -- perspective UVs, mip/LOD, filtering, wrap, depth and clear mode among them. No GPU, no dependencies, runs in CI. |
 | **null** | Working | Counts primitives, draws nothing. What the bring-up host uses when the question is "did it ask to draw". |
-| **gl33-sdl2** | Not started | The intended presentation path. See below. |
+| **gl33-sdl2** | Working at native resolution | Triangles, strips, fans and sprites; render targets and aliases, perspective texturing, PSP mip/LOD/filter rules, depth, scissor, blend, alpha test and fog. Remaining gaps are listed below. |
 
 Selection is `psp_render_select(name)` (`src/render.c`), wired to
 **`PSPRECOMP_RENDER`** in `host/boot.c` (3 Sep). Before that nothing outside
@@ -123,11 +124,11 @@ backend. The host prints the names it would have taken, which it reads from
 A set-but-empty value means unset, as `PSPRECOMP_AUDIO_DUMP` has it. Every run
 now prints which backend it used.
 
-`init()` is called once the backend is chosen; both current backends return 0
-without doing anything. `shutdown()` and `present()` remain unwired, and
-`shutdown()` is not merely an oversight: boot.c skips its teardown whenever a
-guest thread is still live, which is the common case, so it would not run
-reliably even if it were called.
+`init()` is called once the backend is chosen. GL records the target size there
+and claims the context lazily on the GE thread; `present()` is driven at each
+display flip. `shutdown()` remains unwired, and that is not merely an
+oversight: boot.c skips its teardown whenever a guest thread is still live,
+which is the common case, so it would not run reliably even if it were called.
 
 ## Choosing the API
 
@@ -202,7 +203,7 @@ otherwise, so the software-versus-GL comparison runs on a desktop rather than
 in CI. That does not weaken the arrangement in *Validation* below: the
 software backend is what must keep working with no GPU, and it does.
 
-## The GL 3.3 backend, when it happens
+## The GL 3.3 backend
 
 Scope it deliberately, because the GE has a large state space and most of it
 does not matter until a game is already drawing:
@@ -212,12 +213,14 @@ does not matter until a game is already drawing:
   backend can be chosen without recompiling~~ **done 3 Sep**, `PSPRECOMP_RENDER`
 - ~~A seam for a backend the runtime cannot carry~~ **done 3 Sep**,
   `psp_render_register()`
-- A per-frame timer. `psp_render_raster_ns()` is cumulative and printed once at
-  the end of a run, which cannot demonstrate the 60 fps the M5 gate asks for
-- Display-list capture and replay. The gate wants "pixel-comparable on a fixed
-  set of display lists"; `09-replay.sh` replays *controller input*, and
-  `PSPRECOMP_FRAMES` dumps final images. Recording GE lists to a file and
-  replaying them into an arbitrary backend does not exist
+- ~~A per-frame timer.~~ **Done 4 Sep.** The GL report distinguishes display
+  callbacks from frames carrying new GPU work and reports average cadence plus
+  median, p95 and maximum intervals. `psp_render_raster_ns()` remains the
+  software backend's cumulative CPU cost.
+- ~~Display-list capture and replay~~ **done 4 Sep**, through GE capture files
+  and `host/gereplay.c`. The remaining capture defect is narrower: the saved
+  display framebuffer arrives empty, so fixed-list numeric diffs work but the
+  replayed image is not yet readable as the original scene.
 - The pixel and depth counters in `ge.c` are software-backend concepts
   (`psp_render_reset_depth` has no GPU meaning) and read zero under any other
   backend; put them behind an optional query first
@@ -233,13 +236,9 @@ known triangle pushed through the batch renders 38,000 red pixels, a forced
 constant in the readback reaches the frame dump, and a clear reaches the
 readback. The pipeline is sound.
 
-**The game's frame is nevertheless uniformly white, and that is the scope
-rather than a fault.** There is no depth test, no blending and no clear
-handling, so a frame is every primitive of that frame painted in submission
-order with the last one winning, and the accumulation is white. Fixing it is
-the second increment; approximating it now would produce a picture that looks
-plausible and is not the software path's, which is the one thing this
-arrangement exists to prevent.
+The first increment's game frame was uniformly white because depth, blending
+and clear handling deliberately had not landed yet. That was an incremental
+bring-up result, not the backend's current output.
 
 **`finish()` had never been called** (fixed the same day). The interface has
 documented it as the end of a display list and a good point to flush batched
@@ -269,20 +268,52 @@ be bit-identical to the oracle through a blend however correct it otherwise
 is. Compare structure and brightness, and reserve exactness for the paths that
 can have it.
 
-**Third increment** — texturing, which is what the frame is still missing:
-- The texture cache keyed on the GE's texture state (address, format, size,
-  CLUT), and the five texture functions
-- Diff against the software path on the same list: at 1x, same structure and
-  the same colour count within reach -- the hangar is 1,893 colours in
-  software against 105 here, and all of that gap is texturing
+**Third increment — done 4 Sep.** Texturing now includes all decoded formats,
+CLUT paging and swizzle, the five texture functions, render-target aliasing,
+and perspective-correct UV/Q interpolation. The cache key covers every mip
+level's address, stride and dimensions rather than only level zero.
 
-**Fourth increment** — the parts that need real work:
-- Texture cache keyed on the GE's texture state (address, format, size, CLUT)
-- The transform pipeline, which needs the VFPU matrices to be correct first
-- Blending, depth, scissor — each is a small addition once the above holds
-- The awkward ones, which no API makes easy: the stencil living in the
-  framebuffer's alpha byte, and the texture function's colour doubling. Both
-  are shader work either way and are not an argument for or against GL.
+Mip selection does not use driver derivatives. The shared
+`psp_render_lod16()` applies the measured AUTO, CONST and SLOPE rules once per
+primitive, including the signed 1/16 bias. The fragment shader uses
+`texelFetch` to implement PSP nearest/bilinear precision, wrap, mip-nearest and
+mip-linear explicitly; this avoids OpenGL's different min/mag switchover and
+also permits independently-sized PSP mip levels. A mission run uploaded 47,779
+complete two-extra-level chains and no incomplete chain; its end-frame RMSE
+against the software renderer fell from 0.01532 to 0.01418.
+
+The same increment made texture identity content-aware. `mem.c` records the
+latest write to each 256-byte guest-memory granule; ordinary scalar and block
+writes mark themselves, while HLE code writing through a raw mapped pointer and
+GL render-target readback mark the completed range explicitly. Cache entries
+cover every active mip range and the reachable part of the CLUT. The global
+write serial makes repeated bindings with no intervening write constant-time;
+after an unrelated write, the entry revalidates only those ranges.
+
+Direct-colour entries do not key on incidental CLUT state, and a bounded
+32-entry probe chooses its least-recently-used member on collision. On
+`mission-1.pad`, this reduces uploads from 232,385 to 1,073 (99.5%), of which
+898 are real dirty invalidations; there are 458,311 hits, 175 cold misses and
+only 16 evictions, with 159/512 slots resident at the end. Generation checks
+cost 0.008 s, complete texture binding 1.157 s and render-target readback
+0.832 s over a 56.6 s run. The resulting framebuffer is byte-identical to the
+pre-cache mip/LOD result. `big.gcap` is likewise byte-identical before and after
+the cache, and its GL output is byte-identical to the software backend.
+
+The cadence counters also resolve the apparent scene-dependent rate: the
+mission's rendered-frame interval is 33 ms median / 34 ms p95, and the hangar's
+is also 33/34 ms. Two `sceDisplaySetFrameBuf` calls arrive per newly rendered
+frame; reporting API calls as frames would falsely claim about 63 fps. Both
+measured paths are steadily following the game's ~30 fps cadence rather than
+the GL renderer slowing down only in the mission.
+
+**Remaining renderer work:**
+- The framebuffer-alpha stencil, doubled blend factors and absolute-difference
+  blend equation; these are shader work and are counted when encountered.
+- Dithering and the point/line primitive paths.
+- GPU timer queries (the present report currently has CPU-side texture and
+  readback costs) and a readable fixed-list image after the capture's
+  empty-framebuffer defect is fixed.
 
 ## Validation
 

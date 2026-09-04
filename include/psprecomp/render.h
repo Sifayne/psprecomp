@@ -37,6 +37,17 @@ typedef struct {
      * gives them that way, and transformed geometry is scaled by the texture
      * size on the way in, so both arrive in the same units. */
     float    u, v;
+    /* Homogeneous terms for texture interpolation.  Ordinary transformed
+     * geometry carries reciprocal clip-space W in inv_w and tex_q == 1, so a
+     * rasterizer reconstructs
+     *
+     *     uv = sum(bary * uv * inv_w) / sum(bary * inv_w)
+     *
+     * instead of stretching an affine map across oblique world geometry.
+     * Texture-matrix projection replaces the denominator with
+     * sum(bary * tex_q * inv_w).  Through-mode geometry and sprites use 1 for
+     * both and therefore retain their screen-space affine mapping. */
+    float    inv_w, tex_q;
     /* Fog coefficient, 0..255: 255 is unfogged and 0 the fog colour, the
      * hardware's own byte. Transformed geometry gets it from its eye-space
      * depth against FOG1/FOG2; through-mode and clear-mode geometry are never
@@ -204,6 +215,13 @@ size_t psp_render_decode_level(const psp_tex_state *t, int level,
                                const psp_clut_state *clut,
                                uint32_t *out, size_t cap,
                                int *out_w, int *out_h);
+
+/* Resolve the PSP's per-primitive level of detail to a signed count of
+ * sixteenths. `rho` is the greatest texture-coordinate gradient in texels per
+ * screen pixel. Keeping this rule in the runtime lets software and GPU
+ * backends make the same AUTO / CONST / SLOPE decision before their samplers
+ * choose and blend mip levels. */
+int psp_render_lod16(const psp_tex_state *t, float rho);
 
 /* Add a backend the runtime does not carry. Anything needing a window or a GL
  * context lives in the host -- the core has no external dependencies and SDL2

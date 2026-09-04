@@ -471,14 +471,15 @@ static uint32_t sample_filtered(float u, float v, int linear) {
  * The level is chosen once per primitive, from the primitive's own texture
  * gradient, not per pixel. Within a level the filter is the min filter when
  * minifying and the mag filter when magnifying. */
-static int lod_sixteenths(float rho) {
+int psp_render_lod16(const psp_tex_state *t, float rho) {
+    if (!t) return 0;
     int lod;
-    switch (g_tex.lod_mode) {
+    switch (t->lod_mode) {
     case 0:  lod = (rho > 0.0f) ? (int)floorf(log2f(rho) * 16.0f) : -4096; break;
-    case 2:  lod = (int)floorf(g_tex.lod_slope * 16.0f); break;
+    case 2:  lod = (int)floorf(t->lod_slope * 16.0f); break;
     default: lod = 0; break;   /* CONST; and the undefined mode 3 measures the same */
     }
-    return lod + g_tex.lod_bias16;
+    return lod + t->lod_bias16;
 }
 
 static uint32_t sample_level(float u, float v, int L, int linear) {
@@ -968,9 +969,11 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * texture entirely, which reads as "the geometry is not arriving" when the
      * geometry is arriving and being shaded wrong.
      *
-     * Interpolation is affine, not perspective-correct: there is no w here to
-     * divide by. On a fullscreen quad that is exact, and on a steeply oblique
-     * one it skews the texture. */
+     * Colour, depth and fog are affine in screen space. Texture coordinates
+     * are not: transformed vertices retain reciprocal clip W (and a texture
+     * projection Q), so the textured branch below performs the homogeneous
+     * divide the PSP uses on oblique geometry. Through-mode vertices carry
+     * ones and reduce exactly to the old affine result. */
     const float inv = 1.0f / (float)area;
     const int textured = texture_usable();
     int lod16 = 0;
@@ -985,7 +988,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             const float dudx = (du1 * e2y - du2 * e1y) / det, dudy = (du2 * e1x - du1 * e2x) / det;
             const float dvdx = (dv1 * e2y - dv2 * e1y) / det, dvdy = (dv2 * e1x - dv1 * e2x) / det;
             const float rx = sqrtf(dudx * dudx + dvdx * dvdx), ry = sqrtf(dudy * dudy + dvdy * dvdy);
-            lod16 = lod_sixteenths(rx > ry ? rx : ry);
+            lod16 = psp_render_lod16(&g_tex, rx > ry ? rx : ry);
         }
     }
 
@@ -1013,8 +1016,16 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                 }
 
                 if (textured) {
-                    const float u = l0 * a->u + l1 * b->u + l2 * c->u;
-                    const float v = l0 * a->v + l1 * b->v + l2 * c->v;
+                    const float den = l0 * a->tex_q * a->inv_w
+                                    + l1 * b->tex_q * b->inv_w
+                                    + l2 * c->tex_q * c->inv_w;
+                    const float rden = den != 0.0f ? 1.0f / den : 0.0f;
+                    const float u = (l0 * a->u * a->inv_w
+                                   + l1 * b->u * b->inv_w
+                                   + l2 * c->u * c->inv_w) * rden;
+                    const float v = (l0 * a->v * a->inv_w
+                                   + l1 * b->v * b->inv_w
+                                   + l2 * c->v * c->inv_w) * rden;
                     const uint32_t texel = sample_mip(u, v, lod16);
                     /* The watched pixel's two inputs, separately: which of the
                      * texel and the shaded vertex colour is the dark one is
@@ -1081,7 +1092,7 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
     int lod16 = 0;
     if (textured) {
         const float rx = fabsf(du) * 16.0f, ry = fabsf(dv) * 16.0f;
-        lod16 = lod_sixteenths(rx > ry ? rx : ry);
+        lod16 = psp_render_lod16(&g_tex, rx > ry ? rx : ry);
     }
 
     for (int y = py0; y < py1; y++) {
