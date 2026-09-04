@@ -222,14 +222,40 @@ does not matter until a game is already drawing:
   (`psp_render_reset_depth` has no GPU meaning) and read zero under any other
   backend; put them behind an optional query first
 
-**First increment** — geometry on the GPU:
-- `SDL_GL_CreateContext` on the window `present.c` already owns
-- Vertex buffer per display list, one draw per primitive batch
-- Through-mode only, matching what the software path already does
+**First increment — done 3 Sep, and what "done" means here.** `host/render_gl.c`
+is a real backend: it claims the context on the GE thread, batches vertices,
+draws them into an off-screen 480x272 target, blits that to the window, and
+reads it back into the guest framebuffer so the project's instruments keep
+working. `PSPRECOMP_RENDER=gl` selects it.
+
+Each stage was verified separately rather than by looking at the result: a
+known triangle pushed through the batch renders 38,000 red pixels, a forced
+constant in the readback reaches the frame dump, and a clear reaches the
+readback. The pipeline is sound.
+
+**The game's frame is nevertheless uniformly white, and that is the scope
+rather than a fault.** There is no depth test, no blending and no clear
+handling, so a frame is every primitive of that frame painted in submission
+order with the last one winning, and the accumulation is white. Fixing it is
+the second increment; approximating it now would produce a picture that looks
+plausible and is not the software path's, which is the one thing this
+arrangement exists to prevent.
+
+**`finish()` had never been called** (fixed the same day). The interface has
+documented it as the end of a display list and a good point to flush batched
+work since it was written, and `ge.c` called only `draw()`. The software path
+never noticed, because it rasterizes each primitive immediately and has
+nothing to batch -- so the gap only appears the moment a backend accumulates.
+
+**Second increment** — the state that makes the frame right:
+- Depth test and depth writes, which is what stops submission order deciding
+  the picture
+- Alpha blending and the alpha test
+- The scissor, and clear-mode draws
 - Diff against the software path on the same list: same pixels, or the backend
   is wrong
 
-**Second increment** — the parts that need real work:
+**Third increment** — the parts that need real work:
 - Texture cache keyed on the GE's texture state (address, format, size, CLUT)
 - The transform pipeline, which needs the VFPU matrices to be correct first
 - Blending, depth, scissor — each is a small addition once the above holds

@@ -14,6 +14,7 @@
 #include "psprecomp/sched.h"
 #include "psprecomp/hle.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/render.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -241,6 +242,16 @@ static void hle_SetFrameBuf(void) {
     /* Present finished pixels: a flip without a preceding Sync still shows
      * what the GE has been given, on hardware as tearing, here as drained. */
     psp_ge_drain_all();
+    /* The flip is what "show what has accumulated" means, so this is where a
+     * backend's present() belongs. It was unwired until now because the
+     * software path writes pixels straight into guest memory and has nothing
+     * to show -- its present() is a no-op, and so is null's.
+     *
+     * Before score_frame and dump_frame_seq on purpose: a GPU backend draws
+     * into its own buffer, and present() is where it reads back into the
+     * guest framebuffer those two are about to read. Wire it after them and
+     * every instrument in this file measures the previous frame. */
+    psp_render_current()->present();
     score_frame(g_fb_addr);
     dump_frame_seq(g_fb_addr);
     /* The frame flip. What the game hands the display is what a window shows;

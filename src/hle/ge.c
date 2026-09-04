@@ -1915,6 +1915,13 @@ static void run_list(ge_queue *q) {
         case GE_FINISH:
             if (cmd == GE_FINISH) g_ge.finishes++;
             q->done = 1;
+            /* The end of a list is what finish() means, and until now nothing
+             * called it -- the interface has documented it as "a good point to
+             * flush batched work" since it was written, and the software path
+             * never noticed because it draws each primitive immediately and
+             * has nothing to batch. A backend that accumulates geometry has no
+             * flush point without this, so its batch spans a whole frame. */
+            psp_render_current()->finish();
             return;
 
         case GE_SIGNAL:
