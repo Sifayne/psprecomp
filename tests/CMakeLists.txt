@@ -60,3 +60,13 @@ add_test(NAME interp COMMAND test_interp)
 add_executable(test_ctrl_replay test_ctrl_replay.c)
 target_link_libraries(test_ctrl_replay PRIVATE psprecomp)
 add_test(NAME ctrl_replay COMMAND test_ctrl_replay)
+
+add_executable(test_ge_capture test_ge_capture.c)
+target_link_libraries(test_ge_capture PRIVATE psprecomp)
+add_test(NAME ge_capture_polls COMMAND test_ge_capture polls capture-polls)
+add_test(NAME ge_capture_legacy COMMAND test_ge_capture legacy capture-legacy.gcap)
+foreach(value "2,2" "5,2" "2," "-1" "2,no" "4294967296")
+    string(MAKE_C_IDENTIFIER "${value}" id)
+    add_test(NAME ge_capture_invalid_${id}
+             COMMAND test_ge_capture invalid capture-invalid-${id} "${value}")
+endforeach()

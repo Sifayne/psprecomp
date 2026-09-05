@@ -358,6 +358,26 @@ draw-plus-blit cost is 0.81 ms mean, 2.1 ms p95 and 2.85 ms maximum.
 
 ## Validation
 
+The host's expanded scene suite uses `PSPRECOMP_GE_CAPTURE_POLLS=740,915,...`
+with `PSPRECOMP_GE_CAPTURE=<prefix>` to record multiple frames in one run.
+Each increasing poll number selects the first qualifying frame beginning at
+or after that controller poll; files are `<prefix>-<poll>.gcap`. The existing
+MINCMDS/MINMEAN filters still apply, and the log records actual start/end
+polls. POLLS takes precedence over the legacy one-shot FRAME selector.
+Malformed schedules disable capture with a diagnostic. Synthetic
+`test_ge_capture` cases cover selection, memory snapshot contents, invalid
+schedules, and the legacy selector.
+
+Six Last Raven scene captures now include garage, mission ground/smoke and
+combat. Each is replayed twice per backend with identical RGB output on the
+repeats; normalized software-versus-GL RMSE ranges from 0.002474 to 0.003105.
+Both combat frames request stencil on 801 draws, and 8/9 line draws are skipped
+by both backends. RGB agreement therefore cannot establish completeness.
+Initial alpha/stencil outcomes and render-target allocation history need
+dedicated tests; the capture runner rejects multi-list frames until the
+recorder can preserve per-list memory lifetimes. The host's
+`docs/RENDER-CHECKS.md` carries the commands, regions and limitations.
+
 The software backend is checked against hand-built display lists in
 `tests/test_raster.c` — synthetic, no game data, asserting pixel positions rather
 than pixel counts. A backend that fills the whole screen and one that fills the

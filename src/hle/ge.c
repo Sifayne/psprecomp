@@ -35,6 +35,7 @@
 #include "psprecomp/sched.h"
 
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -2577,6 +2578,12 @@ static uint8_t *g_cap_state;         /* state as of the frame's start */
 static uint8_t *g_cap_ram, *g_cap_vram, *g_cap_mod;
 static uint32_t g_cap_mod_base, g_cap_mod_size;
 static const char *g_cap_path;
+/* A scene suite uses the same pad-poll timebase as its input recording. Each
+ * requested poll selects the first complete, qualifying frame starting at or
+ * after it. The original one-shot FRAME selector remains available. */
+enum { GE_CAP_MAX_POLLS = 64 };
+static uint32_t g_cap_polls[GE_CAP_MAX_POLLS], g_cap_start_poll;
+static int g_cap_poll_count, g_cap_poll_index;
 
 size_t psp_ge_state_size(void) { return sizeof g_tl + sizeof g_ge; }
 
@@ -2616,6 +2623,29 @@ static void cap_init(void) {
     if (g_cap_path && !*g_cap_path) g_cap_path = NULL;
     const char *f = getenv("PSPRECOMP_GE_CAPTURE_FRAME");
     g_cap_frame = (g_cap_path && f && *f) ? atoi(f) : (g_cap_path ? 1 : -1);
+    const char *polls = getenv("PSPRECOMP_GE_CAPTURE_POLLS");
+    if (g_cap_path && polls && *polls) {
+        const char *p = polls;
+        for (;;) {
+            char *end;
+            errno = 0;
+            const unsigned long value = strtoul(p, &end, 10);
+            if (*p < '0' || *p > '9' || end == p || errno == ERANGE ||
+                value > UINT32_MAX || g_cap_poll_count == GE_CAP_MAX_POLLS ||
+                (g_cap_poll_count && value <= g_cap_polls[g_cap_poll_count - 1]) ||
+                (*end && *end != ',')) {
+                fprintf(stderr, "ge: invalid PSPRECOMP_GE_CAPTURE_POLLS; "
+                                "expected up to 64 increasing poll numbers\n");
+                g_cap_poll_count = 0;
+                g_cap_frame = -1;
+                return;
+            }
+            g_cap_polls[g_cap_poll_count++] = (uint32_t)value;
+            if (!*end) break;
+            p = end + 1;
+        }
+        g_cap_frame = 1;       /* POLLS takes precedence over FRAME */
+    }
     /* Frames are not equal: this game's compositing frames run a few hundred
      * commands and the ones that draw the room run thousands, and picking by
      * number lands on whichever happens to be there. This says "the first
@@ -2739,8 +2769,19 @@ static uint64_t cap_framebuffer_rgb_sum(uint64_t *samples) {
 }
 
 static void cap_write(void) {
-    FILE *f = fopen(g_cap_path, "wb");
-    if (!f) { fprintf(stderr, "ge: cannot write capture %s\n", g_cap_path); return; }
+    char numbered[4096];
+    const char *path = g_cap_path;
+    if (g_cap_poll_count) {
+        const int n = snprintf(numbered, sizeof numbered, "%s-%u.gcap",
+                               g_cap_path, g_cap_polls[g_cap_poll_index]);
+        if (n < 0 || (size_t)n >= sizeof numbered) {
+            fprintf(stderr, "ge: capture path is too long\n");
+            return;
+        }
+        path = numbered;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "ge: cannot write capture %s\n", path); return; }
     ge_cap_header h = { GE_CAP_MAGIC, GE_CAP_VER, (uint32_t)psp_ge_state_size(),
                         (uint32_t)g_cap_n, PSP_RAM_BASE, PSP_RAM_SIZE,
                         PSP_VRAM_BASE, PSP_VRAM_SIZE,
@@ -2757,7 +2798,8 @@ static void cap_write(void) {
     if (g_cap_min_mean && g_cap_fb_samples)
         fprintf(stderr, ", framebuffer RGB mean %.2f",
                 (double)g_cap_fb_sum / (double)g_cap_fb_samples);
-    fprintf(stderr, " -> %s\n", g_cap_path);
+    fprintf(stderr, ", polls %u..%u -> %s\n", g_cap_start_poll,
+            psp_ctrl_polls(), path);
 }
 
 /* Called at every frame boundary, which is what drain_all marks. */
@@ -2787,6 +2829,7 @@ static void cap_frame_boundary(void) {
         }
         if (g_cap_n == 0 || ran < g_cap_min_cmds || reject_fb) {
             psp_ge_state_save(g_cap_state);
+            g_cap_start_poll = psp_ctrl_polls();
             g_cap_cmd0 = g_ge.commands;
             g_cap_n = 0;
             g_cap_snapped = 0;
@@ -2794,14 +2837,18 @@ static void cap_frame_boundary(void) {
         }
         cap_write();
         g_cap_arming = 0;
-        g_cap_frame = -1;          /* once */
-        return;
+        if (!g_cap_poll_count || ++g_cap_poll_index == g_cap_poll_count) {
+            g_cap_frame = -1;
+            return;
+        }
     }
     g_cap_seen++;
-    if (g_cap_seen == g_cap_frame) {
+    if (g_cap_poll_count ? psp_ctrl_polls() >= g_cap_polls[g_cap_poll_index]
+                         : g_cap_seen == g_cap_frame) {
         if (!g_cap_state) g_cap_state = malloc(psp_ge_state_size());
         if (!g_cap_state) return;
         psp_ge_state_save(g_cap_state);   /* before the frame's commands run */
+        g_cap_start_poll = psp_ctrl_polls();
         g_cap_cmd0 = g_ge.commands;
         g_cap_n = 0;
         g_cap_snapped = 0;
