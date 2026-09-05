@@ -118,6 +118,11 @@ void psp_mem_watch_write(uint32_t addr);
 /* As above, but only report writes of this exact value. */
 void psp_mem_watch_write_value(uint32_t addr, uint32_t val);
 int psp_mem_watch_hits(void);
+/* Hold or release the watch's report budget. Armed by default; the sceCtrl HLE
+ * disarms it at init when PSPRECOMP_WATCHMEM_FROM names a poll and re-arms it
+ * there, so a word rewritten every frame from mission start does not spend all
+ * 32 reports before the write in question. */
+void psp_mem_watch_arm(int armed);
 
 uint8_t  psp_read8 (uint32_t addr);
 uint16_t psp_read16(uint32_t addr);

@@ -262,6 +262,17 @@ static uint32_t         g_ctrl_frame;
 static uint32_t         g_ctrl_polls;
 
 uint32_t psp_ctrl_polls(void)   { return g_ctrl_polls; }
+
+/* The stick as the guest last saw it: the merged lane, after the script took
+ * or returned it. For native code that wants the magnitude the game's own
+ * control path throws away -- it thresholds the stick into button bits. Read
+ * from the same value ctrl_fill wrote, so it is what a recording holds and a
+ * replay reproduces. */
+static uint8_t g_ctrl_last_ax = 128, g_ctrl_last_ay = 128;
+void psp_ctrl_last_stick(uint8_t *ax, uint8_t *ay) {
+    if (ax) *ax = g_ctrl_last_ax;
+    if (ay) *ay = g_ctrl_last_ay;
+}
 uint32_t psp_ctrl_samples(void) { return g_ctrl_frame; }
 
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
@@ -454,12 +465,99 @@ static void ctrl_wait_sample(void) {
     g_sample_due = psp_clock_next_frame();
 }
 
+/* ---- PSPRECOMP_RAMSNAP -- whole-RAM snapshots at chosen polls -------------
+ *
+ * PSPRECOMP_RAMSNAP=<prefix> with PSPRECOMP_RAMSNAP_POLLS=<n>[,<n>...] writes
+ * the guest's 32 MB of RAM to <prefix>-<poll>.ram at each named poll, before
+ * that poll's pad state is written.
+ *
+ * This exists for one question FINDPTR cannot ask: "which word changes by a
+ * constant each frame while the stick is held". FINDPTR needs a value to look
+ * for, and a heading's representation -- float radians, degrees, a 16-bit
+ * binary angle -- is exactly what is not known. Three snapshots a poll apart
+ * during a hold settle it offline without guessing: a word whose successive
+ * differences are equal and non-zero is an integrator's output, and its step
+ * says what the unit is. See scripts/ram-diff.py in last-raven.
+ *
+ * Taken at the poll, the timebase scenarios are keyed on, so a snapshot lines
+ * up with the input that produced it. Capped at 16 -- half a gigabyte --
+ * stated here rather than discovered from a full disk. */
+enum { RAMSNAP_MAX = 16 };
+static const char *g_ramsnap_prefix;
+static uint32_t    g_ramsnap_polls[RAMSNAP_MAX];
+static int         g_ramsnap_n, g_ramsnap_next;
+
+/* PSPRECOMP_WATCHMEM_FROM=<poll>: hold PSPRECOMP_WATCHMEM's report budget until
+ * that poll. Lives here because the poll count does; mem.c only knows about
+ * writes. */
+static uint32_t g_watch_from;
+
+static void parse_watch_from(void) {
+    const char *v = getenv("PSPRECOMP_WATCHMEM_FROM");
+    if (!v || !*v) return;
+    g_watch_from = (uint32_t)strtoul(v, NULL, 0);
+    if (g_watch_from) {
+        psp_mem_watch_arm(0);
+        printf("      watchmem  reporting from poll %u\n", g_watch_from);
+    }
+}
+
+static void parse_ramsnap(void) {
+    const char *p = getenv("PSPRECOMP_RAMSNAP");
+    if (!p || !*p) return;
+    g_ramsnap_prefix = p;
+    const char *v = getenv("PSPRECOMP_RAMSNAP_POLLS");
+    for (const char *s = v ? v : ""; *s && g_ramsnap_n < RAMSNAP_MAX; ) {
+        char *end;
+        const uint32_t n = (uint32_t)strtoul(s, &end, 10);
+        if (end == s) break;
+        g_ramsnap_polls[g_ramsnap_n++] = n;
+        s = (*end == ',') ? end + 1 : end;
+    }
+    printf("      ramsnap   %d snapshot(s) to %s-<poll>.ram\n", g_ramsnap_n, p);
+}
+
+static void ramsnap_step(uint32_t poll) {
+    /* Listed ascending. >= rather than ==, so a poll listed below the current
+     * count fires late instead of blocking every one after it. */
+    if (g_ramsnap_next >= g_ramsnap_n || poll < g_ramsnap_polls[g_ramsnap_next]) return;
+    g_ramsnap_next++;
+    char path[1024];
+    snprintf(path, sizeof path, "%s-%u.ram", g_ramsnap_prefix, poll);
+    const void *ram = psp_mem_ptr(PSP_RAM_BASE, PSP_RAM_SIZE);
+    FILE *f = ram ? fopen(path, "wb") : NULL;
+    if (!f) { fprintf(stderr, "ramsnap: cannot write %s\n", path); return; }
+    const size_t got = fwrite(ram, 1, PSP_RAM_SIZE, f);
+    fclose(f);
+    fprintf(stderr, "ramsnap: poll %u -> %s (%zu bytes)\n", poll, path, got);
+
+    /* The module image too, as <prefix>-<poll>.mod. This runtime maps the
+     * module at guest address 0, and its data and BSS are not in RAM at all --
+     * which is where this game keeps its player object, so a RAM-only diff
+     * looked straight past the heading it was hunting. The extent is not known
+     * here; probe upward in 64K steps until the mapping ends. Best effort: a
+     * process with no module loaded writes no .mod and says nothing. */
+    uint32_t mod = 0;
+    while (mod < 0x01000000u && psp_mem_ptr(0, mod + 0x10000u)) mod += 0x10000u;
+    if (mod) {
+        snprintf(path, sizeof path, "%s-%u.mod", g_ramsnap_prefix, poll);
+        f = fopen(path, "wb");
+        if (!f) { fprintf(stderr, "ramsnap: cannot write %s\n", path); return; }
+        const size_t gotm = fwrite(psp_mem_ptr(0, mod), 1, mod, f);
+        fclose(f);
+        fprintf(stderr, "ramsnap: poll %u -> %s (%zu bytes, module at 0)\n",
+                poll, path, gotm);
+    }
+}
+
 /* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16. */
 static void ctrl_fill(void) {
     const uint64_t us = psp_clock_peek();
     g_ctrl_polls++;
+    if (g_watch_from && g_ctrl_polls == g_watch_from) psp_mem_watch_arm(1);
     pad_press_step(us);
     psp_ctrl_replay_step(g_ctrl_polls, us);
+    ramsnap_step(g_ctrl_polls);
 
     /* The merge. Buttons OR; the stick belongs to whoever last claimed it. */
     const uint32_t host = atomic_load(&g_host_buttons);
@@ -468,6 +566,8 @@ static void ctrl_fill(void) {
     const uint32_t buttons = g_hold_buttons | g_script_buttons | host;
     const uint8_t  ax = g_script_analog ? g_script_ax : hax;
     const uint8_t  ay = g_script_analog ? g_script_ay : hay;
+    g_ctrl_last_ax = ax;
+    g_ctrl_last_ay = ay;
 
     /* A scenario driving a run that also has a hand on the pad is still a
      * useful run -- it is how you take over one that is stuck -- but it is no
@@ -740,6 +840,8 @@ void psp_misc_init(void) {
     psp_misc_reset();
     g_hold_buttons = parse_pad();
     parse_pad_press();
+    parse_ramsnap();
+    parse_watch_from();
     psp_ctrl_replay_init();
 }
 

@@ -54,6 +54,9 @@ void psp_trace_enter(uint32_t addr);
 void psp_trace_dump(void);
 void psp_trace_reset(void);
 uint32_t psp_trace_last(void);
+/* The entry `back` places before the most recent (1 = the one before
+ * psp_trace_last()); 0 past the end of the ring. Entries, not a stack. */
+uint32_t psp_trace_recent(int back);
 void psp_trace_watch(uint32_t addr, void (*fn)(uint32_t));
 void psp_trace_loop(uint32_t addr);
 void psp_trace_mark(uint32_t addr);

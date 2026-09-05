@@ -228,6 +228,8 @@ static ge_queue g_queue[MAX_QUEUES];
  * declared here because both the list runner and the enqueue path call into
  * it and they come first. */
 static void cap_note_list(const ge_queue *q);
+static void view_log_note(void);          /* PSPRECOMP_VIEW_LOG; see below */
+static void view_log_note_world(void);
 static void cap_snapshot_memory(void);
 static uint32_t g_next_id;
 
@@ -2020,11 +2022,20 @@ static void run_list(ge_queue *q) {
         case GE_WORLDMATRIXDATA:
             if (drawlog_aux()) fprintf(stderr, "mtx: WORLD DATA  arg=%06X -> [%d] = %.2f\n",
                                         arg, g_tl.world_n, ge_float(arg));
-            if (g_tl.world_n < 12) g_tl.world[g_tl.world_n++] = ge_float(arg);
+            if (g_tl.world_n < 12) {
+                g_tl.world[g_tl.world_n++] = ge_float(arg);
+                if (g_tl.world_n == 12) view_log_note_world();
+            }
             g_tl.world_words++;
             break;
         case GE_VIEWMATRIXDATA:
-            if (g_tl.view_n < 12) g_tl.view[g_tl.view_n++] = ge_float(arg);
+            if (g_tl.view_n < 12) {
+                g_tl.view[g_tl.view_n++] = ge_float(arg);
+                /* The twelfth word completes an upload. Noted here and not at
+                 * the frame boundary: the HUD draws last and sets a view of
+                 * its own, so by drain time the scene's matrix is gone. */
+                if (g_tl.view_n == 12) view_log_note();
+            }
             g_tl.view_words++;
             break;
         case GE_PROJMATRIXDATA:
@@ -2909,7 +2920,169 @@ static void cap_frame_boundary(void) {
     }
 }
 
-void psp_ge_drain_all(void) { drain_all(); cap_frame_boundary(); }
+/* ---- PSPRECOMP_VIEW_LOG=<file> -- the camera, per frame ------------------
+ *
+ * The GE's matrices are the one piece of the guest's own world state this
+ * runtime already decodes. Everything else about where the player is and which
+ * way they face lives in guest memory under no name, but the transforms arrive
+ * here as floats every frame, for free.
+ *
+ * Which matrix carries the camera is a fact about the game, not the GE, and
+ * for this game it is not the view matrix. A full mission uploads the view
+ * ~155,000 times and it is the same axis flip, diag(1,-1,-1), every time; the
+ * camera is composed on the CPU -- PS2-era scalar code -- into each object's
+ * world matrix, ~240 uploads a frame. So the log records both: every distinct
+ * view upload (tag V, which for this game is two lines a run), and the k-th
+ * world upload of each frame (tag W). For a static object drawn at a stable
+ * point in the frame, that world matrix *is* the camera, up to a constant.
+ *
+ * That makes it the instrument for questions the host otherwise cannot ask:
+ * what turn rate does a given stick deflection actually produce, is there a
+ * deadzone, is there a maximum, how long does the camera take to settle. Those
+ * are measurements, and without this they are guesses.
+ *
+ * Read-only and off unless asked for. Noted when an upload *completes* -- the
+ * twelfth VIEWMATRIXDATA word -- and not at the frame boundary. The first
+ * version sampled at drain time and saw one matrix for an entire mission: the
+ * HUD draws last, sets a 2D view of its own, and had overwritten the scene's
+ * by the time the frame ended. Every distinct upload gets a line, so the 2D
+ * one still appears; it is the constant diag(1,-1,-1) and trivially filtered.
+ *
+ * Stamped with the pad-poll count rather than a frame number or a wall clock,
+ * because that is the unit scenario files are keyed on: a line here lines up
+ * with the input that produced it, and stays lined up when the host runs at a
+ * different speed. */
+static FILE *g_view_log;
+static int   g_view_log_init;
+/* The last few uploads, not the last one. A frame uploads the scene's matrix
+ * and then the HUD's, so "differs from the previous upload" is true twice a
+ * frame even when the camera has not moved; remembering a handful collapses a
+ * still camera to nothing. The cost is that a camera snapping *back* to a
+ * matrix seen within the last four uploads is not logged either -- rare with
+ * float trig, but real for a menu camera stepping between fixed positions. */
+enum { VIEW_RING = 4 };
+/* One ring per tag: the view flip is constant, and a moving camera's world
+ * uploads would evict it from a shared ring every few frames, re-logging the
+ * same matrix each time -- 952 lines of it in one probe run. */
+static float g_view_ring[2][VIEW_RING][12];
+static int   g_view_ring_n[2], g_view_ring_next[2];
+
+static void view_log_emit(char tag, const float *m, int dedupe) {
+    if (!g_view_log_init) {
+        g_view_log_init = 1;
+        const char *p = getenv("PSPRECOMP_VIEW_LOG");
+        if (p && *p) {
+            g_view_log = fopen(p, "w");
+            if (!g_view_log) {
+                fprintf(stderr, "ge: cannot write PSPRECOMP_VIEW_LOG %s\n", p);
+            } else {
+                fprintf(g_view_log,
+                    "# tag poll  m[0..11] (3x4, column-major: 3 basis columns "
+                    "then translation)  yaw_deg pitch_deg\n"
+                    "# tag V = a GE view matrix upload; W = the k-th world matrix "
+                    "upload of a frame (PSPRECOMP_VIEW_LOG_WORLD, default 1). This "
+                    "game holds its view matrix constant and composes the camera "
+                    "into each object's world matrix, so a static object's W line "
+                    "is the camera up to a constant. WORLD=all logs every upload, "
+                    "undeduplicated, with an F <poll> line at each frame boundary; "
+                    "PSPRECOMP_VIEW_LOG_POLLS=lo-hi[,lo-hi] confines W lines to "
+                    "those polls.\n"
+                    "# yaw and pitch are derived from the third basis column on "
+                    "the assumption that it is the forward axis. That convention "
+                    "is UNVERIFIED -- confirm it against a known rotation before "
+                    "trusting the two derived columns; the twelve raw floats are "
+                    "the measurement.\n");
+            }
+        }
+    }
+    if (!g_view_log) return;
+
+    /* One line per *new* matrix. A held stick still redraws every frame, and
+     * a log with a line per frame regardless is mostly duplicates. */
+    if (dedupe) {
+        const int r = tag == 'W';
+        for (int i = 0; i < g_view_ring_n[r]; i++)
+            if (!memcmp(g_view_ring[r][i], m, sizeof g_view_ring[r][i])) return;
+        memcpy(g_view_ring[r][g_view_ring_next[r]], m, sizeof g_view_ring[r][0]);
+        g_view_ring_next[r] = (g_view_ring_next[r] + 1) % VIEW_RING;
+        if (g_view_ring_n[r] < VIEW_RING) g_view_ring_n[r]++;
+    }
+
+    const float fx = m[6], fy = m[7], fz = m[8];
+    const double yaw   = atan2((double)fx, (double)fz) * 180.0 / 3.14159265358979323846;
+    const double pitch = atan2((double)fy,
+                               sqrt((double)fx * fx + (double)fz * fz))
+                         * 180.0 / 3.14159265358979323846;
+
+    fprintf(g_view_log, "%c %u", tag, psp_ctrl_polls());
+    for (int i = 0; i < 12; i++) fprintf(g_view_log, " %.6f", m[i]);
+    fprintf(g_view_log, " %.3f %.3f\n", yaw, pitch);
+    fflush(g_view_log);   /* a run that ends in a crash still leaves its trace */
+}
+
+/* View uploads always; world uploads only the k-th of each frame, counted from
+ * the frame boundary psp_ge_drain_all marks. k = 0 turns world logging off.
+ *
+ * `all` logs every world upload, undeduplicated, with an `F <poll>` line at
+ * each frame boundary so a reader can match objects across frames by their
+ * position in the frame. That exists because the k-th upload turned out not to
+ * be one object: draw order shifts with what is on screen, so a single index
+ * mixes terrain, HUD pieces and enemies from frame to frame. With every upload
+ * in hand the camera is recoverable anyway -- every static object's matrix
+ * rotates by exactly the camera's rotation, so the dominant per-object yaw
+ * delta between two frames is the camera's. See scripts/view-analyze.py.
+ *
+ * PSPRECOMP_VIEW_LOG_POLLS=lo-hi[,lo-hi...] confines world logging to those
+ * polls, which is what makes `all` affordable at ~240 uploads a frame. */
+enum { VIEW_WORLD_ALL = -2, VIEW_POLL_RANGES = 16 };
+static int      g_view_world_seen, g_view_world_k = -1;
+static uint32_t g_view_poll_lo[VIEW_POLL_RANGES], g_view_poll_hi[VIEW_POLL_RANGES];
+static int      g_view_poll_n;
+
+static void view_log_world_init(void) {
+    const char *e = getenv("PSPRECOMP_VIEW_LOG_WORLD");
+    g_view_world_k = (!e || !*e) ? 1 : !strcmp(e, "all") ? VIEW_WORLD_ALL : atoi(e);
+    const char *p = getenv("PSPRECOMP_VIEW_LOG_POLLS");
+    while (p && *p && g_view_poll_n < VIEW_POLL_RANGES) {
+        char *end;
+        const uint32_t lo = (uint32_t)strtoul(p, &end, 10);
+        if (end == p) break;
+        uint32_t hi = lo;
+        if (*end == '-') hi = (uint32_t)strtoul(end + 1, &end, 10);
+        g_view_poll_lo[g_view_poll_n] = lo;
+        g_view_poll_hi[g_view_poll_n] = hi;
+        g_view_poll_n++;
+        p = (*end == ',') ? end + 1 : end;
+    }
+}
+
+static int view_log_world_wanted(void) {
+    if (!g_view_poll_n) return 1;
+    const uint32_t poll = psp_ctrl_polls();
+    for (int i = 0; i < g_view_poll_n; i++)
+        if (poll >= g_view_poll_lo[i] && poll <= g_view_poll_hi[i]) return 1;
+    return 0;
+}
+
+static void view_log_note(void) { view_log_emit('V', g_tl.view, 1); }
+
+static void view_log_note_world(void) {
+    if (g_view_world_k == -1) view_log_world_init();
+    if (g_view_world_k == 0 || !view_log_world_wanted()) return;
+    g_view_world_seen++;
+    if (g_view_world_k == VIEW_WORLD_ALL)           view_log_emit('W', g_tl.world, 0);
+    else if (g_view_world_seen == g_view_world_k)   view_log_emit('W', g_tl.world, 1);
+}
+
+/* The frame boundary: restart the per-frame count, and in `all` mode say so in
+ * the log, so the uploads before this line are one frame's. */
+static void view_log_frame_mark(void) {
+    g_view_world_seen = 0;
+    if (g_view_world_k == VIEW_WORLD_ALL && g_view_log && view_log_world_wanted())
+        fprintf(g_view_log, "F %u\n", psp_ctrl_polls());
+}
+
+void psp_ge_drain_all(void) { drain_all(); cap_frame_boundary(); view_log_frame_mark(); }
 
 /* Replay one captured list. Deliberately not sceGeListEnQueue: that reads its
  * arguments from guest registers and hands back an id nobody here has any use

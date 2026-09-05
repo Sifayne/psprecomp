@@ -135,6 +135,16 @@ uint32_t psp_trace_last(void) {
     return g_trace_n ? g_trace[(g_trace_n - 1) % TRACE_DEPTH] : 0;
 }
 
+/* The entry `back` places before the most recent one: 1 is the function
+ * entered just before psp_trace_last(). Entries, not a call stack -- a leaf
+ * that returned is still there -- but for "who called the wrapper that called
+ * this memcpy" that is exactly the order wanted. 0 for anything past what the
+ * ring holds. */
+uint32_t psp_trace_recent(int back) {
+    if (back < 0 || (uint64_t)back >= g_trace_n || back >= TRACE_DEPTH) return 0;
+    return g_trace[(g_trace_n - 1 - (uint64_t)back) % TRACE_DEPTH];
+}
+
 void psp_trace_dump(void) {
     if (!g_trace_n) {
         fprintf(stderr, "  (no function trace -- build the generated code with "

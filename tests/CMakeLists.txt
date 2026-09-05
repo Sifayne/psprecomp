@@ -61,6 +61,18 @@ add_executable(test_ctrl_replay test_ctrl_replay.c)
 target_link_libraries(test_ctrl_replay PRIVATE psprecomp)
 add_test(NAME ctrl_replay COMMAND test_ctrl_replay)
 
+add_executable(test_view_log test_view_log.c)
+target_link_libraries(test_view_log PRIVATE psprecomp)
+add_test(NAME view_log COMMAND test_view_log view-log-test.txt)
+
+add_executable(test_ramsnap test_ramsnap.c)
+target_link_libraries(test_ramsnap PRIVATE psprecomp)
+add_test(NAME ramsnap COMMAND test_ramsnap ramsnap-test)
+
+add_executable(test_watch_arm test_watch_arm.c)
+target_link_libraries(test_watch_arm PRIVATE psprecomp)
+add_test(NAME watch_arm COMMAND test_watch_arm)
+
 add_executable(test_ge_capture test_ge_capture.c)
 target_link_libraries(test_ge_capture PRIVATE psprecomp)
 add_test(NAME ge_capture_polls COMMAND test_ge_capture polls capture-polls)

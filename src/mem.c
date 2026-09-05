@@ -109,6 +109,14 @@ void psp_mem_watch_write_value(uint32_t addr, uint32_t val) {
 }
 int psp_mem_watch_hits(void) { return g_whits; }
 
+/* Armed by default. The report budget is 32 hits, and a word that is cleared
+ * at mission start and rewritten every frame spends all 32 on the clears --
+ * the write that matters, minutes later, is never seen. The sceCtrl HLE
+ * disarms this at init when PSPRECOMP_WATCHMEM_FROM names a poll and re-arms
+ * it when that poll arrives, so the budget starts where the question does. */
+static int g_warmed = 1;
+void psp_mem_watch_arm(int armed) { g_warmed = armed; }
+
 /* The value as well as the writer.
  *
  * Naming the function that wrote a word is only half an answer, and reporting
@@ -120,6 +128,7 @@ int psp_mem_watch_hits(void) { return g_whits; }
  * write. */
 static void note_write_val(uint32_t addr, uint32_t width, uint32_t val) {
     if (!g_wwatch || addr + width <= g_wwatch || addr > g_wwatch) return;
+    if (!g_warmed) return;
     if (g_wfilter && val != g_wvalue) return;
     if (g_whits++ < 32) {
         union { uint32_t u; float f; } c; c.u = val;
@@ -136,6 +145,14 @@ static void note_write_val(uint32_t addr, uint32_t width, uint32_t val) {
                 psp_cpu.r[PSP_REG_T0], psp_cpu.r[PSP_REG_T1],
                 psp_cpu.r[PSP_REG_T2], psp_cpu.r[PSP_REG_T3],
                 psp_cpu.r[PSP_REG_SP], psp_cpu.r[PSP_REG_RA]);
+        /* The functions entered before the writer, newest first. "from fn"
+         * names the last *entry*, and for a memcpy called through a wrapper
+         * that is the memcpy: the registers hold the wrapper's return address,
+         * the wrapper's own is on the guest stack, and the function that
+         * actually decided the value is two entries back. */
+        fprintf(stderr, "        entered before it: 0x%08X <- 0x%08X <- 0x%08X <- 0x%08X\n",
+                psp_trace_recent(1), psp_trace_recent(2),
+                psp_trace_recent(3), psp_trace_recent(4));
     }
 }
 
