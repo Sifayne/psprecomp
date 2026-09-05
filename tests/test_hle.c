@@ -709,6 +709,34 @@ static void test_ge_display_list(void) {
           "eDRAM is 2 MB");
 }
 
+/* GU_SIGNAL_PAUSE is followed by a FINISH/END pair where hardware pauses for
+ * the callback. It then resumes the same display list after that END. The HLE
+ * does not deliver GE callbacks yet, so it resumes immediately, but it must
+ * still execute the commands through the list's real final FINISH. */
+static void test_ge_signal_pause(void) {
+    psp_ge_reset();
+
+    const uint32_t LIST = 0x0882C000u;
+    psp_write32(LIST + 0x00, (0x0Eu << 24) | (0x03u << 16) | 1u); /* PAUSE */
+    psp_write32(LIST + 0x04, (0x0Cu << 24));                      /* END */
+    psp_write32(LIST + 0x08, (0x0Fu << 24));                      /* pause FINISH */
+    psp_write32(LIST + 0x0C, (0x0Cu << 24));                      /* pause END */
+    psp_write32(LIST + 0x10, (0x00u << 24));                      /* after resume */
+    psp_write32(LIST + 0x14, (0x0Fu << 24));                      /* final FINISH */
+    psp_write32(LIST + 0x18, (0x0Cu << 24));                      /* final END */
+
+    uint64_t before = psp_ge_command_count();
+    uint32_t qid = call(psp_nid("sceGeListEnQueue"), LIST, 0, 0, 0);
+    CHECK(qid != 0, "signal PAUSE list enqueued, got 0x%08X", qid);
+    CHECK(call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0) == 0,
+          "signal PAUSE list drains");
+
+    uint64_t executed = psp_ge_command_count() - before;
+    CHECK(executed == 6,
+          "SIGNAL PAUSE resumes through final FINISH: executed %llu commands, want 6",
+          (unsigned long long)executed);
+}
+
 /* A list that jumps to itself must terminate rather than hang the host -- this
  * is a normal transient state while the CPU is still writing the list. */
 static void test_ge_infinite_list(void) {
@@ -840,6 +868,7 @@ int main(void) {
     test_io_dirs();
     test_net();
     test_ge_display_list();
+    test_ge_signal_pause();
     test_ge_infinite_list();
     test_sas_adpcm();
     test_stdio_async();

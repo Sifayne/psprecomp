@@ -206,6 +206,9 @@ static int fx16_floor(float f) {
 #define MAX_QUEUES 8
 #define GE_STACK   8
 
+/* SIGNAL behaviour emitted by sceGuSignal(GU_SIGNAL_PAUSE). */
+#define GE_SIGNAL_HANDLER_PAUSE 0x03
+
 /* Primitive types, from the PRIM argument's type field. */
 static const char *const PRIM_NAME[8] = {
     "points", "lines", "line-strip", "triangles",
@@ -218,6 +221,7 @@ typedef struct {
     uint32_t stall;     /* stop before this address; 0 means "no stall" */
     uint32_t base;      /* GE_BASE: high bits for addresses */
     uint32_t origin;
+    int      signal;    /* pending PAUSE through its FINISH/END pair */
     int      used;
     int      done;
 } ge_queue;
@@ -1997,9 +2001,18 @@ static void run_list(ge_queue *q) {
              * skipping would under-report what the game drew. */
             break;
 
-        case GE_END:
         case GE_FINISH:
-            if (cmd == GE_FINISH) g_ge.finishes++;
+            if (q->signal == GE_SIGNAL_HANDLER_PAUSE) {
+                /* sceGuSignal(GU_SIGNAL_PAUSE) deliberately places a
+                 * FINISH/END pair after SIGNAL/END. Hardware pauses here for
+                 * the signal callback, then sceGeContinue resumes after the
+                 * END. Callbacks are not modelled yet, so flush the completed
+                 * work and resume immediately rather than truncating the
+                 * remainder of the list. */
+                psp_render_current()->finish();
+                break;
+            }
+            g_ge.finishes++;
             q->done = 1;
             cap_snapshot_memory();
             /* The end of a list is what finish() means, and until now nothing
@@ -2010,6 +2023,32 @@ static void run_list(ge_queue *q) {
              * flush point without this, so its batch spans a whole frame. */
             psp_render_current()->finish();
             return;
+
+        case GE_END: {
+            /* END is also the second word of every SIGNAL encoding. Treating
+             * it as list completion drops everything after a signal -- in
+             * this game, the rest of the scene and the entire HUD. */
+            uint32_t signal = psp_read32(q->list - 8);
+            if ((signal >> 24) != GE_SIGNAL) {
+                if ((signal >> 24) == GE_FINISH &&
+                    q->signal == GE_SIGNAL_HANDLER_PAUSE) {
+                    q->signal = 0;
+                    break;
+                }
+                /* Preserve the old bare-END fallback. Normal completed lists
+                 * stop at FINISH above and never reach their trailing END. */
+                q->done = 1;
+                cap_snapshot_memory();
+                psp_render_current()->finish();
+                return;
+            }
+
+            uint32_t behaviour = (signal >> 16) & 0xFF;
+            if (behaviour == GE_SIGNAL_HANDLER_PAUSE) {
+                q->signal = (int)behaviour;
+            }
+            break;
+        }
 
         case GE_SIGNAL:
             /* Raises a callback on hardware. Callbacks are not delivered yet
