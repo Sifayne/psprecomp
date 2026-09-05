@@ -864,7 +864,11 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
     }
     if (g_zs.write) g_depth[y * DEPTH_STRIDE + x] = z;
     if (g_bs.stencil_test) stencil = (int)stencil_op(g_bs.op_zpass, cur_stencil);
-    if (!g_bs.write_colour) { if (stencil >= 0) write_stencil_only(x, y, (uint32_t)stencil); return; }
+    if (!g_bs.write_colour) {
+        if (stencil >= 0) write_stencil_only(x, y, (uint32_t)stencil);
+        else if (g_bs.write_alpha) write_stencil_only(x, y, chan(rgba, 3));
+        return;
+    }
     if (g_bs.enable) { rgba = blend(rgba, get_pixel(x, y)); g_px_blend++; }
     if (watched) {
         g_pw_left--;
@@ -1133,10 +1137,99 @@ static uint64_t now_ns(void) { return psp_os_mono_ns(); }
 
 uint64_t psp_render_raster_ns(void) { return g_raster_ns; }
 
+static int64_t floor_div(int64_t n, int64_t d) {
+    return n / d - (n % d < 0);
+}
+
+/* Intersect the integer sample interval with lo <= floor((p + d*i)/s)
+ * <= hi. Clipping the interval first bounds the work even for very long
+ * offscreen lines; it must not restart interpolation at the scissor edge. */
+static int line_clip_axis(int64_t p, int64_t d, int64_t s, int lo, int hi,
+                          int64_t *first, int64_t *last) {
+    const int64_t low = (int64_t)lo * s, high = ((int64_t)hi + 1) * s - 1;
+    if (!d) return p >= low && p <= high;
+    const int64_t begin = d > 0 ? -floor_div(p - low, d)
+                                : -floor_div(high - p, -d);
+    const int64_t end = d > 0 ? floor_div(high - p, d)
+                              : floor_div(p - low, -d);
+    if (*first < begin) *first = begin;
+    if (*last > end) *last = end;
+    return *first <= *last;
+}
+
+void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
+                          int x0, int y0, int x1, int y1,
+                          psp_line_pixel_fn emit, void *opaque) {
+    const int64_t dx = (int64_t)b->x - a->x, dy = (int64_t)b->y - a->y;
+    const int64_t ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+    const int64_t steps = (ax > ay ? ax : ay) / PSP_SUBPX;
+    if (!steps || x0 > x1 || y0 > y1) return;
+    /* The far endpoint is excluded. At integer boundaries a decreasing
+     * coordinate owns the pixel immediately before it, including at i=0.
+     * Reversing an integer horizontal/vertical interval keeps its coverage. */
+    const int64_t px = ((int64_t)a->x - (dx < 0)) * steps;
+    const int64_t py = ((int64_t)a->y - (dy < 0)) * steps;
+    const int64_t scale = steps * PSP_SUBPX;
+    int64_t first = 0, last = steps - 1;
+    if (!line_clip_axis(px, dx, scale, x0, x1, &first, &last) ||
+        !line_clip_axis(py, dy, scale, y0, y1, &first, &last)) return;
+    for (int64_t i = first; i <= last; i++) {
+        const float t = (float)((double)i / (double)steps), s = 1.0f - t;
+        psp_vertex v = *a;
+        v.x = (int)floor_div(px + dx * i, scale) * PSP_SUBPX + PSP_SUBPX / 2;
+        v.y = (int)floor_div(py + dy * i, scale) * PSP_SUBPX + PSP_SUBPX / 2;
+        v.z = s * a->z + t * b->z;
+        v.rgba = 0;
+        for (int c = 0; c < 4; c++)
+            v.rgba |= (uint32_t)((chan(a->rgba, c) * (steps - i) +
+                                  chan(b->rgba, c) * i) / steps) << (8 * c);
+        v.fog = (int)(s * (float)a->fog + t * (float)b->fog + 0.5f);
+        const float den = s * a->tex_q * a->inv_w + t * b->tex_q * b->inv_w;
+        v.u = den ? (s * a->u * a->inv_w + t * b->u * b->inv_w) / den : 0;
+        v.v = den ? (s * a->v * a->inv_w + t * b->v * b->inv_w) / den : 0;
+        v.inv_w = v.tex_q = 1.0f;
+        emit(&v, opaque);
+    }
+}
+
+int psp_render_line_lod16(const psp_tex_state *t,
+                          const psp_vertex *a, const psp_vertex *b) {
+    const float dx = fabsf((float)b->x - (float)a->x) / PSP_SUBPX;
+    const float dy = fabsf((float)b->y - (float)a->y) / PSP_SUBPX;
+    const float extent = dx > dy ? dx : dy;
+    return psp_render_lod16(t, extent ? hypotf(b->u - a->u, b->v - a->v) / extent : 1);
+}
+
+static void sw_point_sample(const psp_vertex *v, void *opaque) {
+    const int x = (int)floor_div(v->x, PSP_SUBPX), y = (int)floor_div(v->y, PSP_SUBPX);
+    if (x < g_sc_x0 || x > g_sc_x1 || y < g_sc_y0 || y > g_sc_y1) return;
+    uint32_t col = v->rgba;
+    if (texture_usable()) {
+        const float q = v->tex_q;
+        col = apply_texfunc(sample_mip(q ? v->u / q : 0, q ? v->v / q : 0,
+                                       *(const int *)opaque), col);
+        g_px_tex++;
+    } else g_px_flat++;
+    shade_pixel(x, y, v->z, apply_fog(col, v->fog));
+}
+
 static void sw_draw(int prim, const psp_vertex *v, int count) {
     g_cur_prim = prim;
     const uint64_t t0 = now_ns();
     switch (prim) {
+    case PSP_PRIM_POINTS: {
+        int lod16 = psp_render_lod16(&g_tex, 1.0f);
+        for (int i = 0; i < count; i++) sw_point_sample(&v[i], &lod16);
+        break;
+    }
+    case PSP_PRIM_LINES:
+    case PSP_PRIM_LINE_STRIP:
+        for (int i = 0; i + 1 < count; i += prim == PSP_PRIM_LINES ? 2 : 1) {
+            int lod16 = psp_render_line_lod16(&g_tex, &v[i], &v[i + 1]);
+            psp_render_walk_line(&v[i], &v[i + 1], g_sc_x0, g_sc_y0, g_sc_x1, g_sc_y1,
+                                  sw_point_sample, &lod16);
+        }
+        break;
     case PSP_PRIM_SPRITES:
         for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1]);
         break;
@@ -1147,7 +1240,7 @@ static void sw_draw(int prim, const psp_vertex *v, int count) {
         for (int i = 0; i + 2 < count; i++) sw_tri(&v[i], &v[i + 1], &v[i + 2]);
         break;
     default:
-        break;                       /* points, lines, fans: not yet */
+        break;                       /* fans are assembled by the GE */
     }
     g_raster_ns += now_ns() - t0;
 }

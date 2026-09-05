@@ -1051,9 +1051,8 @@ static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
 /* Transformed geometry, one primitive at a time.
  *
  * Triangles go through emit_tri below -- the near-plane clip, the guard band
- * and the cull are per-triangle decisions -- and everything else is handed to
- * the backend as decoded, with vertices at or behind the eye projected to
- * (0,0), since there is no clipper for points, lines or sprites. */
+ * and the cull are per-triangle decisions. Points and lines use the same
+ * near-plane/guard-band policy below. Sprites retain the two-corner path. */
 /* PSPRECOMP_GE_DRAWLOG=<n> narrates the first n primitives: where they landed,
  * what colour, and whether a texture was bound.
  *
@@ -1245,6 +1244,46 @@ static int clip_near(const clipvert *in, int n, clipvert *out) {
         if ((da >= 0.0f) != (db >= 0.0f)) lerp_clip(a, b, da / (da - db), &out[m++]);
     }
     return m;
+}
+
+/* A line is clipped as a segment, not as a two-vertex polygon (which would
+ * generate the same intersection twice). Points have no intersection to add.
+ * This follows the triangle path's existing clip/clamp and guard-band policy. */
+static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) {
+    if (!g_tl.depth_clamp) {
+        for (int i = 0; i < n; i++) {
+            if (!(p[i].c[3] > 0)) { g_skip_nearplane += (uint64_t)n; return; }
+            const float z = p[i].c[2] / p[i].c[3];
+            if (!(z >= -1 && z <= 1)) { g_clip_z += (uint64_t)n; return; }
+        }
+    } else {
+        const float a = p[0].c[2] + p[0].c[3];
+        const float b = p[n-1].c[2] + p[n-1].c[3];
+        if (a < 0 && b < 0) { g_clip_z += (uint64_t)n; return; }
+        if ((a < 0) != (b < 0)) {
+            clipvert cut;
+            lerp_clip(&p[0], &p[1], a / (a-b), &cut);
+            p[a < 0 ? 0 : 1] = cut;
+            g_clip_split++;
+        }
+    }
+    psp_vertex v[2];
+    const float ox = g_tl.vp_set ? g_tl.off_x : 1808.0f;
+    const float oy = g_tl.vp_set ? g_tl.off_y : 1912.0f;
+    for (int i = 0; i < n; i++) {
+        if (!(p[i].c[3] > 0)) { g_skip_nearplane += (uint64_t)n; return; }
+        float x, y, z;
+        to_screen(p[i].c, &x, &y, &z);
+        if (!(x >= -ox && x < 4096-ox && y >= -oy && y < 4096-oy) || !isfinite(z)) {
+            g_clip_guard += (uint64_t)n; return;
+        }
+        v[i] = p[i].v;
+        v[i].x = fx16_floor(x + 1.0f / (2 * PSP_SUBPX));
+        v[i].y = fx16_floor(y + 1.0f / (2 * PSP_SUBPX));
+        v[i].z = g_tl.depth_clamp ? fmaxf(0, fminf(65535, z)) : z;
+        v[i].inv_w = 1.0f / p[i].c[3];
+    }
+    be->draw(n == 1 ? PSP_PRIM_POINTS : PSP_PRIM_LINES, v, n);
 }
 
 static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int flip) {
@@ -1610,6 +1649,16 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                  * -- ignoring that culls exactly half of every strip. */
                 emit_tri(be, tri, type == PSP_PRIM_TRIANGLE_STRIP && ((i - 2) & 1));
             }
+        } else if (type <= PSP_PRIM_LINE_STRIP) {
+            const uint32_t size = type == PSP_PRIM_POINTS ? 1 : 2;
+            const uint32_t advance = type == PSP_PRIM_LINES ? 2 : 1;
+            for (uint32_t i = 0; i + size <= decoded; i += advance) {
+                clipvert p[2];
+                for (uint32_t j = 0; j < size; j++) {
+                    p[j].v = v[i+j]; memcpy(p[j].c, cl[i+j], sizeof p[j].c);
+                }
+                emit_point_line(be, p, (int)size);
+            }
         } else {
             be->draw((int)type, v, (int)decoded);
         }
@@ -1617,6 +1666,8 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         if ((type == PSP_PRIM_TRIANGLE_STRIP || type == PSP_PRIM_TRIANGLE_FAN) &&
             decoded == BATCH && done + decoded < count)
             done += decoded - 2;
+        else if (type == PSP_PRIM_LINE_STRIP && decoded == BATCH && done + decoded < count)
+            done += decoded - 1;
         else
             done += decoded;
     }
@@ -1814,8 +1865,8 @@ static void draw_prim(uint32_t type, uint32_t count) {
         uint32_t n = count - done;
         if (n > BATCH) n = BATCH;
 
-        /* Strips are order-dependent, so a batch boundary must overlap by two
-         * vertices or the triangle spanning it is lost. */
+        /* Strips overlap at a batch boundary: two vertices for triangles,
+         * one for lines, or the primitive spanning the boundary is lost. */
         uint32_t decoded = 0;
         for (; decoded < n; decoded++) {
             if (!read_vertex(vertex_addr(done + decoded, stride),
@@ -1857,6 +1908,8 @@ static void draw_prim(uint32_t type, uint32_t count) {
 
         if (type == 4 && decoded == BATCH && done + decoded < count)
             done += decoded - 2;     /* strip overlap */
+        else if (type == PSP_PRIM_LINE_STRIP && decoded == BATCH && done + decoded < count)
+            done += decoded - 1;
         else
             done += decoded;
     }

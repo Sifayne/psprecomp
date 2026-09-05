@@ -922,6 +922,112 @@ static void test_backend_registration(void) {
     CHECK(psp_render_select("software") == 0, "software reselectable after");
 }
 
+static void test_points_and_lines(void) {
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, 10, 10, 0xFF00FF00); vertex(1, 12, 10, 0xFF00FF00);
+    vertex(2, 24, 10, 0xFFFF00FF); vertex(3, 22, 10, 0xFFFF00FF);
+    vertex(4, 26, 10, 0xFFFFFFFF);  /* incomplete pair must draw nothing */
+    cmd(0x04, (PSP_PRIM_LINES << 16) | 5); end_list();
+    for (int x = 0; x < 30; x++) {
+        const uint32_t want = x == 10 || x == 11 ? 0x00FF00 :
+                               x == 22 || x == 23 ? 0xFF00FF : 0;
+        CHECK(pixel(x, 10) == want, "line endpoint x=%d: %06X want %06X", x, pixel(x, 10), want);
+    }
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, 10, 10, 0xFF00FF00); vertex(1, 12, 10, 0xFF00FF00);
+    cmd(0x04, (PSP_PRIM_POINTS << 16) | 2); end_list();
+    CHECK(pixel(10, 10) == 0x00FF00 && pixel(12, 10) == 0x00FF00 && !pixel(11, 10),
+          "points include each submitted endpoint, not the interval");
+
+    psp_ge_reset(); clear_fb(); begin_list();
+    for (int i = 0; i < 260; i++) vertex(i, 10 + i, 20, 0xFFFFFFFF);
+    cmd(0x04, (PSP_PRIM_LINE_STRIP << 16) | 260); end_list();
+    for (int x = 0; x < 280; x++)
+        CHECK(pixel(x, 20) == (x >= 10 && x < 269 ? 0xFFFFFFu : 0),
+              "line strip preserves batch boundary, x=%d", x);
+}
+
+static void test_alpha_only_clear(void) {
+    psp_ge_reset(); clear_fb();
+    psp_write32(FB + (10*480+10)*4, 0x44332211);
+    begin_list();
+    vertex(0, 10, 10, 0x99FFFFFF); vertex(1, 11, 11, 0x99FFFFFF);
+    cmd(0xD3, 1 | (2 << 8)); /* clear mode, stencil only */
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2);
+    cmd(0xD3, 0); end_list();
+    CHECK(psp_read32(FB + (10*480+10)*4) == 0x99332211,
+          "stencil-only clear writes alpha and preserves RGB");
+}
+
+static void float_vertex(int i, float x, float y, float z) {
+    const float pos[] = {x, y, z};
+    psp_write32(VERTS + (uint32_t)i*16, 0xFFFFFFFF);
+    for (int k = 0; k < 3; k++) {
+        uint32_t bits; memcpy(&bits, &pos[k], 4);
+        psp_write32(VERTS + (uint32_t)i*16 + 4 + (uint32_t)k*4, bits);
+    }
+}
+
+static void test_transformed_lines(void) {
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u<<2) | (3u<<7));
+    for (int m = 0; m < 3; m++) {
+        cmd((uint8_t)(0x3A + 2*m), 0);
+        for (int i = 0; i < (m == 2 ? 16 : 12); i++)
+            cmd((uint8_t)(0x3B + 2*m), i % (m == 2 ? 5 : 4) == 0 ? 0x3F8000 : 0);
+    }
+    /* Identity matrices/default viewport. Clip at z=-1 halfway along this
+     * segment, so only its right half (x=240..359) is visible. */
+    float_vertex(0,-0.5f,0,-2); float_vertex(1,0.5f,0,0);
+    cmd(0x1C, 1); cmd(0x04, (PSP_PRIM_LINES<<16) | 2); end_list();
+    CHECK(!pixel(239,136) && pixel(240,136) == 0xFFFFFF &&
+          pixel(359,136) == 0xFFFFFF && !pixel(360,136), "transformed line clips near plane");
+
+    psp_ge_reset(); clear_fb(); begin_list_vtype((7u<<2) | (3u<<7));
+    for (int m = 0; m < 2; m++) {
+        cmd((uint8_t)(0x3A + 2*m), 0);
+        for (int i = 0; i < 12; i++) cmd((uint8_t)(0x3B + 2*m), i%4 == 0 ? 0x3F8000 : 0);
+    }
+    float_vertex(0,0,0,0); float_vertex(1,0.5f,0,0);
+    cmd(0x3E, 0); /* A projection with W=-1: do not draw a point at (0,0). */
+    for (int i = 0; i < 16; i++) {
+        const float f = i == 15 ? -1.0f : i%5 == 0 ? 1.0f : 0.0f;
+        uint32_t bits; memcpy(&bits, &f, 4); cmd(0x3F, bits>>8);
+    }
+    cmd(0x04, (PSP_PRIM_POINTS<<16) | 2); end_list();
+    CHECK(psp_ge_pixels() == 0, "behind-eye points are rejected");
+}
+
+typedef struct { int count; psp_vertex first, last; } line_samples;
+static void collect_line(const psp_vertex *v, void *data) {
+    line_samples *s = data;
+    if (!s->count++) s->first = *v;
+    s->last = *v;
+}
+
+static void test_line_interpolation_and_clipping(void) {
+    psp_vertex a = { .x = -16 * 1000000, .y = 16 * 5, .rgba = 0xFF000000,
+                     .inv_w = 1, .tex_q = 1, .fog = 255 };
+    psp_vertex b = a; b.x = 16 * 1000000; b.rgba = 0xFFFFFFFF;
+    line_samples s = {0};
+    psp_render_walk_line(&a, &b, 10, 0, 19, 9, collect_line, &s);
+    CHECK(s.count == 10 && s.first.x == 168 && s.last.x == 312,
+          "huge offscreen line clips to ten samples, got %d", s.count);
+    CHECK((s.first.rgba & 255) == 127, "scissor must not reset colour interpolation");
+    a.x = a.y = 0; b.x = b.y = 64; b.inv_w = 0.5f; b.u = 8; b.z = 100;
+    s = (line_samples){0};
+    psp_render_walk_line(&a, &b, 2, 2, 2, 2, collect_line, &s);
+    CHECK(s.count == 1 && s.first.x == 40 && s.first.y == 40, "diagonal scissor sample");
+    CHECK(s.first.z == 50 && s.first.u > 2.666f && s.first.u < 2.667f &&
+          s.first.inv_w == 1 && s.first.tex_q == 1, "line perspective and depth interpolation");
+    s = (line_samples){0};
+    psp_render_walk_line(&a, &a, 0, 0, 10, 10, collect_line, &s);
+    CHECK(!s.count, "zero length line is not a point");
+    b.x = -64; b.y = -64;
+    psp_render_walk_line(&a, &b, 0, 0, 10, 10, collect_line, &s);
+    CHECK(!s.count, "negative coordinates floor and descending boundary excludes origin");
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -949,6 +1055,10 @@ int main(void) {
     test_ge_reset_clears_depth();
     test_backend_selection();
     test_backend_registration();
+    test_points_and_lines();
+    test_alpha_only_clear();
+    test_transformed_lines();
+    test_line_interpolation_and_clipping();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

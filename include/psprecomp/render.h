@@ -223,6 +223,17 @@ size_t psp_render_decode_level(const psp_tex_state *t, int level,
  * choose and blend mip levels. */
 int psp_render_lod16(const psp_tex_state *t, float rho);
 
+/* One-pixel primitives use explicit coverage, not the host API's line rules.
+ * Walk a half-open segment, clipped to inclusive pixel bounds. Each callback
+ * receives a pixel-centred vertex with already interpolated colour, depth,
+ * fog and divided texture coordinates (inv_w = tex_q = 1). */
+typedef void (*psp_line_pixel_fn)(const psp_vertex *sample, void *opaque);
+void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
+                          int x0, int y0, int x1, int y1,
+                          psp_line_pixel_fn emit, void *opaque);
+int psp_render_line_lod16(const psp_tex_state *t,
+                          const psp_vertex *a, const psp_vertex *b);
+
 /* Add a backend the runtime does not carry. Anything needing a window or a GL
  * context lives in the host -- the core has no external dependencies and SDL2
  * is the host's -- so the host builds one and registers it here, after which

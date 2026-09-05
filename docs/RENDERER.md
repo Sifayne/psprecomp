@@ -33,9 +33,9 @@ during bring-up.
 
 Three reasons, in order of how much they cost to get wrong:
 
-1. **The software path must survive.** It is the oracle. A GPU backend that
-   disagrees with it is wrong, and you cannot establish that if the GPU backend
-   is the only one. `tests/test_raster.c` asserts *where* pixels land using
+1. **The software path must survive.** It is the differential oracle. A
+   disagreement needs investigation on both sides; either implementation can
+   contain bugs. `tests/test_raster.c` asserts *where* pixels land using
    nothing but the software path, and that must keep working on a machine with
    no GPU at all — CI included.
 
@@ -107,9 +107,9 @@ backend is wrong the same way, which is at least diagnosable.
 
 | Backend | State | Notes |
 |---|---|---|
-| **software** | Working | The reference. Triangles, strips and sprites; points, lines and fans are not drawn. 21 tests in `test_raster.c` assert pixel positions and sampling rules -- perspective UVs, mip/LOD, filtering, wrap, depth and clear mode among them. No GPU, no dependencies, runs in CI. |
+| **software** | Working | The differential reference. Points, lines, line strips, triangles, triangle strips and sprites; GE-assembled fans. `test_raster.c` asserts pixel positions and sampling rules -- perspective UVs, mip/LOD, filtering, wrap, depth and clear mode among them. No GPU, no dependencies, runs in CI. |
 | **null** | Working | Counts primitives, draws nothing. What the bring-up host uses when the question is "did it ask to draw". |
-| **gl33-sdl2** | Working at native resolution | Triangles, strips, fans and sprites; render targets and aliases, perspective texturing, PSP mip/LOD/filter rules, depth, scissor, blend, alpha test and fog. Remaining gaps are listed below. |
+| **gl33-sdl2** | Working at native resolution | Points, lines, strips, triangles, fans and sprites; render targets and aliases, perspective texturing, PSP mip/LOD/filter rules, depth, scissor, blend, alpha test, RGBA8888 alpha-backed stencil and fog. Remaining gaps are listed below. |
 
 Selection is `psp_render_select(name)` (`src/render.c`), wired to
 **`PSPRECOMP_RENDER`** in `host/boot.c` (3 Sep). Before that nothing outside
@@ -351,10 +351,29 @@ from 62,870 to 122,818 of 130,560 and reduce normalized RMSE from 0.005718 to
 mission still completes at zero bad accesses and normal pacing; its measured
 draw-plus-blit cost is 0.81 ms mean, 2.1 ms p95 and 2.85 ms maximum.
 
+**Fifth increment — done 4 Sep.** Points and lines now use explicit pixel
+coverage shared between backends (`psp_render_walk_line`). GL expands samples
+to pixel quads and uses the normal fragment pipeline; software shades them
+directly. Line-strip decode batches retain their shared endpoint. Transformed
+points/lines follow the existing near-plane/guard-band policy instead of
+projecting behind-eye vertices onto the origin. Integer endpoint cases are
+checked against public primitive fixtures; fractional coverage still merits
+wider hardware checks.
+
+RGBA8888 stencil uses GL's 8-bit stencil attachment, with lazy GPU bit-plane
+imports/exports to keep the PSP framebuffer alpha byte coherent. Reconcile
+before destination-alpha blending, target sampling, readback and partial alpha
+clears. Blended primitives which also change stencil synchronize individually
+when their destination-alpha dependency requires it. The host's synthetic
+`render_tests.c` checks all 256 byte values and fail/pass operations in RGBA,
+not only RGB; it also found software dropping stencil-only clears when RGB
+writes were disabled, fixed in `shade_pixel()`.
+
 **Remaining renderer work:**
-- The framebuffer-alpha stencil, doubled blend factors and absolute-difference
-  blend equation; these are shader work and are counted when encountered.
-- Dithering and the point/line primitive paths.
+- Stencil for 5650/5551/4444 targets, doubled blend factors and absolute-difference
+  blend equation; these remain explicitly counted when encountered.
+- History-dependent render-target size/format changes, dithering, broader
+  scene/hardware coverage and fractional point/line edge cases.
 
 ## Validation
 
@@ -371,10 +390,13 @@ schedules, and the legacy selector.
 Six Last Raven scene captures now include garage, mission ground/smoke and
 combat. Each is replayed twice per backend with identical RGB output on the
 repeats; normalized software-versus-GL RMSE ranges from 0.002474 to 0.003105.
-Both combat frames request stencil on 801 draws, and 8/9 line draws are skipped
-by both backends. RGB agreement therefore cannot establish completeness.
-Initial alpha/stencil outcomes and render-target allocation history need
-dedicated tests; the capture runner rejects multi-list frames until the
+Both combat frames now execute their 801 stencil-enabled draws and 8/9 line
+draws, with no unsupported counts for either feature. The host's synthetic
+suite passes 430 exact RGBA assertions per backend, including alpha clears,
+stencil outcomes, depth rejection, texture alpha and destination-alpha blending.
+RGB agreement alone still cannot establish completeness. Reduced-bit-depth
+stencil and render-target allocation history need dedicated tests; the capture
+runner rejects multi-list frames until the
 recorder can preserve per-list memory lifetimes. The host's
 `docs/RENDER-CHECKS.md` carries the commands, regions and limitations.
 
