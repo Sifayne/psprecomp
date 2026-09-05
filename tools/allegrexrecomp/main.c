@@ -43,13 +43,19 @@ static int usage(void) {
         "  allegrexrecomp dis     <file> [start-addr] [count]\n"
         "  allegrexrecomp cover   <file>\n"
         "  allegrexrecomp funcs   <file> [--list]\n"
-        "  allegrexrecomp emit    <file> <outdir> [prefix]\n"
+        "  allegrexrecomp emit    <file> <outdir> [prefix] [--replace <addrs>|@<file>]\n"
         "  allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs] [--dispatch] [--drain <s>]\n"
         "  allegrexrecomp decrypt <file> [--keys <path>]\n"
         "  allegrexrecomp kirk1   <file> [out] [--keys <path>]\n"
         "\n"
         "Accepts .iso disc images, PBP containers, ~PSP / ~SCE wrappers,\n"
         "ELF/PRX modules, and raw binaries.\n"
+        "\n"
+        "--replace names functions (hex addresses, comma-separated, or @file with\n"
+        "one per line and # comments) that the host will implement itself. Their\n"
+        "translated bodies are emitted as psp_func_<addr>__orig and the public\n"
+        "psp_func_<addr> is left for the host to define, so a native version wins\n"
+        "at link time and can still call the original.\n"
         "\n"
         "Key material is never bundled. Supply it via --keys, $PSPRECOMP_KEYS,\n"
         "or ./keys/psp_keys.txt — see docs/DECRYPT.md.\n");
@@ -746,7 +752,71 @@ static int cmd_funcs(const char *path, int list) {
 
 /* ---- the emitter --------------------------------------------------------- */
 
-static int cmd_emit(const char *path, const char *outdir, const char *prefix) {
+/* --replace <addr>[,<addr>...] or --replace @<file>.
+ *
+ * The file form exists because this list grows by hand and a build script
+ * carrying a dozen addresses on one command line is a quoting accident waiting
+ * to happen. One address per line, `#` to end-of-line is a comment, so the file
+ * can say *why* each function is replaced -- which is the part that would
+ * otherwise live only in somebody's memory.
+ *
+ * Returns the count, or -1 with a message. */
+static int parse_replace(const char *spec, uint32_t **out) {
+    char *buf = NULL;
+    const char *text = spec;
+
+    if (*spec == '@') {
+        FILE *fp = fopen(spec + 1, "r");
+        if (!fp) { fprintf(stderr, "cannot read %s\n", spec + 1); return -1; }
+        size_t cap = 4096, len = 0;
+        buf = (char *)malloc(cap);
+        if (!buf) { fclose(fp); return -1; }
+        int ch;
+        while ((ch = fgetc(fp)) != EOF) {
+            if (len + 2 > cap) {
+                char *nb = (char *)realloc(buf, cap * 2);
+                if (!nb) { free(buf); fclose(fp); return -1; }
+                buf = nb; cap *= 2;
+            }
+            /* Comments and newlines both just become separators. */
+            buf[len++] = (char)ch;
+        }
+        buf[len] = '\0';
+        fclose(fp);
+        for (char *p = buf; *p; p++)
+            if (*p == '#') while (*p && *p != '\n') *p++ = ' ';
+        text = buf;
+    }
+
+    int n = 0, cap = 8;
+    uint32_t *list = (uint32_t *)malloc((size_t)cap * sizeof *list);
+    if (!list) { free(buf); return -1; }
+
+    for (const char *p = text; *p; ) {
+        while (*p == ',' || *p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (!*p) break;
+        char *end;
+        const unsigned long v = strtoul(p, &end, 16);   /* addresses are hex */
+        if (end == p) {
+            fprintf(stderr, "--replace: not an address: %s\n", p);
+            free(list); free(buf); return -1;
+        }
+        if (n == cap) {
+            uint32_t *nl = (uint32_t *)realloc(list, (size_t)cap * 2 * sizeof *list);
+            if (!nl) { free(list); free(buf); return -1; }
+            list = nl; cap *= 2;
+        }
+        list[n++] = (uint32_t)v;
+        p = end;
+    }
+
+    free(buf);
+    *out = list;
+    return n;
+}
+
+static int cmd_emit(const char *path, const char *outdir, const char *prefix,
+                    const uint32_t *replace, int nreplace) {
     psp_blob b;
     elf_info e;
     a_analysis an;
@@ -779,10 +849,28 @@ static int cmd_emit(const char *path, const char *outdir, const char *prefix) {
     o.module = module;
     o.imports = imp;
     o.nimports = nimp;
+    o.replace = replace;
+    o.nreplace = nreplace;
 
     printf("module:     %s\n", module);
     printf("functions:  %d\n", an.nfuncs);
-    printf("imports:    %d\n\n", an.nimports);
+    printf("imports:    %d\n", an.nimports);
+
+    /* An address that names no discovered function emits nothing, declares
+     * nothing, and fails at link time with an undefined psp_func_<addr> that
+     * the host does define -- which reads as a build system problem rather
+     * than as the typo it is. Say so here instead. */
+    if (nreplace) {
+        printf("replacing:  %d function(s) left to the host\n", nreplace);
+        for (int i = 0; i < nreplace; i++) {
+            int found = 0;
+            for (int j = 0; j < an.nfuncs && !found; j++)
+                if (an.funcs[j].addr == replace[i]) found = 1;
+            printf("  0x%08X  %s\n", replace[i],
+                   found ? "ok" : "*** NOT A DISCOVERED FUNCTION -- nothing will be replaced");
+        }
+    }
+    printf("\n");
 
     int rc = a_emit(&an, &o);
 
@@ -1250,7 +1338,32 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "funcs"))   return cmd_funcs(argv[2], argc > 3 && !strcmp(argv[3], "--list"));
     if (!strcmp(cmd, "emit")) {
         if (argc < 4) return usage();
-        return cmd_emit(argv[2], argv[3], argc > 4 ? argv[4] : NULL);
+        /* prefix stays positional and optional, so it is only argv[4] when
+         * argv[4] is not the start of the flags. */
+        const char *prefix = (argc > 4 && strncmp(argv[4], "--", 2)) ? argv[4] : NULL;
+        uint32_t *replace = NULL;
+        int nreplace = 0;
+        for (int i = prefix ? 5 : 4; i < argc; i++) {
+            if (!strcmp(argv[i], "--replace") && i + 1 < argc) {
+                uint32_t *add = NULL;
+                const int n = parse_replace(argv[++i], &add);
+                if (n < 0) { free(replace); return 2; }
+                uint32_t *merged = (uint32_t *)realloc(replace,
+                                       (size_t)(nreplace + n) * sizeof *merged);
+                if (!merged) { free(replace); free(add); return 1; }
+                replace = merged;
+                for (int k = 0; k < n; k++) replace[nreplace + k] = add[k];
+                nreplace += n;
+                free(add);
+            } else {
+                fprintf(stderr, "unknown option: %s\n", argv[i]);
+                free(replace);
+                return usage();
+            }
+        }
+        const int rc = cmd_emit(argv[2], argv[3], prefix, replace, nreplace);
+        free(replace);
+        return rc;
     }
     if (!strcmp(cmd, "extract")) {
         if (argc < 5) return usage();

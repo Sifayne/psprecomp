@@ -31,6 +31,23 @@ typedef struct {
      * comment. Without it the thunks can only trap. */
     const psp_import_entry *imports;
     int                     nimports;
+
+    /* Addresses the host means to implement itself.
+     *
+     * For each one the translated body is still emitted, but under
+     * `psp_func_<addr>__orig`, and the public `psp_func_<addr>` is left
+     * undefined. A hand-written native C function of that name, compiled into
+     * the host, then satisfies every call site the emitter wrote -- direct
+     * `jal`s included, which no run-time hook can reach because they lower to
+     * plain C calls and never touch the dispatch table.
+     *
+     * This is how a recompilation gets to *change* the game rather than only
+     * run it: the original stays callable as `__orig`, so a replacement can
+     * defer to it, wrap it, or ignore it. Keeping the body is what makes the
+     * mechanism cheap to back out of and what lets one build carry both the
+     * stock behaviour and the new one. */
+    const uint32_t *replace;
+    int             nreplace;
 } emit_opts;
 
 /* Emit <outdir>/<prefix>_funcs.c, <prefix>_funcs.h and <prefix>_imports.c.

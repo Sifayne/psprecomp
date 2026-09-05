@@ -36,7 +36,20 @@ typedef struct {
     uint8_t *is_fallthrough_target;
     uint32_t *entries;     /* interior labels that got a dispatch thunk */
     int nentries, centries;
+    const emit_opts *o;    /* for the replace set; see is_replaced() */
 } ectx;
+
+/* Is this function one the host will define itself? See emit_opts.replace.
+ *
+ * Linear over a list that holds a handful of addresses in practice -- a
+ * replacement is written by hand, one at a time, so this will not grow to the
+ * size where the scan matters. */
+static int is_replaced(const emit_opts *o, uint32_t addr) {
+    if (!o || !o->replace) return 0;
+    for (int i = 0; i < o->nreplace; i++)
+        if (o->replace[i] == addr) return 1;
+    return 0;
+}
 
 static void entry_push(ectx *c, uint32_t a) {
     if (c->nentries == c->centries) {
@@ -1044,8 +1057,24 @@ static void emit_function(ectx *c, const a_func *fn) {
 
     /* The real entry, plus one thunk per interior label so anything that can be
      * jumped to can also be dispatched to. */
-    fprintf(f, "void psp_func_%08X(void) { psp_body_%08X(0x%08Xu); }\n",
-            fn->addr, fn->addr, fn->addr);
+    if (is_replaced(c->o, fn->addr)) {
+        /* Named __orig and left for the host to front. Every call site in the
+         * module still says psp_func_<addr>, so the host's definition wins at
+         * link time without a single call site changing.
+         *
+         * The interior-label thunks below are deliberately *not* renamed: they
+         * enter psp_body_<addr> directly, so control that jumps into the middle
+         * of this function still runs the original. That is the honest
+         * behaviour -- a replacement stands in for the function, not for every
+         * block inside it -- but it means replacing a function that is also
+         * jumped into partway is not the clean substitution it looks like.
+         * Check for psp_at_ thunks on a candidate before relying on one. */
+        fprintf(f, "void psp_func_%08X__orig(void) { psp_body_%08X(0x%08Xu); }\n",
+                fn->addr, fn->addr, fn->addr);
+    } else {
+        fprintf(f, "void psp_func_%08X(void) { psp_body_%08X(0x%08Xu); }\n",
+                fn->addr, fn->addr, fn->addr);
+    }
     for (uint32_t a = fn->start; a < fn->end; a += 4) {
         if (!owned_by(an, a, owner) || !c->is_label[widx(an, a)]) continue;
         if (c->is_slot[widx(an, a)] || a == fn->addr) continue;
@@ -1118,6 +1147,16 @@ static void emit_header(FILE *f, const a_analysis *an, const emit_opts *o) {
 
     for (int i = 0; i < an->nfuncs; i++)
         fprintf(f, "void psp_func_%08X(void);\n", an->funcs[i].addr);
+
+    /* The replaced ones keep their declaration above -- the host defines that
+     * symbol -- and gain one for the original body, so a replacement can call
+     * through to it. Declared here rather than in the host so the two can
+     * never disagree about the signature. */
+    if (o->nreplace) {
+        fprintf(f, "\n/* Originals of the functions the host replaces. */\n");
+        for (int i = 0; i < o->nreplace; i++)
+            fprintf(f, "void psp_func_%08X__orig(void);\n", o->replace[i]);
+    }
 
     fprintf(f, "\n");
     for (int i = 0; i < an->nimports; i++)
@@ -1206,6 +1245,7 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     ectx c;
     c.out = f;
     c.an = an;
+    c.o = o;
     c.is_label = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
     c.is_slot  = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
     c.is_fallthrough_target = NULL;

@@ -130,7 +130,10 @@ static void test_return_delay_slot_not_owned(void) {
     const uint32_t seeds[2] = { DS_BASE, DS_BASE + 4 };
     CHECK(a_discover(&an, seeds, 2, 2) == 0, "delay slot: discovery runs");
 
-    emit_opts o;
+    /* Zero-initialised: the optional fields (imports, replace) are read by the
+     * emitter, and leaving them as whatever was on the stack made these tests
+     * depend on luck. */
+    emit_opts o = {0};
     o.outdir = ".";
     o.prefix = "t_ds";
     o.module = "synthetic";
@@ -207,7 +210,10 @@ static void test_indirect_call_is_not_terminal(void) {
     const uint32_t seeds[2] = { IC_BASE, IC_BASE + 8 };
     CHECK(a_discover(&an, seeds, 2, 2) == 0, "indirect call: discovery runs");
 
-    emit_opts o;
+    /* Zero-initialised: the optional fields (imports, replace) are read by the
+     * emitter, and leaving them as whatever was on the stack made these tests
+     * depend on luck. */
+    emit_opts o = {0};
     o.outdir = ".";
     o.prefix = "t_ic";
     o.module = "synthetic";
@@ -282,7 +288,10 @@ static void test_vfpu_branch_condition(void) {
     const uint32_t seed = BV_BASE;
     CHECK(a_discover(&an, &seed, 1, 1) == 0, "vfpu branch: discovery runs");
 
-    emit_opts o;
+    /* Zero-initialised: the optional fields (imports, replace) are read by the
+     * emitter, and leaving them as whatever was on the stack made these tests
+     * depend on luck. */
+    emit_opts o = {0};
     o.outdir = ".";
     o.prefix = "t_bv";
     o.module = "synthetic";
@@ -298,6 +307,111 @@ static void test_vfpu_branch_condition(void) {
           "vfpu branch: bvf tests the negation of its condition code");
     CHECK(strstr(src, "unhandled branch") == NULL,
           "vfpu branch: no branch in this function is emitted as never taken");
+    free(src);
+    a_analysis_free(&an);
+}
+
+/* A replaced function keeps its body under __orig and gives up its public name.
+ *
+ * The contract has four halves and all four matter: the body still exists (so a
+ * replacement can defer to the original), the public symbol is *absent* (so the
+ * host's definition is what every call site binds to), the header declares both
+ * (so the two cannot disagree), and registration still names the public symbol
+ * (so indirect calls reach the replacement too, not just direct ones). */
+static void test_replace_leaves_the_symbol_to_the_host(void) {
+    uint8_t code[sizeof CODE];
+    for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(CODE[i]);
+        code[i * 4 + 1] = (uint8_t)(CODE[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(CODE[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(CODE[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = BASE;
+    an.size = (uint32_t)sizeof code;
+
+    uint32_t seed = BASE;
+    CHECK(a_discover(&an, &seed, 1, 1) == 0, "replace: discovery runs");
+
+    const uint32_t replace[1] = { BASE };
+    emit_opts o = {0};
+    o.outdir = ".";
+    o.prefix = "t_rep";
+    o.module = "synthetic";
+    o.replace = replace;
+    o.nreplace = 1;
+    CHECK(a_emit(&an, &o) == 0, "replace: emission succeeds");
+
+    char *src = slurp("./t_rep_funcs.c", NULL);
+    CHECK(src != NULL, "replace: generated .c is readable");
+    if (!src) { a_analysis_free(&an); return; }
+
+    expect_contains(src, "void psp_func_08804000__orig(void)",
+                    "replace: the original body is still emitted, under __orig");
+    CHECK(strstr(src, "void psp_func_08804000(void) {") == NULL,
+          "replace: the public symbol is left undefined for the host");
+    expect_contains(src, "psp_body_08804000",
+                    "replace: the translated body itself is untouched");
+    expect_contains(src, "psp_register(0x08804000u, psp_func_08804000);",
+                    "replace: registration still points at the public symbol, "
+                    "so indirect calls reach the replacement");
+    free(src);
+
+    char *hdr = slurp("./t_rep_funcs.h", NULL);
+    CHECK(hdr != NULL, "replace: generated .h is readable");
+    if (hdr) {
+        expect_contains(hdr, "void psp_func_08804000(void);",
+                        "replace: header still declares the public symbol");
+        expect_contains(hdr, "void psp_func_08804000__orig(void);",
+                        "replace: header declares the original for the host to call");
+        free(hdr);
+    }
+
+    a_analysis_free(&an);
+}
+
+/* Not listing an address must change nothing at all -- this is what keeps every
+ * existing gate green when the feature is compiled in but unused. */
+static void test_replace_absent_changes_nothing(void) {
+    uint8_t code[sizeof CODE];
+    for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(CODE[i]);
+        code[i * 4 + 1] = (uint8_t)(CODE[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(CODE[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(CODE[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = BASE;
+    an.size = (uint32_t)sizeof code;
+
+    uint32_t seed = BASE;
+    CHECK(a_discover(&an, &seed, 1, 1) == 0, "replace/none: discovery runs");
+
+    /* An address that names no function: the emitter must ignore it rather
+     * than replace something adjacent. */
+    const uint32_t bogus[1] = { BASE + 0x1000u };
+    emit_opts o = {0};
+    o.outdir = ".";
+    o.prefix = "t_norep";
+    o.module = "synthetic";
+    o.replace = bogus;
+    o.nreplace = 1;
+    CHECK(a_emit(&an, &o) == 0, "replace/none: emission succeeds");
+
+    char *src = slurp("./t_norep_funcs.c", NULL);
+    CHECK(src != NULL, "replace/none: generated .c is readable");
+    if (!src) { a_analysis_free(&an); return; }
+
+    expect_contains(src, "void psp_func_08804000(void) {",
+                    "replace/none: an unlisted function keeps its public name");
+    CHECK(strstr(src, "__orig") == NULL,
+          "replace/none: nothing is renamed when no listed address matches");
     free(src);
     a_analysis_free(&an);
 }
@@ -326,7 +440,10 @@ int main(void) {
     CHECK(an.insns == 8, "all eight instructions visited, got %llu",
           (unsigned long long)an.insns);
 
-    emit_opts o;
+    /* Zero-initialised: the optional fields (imports, replace) are read by the
+     * emitter, and leaving them as whatever was on the stack made these tests
+     * depend on luck. */
+    emit_opts o = {0};
     o.outdir = ".";
     o.prefix = "t_emit";
     o.module = "synthetic";
@@ -398,6 +515,8 @@ int main(void) {
     test_return_delay_slot_not_owned();
     test_indirect_call_is_not_terminal();
     test_vfpu_branch_condition();
+    test_replace_leaves_the_symbol_to_the_host();
+    test_replace_absent_changes_nothing();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);
