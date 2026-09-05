@@ -33,6 +33,7 @@ static int failures;
 #define FB     0x04000000u          /* eDRAM */
 #define LIST   0x08800000u
 #define VERTS  0x08810000u
+#define INDICES 0x08830000u
 
 /* VTYPE: 8888 colour, 16-bit position, through mode. */
 #define VTYPE_2D  ((7u << 2) | (2u << 7) | (1u << 23))
@@ -873,8 +874,25 @@ static void probe_depth(int t, int f, int w) { (void)t; (void)f; (void)w; }
 static void probe_blend(const psp_blend_state *b) { (void)b; }
 static void probe_fog(int e, uint32_t c) { (void)e; (void)c; }
 static unsigned g_probe_draws;
+static unsigned g_probe_vertices;
+static unsigned g_probe_sequence_errors;
+static int g_probe_check_sequence;
+
+static unsigned quad_index(unsigned position) {
+    static const unsigned corners[6] = { 0, 1, 2, 0, 2, 3 };
+    return position / 6 * 4 + corners[position % 6];
+}
+
 static void probe_draw(int p, const psp_vertex *v, int n) {
-    (void)p; (void)v; (void)n; g_probe_draws++;
+    g_probe_draws++;
+    if (!g_probe_check_sequence) return;
+    if (p != PSP_PRIM_TRIANGLES || n <= 0 || n % 3 != 0)
+        g_probe_sequence_errors++;
+    for (int i = 0; i < n; i++) {
+        const unsigned want = quad_index(g_probe_vertices);
+        if ((v[i].rgba & 0xFFu) != want) g_probe_sequence_errors++;
+        g_probe_vertices++;
+    }
 }
 static void probe_noop(void) { }
 
@@ -968,6 +986,70 @@ static void float_vertex(int i, float x, float y, float z) {
     }
 }
 
+/* The mission text is 64 indexed glyph quads in one triangle draw: 384
+ * indices over 256 vertices.  The GE used to split that at 256 rather than a
+ * multiple of three, lose one corner, and regroup every remaining triangle.
+ * Check both paths because transformed UI text and through-mode geometry have
+ * separate batching loops. */
+static void write_indexed_quads(int transformed) {
+    static const int x[4] = { -1, -1, 1, 1 };
+    static const int y[4] = { -1,  1, 1, -1 };
+    for (int i = 0; i < 256; i++) {
+        const uint32_t colour = 0xFF000000u | (uint32_t)i;
+        if (transformed) {
+            float_vertex(i, (float)x[i & 3] * 0.25f,
+                         (float)y[i & 3] * 0.25f, 0.0f);
+            psp_write32(VERTS + (uint32_t)i * 16, colour);
+        } else {
+            vertex(i, 200 + x[i & 3], 100 + y[i & 3], colour);
+        }
+    }
+    for (unsigned i = 0; i < 384; i++)
+        psp_write8(INDICES + i, (uint8_t)quad_index(i));
+}
+
+static void identity_matrices(void) {
+    for (int m = 0; m < 3; m++) {
+        cmd((uint8_t)(0x3A + 2*m), 0);
+        const int words = m == 2 ? 16 : 12;
+        for (int i = 0; i < words; i++)
+            cmd((uint8_t)(0x3B + 2*m), i % (m == 2 ? 5 : 4) == 0 ? 0x3F8000 : 0);
+    }
+}
+
+static void test_indexed_triangle_batch_boundary(void) {
+    CHECK(psp_render_select("probe") == 0, "probe selectable for batch test");
+
+    psp_ge_reset();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 11));
+    cmd(0x02, INDICES & 0xFFFFFF);                 /* IADDR, 8-bit indices */
+    identity_matrices();
+    write_indexed_quads(1);
+    g_probe_draws = g_probe_vertices = g_probe_sequence_errors = 0;
+    g_probe_check_sequence = 1;
+    cmd(0x04, (PSP_PRIM_TRIANGLES << 16) | 384);
+    end_list();
+    g_probe_check_sequence = 0;
+    CHECK(g_probe_draws == 128 && g_probe_vertices == 384 && !g_probe_sequence_errors,
+          "transformed indexed triangles cross batch intact: %u draws, %u vertices, %u errors",
+          g_probe_draws, g_probe_vertices, g_probe_sequence_errors);
+
+    psp_ge_reset();
+    begin_list_vtype(VTYPE_2D | (1u << 11));
+    cmd(0x02, INDICES & 0xFFFFFF);                 /* IADDR, 8-bit indices */
+    write_indexed_quads(0);
+    g_probe_draws = g_probe_vertices = g_probe_sequence_errors = 0;
+    g_probe_check_sequence = 1;
+    cmd(0x04, (PSP_PRIM_TRIANGLES << 16) | 384);
+    end_list();
+    g_probe_check_sequence = 0;
+    CHECK(g_probe_draws == 2 && g_probe_vertices == 384 && !g_probe_sequence_errors,
+          "through indexed triangles cross batch intact: %u draws, %u vertices, %u errors",
+          g_probe_draws, g_probe_vertices, g_probe_sequence_errors);
+
+    CHECK(psp_render_select("software") == 0, "software reselectable after batch test");
+}
+
 static void test_transformed_lines(void) {
     psp_ge_reset(); clear_fb();
     begin_list_vtype((7u<<2) | (3u<<7));
@@ -1055,6 +1137,7 @@ int main(void) {
     test_ge_reset_clears_depth();
     test_backend_selection();
     test_backend_registration();
+    test_indexed_triangle_batch_boundary();
     test_points_and_lines();
     test_alpha_only_clear();
     test_transformed_lines();

@@ -1482,19 +1482,35 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba) {
     *rgba = c;
 }
 
+enum { GE_VERTEX_BATCH = 256 };
+
+/* Keep independent primitives whole when a draw is larger than the stack
+ * buffer.  A triangle list cannot be cut at 256: the backend consumes triples,
+ * so it draws 255 vertices, drops vertex 255, and starts the next batch at
+ * vertex 256.  The game's long indexed text draws exposed this exactly after
+ * 42 glyph quads (252 vertices).  The final batch may contain an incomplete
+ * primitive because the GE count itself may; only intermediate boundaries
+ * must be aligned so a later complete primitive is not shifted. */
+static uint32_t primitive_batch_count(uint32_t type, uint32_t remaining) {
+    if (remaining <= GE_VERTEX_BATCH) return remaining;
+
+    uint32_t multiple = 1;
+    if (type == PSP_PRIM_TRIANGLES) multiple = 3;
+    else if (type == PSP_PRIM_LINES || type == PSP_PRIM_SPRITES) multiple = 2;
+    return GE_VERTEX_BATCH - GE_VERTEX_BATCH % multiple;
+}
+
 static void draw_prim_transformed(uint32_t type, uint32_t count,
                                   int col_off, int pos_off, int tex_off,
                                   int norm_off, int stride) {
-    enum { BATCH = 256 };
-    psp_vertex v[BATCH];
-    float      cl[BATCH][4];
+    psp_vertex v[GE_VERTEX_BATCH];
+    float      cl[GE_VERTEX_BATCH][4];
     const psp_render_backend *be = psp_render_current();
     if (g_tl.lighting) lights_to_eye();
 
     uint32_t done = 0;
     while (done < count) {
-        uint32_t n = count - done;
-        if (n > BATCH) n = BATCH;
+        const uint32_t n = primitive_batch_count(type, count - done);
 
         uint32_t decoded = 0;
         for (; decoded < n; decoded++) {
@@ -1666,9 +1682,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         }
 
         if ((type == PSP_PRIM_TRIANGLE_STRIP || type == PSP_PRIM_TRIANGLE_FAN) &&
-            decoded == BATCH && done + decoded < count)
+            decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 2;
-        else if (type == PSP_PRIM_LINE_STRIP && decoded == BATCH && done + decoded < count)
+        else if (type == PSP_PRIM_LINE_STRIP && decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 1;
         else
             done += decoded;
@@ -1858,14 +1874,12 @@ static void draw_prim(uint32_t type, uint32_t count) {
         return;
     }
 
-    enum { BATCH = 256 };
-    psp_vertex v[BATCH];
+    psp_vertex v[GE_VERTEX_BATCH];
     const psp_render_backend *be = psp_render_current();
 
     uint32_t done = 0;
     while (done < count) {
-        uint32_t n = count - done;
-        if (n > BATCH) n = BATCH;
+        const uint32_t n = primitive_batch_count(type, count - done);
 
         /* Strips overlap at a batch boundary: two vertices for triangles,
          * one for lines, or the primitive spanning the boundary is lost. */
@@ -1908,9 +1922,9 @@ static void draw_prim(uint32_t type, uint32_t count) {
         }
         be->draw((int)type, v, (int)decoded);
 
-        if (type == 4 && decoded == BATCH && done + decoded < count)
+        if (type == PSP_PRIM_TRIANGLE_STRIP && decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 2;     /* strip overlap */
-        else if (type == PSP_PRIM_LINE_STRIP && decoded == BATCH && done + decoded < count)
+        else if (type == PSP_PRIM_LINE_STRIP && decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 1;
         else
             done += decoded;
