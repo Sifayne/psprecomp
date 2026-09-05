@@ -248,6 +248,88 @@ static void test_round_trip(void) {
                    i, first[i], second[i], first[i] != second[i] ? "  <--" : "");
 }
 
+/* The look channel: a second stick and a mouse delta, carried in the same
+ * lanes and written by the recorder as optional trailing fields. What has to
+ * be true: a `state` or `analog` line with two more numbers claims the second
+ * stick for the script; `mouse` delivers a delta at exactly one poll and never
+ * again; a line without the fields leaves the channel as it was; `neutral`
+ * releases it, after which the host lane shows through and mouse motion sums
+ * between polls and is taken by each one. */
+static void test_look_channel(void) {
+    const char *p = write_scenario("t-look.pad",
+        "@1 analog 128 128 200 60\n"
+        "@2 mouse -40 12\n"
+        "@3 state none 100 128\n"
+        "@4 state none 128 128 128 128\n"
+        "@5 analog 10 20 30 40\n"
+        "@7 neutral\n");
+    load(p);
+    uint8_t ax, ay, rx, ry; int mdx, mdy;
+
+    poll_pad(&ax, &ay); psp_ctrl_last_look(&rx, &ry, &mdx, &mdy);
+    CHECK(ax == 128 && rx == 200 && ry == 60 && mdx == 0,
+          "@1 analog with four values claims the second stick (rx %u ry %u)", rx, ry);
+    poll_pad(NULL, NULL); psp_ctrl_last_look(&rx, &ry, &mdx, &mdy);
+    CHECK(mdx == -40 && mdy == 12 && rx == 200,
+          "@2 a mouse delta arrives with the stick still held (mdx %d mdy %d rx %u)",
+          mdx, mdy, rx);
+    poll_pad(&ax, NULL); psp_ctrl_last_look(&rx, &ry, &mdx, &mdy);
+    CHECK(ax == 100 && rx == 200 && mdx == 0 && mdy == 0,
+          "@3 a line without look fields leaves the stick, and the delta was spent "
+          "(ax %u rx %u mdx %d)", ax, rx, mdx);
+    poll_pad(NULL, NULL); psp_ctrl_last_look(&rx, &ry, &mdx, &mdy);
+    CHECK(rx == 128 && ry == 128, "@4 an explicit 128 128 centres it (rx %u ry %u)", rx, ry);
+
+    /* Live look input while the script owns the channel is ignored, and the
+     * mouse sum is still taken by the poll so it cannot leak out later. */
+    psp_ctrl_set_look(250, 250); psp_ctrl_add_mouse(99, 99);
+    poll_pad(&ax, &ay); psp_ctrl_last_look(&rx, &ry, &mdx, &mdy);
+    CHECK(ax == 10 && ay == 20 && rx == 30 && ry == 40 && mdx == 0,
+          "@5 both sticks from the script, live look ignored (rx %u mdx %d)", rx, mdx);
+    poll_pad(NULL, NULL); psp_ctrl_last_look(&rx, &ry, &mdx, &mdy);
+    CHECK(rx == 30 && mdx == 0, "@6 nothing due: the script's stick holds (rx %u)", rx);
+
+    psp_ctrl_add_mouse(5, 0); psp_ctrl_add_mouse(6, 0);
+    poll_pad(NULL, NULL); psp_ctrl_last_look(&rx, &ry, &mdx, &mdy);
+    CHECK(rx == 250 && mdx == 11,
+          "@7 neutral releases the channel: the host stick shows and motion summed "
+          "between polls (rx %u mdx %d)", rx, mdx);
+    poll_pad(NULL, NULL); psp_ctrl_last_look(&rx, &ry, &mdx, &mdy);
+    CHECK(mdx == 0, "@8 the sum was taken by the previous poll (mdx %d)", mdx);
+
+    psp_ctrl_set_look(128, 128);
+    unload();
+}
+
+/* What the recorder writes for the channel, and that it is exactly what the
+ * parser above reads back. */
+static void test_look_is_recorded(void) {
+    unsetenv("PSPRECOMP_REPLAY");
+    setenv("PSPRECOMP_REPLAY_REC", "t-look-rec.pad", 1);
+    psp_misc_init();
+    psp_ctrl_set_look(200, 60);  poll_pad(NULL, NULL);      /* 1: the stick */
+    psp_ctrl_add_mouse(-40, 12); poll_pad(NULL, NULL);      /* 2: and a delta */
+    poll_pad(NULL, NULL);                                    /* 3: delta spent */
+    psp_ctrl_set_look(128, 128); poll_pad(NULL, NULL);      /* 4: released */
+    poll_pad(NULL, NULL);                                    /* 5: nothing new */
+    psp_ctrl_replay_finish(NULL);
+    unsetenv("PSPRECOMP_REPLAY_REC");
+
+    char text[2048] = {0};
+    FILE *f = fopen("t-look-rec.pad", "r");
+    if (f) { (void)fread(text, 1, sizeof text - 1, f); fclose(f); }
+    CHECK(strstr(text, "@1      state none 128 128 200 60   #") != NULL,
+          "the second stick is written as two trailing fields");
+    CHECK(strstr(text, "@2      state none 128 128 200 60 -40 12   #") != NULL,
+          "a mouse delta as two more");
+    CHECK(strstr(text, "@3      state none 128 128 200 60   #") != NULL,
+          "the delta is not carried into the next poll");
+    CHECK(strstr(text, "@4      state none 128 128 128 128   #") != NULL,
+          "the return to neutral is written, so a replay releases the channel");
+    CHECK(strstr(text, "@5 ") == NULL, "and nothing is written when nothing changed");
+    psp_misc_init();
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -261,10 +343,13 @@ int main(void) {
     test_hold_lane_survives_the_script();
     test_host_lane_composes();
     test_round_trip();
+    test_look_channel();
+    test_look_is_recorded();
 
     remove("t-directives.pad"); remove("t-bad.pad"); remove("t-tap.pad");
     remove("t-catchup.pad"); remove("t-lanes.pad"); remove("t-host.pad");
     remove("t-rt-src.pad"); remove("t-rt-rec.pad");
+    remove("t-look.pad"); remove("t-look-rec.pad");
     psp_mem_free();
 
     if (failures) {

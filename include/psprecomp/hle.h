@@ -427,10 +427,24 @@ uint32_t psp_ctrl_polls(void);
 void psp_ctrl_last_stick(uint8_t *ax, uint8_t *ay);
 uint32_t psp_ctrl_samples(void);
 
+/* The look channel: a second stick (0..255 centred on 128) and mouse motion,
+ * carried through the same lanes as the pad so a recording holds them and a
+ * replay reproduces them. The PSP has neither, and nothing here reaches
+ * SceCtrlData; native replacements read them with psp_ctrl_last_look. Mouse
+ * motion is a running sum the host adds to and each poll takes, because it
+ * arrives at the mouse's rate and is read at the guest's, and a delta written
+ * and overwritten between two polls is travel that silently never happened. */
+void psp_ctrl_set_look(uint8_t rx, uint8_t ry);
+void psp_ctrl_add_mouse(int dx, int dy);
+void psp_ctrl_last_look(uint8_t *rx, uint8_t *ry, int *mdx, int *mdy);
+
 /* Publish into the script lane. `analog_owned` non-zero takes the stick away
  * from live input until a later call hands it back. */
 void psp_ctrl_script_set(uint32_t buttons, int analog_owned,
                          uint8_t ax, uint8_t ay);
+/* The script lane's look channel. `owned` takes the second stick away from
+ * live input; the mouse delta is delivered once, at the next poll. */
+void psp_ctrl_script_set_look(int owned, uint8_t rx, uint8_t ry, int mdx, int mdy);
 
 /* A button name from the shared table ("cross", "ltrigger", case-insensitive),
  * or 0x<hex> for a bit the table does not name. 0 if unrecognised. `n` is the
@@ -447,9 +461,11 @@ void psp_ctrl_replay_init(void);
 void psp_ctrl_replay_reset(void);
 /* Advance the scenario to (polls, us), applying at most one visible edge. */
 void psp_ctrl_replay_step(uint32_t polls, uint64_t us);
-/* Record the composed pad state; writes a line only when it changes. */
+/* Record the composed pad state, look channel included; writes a line only
+ * when it changes. */
 void psp_ctrl_replay_record(uint32_t polls, uint64_t us,
-                            uint32_t buttons, uint8_t ax, uint8_t ay);
+                            uint32_t buttons, uint8_t ax, uint8_t ay,
+                            uint8_t rx, uint8_t ry, int mdx, int mdy);
 /* Live input arrived while a scenario was driving. Reported once. */
 void psp_ctrl_replay_taint(uint32_t polls);
 /* Close the recording and report. `summary` may be NULL. */

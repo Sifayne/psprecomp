@@ -253,6 +253,17 @@ static int              g_script_analog;
 static _Atomic uint32_t g_host_buttons;
 static _Atomic uint8_t  g_host_ax, g_host_ay;
 
+/* The look channel, in the same lanes. A second stick, centred like the
+ * first, and mouse motion as a running sum: the host adds to it at whatever
+ * rate the mouse reports, the poll takes it, and the script lane's delta is
+ * delivered once. Nothing here reaches SceCtrlData -- the PSP has neither --
+ * so a game that has not been changed cannot see any of it. */
+static uint8_t          g_script_rx = 128, g_script_ry = 128;
+static int              g_script_mdx, g_script_mdy;
+static int              g_script_look;
+static _Atomic uint8_t  g_host_rx, g_host_ry;      /* centred at init */
+static _Atomic int      g_host_mdx, g_host_mdy;
+
 /* The SceCtrlData timestamp field, one per *sample* written. Games do
  * arithmetic on it, so it counts what it has always counted. */
 static uint32_t         g_ctrl_frame;
@@ -273,12 +284,38 @@ void psp_ctrl_last_stick(uint8_t *ax, uint8_t *ay) {
     if (ax) *ax = g_ctrl_last_ax;
     if (ay) *ay = g_ctrl_last_ay;
 }
+
+static uint8_t g_ctrl_last_rx = 128, g_ctrl_last_ry = 128;
+static int     g_ctrl_last_mdx, g_ctrl_last_mdy;
+void psp_ctrl_last_look(uint8_t *rx, uint8_t *ry, int *mdx, int *mdy) {
+    if (rx)  *rx  = g_ctrl_last_rx;
+    if (ry)  *ry  = g_ctrl_last_ry;
+    if (mdx) *mdx = g_ctrl_last_mdx;
+    if (mdy) *mdy = g_ctrl_last_mdy;
+}
 uint32_t psp_ctrl_samples(void) { return g_ctrl_frame; }
 
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
     atomic_store(&g_host_buttons, buttons);
     atomic_store(&g_host_ax, ax);
     atomic_store(&g_host_ay, ay);
+}
+
+void psp_ctrl_set_look(uint8_t rx, uint8_t ry) {
+    atomic_store(&g_host_rx, rx);
+    atomic_store(&g_host_ry, ry);
+}
+
+void psp_ctrl_add_mouse(int dx, int dy) {
+    atomic_fetch_add(&g_host_mdx, dx);
+    atomic_fetch_add(&g_host_mdy, dy);
+}
+
+void psp_ctrl_script_set_look(int owned, uint8_t rx, uint8_t ry, int mdx, int mdy) {
+    g_script_look = owned;
+    if (owned) { g_script_rx = rx; g_script_ry = ry; }
+    g_script_mdx = mdx;
+    g_script_mdy = mdy;
 }
 
 /* Set by the script lane's owner; read here so the composed value can say so.
@@ -569,11 +606,27 @@ static void ctrl_fill(void) {
     g_ctrl_last_ax = ax;
     g_ctrl_last_ay = ay;
 
+    /* The look channel merges the same way, except that the mouse is taken
+     * rather than read -- the sum restarts at every poll -- and the script's
+     * delta is spent here, so a later poll does not deliver it again. */
+    const uint8_t hrx  = atomic_load(&g_host_rx);
+    const uint8_t hry  = atomic_load(&g_host_ry);
+    const int     hmdx = atomic_exchange(&g_host_mdx, 0);
+    const int     hmdy = atomic_exchange(&g_host_mdy, 0);
+    g_ctrl_last_rx  = g_script_look ? g_script_rx  : hrx;
+    g_ctrl_last_ry  = g_script_look ? g_script_ry  : hry;
+    g_ctrl_last_mdx = g_script_look ? g_script_mdx : hmdx;
+    g_ctrl_last_mdy = g_script_look ? g_script_mdy : hmdy;
+    g_script_mdx = g_script_mdy = 0;
+
     /* A scenario driving a run that also has a hand on the pad is still a
      * useful run -- it is how you take over one that is stuck -- but it is no
      * longer the scenario's run, and that has to be impossible to miss. */
-    if (host || hax != 128 || hay != 128) psp_ctrl_replay_taint(g_ctrl_polls);
-    psp_ctrl_replay_record(g_ctrl_polls, us, buttons, ax, ay);
+    if (host || hax != 128 || hay != 128 || hrx != 128 || hry != 128 || hmdx || hmdy)
+        psp_ctrl_replay_taint(g_ctrl_polls);
+    psp_ctrl_replay_record(g_ctrl_polls, us, buttons, ax, ay,
+                           g_ctrl_last_rx, g_ctrl_last_ry,
+                           g_ctrl_last_mdx, g_ctrl_last_mdy);
 
     uint32_t buf = psp_arg(0), count = psp_arg(1);
     if (!count) count = 1;
@@ -842,6 +895,10 @@ void psp_misc_init(void) {
     parse_pad_press();
     parse_ramsnap();
     parse_watch_from();
+    atomic_store(&g_host_rx, 128);
+    atomic_store(&g_host_ry, 128);
+    atomic_store(&g_host_mdx, 0);
+    atomic_store(&g_host_mdy, 0);
     psp_ctrl_replay_init();
 }
 

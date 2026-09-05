@@ -49,6 +49,7 @@ enum {
     EV_MARK,        /* narrate                                             */
     EV_WAIT,        /* advance the cursor, change nothing                  */
     EV_STOP,        /* end the run at a defined poll                       */
+    EV_MOUSE,       /* deliver one poll's worth of mouse travel            */
 };
 
 enum { WHEN_POLL, WHEN_US };
@@ -60,6 +61,9 @@ typedef struct {
     uint64_t when;
     uint32_t mask;
     uint8_t  ax, ay;
+    uint8_t  rx, ry;        /* the look channel: the second stick...       */
+    int      mdx, mdy;      /* ...and one poll's mouse travel              */
+    int      look;          /* the line gave look values: claim the channel */
     char    *text;          /* EV_MARK only; owned                         */
     int      line;          /* for diagnostics                             */
 } ev;
@@ -85,6 +89,10 @@ static uint64_t  g_prev_us;
 static uint32_t  g_buttons;
 static uint8_t   g_ax = 128, g_ay = 128;
 static int       g_analog_owned;
+/* The look channel, owned the same way; the mouse delta is spent once. */
+static uint8_t   g_rx = 128, g_ry = 128;
+static int       g_mdx, g_mdy;
+static int       g_look_owned;
 
 /* ---- the recorder -------------------------------------------------------- */
 
@@ -92,6 +100,8 @@ static FILE     *g_rec;
 static int       g_rec_first = 1;
 static uint32_t  g_rec_buttons;
 static uint8_t   g_rec_ax = 128, g_rec_ay = 128;
+static uint8_t   g_rec_rx = 128, g_rec_ry = 128;
+static int       g_rec_mdx, g_rec_mdy;
 static uint32_t  g_rec_events;
 
 /* ---- parsing ------------------------------------------------------------- */
@@ -177,6 +187,25 @@ static void strip_comment(char *s) {
     size_t n = strlen(s);
     while (n && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r' || s[n-1] == '\n'))
         s[--n] = 0;
+}
+
+/* The optional look fields after a stick pair: `rx ry [mdx mdy]`, as the
+ * recorder writes them. Returns 1 if the stick pair was there, which is what
+ * claims the channel for the script; a line without it leaves the channel as
+ * it was. */
+static int parse_look(char *q, long *rx, long *ry, long *mdx, long *mdy) {
+    char *end = q;
+    const long v = strtol(q, &end, 10);
+    if (end == q) return 0;
+    *rx = v;
+    *ry = strtol(end, &end, 10);
+    char *end2 = end;
+    const long d = strtol(end, &end2, 10);
+    if (end2 != end) {
+        *mdx = d;
+        *mdy = strtol(end2, NULL, 10);
+    }
+    return 1;
 }
 
 static int parse_file(const char *path) {
@@ -267,27 +296,50 @@ static int parse_file(const char *path) {
             /* What the recorder writes: the whole lane in one event, so a
              * poll where two things changed replays as one poll. */
             char *p2 = strpbrk(arg, " \t");
-            long ax = 128, ay = 128;
+            long ax = 128, ay = 128, rx = 128, ry = 128, mdx = 0, mdy = 0;
+            int look = 0;
             if (p2) {
                 *p2 = 0;
                 char *q = p2 + 1;
                 ax = strtol(q, &q, 10);
-                ay = strtol(q, NULL, 10);
+                ay = strtol(q, &q, 10);
+                look = parse_look(q, &rx, &ry, &mdx, &mdy);
             }
             int ok; uint32_t m = parse_buttons(arg, line, &ok);
             if (!ok) { errors++; continue; }
             ev *e = push(EV_STATE, unit, rel, when, line);
-            if (e) { e->mask = m; e->ax = (uint8_t)ax; e->ay = (uint8_t)ay; }
+            if (e) {
+                e->mask = m; e->ax = (uint8_t)ax; e->ay = (uint8_t)ay;
+                e->rx = (uint8_t)rx; e->ry = (uint8_t)ry;
+                e->mdx = (int)mdx; e->mdy = (int)mdy; e->look = look;
+            }
 
         } else if (!strcasecmp(dir, "analog")) {
-            long ax = 128, ay = 128;
+            /* `analog x y` is the stick; `analog x y rx ry` both sticks;
+             * `center` centres whatever the script holds. */
+            long ax = 128, ay = 128, rx = 128, ry = 128, mdx = 0, mdy = 0;
+            int look = 1;
             if (strncasecmp(arg, "cent", 4)) {
                 char *q = arg;
                 ax = strtol(q, &q, 10);
-                ay = strtol(q, NULL, 10);
+                ay = strtol(q, &q, 10);
+                look = parse_look(q, &rx, &ry, &mdx, &mdy);
             }
             ev *e = push(EV_ANALOG, unit, rel, when, line);
-            if (e) { e->ax = (uint8_t)ax; e->ay = (uint8_t)ay; }
+            if (e) {
+                e->ax = (uint8_t)ax; e->ay = (uint8_t)ay;
+                e->rx = (uint8_t)rx; e->ry = (uint8_t)ry;
+                e->mdx = (int)mdx; e->mdy = (int)mdy; e->look = look;
+            }
+
+        } else if (!strcasecmp(dir, "mouse")) {
+            /* One poll's worth of mouse travel. A drag is a run of these,
+             * one per poll, which is what the recorder writes for one. */
+            char *q = arg;
+            const long dx = strtol(q, &q, 10);
+            const long dy = strtol(q, NULL, 10);
+            ev *e = push(EV_MOUSE, unit, rel, when, line);
+            if (e) { e->mdx = (int)dx; e->mdy = (int)dy; e->look = 1; }
 
         } else if (!strcasecmp(dir, "neutral")) {
             push(EV_NEUTRAL, unit, rel, when, line);
@@ -331,6 +383,8 @@ static int parse_file(const char *path) {
 
 static void publish(void) {
     psp_ctrl_script_set(g_buttons, g_analog_owned, g_ax, g_ay);
+    psp_ctrl_script_set_look(g_look_owned, g_rx, g_ry, g_mdx, g_mdy);
+    g_mdx = g_mdy = 0;              /* a delta is delivered once */
 }
 
 void psp_ctrl_replay_reset(void) {
@@ -341,8 +395,10 @@ void psp_ctrl_replay_reset(void) {
     g_loaded = g_finished = g_tainted = 0;
     g_prev_poll = 0; g_prev_us = 0;
     g_buttons = 0; g_ax = g_ay = 128; g_analog_owned = 0;
+    g_rx = g_ry = 128; g_mdx = g_mdy = 0; g_look_owned = 0;
     if (g_rec) { fclose(g_rec); g_rec = NULL; }
     g_rec_first = 1; g_rec_buttons = 0; g_rec_ax = g_rec_ay = 128;
+    g_rec_rx = g_rec_ry = 128; g_rec_mdx = g_rec_mdy = 0;
     g_rec_events = 0;
 }
 
@@ -418,14 +474,27 @@ void psp_ctrl_replay_step(uint32_t polls, uint64_t us) {
         case EV_STATE:
             g_buttons = e->mask;
             g_ax = e->ax; g_ay = e->ay; g_analog_owned = 1;
+            if (e->look) {
+                g_rx = e->rx; g_ry = e->ry; g_mdx = e->mdx; g_mdy = e->mdy;
+                g_look_owned = 1;
+            }
             edge = 1;
             break;
         case EV_ANALOG:
             g_ax = e->ax; g_ay = e->ay; g_analog_owned = 1;
+            if (e->look) {
+                g_rx = e->rx; g_ry = e->ry; g_mdx = e->mdx; g_mdy = e->mdy;
+                g_look_owned = 1;
+            }
+            edge = 1;
+            break;
+        case EV_MOUSE:
+            g_mdx = e->mdx; g_mdy = e->mdy; g_look_owned = 1;
             edge = 1;
             break;
         case EV_NEUTRAL:
             g_buttons = 0; g_analog_owned = 0; g_ax = g_ay = 128;
+            g_look_owned = 0; g_rx = g_ry = 128; g_mdx = g_mdy = 0;
             edge = 1;
             break;
         case EV_MARK:
@@ -488,24 +557,42 @@ static void write_buttons(FILE *f, uint32_t m) {
 }
 
 void psp_ctrl_replay_record(uint32_t polls, uint64_t us,
-                            uint32_t buttons, uint8_t ax, uint8_t ay) {
+                            uint32_t buttons, uint8_t ax, uint8_t ay,
+                            uint8_t rx, uint8_t ry, int mdx, int mdy) {
     if (!g_rec) return;
     if (!g_rec_first && buttons == g_rec_buttons &&
-        ax == g_rec_ax && ay == g_rec_ay) return;
+        ax == g_rec_ax && ay == g_rec_ay &&
+        rx == g_rec_rx && ry == g_rec_ry && mdx == g_rec_mdx && mdy == g_rec_mdy)
+        return;
+
+    const int look_neutral = rx == 128 && ry == 128 && !mdx && !mdy;
+    const int was_look = !g_rec_first &&
+        !(g_rec_rx == 128 && g_rec_ry == 128 && !g_rec_mdx && !g_rec_mdy);
 
     /* The first poll establishes the baseline; only write it if it is not
      * already the neutral the player starts from. */
     if (g_rec_first) {
         g_rec_first = 0;
         g_rec_buttons = buttons; g_rec_ax = ax; g_rec_ay = ay;
-        if (!buttons && ax == 128 && ay == 128) return;
+        g_rec_rx = rx; g_rec_ry = ry; g_rec_mdx = mdx; g_rec_mdy = mdy;
+        if (!buttons && ax == 128 && ay == 128 && look_neutral) return;
     } else {
         g_rec_buttons = buttons; g_rec_ax = ax; g_rec_ay = ay;
+        g_rec_rx = rx; g_rec_ry = ry; g_rec_mdx = mdx; g_rec_mdy = mdy;
     }
 
     fprintf(g_rec, "@%-6u state ", polls);
     write_buttons(g_rec, buttons);
-    fprintf(g_rec, " %u %u   # t=%.3fs\n", ax, ay, (double)us / 1e6);
+    fprintf(g_rec, " %u %u", ax, ay);
+    /* The look channel is written while it is non-neutral and once more when
+     * it returns to neutral, so a replay releases it where the player did. A
+     * line without it leaves the channel as it was. The mouse delta, when
+     * there is one, follows the stick pair. */
+    if (!look_neutral || was_look) {
+        fprintf(g_rec, " %u %u", rx, ry);
+        if (mdx || mdy) fprintf(g_rec, " %d %d", mdx, mdy);
+    }
+    fprintf(g_rec, "   # t=%.3fs\n", (double)us / 1e6);
     /* Flushed per line, not per run: these are a handful of lines even in a
      * long session, and a run that crashes is exactly the run whose input you
      * wanted written down. */
