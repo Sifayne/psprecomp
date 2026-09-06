@@ -76,6 +76,11 @@ uint64_t psp_mem_range_generation(uint32_t addr, uint32_t size) {
     return newest;
 }
 
+static void (*g_write_observer)(uint32_t, uint32_t);
+void psp_mem_set_write_observer(void (*observer)(uint32_t, uint32_t)) {
+    g_write_observer = observer;
+}
+
 void psp_mem_mark_write(uint32_t addr, uint32_t size) {
     if (!size) return;
     uint32_t off = 0;
@@ -90,6 +95,7 @@ void psp_mem_mark_write(uint32_t addr, uint32_t size) {
     const uint32_t last = (uint32_t)(((uint64_t)off + size - 1u) >>
                                      WRITE_GRANULE_SHIFT);
     for (uint32_t i = first; i <= last; i++) table[i] = stamp;
+    if (g_write_observer) g_write_observer(addr & PSP_ADDR_MASK, size);
 }
 
 /* Watch writes to one address. "Which code writes this word" is a question
@@ -311,6 +317,7 @@ void psp_mem_dump_bad(FILE *out, int top) {
 }
 
 int psp_mem_init(void) {
+    g_write_observer = NULL;
     psp_mem.ram     = (uint8_t *)calloc(1, PSP_RAM_SIZE);
     psp_mem.vram    = (uint8_t *)calloc(1, PSP_VRAM_SIZE);
     psp_mem.scratch = (uint8_t *)calloc(1, PSP_SCRATCH_SIZE);
@@ -334,6 +341,7 @@ int psp_mem_init(void) {
 }
 
 void psp_mem_free(void) {
+    g_write_observer = NULL;
     free(psp_mem.ram);
     free(psp_mem.vram);
     free(psp_mem.scratch);

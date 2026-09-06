@@ -170,6 +170,13 @@ static void test_square_root(void) {
              "general sqrt keeps its negative-input rule");
 }
 
+static unsigned observed_writes;
+static uint32_t observed_addr, observed_size, observed_value;
+static void observe_write(uint32_t addr, uint32_t size) {
+    observed_writes++; observed_addr=addr; observed_size=size;
+    observed_value=psp_read8(addr);
+}
+
 static void test_memory(void) {
     CHECK(psp_mem_init() == 0, "memory init");
 
@@ -180,6 +187,15 @@ static void test_memory(void) {
     CHECK(initial_serial != 0, "memory reset has a cache-visible serial");
     CHECK(psp_mem_range_generation(tracked, 4) == 0,
           "fresh range has generation zero");
+    psp_mem_set_write_observer(observe_write);
+    psp_write8(0x44001000u, 0x5A);
+    CHECK(observed_writes==1 && observed_addr==tracked && observed_size==1 && observed_value==0x5A,
+          "write observer sees normalized address and bytes after the store");
+    psp_write8(tracked, 0x5A);
+    CHECK(observed_writes==2,"same-value stores still notify GPU ownership");
+    (void)psp_read8(tracked);
+    CHECK(observed_writes==2,"reads do not notify write observer");
+    psp_mem_set_write_observer(NULL);
 
     psp_write32(tracked, 0xAABBCCDDu);
     const uint64_t first_generation = psp_mem_range_generation(tracked, 4);
@@ -252,12 +268,15 @@ static void test_memory(void) {
     CHECK(psp_mem_bad_access == before + 1, "straddling read is rejected");
 
     const uint64_t before_reset = psp_mem_write_serial();
+    psp_mem_set_write_observer(observe_write);
     psp_mem_free();
     CHECK(psp_mem_init() == 0, "memory reinitialises");
     CHECK(psp_mem_write_serial() > before_reset,
           "memory reset invalidates surviving external caches");
     CHECK(psp_mem_range_generation(tracked, 4) == 0,
           "memory reset restores pristine range generations");
+    psp_write8(tracked, 0xCC);
+    CHECK(observed_writes==2,"memory reset removes the old GPU observer");
     psp_mem_free();
 }
 

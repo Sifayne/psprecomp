@@ -16,6 +16,7 @@
 #include "psprecomp/cpu.h"
 
 #include <stdio.h>
+#include <math.h>
 #include <string.h>
 
 static int failures;
@@ -877,6 +878,7 @@ static unsigned g_probe_draws;
 static unsigned g_probe_vertices;
 static unsigned g_probe_sequence_errors;
 static int g_probe_check_sequence;
+static psp_vertex g_probe_first;
 
 static unsigned quad_index(unsigned position) {
     static const unsigned corners[6] = { 0, 1, 2, 0, 2, 3 };
@@ -885,6 +887,7 @@ static unsigned quad_index(unsigned position) {
 
 static void probe_draw(int p, const psp_vertex *v, int n) {
     g_probe_draws++;
+    if (n) g_probe_first=v[0];
     if (!g_probe_check_sequence) return;
     if (p != PSP_PRIM_TRIANGLES || n <= 0 || n % 3 != 0)
         g_probe_sequence_errors++;
@@ -1050,6 +1053,22 @@ static void test_indexed_triangle_batch_boundary(void) {
     CHECK(psp_render_select("software") == 0, "software reselectable after batch test");
 }
 
+static void test_precise_vertex_payload(void) {
+    CHECK(psp_render_select("probe")==0,"probe selectable for float vertex test");
+    psp_ge_reset();
+    begin_list_vtype((7u<<2)|(3u<<7));
+    identity_matrices();
+    float_vertex(0,(40.24f-240.0f)/240.0f,0,0);
+    cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
+    CHECK(g_probe_first.precise && fabsf(g_probe_first.precise_x-40.24f)<0.0001f,
+          "GE retains pre-quantization projection %.8f",g_probe_first.precise_x);
+    CHECK(g_probe_first.x==644,"legacy geometry still rounds to 40.25 pixels");
+    psp_ge_reset(); begin_list(); vertex(0,10,20,0xFFFFFFFF);
+    cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
+    CHECK(!g_probe_first.precise,"through-mode vertices keep the PSP coordinate contract");
+    CHECK(psp_render_select("software")==0,"software reselected after float payload test");
+}
+
 static void test_transformed_lines(void) {
     psp_ge_reset(); clear_fb();
     begin_list_vtype((7u<<2) | (3u<<7));
@@ -1138,6 +1157,7 @@ int main(void) {
     test_backend_selection();
     test_backend_registration();
     test_indexed_triangle_batch_boundary();
+    test_precise_vertex_payload();
     test_points_and_lines();
     test_alpha_only_clear();
     test_transformed_lines();

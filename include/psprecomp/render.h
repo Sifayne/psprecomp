@@ -61,6 +61,11 @@ typedef struct {
      * does: the perspective camera may already be corrected while HUD and 2D
      * geometry still need a separate safe-area transform. */
     int      screen_space;
+    /* Optional pre-quantization screen position for enhanced GPU rendering.
+     * The legacy x/y fields remain the software and 1x coverage contract.
+     * Zero-initialized and through-mode vertices use x/y unless precise is set. */
+    float    precise_x, precise_y;
+    int      precise;
 } psp_vertex;
 
 /* The bound texture, as the GE describes it.

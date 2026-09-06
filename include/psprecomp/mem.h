@@ -82,6 +82,11 @@ uint64_t psp_mem_write_serial(void);
 uint64_t psp_mem_range_generation(uint32_t addr, uint32_t size);
 void     psp_mem_mark_write(uint32_t addr, uint32_t size);
 
+/* Optional serialized write observer for GPU/guest framebuffer coherence.
+ * Receives normalized addresses after a tracked write. Must not write memory
+ * or call a GPU API. Passing NULL removes it; reset/free also remove it. */
+void psp_mem_set_write_observer(void (*observer)(uint32_t addr, uint32_t size));
+
 /* The PSP is little-endian and so is every host we target, so these are plain
  * loads once the address is resolved. Unmapped accesses return 0 / are dropped
  * and bump psp_mem_bad_access — a recompiled game that starts faulting here is

@@ -869,6 +869,8 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
     out->inv_w = out->tex_q = 1.0f; /* through mode is affine in screen space */
     out->fog = 255;              /* through-mode geometry is never fogged */
     out->screen_space = 1;
+    out->precise = 0;
+    out->precise_x = out->precise_y = 0;
 
     /* Through-mode texture coordinates are in texels, whatever their width, so
      * every form is taken as it comes. Leaving the narrow ones at zero -- which
@@ -1287,6 +1289,7 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
         v[i] = p[i].v;
         v[i].x = fx16_floor(x + 1.0f / (2 * PSP_SUBPX));
         v[i].y = fx16_floor(y + 1.0f / (2 * PSP_SUBPX));
+        v[i].precise_x = x; v[i].precise_y = y; v[i].precise = 1;
         v[i].z = g_tl.depth_clamp ? fmaxf(0, fminf(65535, z)) : z;
         v[i].inv_w = 1.0f / p[i].c[3];
     }
@@ -1332,6 +1335,7 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
         p[i] = poly[i].v;
         p[i].x = fx16_floor(sx + 1.0f / (2 * PSP_SUBPX));
         p[i].y = fx16_floor(sy + 1.0f / (2 * PSP_SUBPX));
+        p[i].precise_x = sx; p[i].precise_y = sy; p[i].precise = 1;
         p[i].z = sz;
         /* Keep the divide's missing term with the screen-space vertex.  UVs
          * are the one interpolant the PSP corrects for perspective; colour
@@ -1598,6 +1602,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
              * is that the far edge lands on the pixel it should. */
             o->x = fx16_floor(sx + 1.0f / (2 * PSP_SUBPX));
             o->y = fx16_floor(sy + 1.0f / (2 * PSP_SUBPX));
+            o->precise_x = sx; o->precise_y = sy; o->precise = 1;
             o->z = sz;
             o->inv_w = clip[3] > 1e-6f ? 1.0f / clip[3] : 1.0f;
             if (clip[3] > 1e-6f) {
