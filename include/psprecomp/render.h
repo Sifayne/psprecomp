@@ -149,6 +149,43 @@ enum {
     PSP_PRIM_SPRITES
 };
 
+/* A vertex as the display list stores it, decoded but not yet transformed:
+ * what draw_model receives. The colour is the vertex's own or, when the
+ * format carries none, the material colour the CPU path would have used; u and
+ * v are already scaled and offset into texels, as psp_vertex carries them. The
+ * normal is only meaningful when the state lights. */
+typedef struct {
+    float    pos[3];
+    float    nrm[3];
+    uint32_t rgba;
+    float    u, v;
+} psp_model_vertex;
+
+/* Everything ge.c's transform pipeline applies between a psp_model_vertex and
+ * the psp_vertex it hands to draw(), captured at the draw. Matrices are the
+ * GE's 4x3 (three columns of three, then the translation) and 4x4; lights are
+ * already in eye space, as light_vertex sees them. A backend implementing
+ * draw_model reproduces draw_prim_transformed and emit_tri from this alone. */
+typedef struct {
+    float world[12], view[12], proj[16], tgen[12];
+    int   lighting, mat_update, mat_alpha;
+    struct {
+        int   enable, type, kind;
+        float pos[3], dir[3];           /* eye space */
+        float atten[3], exponent, cutoff;
+        float amb[3], dif[3], spec[3];
+    } light[4];
+    float mat_emissive[3], mat_ambient[3], mat_diffuse[3], mat_specular[3];
+    float mat_spec_coef, global_amb[3];
+    int   fog_enable;
+    float fog_end, fog_range;
+    int   vp_set;
+    float vp_xs, vp_ys, vp_zs, vp_xc, vp_yc, vp_zc, off_x, off_y;
+    int   depth_clamp, cull_enable, cull_ccw;
+    int   tex_map_mode, tex_proj_mode;
+    int   tex_w, tex_h;
+} psp_xform_state;
+
 typedef struct {
     const char *name;
 
@@ -197,6 +234,16 @@ typedef struct {
 
     /* sceDisplaySetFrameBuf � show what has accumulated. */
     void (*present)(void);
+
+    /* Optional: the transform on the backend. When both are set and model_ok()
+     * answers 1, ge.c hands transformed-3D triangle draws over as model-space
+     * vertices plus the transform-and-lighting state instead of running its
+     * own pipeline; the backend then owes the result the CPU path would have
+     * produced (see psp_xform_state). Either NULL, or model_ok() == 0, keeps
+     * the CPU path. */
+    int  (*model_ok)(void);
+    void (*draw_model)(int prim, const psp_model_vertex *v, int count,
+                       const psp_xform_state *xs);
 } psp_render_backend;
 
 /* Select a backend by name ("software", "null", ...). Returns 0 on success,

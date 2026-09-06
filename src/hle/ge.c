@@ -57,6 +57,7 @@
 #define GE_PROF_TSC() ((uint64_t)0)
 #endif
 static int      g_prof_on = -1;
+static uint64_t g_model_verts;      /* vertices handed to the backend's own transform */
 static uint64_t g_prof[6], g_prof_verts, g_prof_batches, g_prof_tsc0, g_prof_ns0;
 static inline uint64_t ge_prof_now(void) { return g_prof_on > 0 ? GE_PROF_TSC() : 0; }
 static uint64_t ge_prof_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
@@ -513,6 +514,8 @@ void psp_ge_dump_stats(FILE *out) {
             (unsigned long long)g_ge.lists,
             (unsigned long long)g_ge.commands,
             (unsigned long long)g_ge.finishes);
+    if (g_model_verts)
+        fprintf(out, "    transformed on the backend: %llu vertices\n", (unsigned long long)g_model_verts);
     if (g_prof_on > 0 && g_prof_verts) {
         const double cyc_per_ns = (double)(GE_PROF_TSC() - g_prof_tsc0) / (double)(ge_prof_ns() - g_prof_ns0 + 1);
         static const char *const NAMES[6] = { "position decode", "matrix products", "colour+fog+lighting", "uv+texgen", "screen+bbox", "clip+draw (per batch)" };
@@ -1605,6 +1608,43 @@ static uint32_t primitive_batch_count(uint32_t type, uint32_t remaining) {
     return GE_VERTEX_BATCH - GE_VERTEX_BATCH % multiple;
 }
 
+/* What draw_model receives alongside the vertices: g_tl and the lights in
+ * eye space, in the backend's own struct. */
+static void fill_xform_state(psp_xform_state *xs) {
+    memset(xs, 0, sizeof *xs);
+    memcpy(xs->world, g_tl.world, sizeof xs->world);
+    memcpy(xs->view,  g_tl.view,  sizeof xs->view);
+    memcpy(xs->proj,  g_tl.proj,  sizeof xs->proj);
+    memcpy(xs->tgen,  g_tl.tgen,  sizeof xs->tgen);
+    xs->lighting = g_tl.lighting; xs->mat_update = g_tl.mat_update; xs->mat_alpha = g_tl.mat_alpha;
+    for (int i = 0; i < 4; i++) {
+        xs->light[i].enable = g_tl.light[i].enable;
+        xs->light[i].type = g_tl.light[i].type;
+        xs->light[i].kind = g_tl.light[i].kind;
+        memcpy(xs->light[i].pos, g_light_eye[i].pos, sizeof xs->light[i].pos);
+        memcpy(xs->light[i].dir, g_light_eye[i].dir, sizeof xs->light[i].dir);
+        memcpy(xs->light[i].atten, g_tl.light[i].atten, sizeof xs->light[i].atten);
+        xs->light[i].exponent = g_tl.light[i].exponent; xs->light[i].cutoff = g_tl.light[i].cutoff;
+        memcpy(xs->light[i].amb, g_tl.light[i].amb, sizeof xs->light[i].amb);
+        memcpy(xs->light[i].dif, g_tl.light[i].dif, sizeof xs->light[i].dif);
+        memcpy(xs->light[i].spec, g_tl.light[i].spec, sizeof xs->light[i].spec);
+    }
+    memcpy(xs->mat_emissive, g_tl.mat_emissive, sizeof xs->mat_emissive);
+    memcpy(xs->mat_ambient,  g_tl.mat_ambient,  sizeof xs->mat_ambient);
+    memcpy(xs->mat_diffuse,  g_tl.mat_diffuse,  sizeof xs->mat_diffuse);
+    memcpy(xs->mat_specular, g_tl.mat_specular, sizeof xs->mat_specular);
+    xs->mat_spec_coef = g_tl.mat_spec_coef;
+    memcpy(xs->global_amb, g_tl.global_amb, sizeof xs->global_amb);
+    xs->fog_enable = g_tl.fog_enable; xs->fog_end = g_tl.fog_end; xs->fog_range = g_tl.fog_range;
+    xs->vp_set = g_tl.vp_set;
+    xs->vp_xs = g_tl.vp_xs; xs->vp_ys = g_tl.vp_ys; xs->vp_zs = g_tl.vp_zs;
+    xs->vp_xc = g_tl.vp_xc; xs->vp_yc = g_tl.vp_yc; xs->vp_zc = g_tl.vp_zc;
+    xs->off_x = g_tl.off_x; xs->off_y = g_tl.off_y;
+    xs->depth_clamp = g_tl.depth_clamp; xs->cull_enable = g_tl.cull_enable; xs->cull_ccw = g_tl.cull_ccw;
+    xs->tex_map_mode = g_tl.tex_map_mode; xs->tex_proj_mode = g_tl.tex_proj_mode;
+    xs->tex_w = (int)g_ge.tex_w; xs->tex_h = (int)g_ge.tex_h;
+}
+
 /* A triangle straight from the vertex batch. When emit_tri would pass it
  * through unclipped -- every w above the vertex loop's own threshold, and
  * inside the near plane the way the clipper tests it (z + w >= 0 under depth
@@ -1667,6 +1707,49 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                              fabsf(g_tl.proj[15]) > 1e-6f;
     if (g_tl.lighting) lights_to_eye();
     const int any_light = g_tl.lighting && any_light_enabled();
+
+    /* The backend's transform, when it offers one. Triangles only (points,
+     * lines and sprites stay here), and not screen-space projections, whose
+     * flag the GL backend reads to tell HUD from scene. */
+    if (be->draw_model && be->model_ok && !screen_space &&
+        (type == PSP_PRIM_TRIANGLES || type == PSP_PRIM_TRIANGLE_STRIP ||
+         type == PSP_PRIM_TRIANGLE_FAN) && be->model_ok()) {
+        psp_xform_state xs;
+        fill_xform_state(&xs);
+        psp_model_vertex mv[GE_VERTEX_BATCH];
+        uint32_t mdone = 0;
+        while (mdone < count) {
+            const uint32_t n = primitive_batch_count(type, count - mdone);
+            uint32_t decoded = 0;
+            for (; decoded < n; decoded++) {
+                const uint32_t a = vertex_addr(mdone + decoded, stride);
+                const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)stride);
+                psp_model_vertex *m = &mv[decoded];
+                if (!read_pos_model_at(vp, a, g_ge.vtype, pos_off, m->pos)) break;
+                m->rgba = current_colour();
+                if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7) {
+                    if (vp) memcpy(&m->rgba, vp + col_off, 4);
+                    else    m->rgba = psp_read32(a + (uint32_t)col_off);
+                }
+                if (any_light) read_normal_model_at(vp, a, g_ge.vtype, norm_off, m->nrm);
+                else { m->nrm[0] = m->nrm[1] = 0.0f; m->nrm[2] = 1.0f; }
+                psp_vertex uv;
+                read_uv_model_at(vp, a, g_ge.vtype, tex_off, &uv);
+                m->u = uv.u; m->v = uv.v;
+                if (g_tl.fog_enable) g_fog_verts++;
+                if (g_tl.lighting)   g_lit_verts++;
+                note_colour(m->rgba);
+            }
+            be->draw_model((int)type, mv, (int)decoded, &xs);
+            g_model_verts += decoded;
+            if ((type == PSP_PRIM_TRIANGLE_STRIP || type == PSP_PRIM_TRIANGLE_FAN) &&
+                decoded == GE_VERTEX_BATCH && mdone + decoded < count)
+                mdone += decoded - 2;
+            else
+                mdone += decoded;
+        }
+        return;
+    }
 
     uint32_t done = 0;
     while (done < count) {
