@@ -1012,9 +1012,8 @@ void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
 
         /* The square roots classify their argument before computing anything,
          * and the classes are not what the C library would do. psp_fsqrt is a
-         * general helper -- it answers 0 for a negative and NaN for an
-         * infinity, which is fine for a rasteriser and wrong for this unit --
-         * so the rules live here rather than in it.
+         * general geometry helper, so the instruction's zero, denormal,
+         * negative, infinity and NaN rules live here rather than in it.
          *
          * Ordinary values already agree to the last bit; only the edges did
          * not, and they were 28 lines of cpu/vfpu/vector. */

@@ -16,6 +16,7 @@
 #include "cpu.h"
 #include "mem.h"
 
+#include <math.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -293,13 +294,13 @@ static inline float psp_fmodf2(float v) {
     return (float)(((int32_t)v) & 1);
 }
 
-/* Newton-Raphson would be faster but the host FPU is exact and this is not the
- * hot path in any recompiled game; correctness first. */
+/* Use the host's binary32 square root rather than an unscaled Newton iteration.
+ * Starting Newton at v and stopping after a fixed number of steps does not
+ * converge across binary32's exponent range: for example, the square of a
+ * 1.34e11-length vector was still nearly 8000 times too large after 24 steps.
+ * The instruction-specific wrappers below classify their own edge cases. */
 static inline float psp_fsqrt(float v) {
-    if (v <= 0.0f) return 0.0f;
-    float g = v;
-    for (int i = 0; i < 24; i++) g = 0.5f * (g + v / g);
-    return g;
+    return v <= 0.0f ? 0.0f : sqrtf(v);
 }
 
 /* COP1 float-to-integer, with the rounding mode named explicitly.
@@ -467,9 +468,8 @@ static inline float psp_fpu_op(double exact, int div_by_zero) {
     return r;
 }
 
-/* sqrt.s. Separate from psp_fsqrt, which is a general helper shared with the
- * rasteriser and answers 0 for a negative and NaN for an infinity -- right
- * there, wrong here.
+/* sqrt.s. Separate from psp_fsqrt, whose non-positive-input rule is useful to
+ * general geometry code but does not implement the instruction's edge cases.
  *
  * Exactness is decidable without an exact square root: r is the correctly
  * rounded result, so r*r is a 24x24-bit product and therefore exact in a

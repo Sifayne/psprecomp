@@ -141,6 +141,35 @@ static void test_bitops(void) {
     CHECK_EQ(psp_sltu((uint32_t)-1, 1), 0u, "sltu is unsigned");
 }
 
+static void test_square_root(void) {
+    /* Cover the exponent range, not just convenient values near one. The old
+     * fixed-iteration Newton helper passed 1 and 4 but had not converged after
+     * 24 steps for the large finite value below. That value is the squared
+     * length which exposed the broken aim basis in Last Raven. */
+    static const struct {
+        uint32_t input;
+        uint32_t output;
+        const char *label;
+    } cases[] = {
+        { 0x00000001u, 0x1A3504F3u, "smallest subnormal" },
+        { 0x00800000u, 0x20000000u, "smallest normal" },
+        { 0x3F800000u, 0x3F800000u, "one" },
+        { 0x40800000u, 0x40000000u, "four" },
+        { 0x6473C556u, 0x51F9CF83u, "large aim-vector length" },
+        { 0x7F7FFFFFu, 0x5F7FFFFFu, "largest finite" },
+    };
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        const uint32_t got = psp_f32_to_bits(
+            psp_fsqrt(psp_bits_to_f32(cases[i].input)));
+        CHECK_EQ(got, cases[i].output, cases[i].label);
+    }
+
+    CHECK_EQ(psp_f32_to_bits(psp_fsqrt(0.0f)), 0u, "sqrt zero");
+    CHECK_EQ(psp_f32_to_bits(psp_fsqrt(-4.0f)), 0u,
+             "general sqrt keeps its negative-input rule");
+}
+
 static void test_memory(void) {
     CHECK(psp_mem_init() == 0, "memory init");
 
@@ -281,6 +310,7 @@ int main(void) {
     test_multiply();
     test_shifts();
     test_bitops();
+    test_square_root();
     test_memory();
     test_unaligned();
 

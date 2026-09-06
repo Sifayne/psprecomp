@@ -8,6 +8,7 @@
  * produces numbers that are wrong and entirely plausible.
  */
 
+#include "psprecomp/recomp_rt.h"
 #include "psprecomp/vfpu.h"
 
 #include <math.h>
@@ -167,6 +168,39 @@ static void test_arithmetic(void) {
     psp_vadd(0x00, 0x00, 0x04, 4);
     get_quad(0x00, out);
     for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i] + b[i], "vadd into its own source");
+}
+
+static void test_large_vector_normalize(void) {
+    psp_vfpu_reset();
+
+    /* This is the same three-lane vdot -> vrsq -> vscl sequence and magnitude
+     * used by the game's aim-basis normalizer. It used to yield a vector only
+     * 0.000125 long, folding an upward weapon direction below the horizon. */
+    const float in[4] = {
+        0.0f,
+        psp_bits_to_f32(0x51F9A354u), /* 1.34023381e11 */
+        psp_bits_to_f32(0x4F948EB7u), /* 4.98476186e9  */
+        0.0f,
+    };
+    float out[4];
+    int scalar[4];
+
+    set_quad(0x00, in);
+    psp_vdot(0x04, 0x00, 0x00, 3);
+    psp_vfpu_regs(0x04, 1, scalar);
+    CHECK(psp_f32_to_bits(psp_cpu.v[scalar[0]]) == 0x6473C556u,
+          "large-vector vdot: got 0x%08X, want 0x6473C556",
+          psp_f32_to_bits(psp_cpu.v[scalar[0]]));
+
+    psp_vunary(PSP_VU_RSQ, 0x04, 0x04, 1);
+    psp_vscl(0x08, 0x00, 0x04, 3);
+    get_quad(0x08, out);
+
+    CHECK_F(out[0], 0.0f, "large-vector normalized x");
+    CHECK_F(out[1], 0.99930906f, "large-vector normalized y");
+    CHECK_F(out[2], 0.037167527f, "large-vector normalized z");
+    CHECK_F(out[0] * out[0] + out[1] * out[1] + out[2] * out[2],
+            1.0f, "large-vector normalized length");
 }
 
 static void test_prefixes(void) {
@@ -500,6 +534,7 @@ int main(void) {
     test_register_addressing();
     test_load_store();
     test_arithmetic();
+    test_large_vector_normalize();
     test_prefixes();
     test_compare();
     test_matrix_ops();
