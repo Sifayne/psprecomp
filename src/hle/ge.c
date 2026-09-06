@@ -868,6 +868,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
     out->u = out->v = 0.0f;
     out->inv_w = out->tex_q = 1.0f; /* through mode is affine in screen space */
     out->fog = 255;              /* through-mode geometry is never fogged */
+    out->screen_space = 1;
 
     /* Through-mode texture coordinates are in texels, whatever their width, so
      * every form is taken as it comes. Leaving the narrow ones at zero -- which
@@ -1510,6 +1511,15 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
     psp_vertex v[GE_VERTEX_BATCH];
     float      cl[GE_VERTEX_BATCH][4];
     const psp_render_backend *be = psp_render_current();
+    /* Perspective projection has a model-dependent clip W (the game's usual
+     * matrix has m[11] = -1, m[15] = 0). Menus and HUD use an orthographic
+     * matrix whose clip W is constant. Carry that distinction past the shared
+     * transform so an aspect-aware host backend can keep the latter in a
+     * native-aspect safe area without double-correcting the wider camera. */
+    const int screen_space = fabsf(g_tl.proj[3])  < 1e-6f &&
+                             fabsf(g_tl.proj[7])  < 1e-6f &&
+                             fabsf(g_tl.proj[11]) < 1e-6f &&
+                             fabsf(g_tl.proj[15]) > 1e-6f;
     if (g_tl.lighting) lights_to_eye();
 
     uint32_t done = 0;
@@ -1527,6 +1537,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             mul_4x4(g_tl.proj,  eye,   clip);
 
             psp_vertex *o = &v[decoded];
+            o->screen_space = screen_space;
             o->rgba = current_colour();
             o->tex_q = 1.0f;
             if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7)
@@ -1803,6 +1814,7 @@ static void imm_vertex(uint32_t arg) {
     o.rgba = (g_imm.rgb & 0xFFFFFFu) | ((arg & 0xFFu) << 24);
     o.inv_w = o.tex_q = 1.0f;
     o.fog  = (arg & 0x400000u) ? (int)(g_imm.fog & 0xFFu) : 255;
+    o.screen_space = 1;
 
     int need, out_type = g_imm.type;
     switch (g_imm.type) {

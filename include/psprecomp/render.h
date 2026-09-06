@@ -54,6 +54,13 @@ typedef struct {
      * fogged and carry 255. Interpolated like a colour channel, applied after
      * the texture function and before blending. */
     int      fog;
+    /* True for presentation-space geometry: either the GE's THROUGH bit
+     * supplied an already projected vertex, or an affine/orthographic matrix
+     * transformed it. Most backends do not need to care because the
+     * coordinates above are screen space either way. An aspect-aware backend
+     * does: the perspective camera may already be corrected while HUD and 2D
+     * geometry still need a separate safe-area transform. */
+    int      screen_space;
 } psp_vertex;
 
 /* The bound texture, as the GE describes it.
