@@ -596,10 +596,16 @@ static void ctrl_fill(void) {
     psp_ctrl_replay_step(g_ctrl_polls, us);
     ramsnap_step(g_ctrl_polls);
 
-    /* The merge. Buttons OR; the stick belongs to whoever last claimed it. */
-    const uint32_t host = atomic_load(&g_host_buttons);
-    const uint8_t  hax  = atomic_load(&g_host_ax);
-    const uint8_t  hay  = atomic_load(&g_host_ay);
+    /* The merge. Buttons OR; the stick belongs to whoever last claimed it.
+     * PSPRECOMP_REPLAY_LIVE=0 keeps the host lane out of a scenario's run
+     * altogether: a controller left plugged in idles a few counts off centre,
+     * and a measurement run must not depend on what is on the desk. */
+    static int live = -1;
+    if (live < 0) { const char *e = getenv("PSPRECOMP_REPLAY_LIVE"); live = !(e && *e && *e == '0'); }
+    const int scripted = !live && psp_ctrl_replay_active();
+    const uint32_t host = scripted ? 0 : atomic_load(&g_host_buttons);
+    const uint8_t  hax  = scripted ? 128 : atomic_load(&g_host_ax);
+    const uint8_t  hay  = scripted ? 128 : atomic_load(&g_host_ay);
     const uint32_t buttons = g_hold_buttons | g_script_buttons | host;
     const uint8_t  ax = g_script_analog ? g_script_ax : hax;
     const uint8_t  ay = g_script_analog ? g_script_ay : hay;
@@ -609,10 +615,10 @@ static void ctrl_fill(void) {
     /* The look channel merges the same way, except that the mouse is taken
      * rather than read -- the sum restarts at every poll -- and the script's
      * delta is spent here, so a later poll does not deliver it again. */
-    const uint8_t hrx  = atomic_load(&g_host_rx);
-    const uint8_t hry  = atomic_load(&g_host_ry);
-    const int     hmdx = atomic_exchange(&g_host_mdx, 0);
-    const int     hmdy = atomic_exchange(&g_host_mdy, 0);
+    const uint8_t hrx  = scripted ? 128 : atomic_load(&g_host_rx);
+    const uint8_t hry  = scripted ? 128 : atomic_load(&g_host_ry);
+    const int     hmdx = scripted ? (atomic_exchange(&g_host_mdx, 0), 0) : atomic_exchange(&g_host_mdx, 0);
+    const int     hmdy = scripted ? (atomic_exchange(&g_host_mdy, 0), 0) : atomic_exchange(&g_host_mdy, 0);
     g_ctrl_last_rx  = g_script_look ? g_script_rx  : hrx;
     g_ctrl_last_ry  = g_script_look ? g_script_ry  : hry;
     g_ctrl_last_mdx = g_script_look ? g_script_mdx : hmdx;
