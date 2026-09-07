@@ -60,7 +60,7 @@ static int      g_prof_on = -1;
 static uint64_t g_model_verts;      /* vertices handed to the backend's own transform */
 static uint64_t g_prof[6], g_prof_verts, g_prof_batches, g_prof_tsc0, g_prof_ns0;
 /* The interpreter on a GPU-transform backend: decode, append, state pushes, the rest of the walk. */
-static uint64_t g_prof_m[4], g_prof_lists, g_prof_op[256], g_prof_opn[256];
+static uint64_t g_prof_m[8], g_prof_lists, g_prof_op[256], g_prof_opn[256];
 static inline uint64_t ge_prof_now(void) { return g_prof_on > 0 ? GE_PROF_TSC() : 0; }
 static uint64_t ge_prof_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static void ge_prof_init(void) {
@@ -292,10 +292,18 @@ static uint64_t g_draw_2d_tex, g_draw_2d_flat, g_draw_3d_tex, g_draw_3d_flat;
 /* The distinct vertex colours the transform path reads. "Everything is white"
  * needs to distinguish a white model from a colour that is not being read. */
 static uint32_t g_col_seen[8]; static int g_col_n;
+static uint32_t g_col_last; static int g_col_last_valid;   /* note_colour's short cut */
+/* What the eye-space lights were last computed from. The view matrix and the
+ * lights change a few times a frame; the draws that read them come by the
+ * hundred. Padding is cleared before the compare, so bytes may be compared. */
+typedef struct { float view[12]; struct { int enable, type; float pos[3], dir[3]; } light[4]; int valid; } light_inputs;
+static light_inputs g_light_eye_from;
 static uint64_t g_clear_draws, g_clear_z_draws;
 static void note_colour(uint32_t c) {
-    for (int i = 0; i < g_col_n; i++) if (g_col_seen[i] == c) return;
+    if (g_col_last_valid && c == g_col_last) return;   /* a model's vertices mostly share one */
+    for (int i = 0; i < g_col_n; i++) if (g_col_seen[i] == c) { g_col_last = c; g_col_last_valid = 1; return; }
     if (g_col_n < 8) g_col_seen[g_col_n++] = c;
+    g_col_last = c; g_col_last_valid = 1;
 }
 
 /* The transform pipeline's state.
@@ -503,9 +511,10 @@ void psp_ge_reset(void) {
     g_imm_draws = 0;
     g_culled = g_xformed = 0;
     g_draw_2d_tex = g_draw_2d_flat = g_draw_3d_tex = g_draw_3d_flat = 0;
-    g_col_n = 0;
+    g_col_n = 0; g_col_last_valid = 0;
     g_clear_draws = g_clear_z_draws = 0;
     memset(&g_tl, 0, sizeof g_tl);
+    memset(&g_light_eye_from, 0, sizeof g_light_eye_from);
     g_next_id = 0x00080000u;
 }
 
@@ -533,6 +542,12 @@ void psp_ge_dump_stats(FILE *out) {
                      app = (double)g_prof_m[1] / cyc_per_ns / 1e6, st = (double)g_prof_m[2] / cyc_per_ns / 1e6;
         fprintf(out, "GE interpreter: %.1f ms in %llu list run(s): model decode %.1f ms (%.0f%%), backend append %.1f ms (%.0f%%), pixel-state pushes %.1f ms (%.0f%%), the rest of the walk %.1f ms (%.0f%%)\n",
                 total, (unsigned long long)g_prof_lists, dec, 100*dec/total, app, 100*app/total, st, 100*st/total, total-dec-app-st, 100*(total-dec-app-st)/total);
+        {
+            uint64_t opsum = 0; for (int i = 0; i < 256; i++) opsum += g_prof_op[i];
+            fprintf(out, "    inside PRIM as well: texture push %.1f ms, transform-state fill %.1f ms, draw prelude %.1f ms; outside every command (fetch, stall test, dispatch): %.1f ms\n",
+                    (double)g_prof_m[4] / cyc_per_ns / 1e6, (double)g_prof_m[5] / cyc_per_ns / 1e6, (double)g_prof_m[6] / cyc_per_ns / 1e6,
+                    total - (double)opsum / cyc_per_ns / 1e6);
+        }
         int order[256]; for (int i = 0; i < 256; i++) order[i] = i;
         for (int a = 0; a < 256; a++) for (int b = a + 1; b < 256; b++) if (g_prof_op[order[b]] > g_prof_op[order[a]]) { int t = order[a]; order[a] = order[b]; order[b] = t; }
         fprintf(out, "    by command, top 12:");
@@ -1514,6 +1529,17 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
 static struct { float pos[3], dir[3]; } g_light_eye[4];
 
 static void lights_to_eye(void) {
+    light_inputs now;
+    memset(&now, 0, sizeof now);
+    memcpy(now.view, g_tl.view, sizeof now.view);
+    for (int i = 0; i < 4; i++) {
+        now.light[i].enable = g_tl.light[i].enable; now.light[i].type = g_tl.light[i].type;
+        memcpy(now.light[i].pos, g_tl.light[i].pos, sizeof now.light[i].pos);
+        memcpy(now.light[i].dir, g_tl.light[i].dir, sizeof now.light[i].dir);
+    }
+    now.valid = 1;
+    if (memcmp(&now, &g_light_eye_from, sizeof now) == 0) return;
+    g_light_eye_from = now;
     for (int i = 0; i < 4; i++) {
         if (!g_tl.light[i].enable) continue;
         if (g_tl.light[i].type == 0) mul_3x3(g_tl.view, g_tl.light[i].pos, g_light_eye[i].pos);
@@ -1627,7 +1653,7 @@ static uint32_t primitive_batch_count(uint32_t type, uint32_t remaining) {
 /* What draw_model receives alongside the vertices: g_tl and the lights in
  * eye space, in the backend's own struct. */
 static void fill_xform_state(psp_xform_state *xs) {
-    memset(xs, 0, sizeof *xs);
+    /* Every member is assigned below; only padding would have been cleared. */
     memcpy(xs->world, g_tl.world, sizeof xs->world);
     memcpy(xs->view,  g_tl.view,  sizeof xs->view);
     memcpy(xs->proj,  g_tl.proj,  sizeof xs->proj);
@@ -1721,6 +1747,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                              fabsf(g_tl.proj[7])  < 1e-6f &&
                              fabsf(g_tl.proj[11]) < 1e-6f &&
                              fabsf(g_tl.proj[15]) > 1e-6f;
+    const uint64_t _x0 = ge_prof_now();
     if (g_tl.lighting) lights_to_eye();
     const int any_light = g_tl.lighting && any_light_enabled();
 
@@ -1732,31 +1759,69 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
          type == PSP_PRIM_TRIANGLE_FAN) && be->model_ok()) {
         psp_xform_state xs;
         fill_xform_state(&xs);
+        if (g_prof_on > 0) g_prof_m[5] += ge_prof_now() - _x0;
         psp_model_vertex mv[GE_VERTEX_BATCH];
         uint32_t mdone = 0;
         while (mdone < count) {
             const uint32_t n = primitive_batch_count(type, count - mdone);
             uint32_t decoded = 0;
             const uint64_t _m0 = ge_prof_now();
+            /* One translation for the batch's vertices and one for its
+             * indices, in place of two per vertex: the bytes are the same,
+             * and a batch the flat map cannot hand over whole (an index off
+             * the end of memory, a range straddling a region) falls back to
+             * the per-vertex lookups, which say what they always said. */
+            const uint32_t vtype = g_ge.vtype;
+            const int isz = VT_INDEX(vtype) == 1 ? 1 : VT_INDEX(vtype) == 2 ? 2 : 0;
+            const uint8_t *vspan = NULL, *ispan = NULL;
+            uint32_t vspan_addr = 0;
+            if (!isz) {
+                vspan_addr = g_ge.vaddr + mdone * (uint32_t)stride;
+                vspan = (const uint8_t *)psp_mem_ptr(vspan_addr, n * (uint32_t)stride);
+            } else {
+                ispan = (const uint8_t *)psp_mem_ptr(g_ge.iaddr + mdone * (uint32_t)isz, n * (uint32_t)isz);
+                if (ispan) {
+                    uint32_t hi = 0;
+                    for (uint32_t k = 0; k < n; k++) {
+                        const uint32_t ix = isz == 1 ? ispan[k] : (uint32_t)ispan[2 * k] | ((uint32_t)ispan[2 * k + 1] << 8);
+                        if (ix > hi) hi = ix;
+                    }
+                    vspan_addr = g_ge.vaddr;
+                    vspan = (const uint8_t *)psp_mem_ptr(g_ge.vaddr, (hi + 1) * (uint32_t)stride);
+                }
+            }
+            const uint32_t base_colour = current_colour();
+            const int vertex_colour = col_off >= 0 && VT_COLOR(vtype) == 7;
             for (; decoded < n; decoded++) {
-                const uint32_t a = vertex_addr(mdone + decoded, stride);
-                const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)stride);
+                uint32_t a;
+                const uint8_t *vp;
+                if (!isz) {
+                    a = vspan_addr + decoded * (uint32_t)stride;
+                    vp = vspan ? vspan + decoded * (uint32_t)stride : (const uint8_t *)psp_mem_ptr(a, (uint32_t)stride);
+                } else if (ispan && vspan) {
+                    const uint32_t ix = isz == 1 ? ispan[decoded] : (uint32_t)ispan[2 * decoded] | ((uint32_t)ispan[2 * decoded + 1] << 8);
+                    a = vspan_addr + ix * (uint32_t)stride;
+                    vp = vspan + ix * (uint32_t)stride;
+                } else {
+                    a = vertex_addr(mdone + decoded, stride);
+                    vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)stride);
+                }
                 psp_model_vertex *m = &mv[decoded];
-                if (!read_pos_model_at(vp, a, g_ge.vtype, pos_off, m->pos)) break;
-                m->rgba = current_colour();
-                if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7) {
+                if (!read_pos_model_at(vp, a, vtype, pos_off, m->pos)) break;
+                m->rgba = base_colour;
+                if (vertex_colour) {
                     if (vp) memcpy(&m->rgba, vp + col_off, 4);
                     else    m->rgba = psp_read32(a + (uint32_t)col_off);
                 }
-                if (any_light) read_normal_model_at(vp, a, g_ge.vtype, norm_off, m->nrm);
+                if (any_light) read_normal_model_at(vp, a, vtype, norm_off, m->nrm);
                 else { m->nrm[0] = m->nrm[1] = 0.0f; m->nrm[2] = 1.0f; }
                 psp_vertex uv;
-                read_uv_model_at(vp, a, g_ge.vtype, tex_off, &uv);
+                read_uv_model_at(vp, a, vtype, tex_off, &uv);
                 m->u = uv.u; m->v = uv.v;
-                if (g_tl.fog_enable) g_fog_verts++;
-                if (g_tl.lighting)   g_lit_verts++;
                 note_colour(m->rgba);
             }
+            if (g_tl.fog_enable) g_fog_verts += decoded;
+            if (g_tl.lighting)   g_lit_verts += decoded;
             const uint64_t _m1 = ge_prof_now();
             be->draw_model((int)type, mv, (int)decoded, &xs);
             if (g_prof_on > 0) { const uint64_t _m2 = ge_prof_now(); g_prof_m[0] += _m1 - _m0; g_prof_m[1] += _m2 - _m1; }
@@ -2119,6 +2184,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
      * value at the draw matters. */
 
     if (!g_ge.vaddr) { g_skip_noaddr += count; return; }
+    const uint64_t _d0 = ge_prof_now();
 
     int col_off = -1, pos_off = 0, tex_off = -1;
     int norm_off;
@@ -2142,7 +2208,9 @@ static void draw_prim(uint32_t type, uint32_t count) {
     g_ge.drawn_prims++;
 
     const int has_uv = g_ge.tex_enable && g_ge.tex_addr;
+    const uint64_t _d1 = ge_prof_now();
     push_texture_state(has_uv);
+    if (g_prof_on > 0) { const uint64_t _d2 = ge_prof_now(); g_prof_m[4] += _d2 - _d1; g_prof_m[6] += _d1 - _d0; }
     if (g_tl.clear_mode) { g_clear_draws++; if (g_tl.clear_z) g_clear_z_draws++; }
     if (VT_THROUGH(g_ge.vtype)) { if (has_uv) g_draw_2d_tex++; else g_draw_2d_flat++; }
     else                        { if (has_uv) g_draw_3d_tex++; else g_draw_3d_flat++; }
@@ -2238,10 +2306,25 @@ static void run_list_body(ge_queue *q) {
      * once. Counting runs made the total depend on how many stall updates
      * the CPU interleaved. */
 
+    /* Words are fetched through one host pointer over a span of the list,
+     * looked up again only when a command redirects the list or the span
+     * runs out: a translated load per word was a sixth of the walk. The span
+     * lookup is the same translation, so an unmapped list still counts a bad
+     * access, and a list in VRAM still reaches the access observer. */
+    const uint8_t *lp = NULL;
+    uint32_t lp_addr = 0, lp_end = 0;
     while (budget--) {
         if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
 
-        uint32_t word = psp_read32(q->list);
+        uint32_t word;
+        if (q->list != lp_addr || q->list + 4 > lp_end || !lp) {
+            uint32_t span = 4096;
+            lp = (const uint8_t *)psp_mem_ptr(q->list, span);
+            if (!lp) { span = 4; lp = (const uint8_t *)psp_mem_ptr(q->list, span); }
+            lp_addr = q->list; lp_end = lp ? q->list + span : 0;
+        }
+        if (lp) { memcpy(&word, lp, 4); lp += 4; lp_addr += 4; }
+        else word = psp_read32(q->list);
         uint32_t cmd  = word >> 24;
         uint32_t arg  = word & 0x00FFFFFF;
         const uint64_t _c0 = ge_prof_now();
