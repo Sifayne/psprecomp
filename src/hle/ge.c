@@ -59,6 +59,8 @@
 static int      g_prof_on = -1;
 static uint64_t g_model_verts;      /* vertices handed to the backend's own transform */
 static uint64_t g_prof[6], g_prof_verts, g_prof_batches, g_prof_tsc0, g_prof_ns0;
+/* The interpreter on a GPU-transform backend: decode, append, state pushes, the rest of the walk. */
+static uint64_t g_prof_m[4], g_prof_lists, g_prof_op[256], g_prof_opn[256];
 static inline uint64_t ge_prof_now(void) { return g_prof_on > 0 ? GE_PROF_TSC() : 0; }
 static uint64_t ge_prof_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static void ge_prof_init(void) {
@@ -524,6 +526,20 @@ void psp_ge_dump_stats(FILE *out) {
                 (unsigned long long)g_prof_verts, (unsigned long long)g_prof_batches, tot / cyc_per_ns / 1e6, tot / cyc_per_ns / (double)g_prof_verts);
         for (int i = 0; i < 6; i++)
             fprintf(out, "    %-24s %7.1f ms  %4.1f%%\n", NAMES[i], (double)g_prof[i] / cyc_per_ns / 1e6, 100.0 * (double)g_prof[i] / (tot > 0 ? tot : 1));
+    }
+    if (g_prof_on > 0 && g_prof_lists) {
+        const double cyc_per_ns = (double)(GE_PROF_TSC() - g_prof_tsc0) / (double)(ge_prof_ns() - g_prof_ns0 + 1);
+        const double total = (double)g_prof_m[3] / cyc_per_ns / 1e6, dec = (double)g_prof_m[0] / cyc_per_ns / 1e6,
+                     app = (double)g_prof_m[1] / cyc_per_ns / 1e6, st = (double)g_prof_m[2] / cyc_per_ns / 1e6;
+        fprintf(out, "GE interpreter: %.1f ms in %llu list run(s): model decode %.1f ms (%.0f%%), backend append %.1f ms (%.0f%%), pixel-state pushes %.1f ms (%.0f%%), the rest of the walk %.1f ms (%.0f%%)\n",
+                total, (unsigned long long)g_prof_lists, dec, 100*dec/total, app, 100*app/total, st, 100*st/total, total-dec-app-st, 100*(total-dec-app-st)/total);
+        int order[256]; for (int i = 0; i < 256; i++) order[i] = i;
+        for (int a = 0; a < 256; a++) for (int b = a + 1; b < 256; b++) if (g_prof_op[order[b]] > g_prof_op[order[a]]) { int t = order[a]; order[a] = order[b]; order[b] = t; }
+        fprintf(out, "    by command, top 12:");
+        for (int i = 0; i < 12 && g_prof_opn[order[i]]; i++)
+            fprintf(out, " %02X:%.0fms/%lluk(%.0fns)", order[i], (double)g_prof_op[order[i]] / cyc_per_ns / 1e6,
+                    (unsigned long long)(g_prof_opn[order[i]] / 1000), (double)g_prof_op[order[i]] / cyc_per_ns / (double)g_prof_opn[order[i]]);
+        fprintf(out, "\n");
     }
     if (g_ge.tex_addr || g_ge.tex_formats_seen) {
         static const char *const TF[16] = {
@@ -1721,6 +1737,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         while (mdone < count) {
             const uint32_t n = primitive_batch_count(type, count - mdone);
             uint32_t decoded = 0;
+            const uint64_t _m0 = ge_prof_now();
             for (; decoded < n; decoded++) {
                 const uint32_t a = vertex_addr(mdone + decoded, stride);
                 const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)stride);
@@ -1740,7 +1757,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 if (g_tl.lighting)   g_lit_verts++;
                 note_colour(m->rgba);
             }
+            const uint64_t _m1 = ge_prof_now();
             be->draw_model((int)type, mv, (int)decoded, &xs);
+            if (g_prof_on > 0) { const uint64_t _m2 = ge_prof_now(); g_prof_m[0] += _m1 - _m0; g_prof_m[1] += _m2 - _m1; }
             g_model_verts += decoded;
             if ((type == PSP_PRIM_TRIANGLE_STRIP || type == PSP_PRIM_TRIANGLE_FAN) &&
                 decoded == GE_VERTEX_BATCH && mdone + decoded < count)
@@ -1995,7 +2014,13 @@ static void push_texture_state(int has_uv) {
     }
 }
 
+static void push_pixel_state_body(void);
 static void push_pixel_state(void) {
+    const uint64_t _s0 = ge_prof_now();
+    push_pixel_state_body();
+    if (g_prof_on > 0) g_prof_m[2] += ge_prof_now() - _s0;
+}
+static void push_pixel_state_body(void) {
     {
         /* Clear mode writes the clear values straight through: no blend, no
          * alpha test, or the clear would be filtered by the state it is
@@ -2196,7 +2221,13 @@ static void draw_prim(uint32_t type, uint32_t count) {
  * The budget is not paranoia: a list whose JUMP forms a cycle is a normal
  * intermediate state while the CPU is still writing, and without a bound a
  * malformed or partially-written list hangs the host with no diagnostic. */
+static void run_list_body(ge_queue *q);
 static void run_list(ge_queue *q) {
+    const uint64_t _r0 = ge_prof_now();
+    run_list_body(q);
+    if (g_prof_on > 0) { g_prof_m[3] += ge_prof_now() - _r0; g_prof_lists++; }
+}
+static void run_list_body(ge_queue *q) {
     ge_note_thread();
     uint32_t stack[GE_STACK];
     int sp = 0;
@@ -2213,6 +2244,7 @@ static void run_list(ge_queue *q) {
         uint32_t word = psp_read32(q->list);
         uint32_t cmd  = word >> 24;
         uint32_t arg  = word & 0x00FFFFFF;
+        const uint64_t _c0 = ge_prof_now();
         q->list += 4;
         g_ge.commands++;
 
@@ -2746,6 +2778,7 @@ static void run_list(ge_queue *q) {
             g_ge.unknown++;
             break;
         }
+        if (g_prof_on > 0) { g_prof_op[cmd] += ge_prof_now() - _c0; g_prof_opn[cmd]++; }
     }
 }
 
