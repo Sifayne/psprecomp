@@ -86,6 +86,10 @@ void     psp_mem_mark_write(uint32_t addr, uint32_t size);
  * Receives normalized addresses after a tracked write. Must not write memory
  * or call a GPU API. Passing NULL removes it; reset/free also remove it. */
 void psp_mem_set_write_observer(void (*observer)(uint32_t addr, uint32_t size));
+/* Narrow the write observer to writes overlapping [lo, hi): a backend that
+ * only cares about its render targets need not be called for every store the
+ * recompiled code makes. Setting an observer resets the range to everything. */
+void psp_mem_set_write_observer_range(uint32_t lo, uint32_t hi);
 
 /* Optional VRAM access observer, called before a pointer into VRAM is handed
  * out -- to a guest load or store, a block copy, an instrument, the texture

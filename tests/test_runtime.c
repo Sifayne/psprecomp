@@ -204,6 +204,18 @@ static void test_memory(void) {
     CHECK(observed_writes==2,"same-value stores still notify GPU ownership");
     (void)psp_read8(tracked);
     CHECK(observed_writes==2,"reads do not notify write observer");
+    {
+        const uint32_t far = tracked + 0x8000u;   /* touched by nothing below */
+        psp_mem_set_write_observer_range(tracked, tracked + 0x40u);
+        psp_write8(far, 0x5A);
+        CHECK(observed_writes==2,"a write outside the observer's range is not reported");
+        psp_write8(tracked + 0x3Fu, 0x5A);
+        CHECK(observed_writes==3,"a write inside the observer's range is reported");
+        psp_mem_set_write_observer(observe_write);
+        psp_write8(far, 0x5B);
+        CHECK(observed_writes==4,"setting an observer resets its range to everything");
+        observed_writes = 2;   /* the checks below were written against this count */
+    }
     psp_mem_set_write_observer(NULL);
 
     /* The VRAM access observer runs before the pointer is handed out, for a

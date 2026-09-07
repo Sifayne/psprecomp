@@ -77,8 +77,15 @@ uint64_t psp_mem_range_generation(uint32_t addr, uint32_t size) {
 }
 
 static void (*g_write_observer)(uint32_t, uint32_t);
+static uint32_t g_write_watch_lo, g_write_watch_hi = UINT32_MAX;
 void psp_mem_set_write_observer(void (*observer)(uint32_t, uint32_t)) {
     g_write_observer = observer;
+    g_write_watch_lo = 0;
+    g_write_watch_hi = UINT32_MAX;
+}
+void psp_mem_set_write_observer_range(uint32_t lo, uint32_t hi) {
+    g_write_watch_lo = lo & PSP_ADDR_MASK;
+    g_write_watch_hi = hi & PSP_ADDR_MASK;
 }
 
 static void (*g_vram_observer)(uint32_t, uint32_t);
@@ -104,7 +111,10 @@ void psp_mem_mark_write(uint32_t addr, uint32_t size) {
     const uint32_t last = (uint32_t)(((uint64_t)off + size - 1u) >>
                                      WRITE_GRANULE_SHIFT);
     for (uint32_t i = first; i <= last; i++) table[i] = stamp;
-    if (g_write_observer) g_write_observer(addr & PSP_ADDR_MASK, size);
+    if (g_write_observer) {
+        const uint32_t a = addr & PSP_ADDR_MASK;
+        if (a < g_write_watch_hi && a + size > g_write_watch_lo) g_write_observer(a, size);
+    }
 }
 
 /* Watch writes to one address. "Which code writes this word" is a question
