@@ -81,6 +81,15 @@ void psp_mem_set_write_observer(void (*observer)(uint32_t, uint32_t)) {
     g_write_observer = observer;
 }
 
+static void (*g_vram_observer)(uint32_t, uint32_t);
+static uint32_t g_vram_watch_lo, g_vram_watch_hi;
+void psp_mem_set_vram_access_observer(void (*observer)(uint32_t, uint32_t), uint32_t lo,
+                                      uint32_t hi) {
+    g_vram_observer = observer;
+    g_vram_watch_lo = lo & PSP_ADDR_MASK;
+    g_vram_watch_hi = hi & PSP_ADDR_MASK;
+}
+
 void psp_mem_mark_write(uint32_t addr, uint32_t size) {
     if (!size) return;
     uint32_t off = 0;
@@ -318,6 +327,7 @@ void psp_mem_dump_bad(FILE *out, int top) {
 
 int psp_mem_init(void) {
     g_write_observer = NULL;
+    g_vram_observer = NULL;
     psp_mem.ram     = (uint8_t *)calloc(1, PSP_RAM_SIZE);
     psp_mem.vram    = (uint8_t *)calloc(1, PSP_VRAM_SIZE);
     psp_mem.scratch = (uint8_t *)calloc(1, PSP_SCRATCH_SIZE);
@@ -342,6 +352,7 @@ int psp_mem_init(void) {
 
 void psp_mem_free(void) {
     g_write_observer = NULL;
+    g_vram_observer = NULL;
     free(psp_mem.ram);
     free(psp_mem.vram);
     free(psp_mem.scratch);
@@ -402,6 +413,8 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
     if (a >= PSP_VRAM_BASE && a < PSP_VRAM_BASE + PSP_VRAM_SIZE) {
         uint32_t off = a - PSP_VRAM_BASE;
         if (off + size > PSP_VRAM_SIZE) return NULL;
+        if (g_vram_observer && a < g_vram_watch_hi && a + size > g_vram_watch_lo)
+            g_vram_observer(a, size);
         return psp_mem.vram + off;
     }
     if (a >= PSP_SCRATCH_BASE && a < PSP_SCRATCH_BASE + PSP_SCRATCH_SIZE) {

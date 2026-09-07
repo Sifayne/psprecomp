@@ -211,6 +211,17 @@ static void dump_frame_seq(uint32_t base) {
 
 static void score_frame(uint32_t base) {
     if (!base || g_fb_format != PSP_DISPLAY_PIXEL_FORMAT_8888) return;
+    /* Only when a capture was asked for. Reading every presented frame back
+     * out of guest memory is a third of a millisecond, and on a GPU backend
+     * it is also the demand that lands the frame's pixels in guest memory
+     * before the guest needs them -- a cost no run should pay for an
+     * instrument nobody reads. */
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *f = getenv("PSPRECOMP_FRAME");
+        wanted = f && *f;
+    }
+    if (!wanted) return;
     g_frames_scored++;
     /* Scored by how much the frame *varies*, not by how much of it is lit. A
      * solid fill -- which a fade is -- scores zero however bright it is, so

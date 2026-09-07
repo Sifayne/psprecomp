@@ -87,6 +87,19 @@ void     psp_mem_mark_write(uint32_t addr, uint32_t size);
  * or call a GPU API. Passing NULL removes it; reset/free also remove it. */
 void psp_mem_set_write_observer(void (*observer)(uint32_t addr, uint32_t size));
 
+/* Optional VRAM access observer, called before a pointer into VRAM is handed
+ * out -- to a guest load or store, a block copy, an instrument, the texture
+ * decoder, anything -- while the address range it is told about overlaps
+ * [lo, hi). A GPU backend that has left pixels in flight uses it to land them
+ * in guest memory before the guest can see or overwrite the bytes; unlike the
+ * write observer it may write memory and call the GPU. The range is the
+ * only cost on the common path: nothing is called for an access outside it.
+ * The observer's own accesses through psp_mem_ptr re-enter it, so it must
+ * retire what it is about to land before writing. Passing NULL removes it;
+ * reset/free also remove it. */
+void psp_mem_set_vram_access_observer(void (*observer)(uint32_t addr, uint32_t size),
+                                      uint32_t lo, uint32_t hi);
+
 /* The PSP is little-endian and so is every host we target, so these are plain
  * loads once the address is resolved. Unmapped accesses return 0 / are dropped
  * and bump psp_mem_bad_access — a recompiled game that starts faulting here is

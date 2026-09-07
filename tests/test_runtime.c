@@ -172,6 +172,15 @@ static void test_square_root(void) {
 
 static unsigned observed_writes;
 static uint32_t observed_addr, observed_size, observed_value;
+static unsigned accesses; static uint32_t access_addr, access_size; static uint8_t access_seen_value;
+static const uint8_t *access_raw;   /* host byte of the watched address, taken before arming */
+static void observe_access(uint32_t addr, uint32_t size) {
+    accesses++; access_addr = addr; access_size = size;
+    /* Not through psp_read8: the observer is re-entered by its own pointer
+     * lookups, and a backend retires its state before it writes. The raw
+     * byte is what the guest's store has not yet changed. */
+    access_seen_value = *access_raw;
+}
 static void observe_write(uint32_t addr, uint32_t size) {
     observed_writes++; observed_addr=addr; observed_size=size;
     observed_value=psp_read8(addr);
@@ -196,6 +205,26 @@ static void test_memory(void) {
     (void)psp_read8(tracked);
     CHECK(observed_writes==2,"reads do not notify write observer");
     psp_mem_set_write_observer(NULL);
+
+    /* The VRAM access observer runs before the pointer is handed out, for a
+     * load or a store, only inside its range, and only while armed. */
+    accesses = 0; access_addr = access_size = 0; access_seen_value = 0;
+    psp_write8(nearby, 0x11);
+    access_raw = (const uint8_t *)psp_mem_ptr(nearby, 1);
+    psp_mem_set_vram_access_observer(observe_access, tracked, tracked + 0x100u);
+    CHECK(psp_read8(nearby) == 0x11 && accesses == 1 && access_addr == nearby && access_size == 1,
+          "access observer sees a load inside the range, before it");
+    psp_write8(nearby, 0x22);
+    CHECK(accesses == 2 && access_seen_value == 0x11,
+          "access observer runs before a store lands");
+    (void)psp_read32(remote);
+    (void)psp_read32(PSP_RAM_BASE + 0x1000u);
+    CHECK(accesses == 2, "accesses outside the range do not reach the observer");
+    (void)psp_read32(tracked + 0xFEu);
+    CHECK(accesses == 3, "an access straddling the range's end is inside it");
+    psp_mem_set_vram_access_observer(NULL, 0, 0);
+    (void)psp_read8(nearby);
+    CHECK(accesses == 3, "a removed access observer is not called");
 
     psp_write32(tracked, 0xAABBCCDDu);
     const uint64_t first_generation = psp_mem_range_generation(tracked, 4);
@@ -277,6 +306,12 @@ static void test_memory(void) {
           "memory reset restores pristine range generations");
     psp_write8(tracked, 0xCC);
     CHECK(observed_writes==2,"memory reset removes the old GPU observer");
+    psp_mem_set_vram_access_observer(observe_access, tracked, tracked + 0x100u);
+    psp_mem_free();
+    CHECK(psp_mem_init() == 0, "memory reinitialises again");
+    accesses = 0;
+    (void)psp_read8(tracked);
+    CHECK(accesses == 0, "memory reset removes the old access observer");
     psp_mem_free();
 }
 
