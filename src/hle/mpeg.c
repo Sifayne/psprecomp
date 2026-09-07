@@ -540,7 +540,25 @@ static void hle_RingbufferAvailableSize(void) {
  * the player to wait for a frame that cannot arrive, which is exactly the
  * infinite spin the choice of INVALID_VALUE above exists to avoid. Refuse the
  * override instead of quietly doing the harmful thing. */
+static int g_decode_override = -1;
+
+int psp_mpeg_decoding_available(void) {
+#if PSPRECOMP_HAVE_OPENH264
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int psp_mpeg_set_decoding(int enabled) {
+    if (enabled < -1 || enabled > 1) return -1;
+    if (enabled == 1 && !psp_mpeg_decoding_available()) return -1;
+    g_decode_override = enabled;
+    return 0;
+}
+
 static int mpeg_decoding(void) {
+    if (g_decode_override >= 0) return g_decode_override;
     static int done, on;
     if (!done) {
         const char *v = getenv("PSPRECOMP_MPEG_DECODE");

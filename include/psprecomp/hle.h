@@ -71,6 +71,10 @@ const psp_hle_entry *psp_hle_entries(int *count);
  * wild pointer shows up far from its cause. */
 void psp_mpeg_register(void);
 void psp_mpeg_reset(void);
+/* Host configuration, set before guest execution. -1 restores the legacy
+ * environment default. Returns -1 if decoding is requested but unavailable. */
+int psp_mpeg_set_decoding(int enabled);
+int psp_mpeg_decoding_available(void);
 
 void psp_hle_dump_recent(FILE *out);
 
