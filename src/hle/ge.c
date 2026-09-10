@@ -2101,8 +2101,10 @@ static void push_pixel_state_body(void) {
     }
     /* Clear mode bypasses the depth test as well as texturing, blending and the
      * alpha test. It is a blit of the clear values, so the comparison is forced
-     * to ALWAYS and depth write comes from the clear-mode depth bit rather than
-     * ZMSK.
+     * to ALWAYS -- an *enabled* test that always passes, not a disabled one --
+     * and depth write comes from the clear-mode depth bit rather than ZMSK. The
+     * distinction matters because a disabled test writes no depth at all, so
+     * encoding the clear as "test off, write on" would stop it clearing.
      *
      * An earlier revision ran the game's own test here instead, on the reasoning
      * that a clear should not overwrite geometry that rejected it. That gets the
@@ -2112,7 +2114,7 @@ static void push_pixel_state_body(void) {
      * to the near end, so every clear failed its own test and the depth buffer
      * was never cleared at all. */
     psp_render_current()->set_depth(
-        g_tl.clear_mode ? 0 : g_tl.ztest_enable,
+        g_tl.clear_mode ? 1 : g_tl.ztest_enable,
         g_tl.clear_mode ? 1 : g_tl.ztest_func,
         g_tl.clear_mode ? g_tl.clear_z : !g_tl.zwrite_off);
     psp_render_current()->set_fog(g_tl.fog_enable, g_tl.fog_colour_raw);

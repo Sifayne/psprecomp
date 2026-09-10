@@ -862,7 +862,10 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
         if (g_bs.stencil_test) write_stencil_only(x, y, stencil_op(g_bs.op_zfail, cur_stencil));
         return;
     }
-    if (g_zs.write) g_depth[y * DEPTH_STRIDE + x] = z;
+    /* A disabled depth test writes no depth, as in GL and on the hardware:
+     * ZMSK alone does not resurrect the write. Clear mode still writes because
+     * the GE layer hands it an enabled test with ALWAYS (src/hle/ge.c). */
+    if (g_zs.test && g_zs.write) g_depth[y * DEPTH_STRIDE + x] = z;
     if (g_bs.stencil_test) stencil = (int)stencil_op(g_bs.op_zpass, cur_stencil);
     if (!g_bs.write_colour) {
         if (stencil >= 0) write_stencil_only(x, y, (uint32_t)stencil);
