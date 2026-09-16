@@ -244,6 +244,13 @@ typedef struct {
     int  (*model_ok)(void);
     void (*draw_model)(int prim, const psp_model_vertex *v, int count,
                        const psp_xform_state *xs);
+
+    /* Optional placement metadata, supplied before every draw (including
+     * through/clear and immediate draws). The projected viewport rectangle
+     * is in guest pixels after OFFSET_X/Y, with absolute width/height. It
+     * does not transform vertices again. Hosts can use it to distinguish
+     * inset 3D views from the main scene on both CPU and GPU transform paths. */
+    void (*set_viewport)(float x, float y, float width, float height);
 } psp_render_backend;
 
 /* Select a backend by name ("software", "null", ...). Returns 0 on success,

@@ -2086,6 +2086,14 @@ static void push_pixel_state(void) {
     if (g_prof_on > 0) g_prof_m[2] += ge_prof_now() - _s0;
 }
 static void push_pixel_state_body(void) {
+    const psp_render_backend *be = psp_render_current();
+    if (be->set_viewport) {
+        const float hx = g_tl.vp_set ? fabsf(g_tl.vp_xs) : 240.0f;
+        const float hy = g_tl.vp_set ? fabsf(g_tl.vp_ys) : 136.0f;
+        const float cx = g_tl.vp_set ? g_tl.vp_xc - g_tl.off_x : 240.0f;
+        const float cy = g_tl.vp_set ? g_tl.vp_yc - g_tl.off_y : 136.0f;
+        be->set_viewport(cx - hx, cy - hy, 2.0f * hx, 2.0f * hy);
+    }
     {
         /* Clear mode writes the clear values straight through: no blend, no
          * alpha test, or the clear would be filtered by the state it is
