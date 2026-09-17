@@ -1,63 +1,41 @@
-/* psprecomp — the utility dialogs.
- *
- * The savedata dialog is implemented for real (M4): InitStart performs the
- * requested mode against ms0:/PSP/SAVEDATA/<game><save>/ immediately, and
- * the status ratchet reports the conversation's shape. The dialog has no UI
- * -- list modes act directly instead of showing a list -- but every byte it
- * reads and writes is on the host where a relaunch finds it.
- *
- * What is deliberately not here: PGD encryption (secure modes store
- * plaintext and round-trip it; secureversion measures the crypto and stays
- * red), the overwrite refusal (SAVE always writes), and LIST UI. Each is
- * noted where it bites. pspautotests' savedata suite is the oracle: every
- * mode below, every result code, and the file-exists lines come out of its
- * .expected files, and the [r]/[x] prefix is timing noise as everywhere.
- */
-
+/* PSP savedata: file operations and an input-driven utility session.
+ * Secure modes still store plaintext; encryption is a separate capability.
+ * Interactive requests never write or delete before explicit confirmation. */
 #include "psprecomp/hle.h"
 #include "psprecomp/cpu.h"
-
+#include "psprecomp/os.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 #ifndef _WIN32
 #include <sys/statvfs.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#else
+#include <direct.h>
+#include <io.h>
+#include <fcntl.h>
+#include <share.h>
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
 #endif
-#include <stdlib.h>
-#include <string.h>
+#endif
 
-/* PspUtilityDialogState, from PSPSDK's psputility.h -- the values a caller
- * compares GetStatus against. NONE is "no dialog is currently active" and QUIT
- * is "the dialog has been cancelled and should be shut down"; those two are the
- * only ones a dialog that never appears can honestly be in. INIT, VISIBLE and
- * FINISHED are named here because the enum is only half an answer without them.
- * https://pspdev.github.io/pspsdk/psputility_8h_source.html */
-#define PSP_UTILITY_DIALOG_NONE     0
-#define PSP_UTILITY_DIALOG_INIT     1
-#define PSP_UTILITY_DIALOG_VISIBLE  2
-#define PSP_UTILITY_DIALOG_QUIT     3
+#define PSP_UTILITY_DIALOG_NONE 0
+#define PSP_UTILITY_DIALOG_INIT 1
+#define PSP_UTILITY_DIALOG_VISIBLE 2
+#define PSP_UTILITY_DIALOG_QUIT 3
 #define PSP_UTILITY_DIALOG_FINISHED 4
-
-static int g_savedata_state;
+static int g_savedata_state, g_savedata_done, g_savedata_interactive;
 static uint32_t g_savedata_param;
-static int g_savedata_done;
-
-void psp_utility_init(void) {
-    g_savedata_state = PSP_UTILITY_DIALOG_NONE;
-    g_savedata_param = 0;
-    g_savedata_done = 0;
-}
-
-/* Said once. A title that offers to load a save on every screen would otherwise
- * repeat this for as long as it runs. */
-static void no_savedata(void) {
-    static int said;
-    if (!said++)
-        fprintf(stderr,
-            "psprecomp: sceUtilitySavedata runs headless: list modes act\n"
-            "  directly instead of showing a list, and secure modes store\n"
-            "  plaintext. Saves load and store; nothing is shown.\n");
-}
+static unsigned char sd_request[1536];
+static int sd_request_valid(void);
+static int sd_io_error;
 
 /* PSPRECOMP_SAVEDATA_LOG=1 narrates InitStart's parameter block: mode,
  * game/save/file names and buffer sizes. That is how the modes a title
@@ -71,8 +49,8 @@ static int savedata_log_on(void) {
     return on;
 }
 
-/* Offsets into SceUtilitySavedataParam, from PSPSDK's psputility_savedata.h
- * (BSD): 48-byte pspUtilityDialogCommon (result at 28), then mode at 48. */
+/* Offsets into SceUtilitySavedataParam; the layout is described in the M4
+ * section below. */
 #define SD_MODE      48u
 #define SD_BIND      52u
 #define SD_OVERWRITE 56u
@@ -99,6 +77,10 @@ static int savedata_log_on(void) {
 #define SD_IDLIST 1524u
 #define SD_FILELIST 1528u
 #define SD_SIZEINFO 1532u
+
+static uint32_t sd_optional(uint32_t p, uint32_t off) {
+    return psp_read32(p) >= off+4 ? psp_read32(p+off) : 0;
+}
 
 static void savedata_log(uint32_t param) {
     if (!savedata_log_on()) return;
@@ -135,19 +117,9 @@ static void savedata_log(uint32_t param) {
  * LOAD_FILE_NOT_FOUND when the dir is there but the data file is not;
  * RW_FILE_NOT_FOUND / RW_NO_DATA are the read/write family's pair for the
  * same two situations; DELETE_NO_DATA when a list delete matches nothing.
- * base.result is written on every InitStart, including success -- the
- * suite reads it back unconditionally.
- *
- * Deliberate approximations, each load-bearing somewhere and each stated:
- * SAVE always writes (the overwrite refusal has no oracle); LISTLOAD and
- * LISTSAVE act directly on param.saveName instead of showing a list, while
- * LISTDELETE without a UI selection deletes nothing (347, as the automated
- * hardware run reports); file categories go by creation record
- * (secure-made files travel secure, PARAM.SFO system, the rest normal --
- * the real distinction is encryption, which is the paragraph above);
- * neededKB is floor(dataSize/1024); free space is the host's, so free*
- * lines track this machine, not a 16GB stick; LISTALLDELETE reports how
- * many data-having saves it removed. */
+ * Interactive results are written only after a decision or an error.
+ * Secure-file classification is tracked in memory; free space is the host's.
+ */
 
 /* Result codes the modes below can produce. */
 #define SD_OK              0u
@@ -158,6 +130,15 @@ static void savedata_log(uint32_t param) {
 #define SD_DELETE_NO_DATA  0x80110347u
 #define SD_LOAD_BROKEN     0x80110306u
 #define SD_RW_BROKEN       0x80110326u
+#define SD_LOAD_ACCESS     0x80110305u   /* read failed */
+#define SD_SAVE_ACCESS     0x80110385u   /* write or list failed */
+#define SD_DELETE_ACCESS   0x80110345u
+#define SD_ERASE_ACCESS    0x80110325u
+#define SD_BAD_PARAM       0x80110004u   /* rejected parameter block */
+#define SD_BUSY            0x80110001u   /* a utility is already running */
+/* Interactive outcomes written to the result word: not PSP status codes. */
+#define SD_RESULT_CANCEL   1u
+#define SD_RESULT_ABORT    2u            /* scripted responses ran out or mismatched */
 
 /* Modes (SceUtilitySavedataParam2 in the suite's shared.h). */
 #define SD_AUTOLOAD   0u
@@ -248,9 +229,11 @@ static int64_t sd_read_file(const char *guest, uint32_t dst, uint32_t cap) {
     if (!f) return -1;
     uint32_t n = 0;
     int c;
+    if (cap && !psp_mem_ptr(dst, cap)) { fclose(f); return -1; }
     while (n < cap && (c = fgetc(f)) != EOF) psp_write8(dst + n++, (uint8_t)c);
-    fclose(f);
-    return (int64_t)n;
+    int bad = ferror(f);
+    if (fclose(f)) bad = 1;
+    return bad ? -1 : (int64_t)n;
 }
 
 /* Write cap bytes of guest memory to a host file, making the parent chain
@@ -270,10 +253,16 @@ static void sd_write_file(const char *guest, uint32_t src, uint32_t cap) {
     sd_make_parents(guest);
     char host[1024];
     psp_io_host_path(guest, host, sizeof host);
+    const void *bytes = cap ? psp_mem_ptr(src, cap) : NULL;
+    if (cap && !bytes) { sd_io_error = 1; return; }
     FILE *f = fopen(host, "wb");
-    if (!f) return;
-    for (uint32_t i = 0; i < cap; i++) fputc(psp_read8(src + i), f);
-    fclose(f);
+    if (!f) { sd_io_error = 1; return; }
+    if (cap && fwrite(bytes, 1, cap, f) != cap) sd_io_error = 1;
+    if (fflush(f)) sd_io_error = 1;
+#ifndef _WIN32
+    if (fsync(fileno(f))) sd_io_error = 1;
+#endif
+    if (fclose(f)) sd_io_error = 1;
 }
 
 /* Minimal valid PARAM.SFO: the VSH-facing fields plus the directory name.
@@ -288,12 +277,12 @@ static void sd_write_sfo(const char *dir, const char *dirname, uint32_t param) {
 
     static const char k0[] = "CATEGORY", k1[] = "SAVEDATA_DIRECTORY",
                       k2[] = "PARENTAL_LEVEL", k3[] = "TITLE",
-                      k4[] = "SAVEDATA_TITLE", k5[] = "DETAIL";
+                      k4[] = "SAVEDATA_TITLE", k5[] = "SAVEDATA_DETAIL";
     const char ms[] = "MS";
     struct ent { const char *key; uint16_t fmt; const char *s; uint32_t v; uint32_t max; };
     struct ent ents[] = {
         { k0, 2, ms, 0, 4 },
-        { k1, 2, dirname, 0, 32 },
+        { k1, 2, dirname, 0, 64 },
         { k2, 4, NULL, parental, 4 },
         { k3, 2, title, 0, 128 },
         { k4, 2, savetitle, 0, 128 },
@@ -304,14 +293,13 @@ static void sd_write_sfo(const char *dir, const char *dirname, uint32_t param) {
     uint32_t klen = 0, dlen = 0;
     for (int i = 0; i < n; i++) {
         klen += (uint32_t)strlen(ents[i].key) + 1;
-        uint32_t len = ents[i].fmt == 4 ? 4 : (uint32_t)strlen(ents[i].s) + 1;
         dlen = (dlen + 3) & ~3u;
-        dlen += (len + 3) & ~3u;
+        dlen += (ents[i].max + 3) & ~3u;
     }
-    uint32_t kstart = 20 + (uint32_t)n * 16, dstart = kstart + klen;
+    uint32_t kstart = 20 + (uint32_t)n * 16, dstart = (kstart + klen + 3) & ~3u;
     uint32_t total = dstart + dlen;
     uint8_t *buf = (uint8_t *)calloc(1, total ? total : 1);
-    if (!buf) return;
+    if (!buf) { sd_io_error = 1; return; }
 #define PUT32(o, v) do { buf[o] = (uint8_t)(v); buf[(o)+1] = (uint8_t)((v) >> 8); \
                          buf[(o)+2] = (uint8_t)((v) >> 16); buf[(o)+3] = (uint8_t)((v) >> 24); } while (0)
 #define PUT16(o, v) do { buf[o] = (uint8_t)(v); buf[(o)+1] = (uint8_t)((v) >> 8); } while (0)
@@ -324,17 +312,18 @@ static void sd_write_sfo(const char *dir, const char *dirname, uint32_t param) {
     for (int i = 0; i < n; i++) {
         uint32_t len = ents[i].fmt == 4 ? 4 : (uint32_t)strlen(ents[i].s) + 1;
         uint32_t max = ents[i].max;
+        if (len>max) len=max;
         dout = (dout + 3) & ~3u;
         PUT16(20 + (uint32_t)i * 16, ko - kstart);
-        PUT16(22 + (uint32_t)i * 16, ents[i].fmt);
+        PUT16(22 + (uint32_t)i * 16, (uint16_t)(ents[i].fmt | 0x0200u));
         PUT32(24 + (uint32_t)i * 16, len);
         PUT32(28 + (uint32_t)i * 16, max);
         PUT32(32 + (uint32_t)i * 16, dout - dstart);
         memcpy(buf + ko, ents[i].key, strlen(ents[i].key) + 1);
         ko += (uint32_t)strlen(ents[i].key) + 1;
         if (ents[i].fmt == 4) { PUT32(dout, ents[i].v); }
-        else memcpy(buf + dout, ents[i].s, len);
-        dout += (len + 3) & ~3u;
+        else memcpy(buf + dout, ents[i].s, len-1);
+        dout += (max + 3) & ~3u;
     }
 #undef PUT32
 #undef PUT16
@@ -345,7 +334,14 @@ static void sd_write_sfo(const char *dir, const char *dirname, uint32_t param) {
     char host[1024];
     psp_io_host_path(guest, host, sizeof host);
     FILE *f = fopen(host, "wb");
-    if (f) { fwrite(buf, 1, total, f); fclose(f); }
+    if (!f) sd_io_error = 1;
+    else {
+        if (fwrite(buf, 1, total, f) != total || fflush(f)) sd_io_error = 1;
+#ifndef _WIN32
+        if (fsync(fileno(f))) sd_io_error = 1;
+#endif
+        if (fclose(f)) sd_io_error = 1;
+    }
     free(buf);
 }
 
@@ -477,10 +473,10 @@ static int sd_classify(const char *dir, const char *file) {
  * way the suite's track a 16GB card -- environmental either way. Used space
  * is measured out of our own files, which is exact. */
 static void sd_fill_sizes(uint32_t param, const char *dir) {
-    uint32_t msfree = psp_read32(param + SD_MSFREE);
-    uint32_t msdata = psp_read32(param + SD_MSDATA);
-    uint32_t utild  = psp_read32(param + SD_UTILDATA);
-    uint32_t sinfo  = psp_read32(param + SD_SIZEINFO);
+    uint32_t msfree = sd_optional(param, SD_MSFREE);
+    uint32_t msdata = sd_optional(param, SD_MSDATA);
+    uint32_t utild  = sd_optional(param, SD_UTILDATA);
+    uint32_t sinfo  = sd_optional(param, SD_SIZEINFO);
     if (!msfree && !msdata && !utild && !sinfo) return;
 
     uint64_t freebytes = 0;
@@ -603,7 +599,7 @@ static void sd_fill_sizes(uint32_t param, const char *dir) {
  * without PARAM.SFO is broken: report RW_DATA_BROKEN with an empty
  * listing, and touch nothing (not even the counts). */
 static uint32_t sd_do_files(uint32_t param, const char *dir) {
-    uint32_t fl = psp_read32(param + SD_FILELIST);
+    uint32_t fl = sd_optional(param, SD_FILELIST);
     char names[256][64];
     int n = psp_io_list_names(dir, names, 256);
     if (n < 0) return SD_RW_NO_DATA;
@@ -648,7 +644,7 @@ static uint32_t sd_do_files(uint32_t param, const char *dir) {
 /* LIST(11): one entry per save dir under the game prefix, names reported
  * bare (TEST99901ABC reads ABC). Sorted, capped at maxCount. */
 static uint32_t sd_do_list(uint32_t param, const char *game) {
-    uint32_t il = psp_read32(param + SD_IDLIST);
+    uint32_t il = sd_optional(param, SD_IDLIST);
     char names[256][64];
     int n = psp_io_list_names("ms0:/PSP/SAVEDATA", names, 256);
     if (n < 0 || !il) return SD_OK;
@@ -690,9 +686,9 @@ static void sd_write_save(uint32_t param, const char *dir, const char *file) {
     sd_write_sidecars(dir, param);
 }
 
-/* Run the mode: read the param block, do the file work, answer the result
- * code. Runs synchronously inside InitStart -- files here are small and
- * instant, and the status ratchet (unchanged) is what paces the caller. */
+#include "savedata_io.h"
+
+/* Execute on the guest thread after a decision, or for a noninteractive mode. */
 static uint32_t sd_do_mode(uint32_t param) {
     char game[14], save[21], file[14];
     sd_getstr(param, SD_GAMENAME, 13, game, sizeof game);
@@ -704,6 +700,7 @@ static uint32_t sd_do_mode(uint32_t param) {
     uint32_t datasz = psp_read32(param + SD_DATASZ);
     char dir[512], guest[512];
     char cand[21];
+    sd_io_error = 0;
 
     switch (mode) {
     case SD_SAVE:
@@ -721,40 +718,36 @@ static uint32_t sd_do_mode(uint32_t param) {
             target = NULL;
             if (list) {
                 for (int i = 0; i < 100; i++) {
+                    if ((uint64_t)list+(uint32_t)i*20u>UINT32_MAX || !psp_mem_ptr(list+(uint32_t)i*20u,20)) return SD_SAVE_ACCESS;
                     sd_getstr(list + (uint32_t)i * 20u, 0, 20, cand, sizeof cand);
                     if (!cand[0]) break;
+                    if (!psp_mem_ptr(list+(uint32_t)i*20u,20) || !sd_component(cand,0) || strlen(cand)>19) return SD_SAVE_ACCESS;
                     sd_dir(game, cand, dir, sizeof dir);
                     if (!sd_exists(dir)) { target = cand; break; }
                 }
                 if (!target) {
                     sd_getstr(list, 0, 20, cand, sizeof cand);
+                    if (!sd_component(cand,1) || strlen(cand)>19) return SD_SAVE_ACCESS;
                     if (cand[0]) { target = cand; sd_dir(game, cand, dir, sizeof dir); }
                     else if (!save[0]) return SD_RW_NO_DATA;
                     else { target = save; sd_dir(game, save, dir, sizeof dir); }
                 }
             } else if (!save[0]) return SD_RW_NO_DATA;
-        } else if (!save[0] && mode == SD_LISTSAVE) {
-            uint32_t list = psp_read32(param + SD_SAVENAMELIST);
-            if (!list) return SD_RW_NO_DATA;
-            sd_getstr(list, 0, 20, cand, sizeof cand);
-            if (!cand[0]) return SD_RW_NO_DATA;
-            target = cand;
-            sd_dir(game, cand, dir, sizeof dir);
         }
         if (!target) { target = save; sd_dir(game, save, dir, sizeof dir); }
-        sd_write_save(param, dir, file);
+        sd_transaction_write(param, dir, file);
+        if (sd_io_error) return SD_SAVE_ACCESS;
         if (file[0]) {
             if (mode == SD_MAKEDATASECURE) sd_mark_secure(dir, file);
             else sd_unmark_secure(dir, file);
         }
-        return SD_OK;
+        return sd_io_error ? SD_SAVE_ACCESS : SD_OK;
     }
 
     /* The load family reads saveName directly -- an empty name denotes the
      * bare game dir, and the list plays no role on these paths. Missing dir
      * is NO_DATA, SFO-less is BROKEN, missing file is FILE_NOT_FOUND.
-     * LISTLOAD shows a list UI: with nothing to show it dismisses to 0
-     * instead of failing, but a broken save still reports its real code. */
+     * Interactive selection has already written the chosen saveName. */
     case SD_LOAD:
     case SD_LISTLOAD:
     case SD_AUTOLOAD: {
@@ -769,15 +762,14 @@ static uint32_t sd_do_mode(uint32_t param) {
             else {
                 if (buf && bufsz) {
                     int64_t n = sd_read_file(guest, buf, bufsz);
-                    psp_write32(param + SD_DATASZ, n > 0 ? (uint32_t)n : 0);
+                    if (n < 0) return SD_LOAD_ACCESS;
+                    psp_write32(param + SD_DATASZ, (uint32_t)n);
                 } else {
                     psp_write32(param + SD_DATASZ, (uint32_t)sd_fsize(guest));
                 }
                 rc = SD_OK;
             }
         }
-        if (mode == SD_LISTLOAD && rc == SD_LOAD_NO_DATA)
-            rc = SD_OK;
         return rc;
     }
 
@@ -785,50 +777,12 @@ static uint32_t sd_do_mode(uint32_t param) {
     case SD_AUTODELETE:
         sd_dir(game, save, dir, sizeof dir);
         if (!sd_exists(dir)) return SD_DELETE_NO_DATA;
-        psp_io_remove_tree(dir);
-        return SD_OK;
+        return sd_remove_tree(dir,0) == 0 ? SD_OK : SD_DELETE_ACCESS;
 
     case SD_DELETEDATA:
         sd_dir(game, save, dir, sizeof dir);
         if (!sd_exists(dir)) return SD_DELETE_NO_DATA;
-        psp_io_remove_tree(dir);
-        return SD_OK;
-
-    case SD_LISTDELETE: {
-        /* Deletes every listed save that exists, then reports DELETE_NO_DATA
-         * anyway: without a UI no selection exists, and the automated
-         * hardware run agrees -- 347 with the save gone (FILES ends empty).
-         * Deleting nothing also ends 347. */
-        uint32_t list = psp_read32(param + SD_SAVENAMELIST);
-        if (list) {
-            for (int i = 0; i < 100; i++) {
-                sd_getstr(list + (uint32_t)i * 20u, 0, 20, cand, sizeof cand);
-                if (!cand[0]) break;
-                sd_dir(game, cand, dir, sizeof dir);
-                if (sd_exists(dir)) psp_io_remove_tree(dir);
-            }
-        }
-        return SD_DELETE_NO_DATA;
-    }
-
-    case SD_LISTALLDEL: {
-        char names[256][64];
-        int n = psp_io_list_names("ms0:/PSP/SAVEDATA", names, 256);
-        int deleted = 0;
-        if (n > 0) {
-            size_t glen = strlen(game);
-            for (int i = 0; i < n; i++) {
-                if (game[0] && strncmp(names[i], game, glen) != 0) continue;
-                char child[512];
-                snprintf(child, sizeof child, "ms0:/PSP/SAVEDATA/%s", names[i]);
-                uint64_t sz = 0; int is_dir = 0;
-                if (psp_io_path_info(child, &sz, &is_dir) != 0 || !is_dir) continue;
-                psp_io_remove_tree(child);
-                deleted++;
-            }
-        }
-        return (uint32_t)deleted;
-    }
+        return sd_remove_tree(dir,0) == 0 ? SD_OK : SD_DELETE_ACCESS;
 
     case SD_ERASE:
     case SD_ERASESECURE: {
@@ -842,7 +796,7 @@ static uint32_t sd_do_mode(uint32_t param) {
         if (!sd_has_data(dir)) return SD_RW_FILE;
         const char *df = file[0] ? file : "DATA.BIN";
         snprintf(guest, sizeof guest, "%s/%s", dir, df);
-        if (sd_exists(guest)) psp_io_remove_tree(guest);
+        if (sd_exists(guest) && sd_remove_tree(guest,0)) return SD_ERASE_ACCESS;
         return SD_OK;
     }
 
@@ -867,7 +821,8 @@ static uint32_t sd_do_mode(uint32_t param) {
         if (sd_is_secure(dir, file) != secmode) return SD_RW_BROKEN;
         if (buf && bufsz) {
             int64_t n = sd_read_file(guest, buf, bufsz);
-            psp_write32(param + SD_DATASZ, n > 0 ? (uint32_t)n : 0);
+            if (n<0) return SD_ERASE_ACCESS;
+            psp_write32(param + SD_DATASZ, (uint32_t)n);
         } else {
             psp_write32(param + SD_DATASZ, (uint32_t)sd_fsize(guest));
         }
@@ -880,13 +835,8 @@ static uint32_t sd_do_mode(uint32_t param) {
         sd_dir(game, save, dir, sizeof dir);
         if (!sd_exists(dir)) return SD_RW_NO_DATA;
         snprintf(guest, sizeof guest, "%s/%s", dir, file);
-        if (buf && datasz) sd_write_file(guest, buf, datasz);
-        else {
-            char host[1024];
-            psp_io_host_path(guest, host, sizeof host);
-            FILE *f = fopen(host, "wb");
-            if (f) fclose(f);
-        }
+        sd_write_file(guest,buf,datasz);
+        if (sd_io_error) return SD_ERASE_ACCESS;
         if (mode == SD_WRITEDATASECURE) sd_mark_secure(dir, file);
         else sd_unmark_secure(dir, file);
         return SD_OK;
@@ -897,9 +847,6 @@ static uint32_t sd_do_mode(uint32_t param) {
         sd_dir(game, save, sizedir, sizeof sizedir);
         if (!sd_exists(sizedir)) sizedir[0] = '\0';
         sd_fill_sizes(param, sizedir[0] ? sizedir : NULL);
-        if (mode == SD_GETSIZE && sizedir[0]) {
-            /* GETSIZE also enumerates handled inside sd_fill_sizes. */
-        }
         return SD_OK;
     }
 
@@ -915,78 +862,458 @@ static uint32_t sd_do_mode(uint32_t param) {
     }
 }
 
-/* Accepted: the dialog opens (silently). The mode runs on the first Update
- * (or a workless ShutdownStart) -- see hle_SavedataUpdate for why not here.
- * base.result carries the outcome, including success: the suite reads it
- * back unconditionally. */
-static void hle_SavedataInitStart(void) {
-    no_savedata();
-    uint32_t param = psp_arg(0);
-    if (!param) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
-    savedata_log(param);
-    g_savedata_param = param;
-    g_savedata_done = 0;
-    g_savedata_state = PSP_UTILITY_DIALOG_INIT;
-    psp_ret(SCE_KERNEL_ERROR_OK);
-}
+/* ---- interactive savedata session --------------------------------------- */
+static psp_savedata_view sd_view, sd_published;
+static psp_os_mutex sd_bridge_lock = PSP_OS_MUTEX_INIT;
+static uint64_t sd_serial, sd_ordinal;
+static int sd_host, sd_pending;
+static struct { uint64_t session, revision; int action, index; } sd_response;
+static int (*sd_redraw)(void);
+static int sd_status_logged=-1;
+static FILE *sd_script;
+static int sd_script_checked, sd_script_failed;
+static unsigned sd_script_line;
 
-/* Reports where the dialog is, then moves it on.
- *
- * The lifecycle is a ratchet rather than a state machine with inputs, and it
- * has to be: the only thing that could drive it here is being asked. A caller
- * polls until the dialog is done with, so a status that only changed when
- * something else changed it would never change at all -- the same trade
- * hle_GetVcount already makes for the scanline counter, and for the same
- * reason.
- *
- * The sequence is hardware's, read off savedata/autosave: INIT, then VISIBLE
- * while the caller drives it, then QUIT to say it is finished with, and after
- * ShutdownStart a FINISHED that settles to NONE. A dialog that does nothing
- * still passes through all of them, which is why they are all here -- stopping
- * at QUIT skipped three of the statuses the tests print. */
-static void hle_SavedataGetStatus(void) {
-    const int now = g_savedata_state;
-    switch (now) {
-    case PSP_UTILITY_DIALOG_INIT:     g_savedata_state = PSP_UTILITY_DIALOG_VISIBLE; break;
-    case PSP_UTILITY_DIALOG_VISIBLE:  g_savedata_state = PSP_UTILITY_DIALOG_QUIT;    break;
-    case PSP_UTILITY_DIALOG_FINISHED: g_savedata_state = PSP_UTILITY_DIALOG_NONE;    break;
-    /* QUIT waits for ShutdownStart, and NONE is the resting state. */
-    default: break;
+static int sd_interactive(uint32_t mode) {
+    return (mode>=SD_LOAD && mode<=SD_LISTALLDEL) || mode==SD_DELETE;
+}
+static int sd_saving(void) { return sd_view.mode==SD_SAVE || sd_view.mode==SD_LISTSAVE; }
+static int sd_loading(void) { return sd_view.mode==SD_LOAD || sd_view.mode==SD_LISTLOAD; }
+static int sd_list_mode(void) {
+    return sd_view.mode==SD_LISTLOAD || sd_view.mode==SD_LISTSAVE ||
+           sd_view.mode==SD_LISTDELETE || sd_view.mode==SD_LISTALLDEL;
+}
+static void sd_publish(void) {
+    sd_view.revision++;
+    psp_os_lock(&sd_bridge_lock);
+    sd_published=sd_view;
+    psp_os_unlock(&sd_bridge_lock);
+}
+int psp_savedata_snapshot(psp_savedata_view *out) {
+    if (!out) return 0;
+    psp_os_lock(&sd_bridge_lock);
+    int changed=out->revision!=sd_published.revision || out->session!=sd_published.session;
+    if (changed) *out=sd_published;
+    int result=sd_published.active ? (changed?2:1) : 0;
+    psp_os_unlock(&sd_bridge_lock);
+    return result;
+}
+int psp_savedata_respond(uint64_t session, uint64_t revision, int action, int index) {
+    psp_os_lock(&sd_bridge_lock);
+    int ok=sd_published.active && !sd_pending && session==sd_published.session &&
+        revision==sd_published.revision && action>=PSP_SAVEDATA_SELECT && action<=PSP_SAVEDATA_CANCEL;
+    if (action==PSP_SAVEDATA_SELECT && (sd_published.stage!=PSP_SAVEDATA_LIST ||
+        index<0 || index>=sd_published.count)) ok=0;
+    if (ok) {
+        sd_response.session=session; sd_response.revision=revision;
+        sd_response.action=action; sd_response.index=index; sd_pending=1;
     }
+    psp_os_unlock(&sd_bridge_lock);
+    return ok;
+}
+void psp_savedata_set_host(int available) {
+    psp_os_lock(&sd_bridge_lock); sd_host=available; psp_os_unlock(&sd_bridge_lock);
+}
+void psp_savedata_set_redraw(int (*redraw)(void)) {
+    psp_os_lock(&sd_bridge_lock); sd_redraw=redraw; psp_os_unlock(&sd_bridge_lock);
+}
+int psp_savedata_set_script(const char *path) {
+    if (sd_script) fclose(sd_script);
+    sd_script=NULL; sd_script_checked=1; sd_script_line=0; sd_script_failed=0;
+    if (path && *path) {
+        sd_script=fopen(path,"r");
+        if (!sd_script) { sd_script_failed=1; return -1; }
+    }
+    return 0;
+}
+void psp_utility_init(void) {
+    g_savedata_state=PSP_UTILITY_DIALOG_NONE;
+    g_savedata_param=0; g_savedata_done=0; g_savedata_interactive=0;
+    memset(&sd_view,0,sizeof sd_view); sd_view.session=++sd_serial;
+    sd_ordinal=0; sd_secure_n=0;
+    /* The dialog host and its redraw hook belong to the host's lifetime,
+     * not to a guest reset: they stay registered. */
+    psp_os_lock(&sd_bridge_lock); sd_pending=0; psp_os_unlock(&sd_bridge_lock);
+    sd_status_logged=-1;
+    psp_savedata_set_script(NULL); sd_script_checked=0;
+    sd_publish();
+}
+static void sd_finish(uint32_t result) {
+    sd_view.result=result; sd_view.active=0;
+    psp_write32(g_savedata_param+SD_RESULT,result);
+    g_savedata_done=1; g_savedata_state=PSP_UTILITY_DIALOG_QUIT;
+    sd_publish();
+}
+static void sd_outcome(uint32_t result, const char *message) {
+    sd_view.result=result;
+    sd_view.stage=result ? PSP_SAVEDATA_ERROR : PSP_SAVEDATA_DONE;
+    snprintf(sd_view.message,sizeof sd_view.message,"%s",message);
+    psp_write32(g_savedata_param+SD_RESULT,result);
+    g_savedata_done=1;
+    sd_publish();
+}
+static unsigned sd_le16(const unsigned char *b) { return b[0] | (unsigned)b[1]<<8; }
+static uint32_t sd_le32(const unsigned char *b) {
+    return b[0] | (uint32_t)b[1]<<8 | (uint32_t)b[2]<<16 | (uint32_t)b[3]<<24;
+}
+/* Read metadata, including saves written by the old minimal SFO writer. */
+static int sd_metadata(const char *dir, psp_savedata_slot *slot) {
+    char guest[512],host[1024]; snprintf(guest,sizeof guest,"%s/PARAM.SFO",dir);
+    if (sd_plain_path(guest,0)!=1) return -1;
+    psp_io_host_path(guest,host,sizeof host);
+    FILE *f=fopen(host,"rb"); if (!f) return -1;
+    unsigned char b[16384]; size_t n=fread(b,1,sizeof b,f); int bad=ferror(f);
+    if (fclose(f)) bad=1;
+    if (bad || n<20 || sd_le32(b)!=0x46535000u) return -1;
+    uint32_t keys=sd_le32(b+8),data=sd_le32(b+12),count=sd_le32(b+16);
+    if (count>(n-20)/16 || keys>=n || data>=n) return -1;
+    for (uint32_t i=0;i<count;i++) {
+        const unsigned char *e=b+20+i*16;
+        uint64_t k=(uint64_t)keys+sd_le16(e), d=(uint64_t)data+sd_le32(e+12);
+        uint32_t len=sd_le32(e+4);
+        if (k>=n || d>=n || len>n-d || !memchr(b+k,0,n-k)) return -1;
+        if (!len || !memchr(b+d,0,len)) continue;
+        const char *key=(const char *)b+k, *value=(const char *)b+d;
+        if (!strcmp(key,"SAVEDATA_TITLE") || (!strcmp(key,"TITLE") && !slot->title[0]))
+            snprintf(slot->title,sizeof slot->title,"%s",value);
+        if (!strcmp(key,"SAVEDATA_DETAIL") || !strcmp(key,"DETAIL"))
+            snprintf(slot->detail,sizeof slot->detail,"%s",value);
+    }
+    return 0;
+}
+static void sd_candidate_dir(int index, char *dir, size_t cap) {
+    if (sd_view.mode==SD_LISTALLDEL)
+        snprintf(dir,cap,"ms0:/PSP/SAVEDATA/%s",sd_view.slots[index].name);
+    else sd_dir(sd_view.game,sd_view.slots[index].name,dir,cap);
+}
+static int sd_add_candidate(const char *name) {
+    const size_t max=sd_view.mode==SD_LISTALLDEL ? 33 : 19;
+    if (!sd_component(name,sd_view.mode!=SD_LISTALLDEL) || strlen(name)>max) return -1;
+    for (int i=0;i<sd_view.count;i++) if (!strcmp(sd_view.slots[i].name,name)) return 0;
+    if (sd_view.count==PSP_SAVEDATA_MAX_SLOTS) return -1;
+    psp_savedata_slot *slot=&sd_view.slots[sd_view.count];
+    memset(slot,0,sizeof *slot); snprintf(slot->name,sizeof slot->name,"%s",name);
+    char dir[512],host[1024],guest[512]; sd_candidate_dir(sd_view.count,dir,sizeof dir);
+    int exists=sd_plain_path(dir,1);
+    if (exists<0) return -1;
+    if (!exists && !sd_saving() && sd_list_mode()) return 0;
+    slot->exists=exists;
+    if (exists) {
+        psp_io_host_path(dir,host,sizeof host);
+        struct stat st; if (!stat(host,&st)) slot->modified=(int64_t)st.st_mtime;
+        sd_dir_clusters(dir,0,&slot->bytes);
+        slot->broken=sd_metadata(dir,slot)!=0;
+        snprintf(guest,sizeof guest,"%s/ICON0.PNG",dir);
+        if (sd_plain_path(guest,0)==1) psp_io_host_path(guest,slot->icon_path,sizeof slot->icon_path);
+        snprintf(guest,sizeof guest,"%s/PIC1.PNG",dir);
+        if (sd_plain_path(guest,0)==1) psp_io_host_path(guest,slot->pic1_path,sizeof slot->pic1_path);
+    } else {
+        snprintf(slot->title,sizeof slot->title,"New save data");
+        uint32_t nd=sd_optional(g_savedata_param,1476);
+        if (nd && psp_mem_ptr(nd,20)) {
+            uint32_t title=psp_read32(nd+16);
+            if (title && psp_mem_ptr(title,128)) sd_getstr(title,0,127,slot->title,sizeof slot->title);
+        }
+    }
+    if (!slot->title[0]) snprintf(slot->title,sizeof slot->title,"%s",slot->name[0]?slot->name:"Save data");
+    sd_view.count++;
+    return 0;
+}
+static int sd_expand_candidates(void) {
+    char names[1024][64]; int n=psp_io_list_names("ms0:/PSP/SAVEDATA",names,1024);
+    if (n<0) return 0;
+    if (n==1024) fprintf(stderr,"savedata: more than 1023 entries under PSP/SAVEDATA; listing the first 1024\n");
+    qsort(names,(size_t)n,sizeof names[0],sd_cmp_str);
+    size_t prefix=strlen(sd_view.game);
+    for (int i=0;i<n;i++) {
+        if (names[i][0]=='.') continue;
+        if (sd_view.mode!=SD_LISTALLDEL && strncmp(names[i],sd_view.game,prefix)) continue;
+        char dir[512]; snprintf(dir,sizeof dir,"ms0:/PSP/SAVEDATA/%s",names[i]);
+        if (sd_plain_path(dir,1)!=1) continue;
+        /* A foreign or unrepresentable directory is not one of this game's
+         * slots: skip it rather than refusing the whole list. */
+        if (sd_add_candidate(names[i]+(sd_view.mode==SD_LISTALLDEL?0:prefix))) continue;
+    }
+    return 0;
+}
+static void sd_initial_focus(const char *name) {
+    uint32_t focus=sd_optional(g_savedata_param,SD_FOCUS);
+    int selected=0,found=0;
+    for (int i=0;i<sd_view.count;i++) {
+        psp_savedata_slot *s=&sd_view.slots[i]; int match=0;
+        switch (focus) {
+        case 0: match=!strcmp(name,s->name); break;
+        case 1: match=i==0; break;
+        case 2: match=1; break;
+        case 3: case 4:
+            match=s->exists && (!found || (focus==3 ? s->modified>sd_view.slots[selected].modified :
+                                                         s->modified<sd_view.slots[selected].modified)); break;
+        case 5: case 6: match=s->exists && (!found || focus==6); break;
+        case 7: case 8: match=!s->exists && (!found || focus==8); break;
+        default: break;
+        }
+        if (match) { selected=i; found=1; }
+    }
+    sd_view.selected=selected;
+}
+static int sd_build_candidates(void) {
+    char name[21]; sd_getstr(g_savedata_param,SD_SAVENAME,20,name,sizeof name);
+    if (sd_view.mode==SD_LISTALLDEL) { if (sd_expand_candidates()) return -1; }
+    else if (sd_list_mode()) {
+        uint32_t list=psp_read32(g_savedata_param+SD_SAVENAMELIST);
+        if (list) {
+            int terminated=0;
+            for (unsigned i=0;i<=PSP_SAVEDATA_MAX_SLOTS;i++) {
+                uint64_t addr=(uint64_t)list+i*20;
+                if (addr>UINT32_MAX || !psp_mem_ptr((uint32_t)addr,20)) return -1;
+                char next[21]; sd_getstr((uint32_t)addr,0,20,next,sizeof next);
+                if (!*next) { terminated=1; break; }
+                if (!strcmp(next,"<>")) { if (sd_expand_candidates()) return -1; }
+                else if (sd_add_candidate(next)) return -1;
+            }
+            if (!terminated) return -1;
+        } else if (!strcmp(name,"<>")) { if (sd_expand_candidates()) return -1; }
+        else if (sd_add_candidate(name)) return -1;
+    } else if (sd_add_candidate(name)) return -1;
+    sd_initial_focus(name);
+    uint32_t nd=sd_optional(g_savedata_param,1476);
+    if (nd && psp_mem_ptr(nd,20)) {
+        uint32_t addr=psp_read32(nd),size=psp_read32(nd+8);
+        if (size && size<=PSP_SAVEDATA_ICON_MAX && psp_mem_ptr(addr,size)) {
+            memcpy(sd_view.new_icon,psp_mem_ptr(addr,size),size); sd_view.new_icon_size=size;
+        }
+    }
+    /* The utility shows artwork behind an unused slot too: the PIC1 the game
+     * would write there, taken from the request's own sidecar field. */
+    if (sd_saving()) {
+        uint32_t addr=psp_read32(g_savedata_param+SD_PIC1),size=psp_read32(g_savedata_param+SD_PIC1+8);
+        if (addr && size && size<=PSP_SAVEDATA_PIC1_MAX && psp_mem_ptr(addr,size)) {
+            memcpy(sd_view.new_pic1,psp_mem_ptr(addr,size),size); sd_view.new_pic1_size=size;
+        }
+    }
+    return 0;
+}
+static void sd_confirm(void) {
+    psp_savedata_slot *slot=&sd_view.slots[sd_view.selected];
+    sd_view.stage=PSP_SAVEDATA_CONFIRM;
+    snprintf(sd_view.message,sizeof sd_view.message,"%s",
+        sd_saving() ? (slot->exists ? "Overwrite this save data?" : "Save to this slot?") :
+        sd_loading() ? "Load this save data?" : "Delete this save data? This cannot be undone.");
+    sd_publish();
+}
+static void sd_execute_selection(void) {
+    if (!sd_request_valid()) {
+        sd_outcome(SD_BAD_PARAM,"Save request changed while the dialog was open."); return;
+    }
+    psp_savedata_slot *slot=&sd_view.slots[sd_view.selected];
+    char dir[512]; sd_candidate_dir(sd_view.selected,dir,sizeof dir);
+    uint32_t result;
+    if (sd_saving() || sd_loading()) {
+        sd_write_str(g_savedata_param+SD_SAVENAME,slot->name,20);
+        if (sd_loading() && slot->broken) result=SD_LOAD_BROKEN;
+        else result=sd_do_mode(g_savedata_param);
+    } else {
+        int lock=sd_card_lock();
+        if (lock<0) result=SD_DELETE_ACCESS;
+        else {
+            result=sd_plain_path(dir,1)==1 ?
+                (sd_remove_tree(dir,0)==0 ? 0u : SD_DELETE_ACCESS) : SD_DELETE_NO_DATA;
+            sd_card_unlock(lock);
+        }
+        if (sd_view.mode!=SD_LISTALLDEL) sd_write_str(g_savedata_param+SD_SAVENAME,slot->name,20);
+    }
+    if (savedata_log_on()) fprintf(stderr,"savedata: session=%llu slot=%s result=%08X\n",
+        (unsigned long long)sd_ordinal,slot->name,result);
+    const char *message=result ? (sd_loading() ? "Unable to load this save data." :
+        sd_saving() ? "Unable to save. Previous data has been retained where possible." : "Unable to delete this save data.") :
+        sd_saving() ? "Save completed." : sd_loading() ? "Load completed." : "Save data deleted.";
+    sd_outcome(result,message);
+}
+static void sd_apply_response(int action,int index) {
+    if (action==PSP_SAVEDATA_SELECT) {
+        if (sd_view.stage==PSP_SAVEDATA_LIST && index>=0 && index<sd_view.count) {
+            sd_view.selected=index; sd_publish();
+        }
+    } else if (sd_view.stage==PSP_SAVEDATA_DONE || sd_view.stage==PSP_SAVEDATA_ERROR) {
+        sd_finish(sd_view.result);
+    } else if (action==PSP_SAVEDATA_CANCEL) {
+        if (sd_view.stage==PSP_SAVEDATA_CONFIRM && sd_list_mode()) {
+            sd_view.stage=PSP_SAVEDATA_LIST; sd_view.message[0]=0; sd_publish();
+        } else sd_finish(SD_RESULT_CANCEL);
+    } else if (action==PSP_SAVEDATA_ACCEPT && sd_view.count) {
+        if (sd_view.stage==PSP_SAVEDATA_CONFIRM) sd_execute_selection();
+        else if (sd_view.stage==PSP_SAVEDATA_LIST) {
+            if (sd_loading() || (sd_saving() && !sd_view.slots[sd_view.selected].exists)) sd_execute_selection();
+            else sd_confirm();
+        }
+    }
+}
+static void sd_script_step(void) {
+    char line[256],game[32],name[80],action[24],extra;
+    unsigned long long ordinal; unsigned mode;
+    while (fgets(line,sizeof line,sd_script)) {
+        sd_script_line++;
+        if (line[0]=='#' || line[0]=='\n' || line[0]=='\r') continue;
+        if (sscanf(line,"%llu %u %31s %79s %23s %c",&ordinal,&mode,game,name,action,&extra)!=5 ||
+            ordinal!=sd_ordinal || mode!=sd_view.mode || strcmp(game,sd_view.game)) break;
+        int index=-1;
+        const char *wanted=!strcmp(name,"-") ? "" : name;
+        for (int i=0;i<sd_view.count;i++) if (!strcmp(wanted,sd_view.slots[i].name)) { index=i; break; }
+        if (!strcmp(action,"select") && index>=0 && sd_view.stage==PSP_SAVEDATA_LIST) {
+            sd_apply_response(PSP_SAVEDATA_SELECT,index); return;
+        }
+        if (strcmp(action,"accept") && strcmp(action,"cancel")) break;
+        if (sd_view.count && index!=sd_view.selected) break;
+        sd_apply_response(!strcmp(action,"accept")?PSP_SAVEDATA_ACCEPT:PSP_SAVEDATA_CANCEL,index);
+        return;
+    }
+    fprintf(stderr,"savedata: script mismatch/EOF at line %u (dialog %llu, mode %u, game %s)\n",
+        sd_script_line,(unsigned long long)sd_ordinal,sd_view.mode,sd_view.game);
+    sd_script_failed=1;
+    sd_finish(g_savedata_done ? sd_view.result : SD_RESULT_ABORT);
+}
+static int sd_validate(uint32_t p) {
+    if (!p || (p&3) || !psp_mem_ptr(p,4)) return 0;
+    uint32_t size=psp_read32(p);
+    if ((size!=1480 && size!=1500 && size!=1536) || !psp_mem_ptr(p,size)) return 0;
+    char game[14],save[21],file[14];
+    sd_getstr(p,SD_GAMENAME,13,game,sizeof game); sd_getstr(p,SD_SAVENAME,20,save,sizeof save);
+    sd_getstr(p,SD_FILENAME,13,file,sizeof file);
+    uint32_t mode=psp_read32(p+SD_MODE);
+    char pattern[21]; snprintf(pattern,sizeof pattern,"%s",save);
+    if (mode==SD_LIST) for (char *c=pattern;*c;c++) if (*c=='*' || *c=='?') *c='x';
+    int wildcard=!strcmp(save,"<>") && (mode==SD_LISTLOAD || mode==SD_LISTSAVE || mode==SD_LISTDELETE);
+    if (mode>SD_GETSIZE || !sd_component(game,mode==SD_LISTALLDEL || mode==SD_LIST) ||
+        (!sd_component(pattern,1) && !wildcard) || !sd_component(file,1)) return 0;
+    uint32_t data=psp_read32(p+SD_DATABUF),cap=psp_read32(p+SD_DATABUFSZ),n=psp_read32(p+SD_DATASZ);
+    if (data && cap && !psp_mem_ptr(data,cap)) return 0;
+    int writing=mode==SD_AUTOSAVE || mode==SD_SAVE || mode==SD_LISTSAVE ||
+        mode==SD_MAKEDATA || mode==SD_MAKEDATASECURE || mode==SD_WRITEDATA || mode==SD_WRITEDATASECURE;
+    if (writing && n && (!data || n>cap || !psp_mem_ptr(data,n))) return 0;
+    for (unsigned off=SD_ICON0;off<=SD_SND0;off+=16) {
+        uint32_t a=psp_read32(p+off),len=psp_read32(p+off+8),space=psp_read32(p+off+4);
+        if (a && ((writing && len>space) || (space && !psp_mem_ptr(a,space)))) return 0;
+    }
+    /* Optional ABI fields must fit both the parameter version and guest RAM. */
+    const unsigned offsets[]={SD_MSFREE,SD_MSDATA,SD_UTILDATA,SD_IDLIST,SD_FILELIST,SD_SIZEINFO};
+    const unsigned sizes[]={20,64,28,12,36,60};
+    for (unsigned i=0;i<sizeof offsets/sizeof offsets[0];i++) {
+        uint32_t ptr=sd_optional(p,offsets[i]);
+        if (ptr && !psp_mem_ptr(ptr,sizes[i])) return 0;
+    }
+    return 1;
+}
+static int sd_request_valid(void) {
+    if (!sd_validate(g_savedata_param)) return 0;
+    const unsigned char *now=psp_mem_ptr(g_savedata_param,psp_read32(g_savedata_param));
+    return !memcmp(now,sd_request,28) &&
+        !memcmp(now+32,sd_request+32,psp_read32(g_savedata_param)-32);
+}
+static void hle_SavedataInitStart(void) {
+    /* Shutdown is synchronous here. Some games start the next utility without
+     * polling FINISHED/NONE after ShutdownStart; a completed shutdown must not
+     * prevent that next request. GetStatus still exposes FINISHED to pollers. */
+    if (g_savedata_state==PSP_UTILITY_DIALOG_FINISHED)
+        g_savedata_state=PSP_UTILITY_DIALOG_NONE;
+    if (g_savedata_state!=PSP_UTILITY_DIALOG_NONE) {
+        if (savedata_log_on()) fprintf(stderr,"savedata: InitStart rejected while status=%d\n",g_savedata_state);
+        psp_ret(SD_BUSY); return;
+    }
+    uint32_t p=psp_arg(0);
+    if (!sd_validate(p)) {
+        if (savedata_log_on() && psp_mem_ptr(p,1480)) {
+            fprintf(stderr,"savedata: rejected parameter size=%u\n",psp_read32(p)); savedata_log(p);
+            for (unsigned off=SD_ICON0;off<=SD_SND0;off+=16)
+                fprintf(stderr,"savedata: sidecar %u buf=%08X cap=%u size=%u\n",off,
+                    psp_read32(p+off),psp_read32(p+off+4),psp_read32(p+off+8));
+        }
+        psp_ret(SD_BAD_PARAM); return;
+    }
+    g_savedata_param=p; g_savedata_done=0;
+    memcpy(sd_request,psp_mem_ptr(p,psp_read32(p)),psp_read32(p));
+    uint32_t mode=psp_read32(p+SD_MODE);
+    g_savedata_interactive=sd_interactive(mode);
+    g_savedata_state=PSP_UTILITY_DIALOG_INIT;
+    savedata_log(p);
+    if (g_savedata_interactive) {
+        memset(&sd_view,0,sizeof sd_view);
+        sd_view.session=++sd_serial; sd_view.active=1; sd_view.mode=mode;
+        sd_view.confirm_circle=psp_read32(p+8)==0;
+        sd_getstr(p,SD_GAMENAME,13,sd_view.game,sizeof sd_view.game);
+        sd_getstr(p,SD_SFO_TITLE,128,sd_view.title,sizeof sd_view.title);
+        sd_ordinal++;
+        if (!sd_script_checked) {
+            const char *path=getenv("PSPRECOMP_SAVEDATA_SCRIPT");
+            if (psp_savedata_set_script(path)) fprintf(stderr,"savedata: cannot open script %s\n",path);
+        }
+        sd_view.stage=sd_list_mode()?PSP_SAVEDATA_LIST:PSP_SAVEDATA_CONFIRM;
+        if (sd_recover_card() || sd_build_candidates()) {
+            sd_outcome(sd_loading()?SD_LOAD_ACCESS:sd_saving()?SD_SAVE_ACCESS:SD_DELETE_ACCESS,
+                       "Unable to read the save list. Check the memory stick directory.");
+        } else if (!sd_view.count || (!sd_saving() && !sd_view.slots[0].exists && !sd_list_mode())) {
+            sd_outcome(sd_loading()?SD_LOAD_NO_DATA:sd_saving()?SD_SAVE_ACCESS:SD_DELETE_NO_DATA,
+                       sd_saving()?"No save slot is available.":"No save data is available.");
+        } else if (!sd_list_mode()) sd_confirm();
+        else sd_publish();
+    }
+    psp_ret(0);
+}
+static void hle_SavedataGetStatus(void) {
+    int now=g_savedata_state;
+    if (savedata_log_on() && now!=sd_status_logged) { fprintf(stderr,"savedata: status=%d\n",now); sd_status_logged=now; }
+    if (now==PSP_UTILITY_DIALOG_INIT) g_savedata_state=PSP_UTILITY_DIALOG_VISIBLE;
+    else if (now==PSP_UTILITY_DIALOG_FINISHED) g_savedata_state=PSP_UTILITY_DIALOG_NONE;
     psp_ret((uint32_t)now);
 }
-
-/* The caller drives the dialog a frame at a time, and the first drive is
- * when the work happens: files land and result/entries are written here,
- * not at InitStart. The suite pins this ordering -- its CHANGE lines come
- * after the Update line, never between InitStart and the first status --
- * which is exactly what doing everything up front gets wrong. ShutdownStart
- * runs anything an Update-less flow skipped, so direct Init-to-Shutdown
- * callers still complete. */
 static void hle_SavedataUpdate(void) {
-    if (g_savedata_param && !g_savedata_done) {
-        g_savedata_done = 1;
-        psp_write32(g_savedata_param + SD_RESULT, sd_do_mode(g_savedata_param));
+    if (!g_savedata_param || g_savedata_state!=PSP_UTILITY_DIALOG_VISIBLE) { psp_ret(0); return; }
+    if (!g_savedata_interactive) {
+        if (!g_savedata_done) {
+            uint32_t mode=psp_read32(g_savedata_param+SD_MODE);
+            uint32_t result=!sd_request_valid() ? SD_BAD_PARAM :
+                (mode==SD_AUTOLOAD && sd_recover_card()) ? SD_LOAD_ACCESS : sd_do_mode(g_savedata_param);
+            psp_write32(g_savedata_param+SD_RESULT,result);
+            g_savedata_done=1;
+        }
+        g_savedata_state=PSP_UTILITY_DIALOG_QUIT;
+    } else if (sd_view.active) {
+        int host,action=0,index=0; int (*redraw)(void);
+        psp_os_lock(&sd_bridge_lock);
+        host=sd_host; redraw=sd_redraw;
+        if (sd_pending && sd_response.session==sd_view.session && sd_response.revision==sd_view.revision) {
+            action=sd_response.action; index=sd_response.index;
+        }
+        sd_pending=0; psp_os_unlock(&sd_bridge_lock);
+        if (sd_script_failed) sd_finish(g_savedata_done?sd_view.result:SD_RESULT_ABORT);
+        else if (sd_script) sd_script_step();
+        else if (!host) {
+            fprintf(stderr,"savedata: interactive mode %u cancelled: no dialog host or script\n",sd_view.mode);
+            sd_finish(g_savedata_done?sd_view.result:SD_RESULT_CANCEL);
+        } else if (action) sd_apply_response(action,index);
+        /* A negative redraw means presentation is gone for good; a backend
+         * that merely cannot draw from this thread returns 0 and skips. */
+        if (redraw && redraw()<0 && sd_view.active) {
+            fprintf(stderr,"savedata: dialog presentation unavailable; cancelling\n");
+            sd_finish(g_savedata_done?sd_view.result:SD_RESULT_CANCEL);
+        }
     }
-    psp_ret(SCE_KERNEL_ERROR_OK);
+    psp_ret(0);
 }
-
 static void hle_SavedataShutdownStart(void) {
-    if (g_savedata_param && !g_savedata_done) {
-        g_savedata_done = 1;
-        psp_write32(g_savedata_param + SD_RESULT, sd_do_mode(g_savedata_param));
+    if (g_savedata_state==PSP_UTILITY_DIALOG_NONE || g_savedata_state==PSP_UTILITY_DIALOG_FINISHED) {
+        psp_ret(SD_BUSY); return;
     }
-    g_savedata_state = PSP_UTILITY_DIALOG_FINISHED;
-    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (g_savedata_interactive) {
+        if (sd_view.active) sd_finish(g_savedata_done?sd_view.result:SD_RESULT_CANCEL);
+    } else if (g_savedata_param && !g_savedata_done) {
+        psp_write32(g_savedata_param+SD_RESULT,sd_request_valid()?sd_do_mode(g_savedata_param):SD_BAD_PARAM); g_savedata_done=1;
+    }
+    g_savedata_state=PSP_UTILITY_DIALOG_FINISHED;
+    psp_ret(0);
 }
-
 void psp_utility_register(void) {
-    psp_hle_register(0x50C4CD57, "sceUtility", "sceUtilitySavedataInitStart",
-                     hle_SavedataInitStart);
-    psp_hle_register(0x8874DBE0, "sceUtility", "sceUtilitySavedataGetStatus",
-                     hle_SavedataGetStatus);
-    psp_hle_register(0xD4B95FFB, "sceUtility", "sceUtilitySavedataUpdate",
-                     hle_SavedataUpdate);
-    psp_hle_register(0x9790B33C, "sceUtility", "sceUtilitySavedataShutdownStart",
-                     hle_SavedataShutdownStart);
+    psp_hle_register(0x50C4CD57,"sceUtility","sceUtilitySavedataInitStart",hle_SavedataInitStart);
+    psp_hle_register(0x8874DBE0,"sceUtility","sceUtilitySavedataGetStatus",hle_SavedataGetStatus);
+    psp_hle_register(0xD4B95FFB,"sceUtility","sceUtilitySavedataUpdate",hle_SavedataUpdate);
+    psp_hle_register(0x9790B33C,"sceUtility","sceUtilitySavedataShutdownStart",hle_SavedataShutdownStart);
 }

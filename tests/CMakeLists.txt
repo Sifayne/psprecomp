@@ -82,3 +82,12 @@ foreach(value "2,2" "5,2" "2," "-1" "2,no" "4294967296")
     add_test(NAME ge_capture_invalid_${id}
              COMMAND test_ge_capture invalid capture-invalid-${id} "${value}")
 endforeach()
+
+add_executable(test_savedata test_savedata.c)
+target_link_libraries(test_savedata PRIVATE psprecomp)
+if(MSVC)
+    target_compile_options(test_savedata PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test_savedata PRIVATE -UNDEBUG)
+endif()
+add_test(NAME savedata COMMAND test_savedata)

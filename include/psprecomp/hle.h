@@ -20,6 +20,7 @@
 
 #include "cpu.h"
 #include "mem.h"
+#include "savedata.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -398,8 +399,7 @@ void psp_umd_init(void);
 void psp_umd_register(void);
 void psp_umd_reset(void);
 
-/* The utility dialogs. Registered but not implemented: a dialog that is absent
- * has to say so, because a caller polls a pending one forever. See utility.c. */
+/* Savedata file services and asynchronous utility dialogs. See savedata.h. */
 void psp_utility_init(void);
 void psp_utility_register(void);
 
@@ -440,6 +440,8 @@ uint32_t psp_ctrl_samples(void);
  * and overwritten between two polls is travel that silently never happened. */
 void psp_ctrl_set_look(uint8_t rx, uint8_t ry);
 void psp_ctrl_add_mouse(int dx, int dy);
+/* Drop accumulated host motion when a modal host UI takes input. */
+void psp_ctrl_clear_mouse(void);
 void psp_ctrl_last_look(uint8_t *rx, uint8_t *ry, int *mdx, int *mdy);
 
 /* Publish into the script lane. `analog_owned` non-zero takes the stick away

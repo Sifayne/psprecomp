@@ -310,6 +310,10 @@ void psp_ctrl_add_mouse(int dx, int dy) {
     atomic_fetch_add(&g_host_mdx, dx);
     atomic_fetch_add(&g_host_mdy, dy);
 }
+void psp_ctrl_clear_mouse(void) {
+    atomic_store(&g_host_mdx, 0);
+    atomic_store(&g_host_mdy, 0);
+}
 
 void psp_ctrl_script_set_look(int owned, uint8_t rx, uint8_t ry, int mdx, int mdy) {
     g_script_look = owned;
