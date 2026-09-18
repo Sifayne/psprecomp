@@ -57,3 +57,28 @@ Thumbs.db
 *.bmp
 *.wav
 *.log
+
+# Local credentials, interpreter caches and agent state.
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+psp_keys.txt
+__pycache__/
+*.py[cod]
+.claude/
+.codex/
+
+# Extracted game code, memory captures and player data.
+game/
+games/
+generated/
+extracted/
+reports/
+ms/
+*.elf
+*.gcap
+*.SFO
+*.sfo
