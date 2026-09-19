@@ -91,3 +91,11 @@ else()
     target_compile_options(test_savedata PRIVATE -UNDEBUG)
 endif()
 add_test(NAME savedata COMMAND test_savedata)
+
+# The random unit follows the hardware fit in src/vfpu.c (vfpuprobe, fw 6.60).
+# provenance/vrnd-observed.txt was recorded under an emulator and disagrees
+# with it on the carry and on vector lane order, so the checker is built for
+# reference but not run.
+add_executable(test_vrnd_observed test_vrnd_observed.c)
+target_link_libraries(test_vrnd_observed PRIVATE psprecomp)
+

@@ -144,6 +144,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     #define DEST_ZERO(reg) ((reg) == 0)
 
     switch (in->op) {
+    case A_VNOP: case A_VSYNC: case A_VFLUSH:
     case A_NOP:
         fprintf(f, "%s;\n", ind);
         return;

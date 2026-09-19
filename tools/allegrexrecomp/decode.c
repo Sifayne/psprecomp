@@ -228,6 +228,9 @@ static const a_opinfo OPINFO[A_OP_COUNT] = {
     [A_VNEG]     = { "vneg",     F_VD_VS },
     [A_VZERO]    = { "vzero",    F_VD_VS },
     [A_VONE]     = { "vone",     F_VD_VS },
+    [A_VNOP]     = { "vnop",     F_NONE },
+    [A_VSYNC]    = { "vsync",    F_NONE },
+    [A_VFLUSH]   = { "vflush",   F_NONE },
     [A_VRCP]     = { "vrcp",     F_VD_VS },
     [A_VRSQ]     = { "vrsq",     F_VD_VS },
     [A_VSQRT]    = { "vsqrt",    F_VD_VS },
@@ -782,7 +785,15 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         }
         break;
 
-    case 0x1D: case 0x1E: case 0x3F:
+    case 0x3F:
+        /* VFPU pipeline controls (PSP prxtool encoding table). Host VFPU
+         * operations finish synchronously; these preserve operand prefixes. */
+        if (word == 0xFFFF0000u) op = A_VNOP;
+        else if (word == 0xFFFF040Du) op = A_VFLUSH;
+        else if ((word & 0xFFFF0000u) == 0xFFFF0000u) op = A_VSYNC;
+        else op = A_VFPU_UNKNOWN;
+        break;
+    case 0x1D: case 0x1E:
         op = A_VFPU_UNKNOWN;
         break;
 
