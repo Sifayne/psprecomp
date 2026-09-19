@@ -300,6 +300,7 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 void psp_sysmem_init(void);
 void psp_sysmem_register(void);
 void psp_sysmem_reset(void);
+uint32_t psp_sysmem_compiled_sdk(void);
 
 void psp_display_init(void);
 void psp_display_register(void);

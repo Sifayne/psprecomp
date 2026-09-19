@@ -32,6 +32,17 @@ add_executable(test_hle test_hle.c)
 target_link_libraries(test_hle PRIVATE psprecomp allegrex_core)
 add_test(NAME hle COMMAND test_hle)
 
+add_executable(test_thread_lifecycle test_thread_lifecycle.c)
+target_link_libraries(test_thread_lifecycle PRIVATE psprecomp allegrex_core)
+add_test(NAME thread_lifecycle COMMAND test_thread_lifecycle)
+set_tests_properties(thread_lifecycle PROPERTIES TIMEOUT 10)
+
+add_executable(test_kernel_observed test_kernel_observed.c)
+target_link_libraries(test_kernel_observed PRIVATE psprecomp allegrex_core)
+add_test(NAME kernel_observed COMMAND test_kernel_observed
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/kernel/observed.txt)
+set_tests_properties(kernel_observed PROPERTIES TIMEOUT 10)
+
 add_executable(test_vfpu test_vfpu.c)
 target_link_libraries(test_vfpu PRIVATE psprecomp)
 add_test(NAME vfpu COMMAND test_vfpu)

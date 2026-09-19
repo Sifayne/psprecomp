@@ -196,29 +196,71 @@ static void hle_Stderr(void) { psp_ret(2); }
  * to sit below the user heap so that psp_sysmem_alloc can never hand the same
  * bytes out twice. User memory begins at 0x08800000 (uofw's
  * include/common/memory.h, SCE_USERSPACE_ADDR_KU0), so the 4MB immediately
- * under it is free for this. */
-#define PSP_VOLATILE_BASE 0x08400000u
-#define PSP_VOLATILE_SIZE 0x00400000u
+ * under it is free for this.
+ *
+ * Under contention Lock blocks and TryLock refuses, an unlock wakes the first
+ * waiter, and a non-zero type is refused: tests/provenance/kernel records
+ * that, together with the address and size, under an emulator (not a PSP).
+ * FIFO selection among several waiters is a host policy; the probe measures
+ * one waiter. */
+#define VOLATILE_ADDRESS 0x08400000u
+#define VOLATILE_BYTES   0x00400000u
+#define VOLATILE_BAD_TYPE 0x80000107u
+#define VOLATILE_BUSY     0x802b0200u
+static struct {
+    int acquired;
+    unsigned count;
+    uint32_t waiting[128]; /* host thread-table capacity */
+} volatile_memory;
 
-static int g_volatile_held;
-
-static void volatile_grant(void) {
-    const uint32_t ptr_out = psp_arg(1), size_out = psp_arg(2);
-    if (ptr_out)  psp_write32(ptr_out,  PSP_VOLATILE_BASE);
-    if (size_out) psp_write32(size_out, PSP_VOLATILE_SIZE);
-    g_volatile_held = 1;
-    psp_ret(SCE_KERNEL_ERROR_OK);
+static void volatile_acquire(int nonblocking) {
+    if (psp_arg(0)) { psp_ret(VOLATILE_BAD_TYPE); return; }
+    const uint32_t address_out=psp_arg(1), bytes_out=psp_arg(2);
+    /* Invalid mapped outputs are a host validation policy. The SDK permits
+     * null outputs; the probe exercises all four null/non-null combinations. */
+    if ((address_out && !psp_mem_ptr(address_out,4)) ||
+        (bytes_out && !psp_mem_ptr(bytes_out,4))) {
+        psp_ret(0x800200d3u); return; /* SDK ILLEGAL_ADDR */
+    }
+    while (volatile_memory.acquired) {
+        if (nonblocking) { psp_ret(VOLATILE_BUSY); return; }
+        if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
+        if (volatile_memory.count==128) { psp_ret(SCE_KERNEL_ERROR_NOTIMPLEMENTED); return; }
+        uint32_t self=psp_sched_current();
+        volatile_memory.waiting[volatile_memory.count++]=self;
+        int result=psp_sched_block(self,PSP_SCHED_BLOCKED,"volatile memory");
+        /* Remove a cancelled/stranded wait without leaving a stale UID. */
+        for (unsigned i=0;i<volatile_memory.count;i++) {
+            if (volatile_memory.waiting[i]!=self) continue;
+            memmove(&volatile_memory.waiting[i],&volatile_memory.waiting[i+1],
+                    (--volatile_memory.count-i)*sizeof(uint32_t));
+            break;
+        }
+        if (result!=0) {
+            psp_sched_stop_all("volatile memory wait has no runnable releaser");
+            psp_ret(SCE_KERNEL_ERROR_NOTIMPLEMENTED); return;
+        }
+    }
+    volatile_memory.acquired=1;
+    if (address_out) psp_write32(address_out,VOLATILE_ADDRESS);
+    if (bytes_out) psp_write32(bytes_out,VOLATILE_BYTES);
+    psp_ret(0);
 }
-
-/* Lock blocks until the block is free; nothing else here ever takes it, so it
- * is always free and the two differ only in what they would do under
- * contention. TryLock is the one games actually call. */
-static void hle_VolatileMemLock(void)    { volatile_grant(); }
-static void hle_VolatileMemTryLock(void) { volatile_grant(); }
-
+static void hle_VolatileMemLock(void) { volatile_acquire(0); }
+static void hle_VolatileMemTryLock(void) { volatile_acquire(1); }
 static void hle_VolatileMemUnlock(void) {
-    g_volatile_held = 0;
-    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (psp_arg(0)) { psp_ret(VOLATILE_BAD_TYPE); return; }
+    if (!volatile_memory.acquired) { psp_ret(SCE_KERNEL_ERROR_SEMA_OVF); return; }
+    volatile_memory.acquired=0;
+    int urgent=0;
+    if (volatile_memory.count) {
+        const uint32_t next=volatile_memory.waiting[0];
+        memmove(volatile_memory.waiting,volatile_memory.waiting+1,
+                --volatile_memory.count*sizeof(uint32_t));
+        urgent=psp_sched_wake(next);
+    }
+    psp_ret(0);
+    if (urgent) psp_sched_preempt();
 }
 /* Power management around suspend. Nothing suspends here. */
 static void hle_ok(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
@@ -1253,6 +1295,7 @@ static void hle_Output2Blocking(void) {
 
 void psp_misc_reset(void) {
     g_intr_enabled = 1;
+    memset(&volatile_memory,0,sizeof volatile_memory);
     g_exit_requested = 0;
     g_hold_buttons   = 0;
     g_script_buttons = 0;
