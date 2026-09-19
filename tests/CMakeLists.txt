@@ -123,6 +123,13 @@ add_test(NAME savedata COMMAND test_savedata)
 # provenance/vrnd-observed.txt was recorded under an emulator and disagrees
 # with it on the carry and on vector lane order, so the checker is built for
 # reference but not run.
+# Savedata's result codes follow saveprobe (fw 6.60) in src/hle/utility.c.
+# provenance/savedata/observed.txt was recorded under an emulator and
+# disagrees with the hardware in 19 of its checks, so the checker is built
+# for reference but not run.
+add_executable(test_savedata_observed test_savedata_observed.c)
+target_link_libraries(test_savedata_observed PRIVATE psprecomp)
+
 add_executable(test_vrnd_observed test_vrnd_observed.c)
 target_link_libraries(test_vrnd_observed PRIVATE psprecomp)
 
