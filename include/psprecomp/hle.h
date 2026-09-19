@@ -503,7 +503,7 @@ int  psp_ctrl_replay_drain(void);
  * cadence this game keeps; it never asks for a vblank. */
 void psp_display_set_present(void (*fn)(uint32_t addr, uint32_t stride,
                                         uint32_t fmt));
-/* Each output buffer: the channel, its reserved shape (sample count per call
+/* Each output buffer: the channel (0..7 normal, 8 for Output2), its reserved shape (sample count per call
  * and PSP_AUDIO_FORMAT_STEREO 0 / MONO 0x10), where the PCM lives in guest
  * memory, and the left and right volumes on the 0..0x8000 scale the call was
  * given. Returns the playback backlog in microseconds, which the blocking
@@ -511,6 +511,10 @@ void psp_display_set_present(void (*fn)(uint32_t addr, uint32_t stride,
 void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples,
                                         uint32_t fmt, uint32_t buf,
                                         uint32_t lvol, uint32_t rvol));
+/* Optional unplayed-frame query for the current sink. Install after set_output;
+ * changing/unregistering the sink clears this query. Without it a sink is
+ * treated as consuming buffers immediately for status reporting. */
+void psp_audio_set_pending(uint32_t (*fn)(int ch));
 /* The host-clock gaps between each channel's outputs; see audio_note_gap. */
 void psp_audio_dump_gaps(FILE *out);
 /* A movie's audio clock against its picture; see mpeg.c. */

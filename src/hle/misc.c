@@ -956,9 +956,12 @@ static void hle_RtcFormatRFC3339(void) {
 /* ---- sceAudio ------------------------------------------------------------ */
 
 #define AUDIO_CHANNELS 8
+#define AUDIO_OUTPUT2_CHANNEL AUDIO_CHANNELS
+#define AUDIO_OUTPUTS (AUDIO_CHANNELS + 1)
 
 typedef struct { int reserved; uint32_t samples; uint32_t format; uint64_t play_until_ns; } audio_ch;
-static audio_ch g_audio[AUDIO_CHANNELS];
+static audio_ch g_audio[AUDIO_OUTPUTS];
+static uint64_t g_output2_until_ns;
 static uint64_t g_audio_blocks;
 
 uint64_t psp_audio_blocks(void) { return g_audio_blocks; }
@@ -975,17 +978,21 @@ uint64_t psp_audio_blocks(void) { return g_audio_blocks; }
  * with psp_sched_delay, the non-blocking ones never wait. */
 static int64_t (*g_audio_out)(int ch, uint32_t samples, uint32_t fmt,
                               uint32_t buf, uint32_t lvol, uint32_t rvol);
+static uint32_t (*g_audio_pending)(int ch);
 
 void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples, uint32_t fmt,
                                         uint32_t buf, uint32_t lvol, uint32_t rvol)) {
     g_audio_out = fn;
+    g_audio_pending = NULL;
 }
+
+void psp_audio_set_pending(uint32_t (*fn)(int ch)) { g_audio_pending = fn; }
 
 /* PSPRECOMP_AUDIO_DUMP=<prefix> appends every output buffer, raw signed
  * 16-bit as the game wrote it, to <prefix>.chN.raw -- one file per channel,
  * with a line on stderr naming its shape. A headless run has no speaker, and
  * "is there sound" is otherwise a question only a windowed run can answer. */
-static FILE *g_audio_dump[AUDIO_CHANNELS];
+static FILE *g_audio_dump[AUDIO_OUTPUTS];
 static const char *audio_dump_prefix(void) {
     static const char *p; static int looked;
     if (!looked) { looked = 1; p = getenv("PSPRECOMP_AUDIO_DUMP"); if (p && !*p) p = NULL; }
@@ -1043,7 +1050,7 @@ static void hle_ChRelease(void) {
  * popping comes down to. Only meaningful when the run is paced against the
  * wall clock -- a window, or PSPRECOMP_REALTIME -- and reported then. */
 typedef struct { uint64_t first_ns, last_ns, max_gap_ns; uint32_t late, outputs; } audio_gap;
-static audio_gap g_audio_gap[AUDIO_CHANNELS];
+static audio_gap g_audio_gap[AUDIO_OUTPUTS];
 static void audio_note_gap(uint32_t ch, uint32_t samples) {
     audio_gap *g = &g_audio_gap[ch];
     const uint64_t now = psp_os_mono_ns();
@@ -1057,7 +1064,7 @@ static void audio_note_gap(uint32_t ch, uint32_t samples) {
     g->outputs++;
 }
 void psp_audio_dump_gaps(FILE *out) {
-    for (uint32_t ch = 0; ch < AUDIO_CHANNELS; ch++) {
+    for (uint32_t ch = 0; ch < AUDIO_OUTPUTS; ch++) {
         const audio_gap *g = &g_audio_gap[ch];
         if (g->outputs < 2) continue;
         fprintf(out, "    audio ch %u: %u outputs over %.1f s, longest wait %.0f ms, %u arrived later than 1.5 buffers\n",
@@ -1153,6 +1160,97 @@ static void hle_ChangeChannelConfig(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Output2 contract: PSPSDK 654ac51 src/audio/pspaudio.h and sceAudio.S.
+ * This implementation uses a host queue query, or a single timed transfer
+ * without a device. The latter is our scheduling policy, not a claim about
+ * firmware FIFO depth or undocumented reservation/status quirks.
+ * Error categories below are SDK constants. Exact errors for unspecified
+ * edge cases still require independent hardware observations. */
+enum {
+    O2_BUSY = 0x80260002u, O2_SIZE = 0x80260006u,
+    O2_NOT_RESERVED = 0x80260008u, O2_VOLUME = 0x8026000Bu,
+    O2_ADDRESS = 0x800200D3u /* PSPSDK src/user/pspkerror.h */
+};
+
+static uint32_t output2_remaining(void) {
+    if (g_audio_out)
+        return g_audio_pending ? g_audio_pending(AUDIO_OUTPUT2_CHANNEL) : 0;
+    const uint64_t now = psp_clock_peek() * 1000ull;
+    if (now >= g_output2_until_ns) return 0;
+    return (uint32_t)(((g_output2_until_ns - now) * PSP_AUDIO_RATE
+                      + 999999999ull) / 1000000000ull);
+}
+
+static int output2_length_ok(uint32_t samples) {
+    return samples >= 17 && samples <= 4111;
+}
+
+static void hle_Output2Reserve(void) {
+    audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
+    const uint32_t samples = psp_arg(0);
+    if (!output2_length_ok(samples)) { psp_ret(O2_SIZE); return; }
+    if (channel->reserved) { psp_ret(O2_BUSY); return; }
+    *channel = (audio_ch){.reserved = 1, .samples = samples};
+    g_output2_until_ns = 0;
+    psp_ret(0);
+}
+
+static void hle_Output2ChangeLength(void) {
+    audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
+    if (!channel->reserved) { psp_ret(O2_NOT_RESERVED); return; }
+    if (!output2_length_ok(psp_arg(0))) { psp_ret(O2_SIZE); return; }
+    channel->samples = psp_arg(0);
+    psp_ret(0);
+}
+
+static void hle_Output2Rest(void) {
+    if (!g_audio[AUDIO_OUTPUT2_CHANNEL].reserved) {
+        psp_ret(O2_NOT_RESERVED); return;
+    }
+    psp_ret(output2_remaining());
+}
+
+static void hle_Output2Release(void) {
+    audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
+    if (!channel->reserved) { psp_ret(O2_NOT_RESERVED); return; }
+    if (output2_remaining()) { psp_ret(O2_BUSY); return; }
+    *channel = (audio_ch){0};
+    g_output2_until_ns = 0;
+    psp_ret(0);
+}
+
+static void hle_Output2Blocking(void) {
+    audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
+    const uint32_t volume = psp_arg(0), pcm = psp_arg(1);
+    if (!channel->reserved) { psp_ret(O2_NOT_RESERVED); return; }
+    if (volume > 0x8000) { psp_ret(O2_VOLUME); return; }
+    if (!pcm || !psp_mem_ptr(pcm, channel->samples * 4)) {
+        psp_ret(O2_ADDRESS); return;
+    }
+    /* No device: finish the previous transfer before accepting the next one.
+     * If scheduling is disabled (unit probes), report busy without losing it. */
+    if (!g_audio_out && output2_remaining()) {
+        const uint64_t now = psp_clock_peek() * 1000ull;
+        if (g_output2_until_ns > now)
+            psp_sched_delay((g_output2_until_ns - now + 999) / 1000);
+        if (output2_remaining()) { psp_ret(O2_BUSY); return; }
+    }
+    const uint32_t samples = channel->samples;
+    g_audio_blocks++;
+    audio_note_gap(AUDIO_OUTPUT2_CHANNEL, samples);
+    audio_dump(AUDIO_OUTPUT2_CHANNEL, samples, 0, pcm);
+    int64_t wait_us;
+    if (g_audio_out) {
+        wait_us = g_audio_out(AUDIO_OUTPUT2_CHANNEL, samples, 0, pcm, volume, volume);
+    } else {
+        wait_us = ((uint64_t)samples * 1000000ull + PSP_AUDIO_RATE - 1) / PSP_AUDIO_RATE;
+        g_output2_until_ns = psp_clock_peek() * 1000ull
+                          + (uint64_t)samples * 1000000000ull / PSP_AUDIO_RATE;
+    }
+    if (wait_us > 0) psp_sched_delay((uint64_t)wait_us);
+    psp_ret(0);
+}
+
 void psp_misc_reset(void) {
     g_intr_enabled = 1;
     g_exit_requested = 0;
@@ -1167,6 +1265,7 @@ void psp_misc_reset(void) {
     g_ctrl_polls = 0;
     memset(&g_press, 0, sizeof g_press);
     memset(g_audio, 0, sizeof g_audio);
+    g_output2_until_ns = 0;
     memset(g_audio_gap, 0, sizeof g_audio_gap);
     g_audio_blocks = 0;
     psp_ctrl_replay_reset();
@@ -1271,4 +1370,9 @@ void psp_misc_register(void) {
     psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
     psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ChangeChannelConfig);
     psp_hle_register(0xB7E1D8E7, "sceAudio", "sceAudioChangeChannelVolume",  hle_ok);
+    psp_hle_register(0x01562BA3, "sceAudio", "sceAudioOutput2Reserve", hle_Output2Reserve);
+    psp_hle_register(0x2D53F36E, "sceAudio", "sceAudioOutput2OutputBlocking", hle_Output2Blocking);
+    psp_hle_register(0x63F2889C, "sceAudio", "sceAudioOutput2ChangeLength", hle_Output2ChangeLength);
+    psp_hle_register(0x647CEF33, "sceAudio", "sceAudioOutput2GetRestSample", hle_Output2Rest);
+    psp_hle_register(0x43196845, "sceAudio", "sceAudioOutput2Release", hle_Output2Release);
 }

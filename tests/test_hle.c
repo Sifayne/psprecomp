@@ -1728,6 +1728,88 @@ static void test_waits_with_threads(void) {
     psp_threadman_reset();
 }
 
+/* PSPSDK 654ac51, src/audio/pspaudio.h and sceAudio.S supply the public
+ * contract and NIDs. These tests assert that contract plus our host queue
+ * behavior; undocumented firmware quirks are not used as an oracle. */
+static unsigned output2_sink_calls, output2_pending_frames;
+static uint32_t output2_pending(int ch) {
+    CHECK(ch == 8, "query independent Output2 channel");
+    return output2_pending_frames;
+}
+static int64_t output2_sink(int ch, uint32_t samples, uint32_t fmt,
+                           uint32_t buf, uint32_t left, uint32_t right) {
+    CHECK(ch == 8 && samples == 512 && fmt == 0, "Output2 stereo PCM shape");
+    CHECK(buf == 0x08820000 && left == 0x8000 && right == left, "PCM pointer and volume");
+    output2_sink_calls++;
+    output2_pending_frames += samples;
+    return 0;
+}
+
+static void test_audio_output2(void) {
+    const uint32_t reserve = 0x01562BA3, output = 0x2D53F36E;
+    const uint32_t rest = 0x647CEF33, release = 0x43196845, length = 0x63F2889C;
+    psp_sched_set_threading(0);
+    psp_audio_set_output(NULL);
+    psp_clock_reset();
+    CHECK((int32_t)call(output, 0x8000, 0x08820000, 0, 0) < 0, "output requires reservation");
+    const uint32_t invalid[] = {0,16,4112,0x80000200};
+    for (unsigned i=0; i<sizeof invalid/sizeof invalid[0]; i++)
+        CHECK((int32_t)call(reserve, invalid[i], 0, 0, 0) < 0, "SDK reserve range is 17..4111");
+    const uint32_t valid[] = {17,4111,512};
+    for (unsigned i=0; i<sizeof valid/sizeof valid[0]; i++) {
+        CHECK(call(reserve, valid[i], 0, 0, 0) == 0, "SDK sample count accepted");
+        CHECK(call(release, 0, 0, 0, 0) == 0, "unused channel releases");
+    }
+    CHECK(call(reserve, 512, 0, 0, 0) == 0, "reserve for PCM tests");
+    CHECK((int32_t)call(reserve, 512, 0, 0, 0) < 0, "duplicate reservation rejected");
+    CHECK(call(psp_nid("sceAudioChReserve"), 0, 64, 0x10, 0) == 0, "normal channel remains independent");
+    CHECK((int32_t)call(output, 0x8001, 0x08820000, 0, 0) < 0, "SDK volume maximum enforced");
+    CHECK((int32_t)call(output, 0x8000, 0xFFFFFFFF, 0, 0) < 0, "invalid PCM cannot be read");
+    CHECK(call(rest, 0, 0, 0, 0) == 0, "rejected writes queue nothing");
+    psp_audio_set_output(output2_sink);
+    psp_audio_set_pending(output2_pending);
+    output2_sink_calls = output2_pending_frames = 0;
+    for (int i=0; i<12; i++)
+        CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 0, "sink accepts each buffer exactly once");
+    CHECK(output2_sink_calls == 12, "all buffers delivered");
+    psp_clock_advance_to(1000000);
+    CHECK(call(rest, 0, 0, 0, 0) == 6144, "guest time does not consume a device queue");
+    CHECK(call(length, 256, 0, 0, 0) == 0, "change future transfer size");
+    CHECK(call(rest, 0, 0, 0, 0) == 6144, "queued sample count retains its original size");
+    output2_pending_frames -= 1024;
+    CHECK(call(rest, 0, 0, 0, 0) == 5120, "query follows device consumption");
+    CHECK((int32_t)call(release, 0, 0, 0, 0) < 0, "do not discard pending PCM on release");
+    output2_pending_frames = 0;
+    CHECK(call(release, 0, 0, 0, 0) == 0, "release after device drains");
+    psp_audio_set_output(NULL);
+    CHECK(call(reserve, 512, 0, 0, 0) == 0, "reserve without device");
+    CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 0, "headless transfer starts");
+    const uint64_t start = psp_clock_peek();
+    psp_clock_advance_to(start + 6000);
+    uint32_t remaining = call(rest, 0, 0, 0, 0);
+    CHECK(remaining > 200 && remaining < 300, "headless count decreases at 44100 frames per second");
+    CHECK(call(length, 17, 0, 0, 0) == 0, "length change does not resize current transfer");
+    CHECK(call(rest, 0, 0, 0, 0) == remaining, "remaining frames independent of future length");
+    psp_clock_advance_to(start + 12000);
+    CHECK(call(rest, 0, 0, 0, 0) == 0, "headless PCM fully consumed");
+    CHECK(call(release, 0, 0, 0, 0) == 0, "release headless channel");
+    CHECK(call(psp_nid("sceAudioOutputBlocking"), 0, 0x8000, 0x08820000, 0) == 64,
+          "ordinary channel retained its sample count");
+    call(psp_nid("sceAudioChRelease"), 0, 0, 0, 0);
+    psp_sched_set_threading(1);
+}
+
+/* Callback observations from tests/provenance/umd/observed.txt, records
+ * 3..10 and 13..18. The oracle is our executable probe output. Physical UMD
+ * timing and deactivation transitions are outside this mounted-image test. */
+static unsigned umd_hits;
+static uint32_t umd_seen[3];
+static void umd_callback(void) {
+    umd_hits++;
+    for (unsigned i = 0; i < 3; i++) umd_seen[i] = psp_arg(i);
+    psp_ret(0);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -1739,6 +1821,7 @@ int main(void) {
     test_sha1_vectors();
     test_nids_match_names();
     test_sysmem();
+    test_audio_output2();
     test_semaphores();
     test_create_attributes();
     test_event_flags();
