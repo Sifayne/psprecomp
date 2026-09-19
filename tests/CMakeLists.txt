@@ -32,6 +32,10 @@ add_executable(test_hle test_hle.c)
 target_link_libraries(test_hle PRIVATE psprecomp allegrex_core)
 add_test(NAME hle COMMAND test_hle)
 
+add_executable(test_directory_sdk test_directory_sdk.c)
+target_link_libraries(test_directory_sdk PRIVATE psprecomp allegrex_core)
+add_test(NAME directory_sdk COMMAND test_directory_sdk)
+
 add_executable(test_interrupt test_interrupt.c)
 target_link_libraries(test_interrupt PRIVATE psprecomp)
 add_test(NAME interrupt COMMAND test_interrupt

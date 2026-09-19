@@ -982,6 +982,10 @@ static void hle_Dread(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
     uint32_t dirent = psp_arg(1);
     if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(0x80020323); return; }
+    /* An entry is an 88-byte stat and a 256-byte name. A buffer that is not
+     * there is refused (PSPSDK's ILLEGAL_ADDR; not measured) rather than
+     * written through, and the listing does not advance. */
+    if (!psp_mem_ptr(dirent, PSP_STAT_LEN + 256)) { psp_ret(0x800200D3u); return; }
 
     if (g_dir[id].pos >= g_dir[id].n) { psp_ret(0); return; }
     const io_dirent *e = &g_dir[id].ent[g_dir[id].pos++];
