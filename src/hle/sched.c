@@ -4,6 +4,7 @@
 #include "psprecomp/cpu.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/clock.h"
+#include "psprecomp/interrupt.h"
 #include "psprecomp/hle.h"          /* psp_ktimer_in_handler */
 
 #include "psprecomp/os.h"
@@ -238,6 +239,17 @@ static void expire_locked(uint64_t now) {
 }
 
 /* The earliest deadline any timed wait has, or 0 for none. */
+/* Whether a guest thread is waiting or sleeping: something an interrupt
+ * handler could still release. The main context counts only while it waits
+ * on a guest object, not while it merely drains. */
+static int has_waiter_locked(void) {
+    for (int i = 0; i < MAX_SCHED_THREADS; i++)
+        if (g_slot[i].used &&
+            (g_slot[i].state == PSP_SCHED_BLOCKED || g_slot[i].state == PSP_SCHED_SLEEPING) &&
+            (i != MAIN_SLOT || g_slot[i].waiting_on)) return 1;
+    return 0;
+}
+
 static uint64_t soonest_locked(void) {
     uint64_t soonest = 0;
     for (int i = 0; i < g_slot_hi; i++)
@@ -334,7 +346,7 @@ static int handoff_locked(void) {
      * something only a timer handler provides was declared stranded. The cap
      * only stops a periodic handler that never readies anyone from spinning
      * guest time on for ever. */
-    int timer_runs = 0, ge_runs = 0;
+    int timer_runs = 0, ge_runs = 0, intr_runs = 0;
     while (best < 0) {
         const uint64_t soonest = soonest_locked();
         const uint64_t timer = timer_runs < IDLE_TIMER_CAP && !psp_ktimer_in_handler()
@@ -355,6 +367,24 @@ static int handoff_locked(void) {
                 best = pick_locked();
                 continue;
             }
+        }
+        /* A Vblank subinterrupt handler, likewise, runs at its moment while
+         * the CPU idles, if some thread is waiting for something it might
+         * provide (src/hle/interrupt.c). The host drain is not such a waiter:
+         * once every guest thread has exited, a leftover registration must
+         * not keep the drain going. The cap is the timers'. */
+        const uint64_t intr = intr_runs < IDLE_TIMER_CAP && has_waiter_locked()
+                            ? psp_interrupt_next_event() : 0;
+        if (intr && (!soonest || intr <= soonest) && (!timer || intr < timer)) {
+            psp_clock_advance_to(intr);
+            psp_os_unlock(&g_lock);
+            psp_display_tick();
+            psp_interrupt_run_pending();
+            psp_os_lock(&g_lock);
+            intr_runs++;
+            expire_locked(psp_clock_peek());
+            best = pick_locked();
+            continue;
         }
         if (timer && (!soonest || timer <= soonest)) {
             psp_clock_advance_to(timer);
@@ -422,6 +452,7 @@ static int await_turn_locked(int me) {
  * it instead. */
 static int switch_away(int me, psp_sched_state why, const char *what,
                        uint64_t deadline_us) {
+    if (psp_interrupt_in_handler()) return -1;
     psp_os_lock(&g_lock);
     g_slot[me].ctx        = psp_cpu;
     /* With a deadline the wait *is* a sleep as far as the handoff is concerned:
@@ -689,6 +720,9 @@ static void yield_as(int displaced) {
      * interrupted; a thread it readied gets the CPU when it has returned (see
      * psp_ktimer_tick), not from inside it. */
     if (psp_ktimer_in_handler()) return;
+    /* Nor does an interrupt handler, and with interrupts suspended nothing
+     * interrupts the running thread. */
+    if (psp_interrupt_in_handler() || !psp_interrupt_enabled()) return;
     /* A yield differs from a block only in that the caller stays runnable --
      * so a lone thread that yields simply gets the token straight back. */
     psp_os_lock(&g_lock);
@@ -745,7 +779,7 @@ static void yield_as(int displaced) {
  * duration cannot be honoured -- but the *ineligibility* can, for one round.
  * That is the half of the semantics that matters. */
 int psp_sched_delay(uint64_t usec) {
-    if (!g_threading) return PSP_SCHED_EXPIRED;
+    if (!g_threading || psp_interrupt_in_handler()) return PSP_SCHED_EXPIRED;
     psp_os_lock(&g_lock);
     const int me = g_self;
 
@@ -805,7 +839,8 @@ int psp_sched_delay(uint64_t usec) {
  * the CPU inside file I/O instead (threadprobe step 86, fw 6.60), which
  * iofilemgr.c's io_park models; that, not a slice, is what lets them run. */
 void psp_sched_tick(void) {
-    if (!g_threading || !g_dispatch || psp_ktimer_in_handler()) return;
+    if (!g_threading || !g_dispatch || psp_ktimer_in_handler() ||
+        psp_interrupt_in_handler() || !psp_interrupt_enabled()) return;
 
     psp_os_lock(&g_lock);
     const int me = g_running;
@@ -1063,7 +1098,9 @@ int psp_sched_terminate(uint32_t uid) {
     return 1;
 }
 
-int psp_sched_can_wait(void) { return g_dispatch && psp_intr_enabled(); }
+int psp_sched_can_wait(void) {
+    return g_dispatch && !psp_interrupt_in_handler() && psp_intr_enabled();
+}
 
 int psp_sched_set_dispatch(int on) {
     const int was = g_dispatch;

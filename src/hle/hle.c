@@ -4,6 +4,7 @@
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/dispatch.h"
+#include "psprecomp/interrupt.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -228,6 +229,10 @@ void psp_hle_call(uint32_t nid) {
      * runs"). Before the call and not after, so that a call which blocks
      * until a GE handler has run finds it already run. */
     psp_ge_tick();
+    /* And the display: Vblank boundaries are accounted under the
+     * registrations that existed at entry, before this call can enable,
+     * replace or release a handler (src/hle/interrupt.c). */
+    psp_display_tick();
 
     for (int i = 0; i < g_count; i++) {
         if (g_entry[i].nid == nid) {
@@ -256,11 +261,15 @@ void psp_hle_call(uint32_t nid) {
             /* After the handler, not before: the call has to finish before the
              * thread can be switched away from, or its result is written into
              * whoever runs next. */
+            psp_display_tick();
+            psp_interrupt_run_pending();
             psp_sched_tick();
             /* After the handler and after the reschedule: a timer handler is
              * guest code, and running it before the call it interrupted has
              * finished would write its result into the caller's $v0. */
             psp_ktimer_tick();
+            psp_display_tick();
+            psp_interrupt_run_pending();
             return;
         }
     }
@@ -282,6 +291,7 @@ void psp_hle_call(uint32_t nid) {
     if (!g_quiet)
         fprintf(stderr, "psprecomp: unimplemented firmware call 0x%08X\n", nid);
     psp_ret(0);
+    psp_interrupt_run_pending();
 }
 
 const char *psp_str(uint32_t addr, char *dst, size_t cap) {

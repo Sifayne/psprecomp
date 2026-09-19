@@ -32,6 +32,18 @@ add_executable(test_hle test_hle.c)
 target_link_libraries(test_hle PRIVATE psprecomp allegrex_core)
 add_test(NAME hle COMMAND test_hle)
 
+add_executable(test_interrupt test_interrupt.c)
+target_link_libraries(test_interrupt PRIVATE psprecomp)
+add_test(NAME interrupt COMMAND test_interrupt
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/intr/observed.txt)
+set_tests_properties(interrupt PROPERTIES TIMEOUT 10)
+
+add_executable(test_ge_callback test_ge_callback.c)
+target_link_libraries(test_ge_callback PRIVATE psprecomp allegrex_core)
+add_test(NAME ge_callback COMMAND test_ge_callback
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/ge/observed.txt)
+set_tests_properties(ge_callback PROPERTIES TIMEOUT 10)
+
 add_executable(test_thread_lifecycle test_thread_lifecycle.c)
 target_link_libraries(test_thread_lifecycle PRIVATE psprecomp allegrex_core)
 add_test(NAME thread_lifecycle COMMAND test_thread_lifecycle)

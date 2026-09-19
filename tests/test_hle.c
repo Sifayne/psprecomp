@@ -924,6 +924,24 @@ static void test_ge_display_list(void) {
           "eDRAM is 2 MB");
 }
 
+static void test_ge_alias_stall(void) {
+    psp_ge_reset();
+    const uint32_t list = 0x0882C000, stall = list + 12;
+    psp_write32(list, 0x10080000);       /* BASE 0x08000000 */
+    psp_write32(list + 4, 0x0882C00C);   /* JUMP to cached stall */
+    psp_write32(list + 8, 0);            /* skipped */
+    psp_write32(stall, 0x0F000000);     /* not released yet */
+    psp_write32(stall + 4, 0x0C000000);
+    uint32_t id = call(psp_nid("sceGeListEnQueue"), list | 0x40000000,
+                       list | 0x40000000, 0, 0);
+    call(psp_nid("sceGeListUpdateStallAddr"), id, stall | 0x40000000, 0, 0);
+    CHECK(psp_ge_command_count() == 2, "uncached stall stops a cached GE jump before FINISH");
+    /* A list held at its stall reads DRAWING (geprobe 6 steps 79 and 80). */
+    CHECK(call(psp_nid("sceGeListSync"), id, 1, 0, 0) == 2, "alias-equivalent stall reads DRAWING");
+    call(psp_nid("sceGeListUpdateStallAddr"), id, 0, 0, 0);
+    CHECK(psp_ge_command_count() == 3, "releasing alias stall consumes FINISH exactly once");
+}
+
 /* GU_SIGNAL_PAUSE is followed by a FINISH/END pair, and the list stops there
  * until sceGeContinue: geprobe 5 step 57 (fw 6.60) reads ListSync(peek) 4
  * and DrawSync(peek) 2 while it waits, and the rest of the list runs inside
@@ -1874,6 +1892,7 @@ int main(void) {
     test_io_dirs();
     test_net();
     test_ge_display_list();
+    test_ge_alias_stall();
     test_ge_signal_pause();
     test_ge_callbacks();
     test_ge_long_list();

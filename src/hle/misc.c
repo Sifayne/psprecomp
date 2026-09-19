@@ -13,6 +13,7 @@
 #include "psprecomp/sched.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/os.h"
+#include "psprecomp/interrupt.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -41,27 +42,6 @@ static void hle_PowerRegisterCallback(void) {
     const uint32_t cb = psp_arg(1);
     psp_ret(psp_threadman_notify_callback(cb, 0));
 }
-
-/* ---- Kernel_Library ------------------------------------------------------
- * Interrupt masking. With no interrupts to mask, the pair only has to be
- * *consistent*: suspend returns a cookie that resume accepts. Games use them
- * to bracket short critical sections, and libc's lightweight mutexes are built
- * on them -- which is why a game stalls in its own startup without these. */
-
-static uint32_t g_intr_enabled = 1;
-
-static void hle_CpuSuspendIntr(void) {
-    uint32_t prev = g_intr_enabled;
-    g_intr_enabled = 0;
-    psp_ret(prev);                    /* the cookie resume expects */
-}
-
-static void hle_CpuResumeIntr(void) {
-    g_intr_enabled = psp_arg(0);
-    psp_ret(SCE_KERNEL_ERROR_OK);
-}
-
-int psp_intr_enabled(void) { return g_intr_enabled != 0; }
 
 /* ---- UtilsForUser -------------------------------------------------------- */
 
@@ -1294,8 +1274,8 @@ static void hle_Output2Blocking(void) {
 }
 
 void psp_misc_reset(void) {
-    g_intr_enabled = 1;
     memset(&volatile_memory,0,sizeof volatile_memory);
+    psp_interrupt_reset();
     g_exit_requested = 0;
     g_hold_buttons   = 0;
     g_script_buttons = 0;
@@ -1330,8 +1310,7 @@ void psp_misc_init(void) {
 void psp_misc_register(void) {
     psp_hle_register(0x04B7766E, "scePower", "scePowerRegisterCallback", hle_PowerRegisterCallback);
 
-    psp_hle_register(0x092968F4, "Kernel_Library", "sceKernelCpuSuspendIntr", hle_CpuSuspendIntr);
-    psp_hle_register(0x5F10D406, "Kernel_Library", "sceKernelCpuResumeIntr",  hle_CpuResumeIntr);
+    psp_interrupt_register();
 
     psp_hle_register(0x79D1C3FA, "UtilsForUser", "sceKernelDcacheWritebackAll",           hle_CacheOp);
     psp_hle_register(0xB435DEC5, "UtilsForUser", "sceKernelDcacheWritebackInvalidateAll", hle_CacheOp);

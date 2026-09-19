@@ -12,6 +12,7 @@
 
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/interrupt.h"
 #include "psprecomp/hle.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/render.h"
@@ -37,7 +38,23 @@ static uint64_t g_vblank_count;
 /* The boundary the most recent vblank was counted at, so that several threads
  * released by one vblank count it once between them. See hle_WaitVblank. */
 static uint64_t g_last_vblank_us;
+/* The boundary the Vblank interrupt was last raised at. Separate from the
+ * count above, which is frames waited for: the savedata status reads that
+ * (src/hle/utility.c), and a frame merely passing on the clock while a
+ * thread polls is not a wait. */
+static uint64_t g_irq_vblank_us;
 static uint32_t g_vcount;         /* scanline counter; see hle_GetVcount */
+
+/* Observe the shared clock, independently of which thread waited or which
+ * firmware API advanced it. Queue only: HLE calls must finish writing their
+ * results before an interrupt is allowed to enter guest code. */
+void psp_display_tick(void) {
+    const uint64_t boundary = psp_clock_peek() / PSP_CLOCK_FRAME_US * PSP_CLOCK_FRAME_US;
+    if (boundary <= g_irq_vblank_us) return;
+    const uint64_t elapsed = (boundary - g_irq_vblank_us) / PSP_CLOCK_FRAME_US;
+    g_irq_vblank_us = boundary;
+    psp_interrupt_raise(PSP_INTERRUPT_VBLANK, elapsed);
+}
 
 static uint32_t g_best[PSP_SCREEN_W * PSP_SCREEN_H];
 static uint64_t g_best_score;
@@ -74,6 +91,7 @@ void psp_display_reset(void) {
     g_mode_h = PSP_SCREEN_H;
     g_vblank_count = 0;
     g_last_vblank_us = 0;
+    g_irq_vblank_us = 0;
     g_vcount = 0;
     g_best_score = 0;
     g_best_addr = 0;
@@ -315,6 +333,8 @@ static void hle_GetFrameBuf(void) {
  * because it says whether the game is looping or stuck. It is counted per
  * vblank rather than per waiter, which is what it was always meant to mean. */
 static void hle_WaitVblank(void) {
+    if (psp_interrupt_in_handler()) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT); return; }
+    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
     const uint64_t target = psp_clock_next_frame();
 
     psp_sched_delay(target - psp_clock_peek());
@@ -330,6 +350,7 @@ static void hle_WaitVblank(void) {
         g_last_vblank_us = target;
         g_vblank_count++;
     }
+    psp_display_tick();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -407,6 +428,7 @@ void psp_display_register(void) {
     psp_hle_register(0x289D82FE, "sceDisplay", "sceDisplaySetFrameBuf",       hle_SetFrameBuf);
     psp_hle_register(0xEEDA2E54, "sceDisplay", "sceDisplayGetFrameBuf",       hle_GetFrameBuf);
     psp_hle_register(0x36CDFADE, "sceDisplay", "sceDisplayWaitVblank",        hle_WaitVblank);
+    psp_hle_register(0x8EB9EC49, "sceDisplay", "sceDisplayWaitVblankCB",      hle_WaitVblank);
     psp_hle_register(0x984C27E7, "sceDisplay", "sceDisplayWaitVblankStart",   hle_WaitVblank);
     psp_hle_register(0x46F186C3, "sceDisplay", "sceDisplayWaitVblankStartCB", hle_WaitVblank);
     psp_hle_register(0x9C6EAAD7, "sceDisplay", "sceDisplayGetVcount",         hle_GetVcount);

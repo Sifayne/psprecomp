@@ -305,6 +305,7 @@ uint32_t psp_sysmem_compiled_sdk(void);
 void psp_display_init(void);
 void psp_display_register(void);
 void psp_display_reset(void);
+void psp_display_tick(void);
 int      psp_display_capture(const char *path);
 uint64_t psp_display_vblanks(void);
 uint32_t psp_display_framebuffer(void);
@@ -338,6 +339,8 @@ void psp_ge_drain_all(void);
  * src/hle/ge.c. */
 void psp_ge_tick(void);
 int  psp_ge_idle_run(uint64_t until_us);
+int psp_ge_callbacks_pending(void);
+void psp_ge_run_pending_callbacks(void);
 
 /* The GE's register state, for capture and replay. Commands are differential,
  * so a frame only means anything against the state it started from -- a replay

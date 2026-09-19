@@ -46,6 +46,7 @@ add_library(psprecomp STATIC
     src/hle/kernlock.c
     src/hle/kernobj.c
     src/hle/ktimer.c
+    src/hle/interrupt.c
     src/hle/sched.c
     src/hle/clock.c
     src/hle/mpeg.c

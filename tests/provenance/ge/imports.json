@@ -1,0 +1,34 @@
+{
+  "name": "IndependentGeProbe",
+  "gp": 655894552,
+  "imports": {
+    "IoFileMgrForUser": [
+      "sceIoWrite"
+    ],
+    "LoadExecForUser": [
+      "sceKernelExitGame"
+    ],
+    "Kernel_Library": [
+      "sceKernelCpuSuspendIntr",
+      "sceKernelCpuResumeIntr",
+      "sceKernelIsCpuIntrEnable"
+    ],
+    "sceGe_user": [
+      "sceGeSetCallback",
+      "sceGeUnsetCallback",
+      "sceGeListEnQueue",
+      "sceGeListSync",
+      "sceGeContinue"
+    ],
+    "SysMemUserForUser": [
+      "sceKernelSetCompiledSdkVersion",
+      "sceKernelGetCompiledSdkVersion",
+      "probeSdk630"
+    ]
+  },
+  "opaque_imports": {
+    "SysMemUserForUser": {
+      "probeSdk630": "0x1b4217bc"
+    }
+  }
+}

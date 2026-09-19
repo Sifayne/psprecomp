@@ -33,6 +33,7 @@
 #endif
 #include "psprecomp/hle.h"
 #include "psprecomp/clock.h"
+#include "psprecomp/interrupt.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/render.h"
 #include "psprecomp/sched.h"
@@ -322,6 +323,12 @@ typedef struct {
     int      paused;    /* stopped at a PAUSE until sceGeContinue */
     int      cont_early;/* sceGeContinue arrived before the pause took hold */
     int      hung;      /* stopped for good at a patch it cannot draw, until sceGeBreak */
+    int      replay;    /* a capture's list (psp_ge_replay_list): no guest to Continue it */
+    /* CALL's return addresses live with the list, not the walk: a walk that
+     * stops at the stall or at the end of its time slice inside a CALL has
+     * to find them when it resumes. */
+    uint32_t stack[GE_STACK];
+    int      sp;
 } ge_queue;
 
 static ge_queue g_queue[MAX_QUEUES];
@@ -412,7 +419,7 @@ static int      g_ge_follow;   /* the guest clock follows the GE to each handler
  * the FINISH, then suspends and resumes interrupts, and the finish handler
  * runs after it has returned. `at` is the GE's time when it reached it; one
  * reached while every thread waits is held until the clock gets there. */
-static struct { int valid, cbid, finish; uint32_t id; uint64_t at; } g_ge_pend;
+static struct { int valid, cbid, finish; uint32_t id, pc; uint64_t at; } g_ge_pend;
 static int g_ge_defer;         /* hold handlers in g_ge_pend (a catch-up) */
 
 static uint64_t ge_now(void) { return psp_clock_peek() * GE_UNITS_PER_US; }
@@ -3700,20 +3707,26 @@ static int g_ge_in_cb;
  * and 0x0E020055 then FINISH 0x0F000066 under signal_arg 0x5A, finish_arg
  * 0xA5 reach the handlers as (0x44, 0x5A), (0x55, 0x5A), (0x66, 0xA5).
  * On hardware they run in interrupt context; here on the thread driving the
- * list, with dispatch off so a handler cannot block or be switched away. */
-static void ge_callback(int cbid, int finish, uint32_t id) {
+ * list, as an interrupt (src/hle/interrupt.c), with dispatch off so a
+ * handler cannot block or be switched away.
+ *
+ * From the game's callback probe (tests/provenance/ge, recorded under an
+ * emulator, not a PSP): the handler runs with its module's gp and the
+ * incoming VFPU controls, and a module built against SDK 0x02000011 or
+ * later finds in a2 the address after the END that follows the command
+ * (`pc`). A host that registers no module keeps the interrupted thread's
+ * gp, as this did before. */
+static void ge_callback(int cbid, int finish, uint32_t id, uint32_t pc) {
     if (cbid < 0 || cbid >= GE_MAX_CALLBACKS || !g_ge_cb[cbid].used) return;
     const uint32_t fn  = finish ? g_ge_cb[cbid].finish_func : g_ge_cb[cbid].signal_func;
     const uint32_t arg = finish ? g_ge_cb[cbid].finish_arg  : g_ge_cb[cbid].signal_arg;
     if (!fn) return;
-    const psp_cpu_state save = psp_cpu;
+    /* Guest code is about to read what the GE drew. */
+    psp_render_current()->finish();
+    const uint32_t a2 = psp_sysmem_compiled_sdk() >= 0x02000011u ? pc : 0;
     const int was = psp_sched_set_dispatch(0);
-    psp_cpu.r[PSP_REG_A0] = id & 0xFFFFu;
-    psp_cpu.r[PSP_REG_A1] = arg;
-    psp_cpu.r[PSP_REG_RA] = 0;
-    psp_dispatch(fn);
+    psp_interrupt_call_now(fn, psp_interrupt_handler_gp(fn), id & 0xFFFFu, arg, a2);
     psp_sched_set_dispatch(was);
-    psp_cpu = save;
 }
 
 /* The GE reaching a SIGNAL or FINISH: the handler runs now, or, during a
@@ -3726,15 +3739,20 @@ static void ge_clock_to(uint64_t at) {
     if (us > psp_clock_peek()) psp_clock_advance_to(us);
 }
 
-static int ge_raise(int cbid, int finish, uint32_t id) {
+static int ge_raise(int cbid, int finish, uint32_t id, uint32_t pc) {
     if (cbid < 0 || cbid >= GE_MAX_CALLBACKS || !g_ge_cb[cbid].used ||
         !(finish ? g_ge_cb[cbid].finish_func : g_ge_cb[cbid].signal_func)) return 0;
-    if (!g_ge_defer) {
+    /* With the CPU's interrupts suspended, or inside another interrupt's
+     * handler, the GE's interrupt waits: the handler is held and runs at the
+     * first completed firmware call after the resume (the game's callback
+     * probe, scenario 4, recorded under an emulator; not measured on a PSP). */
+    if (!g_ge_defer && psp_intr_enabled() && !psp_interrupt_in_handler()) {
         if (g_ge_follow) ge_clock_to(g_ge_t);
-        ge_callback(cbid, finish, id);
+        ge_callback(cbid, finish, id, pc);
         return 0;
     }
     g_ge_pend.valid = 1; g_ge_pend.cbid = cbid; g_ge_pend.finish = finish; g_ge_pend.id = id;
+    g_ge_pend.pc = pc;
     g_ge_pend.at = g_ge_t;
     return 1;
 }
@@ -3749,9 +3767,18 @@ static int ge_deliver(int force) {
     g_ge_pend.valid = 0;
     if (force) ge_clock_to(g_ge_pend.at);
     g_ge_in_cb = 1;
-    ge_callback(g_ge_pend.cbid, g_ge_pend.finish, g_ge_pend.id);
+    ge_callback(g_ge_pend.cbid, g_ge_pend.finish, g_ge_pend.id, g_ge_pend.pc);
     g_ge_in_cb = 0;
     return 0;
+}
+
+/* For the interrupt layer (src/hle/interrupt.c): a handler held for an
+ * interrupt-enabled moment, and delivering it at a completed firmware call. */
+int psp_ge_callbacks_pending(void) { return g_ge_pend.valid; }
+
+void psp_ge_run_pending_callbacks(void) {
+    if (g_ge_walking || g_ge_in_cb || psp_interrupt_in_handler()) return;
+    ge_deliver(0);
 }
 
 /* BBOX (0x07): the next `count` vertices at VADDR, of the current vertex
@@ -3848,8 +3875,6 @@ static void run_list(ge_queue *q) {
 }
 static void run_list_body(ge_queue *q) {
     ge_note_thread();
-    uint32_t stack[GE_STACK];
-    int sp = 0;
     uint64_t budget = 1u << 22;
 
     /* NB: lists are counted at enqueue (submitted), not here: a
@@ -3927,11 +3952,11 @@ static void run_list_body(ge_queue *q) {
             q->list = (q->base | (arg & 0xFFFFFC));
             break;
         case GE_CALL:
-            if (sp < GE_STACK) stack[sp++] = q->list;
+            if (q->sp < GE_STACK) q->stack[q->sp++] = q->list;
             q->list = (q->base | (arg & 0xFFFFFC));
             break;
         case GE_RET:
-            if (sp > 0) q->list = stack[--sp];
+            if (q->sp > 0) q->list = q->stack[--q->sp];
             break;
         case GE_BBOX:
             g_ge.bbox_hidden = bbox_hidden(arg & 0xFFFF);
@@ -3959,6 +3984,9 @@ static void run_list_body(ge_queue *q) {
                  * lets it through; not measured. */
                 psp_render_current()->finish();
                 if (q->cont_early) { q->cont_early = 0; break; }
+                /* A capture's replay has no guest to call sceGeContinue, so
+                 * it goes on through to the list's real FINISH. */
+                if (q->replay) break;
                 q->paused = 1;
                 return;
             }
@@ -3974,7 +4002,7 @@ static void run_list_body(ge_queue *q) {
             psp_render_current()->finish();
             /* The list is done before its handler runs, so a handler that
              * asks after it is told so. Not measured. */
-            ge_raise(q->cbid, 1, arg);
+            ge_raise(q->cbid, 1, arg, q->list + 4);
             return;
 
         case GE_END: {
@@ -4015,7 +4043,7 @@ static void run_list_body(ge_queue *q) {
              * (geprobe 6 asks). */
             if (((arg >> 16) & 0xFF) == GE_SIGNAL_HANDLER_PAUSE) q->signal = GE_SIGNAL_HANDLER_PAUSE;
             if (((arg >> 16) & 0xFF) >= 1 && ((arg >> 16) & 0xFF) <= 3 &&
-                ge_raise(q->cbid, 0, arg))
+                ge_raise(q->cbid, 0, arg, q->list + 4))
                 return;
             break;
 
@@ -5300,6 +5328,7 @@ void psp_ge_replay_list(uint32_t list, uint32_t stall, uint32_t base) {
     if (!q) return;
     memset(q, 0, sizeof *q);
     q->used = 1; q->id = 0x10000u + (uint32_t)(q - g_queue); q->cbid = -1;
+    q->replay = 1;
     q->list = list & 0x0FFFFFFCu;
     q->stall = stall & 0x0FFFFFFCu;
     q->base = base;
@@ -5411,6 +5440,9 @@ static void hle_Continue(void) {
  * 6.60) registers 15 beside libgu's own and the 16th is refused with it. */
 static void hle_SetCallback(void) {
     const uint32_t p = psp_arg(0);
+    /* Four words the call reads; an unreadable table is refused rather than
+     * read as zeros (PSPSDK's ILLEGAL_ADDR; not measured). */
+    if (!psp_mem_ptr(p, 16)) { psp_ret(0x800200D3u); return; }
     for (int i = 0; i < GE_MAX_CALLBACKS; i++) {
         if (g_ge_cb[i].used) continue;
         g_ge_cb[i].used        = 1;
@@ -5426,7 +5458,13 @@ static void hle_SetCallback(void) {
 
 static void hle_UnsetCallback(void) {
     const uint32_t id = psp_arg(0);
-    if (id < GE_MAX_CALLBACKS) g_ge_cb[id].used = 0;
+    if (id < GE_MAX_CALLBACKS) {
+        g_ge_cb[id].used = 0;
+        /* Lists queued under it call nothing now, rather than whatever a later
+         * SetCallback puts in the same slot. */
+        for (int i = 0; i < MAX_QUEUES; i++)
+            if (g_queue[i].used && g_queue[i].cbid == (int)id) g_queue[i].cbid = -1;
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
