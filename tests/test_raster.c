@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 
 static int failures;
 
@@ -744,6 +745,33 @@ static void test_bilinear_equals_nearest_at_1to1(void) {
                          " got 0x%08X want 0x%08X", k, j, got, ramp_texel(k, j));
             }
         }
+}
+
+static void test_half_pixel_texture_boundary(void) {
+    /* Half-pixel-aligned quads put pixel centres exactly on texel boundaries.
+     * Neither a triangulation diagonal nor normalized float weights may move
+     * a sample to its left/upper neighbour. */
+    const psp_render_backend *be = psp_render_current();
+    psp_ge_reset();
+    clear_fb();
+    upload_ramp_texture(512, 64);
+    be->set_target(FB, 480, 3);
+    be->set_scissor(0, 0, 479, 271);
+    psp_tex_state t = { .addr=TEX, .stride=512, .w=512, .h=64, .fmt=3,
+        .func=3, .tcc_rgba=1, .wrap_s=1, .wrap_t=1 };
+    be->set_texture(&t);
+    psp_vertex v[4] = {
+        {.x=81*16+8, .y=114*16+8, .u=0, .v=0},
+        {.x=81*16+8, .y=157*16+8, .u=0, .v=43},
+        {.x=408*16+8,.y=114*16+8, .u=327,.v=0},
+        {.x=408*16+8,.y=157*16+8, .u=327,.v=43},
+    };
+    for (int i=0;i<4;i++) { v[i].rgba=0xFFFFFFFF; v[i].inv_w=v[i].tex_q=1; v[i].fog=255; }
+    be->draw(PSP_PRIM_TRIANGLE_STRIP,v,4);
+    unsigned wrong=0;
+    for (int y=1;y<43;y++) for (int x=1;x<255;x++)
+        if (pixel(81+x,114+y)!=ramp_texel(x,y)) wrong++;
+    CHECK(!wrong,"half-pixel nearest quad has %u incorrect texels",wrong);
 }
 
 /* Depth commands, and a vertex carrying a z. The 16-bit position slot has one
@@ -2067,7 +2095,6 @@ static void probe_draw(int p, const psp_vertex *v, int n) {
     }
 }
 static void probe_noop(void) { }
-
 static const psp_render_backend probe_backend = {
     .name = "probe", .init = probe_init, .shutdown = probe_noop,
     .set_target = probe_target, .set_scissor = probe_scissor,
@@ -2728,6 +2755,7 @@ int main(void) {
     test_texture_lod_rules();
     test_texture_mip_chain();
     test_bilinear_equals_nearest_at_1to1();
+    test_half_pixel_texture_boundary();
     test_clear_mode_clears_depth();
     test_depth_test_still_rejects();
     test_depth_in_vram();

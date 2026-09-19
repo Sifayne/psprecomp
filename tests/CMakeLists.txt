@@ -122,3 +122,7 @@ add_test(NAME savedata COMMAND test_savedata)
 add_executable(test_vrnd_observed test_vrnd_observed.c)
 target_link_libraries(test_vrnd_observed PRIVATE psprecomp)
 
+add_executable(test_vertex_observed test_vertex_observed.c)
+target_link_libraries(test_vertex_observed PRIVATE psprecomp)
+add_test(NAME vertex_observed COMMAND test_vertex_observed
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/vertices/observed.txt)

@@ -1,0 +1,28 @@
+{
+  "suite": "vertices",
+  "command": [
+    "/usr/bin/PPSSPPHeadless",
+    "--graphics=software",
+    "--root",
+    "/home/sif/Projects/third-birthday-recomp/reports/104-vertices",
+    "--timeout=30",
+    "-l",
+    "/home/sif/Projects/third-birthday-recomp/reports/104-vertices/probe.elf"
+  ],
+  "executable_sha256": "c065cf204335e9eb26a85592947e9f8fb4ddc718bc4eaad2ce06240a01d82f8d",
+  "probe_sha256": "06a0e1b8e11a10701fda2fb1d577240c5c37a995acb3de092d89d287b2862cb9",
+  "observations_sha256": "9c1d511f3c164684f7996b1f287272b825996138811ca9a6af144b851beafe0e",
+  "fixture_sha256": "9c1d511f3c164684f7996b1f287272b825996138811ca9a6af144b851beafe0e",
+  "sources": {
+    "probe.c": "badbd2647c130efec9ae0780c2e7bdaa2974e9f189f4fa02debae756ab7d4efa",
+    "imports.S": "c61cda1308f0111ffd4d734a9bb98e1674dc2691f78e4efc79ae9619e67e7ae0",
+    "probe.ld": "f46ef37392ea8cf736ed7217401708ec9f18bc2c4294a21e249b5911d503fea6",
+    "cases.h": "a737f9760dffcc06b108778540fd952f51f1642dc7ab656917abb4d29cffc006",
+    "cases.json": "553016857795a862f8eff4717c9abf5f90cbbf16494f1e41e04a32ea2976ff22",
+    "make_cases.py": "067d14157acb6eeabf7a287f0744060995e65ec1a6557c6a777d03b5c3c5b720"
+  },
+  "clang": "clang version 22.1.8",
+  "linker": "LLD 22.1.8 (compatible with GNU linkers)",
+  "observations": 2806,
+  "evidence": "external executable output; not physical PSP"
+}

@@ -1419,16 +1419,16 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                           plane_chan(acc[2]) << 16 | plane_chan(acc[3]) << 24;
 
                 if (textured) {
-                    const float den = l0 * a->tex_q * a->inv_w
-                                    + l1 * b->tex_q * b->inv_w
-                                    + l2 * c->tex_q * c->inv_w;
-                    const float rden = den != 0.0f ? 1.0f / den : 0.0f;
-                    const float u = (l0 * a->u * a->inv_w
-                                   + l1 * b->u * b->inv_w
-                                   + l2 * c->u * c->inv_w) * rden;
-                    const float v = (l0 * a->v * a->inv_w
-                                   + l1 * b->v * b->inv_w
-                                   + l2 * c->v * c->inv_w) * rden;
+                    /* Keep exact edge weights until the homogeneous divide.
+                     * Normalizing each one to float first can put an exact
+                     * integer UV just below its texel boundary. Half-pixel
+                     * aligned UI quads expose this as ragged nearest edges. */
+                    const double q0 = (double)w0 * a->inv_w;
+                    const double q1 = (double)w1 * b->inv_w;
+                    const double q2 = (double)w2 * c->inv_w;
+                    const double den = q0 * a->tex_q + q1 * b->tex_q + q2 * c->tex_q;
+                    const float u = den != 0.0 ? (float)((q0 * a->u + q1 * b->u + q2 * c->u) / den) : 0.0f;
+                    const float v = den != 0.0 ? (float)((q0 * a->v + q1 * b->v + q2 * c->v) / den) : 0.0f;
                     const uint32_t texel = sample_mip(u, v, lod16);
                     /* The watched pixel's two inputs, separately: which of the
                      * texel and the shaded vertex colour is the dark one is
