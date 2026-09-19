@@ -3,7 +3,7 @@
  * The UMD drive. There is no drive: `sceIoOpen` reads from a host directory, so
  * by the time a game asks whether the disc is ready, it already is.
  *
- * That makes every call here trivial, and the triviality is the point. A game's
+ * Media is immediately available, but readiness callbacks still matter. A game's
  * startup usually runs
  *
  *     sceUmdCheckMedium();                  is there a disc?
@@ -46,8 +46,23 @@ void psp_umd_init(void)  { psp_umd_reset(); }
  * before it reads anything. */
 static void hle_CheckMedium(void) { psp_ret(1); }
 
-/* Spinning up a drive that is already spinning. */
-static void hle_Activate(void)   { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* PSPSDK documents activation and UmdCallback's event argument. Our
+ * independent UMD probe records activation notifications as PRESENT | READY
+ * (0x22), deferred until a callback check; repeated notifications accumulate
+ * in the common callback queue. See tests/provenance/umd/ for the experiment.
+ * Units 1 and 2 and ignored drive strings are observed executable behavior;
+ * this host's mounted-image policy does not reproduce physical drive timing. */
+static void hle_Activate(void) {
+    const uint32_t unit = psp_arg(0);
+    if (unit != 1 && unit != 2) {
+        psp_ret(0x80010016u); /* observed return for unit 0, probe record 13 */
+        return;
+    }
+    if (g_callback_id)
+        psp_threadman_notify_callback(g_callback_id, PSP_UMD_PRESENT | PSP_UMD_READY);
+    psp_ret(0);
+}
+
 static void hle_Deactivate(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 /* Wait until the drive reaches `state`.
@@ -70,15 +85,22 @@ static void hle_WaitDriveStat(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* The drive raises a callback on insert/eject. Neither happens, so the id is
- * recorded and never fired -- registering is accepted so the game's bookkeeping
- * stays consistent, and unregistering finds what it expects. */
+static void hle_WaitDriveStatCB(void) {
+    hle_WaitDriveStat();
+    if (psp_cpu.r[PSP_REG_V0] == SCE_KERNEL_ERROR_OK)
+        psp_threadman_run_callbacks();
+}
+
+/* One callback registration, notified on activation. Registration by itself
+ * does not imply a drive transition. */
 static void hle_RegisterCallback(void) {
+    if (!psp_threadman_callback_exists(psp_arg(0))) { psp_ret(0x80010016); return; }
     g_callback_id = psp_arg(0);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_UnRegisterCallback(void) {
+    if (psp_arg(0) != g_callback_id) { psp_ret(0x80010016); return; }
     g_callback_id = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -88,7 +110,8 @@ void psp_umd_register(void) {
     psp_hle_register(0xC6183D47, "sceUmdUser", "sceUmdActivate",              hle_Activate);
     psp_hle_register(0xE83742BA, "sceUmdUser", "sceUmdDeactivate",            hle_Deactivate);
     psp_hle_register(0x8EF08FCE, "sceUmdUser", "sceUmdWaitDriveStat",         hle_WaitDriveStat);
-    psp_hle_register(0x4A9E5E29, "sceUmdUser", "sceUmdWaitDriveStatCB",       hle_WaitDriveStat);
+    psp_hle_register(0x56202973, "sceUmdUser", "sceUmdWaitDriveStatWithTimer", hle_WaitDriveStat);
+    psp_hle_register(0x4A9E5E29, "sceUmdUser", "sceUmdWaitDriveStatCB",       hle_WaitDriveStatCB);
     psp_hle_register(0xAEE7404D, "sceUmdUser", "sceUmdRegisterUMDCallBack",   hle_RegisterCallback);
     psp_hle_register(0xBD2BDE07, "sceUmdUser", "sceUmdUnRegisterUMDCallBack", hle_UnRegisterCallback);
 }

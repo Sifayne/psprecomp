@@ -2405,6 +2405,8 @@ uint32_t psp_threadman_notify_callback(uint32_t cbid, uint32_t arg) {
     return SCE_KERNEL_ERROR_OK;
 }
 
+int psp_threadman_callback_exists(uint32_t cbid) { return find_cb(cbid) != NULL; }
+
 static void hle_NotifyCallback(void) {
     psp_ret(psp_threadman_notify_callback(psp_arg(0), psp_arg(1)));
 }

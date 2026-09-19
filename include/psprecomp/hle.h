@@ -551,6 +551,7 @@ void psp_threadman_cb_end(void);
 /* Raise a callback from outside threadman -- scePowerRegisterCallback fires one
  * as it registers. Returns what sceKernelNotifyCallback would. */
 uint32_t psp_threadman_notify_callback(uint32_t cbid, uint32_t arg);
+int psp_threadman_callback_exists(uint32_t cbid);
 
 /* Shared with the other kernel object types: one uid space, and one way of
  * writing a name into a SceKernel*Info block. */

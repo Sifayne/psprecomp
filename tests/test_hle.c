@@ -1810,6 +1810,47 @@ static void umd_callback(void) {
     psp_ret(0);
 }
 
+static void test_umd_activation_callback(void) {
+    psp_threadman_reset();
+    psp_umd_reset();
+    umd_hits = 0;
+    memset(umd_seen, 0, sizeof umd_seen);
+    psp_register(0x08802000, umd_callback);
+    uint32_t cb = call(0xE81CAF8F, guest_name("UMD probe"),
+                       0x08802000, 0x13579bdf, 0);
+    CHECK((int32_t)cb >= 0, "SDK callback creation");
+    CHECK(call(0xAEE7404D, cb, 0, 0, 0) == 0, "register UMD callback");
+    CHECK(call(0x349D6D6C, 0, 0, 0, 0) == 0 && !umd_hits,
+          "registration alone produces no callback");
+    CHECK(call(0xC6183D47, 1, guest_name("disc0:"), 0, 0) == 0 && !umd_hits,
+          "activation queues callback");
+    CHECK(call(0x56202973, 0x20, 1000, 0, 0) == 0 && !umd_hits,
+          "ordinary ready wait does not consume callback");
+    CHECK(call(0x349D6D6C, 0, 0, 0, 0) == 1 && umd_hits == 1,
+          "callback check consumes queued notification");
+    CHECK(umd_seen[0] == 1 && umd_seen[1] == 0x22 && umd_seen[2] == 0x13579bdf,
+          "observed count, activation event and callback common value");
+    call(0xC6183D47, 1, 0, 0, 0);
+    call(0xC6183D47, 1, 0, 0, 0);
+    CHECK(call(0x4A9E5E29, 0x20, 1000, 0, 0) == 0 && umd_hits == 2,
+          "callback-aware ready wait consumes pending notifications");
+    CHECK(umd_seen[0] == 2 && umd_seen[1] == 0x22,
+          "two activations coalesce with observed count");
+    CHECK(call(0xC6183D47, 0, 0, 0, 0) == 0x80010016,
+          "observed invalid-unit result");
+    CHECK(call(0x349D6D6C, 0, 0, 0, 0) == 0 && umd_hits == 2,
+          "failed activation does not notify");
+    call(0xC6183D47, 2, 0, 0, 0);
+    CHECK(call(0x349D6D6C, 0, 0, 0, 0) == 1 && umd_hits == 3,
+          "observed unit-2 notification");
+    call(0xBD2BDE07, cb, 0, 0, 0);
+    call(0xC6183D47, 1, 0, 0, 0);
+    CHECK(call(0x349D6D6C, 0, 0, 0, 0) == 0 && umd_hits == 3,
+          "unregistration prevents later notifications");
+    call(0xEDBA5844, cb, 0, 0, 0);
+    psp_umd_reset();
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -1822,6 +1863,7 @@ int main(void) {
     test_nids_match_names();
     test_sysmem();
     test_audio_output2();
+    test_umd_activation_callback();
     test_semaphores();
     test_create_attributes();
     test_event_flags();
