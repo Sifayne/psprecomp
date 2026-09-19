@@ -257,6 +257,84 @@ int psp_header_parse(const uint8_t *d, size_t len, psp_header *out) {
 
 /* ---- ELF / PRX ----------------------------------------------------------- */
 
+/* Read the module-info reference emitted by PSPSDK's psp-prxgen output_ph().
+ * The producer writes its allocated FILE offset to p_paddr and sets bit 31
+ * for a kernel module. We locate it only inside that first load segment.
+ * Independent source: PSPSDK 654ac51, tools/psp-prxgen.c:694-722 (BSD).
+ * This replaces the earlier source-cross-checked fallback; its provenance
+ * history is retained in the game's docs/PROVENANCE.md. */
+static void elf_prx_metadata(elf_info *e, const uint8_t *ph, size_t len) {
+    if (e->type != ET_PSP_PRX) return;
+    const uint32_t file = rd32(ph + 12) & ~(UINT32_C(1) << 31);
+    const uint32_t begin = rd32(ph + 4);
+    const uint32_t bytes = rd32(ph + 16);
+    const uint32_t address = rd32(ph + 8);
+    const uint32_t header_bytes = 52; /* PSPSDK tools/prxtypes.h: PspModuleInfo */
+    if (file < begin || file > len || len - file < header_bytes) return;
+    const uint32_t delta = file - begin;
+    if (delta > bytes || bytes - delta < header_bytes) return;
+    if (address > UINT32_MAX - delta) return;
+    e->modinfo_offset = file;
+    e->modinfo_addr = address + delta;
+    e->modinfo_size = header_bytes;
+}
+
+/* Translate a file-backed virtual range without assuming equal segment bias. */
+static int elf_file_range(const elf_info *e, size_t len, uint32_t addr,
+                          uint32_t size, uint32_t *offset) {
+    for (int i = 0; i < e->nsegments; i++) {
+        const elf_segment *s = &e->seg[i];
+        if (addr < s->addr) continue;
+        uint64_t delta = (uint64_t)addr - s->addr;
+        uint64_t off = (uint64_t)s->offset + delta;
+        if (delta + size <= s->filesz && off + size <= len && off <= UINT32_MAX) {
+            *offset = (uint32_t)off;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* With stripped section names the module's import descriptors still identify
+ * the thunks. Only accept a single contiguous span, as required by a_analysis.
+ * Tables with holes must not turn intervening guest code into firmware calls. */
+static void elf_import_extent(const uint8_t *d, size_t len, elf_info *e) {
+    psp_module_info mi;
+    if (e->stub_size || !e->modinfo_size ||
+        psp_modinfo_parse(d, len, e->modinfo_offset, &mi)) return;
+    uint32_t cursor = mi.stub_top, lo = UINT32_MAX, hi = 0, total = 0;
+    while (cursor < mi.stub_end) {
+        uint32_t off;
+        if (mi.stub_end - cursor < 20 || elf_file_range(e, len, cursor, 20, &off)) return;
+        uint32_t stride = (uint32_t)d[off + 8] * 4;
+        if (stride < 20 || stride > mi.stub_end - cursor) return;
+        uint32_t count = rd16(d + off + 10), start = rd32(d + off + 16);
+        uint32_t size = count * 8, ignored;
+        if (size) {
+            if ((uint64_t)start + size > UINT32_MAX ||
+                elf_file_range(e, len, start, size, &ignored) ||
+                (uint64_t)total + size > UINT32_MAX) return;
+            /* A hole and an overlap could otherwise cancel in the size sum.
+             * Earlier descriptors have already passed all range checks. */
+            for (uint32_t prior = mi.stub_top; prior < cursor;) {
+                uint32_t po;
+                if (elf_file_range(e, len, prior, 20, &po)) return;
+                uint32_t ps = rd32(d + po + 16), pn = rd16(d + po + 10) * 8u;
+                if (pn && start < ps + pn && ps < start + size) return;
+                prior += (uint32_t)d[po + 8] * 4;
+            }
+            if (start < lo) lo = start;
+            if (start + size > hi) hi = start + size;
+            total += size;
+        }
+        cursor += stride;
+    }
+    if (total && hi - lo == total && !elf_file_range(e, len, lo, total, &e->stub_offset)) {
+        e->stub_addr = lo;
+        e->stub_size = total;
+    }
+}
+
 int elf_parse(const uint8_t *d, size_t len, elf_info *out) {
     if (len < 52 || memcmp(d, "\x7f" "ELF", 4) != 0) return -1;
     if (d[4] != 1 || d[5] != 1) return -1;   /* ELFCLASS32, ELFDATA2LSB */
@@ -284,6 +362,8 @@ int elf_parse(const uint8_t *d, size_t len, elf_info *out) {
         s->memsz  = rd32(d + p + 20);
         s->flags  = rd32(d + p + 24);
 
+        if (n == 1) elf_prx_metadata(out, d + p, len);
+
         /* First executable (PF_X) segment is the .text we hand to the decoder. */
         if ((s->flags & 0x1) && out->text_size == 0) {
             out->text_addr   = s->addr;
@@ -300,7 +380,7 @@ int elf_parse(const uint8_t *d, size_t len, elf_info *out) {
     uint16_t shentsize = rd16(d + 46);
     uint16_t shnum     = rd16(d + 48);
     uint16_t shstrndx  = rd16(d + 50);
-    if (!shoff || shentsize < 40 || !shnum || shstrndx >= shnum) return 0;
+    if (!shoff || shentsize < 40 || !shnum) goto finish;
 
     out->shoff = shoff;
     out->shentsize = shentsize;
@@ -308,10 +388,12 @@ int elf_parse(const uint8_t *d, size_t len, elf_info *out) {
 
     /* Locate the section-name string table via its own section header. */
     size_t strhdr = (size_t)shoff + (size_t)shstrndx * shentsize;
-    if (strhdr + 40 > len) return 0;
-    uint32_t stroff = rd32(d + strhdr + 16);
-    uint32_t strsz  = rd32(d + strhdr + 20);
-    if ((size_t)stroff + strsz > len) return 0;
+    uint32_t stroff = 0, strsz = 0;
+    if (shstrndx < shnum && strhdr + 40 <= len) {
+        stroff = rd32(d + strhdr + 16);
+        strsz = rd32(d + strhdr + 20);
+        if ((size_t)stroff + strsz > len) strsz = 0;
+    }
 
     out->nsections = shnum;
 
@@ -323,6 +405,17 @@ int elf_parse(const uint8_t *d, size_t len, elf_info *out) {
         uint32_t addr    = rd32(d + sh + 12);
         uint32_t off     = rd32(d + sh + 16);
         uint32_t size    = rd32(d + sh + 20);
+        /* A nameless executable section containing e_entry is a better code
+         * bound than the entire RWX segment, which also contains data. */
+        uint32_t flags = rd32(d + sh + 8);
+        if (!out->text_from_section && rd32(d + sh + 4) == 1 && (flags & 6) == 6 &&
+            out->entry >= addr && (uint64_t)out->entry < (uint64_t)addr + size &&
+            (size_t)off + size <= len) {
+            out->text_addr = addr;
+            out->text_offset = off;
+            out->text_size = size;
+            out->text_from_section = 1;
+        }
         if (nameoff >= strsz) continue;
 
         const char *name = (const char *)(d + stroff + nameoff);
@@ -366,6 +459,8 @@ int elf_parse(const uint8_t *d, size_t len, elf_info *out) {
             out->modinfo_size = size;
         }
     }
+finish:
+    elf_import_extent(d, len, out);
     return 0;
 }
 

@@ -173,6 +173,45 @@ static void test_elf(void) {
     CHECK(e.nsegments == 0, "a bogus phoff yields no segments");
 }
 
+static void test_unnamed_prx(void) {
+    uint8_t buf[0x400] = {0};
+    memcpy(buf, "\x7f" "ELF", 4); buf[4] = 1; buf[5] = 1;
+    put16(buf + 16, ET_PSP_PRX); put32(buf + 24, 0x1010);
+    put32(buf + 28, 52); put16(buf + 42, 32); put16(buf + 44, 1);
+    put32(buf + 32, 0x300); put16(buf + 46, 40); put16(buf + 48, 2);
+    uint8_t *ph = buf + 52;
+    put32(ph, 1); put32(ph + 4, 0x80); put32(ph + 8, 0x1000);
+    put32(ph + 12, 0x80000100); /* module-info file offset with flag */
+    put32(ph + 16, 0x200); put32(ph + 20, 0x200); put32(ph + 24, 7);
+    memcpy(buf + 0x104, "synthetic", 10);
+    put32(buf + 0x12C, 0x10C0); put32(buf + 0x130, 0x10E8);
+    /* Two imports in reverse address order, one 8-byte thunk each. */
+    buf[0x148] = 5; put16(buf + 0x14A, 1); put32(buf + 0x150, 0x1048);
+    buf[0x15C] = 5; put16(buf + 0x15E, 1); put32(buf + 0x164, 0x1040);
+    uint8_t *sh = buf + 0x328;
+    put32(sh + 4, 1); put32(sh + 8, 6); put32(sh + 12, 0x1000);
+    put32(sh + 16, 0x80); put32(sh + 20, 0x40);
+    elf_info e;
+    CHECK(!elf_parse(buf, sizeof buf, &e), "parse PRX with unnamed sections");
+    CHECK(e.text_from_section && e.text_size == 0x40, "exclude data from code extent");
+    CHECK(e.modinfo_offset == 0x100 && e.modinfo_addr == 0x1080, "p_paddr is a file offset");
+    CHECK(e.stub_addr == 0x1040 && e.stub_size == 16 && e.stub_offset == 0xC0,
+          "derive firmware thunks from import descriptors");
+    put32(buf + 32, 0); put16(buf + 48, 0);
+    CHECK(!elf_parse(buf, sizeof buf, &e) && e.modinfo_size == 52 && e.stub_size == 16,
+          "module info and imports work with no section table");
+    put32(buf + 0x150, 0x1050);
+    CHECK(!elf_parse(buf, sizeof buf, &e) && !e.stub_size, "do not swallow code between thunks");
+    put32(buf + 0x150, 0x1048); buf[0x148] = 1;
+    CHECK(!elf_parse(buf, sizeof buf, &e) && !e.stub_size, "reject malformed descriptor stride");
+    buf[0x148] = 5; put32(buf + 0x130, 0xFFFFFFFF);
+    CHECK(!elf_parse(buf, sizeof buf, &e) && !e.stub_size, "bound import table reads");
+    put32(ph + 12, 0xFFFFFFF0);
+    CHECK(!elf_parse(buf, sizeof buf, &e) && !e.modinfo_size, "bound module-info offset");
+    put32(ph + 12, 0x100); put16(buf + 16, 2);
+    CHECK(!elf_parse(buf, sizeof buf, &e) && !e.modinfo_size, "p_paddr fallback is PRX-specific");
+}
+
 static void test_sfo(void) {
     /* PARAM.SFO: a key table and a data table, both at header-declared offsets.
      * We check that a malformed one is refused rather than walked. */
@@ -282,6 +321,7 @@ int main(void) {
     test_pbp();
     test_psp_header();
     test_elf();
+    test_unnamed_prx();
     test_sfo();
     test_rebase();
 
