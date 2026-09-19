@@ -723,12 +723,18 @@ static void test_net(void) {
     /* The two value-returning calls. Ntostr is void: only the string is
      * checked, not $v0. An invalid pointer is skipped, not faulted. */
     const uint32_t MAC = 0x08830100u, BUF = 0x08830200u;
+    const uint8_t address[] = {0x02, 0x34, 0x56, 0x78, 0x9a, 0xbc};
+    psp_mem_write_block(MAC, address, sizeof address);
+    psp_write32(BUF-4, 0x87654321);
+    psp_write32(BUF+18, 0x12345678);
     call(psp_nid("sceNetEtherNtostr"), MAC, BUF, 0, 0);
     char got[32];
-    CHECK(strcmp(psp_str(BUF, got, sizeof got), "00:00:00:00:00:00") == 0,
-          "ntostr formats the zero MAC, got \"%s\"", got);
+    CHECK(strcmp(psp_str(BUF, got, sizeof got), "02:34:56:78:9a:bc") == 0,
+          "ntostr formats the caller's MAC, got \"%s\"", got);
+    CHECK(psp_read32(BUF-4)==0x87654321 && psp_read32(BUF+18)==0x12345678,
+          "ntostr respects the buffer's bounds");
     call(psp_nid("sceNetEtherNtostr"), 0xDEADBEEFu, BUF, 0, 0);
-    CHECK(strcmp(psp_str(BUF, got, sizeof got), "00:00:00:00:00:00") == 0,
+    CHECK(strcmp(psp_str(BUF, got, sizeof got), "02:34:56:78:9a:bc") == 0,
           "ntostr with a bad source leaves the buffer");
     CHECK(call(psp_nid("sceWlanGetSwitchState"), 0, 0, 0, 0) == 0,
           "the WLAN switch reads off");
