@@ -59,6 +59,15 @@ add_test(NAME kernel_observed COMMAND test_kernel_observed
          ${CMAKE_CURRENT_SOURCE_DIR}/provenance/kernel/observed.txt)
 set_tests_properties(kernel_observed PROPERTIES TIMEOUT 10)
 
+# sceMpeg follows mpegprobe (fw 6.60) where it measured: the handle is the
+# buffer, the ring's word after the struct is the caller's gp, InitAu leaves
+# the timestamps and sets size 0, and the stream-size query checks the size
+# word, not the magic. provenance/mpeg/observed.txt, recorded under an
+# emulator, differs in exactly those 176 checks, so its checker is built for
+# reference but not run.
+add_executable(test_mpeg_observed test_mpeg_observed.c)
+target_link_libraries(test_mpeg_observed PRIVATE psprecomp allegrex_core)
+
 add_executable(test_vfpu test_vfpu.c)
 target_link_libraries(test_vfpu PRIVATE psprecomp)
 add_test(NAME vfpu COMMAND test_vfpu)
@@ -129,6 +138,11 @@ add_test(NAME savedata COMMAND test_savedata)
 # for reference but not run.
 add_executable(test_savedata_observed test_savedata_observed.c)
 target_link_libraries(test_savedata_observed PRIVATE psprecomp)
+
+add_executable(test_mpeg_au test_mpeg_au.c)
+target_link_libraries(test_mpeg_au PRIVATE psprecomp)
+add_test(NAME mpeg_au COMMAND test_mpeg_au)
+set_tests_properties(mpeg_au PROPERTIES SKIP_RETURN_CODE 77)
 
 add_executable(test_vrnd_observed test_vrnd_observed.c)
 target_link_libraries(test_vrnd_observed PRIVATE psprecomp)

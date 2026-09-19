@@ -1,0 +1,26 @@
+{
+  "suite": "mpeg",
+  "command": [
+    "/usr/bin/PPSSPPHeadless",
+    "--root",
+    "/home/sif/Projects/third-birthday-recomp/reports/148-mpeg",
+    "--timeout=30",
+    "-l",
+    "/home/sif/Projects/third-birthday-recomp/reports/148-mpeg/probe.elf"
+  ],
+  "executable_sha256": "c065cf204335e9eb26a85592947e9f8fb4ddc718bc4eaad2ce06240a01d82f8d",
+  "runner_sha256": "a2e6039ecb53ce876ddbb03f51efa71d3402f6fa191bd26b93cfe0013bfc5e5c",
+  "probe_sha256": "1b78d822b75097942ab40e6237cd2712a70b75d84ee2f40d7584ca999855464b",
+  "observations_sha256": "a5cfbbed09bad87f3bf3ca089796ee59de116ba452803842893625667aed47c3",
+  "fixture_sha256": "a5cfbbed09bad87f3bf3ca089796ee59de116ba452803842893625667aed47c3",
+  "sources": {
+    "probe.c": "2fa5c095ad8f4645d397070f356910397f712de993c41bbadda02acb346b204c",
+    "abi.S": "49cfe801e915edf02181bb92fb8d6bad0315e7f6803770a8868a6f8ffbd39960",
+    "imports.S": "4618c41c308226d6912f9f70b7bde7e2443484c9fc65248df14686661e7e82b8",
+    "probe.ld": "f46ef37392ea8cf736ed7217401708ec9f18bc2c4294a21e249b5911d503fea6"
+  },
+  "clang": "clang version 22.1.8",
+  "linker": "LLD 22.1.8 (compatible with GNU linkers)",
+  "observations": 148,
+  "evidence": "external executable output; not physical PSP"
+}
