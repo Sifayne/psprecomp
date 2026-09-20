@@ -48,6 +48,11 @@ add_test(NAME ge_callback COMMAND test_ge_callback
          ${CMAKE_CURRENT_SOURCE_DIR}/provenance/ge/observed.txt)
 set_tests_properties(ge_callback PROPERTIES TIMEOUT 10)
 
+add_executable(test_ge_sync test_ge_sync.c)
+target_link_libraries(test_ge_sync PRIVATE psprecomp)
+add_test(NAME ge_sync COMMAND test_ge_sync)
+add_test(NAME ge_sync_capture COMMAND test_ge_sync sync-capture.gcap)
+
 add_executable(test_thread_lifecycle test_thread_lifecycle.c)
 target_link_libraries(test_thread_lifecycle PRIVATE psprecomp allegrex_core)
 add_test(NAME thread_lifecycle COMMAND test_thread_lifecycle)

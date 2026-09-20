@@ -303,6 +303,11 @@ static int fx16_sat(float f) {
 /* SIGNAL behaviour emitted by sceGuSignal(GU_SIGNAL_PAUSE); PSPSDK's pspgu.h
  * defines GU_SIGNAL_PAUSE as 3. */
 #define GE_SIGNAL_HANDLER_PAUSE 0x03
+/* PSPSDK pspge.h's PSP_GE_SIGNAL_SYNC: a SIGNAL 08 / END / FINISH / END
+ * sequence is a sync point inside the list, not its end. The 3rd
+ * Birthday's list writer (003FC590) emits it and goes on writing the HUD
+ * after it. Not measured on a PSP. */
+#define GE_SIGNAL_SYNC 0x08
 
 /* Primitive types, from the PRIM argument's type field. */
 static const char *const PRIM_NAME[8] = {
@@ -316,7 +321,7 @@ typedef struct {
     uint32_t stall;     /* stop before this address; 0 means "no stall" */
     uint32_t base;      /* GE_BASE: high bits for addresses */
     uint32_t origin;
-    int      signal;    /* pending PAUSE through its FINISH/END pair */
+    int      signal;    /* pending PAUSE or SYNC through its FINISH/END pair */
     int      used;
     int      done;
     int      cbid;      /* sceGeSetCallback id given at EnQueue; -1 none */
@@ -3971,6 +3976,13 @@ static void run_list_body(ge_queue *q) {
             break;
 
         case GE_FINISH:
+            if (q->signal == GE_SIGNAL_SYNC) {
+                /* A sync point's FINISH flushes what came before it and the
+                 * list goes on: no finish handler, no capture snapshot, and
+                 * the list is not done. The END after it clears the mark. */
+                psp_render_current()->finish();
+                break;
+            }
             if (q->signal == GE_SIGNAL_HANDLER_PAUSE) {
                 /* sceGuSignal(GU_SIGNAL_PAUSE) writes SIGNAL, END, FINISH,
                  * END. geprobe 5 step 57 (fw 6.60): the signal handler runs
@@ -4012,7 +4024,7 @@ static void run_list_body(ge_queue *q) {
             uint32_t signal = psp_read32(q->list - 8);
             if ((signal >> 24) != GE_SIGNAL) {
                 if ((signal >> 24) == GE_FINISH &&
-                    q->signal == GE_SIGNAL_HANDLER_PAUSE) {
+                    (q->signal == GE_SIGNAL_HANDLER_PAUSE || q->signal == GE_SIGNAL_SYNC)) {
                     q->signal = 0;
                     break;
                 }
@@ -4025,7 +4037,7 @@ static void run_list_body(ge_queue *q) {
             }
 
             uint32_t behaviour = (signal >> 16) & 0xFF;
-            if (behaviour == GE_SIGNAL_HANDLER_PAUSE) {
+            if (behaviour == GE_SIGNAL_HANDLER_PAUSE || behaviour == GE_SIGNAL_SYNC) {
                 q->signal = (int)behaviour;
             }
             break;
