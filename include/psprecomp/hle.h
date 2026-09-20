@@ -76,6 +76,10 @@ void psp_mpeg_reset(void);
  * environment default. Returns -1 if decoding is requested but unavailable. */
 int psp_mpeg_set_decoding(int enabled);
 int psp_mpeg_decoding_available(void);
+/* Whether a late movie picture may be dropped to hold the sound (1), or every
+ * picture is handed over (0); -1 restores the PSPRECOMP_MPEG_NODROP default.
+ * See the catch-up comment in mpeg.c for what each choice costs. */
+int psp_mpeg_set_drop(int enabled);
 
 void psp_hle_dump_recent(FILE *out);
 
