@@ -156,3 +156,9 @@ add_executable(test_pixels_observed test_pixels_observed.c)
 target_link_libraries(test_pixels_observed PRIVATE psprecomp)
 add_test(NAME pixels_observed COMMAND test_pixels_observed
          ${CMAKE_CURRENT_SOURCE_DIR}/provenance/pixels/observed.txt)
+
+add_executable(test_disc_observed test_disc_observed.c)
+target_link_libraries(test_disc_observed PRIVATE psprecomp allegrex_core)
+add_test(NAME disc_observed COMMAND test_disc_observed
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/observed.txt
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/probe.iso)

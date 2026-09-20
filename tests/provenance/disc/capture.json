@@ -1,0 +1,28 @@
+{
+  "suite": "disc",
+  "command": [
+    "/usr/bin/PPSSPPHeadless",
+    "--root",
+    "/home/sif/Projects/third-birthday-recomp/reports/162-disc",
+    "--timeout=30",
+    "-l",
+    "/home/sif/Projects/third-birthday-recomp/reports/162-disc/probe.iso"
+  ],
+  "executable_sha256": "c065cf204335e9eb26a85592947e9f8fb4ddc718bc4eaad2ce06240a01d82f8d",
+  "runner_sha256": "71b7d3a8529323f4f929403a901867896423a2b07c5045a9cf54ed7139ed22b8",
+  "probe_sha256": "b652852fb5b56dd6e9afe6ff66b0c91392a94ace71b136484e3159e0a966f341",
+  "observations_sha256": "1eb693b0fe02fcdb3cb458f4af9b508705e85fb23f30d86d9aefba7ba11a744e",
+  "fixture_sha256": "1eb693b0fe02fcdb3cb458f4af9b508705e85fb23f30d86d9aefba7ba11a744e",
+  "sources": {
+    "probe.c": "989d4691004a63911f30b51cd76f3f58ff72a28c1770258ed62936b4b5c142e8",
+    "abi.S": "55b594718bab1e197f50d49a5ce344f1057ba3d7c86fcb4450873264f79ebbbe",
+    "imports.S": "b0d7d8070a42cdd9e20b7a4a804f21d714d3c23a571f3dc428ed9fb228408446",
+    "probe.ld": "f46ef37392ea8cf736ed7217401708ec9f18bc2c4294a21e249b5911d503fea6",
+    "make_iso.py": "b22d8d5b9f776713c1c5903fe360a757472fc509009562bd9621e6a3145b0370"
+  },
+  "image_sha256": "ca07ca04021f867751470468de16325802835ba066eafc763b6d41d2ef6c46f7",
+  "clang": "clang version 22.1.8",
+  "linker": "LLD 22.1.8 (compatible with GNU linkers)",
+  "observations": 154,
+  "evidence": "external executable output; not physical PSP"
+}

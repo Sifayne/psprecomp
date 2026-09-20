@@ -380,11 +380,13 @@ void psp_io_set_root(const char *root);
 
 /* Back the raw UMD block device with a disc image.
  *
- * `disc0:` is the ISO9660 filesystem and maps to a directory; `umd0:` and
- * `umd1:` are the block device underneath it, and a game opens those by bare
- * name to read sectors -- which is how a PSP title reaches its own data when it
- * does not want the filesystem. With no image set those opens fail, and a game
- * that retries on failure never gets past its first read. */
+ * `disc0:` is the ISO9660 filesystem, served from the image when one is set
+ * and from a directory otherwise; `umd0:` and `umd1:` are the block device
+ * underneath it, and a game opens those by bare name to read sectors -- which
+ * is how a PSP title reaches its own data when it does not want the
+ * filesystem (tests/provenance/disc, run as a game booted from its image).
+ * With no image set those opens fail, and a game that retries on failure
+ * never gets past its first read. */
 void psp_io_set_umd_image(const char *path);
 uint64_t psp_io_bytes_read(void);
 /* Map a guest path to its host path (same rewriting opens use). For layers

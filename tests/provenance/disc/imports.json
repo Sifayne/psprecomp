@@ -1,0 +1,37 @@
+{
+  "name": "IndependentDiscProbe",
+  "imports": {
+    "IoFileMgrForUser": [
+      "sceIoWrite",
+      "sceIoOpen",
+      "sceIoClose",
+      "sceIoRead",
+      "sceIoLseek",
+      "sceIoLseek32",
+      "sceIoGetstat",
+      "sceIoDopen",
+      "sceIoDread",
+      "sceIoDclose",
+      "sceIoOpenAsync",
+      "sceIoReadAsync",
+      "sceIoLseekAsync",
+      "sceIoCloseAsync",
+      "sceIoPollAsync",
+      "sceIoWaitAsync",
+      "sceIoWaitAsyncCB",
+      "sceIoGetAsyncStat"
+    ],
+    "LoadExecForUser": [
+      "sceKernelExitGame"
+    ],
+    "ThreadManForUser": [
+      "sceKernelDelayThread"
+    ],
+    "sceUmdUser": [
+      "sceUmdActivate",
+      "sceUmdDeactivate",
+      "sceUmdWaitDriveStatWithTimer",
+      "sceUmdGetDriveStat"
+    ]
+  }
+}

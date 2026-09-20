@@ -37,7 +37,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", help="path to an external PPSSPPHeadless executable")
     parser.add_argument("output", type=Path, help="new output directory")
-    parser.add_argument("--suite", choices=("vrnd", "umd", "intr", "ge", "vertices", "savedata", "kernel", "mpeg", "pixels"), default="vrnd")
+    parser.add_argument("--suite", choices=("vrnd", "umd", "intr", "ge", "vertices", "savedata", "kernel", "mpeg", "pixels", "disc"), default="vrnd")
     args = parser.parse_args()
     executable = Path(shutil.which(args.executable) or args.executable).resolve(strict=True)
     output = args.output.resolve()
@@ -52,7 +52,7 @@ def main():
              else ["probe.c", "imports.S", "probe.ld"])
     if args.suite in ("intr", "ge"):
         names.insert(1, "control.S")
-    if args.suite in ("kernel", "mpeg"):
+    if args.suite in ("kernel", "mpeg", "disc"):
         names.insert(1, "abi.S")
     for name in names[:-1]:
         obj = output / (Path(name).stem + ".o")
@@ -64,6 +64,14 @@ def main():
     command = [str(executable), "--root", str(output), "--timeout=30", "-l", str(elf)]
     if args.suite in ("vertices", "pixels"):
         command.insert(1, "--graphics=software")
+    if args.suite == "disc":
+        # The probe runs as a game booted from its own disc: make_iso.py puts
+        # the ELF just built into a bootable ISO 9660 image of its own, and
+        # the executable is given the image, not the ELF. (Loaded from the
+        # host with the image mounted by -m, the same probe sees no umd0:.)
+        image = output / "probe.iso"
+        subprocess.run(["python3", str(source / "make_iso.py"), str(elf), "-o", str(image)], check=True)
+        command[-1] = str(image)
     if args.suite == "savedata":
         # Hide the entire real home. The observed executable uses ~/.ppsspp
         # as ms0; --root is host0 and does not isolate savedata by itself.
@@ -109,9 +117,9 @@ def main():
     elif args.suite == "vertices":
         if not lines or not lines[-1].startswith("00000002 "):
             raise RuntimeError("incomplete vertex experiment; see diagnostics.txt")
-    elif args.suite == "pixels":
+    elif args.suite in ("pixels", "disc"):
         if not lines or not lines[-1].startswith("00000009 "):
-            raise RuntimeError("incomplete pixel experiment; see diagnostics.txt")
+            raise RuntimeError(f"incomplete {args.suite} experiment; see diagnostics.txt")
     elif args.suite == "ge":
         if not 85 <= len(lines) <= 117 or not lines[-1].startswith("00000003 "):
             raise RuntimeError("incomplete GE version experiment; see diagnostics.txt")
@@ -125,7 +133,9 @@ def main():
                     probe_sha256=digest(elf), observations_sha256=digest(output / "observed.txt"),
                     fixture_sha256=digest(output / "fixture.txt"),
                     sources={name: digest(source / name) for name in names +
-                             (["cases.h", "cases.json", "make_cases.py"] if args.suite == "vertices" else [])},
+                             (["cases.h", "cases.json", "make_cases.py"] if args.suite == "vertices" else
+                              ["make_iso.py"] if args.suite == "disc" else [])},
+                    **({"image_sha256": digest(output / "probe.iso")} if args.suite == "disc" else {}),
                     clang=subprocess.check_output(["clang", "--version"], text=True).splitlines()[0],
                     linker=subprocess.check_output(["ld.lld", "--version"], text=True).strip(),
                     observations=len(lines), evidence="external executable output; not physical PSP")

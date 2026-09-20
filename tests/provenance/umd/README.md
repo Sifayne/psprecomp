@@ -26,8 +26,11 @@ Unit 0 returns `0x80010016` without notifying; units 1 and 2 notify, including
 with a null drive argument. Unregistration stops later notifications.
 
 The probe intentionally records more than this replacement implements.
-Deactivation and delayed transitions back to READY (steps 11 onward) are
-not reproduced by the runtime's mounted-image policy. The unregister return
+Deactivation now drops the drive state from 0x32 to 0x12, `sceUmdGetDriveStat`
+reports it, and a wait for READY afterwards returns the recorded timeout
+result (steps 11 and 22); no observed step brings READY back, so nothing
+does. The disc probe (`../disc`, kind 8) records the same states around its
+own activation. The unregister return
 value in this executable is a callback ID; the host returns zero. The tests
 check removal, not identity of that return value. Physical drive timing,
 invalid callback IDs, absent media and unmeasured unit values remain outside
