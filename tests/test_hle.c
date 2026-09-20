@@ -1869,6 +1869,38 @@ static void test_umd_activation_callback(void) {
     psp_umd_reset();
 }
 
+/* Original host-interface test: a completed outer call may offer a scheduling
+ * opportunity, but nested calls must not expose partially executed handlers. */
+static unsigned host_work_calls, host_inner_done;
+static uint32_t host_work_nid, host_work_result;
+static void host_inner(void) { host_inner_done++; psp_ret(17); }
+static void host_outer(void) {
+    psp_hle_call(0xff001001u);
+    CHECK(host_work_calls == 0, "no host callback inside outer handler");
+    CHECK(psp_cpu.r[PSP_REG_V0] == 17, "nested handler result preserved");
+    psp_ret(29);
+}
+static void host_work(uint32_t nid, uint64_t elapsed_ns) {
+    (void)elapsed_ns;
+    host_work_calls++;
+    host_work_nid = nid;
+    host_work_result = psp_cpu.r[PSP_REG_V0];
+    CHECK(host_inner_done == 1, "inner call completed before host callback");
+    psp_sched_yield();
+}
+static void test_host_work_boundary(void) {
+    psp_hle_register_unnamed(0xff001001u, "host-test", host_inner);
+    psp_hle_register_unnamed(0xff001002u, "host-test", host_outer);
+    host_work_calls = host_inner_done = 0;
+    psp_hle_set_host_work(host_work);
+    CHECK(call(0xff001002u, 0, 0, 0, 0) == 29, "host yield preserves outer result");
+    CHECK(host_work_calls == 1 && host_work_nid == 0xff001002u && host_work_result == 29,
+          "one callback observes the completed outer call");
+    psp_hle_set_host_work(NULL);
+    call(0xff001001u, 0, 0, 0, 0);
+    CHECK(host_work_calls == 1, "unregistering disables callback");
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -1907,6 +1939,7 @@ int main(void) {
     test_time_calls();
     test_pool_free_pointers();
     test_waits_with_threads();
+    test_host_work_boundary();
 
     psp_mem_free();
 

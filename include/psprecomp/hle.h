@@ -48,6 +48,13 @@ int psp_hle_is_named(int index);
 /* Call a firmware function by NID. An unregistered NID reports itself by name
  * where possible and by number otherwise, rather than failing silently. */
 void psp_hle_call(uint32_t nid);
+/* Optional host scheduling policy, configured before guest execution. Called
+ * after an outermost registered handler has completed and written its result,
+ * before returning to guest code. elapsed_ns measures the handler's host wall
+ * duration (possibly including suspension), not emulated CPU cycles. Nested
+ * calls are excluded so a host cannot yield halfway through an outer handler.
+ * NULL disables both the callback and timing. No default firmware policy. */
+void psp_hle_set_host_work(void (*fn)(uint32_t nid, uint64_t elapsed_ns));
 
 /* Silence the per-call "unimplemented firmware call" message. Intended for
  * batch callers making millions of calls; see the note in hle.c. */
