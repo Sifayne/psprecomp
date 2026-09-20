@@ -37,7 +37,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", help="path to an external PPSSPPHeadless executable")
     parser.add_argument("output", type=Path, help="new output directory")
-    parser.add_argument("--suite", choices=("vrnd", "umd", "intr", "ge", "vertices", "savedata", "kernel", "mpeg"), default="vrnd")
+    parser.add_argument("--suite", choices=("vrnd", "umd", "intr", "ge", "vertices", "savedata", "kernel", "mpeg", "pixels"), default="vrnd")
     args = parser.parse_args()
     executable = Path(shutil.which(args.executable) or args.executable).resolve(strict=True)
     output = args.output.resolve()
@@ -62,7 +62,7 @@ def main():
     subprocess.run(["ld.lld", "-m", "elf32ltsmip", "-T", str(source / "probe.ld"),
                     *objects, "-o", str(elf)], check=True)
     command = [str(executable), "--root", str(output), "--timeout=30", "-l", str(elf)]
-    if args.suite == "vertices":
+    if args.suite in ("vertices", "pixels"):
         command.insert(1, "--graphics=software")
     if args.suite == "savedata":
         # Hide the entire real home. The observed executable uses ~/.ppsspp
@@ -109,6 +109,9 @@ def main():
     elif args.suite == "vertices":
         if not lines or not lines[-1].startswith("00000002 "):
             raise RuntimeError("incomplete vertex experiment; see diagnostics.txt")
+    elif args.suite == "pixels":
+        if not lines or not lines[-1].startswith("00000009 "):
+            raise RuntimeError("incomplete pixel experiment; see diagnostics.txt")
     elif args.suite == "ge":
         if not 85 <= len(lines) <= 117 or not lines[-1].startswith("00000003 "):
             raise RuntimeError("incomplete GE version experiment; see diagnostics.txt")

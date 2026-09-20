@@ -151,3 +151,8 @@ add_executable(test_vertex_observed test_vertex_observed.c)
 target_link_libraries(test_vertex_observed PRIVATE psprecomp)
 add_test(NAME vertex_observed COMMAND test_vertex_observed
          ${CMAKE_CURRENT_SOURCE_DIR}/provenance/vertices/observed.txt)
+
+add_executable(test_pixels_observed test_pixels_observed.c)
+target_link_libraries(test_pixels_observed PRIVATE psprecomp)
+add_test(NAME pixels_observed COMMAND test_pixels_observed
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/pixels/observed.txt)

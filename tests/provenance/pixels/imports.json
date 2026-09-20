@@ -1,0 +1,15 @@
+{
+  "name": "IndependentPixelProbe",
+  "imports": {
+    "IoFileMgrForUser": [
+      "sceIoWrite"
+    ],
+    "LoadExecForUser": [
+      "sceKernelExitGame"
+    ],
+    "sceGe_user": [
+      "sceGeListEnQueue",
+      "sceGeListSync"
+    ]
+  }
+}

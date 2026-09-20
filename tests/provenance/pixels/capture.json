@@ -1,0 +1,26 @@
+{
+  "suite": "pixels",
+  "command": [
+    "/usr/bin/PPSSPPHeadless",
+    "--graphics=software",
+    "--root",
+    "/home/sif/Projects/third-birthday-recomp/reports/152-pixels",
+    "--timeout=30",
+    "-l",
+    "/home/sif/Projects/third-birthday-recomp/reports/152-pixels/probe.elf"
+  ],
+  "executable_sha256": "c065cf204335e9eb26a85592947e9f8fb4ddc718bc4eaad2ce06240a01d82f8d",
+  "runner_sha256": "317ed3e6073d4a4a53d0698ac03397f3f825e1375512299fa8a0de042c2a3117",
+  "probe_sha256": "8da20a1ec7a5ab16335fa94f51b6a850b278ec96b30b09b9d2ee5ec8ffe89a9d",
+  "observations_sha256": "eb3ddec12a8ca5e3988a098ec7f0425fed9900e03a0c017d5b7190cd77981f14",
+  "fixture_sha256": "eb3ddec12a8ca5e3988a098ec7f0425fed9900e03a0c017d5b7190cd77981f14",
+  "sources": {
+    "probe.c": "2eeb17b750e2b697e7e23e824b1058f356f843e9228149cfe90cb090ad16723e",
+    "imports.S": "aff449eb5847969b422cf4e2658c0c426fb0a3cc79a80141b02eaa838b334eaf",
+    "probe.ld": "f46ef37392ea8cf736ed7217401708ec9f18bc2c4294a21e249b5911d503fea6"
+  },
+  "clang": "clang version 22.1.8",
+  "linker": "LLD 22.1.8 (compatible with GNU linkers)",
+  "observations": 5374,
+  "evidence": "external executable output; not physical PSP"
+}
