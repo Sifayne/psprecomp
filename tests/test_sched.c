@@ -56,6 +56,8 @@ static int failures;
 #define ENTRY_TIMED    0x00005000u
 #define ENTRY_TWOKEN   0x00006000u
 #define ENTRY_TWAKER   0x00007000u
+#define ENTRY_SLEEPER  0x0000D000u
+#define ENTRY_SPINNER  0x0000E000u
 
 #define UID_WAITER     0x00040001u
 #define UID_WAKER      0x00040002u
@@ -63,6 +65,8 @@ static int failures;
 #define UID_STRANDED   0x00040004u
 #define UID_TIMED      0x00040005u
 #define UID_TWOKEN     0x00040006u
+#define UID_SLEEPER    0x00040007u
+#define UID_SPINNER    0x00040008u
 
 /* A guest stack pointer. Never dereferenced — thread_main only copies it into
  * $sp, and none of these bodies touch memory. */
@@ -131,6 +135,25 @@ static void body_waker(void) {
 
 static void body_waker_timed(void) {
     psp_sched_wake(UID_TWOKEN);
+}
+
+/* A frame loop that delays, and a worker that never blocks. */
+#define SPIN_LIMIT 50000
+
+static volatile int spin_count, spin_at_wake, sleeper_woke;
+
+static void body_sleeper(void) {
+    psp_sched_delay(2000);                /* 2 ms: expires inside one 5 ms slice */
+    spin_at_wake = spin_count;
+    sleeper_woke = 1;
+    check_one_running("inside sleeper, after its delay");
+}
+
+static void body_spinner(void) {
+    for (spin_count = 0; spin_count < SPIN_LIMIT && !sleeper_woke; spin_count++) {
+        psp_clock_tick();                 /* what every firmware call costs */
+        psp_sched_tick();
+    }
 }
 
 /* A timed wait nothing will ever satisfy: released by its own deadline. */
@@ -588,6 +611,37 @@ static void test_thread_counters(void) {
           st_after.releases, st_after.thread_preempts, st_after.intr_preempts);
 }
 
+/* An expired delay beats a thread that never blocks.
+ *
+ * Ticks are the only place a spinner can give way, and a tick only rotates
+ * when somebody else could run. A sleeper whose deadline has passed still
+ * reads SLEEPING until a handoff promotes it, so a tick that counted only
+ * READY threads let the spinner keep the CPU through every expired delay.
+ * Armored Core 3 Portable's movie decoder did exactly that at the end of the
+ * prologue: it spun on sceMpegRingbufferAvailableSize while the frame loop sat
+ * in a 16.9 ms sceKernelDelayThread, and the game never polled the pad again.
+ *
+ * The sleeper outranks the spinner, as a frame loop outranks a worker, so once
+ * it is runnable it is also the one that runs. */
+static void test_expired_delay_preempts_a_spinner(void) {
+    psp_sched_reset();
+    psp_sched_set_threading(1);
+    psp_clock_reset();
+    spin_count = spin_at_wake = sleeper_woke = 0;
+
+    CHECK(psp_sched_spawn(UID_SLEEPER, ENTRY_SLEEPER, FAKE_SP, 0, 0, 0, 30) == 0,
+          "spawning the sleeper failed");
+    CHECK(psp_sched_spawn(UID_SPINNER, ENTRY_SPINNER, FAKE_SP, 0, 0, 0, 40) == 0,
+          "spawning the spinner failed");
+
+    const int live = psp_sched_drain(5);
+    CHECK(live == 0, "%d thread(s) still alive", live);
+    CHECK(sleeper_woke, "the sleeper never woke");
+    CHECK(spin_at_wake > 0 && spin_at_wake < SPIN_LIMIT,
+          "the sleeper ran after %d spinner ticks; it should have been let in "
+          "before the spinner gave up at %d", spin_at_wake, SPIN_LIMIT);
+}
+
 int main(void) {
     psp_register(ENTRY_Q_C + 0x30, body_st);
     psp_register(ENTRY_Q_C + 0x40, body_st_hi);
@@ -605,6 +659,8 @@ int main(void) {
     psp_register(ENTRY_TIMED,    body_timed);
     psp_register(ENTRY_TWOKEN,   body_timed_woken);
     psp_register(ENTRY_TWAKER,   body_waker_timed);
+    psp_register(ENTRY_SLEEPER,  body_sleeper);
+    psp_register(ENTRY_SPINNER,  body_spinner);
 
     psp_sched_init();
 
@@ -613,6 +669,7 @@ int main(void) {
     test_thread_inherits_gp();
     test_timed_wait_expires_when_nothing_can_satisfy_it();
     test_timed_wait_prefers_a_signal();
+    test_expired_delay_preempts_a_spinner();
     test_block_and_wake_round_trip();
     test_thread_identity();
     test_guest_thread_unsatisfiable_wait();
