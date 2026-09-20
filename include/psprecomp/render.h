@@ -290,6 +290,13 @@ typedef struct {
      * does not transform vertices again. Hosts can use it to distinguish
      * inset 3D views from the main scene on both CPU and GPU transform paths. */
     void (*set_viewport)(float x, float y, float width, float height);
+
+    /* Optional: sceDisplaySetFrameBuf's buffer, its stride in pixels and its
+     * pixel format, given just before present(). A backend that composes its
+     * own targets shows this buffer -- not the last one the GE drew into --
+     * so a buffer the CPU or a DMA filled, such as a decoded movie picture,
+     * is what the window shows. */
+    void (*set_display)(uint32_t addr, uint32_t stride, int fmt);
 } psp_render_backend;
 
 /* Select a backend by name ("software", "null", ...). Returns 0 on success,
@@ -320,6 +327,15 @@ size_t psp_render_decode_level(const psp_tex_state *t, int level,
                                const psp_clut_state *clut,
                                uint32_t *out, size_t cap,
                                int *out_w, int *out_h);
+/* Host upload variant: preserve the declared dimensions, filling texels whose
+ * source or palette entry lies outside its backing region with transparent
+ * padding. Reports those texels separately; does not pretend they were guest
+ * reads or emulate hardware mirroring. The strict decoder and software
+ * sampler continue to report invalid sampled memory normally. */
+size_t psp_render_decode_level_padded(const psp_tex_state *t, int level,
+                                      const psp_clut_state *clut,
+                                      uint32_t *out, size_t cap,
+                                      int *out_w, int *out_h, size_t *padded);
 
 /* Resolve the PSP's per-primitive level of detail to a signed count of
  * sixteenths. `rho` is the greatest texture-coordinate gradient in texels per

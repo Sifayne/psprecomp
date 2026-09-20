@@ -280,7 +280,10 @@ static void hle_SetFrameBuf(void) {
      * into its own buffer, and present() is where it reads back into the
      * guest framebuffer those two are about to read. Wire it after them and
      * every instrument in this file measures the previous frame. */
-    psp_render_current()->present();
+    const psp_render_backend *backend = psp_render_current();
+    if (backend->set_display)
+        backend->set_display(g_fb_addr, g_fb_width, (int)g_fb_format);
+    backend->present();
     score_frame(g_fb_addr);
     dump_frame_seq(g_fb_addr);
     /* The frame flip. What the game hands the display is what a window shows;
