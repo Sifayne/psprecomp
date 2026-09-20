@@ -53,6 +53,10 @@ target_link_libraries(test_ge_sync PRIVATE psprecomp)
 add_test(NAME ge_sync COMMAND test_ge_sync)
 add_test(NAME ge_sync_capture COMMAND test_ge_sync sync-capture.gcap)
 
+add_executable(test_texture_upload test_texture_upload.c)
+target_link_libraries(test_texture_upload PRIVATE psprecomp)
+add_test(NAME texture_upload COMMAND test_texture_upload)
+
 add_executable(test_thread_lifecycle test_thread_lifecycle.c)
 target_link_libraries(test_thread_lifecycle PRIVATE psprecomp allegrex_core)
 add_test(NAME thread_lifecycle COMMAND test_thread_lifecycle)

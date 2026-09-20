@@ -68,6 +68,10 @@ void psp_mem_module_region(uint32_t *base, uint32_t *size);
  * `size` is the access width; a read straddling the end of a region is
  * rejected rather than silently truncated. */
 void *psp_mem_ptr(uint32_t addr, uint32_t size);
+/* Bytes remaining in the backing region containing addr, or zero if unmapped.
+ * Metadata only: no memory read, access observer, or bad-access notification.
+ * Host bulk uploads may use this to exclude unbacked padding. */
+uint32_t psp_mem_mapped_span(uint32_t addr);
 
 /* Guest-memory write generations, for caches whose contents depend on bytes
  * behind psp_mem_ptr(). Every psp_write* and psp_mem_write_block call marks its
