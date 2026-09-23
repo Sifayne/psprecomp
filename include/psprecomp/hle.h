@@ -453,6 +453,9 @@ uint64_t psp_audio_blocks(void);
  * counts SceCtrlData entries written, which is the guest-visible timestamp
  * and counts what it always counted. */
 uint32_t psp_ctrl_polls(void);
+/* Buttons newly pressed in the last merged poll, including recorded carrier
+ * bits. This is a snapshot, not a queue: menu/paused polls do not accumulate. */
+uint32_t psp_ctrl_pressed_buttons(void);
 /* The stick as the guest last read it (merged lane, 0..255 centred on 128),
  * for native replacements that want the magnitude the game's own control code
  * discards. Same value a recording holds, so a replay reproduces it. */

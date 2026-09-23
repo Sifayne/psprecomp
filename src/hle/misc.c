@@ -333,8 +333,10 @@ static uint32_t         g_ctrl_frame;
  * is "one thing the guest did", and unlike g_ctrl_frame it does not move when
  * a game changes how many samples it asks for per poll. */
 static uint32_t         g_ctrl_polls;
+static uint32_t         g_ctrl_last_buttons, g_ctrl_pressed_buttons;
 
 uint32_t psp_ctrl_polls(void)   { return g_ctrl_polls; }
+uint32_t psp_ctrl_pressed_buttons(void) { return g_ctrl_pressed_buttons; }
 
 /* The stick as the guest last saw it: the merged lane, after the script took
  * or returned it. For native code that wants the magnitude the game's own
@@ -673,6 +675,8 @@ static void ctrl_fill(void) {
     const uint8_t  hax  = scripted ? 128 : atomic_load(&g_host_ax);
     const uint8_t  hay  = scripted ? 128 : atomic_load(&g_host_ay);
     const uint32_t buttons = g_hold_buttons | g_script_buttons | host;
+    g_ctrl_pressed_buttons = buttons & ~g_ctrl_last_buttons;
+    g_ctrl_last_buttons = buttons;
     const uint8_t  ax = g_script_analog ? g_script_ax : hax;
     const uint8_t  ay = g_script_analog ? g_script_ay : hay;
     g_ctrl_last_ax = ax;
@@ -1286,6 +1290,7 @@ void psp_misc_reset(void) {
     atomic_store(&g_host_ay, 128);
     g_ctrl_frame = 0;
     g_ctrl_polls = 0;
+    g_ctrl_last_buttons = g_ctrl_pressed_buttons = 0;
     memset(&g_press, 0, sizeof g_press);
     memset(g_audio, 0, sizeof g_audio);
     g_output2_until_ns = 0;

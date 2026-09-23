@@ -102,10 +102,13 @@ static void test_directives(void) {
 
     uint8_t ax = 0, ay = 0;
     CHECK(poll_pad(NULL, NULL) == BTN_CROSS, "@1 down cross");
+    CHECK(psp_ctrl_pressed_buttons()==BTN_CROSS, "merged press snapshot");
     CHECK(poll_pad(NULL, NULL) == 0, "@2 up cross");
+    CHECK(!psp_ctrl_pressed_buttons(), "release is not a press");
     CHECK(poll_pad(NULL, NULL) == (BTN_START | BTN_SQUARE), "@3 a button list");
     CHECK(poll_pad(NULL, NULL) == (BTN_START | BTN_SQUARE | 0x000400u),
           "@4 a raw 0x bit");
+    CHECK(psp_ctrl_pressed_buttons()==0x000400u, "carrier press excludes held buttons");
     CHECK(poll_pad(&ax, &ay) == 0 && ax == 200 && ay == 60,
           "@5 state assigns buttons and stick: got %u,%u", ax, ay);
     CHECK(poll_pad(&ax, &ay) == 0 && ax == 128 && ay == 128, "@6 analog center");
@@ -115,6 +118,7 @@ static void test_directives(void) {
     poll_pad(NULL, NULL);                      /* poll 10: wait, not an edge */
     CHECK(poll_pad(NULL, NULL) == BTN_UP,
           "poll 11: @12 is not due yet -- a stamp is a floor, not a queue");
+    CHECK(!psp_ctrl_pressed_buttons(), "held buttons do not repeat a press");
     CHECK(poll_pad(NULL, NULL) == (BTN_UP | BTN_DOWN), "@12 after a wait");
 
     unload();
@@ -330,6 +334,70 @@ static void test_look_is_recorded(void) {
     psp_misc_init();
 }
 
+/* A title can supply room for ten samples and read the latched look more
+ * than once. Neither operation changes its poll identity or spends mouse
+ * motion. Native gameplay owns that consumption, separately from transport. */
+static void test_look_snapshot_and_clear(void) {
+    unload();
+    psp_ctrl_set(0x03fc0c00u, 170, 90);
+    psp_ctrl_set_look(201, 61);
+    psp_ctrl_add_mouse(17, -9);
+    psp_cpu.r[PSP_REG_A0] = BUF;
+    psp_cpu.r[PSP_REG_A1] = 10;
+    psp_hle_call(CTRL_PEEK);
+    CHECK(psp_ctrl_polls() == 1 && psp_cpu.r[PSP_REG_V0]==10,
+          "ten samples of room are one poll");
+    CHECK(psp_ctrl_pressed_buttons()==0x03fc0c00u, "snapshot retains the press edge");
+    CHECK(psp_read32(BUF + 4) == 0x03fc0c00u, "physical carrier bits survive");
+    psp_ctrl_set_look(30, 40); /* Live changes cannot alter a recorded snapshot. */
+    psp_ctrl_add_mouse(100, 100);
+    for (int i = 0; i < 3; i++) {
+        uint8_t rx, ry; int dx, dy;
+        psp_ctrl_last_look(&rx, &ry, &dx, &dy);
+        CHECK(rx == 201 && ry == 61 && dx == 17 && dy == -9,
+              "look snapshot remains identical on reread %d", i);
+    }
+    psp_ctrl_clear_mouse(); /* Focus/modal reset drops only unpolled motion. */
+    poll_pad(NULL, NULL);
+    uint8_t rx, ry; int dx, dy;
+    psp_ctrl_last_look(&rx, &ry, &dx, &dy);
+    CHECK(rx == 30 && ry == 40 && dx == 0 && dy == 0,
+          "next poll sees new stick and no cleared mouse backlog");
+    unload();
+}
+
+static void test_complete_input_round_trip(void) {
+    uint32_t buttons[5] = {0x00400400u, 0x00800800u, 0x03000000u, 0x03fc0c00u, 0};
+    uint8_t axes[5][4] = {{160,128,128,192}, {128,64,255,0}, {0,255,64,128},
+                         {192,192,128,128}, {128,128,128,128}};
+    int mouse[5][2] = {{7,-3}, {-12,9}, {0,0}, {100,-50}, {0,0}};
+    unload();
+    setenv("PSPRECOMP_REPLAY_REC", "t-complete-rec.pad", 1);
+    psp_misc_init();
+    for (int i = 0; i < 5; i++) {
+        psp_ctrl_set(buttons[i], axes[i][0], axes[i][1]);
+        psp_ctrl_set_look(axes[i][2], axes[i][3]);
+        psp_ctrl_add_mouse(mouse[i][0], mouse[i][1]);
+        poll_pad(NULL, NULL);
+        CHECK(psp_ctrl_pressed_buttons()==(buttons[i] & ~(i ? buttons[i-1] : 0)),
+              "live merged button edges at poll %d", i+1);
+    }
+    psp_ctrl_replay_finish(NULL);
+    unsetenv("PSPRECOMP_REPLAY_REC");
+    load("t-complete-rec.pad");
+    for (int i = 0; i < 5; i++) {
+        uint8_t ax, ay, rx, ry; int dx, dy;
+        uint32_t b = poll_pad(&ax, &ay);
+        CHECK(psp_ctrl_pressed_buttons()==(buttons[i] & ~(i ? buttons[i-1] : 0)),
+              "replayed button edges at poll %d", i+1);
+        psp_ctrl_last_look(&rx, &ry, &dx, &dy);
+        CHECK(b == buttons[i] && ax == axes[i][0] && ay == axes[i][1] &&
+              rx == axes[i][2] && ry == axes[i][3] && dx == mouse[i][0] && dy == mouse[i][1],
+              "complete physical input record/replay at poll %d", i + 1);
+    }
+    unload();
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -345,11 +413,14 @@ int main(void) {
     test_round_trip();
     test_look_channel();
     test_look_is_recorded();
+    test_look_snapshot_and_clear();
+    test_complete_input_round_trip();
 
     remove("t-directives.pad"); remove("t-bad.pad"); remove("t-tap.pad");
     remove("t-catchup.pad"); remove("t-lanes.pad"); remove("t-host.pad");
     remove("t-rt-src.pad"); remove("t-rt-rec.pad");
     remove("t-look.pad"); remove("t-look-rec.pad");
+    remove("t-complete-rec.pad");
     psp_mem_free();
 
     if (failures) {
