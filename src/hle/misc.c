@@ -570,6 +570,43 @@ static void ctrl_wait_sample(void) {
     g_sample_due = psp_clock_next_frame();
 }
 
+/* How many samples a buffer call hands back. Observed from an external
+ * executable (tests/provenance/ctrl, not a physical PSP), and consistent with
+ * the hardware-recorded ctrl/sampling and ctrl/vblank expectations:
+ *
+ *   - Read returns the samples taken since the previous Read -- one per
+ *     vblank -- newest last, at most 63 of them, and at most the room the
+ *     caller gave. With none unread it waits for the next one. A title that
+ *     reads every other vblank gets two per call; one that reads every vblank
+ *     gets one. Room 0 behaves as room 1.
+ *   - Peek returns `count` samples of history without consuming anything;
+ *     room 0 returns 0 and writes nothing.
+ *   - Room above 64 is rejected by both with SCE_ERROR_INVALID_SIZE, and
+ *     nothing is written.
+ *
+ * Handing back as many samples as the room allowed (the old behaviour) made
+ * The 3rd Birthday, which reads with room for ten every other vblank, count
+ * ten samples per poll into its per-sample menu repeat, and a short tap
+ * skipped entries. One sample per call halved the real rate instead.
+ *
+ * This provider has one merged snapshot per call, not a sample history, so
+ * every entry carries the current state. The unread count comes from the
+ * guest clock's vblank grid; scenarios replay in virtual time, where it is
+ * deterministic. In live play a late frame can deliver more than two, as
+ * the hardware would. */
+enum { CTRL_HISTORY = 64, CTRL_UNREAD_MAX = 63 };
+static uint64_t g_read_frame = UINT64_MAX;  /* vblank of the last Read's newest sample */
+
+static uint32_t ctrl_unread_samples(uint32_t room) {
+    const uint64_t frame = psp_clock_peek() / PSP_CLOCK_FRAME_US;
+    uint64_t unread = g_read_frame == UINT64_MAX || frame <= g_read_frame
+                    ? 1 : frame - g_read_frame;
+    g_read_frame = frame;
+    if (unread > CTRL_UNREAD_MAX) unread = CTRL_UNREAD_MAX;
+    if (!room) room = 1;
+    return unread < room ? (uint32_t)unread : room;
+}
+
 /* ---- PSPRECOMP_RAMSNAP -- whole-RAM snapshots at chosen polls -------------
  *
  * PSPRECOMP_RAMSNAP=<prefix> with PSPRECOMP_RAMSNAP_POLLS=<n>[,<n>...] writes
@@ -655,8 +692,9 @@ static void ramsnap_step(uint32_t poll) {
     }
 }
 
-/* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16. */
-static void ctrl_fill(void) {
+/* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16.
+ * Delivers `samples` entries of the merged state and returns that count. */
+static void ctrl_fill(uint32_t samples) {
     const uint64_t us = psp_clock_peek();
     g_ctrl_polls++;
     if (g_watch_from && g_ctrl_polls == g_watch_from) psp_mem_watch_arm(1);
@@ -704,21 +742,32 @@ static void ctrl_fill(void) {
                            g_ctrl_last_rx, g_ctrl_last_ry,
                            g_ctrl_last_mdx, g_ctrl_last_mdy);
 
-    uint32_t buf = psp_arg(0), count = psp_arg(1);
-    if (!count) count = 1;
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t at = buf + i * 16;
+    /* Room past the delivered samples is left untouched. */
+    const uint32_t buf = psp_arg(0);
+    for (uint32_t i = 0; i < samples; i++) {
+        const uint32_t at = buf + i * 16;
         psp_write32(at, g_ctrl_frame++);
         psp_write32(at + 4, buttons);
         psp_write8(at + 8, ax);
         psp_write8(at + 9, ay);
         for (int k = 10; k < 16; k++) psp_write8(at + (uint32_t)k, 0);
     }
-    psp_ret(count);
+    psp_ret(samples);
 }
 
-static void hle_ReadBufferPositive(void) { ctrl_wait_sample(); ctrl_fill(); }
-static void hle_PeekBufferPositive(void) { ctrl_fill(); }
+static void hle_ReadBufferPositive(void) {
+    const uint32_t room = psp_arg(1);
+    if (room > CTRL_HISTORY) { psp_ret(SCE_ERROR_INVALID_SIZE); return; }
+    ctrl_wait_sample();
+    ctrl_fill(ctrl_unread_samples(room));
+}
+
+static void hle_PeekBufferPositive(void) {
+    const uint32_t room = psp_arg(1);
+    if (room > CTRL_HISTORY) { psp_ret(SCE_ERROR_INVALID_SIZE); return; }
+    if (!room) { psp_ret(0); return; }
+    ctrl_fill(room);
+}
 
 /* ---- sceRtc ----------------------------------------------------------------
  *
@@ -1290,6 +1339,7 @@ void psp_misc_reset(void) {
     atomic_store(&g_host_ay, 128);
     g_ctrl_frame = 0;
     g_ctrl_polls = 0;
+    g_read_frame = UINT64_MAX;
     g_ctrl_last_buttons = g_ctrl_pressed_buttons = 0;
     memset(&g_press, 0, sizeof g_press);
     memset(g_audio, 0, sizeof g_audio);

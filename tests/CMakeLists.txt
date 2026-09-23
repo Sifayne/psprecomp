@@ -74,6 +74,12 @@ set_tests_properties(kernel_observed PROPERTIES TIMEOUT 10)
 # word, not the magic. provenance/mpeg/observed.txt, recorded under an
 # emulator, differs in exactly those 176 checks, so its checker is built for
 # reference but not run.
+add_executable(test_ctrl_observed test_ctrl_observed.c)
+target_link_libraries(test_ctrl_observed PRIVATE psprecomp allegrex_core)
+add_test(NAME ctrl_observed COMMAND test_ctrl_observed
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/ctrl/observed.txt)
+set_tests_properties(ctrl_observed PROPERTIES TIMEOUT 10)
+
 add_executable(test_mpeg_observed test_mpeg_observed.c)
 target_link_libraries(test_mpeg_observed PRIVATE psprecomp allegrex_core)
 

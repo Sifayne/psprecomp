@@ -1,0 +1,32 @@
+{
+  "name": "IndependentCtrlProbe",
+  "imports": {
+    "IoFileMgrForUser": [
+      "sceIoWrite"
+    ],
+    "LoadExecForUser": [
+      "sceKernelExitGame"
+    ],
+    "sceDisplay": [
+      "sceDisplayWaitVblankStart",
+      "sceDisplayGetVcount"
+    ],
+    "sceCtrl": [
+      "sceCtrlSetSamplingCycle",
+      "sceCtrlSetSamplingMode",
+      "sceCtrlReadBufferPositive",
+      "sceCtrlPeekBufferPositive"
+    ]
+  },
+  "opaque_imports": {
+    "IoFileMgrForUser": {"sceIoWrite": "0x42EC03AC"},
+    "LoadExecForUser": {"sceKernelExitGame": "0x05572A5F"},
+    "sceDisplay": {"sceDisplayWaitVblankStart": "0x984C27E7",
+                   "sceDisplayGetVcount": "0x9C6EAAD7"},
+    "sceCtrl": {"sceCtrlSetSamplingCycle": "0x6A2774F3",
+                "sceCtrlSetSamplingMode": "0x1F4011E6",
+                "sceCtrlReadBufferPositive": "0x1F803938",
+                "sceCtrlPeekBufferPositive": "0x3A622550"}
+  },
+  "gp": 0
+}

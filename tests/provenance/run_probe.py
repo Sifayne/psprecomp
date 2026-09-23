@@ -37,7 +37,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", help="path to an external PPSSPPHeadless executable")
     parser.add_argument("output", type=Path, help="new output directory")
-    parser.add_argument("--suite", choices=("vrnd", "umd", "intr", "ge", "vertices", "savedata", "kernel", "mpeg", "pixels", "disc"), default="vrnd")
+    parser.add_argument("--suite", choices=("vrnd", "umd", "intr", "ge", "vertices", "savedata", "kernel", "mpeg", "pixels", "disc", "ctrl"), default="vrnd")
     args = parser.parse_args()
     executable = Path(shutil.which(args.executable) or args.executable).resolve(strict=True)
     output = args.output.resolve()
@@ -123,6 +123,9 @@ def main():
     elif args.suite == "ge":
         if not 85 <= len(lines) <= 117 or not lines[-1].startswith("00000003 "):
             raise RuntimeError("incomplete GE version experiment; see diagnostics.txt")
+    elif args.suite == "ctrl":
+        if not lines or not lines[-1].startswith("000000ff "):
+            raise RuntimeError("incomplete controller experiment; see diagnostics.txt")
     elif len(lines) != expected:
         raise RuntimeError(f"expected {expected} observations, received {len(lines)}; see diagnostics.txt")
     observations = "\n".join(lines) + "\n"

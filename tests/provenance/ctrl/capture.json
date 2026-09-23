@@ -1,0 +1,25 @@
+{
+  "suite": "ctrl",
+  "command": [
+    "/usr/bin/PPSSPPHeadless",
+    "--root",
+    "/tmp/claude-1000/-home-sif-Projects-third-birthday-recomp/b34498b5-8d1a-475b-aa7a-d3d7bcfc05d5/scratchpad/ctrl-capture",
+    "--timeout=30",
+    "-l",
+    "/tmp/claude-1000/-home-sif-Projects-third-birthday-recomp/b34498b5-8d1a-475b-aa7a-d3d7bcfc05d5/scratchpad/ctrl-capture/probe.elf"
+  ],
+  "executable_sha256": "c065cf204335e9eb26a85592947e9f8fb4ddc718bc4eaad2ce06240a01d82f8d",
+  "runner_sha256": "623e2e69b973dad1f4c759c2b15c4b7e1cc5c1b236938815bbe4df81ed059da5",
+  "probe_sha256": "ac18cb1cbcf04a5d7fc823f95c6b94b5b31be99d6cdb62f06894f1e1ffe90836",
+  "observations_sha256": "0d546d77aef66f15e1219dcff6dbfd45a42794de3a9b87fb8390f9ba71437ab1",
+  "fixture_sha256": "0d546d77aef66f15e1219dcff6dbfd45a42794de3a9b87fb8390f9ba71437ab1",
+  "sources": {
+    "probe.c": "334d069fe9ab54b0f8f9e0d1945a7ab8d27ffb30b8e3ec9e4b97600798e06325",
+    "imports.S": "b0c31fe69f21be8a9905e9b18fcfc0cbe2b94005b8e9b9d89c6bf8a06419425e",
+    "probe.ld": "f46ef37392ea8cf736ed7217401708ec9f18bc2c4294a21e249b5911d503fea6"
+  },
+  "clang": "clang version 22.1.8",
+  "linker": "LLD 22.1.8 (compatible with GNU linkers)",
+  "observations": 36,
+  "evidence": "external executable output; not physical PSP"
+}
