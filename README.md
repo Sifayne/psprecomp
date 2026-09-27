@@ -35,12 +35,10 @@ got there first — same idea, offline MIPS-to-C plus a native runtime, with an
 SDL3/Vulkan backend. Worth reading if you are interested in this problem.
 
 The two differ mainly in licensing posture: that project ports GPL code from
-PPSSPP for parts of its HLE, while psprecomp keeps a hard MIT boundary. It
-copies no emulator code; emulators are an oracle to diff against (see
-[docs/ORACLE.md](docs/ORACLE.md)), and where an HLE source file takes a name or
-an error-code value from PPSSPP's tables, the comment there says so. If you
-want a permissively-licensed base to build on, that is the distinction that
-matters.
+PPSSPP for parts of its HLE, while psprecomp keeps a hard MIT boundary and uses
+emulators only as an oracle to diff against (see
+[docs/ORACLE.md](docs/ORACLE.md)). If you want a permissively-licensed base to
+build on, that is the distinction that matters.
 
 ## Why PSP?
 
@@ -330,7 +328,7 @@ Neither can be linked into an MIT toolkit, and neither needs to be:
 |---|---|---|
 | [uofw](https://github.com/uofw/uofw) | **MIT** | A complete reverse engineering of the PSP firmware in readable C. The reference for the HLE layer. |
 | [pspsdk](https://github.com/pspdev/pspsdk) | **BSD** | Headers and the published ABI for `sceGu` / `sceKernel` / `sceAudio`. (`tools/PrxEncrypter` is GPL-3.0 and excluded.) |
-| **PPSSPP** | GPLv2+ | **Oracle** — run as a separate process and compared against. No code copied, linked, or vendored. A few HLE files take function names or error-code values from its tables, and say so where they do. |
+| **PPSSPP** | GPLv2+ | **Oracle only** — run as a separate process and compared against. No code copied, linked, or vendored. |
 | [pspautotests](https://github.com/hrydgard/pspautotests) | — | A hardware-validated behavioural corpus to check the runtime against. |
 
 Same arrangement `ps3recomp` has with RPCS3 and `lynxrecomp` has with Handy: the
