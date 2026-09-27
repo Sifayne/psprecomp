@@ -772,17 +772,18 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  * The commands are PSPSDK's TRANSFER_* group (guInternal.h): SRC 0xb2, SRC_W
  * 0xb3, DST 0xb4, DST_W 0xb5, START 0xea, SRC_OFFSET 0xeb, DST_OFFSET 0xec,
  * SIZE 0xee. How the fields sit inside them is what PSPSDK's sceGuCopyImage
- * writes, and the parts worth naming are the ways to be quietly wrong:
+ * writes, and the parts worth naming are the ways to be quietly wrong. The
+ * masks were checked on a PSP (firmware 6.60) with tools/hwprobe/mpegprobe:
  *   - address bits 0-23 come from SRC/DST, and bits 24-31 from the *stride*
  *     register's high byte -- the same split as FBP/FBW. PSPSDK's pspgu.h
- *     says the data must be 16-byte aligned, so the low four bits are
- *     masked off here (0xFFFFF0); what the GE does when they are set is
- *     untested.
+ *     says the data must be 16-byte aligned, and the GE ignores the low four
+ *     bits: a source or destination 2, 4, 8 or 12 bytes in copied from or
+ *     to the aligned address below it, in both pixel sizes.
  *   - width and height are stored as n-1; offsets are y << 10 | x.
- *   - the stride is a multiple of 8 up to 1024, so the field is read as
- *     0x7F8. Reading anything above 0x400 as zero is unsourced. Neither
- *     sceGuCopyImage nor Last Raven sends one: the game's only transfer
- *     builder (0x2B678C) is called with strides 0x200 and 0x80.
+ *   - the stride is bits 3-10 of its register (0x7F8). On the PSP 0x44 acted
+ *     as 0x40, 0x404 as 0x400 and 0x808 as 0x008, while 0x408 and 0x7F8 were
+ *     used as given, for source and destination alike. Last Raven's only
+ *     transfer builder (0x2B678C) is called with strides 0x200 and 0x80.
  *   - TRANSFERSTART bit 0 selects 32-bit pixels (PSM 8888); everything else
  *     is 16-bit.
  */
@@ -791,8 +792,7 @@ static uint32_t xfer_addr(uint32_t base, uint32_t widthreg) {
 }
 
 static uint32_t xfer_stride(uint32_t widthreg) {
-    const uint32_t stride = widthreg & 0x7F8u;
-    return stride > 0x400u ? 0u : stride;
+    return widthreg & 0x7F8u;
 }
 
 static void do_block_transfer(void) {

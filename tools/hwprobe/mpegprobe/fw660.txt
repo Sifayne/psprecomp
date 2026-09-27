@@ -1,0 +1,497 @@
+mpegprobe 1
+firmware (sceKernelDevkitVersion) = 06060010
+log: ms0:/PSP/GAME/mpegprobe/mpegprobe.txt
+
+
+==== mpegprobe 2, firmware (sceKernelDevkitVersion) 06060010 ====
+
+---- test X: MPEG sizes and structures ----
+[1] sceUtilityLoadModule(AV_AVCODEC)
+  = 00000000
+[2] sceUtilityLoadModule(AV_MPEGBASE)
+  = 00000000
+[3] sceMpegInit
+  = 00000000
+[4] sceMpegQueryMemSize(0)
+  = 65536 (0x10000)
+[5] sceMpegRingbufferQueryMemSize(1)
+  = 2152 (0x868)
+[6] sceMpegRingbufferQueryMemSize(2)
+  = 4304 (0x10D0)
+[7] sceMpegRingbufferQueryMemSize(3)
+  = 6456 (0x1938)
+[8] sceMpegRingbufferQueryMemSize(4)
+  = 8608 (0x21A0)
+[9] sceMpegRingbufferQueryMemSize(16)
+  = 34432 (0x8680)
+[10] sceMpegRingbufferQueryMemSize(32)
+  = 68864 (0x10D00)
+[11] sceMpegRingbufferQueryMemSize(64)
+  = 137728 (0x21A00)
+[12] sceMpegRingbufferQueryMemSize(256)
+  = 550912 (0x86800)
+[13] sceMpegRingbufferQueryMemSize(512)
+  = 1101824 (0x10D000)
+[14] sceMpegRingbufferQueryMemSize(640)
+  = 1377280 (0x150400)
+[15] sceMpegRingbufferQueryMemSize(640)
+  = 1377280 (0x150400)
+ring struct at 08829B80, ring data at 088324C0, MPEG buffer at 08982900, callback 08804658
+[16] sceMpegRingbufferConstruct(ring, 640, data, 1377280, cb, 0x12345678)
+  = 00000000
+ring after Construct (the struct is 44 bytes; +2C is the word after it):
+  +00 00000280  = 640
+  +04 00000000  = 0
+  +08 00000000  = 0
+  +0C 00000000  = 0
+  +10 00000800  = 2048
+  +14 088324C0  = ring data + 0x0
+  +18 08804658  = 142624344
+  +1C 12345678  = 305419896
+  +20 089724C0  = ring data + 0x140000
+  +24 CCCCCCCC  = -858993460
+  +28 00000000  = 0
+  +2C 0882F900  = 142801152
+[17] sceMpegCreate(&mpeg, buffer, 65536, ring, 512, 0, 0)
+  = 00000000; handle 08982900 (handle - buffer = 0x0)
+ring after Create:
+  +00 00000280  = 640
+  +04 00000000  = 0
+  +08 00000000  = 0
+  +0C 00000000  = 0
+  +10 00000800  = 2048
+  +14 088324C0  = ring data + 0x0
+  +18 08804658  = 142624344
+  +1C 12345678  = 305419896
+  +20 089724C0  = ring data + 0x140000
+  +24 CCCCCCCC  = -858993460
+  +28 08829AE8  = 142777064
+  +2C 0882F900  = 142801152
+[18] sceMpegRingbufferAvailableSize
+  = 00000280 (640)
+[19] sceMpegQueryAtracEsSize
+  = 00000000: es size 2112 (0x840), output size 8192 (0x2000)
+[20] sceMpegMallocAvcEsBuf
+  = 00000001
+[21] sceMpegInitAu(video)
+  = 00000000
+video AU after InitAu (PSPSDK: pts msb, pts, dts msb, dts, es, size; +18 is past it):
+     +00 CCCCCCCC  +04 CCCCCCCC  +08 CCCCCCCC  +0C CCCCCCCC
+     +10 00000001  +14 00000000  +18 CCCCCCCC  +1C CCCCCCCC
+[22] sceMpegInitAu(audio, es buffer 08992940)
+  = 00000000
+audio AU after InitAu:
+     +00 CCCCCCCC  +04 CCCCCCCC  +08 CCCCCCCC  +0C CCCCCCCC
+     +10 08992940  +14 00000000  +18 CCCCCCCC  +1C CCCCCCCC
+[23] sceMpegDelete
+[24] sceMpegRingbufferDestruct
+[25] sceMpegFinish
+---- end of test ----
+
+---- test TRIANGLE: GE image copies ----
+source pixels hold their own index: 32-bit 0x5A000000 | i, 16-bit 0x8000 | i.
+each line: where in the destination a pixel landed <- which source pixel it holds
+[1] sceGuInit
+[2] GE copy: baseline, 32-bit
+  src base+0 stride 0x40 at (0,0), dst base+0 stride 0x40 at (0,0), 4x2
+   dst byte +0x00000 <- src byte +0x00000
+   dst byte +0x00004 <- src byte +0x00004
+   dst byte +0x00008 <- src byte +0x00008
+   dst byte +0x0000C <- src byte +0x0000C
+   dst byte +0x00100 <- src byte +0x00100
+   dst byte +0x00104 <- src byte +0x00104
+   dst byte +0x00108 <- src byte +0x00108
+   dst byte +0x0010C <- src byte +0x0010C
+   8 pixels written in total
+[3] GE copy: baseline, 16-bit
+  src base+0 stride 0x40 at (0,0), dst base+0 stride 0x40 at (0,0), 8x2
+   dst byte +0x00000 <- src byte +0x00000
+   dst byte +0x00002 <- src byte +0x00002
+   dst byte +0x00004 <- src byte +0x00004
+   dst byte +0x00006 <- src byte +0x00006
+   dst byte +0x00008 <- src byte +0x00008
+   dst byte +0x0000A <- src byte +0x0000A
+   dst byte +0x0000C <- src byte +0x0000C
+   dst byte +0x0000E <- src byte +0x0000E
+   dst byte +0x00080 <- src byte +0x00080
+   dst byte +0x00082 <- src byte +0x00082
+   dst byte +0x00084 <- src byte +0x00084
+   dst byte +0x00086 <- src byte +0x00086
+   16 pixels written in total
+[4] GE copy: src stride 0x3F8
+  src base+0 stride 0x3F8 at (0,1), dst base+0 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x00FE0
+   dst byte +0x00004 <- src byte +0x00FE4
+   dst byte +0x00008 <- src byte +0x00FE8
+   dst byte +0x0000C <- src byte +0x00FEC
+   4 pixels written in total
+[5] GE copy: src stride 0x400
+  src base+0 stride 0x400 at (0,1), dst base+0 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x01000
+   dst byte +0x00004 <- src byte +0x01004
+   dst byte +0x00008 <- src byte +0x01008
+   dst byte +0x0000C <- src byte +0x0100C
+   4 pixels written in total
+[6] GE copy: src address +4
+  src base+4 stride 0x40 at (0,0), dst base+0 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x00000
+   dst byte +0x00004 <- src byte +0x00004
+   dst byte +0x00008 <- src byte +0x00008
+   dst byte +0x0000C <- src byte +0x0000C
+   4 pixels written in total
+[7] GE copy: src address +8
+  src base+8 stride 0x40 at (0,0), dst base+0 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x00000
+   dst byte +0x00004 <- src byte +0x00004
+   dst byte +0x00008 <- src byte +0x00008
+   dst byte +0x0000C <- src byte +0x0000C
+   4 pixels written in total
+[8] GE copy: src address +12
+  src base+12 stride 0x40 at (0,0), dst base+0 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x00000
+   dst byte +0x00004 <- src byte +0x00004
+   dst byte +0x00008 <- src byte +0x00008
+   dst byte +0x0000C <- src byte +0x0000C
+   4 pixels written in total
+[9] GE copy: 16-bit src +2
+  src base+2 stride 0x40 at (0,0), dst base+0 stride 0x40 at (0,0), 8x1
+   dst byte +0x00000 <- src byte +0x00000
+   dst byte +0x00002 <- src byte +0x00002
+   dst byte +0x00004 <- src byte +0x00004
+   dst byte +0x00006 <- src byte +0x00006
+   dst byte +0x00008 <- src byte +0x00008
+   dst byte +0x0000A <- src byte +0x0000A
+   dst byte +0x0000C <- src byte +0x0000C
+   dst byte +0x0000E <- src byte +0x0000E
+   8 pixels written in total
+[10] GE copy: 16-bit src +4
+  src base+4 stride 0x40 at (0,0), dst base+0 stride 0x40 at (0,0), 8x1
+   dst byte +0x00000 <- src byte +0x00000
+   dst byte +0x00002 <- src byte +0x00002
+   dst byte +0x00004 <- src byte +0x00004
+   dst byte +0x00006 <- src byte +0x00006
+   dst byte +0x00008 <- src byte +0x00008
+   dst byte +0x0000A <- src byte +0x0000A
+   dst byte +0x0000C <- src byte +0x0000C
+   dst byte +0x0000E <- src byte +0x0000E
+   8 pixels written in total
+[11] GE copy: src stride 0x44
+  src base+0 stride 0x44 at (0,1), dst base+0 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x00100
+   dst byte +0x00004 <- src byte +0x00104
+   dst byte +0x00008 <- src byte +0x00108
+   dst byte +0x0000C <- src byte +0x0010C
+   4 pixels written in total
+[12] GE copy: src stride 0x404
+  src base+0 stride 0x404 at (0,1), dst base+0 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x01000
+   dst byte +0x00004 <- src byte +0x01004
+   dst byte +0x00008 <- src byte +0x01008
+   dst byte +0x0000C <- src byte +0x0100C
+   4 pixels written in total
+[13] GE copy: src stride 0x408
+  src base+0 stride 0x408 at (0,1), dst base+0 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x01020
+   dst byte +0x00004 <- src byte +0x01024
+   dst byte +0x00008 <- src byte +0x01028
+   dst byte +0x0000C <- src byte +0x0102C
+   4 pixels written in total
+[14] GE copy: src stride 0x7F8
+  src base+0 stride 0x7F8 at (0,1), dst base+0 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x01FE0
+   dst byte +0x00004 <- src byte +0x01FE4
+   dst byte +0x00008 <- src byte +0x01FE8
+   dst byte +0x0000C <- src byte +0x01FEC
+   4 pixels written in total
+[15] GE copy: src stride 0x808
+  src base+0 stride 0x808 at (0,1), dst base+0 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x00020
+   dst byte +0x00004 <- src byte +0x00024
+   dst byte +0x00008 <- src byte +0x00028
+   dst byte +0x0000C <- src byte +0x0002C
+   4 pixels written in total
+[16] GE copy: dst address +4
+  src base+0 stride 0x40 at (0,0), dst base+4 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x00000
+   dst byte +0x00004 <- src byte +0x00004
+   dst byte +0x00008 <- src byte +0x00008
+   dst byte +0x0000C <- src byte +0x0000C
+   4 pixels written in total
+[17] GE copy: dst address +8
+  src base+0 stride 0x40 at (0,0), dst base+8 stride 0x40 at (0,0), 4x1
+   dst byte +0x00000 <- src byte +0x00000
+   dst byte +0x00004 <- src byte +0x00004
+   dst byte +0x00008 <- src byte +0x00008
+   dst byte +0x0000C <- src byte +0x0000C
+   4 pixels written in total
+[18] GE copy: 16-bit dst +2
+  src base+0 stride 0x40 at (0,0), dst base+2 stride 0x40 at (0,0), 8x1
+   dst byte +0x00000 <- src byte +0x00000
+   dst byte +0x00002 <- src byte +0x00002
+   dst byte +0x00004 <- src byte +0x00004
+   dst byte +0x00006 <- src byte +0x00006
+   dst byte +0x00008 <- src byte +0x00008
+   dst byte +0x0000A <- src byte +0x0000A
+   dst byte +0x0000C <- src byte +0x0000C
+   dst byte +0x0000E <- src byte +0x0000E
+   8 pixels written in total
+[19] GE copy: dst stride 0x408
+  src base+0 stride 0x40 at (0,0), dst base+0 stride 0x408 at (0,1), 4x1
+   dst byte +0x01020 <- src byte +0x00000
+   dst byte +0x01024 <- src byte +0x00004
+   dst byte +0x01028 <- src byte +0x00008
+   dst byte +0x0102C <- src byte +0x0000C
+   4 pixels written in total
+[20] GE copy: dst stride 0x808
+  src base+0 stride 0x40 at (0,0), dst base+0 stride 0x808 at (0,1), 4x1
+   dst byte +0x00020 <- src byte +0x00000
+   dst byte +0x00024 <- src byte +0x00004
+   dst byte +0x00028 <- src byte +0x00008
+   dst byte +0x0002C <- src byte +0x0000C
+   4 pixels written in total
+---- end of test ----
+
+---- test SQUARE: movie ----
+no movie.pmf beside the EBOOT (80010002)
+---- end of test ----
+
+==== mpegprobe 2, firmware (sceKernelDevkitVersion) 06060010 ====
+
+---- test SQUARE: movie ----
+movie.pmf: 440320 bytes; read 2048 header bytes
+[1] sceUtilityLoadModule(AV_AVCODEC)
+  = 00000000
+[2] sceUtilityLoadModule(AV_MPEGBASE)
+  = 00000000
+[3] sceMpegInit
+  = 00000000
+[4] sceMpegQueryMemSize(0)
+  = 65536 (0x10000)
+[5] sceMpegRingbufferQueryMemSize(640)
+  = 1377280 (0x150400)
+ring struct at 08829B80, ring data at 088324C0, MPEG buffer at 08982900, callback 08804658
+[6] sceMpegRingbufferConstruct(ring, 640, data, 1377280, cb, 0x12345678)
+  = 00000000
+[7] sceMpegCreate(&mpeg, buffer, 65536, ring, 512, 0, 0)
+  = 00000000; handle 08982900 (handle - buffer = 0x0)
+[8] sceMpegRingbufferAvailableSize
+  = 00000280 (640)
+[9] sceMpegQueryAtracEsSize
+  = 00000000: es size 2112 (0x840), output size 8192 (0x2000)
+[10] sceMpegMallocAvcEsBuf
+  = 00000001
+[11] sceMpegInitAu(video)
+  = 00000000
+[12] sceMpegInitAu(audio, es buffer 08992940)
+  = 00000000
+header words (big-endian): 00 50534D46  04 30303135  08 00000800  0C 0006B000
+                           10 00000000  14 00000000  18 00000000  1C 00000000
+[13] QueryStreamOffset/Size, header unchanged
+  QueryStreamOffset = 00000000, offset 00000800; QueryStreamSize = 00000000, size 0006B000
+[14] QueryStreamOffset/Size, header word 0x08 := 0x00001000
+  QueryStreamOffset = 00000000, offset 00001000; QueryStreamSize = 00000000, size 0006B000
+[15] QueryStreamOffset/Size, header word 0x08 := 0x00000800
+  QueryStreamOffset = 00000000, offset 00000800; QueryStreamSize = 00000000, size 0006B000
+[16] QueryStreamOffset/Size, header word 0x08 := 0x00000801
+  QueryStreamOffset = 806101FE, offset 00000000; QueryStreamSize = 00000000, size 0006B000
+[17] QueryStreamOffset/Size, header word 0x08 := 0
+  QueryStreamOffset = 806101FE, offset 00000000; QueryStreamSize = 00000000, size 0006B000
+[18] QueryStreamOffset/Size, header word 0x0C := 0x00123456
+  QueryStreamOffset = 00000000, offset 00000800; QueryStreamSize = 806101FE, size 00000000
+[19] QueryStreamOffset/Size, header word 0x0C := 0
+  QueryStreamOffset = 00000000, offset 00000800; QueryStreamSize = 00000000, size 00000000
+[20] QueryStreamOffset/Size, header word 0x04 := 0
+  QueryStreamOffset = 80610002, offset 00000000; QueryStreamSize = 00000000, size 0006B000
+[21] QueryStreamOffset/Size, header word 0x00 := 0
+  QueryStreamOffset = 806101FE, offset 00000000; QueryStreamSize = 00000000, size 0006B000
+[22] sceMpegQueryStreamOffset(real header)
+  = 00000000, offset 00000800
+[23] sceMpegRegistStream(type 0, 0)
+  = 08983BC0
+[24] sceMpegRegistStream(type 1, 0)
+  = 08984000
+[25] sceMpegRingbufferPut(ring, 32, 640)
+  callback(ring data + 0x0, packets 32, param 12345678) -> read 65536 bytes
+  = 00000020
+ring after Put:
+  +00 00000280  = 640
+  +04 00000020  = 32
+  +08 00000020  = 32
+  +0C 00000000  = 0
+  +10 00000800  = 2048
+  +14 088324C0  = ring data + 0x0
+  +18 08804658  = 142624344
+  +1C 12345678  = 305419896
+  +20 089724C0  = ring data + 0x140000
+  +24 CCCCCCCC  = -858993460
+  +28 08829AE8  = 142777064
+  +2C 0882F900  = 142801152
+[26] sceMpegGetAvcAu (first call)
+GetAvcAu #0 = 0, 4th arg now 00000001; AU:
+     +00 00000000  +04 00015F90  +08 00000000  +0C 000153D5
+     +10 00000001  +14 000002E5
+[27] sceMpegGetAtracAu (first call)
+GetAtracAu #0 = 0, 4th arg now 08992948; AU:
+     +00 00000000  +04 00014C4D  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 08992940  +14 000002F0
+[28] sceMpegRingbufferPut(ring, 32, 608)
+  callback(ring data + 0x10000, packets 32, param 12345678) -> read 65536 bytes
+  = 00000020
+ring after Put:
+  +00 00000280  = 640
+  +04 00000040  = 64
+  +08 00000040  = 64
+  +0C 00000000  = 0
+  +10 00000800  = 2048
+  +14 088324C0  = ring data + 0x0
+  +18 08804658  = 142624344
+  +1C 12345678  = 305419896
+  +20 089724C0  = ring data + 0x140000
+  +24 CCCCCCCC  = -858993460
+  +28 08829AE8  = 142777064
+  +2C 0882F900  = 142801152
+GetAvcAu #1 = 0, 4th arg now 00000001; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 00000001  +14 0000014C
+GetAtracAu #1 = 0, 4th arg now 08992948; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 08992940  +14 000002F0
+[29] sceMpegRingbufferPut(ring, 32, 576)
+  callback(ring data + 0x20000, packets 32, param 12345678) -> read 65536 bytes
+  = 00000020
+ring after Put:
+  +00 00000280  = 640
+  +04 00000060  = 96
+  +08 00000060  = 96
+  +0C 00000000  = 0
+  +10 00000800  = 2048
+  +14 088324C0  = ring data + 0x0
+  +18 08804658  = 142624344
+  +1C 12345678  = 305419896
+  +20 089724C0  = ring data + 0x140000
+  +24 CCCCCCCC  = -858993460
+  +28 08829AE8  = 142777064
+  +2C 0882F900  = 142801152
+GetAvcAu #2 = 0, 4th arg now 00000001; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 00000001  +14 00000238
+GetAtracAu #2 = 0, 4th arg now 08992948; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 08992940  +14 000002F0
+[30] sceMpegRingbufferPut(ring, 32, 544)
+  callback(ring data + 0x30000, packets 32, param 12345678) -> read 65536 bytes
+  = 00000020
+ring after Put:
+  +00 00000280  = 640
+  +04 00000080  = 128
+  +08 00000080  = 128
+  +0C 00000000  = 0
+  +10 00000800  = 2048
+  +14 088324C0  = ring data + 0x0
+  +18 08804658  = 142624344
+  +1C 12345678  = 305419896
+  +20 089724C0  = ring data + 0x140000
+  +24 CCCCCCCC  = -858993460
+  +28 08829AE8  = 142777064
+  +2C 0882F900  = 142801152
+GetAvcAu #3 = 0, 4th arg now 00000001; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 00000001  +14 00000576
+GetAtracAu #3 = 0, 4th arg now 08992948; AU:
+     +00 00000000  +04 00017D48  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 08992940  +14 000002F0
+[31] sceMpegRingbufferPut(ring, 32, 514)
+  callback(ring data + 0x40000, packets 32, param 12345678) -> read 65536 bytes
+  = 00000020
+ring after Put:
+  +00 00000280  = 640
+  +04 000000A0  = 160
+  +08 000000A0  = 160
+  +0C 00000000  = 0
+  +10 00000800  = 2048
+  +14 088324C0  = ring data + 0x0
+  +18 08804658  = 142624344
+  +1C 12345678  = 305419896
+  +20 089724C0  = ring data + 0x140000
+  +24 CCCCCCCC  = -858993460
+  +28 08829AE8  = 142777064
+  +2C 0882F900  = 142801152
+GetAvcAu #4 = 0, 4th arg now 00000001; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 00000001  +14 000006FE
+GetAtracAu #4 = 0, 4th arg now 08992948; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 08992940  +14 000002F0
+[32] sceMpegRingbufferPut(ring, 32, 482)
+  callback(ring data + 0x50000, packets 32, param 12345678) -> read 65536 bytes
+  = 00000020
+ring after Put:
+  +00 00000280  = 640
+  +04 000000C0  = 192
+  +08 000000C0  = 192
+  +0C 00000000  = 0
+  +10 00000800  = 2048
+  +14 088324C0  = ring data + 0x0
+  +18 08804658  = 142624344
+  +1C 12345678  = 305419896
+  +20 089724C0  = ring data + 0x140000
+  +24 CCCCCCCC  = -858993460
+  +28 08829AE8  = 142777064
+  +2C 0882F900  = 142801152
+GetAvcAu #5 = 0, 4th arg now 00000001; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 00000001  +14 0000081C
+GetAtracAu #5 = 0, 4th arg now 08992948; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 08992940  +14 000002F0
+[33] sceMpegRingbufferPut(ring, 32, 453)
+  callback(ring data + 0x60000, packets 32, param 12345678) -> read 45056 bytes
+  callback(ring data + 0x6B000, packets 10, param 12345678) -> read 0 bytes
+  = 00000016
+ring after Put:
+  +00 00000280  = 640
+  +04 000000D6  = 214
+  +08 000000D6  = 214
+  +0C 00000000  = 0
+  +10 00000800  = 2048
+  +14 088324C0  = ring data + 0x0
+  +18 08804658  = 142624344
+  +1C 12345678  = 305419896
+  +20 089724C0  = ring data + 0x140000
+  +24 CCCCCCCC  = -858993460
+  +28 08829AE8  = 142777064
+  +2C 0882F900  = 142801152
+GetAvcAu #6 = 0, 4th arg now 00000001; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 00000001  +14 00000CA5
+GetAtracAu #6 = 0, 4th arg now 08992948; AU:
+     +00 00000000  +04 0001AE42  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 08992940  +14 000002F0
+[34] sceMpegRingbufferPut(ring, 32, 433)
+  callback(ring data + 0x6B000, packets 32, param 12345678) -> read 0 bytes
+  = 00000000
+ring after Put:
+  +00 00000280  = 640
+  +04 000000D6  = 214
+  +08 000000D6  = 214
+  +0C 00000000  = 0
+  +10 00000800  = 2048
+  +14 088324C0  = ring data + 0x0
+  +18 08804658  = 142624344
+  +1C 12345678  = 305419896
+  +20 089724C0  = ring data + 0x140000
+  +24 CCCCCCCC  = -858993460
+  +28 08829AE8  = 142777064
+  +2C 0882F900  = 142801152
+GetAvcAu #7 = 0, 4th arg now 00000001; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 00000001  +14 00000E97
+GetAtracAu #7 = 0, 4th arg now 08992948; AU:
+     +00 FFFFFFFF  +04 FFFFFFFF  +08 FFFFFFFF  +0C FFFFFFFF
+     +10 08992940  +14 000002F0
+stopped after 8 puts
+8 video and 8 audio access units logged
+[35] sceMpegDelete
+[36] sceMpegRingbufferDestruct
+[37] sceMpegFinish
+---- end of test ----
