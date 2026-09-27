@@ -774,8 +774,10 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  * SIZE 0xee. How the fields sit inside them is what PSPSDK's sceGuCopyImage
  * writes, and the parts worth naming are the ways to be quietly wrong:
  *   - address bits 0-23 come from SRC/DST, and bits 24-31 from the *stride*
- *     register's high byte -- the same split as FBP/FBW. The low four bits
- *     are masked off here (0xFFFFF0); that alignment is unsourced.
+ *     register's high byte -- the same split as FBP/FBW. PSPSDK's pspgu.h
+ *     says the data must be 16-byte aligned, so the low four bits are
+ *     masked off here (0xFFFFF0); what the GE does when they are set is
+ *     untested.
  *   - width and height are stored as n-1; offsets are y << 10 | x.
  *   - the stride is a multiple of 8 up to 1024, so the field is read as
  *     0x7F8. Reading anything above 0x400 as zero is unsourced; sceGuCopyImage
