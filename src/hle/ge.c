@@ -780,8 +780,9 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  *     untested.
  *   - width and height are stored as n-1; offsets are y << 10 | x.
  *   - the stride is a multiple of 8 up to 1024, so the field is read as
- *     0x7F8. Reading anything above 0x400 as zero is unsourced; sceGuCopyImage
- *     never sends one.
+ *     0x7F8. Reading anything above 0x400 as zero is unsourced. Neither
+ *     sceGuCopyImage nor Last Raven sends one: the game's only transfer
+ *     builder (0x2B678C) is called with strides 0x200 and 0x80.
  *   - TRANSFERSTART bit 0 selects 32-bit pixels (PSM 8888); everything else
  *     is 16-bit.
  */

@@ -99,23 +99,38 @@
 
 /* ---- constants ------------------------------------------------------------
  *
- * Sources as in the header comment. "Unsourced" means no source outside the
- * movie playing: those values stand until they are checked against the game.
+ * Sources as in the header comment, plus this game's own movies and player.
+ * The movies are all 18 PMF files on Last Raven's disc, checked together with
+ * the 48 in the two sibling titles that share its player; the addresses are in
+ * Last Raven's executable. "Unsourced" means no source at all yet. Where the
+ * game never looks at a value, the comment says so, because then a wrong value
+ * cannot change what the game does.
  */
-#define MPEG_MEMSIZE            0x10000u    /* unsourced: what Create needs */
-/* A ring packet's payload: one 2048-byte sector of the stream, the unit the
- * game's ring callback reads the file in (see RingbufferPut). */
+/* Unsourced. The game allocates whatever sceMpegQueryMemSize(0) answers
+ * (0x274D2C), so it does not pin this down. */
+#define MPEG_MEMSIZE            0x10000u
+/* A ring packet's payload: one 2048-byte sector of the stream. The game's ring
+ * callback (0x27403C) reads packets << 11 bytes and returns bytes >> 11. */
 #define MPEG_AVC_ES_SIZE        2048
-#define MPEG_ATRAC_ES_SIZE      2112        /* unsourced */
+/* Unsourced as the firmware's answer, but big enough: every ATRAC3+ frame in
+ * these movies is 744 bytes plus its 8-byte header, 752 in all, and the game
+ * sizes its buffer from whatever this reports (0x275CA8). */
+#define MPEG_ATRAC_ES_SIZE      2112
 /* One decoded ATRAC3+ frame: 2048 samples, two channels, 16 bits each. */
 #define MPEG_ATRAC_ES_OUT_SIZE  (2048 * 2 * 2)
 /* 90000 * 2048 / 44100: one ATRAC3+ frame, in PSP's 90kHz timestamp units. */
 #define MPEG_ATRAC_PTS_STEP     4180u
-/* A 2048-byte sector plus a 104-byte header; the 104 is unsourced. */
+/* A 2048-byte sector plus a 104-byte header; the 104 is unsourced. The game
+ * allocates what sceMpegRingbufferQueryMemSize(640) answers (0x274460), so all
+ * it needs is room for 640 sectors. */
 #define MPEG_RINGBUFFER_PACKET  (104 + 2048)
 
-/* The magic is the first four bytes of every PMF file. The two field offsets
- * are unsourced. */
+/* The magic is the first four bytes of every PMF file. In every one of these
+ * movies the word at 0x08 is 0x800, where the first MPEG pack header starts,
+ * and the word at 0x0C is the file's length less 0x800. The game reads the
+ * first 0x800 bytes (0x2735F0), seeks to what QueryStreamOffset returns
+ * (0x273D20), and feeds exactly QueryStreamSize bytes (0x27416C), so the two
+ * are the stream's offset and its length in bytes. */
 #define PSMF_MAGIC              0x464D5350u  /* "PSMF" */
 #define PSMF_STREAM_OFFSET_OFF  0x08         /* big-endian u32 */
 #define PSMF_STREAM_SIZE_OFF    0x0C         /* big-endian u32 */
@@ -130,8 +145,9 @@
 /* SceMpegRingbuffer, as the guest sees it. The offsets are PSPSDK's; PSPSDK
  * names only packets, data, callback, its argument and the mpeg pointer, and
  * calls the other six words unknown. The meanings given to those here are
- * unsourced, except packetsFree, which the game reads to decide whether it
- * may queue more data. Field order matters: the game reads these directly. */
+ * unsourced. The game never reads any word of the struct itself: it only uses
+ * what sceMpegRingbufferAvailableSize returns, and takes an answer equal to
+ * its own packet count, 640, to mean the ring has drained (0x27512C). */
 #define RB_PACKETS          0
 #define RB_PACKETS_READ     4
 #define RB_PACKETS_WRITTEN  8
@@ -146,15 +162,15 @@
 
 /* SceMpegAu: two 64-bit timestamps then the elementary-stream buffer and its
  * size, at PSPSDK's offsets. PSPSDK puts each timestamp's high word first
- * (iPtsMSB, then iPts); the writes below put the value in the first word and
- * zero in the second. */
-#define AU_PTS       0
+ * (iPtsMSB, then iPts), and so do the writes below. The game never reads an
+ * access unit back, so it cannot confirm the order. */
+#define AU_PTS       0      /* high word; the low word follows at +4 */
 #define AU_DTS       8
 #define AU_ES_BUFFER 16
 #define AU_ES_SIZE   20
 
-/* An unset timestamp (unsourced). A player compares against this to decide it
- * has none. */
+/* An unset timestamp (unsourced). The game never compares a timestamp with
+ * this, or with anything else. */
 #define MPEG_TIMESTAMP_UNSET 0xFFFFFFFFu
 
 #define MAX_MPEG    4
@@ -1300,10 +1316,10 @@ static void hle_GetAvcAu(void) {
         /* The timestamps are what the player paces itself on. The elementary
          * stream stays on our side: the game passes this straight back to
          * sceMpegAvcDecode and never reads through esBuffer itself. */
-        psp_write32(au + AU_PTS,     c->pts);
-        psp_write32(au + AU_PTS + 4, 0);
-        psp_write32(au + AU_DTS,     c->pts);
-        psp_write32(au + AU_DTS + 4, 0);
+        psp_write32(au + AU_PTS,     0);
+        psp_write32(au + AU_PTS + 4, c->pts);
+        psp_write32(au + AU_DTS,     0);
+        psp_write32(au + AU_DTS + 4, c->pts);
         psp_write32(au + AU_ES_SIZE, 0);
     }
     if (mpeg_logging() && c->frames <= 3)
@@ -1371,10 +1387,10 @@ static void hle_GetAtracAu(void) {
         const uint32_t esbuf = psp_read32(au + AU_ES_BUFFER);
         if (esbuf && total <= MPEG_ATRAC_ES_SIZE)
             psp_mem_write_block(esbuf, c->aes + c->aes_pos, (uint32_t)total);
-        psp_write32(au + AU_PTS,     c->atrac_pts);
-        psp_write32(au + AU_PTS + 4, 0);
-        psp_write32(au + AU_DTS,     c->atrac_pts);
-        psp_write32(au + AU_DTS + 4, 0);
+        psp_write32(au + AU_PTS,     0);
+        psp_write32(au + AU_PTS + 4, c->atrac_pts);
+        psp_write32(au + AU_DTS,     0);
+        psp_write32(au + AU_DTS + 4, c->atrac_pts);
         psp_write32(au + AU_ES_SIZE, (uint32_t)total);
     }
     c->aes_pos += total;
