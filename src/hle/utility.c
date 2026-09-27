@@ -112,30 +112,36 @@ static void savedata_log(uint32_t param) {
  * it: without Kirk PGD there is no honest ciphertext, and bytes the caller
  * gets back are worth more than bytes shaped like hardware's.
  *
- * Result codes (values from PPSSPP's ErrorCodes.h, meanings confirmed by
- * the suite): 0 success; LOAD_NO_DATA when no save dir matches at all;
- * LOAD_FILE_NOT_FOUND when the dir is there but the data file is not;
- * RW_FILE_NOT_FOUND / RW_NO_DATA are the read/write family's pair for the
- * same two situations; DELETE_NO_DATA when a list delete matches nothing.
+ * Result codes are uofw's (include/utility/utility_savedata.h and
+ * utility_common.h; MIT), named below as uofw names them: 0 success;
+ * LOAD_NO_DATA when no save dir matches at all; 0x80110309 when the dir is
+ * there but the data file is not; RW_NO_DATA / RW_FILE_NOT_FOUND are the
+ * read/write family's pair for the same two situations; DELETE_NO_DATA when a
+ * list delete matches nothing. uofw gives 0x80110309 two names, LOAD_NO_UMD
+ * and LOAD_INTERNAL_ERROR, and no file-not-found code in the load family; it
+ * is used for that here because it sits where RW_FILE_NOT_FOUND (0x80110329)
+ * sits in its own family. That pairing is an inference, not a lookup.
  * Interactive results are written only after a decision or an error.
  * Secure-file classification is tracked in memory; free space is the host's.
  */
 
 /* Result codes the modes below can produce. */
 #define SD_OK              0u
-#define SD_LOAD_NO_DATA    0x80110307u
-#define SD_LOAD_FILE       0x80110309u
-#define SD_RW_NO_DATA      0x80110327u
-#define SD_RW_FILE         0x80110329u
-#define SD_DELETE_NO_DATA  0x80110347u
-#define SD_LOAD_BROKEN     0x80110306u
-#define SD_RW_BROKEN       0x80110326u
-#define SD_LOAD_ACCESS     0x80110305u   /* read failed */
-#define SD_SAVE_ACCESS     0x80110385u   /* write or list failed */
-#define SD_DELETE_ACCESS   0x80110345u
-#define SD_ERASE_ACCESS    0x80110325u
-#define SD_BAD_PARAM       0x80110004u   /* rejected parameter block */
-#define SD_BUSY            0x80110001u   /* a utility is already running */
+#define SD_LOAD_NO_DATA    0x80110307u   /* LOAD_NO_DATA */
+#define SD_LOAD_FILE       0x80110309u   /* LOAD_NO_UMD; see above */
+#define SD_RW_NO_DATA      0x80110327u   /* RW_NO_DATA */
+#define SD_RW_FILE         0x80110329u   /* RW_FILE_NOT_FOUND */
+#define SD_DELETE_NO_DATA  0x80110347u   /* DELETE_NO_DATA */
+#define SD_LOAD_BROKEN     0x80110306u   /* LOAD_DATA_BROKEN */
+#define SD_RW_BROKEN       0x80110326u   /* RW_DATA_BROKEN */
+#define SD_LOAD_ACCESS     0x80110305u   /* LOAD_ACCESS_ERROR: read failed */
+#define SD_SAVE_ACCESS     0x80110385u   /* SAVE_ACCESS_ERROR: write, list */
+#define SD_DELETE_ACCESS   0x80110345u   /* DELETE_ACCESS_ERROR */
+#define SD_ERASE_ACCESS    0x80110325u   /* RW_ACCESS_ERROR */
+/* The two common-utility codes: a rejected parameter block
+ * (INVALID_PARAM_SIZE), and a utility already running (INVALID_STATUS). */
+#define SD_BAD_PARAM       0x80110004u
+#define SD_BUSY            0x80110001u
 /* Interactive outcomes written to the result word: not PSP status codes. */
 #define SD_RESULT_CANCEL   1u
 #define SD_RESULT_ABORT    2u            /* scripted responses ran out or mismatched */

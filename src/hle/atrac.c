@@ -1005,9 +1005,11 @@ static void hle_IsSecondBufferNeeded(void) {
     psp_ret(0);
 }
 
-/* Names found by hashing the identifiers in pspautotests' audio/atrac sources
- * against this module's import table; tests/test_hle.c re-derives every NID
- * from its name, so a wrong pairing here fails the build's tests. */
+/* NIDs and names are PSPSDK's import stubs (src/atrac3/sceAtrac3plus.S; BSD),
+ * and uofw's libatrac3plus exports (src/kd/libatrac3plus/exports.exp; MIT) for
+ * the three PSPSDK lacks: GetOutputChannel, IsSecondBufferNeeded and
+ * GetBufferInfoForResetting. tests/test_hle.c re-derives every NID from its
+ * name, so a wrong pairing here fails the build's tests. */
 void psp_atrac_register(void) {
     psp_hle_register(0x7A20E7AF, "sceAtrac3plus", "sceAtracSetDataAndGetID",          hle_SetDataAndGetID);
     psp_hle_register(0x0FAE370E, "sceAtrac3plus", "sceAtracSetHalfwayBufferAndGetID", hle_SetHalfwayBufferAndGetID);

@@ -331,9 +331,9 @@ void psp_sysmem_register(void) {
      * 0x05050010, and this is the NID it imports.
      *
      * Registered *unnamed* on purpose, and the reason is checkable rather than
-     * a matter of taste. The circulating label for this NID is
-     * `sceKernelSetCompiledSdkVersion500_505`, and SHA-1 of that string is
-     * 0xC28A2329, not 0x91DE343C -- so whatever that label is, it is not the
+     * a matter of taste. uofw's sysmem exports label this NID
+     * `sceKernelSetCompiledSdkVersion500_550`, and SHA-1 of that string is
+     * 0xA503C960, not 0x91DE343C -- so whatever that label is, it is not the
      * exported symbol, and the real name is not known. Registering it as named
      * would put a false name in the diagnostics and fail the SHA-1 check in
      * test_hle.c, which is right to reject it. */

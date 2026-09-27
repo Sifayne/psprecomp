@@ -604,9 +604,10 @@ static void on_thread_end(uint32_t uid, uint32_t status) {
 
 /* sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout)
  *
- * The second argument is a *timeout pointer*, not somewhere to put the exit
- * status -- writing the status there corrupted whatever the guest kept at that
- * address. The status is the *return value*, which threads/threadend prints:
+ * The second argument is a *timeout pointer* (PSPSDK's pspthreadman.h
+ * declares it so), not somewhere to put the exit status -- writing the status
+ * there corrupted whatever the guest kept at that address. The status is the
+ * *return value*, which threads/threadend prints:
  * a thread whose body returns 5 is waited on, and the wait answers
  * `Already ended: 00000005`. */
 static void hle_WaitThreadEnd(void) {

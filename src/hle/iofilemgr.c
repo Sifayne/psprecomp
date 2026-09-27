@@ -479,7 +479,9 @@ static void write_stat(uint32_t out, int is_dir, uint64_t size, uint32_t lba) {
      * one did, opening umd1: and then never issuing a read.
      *
      * So st_private[0] carries the file's starting sector, which is the one
-     * field of the stat block this game reads. */
+     * field of the stat block this game reads, and which is what the
+     * firmware's ISO filesystem puts there (uofw src/kd/isofs/isofs.c:
+     * `stat->st_private[0] = isoDir->lbn`). */
     psp_write32(out + 64, lba);
 
     /* The three timestamps stay zero. Nothing in a game's load path reads them,
@@ -807,9 +809,11 @@ static void hle_Dclose(void) {
 
 /* The five directory calls M1 named and M4 needs. The game stats
  * ms0:/PSP/SAVEDATA/<id> to probe for saves and makes the tree when it
- * writes; nothing on a measured path calls these yet, so they are shaped
- * by PPSSPP's documented behaviour (Core/HLE/sceIo.cpp) rather than by a
- * capture. */
+ * writes; nothing on a measured path calls these yet, so there is no capture
+ * to shape them. NIDs and names are PSPSDK's IoFileMgrForUser stubs
+ * (src/user/IoFileMgrForUser.S; BSD). They behave as the host filesystem
+ * does, and the failures are uofw's errno codes (include/common/errors.h):
+ * 0x80010002 FILE_NOT_FOUND, 0x80010011 FILE_ALREADY_EXISTS. */
 
 /* The process-wide current directory for paths without a device prefix.
  * The game only ever passes absolute device paths (no measured open names
@@ -851,9 +855,9 @@ static void hle_Chdir(void) {
 }
 
 /* Attribute changes have no observable consumer -- nothing reads back modes
- * or times -- so this validates the path and reports success, the way
- * PPSSPP leaves it unimplemented-but-zero. Mapping chmod bits onto host
- * bits would be a second attributes model to keep correct. */
+ * or times -- so this validates the path and reports success without changing
+ * anything. Mapping chmod bits onto host bits would be a second attributes
+ * model to keep correct. */
 static void hle_Chstat(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
@@ -969,19 +973,20 @@ int psp_io_remove_tree(const char *guest) {
  * a way to be wrong. So every operation stores its result immediately and poll
  * reports it on the first ask.
  *
- * The three states an async handle can be in:
+ * The three states an async handle can be in, as uofw's do_get_async_stat
+ * (src/kd/iofilemgr/iofilemgr.c) sorts them:
  *   - an operation still running    -> poll returns 1, wait blocks
  *   - a result waiting              -> written as a 64-bit value, poll returns 0
- *   - nothing outstanding           -> SCE_KERNEL_ERROR_NOASYNC
+ *   - nothing outstanding           -> SCE_ERROR_KERNEL_NO_ASYNC_OP
  * pspautotests does not cover the async calls, so unlike most rules in this
- * tree these three are not pinned by a capture -- they are the shape the API
- * has to have for its own return codes to mean anything.
+ * tree these three are not pinned by a capture.
  * The first case cannot arise here, which is the one place this differs from
  * hardware: a game that depends on a read *not* having finished yet sees it
  * finished. That is the safe direction -- the data is there either way.
  */
+/* uofw include/common/errors.h: BAD_FILE_DESCRIPTOR and NO_ASYNC_OP. */
 #define SCE_ERROR_BADF     0x80020323u
-#define SCE_ERROR_NOASYNC  0x80020321u
+#define SCE_ERROR_NOASYNC  0x8002032Au
 
 static void async_done(io_file *h, int64_t value) {
     h->result = value;

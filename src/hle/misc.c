@@ -139,24 +139,23 @@ static void hle_Stderr(void) { psp_ret(2); }
 
 /* ---- sceSuspendForUser --------------------------------------------------- */
 
-/* Volatile memory: the 4MB between the kernel area and user RAM.
- *
- * It belongs to the UMD cache, and a game may borrow it -- typically as the
- * scratch buffer it decompresses an archive into. The call reports the block
- * back through two out-parameters, and a stub that returned "success" while
- * writing neither left the game holding a null pointer and a length of zero. It
- * then walked a table through that pointer, which is how this surfaced: an
- * endless run of bad accesses just past the end of .bss, in a structure whose
- * two neighbouring fields were the very pointers passed in here.
+/* Volatile memory: a block the firmware lends a game on request, typically
+ * as the scratch buffer it decompresses an archive into. The call reports the
+ * block back through two out-parameters, and a stub that returned "success"
+ * while writing neither left the game holding a null pointer and a length of
+ * zero. It then walked a table through that pointer, which is how this
+ * surfaced: an endless run of bad accesses just past the end of .bss, in a
+ * structure whose two neighbouring fields were the very pointers passed in
+ * here.
  *
  * Where the block sits is this file's choice rather than a fact to look up:
  * the call reports address and size through out-parameters and the guest uses
  * what it is handed. Two things constrain the choice. It has to be mapped,
  * which it is -- PSP_RAM_BASE is 0x08000000 and the RAM is 32MB -- and it has
  * to sit below the user heap so that psp_sysmem_alloc can never hand the same
- * bytes out twice. User memory begins at 0x08800000 (uofw documents the map),
- * so the 4MB immediately under it is free for this and is where hardware keeps
- * the UMD cache the call is borrowing. */
+ * bytes out twice. User memory begins at 0x08800000 (uofw's
+ * include/common/memory.h, SCE_USERSPACE_ADDR_KU0), so the 4MB immediately
+ * under it is free for this. */
 #define PSP_VOLATILE_BASE 0x08400000u
 #define PSP_VOLATILE_SIZE 0x00400000u
 
