@@ -101,7 +101,9 @@ static int fx16_floor(float f) {
 /* Texture state. The command numbers here and above are PSPSDK's, from
  * src/gu/guInternal.h -- BSD, and the SDK that emits them, so it is the
  * definition rather than a reading of one. Names differ (TEX_ADDR0,
- * TEX_BUF_WIDTH0, CLUT_BUF_PTR); the values do not. */
+ * TEX_BUF_WIDTH0, CLUT_BUF_PTR); the values do not. Every GE_* command number
+ * in this file is also a command of the same number in uofw's
+ * include/ge_user.h (MIT). */
 #define GE_TEXADDR0     0xA0
 #define GE_TEXBUFWIDTH0 0xA8
 #define GE_CLUTADDR     0xB0
@@ -236,7 +238,8 @@ static int fx16_floor(float f) {
 #define MAX_QUEUES 8
 #define GE_STACK   8
 
-/* SIGNAL behaviour emitted by sceGuSignal(GU_SIGNAL_PAUSE). */
+/* SIGNAL behaviour emitted by sceGuSignal(GU_SIGNAL_PAUSE); PSPSDK's pspgu.h
+ * defines GU_SIGNAL_PAUSE as 3. */
 #define GE_SIGNAL_HANDLER_PAUSE 0x03
 
 /* Primitive types, from the PRIM argument's type field. */
@@ -768,13 +771,17 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  *
  * The commands are PSPSDK's TRANSFER_* group (guInternal.h): SRC 0xb2, SRC_W
  * 0xb3, DST 0xb4, DST_W 0xb5, START 0xea, SRC_OFFSET 0xeb, DST_OFFSET 0xec,
- * SIZE 0xee. How the fields sit inside them is what sceGuCopyImage writes, and
- * the parts worth naming are the ways to be quietly wrong:
- *   - address low bits come from SRC/DST masked to 0xFFFFF0, and bits 24-31
- *     from the *stride* register's high byte -- the same split as FBP/FBW.
- *   - width and height are stored as n-1.
- *   - the stride field is 0x7F8 wide, and anything above 0x400 means zero.
- *   - TRANSFERSTART bit 0 selects 32-bit pixels; everything else is 16-bit.
+ * SIZE 0xee. How the fields sit inside them is what PSPSDK's sceGuCopyImage
+ * writes, and the parts worth naming are the ways to be quietly wrong:
+ *   - address bits 0-23 come from SRC/DST, and bits 24-31 from the *stride*
+ *     register's high byte -- the same split as FBP/FBW. The low four bits
+ *     are masked off here (0xFFFFF0); that alignment is unsourced.
+ *   - width and height are stored as n-1; offsets are y << 10 | x.
+ *   - the stride is a multiple of 8 up to 1024, so the field is read as
+ *     0x7F8. Reading anything above 0x400 as zero is unsourced; sceGuCopyImage
+ *     never sends one.
+ *   - TRANSFERSTART bit 0 selects 32-bit pixels (PSM 8888); everything else
+ *     is 16-bit.
  */
 static uint32_t xfer_addr(uint32_t base, uint32_t widthreg) {
     return (base & 0xFFFFF0u) | ((widthreg & 0xFF0000u) << 8);
@@ -2110,8 +2117,10 @@ static void push_pixel_state_body(void) {
     /* Clear mode bypasses the depth test as well as texturing, blending and the
      * alpha test. It is a blit of the clear values, so the comparison is forced
      * to ALWAYS -- an *enabled* test that always passes, not a disabled one --
-     * and depth write comes from the clear-mode depth bit rather than ZMSK. The
-     * distinction matters because a disabled test writes no depth at all, so
+     * and depth write comes from the clear-mode depth bit rather than ZMSK.
+     * That bit is PSPSDK's: sceGuClear sends its GU_*_BUFFER_BIT flags
+     * shifted into CLEAR_MODE bits 8-10, depth at bit 10. The distinction
+     * matters because a disabled test writes no depth at all, so
      * encoding the clear as "test off, write on" would stop it clearing.
      *
      * An earlier revision ran the game's own test here instead, on the reasoning

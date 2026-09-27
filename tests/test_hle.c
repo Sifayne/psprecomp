@@ -507,47 +507,29 @@ static void test_guest_strings(void) {
  * wakeups never arrive -- the success-lie. Out-parameters stay untouched on
  * the failure paths, the Refer*Status rule. */
 static void test_net(void) {
-    static const struct { const char *name; uint32_t want; } refused[] = {
-        { "sceNetAdhocInit",         SCE_KERNEL_ERROR_NOTIMPLEMENTED  },
-        { "sceNetAdhocctlInit",      SCE_KERNEL_ERROR_NOTIMPLEMENTED  },
-        { "sceNetAdhocTerm",         SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPdpCreate",    SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPdpSend",      SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPdpRecv",      SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPdpDelete",    SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPtpClose",     SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPtpSend",      SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPtpOpen",      SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPtpRecv",      SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPtpAccept",    SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPtpListen",    SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPtpConnect",   SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocPtpFlush",     SCE_NET_ADHOC_ERROR_NOT_INITIALIZED    },
-        { "sceNetAdhocctlTerm",      SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
-        { "sceNetAdhocctlAddHandler",SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
-        { "sceNetAdhocctlDelHandler",SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
-        { "sceNetAdhocctlDisconnect",SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
-        { "sceNetAdhocctlConnect",   SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
-        { "sceNetAdhocctlGetState",  SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
-        { "sceNetAdhocctlGetPeerList", SCE_NET_ADHOCCTL_ERROR_NOT_INITIALIZED },
-        { "sceNetGetLocalEtherAddr", SCE_NET_ERROR_NO_ADDRESS },
+    static const char *const refused[] = {
+        "sceNetAdhocInit",          "sceNetAdhocctlInit",
+        "sceNetAdhocTerm",          "sceNetAdhocPdpCreate",
+        "sceNetAdhocPdpSend",       "sceNetAdhocPdpRecv",
+        "sceNetAdhocPdpDelete",     "sceNetAdhocPtpClose",
+        "sceNetAdhocPtpSend",       "sceNetAdhocPtpOpen",
+        "sceNetAdhocPtpRecv",       "sceNetAdhocPtpAccept",
+        "sceNetAdhocPtpListen",     "sceNetAdhocPtpConnect",
+        "sceNetAdhocPtpFlush",      "sceNetAdhocctlTerm",
+        "sceNetAdhocctlAddHandler", "sceNetAdhocctlDelHandler",
+        "sceNetAdhocctlDisconnect", "sceNetAdhocctlConnect",
+        "sceNetAdhocctlGetState",   "sceNetAdhocctlGetPeerList",
+        "sceNetGetLocalEtherAddr",
     };
     for (size_t i = 0; i < sizeof refused / sizeof refused[0]; i++) {
-        uint32_t got = call(psp_nid(refused[i].name), 0, 0, 0, 0);
-        CHECK(got == refused[i].want, "%s: got 0x%08X, want 0x%08X",
-              refused[i].name, got, refused[i].want);
+        uint32_t got = call(psp_nid(refused[i]), 0, 0, 0, 0);
+        CHECK(got == SCE_KERNEL_ERROR_NOTIMPLEMENTED, "%s: got 0x%08X, want 0x%08X",
+              refused[i], got, SCE_KERNEL_ERROR_NOTIMPLEMENTED);
     }
 
-    /* sceNetInit manages a pool, not the radio: real argument validation,
-     * then vacuous success -- the two rules PPSSPP pins against hardware. */
+    /* sceNetInit manages a pool, not the radio: vacuous success. */
     CHECK(call(psp_nid("sceNetInit"), 65536, 30, 0x1000, 30) == 0,
           "net init succeeds");
-    CHECK(call(psp_nid("sceNetInit"), 0, 30, 0x1000, 30) == SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE,
-          "net init refuses a zero pool");
-    CHECK(call(psp_nid("sceNetInit"), 65536, 0x07, 0x1000, 30) == SCE_KERNEL_ERROR_ILLEGAL_PRIORITY,
-          "net init refuses a bad callout priority");
-    CHECK(call(psp_nid("sceNetInit"), 65536, 30, 0x1000, 0x78) == SCE_KERNEL_ERROR_ILLEGAL_PRIORITY,
-          "net init refuses a bad netintr priority");
     CHECK(call(psp_nid("sceNetTerm"), 0, 0, 0, 0) == 0, "net term succeeds");
 
     /* Failure writes nothing: seed guards around the two calls that take

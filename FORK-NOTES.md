@@ -38,9 +38,11 @@ arbitrary synthetic keys.
 ## Remaining limits
 
 - The Windows half of `src/os.c` has not been validated with a Windows build.
-- Some MPEG constants and PSP ABI facts come from community reverse
-  engineering; source comments identify the evidence. PPSSPP references in
-  the networking shim identify names, numeric values and observed behavior.
+- No code, names or values may be taken from PPSSPP. PSP facts in the
+  runtime come from PSPSDK (BSD), uofw (MIT), hardware captures or the game's
+  own behaviour, and source comments name the source. A few sceMpeg sizes and
+  ring buffer fields in `src/hle/mpeg.c` predate that rule and are marked
+  "unsourced" until they have one.
 - Upstream contributions need their own review and scope. The original patch
   series mixes core toolchain changes and game-driven HLE work; publishing
   this fork does not submit those changes upstream.
