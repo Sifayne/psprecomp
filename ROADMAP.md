@@ -1,6 +1,10 @@
 # Roadmap
 
-Phased plan. Phase 1 is done; phase 2 is the gate everything else waits behind.
+Phased plan, last checked against the code on 2026-09-27. Phases 1, 2a and 4
+are done, phase 3 lacks only a hints file, and phase 5 lacks only the PPSSPP
+cross-check. Phase 2b is still open but off the critical path, because
+`pspdecrypt` supplies plaintext modules today. What is left is breadth: see
+*Open work* at the end.
 
 ## Phase 1 — the container stack and the decoder ✅
 
@@ -143,10 +147,11 @@ about being self-contained, which is a goal but not a gate.
       recognise pointers by shape: in the code extent, instruction-aligned, and
       pointing at something that decodes. Deliberately kept separate and named
       as a **heuristic** rather than enumeration. **70% -> 88%** on `hell2k`.
-- [ ] **Jump-table resolution** — the `lui`/`addiu`/`sll`/`addu`/`lw`/`jr`
-      idiom that MIPS compilers emit for `switch`. 38 unresolved sites in
-      Lumberjack. Unresolved tables become dispatch-table lookups rather than
-      analysis failures.
+- [x] **Jump-table resolution** — the `lui`/`addiu`/`sll`/`addu`/`lw`/`jr`
+      idiom that MIPS compilers emit for `switch` (`resolve_jump_table` in
+      `analyze.c`). A table is rejected wholesale if any entry fails to land on
+      valid code in `.text`. A table it cannot resolve still works at run time,
+      because every label is dispatchable.
 - [x] **The delay-slot problem.** Ordinary branches capture their condition
       into a temporary before the slot runs (so a slot that writes a compared
       register cannot flip the branch); likely branches duplicate the slot into
@@ -168,44 +173,102 @@ about being self-contained, which is a goal but not a gate.
       *below* its entry point (so functions carry a `start` as well as an `end`).
 - [ ] **Hints file** — per-title force-code/force-data, function names, and
       HLE overrides, so a title's hard-won analysis is data rather than a patch.
+      The override part exists as `emit --replace`: listed functions are left
+      for the host to implement, with the translated body still callable as
+      `psp_func_<addr>__orig`. Force-code/force-data and names do not.
 
-## Phase 4 — the HLE library
+## Phase 4 — the HLE library ✅
 
 Games do not touch hardware directly; they call the firmware. That surface is a
-library, which means it is implemented, not emulated.
+library, which means it is implemented, not emulated. 340 functions across 25
+libraries are registered; `test_hle` checks every named NID against SHA-1 of
+its name.
 
-- [ ] **`sceKernel`** — threads, semaphores, event flags, mutexes, callbacks,
-      the memory partitions, timers. Modelled on the MIT-licensed `uofw`
-      reference implementation.
-- [ ] **`sceIo`** — the file API over a host directory standing in for the UMD.
-- [ ] **`sceCtrl`** — the pad, mapped to host input.
-- [ ] **`sceDisplay` + `sceGe`** — the display list processor. The GE is a
+- [x] **`sceKernel`** — threads, semaphores, event flags, mutexes and
+      LwMutexes, callbacks, the memory partitions, VPL/FPL, mailboxes, message
+      pipes, TLS pools, alarms and VTimers (`threadman.c`, `kernlock.c`,
+      `kernobj.c`, `ktimer.c`, `sysmem.c`). Error codes and pool layouts are
+      transcribed from pspautotests' hardware captures.
+- [x] **`sceIo`** — the file API over a host directory standing in for the UMD,
+      or over files inside an ISO; sync and async calls, directories.
+- [x] **`sceCtrl`** — the pad, merged from host input, `PSPRECOMP_PAD` and
+      scripted scenarios, with a recorder (`ctrl_replay.c`).
+- [x] **`sceDisplay` + `sceGe`** — the display list processor. The GE is a
       fixed-function GPU with a documented command stream; it is emulated as a
-      peripheral, the same split as the Lynx's Suzy/Mikey.
-- [ ] **`sceAudio` / `sceSas`** — PCM out and the hardware voice mixer.
-- [ ] **Module import resolution** — a PRX's import stubs bound to HLE
-      implementations at load time, with an unimplemented-call trap that names
-      the missing function instead of crashing.
+      peripheral, the same split as the Lynx's Suzy/Mikey. See phase 5 for
+      rendering.
+- [x] **`sceAudio` / `sceSas`** — PCM out to a host hook, and the hardware
+      voice mixer with its ADSR curves and argument checks.
+- [x] **`sceAtrac3plus` and `sceMpeg`** — the streaming contracts, with
+      optional libavcodec and openh264 behind them for the actual decoding.
+- [x] **`sceUtility` savedata** — `ms0:/PSP/SAVEDATA` on a host directory, an
+      interactive session a host can present, and a savedata host bridge
+      (`include/psprecomp/savedata.h`).
+- [x] **`sceUmd`, `scePower`, `sceRtc`, `sceDmac`, ModuleMgr, LoadExec** — the
+      small libraries a game's startup needs.
+- [x] **`sceNet` / adhoc** — refused the way hardware refuses with no radio.
+- [x] **Module import resolution** — the emitter turns each import stub into
+      a traced call through the NID table, and the interpreter binds
+      `.sceStub.text` thunks to the same table. An unregistered NID is logged
+      by number and returns 0 rather than crashing.
 
 ## Phase 5 — running the recompiled C
 
-- [ ] **Dispatch table** — `addr -> psp_fn_t`, for indirect calls and jump
-      tables. Static `jal` stays a direct C call.
-- [ ] **The interpreter oracle** — an Allegrex interpreter sharing this repo's
+- [x] **Dispatch table** — `addr -> psp_fn_t`, for indirect calls and jump
+      tables (`src/dispatch.c`). Static `jal` stays a direct C call.
+- [x] **The interpreter oracle** — an Allegrex interpreter sharing this repo's
       decoder and runtime, so the recompiled path can be diffed against it
-      instruction-for-instruction. When they disagree, the bug is in exactly
-      one of them. This is the bring-up tool that everything else leans on.
+      instruction-for-instruction (`tools/allegrexrecomp/interp.c`,
+      `allegrexrecomp interp`). When they disagree, the bug is in exactly one of
+      them. This is the bring-up tool that everything else leans on.
+- [x] **Threads** — each guest thread on its own host thread, with a handoff
+      token so exactly one runs at a time (`src/hle/sched.c`), and a guest
+      clock that advances at every firmware call (`src/hle/clock.c`).
 - [ ] **PPSSPP cross-check** — trace comparison against the external oracle at
       the syscall and frame level. See [`docs/ORACLE.md`](docs/ORACLE.md).
-- [ ] **First pixels** — a recompiled module reaching a rendered frame.
+      Nothing in this repo produces or compares such traces yet.
+- [x] **First pixels** — a recompiled module reaching a rendered frame.
+      Armored Core: Last Raven Portable renders its garage, missions and
+      combat.
+- [x] **A render backend interface** — twelve required calls in
+      `include/psprecomp/render.h` plus optional hooks for a backend that runs
+      its own transform, the software backend as the reference, a null backend
+      for counting, and `psp_render_register` for a backend the host supplies.
+      See [`docs/RENDERER.md`](docs/RENDERER.md).
+- [x] **GE capture** — frames of display-list work plus the memory they read,
+      selected by pad poll, for replay against any backend.
 
 ## Phase 6 — corpus and player-facing layer
 
 - [ ] `scripts/sweep` over a large PSP corpus as a correctness harness:
       decrypt-all, decode-all, report coverage. Every module that fails is a
       concrete decoder or container bug, and the aggregate VFPU percentage
-      tells us which titles are cheap targets.
-- [ ] VFPU completion, driven by what the corpus says is actually used.
-- [ ] Save states, an SDL2 + Dear ImGui frontend, controller remapping —
-      built on the runtime, kept behind an opt-in CMake option so the core
-      stays dependency-free.
+      tells us which titles are cheap targets. There is no `scripts/`
+      directory yet.
+- [x] VFPU completion. The emitter translates every VFPU instruction the
+      decoder names; a sub-encoding the runtime does not recognise traps by
+      name.
+- [ ] Save states, an SDL2 + Dear ImGui frontend, controller remapping.
+      The SDL2 window, audio and GL backend exist, but in the game repo's host
+      rather than behind a CMake option here. RAM snapshots
+      (`PSPRECOMP_RAMSNAP`) are an instrument, not save states.
+
+## Open work
+
+Gaps found in the code while checking this file, none of them on a phase above:
+
+- [ ] **GE features** — skinned (weighted) vertices are dropped, Bezier and
+      spline patches are counted but not drawn, bounding-box conditional jumps
+      are never taken, `sceGeSetCallback` handlers are accepted but never
+      called, and dithering is not implemented (`src/hle/ge.c`). The GL
+      backend's own gaps are listed in [`docs/RENDERER.md`](docs/RENDERER.md).
+- [ ] **Preemption** — a thread yields only at firmware calls, so one that
+      spins without calling the kernel hangs (reported, not silent).
+- [ ] **Static-constructor discovery** — `src/ctors.c` picks the single
+      longest null-terminated table; its own notes say candidates should be
+      scored on locality before it is trusted on another title.
+- [ ] **MPEG decode** — the opt-in path produces frames and samples but does
+      not yet get a game further, and assumes a single context.
+- [ ] **Secure savedata** — secure modes store plaintext.
+- [ ] **Windows** — the Windows half of `src/os.c` has not been through a
+      Windows build in this fork.
