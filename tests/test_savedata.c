@@ -369,6 +369,25 @@ static void fw660_cross_mode(void) {
     hw(15,"HWKEY",""); key('A',0); psp_write8(data,0); assert(run()==0 && psp_read8(data)=='k');
     hw(16,"HWPLAIN",""); psp_write8(data,0); assert(run()==0 && psp_read8(data)=='p');
 }
+static void fw660_sizes(void) {
+    /* SIZES whose msData names a missing save: SIZES_NO_DATA, msData left
+     * alone, msFree filled, and utilityData the requested save's own size:
+     * 256-byte data file + PARAM.SFO + directory = 3 clusters (step 50). */
+    const uint32_t fr=0x08819000, md=0x08819100, ud=0x08819200;
+    hw(8,"HWNOSUCH",""); psp_write32(p+124,256);
+    for (unsigned i=0;i<0x300;i++) psp_write8(fr+i,0);
+    str(md,"UITEST001"); str(md+16,"HWNOSUCH");
+    psp_write32(p+1488,fr); psp_write32(p+1492,md); psp_write32(p+1496,ud);
+    assert(run()==0x801103C7u);
+    assert(psp_read32(fr)==0x8000u && psp_read32(fr+4)>0);
+    for (unsigned i=36;i<64;i++) assert(!psp_read8(md+i));
+    assert(psp_read32(ud)==3 && psp_read32(ud+4)==96 && psp_read32(ud+16)==96);
+    assert(psp_read8(ud+8)=='9' && psp_read8(ud+9)=='6' && psp_read8(ud+10)==' ');
+    /* An existing save: result 0 and msData filled. A 40000-byte ICON0 in
+     * the request adds its two clusters to utilityData. */
+    str(md+16,"HWSFO"); psp_write32(p+1412,data); psp_write32(p+1416,40000); psp_write32(p+1420,40000);
+    assert(run()==0 && psp_read32(md+36)>=3 && psp_read32(ud)==5);
+}
 int main(void) {
 #ifndef _WIN32
     snprintf(root,sizeof root,"/tmp/psprecomp-savedata-XXXXXX"); assert(mkdtemp(root));
@@ -377,7 +396,7 @@ int main(void) {
 #endif
     assert(psp_mem_init()==0); psp_cpu_reset(); psp_hle_init(); psp_io_set_root(root); psp_savedata_set_host(1);
     lifecycle(); roundtrip(); deletion(); errors(); request_safety(); headless(); scripts(); coverage();
-    fw660_status(); fw660_sfo(); fw660_keys(); fw660_cross_mode();
+    fw660_status(); fw660_sfo(); fw660_keys(); fw660_cross_mode(); fw660_sizes();
     assert(psp_mem_bad_access==0); psp_mem_free();
     printf("savedata: lifecycle, independent slots, writeback, metadata, cancellation, overwrite, deletion, errors, recovery, scripts, focus, new-data artwork and foreign directories passed\n");
     return 0;

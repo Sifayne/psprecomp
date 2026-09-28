@@ -138,6 +138,7 @@ static void savedata_log(uint32_t param) {
 #define SD_RW_NO_DATA      0x80110327u   /* RW_NO_DATA */
 #define SD_RW_FILE         0x80110329u   /* RW_FILE_NOT_FOUND */
 #define SD_DELETE_NO_DATA  0x80110347u   /* DELETE_NO_DATA */
+#define SD_SIZES_NO_DATA   0x801103C7u   /* SIZES_NO_DATA: msData names no save */
 #define SD_LOAD_BROKEN     0x80110306u   /* LOAD_DATA_BROKEN */
 #define SD_LOAD_BAD_PARAMS 0x80110308u   /* LOAD_BAD_PARAMS */
 #define SD_RW_BROKEN       0x80110326u   /* RW_DATA_BROKEN */
@@ -615,8 +616,9 @@ static void sd_kb_str(uint64_t kb, uint32_t addr) {
 }
 
 /* Sum of file clusters under a save dir, +1 for the directory itself when
- * asked: msData counts files-plus-dir (4 for three files), utilityData
- * counts files alone (3). Read off sizes.expected, where both appear. */
+ * asked: msData counts files-plus-dir (4 for three files, read off
+ * sizes.expected). utilityData is not measured this way; see
+ * sd_fill_sizes. */
 static uint32_t sd_dir_clusters(const char *dir, int with_dir, uint64_t *bytes_out) {
     char names[256][64];
     int n = psp_io_list_names(dir, names, 256);
@@ -660,14 +662,18 @@ static int sd_classify(const sd_sfo_state *st, const char *file) {
 
 /* Fill the SIZES-family structs. Free space is the host's (statvfs where
  * available, a big stick otherwise), so free* lines track this machine the
- * way the suite's track a 16GB card -- environmental either way. Used space
- * is measured out of our own files, which is exact. */
-static void sd_fill_sizes(uint32_t param) {
+ * way the suite's track a 16GB card -- environmental either way. msData is
+ * measured out of our own files, which is exact. Returns SIZES_NO_DATA
+ * when msData names a save that does not exist, after filling the rest:
+ * saveprobe step 50 on fw 6.60 (msData left alone, msFree and utilityData
+ * filled). */
+static uint32_t sd_fill_sizes(uint32_t param) {
     uint32_t msfree = sd_optional(param, SD_MSFREE);
     uint32_t msdata = sd_optional(param, SD_MSDATA);
     uint32_t utild  = sd_optional(param, SD_UTILDATA);
     uint32_t sinfo  = sd_optional(param, SD_SIZEINFO);
-    if (!msfree && !msdata && !utild && !sinfo) return;
+    uint32_t rc = SD_OK;
+    if (!msfree && !msdata && !utild && !sinfo) return rc;
 
     uint64_t freebytes = 0;
 #ifndef _WIN32
@@ -716,19 +722,26 @@ static void sd_fill_sizes(uint32_t param) {
             sd_kb_str((uint64_t)cl * 32u, msdata + 44);
             sd_write_u32(msdata + 52, cl * 32u);
             sd_kb_str((uint64_t)cl * 32u, msdata + 56);
+        } else {
+            rc = SD_SIZES_NO_DATA;
         }
     }
+    /* utilityData is the space the requested save takes, worked out from
+     * the request rather than the card: fw 6.60 answered 3 clusters (96 KB)
+     * for a save that did not exist, with a 256-byte data file, while the
+     * card held at least 12 saves (saveprobe step 50). That is the data
+     * file, the 4912-byte PARAM.SFO and, inferred, one for the directory;
+     * sidecars are counted the same way. Whether a secure file's 16 extra
+     * bytes count (dataSize 32768 vs 32769) is unmeasured. */
     if (utild) {
-        char names[256][64];
-        int n = psp_io_list_names("ms0:/PSP/SAVEDATA", names, 256);
-        uint32_t cl = 0;
-        if (n > 0) {
-            for (int i = 0; i < n; i++) {
-                char child[512];
-                snprintf(child, sizeof child, "ms0:/PSP/SAVEDATA/%s", names[i]);
-                uint64_t bytes = 0;
-                cl += sd_dir_clusters(child, 0, &bytes);
-            }
+        char file[14];
+        sd_getstr(param, SD_FILENAME, 13, file, sizeof file);
+        uint32_t cl = 1 + sd_clusters(SD_SFO_SIZE);
+        if (file[0]) cl += sd_clusters(psp_read32(param + SD_DATASZ));
+        for (uint32_t off = SD_ICON0; off <= SD_SND0; off += 16) {
+            uint32_t buf = psp_read32(param + off), bsz = psp_read32(param + off + 4),
+                     sz = psp_read32(param + off + 8);
+            if (buf && (sz || bsz)) cl += sd_clusters(sz ? sz : bsz);
         }
         sd_write_u32(utild + 0, cl);
         sd_write_u32(utild + 4, cl * 32u);
@@ -754,6 +767,7 @@ static void sd_fill_sizes(uint32_t param) {
          * overran the game's array: saveprobe step 55's sectorSize read
          * "DATA" once DATA.BIN was listed as secure. */
     }
+    return rc;
 }
 
 /* FILES(12): secure/normal/system buckets. Files in the save's
@@ -1011,7 +1025,7 @@ static uint32_t sd_do_mode(uint32_t param) {
         sd_write_sfo(dir, dir + strlen("ms0:/PSP/SAVEDATA/"), param);
         return sd_io_error ? SD_ERASE_ACCESS : SD_OK;
 
-    case SD_SIZES:
+    case SD_SIZES: return sd_fill_sizes(param);
     case SD_GETSIZE:
         sd_fill_sizes(param);
         return SD_OK;
