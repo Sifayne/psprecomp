@@ -93,14 +93,19 @@ static int grain_ok(uint32_t g) { return g >= 64 && g <= SAS_MAX_GRAIN && (g % 3
  * documented pairs read (115, 52) here and (115, -52) elsewhere.
  *
  * Entries past the ninth are measured rather than derived -- they are the
- * module's own data, whatever sits after the table. W[19] is the one value
- * the corpus underdetermines: filter 14 clamps, so anything from 82 to 85
- * gives its output. Nothing an encoder emits reaches past filter 4. */
+ * module's own data, whatever sits after the table, so another firmware may
+ * differ. sasprobe fits both weights of every filter from its output on
+ * firmware 6.60 (steps 133-148): each has exactly one fit, and all sixteen
+ * are this table's. W[19], filter 14's second weight, is 6: the corpus's
+ * filter-14 run clamps before that weight shows and allowed 82 to 85, but
+ * sasprobe's input reaches it first, and 85 oscillates where hardware
+ * saturates at 32767 (step 147). Nothing an encoder emits reaches past
+ * filter 4. */
 static const int VAG_W[21] = {
     /* first  weights, 0..4 */    0, 60, 115,  98, 122,
     /* second weights, 0..4 */    0,  0,  52,  55,  60,
     /* past the table          */ 0,  0,   0,   2, 125,
-                                  0, 91,   0, 216,  85, 151,
+                                  0, 91,   0, 216,   6, 151,
 };
 
 enum { ENV_OFF = 0, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
