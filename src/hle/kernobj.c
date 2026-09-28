@@ -420,8 +420,16 @@ static void hle_FreeVpl(void) {
      *
      * And that one is decided before the uid is. vpl/free refuses a null uid
      * with a good pointer as UNKNOWN_VPLID and a null uid with 0xDEADBEEF as
-     * 0x800200D3, so the pointer is what the kernel objects to first. */
-    if (ptr && !psp_mem_ptr(ptr, 4)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+     * 0x800200D3, so the pointer is what the kernel objects to first.
+     *
+     * "Not mapped" is too wide. syncprobe steps 227-228 (fw 6.60) free 0x10,
+     * which is no memory at all: against a pool it is ILLEGAL_MEMBLOCK, and
+     * against uid 0 it is UNKNOWN_VPLID. So the kernel only refuses a pointer
+     * with bit 31 set, as 0xDEADBEEF has -- the user-mode pointer check that
+     * uofw's pspK1PtrOk spells out. This read psp_mem_ptr, which the interp
+     * harness satisfies for 0x10 (it maps the module at 0) and a native build
+     * does not. Nothing below dereferences ptr. */
+    if (ptr & 0x80000000u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
 
     psp_vpl *v = find_vpl(id);
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VPLID); return; }
@@ -1631,10 +1639,11 @@ static void hle_FreeFpl(void) {
     psp_fpl *f = find_fpl(id);
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_FPLID); return; }
 
-    /* The same two-way split the vpl has: a pointer that is not mapped memory
-     * at all is ILLEGAL_SIZE, while one that is real but is not the start of a
-     * live block of *this* pool is ILLEGAL_MEMBLOCK. */
-    if (ptr && !psp_mem_ptr(ptr, 1)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+    /* The same two-way split the vpl has: a kernel-space pointer is
+     * ILLEGAL_SIZE, while any other that is not the start of a live block of
+     * *this* pool is ILLEGAL_MEMBLOCK -- 0x10 included (syncprobe step 230,
+     * fw 6.60; see hle_FreeVpl). */
+    if (ptr & 0x80000000u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
     if (ptr >= f->base && ptr < f->base + f->nblocks * f->stride) {
         const uint32_t i = (ptr - f->base) / f->stride;
         if (f->base + i * f->stride == ptr && fpl_is_taken(f, i)) {

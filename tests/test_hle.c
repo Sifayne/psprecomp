@@ -1201,6 +1201,29 @@ static void test_time_calls(void) {
           "RFC3339 at +540: \"%s\"", s);
 }
 
+/* Freeing a pointer that is no memory at all (syncprobe steps 226-231, fw
+ * 6.60): 0x10 is a bad block, not a bad address, and uid 0 is still an
+ * unknown pool; only a kernel-space pointer is 0x800200D3. */
+static void test_pool_free_pointers(void) {
+    const uint32_t name = guest_name("pool");
+    const uint32_t vpl = call5(psp_nid("sceKernelCreateVpl"), name, 2, 0, 0x100, 0);
+    const uint32_t fpl = call7(psp_nid("sceKernelCreateFpl"), name, 2, 0, 0x10, 2, 0, 0);
+    CHECK((int32_t)vpl > 0 && (int32_t)fpl > 0, "vpl %08X fpl %08X", vpl, fpl);
+
+    const uint32_t FV = psp_nid("sceKernelFreeVpl"), FF = psp_nid("sceKernelFreeFpl");
+    CHECK(call(FV, vpl, 0, 0, 0) == 0x800201B6u, "FreeVpl(vpl, NULL)");
+    CHECK(call(FV, vpl, 0x10, 0, 0) == 0x800201B6u, "FreeVpl(vpl, 0x10)");
+    CHECK(call(FV, 0, 0x10, 0, 0) == 0x8002019Cu, "FreeVpl(0, 0x10)");
+    CHECK(call(FV, 0, 0xDEADBEEFu, 0, 0) == 0x800200D3u, "FreeVpl(0, 0xDEADBEEF)");
+    CHECK(call(FF, fpl, 0, 0, 0) == 0x800201B6u, "FreeFpl(fpl, NULL)");
+    CHECK(call(FF, fpl, 0x10, 0, 0) == 0x800201B6u, "FreeFpl(fpl, 0x10)");
+    CHECK(call(FF, 0, 0x10, 0, 0) == 0x8002019Du, "FreeFpl(0, 0x10)");
+    CHECK(call(FF, fpl, 0xDEADBEEFu, 0, 0) == 0x800200D3u, "FreeFpl(fpl, 0xDEADBEEF)");
+
+    call(psp_nid("sceKernelDeleteVpl"), vpl, 0, 0, 0);
+    call(psp_nid("sceKernelDeleteFpl"), fpl, 0, 0, 0);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -1230,6 +1253,7 @@ int main(void) {
     test_stdio_async();
     test_display();
     test_time_calls();
+    test_pool_free_pointers();
 
     psp_mem_free();
 
