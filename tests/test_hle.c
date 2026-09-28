@@ -1152,6 +1152,127 @@ static void test_sas_hardware_rules(void) {
           call(psp_nid("__sceSasGetEnvelopeHeight"), SAS_CORE, 0, 0, 0));
 }
 
+/* What sasprobe 3 measured on firmware 6.60 (run 4); each check names its
+ * step. */
+static void test_sas_round3_rules(void) {
+    const uint32_t RAMP = SAS_DATA, CONST = SAS_DATA + 0x1000u;
+    for (uint32_t i = 0; i < 64; i++) {
+        psp_write16(RAMP + i * 2u, (uint16_t)(4 * (i + 1)));
+        psp_write16(CONST + i * 2u, 16384);
+    }
+
+    /* The noise clock (step 264): frequency 53 moves the register after the
+     * voice's sample 3 and then 6, 6, 3, 3, 6 samples apart. */
+    sas_fresh();
+    call(psp_nid("__sceSasSetNoise"), SAS_CORE, 0, 53, 0);
+    sas_flat_voice(0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    sas_core();
+    {
+        static const int at[9][2] = { { 35, 0 }, { 36, 1 }, { 41, 1 }, { 42, 3 }, { 47, 3 },
+                                      { 48, 7 }, { 50, 7 }, { 51, 15 }, { 54, 31 } };
+        for (int i = 0; i < 9; i++)
+            CHECK(sas_left((uint32_t)at[i][0]) == at[i][1], "noise 53: L[%d] = %d, want %d",
+                  at[i][0], sas_left((uint32_t)at[i][0]), at[i][1]);
+    }
+
+    /* The re-key fade (steps 177, 275): KeyOff and KeyOn with no core
+     * between. The old voice plays sample 0, then fades over 20 samples by
+     * 0.625 a sample; the new one starts at 32 as ever. */
+    sas_fresh();
+    call5(psp_nid("__sceSasSetVoicePCM"), SAS_CORE, 0, CONST, 64, 0);
+    sas_flat_voice(0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    sas_core();
+    call(psp_nid("__sceSasSetKeyOff"), SAS_CORE, 0, 0, 0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    sas_core();
+    {
+        static const int at[7][2] = { { 0, 16384 }, { 1, 10240 }, { 2, 6400 }, { 10, 149 },
+                                      { 20, 1 }, { 21, 0 }, { 33, 16384 } };
+        for (int i = 0; i < 7; i++)
+            CHECK(sas_left((uint32_t)at[i][0]) == at[i][1], "re-key: L[%d] = %d, want %d",
+                  at[i][0], sas_left((uint32_t)at[i][0]), at[i][1]);
+    }
+
+    /* The pause fade (steps 305, 310-312): the first paused core plays the
+     * sample due and then fades the *next* source sample; nothing advances,
+     * so the resumed voice plays that first sample again. The looping ramp
+     * is at its sample 32 (132) when the second core starts. */
+    sas_fresh();
+    call5(psp_nid("__sceSasSetVoicePCM"), SAS_CORE, 0, RAMP, 64, 0);
+    sas_flat_voice(0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    sas_core();
+    call(psp_nid("__sceSasSetPause"), SAS_CORE, 1, 1, 0);
+    sas_core();
+    CHECK(sas_left(0) == 132 && sas_left(1) == 85 && sas_left(2) == 53 && sas_left(21) == 0,
+          "pause: L[0..2] %d %d %d L[21] %d, want 132 85 53 0",
+          sas_left(0), sas_left(1), sas_left(2), sas_left(21));
+    sas_core();
+    CHECK(sas_left(0) == 0 && sas_left(1) == 0, "a second paused core is silent");
+    call(psp_nid("__sceSasSetPause"), SAS_CORE, 1, 0, 0);
+    sas_core();
+    CHECK(sas_left(0) == 132 && sas_left(1) == 136, "resumed: L[0..1] %d %d, want 132 136",
+          sas_left(0), sas_left(1));
+
+    /* Waves at pitch 441, a 100-sample period (steps 338, 344, 346, 347). */
+    {
+        static const struct { const char *call; uint32_t duty; uint32_t n; int want; } w[] = {
+            { "__sceSasSetSteepWave", 25, 24, 8192 },   { "__sceSasSetSteepWave", 25, 25, -8192 },
+            { "__sceSasSetTrianglarWave", 0, 1, 16057 }, { "__sceSasSetTrianglarWave", 0, 99, -16057 },
+            { "__sceSasSetTrianglarWave", 75, 50, -1 },  { "__sceSasSetTrianglarWave", 100, 99, 31527 },
+        };
+        for (unsigned i = 0; i < sizeof w / sizeof w[0]; i++) {
+            sas_fresh();
+            call(psp_nid(w[i].call), SAS_CORE, 0, w[i].duty, 0);
+            sas_flat_voice(0);
+            call(psp_nid("__sceSasSetPitch"), SAS_CORE, 0, 441, 0);
+            call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+            sas_core();
+            CHECK(sas_left(32 + w[i].n) == w[i].want, "%s(%u): L[32+%u] = %d, want %d", w[i].call,
+                  w[i].duty, w[i].n, sas_left(32 + w[i].n), w[i].want);
+        }
+    }
+
+    /* A volume of 0x80000000 is accepted and kept as 16 bits: silence
+     * (step 291). */
+    sas_fresh();
+    call5(psp_nid("__sceSasSetVoicePCM"), SAS_CORE, 0, CONST, 64, 0);
+    sas_flat_voice(0);
+    call7(psp_nid("__sceSasSetVolume"), SAS_CORE, 0, 0x80000000u, 0x1000, 0, 0, 0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    sas_core();
+    CHECK(sas_left(100) == 0 && (int16_t)psp_read16(SAS_OUT + 100 * 4 + 2) == 16384,
+          "volume 0x80000000: L[100] %d R[100] %d, want 0 16384", sas_left(100),
+          (int16_t)psp_read16(SAS_OUT + 100 * 4 + 2));
+
+    /* A sustain that has fallen below 0x8000 ends at the next core (step
+     * 136): exponent-rev 0x1000000 from 0x20000000 reads 0x6A2A after ten
+     * cores and 0 after eleven. */
+    sas_fresh();
+    call5(psp_nid("__sceSasSetVoicePCM"), SAS_CORE, 0, CONST, 64, 0);
+    call7(psp_nid("__sceSasSetVolume"), SAS_CORE, 0, 0x1000, 0x1000, 0, 0, 0);
+    call7(psp_nid("__sceSasSetADSRmode"), SAS_CORE, 0, 0xF, 0, 5, 3, 1);
+    call7(psp_nid("__sceSasSetADSR"), SAS_CORE, 0, 0xF, 0x7FFFFFFF, 0x20000000, 0x1000000, 0);
+    call(psp_nid("__sceSasSetSL"), SAS_CORE, 0, 0x20000000, 0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    for (int c = 0; c < 10; c++) sas_core();
+    CHECK(call(psp_nid("__sceSasGetEnvelopeHeight"), SAS_CORE, 0, 0, 0) == 0x6A2Au,
+          "sustain after 10 cores: %08X, want 00006A2A",
+          call(psp_nid("__sceSasGetEnvelopeHeight"), SAS_CORE, 0, 0, 0));
+    sas_core();
+    CHECK(call(psp_nid("__sceSasGetEnvelopeHeight"), SAS_CORE, 0, 0, 0) == 0 &&
+          (call(psp_nid("__sceSasGetEndFlag"), SAS_CORE, 0, 0, 0) & 1u),
+          "and ended after 11");
+
+    /* Refusals: a null core to __sceSasCore (step 355), feedback 128 (319). */
+    CHECK(call(psp_nid("__sceSasCore"), 0, SAS_OUT, 0, 0) == 0x80420005u,
+          "__sceSasCore(NULL) is refused");
+    CHECK(call(psp_nid("__sceSasRevParam"), SAS_CORE, 0, 128, 0) == 0x80420021u,
+          "RevParam feedback 128 is refused");
+}
+
 /* stdout and stderr are not in the descriptor table, and an async write to
  * them used to return BADF -- which dropped the message a panic path writes
  * right before abort(). The synchronous path handled those fds; this pins the
@@ -1430,6 +1551,7 @@ int main(void) {
     test_ge_infinite_list();
     test_sas_adpcm();
     test_sas_hardware_rules();
+    test_sas_round3_rules();
     test_stdio_async();
     test_display();
     test_time_calls();
