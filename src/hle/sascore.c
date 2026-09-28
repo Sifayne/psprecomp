@@ -129,23 +129,32 @@ static int curve_ok(uint32_t mode, int phase_is_attack, int phase_is_sustain) {
     return phase_is_attack ? ((m & 1u) == 0u) : ((m & 1u) == 1u);
 }
 
+/* What a voice plays. __sceSasSetVoice hands it VAG ADPCM, which is decoded
+ * a 16-byte block at a time; __sceSasSetVoicePCM hands it raw signed 16-bit
+ * samples, which are read as they are. The game uses both -- its menu sounds
+ * are VAG and its voice clips PCM -- and the PCM path was missing entirely,
+ * so those voices were silent. */
+enum { SRC_NONE = 0, SRC_VAG, SRC_PCM };
+typedef struct {
+    int      kind;
+    uint32_t addr;
+    uint32_t size;          /* VAG: bytes; PCM: samples, 1..0x10000 */
+    int32_t  loop;          /* VAG: loop mode 0/1; PCM: loop position, negative for none */
+} sas_source;
 
 typedef struct {
-    /* A voice plays one of two things. __sceSasSetVoice hands it VAG ADPCM,
-     * which is decoded a 16-byte block at a time; __sceSasSetVoicePCM hands
-     * it raw signed 16-bit samples, which are read as they are. The game uses
-     * both -- its menu sounds are VAG and its voice clips PCM -- and the PCM
-     * path was missing entirely, so those voices were silent. */
-    int      is_pcm;
-    uint32_t pcm_addr;
-    int32_t  pcm_size;      /* samples */
-    int32_t  pcm_loop;      /* first sample of the loop; negative means none */
+    /* The sample the setters name and the sample that is playing are two
+     * things. A SetVoice or SetVoicePCM on a playing voice does not touch
+     * what it plays: firmware 6.60 goes on looping the old VAG blocks
+     * (sasprobe step 171) and the old PCM loop (step 178) after the call, for
+     * as long as the probe listened. `next` is what the setters wrote, and a
+     * key-on makes it `src`. */
+    sas_source next;
+    sas_source src;
+
     int32_t  pcm_pos;       /* the resampler's sample index; -1 past the end */
     int      pcm_adv;       /* the last step consumed a sample (see pcm_fetch) */
 
-    uint32_t vag_addr;      /* guest address of the sample data */
-    uint32_t vag_size;
-    int      loop;          /* loop mode: a block flagged 3 jumps back */
     uint32_t loop_start;    /* byte offset of the block flagged 6, else 0 */
     int      vag_end;       /* the stream has ended: no more blocks */
     uint32_t pos;           /* byte offset of the current 16-byte block */
@@ -282,9 +291,9 @@ static int clamp16(int v) {
  * it leaves the title screen: NEW GAME hung on a sound effect. */
 static int decode_block(sas_voice *v) {
     if (v->vag_end) return 0;
-    if (v->pos + 16 > v->vag_size) { v->vag_end = 1; return 0; }
+    if (v->pos + 16 > v->src.size) { v->vag_end = 1; return 0; }
 
-    uint32_t at = v->vag_addr + v->pos;
+    uint32_t at = v->src.addr + v->pos;
     uint8_t hdr   = psp_read8(at);
     uint8_t flags = psp_read8(at + 1);
     if (flags == 7) { v->vag_end = 1; return 0; }
@@ -309,7 +318,7 @@ static int decode_block(sas_voice *v) {
 
     if (flags == 6) v->loop_start = v->pos;
     v->pos += 16;
-    if (flags == 3 && v->loop) v->pos = v->loop_start;
+    if (flags == 3 && v->src.loop) v->pos = v->loop_start;
     v->decoded_valid = 1;
     return 1;
 }
@@ -443,14 +452,15 @@ static int32_t ceil_frac(int32_t d, uint32_t f) {
  * (SetVoicePCM accepts any negative one) is no loop (step 179). */
 static int32_t pcm_next(const sas_voice *v, int32_t i) {
     if (i < 0) return -1;
-    if (i + 1 < v->pcm_size) return i + 1;
-    return (v->pcm_loop >= 0 && v->pcm_loop < v->pcm_size) ? v->pcm_loop : -1;
+    const int32_t size = (int32_t)v->src.size, loop = v->src.loop;
+    if (i + 1 < size) return i + 1;
+    return (loop >= 0 && loop < size) ? loop : -1;
 }
 
 /* A PCM voice whose address is zero is accepted by hardware (pcm.expected,
  * "Zero: OK"); it plays silence here rather than reading address zero. */
 static int32_t pcm_at(const sas_voice *v, int32_t i) {
-    return v->pcm_addr ? (int16_t)psp_read16(v->pcm_addr + (uint32_t)i * 2u) : 0;
+    return v->src.addr ? (int16_t)psp_read16(v->src.addr + (uint32_t)i * 2u) : 0;
 }
 
 static uint32_t pcm_pitch(const sas_voice *v) { return v->pitch < 0x1000u ? v->pitch : 0x1000u; }
@@ -512,8 +522,10 @@ static void vag_advance(sas_voice *v) {
     v->frac &= 0xFFFu;
 }
 
-/* Back to the start of the voice's sample, with the resampler at rest. */
+/* Take up the sample the setters last named, from its start, with the
+ * resampler at rest. */
 static void restart_source(sas_voice *v) {
+    v->src = v->next;
     v->frac = 0;
     v->pcm_pos = 0;
     v->pcm_adv = 1;
@@ -546,13 +558,14 @@ static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix
             }
         }
         if (!v->playing || v->paused) continue;
-        if (!v->is_pcm && !v->vag_addr) continue;
+        if (v->src.kind == SRC_NONE || (v->src.kind == SRC_VAG && !v->src.addr)) continue;
+        const int pcm = v->src.kind == SRC_PCM;
 
         for (uint32_t i = 0; i < samples; i++) {
             if (v->start_delay > 0) { v->start_delay--; continue; }
 
             int32_t s;
-            if (!(v->is_pcm ? pcm_fetch(v, &s) : vag_fetch(v, &s))) { end_voice(v); break; }
+            if (!(pcm ? pcm_fetch(v, &s) : vag_fetch(v, &s))) { end_voice(v); break; }
 
             /* Read the envelope, then step it -- in that order. The first
              * sample of a voice is multiplied by a height of zero and comes
@@ -572,7 +585,7 @@ static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix
             step_envelope(v);
             if (!v->playing) break;   /* the envelope ended the voice */
 
-            if (v->is_pcm) pcm_advance(v); else vag_advance(v);
+            if (pcm) pcm_advance(v); else vag_advance(v);
         }
     }
 }
@@ -644,11 +657,13 @@ static void hle_SetVoice(void) {
      * everything else, -1 included, with the same code that call uses for a
      * bad position. */
     if (psp_arg(4) > 1u) { psp_ret(SAS_ERROR_LOOP_POS); return; }
-    v->is_pcm   = 0;
-    v->vag_addr = psp_arg(2);
-    v->vag_size = size;
-    v->loop     = (int)psp_arg(4);
-    restart_source(v);
+    /* Played from the next key-on, not now (see sas_voice). Whether the old
+     * stream picks up the new size or loop mode at its own loop point is not
+     * measured. */
+    v->next.kind = SRC_VAG;
+    v->next.addr = psp_arg(2);
+    v->next.size = size;
+    v->next.loop = (int32_t)psp_arg(4);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -668,12 +683,11 @@ static void hle_SetVoicePCM(void) {
     const int32_t loop = (int32_t)psp_arg(4);
     if (size <= 0 || size > 0x10000) { psp_ret(SAS_ERROR_PCM_SIZE); return; }
     if (loop >= size) { psp_ret(SAS_ERROR_LOOP_POS); return; }
-    v->is_pcm   = 1;
-    v->pcm_addr = psp_arg(2);
-    v->pcm_size = size;
-    v->pcm_loop = loop;
-    v->vag_addr = 0;
-    restart_source(v);
+    /* Played from the next key-on, not now (see sas_voice). */
+    v->next.kind = SRC_PCM;
+    v->next.addr = psp_arg(2);
+    v->next.size = (uint32_t)size;
+    v->next.loop = loop;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
