@@ -140,7 +140,8 @@ typedef struct {
     uint32_t pcm_addr;
     int32_t  pcm_size;      /* samples */
     int32_t  pcm_loop;      /* first sample of the loop; negative means none */
-    int32_t  pcm_pos;       /* the sample about to be played */
+    int32_t  pcm_pos;       /* the resampler's sample index; -1 past the end */
+    int      pcm_adv;       /* the last step consumed a sample (see pcm_fetch) */
 
     uint32_t vag_addr;      /* guest address of the sample data */
     uint32_t vag_size;
@@ -152,6 +153,12 @@ typedef struct {
     int      hist1, hist2;  /* ADPCM history */
     int16_t  decoded[28];
     int      decoded_valid;
+    /* The VAG resampler's two-sample window, u[I] and u[I+1] of the stream
+     * with a 0 in front (see vag_fetch). `vag_nxt` is read from the stream
+     * only when an output first needs it. */
+    int32_t  vag_cur, vag_nxt;
+    int      vag_cur_ok;    /* 0 once the window has run past the stream */
+    int      vag_nxt_state; /* VAG_NXT_* */
 
     uint32_t pitch;         /* 0x1000 == 1.0 */
     uint32_t frac;          /* resampling accumulator, 12-bit fraction */
@@ -199,8 +206,9 @@ typedef struct {
      * sample the voice starts from at output index 32, with the loop
      * arriving 32 late to match. */
     int32_t  start_delay;
-    int32_t  src_delay;   /* extra samples before the first source sample */
 } sas_voice;
+
+enum { VAG_NXT_UNREAD = 0, VAG_NXT_OK, VAG_NXT_END };
 
 static sas_voice g_voice[SAS_VOICES];
 static uint32_t  g_grain = 256;
@@ -394,6 +402,130 @@ static void step_envelope(sas_voice *v) {
     v->env = (int32_t)h;
 }
 
+/* ---- the resampler ------------------------------------------------------
+ *
+ * Every pitch interpolates. The output is a straight line between two source
+ * samples a and b at the voice's 12-bit fraction f, rounded up:
+ *
+ *     out = a + ceil((b - a) * f / 4096)
+ *
+ * sasprobe's PCM and pitch captures (steps 172-191, fw 6.60) pin it: at
+ * 0x800 a ramp of 4, 8, 12 ... plays 0 10 8 14 12 18, which no nearest-sample
+ * fetch gives, and the eleven pitch_*.bin captures, pitch_change.bin and the
+ * six pcm_loop_* ones come out exact. The rounding is measured on rising
+ * slopes only; a falling slope rounds up here too, which is not measured.
+ *
+ * The two kinds differ in three ways, all measured:
+ *   - A PCM voice's pitch stops at 0x1000: 0x1800, 0x2000 and 0x4000 play
+ *     exactly as 0x1000 does (steps 182-185, 191). A VAG voice's does not:
+ *     0x2000 skips every other sample (step 151).
+ *   - A VAG voice interpolates over its decoded stream with a 0 in front, the
+ *     history the ADPCM decode starts from. That 0 is why a VAG's first
+ *     sample is heard one output after a PCM's (33 against 32), and why the
+ *     offset scales with the pitch instead of being a fixed extra sample.
+ *   - A PCM voice looks one sample ahead whenever the last step consumed
+ *     nothing (pcm_fetch), which is what puts 10 between 0 and 8 above.
+ *
+ * Both end the same way: when the sample the interpolator needs next is past
+ * the end, the voice ends. So the last sample of a one-shot is never heard
+ * -- a 100-sample PCM plays samples 0-98 (steps 172, 179) and a VAG's last
+ * block plays 27 of its 28 (step 75, vag_flags*.bin) -- and the end flag
+ * rises one sample earlier than a player that heard it. */
+
+static int32_t ceil_frac(int32_t d, uint32_t f) {
+    return (int32_t)-shr_floor(-(int64_t)d * (int64_t)f, 12);
+}
+
+/* The sample after `i` in a PCM voice: the next one, the loop position past
+ * the end, or -1 when there is none. A loop position outside the sample
+ * (SetVoicePCM accepts any negative one) is no loop (step 179). */
+static int32_t pcm_next(const sas_voice *v, int32_t i) {
+    if (i < 0) return -1;
+    if (i + 1 < v->pcm_size) return i + 1;
+    return (v->pcm_loop >= 0 && v->pcm_loop < v->pcm_size) ? v->pcm_loop : -1;
+}
+
+/* A PCM voice whose address is zero is accepted by hardware (pcm.expected,
+ * "Zero: OK"); it plays silence here rather than reading address zero. */
+static int32_t pcm_at(const sas_voice *v, int32_t i) {
+    return v->pcm_addr ? (int16_t)psp_read16(v->pcm_addr + (uint32_t)i * 2u) : 0;
+}
+
+static uint32_t pcm_pitch(const sas_voice *v) { return v->pitch < 0x1000u ? v->pitch : 0x1000u; }
+
+/* The PCM resampler keeps an index I, the fraction f and whether the last
+ * step consumed a sample. It interpolates from I when it did and from the
+ * sample after I when it did not. Pitch 0 plays silence (step 190). Returns
+ * 0 when the voice has run out. */
+static int pcm_fetch(const sas_voice *v, int32_t *out) {
+    const int32_t j = v->pcm_adv ? v->pcm_pos : pcm_next(v, v->pcm_pos);
+    const int32_t k = pcm_next(v, j);
+    if (j < 0 || k < 0) return 0;
+    if (pcm_pitch(v) == 0) { *out = 0; return 1; }
+    const int32_t a = pcm_at(v, j);
+    *out = a + ceil_frac(pcm_at(v, k) - a, v->frac);
+    return 1;
+}
+
+static void pcm_advance(sas_voice *v) {
+    v->frac += pcm_pitch(v);
+    v->pcm_adv = v->frac >= 0x1000u;
+    if (v->pcm_adv) {
+        v->frac -= 0x1000u;
+        v->pcm_pos = pcm_next(v, v->pcm_pos);
+    }
+}
+
+/* The next decoded sample of a VAG voice's stream; 0 at its end. */
+static int vag_stream_next(sas_voice *v, int32_t *s) {
+    if (!v->decoded_valid || v->sample_idx >= 28) {
+        if (!decode_block(v)) return 0;
+        v->sample_idx = 0;
+    }
+    *s = v->decoded[v->sample_idx++];
+    return 1;
+}
+
+static void vag_read_nxt(sas_voice *v) {
+    if (v->vag_nxt_state == VAG_NXT_UNREAD)
+        v->vag_nxt_state = vag_stream_next(v, &v->vag_nxt) ? VAG_NXT_OK : VAG_NXT_END;
+}
+
+static int vag_fetch(sas_voice *v, int32_t *out) {
+    if (!v->vag_cur_ok) return 0;
+    vag_read_nxt(v);
+    if (v->vag_nxt_state != VAG_NXT_OK) return 0;
+    *out = v->vag_cur + ceil_frac(v->vag_nxt - v->vag_cur, v->frac);
+    return 1;
+}
+
+static void vag_advance(sas_voice *v) {
+    v->frac += v->pitch;
+    for (uint32_t n = v->frac >> 12; n > 0 && v->vag_cur_ok; n--) {
+        vag_read_nxt(v);
+        v->vag_cur_ok = v->vag_nxt_state == VAG_NXT_OK;
+        v->vag_cur = v->vag_nxt;
+        v->vag_nxt_state = VAG_NXT_UNREAD;
+    }
+    v->frac &= 0xFFFu;
+}
+
+/* Back to the start of the voice's sample, with the resampler at rest. */
+static void restart_source(sas_voice *v) {
+    v->frac = 0;
+    v->pcm_pos = 0;
+    v->pcm_adv = 1;
+    v->pos = 0;
+    v->loop_start = 0;
+    v->last_block = 0;
+    v->sample_idx = 0;
+    v->hist1 = v->hist2 = 0;
+    v->decoded_valid = 0;
+    v->vag_cur = 0;
+    v->vag_cur_ok = 1;
+    v->vag_nxt_state = VAG_NXT_UNREAD;
+}
+
 /* Render `samples` stereo frames, summing every active voice. */
 static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix_er,
                    uint32_t samples) {
@@ -418,25 +550,7 @@ static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix
             if (v->start_delay > 0) { v->start_delay--; continue; }
 
             int32_t s;
-            int fetched = 1;
-            if (v->src_delay > 0) {
-                v->src_delay--;
-                fetched = 0;
-                s = 0;
-            } else if (v->is_pcm) {
-                /* A PCM voice whose address is zero is accepted by hardware
-                 * (pcm.expected, "Zero: OK"); it plays silence here rather
-                 * than reading whatever is at address zero. */
-                s = (v->pcm_addr && v->pcm_pos < v->pcm_size)
-                        ? (int16_t)psp_read16(v->pcm_addr + (uint32_t)v->pcm_pos * 2u)
-                        : 0;
-            } else {
-                if (!v->decoded_valid || v->sample_idx >= 28) {
-                    v->sample_idx = 0;
-                    if (!decode_block(v)) { v->playing = 0; v->on = 0; v->ended = 1; break; }
-                }
-                s = v->decoded[v->sample_idx];
-            }
+            if (!(v->is_pcm ? pcm_fetch(v, &s) : vag_fetch(v, &s))) { end_voice(v); break; }
 
             /* Read the envelope, then step it -- in that order. The first
              * sample of a voice is multiplied by a height of zero and comes
@@ -456,27 +570,7 @@ static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix
             step_envelope(v);
             if (!v->playing) break;   /* the envelope ended the voice */
 
-            /* Pitch is a 12-bit fixed-point step: 0x1000 plays at the source
-             * rate, 0x2000 an octave up. */
-            if (!fetched) continue;   /* nothing read, so nothing to advance */
-            v->frac += v->pitch;
-            while (v->frac >= 0x1000) {
-                v->frac -= 0x1000;
-                if (v->is_pcm) {
-                    v->pcm_pos++;
-                    if (v->pcm_pos >= v->pcm_size) {
-                        if (v->pcm_loop >= 0 && v->pcm_loop < v->pcm_size) v->pcm_pos = v->pcm_loop;
-                        else { v->playing = 0; v->on = 0; v->ended = 1; break; }
-                    }
-                } else {
-                    v->sample_idx++;
-                    if (v->sample_idx >= 28) {
-                        v->sample_idx = 0;
-                        if (!decode_block(v)) { v->playing = 0; v->on = 0; v->ended = 1; break; }
-                    }
-                }
-            }
-            if (!v->playing) break;
+            if (v->is_pcm) pcm_advance(v); else vag_advance(v);
         }
     }
 }
@@ -546,12 +640,7 @@ static void hle_SetVoice(void) {
     v->vag_addr = psp_arg(2);
     v->vag_size = size;
     v->loop     = (int)psp_arg(4);
-    v->pos = 0;
-    v->loop_start = 0;
-    v->last_block = 0;
-    v->sample_idx = 0;
-    v->hist1 = v->hist2 = 0;
-    v->decoded_valid = 0;
+    restart_source(v);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -575,9 +664,8 @@ static void hle_SetVoicePCM(void) {
     v->pcm_addr = psp_arg(2);
     v->pcm_size = size;
     v->pcm_loop = loop;
-    v->pcm_pos  = 0;
     v->vag_addr = 0;
-    v->decoded_valid = 0;
+    restart_source(v);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -771,29 +859,11 @@ static void hle_SetKeyOn(void) {
     v->keyoff_pending = 0;
     v->playing = 1;
     v->ended = 0;
-    v->pos = 0;
-    v->last_block = 0;
-    v->sample_idx = 0;
-    v->frac = 0;
-    v->hist1 = v->hist2 = 0;
-    v->decoded_valid = 0;
-    v->pcm_pos = 0;
-    /* 32 samples before the first one is heard (item 44) -- and 33 for a
-     * VAG, whose first decoded sample lands at output 33 where a PCM voice's
-     * lands at 32. vag.expected's data sweeps are the whole of the evidence:
-     * the sample values match from the first nibble, one output sample later
-     * than this used to place them. Reading a block header costs the ADPCM
-     * path a sample that the PCM path does not spend. */
-    /* Two delays, not one. The voice goes live 32 samples after the key-on
-     * (item 44) and its envelope starts running there whatever it is playing.
-     * A VAG's first decoded sample then lands one sample later still, at 33
-     * where a PCM voice's lands at 32 -- vag.expected's data sweeps match
-     * from the first nibble at that offset, and the sample at 33 comes out at
-     * full scale, which is only possible if the envelope had already taken
-     * its first step during the sample the ADPCM path spends on the block
-     * header. */
+    restart_source(v);
+    /* 32 samples before the voice goes live (item 44). A VAG's first decoded
+     * sample is heard one output later still, at 33, but that is the
+     * resampler's leading 0 (see vag_fetch), not a second delay. */
     v->start_delay = 32;
-    v->src_delay   = v->is_pcm ? 0 : 1;
     v->env = 0;
     v->env_state = ENV_ATTACK;
     psp_ret(SCE_KERNEL_ERROR_OK);
