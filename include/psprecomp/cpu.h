@@ -97,9 +97,12 @@ void psp_cpu_reset_vfpu_ctrl(void);
  *
  * Every general register the thread did not get from its creator holds
  * 0xDEADBEEF on hardware, except $k1, which is 0 (vfpuprobe step 147,
- * fw 6.60: at, v0, v1, a2, a3, t0-t9, s0-s7 all read DEADBEEF). $fp read as
- * something that is neither 0 nor DEADBEEF; the callers set it to the initial
- * $sp, the simplest value that fits, and the probe did not print it. */
+ * fw 6.60: at, v0, v1, a2, a3, t0-t9, s0-s7 all read DEADBEEF). $fp is the
+ * initial $sp, as the callers set it: with no arguments sp = top-320,
+ * fp = sp, k0 = top-256 and a1 = 0; with 16 bytes sp = top-336, fp = sp,
+ * k0 = top-256 and a1 = top-272, where the arguments were copied (vfpuprobe
+ * v3 step 162, fw 6.60). $ra differs between two threads there; the probe
+ * did not print what it holds. */
 void psp_cpu_reset_thread(void);
 #define PSP_GPR_FRESH 0xDEADBEEFu
 
