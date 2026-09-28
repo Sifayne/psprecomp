@@ -785,6 +785,117 @@ static void test_sas_adpcm(void) {
     CHECK((ended & ~1u) != 0, "unused voices report ended, got 0x%08X", ended);
 }
 
+/* sasprobe's rendering setup: grain 256, one voice at full volume with no
+ * sends, and a flat envelope -- full height from its second sample on. */
+enum { SAS_CORE = 0x08860000u, SAS_OUT = 0x08850000u, SAS_DATA = 0x08870000u };
+
+static void sas_flat_voice(uint32_t v) {
+    call7(psp_nid("__sceSasSetVolume"), SAS_CORE, v, 0x1000, 0x1000, 0, 0, 0);
+    call7(psp_nid("__sceSasSetADSRmode"), SAS_CORE, v, 0xF, 0, 1, 1, 1);
+    call7(psp_nid("__sceSasSetADSR"), SAS_CORE, v, 0xF, 0x7FFFFFFF, 0, 0, 0);
+    call(psp_nid("__sceSasSetSL"), SAS_CORE, v, 0x40000000u, 0);
+}
+
+static void sas_core(void) { call(psp_nid("__sceSasCore"), SAS_CORE, SAS_OUT, 0, 0); }
+static int sas_left(uint32_t i) { return (int16_t)psp_read16(SAS_OUT + i * 4u); }
+
+static void sas_fresh(void) {
+    psp_sas_reset();
+    CHECK(call5(psp_nid("__sceSasInit"), SAS_CORE, 256, 32, 0, 44100) == 0, "SAS init");
+}
+
+/* The rules sasprobe measured on firmware 6.60; each check names its step. */
+static void test_sas_hardware_rules(void) {
+    const uint32_t PCM = SAS_DATA;
+    for (uint32_t i = 0; i < 64; i++) psp_write16(PCM + i * 2u, (uint16_t)(4 * (i + 1)));
+
+    /* Every pitch interpolates, rounding up (step 181): at 0x800 a ramp of
+     * 4, 8, 12 ... plays 0 10 8 14 12 18 from L[32]. */
+    sas_fresh();
+    call5(psp_nid("__sceSasSetVoicePCM"), SAS_CORE, 0, PCM, 64, 0xFFFFFFFFu);
+    sas_flat_voice(0);
+    call(psp_nid("__sceSasSetPitch"), SAS_CORE, 0, 0x800, 0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    sas_core();
+    {
+        static const int want[6] = { 0, 10, 8, 14, 12, 18 };
+        for (uint32_t i = 0; i < 6; i++)
+            CHECK(sas_left(32 + i) == want[i], "pitch 0x800: L[%u] = %d, want %d",
+                  32 + i, sas_left(32 + i), want[i]);
+    }
+
+    /* A PCM voice's pitch stops at 0x1000 (step 182): 0x2000 plays the ramp
+     * one sample per output. */
+    sas_fresh();
+    call5(psp_nid("__sceSasSetVoicePCM"), SAS_CORE, 0, PCM, 64, 0xFFFFFFFFu);
+    sas_flat_voice(0);
+    call(psp_nid("__sceSasSetPitch"), SAS_CORE, 0, 0x2000, 0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    sas_core();
+    CHECK(sas_left(33) == 8 && sas_left(34) == 12 && sas_left(35) == 16,
+          "PCM pitch 0x2000 plays as 0x1000: L[33..35] = %d %d %d, want 8 12 16",
+          sas_left(33), sas_left(34), sas_left(35));
+
+    /* The key-on waits for the next core (steps 73, 75), and a one-shot's
+     * last sample is never heard (step 172): 4 samples play 8, 12 and stop. */
+    sas_fresh();
+    call5(psp_nid("__sceSasSetVoicePCM"), SAS_CORE, 0, PCM, 4, 0xFFFFFFFFu);
+    sas_flat_voice(0);
+    CHECK(call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0) == 0, "key on");
+    CHECK(call(psp_nid("__sceSasGetEndFlag"), SAS_CORE, 0, 0, 0) & 1u,
+          "the end flag is still up straight after KeyOn");
+    CHECK(call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0) == 0x80420016u,
+          "but the key is down: a second KeyOn is refused");
+    sas_core();
+    CHECK(sas_left(33) == 8 && sas_left(34) == 12 && sas_left(35) == 0,
+          "one-shot of 4: L[33..35] = %d %d %d, want 8 12 0",
+          sas_left(33), sas_left(34), sas_left(35));
+    CHECK(call(psp_nid("__sceSasGetEndFlag"), SAS_CORE, 0, 0, 0) & 1u,
+          "the one-shot has ended after its core");
+
+    /* VAG flag 7 ends the stream before its block (step 162): block 0 plays
+     * 256 for 27 samples, block 1 is never heard. */
+    sas_fresh();
+    for (uint32_t b = 0; b < 2; b++) {
+        psp_write8(SAS_DATA + 16 * b, 0x04);              /* filter 0, shift 4 */
+        psp_write8(SAS_DATA + 16 * b + 1, b ? 7 : 0);
+        for (uint32_t i = 2; i < 16; i++) psp_write8(SAS_DATA + 16 * b + i, b ? 0x22 : 0x11);
+    }
+    call5(psp_nid("__sceSasSetVoice"), SAS_CORE, 0, SAS_DATA, 32, 0);
+    sas_flat_voice(0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    sas_core();
+    CHECK(sas_left(33) == 256 && sas_left(59) == 256 && sas_left(60) == 0,
+          "VAG flag 7: L[33] %d L[59] %d L[60] %d, want 256 256 0",
+          sas_left(33), sas_left(59), sas_left(60));
+
+    /* The noise register (step 198): frequency 63 ticks every 2 samples from
+     * the voice's second, shifting in ones from 0. */
+    sas_fresh();
+    call(psp_nid("__sceSasSetNoise"), SAS_CORE, 0, 63, 0);
+    sas_flat_voice(0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    sas_core();
+    {
+        static const int want[8] = { 0, 1, 1, 3, 3, 7, 7, 15 };
+        for (uint32_t i = 0; i < 8; i++)
+            CHECK(sas_left(32 + i) == want[i], "noise 63: L[%u] = %d, want %d",
+                  32 + i, sas_left(32 + i), want[i]);
+    }
+
+    /* A direct decay sets the height to its rate (step 110). */
+    sas_fresh();
+    call5(psp_nid("__sceSasSetVoicePCM"), SAS_CORE, 0, PCM, 64, 0);
+    call7(psp_nid("__sceSasSetADSRmode"), SAS_CORE, 0, 0xF, 0, 5, 1, 1);
+    call7(psp_nid("__sceSasSetADSR"), SAS_CORE, 0, 0xF, 0x7FFFFFFF, 0x20000000, 0, 0);
+    call(psp_nid("__sceSasSetSL"), SAS_CORE, 0, 0x10000000, 0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    sas_core();
+    CHECK(call(psp_nid("__sceSasGetEnvelopeHeight"), SAS_CORE, 0, 0, 0) == 0x20000000u,
+          "direct decay 0x20000000 holds there, got %08X",
+          call(psp_nid("__sceSasGetEnvelopeHeight"), SAS_CORE, 0, 0, 0));
+}
+
 /* stdout and stderr are not in the descriptor table, and an async write to
  * them used to return BADF -- which dropped the message a panic path writes
  * right before abort(). The synchronous path handled those fds; this pins the
@@ -856,6 +967,7 @@ int main(void) {
     test_ge_signal_pause();
     test_ge_infinite_list();
     test_sas_adpcm();
+    test_sas_hardware_rules();
     test_stdio_async();
     test_display();
 
