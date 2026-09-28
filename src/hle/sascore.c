@@ -62,6 +62,13 @@
  * __sceSasSetTrianglarWave alike (sasprobe step 229, fw 6.60). Not in
  * PSPSDK's list of codes. */
 #define SAS_ERROR_WAVE_DUTY    0x80420017u
+/* The reverb calls' codes, PSPSDK's FX_TYPE, FX_FEEDBACK, FX_DELAY and
+ * FX_VOLUME_VAL; which call refuses what with each is sasprobe's (steps
+ * 224-226, fw 6.60). */
+#define SAS_ERROR_REV_TYPE     0x80420020u
+#define SAS_ERROR_REV_FEEDBACK 0x80420021u
+#define SAS_ERROR_REV_DELAY    0x80420022u
+#define SAS_ERROR_REV_VOLUME   0x80420023u
 
 static int grain_ok(uint32_t g) { return g >= 64 && g <= SAS_MAX_GRAIN && (g % 32) == 0; }
 
@@ -1208,9 +1215,39 @@ static void hle_CoreWithMix(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Reverb and noise: accepted and recorded so a game's setup sequence completes.
- * The dry mix is what carries the music and effects; reverb is a refinement. */
-static void hle_accept(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* Reverb: the four calls check their arguments as firmware 6.60 does, so a
+ * game's setup sequence sees the same answers, but the reverb itself -- the
+ * wet signal the sends feed -- is not rendered. Hardware's is a half-rate
+ * engine (only even output frames of the wet signal are nonzero, and left
+ * differs from right, step 228) whose response sasprobe's one burst does not
+ * pin down; the dry mix is what carries the music and effects.
+ *
+ * __sceSasRevType(sasCore, type): -1..8, signed (step 224). */
+static void hle_RevType(void) {
+    const int32_t type = (int32_t)psp_arg(1);
+    psp_ret(type < -1 || type > 8 ? SAS_ERROR_REV_TYPE : SCE_KERNEL_ERROR_OK);
+}
+
+/* __sceSasRevParam(sasCore, delay, feedback): both unsigned, the delay
+ * checked first. Delay 128 is refused (with 129 and -1), though PSPSDK's
+ * header allows 0..128; feedback 129 and -1 are refused (step 225). Whether
+ * feedback 128 passes is not measured -- (128, 128) stops at the delay --
+ * and PSPSDK's 0..128 is kept for it. */
+static void hle_RevParam(void) {
+    if (psp_arg(1) > 127u) { psp_ret(SAS_ERROR_REV_DELAY); return; }
+    if (psp_arg(2) > 128u) { psp_ret(SAS_ERROR_REV_FEEDBACK); return; }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* __sceSasRevEVOL(sasCore, left, right): each at most 0x1000, unsigned, so
+ * every negative volume is refused too -- unlike SetVolume's (step 226). */
+static void hle_RevEVOL(void) {
+    const int bad = psp_arg(1) > 0x1000u || psp_arg(2) > 0x1000u;
+    psp_ret(bad ? SAS_ERROR_REV_VOLUME : SCE_KERNEL_ERROR_OK);
+}
+
+/* __sceSasRevVON(sasCore, dry, wet): anything is accepted (step 227). */
+static void hle_RevVON(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 void psp_sas_register(void) {
     psp_hle_register(0x42778A9F, "sceSasCore", "__sceSasInit",              hle_Init);
@@ -1240,8 +1277,8 @@ void psp_sas_register(void) {
     /* NIDs from PSPSDK's stub library, libpspsascore.a. */
     psp_hle_register(0xD5EBBBCD, "sceSasCore", "__sceSasSetSteepWave",      hle_SetSteepWave);
     psp_hle_register(0xA232CBE6, "sceSasCore", "__sceSasSetTrianglarWave",  hle_SetTrianglarWave);
-    psp_hle_register(0x33D4AB37, "sceSasCore", "__sceSasRevType",           hle_accept);
-    psp_hle_register(0x267A6DD2, "sceSasCore", "__sceSasRevParam",          hle_accept);
-    psp_hle_register(0xD5A229C9, "sceSasCore", "__sceSasRevEVOL",           hle_accept);
-    psp_hle_register(0xF983B186, "sceSasCore", "__sceSasRevVON",            hle_accept);
+    psp_hle_register(0x33D4AB37, "sceSasCore", "__sceSasRevType",           hle_RevType);
+    psp_hle_register(0x267A6DD2, "sceSasCore", "__sceSasRevParam",          hle_RevParam);
+    psp_hle_register(0xD5A229C9, "sceSasCore", "__sceSasRevEVOL",           hle_RevEVOL);
+    psp_hle_register(0xF983B186, "sceSasCore", "__sceSasRevVON",            hle_RevVON);
 }
