@@ -147,7 +147,7 @@ typedef struct {
     uint32_t vag_size;
     int      loop;          /* loop mode: a block flagged 3 jumps back */
     uint32_t loop_start;    /* byte offset of the block flagged 6, else 0 */
-    int      last_block;    /* the block just decoded ended the sample */
+    int      vag_end;       /* the stream has ended: no more blocks */
     uint32_t pos;           /* byte offset of the current 16-byte block */
     int      sample_idx;    /* 0..27 within the block */
     int      hist1, hist2;  /* ADPCM history */
@@ -257,34 +257,33 @@ static int clamp16(int v) {
 }
 
 /* Decode the 16-byte ADPCM block at the voice's current position into its
- * 28-sample buffer. Returns 0 when the voice has ended.
+ * 28-sample buffer. Returns 0 when the stream has ended.
  *
- * Where a voice ends is measured where the corpus reaches, and conventional
- * where it does not. audio/sascore/vag.expected plays a 16-block sample in
- * loop mode 1 with every block after the first carrying one flag value, and
- * 16 blocks are 448 samples, inside its one 512-sample grain -- so with flags
- * 0, 1, 7, 0x41 and 0x87 the voice reports ended, and the only thing that is
- * measured by that is that **the buffer end ends a voice whatever the loop
- * mode**, and that the flagged block is decoded (its samples are printed).
- * Two flag facts are measured: exactly 3 keeps the voice playing -- a loop
- * end that jumps back -- and 0x41 does not end it: the same test plays
- * music.vag with its file header still in front, so block 0's flag byte is
- * the 'A' of "VAGp", and the voice is still playing a grain later. So the
- * check is on exact values, not bit 0. Exactly 1 and exactly 7 ending the
- * voice after their block, and 6 marking the loop start, are the format's
- * convention and not reached by any test here.
+ * The flag byte, as firmware 6.60 plays it (sasprobe steps 152-170, all 19
+ * vag_flags*.bin captures exact):
  *
- * This used to restart from byte 0 at both the buffer end and flag 7 whenever
- * loop mode was set. Armored Core starts its menu sounds with loop mode set,
- * so its "decide" sound played forever, and the game waits for that sound to
- * finish before it leaves the title screen: NEW GAME hung on a sound effect. */
+ *   7     ends the stream *before* its block: the block is never played, in
+ *         either loop mode (steps 162-164)
+ *   3     in loop mode 1, continues at the loop start after its block; in
+ *         loop mode 0 it is ignored (156, 159)
+ *   6     marks the loop start (the last block flagged 6, else block 0)
+ *   else  ignored -- 1, 2, 4, 5, 0x41 and 0x87 all play straight through
+ *         (154-155, 165-170). So a block flagged 1 does not end the sample.
+ *
+ * and the end of the buffer ends the voice whatever the loop mode (152-153).
+ * That last one is the one that matters most in practice: this used to
+ * restart from byte 0 at the buffer end whenever loop mode was set, and
+ * Armored Core starts its menu sounds with loop mode set, so its "decide"
+ * sound played forever -- and the game waits for that sound to finish before
+ * it leaves the title screen: NEW GAME hung on a sound effect. */
 static int decode_block(sas_voice *v) {
-    if (v->last_block) return 0;
-    if (v->pos + 16 > v->vag_size) return 0;
+    if (v->vag_end) return 0;
+    if (v->pos + 16 > v->vag_size) { v->vag_end = 1; return 0; }
 
     uint32_t at = v->vag_addr + v->pos;
     uint8_t hdr   = psp_read8(at);
     uint8_t flags = psp_read8(at + 1);
+    if (flags == 7) { v->vag_end = 1; return 0; }
 
     int shift  = hdr & 0x0F;
     int filter = (hdr >> 4) & 0x0F;      /* all sixteen are real; see VAG_W */
@@ -307,7 +306,6 @@ static int decode_block(sas_voice *v) {
     if (flags == 6) v->loop_start = v->pos;
     v->pos += 16;
     if (flags == 3 && v->loop) v->pos = v->loop_start;
-    else if (flags == 1 || flags == 3 || flags == 7) v->last_block = 1;
     v->decoded_valid = 1;
     return 1;
 }
@@ -517,7 +515,7 @@ static void restart_source(sas_voice *v) {
     v->pcm_adv = 1;
     v->pos = 0;
     v->loop_start = 0;
-    v->last_block = 0;
+    v->vag_end = 0;
     v->sample_idx = 0;
     v->hist1 = v->hist2 = 0;
     v->decoded_valid = 0;
