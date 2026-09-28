@@ -16,7 +16,7 @@ probe, one after another; only the last run in each is compared, unless
 PSP off is started again and skips that step, so its last run is the whole
 result. Binary files are compared by
 content: .bin as 32-bit words (reporting the input word too when
-vfpu_inputs.bin is present), .raw as pixels of a 480-wide frame. Standard
+vfpu_inputs.bin is present and as long), .raw as pixels of a 480-wide frame. Standard
 library only."""
 import os, re, struct, sys
 
@@ -87,6 +87,8 @@ def compare_words(name, hw, pc, inputs):
     if not y:
         print(f"{name}: missing in psprecomp")
         return
+    if inputs and len(x) != len(inputs) * 4:
+        inputs = None   # a file with inputs of its own (vfpuprobe's core dumps)
     n = min(len(x), len(y)) // 4
     wa = struct.unpack(f"<{n}I", x[:n * 4])
     wb = struct.unpack(f"<{n}I", y[:n * 4])
