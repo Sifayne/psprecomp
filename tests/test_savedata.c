@@ -343,6 +343,9 @@ static void fw660_sfo(void) {
     for (unsigned i=0;i<48;i++) psp_write8(ents+i,0xA5);
     assert(run()==0); assert(psp_read32(fl+16)==0x8000u);
     for (unsigned i=0;i<48;i++) assert(psp_read8(ents+i)==0xA5);
+    /* An ICON0 is a system file, like PARAM.SFO (ICON: step 91). */
+    hw(1,"HWSFO","icon"); psp_write32(p+1412,data); psp_write32(p+1416,64); psp_write32(p+1420,64);
+    assert(run()==0 && files_of("HWSFO")==102);
 }
 /* key A = 00..0F, key B = FF..F0 (saveprobe's), 0 = all zero. */
 static void key(char which,unsigned version) {

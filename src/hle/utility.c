@@ -679,13 +679,17 @@ static int sd_cmp_str(const void *a, const void *b) {
     return strcmp((const char *)a, (const char *)b);
 }
 
-/* 0 secure, 1 normal, 2 system. PARAM.SFO is always system; otherwise the
- * save's secure-file list decides, where hardware records the class.
- * Secure modes still store plaintext, so the list is the only on-card
- * difference, and FILES needs it to tell a secure DATA.BIN from a
- * WRITEDATA-made OTHER.BIN. */
+/* 0 secure, 1 normal, 2 system. PARAM.SFO and the sidecars are system:
+ * FILES of a save with an ICON0 reads "secure 1 normal 0 system 2", ICON0.PNG
+ * among the system files (saveprobe step 91, fw 6.60); ICON1.PMF, PIC1.PNG
+ * and SND0.AT3 are taken to go the same way. Otherwise the save's
+ * secure-file list decides, where hardware records the class. Secure modes
+ * still store plaintext, so the list is the only on-card difference, and
+ * FILES needs it to tell a secure DATA.BIN from a WRITEDATA-made OTHER.BIN. */
 static int sd_classify(const sd_sfo_state *st, const char *file) {
-    if (!strcmp(file, "PARAM.SFO")) return 2;
+    static const char *const sys[] = { "PARAM.SFO", "ICON0.PNG", "ICON1.PMF", "PIC1.PNG", "SND0.AT3" };
+    for (size_t i = 0; i < sizeof sys / sizeof sys[0]; i++)
+        if (!strcmp(file, sys[i])) return 2;
     return sd_fl_secure(st, file) ? 0 : 1;
 }
 
