@@ -356,6 +356,107 @@ void psp_mtvc(int index, uint32_t value) {
     }
 }
 
+/* ---- the random generator: vrnds, vrndi, vrndf1, vrndf2 ------------------
+ *
+ * The state is the eight rcx control registers, each a 1.0f-shaped word whose
+ * low 20 bits carry state (bits 16..19 and 0..15). Measured on firmware 6.60
+ * (vfpuprobe steps 147 and 154-159) and reproduced exactly:
+ *
+ *   - vrnds S writes rcx_i = 0x3F800000 | ((S >> 4i) & 0xF) << 16
+ *                           | (i < 4 ? S & 0xFFFF : S >> 16),
+ *     for all five seeds probed (0, 1, 12345678, FFFFFFFF, 3F800000);
+ *   - vrndf1 is 0x3F800000 | (r & 0x7FFFFF) and vrndf2 0x40000000 |
+ *     (r & 0x7FFFFF), where r is the value vrndi would have returned: all
+ *     three advance one stream, one step per lane;
+ *   - the state is per thread and reset with the other control registers.
+ *
+ * Read that way the 160 state bits are five 32-bit words, and vrnds sets all
+ * five to S: x = rcx0|rcx4 (low halves), y = rcx1|rcx5, z = rcx2|rcx6,
+ * w = rcx3|rcx7, and c = the eight nibbles, rcx_i's at bits 4i. The reset
+ * state is x=1 y=2 z=4 w=8 c=0. Each draw is then
+ *
+ *     x = 69069x + 1;  y = xorshift(y; <<13, >>17, <<5);
+ *     t = z + 2w + c;  z = w;  w = t;          result x + y + w
+ *
+ * which is fitted, not read from a document, and reproduces every value the
+ * probe logged from the reset state (00094E24 245A1029 ECF210C2 91ABC47B, in
+ * the main thread and in a fresh one) and from seeds 0, 1 and 12345678 --
+ * 28 of 28 -- in all three output forms.
+ *
+ * What is not known is the carry: what c becomes after a draw. Taking it as
+ * zero is what the four sequences above require; the textbook multiply-with-
+ * carry rule (c = t >> 32) breaks seed 12345678 from its fourth draw. But from
+ * seed FFFFFFFF the hardware adds 2 and then 1 more to t at every draw after
+ * the first, and from 3F800000 1 at the fourth and eighth, and no rule over
+ * this state found so far produces both. So from those two seeds this model
+ * matches the first draw and the first three respectively, and after that
+ * differs in the low bits (by 2, 5, 13 ... 457 for FFFFFFFF). Reading rcx
+ * after each draw would settle it. */
+static uint32_t rcx_word(int lo) {
+    return (psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + lo] & 0xFFFFu) |
+           (psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + lo + 4] & 0xFFFFu) << 16;
+}
+static void rcx_set_word(int lo, uint32_t v) {
+    uint32_t *r = &psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + lo];
+    r[0] = (r[0] & ~0xFFFFu) | (v & 0xFFFFu);
+    r[4] = (r[4] & ~0xFFFFu) | (v >> 16);
+}
+static uint32_t rcx_nibbles(void) {
+    uint32_t c = 0;
+    for (int i = 0; i < 8; i++)
+        c |= ((psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + i] >> 16) & 0xFu) << (4 * i);
+    return c;
+}
+static void rcx_set_nibbles(uint32_t c) {
+    for (int i = 0; i < 8; i++) {
+        uint32_t *r = &psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + i];
+        *r = (*r & ~0xF0000u) | ((c >> (4 * i)) & 0xFu) << 16;
+    }
+}
+
+static uint32_t vrnd_next(void) {
+    uint32_t x = rcx_word(0), y = rcx_word(1), z = rcx_word(2), w = rcx_word(3);
+    const uint32_t c = rcx_nibbles();
+    x = 69069u * x + 1u;
+    y ^= y << 13; y ^= y >> 17; y ^= y << 5;
+    const uint32_t t = z + 2u * w + c;
+    z = w;
+    w = t;
+    rcx_set_word(0, x); rcx_set_word(1, y); rcx_set_word(2, z); rcx_set_word(3, w);
+    rcx_set_nibbles(0);
+    return x + y + w;
+}
+
+void psp_vrnds(uint32_t vs, int size) {
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    read_src(vs, size, PFXS, sv);
+    const uint32_t s = psp_f32_to_bits(sv[0]);
+    for (int i = 0; i < 8; i++)
+        psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + i] = 0x3F800000u | ((s >> (4 * i)) & 0xFu) << 16
+                                             | (i < 4 ? s & 0xFFFFu : s >> 16);
+    eat_prefixes();
+}
+
+void psp_vrnd(uint32_t vd, int kind, int size) {
+    int r[4];
+    const int n = psp_vfpu_regs(vd, size, r);
+    float out[4];
+    for (int i = 0; i < n; i++) {
+        const uint32_t v = vrnd_next();
+        out[i] = psp_bits_to_f32(kind == 0 ? v
+                                 : (kind == 1 ? 0x3F800000u : 0x40000000u) | (v & 0x7FFFFFu));
+    }
+    if (kind == 0) {
+        /* An integer: the destination prefix masks lanes but does not
+         * saturate, as for vf2i. */
+        for (int i = 0; i < n; i++)
+            if (!((PFXD >> (8 + i)) & 1)) psp_cpu.v[r[i]] = out[i];
+    } else {
+        write_dst(vd, size, out);
+    }
+    eat_prefixes();
+}
+
 /* ---- integer/vector moves ------------------------------------------------ */
 
 uint32_t psp_mfv(uint32_t vd) {

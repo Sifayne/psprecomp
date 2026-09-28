@@ -279,6 +279,10 @@ static const a_opinfo OPINFO[A_OP_COUNT] = {
     [A_VT4444]   = { "vt4444",   F_VD_VS },
     [A_VT5551]   = { "vt5551",   F_VD_VS },
     [A_VT5650]   = { "vt5650",   F_VD_VS },
+    [A_VRNDS]    = { "vrnds",    F_VD_VS },
+    [A_VRNDI]    = { "vrndi",    F_VD_VS },
+    [A_VRNDF1]   = { "vrndf1",   F_VD_VS },
+    [A_VRNDF2]   = { "vrndf2",   F_VD_VS },
     [A_VFPU_UNKNOWN] = { "vfpu?", F_UNKNOWN },
 };
 
@@ -679,6 +683,14 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
             break;
         case 0x01:                                  /* VFPU4: rs=1 */
             switch (RT_F(word)) {
+            /* The random generator. vrnds.s S200 assembles to 0xD0200800 (the
+             * seed in vs) and vrndi/vrndf1/vrndf2.s S100 to 0xD0210004,
+             * 0xD0220004 and 0xD0230004 (the result in vd): the words in
+             * vfpuprobe's PRX, built with PSPSDK's assembler. */
+            case 0x00: op = A_VRNDS;  break;
+            case 0x01: op = A_VRNDI;  break;
+            case 0x02: op = A_VRNDF1; break;
+            case 0x03: op = A_VRNDF2; break;
             case 0x12: op = A_VF2H; break;
             case 0x13: op = A_VH2F; break;
             /* Four variants each, selected by the low two bits of rt: the

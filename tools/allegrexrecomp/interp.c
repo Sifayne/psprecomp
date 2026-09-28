@@ -427,6 +427,11 @@ static psp_interp_status exec_simple(const a_insn *in) {
     case A_VIIM: psp_vimm(in->vt, (float)in->imm);       return I_RUNNING;
     case A_VFIM: psp_vimm(in->vt, a_half_to_float((uint16_t)in->imm)); return I_RUNNING;
 
+    case A_VRNDS:  psp_vrnds(in->vs, in->vsize);     return I_RUNNING;
+    case A_VRNDI:  psp_vrnd(in->vd, 0, in->vsize);   return I_RUNNING;
+    case A_VRNDF1: psp_vrnd(in->vd, 1, in->vsize);   return I_RUNNING;
+    case A_VRNDF2: psp_vrnd(in->vd, 2, in->vsize);   return I_RUNNING;
+
     case A_VF2H: psp_vf2h(in->vd, in->vs, in->vsize); return I_RUNNING;
     case A_VH2F: psp_vh2f(in->vd, in->vs, in->vsize); return I_RUNNING;
     case A_VX2I: psp_vx2i(in->vd, in->vs, in->rt & 3, in->vsize); return I_RUNNING;

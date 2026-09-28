@@ -638,6 +638,76 @@ static void test_special_values(void) {
     psp_vfpu_reset();
 }
 
+/* ---- the random generator --------------------------------------------------
+ *
+ * What vfpuprobe measured (steps 154-159, fw 6.60): the seeding, the output
+ * forms, and the streams the model reproduces exactly -- from the reset state
+ * and from seeds 0, 1 and 12345678. The streams from FFFFFFFF and 3F800000
+ * depend on a carry rule nobody has identified and are deliberately not
+ * asserted. */
+static void draw_quad(int kind, uint32_t out[4]) {
+    int q[4];
+    psp_vfpu_regs(0x00, 4, q);
+    psp_vrnd(0x00, kind, 4);
+    for (int i = 0; i < 4; i++) out[i] = psp_f32_to_bits(psp_cpu.v[q[i]]);
+}
+
+static void test_random(void) {
+    psp_vfpu_reset();
+    int r[4];
+    psp_vfpu_regs(0x08, 1, r);
+
+    psp_cpu.v[r[0]] = psp_bits_to_f32(0x12345678u);
+    psp_vrnds(0x08, 1);
+    static const uint32_t seeded[8] = {
+        0x3F885678, 0x3F875678, 0x3F865678, 0x3F855678,
+        0x3F841234, 0x3F831234, 0x3F821234, 0x3F811234,
+    };
+    for (int i = 0; i < 8; i++)
+        CHECK(psp_mfvc(PSP_VFPU_RCX0 + i) == seeded[i], "vrnds 12345678: rcx%d %08X, want %08X",
+              i, psp_mfvc(PSP_VFPU_RCX0 + i), seeded[i]);
+    psp_cpu.v[r[0]] = psp_bits_to_f32(0x3F800000u);
+    psp_vrnds(0x08, 1);
+    CHECK(psp_mfvc(PSP_VFPU_RCX0 + 0) == 0x3F800000u && psp_mfvc(PSP_VFPU_RCX0 + 5) == 0x3F883F80u,
+          "vrnds 3F800000: rcx0 %08X rcx5 %08X", psp_mfvc(PSP_VFPU_RCX0), psp_mfvc(PSP_VFPU_RCX0 + 5));
+
+    /* From the reset state, before anything seeds it (step 154). */
+    uint32_t got[4];
+    psp_vfpu_reset();
+    draw_quad(0, got);
+    CHECK(got[0] == 0x00094E24u && got[1] == 0x245A1029u && got[2] == 0xECF210C2u &&
+          got[3] == 0x91ABC47Bu, "vrndi from reset: %08X %08X %08X %08X",
+          got[0], got[1], got[2], got[3]);
+
+    /* Seeds 0, 1 and 12345678, eight draws as two quads, in all three forms:
+     * the float forms take the same stream's low 23 bits. */
+    static const struct { uint32_t seed, raw[8]; } streams[] = {
+        { 0x00000000, { 0x00000001, 0x00010DCE, 0x1C5983F7, 0xC35937CC,
+                        0x2E130A5D, 0xE723057A, 0xE3CC94B3, 0x63132A58 } },
+        { 0x00000001, { 0x00052DF3, 0x20618A01, 0x6125E0A7, 0x4068A3E1,
+                        0x761C1DCB, 0x103BF1B8, 0x88C5605C, 0x93D08434 } },
+        { 0x12345678, { 0x632F0A9E, 0x9CB065E1, 0xA483C0E3, 0x752E3534,
+                        0xE235C17D, 0x89248F57, 0xD8FA70D8, 0x213C6031 } },
+    };
+    for (unsigned sidx = 0; sidx < sizeof streams / sizeof streams[0]; sidx++) {
+        for (int kind = 0; kind < 3; kind++) {
+            psp_cpu.v[r[0]] = psp_bits_to_f32(streams[sidx].seed);
+            psp_vrnds(0x08, 1);
+            for (int half = 0; half < 2; half++) {
+                draw_quad(kind, got);
+                for (int i = 0; i < 4; i++) {
+                    const uint32_t raw = streams[sidx].raw[4 * half + i];
+                    const uint32_t want = kind == 0 ? raw
+                        : (kind == 1 ? 0x3F800000u : 0x40000000u) | (raw & 0x7FFFFFu);
+                    CHECK(got[i] == want, "seed %08X kind %d draw %d: %08X, want %08X",
+                          streams[sidx].seed, kind, 4 * half + i, got[i], want);
+                }
+            }
+        }
+    }
+    psp_vfpu_reset();
+}
+
 /* ---- control state --------------------------------------------------------
  *
  * The reset values and the per-thread ownership, as a PSP on firmware 6.60
@@ -709,6 +779,7 @@ int main(void) {
     test_matrix_transform();
     test_vrot();
     test_special_values();
+    test_random();
 
     psp_mem_free();
 

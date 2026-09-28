@@ -505,6 +505,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         return;
     }
 
+    case A_VRNDS:
+        fprintf(f, "%spsp_vrnds(%u, %u);\n", ind, in->vs, in->vsize); return;
+    case A_VRNDI: case A_VRNDF1: case A_VRNDF2:
+        fprintf(f, "%spsp_vrnd(%u, %d, %u);\n", ind, in->vd,
+                in->op == A_VRNDI ? 0 : in->op == A_VRNDF1 ? 1 : 2, in->vsize); return;
     /* Matrix ops that need no multiply. `vsize` is the matrix order here. */
     case A_VF2H:
         fprintf(f, "%spsp_vf2h(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize); return;
