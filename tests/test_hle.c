@@ -674,8 +674,9 @@ static void test_ge_display_list(void) {
     for (uint32_t i = 0; i < n; i++) psp_write32(LIST + i * 4, w[i]);
 
     uint64_t before = psp_ge_command_count();
-    /* sceGeListEnQueue(list, stall=0, cbid, arg), then DrawSync(WAIT):
-     * the GE is deferred, so nothing executes until the sync drains it. */
+    /* sceGeListEnQueue(list, stall=0, cbid, arg), then DrawSync(WAIT): a
+     * stall-less list with nothing ahead of it runs inside EnQueue, and the
+     * sync finds nothing left to drain. */
     uint32_t qid = call(psp_nid("sceGeListEnQueue"), LIST, 0, 0, 0);
     CHECK(qid != 0, "list enqueued, got 0x%08X", qid);
     CHECK(call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0) == 0, "draw sync drains");
@@ -696,8 +697,9 @@ static void test_ge_display_list(void) {
 
 /* GU_SIGNAL_PAUSE is followed by a FINISH/END pair where hardware pauses for
  * the callback. It then resumes the same display list after that END. The HLE
- * does not deliver GE callbacks yet, so it resumes immediately, but it must
- * still execute the commands through the list's real final FINISH. */
+ * calls the signal handler at the SIGNAL and does not model sceGeContinue, so
+ * it resumes immediately, but it must still execute the commands through the
+ * list's real final FINISH. */
 static void test_ge_signal_pause(void) {
     psp_ge_reset();
 
@@ -720,6 +722,60 @@ static void test_ge_signal_pause(void) {
     CHECK(executed == 6,
           "SIGNAL PAUSE resumes through final FINISH: executed %llu commands, want 6",
           (unsigned long long)executed);
+}
+
+/* GE callbacks, geprobe step 26 (fw 6.60): sceGeSetCallback with signal_arg
+ * 0x5A and finish_arg 0xA5, then a raw list SIGNAL 0x44 (behaviour 1), SIGNAL
+ * 0x55 (behaviour 2), FINISH 0x66 with no stall. All three handlers have run
+ * when EnQueue returns, with (id, arg); ListSync(wait) and DrawSync(wait)
+ * read 0, and ListSync(peek) after them 0x80000100. */
+static uint32_t g_gecb[8][3];
+static int g_gecb_n;
+static void gecb_note(uint32_t kind) {
+    if (g_gecb_n < 8) {
+        g_gecb[g_gecb_n][0] = kind;
+        g_gecb[g_gecb_n][1] = psp_cpu.r[PSP_REG_A0];
+        g_gecb[g_gecb_n][2] = psp_cpu.r[PSP_REG_A1];
+        g_gecb_n++;
+    }
+    psp_cpu.r[PSP_REG_A0] = 0xDEAD;     /* the caller's registers come back */
+}
+static void gecb_signal(void) { gecb_note(1); }
+static void gecb_finish(void) { gecb_note(2); }
+
+static void test_ge_callbacks(void) {
+    psp_ge_reset();
+    g_gecb_n = 0;
+    psp_register(0x08A00000u, gecb_signal);
+    psp_register(0x08A00100u, gecb_finish);
+    const uint32_t CB = 0x08834000u, LIST = 0x08834100u;
+    psp_write32(CB + 0, 0x08A00000u); psp_write32(CB + 4, 0x5A);
+    psp_write32(CB + 8, 0x08A00100u); psp_write32(CB + 12, 0xA5);
+    const uint32_t cbid = call(psp_nid("sceGeSetCallback"), CB, 0, 0, 0);
+    CHECK((int32_t)cbid >= 0, "sceGeSetCallback gives an id, got 0x%08X", cbid);
+
+    static const uint32_t w[] = { 0x0E010044, 0x0C000000, 0x0E020055, 0x0C000000,
+                                  0x0F000066, 0x0C000000, 0 };
+    for (uint32_t i = 0; i < 7; i++) psp_write32(LIST + i * 4, w[i]);
+    const uint32_t qid = call(psp_nid("sceGeListEnQueue"), LIST, 0, cbid, 0);
+    CHECK(g_gecb_n == 3 &&
+          g_gecb[0][0] == 1 && g_gecb[0][1] == 0x44 && g_gecb[0][2] == 0x5A &&
+          g_gecb[1][0] == 1 && g_gecb[1][1] == 0x55 && g_gecb[1][2] == 0x5A &&
+          g_gecb[2][0] == 2 && g_gecb[2][1] == 0x66 && g_gecb[2][2] == 0xA5,
+          "signal 44, signal 55, finish 66 inside EnQueue: %d call(s)", g_gecb_n);
+    CHECK(psp_cpu.r[PSP_REG_A0] == LIST, "the handlers leave EnQueue's registers: a0 0x%08X",
+          psp_cpu.r[PSP_REG_A0]);
+    CHECK(call(psp_nid("sceGeListSync"), qid, 0, 0, 0) == 0, "ListSync(wait) on the done list reads 0");
+    CHECK(call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0) == 0, "DrawSync(wait) reads 0");
+    const uint32_t after = call(psp_nid("sceGeListSync"), qid, 1, 0, 0);
+    CHECK(after == 0x80000100u, "ListSync(peek) after DrawSync: 0x%08X, hardware 80000100", after);
+    CHECK(call(psp_nid("sceGeUnsetCallback"), cbid, 0, 0, 0) == 0, "sceGeUnsetCallback reads 0");
+
+    /* Once unset, the same list calls nobody. */
+    g_gecb_n = 0;
+    call(psp_nid("sceGeListEnQueue"), LIST, 0, cbid, 0);
+    call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0);
+    CHECK(g_gecb_n == 0, "an unset callback is not called: %d call(s)", g_gecb_n);
 }
 
 /* A list that jumps to itself must terminate rather than hang the host -- this
@@ -965,6 +1021,7 @@ int main(void) {
     test_net();
     test_ge_display_list();
     test_ge_signal_pause();
+    test_ge_callbacks();
     test_ge_infinite_list();
     test_sas_adpcm();
     test_sas_hardware_rules();
