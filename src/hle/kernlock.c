@@ -129,7 +129,21 @@ static int mutex_release(psp_mutex *m) {
     const psp_waiter w = psp_waitq_take(&m->q, i);
     m->count = (int32_t)w.need;
     m->owner = w.uid;
-    return psp_sched_wake(w.uid);
+    return psp_sched_wake_as(w.uid, PSP_WAIT_WOKE_SATISFIED);
+}
+
+/* A thread that ends holding a mutex leaves it free (syncprobe steps 90-91,
+ * fw 6.60: owner -1, count 0, and the next TryLock succeeds). What a thread
+ * queued on it at that moment is told is not measured; handing it over like
+ * an unlock is the assumption here. */
+void psp_kernlock_thread_ended(uint32_t uid) {
+    for (int i = 0; i < MAX_MUTEXES; i++) {
+        psp_mutex *m = &g_mutex[i];
+        if (!m->used || m->count == 0 || m->owner != uid) continue;
+        m->count = 0;
+        m->owner = 0;
+        (void)mutex_release(m);
+    }
 }
 
 /* The common body of the two blocking locks and the non-blocking one. */
@@ -194,6 +208,13 @@ static void mutex_lock(int may_block, int has_timeout) {
     if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
+        return;
+    }
+    /* Handed the mutex: a delete before we ran does not take it back
+     * (syncprobe step 219). */
+    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
     m = find_mutex(id);
@@ -305,20 +326,21 @@ static void hle_ReferMutexStatus(void) {
      * hardware reports how much it filled. A caller offering *zero* gets zero
      * back and nothing written -- `0: 00000000 => 0` in threads/refer.expected,
      * against `=> 104` for both -1 and 1, so it is not a min. */
-    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
-    psp_write32(info +  0, 56);
-    psp_threadman_write_name(info + 4, m->name);
-    psp_write32(info + 36, m->attr);
-    psp_write32(info + 40, (uint32_t)m->init_count);
-    psp_write32(info + 44, (uint32_t)m->count);
+    uint8_t img[56];
+    psp_refer_img32(img, 0, 56);
+    psp_refer_imgname(img, m->name);
+    psp_refer_img32(img, 36, m->attr);
+    psp_refer_img32(img, 40, (uint32_t)m->init_count);
+    psp_refer_img32(img, 44, (uint32_t)m->count);
     /* "Nobody holds it" is **-1**, not zero, and the tests read that field
      * through `info.lockThread == -1 ? 0 : 1` -- so a zero we wrote for an
      * unlocked mutex printed as *locked*. Which also means the owner cannot be
      * derived from the uid alone here: the main context's uid is 0, so a mutex
      * it holds would be indistinguishable from a free one. The count is what
      * says whether it is held. */
-    psp_write32(info + 48, m->count > 0 ? m->owner : 0xFFFFFFFFu);
-    psp_write32(info + 52, (uint32_t)psp_waitq_count(&m->q));
+    psp_refer_img32(img, 48, m->count > 0 ? m->owner : 0xFFFFFFFFu);
+    psp_refer_img32(img, 52, (uint32_t)psp_waitq_count(&m->q));
+    psp_refer_put(info, img, sizeof img);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -497,9 +519,14 @@ static void hle_DeleteLwMutex(void) {
     }
     const int urgent = psp_waitq_release_all(&m->q);
     m->used = 0;
-    /* The uid is left in the workarea on purpose. It is what makes a *deleted*
-     * lwmutex distinguishable from a never-registered one, and the two get
-     * different answers to everything afterwards. */
+    /* syncprobe steps 113, 122, 220 (fw 6.60): the workarea reads back
+     * count 0, thread -1, waiting 0, uid -1 after a delete (attr and pads
+     * were 0 before and after, so whether they are written is not known).
+     * A uid of -1 resolves to nothing, so every later call is NOT_FOUND. */
+    psp_write32(wa + LW_COUNT,   0);
+    psp_write32(wa + LW_THREAD,  0xFFFFFFFFu);
+    psp_write32(wa + LW_WAITING, 0);
+    psp_write32(wa + LW_UID,     0xFFFFFFFFu);
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_preempt();
 }
@@ -510,6 +537,11 @@ static uint32_t lw_count_error(uint32_t wa, int32_t count, int locking) {
     const uint32_t attr = psp_read32(wa + LW_ATTR);
     const int32_t  cur  = (int32_t)psp_read32(wa + LW_COUNT);
     if (count <= 0) return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
+    /* Held by the caller without the recursive attribute is RECURSIVE even
+     * for a count of 2 (syncprobe step 107), unlike a mutex. */
+    if (locking && cur > 0 && !(attr & LWMUTEX_ATTR_RECURSE) &&
+        psp_read32(wa + LW_THREAD) == psp_sched_current())
+        return SCE_KERNEL_ERROR_LWMUTEX_RECURSIVE;
     if (count > 1 && !(attr & LWMUTEX_ATTR_RECURSE))
         return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
     if (locking && cur > INT32_MAX - count)
@@ -583,6 +615,11 @@ static void lw_lock(int may_block, int has_timeout, int flatten) {
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, m->waitdesc,
                                          deadline);
 
+    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
     m = find_lw(uid);
     if (!m) { psp_wait_writeback(tmo_ptr, deadline);
               psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
@@ -641,7 +678,7 @@ static void hle_UnlockLwMutex(void) {
             psp_write32(wa + LW_COUNT,   w.need);
             psp_write32(wa + LW_THREAD,  w.uid);
             psp_write32(wa + LW_WAITING, (uint32_t)psp_waitq_count(&m->q));
-            urgent = psp_sched_wake(w.uid);
+            urgent = psp_sched_wake_as(w.uid, PSP_WAIT_WOKE_SATISFIED);
         }
     }
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -653,21 +690,22 @@ static void hle_UnlockLwMutex(void) {
 static void lw_write_info(const psp_lwmutex *m, uint32_t info) {
     const uint32_t wa  = m->workarea;
     const uint32_t thr = psp_read32(wa + LW_THREAD);
-    psp_write32(info +  0, 64);
-    psp_threadman_write_name(info + 4, m->name);
-    psp_write32(info + 36, psp_read32(wa + LW_ATTR));
-    psp_write32(info + 40, m->uid);
-    psp_write32(info + 44, wa);
-    psp_write32(info + 48, (uint32_t)m->init_count);
-    psp_write32(info + 52, psp_read32(wa + LW_COUNT));
-    psp_write32(info + 56, thr ? thr : 0xFFFFFFFFu);
-    psp_write32(info + 60, (uint32_t)psp_waitq_count(&m->q));
+    uint8_t img[64];
+    psp_refer_img32(img, 0, 64);
+    psp_refer_imgname(img, m->name);
+    psp_refer_img32(img, 36, psp_read32(wa + LW_ATTR));
+    psp_refer_img32(img, 40, m->uid);
+    psp_refer_img32(img, 44, wa);
+    psp_refer_img32(img, 48, (uint32_t)m->init_count);
+    psp_refer_img32(img, 52, psp_read32(wa + LW_COUNT));
+    psp_refer_img32(img, 56, thr ? thr : 0xFFFFFFFFu);
+    psp_refer_img32(img, 60, (uint32_t)psp_waitq_count(&m->q));
+    psp_refer_put(info, img, sizeof img);
 }
 
 static void lw_refer(const psp_lwmutex *m, uint32_t info) {
     if (!m)    { psp_ret(SCE_KERNEL_ERROR_NOT_FOUND_LWMUTEX); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
-    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
     lw_write_info(m, info);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -676,7 +714,10 @@ static void hle_ReferLwMutexStatus(void) {
     const uint32_t wa = psp_arg(0);
     if (!wa) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
     psp_lwmutex *m = NULL;
-    (void)lw_resolve(wa, &m, 1);
+    /* By the uid in the workarea: a copy of a live workarea is answered OK
+     * (syncprobe step 115), unlike DeleteLwMutex on it. Which workarea's
+     * fields it then reports is not measured. */
+    (void)lw_resolve(wa, &m, 0);
     lw_refer(m, psp_arg(1));
 }
 

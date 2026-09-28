@@ -67,9 +67,9 @@
  * allocation. Free nodes are linked in a **circular** list through `next`, and
  * the terminator is permanently one of them.
  *
- * The test also pins where the pools *are*: it reaches the middle pool's
- * accounting as `addr3 + 0x18`, which only resolves if three pools created in
- * order descend in memory. So a vpl's pool is allocated from the **high** end.
+ * Pools are allocated from the **low** end: syncprobe step 190 (fw 6.60)
+ * finds three 0x100 pools created in order at +0x100 and +0x200 from the
+ * first.
  */
 #define VPL_ACCT_SIZE  32u
 #define VPL_BOTTOM     24u    /* bottomBlock's offset within the accounting */
@@ -163,9 +163,9 @@ static void hle_CreateVpl(void) {
      * 0x10000000 and 0x02000000 are refused where 0x01800000 succeeds, so the
      * boundary is what is actually free and not a constant.
      *
-     * From the high end, which vpl/order pins: it reaches the middle of three
-     * pools as `addr3 + 0x18`, and that only resolves if they descend. */
-    const uint32_t base = pool ? psp_sysmem_alloc(total, 1) : 0;
+     * From the LOW end: syncprobe step 190 (fw 6.60) finds three 0x100 pools
+     * created in order at +0x100 and +0x200 from the first. */
+    const uint32_t base = pool ? psp_sysmem_alloc(total, 0) : 0;
     if (pool && !base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     psp_vpl *v = NULL;
@@ -220,9 +220,11 @@ static uint32_t vpl_start(const psp_vpl *v) { return v->base + 8; }
  * `bottom at 0x18, next->0xf8, 0xe0` and `0xf8, next->0x18, 0`. */
 static void vpl_init(psp_vpl *v) {
     const uint32_t bottom = vpl_bottom(v), term = vpl_term(v);
-    psp_write32(v->base + VA_START,   vpl_start(v));
-    psp_write32(v->base + VA_START2,  vpl_start(v));
-    psp_write32(v->base + VA_START7,  vpl_start(v) + 7);
+    /* The accounting's own start words hold the pool base, although an
+     * allocated block's `next` is base + 8 (syncprobe step 180). */
+    psp_write32(v->base + VA_START,   v->base);
+    psp_write32(v->base + VA_START2,  v->base);
+    psp_write32(v->base + VA_START7,  v->base + 7);
     psp_write32(v->base + VA_TOTAL_M8, v->total - 8);
     psp_write32(v->base + VA_ALLOCED, 0);
     set_next(bottom, term);  set_size(bottom, term - bottom);
@@ -235,51 +237,30 @@ static uint32_t vpl_free_size(const psp_vpl *v) {
     return v->pool_size - psp_read32(v->base + VA_ALLOCED) * 8;
 }
 
-/* Carve from the *top* of the first free block that fits, walking the circular
- * list from the head.
- *
- * Top, not bottom: order.expected has the bottom block shrink from 0xe0 to
- * 0xc8 while the new allocation appears at 0xe0 -- immediately above what is
- * left of the free block. And the head advances to that block's `next`
- * afterwards, which is why a second allocation from the same block leaves the
- * head where it already was. */
-/* Open, and the last line threads/vpl/free differs by. That test allocates
- * three adjacent blocks, frees all three, and allocates again: hardware reuses
- * the merged hole where the first one was, and we take the other free region
- * instead. The reason is the head this search starts from -- vpl_give_back
- * leaves it at the free node *preceding* the returned block, which after a
- * forward merge is the low block rather than the merged one.
- *
- * Do not change the head rule on that one observation. order.expected matches
- * today and is what pins it, and its three frees agree with the current rule
- * and with nothing simpler. Whatever replaces it has to satisfy both tests. */
+/* Carve from the *top* of the first free block that fits. order.expected has
+ * the bottom block shrink from 0xe0 to 0xc8 while the new allocation appears
+ * at 0xe0 -- immediately above what is left of the free block -- and syncprobe
+ * steps 184-186 show the same on fw 6.60. */
 static uint32_t vpl_alloc(psp_vpl *v, uint32_t bytes) {
     if (!v->base) return 0;
     const uint32_t need = round_up(bytes, VPL_ALIGN) + VPL_HEADER;
 
-    uint32_t b = vpl_head(v), prev = 0;
-    for (uint32_t guard = 0; guard < 4096; guard++) {
-        const uint32_t sz = blk_size(b);
-        if (sz >= need) break;
+    /* K&R malloc with a roving pointer (syncprobe steps 180-197, fw 6.60,
+     * reproduced line for line by findings/syncprobe-tools/vplmodel.py):
+     * the search starts at head->next, not at the head, and afterwards the
+     * head is the node *before* the block used. */
+    const uint32_t start = vpl_head(v);
+    uint32_t prev = start, b = blk_next(start);
+    for (uint32_t guard = 0; blk_size(b) < need; guard++) {
+        if (b == start || guard >= 4096) return 0;   /* all the way round */
         prev = b;
         b = blk_next(b);
-        if (b == vpl_head(v)) return 0;        /* all the way round */
     }
     const uint32_t sz = blk_size(b);
-    if (sz < need) return 0;
-
     const uint32_t at = b + (sz - need);       /* the new block's header */
-    if (sz == need) {
-        /* The free block is consumed whole, so it leaves the list. Its
-         * predecessor has to be found the long way round when the head is the
-         * block itself. */
-        if (!prev) { prev = b; while (blk_next(prev) != b) prev = blk_next(prev); }
-        set_next(prev, blk_next(b));
-        set_head(v, blk_next(b));
-    } else {
-        set_size(b, sz - need);
-        set_head(v, blk_next(b));
-    }
+    if (sz == need) set_next(prev, blk_next(b));   /* consumed whole */
+    else            set_size(b, sz - need);
+    set_head(v, prev);
     set_next(at, vpl_start(v));
     set_size(at, need);
     psp_write32(v->base + VA_ALLOCED,
@@ -345,7 +326,7 @@ static int vpl_release(psp_vpl *v) {
         if (!got) break;
         const psp_waiter w = psp_waitq_take(&v->q, i);
         if (w.out) psp_write32(w.out, got);
-        urgent |= psp_sched_wake(w.uid);
+        urgent |= psp_sched_wake_as(w.uid, PSP_WAIT_WOKE_SATISFIED);
     }
     return urgent;
 }
@@ -399,6 +380,11 @@ static void vpl_allocate(int may_block, int has_timeout) {
     if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
+        return;
+    }
+    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
+        psp_wait_writeback(tmo_ptr, deadline);    /* syncprobe step 222 */
+        psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
     v = find_vpl(id);
@@ -469,13 +455,14 @@ static void hle_ReferVplStatus(void) {
     const uint32_t info = psp_arg(1);
     if (!v)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VPLID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
-    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
-    psp_write32(info +  0, 52);
-    psp_threadman_write_name(info + 4, v->name);
-    psp_write32(info + 36, v->attr);
-    psp_write32(info + 40, v->pool_size);
-    psp_write32(info + 44, vpl_free_size(v));
-    psp_write32(info + 48, (uint32_t)psp_waitq_count(&v->q));
+    uint8_t img[52];
+    psp_refer_img32(img, 0, 52);
+    psp_refer_imgname(img, v->name);
+    psp_refer_img32(img, 36, v->attr);
+    psp_refer_img32(img, 40, v->pool_size);
+    psp_refer_img32(img, 44, vpl_free_size(v));
+    psp_refer_img32(img, 48, (uint32_t)psp_waitq_count(&v->q));
+    psp_refer_put(info, img, sizeof img);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1021,14 +1008,15 @@ static void hle_ReferMsgPipeStatus(void) {
     const uint32_t info = psp_arg(1);
     if (!p)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MPPID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
-    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
-    psp_write32(info +  0, 56);
-    psp_threadman_write_name(info + 4, p->name);
-    psp_write32(info + 36, p->attr);
-    psp_write32(info + 40, p->buf_size);
-    psp_write32(info + 44, mpp_free(p));
-    psp_write32(info + 48, (uint32_t)psp_waitq_count(&p->send_q));
-    psp_write32(info + 52, (uint32_t)psp_waitq_count(&p->recv_q));
+    uint8_t img[56];
+    psp_refer_img32(img, 0, 56);
+    psp_refer_imgname(img, p->name);
+    psp_refer_img32(img, 36, p->attr);
+    psp_refer_img32(img, 40, p->buf_size);
+    psp_refer_img32(img, 44, mpp_free(p));
+    psp_refer_img32(img, 48, (uint32_t)psp_waitq_count(&p->send_q));
+    psp_refer_img32(img, 52, (uint32_t)psp_waitq_count(&p->recv_q));
+    psp_refer_put(info, img, sizeof img);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1149,7 +1137,8 @@ static void mbx_insert(psp_mbx *m, uint32_t msg) {
         return;
     }
     if (m->attr & MBX_ATTR_MSG_PRIO) {
-        /* Ordered by the packet's own priority byte, ahead of equals. */
+        /* Ordered by the packet's own priority byte, after equals (syncprobe
+         * steps 133-134, fw 6.60). */
         const uint32_t pri = psp_read8(msg + MSG_PRIO);
         const uint32_t head = mbx_first(m);
         uint32_t prev = m->last, at = head, i = 0;
@@ -1262,7 +1251,7 @@ static void hle_SendMbx(void) {
     if (i >= 0) {
         const psp_waiter w = psp_waitq_take(&m->q, i);
         if (w.out) psp_write32(w.out, msg);
-        const int urgent = psp_sched_wake(w.uid);
+        const int urgent = psp_sched_wake_as(w.uid, PSP_WAIT_WOKE_SATISFIED);
         psp_ret(SCE_KERNEL_ERROR_OK);
         if (urgent) psp_sched_preempt();
         return;
@@ -1323,6 +1312,11 @@ static void mbx_receive(int may_block, int has_timeout) {
         psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
         return;
     }
+    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
+        psp_wait_writeback(tmo_ptr, deadline);    /* syncprobe step 221 */
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
     m = find_mbx(id);
     if (!m) { psp_wait_writeback(tmo_ptr, deadline);
               psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
@@ -1359,13 +1353,14 @@ static void hle_ReferMbxStatus(void) {
      * rule the other Refer calls already follow, which this one did not.
      * mbx/refer sweeps the size field: `Size 00000000 => 00000000`, against
      * `=> 00000034` for every other value it tries, including -1. */
-    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
-    psp_write32(info +  0, 52);
-    psp_threadman_write_name(info + 4, m->name);
-    psp_write32(info + 36, m->attr);
-    psp_write32(info + 40, (uint32_t)psp_waitq_count(&m->q));
-    psp_write32(info + 44, m->count);
-    psp_write32(info + 48, mbx_first(m));
+    uint8_t img[52];
+    psp_refer_img32(img, 0, 52);
+    psp_refer_imgname(img, m->name);
+    psp_refer_img32(img, 36, m->attr);
+    psp_refer_img32(img, 40, (uint32_t)psp_waitq_count(&m->q));
+    psp_refer_img32(img, 44, m->count);
+    psp_refer_img32(img, 48, mbx_first(m));
+    psp_refer_put(info, img, sizeof img);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1409,10 +1404,8 @@ void psp_kernobj_register_mbx(void) {
  * of fpl/create leave their pools alive, so the loop had no slot to start
  * from and the failure looked like memory rather than bookkeeping. */
 #define MAX_FPLS 2048
-/* create.expected creates pools of 0x131, 0x136 and 0x139 blocks and expects
- * each to succeed. A count of 0x04000000 is refused, but for want of memory
- * rather than a table limit. */
-#define MAX_FPL_BLOCKS 1024
+/* No block-count limit of our own: syncprobe step 202 (fw 6.60) creates a
+ * pool of 0x2000 blocks. What memory there is decides (NO_MEMORY). */
 
 /* Seventh object type, seventh attribute rule: 0x41FF. create.expected accepts
  * 0x1, 0x100, 0x4000 and 0x41FF and refuses 0x200, 0x300, 0x400, 0x800,
@@ -1435,7 +1428,7 @@ typedef struct {
      * `Alloc #2 is 16 bytes before #3`, where reusing the lowest free block
      * would put #3 below #2 and print "after". A freed block goes to the back
      * of the queue and allocations keep climbing. */
-    uint16_t  freelist[MAX_FPL_BLOCKS];
+    uint32_t *freelist;      /* nblocks entries, malloc'd */
     uint32_t  head, free_blocks;
     int       alive;
     psp_waitq q;
@@ -1445,8 +1438,10 @@ typedef struct {
 static psp_fpl g_fpl[MAX_FPLS];
 
 static void fpl_reset(void) {
-    for (int i = 0; i < MAX_FPLS; i++)
+    for (int i = 0; i < MAX_FPLS; i++) {
         if (g_fpl[i].alive && g_fpl[i].base) psp_sysmem_release(g_fpl[i].base);
+        free(g_fpl[i].freelist);
+    }
     memset(g_fpl, 0, sizeof g_fpl);
 }
 
@@ -1476,7 +1471,6 @@ static void hle_CreateFpl(void) {
      * not a memory one: `Count 0x04000000` with a 0x100 block is refused with
      * ILLEGAL_MEMSIZE where merely asking for too much answers NO_MEMORY. */
     if (count > 0xFFFFFFFFu / bsize) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
-    if (count > MAX_FPL_BLOCKS) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     /* The option block's second word is an alignment, and it must be zero or a
      * power of two. create.expected sweeps it: 0, 1, 2, 4 and 8 are accepted;
@@ -1498,19 +1492,24 @@ static void hle_CreateFpl(void) {
      * test leaves the options null and measures 16. */
     const uint32_t stride = (bsize + align - 1) & ~(align - 1);
 
+    if (count > 0xFFFFFFFFu / stride) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
     const uint32_t base = psp_sysmem_alloc(stride * count, 0);
     if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    uint32_t *list = malloc((size_t)count * sizeof *list);
+    if (!list) { psp_sysmem_release(base); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     psp_fpl *f = NULL;
     for (int i = 0; i < MAX_FPLS; i++) if (!g_fpl[i].alive) { f = &g_fpl[i]; break; }
-    if (!f) { psp_sysmem_release(base); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    if (!f) { free(list); psp_sysmem_release(base); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
+    free(f->freelist);
     memset(f, 0, sizeof *f);
+    f->freelist = list;
     psp_str(name, f->name, sizeof f->name);
     f->attr = attr; f->base = base; f->block_size = bsize; f->nblocks = count;
     f->stride = stride;
     f->free_blocks = count;
-    for (uint32_t i = 0; i < count; i++) f->freelist[i] = (uint16_t)i;
+    for (uint32_t i = 0; i < count; i++) f->freelist[i] = i;
     f->uid   = psp_threadman_next_uid();
     f->alive = 1;
     char nm[sizeof f->name];
@@ -1639,7 +1638,7 @@ static void hle_FreeFpl(void) {
     if (ptr >= f->base && ptr < f->base + f->nblocks * f->stride) {
         const uint32_t i = (ptr - f->base) / f->stride;
         if (f->base + i * f->stride == ptr && fpl_is_taken(f, i)) {
-            f->freelist[(f->head + f->free_blocks) % f->nblocks] = (uint16_t)i;
+            f->freelist[(f->head + f->free_blocks) % f->nblocks] = i;
             f->free_blocks++;
             const int urgent = fpl_release(f);
             psp_ret(SCE_KERNEL_ERROR_OK);
@@ -1665,14 +1664,15 @@ static void hle_ReferFplStatus(void) {
     const uint32_t info = psp_arg(1);
     if (!f)    { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_FPLID); return; }
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
-    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
-    psp_write32(info +  0, 56);
-    psp_threadman_write_name(info + 4, f->name);
-    psp_write32(info + 36, f->attr);
-    psp_write32(info + 40, f->block_size);
-    psp_write32(info + 44, f->nblocks);
-    psp_write32(info + 48, f->free_blocks);
-    psp_write32(info + 52, (uint32_t)psp_waitq_count(&f->q));
+    uint8_t img[56];
+    psp_refer_img32(img, 0, 56);
+    psp_refer_imgname(img, f->name);
+    psp_refer_img32(img, 36, f->attr);
+    psp_refer_img32(img, 40, f->block_size);
+    psp_refer_img32(img, 44, f->nblocks);
+    psp_refer_img32(img, 48, f->free_blocks);
+    psp_refer_img32(img, 52, (uint32_t)psp_waitq_count(&f->q));
+    psp_refer_put(info, img, sizeof img);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

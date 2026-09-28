@@ -591,6 +591,7 @@ static void thread_ended(psp_thread *t, uint32_t status) {
     t->exit_status = status;
     t->state       = TH_DORMANT;
     psp_kernobj_thread_ended(t->uid);
+    psp_kernlock_thread_ended(t->uid);
     for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++)
         psp_sched_wake(t->enders[i]);
     t->nenders = 0;
@@ -1125,6 +1126,12 @@ void psp_threadman_write_name(uint32_t dst, const char *name) {
     for (int i = 0; i < 32; i++) psp_write8(dst + (uint32_t)i, (uint8_t)buf[i]);
 }
 
+void psp_refer_put(uint32_t info, const uint8_t *img, uint32_t len) {
+    uint32_t n = psp_read32(info);
+    if (n > len) n = len;
+    for (uint32_t i = 0; i < n; i++) psp_write8(info + i, img[i]);
+}
+
 static void hle_CreateSema(void) {
     /* (name, attr, initVal, maxVal, option) */
     if (!name_ok(psp_arg(0))) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
@@ -1196,30 +1203,16 @@ static void hle_SignalSema(void) {
  * WaitSema is the whole point of the call: a caller uses it precisely because
  * it has something else to do when the answer is no. */
 static void hle_PollSema(void) {
-    /* Three answers in an order that is not the obvious one, and
-     * semaphores/poll pins every step of it.
-     *
-     * An empty semaphore answers SEMA_ZERO whatever it was asked for, so that
-     * comes first: polling for zero while *not* signalled is SEMA_ZERO and
-     * polling for zero while signalled is ILLEGAL_COUNT.
-     *
-     * Then the count, which is checked before the uid even exists as a
-     * question: `sceKernelPollSema(NULL, 0)` answers ILLEGAL_COUNT where
-     * `sceKernelPollSema(NULL, 1)` answers UNKNOWN_SEMID.
-     *
-     * The waitq test in the first step is the least certain part: a semaphore
-     * at zero *with a waiter* answers ILLEGAL_COUNT rather than SEMA_ZERO, so
-     * "nothing to give" is not the same as "count is zero". One observation
-     * supports it -- `Zero same` -- and nothing contradicts it. */
+    /* syncprobe (fw 6.60) steps 17-21, 40-41: the count first (0 and
+     * negative are ILLEGAL_COUNT even on an empty semaphore), then the uid,
+     * then more than the maximum (ILLEGAL_COUNT), and a poll never takes
+     * what is there while a thread waits (SEMA_ZERO). */
     psp_sema *s = find_sema(psp_arg(0));
     const int32_t need = (int32_t)psp_arg(1);
-    if (s && s->count <= 0 && psp_waitq_count(&s->q) == 0) {
-        psp_ret(SCE_KERNEL_ERROR_SEMA_ZERO);
-        return;
-    }
     if (need <= 0)          { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_COUNT); return; }
     if (!s)                 { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
-    if (s->count < need)    { psp_ret(SCE_KERNEL_ERROR_SEMA_ZERO); return; }
+    if (s->max_count > 0 && need > s->max_count) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_COUNT); return; }
+    if (psp_waitq_count(&s->q) > 0 || s->count < need) { psp_ret(SCE_KERNEL_ERROR_SEMA_ZERO); return; }
     s->count -= need;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1308,7 +1301,9 @@ static int sema_release(psp_sema *s) {
         const psp_waiter w = psp_waitq_take(&s->q, i);
         s->count -= (int32_t)w.need;
         sema_log(s, "taken", (int32_t)w.need, 0);
-        urgent |= psp_sched_wake(w.uid);
+        /* SATISFIED, so a delete before the waiter runs does not undo it
+         * (syncprobe step 217: hardware answers the waiter OK). */
+        urgent |= psp_sched_wake_as(w.uid, PSP_WAIT_WOKE_SATISFIED);
     }
     return urgent;
 }
@@ -1322,9 +1317,12 @@ static void hle_WaitSema(void) {
      * before the count is consulted and without touching the timeout word --
      * semaphores/wait.expected reports `Greater than max: Failed (800201BD,
      * 500ms left)`, so the call never waited. */
+    /* The count before the uid (syncprobe step 22: WaitSema(0, 0) is
+     * ILLEGAL_COUNT), the maximum after it. */
+    if (need <= 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_COUNT); return; }
     psp_sema *s = find_sema(id);
     if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
-    if (need <= 0 || (s->max_count > 0 && need > s->max_count)) {
+    if (s->max_count > 0 && need > s->max_count) {
         psp_ret(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
         return;
     }
@@ -1349,6 +1347,15 @@ static void hle_WaitSema(void) {
 
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, s->waitdesc,
                                          deadline);
+    if (rc == PSP_SCHED_WOKEN) {
+        const int why = psp_sched_wake_reason();
+        if (why == PSP_WAIT_WOKE_SATISFIED || why == PSP_WAIT_WOKE_CANCELLED) {
+            psp_wait_writeback(tmo_ptr, deadline);
+            psp_ret(why == PSP_WAIT_WOKE_SATISFIED ? SCE_KERNEL_ERROR_OK
+                                                   : SCE_KERNEL_ERROR_WAIT_CANCEL);
+            return;
+        }
+    }
 
     /* Gone while we were parked, which is what sceKernelDeleteSema releasing
      * its waiters looks like from in here -- and a different answer from asking
@@ -1382,6 +1389,28 @@ static void hle_WaitSema(void) {
      * one elapsed -- a fabricated timeout is something a game acts on. */
     wait_deadlock("sceKernelWaitSema");
     psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* sceKernelCancelSema(uid, newCount, numWaitThreads) -- syncprobe steps 44-45
+ * (fw 6.60): the waiters are woken with WAIT_CANCEL in queue order, their
+ * number written if the pointer is not NULL, and the count set to newCount;
+ * above the maximum is ILLEGAL_COUNT with nothing changed or written. -1
+ * gave 0 on a semaphore created with 0: whether negative means "the initial
+ * count" or "zero" is not settled (init_count is used here). */
+static void hle_CancelSema(void) {
+    psp_sema *s = find_sema(psp_arg(0));
+    if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_SEMID); return; }
+    const int32_t  count = (int32_t)psp_arg(1);
+    const uint32_t out   = psp_arg(2);
+    if (s->max_count > 0 && count > s->max_count) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
+        return;
+    }
+    if (out) psp_write32(out, (uint32_t)psp_waitq_count(&s->q));
+    const int urgent = psp_waitq_cancel_all(&s->q);
+    s->count = count < 0 ? s->init_count : count;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_preempt();
 }
 
 /* ---- event flags --------------------------------------------------------- */
@@ -1426,6 +1455,10 @@ static void hle_CreateEventFlag(void) {
 static void hle_DeleteEventFlag(void) {
     psp_evflag *f = find_flag(psp_arg(0));
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
+    /* Each waiter is told the pattern at the time of the delete (syncprobe
+     * step 70: out=0000000C, not 0). */
+    for (int i = 0; i < psp_waitq_count(&f->q); i++)
+        if (f->q.w[i].out) psp_write32(f->q.w[i].out, f->pattern);
     const int urgent = psp_waitq_release_all(&f->q);
     f->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -1484,7 +1517,7 @@ static int flag_release(psp_evflag *f) {
         psp_waitq_drop(&f->q, w.uid);
         if (w.out) psp_write32(w.out, f->pattern);
         flag_take(f, w.need, w.mode);
-        urgent |= psp_sched_wake(w.uid);
+        urgent |= psp_sched_wake_as(w.uid, PSP_WAIT_WOKE_SATISFIED);
     }
     return urgent;
 }
@@ -1505,6 +1538,22 @@ static void hle_ClearEventFlag(void) {
      * backwards leaves a game waiting on a flag that never clears. */
     f->pattern &= psp_arg(1);
     psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* sceKernelCancelEventFlag(uid, newPattern, numWaitThreads) -- syncprobe
+ * step 71 (fw 6.60): the pattern becomes newPattern, every waiter is told it
+ * and woken with WAIT_CANCEL, and the waiter count is written. */
+static void hle_CancelEventFlag(void) {
+    psp_evflag *f = find_flag(psp_arg(0));
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_EVFID); return; }
+    const uint32_t out = psp_arg(2);
+    if (out) psp_write32(out, (uint32_t)psp_waitq_count(&f->q));
+    f->pattern = psp_arg(1);
+    for (int i = 0; i < psp_waitq_count(&f->q); i++)
+        if (f->q.w[i].out) psp_write32(f->q.w[i].out, f->pattern);
+    const int urgent = psp_waitq_cancel_all(&f->q);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_preempt();
 }
 
 /* sceKernelWaitEventFlag(evfid, bits, mode, outBits, timeout)
@@ -1574,16 +1623,24 @@ static void hle_WaitEventFlag(void) {
 
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, f->waitdesc,
                                          deadline);
+    /* Released or cancelled: the waker already wrote the pattern. */
+    if (rc == PSP_SCHED_WOKEN) {
+        const int why = psp_sched_wake_reason();
+        if (why == PSP_WAIT_WOKE_SATISFIED || why == PSP_WAIT_WOKE_CANCELLED) {
+            psp_wait_writeback(tmo_ptr, deadline);
+            psp_ret(why == PSP_WAIT_WOKE_SATISFIED ? SCE_KERNEL_ERROR_OK
+                                                   : SCE_KERNEL_ERROR_WAIT_CANCEL);
+            return;
+        }
+    }
 
     /* Gone while we were parked, which is what sceKernelDeleteEventFlag
      * releasing its waiters looks like from in here -- and a different answer
      * from asking about a flag that was already gone before the call. */
     f = find_flag(id);
     if (!f) {
-        /* And it still reports a pattern: zero, because there is no longer a
-         * flag to have one. The scheduling harness in every events test reads
-         * that word after deleting the flag under its waiter and prints it. */
-        if (out) psp_write32(out, 0);
+        /* DeleteEventFlag already wrote the flag's last pattern into our out
+         * word (syncprobe step 70 on fw 6.60: out=0C, not 0). */
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE);
         return;
@@ -1636,14 +1693,15 @@ static void hle_ReferSemaStatus(void) {
     /* A caller offering zero bytes gets zero back and nothing written. See
      * the same guard on every other Refer*Status: threads/refer measured it
      * first and each type's own test repeats it. */
-    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
-    psp_write32(info +  0, 56);
-    psp_threadman_write_name(info + 4, sm->name);
-    psp_write32(info + 36, sm->attr);
-    psp_write32(info + 40, (uint32_t)sm->init_count);
-    psp_write32(info + 44, (uint32_t)sm->count);
-    psp_write32(info + 48, (uint32_t)sm->max_count);
-    psp_write32(info + 52, (uint32_t)psp_waitq_count(&sm->q));
+    uint8_t img[56];
+    psp_refer_img32(img, 0, 56);
+    psp_refer_imgname(img, sm->name);
+    psp_refer_img32(img, 36, sm->attr);
+    psp_refer_img32(img, 40, (uint32_t)sm->init_count);
+    psp_refer_img32(img, 44, (uint32_t)sm->count);
+    psp_refer_img32(img, 48, (uint32_t)sm->max_count);
+    psp_refer_img32(img, 52, (uint32_t)psp_waitq_count(&sm->q));
+    psp_refer_put(info, img, sizeof img);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1708,13 +1766,14 @@ static void hle_ReferEventFlagStatus(void) {
     /* A caller offering zero bytes gets zero back and nothing written. See
      * the same guard on every other Refer*Status: threads/refer measured it
      * first and each type's own test repeats it. */
-    if (psp_read32(info) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
-    psp_write32(info +  0, 52);
-    psp_threadman_write_name(info + 4, f->name);
-    psp_write32(info + 36, f->attr);
-    psp_write32(info + 40, f->init_pattern);
-    psp_write32(info + 44, f->pattern);
-    psp_write32(info + 48, (uint32_t)psp_waitq_count(&f->q));
+    uint8_t img[52];
+    psp_refer_img32(img, 0, 52);
+    psp_refer_imgname(img, f->name);
+    psp_refer_img32(img, 36, f->attr);
+    psp_refer_img32(img, 40, f->init_pattern);
+    psp_refer_img32(img, 44, f->pattern);
+    psp_refer_img32(img, 48, (uint32_t)psp_waitq_count(&f->q));
+    psp_refer_put(info, img, sizeof img);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -2202,6 +2261,7 @@ void psp_threadman_register(void) {
      * so a thread carried on holding a lock it had never taken. */
     psp_hle_register(0x6D212BAC, "ThreadManForUser", "sceKernelWaitSemaCB",              hle_WaitSemaCB);
     psp_hle_register(0x58B1F937, "ThreadManForUser", "sceKernelPollSema",                hle_PollSema);
+    psp_hle_register(0x8FFDF9A2, "ThreadManForUser", "sceKernelCancelSema",              hle_CancelSema);
     psp_hle_register(0x912354A7, "ThreadManForUser", "sceKernelRotateThreadReadyQueue",  hle_RotateReadyQueue);
     psp_hle_register(0xEDBA5844, "ThreadManForUser", "sceKernelDeleteCallback",          hle_DeleteCallback);
 
@@ -2212,6 +2272,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0x402FCF22, "ThreadManForUser", "sceKernelWaitEventFlag",           hle_WaitEventFlag);
     psp_hle_register(0x30FD48F0, "ThreadManForUser", "sceKernelPollEventFlag",           hle_PollEventFlag);
     psp_hle_register(0x328C546A, "ThreadManForUser", "sceKernelWaitEventFlagCB",         hle_WaitEventFlagCB);
+    psp_hle_register(0xCD203292, "ThreadManForUser", "sceKernelCancelEventFlag",         hle_CancelEventFlag);
 
     psp_hle_register(0xE81CAF8F, "ThreadManForUser", "sceKernelCreateCallback",          hle_CreateCallback);
     psp_hle_register(0xBC6FEBC5, "ThreadManForUser", "sceKernelReferSemaStatus",         hle_ReferSemaStatus);

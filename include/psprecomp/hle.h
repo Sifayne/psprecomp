@@ -560,6 +560,20 @@ enum {
     PSP_TMID_SUSPENDED = 0x42, PSP_TMID_DORMANT = 0x43,
 };
 void     psp_threadman_write_name(uint32_t dst, const char *name);
+/* Copy a Refer*Status result into the caller's block. `img` is the whole
+ * struct as the kernel builds it, first word = its own size; hardware copies
+ * min(the caller's size word, len) bytes of it (syncprobe step 24: size 4
+ * gets only the size word). A size of 0 therefore gets nothing. */
+void     psp_refer_put(uint32_t info, const uint8_t *img, uint32_t len);
+static inline void psp_refer_img32(uint8_t *img, uint32_t off, uint32_t v) {
+    img[off] = (uint8_t)v; img[off + 1] = (uint8_t)(v >> 8);
+    img[off + 2] = (uint8_t)(v >> 16); img[off + 3] = (uint8_t)(v >> 24);
+}
+/* The 32-byte name at offset 4, truncated to 31 characters. */
+static inline void psp_refer_imgname(uint8_t *img, const char *name) {
+    for (int i = 0; i < 32; i++) img[4 + i] = 0;
+    for (int i = 0; i < 31 && name[i]; i++) img[4 + i] = (uint8_t)name[i];
+}
 
 void psp_kernlock_register(void);
 void psp_kernlock_register_lw(void);
@@ -575,10 +589,12 @@ void psp_ktimer_reset(void);
  * path, which is the only place guest time is observed to move. */
 void psp_ktimer_tick(void);
 void psp_kernobj_reset(void);
-/* A thread has ended: return anything it still holds. Only thread-local
- * storage cares -- a pool block or a mutex outlives its owner, a tls block by
- * definition does not. */
+/* A thread has ended: return anything it still holds. Thread-local storage
+ * does, and so does a mutex -- syncprobe step 90 (fw 6.60): a mutex whose
+ * owner exits reads back free (owner -1) and the next TryLock succeeds. A
+ * pool block outlives its owner. */
 void psp_kernobj_thread_ended(uint32_t uid);
+void psp_kernlock_thread_ended(uint32_t uid);
 void psp_kernlock_reset(void);
 
 void psp_threadman_init(void);
