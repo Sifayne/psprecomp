@@ -181,8 +181,8 @@ void psp_threadman_reset(void) {
     g_cb_hi = g_sema_hi = g_flag_hi = 0;
     g_next_uid = UID_BASE;
     g_warned_block = 0;
-    /* The clock first: the scheduler stamps the main context's timeslice from
-     * it, so resetting time afterwards would leave that stamp in the future. */
+    /* The clock first: the scheduler's ready-queue stamps are guest times, and
+     * a clock reset after them would leave stamps in the future. */
     psp_clock_reset();
     psp_sched_reset();
     psp_kernlock_reset();
@@ -899,12 +899,20 @@ static void hle_CancelWakeupThread(void) {
  * dispatch would break the outer one. pspautotests' scheduling/dispatch is an
  * entire test of this, and without it that test deadlocks before it prints
  * anything at all. */
-/* These do *not* nest. Suspending dispatch that is already suspended is an
- * error, and so is resuming with anything that is not a state a suspend
- * returned -- which is how the second failure in dispatch.expected arises, the
- * test handing the failed suspend's error code straight to resume. */
+/* threadprobe step 83 (fw 6.60) settles how: `suspend=00000001 suspend
+ * again=00000000`, then `resume(second)=00000000 resume(first)=00000000`. A
+ * second suspend is not an error, it answers 0 (already off), and resuming
+ * with that 0 leaves dispatch off, so the outer resume(1) is the one that
+ * turns it on. A 0x10 thread started while it was off runs as soon as that
+ * resume returns (`m1 m2 W m3`): turning dispatch back on is a reschedule
+ * point.
+ *
+ * This answered CPUDI (0x80020066) to the second suspend, from a comment that
+ * said these do not nest. The name in PSPSDK is "CPU interrupts disabled", so
+ * that answer presumably belongs to a suspend made with interrupts off, which
+ * nothing here models; unmeasured. A resume with anything but 0 or 1 still
+ * answers it, also unmeasured. */
 static void hle_SuspendDispatchThread(void) {
-    if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CPUDI); return; }
     psp_ret((uint32_t)psp_sched_set_dispatch(0));
 }
 
@@ -913,6 +921,10 @@ static void hle_ResumeDispatchThread(void) {
     if (state > 1) { psp_ret(SCE_KERNEL_ERROR_CPUDI); return; }
     psp_sched_set_dispatch((int)state);
     psp_ret(SCE_KERNEL_ERROR_OK);
+    /* Anything more urgent that became ready while dispatch was off runs now.
+     * The reschedule after every firmware call would do it too; asking here
+     * says where it belongs. */
+    if (state) psp_sched_tick();
 }
 
 /* A module's entry point is not running on "no thread".
@@ -1095,15 +1107,16 @@ static void note_signalled(uint32_t uid) {
  * never created at all, and both look identical to started and long since
  * finished. This keeps the record instead. */
 void psp_threadman_dump_threads(FILE *out) {
-    static const char *const ST[] = { "dormant", "ready", "running", "suspended" };
+    static const char *const ST[] = { "dormant", "ready", "running" };
     fprintf(out, "  threads created:\n");
     for (int i = 0; i < MAX_THREADS; i++) {
         const psp_thread *t = &g_thread[i];
         if (!t->uid) continue;          /* never allocated */
-        fprintf(out, "    uid 0x%08X  entry 0x%08X  prio %-3u  %-9s  exit %u  %s%s\n",
+        fprintf(out, "    uid 0x%08X  entry 0x%08X  prio %-3u  %-9s  exit %u  %s%s%s\n",
                 t->uid, t->entry, t->priority,
-                (unsigned)t->state < 4 ? ST[t->state] : "?",
+                (unsigned)t->state < 3 ? ST[t->state] : "?",
                 t->exit_status, t->name,
+                t->suspended ? "  (suspended)" : "",
                 t->used ? "" : "  (deleted)");
     }
 }

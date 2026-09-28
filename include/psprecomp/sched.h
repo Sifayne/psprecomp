@@ -288,9 +288,11 @@ int  psp_sched_resume(uint32_t uid);
  *
  * A guest asks for this around a critical section it needs to finish
  * uninterrupted, and pspautotests' scheduling/dispatch is an entire test of it.
- * While off, the timeslice does not fire and a yield does nothing; the current
- * thread keeps the CPU until it turns dispatch back on. Returns the previous
- * setting, which is what the guest passes back to restore it. */
+ * While off, nothing preempts and a yield does nothing; the current thread
+ * keeps the CPU until it turns dispatch back on, and a more urgent thread
+ * readied meanwhile runs then (threadprobe step 83, fw 6.60). Returns the
+ * previous setting, which is what the guest passes back to restore it -- so a
+ * nested suspend returns 0 and its resume leaves dispatch off. */
 int  psp_sched_set_dispatch(int on);
 
 /* Whether a thread may block at all right now.

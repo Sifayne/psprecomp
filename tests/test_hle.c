@@ -486,6 +486,26 @@ static void test_threads(void) {
     CHECK(call(GETID, 0, 0, 0, 0) == 0, "no current thread outside one");
 }
 
+/* Argument checks and small rules threadprobe measured on fw 6.60. */
+static void test_thread_rules(void) {
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_dispatch_reset();
+
+    /* Dispatch suspend nests by returning the previous state (step 83). */
+    const uint32_t SUSP = psp_nid("sceKernelSuspendDispatchThread");
+    const uint32_t RES  = psp_nid("sceKernelResumeDispatchThread");
+    const uint32_t d1 = call(SUSP, 0, 0, 0, 0);
+    const uint32_t d2 = call(SUSP, 0, 0, 0, 0);
+    CHECK(d1 == 1 && d2 == 0, "suspend dispatch twice: %08X %08X, expected 1 0", d1, d2);
+    CHECK(call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0) ==
+          SCE_KERNEL_ERROR_CAN_NOT_WAIT, "a delay while dispatch is off");
+    CHECK(call(RES, d2, 0, 0, 0) == 0, "resume(0)");
+    CHECK(call(RES, d1, 0, 0, 0) == 0, "resume(1)");
+    CHECK(call(SUSP, 0, 0, 0, 0) == 1, "dispatch is back on after resume(1)");
+    call(RES, 1, 0, 0, 0);
+}
+
 static void test_guest_strings(void) {
     /* Names come out of guest memory, so the reader has to terminate and must
      * not run past the buffer. */
@@ -1016,6 +1036,7 @@ int main(void) {
     test_event_flags();
     test_threads();
     test_thread_argument_block();
+    test_thread_rules();
     test_guest_strings();
     test_io_dirs();
     test_net();
