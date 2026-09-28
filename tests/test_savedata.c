@@ -236,6 +236,86 @@ static void fw660_status(void) {
     assert(call(0x8874DBE0,0)==0);
     assert(psp_read32(p+28)==0);
 }
+/* A noninteractive request, start to finish. */
+static uint32_t run(void) { start(); update(); return finish(); }
+static uint32_t le32(const unsigned char *b) {
+    return b[0] | (uint32_t)b[1]<<8 | (uint32_t)b[2]<<16 | (uint32_t)b[3]<<24;
+}
+static long card_file(const char *save,const char *file,unsigned char *out,size_t cap) {
+    char path[512]; snprintf(path,sizeof path,"%s/ms/PSP/SAVEDATA/UITEST001%s/%s",root,save,file);
+    FILE *f=fopen(path,"rb"); if (!f) return -1;
+    long n=(long)fread(out,1,cap,f); fclose(f); return n;
+}
+static const uint32_t fl=0x08817000, ents=0x08818000;
+/* setup() without the save-name list: AUTOSAVE would otherwise move an
+ * overwrite to the list's first entry. */
+static void hw(unsigned mode,const char *name,const char *value) {
+    setup(mode,name,value); psp_write32(p+96,0);
+}
+/* FILES of save: the three counts, as secure*100 + normal*10 + system. */
+static int files_of(const char *save) {
+    setup(12,save,"");
+    for (unsigned i=0;i<36;i++) psp_write8(fl+i,0);
+    psp_write32(fl+0,4); psp_write32(fl+4,4); psp_write32(fl+8,4);
+    psp_write32(fl+24,ents); psp_write32(fl+28,ents+320); psp_write32(fl+32,ents+640);
+    psp_write32(p+1528,fl);
+    assert(run()==0);
+    return (int)(psp_read32(fl+12)*100+psp_read32(fl+16)*10+psp_read32(fl+20));
+}
+static void fw660_sfo(void) {
+    /* PARAM.SFO as hardware writes it: 4912 bytes, version 0x101, eight keys
+     * sorted by name at 0x94, data at 0x108 (every save step; sfo_model.py). */
+    hw(1,"HWSFO","sfo"); psp_write32(p+1408,3); assert(run()==0);
+    unsigned char b[8192]; assert(card_file("HWSFO","PARAM.SFO",b,sizeof b)==4912);
+    assert(le32(b)==0x46535000u && le32(b+4)==0x101 && le32(b+8)==0x94 && le32(b+12)==0x108 && le32(b+16)==8);
+    static const struct { const char *key; unsigned fmt, len, max, off; } want[]={
+        {"CATEGORY",0x0204,3,4,0x108},        {"PARENTAL_LEVEL",0x0404,4,4,0x10C},
+        {"SAVEDATA_DETAIL",0x0204,36,1024,0x110}, {"SAVEDATA_DIRECTORY",0x0204,15,64,0x510},
+        {"SAVEDATA_FILE_LIST",0x0004,3168,3168,0x550}, {"SAVEDATA_PARAMS",0x0004,128,128,0x11B0},
+        {"SAVEDATA_TITLE",0x0204,4,128,0x1230}, {"TITLE",0x0204,10,128,0x12B0}};
+    for (int i=0;i<8;i++) {
+        const unsigned char *e=b+20+i*16;
+        assert(!strcmp((const char *)b+0x94+(e[0]|e[1]<<8),want[i].key));
+        assert((unsigned)(e[2]|e[3]<<8)==want[i].fmt && le32(e+4)==want[i].len && le32(e+8)==want[i].max);
+        assert(0x108+le32(e+12)==want[i].off);
+    }
+    /* The final directory name, not the transaction's staging name. */
+    assert(!strcmp((const char *)b+0x510,"UITEST001HWSFO") && le32(b+0x10C)==3);
+    /* An AUTOSAVE lists its data file secure (FILES step 53: secure 1
+     * normal 0 system 1) with flags 0x21 at secureVersion 0. */
+    assert(!memcmp(b+0x550,"DATA.BIN\0\0\0\0",13) && !b[0x570] && b[0x11B0]==0x21);
+    assert(files_of("HWSFO")==101);
+    /* secureVersion 1 and 3 write flags 0x01 (A1, A3). */
+    hw(1,"HWSFO","v3"); psp_write32(p+1516,3); assert(run()==0);
+    assert(card_file("HWSFO","PARAM.SFO",b,sizeof b)==4912 && b[0x11B0]==0x01);
+    assert(!memcmp(b+0x550,"DATA.BIN",9) && !b[0x570]);   /* still one entry */
+    /* MAKEDATA lists nothing (DPLAIN); MAKEDATASECURE lists the file (DSEC). */
+    hw(14,"HWPLAIN","plain"); assert(run()==0);
+    assert(card_file("HWPLAIN","PARAM.SFO",b,sizeof b)==4912 && !b[0x550] && b[0x11B0]==0x21);
+    assert(files_of("HWPLAIN")==11);
+    hw(13,"HWSEC","secure"); assert(run()==0);
+    assert(files_of("HWSEC")==101);
+    /* WRITEDATA rewrites PARAM.SFO too (DSEC steps 37-38): a plaintext
+     * write drops the file from the list, a secure one puts it back. */
+    hw(18,"HWSEC","now plain"); str(p+256,"renamed"); assert(run()==0);
+    assert(card_file("HWSEC","PARAM.SFO",b,sizeof b)==4912 && !b[0x550]);
+    assert(!strcmp((const char *)b+0x1230,"renamed"));
+    assert(files_of("HWSEC")==11);
+    hw(17,"HWSEC","secure again"); assert(run()==0);
+    assert(files_of("HWSEC")==101);
+    /* A second secure file joins the list after the first. */
+    hw(17,"HWSEC","other"); str(p+100,"OTHER.BIN"); assert(run()==0);
+    assert(card_file("HWSEC","PARAM.SFO",b,sizeof b)==4912);
+    assert(!strcmp((const char *)b+0x550,"DATA.BIN") && !strcmp((const char *)b+0x570,"OTHER.BIN"));
+    assert(files_of("HWSEC")==201);
+    /* GETSIZE's entries are the game's input: nothing is written into them. */
+    hw(22,"HWSEC",""); psp_write32(p+1532,fl);
+    for (unsigned i=0;i<60;i++) psp_write8(fl+i,0);
+    psp_write32(fl+0,1); psp_write32(fl+4,1); psp_write32(fl+8,ents); psp_write32(fl+12,ents+24);
+    for (unsigned i=0;i<48;i++) psp_write8(ents+i,0xA5);
+    assert(run()==0); assert(psp_read32(fl+16)==0x8000u);
+    for (unsigned i=0;i<48;i++) assert(psp_read8(ents+i)==0xA5);
+}
 int main(void) {
 #ifndef _WIN32
     snprintf(root,sizeof root,"/tmp/psprecomp-savedata-XXXXXX"); assert(mkdtemp(root));
@@ -244,7 +324,7 @@ int main(void) {
 #endif
     assert(psp_mem_init()==0); psp_cpu_reset(); psp_hle_init(); psp_io_set_root(root); psp_savedata_set_host(1);
     lifecycle(); roundtrip(); deletion(); errors(); request_safety(); headless(); scripts(); coverage();
-    fw660_status();
+    fw660_status(); fw660_sfo();
     assert(psp_mem_bad_access==0); psp_mem_free();
     printf("savedata: lifecycle, independent slots, writeback, metadata, cancellation, overwrite, deletion, errors, recovery, scripts, focus, new-data artwork and foreign directories passed\n");
     return 0;

@@ -173,10 +173,9 @@ static void sd_transaction_write(uint32_t param, const char *dir, const char *fi
     }
     psp_io_mkdir_all(pending);
     if (sd_plain_path(pending,1)!=1) { sd_io_error=1; goto cleanup; }
-    sd_write_save(param,pending,file);
     /* PARAM.SFO must name the final directory, not its staging name. */
     const char *leaf=strrchr(dir,'/');
-    sd_write_sfo(pending,leaf?leaf+1:dir,param);
+    sd_write_save(param,pending,leaf?leaf+1:dir,file);
     sd_sync_dir(pending);
     if (sd_io_error) goto cleanup;
     if (existed && sd_rename(dir,backup)) { sd_io_error=1; goto cleanup; }

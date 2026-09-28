@@ -104,14 +104,18 @@ static void savedata_log(uint32_t param) {
  * (BSD): a 48-byte pspUtilityDialogCommon (result at 28), then mode at 48.
  * pspautotests' savedata suite carries the same layout and pins, per mode,
  * the result code, every field the dialog touches, and which files exist
- * afterwards -- that is the whole contract below.
+ * afterwards. Where a PSP on firmware 6.60 disagrees (tools/hwprobe/
+ * saveprobe, run fw660-run1), the hardware wins and the code cites it.
  *
  * Layout on the card is hardware's: ms0:/PSP/SAVEDATA/<game><save>/ holds
  * the data file under param.fileName, PARAM.SFO, and the icon/sound files.
  * The game name and save name concatenate with no separator (TEST99901 +
- * ABC, per checkpointExists). Secure modes store plaintext and round-trip
- * it: without Kirk PGD there is no honest ciphertext, and bytes the caller
- * gets back are worth more than bytes shaped like hardware's.
+ * ABC, per checkpointExists; SAVEDATA_DIRECTORY PRCP00000A0 on hardware).
+ * Secure modes store plaintext and round-trip it. Hardware writes a 16-byte
+ * random header plus ciphertext (sceChnnlsv; there is no PGD container) and
+ * MACs in PARAM.SFO; without that crypto there is no honest ciphertext, and
+ * bytes the caller gets back are worth more than bytes shaped like
+ * hardware's.
  *
  * Result codes are uofw's (include/utility/utility_savedata.h and
  * utility_common.h; MIT), named below as uofw names them: 0 success;
@@ -123,7 +127,8 @@ static void savedata_log(uint32_t param) {
  * is used for that here because it sits where RW_FILE_NOT_FOUND (0x80110329)
  * sits in its own family. That pairing is an inference, not a lookup.
  * Interactive results are written only after a decision or an error.
- * Secure-file classification is tracked in memory; free space is the host's.
+ * Secure-file classification lives in PARAM.SFO, as on hardware; free space
+ * is the host's.
  */
 
 /* Result codes the modes below can produce. */
@@ -272,68 +277,209 @@ static void sd_write_file(const char *guest, uint32_t src, uint32_t cap) {
     if (fclose(f)) sd_io_error = 1;
 }
 
-/* Minimal valid PARAM.SFO: the VSH-facing fields plus the directory name.
- * Nothing here reads it back -- the layout is for anything outside that
- * lists the card -- so minimal and well-formed beats complete and guessed. */
+/* ---- PARAM.SFO ---------------------------------------------------------
+ *
+ * Laid out exactly as firmware 6.60 writes it: saveprobe's 14 PARAM.SFOs
+ * (hwresults fw660-run1) rebuild byte for byte from the request plus their
+ * MAC bytes (findings/saveprobe-tools/sfo_model.py). Header version 0x101,
+ * then eight keys sorted by name, each value zero-padded to its maximum, so
+ * the file is always 4912 bytes: keys at 0x94, data at 0x108. Strings are
+ * format 0x0204 with len counting the NUL, PARENTAL_LEVEL is 0x0404, and
+ * the two binary keys are 0x0004 at full length:
+ *
+ *   SAVEDATA_FILE_LIST  99 entries of 32 bytes: name[13], a 16-byte MAC at
+ *                       +13, three zero bytes. Only secure files are listed,
+ *                       in the order written; a MAKEDATA-only save has an
+ *                       empty list (DPLAIN, DPLAINK).
+ *   SAVEDATA_PARAMS     byte 0 flags: 0x01 for secureVersion 1 or 3, else
+ *                       0x21 (plain saves too); MACs at 0x10 and 0x20, and
+ *                       at 0x70 when flags & 0x20; zero elsewhere.
+ *
+ * The list is where hardware keeps the secure/normal class of each file, so
+ * it is read back here too (FILES, READDATA) and survives a relaunch. The
+ * MACs need the savedata crypto (sceChnnlsv), which is not implemented:
+ * they stay zero. */
+#define SD_SFO_SIZE     4912u
+#define SD_FL_ENTRIES   99u
+#define SD_FL_LEN       (SD_FL_ENTRIES * 32u)
+#define SD_PARAMS_LEN   128u
+#define SD_FLAG_GAMEKEY 0x20u    /* SAVEDATA_PARAMS[0]: bound to the game key */
+#define SD_SECURE_VERSION 1516u  /* uint32 in the 1536-byte block, after key[16] */
+
+static unsigned sd_le16(const unsigned char *b) { return b[0] | (unsigned)b[1]<<8; }
+static uint32_t sd_le32(const unsigned char *b) {
+    return b[0] | (uint32_t)b[1]<<8 | (uint32_t)b[2]<<16 | (uint32_t)b[3]<<24;
+}
+static void sd_put16(uint8_t *b, uint32_t v) { b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); }
+static void sd_put32(uint8_t *b, uint32_t v) {
+    b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); b[2] = (uint8_t)(v >> 16); b[3] = (uint8_t)(v >> 24);
+}
+
+/* The secure-state keys of a save's PARAM.SFO. Absent keys read as zero:
+ * a save without the SFO, or one written by psprecomp's earlier six-key
+ * writer, lists no secure files and carries flags 0. */
+typedef struct { uint8_t params[SD_PARAMS_LEN]; uint8_t files[SD_FL_LEN]; } sd_sfo_state;
+
+static const uint8_t *sd_sfo_value(const uint8_t *b, size_t n, const char *key, uint32_t *len) {
+    if (n < 20 || sd_le32(b) != 0x46535000u) return NULL;
+    uint32_t keys = sd_le32(b + 8), data = sd_le32(b + 12), count = sd_le32(b + 16);
+    if (count > (n - 20) / 16 || keys >= n || data > n) return NULL;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *e = b + 20 + i * 16;
+        uint64_t k = (uint64_t)keys + sd_le16(e), d = (uint64_t)data + sd_le32(e + 12);
+        uint32_t l = sd_le32(e + 4);
+        if (k >= n || !memchr(b + k, 0, n - k)) return NULL;
+        if (strcmp((const char *)b + k, key)) continue;
+        if (d > n || l > n - d) return NULL;
+        *len = l;
+        return b + d;
+    }
+    return NULL;
+}
+
+static void sd_sfo_read_state(const char *dir, sd_sfo_state *st) {
+    memset(st, 0, sizeof *st);
+    char guest[512], host[1024];
+    snprintf(guest, sizeof guest, "%s/PARAM.SFO", dir);
+    psp_io_host_path(guest, host, sizeof host);
+    FILE *f = fopen(host, "rb");
+    if (!f) return;
+    static uint8_t b[16384];
+    size_t n = fread(b, 1, sizeof b, f);
+    fclose(f);
+    uint32_t len = 0;
+    const uint8_t *v = sd_sfo_value(b, n, "SAVEDATA_PARAMS", &len);
+    if (v) memcpy(st->params, v, len < SD_PARAMS_LEN ? len : SD_PARAMS_LEN);
+    v = sd_sfo_value(b, n, "SAVEDATA_FILE_LIST", &len);
+    if (v) memcpy(st->files, v, len < SD_FL_LEN ? len : SD_FL_LEN);
+}
+
+/* name[13] of a list entry: the file name cut to 12 characters. */
+static void sd_fl_name(const char *file, char out[13]) {
+    memset(out, 0, 13);
+    for (int i = 0; i < 12 && file[i]; i++) out[i] = file[i];
+}
+
+static int sd_fl_index(const sd_sfo_state *st, const char *file) {
+    char name[13];
+    sd_fl_name(file, name);
+    if (!name[0]) return -1;
+    for (uint32_t i = 0; i < SD_FL_ENTRIES; i++)
+        if (st->files[i * 32] && !memcmp(st->files + i * 32, name, 13)) return (int)i;
+    return -1;
+}
+
+static int sd_fl_secure(const sd_sfo_state *st, const char *file) {
+    return sd_fl_index(st, file) >= 0;
+}
+
+/* Record file as secure (in place when listed, else in the first free
+ * entry), or drop it from the list and close the gap. */
+static void sd_fl_update(sd_sfo_state *st, const char *file, int secure) {
+    int at = sd_fl_index(st, file);
+    if (secure) {
+        if (at < 0) {
+            for (uint32_t i = 0; i < SD_FL_ENTRIES && at < 0; i++)
+                if (!st->files[i * 32]) at = (int)i;
+            if (at < 0) return;                  /* 99 secure files already */
+        }
+        uint8_t *e = st->files + (uint32_t)at * 32u;
+        memset(e, 0, 32);
+        sd_fl_name(file, (char *)e);
+    } else if (at >= 0) {
+        uint32_t from = ((uint32_t)at + 1) * 32u;
+        memmove(st->files + (uint32_t)at * 32u, st->files + from, SD_FL_LEN - from);
+        memset(st->files + SD_FL_LEN - 32, 0, 32);
+    }
+}
+
+/* Whether a mode writes its data file secure: the SAVE family (FILES of an
+ * AUTOSAVE lists it secure, saveprobe step 53) and the *SECURE data modes;
+ * MAKEDATA and WRITEDATA write plaintext and list nothing (DPLAIN, DPLAINK). */
+static int sd_mode_secure(uint32_t mode) {
+    return mode == SD_AUTOSAVE || mode == SD_SAVE || mode == SD_LISTSAVE ||
+           mode == SD_MAKEDATASECURE || mode == SD_WRITEDATASECURE;
+}
+
+/* SAVEDATA_PARAMS[0]. A block shorter than 1536 bytes (SDK before 2.00)
+ * has no key or secureVersion, so its save cannot be bound to a game key:
+ * it gets the flags of the saves that open with any key. That choice is an
+ * inference; no probe step used a short block. */
+static uint8_t sd_sfo_flags(uint32_t param) {
+    if (psp_read32(param) < 1536) return 0x01;
+    uint32_t ver = psp_read32(param + SD_SECURE_VERSION);
+    return (ver == 1 || ver == 3) ? 0x01 : (uint8_t)(0x01 | SD_FLAG_GAMEKEY);
+}
+
+/* Write dir/PARAM.SFO for the request at param: the directory as named
+ * (dirname: a transaction stages under another one), the request's SFO
+ * strings and flags, and the secure-file list carried over from the SFO
+ * already in dir, with this request's data file added (secure modes) or
+ * removed (plain ones). */
 static void sd_write_sfo(const char *dir, const char *dirname, uint32_t param) {
-    char title[129], savetitle[129], detail[1025];
+    char title[129], savetitle[129], detail[1025], file[14];
     sd_getstr(param, SD_SFO_TITLE, 0x80, title, sizeof title);
     sd_getstr(param, SD_SFO_SAVETITLE, 0x80, savetitle, sizeof savetitle);
     sd_getstr(param, SD_SFO_DETAIL, 0x400, detail, sizeof detail);
-    uint32_t parental = psp_read32(param + SD_SFO_PARENTAL);
+    sd_getstr(param, SD_FILENAME, 13, file, sizeof file);
+    uint32_t mode = psp_read32(param + SD_MODE);
 
-    static const char k0[] = "CATEGORY", k1[] = "SAVEDATA_DIRECTORY",
-                      k2[] = "PARENTAL_LEVEL", k3[] = "TITLE",
-                      k4[] = "SAVEDATA_TITLE", k5[] = "SAVEDATA_DETAIL";
-    const char ms[] = "MS";
-    struct ent { const char *key; uint16_t fmt; const char *s; uint32_t v; uint32_t max; };
-    struct ent ents[] = {
-        { k0, 2, ms, 0, 4 },
-        { k1, 2, dirname, 0, 64 },
-        { k2, 4, NULL, parental, 4 },
-        { k3, 2, title, 0, 128 },
-        { k4, 2, savetitle, 0, 128 },
-        { k5, 2, detail, 0, 1024 },
+    static sd_sfo_state st;
+    sd_sfo_read_state(dir, &st);
+    if (file[0]) sd_fl_update(&st, file, sd_mode_secure(mode));
+    memset(st.params, 0, sizeof st.params);
+    st.params[0] = sd_sfo_flags(param);
+
+    uint8_t parental[4];
+    sd_put32(parental, psp_read32(param + SD_SFO_PARENTAL));
+    enum { STR = 0x0204, INT = 0x0404, BIN = 0x0004 };
+    /* Sorted by key, as hardware writes them. */
+    const struct { const char *key; uint16_t fmt; uint32_t max; const void *v; } ents[] = {
+        { "CATEGORY",           STR, 4,             "MS" },
+        { "PARENTAL_LEVEL",     INT, 4,             parental },
+        { "SAVEDATA_DETAIL",    STR, 1024,          detail },
+        { "SAVEDATA_DIRECTORY", STR, 64,            dirname },
+        { "SAVEDATA_FILE_LIST", BIN, SD_FL_LEN,     st.files },
+        { "SAVEDATA_PARAMS",    BIN, SD_PARAMS_LEN, st.params },
+        { "SAVEDATA_TITLE",     STR, 128,           savetitle },
+        { "TITLE",              STR, 128,           title },
     };
-    const int n = (int)(sizeof ents / sizeof ents[0]);
-
+    const uint32_t n = (uint32_t)(sizeof ents / sizeof ents[0]);
     uint32_t klen = 0, dlen = 0;
-    for (int i = 0; i < n; i++) {
+    for (uint32_t i = 0; i < n; i++) {
         klen += (uint32_t)strlen(ents[i].key) + 1;
-        dlen = (dlen + 3) & ~3u;
-        dlen += (ents[i].max + 3) & ~3u;
+        dlen += ents[i].max;
     }
-    uint32_t kstart = 20 + (uint32_t)n * 16, dstart = (kstart + klen + 3) & ~3u;
-    uint32_t total = dstart + dlen;
-    uint8_t *buf = (uint8_t *)calloc(1, total ? total : 1);
-    if (!buf) { sd_io_error = 1; return; }
-#define PUT32(o, v) do { buf[o] = (uint8_t)(v); buf[(o)+1] = (uint8_t)((v) >> 8); \
-                         buf[(o)+2] = (uint8_t)((v) >> 16); buf[(o)+3] = (uint8_t)((v) >> 24); } while (0)
-#define PUT16(o, v) do { buf[o] = (uint8_t)(v); buf[(o)+1] = (uint8_t)((v) >> 8); } while (0)
-    PUT32(0, 0x46535000u);
-    PUT32(4, 0x101u);
-    PUT32(8, kstart);
-    PUT32(12, dstart);
-    PUT32(16, (uint32_t)n);
-    uint32_t ko = kstart, dout = dstart;
-    for (int i = 0; i < n; i++) {
-        uint32_t len = ents[i].fmt == 4 ? 4 : (uint32_t)strlen(ents[i].s) + 1;
-        uint32_t max = ents[i].max;
-        if (len>max) len=max;
-        dout = (dout + 3) & ~3u;
-        PUT16(20 + (uint32_t)i * 16, ko - kstart);
-        PUT16(22 + (uint32_t)i * 16, (uint16_t)(ents[i].fmt | 0x0200u));
-        PUT32(24 + (uint32_t)i * 16, len);
-        PUT32(28 + (uint32_t)i * 16, max);
-        PUT32(32 + (uint32_t)i * 16, dout - dstart);
-        memcpy(buf + ko, ents[i].key, strlen(ents[i].key) + 1);
+    const uint32_t kstart = 20 + n * 16, dstart = (kstart + klen + 3) & ~3u;
+    static uint8_t buf[SD_SFO_SIZE];
+    if (dstart + dlen != SD_SFO_SIZE) { sd_io_error = 1; return; }
+    memset(buf, 0, sizeof buf);
+    sd_put32(buf + 0, 0x46535000u);
+    sd_put32(buf + 4, 0x101u);
+    sd_put32(buf + 8, kstart);
+    sd_put32(buf + 12, dstart);
+    sd_put32(buf + 16, n);
+    uint32_t ko = 0, dout = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t max = ents[i].max, len = max;
+        if (ents[i].fmt == STR) {
+            /* A string longer than its field keeps max - 1 bytes and the NUL. */
+            len = (uint32_t)strlen((const char *)ents[i].v) + 1;
+            if (len > max) len = max;
+            memcpy(buf + dstart + dout, ents[i].v, len - 1);
+        } else {
+            memcpy(buf + dstart + dout, ents[i].v, max);
+        }
+        uint8_t *e = buf + 20 + i * 16;
+        sd_put16(e + 0, ko);
+        sd_put16(e + 2, ents[i].fmt);
+        sd_put32(e + 4, len);
+        sd_put32(e + 8, max);
+        sd_put32(e + 12, dout);
+        memcpy(buf + kstart + ko, ents[i].key, strlen(ents[i].key) + 1);
         ko += (uint32_t)strlen(ents[i].key) + 1;
-        if (ents[i].fmt == 4) { PUT32(dout, ents[i].v); }
-        else memcpy(buf + dout, ents[i].s, len-1);
-        dout += (max + 3) & ~3u;
+        dout += max;
     }
-#undef PUT32
-#undef PUT16
 
     char guest[512];
     snprintf(guest, sizeof guest, "%s/PARAM.SFO", dir);
@@ -343,13 +489,12 @@ static void sd_write_sfo(const char *dir, const char *dirname, uint32_t param) {
     FILE *f = fopen(host, "wb");
     if (!f) sd_io_error = 1;
     else {
-        if (fwrite(buf, 1, total, f) != total || fflush(f)) sd_io_error = 1;
+        if (fwrite(buf, 1, SD_SFO_SIZE, f) != SD_SFO_SIZE || fflush(f)) sd_io_error = 1;
 #ifndef _WIN32
         if (fsync(fileno(f))) sd_io_error = 1;
 #endif
         if (fclose(f)) sd_io_error = 1;
     }
-    free(buf);
 }
 
 /* Icon/sound sidecars: ICON0.PNG, ICON1.PMF, PIC1.PNG, SND0.AT3. Written
@@ -425,61 +570,28 @@ static int sd_cmp_str(const void *a, const void *b) {
     return strcmp((const char *)a, (const char *)b);
 }
 
-/* Secure-created files, by "game+save/filename". The on-card distinction is
- * encryption, which this implementation does not do (secure modes store
- * plaintext); without a record, FILES could not tell a secure-made DATA.BIN
- * from a WRITEDATA-made OTHER.BIN, which is exactly what the fileList and
- * emptyfilename suites pin. In-memory only: across a relaunch everything
- * reads back either way, which is what the game needs. */
-#define SD_SECURE_MAX 256
-static char sd_secure[SD_SECURE_MAX][80];
-static int sd_secure_n;
-
-static void sd_mark_secure(const char *dir, const char *file) {
-    char key[80];
-    snprintf(key, sizeof key, "%s/%s", dir, file);
-    for (int i = 0; i < sd_secure_n; i++)
-        if (!strcmp(sd_secure[i], key)) return;
-    if (sd_secure_n < SD_SECURE_MAX) {
-        snprintf(sd_secure[sd_secure_n], sizeof sd_secure[0], "%s", key);
-        sd_secure_n++;
-    }
-}
-
+/* Whether dir/file is secure: listed in the save's SAVEDATA_FILE_LIST,
+ * where hardware records it. Secure modes still store plaintext, so the
+ * list is the only on-card difference, and FILES needs it to tell a
+ * secure DATA.BIN from a WRITEDATA-made OTHER.BIN. */
 static int sd_is_secure(const char *dir, const char *file) {
-    char key[80];
-    snprintf(key, sizeof key, "%s/%s", dir, file);
-    for (int i = 0; i < sd_secure_n; i++)
-        if (!strcmp(sd_secure[i], key)) return 1;
-    return 0;
-}
-
-/* A plaintext overwrite clears the record: what is on the card now reads
- * through either mode. */
-static void sd_unmark_secure(const char *dir, const char *file) {
-    char key[80];
-    snprintf(key, sizeof key, "%s/%s", dir, file);
-    for (int i = 0; i < sd_secure_n; i++) {
-        if (!strcmp(sd_secure[i], key)) {
-            sd_secure_n--;
-            snprintf(sd_secure[i], sizeof sd_secure[0], "%s", sd_secure[sd_secure_n]);
-            return;
-        }
-    }
+    static sd_sfo_state st;
+    sd_sfo_read_state(dir, &st);
+    return sd_fl_secure(&st, file);
 }
 
 /* 0 secure, 1 normal, 2 system. PARAM.SFO is always system; otherwise the
- * creation record decides. */
-static int sd_classify(const char *dir, const char *file) {
+ * save's secure-file list decides. */
+static int sd_classify(const sd_sfo_state *st, const char *file) {
     if (!strcmp(file, "PARAM.SFO")) return 2;
-    return sd_is_secure(dir, file) ? 0 : 1;
+    return sd_fl_secure(st, file) ? 0 : 1;
 }
 
 /* Fill the SIZES-family structs. Free space is the host's (statvfs where
  * available, a big stick otherwise), so free* lines track this machine the
  * way the suite's track a 16GB card -- environmental either way. Used space
  * is measured out of our own files, which is exact. */
-static void sd_fill_sizes(uint32_t param, const char *dir) {
+static void sd_fill_sizes(uint32_t param) {
     uint32_t msfree = sd_optional(param, SD_MSFREE);
     uint32_t msdata = sd_optional(param, SD_MSDATA);
     uint32_t utild  = sd_optional(param, SD_UTILDATA);
@@ -564,47 +676,21 @@ static void sd_fill_sizes(uint32_t param, const char *dir) {
         sd_write_str(sinfo + 40, "", 8);
         sd_write_u32(sinfo + 48, datasz / 1024u);
         sd_write_str(sinfo + 52, "", 8);
-        /* Per-file entries mirror FILES below; sizes only, names included.
-         * Unpinned by the suite (no entries exist in its size checks) but
-         * read by anything sizing a real save. numSecure/numNormal double
-         * as capacities here -- there is no separate result count -- so
-         * they are read, never written. Entry layout matches sd_do_files
-         * (80 bytes). */
-        uint32_t maxsec = psp_read32(sinfo + 0), maxnor = psp_read32(sinfo + 4);
-        uint32_t psec = psp_read32(sinfo + 8), pnor = psp_read32(sinfo + 12);
-        if ((psec || pnor) && dir && sd_exists(dir)) {
-            char names[256][64];
-            int n = psp_io_list_names(dir, names, 256);
-            uint32_t nsec = 0, nnor = 0;
-            if (n > 0) {
-                qsort(names, (size_t)n, sizeof names[0], sd_cmp_str);
-                for (int i = 0; i < n; i++) {
-                    char child[512];
-                    snprintf(child, sizeof child, "%s/%s", dir, names[i]);
-                    uint64_t sz = 0; int is_dir = 0;
-                    if (psp_io_path_info(child, &sz, &is_dir) != 0 || is_dir) continue;
-                    int cls = sd_classify(dir, names[i]);
-                    uint32_t dst = 0;
-                    if (cls == 0 && nsec < maxsec && psec) dst = psec + nsec++ * 80u;
-                    else if (cls == 2) continue;
-                    else if (cls == 1 && nnor < maxnor && pnor) dst = pnor + nnor++ * 80u;
-                    else continue;
-                    sd_write_u32(dst + 0, 0x21FFu);
-                    sd_write_u32(dst + 8, (uint32_t)sz);
-                    sd_write_u32(dst + 12, (uint32_t)(sz >> 32));
-                    sd_write_str(dst + 64, names[i], 16);
-                }
-            }
-        }
+        /* secureEntries/normalEntries are the game's input, not output:
+         * PspUtilitySavedataSizeEntry is a u64 size and name[16], 24 bytes
+         * (PSPSDK psputility_savedata.h), the files it means to write.
+         * Nothing is written into them. Writing 80-byte FILES entries there
+         * overran the game's array: saveprobe step 55's sectorSize read
+         * "DATA" once DATA.BIN was listed as secure. */
     }
 }
 
-/* FILES(12): secure/normal/system buckets by creation record -- files a
- * secure mode made travel secure, WRITEDATA-made travel normal, PARAM.SFO
- * travels system. Secure-creation is tracked because the on-card
- * distinction is encryption, which this implementation does not do. A dir
- * without PARAM.SFO is broken: report RW_DATA_BROKEN with an empty
- * listing, and touch nothing (not even the counts). */
+/* FILES(12): secure/normal/system buckets. Files in the save's
+ * SAVEDATA_FILE_LIST travel secure, the rest normal, PARAM.SFO system:
+ * FILES of an AUTOSAVE reads "secure 1 normal 0 system 1" on fw 6.60
+ * (saveprobe step 53). A dir without PARAM.SFO is broken: report
+ * RW_DATA_BROKEN with an empty listing, and touch nothing (not even the
+ * counts). */
 static uint32_t sd_do_files(uint32_t param, const char *dir) {
     uint32_t fl = sd_optional(param, SD_FILELIST);
     char names[256][64];
@@ -612,6 +698,8 @@ static uint32_t sd_do_files(uint32_t param, const char *dir) {
     if (n < 0) return SD_RW_NO_DATA;
     if (!sd_has_sfo(dir)) return SD_RW_BROKEN;
     qsort(names, (size_t)n, sizeof names[0], sd_cmp_str);
+    static sd_sfo_state st;
+    sd_sfo_read_state(dir, &st);
     if (fl) {
         uint32_t maxsec = psp_read32(fl + 0), maxnor = psp_read32(fl + 4),
                  maxsys = psp_read32(fl + 8);
@@ -623,8 +711,8 @@ static uint32_t sd_do_files(uint32_t param, const char *dir) {
             snprintf(child, sizeof child, "%s/%s", dir, names[i]);
             uint64_t sz = 0; int is_dir = 0;
             if (psp_io_path_info(child, &sz, &is_dir) != 0 || is_dir) continue;
-            int sys = !strcmp(names[i], "PARAM.SFO");
-            int sec = !sys && sd_is_secure(dir, names[i]);
+            int cls = sd_classify(&st, names[i]);
+            int sys = cls == 2, sec = cls == 0;
             uint32_t dst = 0;
             if (sys && nsys < maxsys && psys) {
                 dst = psys + nsys * 80u; nsys++;
@@ -674,10 +762,11 @@ static uint32_t sd_do_list(uint32_t param, const char *game) {
     return SD_OK;
 }
 
-/* Write the data file, SFO and sidecars for a save-shaped mode. Empty
- * fileName writes everything but the data file (the suite's empty-filename
- * trials pin exactly that: dir plus PARAM.SFO, result 0). */
-static void sd_write_save(uint32_t param, const char *dir, const char *file) {
+/* Write the data file, SFO and sidecars for a save-shaped mode into dir,
+ * whose PARAM.SFO names the save dirname. Empty fileName writes everything
+ * but the data file (the suite's empty-filename trials pin exactly that:
+ * dir plus PARAM.SFO, result 0). */
+static void sd_write_save(uint32_t param, const char *dir, const char *dirname, const char *file) {
     char guest[512], leaf[64];
     snprintf(leaf, sizeof leaf, "%s", file);
     if (leaf[0]) {
@@ -688,8 +777,7 @@ static void sd_write_save(uint32_t param, const char *dir, const char *file) {
     } else {
         psp_io_mkdir_all(dir);
     }
-    const char *slash = strrchr(dir, '/');
-    sd_write_sfo(dir, slash ? slash + 1 : dir, param);
+    sd_write_sfo(dir, dirname, param);
     sd_write_sidecars(dir, param);
 }
 
@@ -742,12 +830,8 @@ static uint32_t sd_do_mode(uint32_t param) {
             } else if (!save[0]) return SD_RW_NO_DATA;
         }
         if (!target) { target = save; sd_dir(game, save, dir, sizeof dir); }
+        /* The data file's class goes into PARAM.SFO's secure-file list. */
         sd_transaction_write(param, dir, file);
-        if (sd_io_error) return SD_SAVE_ACCESS;
-        if (file[0]) {
-            if (mode == SD_MAKEDATASECURE) sd_mark_secure(dir, file);
-            else sd_unmark_secure(dir, file);
-        }
         return sd_io_error ? SD_SAVE_ACCESS : SD_OK;
     }
 
@@ -844,18 +928,16 @@ static uint32_t sd_do_mode(uint32_t param) {
         snprintf(guest, sizeof guest, "%s/%s", dir, file);
         sd_write_file(guest,buf,datasz);
         if (sd_io_error) return SD_ERASE_ACCESS;
-        if (mode == SD_WRITEDATASECURE) sd_mark_secure(dir, file);
-        else sd_unmark_secure(dir, file);
-        return SD_OK;
+        /* PARAM.SFO is rewritten too, with the file's class: DSEC's SFO
+         * changed between its MAKEDATASECURE and its WRITEDATASECURE
+         * (saveprobe steps 37-38, CRC CC490645 -> 03F941FA). */
+        sd_write_sfo(dir, dir + strlen("ms0:/PSP/SAVEDATA/"), param);
+        return sd_io_error ? SD_ERASE_ACCESS : SD_OK;
 
     case SD_SIZES:
-    case SD_GETSIZE: {
-        char sizedir[512];
-        sd_dir(game, save, sizedir, sizeof sizedir);
-        if (!sd_exists(sizedir)) sizedir[0] = '\0';
-        sd_fill_sizes(param, sizedir[0] ? sizedir : NULL);
+    case SD_GETSIZE:
+        sd_fill_sizes(param);
         return SD_OK;
-    }
 
     case SD_FILES:
         sd_dir(game, save, dir, sizeof dir);
@@ -937,7 +1019,7 @@ void psp_utility_init(void) {
     g_savedata_state=PSP_UTILITY_DIALOG_NONE;
     g_savedata_param=0; g_savedata_done=0; g_savedata_interactive=0;
     memset(&sd_view,0,sizeof sd_view); sd_view.session=++sd_serial;
-    sd_ordinal=0; sd_secure_n=0;
+    sd_ordinal=0;
     /* The dialog host and its redraw hook belong to the host's lifetime,
      * not to a guest reset: they stay registered. */
     psp_os_lock(&sd_bridge_lock); sd_pending=0; psp_os_unlock(&sd_bridge_lock);
@@ -958,10 +1040,6 @@ static void sd_outcome(uint32_t result, const char *message) {
     psp_write32(g_savedata_param+SD_RESULT,result);
     g_savedata_done=1;
     sd_publish();
-}
-static unsigned sd_le16(const unsigned char *b) { return b[0] | (unsigned)b[1]<<8; }
-static uint32_t sd_le32(const unsigned char *b) {
-    return b[0] | (uint32_t)b[1]<<8 | (uint32_t)b[2]<<16 | (uint32_t)b[3]<<24;
 }
 /* Read metadata, including saves written by the old minimal SFO writer. */
 static int sd_metadata(const char *dir, psp_savedata_slot *slot) {
