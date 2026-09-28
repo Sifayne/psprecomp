@@ -456,8 +456,12 @@ static inline int psp_fpu_nan_operand(float a, float b, float *out) {
 }
 
 /* Round an operation's exact answer under RM and record what it raised.
- * `muldiv` selects the mul/div rules: O comes with I, a tiny result raises U
- * even when exact, and FS flushes it. */
+ * `muldiv` selects the mul/div rules (1 mul.s, 2 div.s): a tiny result
+ * raises U even when exact, and FS flushes it. An overflow raises O, and
+ * mul.s adds I to it where add.s, sub.s and div.s do not: max*max gives
+ * cause 14 but max+max, max/0.5, max/denormal and 1/2^-128 cause 10, in
+ * every rounding mode and under FS (vfpuprobe v3 steps 165, 166 and 169,
+ * fw 6.60). */
 static inline float psp_fpu_result(double exact, int muldiv) {
     const uint32_t fcr = psp_cpu.fcr31;
     if (exact != exact) {                                   /* inf-inf, 0*inf, 0/0 */
@@ -470,7 +474,7 @@ static inline float psp_fpu_result(double exact, int muldiv) {
     const uint32_t rb  = psp_f32_to_bits(r);
     const double   mag = exact < 0.0 ? -exact : exact;
     if ((rb & 0x7F800000u) == 0x7F800000u || mag >= 0x1p128) {  /* overflow, any mode */
-        psp_fpu_raise(muldiv ? (PSP_FE_O | PSP_FE_I) : PSP_FE_O);
+        psp_fpu_raise(muldiv == 1 ? (PSP_FE_O | PSP_FE_I) : PSP_FE_O);
         return r;
     }
     const uint32_t inexact = (double)r != exact ? PSP_FE_I : 0u;
@@ -510,7 +514,7 @@ static inline float psp_fdiv(float a, float b) {
         psp_fpu_raise(PSP_FE_Z);
         return psp_bits_to_f32(((ab ^ bb) & 0x80000000u) | 0x7F800000u);
     }
-    return psp_fpu_result((double)a / (double)b, 1);
+    return psp_fpu_result((double)a / (double)b, 2);
 }
 
 /* sqrt.s. Separate from psp_fsqrt, whose non-positive-input rule is useful to
