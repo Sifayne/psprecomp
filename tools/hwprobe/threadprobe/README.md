@@ -25,10 +25,41 @@ firmware's thread manager and clocks do. It covers the behaviour that
 - **TLS pools, alarms and vtimers**: status structs, block offsets and
   reuse, waiter order, limits, handler arguments and return values.
 - **Time and memory**: system time, clock conversions, the libc clocks, the
-  RTC tick and sceRtc's calendar arithmetic (none of which psprecomp has),
-  and sysmem free sizes, granules, alignment and partitions.
+  RTC tick and sceRtc's calendar arithmetic, and sysmem free sizes, granules,
+  alignment and partitions.
 
 Each step's comment names the psprecomp file:line claim that the step checks.
+
+## Version 3
+
+Version 3 keeps version 2's 158 steps and titles, so the logs line up in
+`compare.py`, and adds 22 steps, each at the end of its section. They are the
+questions the analysis of the second hardware run left open
+(`fw660-run2/findings/threadprobe.md`):
+
+| section | new step |
+| --- | --- |
+| basics | main's argc, and each argv string's length, device, file name and place on main's stack (the start block that explains step 85) |
+| create | CreateThread check order with two or more bad arguments, and a kernel-space entry |
+| refer | waitType and waitId for mbx, vpl, fpl, msgpipe, mutex, lwmutex and TLS waits |
+| exit | an entry that returns -5, and one that returns 0x80020001 |
+| suspend | a suspended waiter whose timeout passes; a suspended waiter that is signalled |
+| sleep | ReleaseWaitThread on a dormant, a suspended ready, a delaying and a waiting+suspended thread; on waits for each object kind: its return, the timeout left, the object's waiter count before and after |
+| preemption | preempt and release counters of a spinning thread main preempts twice; two equal threads, the first spinning 200ms; whether sceIo open/write/close/read/lseek/getstat/remove let an equal-priority thread run, with main's releaseCount across each |
+| delay | DelayThreadCB(0) with a pending notify and with a ready thread; DelayThread(n) for n = 0..100 with a ready thread, four times each |
+| dispatch | DelayThread(0) with dispatch off, ResumeDispatchThread(2) and (-1), SuspendDispatchThread with interrupts off; DelayThread and WaitSema with interrupts off |
+| attribute and stack | GetThreadStackFreeSize in NO_FILLSTACK threads over 0xCC and over 0xFF, and a CLEAR_STACK one |
+| TLS pools | partition 5 |
+| alarms | a handler returning 1000 five times: first-hit lateness, gaps, each hit against the first |
+| vtimers | a handler that falls due while main is in DelayThread |
+| time | LibcGettimeofday's seconds against LibcTime and uptime, the timezone struct, two reads 20ms apart |
+| rtc | CheckValid of year 9999 and 10000; GetTick of 2023-02-30 and 2023-13-01 |
+| user memory | the drop for an Addr block 0x80 into a granule; partitions 5 and 9; total minus max |
+
+The last step (StartThread with argp 0x10) switched the PSP off in version 2
+and is now `KNOWN_CRASH`: it logs "not run" unless built with
+`-DRUN_KNOWN_CRASHES`. The step that runs DelayThread and WaitSema with
+interrupts off could hang a PSP; starting the probe again skips it.
 
 ## Build
 

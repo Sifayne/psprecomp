@@ -28,6 +28,8 @@
 #include <psputils.h>
 #include <psppower.h>
 #include <psprtc.h>
+#include <pspiofilemgr.h>
+#include <pspintrman.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -42,7 +44,7 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
  * all of it). */
 PSP_HEAP_SIZE_KB(256);
 
-#define PROBE_VERSION 2
+#define PROBE_VERSION 3
 
 typedef unsigned int w32;
 
@@ -55,6 +57,11 @@ int    sceKernelFreeTlspl(SceUID uid);
 int    sceKernelReferTlsplStatus(SceUID uid, void *info);
 SceUID sceKernelCreateMutex(const char *name, SceUInt attr, int count, void *opt);
 int    sceKernelDeleteMutex(SceUID uid);
+int    sceKernelLockMutex(SceUID uid, int count, SceUInt *timeout);
+int    sceKernelUnlockMutex(SceUID uid, int count);
+/* 56 bytes: size, name[32], attr, initCount, currentCount, lockThread,
+ * numWaitThreads (word 13). */
+int    sceKernelReferMutexStatus(SceUID uid, void *info);
 
 /* stubs.S */
 extern w32 g_entry_regs[68];
@@ -207,6 +214,8 @@ static void rec_seq(void) { rec("  seq: %s\n", g_seqn ? g_seq : "(none)"); }
 
 static SceUID g_main;
 static int    g_starts;          /* successful sceKernelStartThread calls */
+static int    g_argc;            /* main()'s */
+static char **g_argv;
 
 static void spin_us(w32 us) {
     w32 t0 = sceKernelGetSystemTimeLow();
@@ -236,11 +245,17 @@ enum {
     O_WAITSEMA, O_SIGNAL, O_WAKEUP, O_EXIT, O_EXITDEL, O_ROTATE, O_CHPRI,
     O_CHECKCB, O_MKCB, O_WAITEND, O_TLSGET, O_TLSFREE, O_REFERSELF,
     O_WAITEF, O_SELFOPS, O_ATTRSWEEP, O_STACKFREE, O_RELEASE,
+    /* version 3: waits on the other object kinds, each with timeout `a` */
+    O_RECVMBX, O_ALLOCVPL, O_ALLOCFPL, O_RECVMPP, O_LOCKMTX, O_LOCKLW,
 };
 typedef struct { int op; int a; const char *s; } op_t;
 
 static SceUID g_uid[8];          /* threads a script can name: [0] is main */
 static SceUID g_sema, g_evf, g_tls;
+static SceUID g_mbx, g_vpl, g_fpl, g_mpp, g_mtx;
+static SceLwMutexWorkarea g_lw;
+/* The timeout word after a script's last timed wait (0xEEEEEEEE: none ran). */
+static volatile SceUInt g_tleft;
 static SceUID g_cbw[4];          /* callbacks created by workers */
 static w32    g_tlsaddr[8];
 static int    g_selfres[32];
@@ -317,7 +332,7 @@ static int script_entry(SceSize len, void *argp) {
         }
         case O_SPIN:    spin_us(p->a); tag(p->s); break;
         case O_WAITSEMA:
-            t = p->a; r = sceKernelWaitSema(g_sema, 1, &t); tagr(p->s, r); break;
+            t = p->a; r = sceKernelWaitSema(g_sema, 1, &t); g_tleft = t; tagr(p->s, r); break;
         case O_SIGNAL:  r = sceKernelSignalSema(g_sema, 1); tagr(p->s, r); break;
         case O_WAKEUP:  r = sceKernelWakeupThread(g_uid[p->a]); tagr(p->s, r); break;
         case O_EXIT:    r = sceKernelExitThread(p->a); tagv(p->s, r); break;
@@ -329,7 +344,7 @@ static int script_entry(SceSize len, void *argp) {
             g_cbw[p->a] = sceKernelCreateCallback(p->s, h_count, (void *)(p->a + 1));
             break;
         case O_WAITEND:
-            t = 500000; r = sceKernelWaitThreadEnd(g_uid[p->a], &t); tagv(p->s, r); break;
+            t = 500000; r = sceKernelWaitThreadEnd(g_uid[p->a], &t); g_tleft = t; tagv(p->s, r); break;
         case O_TLSGET: {
             void *q = sceKernelGetTlsAddr(g_tls);
             g_tlsaddr[p->a] = (w32)q;
@@ -346,6 +361,7 @@ static int script_entry(SceSize len, void *argp) {
             u32 bits = 0;
             t = p->a;
             r = sceKernelWaitEventFlag(g_evf, 1, PSP_EVENT_WAITAND, &bits, &t);
+            g_tleft = t;
             tagr(p->s, r);
             break;
         }
@@ -365,6 +381,37 @@ static int script_entry(SceSize len, void *argp) {
             g_selfres[2] = sceKernelCheckThreadStack();
             break;
         case O_RELEASE: r = sceKernelReleaseWaitThread(g_uid[p->a]); tagr(p->s, r); break;
+        /* What a wait takes, it gives back, so the object is as it was. */
+        case O_RECVMBX: {
+            void *m = NULL;
+            t = p->a; r = sceKernelReceiveMbx(g_mbx, &m, &t); g_tleft = t; tagr(p->s, r);
+            break;
+        }
+        case O_ALLOCVPL: {
+            void *d = NULL;
+            t = p->a; r = sceKernelAllocateVpl(g_vpl, 0x800, &d, &t); g_tleft = t; tagr(p->s, r);
+            if (r == 0 && d) sceKernelFreeVpl(g_vpl, d);
+            break;
+        }
+        case O_ALLOCFPL: {
+            void *d = NULL;
+            t = p->a; r = sceKernelAllocateFpl(g_fpl, &d, &t); g_tleft = t; tagr(p->s, r);
+            if (r == 0 && d) sceKernelFreeFpl(g_fpl, d);
+            break;
+        }
+        case O_RECVMPP: {
+            char m[8];
+            t = p->a; r = sceKernelReceiveMsgPipe(g_mpp, m, 4, 0, NULL, &t); g_tleft = t; tagr(p->s, r);
+            break;
+        }
+        case O_LOCKMTX:
+            t = p->a; r = sceKernelLockMutex(g_mtx, 1, &t); g_tleft = t; tagr(p->s, r);
+            if (r == 0) sceKernelUnlockMutex(g_mtx, 1);
+            break;
+        case O_LOCKLW:
+            t = p->a; r = sceKernelLockLwMutex(&g_lw, 1, &t); g_tleft = t; tagr(p->s, r);
+            if (r == 0) sceKernelUnlockLwMutex(&g_lw, 1);
+            break;
         default: return 0x0BAD;
         }
     }
@@ -441,6 +488,127 @@ static void rec_brief(const char *label, SceUID th) {
         ti.wakeupCount, (w32)ti.exitStatus);
 }
 
+/* ---- version 3: one waitable object of each kind ----------------------------
+ *
+ * Each is set up so that a thread asking for it waits: a semaphore at 0, an
+ * event flag at 0, an empty mbx, a vpl and an fpl main has taken, an empty
+ * pipe, a mutex and an lwmutex main holds, a one-block TLS pool main holds. */
+
+static void *g_vplmain, *g_fplmain;
+
+static void objs_make(void) {
+    g_sema = sceKernelCreateSema("o_sema", 0, 0, 1, NULL);            nm_add(g_sema, "sema");
+    g_evf  = sceKernelCreateEventFlag("o_evf", 0, 0, NULL);           nm_add(g_evf, "evf");
+    g_mbx  = sceKernelCreateMbx("o_mbx", 0, NULL);                    nm_add(g_mbx, "mbx");
+    g_vpl  = sceKernelCreateVpl("o_vpl", 2, 0, 0x1000, NULL);         nm_add(g_vpl, "vpl");
+    g_vplmain = NULL;
+    sceKernelTryAllocateVpl(g_vpl, 0xC00, &g_vplmain);
+    g_fpl  = sceKernelCreateFpl("o_fpl", 2, 0, 0x100, 1, NULL);       nm_add(g_fpl, "fpl");
+    g_fplmain = NULL;
+    sceKernelTryAllocateFpl(g_fpl, &g_fplmain);
+    g_mpp  = sceKernelCreateMsgPipe("o_mpp", 2, 0, (void *)0x100, NULL); nm_add(g_mpp, "msgpipe");
+    g_mtx  = sceKernelCreateMutex("o_mtx", 0, 0, NULL);               nm_add(g_mtx, "mutex");
+    sceKernelLockMutex(g_mtx, 1, NULL);
+    memset(&g_lw, 0, sizeof g_lw);
+    sceKernelCreateLwMutex(&g_lw, "o_lw", 0, 0, NULL);                nm_add(g_lw.uid, "lwmutex");
+    sceKernelLockLwMutex(&g_lw, 1, NULL);
+    g_tls  = sceKernelCreateTlspl("o_tls", 2, 0, 0x10, 1, NULL);      nm_add(g_tls, "tlspl");
+    sceKernelGetTlsAddr(g_tls);
+}
+
+/* Deleting an object releases whoever waits on it. The mutexes and the TLS
+ * pool are held by main; if a delete is refused for that, main lets go and
+ * the waiter, which takes the object and gives it straight back, runs first. */
+static void objs_free(void) {
+    sceKernelDeleteSema(g_sema);
+    sceKernelDeleteEventFlag(g_evf);
+    sceKernelDeleteMbx(g_mbx);
+    sceKernelDeleteVpl(g_vpl);
+    sceKernelDeleteFpl(g_fpl);
+    sceKernelDeleteMsgPipe(g_mpp);
+    if (sceKernelDeleteMutex(g_mtx) != 0) {
+        sceKernelUnlockMutex(g_mtx, 1);
+        sceKernelDelayThread(1000);
+        sceKernelDeleteMutex(g_mtx);
+    }
+    if (sceKernelDeleteLwMutex(&g_lw) != 0) {
+        sceKernelUnlockLwMutex(&g_lw, 1);
+        sceKernelDelayThread(1000);
+        sceKernelDeleteLwMutex(&g_lw);
+    }
+    if (sceKernelDeleteTlspl(g_tls) != 0) {
+        sceKernelFreeTlspl(g_tls);
+        sceKernelDelayThread(1000);
+        sceKernelDeleteTlspl(g_tls);
+    }
+}
+
+/* How many threads wait on each object, by its own status call. */
+static int wn_sema(void) {
+    SceKernelSemaInfo i; i.size = sizeof i;
+    return sceKernelReferSemaStatus(g_sema, &i) ? -1 : i.numWaitThreads;
+}
+static int wn_evf(void) {
+    SceKernelEventFlagInfo i; i.size = sizeof i;
+    return sceKernelReferEventFlagStatus(g_evf, &i) ? -1 : i.numWaitThreads;
+}
+static int wn_mbx(void) {
+    SceKernelMbxInfo i; i.size = sizeof i;
+    return sceKernelReferMbxStatus(g_mbx, &i) ? -1 : i.numWaitThreads;
+}
+static int wn_vpl(void) {
+    SceKernelVplInfo i; i.size = sizeof i;
+    return sceKernelReferVplStatus(g_vpl, &i) ? -1 : i.numWaitThreads;
+}
+static int wn_fpl(void) {
+    SceKernelFplInfo i; i.size = sizeof i;
+    return sceKernelReferFplStatus(g_fpl, &i) ? -1 : i.numWaitThreads;
+}
+static int wn_mpp(void) {
+    SceKernelMppInfo i; i.size = sizeof i;
+    return sceKernelReferMsgPipeStatus(g_mpp, &i) ? -1 : i.numReceiveWaitThreads;
+}
+static int wn_mtx(void) {
+    w32 i[14];
+    i[0] = 56;
+    return sceKernelReferMutexStatus(g_mtx, i) ? -1 : (int)i[13];
+}
+static int wn_lw(void) { return g_lw.numWaitThreads; }
+static int wn_tls(void) {
+    w32 i[16];
+    i[0] = 64;
+    return sceKernelReferTlsplStatus(g_tls, i) ? -1 : (int)i[14];
+}
+
+/* A 0x30 thread runs `ops` (one wait, 1s timeout, tagged with its return);
+ * main lets it park, releases it, and then lets it run. */
+static void rw_one(const char *label, const op_t *ops, int (*waiters)(void)) {
+    seq_clear();
+    g_tleft = 0xEEEEEEEE;
+    SceUID th = spawn("rw", 0x30, ops);
+    sceKernelDelayThread(1000);
+    int before = waiters ? waiters() : -1;
+    int r = sceKernelReleaseWaitThread(th);
+    int after = waiters ? waiters() : -1;
+    wait_end(th, 200000);
+    rec("  %-9s release=%s waiters %d->%d  %s  timeout-after=%s\n", label, hx(r), before, after,
+        g_seqn ? g_seq : "(no tag)",
+        g_tleft == 0xEEEEEEEE ? "-" : ta(g_tleft, 1000000));
+    reap(th);
+}
+
+static const op_t S_RW_SEMA[] = { { O_WAITSEMA, 1000000, "sema" }, { O_END, 0, 0 } };
+static const op_t S_RW_EVF[]  = { { O_WAITEF, 1000000, "evf" }, { O_END, 0, 0 } };
+static const op_t S_RW_MBX[]  = { { O_RECVMBX, 1000000, "mbx" }, { O_END, 0, 0 } };
+static const op_t S_RW_VPL[]  = { { O_ALLOCVPL, 1000000, "vpl" }, { O_END, 0, 0 } };
+static const op_t S_RW_FPL[]  = { { O_ALLOCFPL, 1000000, "fpl" }, { O_END, 0, 0 } };
+static const op_t S_RW_MPP[]  = { { O_RECVMPP, 1000000, "msgpipe" }, { O_END, 0, 0 } };
+static const op_t S_RW_MTX[]  = { { O_LOCKMTX, 1000000, "mutex" }, { O_END, 0, 0 } };
+static const op_t S_RW_LW[]   = { { O_LOCKLW, 1000000, "lwmutex" }, { O_END, 0, 0 } };
+static const op_t S_RW_TLS[]  = { { O_TLSGET, 1, "tlspl" }, { O_END, 0, 0 } };
+static const op_t S_RW_END[]  = { { O_WAITEND, 1, "threadend" }, { O_END, 0, 0 } };
+static const op_t S_RW_DELAY[] = { { O_DELAY, 1000000, "delay" }, { O_END, 0, 0 } };
+
 /* ======================================================================= */
 
 static void sec_basics(void) {
@@ -463,6 +631,32 @@ static void sec_basics(void) {
     rec("  ReferThreadStatus(own id) = %s, same entry/stack as (0): %s\n", hx(r),
         (t2.entry == ti.entry && t2.stack == ti.stack) ? "yes" : "no");
     g_nperm = g_nnm;
+
+    /* tools/allegrexrecomp/main.c:1097 -- psprecomp's interp calls
+     * module_start with $a0 = $a1 = 0, so user_main gets no argument block;
+     * a PSP passes the EBOOT's path. Step 85's free stack differs by it. The
+     * strings are logged by length and shape, not content: the folder the
+     * probe was run from is in the path. */
+    ST("main: argc, and each argv string's length, device, file name and place on main's stack");
+    rec("  argc=%d\n", g_argc);
+    {
+        w32 base = (w32)ti.stack, size = (w32)ti.stackSize;
+        int total = 0;
+        for (int i = 0; i < g_argc && i < 4 && g_argv; i++) {
+            const char *s = g_argv[i];
+            if (!s) { rec("  argv[%d]=NULL\n", i); continue; }
+            int n = (int)strlen(s);
+            total += n + 1;
+            const char *colon = strchr(s, ':'), *slash = strrchr(s, '/');
+            char dev[12] = "-";
+            if (colon && colon - s < (int)sizeof dev) { memcpy(dev, s, colon - s); dev[colon - s] = 0; }
+            int next = i + 1 < g_argc && g_argv[i + 1] == s + n + 1;
+            rec("  argv[%d]: length %d, device \"%s\", file \"%s\", at %s, next string right after: %s\n",
+                i, n, dev, slash ? slash + 1 : s, stkrel((w32)s, base, size),
+                i + 1 < g_argc ? (next ? "yes" : "no") : "-");
+        }
+        rec("  strings with their NULs: %d bytes\n", total);
+    }
 }
 
 /* ======================================================================= */
@@ -572,6 +766,32 @@ static void sec_create(void) {
         rec("  created %d of 200, first failure %s, delete failures %d\n",
             ok, hx(first_fail), del_fail);
     }
+
+    /* threadman.c:343-351 -- the name first (step 150), then priority, stack
+     * size and attribute, in the order the single-argument steps were written;
+     * which answer wins when several are wrong is unmeasured. A kernel-space
+     * entry is not checked at all. Never started, deleted at once. */
+    if (!ST("create: check order with two or more bad arguments (NULL name, priority 0, stack 0x100, attr 0x100, entry 0x88000000)")) {
+        static const struct { const char *l; int noname; int prio; int size; w32 attr; w32 entry; } cs[] = {
+            { "name+prio",      1, 0,    0x1000, 0,     0 },
+            { "name+size",      1, 0x30, 0x100,  0,     0 },
+            { "name+attr",      1, 0x30, 0x1000, 0x100, 0 },
+            { "prio+size",      0, 0,    0x100,  0,     0 },
+            { "prio+attr",      0, 0,    0x1000, 0x100, 0 },
+            { "size+attr",      0, 0x30, 0x100,  0x100, 0 },
+            { "prio+size+attr", 0, 0,    0x100,  0x100, 0 },
+            { "kentry",         0, 0x30, 0x1000, 0,     0x88000000 },
+            { "kentry+prio",    0, 0,    0x1000, 0,     0x88000000 },
+            { "name+kentry",    1, 0x30, 0x1000, 0,     0x88000000 },
+        };
+        for (int i = 0; i < (int)(sizeof cs / sizeof cs[0]); i++) {
+            SceKernelThreadEntry e = cs[i].entry ? (SceKernelThreadEntry)cs[i].entry : script_entry;
+            SceUID th = sceKernelCreateThread(cs[i].noname ? NULL : "order", e, cs[i].prio,
+                                              cs[i].size, cs[i].attr, NULL);
+            rec("  %-15s %s\n", cs[i].l, cu(th));
+            if (th > 0) sceKernelDeleteThread(th);
+        }
+    }
 }
 
 /* ======================================================================= */
@@ -677,6 +897,30 @@ static void sec_refer(void) {
     SceKernelThreadInfo ti;
     rec("  deleted: %s\n", hx(refer(th, &ti)));
     (void)S_RET42;
+
+    /* threadman.c:2184-2190 -- psprecomp reports a waitType only for the
+     * waits threadman.c owns (sleep 1, delay 2, sema 3, evf 4, thread end 9:
+     * steps 9-12); the object waits in kernobj.c and kernlock.c report 0.
+     * Deleting each object then releases its waiter (the seq line). */
+    ST("ReferThreadStatus: waitType and waitId of threads waiting on a mbx, vpl, fpl, msgpipe, mutex, lwmutex and TLS pool");
+    fresh(); seq_clear();
+    objs_make();
+    {
+        static const op_t *const sc[] = { S_RW_MBX, S_RW_VPL, S_RW_FPL, S_RW_MPP, S_RW_MTX, S_RW_LW, S_RW_TLS };
+        static const char *const tn[] = { "w_mbx", "w_vpl", "w_fpl", "w_msgpipe", "w_mutex", "w_lwmutex", "w_tlspl" };
+        SceUID w[7];
+        for (int i = 0; i < 7; i++) w[i] = spawn(tn[i], 0x30, sc[i]);
+        sceKernelDelayThread(1000);
+        for (int i = 0; i < 7; i++) {
+            int rr = refer(w[i], &ti);
+            rec("  %-10s refer=%s status=%08X waitType=%08X waitId=%s\n", tn[i], hx(rr),
+                (w32)ti.status, (w32)ti.waitType, nm(ti.waitId));
+        }
+        objs_free();
+        for (int i = 0; i < 7; i++) wait_end(w[i], 200000);
+        rec_seq();
+        for (int i = 0; i < 7; i++) reap(w[i]);
+    }
 }
 
 /* ======================================================================= */
@@ -1229,6 +1473,23 @@ static void sec_exit(void) {
     rec("  timeout 0: %s after=%s; timeout 1: %s after=%s\n", hx(r), ta(t, 0), hx(r1), ta(t1, 1));
     rec_seq();
     reap(th);
+
+    /* threadman.c:583-612 -- whatever the entry returns is the exit status,
+     * negative or an error code alike; ExitThread(-5) (above) is the other
+     * way in. */
+    ST("exit: entry returns -5, and returns 0x80020001; WaitThreadEnd, GetThreadExitStatus, refer");
+    {
+        static const op_t S_RETNEG[] = { { O_END, -5, 0 } };
+        static const op_t S_RETERR[] = { { O_END, (int)0x80020001, 0 } };
+        for (int k = 0; k < 2; k++) {
+            th = spawn(k ? "ex_err" : "ex_neg", 0x30, k ? S_RETERR : S_RETNEG);
+            r = wait_end(th, 200000);
+            rec("  returns %s: WaitThreadEnd=%s GetThreadExitStatus=%s\n", k ? "80020001" : "-5",
+                hx(r), hx(sceKernelGetThreadExitStatus(th)));
+            rec_brief("after", th);
+            reap(th);
+        }
+    }
 }
 
 /* ======================================================================= */
@@ -1293,6 +1554,44 @@ static void sec_suspend(void) {
     wait_end(th, 200000);
     rec("  suspend=%s wakeup=%s resume=%s\n", hx(r), hx(r2), hx(r3)); rec_seq();
     reap(th);
+
+    /* sched.h -- suspension is a flag over the wait (psp_thread.suspended):
+     * psprecomp lets a deadline or a signal end the wait underneath it, and
+     * the thread runs once resumed. */
+    static const op_t S_WSEMA10MS[] = { { O_WAITSEMA, 10000, "W" }, { O_END, 0, 0 } };
+    static const op_t S_WSEMA10S[] = { { O_WAITSEMA, 10000000, "W" }, { O_END, 0, 0 } };
+    SceKernelSemaInfo si;
+    ST("suspend a 0x30 thread waiting on a semaphore (10ms timeout), let the timeout pass, resume");
+    fresh(); seq_clear();
+    g_sema = sceKernelCreateSema("ssema", 0, 0, 1, NULL);
+    th = spawn("su_tmo", 0x30, S_WSEMA10MS);
+    sceKernelDelayThread(1000);
+    r = sceKernelSuspendThread(th);
+    sceKernelDelayThread(30000);
+    rec_brief("suspended, 30ms later", th);
+    si.size = sizeof si;
+    sceKernelReferSemaStatus(g_sema, &si);
+    rec("  sema: count=%d waiters=%d\n", si.currentCount, si.numWaitThreads);
+    tag("m1"); r2 = sceKernelResumeThread(th); tag("m2");
+    wait_end(th, 200000);
+    rec("  suspend=%s resume=%s\n", hx(r), hx(r2)); rec_seq();
+    reap(th);
+
+    ST("suspend a 0x30 thread waiting on a semaphore, signal it while suspended, resume");
+    fresh(); seq_clear();
+    th = spawn("su_sig", 0x30, S_WSEMA10S);
+    sceKernelDelayThread(1000);
+    r = sceKernelSuspendThread(th);
+    r2 = sceKernelSignalSema(g_sema, 1);
+    rec_brief("suspended, signalled", th);
+    si.size = sizeof si;
+    sceKernelReferSemaStatus(g_sema, &si);
+    rec("  sema: count=%d waiters=%d\n", si.currentCount, si.numWaitThreads);
+    tag("m1"); r3 = sceKernelResumeThread(th); tag("m2");
+    wait_end(th, 200000);
+    rec("  suspend=%s signal=%s resume=%s\n", hx(r), hx(r2), hx(r3)); rec_seq();
+    reap(th);
+    sceKernelDeleteSema(g_sema);
 }
 
 /* ======================================================================= */
@@ -1522,9 +1821,62 @@ static void sec_sleep(void) {
     rec_brief("sleeper after release", th);
     reap(th); reap(th2);
     rec("  sleeping=%s ready=%s main=%s\n", hx(r), hx(r2), hx(r3)); rec_seq();
+
+    /* threadman.c:628-660 -- NOT_WAIT for anything not waiting; a delay ends
+     * like any other wait (RELEASE_WAIT); a suspended waiter's wait ends
+     * underneath its suspension and it stays suspended. */
+    ST("ReleaseWaitThread on a dormant thread, a suspended ready one, one in DelayThread(1s), one waiting and suspended");
+    {
+        SceUID d = mk("rw_dorm", 0x30);
+        int rd = sceKernelReleaseWaitThread(d);
+        sceKernelDeleteThread(d);
+        SceUID s = spawn("rw_susp", 0x30, S_SLEEP_WS);
+        sceKernelSuspendThread(s);
+        int rs = sceKernelReleaseWaitThread(s);
+        reap(s);
+        rec("  dormant=%s suspended ready=%s\n", hx(rd), hx(rs));
+        rw_one("delay", S_RW_DELAY, NULL);
+
+        fresh(); seq_clear();
+        g_tleft = 0xEEEEEEEE;
+        g_sema = sceKernelCreateSema("rw_sema", 0, 0, 1, NULL);
+        SceUID ws = spawn("rw_ws", 0x30, S_RW_SEMA);
+        sceKernelDelayThread(1000);
+        int su = sceKernelSuspendThread(ws);
+        int rws = sceKernelReleaseWaitThread(ws);
+        rec_brief("waiting+suspended, released", ws);
+        tag("m1"); int res = sceKernelResumeThread(ws); tag("m2");
+        wait_end(ws, 200000);
+        rec("  waiting+suspended: suspend=%s release=%s resume=%s timeout-after=%s\n", hx(su), hx(rws),
+            hx(res), g_tleft == 0xEEEEEEEE ? "-" : ta(g_tleft, 1000000));
+        rec_seq();
+        reap(ws);
+        sceKernelDeleteSema(g_sema);
+    }
+
+    /* kernobj.c:21-28 (wait_end_code), kernlock.c:237-243, 650-651 -- every
+     * object wait answers RELEASE_WAIT and leaves its queue; unmeasured until
+     * this step. A released GetTlsAddr is NULL here (kernobj.c). */
+    ST("ReleaseWaitThread on 0x30 threads waiting (1s) on a sema, evf, mbx, vpl, fpl, msgpipe, mutex, lwmutex, TLS pool, thread end");
+    objs_make();
+    rw_one("sema", S_RW_SEMA, wn_sema);
+    rw_one("evf", S_RW_EVF, wn_evf);
+    rw_one("mbx", S_RW_MBX, wn_mbx);
+    rw_one("vpl", S_RW_VPL, wn_vpl);
+    rw_one("fpl", S_RW_FPL, wn_fpl);
+    rw_one("msgpipe", S_RW_MPP, wn_mpp);
+    rw_one("mutex", S_RW_MTX, wn_mtx);
+    rw_one("lwmutex", S_RW_LW, wn_lw);
+    rw_one("tlspl", S_RW_TLS, wn_tls);
+    g_uid[1] = spawn("rw_target", 0x30, S_SLEEP_WS);
+    rw_one("threadend", S_RW_END, NULL);
+    reap(g_uid[1]);
+    objs_free();
 }
 
 /* ======================================================================= */
+
+static char g_iobuf[0x8000] __attribute__((aligned(64)));
 
 static const op_t S_TSA[] = { { O_TAG, 0, "A0" }, { O_SPIN, 20000, "A1" }, { O_END, 0, 0 } };
 static const op_t S_TSB[] = { { O_TAG, 0, "B" }, { O_END, 0, 0 } };
@@ -1597,6 +1949,89 @@ static void sec_preempt(void) {
     wait_end(b, 500000); wait_end(a, 500000);
     rec_seq();
     reap(a); reap(b);
+
+    /* threadman.c:2209 -- psprecomp keeps the three counters; step 1 read
+     * main's as intrPreempt 0, threadPreempt 1. Whether a thread preempted by
+     * a more urgent one waking counts a thread preemption, an interrupt one,
+     * or a release, is what this settles. */
+    ST("counters: a 0x30 thread spins 30ms while main wakes twice from 5ms delays; its and main's preempt and release counts");
+    {
+        static const op_t S_SPINREF[] = { { O_SPIN, 30000, "W" }, { O_REFERSELF, 0, 0 }, { O_END, 0, 0 } };
+        SceKernelThreadInfo m0, m1;
+        fresh(); seq_clear();
+        g_wref_ret = (int)0xEEEEEEEE;
+        refer(0, &m0);
+        th = spawn("W", 0x30, S_SPINREF);
+        tag("m1"); sceKernelDelayThread(5000); tag("m2"); sceKernelDelayThread(5000); tag("m3");
+        refer(0, &m1);
+        wait_end(th, 500000);
+        rec("  W: refer=%s threadPreempt=%u intrPreempt=%s release=%u\n", hx(g_wref_ret),
+            (w32)g_wref.threadPreemptCount, g_wref.intrPreemptCount ? "nz" : "0",
+            (w32)g_wref.releaseCount);
+        rec("  main across its two delays: threadPreempt+%u intrPreempt+%s release+%u\n",
+            (w32)(m1.threadPreemptCount - m0.threadPreemptCount),
+            m1.intrPreemptCount != m0.intrPreemptCount ? "nz" : "0",
+            (w32)(m1.releaseCount - m0.releaseCount));
+        rec_seq();
+        reap(th);
+    }
+
+    /* sched.c -- no timeslice between equals (step 76 spun 20ms); 200ms is
+     * long enough for any slice a kernel might have. */
+    ST("timeslice: two ready 0x30 threads, the first spins 200ms on GetSystemTimeLow");
+    {
+        static const op_t S_TSA200[] = { { O_TAG, 0, "A0" }, { O_SPIN, 200000, "A1" }, { O_END, 0, 0 } };
+        fresh(); seq_clear();
+        a = mk("A", 0x30); b = mk("B", 0x30);
+        go(a, S_TSA200); go(b, S_TSB);
+        wait_end(b, 1000000); wait_end(a, 1000000);
+        rec_seq();
+        reap(a); reap(b);
+    }
+
+    /* iofilemgr.c -- psprecomp's sceIo calls finish inside the call, so an
+     * equal-priority ready thread never runs during one. On a PSP a call that
+     * waits for the memory stick blocks its caller. The file is the probe's
+     * own, beside the EBOOT, and is removed by the last call. */
+    ST("sceIo from main (0x20) with a ready 0x20 thread: did it run inside open, write, close, open, read, lseek, read, close, getstat, remove; main's releaseCount across each");
+    {
+        static const char *const lab[] = { "open(w)", "write 32K", "close", "open(r)", "read 32K",
+                                           "lseek 0", "read 16", "close", "getstat", "remove" };
+        char path[128];
+        snprintf(path, sizeof path, "%su2.bin", probe_dir());
+        SceUID fd = -1;
+        for (int i = 0; i < 0x8000; i++) g_iobuf[i] = (char)i;
+        for (int k = 0; k < 10; k++) {
+            SceKernelThreadInfo i0, i1;
+            SceUID w = sceKernelCreateThread("W", script_entry, 0x20, 0x2000, 0, NULL);
+            go(w, S_TAGW_END);
+            seq_clear();
+            refer(0, &i0);
+            tag("m");
+            int rr = 0;
+            SceIoStat st;
+            switch (k) {
+            case 0: rr = fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777); break;
+            case 1: rr = sceIoWrite(fd, g_iobuf, 0x8000); break;
+            case 2: rr = sceIoClose(fd); break;
+            case 3: rr = fd = sceIoOpen(path, PSP_O_RDONLY, 0); break;
+            case 4: rr = sceIoRead(fd, g_iobuf, 0x8000); break;
+            case 5: rr = (int)sceIoLseek32(fd, 0, PSP_SEEK_SET); break;
+            case 6: rr = sceIoRead(fd, g_iobuf, 16); break;
+            case 7: rr = sceIoClose(fd); break;
+            case 8: rr = sceIoGetstat(path, &st); break;
+            case 9: rr = sceIoRemove(path); break;
+            }
+            tag("c");
+            refer(0, &i1);
+            sceKernelDelayThread(1000);
+            wait_end(w, 200000);
+            reap(w);
+            rec("  %-10s = %s  seq: %s  release+%u\n", lab[k],
+                (k == 0 || k == 3) && rr > 0 ? "fd" : hx(rr), g_seq,
+                (w32)(i1.releaseCount - i0.releaseCount));
+        }
+    }
 }
 
 /* ======================================================================= */
@@ -1684,6 +2119,49 @@ static void sec_delay(void) {
             t2 - t1 >= 5000 ? "yes" : "no",
             clk.hi == 0 && clk.low == 5000 ? "unchanged" : "changed");
     }
+
+    /* threadman.c:2530-2556 -- a CB delay delivers first, then sleeps even
+     * for 0 (DelayThread(0) does not park: step 80). */
+    ST("delay: DelayThreadCB(0) with a pending callback notify, then with a ready 0x20 thread");
+    {
+        g_cbhits = 0; g_cbret = 0;
+        SceUID cb = sceKernelCreateCallback("dcb", h_count, NULL);
+        fresh(); seq_clear();
+        sceKernelNotifyCallback(cb, 1);
+        tag("m1"); r = sceKernelDelayThreadCB(0); tag("m2");
+        int hits = g_cbhits;
+        a = mk("W", 0x20);
+        go(a, S_TAGW_END);
+        tag("n1"); int r2 = sceKernelDelayThreadCB(0); tag("n2");
+        sceKernelDelayThread(1000); tag("n3");
+        wait_end(a, 200000);
+        rec("  DelayThreadCB(0)=%s delivered=%d; with a ready thread=%s\n", hx(r), hits, hx(r2));
+        rec_seq();
+        reap(a);
+        sceKernelDeleteCallback(cb);
+    }
+
+    /* Step 81 (DelayThread(1) with a ready 0x20 thread) came out both ways on
+     * two runs: the wait can end before the other thread is dispatched. */
+    ST("delay: DelayThread(n) for n = 0, 1, 2, 5, 10, 50, 100 with a ready 0x20 thread, 4 times each: how often it ran before main came back");
+    {
+        static const int ns[] = { 0, 1, 2, 5, 10, 50, 100 };
+        for (int i = 0; i < 7; i++) {
+            int first = 0;
+            for (int k = 0; k < 4; k++) {
+                fresh(); seq_clear();
+                a = sceKernelCreateThread("W", script_entry, 0x20, 0x2000, 0, NULL);
+                go(a, S_TAGW_END);
+                sceKernelDelayThread(ns[i]);
+                tag("m");
+                sceKernelDelayThread(1000);
+                wait_end(a, 200000);
+                reap(a);
+                if (g_seq[0] == 'W') first++;
+            }
+            rec("  n=%3d: %d of 4\n", ns[i], first);
+        }
+    }
 }
 
 /* ======================================================================= */
@@ -1728,6 +2206,51 @@ static void sec_dispatch(void) {
     rec_seq();
     reap(th);
     sceKernelDeleteSema(s);
+
+    /* threadman.c:696-701 -- dispatch is checked before a 0 delay returns;
+     * threadman.c:1142-1145 -- a resume with anything but 0 or 1 is CPUDI
+     * (0x80020066); misc.c:53-62 -- interrupts off changes nothing. All three
+     * unmeasured. Each resume that might have been refused is followed by a
+     * suspend that says what state it left, and resume(1). */
+    ST("dispatch: DelayThread(0) while suspended; ResumeDispatchThread(2) and (-1); SuspendDispatchThread with interrupts suspended");
+    {
+        int d = sceKernelSuspendDispatchThread();
+        int dz = sceKernelDelayThread(0);
+        int rz = sceKernelResumeDispatchThread(d);
+        sceKernelSuspendDispatchThread();
+        int r2 = sceKernelResumeDispatchThread(2);
+        int c2 = sceKernelSuspendDispatchThread();
+        sceKernelResumeDispatchThread(1);
+        sceKernelSuspendDispatchThread();
+        int rm = sceKernelResumeDispatchThread(-1);
+        int cm = sceKernelSuspendDispatchThread();
+        sceKernelResumeDispatchThread(1);
+        int on = sceKernelSuspendDispatchThread();
+        sceKernelResumeDispatchThread(on);
+        unsigned fl = sceKernelCpuSuspendIntr();
+        int si = sceKernelSuspendDispatchThread();
+        int ri = si >= 0 ? sceKernelResumeDispatchThread(si) : 0;
+        sceKernelCpuResumeIntr(fl);
+        rec("  while suspended: DelayThread(0)=%s; resume=%s\n", hx(dz), hx(rz));
+        rec("  ResumeDispatchThread(2)=%s, then suspend answers %s; ResumeDispatchThread(-1)=%s, then suspend answers %s; afterwards suspend answers %s\n",
+            hx(r2), hx(c2), hx(rm), hx(cm), hx(on));
+        rec("  interrupts suspended: SuspendDispatchThread=%s ResumeDispatchThread=%s\n", hx(si),
+            si >= 0 ? hx(ri) : "-");
+    }
+
+    /* misc.c:53-62 -- psprecomp has no interrupts, so a wait with them
+     * suspended waits as usual. A PSP might refuse (CPUDI) or might park a
+     * thread that no timer can wake; the step is skipped on a restart. */
+    if (!ST("dispatch: DelayThread(1000), and WaitSema with a 1000us timeout, with interrupts suspended")) {
+        SceUID is = sceKernelCreateSema("isema", 0, 0, 1, NULL);
+        unsigned fl = sceKernelCpuSuspendIntr();
+        int dl = sceKernelDelayThread(1000);
+        SceUInt t3 = 1000;
+        int ws2 = sceKernelWaitSema(is, 1, &t3);
+        sceKernelCpuResumeIntr(fl);
+        rec("  DelayThread=%s WaitSema=%s timeout-after=%s\n", hx(dl), hx(ws2), ta(t3, 1000));
+        sceKernelDeleteSema(is);
+    }
 }
 
 /* ======================================================================= */
@@ -1777,6 +2300,29 @@ static void sec_attr(void) {
     sceKernelDeleteThread(c);
     rec("  deleted=%s main CheckThreadStack=%s\n", hx(sceKernelGetThreadStackFreeSize(c)),
         hx(sceKernelCheckThreadStack()));
+
+    /* threadman.c:1281-1291 -- the free size is the run of 0xFF bytes above
+     * the bottom 0x10, whatever put them there, so a NO_FILLSTACK stack
+     * scribbled with 0xCC reads 0 and one set to 0xFF reads nearly all. */
+    ST("GetThreadStackFreeSize from inside running 0x1000 threads: plain, NO_FILLSTACK over 0xCC, NO_FILLSTACK over 0xFF, CLEAR_STACK");
+    {
+        static const struct { w32 attr; int fill; const char *l; } v[] = {
+            { 0, -1, "plain" }, { ATTR_NO_FILLSTACK, 0xCC, "nofill+CC" },
+            { ATTR_NO_FILLSTACK, 0xFF, "nofill+FF" }, { ATTR_CLEAR_STACK, -1, "clear" } };
+        for (int i = 0; i < 4; i++) {
+            for (int k = 0; k < 3; k++) g_selfres[k] = (int)0xEEEEEEEE;
+            th = sceKernelCreateThread("sf3", script_entry, 0x10, 0x1000, v[i].attr, NULL);
+            if (v[i].fill >= 0) {
+                SceKernelThreadInfo ti;
+                if (refer(th, &ti) == 0 && ti.stack) memset(ti.stack, v[i].fill, ti.stackSize);
+            }
+            go(th, S_STACKFREE);
+            wait_end(th, 200000);
+            rec("  %-10s create=%s (0)=%s CheckThreadStack=%s\n", v[i].l, cu(th),
+                hx(g_selfres[0]), hx(g_selfres[2]));
+            reap(th);
+        }
+    }
 }
 
 /* ======================================================================= */
@@ -2335,6 +2881,15 @@ static void sec_tls(void) {
         for (int i = 0; i < n; i++) sceKernelDeleteTlspl(many[i]);
         rec("  created %d, then %s\n", n, hx(fail));
     }
+
+    /* kernobj.c:137-146 -- the vpl table since step 107; its 5 is ILLEGAL_PERM,
+     * on no measurement. */
+    ST("tlspl: partition 5");
+    {
+        SceUID x = sceKernelCreateTlspl("part5", 5, 0, 4, 1, NULL);
+        rec("  5:%s\n", x > 0 ? "ok" : hx(x));
+        if (x > 0) sceKernelDeleteTlspl(x);
+    }
 }
 
 /* ======================================================================= */
@@ -2488,6 +3043,33 @@ static void sec_alarm(void) {
         ai.size = sizeof ai;
         rec("  cancel(0)=%s refer(0)=%s cancelled: refer=%s\n", hx(sceKernelCancelAlarm(0)),
             hx(sceKernelReferAlarmStatus(0, &ai)), hx(sceKernelReferAlarmStatus(a, &ai)));
+    }
+
+    /* ktimer.c:148-155, 187 -- a handler's return re-arms from the moment the
+     * alarm was due, not when it ran (step 116: the first gap came out under
+     * 1000us). Hit k then lands k*1000us after hit 0 plus the difference of
+     * two lateness values; re-arming from the run would add every lateness. */
+    ST("alarm: handler returns 1000 five times, then 0; main spins 20ms: lateness of the first hit, each gap, each hit against hit 0");
+    {
+        al_reset();
+        for (int i = 0; i < 5; i++) g_alret[i] = 1000;
+        w32 t0 = sceKernelGetSystemTimeLow();
+        a = sceKernelSetAlarm(1000, h_alarm, &g_alobj);
+        spin_us(20000);
+        rec("  set=%s hits=%d\n", cu(a), g_alhits);
+        if (g_alhits > 0) {
+            w32 late = g_altime[0] - t0;
+            rec("  hit 0 after set: %s\n", late < 1000 ? "<1000" : late < 1050 ? "1000..1049" :
+                late < 1200 ? "1050..1199" : ">=1200");
+        }
+        for (int k = 1; k < g_alhits && k < 6; k++) {
+            w32 gap = g_altime[k] - g_altime[k - 1];
+            int drift = (int)(g_altime[k] - g_altime[0]) - k * 1000;
+            rec("  hit %d: gap %s; from hit 0, k*1000 %s\n", k,
+                gap < 950 ? "<950" : gap < 1000 ? "950..999" : gap < 1050 ? "1000..1049" : ">=1050",
+                drift < -50 ? "-more than 50" : drift <= 50 ? "+-50" : "+more than 50");
+        }
+        rec("  cancel after=%s\n", hx(sceKernelCancelAlarm(a)));
     }
 }
 
@@ -2731,6 +3313,26 @@ static void sec_vtimer(void) {
         hx(sceKernelReferVTimerStatus(v3, &vi)), hx(sceKernelDeleteVTimer(v3)),
         hx(sceKernelCancelVTimerHandler(v3)), hx(sceKernelDeleteVTimer(0)));
     rec("  delete vt=%s\n", hx(sceKernelDeleteVTimer(v)));
+
+    /* sched.c:323-348 -- psprecomp runs a timer handler that falls due while
+     * every thread waits at that moment, as the interrupt would; step 115
+     * showed it for an alarm. */
+    ST("vtimer: handler at 2000 while main sits in DelayThread(10ms): the vtimer's time when it ran");
+    vt_reset();
+    SceUID v4 = sceKernelCreateVTimer("vt4", NULL);
+    g_vtid = v4;
+    clk.low = 2000; clk.hi = 0;
+    r = sceKernelSetVTimerHandler(v4, &clk, h_vt, &g_vtobj);
+    sceKernelStartVTimer(v4);
+    sceKernelDelayThread(10000);
+    sceKernelStopVTimer(v4);
+    rec("  SetVTimerHandler=%s hits=%d", hx(r), g_vthits);
+    if (g_vthits)
+        rec(" ran at vtimer time %s\n", g_vtreal[0][1] ? "(high word set)" : g_vtreal[0][0] < 2000 ? "<2000" :
+            g_vtreal[0][0] < 3000 ? "2000..2999" : g_vtreal[0][0] < 9000 ? "3000..8999" : ">=9000");
+    else
+        rec("\n");
+    rec("  delete=%s\n", hx(sceKernelDeleteVTimer(v4)));
 }
 
 /* ======================================================================= */
@@ -2801,6 +3403,32 @@ static void sec_time(void) {
     memset(&dt, 0, sizeof dt);
     r = sceRtcGetCurrentClock(&dt, 0);
     rec("  GetCurrentClock(tz 0)=%s year>=2020 %s\n", hx(r), dt.year >= 2020 ? "yes" : "no");
+
+    /* misc.c:146-160 -- psprecomp's seconds are the Unix time, and step 133
+     * read the PSP's as not after 2001: unwritten, small, or on another
+     * epoch. Relations only; the second read says whether usec and sec make
+     * one clock. */
+    ST("time: LibcGettimeofday seconds against LibcTime and uptime; a timezone struct; two reads across DelayThread(20000)");
+    {
+        w32 tz[2] = { 0xEEEEEEEE, 0xEEEEEEEE };
+        SceKernelTimeval a = { 0xEEEEEEEE, 0xEEEEEEEE }, b = { 0xEEEEEEEE, 0xEEEEEEEE };
+        int ra = sceKernelLibcGettimeofday(&a, (struct timezone *)tz);
+        w32 lt = (w32)sceKernelLibcTime(NULL);
+        w32 up = (w32)(sceKernelGetSystemTimeWide() / 1000000);
+        sceKernelDelayThread(20000);
+        int rb = sceKernelLibcGettimeofday(&b, NULL);
+        const w32 s = a.tv_sec;
+        rec("  ret=%s tv_sec: %s; within 2s of LibcTime %s; within 2s of uptime %s\n", hx(ra),
+            s == 0xEEEEEEEE ? "untouched" : s == 0 ? "0" : s < 86400 ? "under a day" :
+            s < 978307200u ? "before 2001" : "after 2001",
+            s - lt + 2 <= 4 ? "yes" : "no", s - up + 2 <= 4 ? "yes" : "no");
+        rec("  timezone words: %s %s\n", tz[0] == 0xEEEEEEEE ? "untouched" : hx(tz[0]),
+            tz[1] == 0xEEEEEEEE ? "untouched" : hx(tz[1]));
+        long long d = ((long long)b.tv_sec - (long long)a.tv_sec) * 1000000 +
+                      ((long long)b.tv_usec - (long long)a.tv_usec);
+        rec("  second read=%s: advanced >=20000us %s, <1000000us %s\n", hx(rb),
+            d >= 20000 ? "yes" : "no", d < 1000000 ? "yes" : "no");
+    }
 }
 
 /* ======================================================================= */
@@ -2901,6 +3529,28 @@ static void sec_rtc(void) {
         strcpy(s, "(untouched)");
         r = sceRtcFormatRFC3339(s, &tick, 540);
         rec("  RFC3339 +540: %s \"%s\"\n", hx(r), s);
+    }
+
+    /* misc.c:821-846 -- a year above 9999 is taken as bad, and GetTick does
+     * the arithmetic on an invalid date (Feb 30 as Mar 2), both unmeasured. */
+    ST("rtc: CheckValid of 9999-12-31 23:59:59.999999 and of year 10000; GetTick of 2023-02-30 and 2023-13-01");
+    {
+        ScePspDateTime y = { 9999, 12, 31, 23, 59, 59, 999999 };
+        int v1 = sceRtcCheckValid(&y);
+        y.year = 10000;
+        int v2 = sceRtcCheckValid(&y);
+        rec("  9999-12-31: %s  year 10000: %s\n", hx(v1), hx(v2));
+        static const struct { ScePspDateTime bad, ref; const char *l; } g[] = {
+            { { 2023, 2, 30, 0, 0, 0, 0 }, { 2023, 3, 2, 0, 0, 0, 0 }, "2023-02-30 vs 2023-03-02" },
+            { { 2023, 13, 1, 0, 0, 0, 0 }, { 2024, 1, 1, 0, 0, 0, 0 }, "2023-13-01 vs 2024-01-01" },
+        };
+        for (int i = 0; i < 2; i++) {
+            u64 tb = 0xEEEEEEEEEEEEEEEEull, tr = 0;
+            int rb = sceRtcGetTick(&g[i].bad, &tb);
+            sceRtcGetTick(&g[i].ref, &tr);
+            rec("  GetTick %s: %s %s\n", g[i].l, hx(rb),
+                tb == 0xEEEEEEEEEEEEEEEEull ? "untouched" : tb == tr ? "same tick" : hx64(tb - tr));
+        }
     }
 }
 
@@ -3007,6 +3657,28 @@ static void sec_sysmem(void) {
     if (b2 > 0) sceKernelFreePartitionMemory(b2);
     rec("  free again=%s head of freed=%s\n", hx(sceKernelFreePartitionMemory(b)),
         pv((w32)sceKernelGetBlockHeadAddr(b)));
+
+    /* sysmem.c:264-270 -- an Addr block asked for 0x80 into a granule starts
+     * at the granule and keeps the rounded size, so the drop is 0x1000;
+     * covering want + size would make it 0x1100. sysmem.c:214-224 -- 5 and 9
+     * follow the vpl table, unmeasured. Step 141 read total > max. */
+    ST("sysmem: total free drop for an Addr block 0x80 into a free granule; partitions 5 and 9; total minus max");
+    {
+        SceUID b0 = sceKernelAllocPartitionMemory(2, "a", PSP_SMEM_Low, 0x1000, NULL);
+        w32 at = b0 > 0 ? (w32)sceKernelGetBlockHeadAddr(b0) : 0;
+        if (b0 > 0) sceKernelFreePartitionMemory(b0);
+        SceSize before = sceKernelTotalFreeMemSize();
+        SceUID ab = at ? sceKernelAllocPartitionMemory(2, "at80", PSP_SMEM_Addr, 0x1000, (void *)(at + 0x80)) : -1;
+        SceSize after = sceKernelTotalFreeMemSize();
+        rec("  Addr at +0x80: %s drop=%08X\n", cu(ab), ab > 0 ? (w32)(before - after) : 0);
+        if (ab > 0) sceKernelFreePartitionMemory(ab);
+        SceUID p5 = sceKernelAllocPartitionMemory(5, "p5", PSP_SMEM_Low, 0x100, NULL);
+        SceUID p9 = sceKernelAllocPartitionMemory(9, "p9", PSP_SMEM_Low, 0x100, NULL);
+        rec("  partition 5: %s partition 9: %s\n", cu(p5), cu(p9));
+        if (p5 > 0) sceKernelFreePartitionMemory(p5);
+        if (p9 > 0) sceKernelFreePartitionMemory(p9);
+        rec("  total-max=%08X\n", (w32)(sceKernelTotalFreeMemSize() - sceKernelMaxFreeMemSize()));
+    }
 }
 
 /* ======================================================================= */
@@ -3130,8 +3802,11 @@ static void sec_badptr(void) {
         regs_case((SceSize)-1, g_argbuf, 0, 0);
 
     /* threadman.c:352-373 -- an argument pointer the kernel cannot read is
-     * 800200d3 and the thread stays unstarted. The last step of the probe. */
-    if (!ST("StartThread with argp = 0x10 (small bad pointer), length 8"))
+     * 800200d3 and the thread stays unstarted. Threadprobe 2 (fw 6.60)
+     * switched the PSP off here instead: the kernel copies the block without
+     * checking the pointer. The last step of the probe. */
+    if (!ST("StartThread with argp = 0x10 (small bad pointer), length 8") &&
+        !KNOWN_CRASH("argp 0x10 switched the PSP off in threadprobe 2"))
         regs_case(8, (void *)0x10, 0, 0);
 }
 
@@ -3172,6 +3847,8 @@ static void leftovers(void) {
 }
 
 int main(int argc, char *argv[]) {
+    g_argc = argc;
+    g_argv = argv;
     probe_init("threadprobe", PROBE_VERSION, argc, argv);
     count_objects(g_count0);
 #ifdef LEAKDEBUG

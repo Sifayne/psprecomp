@@ -2,7 +2,7 @@
  *
  * 1. Imports PSPSDK has no stubs for. The NIDs are the ones psprecomp's own
  *    registration table uses (src/hle/kernobj.c:2030-2034 for the TLS pool,
- *    src/hle/kernlock.c:341-342 for the mutex). Which library exports each
+ *    src/hle/kernlock.c:368-378 for the mutex). Which library exports each
  *    one on firmware 6.60 is from uofw's export tables (MIT):
  *    src/kd/threadman/exports.exp and src/kd/usersystemlib/exports.exp.
  *
@@ -60,6 +60,9 @@ __stub_module_\sym:
 	IMPORT_FUNC	tp_ThreadManForUser,0x721067F3,sceKernelReferTlsplStatus
 	IMPORT_FUNC	tp_ThreadManForUser,0xB7D098C6,sceKernelCreateMutex
 	IMPORT_FUNC	tp_ThreadManForUser,0xF8170FBE,sceKernelDeleteMutex
+	IMPORT_FUNC	tp_ThreadManForUser,0xB011B11F,sceKernelLockMutex
+	IMPORT_FUNC	tp_ThreadManForUser,0x6B30100F,sceKernelUnlockMutex
+	IMPORT_FUNC	tp_ThreadManForUser,0xA9C2CB9A,sceKernelReferMutexStatus
 
 	TP_IMPORT_START "Kernel_Library",tp_Kernel_Library,0x00090000
 	IMPORT_FUNC	tp_Kernel_Library,0xFA835CDE,sceKernelGetTlsAddr
