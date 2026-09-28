@@ -350,6 +350,13 @@ void psp_mtvc(int index, uint32_t value) {
      * make the two views of the same register disagree. */
     case 0: case 1: case 2: psp_cpu.vfpu_ctrl[index] = value & 0xFFFFFFu; break;
     case 3:                 psp_cpu.vfpu_cc = value;            break;
+    /* An rcx register keeps only its 20 state bits and reads back as a
+     * 1.0f-shaped word: FFFFFFFF -> 3F8FFFFF, 12345678 -> 3F845678,
+     * 3F800000 -> 3F800000, each write touching only its own register
+     * (vfpuprobe v3 step 185, fw 6.60). */
+    case 8: case 9: case 10: case 11: case 12: case 13: case 14: case 15:
+        psp_cpu.vfpu_ctrl[index] = 0x3F800000u | (value & 0xFFFFFu);
+        break;
     default:
         if (index >= 0 && index < 16) psp_cpu.vfpu_ctrl[index] = value;
         break;
@@ -360,7 +367,7 @@ void psp_mtvc(int index, uint32_t value) {
  *
  * The state is the eight rcx control registers, each a 1.0f-shaped word whose
  * low 20 bits carry state (bits 16..19 and 0..15). Measured on firmware 6.60
- * (vfpuprobe steps 147 and 154-159) and reproduced exactly:
+ * (vfpuprobe steps 147 and 154-159, v3 steps 174-187) and reproduced exactly:
  *
  *   - vrnds S writes rcx_i = 0x3F800000 | ((S >> 4i) & 0xF) << 16
  *                           | (i < 4 ? S & 0xFFFF : S >> 16),
@@ -377,21 +384,18 @@ void psp_mtvc(int index, uint32_t value) {
  *
  *     x = 69069x + 1;  y = xorshift(y; <<13, >>17, <<5);
  *     t = z + 2w + c;  z = w;  w = t;          result x + y + w
+ *     c = max(((2z + w + c) >> 32) - 1, 0)      (with the old z, w, c)
  *
- * which is fitted, not read from a document, and reproduces every value the
- * probe logged from the reset state (00094E24 245A1029 ECF210C2 91ABC47B, in
- * the main thread and in a fresh one) and from seeds 0, 1 and 12345678 --
- * 28 of 28 -- in all three output forms.
- *
- * What is not known is the carry: what c becomes after a draw. Taking it as
- * zero is what the four sequences above require; the textbook multiply-with-
- * carry rule (c = t >> 32) breaks seed 12345678 from its fourth draw. But from
- * seed FFFFFFFF the hardware adds 2 and then 1 more to t at every draw after
- * the first, and from 3F800000 1 at the fourth and eighth, and no rule over
- * this state found so far produces both. So from those two seeds this model
- * matches the first draw and the first three respectively, and after that
- * differs in the low bits (by 2, 5, 13 ... 457 for FFFFFFFF). Reading rcx
- * after each draw would settle it. */
+ * and after the draw the nibbles hold c: all zero but rcx0's, which is 0, 1
+ * or 2. This is fitted, not read from a document. The carry is an odd rule
+ * (the sum it comes from is not the one that makes t), but it is the one
+ * rule over this state that reproduces every draw the probe logged with the
+ * eight rcx read back after it (1,624 distinct transitions): from seeds 0,
+ * 1, 12345678, FFFFFFFF and 3F800000 (vfpuprobe v3 steps 179-183), from
+ * every one-bit seed (step 186, 512 draws) and from seed 0 with each of the
+ * 160 state bits flipped by mtvc (step 187, 2,048 draws) -- state and
+ * result, running free from the seed. The plain carry t >> 32 gets 198 of
+ * the 1,624 wrong. */
 static uint32_t rcx_word(int lo) {
     return (psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + lo] & 0xFFFFu) |
            (psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + lo + 4] & 0xFFFFu) << 16;
@@ -420,10 +424,11 @@ static uint32_t vrnd_next(void) {
     x = 69069u * x + 1u;
     y ^= y << 13; y ^= y >> 17; y ^= y << 5;
     const uint32_t t = z + 2u * w + c;
+    const uint32_t hi = (uint32_t)((2ull * z + w + c) >> 32);
     z = w;
     w = t;
     rcx_set_word(0, x); rcx_set_word(1, y); rcx_set_word(2, z); rcx_set_word(3, w);
-    rcx_set_nibbles(0);
+    rcx_set_nibbles(hi ? hi - 1u : 0u);
     return x + y + w;
 }
 

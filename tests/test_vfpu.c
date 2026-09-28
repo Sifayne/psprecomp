@@ -802,9 +802,8 @@ static void test_transcendentals(void) {
  *
  * What vfpuprobe measured (steps 154-159, fw 6.60): the seeding, the output
  * forms, and the streams the model reproduces exactly -- from the reset state
- * and from seeds 0, 1 and 12345678. The streams from FFFFFFFF and 3F800000
- * depend on a carry rule nobody has identified and are deliberately not
- * asserted. */
+ * and from seeds 0, 1 and 12345678 -- and, with the carry rule fitted to
+ * v3 steps 179-187, from FFFFFFFF and 3F800000, rcx included. */
 static void draw_quad(int kind, uint32_t out[4]) {
     int q[4];
     psp_vfpu_regs(0x00, 4, q);
@@ -848,6 +847,10 @@ static void test_random(void) {
                         0x761C1DCB, 0x103BF1B8, 0x88C5605C, 0x93D08434 } },
         { 0x12345678, { 0x632F0A9E, 0x9CB065E1, 0xA483C0E3, 0x752E3534,
                         0xE235C17D, 0x89248F57, 0xD8FA70D8, 0x213C6031 } },
+        { 0xFFFFFFFF, { 0x0002D24F, 0xDFB0959D, 0xEA156854, 0x4A6BEDED,
+                        0xEF2BFD71, 0x831EC646, 0xCA27FC91, 0x5CFC70F2 } },
+        { 0x3F800000, { 0x2703E7C1, 0x430D7FAB, 0xFBA263FD, 0xF225DFEF,
+                        0xBD70ECE5, 0xC0463FBF, 0x76501414, 0x16E87BF7 } },
     };
     for (unsigned sidx = 0; sidx < sizeof streams / sizeof streams[0]; sidx++) {
         for (int kind = 0; kind < 3; kind++) {
@@ -865,6 +868,50 @@ static void test_random(void) {
             }
         }
     }
+
+    /* The carry lives in rcx0's nibble after a draw (step 182): from
+     * FFFFFFFF it is 2 after the first draw and 1 after the next two, and
+     * the eight rcx read exactly these. Step 183: from 3F800000, 1 after the
+     * third draw and 0 after the fourth. */
+    static const uint32_t ff_rcx[3][8] = {
+        { 0x3F82F234, 0x3F80E01F, 0x3F80FFFF, 0x3F80FFFC, 0x3F80FFFE, 0x3F800003, 0x3F80FFFF, 0x3F80FFFF },
+        { 0x3F8197A5, 0x3F80FDFF, 0x3F80FFFC, 0x3F80FFF9, 0x3F80E3A8, 0x3F80FC07, 0x3F80FFFF, 0x3F80FFFF },
+        { 0x3F81D022, 0x3F809843, 0x3F80FFF9, 0x3F80FFEF, 0x3F807559, 0x3F8074BB, 0x3F80FFFF, 0x3F80FFFF },
+    };
+    psp_cpu.v[r[0]] = psp_bits_to_f32(0xFFFFFFFFu);
+    psp_vrnds(0x08, 1);
+    for (int d = 0; d < 3; d++) {
+        psp_vrnd(0x00, 0, 1);
+        for (int i = 0; i < 8; i++)
+            CHECK(psp_mfvc(PSP_VFPU_RCX0 + i) == ff_rcx[d][i],
+                  "seed FFFFFFFF draw %d: rcx%d %08X, want %08X", d + 1, i,
+                  psp_mfvc(PSP_VFPU_RCX0 + i), ff_rcx[d][i]);
+    }
+    psp_cpu.v[r[0]] = psp_bits_to_f32(0x3F800000u);
+    psp_vrnds(0x08, 1);
+    for (int d = 0; d < 4; d++) psp_vrnd(0x00, 0, 1);
+    CHECK(psp_mfvc(PSP_VFPU_RCX0) == 0x3F8037CCu && psp_mfvc(PSP_VFPU_RCX0 + 3) == 0x3F800001u &&
+          psp_mfvc(PSP_VFPU_RCX0 + 7) == 0x3F802580u,
+          "seed 3F800000 after 4 draws: rcx0 %08X rcx3 %08X rcx7 %08X", psp_mfvc(PSP_VFPU_RCX0),
+          psp_mfvc(PSP_VFPU_RCX0 + 3), psp_mfvc(PSP_VFPU_RCX0 + 7));
+
+    /* mtvc keeps an rcx register's 20 state bits under 3F800000, and only
+     * that register (step 185). */
+    static const uint32_t mt[][2] = {
+        { 0xFFFFFFFF, 0x3F8FFFFF }, { 0x00000000, 0x3F800000 },
+        { 0x12345678, 0x3F845678 }, { 0x3F800000, 0x3F800000 },
+    };
+    for (int reg = 0; reg < 8; reg++)
+        for (size_t k = 0; k < sizeof mt / sizeof mt[0]; k++) {
+            psp_cpu.v[r[0]] = psp_bits_to_f32(0u);
+            psp_vrnds(0x08, 1);
+            psp_mtvc(PSP_VFPU_RCX0 + reg, mt[k][0]);
+            for (int i = 0; i < 8; i++) {
+                const uint32_t want = i == reg ? mt[k][1] : 0x3F800000u;
+                CHECK(psp_mfvc(PSP_VFPU_RCX0 + i) == want, "mtvc rcx%d %08X: rcx%d %08X, want %08X",
+                      reg, mt[k][0], i, psp_mfvc(PSP_VFPU_RCX0 + i), want);
+            }
+        }
     psp_vfpu_reset();
 }
 
