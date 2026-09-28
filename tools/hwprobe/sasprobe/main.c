@@ -12,7 +12,9 @@
  * decimal, and "L[i]" is output frame i counted from the first core after the
  * key-on. A SasCore word that points into memory is shown as an offset from
  * one of the probe's own buffers ("vag+0", "u:core+40" for an uncached
- * alias), or as "ptr" when it points anywhere else.
+ * alias), or as "ptr" when it points anywhere else. The reverb impulse files
+ * (rev_imp_*.bin, version 3) keep only the even frames, L,R each; the log
+ * counts the odd frames that were not silent.
  *
  * fresh() starts most tests: __sceSasInit, then every voice unpaused, silenced
  * and keyed off with an instant release, then one core. On a firmware whose
@@ -34,7 +36,7 @@ PSP_MODULE_INFO("sasprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(512);
 
-#define PROBE_VERSION 2
+#define PROBE_VERSION 3
 
 typedef unsigned int w32;   /* PSPSDK's u32 is long; this prints with %X */
 
@@ -271,6 +273,26 @@ static void log_ch(int ch, int from, int count) {
 static int first_nz(void) {
     for (int i = 0; i < frames(); i++) if (CL(i) || CR(i)) return i;
     return -1;
+}
+
+/* Channel `ch` over frames from..to-1: its value at `from`, then the frames
+ * whose value differs from the frame before (for noise, a tick of the
+ * generator), the first `max` of them as "frame:value", and how many there
+ * were. */
+static int log_ticks(const char *label, int ch, int from, int to, int max) {
+    int n = 0, prev = g_cap[2 * from + ch];
+    if (to > frames()) to = frames();
+    out("  %s from %d, ticks:", label, prev);
+    for (int i = from + 1; i < to; i++) {
+        const int v = g_cap[2 * i + ch];
+        if (v != prev) {
+            if (n < max) out(" %d:%d", i, v);
+            n++;
+        }
+        prev = v;
+    }
+    out(" (%d in all)\n", n);
+    return n;
 }
 
 static int lr_diff(void) {
@@ -637,6 +659,36 @@ static void sec_init(void) {
     out("  L[100] %d L[300] %d, end flags %08X %08X, heights v7 %08X v8 %08X\n",
         CL(100), CL(300), g_ef[0], g_ef[1],
         (w32)__sceSasGetEnvelopeHeight(core, 7), (w32)__sceSasGetEnvelopeHeight(core, 8));
+
+    /* v3. Step 16 heard voice 8 with a count of 8. With a count of 1: does
+     * every voice render, or is the count rounded up (to 8, 16)? The four
+     * constants are digits of one sum, so L names the voices heard. */
+    step("init: maxVoices 1: v0 (constant 1), v8 (10), v16 (100), v31 (4096) set up and keyed on");
+    fresh();
+    ret(__sceSasInit(core, 256, 1, 0, 44100));
+    fill_const(PCM(1), PCM_N, 1);
+    fill_const(PCM(2), PCM_N, 10);
+    fill_const(PCM(3), PCM_N, 100);
+    sync();
+    {
+        static const int vs[4] = { 0, 8, 16, 31 };
+        for (int k = 0; k < 4; k++) {
+            const int v = vs[k];
+            int r1 = __sceSasSetVoicePCM(core, v, PCM((k + 1) & 3), 256, 0);
+            int r2 = __sceSasSetVolume(core, v, 0x1000, 0x1000, 0, 0);
+            int r3 = __sceSasSetADSRmode(core, v, 0xF, 0, 1, 1, 1);
+            int r4 = __sceSasSetADSR(core, v, 0xF, 0x7FFFFFFF, 0, 0, 0);
+            int r5 = __sceSasSetSL(core, v, 0x40000000);
+            int r6 = __sceSasSetKeyOn(core, v);
+            out("  v%d: SetVoicePCM %08X SetVolume %08X SetADSRmode %08X SetADSR %08X SetSL %08X KeyOn %08X\n",
+                v, (w32)r1, (w32)r2, (w32)r3, (w32)r4, (w32)r5, (w32)r6);
+        }
+    }
+    render(2, -1);
+    out("  L[100] %d L[300] %d, end flags %08X %08X, heights v0 %08X v8 %08X v16 %08X v31 %08X\n",
+        CL(100), CL(300), g_ef[0], g_ef[1],
+        (w32)__sceSasGetEnvelopeHeight(core, 0), (w32)__sceSasGetEnvelopeHeight(core, 8),
+        (w32)__sceSasGetEnvelopeHeight(core, 16), (w32)__sceSasGetEnvelopeHeight(core, 31));
 }
 
 /* ============================================================================
@@ -1216,6 +1268,10 @@ typedef struct {
 #define SS(m, r, n)        { "sustain", 0, FULL, 1, FULL, m, r, 1, 0, 0x20000000, n, -1, 256 }
 /* release under test from full height, key off before core 2 */
 #define SR(m, r, n)        { "release", 0, FULL, 1, 0, 1, 0, m, r, TOP, n, 2, 256 }
+/* v3: sustain under test from 0x20000000 itself. SS's lin-dec decay of
+ * 0x7FFFFFFF overshoots to 0, so every SS sweep starts its sustain at 0; a
+ * direct decay to the level starts it at the level. */
+#define SS2(m, r, n)       { "sustain from SL", 0, FULL, 5, 0x20000000, m, r, 1, 0, 0x20000000, n, -1, 256 }
 
 static const sweep_t g_sweeps[] = {
     SA(0, 0x1000, 6), SA(0, 0x40000, 20), SA(0, 0x100000, 6), SA(0, 0x2000000, 4),
@@ -1238,6 +1294,10 @@ static const sweep_t g_sweeps[] = {
     /* SetSimpleADSR in place of the two setters: ar = adsr1, dr = adsr2 */
     { "simple", -1, 0x28A8, 0, 0x5030, 0, 0, 0, 0, NOSL, 24, 12, 256 },
     { "simple", -1, 0x9F13, 0, 0xC7C4, 0, 0, 0, 0, NOSL, 28, 16, 256 },
+    /* v3: lin-dec to 0 in whole steps and past it, exp-rev at 0x1000000
+     * and at 0, direct 0 and direct past the top, all from a nonzero height */
+    SS2(1, 0x40000, 12), SS2(1, 0x30000, 12), SS2(3, 0x1000000, 16), SS2(3, 0, 4),
+    SS2(5, 0, 4), SS2(5, FULL, 3),
 };
 
 static void sec_adsr(void) {
@@ -1452,6 +1512,41 @@ static void sec_vagflags(void) {
     }
     log_rle(3 * 256);
     save("vag_setvoice_playing.bin");
+
+    /* v3. Step 171 kept the old loop playing after the SetVoice. Does the
+     * old stream take up the new size or loop mode (a one-shot of 2 blocks)
+     * when it reaches its loop, and does a key-on then start the new data?
+     * VAG2's third and fourth blocks (nibbles 11, 12) lie past its new size;
+     * nibbles 9..12 play as -7..-4 times 256. */
+    step("vagflags: SetVoice to a 2-block one-shot (nibbles 9,10) while a 0,0,0,3 loop plays, after core 1; KeyOff+KeyOn after core 3; 6 cores");
+    fresh();
+    vag_clear(VAG);
+    for (int b = 0; b < 4; b++) vag_blk_c(VAG, 0, 4, b == 3 ? 3 : 0, b + 1);
+    vag_clear(VAG2);
+    for (int b = 0; b < 4; b++) vag_blk_c(VAG2, 0, 4, 0, b + 9);
+    vag_voice(0, VAG, 64, 1);
+    env_flat(0);
+    keyon(0);
+    {
+        const int w = grain_words();
+        for (int i = 0; i < 6; i++) {
+            if (i == 1) {
+                sync();
+                out("  SetVoice %08X\n", (w32)__sceSasSetVoice(core, 0, VAG2, 32, 0));
+            }
+            if (i == 3) {
+                int r1 = __sceSasSetKeyOff(core, 0), r2 = __sceSasSetKeyOn(core, 0);
+                out("  KeyOff %08X KeyOn %08X\n", (w32)r1, (w32)r2);
+            }
+            core_raw();
+            memcpy(g_cap + i * w, g_out, w * 2);
+            g_ef[i] = (w32)__sceSasGetEndFlag(core);
+        }
+        g_capn = 6 * w;
+    }
+    log_rle(6 * 256);
+    log_end(0, 6);
+    save("vag_setvoice_rekey.bin");
 }
 
 /* ============================================================================
@@ -1527,6 +1622,36 @@ static void sec_pcm(void) {
             save("pcm_loop_m2.bin");
         }
     }
+
+    /* v3. Step 178 kept R16 playing after the SetVoicePCM. Does the old
+     * stream wrap at its own size (100) or the new one (50, one-shot), and
+     * does a key-on then play the 5000s and end? */
+    step("pcm: SetVoicePCM(constant 5000, size 50, one-shot) while R16 size 100 loop 0 plays, after core 1; KeyOff+KeyOn after core 2; 5 cores");
+    fresh();
+    fill_const(PCM(1), PCM_N, 5000);
+    pcm_voice(0, R16, 100, 0);
+    env_flat(0);
+    keyon(0);
+    {
+        const int w = grain_words();
+        for (int i = 0; i < 5; i++) {
+            if (i == 1) {
+                sync();
+                out("  SetVoicePCM %08X\n", (w32)__sceSasSetVoicePCM(core, 0, PCM(1), 50, -1));
+            }
+            if (i == 2) {
+                int r1 = __sceSasSetKeyOff(core, 0), r2 = __sceSasSetKeyOn(core, 0);
+                out("  KeyOff %08X KeyOn %08X\n", (w32)r1, (w32)r2);
+            }
+            core_raw();
+            memcpy(g_cap + i * w, g_out, w * 2);
+            g_ef[i] = (w32)__sceSasGetEndFlag(core);
+        }
+        g_capn = 5 * w;
+    }
+    log_ranges(5 * 256);
+    log_end(0, 5);
+    save("pcm_setvoice_rekey.bin");
 }
 
 /* ============================================================================
@@ -1574,6 +1699,35 @@ static void sec_pitch(void) {
     log_ch(0, 252, 8);
     log_ch(0, 508, 8);
     save("pitch_change.bin");
+
+    /* v3. Rising slopes interpolate as a + ceil((b - a) * f / 4096). A
+     * falling slope tells that rule from rounding the step away from zero
+     * (or toward it). 64 samples: from 100 in steps of -4, then -3, then -7,
+     * crossing zero, then +5 among negatives; at pitch 0x100 each sample
+     * spans 16 frames. */
+    step("pitch: 0x100 on a falling ramp (16 steps each of -4, -3, -7, then +5, from 100), 4 cores");
+    fresh();
+    {
+        int v = 100;
+        for (int i = 0; i < PCM_N; i++) {
+            PCM(1)[i] = (short)v;
+            v += i < 16 ? -4 : i < 32 ? -3 : i < 48 ? -7 : 5;
+            if (v > 30000) v = 30000;
+        }
+    }
+    pcm_voice(0, PCM(1), PCM_N, -1);
+    env_flat(0);
+    {
+        int r = __sceSasSetPitch(core, 0, 0x100);
+        if (r) out("  SetPitch %08X\n", (w32)r);
+    }
+    keyon(0);
+    render(4, 0);
+    log_ch(0, 32, 40);
+    log_ch(0, 288, 24);
+    log_end(0, 4);
+    log_sum();
+    save("pitch_0100_fall.bin");
 }
 
 /* ============================================================================
@@ -1590,6 +1744,44 @@ static void noise_stats(void) {
         if ((v < 0) != (p < 0)) signs++;
     }
     out("  min %d max %d, value changes %d, sign changes %d, L != R %d\n", mn, mx, changes, signs, lr_diff());
+}
+
+/* Voice `v` as noise at `f`, flat envelope, volumes lv/rv. */
+static void noise_voice(int v, int f, int lv, int rv) {
+    pcm_voice(v, PCM(0), 256, 0);
+    int r1 = __sceSasSetNoise(core, v, f);
+    int r2 = __sceSasSetVolume(core, v, lv, rv, 0, 0);
+    if (r1 || r2) out("  (v%d: SetNoise %08X SetVolume %08X)\n", v, (w32)r1, (w32)r2);
+    env_flat(v);
+}
+
+/* Key on noise at `f` and render core by core until 12 ticks, or 4 ticks
+ * and 96 cores, or 640 cores (f0 is expected near 32768 frames a tick).
+ * Logs the frame of the first tick, the gaps after it, and the values. */
+static void noise_ticks(int f) {
+    enum { MAXT = 12 };
+    int at[MAXT], val[MAXT], n = 0, prev = 0, c;
+    fresh();
+    noise_voice(0, f, 0x1000, 0x1000);
+    keyon(0);
+    for (c = 0; c < 640; c++) {
+        int r = core_raw();
+        if (r) { out("  core %d = %08X\n", c, (w32)r); break; }
+        for (int i = 0; i < 256; i++) {
+            const int v = g_out[2 * i];
+            if (v != prev && n < MAXT) { at[n] = c * 256 + i; val[n] = v; n++; }
+            prev = v;
+        }
+        if (n >= MAXT || (n >= 4 && c >= 95)) { c++; break; }
+    }
+    out("  %d cores, %d ticks:", c, n);
+    for (int k = 0; k < n; k++) {
+        if (k) out(" +%d", at[k] - at[k - 1]);
+        else   out(" at %d", at[0]);
+    }
+    out("\n  values:");
+    for (int k = 0; k < n; k++) out(" %d", val[k]);
+    out("\n");
 }
 
 static void sec_noise(void) {
@@ -1636,6 +1828,99 @@ static void sec_noise(void) {
     keyon(0);
     render(1, 0);
     log_ch(0, 30, 16);
+
+    /* v3: the tick clock at every frequency. The register (s<<1 | 1^b9^b10^
+     * b11^b14, from 0) is exact at f63, and the voice plays it as it is, so
+     * each tick changes L. Run 1 timed only f32, f48 and f63. Frames count
+     * from the first core after the key-on. */
+    for (int f = 0; f < 64; f++) {
+        step("noise: freq %d: first ticks (frame, then the gaps): 12, or 4 once 96 cores have run, within 640 cores", f);
+        noise_ticks(f);
+    }
+
+    /* v3: what restarts the clock and the register. f48 ticks every 10
+     * frames and 256 is not a multiple of 10, so a clock that runs on
+     * through a re-key shows up as a shifted first tick. */
+    for (int k = 1; k <= 3; k++) {
+        step("noise: freq 48, KeyOff+KeyOn after %d core%s with no core between: ticks of the next core", k, k > 1 ? "s" : "");
+        fresh();
+        noise_voice(0, 48, 0x1000, 0x1000);
+        keyon(0);
+        render(k, 0);
+        {
+            int last = -1, n = 0;
+            for (int i = 1; i < frames(); i++) if (CL(i) != CL(i - 1)) { last = i; n++; }
+            out("  before the re-key: %d ticks, the last at frame %d (%d)\n", n, last, last >= 0 ? CL(last) : 0);
+        }
+        {
+            int r1 = __sceSasSetKeyOff(core, 0), r2 = __sceSasSetKeyOn(core, 0);
+            out("  KeyOff %08X KeyOn %08X\n", (w32)r1, (w32)r2);
+        }
+        render(1, 0);
+        log_ticks("L", 0, 0, 256, 8);
+    }
+    step("noise: freq 48, after 1 core SetNoise(48) again, then KeyOff+KeyOn: ticks of the next core");
+    fresh();
+    noise_voice(0, 48, 0x1000, 0x1000);
+    keyon(0);
+    render(1, 0);
+    out("  SetNoise %08X", (w32)__sceSasSetNoise(core, 0, 48));
+    out(" KeyOff %08X", (w32)__sceSasSetKeyOff(core, 0));
+    out(" KeyOn %08X\n", (w32)__sceSasSetKeyOn(core, 0));
+    render(1, 0);
+    log_ticks("L", 0, 0, 256, 8);
+    step("noise: freq 48, after 1 core SetNoise(63) with no key-on: ticks of the next 2 cores");
+    fresh();
+    noise_voice(0, 48, 0x1000, 0x1000);
+    keyon(0);
+    render(1, 0);
+    out("  SetNoise %08X\n", (w32)__sceSasSetNoise(core, 0, 63));
+    render(2, 0);
+    log_ticks("L", 0, 0, 512, 12);
+    step("noise: freq 48, keyed off with an instant release after 1 core, 1 core off, then KeyOn: ticks of the next core");
+    fresh();
+    noise_voice(0, 48, 0x1000, 0x1000);
+    env(0, 0, FULL, 1, 0, 1, 0, 1, FULL, TOP);
+    keyon(0);
+    render(1, 0);
+    out("  KeyOff %08X", (w32)__sceSasSetKeyOff(core, 0));
+    render(1, 0);
+    out(" end flag %08X", g_ef[0]);
+    out(" KeyOn %08X\n", (w32)__sceSasSetKeyOn(core, 0));
+    render(1, 0);
+    log_ticks("L", 0, 0, 256, 8);
+
+    /* v3: one generator per voice, or one shared (as one clock, or one
+     * register)? v0 is heard only on the left, v1 only on the right. */
+    step("noise: v0 freq 48 (left only) and v1 freq 48 (right only) keyed on together, 2 cores");
+    fresh();
+    noise_voice(0, 48, 0x1000, 0);
+    noise_voice(1, 48, 0, 0x1000);
+    keyon(0);
+    keyon(1);
+    render(2, -1);
+    log_ticks("L", 0, 0, 512, 8);
+    log_ticks("R", 1, 0, 512, 8);
+    out("  frames with L != R: %d\n", lr_diff());
+    step("noise: v0 freq 48 (left only) and v1 freq 63 (right only) keyed on together, 2 cores");
+    fresh();
+    noise_voice(0, 48, 0x1000, 0);
+    noise_voice(1, 63, 0, 0x1000);
+    keyon(0);
+    keyon(1);
+    render(2, -1);
+    log_ticks("L", 0, 0, 512, 8);
+    log_ticks("R", 1, 0, 512, 12);
+    step("noise: v0 freq 48 (left only) keyed on, v1 freq 48 (right only) keyed on a core later; the 2 cores after that");
+    fresh();
+    noise_voice(0, 48, 0x1000, 0);
+    noise_voice(1, 48, 0, 0x1000);
+    keyon(0);
+    core_raw();
+    keyon(1);
+    render(2, -1);
+    log_ticks("L", 0, 0, 512, 8);
+    log_ticks("R", 1, 0, 512, 8);
 }
 
 /* ============================================================================
@@ -1724,6 +2009,41 @@ static void sec_outmode(void) {
     keyon(0);
     render(2, -1);
     out("  L[100] %d R[100] %d\n", CL(100), CR(100));
+
+    /* v3. Step 49: SetVolume takes 0x80000000 in all four places. What is
+     * kept (voice 0's volume words, +20 and +24 by the layout section) and
+     * what is heard, dry and send? */
+    step("outmode: SetVolume(0x80000000, 0x1000, 0x80000000, 0x1000) on a constant 1000 in mode 1: the volume words and the four blocks at [100]");
+    fresh();
+    fill_const(PCM(2), PCM_N, 1000);
+    {
+        int r = __sceSasSetOutputmode(core, 1);
+        out("  SetOutputmode %08X", (w32)r);
+        if (r == 0) g_mode = 1;
+    }
+    pcm_voice(0, PCM(2), 256, 0);
+    out(" SetVolume %08X", (w32)__sceSasSetVolume(core, 0, (int)0x80000000, 0x1000, (int)0x80000000, 0x1000));
+    out(" words +20 %08X +24 %08X\n", rd(0x20), rd(0x24));
+    env_flat(0);
+    keyon(0);
+    render(2, 0);
+    if (g_mode == 1) {
+        const int w = grain_words();
+        for (int b = 0; b < 4; b++) out("  block %d: [100] %d\n", b, g_cap[w + b * 256 + 100]);
+    }
+    __sceSasSetOutputmode(core, 0);
+    g_mode = 0;
+    step("outmode: SetVolume(0x80000000, 0x1000, 0, 0) on constants 1000 and -1000 in mode 0: L and R");
+    for (int k = 0; k < 2; k++) {
+        fresh();
+        fill_const(PCM(2), PCM_N, k ? -1000 : 1000);
+        pcm_voice(0, PCM(2), 256, 0);
+        int r = __sceSasSetVolume(core, 0, (int)0x80000000, 0x1000, 0, 0);
+        env_flat(0);
+        keyon(0);
+        render(2, -1);
+        out("  %d: SetVolume %08X, L[100] %d R[100] %d L[300] %d\n", k ? -1000 : 1000, (w32)r, CL(100), CR(100), CL(300));
+    }
 }
 
 /* ============================================================================
@@ -1783,6 +2103,37 @@ static void sec_mix(void) {
         }
         out("  SetOutputmode(1) %08X, CoreWithMix %08X, %d shorts changed\n", (w32)r1, (w32)r, changed);
         __sceSasSetOutputmode(core, 0);
+    }
+
+    /* v3. A refused CoreWithMix leaves the buffer alone (step 207); does it
+     * still move the voices on? RAMP[i] = 4*(i+1), so L/4 - 1 is the sample
+     * index, and a skipped core shows as a jump of 256. */
+    step("mix: a RAMP voice, one core, CoreWithMix(0x1001, 0x1000) refused, one core: did the refused call advance the voice?");
+    fresh();
+    pcm_voice(0, RAMP, RAMP_N, -1);
+    env_flat(0);
+    keyon(0);
+    core_raw();
+    {
+        const int last = g_out[2 * 255];
+        int r = mix_call(0x1001, 0x1000, 0, 0);
+        core_raw();
+        out("  last L before %d, CoreWithMix %08X, first L after %d\n", last, (w32)r, g_out[0]);
+    }
+    step("mix: the same with the CoreWithMix refused by output mode 1 (mode 0 again for the next core)");
+    fresh();
+    pcm_voice(0, RAMP, RAMP_N, -1);
+    env_flat(0);
+    keyon(0);
+    core_raw();
+    {
+        const int last = g_out[2 * 255];
+        int r1 = __sceSasSetOutputmode(core, 1);
+        int r = mix_call(0x1000, 0x1000, 0, 0);
+        int r2 = __sceSasSetOutputmode(core, 0);
+        core_raw();
+        out("  last L before %d, SetOutputmode(1) %08X, CoreWithMix %08X, SetOutputmode(0) %08X, first L after %d\n",
+            last, (w32)r1, (w32)r, (w32)r2, g_out[0]);
     }
 }
 
@@ -1858,6 +2209,29 @@ static void sec_endflag(void) {
  * pause
  * ==========================================================================*/
 
+/* `cores` cores of voice 0 into g_cap, paused before core `pause_at` and
+ * resumed before core `resume_at`; heights, end and pause flags logged. */
+static void pause_run(int cores, int pause_at, int resume_at) {
+    const int w = grain_words();
+    w32 pf[MAXG];
+    if (cores > MAXG) cores = MAXG;
+    for (int i = 0; i < cores; i++) {
+        if (i == pause_at) out("  SetPause(1,1) %08X\n", (w32)__sceSasSetPause(core, 1, 1));
+        if (i == resume_at) out("  SetPause(1,0) %08X\n", (w32)__sceSasSetPause(core, 1, 0));
+        core_raw();
+        memcpy(g_cap + i * w, g_out, w * 2);
+        g_ef[i] = (w32)__sceSasGetEndFlag(core);
+        g_h[i] = (w32)__sceSasGetEnvelopeHeight(core, 0);
+        pf[i] = (w32)__sceSasGetPauseFlag(core);
+    }
+    g_capn = cores * w;
+    log_heights(cores);
+    log_end(0, cores);
+    out("  pause flags:");
+    for (int i = 0; i < cores; i++) out(" %08X", pf[i]);
+    out("\n");
+}
+
 static void sec_pause(void) {
     section("pause");
     fresh();
@@ -1926,6 +2300,36 @@ static void sec_pause(void) {
     out(" Init %08X", (w32)__sceSasInit(core, 256, 32, 0, 44100));
     out(" flag %08X\n", (w32)__sceSasGetPauseFlag(core));
     __sceSasSetPause(core, 0xFFFFFFFFu, 0);
+
+    /* v3. Step 218's paused core fades 196, 123, 77, ... to 0, about x0.627
+     * a frame, from the sample due next; no simple law fits so few values.
+     * At full scale the fade has some 23 frames to show its law; the right
+     * side at half volume shows whether it comes before or after the
+     * volume, a negative constant how it rounds, and a pause at another
+     * core on an interpolated ramp that it starts from the sample due. */
+    for (int k = 0; k < 2; k++) {
+        const int c = k ? -32768 : 32767;
+        step("pause: constant %d at volumes 1000/800 (flat envelope), paused before core 1, resumed before core 3, 4 cores", c);
+        fresh();
+        fill_const(PCM(1), PCM_N, c);
+        pcm_voice(0, PCM(1), 256, 0);
+        __sceSasSetVolume(core, 0, 0x1000, 0x800, 0, 0);
+        env_flat(0);
+        keyon(0);
+        pause_run(4, 1, 3);
+        log_ch(0, 252, 36);
+        log_ch(1, 252, 36);
+        log_ch(0, 766, 6);
+    }
+    step("pause: RAMP at pitch 0x800 (flat envelope), paused before core 2, resumed before core 3, 4 cores");
+    fresh();
+    pcm_voice(0, RAMP, RAMP_N, -1);
+    env_flat(0);
+    __sceSasSetPitch(core, 0, 0x800);
+    keyon(0);
+    pause_run(4, 2, 3);
+    log_ch(0, 508, 28);
+    log_ch(0, 766, 6);
 }
 
 /* ============================================================================
@@ -1963,6 +2367,81 @@ static void sec_heights(void) {
 /* ============================================================================
  * reverb (sascore.c:917-919 accepts every call)
  * ==========================================================================*/
+
+/* v3: voice 0 keyed on to play `nf` frames of 32767 from frame `f0`, a
+ * one-shot whose sample i is frame 32 + i (the one at frame 32 is heard at
+ * height 0, the last is never heard), at dry volume `dry` and sends `send`
+ * on both sides, flat envelope. */
+static void pulse_voice(int f0, int nf, int dry, int send) {
+    memset(g_pcmmem[1], 0, sizeof g_pcmmem[1]);
+    for (int j = 0; j < nf; j++) PCM(1)[f0 - 32 + j] = 32767;
+    pcm_voice(0, PCM(1), f0 - 32 + nf + 1, -1);
+    int r = __sceSasSetVolume(core, 0, dry, dry, send, send);
+    if (r) out("  (SetVolume %08X)\n", (w32)r);
+    env_flat(0);
+    keyon(0);
+}
+
+/* v3: the wet signal alone, after fresh(). Effect `type` with RevParam
+ * (delay, fb), EVOL 0x1000 both sides, VON(1, 1). Voice 0 plays the pulse
+ * (pulse_voice) with dry volumes 0 and sends 0x1000. Two cores before the
+ * key-on show whether an earlier
+ * effect left anything sounding; if so, cores run until one is silent (at
+ * most 400). Then `cores` cores: the even frames go to g_cap as L,R pairs
+ * and to `file`, and the odd frames that were not silent are counted. */
+static void rev_capture(int type, int delay, int fb, int f0, int nf, int cores, const char *file) {
+    int odd = 0, fl = -1, fr = -1, vl = 0, vr = 0, pl = 0, pr = 0, pla = -1, pra = -1;
+    out("  RevType %08X", (w32)__sceSasRevType(core, type));
+    out(" RevParam %08X", (w32)__sceSasRevParam(core, delay, fb));
+    out(" RevEVOL %08X", (w32)__sceSasRevEVOL(core, 0x1000, 0x1000));
+    out(" RevVON %08X\n", (w32)__sceSasRevVON(core, 1, 1));
+    {
+        int nz = 0, more = 0;
+        for (int c = 0; c < 2; c++) {
+            core_raw();
+            for (int i = 0; i < 2 * g_grain; i++) if (g_out[i]) nz++;
+        }
+        if (nz) {
+            for (more = 1; more <= 400; more++) {
+                int any = 0;
+                core_raw();
+                for (int i = 0; i < 2 * g_grain; i++) if (g_out[i]) { any = 1; break; }
+                if (!any) break;
+            }
+        }
+        out("  before the key-on: %d samples not silent in 2 cores", nz);
+        if (nz) out(", silent after %d more", more);
+        out("\n");
+    }
+    pulse_voice(f0, nf, 0, 0x1000);
+    if (cores * 256 > CAP_SHORTS) cores = CAP_SHORTS / 256;
+    for (int c = 0; c < cores; c++) {
+        int r = core_raw();
+        if (r) out("  core %d = %08X\n", c, (w32)r);
+        for (int i = 0; i < 256; i++) {
+            const int f = c * 256 + i, l = g_out[2 * i], rr = g_out[2 * i + 1];
+            if (f & 1) { if (l || rr) odd++; continue; }
+            g_cap[f] = (short)l;       /* pair f/2 */
+            g_cap[f + 1] = (short)rr;
+            if (l && fl < 0) { fl = f; vl = l; }
+            if (rr && fr < 0) { fr = f; vr = rr; }
+            if ((l < 0 ? -l : l) > pl) { pl = l < 0 ? -l : l; pla = f; }
+            if ((rr < 0 ? -rr : rr) > pr) { pr = rr < 0 ? -rr : rr; pra = f; }
+        }
+    }
+    g_capn = cores * 256;
+    out("  odd frames not silent %d; first L at %d (%d), first R at %d (%d); peak |L| %d at %d, |R| %d at %d\n",
+        odd, fl, vl, fr, vr, pl, pla, pr, pra);
+    for (int ch = 0; ch < 2; ch++) {
+        int n = 0;
+        out("  first %c:", ch ? 'R' : 'L');
+        for (int k = 0; k < g_capn / 2 && n < 8; k++)
+            if (g_cap[2 * k + ch]) { out(" %d:%d", 2 * k, g_cap[2 * k + ch]); n++; }
+        out("\n");
+    }
+    log_sum();
+    if (file) save(file);
+}
 
 static void sec_reverb(void) {
     section("reverb");
@@ -2012,6 +2491,55 @@ static void sec_reverb(void) {
     __sceSasRevType(core, -1);
     __sceSasRevEVOL(core, 0, 0);
     __sceSasRevVON(core, 0, 0);
+
+    /* v3. Step 225 refused (128, 128) as a delay: is feedback 128 allowed
+     * on its own, and where does the delay stop? */
+    step("reverb: RevParam feedback 128 alone, and delay 127 and 128 alone");
+    fresh();
+    {
+        static const int ps[][2] = { { 0, 128 }, { 127, 128 }, { 0, 127 }, { 127, 0 }, { 128, 0 }, { 127, 127 } };
+        for (unsigned i = 0; i < sizeof ps / sizeof ps[0]; i++)
+            out("  (%d, %d): %08X\n", ps[i][0], ps[i][1], (w32)__sceSasRevParam(core, ps[i][0], ps[i][1]));
+    }
+
+    /* v3: the impulse response of every effect type, for fitting the wet
+     * signal. The hall burst (step 228) showed a half-rate engine: flat
+     * echoes with sharp edges and only even frames sounding, so a one-frame
+     * impulse could fall between the frames the engine takes in. Each type
+     * therefore gets a pulse two frames long (one sample at half rate), and
+     * the hall is also given one-frame impulses on an odd and an even frame
+     * to show how the input is taken. Echo is repeated with another delay
+     * and with no feedback, for what the two parameters do. */
+    step("reverb: the 2-frame pulse itself, dry at 0x1000 and no effect: L and R from frame 30");
+    fresh();
+    pulse_voice(33, 2, 0x1000, 0);
+    render(1, 0);
+    log_ch(0, 30, 8);
+    log_ch(1, 30, 8);
+    {
+        static const char *const rt[9] = { "room", "small", "medium", "large", "hall", "space", "echo", "delay", "pipe" };
+        char name[32];
+        for (int t = 0; t < 9; t++) {
+            step("reverb: type %d (%s), RevParam(16, 64): a 2-frame pulse of 32767 at L[33..34], sends only, 64 cores, even frames saved", t, rt[t]);
+            fresh();
+            sprintf(name, "rev_imp_t%d.bin", t);
+            rev_capture(t, 16, 64, 33, 2, 64, name);
+        }
+    }
+    step("reverb: type 6 (echo), RevParam(8, 64): the same pulse, 64 cores, even frames saved");
+    fresh();
+    rev_capture(6, 8, 64, 33, 2, 64, "rev_imp_t6_d8.bin");
+    step("reverb: type 6 (echo), RevParam(16, 0): the same pulse, 64 cores, even frames saved");
+    fresh();
+    rev_capture(6, 16, 0, 33, 2, 64, "rev_imp_t6_fb0.bin");
+    for (int k = 0; k < 2; k++) {
+        step("reverb: type 4 (hall), RevParam(16, 64): one frame of 32767 at L[%d] (%s), 16 cores, not saved", 33 + k, k ? "even" : "odd");
+        fresh();
+        rev_capture(4, 16, 64, 33 + k, 1, 16, NULL);
+    }
+    __sceSasRevType(core, -1);
+    __sceSasRevEVOL(core, 0, 0);
+    __sceSasRevVON(core, 0, 0);
 }
 
 /* ============================================================================
@@ -2040,6 +2568,35 @@ static void sec_waves(void) {
         log_sum();
         log_ch(0, 30, 24);
         save(k ? "wave_tri50.bin" : "wave_steep50.bin");
+    }
+
+    /* v3. Duty 50 at pitch 441 is exact in run 1's model; the other duties
+     * were never heard. Then duty 50 and 25 at other pitches: 150 (a 294-
+     * frame period, finer steps through the shape) and 1000 (a period that
+     * is not a whole number of frames), which also shows whether the
+     * triangle's odd last-quarter offset depends on the pitch. */
+    {
+        static const struct { int duty, pitch; } wc[] = {
+            { 0, 441 }, { 25, 441 }, { 75, 441 }, { 100, 441 },
+            { 50, 1000 }, { 50, 150 }, { 25, 150 } };
+        char name[40];
+        for (int k = 0; k < 2; k++)
+            for (unsigned i = 0; i < sizeof wc / sizeof wc[0]; i++) {
+                const int d = wc[i].duty, p = wc[i].pitch;
+                step("waves: %s wave %d, pitch %d, flat envelope, 2 cores", k ? "triangular" : "steep", d, p);
+                fresh();
+                pcm_voice(0, PCM(0), 256, 0);
+                out("  Set %08X", (w32)(k ? __sceSasSetTriangularWave(core, 0, d) : __sceSasSetSteepWave(core, 0, d)));
+                out(" SetPitch %08X\n", (w32)__sceSasSetPitch(core, 0, p));
+                env_flat(0);
+                keyon(0);
+                render(2, 0);
+                log_sum();
+                log_ch(0, 30, 24);
+                if (p == 441) sprintf(name, "wave_%s%02d.bin", k ? "tri" : "steep", d);
+                else          sprintf(name, "wave_%s%02d_p%d.bin", k ? "tri" : "steep", d, p);
+                save(name);
+            }
     }
 }
 
