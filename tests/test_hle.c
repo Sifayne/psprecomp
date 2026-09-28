@@ -574,6 +574,25 @@ static void test_thread_rules(void) {
         CHECK(r == bad[i].want, "create(prio %X, size %X, attr %X) = %08X, expected %08X",
               bad[i].prio, bad[i].size, bad[i].attr, r, bad[i].want);
     }
+    /* Which check wins (step 9): a kernel entry, then attr, priority, stack
+     * size, and the NULL name last. */
+    struct { uint32_t name, entry, prio, size, attr, want; } order[] = {
+        { 0, ENTRY, 0x00, 0x1000, 0, SCE_KERNEL_ERROR_ILLEGAL_PRIORITY },
+        { 0, ENTRY, 0x20, 0x100,  0, SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE },
+        { 0, ENTRY, 0x20, 0x1000, 0x100, SCE_KERNEL_ERROR_ILLEGAL_ATTR },
+        { 1, ENTRY, 0x00, 0x100,  0, SCE_KERNEL_ERROR_ILLEGAL_PRIORITY },
+        { 1, ENTRY, 0x00, 0x1000, 0x100, SCE_KERNEL_ERROR_ILLEGAL_ATTR },
+        { 1, ENTRY, 0x20, 0x100,  0x100, SCE_KERNEL_ERROR_ILLEGAL_ATTR },
+        { 1, 0x88000000u, 0x20, 0x1000, 0, 0x800200D3u },
+        { 1, 0x88000000u, 0x00, 0x1000, 0, 0x800200D3u },
+        { 0, 0x88000000u, 0x20, 0x1000, 0, 0x800200D3u },
+    };
+    for (unsigned i = 0; i < sizeof order / sizeof *order; i++) {
+        const uint32_t r = call5(CREATE, order[i].name ? guest_name("bad") : 0,
+                                 order[i].entry, order[i].prio, order[i].size, order[i].attr);
+        CHECK(r == order[i].want, "create #%u = %08X, expected %08X", i, r, order[i].want);
+    }
+
     const uint32_t ok = call5(CREATE, guest_name("ok"), ENTRY, 0x08, 0x201,
                               0x80804001u);
     CHECK((int32_t)ok > 0, "create(8, 0x201, 0x80804001) = %08X", ok);

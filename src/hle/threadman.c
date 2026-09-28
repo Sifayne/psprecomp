@@ -336,16 +336,22 @@ static void release_stack(psp_thread *t) {
  *     wrapping, so -1 and 0x7FFFFFFF are refused as NO_MEMORY by the
  *     allocator. This used to raise anything smaller to 0x200 instead;
  *   - the attribute, above.
- * The order when several are wrong at once is unmeasured; this checks them in
- * the order the probe did. A NULL entry and a duplicate name are accepted
- * (steps 4 and 6); a NULL name is 80020001 (step 150), as it is for the other
- * create calls. */
+ * A NULL entry and a duplicate name are accepted (steps 4 and 6); a NULL name
+ * is 80020001 (step 150), as it is for the other create calls.
+ *
+ * When several are wrong at once, threadprobe step 9 (fw 6.60) gives the
+ * order: an entry in kernel space first (0x88000000 is 800200D3, and beats a
+ * bad priority and a NULL name), then the attribute (it beats priority and
+ * stack size), then priority (it beats stack size), then stack size, and the
+ * NULL name last (it loses to each of the three). Entry against attribute is
+ * unmeasured. This used to check the name first and the attribute last. */
 static void hle_CreateThread(void) {
     const uint32_t prio = psp_arg(2), size = psp_arg(3), attr = psp_arg(4);
-    if (!psp_arg(0)) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    if (psp_arg(1) & 0x80000000u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
+    if (attr & PSP_THREAD_ATTR_REFUSED) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
     if (prio < 0x08u || prio > 0x77u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY); return; }
     if (size < 0x200u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE); return; }
-    if (attr & PSP_THREAD_ATTR_REFUSED) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+    if (!psp_arg(0)) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
     const uint64_t rounded = ((uint64_t)size + 0xFFu) & ~(uint64_t)0xFFu;
     if (rounded > 0xFFFFFFFFu) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
@@ -566,8 +572,8 @@ static void hle_ExitThread(void) {
     /* A negative status is not kept: threadprobe step 43 (fw 6.60) exits with
      * -5 and reads 800200D2 back from both WaitThreadEnd and
      * GetThreadExitStatus (ILLEGAL_ARGUMENT in PSPSDK's naming; see hle.h).
-     * Whether a negative value *returned* from the entry is treated the same
-     * is unmeasured, so that path keeps it. */
+     * A negative value returned from the entry is treated the same way
+     * (on_thread_end). */
     uint32_t status = psp_arg(0);
     if ((int32_t)status < 0) status = SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
 
@@ -779,9 +785,14 @@ static void drop_ender(psp_thread *t, uint32_t w) {
         if (t->enders[i] == w) t->enders[i] = NO_ENDER;
 }
 
+/* An entry that returns ends the thread with its $v0, and a negative one is
+ * not kept, as with ExitThread: threadprobe step 54 (fw 6.60) returns -5 and
+ * 0x80020001 and reads 800200D2 for both from WaitThreadEnd,
+ * GetThreadExitStatus and the refer. This path kept the value as it was. */
 static void on_thread_end(uint32_t uid, uint32_t status) {
     psp_thread *t = find_thread(uid);
     if (!t) return;
+    if ((int32_t)status < 0) status = SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
     thread_ended(t, status);
 }
 
