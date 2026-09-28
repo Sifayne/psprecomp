@@ -33,7 +33,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 2
+#define PROBE_VERSION 3
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -68,6 +68,10 @@ static void *gumem(const void *src, int size) {
 
 /* ---- scene framing ------------------------------------------------------- */
 
+/* Set while a scene is built from several lists: scene_begin then leaves the
+ * buffers as the previous list left them. */
+static int g_keep;
+
 static void scene_begin(int psm, w32 clear) {
     sceGuStart(GU_DIRECT, g_list);
     sceGuDrawBuffer(psm, (void *)0, FB_W);
@@ -98,7 +102,8 @@ static void scene_begin(int psm, w32 clear) {
     sceGuClearColor(clear);
     sceGuClearDepth(0);
     sceGuClearStencil(0);
-    sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT | GU_STENCIL_BUFFER_BIT);
+    if (!g_keep)
+        sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT | GU_STENCIL_BUFFER_BIT);
 
     sceGumMatrixMode(GU_PROJECTION);
     sceGumLoadIdentity();
@@ -124,9 +129,29 @@ static const short SAMPLES[][2] = {
 };
 #define NSAMPLES ((int)(sizeof SAMPLES / sizeof SAMPLES[0]))
 
+/* Wait for the GE to finish the list, for at most a second. geprobe 2's
+ * bounding-box scene never came back on firmware 6.60 (the log stops in it),
+ * so a list that is still running after a second is broken off with
+ * sceGeBreak(1), which resets the queue, and the probe says so and carries on.
+ * Returns what the GE answered: sceGeDrawSync(0) once idle, or the break's
+ * result with bit 31 clear and 0x10000000 set when it had to break. */
+static int ge_wait(void) {
+    for (int ms = 0; ms < 1000; ms++) {
+        if (sceGeDrawSync(1) == PSP_GE_LIST_DONE)
+            return sceGeDrawSync(0);
+        sceKernelDelayThread(1000);
+    }
+    int peek = sceGeDrawSync(1);
+    int b = sceGeBreak(1, NULL);
+    out("  GE still busy after 1 s: sceGeDrawSync(peek) = %08X; sceGeBreak(1) %s\n",
+        (unsigned)peek, b >= 0 ? "ok" : "error");
+    if (b < 0) ret(b);
+    return 0x10000000 | (b & 0x0FFFFFFF);
+}
+
 static void scene_end(const char *name, int psm, int dump_depth) {
     sceGuFinish();
-    int r = sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+    int r = ge_wait();
     const int bpp = (psm == GU_PSM_8888) ? 4 : 2;
     const unsigned char *vram = (const unsigned char *)VRAM_UNCACHED;
     for (int y = 0; y < SCR_H; y++)
@@ -262,7 +287,7 @@ static void geometry_2d(void) {
 }
 
 static void scene_geometry(int psm, const char *name) {
-    step("scene %02d: %s", g_scene, name);
+    if (step("scene %02d: %s", g_scene, name)) return;
     scene_begin(psm, 0xFF201008);
     geometry_2d();
     scene_end(name, psm, 0);
@@ -289,7 +314,7 @@ static void dither_body(void) {
 }
 
 static void scene_dither(int psm, const char *name, const ScePspIMatrix4 *m, int on) {
-    step("scene %02d: %s", g_scene, name);
+    if (step("scene %02d: %s", g_scene, name)) return;
     scene_begin(psm, 0x00000000);
     if (m) sceGuSetDither(m);
     if (on) sceGuEnable(GU_DITHER); else sceGuDisable(GU_DITHER);
@@ -300,7 +325,7 @@ static void scene_dither(int psm, const char *name, const ScePspIMatrix4 *m, int
 /* Blending: bars of a source colour over a background gradient, one bar per
  * equation and factor pair. */
 static void scene_blend(void) {
-    step("scene %02d: blend", g_scene);
+    if (step("scene %02d: blend", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
     grad2d(0, 0, 480, 272, 0x20FF4000, 0xE00040FF);
     sceGuEnable(GU_BLEND);
@@ -332,7 +357,7 @@ static void scene_blend(void) {
 /* Texture filtering: a 16x16 texture magnified with nearest and linear, at
  * whole and half-texel offsets, and minified. */
 static void scene_filter(void) {
-    step("scene %02d: texture filtering", g_scene);
+    if (step("scene %02d: texture filtering", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
     tex8888(GU_NEAREST, GU_NEAREST);
     tsprite(8, 8, 136, 136, 0, 0, 16, 16, 0xFFFFFFFF);
@@ -354,7 +379,7 @@ static void scene_filter(void) {
 /* Texture functions, with and without texture alpha, a vertex colour, the
  * environment colour, and colour doubling (bit 16 of TFUNC, command 0xC9). */
 static void scene_texfunc(void) {
-    step("scene %02d: texture functions", g_scene);
+    if (step("scene %02d: texture functions", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF303030);
     tex8888(GU_NEAREST, GU_NEAREST);
     sceGuEnable(GU_BLEND);
@@ -374,7 +399,7 @@ static void scene_texfunc(void) {
 /* CLUT textures: T8 through an 8888 and a 5650 palette, with shift, mask and
  * start offset. */
 static void scene_clut(void) {
-    step("scene %02d: CLUT", g_scene);
+    if (step("scene %02d: CLUT", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
     sceGuEnable(GU_TEXTURE_2D);
     sceGuTexMode(GU_PSM_T8, 0, 0, 0);
@@ -405,7 +430,7 @@ static void quad3d(float x0, float y0, float x1, float y1, float z, w32 c0, w32 
 
 /* Fog: quads at stepped depths, one fog range, and a slanted floor. */
 static void scene_fog(void) {
-    step("scene %02d: fog", g_scene);
+    if (step("scene %02d: fog", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
     sceGuEnable(GU_FOG);
     sceGuFog(2.0f, 20.0f, 0x00FF8040);
@@ -443,7 +468,7 @@ static void lit_fan(float cx, float cy, float z) {
 }
 
 static void scene_light(void) {
-    step("scene %02d: lighting", g_scene);
+    if (step("scene %02d: lighting", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
     sceGuEnable(GU_LIGHTING);
     sceGuAmbient(0xFF202020);
@@ -493,7 +518,7 @@ static void scene_light(void) {
 /* Depth: interpenetrating triangles, each depth function, and the depth
  * buffer itself. */
 static void scene_depth(void) {
-    step("scene %02d: depth", g_scene);
+    if (step("scene %02d: depth", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
     sceGuEnable(GU_DEPTH_TEST);
     sceGuDepthMask(GU_FALSE);                 /* writes on */
@@ -521,7 +546,7 @@ static void scene_depth(void) {
 /* Clipping: triangles crossing the near plane, the screen edges and far past
  * them, with and without clip planes enabled. */
 static void scene_clip(void) {
-    step("scene %02d: clipping", g_scene);
+    if (step("scene %02d: clipping", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF101010);
     for (int cp = 0; cp < 2; cp++) {
         if (cp) sceGuEnable(GU_CLIP_PLANES); else sceGuDisable(GU_CLIP_PLANES);
@@ -541,7 +566,7 @@ static void scene_clip(void) {
 
 /* Alpha test, colour test, stencil, logic ops and the pixel mask. */
 static void scene_tests(void) {
-    step("scene %02d: alpha/colour/stencil/logic/mask", g_scene);
+    if (step("scene %02d: alpha/colour/stencil/logic/mask", g_scene)) return;
     scene_begin(GU_PSM_8888, 0x80402010);
     sceGuEnable(GU_ALPHA_TEST);
     sceGuAlphaFunc(GU_GREATER, 0x80, 0xFF);
@@ -587,7 +612,7 @@ static void scene_tests(void) {
 
 /* Skinning: two bone matrices, vertices weighted between them. */
 static void scene_skin(void) {
-    step("scene %02d: skinning", g_scene);
+    if (step("scene %02d: skinning", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
     ScePspFMatrix4 b0, b1, b2;
     memset(&b0, 0, sizeof b0); memset(&b1, 0, sizeof b1); memset(&b2, 0, sizeof b2);
@@ -626,7 +651,7 @@ static void scene_skin(void) {
 
 /* Morphing: two vertex sets blended by the morph weights. */
 static void scene_morph(void) {
-    step("scene %02d: morph", g_scene);
+    if (step("scene %02d: morph", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
     static const float MW[][2] = { { 1, 0 }, { 0.5f, 0.5f }, { 0, 1 }, { 0.25f, 1.0f } };
     for (int i = 0; i < 4; i++) {
@@ -655,7 +680,7 @@ static void patch_grid(CV *v, int nu, int nv, float cx, float cy, float s) {
 }
 
 static void scene_bezier(void) {
-    step("scene %02d: Bezier patches", g_scene);
+    if (step("scene %02d: Bezier patches", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
     CV g[16];
     static const struct { int du, dv, prim; float cx, cy; } P[] = {
@@ -681,7 +706,7 @@ static void scene_bezier(void) {
 }
 
 static void scene_spline(void) {
-    step("scene %02d: spline patches", g_scene);
+    if (step("scene %02d: spline patches", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
     CV g[20];
     static const struct { int ue, ve; float cx, cy; } E[] = {
@@ -714,18 +739,40 @@ static void bbox_object(float cx, float cy, float cz, float h, int slot, w32 col
     sceGuEndObject();
 }
 
+/* One list per object, each its own step: geprobe 2 drew all eight in one
+ * list and firmware 6.60 never finished it, so this names the object. The
+ * marker's centre pixel says whether the GE drew it (the box was visible). */
 static void scene_bbox(void) {
-    step("scene %02d: bounding-box jumps", g_scene);
+    static const struct { float cx, cy, cz, h; w32 color; const char *what; } B[8] = {
+        { 0.0f,  0.0f,   -5.0f, 0.5f, 0xFFFFFFFF, "in view" },
+        { 20.0f, 0.0f,   -5.0f, 0.5f, 0xFF0000FF, "far right" },
+        { 0.0f,  0.0f,    5.0f, 0.5f, 0xFF00FF00, "behind the camera" },
+        { 3.2f,  0.0f,   -5.0f, 0.6f, 0xFFFF0000, "straddling the right edge" },
+        { 0.0f,  0.0f,   -1.0f, 0.4f, 0xFF00FFFF, "straddling the near plane" },
+        { 0.0f,  0.0f, -200.0f, 0.5f, 0xFFFF00FF, "beyond the far plane" },
+        { 0.0f,  30.0f,  -5.0f, 0.5f, 0xFFFFFF00, "far above" },
+        { 0.0f,  2.0f,   -5.0f, 0.3f, 0xFF808080, "just above the top edge" },
+    };
+    if (step("scene %02d: bounding-box jumps: clear", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
-    bbox_object(0.0f, 0.0f, -5.0f, 0.5f, 0, 0xFFFFFFFF);    /* in view */
-    bbox_object(20.0f, 0.0f, -5.0f, 0.5f, 1, 0xFF0000FF);   /* far right */
-    bbox_object(0.0f, 0.0f, 5.0f, 0.5f, 2, 0xFF00FF00);     /* behind the camera */
-    bbox_object(3.2f, 0.0f, -5.0f, 0.6f, 3, 0xFFFF0000);    /* straddles the right edge */
-    bbox_object(0.0f, 0.0f, -1.0f, 0.4f, 4, 0xFF00FFFF);    /* straddles the near plane */
-    bbox_object(0.0f, 0.0f, -200.0f, 0.5f, 5, 0xFFFF00FF);  /* beyond the far plane */
-    bbox_object(0.0f, 30.0f, -5.0f, 0.5f, 6, 0xFFFFFF00);   /* far above */
-    bbox_object(0.0f, 2.0f, -5.0f, 0.3f, 7, 0xFF808080);    /* just above the top edge */
-    scene_end("bbox", GU_PSM_8888, 0);
+    sceGuFinish();
+    out("  wait %08X\n", (unsigned)ge_wait());
+    g_keep = 1;
+    for (int i = 0; i < 8; i++) {
+        if (step("scene %02d: bounding box %d, %s", g_scene, i, B[i].what)) continue;
+        scene_begin(GU_PSM_8888, 0xFF000000);
+        bbox_object(B[i].cx, B[i].cy, B[i].cz, B[i].h, i, B[i].color);
+        sceGuFinish();
+        int r = ge_wait();
+        const w32 *px = (const w32 *)VRAM_UNCACHED + 241 * FB_W + 35 + i * 58;
+        out("  wait %08X; marker %s (pixel %08X)\n", (unsigned)r,
+            (*px & 0xFFFFFF) == (B[i].color & 0xFFFFFF) ? "drawn" : "not drawn", *px);
+    }
+    if (!step("scene %02d: bounding-box jumps: dump", g_scene)) {
+        scene_begin(GU_PSM_8888, 0xFF000000);
+        scene_end("bbox", GU_PSM_8888, 0);
+    }
+    g_keep = 0;
 }
 
 /* ---- GE callbacks --------------------------------------------------------
@@ -757,64 +804,67 @@ static void log_events(void) {
 static void section_callbacks(void) {
     section("GE callbacks");
 
-    step("libgu: signal CONTINUE 0x11, SUSPEND 0x22, then finish id 0x33");
-    g_nev = 0; g_phase = 0;
-    sceGuSetCallback(GU_CALLBACK_SIGNAL, gu_signal_cb);
-    sceGuSetCallback(GU_CALLBACK_FINISH, gu_finish_cb);
-    g_phase = 1;
-    sceGuStart(GU_DIRECT, g_list);
-    sceGuClearColor(0xFF000000);
-    sceGuClear(GU_COLOR_BUFFER_BIT);
-    sceGuSignal(GU_BEHAVIOR_CONTINUE, 0x11);
-    rect2d(0, 0, 32, 32, 0xFFFFFFFF);
-    sceGuSignal(GU_BEHAVIOR_SUSPEND, 0x22);
-    rect2d(32, 0, 64, 32, 0xFFFFFFFF);
-    g_phase = 2;
-    sceGuFinishId(0x33);
-    g_phase = 3;
-    int r = sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
-    g_phase = 4;
-    out("  sceGuSync = %08X\n", (unsigned)r);
-    sceKernelDelayThread(20000);
-    log_events();
-    sceGuSetCallback(GU_CALLBACK_SIGNAL, NULL);
-    sceGuSetCallback(GU_CALLBACK_FINISH, NULL);
+    int r;
+    if (!step("libgu: signal CONTINUE 0x11, SUSPEND 0x22, then finish id 0x33")) {
+        g_nev = 0; g_phase = 0;
+        sceGuSetCallback(GU_CALLBACK_SIGNAL, gu_signal_cb);
+        sceGuSetCallback(GU_CALLBACK_FINISH, gu_finish_cb);
+        g_phase = 1;
+        sceGuStart(GU_DIRECT, g_list);
+        sceGuClearColor(0xFF000000);
+        sceGuClear(GU_COLOR_BUFFER_BIT);
+        sceGuSignal(GU_BEHAVIOR_CONTINUE, 0x11);
+        rect2d(0, 0, 32, 32, 0xFFFFFFFF);
+        sceGuSignal(GU_BEHAVIOR_SUSPEND, 0x22);
+        rect2d(32, 0, 64, 32, 0xFFFFFFFF);
+        g_phase = 2;
+        sceGuFinishId(0x33);
+        g_phase = 3;
+        r = sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+        g_phase = 4;
+        out("  sceGuSync = %08X\n", (unsigned)r);
+        sceKernelDelayThread(20000);
+        log_events();
+        sceGuSetCallback(GU_CALLBACK_SIGNAL, NULL);
+        sceGuSetCallback(GU_CALLBACK_FINISH, NULL);
+    }
 
-    step("sceGe: SetCallback, a raw list with SIGNAL and FINISH, EnQueue, ListSync");
-    g_nev = 0; g_phase = 0;
-    PspGeCallbackData cb;
-    memset(&cb, 0, sizeof cb);
-    cb.signal_func = ge_signal_cb;
-    cb.signal_arg  = (void *)0x5A;
-    cb.finish_func = ge_finish_cb;
-    cb.finish_arg  = (void *)0xA5;
-    int cbid = sceGeSetCallback(&cb);
-    out("  sceGeSetCallback %s\n", cbid >= 0 ? "ok (id >= 0)" : "error");
-    if (cbid < 0) ret(cbid);
-    unsigned int *raw = (unsigned int *)((unsigned int)memalign(16, 64) | 0x40000000u);
-    int k = 0;
-    raw[k++] = 0x0E010044;     /* SIGNAL, behaviour 1 (suspend), id 0x0044 */
-    raw[k++] = 0x0C000000;     /* END */
-    raw[k++] = 0x0E020055;     /* SIGNAL, behaviour 2 (continue), id 0x0055 */
-    raw[k++] = 0x0C000000;     /* END */
-    raw[k++] = 0x0F000066;     /* FINISH 0x66 */
-    raw[k++] = 0x0C000000;     /* END */
-    raw[k++] = 0;
-    g_phase = 1;
-    int lid = sceGeListEnQueue(raw, NULL, cbid, NULL);
-    g_phase = 2;
-    out("  sceGeListEnQueue %s\n", lid >= 0 ? "ok (id >= 0)" : "error");
-    if (lid < 0) ret(lid);
-    int s = sceGeListSync(lid, 0);
-    g_phase = 3;
-    out("  sceGeListSync(wait) = %08X\n", (unsigned)s);
-    s = sceGeDrawSync(0);
-    out("  sceGeDrawSync(wait) = %08X\n", (unsigned)s);
-    sceKernelDelayThread(20000);
-    log_events();
-    s = sceGeListSync(lid, 1);
-    out("  sceGeListSync(peek) after = %08X\n", (unsigned)s);
-    if (cbid >= 0) { r = sceGeUnsetCallback(cbid); out("  sceGeUnsetCallback = %08X\n", (unsigned)r); }
+    if (!step("sceGe: SetCallback, a raw list with SIGNAL and FINISH, EnQueue, ListSync")) {
+        g_nev = 0; g_phase = 0;
+        PspGeCallbackData cb;
+        memset(&cb, 0, sizeof cb);
+        cb.signal_func = ge_signal_cb;
+        cb.signal_arg  = (void *)0x5A;
+        cb.finish_func = ge_finish_cb;
+        cb.finish_arg  = (void *)0xA5;
+        int cbid = sceGeSetCallback(&cb);
+        out("  sceGeSetCallback %s\n", cbid >= 0 ? "ok (id >= 0)" : "error");
+        if (cbid < 0) ret(cbid);
+        unsigned int *raw = (unsigned int *)((unsigned int)memalign(16, 64) | 0x40000000u);
+        int k = 0;
+        raw[k++] = 0x0E010044;     /* SIGNAL, behaviour 1 (suspend), id 0x0044 */
+        raw[k++] = 0x0C000000;     /* END */
+        raw[k++] = 0x0E020055;     /* SIGNAL, behaviour 2 (continue), id 0x0055 */
+        raw[k++] = 0x0C000000;     /* END */
+        raw[k++] = 0x0F000066;     /* FINISH 0x66 */
+        raw[k++] = 0x0C000000;     /* END */
+        raw[k++] = 0;
+        g_phase = 1;
+        int lid = sceGeListEnQueue(raw, NULL, cbid, NULL);
+        g_phase = 2;
+        out("  sceGeListEnQueue %s\n", lid >= 0 ? "ok (id >= 0)" : "error");
+        if (lid < 0) ret(lid);
+        int s = sceGeListSync(lid, 0);
+        g_phase = 3;
+        out("  sceGeListSync(wait) = %08X\n", (unsigned)s);
+        s = sceGeDrawSync(0);
+        out("  sceGeDrawSync(wait) = %08X\n", (unsigned)s);
+        sceKernelDelayThread(20000);
+        log_events();
+        s = sceGeListSync(lid, 1);
+        out("  sceGeListSync(peek) after = %08X\n", (unsigned)s);
+        if (cbid >= 0) { r = sceGeUnsetCallback(cbid); out("  sceGeUnsetCallback = %08X\n", (unsigned)r); }
+    }
 }
 
 /* ---- main ---------------------------------------------------------------- */
