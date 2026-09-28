@@ -1148,6 +1148,59 @@ static void test_display(void) {
           "vblank waits advance the frame counter (the bring-up heartbeat)");
 }
 
+/* A ScePspDateTime: six u16 and a u32 microsecond. */
+static void put_date(uint32_t at, int y, int mo, int d, int h, int mi, int s, uint32_t us) {
+    const int f[6] = { y, mo, d, h, mi, s };
+    for (int i = 0; i < 6; i++) psp_write16(at + 2u * (uint32_t)i, (uint16_t)f[i]);
+    psp_write32(at + 12, us);
+}
+
+/* The SysClock conversions and the sceRtc calendar, against what a 6.60 PSP
+ * answered (threadprobe steps 132-140). */
+static void test_time_calls(void) {
+    const uint32_t B = 0x08805000u;   /* scratch in user RAM */
+
+    CHECK(call(psp_nid("sceKernelUSec2SysClock"), 1234567, B, 0, 0) == 0 &&
+          psp_read32(B) == 0x0012D687u && psp_read32(B + 4) == 0, "USec2SysClock(1234567)");
+    psp_write32(B, 0x12345678u);
+    psp_write32(B + 4, 9);
+    call(psp_nid("sceKernelSysClock2USec"), B, B + 8, B + 12, 0);
+    CHECK(psp_read32(B + 8) == 0x9830 && psp_read32(B + 12) == 0x1EA78,
+          "SysClock2USec(0x9_12345678) = %X s %X us", psp_read32(B + 8), psp_read32(B + 12));
+
+    /* A tick is a microsecond since 0001-01-01. */
+    put_date(B, 2000, 1, 1, 0, 0, 0, 0);
+    CHECK(call(psp_nid("sceRtcGetTick"), B, B + 16, 0, 0) == 0, "GetTick");
+    CHECK(psp_read32(B + 16) == 0x3A63A000u && psp_read32(B + 20) == 0x00E01D00u,
+          "tick of 2000-01-01 = %08X_%08X", psp_read32(B + 20), psp_read32(B + 16));
+
+    const uint32_t DOW = psp_nid("sceRtcGetDayOfWeek");
+    CHECK(call(DOW, 2000, 1, 1, 0) == 6, "2000-01-01 is a Saturday");
+    CHECK(call(DOW, 2023, 2, 30, 0) == 4, "2023-02-30 runs on into March");
+    CHECK(call(DOW, 2023, 13, 1, 0) == 1, "month 13 carries into the year");
+    CHECK(call(psp_nid("sceRtcGetDaysInMonth"), 2023, 13, 0, 0) == 0x800001FFu, "month 13");
+    CHECK(call(psp_nid("sceRtcGetDaysInMonth"), 2000, 2, 0, 0) == 29, "February 2000");
+
+    put_date(B + 32, 2023, 2, 30, 0, 0, 0, 0);
+    CHECK(call(psp_nid("sceRtcCheckValid"), B + 32, 0, 0, 0) == (uint32_t)-3, "Feb 30 is a bad day");
+
+    /* Months clamp the day: 2000-01-31 + 1 month is 2000-02-29. */
+    put_date(B, 2000, 1, 31, 0, 0, 0, 0);
+    call(psp_nid("sceRtcGetTick"), B, B + 16, 0, 0);
+    CHECK(call(psp_nid("sceRtcTickAddMonths"), B + 24, B + 16, 1, 0) == 0, "TickAddMonths");
+    call(psp_nid("sceRtcSetTick"), B + 32, B + 24, 0, 0);
+    CHECK(psp_read16(B + 32) == 2000 && psp_read16(B + 34) == 2 && psp_read16(B + 36) == 29,
+          "Jan 31 + 1 month = %u-%u-%u", psp_read16(B + 32), psp_read16(B + 34),
+          psp_read16(B + 36));
+
+    put_date(B, 2000, 1, 1, 0, 0, 0, 0);
+    call(psp_nid("sceRtcGetTick"), B, B + 16, 0, 0);
+    call(psp_nid("sceRtcFormatRFC3339"), B + 64, B + 16, 540, 0);
+    char s[40];
+    CHECK(strcmp(psp_str(B + 64, s, sizeof s), "2000-01-01T09:00:00.00+09:00") == 0,
+          "RFC3339 at +540: \"%s\"", s);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -1176,6 +1229,7 @@ int main(void) {
     test_sas_hardware_rules();
     test_stdio_async();
     test_display();
+    test_time_calls();
 
     psp_mem_free();
 

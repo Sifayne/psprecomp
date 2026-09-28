@@ -1,7 +1,7 @@
 /* psprecomp — the smaller firmware libraries.
  *
  * Kernel_Library, UtilsForUser, StdioForUser, sceSuspendForUser,
- * LoadExecForUser, ModuleMgrForUser, sceCtrl, sceAudio and scePower.
+ * LoadExecForUser, ModuleMgrForUser, sceCtrl, sceRtc, sceAudio and scePower.
  * Individually small,
  * but collectively they are what a game's C runtime needs before main() gets
  * anywhere -- newlib's reentrancy setup alone wants interrupt masking, a
@@ -103,27 +103,56 @@ static void dmac_copy(void) {
 static void hle_DmacMemcpy(void)    { dmac_copy(); }
 static void hle_DmacTryMemcpy(void) { dmac_copy(); }
 
+/* ---- the wall clock --------------------------------------------------------
+ *
+ * A date at guest time 0, and the guest clock from there: every difference
+ * between two readings is guest time -- a 20ms DelayThread moves it 20ms, as
+ * on the PSP (threadprobe steps 133-134, fw 6.60), however long the host took.
+ * It used to be host time(NULL) per call, whole seconds, with LibcClock on the
+ * host's CPU clock, which does not move while a guest thread waits.
+ *
+ * The date is the host's, read once, only when the clock runs against wall
+ * time (psp_clock_realtime, clock.h). On the deterministic clock
+ * it is a fixed day, so a game that reads the date still makes the same calls
+ * on every run and the differential oracle's two sides agree; the sceRtc
+ * tick, which this now feeds, was deterministic before. */
+#define WALL_FIXED_UNIX 1767225600u   /* 2026-01-01 00:00:00 UTC */
+
+static uint64_t wall_us(void) {
+    static int have;
+    static uint64_t base;          /* microseconds since 1970 at guest time 0 */
+    if (!have) {
+        base = psp_clock_is_realtime()
+             ? (uint64_t)time(NULL) * 1000000u - psp_clock_peek()
+             : (uint64_t)WALL_FIXED_UNIX * 1000000u;
+        have = 1;
+    }
+    return base + psp_clock_peek();
+}
+
 static void hle_LibcTime(void) {
-    time_t t = time(NULL);
+    const uint32_t t = (uint32_t)(wall_us() / 1000000u);
     uint32_t out = psp_arg(0);
-    if (out) psp_write32(out, (uint32_t)t);
-    psp_ret((uint32_t)t);
+    if (out) psp_write32(out, t);
+    psp_ret(t);
 }
 
+/* Microseconds of guest time. threadprobe step 133 (fw 6.60): it advances at
+ * least 20000 across DelayThread(20000). */
 static void hle_LibcClock(void) {
-    /* Microseconds since start. A game that uses this for frame pacing needs
-     * it to advance, so it is derived from the host clock rather than being a
-     * constant -- a frozen clock makes a game either spin or run at infinite
-     * speed, both of which look like a hang. */
-    psp_ret((uint32_t)((uint64_t)clock() * 1000000ull / CLOCKS_PER_SEC));
+    psp_ret((uint32_t)psp_clock_peek());
 }
 
+/* threadprobe step 133 (fw 6.60) reads a microsecond part below 1000000 and
+ * not zero, which whole seconds never gave. Its seconds are NOT after 2001 on
+ * the PSP -- small or never written; which is for threadprobe 3 to say -- and
+ * stay the Unix time here until then. */
 static void hle_LibcGettimeofday(void) {
     uint32_t tv = psp_arg(0);
     if (tv) {
-        time_t t = time(NULL);
-        psp_write32(tv, (uint32_t)t);
-        psp_write32(tv + 4, 0);
+        const uint64_t us = wall_us();
+        psp_write32(tv, (uint32_t)(us / 1000000u));
+        psp_write32(tv + 4, (uint32_t)(us % 1000000u));
     }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -653,31 +682,256 @@ static void ctrl_fill(void) {
 static void hle_ReadBufferPositive(void) { ctrl_wait_sample(); ctrl_fill(); }
 static void hle_PeekBufferPositive(void) { ctrl_fill(); }
 
-/* ---- sceRtc, the two calls that are a clock ------------------------------
+/* ---- sceRtc ----------------------------------------------------------------
  *
- * Only the tick counter. The rest of sceRtc is calendar work -- converting
- * ticks to a pspTime, timezone arithmetic, day-of-week lookup -- and none of it
- * is here; rtc/arithmetic alone differs by more than a thousand lines. These
- * two are separable because they are not calendar at all, they are the clock
- * this runtime already keeps.
+ * A tick is a microsecond counted from 0001-01-01 00:00:00 UTC, proleptic
+ * Gregorian. threadprobe (fw 6.60) pins it: resolution 1000000 (step 134),
+ * GetTick of 2000-01-01 is 0x00E01D00_3A63A000, 730119 days of them (step
+ * 138), and a current tick is past 1970 (step 134). The tick counter used to
+ * start at module start; differences, which rtc/rtc and ctrl/ctrl measure,
+ * are unchanged, since the date is the wall clock above plus guest time.
  *
- * A tick is a microsecond, which the tests state rather than assert in a
- * header: rtc/rtc delays 2000us between two reads and checks the difference is
- * at least 2000, and ctrl/ctrl times five pad reads against a 5000us threshold.
- * Both are differences, so the epoch does not enter into it -- which is
- * fortunate, because ours is "since the module started" and a PSP's is not. */
+ * The calendar calls were not here at all (unimplemented, answering 0 and
+ * writing nothing). Each one below cites the step that measured it. */
+
+#define RTC_US_PER_DAY   86400000000ull
+/* Days from 0001-01-01 to 1970-01-01. */
+#define RTC_DAYS_TO_1970 719162
+
+/* A ScePspDateTime: six u16 (year, month, day, hour, minute, second) and a
+ * u32 microsecond -- 16 bytes. */
+typedef struct { int64_t year, month, day, hour, minute, second, us; } rtc_date;
+
+static rtc_date rtc_read_date(uint32_t at) {
+    rtc_date d;
+    d.year   = psp_read16(at + 0);  d.month  = psp_read16(at + 2);
+    d.day    = psp_read16(at + 4);  d.hour   = psp_read16(at + 6);
+    d.minute = psp_read16(at + 8);  d.second = psp_read16(at + 10);
+    d.us     = psp_read32(at + 12);
+    return d;
+}
+
+static void rtc_write_date(uint32_t at, const rtc_date *d) {
+    psp_write16(at + 0, (uint16_t)d->year);   psp_write16(at + 2, (uint16_t)d->month);
+    psp_write16(at + 4, (uint16_t)d->day);    psp_write16(at + 6, (uint16_t)d->hour);
+    psp_write16(at + 8, (uint16_t)d->minute); psp_write16(at + 10, (uint16_t)d->second);
+    psp_write32(at + 12, (uint32_t)d->us);
+}
+
+static int64_t floor_div(int64_t a, int64_t b) { return a / b - ((a % b != 0) && ((a < 0) != (b < 0))); }
+
+/* Days since 1970-01-01 of a civil date. A month outside 1..12 carries into
+ * the year and a day past the month's end runs on into the next, which is
+ * what GetDayOfWeek does with 2023-02-30 (a Thursday, 4) and 2023-13-01 (a
+ * Monday, 1) in step 136. */
+static int64_t rtc_days(int64_t y, int64_t m, int64_t d) {
+    y += floor_div(m - 1, 12);
+    m = m - 1 - floor_div(m - 1, 12) * 12 + 1;
+    y -= m <= 2;
+    const int64_t era = floor_div(y, 400);
+    const int64_t yoe = y - era * 400;
+    const int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+static void rtc_civil(int64_t z, int64_t *y, int64_t *m, int64_t *d) {
+    z += 719468;
+    const int64_t era = floor_div(z, 146097);
+    const int64_t doe = z - era * 146097;
+    const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const int64_t mp  = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    *m = mp < 10 ? mp + 3 : mp - 9;
+    *y = yoe + era * 400 + (*m <= 2);
+}
+
+static uint64_t rtc_tick_of(const rtc_date *t) {
+    const int64_t days = rtc_days(t->year, t->month, t->day) + RTC_DAYS_TO_1970;
+    return (uint64_t)days * RTC_US_PER_DAY +
+           (uint64_t)((t->hour * 3600 + t->minute * 60 + t->second) * 1000000 + t->us);
+}
+
+static rtc_date rtc_date_of(uint64_t tick) {
+    rtc_date t;
+    const uint64_t day = tick / RTC_US_PER_DAY, rest = tick % RTC_US_PER_DAY;
+    rtc_civil((int64_t)day - RTC_DAYS_TO_1970, &t.year, &t.month, &t.day);
+    t.hour   = (int64_t)(rest / 3600000000ull);
+    t.minute = (int64_t)(rest / 60000000ull % 60);
+    t.second = (int64_t)(rest / 1000000ull % 60);
+    t.us     = (int64_t)(rest % 1000000ull);
+    return t;
+}
+
+static int rtc_leap(int64_t y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+
+static int rtc_month_days(int64_t y, int64_t m) {
+    static const int n[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    return m == 2 && rtc_leap(y) ? 29 : n[m - 1];
+}
+
+static uint64_t rtc_now(void) {
+    return wall_us() + (uint64_t)RTC_DAYS_TO_1970 * RTC_US_PER_DAY;
+}
+
+static void rtc_write_tick(uint32_t at, uint64_t t) {
+    psp_write32(at, (uint32_t)t);
+    psp_write32(at + 4, (uint32_t)(t >> 32));
+}
+
+static uint64_t rtc_read_tick(uint32_t at) {
+    return (uint64_t)psp_read32(at) | ((uint64_t)psp_read32(at + 4) << 32);
+}
+
 static void hle_RtcGetCurrentTick(void) {
     const uint32_t out = psp_arg(0);
-    const uint64_t us = psp_clock_read();
-    if (out) {
-        psp_write32(out, (uint32_t)us);
-        psp_write32(out + 4, (uint32_t)(us >> 32));
-    }
+    if (out) rtc_write_tick(out, rtc_now());
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* Ticks per second, and the unit above is what makes it this number. */
 static void hle_RtcGetTickResolution(void) { psp_ret(1000000u); }
+
+/* (date, tz minutes): the date now, tz minutes east of UTC (step 134). */
+static void hle_RtcGetCurrentClock(void) {
+    const uint32_t out = psp_arg(0);
+    const int32_t tz = (int32_t)psp_arg(1);
+    const rtc_date d = rtc_date_of(rtc_now() + (uint64_t)((int64_t)tz * 60000000));
+    if (out) rtc_write_date(out, &d);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Step 135: 1900 0, 2000 1, 2004 1, 2023 0. */
+static void hle_RtcIsLeapYear(void) { psp_ret((uint32_t)rtc_leap((int32_t)psp_arg(0))); }
+
+/* Step 135: 2000/2 29, 1900/2 28, 2023/4 30, and months 13 and 0 are
+ * 0x800001FF -- not a kernel code, but the one the PSP gives. */
+static void hle_RtcGetDaysInMonth(void) {
+    const int32_t y = (int32_t)psp_arg(0), m = (int32_t)psp_arg(1);
+    if (m < 1 || m > 12) { psp_ret(0x800001FFu); return; }
+    psp_ret((uint32_t)rtc_month_days(y, m));
+}
+
+/* Step 136: 0 is Sunday; 2000-01-01 6, 1970-01-01 4, 2026-09-27 0. */
+static void hle_RtcGetDayOfWeek(void) {
+    const int64_t days = rtc_days((int32_t)psp_arg(0), (int32_t)psp_arg(1), (int32_t)psp_arg(2));
+    psp_ret((uint32_t)(days - floor_div(days + 4, 7) * 7 + 4));
+}
+
+/* Step 137: 0, or the first bad field in this order, as -1 (year) down to -7
+ * (microsecond). February 30 is a bad day. A year above 9999 is unmeasured
+ * and taken as bad. */
+static void hle_RtcCheckValid(void) {
+    const rtc_date d = rtc_read_date(psp_arg(0));
+    int32_t r = 0;
+    if (d.year < 1 || d.year > 9999)                          r = -1;
+    else if (d.month < 1 || d.month > 12)                     r = -2;
+    else if (d.day < 1 || d.day > rtc_month_days(d.year, d.month)) r = -3;
+    else if (d.hour > 23)                                     r = -4;
+    else if (d.minute > 59)                                   r = -5;
+    else if (d.second > 59)                                   r = -6;
+    else if (d.us > 999999)                                   r = -7;
+    psp_ret((uint32_t)r);
+}
+
+/* (date, &tick) and (&date, &tick), step 138. What either does with an
+ * invalid date is unmeasured; this does the arithmetic regardless. */
+static void hle_RtcGetTick(void) {
+    const uint32_t date = psp_arg(0), out = psp_arg(1);
+    const rtc_date d = rtc_read_date(date);
+    if (out) rtc_write_tick(out, rtc_tick_of(&d));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_RtcSetTick(void) {
+    const uint32_t date = psp_arg(0), in = psp_arg(1);
+    const rtc_date d = rtc_date_of(rtc_read_tick(in));
+    rtc_write_date(date, &d);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* time_t is 32 bits to the firmware: GetTime_t writes one word (step 138,
+ * 2000-01-01 is 386D4380), and SetTime_t takes its time in $a1. The probe
+ * was built with a 64-bit time_t and passed 0 in $a2:$a3; the PSP read $a1,
+ * which held 1, and answered 1970-01-01 00:00:01. */
+static void hle_RtcGetTime_t(void) {
+    const rtc_date d = rtc_read_date(psp_arg(0));
+    const uint64_t t = rtc_tick_of(&d);
+    const uint64_t epoch = (uint64_t)RTC_DAYS_TO_1970 * RTC_US_PER_DAY;
+    if (psp_arg(1)) psp_write32(psp_arg(1), (uint32_t)((t - epoch) / 1000000u));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_RtcSetTime_t(void) {
+    const uint64_t t = (uint64_t)RTC_DAYS_TO_1970 * RTC_US_PER_DAY +
+                       (uint64_t)psp_arg(1) * 1000000u;
+    const rtc_date d = rtc_date_of(t);
+    rtc_write_date(psp_arg(0), &d);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Step 140: -1, 0, 1. */
+static void hle_RtcCompareTick(void) {
+    const uint64_t a = rtc_read_tick(psp_arg(0)), b = rtc_read_tick(psp_arg(1));
+    psp_ret(a < b ? 0xFFFFFFFFu : a > b ? 1u : 0u);
+}
+
+/* The TickAdd family (step 139, from 2000-01-31): (dest, src, n), with n a
+ * u64 in $a2:$a3 for ticks, microseconds, seconds and minutes and an int in
+ * $a2 for the rest. The fixed units are plain multiples, wrapping in 64 bits
+ * (Minutes(-1) is -60 s). Months and years move the calendar date and keep
+ * the time of day, clamping the day to the new month: Jan 31 + 1 month is
+ * 2000-02-29, and 2000-01-31 + 1 year is 366 days on. */
+static uint64_t arg64(int i) { return (uint64_t)psp_arg(i) | ((uint64_t)psp_arg(i + 1) << 32); }
+
+static void rtc_add(uint64_t delta) {
+    const uint32_t dst = psp_arg(0);
+    const uint64_t t = rtc_read_tick(psp_arg(1)) + delta;
+    if (dst) rtc_write_tick(dst, t);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_RtcTickAddTicks(void)        { rtc_add(arg64(2)); }
+static void hle_RtcTickAddMicroseconds(void) { rtc_add(arg64(2)); }
+static void hle_RtcTickAddSeconds(void)      { rtc_add(arg64(2) * 1000000ull); }
+static void hle_RtcTickAddMinutes(void)      { rtc_add(arg64(2) * 60000000ull); }
+static void hle_RtcTickAddHours(void)  { rtc_add((uint64_t)((int64_t)(int32_t)psp_arg(2) * 3600000000ll)); }
+static void hle_RtcTickAddDays(void)   { rtc_add((uint64_t)((int64_t)(int32_t)psp_arg(2) * (int64_t)RTC_US_PER_DAY)); }
+static void hle_RtcTickAddWeeks(void)  { rtc_add((uint64_t)((int64_t)(int32_t)psp_arg(2) * 7 * (int64_t)RTC_US_PER_DAY)); }
+
+static void rtc_add_months(int64_t months) {
+    const uint32_t dst = psp_arg(0);
+    const uint64_t src = rtc_read_tick(psp_arg(1));
+    rtc_date d = rtc_date_of(src);
+    const int64_t m0 = d.year * 12 + (d.month - 1) + months;
+    d.year  = floor_div(m0, 12);
+    d.month = m0 - d.year * 12 + 1;
+    const int last = rtc_month_days(d.year, d.month);
+    if (d.day > last) d.day = last;
+    if (dst) rtc_write_tick(dst, rtc_tick_of(&d));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_RtcTickAddMonths(void) { rtc_add_months((int32_t)psp_arg(2)); }
+static void hle_RtcTickAddYears(void)  { rtc_add_months((int64_t)(int32_t)psp_arg(2) * 12); }
+
+/* (buffer, &utc, tz minutes), step 140: "2000-01-01T00:00:00.00Z" at +0 and
+ * "2000-01-01T09:00:00.00+09:00" at +540 -- the local time, two digits of
+ * fraction, and the offset. */
+static void hle_RtcFormatRFC3339(void) {
+    const uint32_t buf = psp_arg(0), in = psp_arg(1);
+    const int32_t tz = (int32_t)psp_arg(2);
+    const rtc_date d = rtc_date_of(rtc_read_tick(in) + (uint64_t)((int64_t)tz * 60000000));
+    char s[48], z[8];
+    if (tz == 0) snprintf(z, sizeof z, "Z");
+    else snprintf(z, sizeof z, "%c%02d:%02d", tz < 0 ? '-' : '+',
+                  (tz < 0 ? -tz : tz) / 60 % 100, (tz < 0 ? -tz : tz) % 60);
+    snprintf(s, sizeof s, "%04d-%02d-%02dT%02d:%02d:%02d.%02d%s", (int)d.year, (int)d.month,
+             (int)d.day, (int)d.hour, (int)d.minute, (int)d.second, (int)(d.us / 10000), z);
+    for (size_t i = 0; i <= strlen(s); i++) psp_write8(buf + (uint32_t)i, (uint8_t)s[i]);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 /* ---- sceAudio ------------------------------------------------------------ */
 
@@ -967,6 +1221,26 @@ void psp_misc_register(void) {
 
     psp_hle_register(0x3F7AD767, "sceRtc", "sceRtcGetCurrentTick",         hle_RtcGetCurrentTick);
     psp_hle_register(0xC41C2853, "sceRtc", "sceRtcGetTickResolution",      hle_RtcGetTickResolution);
+    psp_hle_register(0x4CFA57B0, "sceRtc", "sceRtcGetCurrentClock",        hle_RtcGetCurrentClock);
+    psp_hle_register(0x42307A17, "sceRtc", "sceRtcIsLeapYear",             hle_RtcIsLeapYear);
+    psp_hle_register(0x05EF322C, "sceRtc", "sceRtcGetDaysInMonth",         hle_RtcGetDaysInMonth);
+    psp_hle_register(0x57726BC1, "sceRtc", "sceRtcGetDayOfWeek",           hle_RtcGetDayOfWeek);
+    psp_hle_register(0x4B1B5E82, "sceRtc", "sceRtcCheckValid",             hle_RtcCheckValid);
+    psp_hle_register(0x6FF40ACC, "sceRtc", "sceRtcGetTick",                hle_RtcGetTick);
+    psp_hle_register(0x7ED29E40, "sceRtc", "sceRtcSetTick",                hle_RtcSetTick);
+    psp_hle_register(0x27C4594C, "sceRtc", "sceRtcGetTime_t",              hle_RtcGetTime_t);
+    psp_hle_register(0x3A807CC8, "sceRtc", "sceRtcSetTime_t",              hle_RtcSetTime_t);
+    psp_hle_register(0x9ED0AE87, "sceRtc", "sceRtcCompareTick",            hle_RtcCompareTick);
+    psp_hle_register(0x44F45E05, "sceRtc", "sceRtcTickAddTicks",           hle_RtcTickAddTicks);
+    psp_hle_register(0x26D25A5D, "sceRtc", "sceRtcTickAddMicroseconds",    hle_RtcTickAddMicroseconds);
+    psp_hle_register(0xF2A4AFE5, "sceRtc", "sceRtcTickAddSeconds",         hle_RtcTickAddSeconds);
+    psp_hle_register(0xE6605BCA, "sceRtc", "sceRtcTickAddMinutes",         hle_RtcTickAddMinutes);
+    psp_hle_register(0x26D7A24A, "sceRtc", "sceRtcTickAddHours",           hle_RtcTickAddHours);
+    psp_hle_register(0xE51B4B7A, "sceRtc", "sceRtcTickAddDays",            hle_RtcTickAddDays);
+    psp_hle_register(0xCF3A2CA8, "sceRtc", "sceRtcTickAddWeeks",           hle_RtcTickAddWeeks);
+    psp_hle_register(0xDBF74F1B, "sceRtc", "sceRtcTickAddMonths",          hle_RtcTickAddMonths);
+    psp_hle_register(0x42842C77, "sceRtc", "sceRtcTickAddYears",           hle_RtcTickAddYears);
+    psp_hle_register(0x0498FB3C, "sceRtc", "sceRtcFormatRFC3339",          hle_RtcFormatRFC3339);
 
     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
