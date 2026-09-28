@@ -1259,6 +1259,34 @@ static void test_hardware_colour_logic_mask(void) {
     CHECK((p & 0xFFFFFF) == 0x808090, "colour test passes 0x908080: %08X", p);
 }
 
+/* Float through-mode coordinates saturate to 12.4, geprobe step 18 (fw 6.60):
+ * the triangle with a vertex at x = 5000 reads E0E0E0 at (470,155) and draws
+ * exactly as with that vertex at 2048. */
+static uint32_t g_sat_frame[3][2];
+static void draw_far_triangle(float x1, int k) {
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    float_vertex(0, 300, 150, 0); psp_write32(VERTS + 0 * 16, 0xFFFFFFFF);
+    float_vertex(1, x1, 160, 0);  psp_write32(VERTS + 1 * 16, 0xFF000000);
+    float_vertex(2, 320, 260, 0); psp_write32(VERTS + 2 * 16, 0xFF808080);
+    cmd(0x04, (PSP_PRIM_TRIANGLES << 16) | 3); end_list();
+    g_sat_frame[k][0] = pixel(470, 155);
+    g_sat_frame[k][1] = pixel(400, 200);
+}
+
+static void test_hardware_through_saturation(void) {
+    draw_far_triangle(5000.0f, 0);
+    draw_far_triangle(2048.0f, 1);
+    CHECK(g_sat_frame[0][0] == 0xE0E0E0, "x = 5000 saturates: %06X at (470,155), hardware E0E0E0",
+          g_sat_frame[0][0]);
+    CHECK(g_sat_frame[0][0] == g_sat_frame[1][0] && g_sat_frame[0][1] == g_sat_frame[1][1],
+          "x = 5000 draws as x = 2048: %06X %06X against %06X %06X",
+          g_sat_frame[0][0], g_sat_frame[0][1], g_sat_frame[1][0], g_sat_frame[1][1]);
+    /* Far enough out that an unclamped float would not fit an int. */
+    draw_far_triangle(1.0e12f, 2);
+    CHECK(g_sat_frame[2][0] == g_sat_frame[0][0], "x = 1e12 saturates too: %06X", g_sat_frame[2][0]);
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -1297,6 +1325,7 @@ int main(void) {
     test_hardware_blend();
     test_hardware_texfunc();
     test_hardware_colour_logic_mask();
+    test_hardware_through_saturation();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

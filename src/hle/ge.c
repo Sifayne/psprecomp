@@ -78,6 +78,18 @@ static int fx16_floor(float f) {
     return i - (s < (float)i);
 }
 
+/* A float through-mode coordinate, saturated to signed 12.4 (-2048 ..
+ * 2047.9375 pixels). geprobe step 18 (fw 6.60) draws a triangle with a
+ * vertex at x = 5000 exactly as if it were at x = 2048: every pixel's
+ * coverage and colour match. The lower bound is assumed by symmetry, not
+ * measured. Clamping the float first also keeps an out-of-range value from
+ * reaching the int conversion; NaN goes to the lower bound. */
+static int fx16_sat(float f) {
+    if (f >= 2048.0f) return 2048 * PSP_SUBPX - 1;
+    if (!(f > -2048.0f)) return -2048 * PSP_SUBPX;
+    return fx16_floor(f);
+}
+
 /* Display-list opcodes. Only the ones the walk needs to be correct about are
  * named; everything else is counted rather than guessed at, because a
  * misidentified state command silently changes rendering. */
@@ -999,9 +1011,9 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
          * screen z range is 0..65535, not -32768..32767. */
         out->z = (float)(uint16_t)psp_read16(addr + (uint32_t)pos_off + 4);
         return 1;
-    case 3: { /* float: floored onto the 1/16 grid, fraction kept */
-        out->x = fx16_floor(psp_read_f32(addr + (uint32_t)pos_off));
-        out->y = fx16_floor(psp_read_f32(addr + (uint32_t)pos_off + 4));
+    case 3: { /* float: floored onto the 1/16 grid, fraction kept, saturated */
+        out->x = fx16_sat(psp_read_f32(addr + (uint32_t)pos_off));
+        out->y = fx16_sat(psp_read_f32(addr + (uint32_t)pos_off + 4));
         out->z = psp_read_f32(addr + (uint32_t)pos_off + 8);
         return 1;
     }
