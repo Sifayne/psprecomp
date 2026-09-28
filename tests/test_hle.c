@@ -567,6 +567,14 @@ static void test_thread_rules(void) {
     const uint32_t RELEASE = psp_nid("sceKernelReleaseWaitThread");
     CHECK(call(RELEASE, 0, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_THID, "release(0)");
     CHECK(call(RELEASE, ok, 0, 0, 0) == SCE_KERNEL_ERROR_NOT_WAIT, "release(dormant)");
+
+    /* GetThreadStackFreeSize (step 85): a thread never started answers its
+     * size less 0x10; an id that names nothing is UNKNOWN_THID. */
+    const uint32_t FREE = psp_nid("sceKernelGetThreadStackFreeSize");
+    CHECK(call(FREE, ok, 0, 0, 0) == 0x300 - 0x10, "free size of a created thread: %08X",
+          call(FREE, ok, 0, 0, 0));
+    CHECK(call(FREE, 0xDEADBEEFu, 0, 0, 0) == SCE_KERNEL_ERROR_UNKNOWN_THID,
+          "free size of an unknown id");
 }
 
 static void test_guest_strings(void) {

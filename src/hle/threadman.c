@@ -212,6 +212,7 @@ void psp_threadman_reset(void) {
 
 static void on_thread_end(uint32_t uid, uint32_t status);
 static void thread_ended(psp_thread *t, uint32_t status);
+static void drop_callbacks_of(uint32_t thread_uid);
 /* An emptied psp_thread.enders entry. Not 0, which is the main context. */
 #define NO_ENDER 0xFFFFFFFFu
 
@@ -561,7 +562,13 @@ static void hle_StartThread(void) {
 }
 
 static void hle_ExitThread(void) {
-    const uint32_t status = psp_arg(0);
+    /* A negative status is not kept: threadprobe step 43 (fw 6.60) exits with
+     * -5 and reads 800200D2 back from both WaitThreadEnd and
+     * GetThreadExitStatus (ILLEGAL_ARGUMENT in PSPSDK's naming; see hle.h).
+     * Whether a negative value *returned* from the entry is treated the same
+     * is unmeasured, so that path keeps it. */
+    uint32_t status = psp_arg(0);
+    if ((int32_t)status < 0) status = SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
 
     /* A thread ending is the last chance to see how it got there, and a thread
      * that ends with a nonzero status is usually reporting a failure its caller
@@ -583,7 +590,6 @@ static void hle_ExitThread(void) {
 
 static void hle_TerminateThread(void);
 static void release_stack(psp_thread *t);
-static void drop_callbacks_of(uint32_t thread_uid);
 
 /* sceKernelExitDeleteThread(status): ExitThread, and the thread's record and
  * stack are freed as it goes. threadprobe step 44 (fw 6.60): its waiter gets
@@ -592,7 +598,7 @@ static void drop_callbacks_of(uint32_t thread_uid);
  * returned 0 and the thread ran on past its own exit. */
 static void hle_ExitDeleteThread(void) {
     uint32_t status = psp_arg(0);
-    if ((int32_t)status < 0) status = SCE_KERNEL_ERROR_ILLEGAL_PARTITION;  /* G13 */
+    if ((int32_t)status < 0) status = SCE_KERNEL_ERROR_ILLEGAL_PARTITION;  /* as ExitThread */
     const uint32_t me = psp_sched_current();
     psp_thread *t = find_thread(me);
     if (t) {
@@ -739,6 +745,11 @@ static void thread_ended(psp_thread *t, uint32_t status) {
     psp_sched_stats_of(t->uid, &t->final_stats);
     if (t->uid == psp_sched_current()) t->final_stats.releases++;
     t->has_final_stats = 1;
+    /* Its callbacks go with it, at the end and not at the delete: threadprobe
+     * step 91 (fw 6.60) refers a callback whose owner has returned but not
+     * been deleted and gets UNKNOWN_CBID. Only a return was measured; exit
+     * and terminate are taken to be the same end. */
+    drop_callbacks_of(t->uid);
     psp_kernobj_thread_ended(t->uid);
     psp_kernlock_thread_ended(t->uid);
     for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++) {
@@ -1220,13 +1231,28 @@ static void hle_ChangeCurrentThreadAttr(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* How much of a thread's stack has never been written: the run of 0xFF fill
+ * bytes upward from base+0x10 (the first 0x10 bytes hold the kernel's word).
+ * threadprobe step 85 (fw 6.60) fits it three ways: a running 0x1000 thread
+ * whose lowest store is at stk+E90 answers 0xE80, the same after it has
+ * finished, and a thread never started answers 0xFF0 -- size-0x10, as if its
+ * whole stack were fill, which it is not yet here (the fill is at start), so
+ * that case is answered without a scan. 0 means the caller; an id that names
+ * nothing is UNKNOWN_THID.
+ *
+ * This used to report the whole stack for any thread, and the caller's for an
+ * unknown id, on the belief that no fill was painted; hle_StartThread does
+ * paint one. */
 static void hle_GetThreadStackFreeSize(void) {
-    /* Real firmware walks the stack looking for the fill pattern. We do not
-     * paint one, so report the whole stack: it is used for "am I close to
-     * overflowing", and claiming plenty of room is the safe direction. */
-    psp_thread *t = find_thread(psp_arg(0));
-    const psp_thread *c = current_thread();
-    psp_ret(t ? t->stack_size : (c ? c->stack_size : 0));
+    const uint32_t id = psp_arg(0) ? psp_arg(0) : psp_sched_current();
+    const psp_thread *t = find_thread(id);
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    if (!t->stack_base || t->stack_size <= 0x10) { psp_ret(0); return; }
+    if (!t->ever_started) { psp_ret(t->stack_size - 0x10); return; }
+    const uint8_t *p = psp_mem_ptr(t->stack_base, t->stack_size);
+    uint32_t n = 0;
+    if (p) while (0x10 + n < t->stack_size && p[0x10 + n] == 0xFF) n++;
+    psp_ret(n);
 }
 
 /* ---- semaphores ---------------------------------------------------------- */
@@ -2373,8 +2399,12 @@ int psp_threadman_run_callbacks(void) {
         const uint32_t count = c->notify_count, arg = c->notify_arg;
         /* Cleared before the handler runs, so a handler that notifies itself --
          * which callbacks/notify does deliberately -- is pending again when it
-         * returns rather than being swallowed or looping here. */
+         * returns rather than being swallowed or looping here. The argument
+         * goes with the count: threadprobe step 87 (fw 6.60) refers a callback
+         * after its delivery and reads `count=0 arg=00000000`; the argument
+         * used to survive. */
         c->notify_count = 0;
+        c->notify_arg   = 0;
 
         /* Guest code, run between two instructions of whichever thread asked.
          * That thread must not be able to tell, so its registers are put back;
