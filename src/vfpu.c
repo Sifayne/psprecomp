@@ -194,6 +194,54 @@ static void write_dst(uint32_t vreg, int size, const float in[4]) {
     }
 }
 
+/* ---- special values -------------------------------------------------------
+ *
+ * The VFPU's arithmetic is not the host's IEEE arithmetic at the edges, and
+ * vfpuprobe on firmware 6.60 pins down how (steps 41-42, 51-84, 89-104):
+ *
+ *   - an operand whose exponent field is 0 -- a zero or a denormal -- is a
+ *     signed zero: 1e-40/1e-40 is 7F800001, 3 * 1e-40 is 0, vcmp EZ says a
+ *     denormal is zero, vf2iu turns 00000001 into 0;
+ *   - a result below 2^-126 is flushed to a signed zero: 1e-38 + 1e-38 is 0,
+ *     not the normal 00D9C7DC;
+ *   - every NaN result is the one pattern 7F800001. Its sign is fixed per
+ *     operation, not propagated: vadd/vsub/vbfy/vocp give +, vmul/vdiv/vscl/
+ *     vcrs give sign(a) ^ sign(b) -- vmul of FFC00000 and 1.0 is FF800001,
+ *     vadd of the same is 7F800001, vdiv of -0 by +0 is FF800001.
+ *
+ * vin/vout wrap each lane of those operations. vmov, vneg, vabs, vmin/vmax and
+ * vsat move bits and keep denormals and NaN payloads as they are, as the
+ * hardware does. The dot-product unit below applies the same rules itself. */
+#define VNAN_BITS 0x7F800001u
+
+static inline float vin(float f) {
+    const uint32_t b = psp_f32_to_bits(f);
+    return (b & 0x7F800000u) ? f : psp_bits_to_f32(b & 0x80000000u);
+}
+
+/* `nan_sign` is 0 or 0x80000000: the sign the operation gives a NaN. */
+static inline float vout(float r, uint32_t nan_sign) {
+    const uint32_t b = psp_f32_to_bits(r);
+    const uint32_t e = b & 0x7F800000u;
+    if (e == 0x7F800000u)
+        return (b & 0x007FFFFFu) ? psp_bits_to_f32(VNAN_BITS | nan_sign) : r;
+    return e ? r : psp_bits_to_f32(b & 0x80000000u);
+}
+
+static inline uint32_t sign_of(float f) { return psp_f32_to_bits(f) & 0x80000000u; }
+
+/* The order vmin, vmax, vscmp and the sorts use: the bits read as a
+ * sign-magnitude integer, with an exponent of 0 as zero. A NaN therefore
+ * orders by its bits -- +NaN above +inf, -NaN below -inf -- and -0 equals +0
+ * (steps 55-57, 69, 71, 77-80). Host `<` said false for every NaN, so vmin of
+ * 2 and 7F800001 depended on the operand order. */
+static inline int32_t vkey(float f) {
+    const uint32_t b = psp_f32_to_bits(f);
+    if (!(b & 0x7F800000u)) return 0;
+    const int32_t m = (int32_t)(b & 0x7FFFFFFFu);
+    return (b >> 31) ? -m : m;
+}
+
 /* ---- the dot-product unit -------------------------------------------------
  *
  * Reproduced rather than approximated, because every reduction in the VFPU is
@@ -539,12 +587,14 @@ void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
     /* s is forced to yzx and t to zxy, then multiplied lane by lane. There is
      * no subtraction: this is half a cross product, and a full one is two of
-     * these with a vsub between. */
+     * these with a vsub between. Each lane is a vmul, special values and all:
+     * -0 * -inf is 7F800001 and FFC00000 * 7FC00001 is FF800001 (step 64). */
+    static const int SI[4] = { 1, 2, 0, 3 }, TI[4] = { 2, 0, 1, 3 };
     float out[4];
-    out[0] = sv[1] * tv[2];
-    out[1] = sv[2] * tv[0];
-    out[2] = sv[0] * tv[1];
-    out[3] = sv[3] * tv[3];
+    for (int i = 0; i < 4; i++) {
+        const float a = sv[SI[i]], b = tv[TI[i]];
+        out[i] = vout(vin(a) * vin(b), sign_of(a) ^ sign_of(b));
+    }
 
     write_dst(vd, size, out);
     eat_prefixes();
@@ -575,26 +625,23 @@ void psp_vcmp_val(uint32_t vd, uint32_t vs, uint32_t vt, int kind, int size) {
     float d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     for (int i = 0; i < n; i++) {
         if (kind == 0) {                                  /* vscmp: -1, 0, 1 */
-            const float a = sv[i] - tv[i];
-            if (a != a) {
-                /* A NaN difference means at least one side is NaN or the two
-                 * are opposite infinities. The hardware still orders them, by
-                 * signed magnitude -- the same treatment vmin/vmax give. */
-                const int32_t si = (int32_t)psp_f32_to_bits(sv[i]);
-                const int32_t ti = (int32_t)psp_f32_to_bits(tv[i]);
-                const int32_t sm = si & 0x7FFFFFFF, tm = ti & 0x7FFFFFFF;
-                const int32_t b = (si < 0 ? -sm : sm) - (ti < 0 ? -tm : tm);
-                d[i] = (float)((0 < b) - (b < 0));
-            } else {
-                d[i] = (float)((0.0f < a) - (a < 0.0f));
-            }
+            /* The sign-magnitude order of vmin/vmax, NaNs and denormals
+             * included: vscmp of 007FFFFF and 0 is 0, of -1 and 7FC00000 is
+             * -1 (step 57). Subtracting first, as this used to, compared the
+             * denormal as a number and fell back to an int32 difference that
+             * could overflow. */
+            const int32_t ks = vkey(sv[i]), kt = vkey(tv[i]);
+            d[i] = (float)((ks > kt) - (ks < kt));
         } else {
             /* A NaN on either side is false, not "unordered": both of these
-             * answer 0.0 rather than propagating it. */
-            const int nan = (sv[i] != sv[i]) || (tv[i] != tv[i]);
+             * answer 0.0 rather than propagating it -- unlike vscmp, which
+             * orders NaNs (vfpuprobe steps 58-59 agree). A denormal is a zero,
+             * as it is to vcmp. */
+            const float a = vin(sv[i]), b = vin(tv[i]);
+            const int nan = (a != a) || (b != b);
             if (nan)              d[i] = 0.0f;
-            else if (kind == 1)   d[i] = (sv[i] >= tv[i]) ? 1.0f : 0.0f;
-            else                  d[i] = (sv[i] <  tv[i]) ? 1.0f : 0.0f;
+            else if (kind == 1)   d[i] = (a >= b) ? 1.0f : 0.0f;
+            else                  d[i] = (a <  b) ? 1.0f : 0.0f;
         }
     }
     write_dst(vd, size, d);
@@ -661,52 +708,54 @@ void psp_vsbn(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  * names a second register. Written out directly here: synthesising a prefix in
  * order to consume it would be a faithful description of the hardware and a
  * worse description of the arithmetic. */
+/* One compare-exchange of the sorts, in the vmin/vmax order (vkey): lanes i < j
+ * receive the smaller and the larger value, or the other way round.
+ *
+ * A tie -- -0 against +0, a denormal against zero -- does not keep both values:
+ * both lanes receive the same one, the lower lane's in vsrt1/vsrt2 and the
+ * higher lane's in vsrt3/vsrt4. vsrt1 of (0, -0, 0, -0) is all 00000000 and
+ * vsrt3 of it all 80000000 (steps 77-80; only the zeros and denormal rows
+ * exercise ties). */
+static void sort_pair(const float s[4], float d[4], int i, int j, int ascending) {
+    const int32_t ki = vkey(s[i]), kj = vkey(s[j]);
+    if (ki == kj) { d[i] = d[j] = ascending ? s[i] : s[j]; return; }
+    const float lo = ki < kj ? s[i] : s[j], hi = ki < kj ? s[j] : s[i];
+    d[i] = ascending ? lo : hi;
+    d[j] = ascending ? hi : lo;
+}
+
 void psp_vfpu9(uint32_t vd, uint32_t vs, int kind, int size) {
     float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     const int n = read_src(vs, size, PFXS, s);
 
-    /* The two swizzles the sorts and butterflies use. */
-    const float yxwz[4] = { s[1], s[0], s[3], s[2] };
-    const float wzyx[4] = { s[3], s[2], s[1], s[0] };
-    const float zwxy[4] = { s[2], s[3], s[0], s[1] };
-
-    #define MIN(a,b) ((a) < (b) ? (a) : (b))
-    #define MAX(a,b) ((a) > (b) ? (a) : (b))
+    /* The butterflies and vocp are vadd/vsub lanes, special values and all:
+     * NaN results are +7F800001 whatever the operands' signs (steps 72, 81,
+     * 82). */
+    #define ADD(a, b) vout(vin(a) + vin(b), 0)
+    #define SUB(a, b) vout(vin(a) - vin(b), 0)
     switch (kind) {
-    case 0:                                              /* vsrt1 */
-        d[0] = MIN(s[0], yxwz[0]); d[1] = MAX(s[1], yxwz[1]);
-        d[2] = MIN(s[2], yxwz[2]); d[3] = MAX(s[3], yxwz[3]);
-        break;
-    case 1:                                              /* vsrt2 */
-        d[0] = MIN(s[0], wzyx[0]); d[1] = MIN(s[1], wzyx[1]);
-        d[2] = MAX(s[2], wzyx[2]); d[3] = MAX(s[3], wzyx[3]);
-        break;
-    case 8:                                              /* vsrt3 */
-        d[0] = MAX(s[0], yxwz[0]); d[1] = MIN(s[1], yxwz[1]);
-        d[2] = MAX(s[2], yxwz[2]); d[3] = MIN(s[3], yxwz[3]);
-        break;
-    case 9:                                              /* vsrt4 */
-        d[0] = MAX(s[0], wzyx[0]); d[1] = MAX(s[1], wzyx[1]);
-        d[2] = MIN(s[2], wzyx[2]); d[3] = MIN(s[3], wzyx[3]);
-        break;
+    case 0:  sort_pair(s, d, 0, 1, 1); sort_pair(s, d, 2, 3, 1); break;  /* vsrt1 */
+    case 1:  sort_pair(s, d, 0, 3, 1); sort_pair(s, d, 1, 2, 1); break;  /* vsrt2 */
+    case 8:  sort_pair(s, d, 0, 1, 0); sort_pair(s, d, 2, 3, 0); break;  /* vsrt3 */
+    case 9:  sort_pair(s, d, 0, 3, 0); sort_pair(s, d, 1, 2, 0); break;  /* vsrt4 */
     case 2:                                              /* vbfy1 */
-        d[0] = s[0] + yxwz[0]; d[1] = -s[1] + yxwz[1];
-        d[2] = s[2] + yxwz[2]; d[3] = -s[3] + yxwz[3];
+        d[0] = ADD(s[0], s[1]); d[1] = SUB(s[0], s[1]);
+        d[2] = ADD(s[2], s[3]); d[3] = SUB(s[2], s[3]);
         break;
     case 3:                                              /* vbfy2 */
-        d[0] = s[0] + zwxy[0]; d[1] =  s[1] + zwxy[1];
-        d[2] = -s[2] + zwxy[2]; d[3] = -s[3] + zwxy[3];
+        d[0] = ADD(s[0], s[2]); d[1] = ADD(s[1], s[3]);
+        d[2] = SUB(s[0], s[2]); d[3] = SUB(s[1], s[3]);
         break;
     case 4:                                              /* vocp: 1 - s */
-        for (int i = 0; i < 4; i++) d[i] = 1.0f - s[i];
+        for (int i = 0; i < 4; i++) d[i] = SUB(1.0f, s[i]);
         break;
     case 10:                                             /* vsgn */
+        /* On the bits: an exponent of 0 gives +0 (vsgn of -1e-40 is 0, not
+         * -1), anything else its sign, NaNs and infinities included (step
+         * 71). */
         for (int i = 0; i < n; i++) {
-            /* Through the bits, so that a NaN difference does not compare
-             * equal to zero and both zeroes give exactly +0. */
-            const uint32_t b = psp_f32_to_bits(s[i] - 0.0f);
-            d[i] = (b == 0 || b == 0x80000000u) ? 0.0f
-                 : (b >> 31) == 0               ? 1.0f : -1.0f;
+            const uint32_t b = psp_f32_to_bits(s[i]);
+            d[i] = !(b & 0x7F800000u) ? 0.0f : (b >> 31) ? -1.0f : 1.0f;
         }
         break;
     default:
@@ -714,8 +763,8 @@ void psp_vfpu9(uint32_t vd, uint32_t vs, int kind, int size) {
         eat_prefixes();
         return;
     }
-    #undef MIN
-    #undef MAX
+    #undef ADD
+    #undef SUB
 
     write_dst(vd, size, d);
     eat_prefixes();
@@ -737,7 +786,9 @@ void psp_vf2i(uint32_t vd, uint32_t vs, int mode, int scale, int size) {
 
     uint32_t d[4] = { 0, 0, 0, 0 };
     for (int i = 0; i < n; i++) {
-        const float f = sv[i];
+        /* A denormal is zero here too: vf2iu of 00000001 is 0, not 1 (step
+         * 41). */
+        const float f = vin(sv[i]);
         if (f != f) { d[i] = 0x7FFFFFFFu; continue; }      /* NaN -> INT_MAX */
         const double v = (double)f * mult;
         /* Compared in double: (float)0x7FFFFFFF rounds up to 0x80000000, so a
@@ -916,6 +967,9 @@ void psp_vf2h(uint32_t vd, uint32_t vs, int size) {
 
 /* ---- arithmetic ---------------------------------------------------------- */
 
+/* `a` and `b` are the lane's operands after the prefixes, `expr` the result;
+ * each op wraps its own special-value rules around the arithmetic (see vin and
+ * vout above). */
 #define BINOP(name, expr)                                                    \
     void psp_##name(uint32_t vd, uint32_t vs, uint32_t vt, int size) {       \
         /* Read every source before writing any destination: vd may alias vs \
@@ -932,12 +986,14 @@ void psp_vf2h(uint32_t vd, uint32_t vs, int size) {
         eat_prefixes();                                                      \
     }
 
-BINOP(vadd, a + b)
-BINOP(vsub, a - b)
-BINOP(vmul, a * b)
-BINOP(vdiv, a / b)
-BINOP(vmin, a < b ? a : b)
-BINOP(vmax, a > b ? a : b)
+BINOP(vadd, vout(vin(a) + vin(b), 0))
+BINOP(vsub, vout(vin(a) - vin(b), 0))
+BINOP(vmul, vout(vin(a) * vin(b), sign_of(a) ^ sign_of(b)))
+BINOP(vdiv, vout(vin(a) / vin(b), sign_of(a) ^ sign_of(b)))
+/* Ties return t, and the bits come through untouched, denormals and NaN
+ * payloads included (vmax of -0 and +0 is +0, of +0 and -0 is -0). */
+BINOP(vmin, vkey(a) < vkey(b) ? a : b)
+BINOP(vmax, vkey(a) > vkey(b) ? a : b)
 
 /* Dot product: sums all lanes into a single destination lane. */
 void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
@@ -965,7 +1021,8 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     read_src(vt, 1, PFXT, tv);
 
     const float k = tv[0];
-    for (int i = 0; i < n; i++) out[i] = sv[i] * k;
+    for (int i = 0; i < n; i++)
+        out[i] = vout(vin(sv[i]) * vin(k), sign_of(sv[i]) ^ sign_of(k));
     write_dst(vd, size, out);
     eat_prefixes();
 }
@@ -981,8 +1038,11 @@ void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
         float r;
         switch (op) {
         case PSP_VU_MOV:  r = a;            break;
-        case PSP_VU_ABS:  r = a < 0 ? -a : a; break;
-        case PSP_VU_NEG:  r = -a;           break;
+        /* On the bits: vabs of -0 is +0 and of FFC00000 is 7FC00000, where
+         * `a < 0 ? -a : a` kept both (step 69). vneg likewise flips only the
+         * sign bit, NaN payloads and denormals included. */
+        case PSP_VU_ABS:  r = psp_bits_to_f32(psp_f32_to_bits(a) & 0x7FFFFFFFu); break;
+        case PSP_VU_NEG:  r = psp_bits_to_f32(psp_f32_to_bits(a) ^ 0x80000000u); break;
         case PSP_VU_ZERO: r = 0.0f;         break;
         case PSP_VU_ONE:  r = 1.0f;         break;
         case PSP_VU_RCP:  r = 1.0f / a;     break;
@@ -1268,8 +1328,11 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     matrix_read(vs, size, m);
     psp_vfpu_regs(vt, 1, t);
     const float k = psp_cpu.v[t[0]];
+    /* vscl on every column, so vscl's special values. Only ordinary values
+     * were probed here (step 115). */
     for (int c = 0; c < size; c++)
-        for (int r = 0; r < size; r++) m[c][r] *= k;
+        for (int r = 0; r < size; r++)
+            m[c][r] = vout(vin(m[c][r]) * vin(k), sign_of(m[c][r]) ^ sign_of(k));
     matrix_write(vd, size, m);
     eat_prefixes();
 }
@@ -1467,7 +1530,9 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
     uint32_t cc = 0;
     int all = 1, any = 0;
     for (int i = 0; i < n; i++) {
-        float a = sv[i], b = tv[i];
+        /* A denormal operand is a zero: 00000001 is EQ to 0 and to -0, EZ,
+         * not NZ, and neither LT nor GT zero (steps 90-97 and 101). */
+        const float a = vin(sv[i]), b = vin(tv[i]);
         int r;
         /* The upper eight conditions test the *first* operand's class rather
          * than comparing the two, and they had all been falling into the
@@ -1502,7 +1567,11 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
      * actually compared, plus the any/all pair. A `vcmp.t` leaves bit 3 alone,
      * and a program can rely on that -- cpu/vfpu/vector sets it with a quad
      * compare and then reads it back after a triple one. Overwriting the whole
-     * register cleared it, which cost 25 lines and looked like a vcmov bug. */
+     * register cleared it, which cost 25 lines and looked like a vcmov bug.
+     *
+     * Not yet confirmed on hardware: vfpuprobe step 105 read CC with an mfvc
+     * straight after each vcmp.q/.t, and on firmware 6.60 that read returns
+     * the *previous* CC, so the step measured the pipeline, not this rule. */
     const uint32_t affected = (1u << 4) | (1u << 5) | ((1u << n) - 1u);
     const uint32_t before = psp_cpu.vfpu_cc;
     psp_cpu.vfpu_cc = (psp_cpu.vfpu_cc & ~affected) | (cc & affected);

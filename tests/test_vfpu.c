@@ -526,6 +526,118 @@ static void test_vrot(void) {
     CHECK_F(psp_cpu.v[14], -1.0f, "vrot.p: writes only two lanes");
 }
 
+/* ---- special values -------------------------------------------------------
+ *
+ * Rows of vfpuprobe section 5 as a PSP on firmware 6.60 printed them: operand
+ * quads s and t in, the destination quad out, bit for bit. */
+static void set_bits(uint32_t vreg, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    const uint32_t w[4] = { a, b, c, d };
+    int r[4];
+    psp_vfpu_regs(vreg, 4, r);
+    for (int i = 0; i < 4; i++) psp_cpu.v[r[i]] = psp_bits_to_f32(w[i]);
+}
+static int quad_is(uint32_t vreg, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    const uint32_t w[4] = { a, b, c, d };
+    int r[4], ok = 1;
+    psp_vfpu_regs(vreg, 4, r);
+    for (int i = 0; i < 4; i++) {
+        const uint32_t got = psp_f32_to_bits(psp_cpu.v[r[i]]);
+        if (got != w[i]) {
+            printf("    lane %d: got %08X, want %08X\n", i, got, w[i]);
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+typedef void (*vbinop)(uint32_t, uint32_t, uint32_t, int);
+static int binop_is(vbinop op, const uint32_t s[4], const uint32_t t[4],
+                    uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    set_bits(0x00, s[0], s[1], s[2], s[3]);
+    set_bits(0x04, t[0], t[1], t[2], t[3]);
+    op(0x08, 0x00, 0x04, 4);
+    return quad_is(0x08, a, b, c, d);
+}
+
+static void test_special_values(void) {
+    psp_vfpu_reset();
+    static const uint32_t NANINF_S[4] = { 0x7FC00000, 0x80000000, 0x7F800000, 0xFF800000 };
+    static const uint32_t NANINF_T[4] = { 0x3F800000, 0x00000000, 0xFF800000, 0xFF800000 };
+    static const uint32_t DEN_S[4]    = { 0x000116C2, 0x800116C2, 0x006CE3EE, 0x40400000 };
+    static const uint32_t DEN_T[4]    = { 0x000116C2, 0x3F800000, 0x006CE3EE, 0x3EAAAAAB };
+    static const uint32_t SNAN_S[4]   = { 0x7F800001, 0xFFC00000, 0x3F800000, 0x40000000 };
+    static const uint32_t SNAN_T[4]   = { 0x40000000, 0x3F800000, 0x7FC00001, 0x80000000 };
+    static const uint32_t ZERO_S[4]   = { 0x00000000, 0x80000000, 0x00000000, 0x80000000 };
+    static const uint32_t ZERO_T[4]   = { 0x00000000, 0x00000000, 0x80000000, 0x80000000 };
+    static const uint32_t EDGE_S[4]   = { 0x007FFFFF, 0x80000001, 0xBF800000, 0xFF800000 };
+    static const uint32_t EDGE_T[4]   = { 0x00000000, 0x3F800000, 0x7FC00000, 0x7F800000 };
+
+    /* One NaN, 7F800001, positive from vadd and signed by the operands in
+     * vmul/vdiv; denormal operands are zeros and tiny results flush. */
+    CHECK(binop_is(psp_vadd, NANINF_S, NANINF_T, 0x7F800001, 0x00000000, 0x7F800001, 0xFF800000),
+          "vadd nan-inf (step 51)");
+    CHECK(binop_is(psp_vadd, DEN_S, DEN_T, 0x00000000, 0x3F800000, 0x00000000, 0x40555555),
+          "vadd denormal (step 51)");
+    CHECK(binop_is(psp_vadd, SNAN_S, SNAN_T, 0x7F800001, 0x7F800001, 0x7F800001, 0x40000000),
+          "vadd snan (step 51)");
+    CHECK(binop_is(psp_vmul, SNAN_S, SNAN_T, 0x7F800001, 0xFF800001, 0x7F800001, 0x80000000),
+          "vmul snan (step 53)");
+    CHECK(binop_is(psp_vmul, EDGE_S, EDGE_T, 0x00000000, 0x80000000, 0xFF800001, 0xFF800000),
+          "vmul sqrt-edge (step 53)");
+    CHECK(binop_is(psp_vdiv, ZERO_S, ZERO_T, 0x7F800001, 0xFF800001, 0xFF800001, 0x7F800001),
+          "vdiv zeros (step 54)");
+    CHECK(binop_is(psp_vdiv, DEN_S, DEN_T, 0x7F800001, 0x80000000, 0x7F800001, 0x41100000),
+          "vdiv denormal (step 54)");
+
+    /* The sign-magnitude order, bits kept, ties to t. */
+    CHECK(binop_is(psp_vmin, SNAN_S, SNAN_T, 0x40000000, 0xFFC00000, 0x3F800000, 0x80000000),
+          "vmin snan (step 55)");
+    CHECK(binop_is(psp_vmin, EDGE_S, EDGE_T, 0x00000000, 0x80000001, 0xBF800000, 0xFF800000),
+          "vmin sqrt-edge (step 55)");
+    CHECK(binop_is(psp_vmax, NANINF_S, NANINF_T, 0x7FC00000, 0x00000000, 0x7F800000, 0xFF800000),
+          "vmax nan-inf (step 56)");
+    set_bits(0x00, EDGE_S[0], EDGE_S[1], EDGE_S[2], EDGE_S[3]);
+    set_bits(0x04, EDGE_T[0], EDGE_T[1], EDGE_T[2], EDGE_T[3]);
+    psp_vcmp_val(0x08, 0x00, 0x04, 0, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0xBF800000, 0xBF800000, 0xBF800000),
+          "vscmp sqrt-edge (step 57)");
+
+    /* vabs and vsgn on the bits. */
+    set_bits(0x00, 0x00000000, 0x80000000, 0xFFC00000, 0x7F800001);
+    psp_vunary(PSP_VU_ABS, 0x08, 0x00, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0x00000000, 0x7FC00000, 0x7F800001), "vabs (step 69)");
+    set_bits(0x00, DEN_S[0], DEN_S[1], DEN_S[2], DEN_S[3]);
+    psp_vfpu9(0x08, 0x00, 10, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0x00000000, 0x00000000, 0x3F800000), "vsgn denormal (step 71)");
+
+    /* The sorts: ties give both lanes one value. */
+    set_bits(0x00, ZERO_S[0], ZERO_S[1], ZERO_S[2], ZERO_S[3]);
+    psp_vfpu9(0x08, 0x00, 0, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0x00000000, 0x00000000, 0x00000000), "vsrt1 zeros (step 77)");
+    psp_vfpu9(0x08, 0x00, 1, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0x80000000, 0x80000000, 0x00000000), "vsrt2 zeros (step 78)");
+    psp_vfpu9(0x08, 0x00, 9, 4);
+    CHECK(quad_is(0x08, 0x80000000, 0x00000000, 0x00000000, 0x80000000), "vsrt4 zeros (step 80)");
+    set_bits(0x00, NANINF_S[0], NANINF_S[1], NANINF_S[2], NANINF_S[3]);
+    psp_vfpu9(0x08, 0x00, 9, 4);
+    CHECK(quad_is(0x08, 0x7FC00000, 0x7F800000, 0x80000000, 0xFF800000), "vsrt4 nan-inf (step 80)");
+    set_bits(0x00, DEN_S[0], DEN_S[1], DEN_S[2], DEN_S[3]);
+    psp_vfpu9(0x08, 0x00, 3, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0x40400000, 0x00000000, 0xC0400000), "vbfy2 denormal (step 82)");
+
+    /* vcmp: a denormal is zero. */
+    int s[4], t[4];
+    psp_vfpu_regs(0x00, 1, s);
+    psp_vfpu_regs(0x04, 1, t);
+    psp_cpu.v[s[0]] = psp_bits_to_f32(0x00000001u);
+    psp_cpu.v[t[0]] = psp_bits_to_f32(0x80000000u);
+    psp_vcmp(1 /* EQ */, 0x00, 0x04, 1);
+    CHECK(psp_cpu.vfpu_cc & 1u, "vcmp EQ: 00000001 equals -0 (step 90)");
+    psp_vcmp(8 /* EZ */, 0x00, 0x04, 1);
+    CHECK(psp_cpu.vfpu_cc & 1u, "vcmp EZ: 00000001 is zero (step 97)");
+    psp_vfpu_reset();
+}
+
 /* ---- control state --------------------------------------------------------
  *
  * The reset values and the per-thread ownership, as a PSP on firmware 6.60
@@ -596,6 +708,7 @@ int main(void) {
     test_matrix_ops();
     test_matrix_transform();
     test_vrot();
+    test_special_values();
 
     psp_mem_free();
 
