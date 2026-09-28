@@ -285,8 +285,11 @@ static void reset_voices(void) {
     }
 }
 
+static void rev_reset(void);
+
 void psp_sas_reset(void) {
     reset_voices();
+    rev_reset();
     g_grain = 256;
     g_output_mode = 0;
     g_sample_rate = 44100;
@@ -953,6 +956,12 @@ static void hle_Init(void) {
      * unpaused (sasprobe steps 15 and 222, fw 6.60). Every Init rewrites the
      * whole struct with the defaults (steps 4-5). */
     reset_voices();
+    /* The effect goes back to off with its lines silent. That every capture
+     * after an Init and a RevType starts from silence is measured (steps
+     * 321-333: "0 samples not silent" before each key-on, after the long
+     * tails of the type before); which of the two calls clears it, and what
+     * EVOL and VON read after an Init, is not. */
+    rev_reset();
     g_grain       = grain;
     g_output_mode = mode;
     g_sample_rate = rate;
@@ -1320,6 +1329,190 @@ static void hle_GetAllEnvelopeHeights(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* ---- reverb -------------------------------------------------------------
+ *
+ * The wet signal the two send volumes feed. Everything below is fitted to
+ * sasprobe 3's impulse responses on firmware 6.60 -- a 32767 pulse through
+ * each of the nine types, 64 cores each (steps 321-331) -- and reproduces
+ * every one of those eleven captures bit for bit, and run 1's and run 4's
+ * hall burst (step 318, 8000 at RevParam(64, 64)) as well. It is a model
+ * that computes the same numbers, not a description of the firmware's
+ * buffer layout, and nothing in it comes from anywhere but those captures.
+ *
+ * Half rate: each pair of frames is one step, taking the sends of the odd
+ * frame and adding the wet sample to the even one; the odd frames get
+ * nothing. A one-frame pulse on an odd frame gives exactly the two-frame
+ * pulse's response, one on an even frame gives silence (steps 332-333), and
+ * no odd frame of any capture is touched. The pairs run from the start of
+ * each core, whose grain is always even.
+ *
+ * Per side, in 16-bit steps with every product floored (>> 15):
+ *
+ *   in    = send * 7936 >> 15                (32767 -> 7935, 8000 -> 1937)
+ *   line  X(t) = ((acc - P) * I >> 15) + P,  acc = in + (X(t - wall) * W >> 15),
+ *                                            P = X(t - prev)
+ *         one or two lines (A, B) a side, each fed by its own side's send
+ *   comb  c = sum(V_k * X_line(t - tau_k)) >> 15, summed before the shift
+ *   APF   r = w(t - D); w = x - (G * r >> 15); y = (G * w >> 15) + r,
+ *         APF1 (D1 per side, G1) and then APF2 (D2, G2)
+ *   out   y * 31 * EVOL >> 16                (y * 31 / 16 at EVOL 0x1000)
+ *
+ * The gains are those the data leaves: hall's I, W, V0, G1 and G2 are the
+ * only values that fit, the others a value inside a narrow range that fits
+ * exactly (medium's I also fits at a few far-off values; 28912, shared with
+ * small and pipe, is kept). Every type but echo and delay has G1 = 2 * D2.
+ *
+ * Echo and delay are one type as far as the data goes -- identical captures
+ * at RevParam(16, 64) -- and are the only ones RevParam moves: a single line
+ * a side through which the pulse comes back every 16d + 4 steps, scaled by
+ * W = -256 * feedback (-16384 exactly at 64; nothing at 0), read at 16d + 7,
+ * with a faint APF1 (D1 16d + 24 left, 16d + 20 right, G1 6 -- 5 to 8 all
+ * fit) and no APF2. Delays 16 and 8, feedback 64 and 0, all exact. The hall
+ * burst at RevParam(64, 64) is what the (16, 64) fit gives, so the other
+ * types are taken not to use it.
+ *
+ * Not measured, and chosen here: which side's send feeds which line (the
+ * captures fed both the same); EVOL other than 0x1000 (taken as a straight
+ * product); VON, which only gates the wet signal here -- dry is never
+ * touched, as dry voices were heard after the probe's VON(0, 0) -- and the
+ * defaults after an Init (off, EVOL 0, VON 0); clamping of a send past 16
+ * bits (clamped); output mode 1, which writes the sends out raw and gets no
+ * wet signal here. */
+
+#define REV_BUF 4096u   /* a power of two past the longest delay, space's 2784 */
+
+typedef struct { int16_t wall, prev; } rev_line;
+typedef struct { uint8_t line, gain; int16_t delay; } rev_tap;   /* line A 0, B 1 */
+
+typedef struct {
+    int32_t iir, wall_gain;       /* I and W */
+    int32_t tap_gain[4];          /* V0..V3 */
+    int32_t g1, g2;
+    int16_t d1[2], d2;            /* d2 0: no APF2 */
+    uint8_t nlines, ntaps;        /* per side */
+    rev_line line[2][2];          /* [side][A, B] */
+    rev_tap  tap[2][4];           /* [side][k] */
+} rev_type;
+
+/* Types 0-5 and 8, from steps 321-326 and 329. Echo and delay (6, 7) are
+ * built from RevParam by rev_params. */
+static const rev_type REV_TYPES[9] = {
+    [0] = { /* room */
+        28032, -17792, { 21688, -16688, 0, 0 }, 182, 21248, { 436, 310 }, 91, 1, 2,
+        { { { 416, 416 } }, { { 380, 380 } } },
+        { { { 0, 0, 230 }, { 0, 1, 354 } }, { { 0, 0, 268 }, { 0, 1, 324 } } } },
+    [1] = { /* small */
+        28912, -25600, { 17424, -16144, 20392, -17184 }, 74, 20160, { 180, 128 }, 37, 2, 4,
+        { { { 205, 205 }, { 200, 200 } }, { { 217, 217 }, { 190, 190 } } },
+        { { { 0, 0, 45 }, { 0, 1, 138 }, { 1, 2, 64 }, { 1, 3, 114 } },
+          { { 0, 0, 89 }, { 0, 1, 215 }, { 1, 2, 108 }, { 1, 3, 181 } } } },
+    [2] = { /* medium */
+        28912, -19264, { 17680, -16656, 20392, -17184 }, 254, 20160, { 612, 434 }, 127, 2, 4,
+        { { { 445, 445 }, { 408, 408 } }, { { 457, 457 }, { 382, 382 } } },
+        { { { 0, 0, 221 }, { 0, 1, 394 }, { 1, 2, 224 }, { 1, 3, 354 } },
+          { { 0, 0, 297 }, { 0, 1, 375 }, { 1, 2, 268 }, { 1, 3, 341 } } } },
+    [3] = { /* large */
+        28512, -22912, { 17680, -16656, 20392, -17184 }, 338, 21184, { 796, 568 }, 169, 2, 4,
+        { { { 751, 751 }, { 674, 674 } }, { { 716, 716 }, { 638, 638 } } },
+        { { { 0, 0, 237 }, { 0, 1, 490 }, { 1, 2, 242 }, { 1, 3, 546 } },
+          { { 0, 0, 313 }, { 0, 1, 535 }, { 1, 2, 284 }, { 1, 3, 485 } } } },
+    [4] = { /* hall */
+        24576, -16384, { 20480, 19456, -18432, -17408 }, 626, 23552, { 1472, 1050 }, 313, 2, 4,
+        { { { 1018, 1022 }, { 1022, 1022 } }, { { 1016, 1018 }, { 1024, 1024 } } },
+        { { { 0, 0, 248 }, { 0, 1, 1022 }, { 1, 2, 508 }, { 1, 3, 960 } },
+          { { 0, 0, 254 }, { 0, 1, 1018 }, { 1, 2, 512 }, { 1, 3, 756 } } } },
+    [5] = { /* space */
+        32256, -20480, { 20480, -19456, -20480, 19456 }, 1122, 21504, { 2784, 1954 }, 561, 2, 4,
+        { { { 1188, 1188 }, { 1432, 1432 } }, { { 1090, 1090 }, { 1396, 1396 } } },
+        { { { 0, 0, 450 }, { 0, 1, 788 }, { 1, 2, 698 }, { 1, 3, 1016 } },
+          { { 0, 0, 502 }, { 0, 1, 895 }, { 1, 2, 296 }, { 1, 3, 1016 } } } },
+    [8] = { /* pipe: the only type whose lines read P at another delay than W */
+        28912, -31488, { 17680, -16656, 20392, -17184 }, 38, 21696, { 88, 64 }, 19, 2, 4,
+        { { { 54, 183 }, { 25, 193 } }, { { 59, 197 }, { 69, 216 } } },
+        { { { 0, 0, 169 }, { 0, 1, 183 }, { 1, 2, 140 }, { 1, 3, 193 } },
+          { { 0, 0, 109 }, { 0, 1, 197 }, { 1, 2, 208 }, { 1, 3, 216 } } } },
+};
+
+static struct {
+    int32_t  type;                /* -1: off */
+    uint32_t delay, feedback;
+    uint32_t evol_l, evol_r;
+    uint32_t von_dry, von_wet;
+    uint32_t t;                   /* steps taken since the lines were cleared */
+    int32_t  line[2][2][REV_BUF]; /* [side][A, B] */
+    int32_t  apf1[2][REV_BUF], apf2[2][REV_BUF];
+} g_rev;
+
+static void rev_clear(void) {
+    memset(g_rev.line, 0, sizeof g_rev.line);
+    memset(g_rev.apf1, 0, sizeof g_rev.apf1);
+    memset(g_rev.apf2, 0, sizeof g_rev.apf2);
+    g_rev.t = 0;
+}
+
+static void rev_reset(void) {
+    g_rev.type = -1;
+    g_rev.delay = g_rev.feedback = 0;
+    g_rev.evol_l = g_rev.evol_r = 0;
+    g_rev.von_dry = g_rev.von_wet = 0;
+    rev_clear();
+}
+
+static rev_type rev_params(void) {
+    if (g_rev.type != 6 && g_rev.type != 7) return REV_TYPES[g_rev.type];
+    const int16_t d = (int16_t)(16 * g_rev.delay);
+    const rev_type e = {
+        32768, -256 * (int32_t)g_rev.feedback, { 32768, 0, 0, 0 }, 6, 0,
+        { (int16_t)(d + 24), (int16_t)(d + 20) }, 0, 1, 1,
+        { { { (int16_t)(d + 4), (int16_t)(d + 4) } }, { { (int16_t)(d + 4), (int16_t)(d + 4) } } },
+        { { { 0, 0, (int16_t)(d + 7) } }, { { 0, 0, (int16_t)(d + 7) } } } };
+    return e;
+}
+
+static int64_t rev_apf(int32_t *w, uint32_t t, int d, int32_t g, int64_t x) {
+    const int64_t r = w[(t - (uint32_t)d) & (REV_BUF - 1)];
+    const int64_t v = x - shr_floor(g * r, 15);
+    w[t & (REV_BUF - 1)] = (int32_t)v;
+    return shr_floor(g * v, 15) + r;
+}
+
+/* One step of one side: the send in, the APFs' output out. */
+static int64_t rev_side(const rev_type *p, int s, int32_t send, uint32_t t) {
+    const uint32_t m = REV_BUF - 1;
+    const int64_t in = shr_floor((int64_t)send * 7936, 15);
+    for (int k = 0; k < p->nlines; k++) {
+        int32_t *x = g_rev.line[s][k];
+        const int64_t acc  = in + shr_floor((int64_t)x[(t - (uint32_t)p->line[s][k].wall) & m] *
+                                            p->wall_gain, 15);
+        const int64_t prev = x[(t - (uint32_t)p->line[s][k].prev) & m];
+        x[t & m] = (int32_t)(shr_floor((acc - prev) * p->iir, 15) + prev);
+    }
+    int64_t sum = 0;
+    for (int k = 0; k < p->ntaps; k++) {
+        const rev_tap *tp = &p->tap[s][k];
+        sum += (int64_t)g_rev.line[s][tp->line][(t - (uint32_t)tp->delay) & m] *
+               p->tap_gain[tp->gain];
+    }
+    int64_t y = rev_apf(g_rev.apf1[s], t, p->d1[s], p->g1, shr_floor(sum, 15));
+    if (p->d2) y = rev_apf(g_rev.apf2[s], t, p->d2, p->g2, y);
+    return y;
+}
+
+/* The wet signal of one core, added to the dry mix `l`/`r` from the sends. */
+static void rev_render(int64_t *l, int64_t *r, const int64_t *el, const int64_t *er,
+                       uint32_t n) {
+    if (g_rev.type < 0) return;
+    const rev_type p = rev_params();
+    for (uint32_t i = 0; i + 1 < n; i += 2) {
+        const uint32_t t = g_rev.t++;
+        const int64_t yl = rev_side(&p, 0, clamp16(el[i + 1]), t);
+        const int64_t yr = rev_side(&p, 1, clamp16(er[i + 1]), t);
+        if (!g_rev.von_wet) continue;
+        l[i] += shr_floor(yl * 31 * (int64_t)g_rev.evol_l, 16);
+        r[i] += shr_floor(yr * 31 * (int64_t)g_rev.evol_r, 16);
+    }
+}
+
 /* `mix_l`/`mix_r` scale what is already in the buffer, not what is rendered
  * into it: outputmode.expected's mix sections pass 0 for both and get the
  * rendered samples back unchanged, which is only possible if the zero applies
@@ -1353,6 +1546,7 @@ static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_
         return;
     }
 
+    rev_render(l, r, el, er, n);
     for (uint32_t i = 0; i < n; i++) {
         int32_t sl = clamp16(l[i]), sr = clamp16(r[i]);
         if (add) {
@@ -1399,17 +1593,17 @@ static void hle_CoreWithMix(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Reverb: the four calls check their arguments as firmware 6.60 does, so a
- * game's setup sequence sees the same answers, but the reverb itself -- the
- * wet signal the sends feed -- is not rendered. Hardware's is a half-rate
- * engine (only even output frames of the wet signal are nonzero, and left
- * differs from right, step 228) whose response sasprobe's one burst does not
- * pin down; the dry mix is what carries the music and effects.
+/* Reverb: the four calls check their arguments as firmware 6.60 does, and
+ * set what rev_render plays (see the reverb section above).
  *
- * __sceSasRevType(sasCore, type): -1..8, signed (step 224). */
+ * __sceSasRevType(sasCore, type): -1..8, signed (step 224). A new type
+ * starts from silent lines; the same type again is taken to leave them be. */
 static void hle_RevType(void) {
     const int32_t type = (int32_t)psp_arg(1);
-    psp_ret(type < -1 || type > 8 ? SAS_ERROR_REV_TYPE : SCE_KERNEL_ERROR_OK);
+    if (type < -1 || type > 8) { psp_ret(SAS_ERROR_REV_TYPE); return; }
+    if (type != g_rev.type) rev_clear();
+    g_rev.type = type;
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* __sceSasRevParam(sasCore, delay, feedback): both unsigned, the delay
@@ -1420,18 +1614,26 @@ static void hle_RevType(void) {
 static void hle_RevParam(void) {
     if (psp_arg(1) > 127u) { psp_ret(SAS_ERROR_REV_DELAY); return; }
     if (psp_arg(2) > 127u) { psp_ret(SAS_ERROR_REV_FEEDBACK); return; }
+    g_rev.delay    = psp_arg(1);
+    g_rev.feedback = psp_arg(2);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* __sceSasRevEVOL(sasCore, left, right): each at most 0x1000, unsigned, so
  * every negative volume is refused too -- unlike SetVolume's (step 226). */
 static void hle_RevEVOL(void) {
-    const int bad = psp_arg(1) > 0x1000u || psp_arg(2) > 0x1000u;
-    psp_ret(bad ? SAS_ERROR_REV_VOLUME : SCE_KERNEL_ERROR_OK);
+    if (psp_arg(1) > 0x1000u || psp_arg(2) > 0x1000u) { psp_ret(SAS_ERROR_REV_VOLUME); return; }
+    g_rev.evol_l = psp_arg(1);
+    g_rev.evol_r = psp_arg(2);
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* __sceSasRevVON(sasCore, dry, wet): anything is accepted (step 227). */
-static void hle_RevVON(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_RevVON(void) {
+    g_rev.von_dry = psp_arg(1);
+    g_rev.von_wet = psp_arg(2);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 void psp_sas_register(void) {
     psp_hle_register(0x42778A9F, "sceSasCore", "__sceSasInit",              hle_Init);

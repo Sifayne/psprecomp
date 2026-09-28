@@ -1273,6 +1273,61 @@ static void test_sas_round3_rules(void) {
           "RevParam feedback 128 is refused");
 }
 
+/* sasprobe 3's reverb captures (steps 321-331, fw 6.60): voice 0 plays 32767
+ * at frames 33 and 34 into the sends only, the effect at EVOL 0x1000 and
+ * VON(1, 1); frames count from the key-on's core. Each `at` row is (frame,
+ * 0 for L or 1 for R, the value the PSP wrote), in frame order. */
+static void sas_rev_pulse(const char *name, int type, uint32_t delay, uint32_t fb,
+                          const int (*at)[3], int n) {
+    sas_fresh();
+    for (uint32_t i = 0; i < 4; i++) psp_write16(SAS_DATA + i * 2u, i == 1 || i == 2 ? 32767 : 0);
+    CHECK(call(psp_nid("__sceSasRevType"), SAS_CORE, (uint32_t)type, 0, 0) == 0, "%s: RevType", name);
+    call(psp_nid("__sceSasRevParam"), SAS_CORE, delay, fb, 0);
+    call(psp_nid("__sceSasRevEVOL"), SAS_CORE, 0x1000, 0x1000, 0);
+    call(psp_nid("__sceSasRevVON"), SAS_CORE, 1, 1, 0);
+    call5(psp_nid("__sceSasSetVoicePCM"), SAS_CORE, 0, SAS_DATA, 4, 0xFFFFFFFFu);
+    sas_flat_voice(0);
+    call7(psp_nid("__sceSasSetVolume"), SAS_CORE, 0, 0, 0, 0x1000, 0x1000, 0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    int k = 0;
+    for (uint32_t c = 0; k < n && c < 64; c++) {
+        sas_core();
+        for (; k < n && (uint32_t)at[k][0] < (c + 1) * 256u; k++) {
+            const uint32_t i = (uint32_t)at[k][0] - c * 256u;
+            const int got = (int16_t)psp_read16(SAS_OUT + i * 4u + (at[k][1] ? 2u : 0u));
+            CHECK(got == at[k][2], "%s: %c[%d] = %d, want %d", name, at[k][1] ? 'R' : 'L',
+                  at[k][0], got, at[k][2]);
+        }
+    }
+}
+
+static void test_sas_reverb(void) {
+    /* Echo: the pulse back at 16d + 7 + D1 steps, then again 16d + 4 later
+     * at feedback / -128 of it; nothing on the odd frames. */
+    static const int echo[][3] = { { 558, 0, 1 }, { 1110, 1, 15372 }, { 1118, 0, 15372 },
+                                   { 1119, 0, 0 }, { 1638, 0, -7688 }, { 2158, 0, 3844 } };
+    sas_rev_pulse("echo (16, 64)", 6, 16, 64, echo, 6);
+    sas_rev_pulse("delay (16, 64)", 7, 16, 64, echo, 6);
+    static const int echo_d8[][3] = { { 598, 1, 15372 }, { 606, 0, 15372 }, { 870, 0, -7688 } };
+    sas_rev_pulse("echo (8, 64)", 6, 8, 64, echo_d8, 3);
+    static const int echo_fb0[][3] = { { 1118, 0, 15372 }, { 1638, 0, 0 }, { 1678, 0, -2 } };
+    sas_rev_pulse("echo (16, 0)", 6, 16, 0, echo_fb0, 3);
+
+    /* The first arrivals and the loudest sample of four of the others. */
+    static const int room[][3] = { { 492, 0, 29 }, { 568, 1, 29 }, { 1188, 1, 5642 },
+                                   { 1364, 0, 5642 } };
+    sas_rev_pulse("room", 0, 16, 64, room, 4);
+    static const int hall[][3] = { { 528, 0, 98 }, { 540, 1, 98 }, { 2640, 1, 5175 },
+                                   { 3472, 0, 5175 } };
+    sas_rev_pulse("hall", 4, 16, 64, hall, 4);
+    static const int space[][3] = { { 624, 1, -216 }, { 932, 0, 211 }, { 4532, 1, -6202 },
+                                    { 6996, 0, -6202 } };
+    sas_rev_pulse("space", 5, 16, 64, space, 4);
+    static const int pipe[][3] = { { 250, 1, 3 }, { 312, 0, 5 }, { 378, 1, 4843 },
+                                   { 592, 1, -8584 }, { 682, 0, 7255 } };
+    sas_rev_pulse("pipe", 8, 16, 64, pipe, 5);
+}
+
 /* stdout and stderr are not in the descriptor table, and an async write to
  * them used to return BADF -- which dropped the message a panic path writes
  * right before abort(). The synchronous path handled those fds; this pins the
@@ -1552,6 +1607,7 @@ int main(void) {
     test_sas_adpcm();
     test_sas_hardware_rules();
     test_sas_round3_rules();
+    test_sas_reverb();
     test_stdio_async();
     test_display();
     test_time_calls();
