@@ -338,9 +338,11 @@ static void release_stack(psp_thread *t) {
  *   - the attribute, above.
  * The order when several are wrong at once is unmeasured; this checks them in
  * the order the probe did. A NULL entry and a duplicate name are accepted
- * (steps 4 and 6). */
+ * (steps 4 and 6); a NULL name is 80020001 (step 150), as it is for the other
+ * create calls. */
 static void hle_CreateThread(void) {
     const uint32_t prio = psp_arg(2), size = psp_arg(3), attr = psp_arg(4);
+    if (!psp_arg(0)) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
     if (prio < 0x08u || prio > 0x77u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY); return; }
     if (size < 0x200u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE); return; }
     if (attr & PSP_THREAD_ATTR_REFUSED) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
@@ -860,11 +862,10 @@ static void hle_WaitThreadEnd(void) {
 }
 
 static void hle_GetThreadId(void) {
-    /* A handler runs on no thread, so there is no id to give back.
-     * threads/alarm/alarm compares the answer against both threads it created
-     * and prints -1 when it matches neither -- which it will not, since no
-     * thread has uid zero. */
-    if (psp_ktimer_in_handler()) { psp_ret(0); return; }
+    /* A handler runs on no thread, so there is no id to give back, and the
+     * kernel says where it was asked: ILLEGAL_CONTEXT (threadprobe step 115,
+     * fw 6.60, from an alarm handler). This answered 0. */
+    if (psp_ktimer_in_handler()) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT); return; }
     psp_ret(psp_sched_current());
 }
 

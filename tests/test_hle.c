@@ -481,7 +481,10 @@ static void test_threads(void) {
     const uint32_t ENTRY = 0x08801000u;
     psp_register(ENTRY, fake_thread_entry);
 
-    uint32_t thid = call5(CREATE, 0 /*name*/, ENTRY, 32 /*prio*/, 0x4000 /*stack*/, 0);
+    /* A NULL name is refused (threadprobe step 150, fw 6.60). */
+    CHECK(call5(CREATE, 0, ENTRY, 32, 0x4000, 0) == SCE_KERNEL_ERROR_ERROR,
+          "a thread with a NULL name is refused");
+    uint32_t thid = call5(CREATE, guest_name("t"), ENTRY, 32 /*prio*/, 0x4000 /*stack*/, 0);
     CHECK(thid != 0, "thread created, got 0x%08X", thid);
 
     /* The caller's context must survive the thread running. */
