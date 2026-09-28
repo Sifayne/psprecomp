@@ -1223,6 +1223,22 @@ static void test_time_calls(void) {
     put_date(B + 32, 2023, 2, 30, 0, 0, 0, 0);
     CHECK(call(psp_nid("sceRtcCheckValid"), B + 32, 0, 0, 0) == (uint32_t)-3, "Feb 30 is a bad day");
 
+    /* GetTick takes month 13 as 12 (step 161): 2023-13-01 is 2023-12-01. */
+    put_date(B, 2023, 13, 1, 0, 0, 0, 0);
+    put_date(B + 32, 2023, 12, 1, 0, 0, 0, 0);
+    call(psp_nid("sceRtcGetTick"), B, B + 16, 0, 0);
+    call(psp_nid("sceRtcGetTick"), B + 32, B + 48, 0, 0);
+    CHECK(psp_read32(B + 16) == psp_read32(B + 48) && psp_read32(B + 20) == psp_read32(B + 52),
+          "GetTick of 2023-13-01 is not 2023-12-01's");
+
+    /* Gettimeofday: seconds under a day and a zeroed timezone (step 154). */
+    for (int i = 0; i < 4; i++) psp_write32(B + 4u * (uint32_t)i, 0xEEEEEEEEu);
+    CHECK(call(psp_nid("sceKernelLibcGettimeofday"), B, B + 8, 0, 0) == 0, "Gettimeofday");
+    CHECK(psp_read32(B) < 86400u && psp_read32(B + 4) < 1000000u,
+          "Gettimeofday seconds %u usec %u", psp_read32(B), psp_read32(B + 4));
+    CHECK(psp_read32(B + 8) == 0 && psp_read32(B + 12) == 0, "timezone %08X %08X",
+          psp_read32(B + 8), psp_read32(B + 12));
+
     /* Months clamp the day: 2000-01-31 + 1 month is 2000-02-29. */
     put_date(B, 2000, 1, 31, 0, 0, 0, 0);
     call(psp_nid("sceRtcGetTick"), B, B + 16, 0, 0);

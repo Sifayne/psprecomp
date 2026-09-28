@@ -146,15 +146,25 @@ static void hle_LibcClock(void) {
 }
 
 /* threadprobe step 133 (fw 6.60) reads a microsecond part below 1000000 and
- * not zero, which whole seconds never gave. Its seconds are NOT after 2001 on
- * the PSP -- small or never written; which is for threadprobe 3 to say -- and
- * stay the Unix time here until then. */
+ * not zero, which whole seconds never gave.
+ *
+ * Step 154 (fw 6.60): the seconds are under 86400, not within 2 s of LibcTime
+ * nor of the uptime in seconds, and two reads 20 ms apart advance by 20 ms to
+ * 1 s, so seconds and microseconds are one clock. The timezone struct, when
+ * given, gets two zero words. What the seconds count is not settled beyond
+ * "under a day"; taken here as the seconds since midnight (UTC) of the wall
+ * clock LibcTime reads, which fits all three relations. This returned the
+ * Unix time, which is after 2001, and left the timezone struct untouched. */
 static void hle_LibcGettimeofday(void) {
-    uint32_t tv = psp_arg(0);
+    const uint32_t tv = psp_arg(0), tz = psp_arg(1);
     if (tv) {
         const uint64_t us = wall_us();
-        psp_write32(tv, (uint32_t)(us / 1000000u));
+        psp_write32(tv, (uint32_t)((us / 1000000u) % 86400u));
         psp_write32(tv + 4, (uint32_t)(us % 1000000u));
+    }
+    if (tz) {
+        psp_write32(tz, 0);
+        psp_write32(tz + 4, 0);
     }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -837,11 +847,19 @@ static void hle_RtcCheckValid(void) {
     psp_ret((uint32_t)r);
 }
 
-/* (date, &tick) and (&date, &tick), step 138. What either does with an
- * invalid date is unmeasured; this does the arithmetic regardless. */
+/* (date, &tick) and (&date, &tick), step 138.
+ *
+ * An invalid date: threadprobe step 161 (fw 6.60) has 2023-02-30 give
+ * 2023-03-02's tick, so a day past the month's end runs on, but 2023-13-01
+ * gives 2023-12-01's (31 days before 2024-01-01), so a month above 12 is
+ * taken as 12 rather than carried into the year the way GetDayOfWeek does
+ * (step 136). This carried it, and gave 2024-01-01. Months above 13 are
+ * unmeasured and taken as 12 too; month 0 is unmeasured and still borrows
+ * from the year. */
 static void hle_RtcGetTick(void) {
     const uint32_t date = psp_arg(0), out = psp_arg(1);
-    const rtc_date d = rtc_read_date(date);
+    rtc_date d = rtc_read_date(date);
+    if (d.month > 12) d.month = 12;
     if (out) rtc_write_tick(out, rtc_tick_of(&d));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
