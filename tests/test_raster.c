@@ -32,6 +32,7 @@ static int failures;
     } while (0)
 
 #define FB     0x04000000u          /* eDRAM */
+#define ZB     0x04088000u          /* depth, past a 512x272x4 colour buffer */
 #define LIST   0x08800000u
 #define VERTS  0x08810000u
 #define INDICES 0x08830000u
@@ -67,6 +68,8 @@ static void begin_list_vtype(uint32_t vtype) {
     cmd(0x10, (VERTS >> 8) & 0xFF0000);            /* BASE */
     cmd(0x9C, FB & 0xFFFFFF);                      /* FBP */
     cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);       /* FBW + address high byte */
+    cmd(0x9E, ZB & 0xFFFFFF);                      /* ZBP */
+    cmd(0x9F, ((ZB >> 8) & 0xFF0000) | 512);       /* ZBW */
     cmd(0x12, vtype);                              /* VTYPE */
     cmd(0x01, VERTS & 0xFFFFFF);                   /* VADDR */
 }
@@ -97,10 +100,15 @@ static uint32_t pixel(int x, int y) {
     return psp_read32(FB + (uint32_t)(y * 480 + x) * 4) & 0x00FFFFFFu;
 }
 
+/* The colour buffer, and the depth buffer as a fresh start leaves it: the
+ * depth lives in VRAM, so a test that wants none left over from the last one
+ * zeroes it the way a new run's memory would be. */
 static void clear_fb(void) {
     for (int y = 0; y < 272; y++)
         for (int x = 0; x < 480; x++)
             psp_write32(FB + (uint32_t)(y * 480 + x) * 4, 0);
+    for (uint32_t a = 0; a < 512u * 272u * 2u; a += 4)
+        psp_write32(ZB + a, 0);
 }
 
 /* A sprite is the PSP's 2D quad: two vertices, opposite corners. */
@@ -798,10 +806,13 @@ static void test_depth_test_still_rejects(void) {
           pixel(150, 100));
 }
 
-/* psp_ge_reset returns depth to its start-of-run contents. Without that, a
- * process that runs the GE twice -- this test binary, the oracle -- carries the
- * first run's depth into the second, and the second silently draws less. */
-static void test_ge_reset_clears_depth(void) {
+/* Depth is 16 bits a pixel in VRAM at ZBP, where the CPU can read it, in the
+ * layout geprobe 2 scene 17 (fw 6.60) dumped for ZBP 0x88000, ZBW 512: the
+ * value for pixel (x, y) sits at the linear offset with address bits 5-9
+ * rotated up by one and bits 6 and 13 inverted. (150, 100): linear offset
+ * 0x88000 + (100 * 512 + 150) * 2 = 0x9912C; bits 5-9 are 0b01001, rotated
+ * 0b10010, so 0x9924C; inverted, 0x9B20C. */
+static void test_depth_in_vram(void) {
     psp_ge_reset();
     clear_fb();
     begin_list();
@@ -810,8 +821,12 @@ static void test_ge_reset_clears_depth(void) {
     vertex_z(1, 200, 150, 1000, 0xFF0000FFu);
     cmd(0x04, (6u << 16) | 2);
     end_list();
+    CHECK(psp_read16(0x0409B20Cu) == 1000, "depth of (150,100) at VRAM 0x9B20C: %u",
+          psp_read16(0x0409B20Cu));
+    CHECK(psp_read16(0x0409912Cu) == 0, "and not at its linear address: %u",
+          psp_read16(0x0409912Cu));
 
-    /* Fresh run: the z=1000 left behind above must not reject this. */
+    /* A fresh start's zeroed VRAM is a fresh depth buffer. */
     psp_ge_reset();
     clear_fb();
     begin_list();
@@ -820,9 +835,8 @@ static void test_ge_reset_clears_depth(void) {
     vertex_z(1, 200, 150, 500, 0xFF00FF00u);
     cmd(0x04, (6u << 16) | 2);
     end_list();
-
     CHECK(pixel(150, 100) == 0x0000FF00u,
-          "depth must not survive psp_ge_reset: 0x%08X", pixel(150, 100));
+          "zeroed VRAM rejects nothing under GEQUAL: 0x%08X", pixel(150, 100));
 }
 
 /* The backend interface itself. The software path is the reference every other
@@ -1330,7 +1344,7 @@ int main(void) {
     test_bilinear_equals_nearest_at_1to1();
     test_clear_mode_clears_depth();
     test_depth_test_still_rejects();
-    test_ge_reset_clears_depth();
+    test_depth_in_vram();
     test_backend_selection();
     test_backend_registration();
     test_indexed_triangle_batch_boundary();

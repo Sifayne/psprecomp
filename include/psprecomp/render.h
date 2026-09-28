@@ -367,10 +367,13 @@ uint64_t psp_render_filter_split(void);
 uint64_t psp_render_raster_ns(void);
 void     psp_render_reset_pixels(void);
 
-/* Return the depth buffer to its start-of-run contents. The game clears depth
- * itself through the GE -- a clear-mode draw with the depth bit set -- so this
- * is only the value in place before its first such draw, not a per-frame clear.
- * psp_ge_reset calls it. */
+/* ZBP / ZBW: where the depth buffer lives in VRAM and its row stride in
+ * pixels. The software backend keeps depth there, 16 bits a pixel. */
+void     psp_render_set_depth_buffer(uint32_t addr, uint32_t stride);
+
+/* Return the depth-buffer registers to their start-of-run values. The depth
+ * itself is guest VRAM; the game clears it through the GE -- a clear-mode
+ * draw with the depth bit set. psp_ge_reset calls it. */
 void     psp_render_reset_depth(void);
 
 #endif

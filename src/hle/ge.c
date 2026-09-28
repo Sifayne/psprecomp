@@ -204,6 +204,8 @@ static int fx16_sat(float f) {
 
 #define GE_FBP          0x9C
 #define GE_FBW          0x9D
+#define GE_ZBP          0x9E
+#define GE_ZBW          0x9F
 
 /* Transform and lighting state.
  *
@@ -458,6 +460,7 @@ typedef struct {
 
 static struct {
     uint32_t fbp, fbw, fbfmt, vtype, vaddr, iaddr;
+    uint32_t zbp, zbw;
     ge_target targets[GE_MAX_TARGETS];
     int       n_targets, cur_target;
     uint64_t  target_overflow;
@@ -2980,6 +2983,18 @@ static void run_list_body(ge_queue *q) {
             g_ge.fbp = (g_ge.fbp & 0x00FFFFFFu) | ((arg & 0xFF0000) << 8);
             ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
             psp_render_current()->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
+            break;
+
+        /* The depth buffer: low 24 bits of the address in ZBP, the high byte
+         * and the stride in ZBW, the same split as FBP/FBW. */
+        case GE_ZBP:
+            g_ge.zbp = (g_ge.zbp & 0xFF000000u) | arg;
+            psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
+            break;
+        case GE_ZBW:
+            g_ge.zbw = arg & 0xFFFF;
+            g_ge.zbp = (g_ge.zbp & 0x00FFFFFFu) | ((arg & 0xFF0000) << 8);
+            psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
             break;
 
         case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;

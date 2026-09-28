@@ -605,52 +605,82 @@ static void put_pixel(int x, int y, uint32_t rgba, int stencil) {
     g_pixels++;
 }
 
-/* The depth buffer.
+/* The depth buffer: 16 bits a pixel in guest VRAM at ZBP, stride ZBW.
  *
- * Kept host-side rather than in guest VRAM at ZBP. The game only ever writes
- * it through the GE, so nothing reads back a value we did not put there, and
- * an array of floats avoids the 16-bit quantisation that would otherwise make
- * coplanar surfaces fight.
+ * It used to live host-side as floats, on the reasoning that nothing reads it
+ * back and that 16-bit quantisation makes coplanar surfaces fight. Hardware
+ * says otherwise on both counts. geprobe 2 scene 17 (fw 6.60) draws eight
+ * pairs of coplanar quads at z = -5 under each depth function: the hardware
+ * stores 12577 across every one and EQUAL passes everywhere, while the host
+ * floats differed in the last bits between the two quads and EQUAL/NOTEQUAL
+ * came out speckled. And the scene's depth dump shows what the CPU reads at
+ * ZBP, which is now what it reads here too.
  *
- * The *game* clears it, not us. A clear-mode draw with the depth bit set writes
- * its own z across the rectangle it covers, which is what the hardware does and
- * what ge.c now asks for. There is deliberately no host-side "clear to far":
- * "far" is whichever end of the 0..65535 window the game's comparison treats as
- * farthest, and only the game knows which. This one runs GEQUAL, where farthest
- * is 0 -- a buffer cleared to 65535 would fail every one of those tests and draw
- * nothing at all. That is the trap an earlier `#define DEPTH_FAR 1.0e30f` fell
- * into, and lowering it to 65535 did not climb out: for GEQUAL both values
- * reject everything.
+ * The value stored is the interpolated window z floored to an integer:
+ * across both of the scene's triangles the hardware's values are exactly a
+ * floored linear plane. That plane's own gradient is not quite the exact one
+ * (values sit within -4..+3 of it); not modelled yet.
  *
- * The reset value below is therefore the one that rejects nothing under the
- * comparison this game uses, so the frames before its first clear draw rather
- * than vanish. It is a placeholder for a real per-title depth convention, not a
- * claim about hardware; a LEQUAL title needs the other end and will need this
- * revisited. */
-#define DEPTH_RESET 0.0f
-static float g_depth[DEPTH_STRIDE * DEPTH_ROWS];
+ * The game clears depth itself through the GE, a clear-mode draw with the
+ * depth bit set; what is there before its first clear is whatever VRAM held,
+ * zero on a fresh start. For a GEQUAL title that rejects nothing, as the old
+ * host-side DEPTH_RESET of 0 was chosen to. */
+static uint32_t g_zb_addr = PSP_VRAM_BASE, g_zb_stride = 512;
 static struct { int test, func, write; } g_zs = { 0, 1 /* always */, 0 };
 
 static void sw_depth(int test_enable, int func, int write_enable) {
     g_zs.test = test_enable; g_zs.func = func; g_zs.write = write_enable;
 }
 
-/* Called from psp_ge_reset, so a second run in the same process -- the test
- * suite does exactly that -- does not inherit the previous run's depth.
- *
- * Deliberately *not* hung off the backend's init() hook, which looks like the
- * natural home and is never called; neither is shutdown() or present(). Putting
- * the reset there would reproduce the bug this replaces, where the only call to
- * the depth clear sat in an unwired vtable slot. */
+void psp_render_set_depth_buffer(uint32_t addr, uint32_t stride) {
+    g_zb_addr = PSP_VRAM_BASE | (addr & 0x001FFFFEu);
+    g_zb_stride = stride ? stride : 512;
+}
+
+/* Called from psp_ge_reset: the depth-buffer registers go back to their
+ * start-of-run values. The buffer's contents are guest VRAM and are reset
+ * with it. */
 void psp_render_reset_depth(void) {
-    for (int i = 0; i < DEPTH_STRIDE * DEPTH_ROWS; i++) g_depth[i] = DEPTH_RESET;
+    g_zb_addr = PSP_VRAM_BASE;
+    g_zb_stride = 512;
+}
+
+/* Where the GE keeps pixel (x, y)'s depth, as the CPU sees it through the
+ * plain VRAM address. Not the linear (y * ZBW + x) * 2: geprobe 2 scene 17
+ * (fw 6.60, ZBP 0x88000, ZBW 512) dumps ZBP linearly and the image comes back
+ * cut into 16-pixel strips. Matching the strips against the scene's geometry
+ * gives one address permutation that puts every one of them back:
+ *
+ *   - bits 0-4 (a strip of 16 pixels) stay;
+ *   - bits 5-9 rotate up by one, bit 9 landing in bit 5, so strips from the
+ *     left and right halves of a 512-pixel row alternate;
+ *   - bits 6 and 13 are inverted, swapping neighbouring strips and blocks of
+ *     8 rows.
+ *
+ * Those two inversions were constant across everything the scene covers (x
+ * 16..463, y 64..223); whether they depend on address bits the scene held
+ * fixed (bit 19 is set throughout at that ZBP) is a question for a probe
+ * with another ZBP. Only the CPU's view depends on it: the GE reads back
+ * through the same mapping it wrote. */
+static uint32_t depth_addr(int x, int y) {
+    const uint32_t l = (g_zb_addr & 0x001FFFFFu) + ((uint32_t)y * g_zb_stride + (uint32_t)x) * 2u;
+    const uint32_t mid = (l >> 5) & 0x1Fu;                       /* bits 5-9 */
+    const uint32_t rot = ((mid << 1) | (mid >> 4)) & 0x1Fu;
+    const uint32_t p = (l & ~(0x1Fu << 5)) | (rot << 5);
+    return PSP_VRAM_BASE | ((p ^ 0x2040u) & 0x001FFFFFu);
+}
+
+static int depth_value(float z) {
+    if (!(z > 0.0f)) return 0;
+    if (z >= 65535.0f) return 65535;
+    return (int)z;
 }
 
 /* GE comparison codes: 0 never, 1 always, 2 equal, 3 notequal, 4 less,
  * 5 lequal, 6 greater, 7 gequal. */
-static int depth_pass(int x, int y, float z) {
+static int depth_pass(int x, int y, int z) {
     if (!g_zs.test) return 1;
-    const float d = g_depth[y * DEPTH_STRIDE + x];
+    const int d = psp_read16(depth_addr(x, y));
     switch (g_zs.func) {
     case 0: return 0;
     case 2: return z == d;
@@ -940,10 +970,11 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
             return;
         }
     }
-    if (!depth_pass(x, y, z)) {
+    const int zi = depth_value(z);
+    if (!depth_pass(x, y, zi)) {
         g_px_zfail++;
-        if (watched) fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d DEPTH-FAILED %08X  z %.0f against %.0f func %d  tex %08X  pixels so far %llu\n",
-                             x, y, g_fb_addr, g_cur_prim, rgba, (double)z, (double)g_depth[y * DEPTH_STRIDE + x], g_zs.func,
+        if (watched) fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d DEPTH-FAILED %08X  z %d against %d func %d  tex %08X  pixels so far %llu\n",
+                             x, y, g_fb_addr, g_cur_prim, rgba, zi, (int)psp_read16(depth_addr(x, y)), g_zs.func,
                              g_tex.addr, (unsigned long long)g_pixels);
         if (g_bs.stencil_test) write_stencil_only(x, y, stencil_op(g_bs.op_zfail, cur_stencil));
         return;
@@ -951,7 +982,7 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
     /* A disabled depth test writes no depth, as in GL and on the hardware:
      * ZMSK alone does not resurrect the write. Clear mode still writes because
      * the GE layer hands it an enabled test with ALWAYS (src/hle/ge.c). */
-    if (g_zs.test && g_zs.write) g_depth[y * DEPTH_STRIDE + x] = z;
+    if (g_zs.test && g_zs.write) psp_write16(depth_addr(x, y), (uint16_t)zi);
     if (g_bs.stencil_test) stencil = (int)stencil_op(g_bs.op_zpass, cur_stencil);
     if (!g_bs.write_colour) {
         if (stencil >= 0) write_stencil_only(x, y, (uint32_t)stencil);
