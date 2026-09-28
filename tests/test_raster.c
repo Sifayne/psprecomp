@@ -1203,6 +1203,22 @@ static void test_hardware_blend(void) {
     CHECK((p >> 16) == 192, "negative doubled factor on 170: B %u, hardware 192", p >> 16);
 }
 
+/* MODULATE with colour doubling, geprobe step 13 (fw 6.60): doubling acts
+ * before the final shift, so texel 255 by vertex 64 is (255 * 65) >> 7 = 129,
+ * not twice the rounded 64. */
+static void test_hardware_texfunc(void) {
+    psp_ge_reset(); clear_fb();
+    psp_write32(TEX, 0xFFFFFFFFu);
+    begin_list_vtype(VTYPE_2D_TEX);
+    texture_state(TEX, 1, 0, 0, 3, 0, 0);
+    cmd(0xC9, 0 | 1u << 16);                       /* MODULATE, RGB, doubled */
+    vertex_uv(0, 30, 30, 0, 0, 0xFF404040u);
+    vertex_uv(1, 31, 31, 1, 1, 0xFF404040u);
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    CHECK(pixel(30, 30) == 0x818181, "doubled MODULATE 255 x 64: %06X, hardware 818181",
+          pixel(30, 30));
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -1239,6 +1255,7 @@ int main(void) {
     test_hardware_shading();
     test_hardware_dither();
     test_hardware_blend();
+    test_hardware_texfunc();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

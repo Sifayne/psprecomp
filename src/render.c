@@ -522,34 +522,50 @@ static psp_blend_state g_bs;
 /* The texture function: how a texel and the vertex colour become the fragment.
  *
  * The five GE_TEXFUNC codes, the RGB/RGBA flag that says whether the texel's
- * alpha takes part, and the colour-doubling flag. Measured in gpu/texfunc,
- * one test per function: under ADD "One + Zero" is white and "Half + Half"
- * is 0xFE, "Half x2 + Half" saturates to white, and under RGB the fragment
- * alpha is the vertex's. Only MODULATE was implemented before, hardcoded at
- * both call sites, so the other four drew as MODULATE. Codes 5..7 are not
+ * alpha takes part, and the colour-doubling flag. Codes 5..7 are not
  * defined; they are treated as MODULATE rather than refused, because a
- * refusal draws untextured and that has been the harder thing to notice. */
+ * refusal draws untextured and that has been the harder thing to notice.
+ *
+ * The arithmetic is geprobe step 13's (fw 6.60), which it reproduces on all
+ * 40 sprites; t is the texel, c the vertex colour, e the TEXENV colour, d the
+ * doubling bit:
+ *
+ *     MODULATE  (t * (c + 1)) >> (8 - d)
+ *     DECAL     RGBA: (t * ta + c * (255 - ta) + 255) >> (8 - d);  RGB: t << d
+ *     BLEND     (c * (255 - t) + e * t + 255) >> (8 - d)
+ *     REPLACE   t << d
+ *     ADD       (t + c) << d
+ *
+ * each clamped to 255. Doubling happens before the final shift, not to the
+ * rounded result: MODULATE of t 255 and c 64, doubled, is 129, where the
+ * rounded (t * c + 127) / 255 this used, then doubled, gave 128 -- (170,54)
+ * reads 000C6DCC on hardware against 000C6CCC. REPLACE and ADD, and which
+ * alpha each function keeps, were right already (gpu/texfunc: ADD's "One +
+ * Zero" is white, "Half x2 + Half" saturates). The alpha product under RGBA
+ * is taken like MODULATE's colour; step 13 cannot tell it from
+ * ((2t+1)(2c+1)) >> 10 or a truncated t * c / 255, only from the rounded
+ * divide, which it excludes. */
 static uint32_t apply_texfunc(uint32_t tex, uint32_t col) {
     const uint32_t ta = chan(tex, 3), ca = chan(col, 3);
+    const uint32_t d = g_tex.color_double ? 1u : 0u, sh = 8u - d;
     uint32_t out = 0;
     for (int i = 0; i < 3; i++) {
         const uint32_t t = chan(tex, i), c = chan(col, i), e = chan(g_tex.env, i);
         uint32_t o;
         switch (g_tex.func) {
-        case 1:  o = g_tex.tcc_rgba ? (t * ta + c * (255u - ta) + 127u) / 255u : t; break;  /* DECAL   */
-        case 2:  o = (c * (255u - t) + e * t + 127u) / 255u;                          break;  /* BLEND   */
-        case 3:  o = t;                                                                break;  /* REPLACE */
-        case 4:  o = t + c; if (o > 255u) o = 255u;                                    break;  /* ADD     */
-        default: o = (t * c + 127u) / 255u;                                            break;  /* MODULATE */
+        case 1:  o = g_tex.tcc_rgba ? (t * ta + c * (255u - ta) + 255u) >> sh : t << d; break;  /* DECAL */
+        case 2:  o = (c * (255u - t) + e * t + 255u) >> sh;                            break;  /* BLEND   */
+        case 3:  o = t << d;                                                            break;  /* REPLACE */
+        case 4:  o = (t + c) << d;                                                      break;  /* ADD     */
+        default: o = (t * (c + 1u)) >> sh;                                              break;  /* MODULATE */
         }
-        if (g_tex.color_double) { o *= 2u; if (o > 255u) o = 255u; }
-        out |= o << (i * 8);
+        out |= (o > 255u ? 255u : o) << (i * 8);
     }
     uint32_t a;
     switch (g_tex.func) {
-    case 1:  a = ca;                                                  break;  /* DECAL keeps the vertex alpha */
-    case 3:  a = g_tex.tcc_rgba ? ta : ca;                            break;  /* REPLACE */
-    default: a = g_tex.tcc_rgba ? (ta * ca + 127u) / 255u : ca;       break;  /* MODULATE, BLEND, ADD */
+    case 1:  a = ca;                                             break;  /* DECAL keeps the vertex alpha */
+    case 3:  a = g_tex.tcc_rgba ? ta : ca;                       break;  /* REPLACE */
+    default: a = g_tex.tcc_rgba ? (ta * (ca + 1u)) >> 8 : ca;    break;  /* MODULATE, BLEND, ADD */
     }
     return out | (a << 24);
 }
