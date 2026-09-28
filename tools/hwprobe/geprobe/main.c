@@ -33,7 +33,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 3
+#define PROBE_VERSION 4
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -728,19 +728,31 @@ static void scene_spline(void) {
 }
 
 /* Bounding-box jumps: each object draws a marker sprite at a fixed screen spot
- * if the GE decides its box is visible. */
+ * if the GE decides its box is visible.
+ *
+ * Both vertex blocks are put in the list before sceGuBeginObject. That call
+ * writes BASE 0 and BJUMP 0 as a placeholder that sceGuEndObject patches with
+ * the real target, and libgu's sceGuDrawArray leaves the stall address alone
+ * inside an object, but sceGuGetMemory does not: called in between, it lets
+ * the GE past the placeholder, and a box the GE finds invisible then jumps to
+ * address 0. geprobe 2 did that (rect2d inside the object) and firmware 6.60
+ * switched itself off; version 1 got away with it because, without matrices,
+ * every box was visible. */
 static void bbox_object(float cx, float cy, float cz, float h, int slot, w32 color) {
     typedef struct { float x, y, z; } P3;
     P3 box[8];
     for (int i = 0; i < 8; i++)
         box[i] = (P3){ cx + ((i & 1) ? h : -h), cy + ((i & 2) ? h : -h), cz + ((i & 4) ? h : -h) };
-    sceGuBeginObject(GU_VERTEX_32BITF | GU_TRANSFORM_3D, 8, NULL, gumem(box, sizeof box));
-    rect2d(10 + slot * 58, 220, 60 + slot * 58, 262, color);
+    CV mark[2] = { { color, 10 + slot * 58, 220, 0 }, { color, 60 + slot * 58, 262, 0 } };
+    void *bv = gumem(box, sizeof box);
+    void *mv = gumem(mark, sizeof mark);
+    sceGuBeginObject(GU_VERTEX_32BITF | GU_TRANSFORM_3D, 8, NULL, bv);
+    sceGuDrawArray(GU_SPRITES, FMT_CV2D, 2, NULL, mv);
     sceGuEndObject();
 }
 
-/* One list per object, each its own step: geprobe 2 drew all eight in one
- * list and firmware 6.60 never finished it, so this names the object. The
+/* One list per object, each its own step, so a box that goes wrong is named
+ * and a restart skips only that box. The
  * marker's centre pixel says whether the GE drew it (the box was visible). */
 static void scene_bbox(void) {
     static const struct { float cx, cy, cz, h; w32 color; const char *what; } B[8] = {

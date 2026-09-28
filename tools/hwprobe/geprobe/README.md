@@ -25,7 +25,7 @@ blending, depth, clipping, the per-pixel tests).
 | 21 | morphing between two vertex sets | 8888 |
 | 22 | Bezier patches at several subdivisions, as triangles, lines and points, and textured with generated UVs | 8888 |
 | 23 | spline patches with each open/closed edge combination | 8888 |
-| 24 | bounding-box jumps: one marker per box, drawn only if the GE finds the box visible. Each box is its own list and step, and a list still running after a second is broken off with `sceGeBreak(1)` and logged: version 2 drew all eight in one list and firmware 6.60 never finished it | 8888 |
+| 24 | bounding-box jumps: one marker per box, drawn only if the GE finds the box visible. Each box is its own list and step, and a list still running after a second is broken off with `sceGeBreak(1)` and logged. Versions 2 and 3 called `sceGuGetMemory` inside `sceGuBeginObject`/`sceGuEndObject`, which lets the GE reach libgu's placeholder BJUMP (target 0) before it is patched; with matrices set, an invisible box took it and firmware 6.60 switched itself off. Version 4 puts both vertex blocks in the list first | 8888 |
 
 After the scenes it records which GE callbacks run, with which arguments and
 when, through libgu (signal and finish) and through a raw `sceGe` list.
