@@ -139,6 +139,7 @@ static void savedata_log(uint32_t param) {
 #define SD_RW_FILE         0x80110329u   /* RW_FILE_NOT_FOUND */
 #define SD_DELETE_NO_DATA  0x80110347u   /* DELETE_NO_DATA */
 #define SD_LOAD_BROKEN     0x80110306u   /* LOAD_DATA_BROKEN */
+#define SD_LOAD_BAD_PARAMS 0x80110308u   /* LOAD_BAD_PARAMS */
 #define SD_RW_BROKEN       0x80110326u   /* RW_DATA_BROKEN */
 #define SD_LOAD_ACCESS     0x80110305u   /* LOAD_ACCESS_ERROR: read failed */
 #define SD_SAVE_ACCESS     0x80110385u   /* SAVE_ACCESS_ERROR: write, list */
@@ -298,13 +299,40 @@ static void sd_write_file(const char *guest, uint32_t src, uint32_t cap) {
  * The list is where hardware keeps the secure/normal class of each file, so
  * it is read back here too (FILES, READDATA) and survives a relaunch. The
  * MACs need the savedata crypto (sceChnnlsv), which is not implemented:
- * they stay zero. */
+ * the SFO's stay zero, and a secure file's slot holds a psprecomp key tag
+ * instead (sd_key_tag), so a load can tell which key made the save. */
 #define SD_SFO_SIZE     4912u
 #define SD_FL_ENTRIES   99u
 #define SD_FL_LEN       (SD_FL_ENTRIES * 32u)
 #define SD_PARAMS_LEN   128u
 #define SD_FLAG_GAMEKEY 0x20u    /* SAVEDATA_PARAMS[0]: bound to the game key */
+#define SD_KEY          1500u    /* key[16], in the 1536-byte block (SDK 2.00+) */
 #define SD_SECURE_VERSION 1516u  /* uint32 in the 1536-byte block, after key[16] */
+
+/* The request's game key, when its block is long enough to carry one. */
+static int sd_request_key(uint32_t param, uint8_t key[16]) {
+    memset(key, 0, 16);
+    if (psp_read32(param) < 1536) return 0;
+    for (uint32_t i = 0; i < 16; i++) key[i] = psp_read8(param + SD_KEY + i);
+    return 1;
+}
+
+/* Placeholder for a secure file's SAVEDATA_FILE_LIST MAC until the savedata
+ * crypto exists: "PRCP" and 12 bytes of an FNV-1a fingerprint of the key.
+ * The prefix marks it as psprecomp's (a hardware MAC starts with it once
+ * in 2^32), and it stands in for what the real MAC does on a load: stop
+ * verifying under another key. It is a tag, not a secret; the key is in
+ * the game binary anyway. */
+static void sd_key_tag(const uint8_t key[16], uint8_t tag[16]) {
+    uint64_t a = 0xcbf29ce484222325ull, b = a ^ 0x5052435050524350ull;
+    for (int i = 0; i < 16; i++) {
+        a = (a ^ key[i]) * 0x100000001b3ull;
+        b = (b ^ key[15 - i]) * 0x100000001b3ull;
+    }
+    memcpy(tag, "PRCP", 4);
+    for (int i = 0; i < 8; i++) tag[4 + i] = (uint8_t)(a >> (8 * i));
+    for (int i = 0; i < 4; i++) tag[12 + i] = (uint8_t)(b >> (8 * i));
+}
 
 static unsigned sd_le16(const unsigned char *b) { return b[0] | (unsigned)b[1]<<8; }
 static uint32_t sd_le32(const unsigned char *b) {
@@ -373,9 +401,9 @@ static int sd_fl_secure(const sd_sfo_state *st, const char *file) {
     return sd_fl_index(st, file) >= 0;
 }
 
-/* Record file as secure (in place when listed, else in the first free
- * entry), or drop it from the list and close the gap. */
-static void sd_fl_update(sd_sfo_state *st, const char *file, int secure) {
+/* Record file as secure with the given MAC slot (in place when listed, else
+ * in the first free entry), or drop it from the list and close the gap. */
+static void sd_fl_update(sd_sfo_state *st, const char *file, int secure, const uint8_t mac[16]) {
     int at = sd_fl_index(st, file);
     if (secure) {
         if (at < 0) {
@@ -386,6 +414,7 @@ static void sd_fl_update(sd_sfo_state *st, const char *file, int secure) {
         uint8_t *e = st->files + (uint32_t)at * 32u;
         memset(e, 0, 32);
         sd_fl_name(file, (char *)e);
+        memcpy(e + 13, mac, 16);
     } else if (at >= 0) {
         uint32_t from = ((uint32_t)at + 1) * 32u;
         memmove(st->files + (uint32_t)at * 32u, st->files + from, SD_FL_LEN - from);
@@ -399,6 +428,44 @@ static void sd_fl_update(sd_sfo_state *st, const char *file, int secure) {
 static int sd_mode_secure(uint32_t mode) {
     return mode == SD_AUTOSAVE || mode == SD_SAVE || mode == SD_LISTSAVE ||
            mode == SD_MAKEDATASECURE || mode == SD_WRITEDATASECURE;
+}
+
+/* The LOAD family's key and secureVersion rules for a secure data file, as
+ * a PSP on firmware 6.60 applies them to a 1536-byte block (saveprobe,
+ * steps 5-36 and 56-67):
+ *   - an all-zero key gives LOAD_BAD_PARAMS unless the request's
+ *     secureVersion is 1 (A0..A3: steps 8, 12 ... 36, 63 and 67; A1 opens
+ *     with it, step 59). It comes after the existence checks: a zero key on
+ *     a missing save still reads LOAD_NO_DATA (steps 2-4, 47);
+ *   - a save whose SAVEDATA_PARAMS flags carry 0x20 (secureVersion 0 or 2)
+ *     opens only with the key that made it, else LOAD_DATA_BROKEN (steps 7,
+ *     11 ... 35, 62). Flags 0x01 saves (secureVersion 1 or 3) open with any
+ *     key (steps 58, 66). That the stored flags decide, not the request's
+ *     secureVersion, is an assumption: every probe load reused the save's.
+ * The save side is not applied: hardware refused one zero-key AUTOSAVE at
+ * secureVersion 0 (step 1, SAVE_BAD_PARAMS), but that rests on one step and
+ * a false positive would stop a game saving. So a save psprecomp let through
+ * with the zero key must load with it too: the zero-key rule skips a save
+ * whose tag is the zero key's.
+ * The key is compared through the file's tag (sd_key_tag); a MAC slot
+ * without one (a PSP's own save, or a short block's) is not checked. */
+static uint32_t sd_load_key_check(uint32_t param, const char *dir, const char *file) {
+    uint8_t key[16], tag[16], zero[16] = {0}, ztag[16];
+    if (!sd_request_key(param, key)) return SD_OK;
+    static sd_sfo_state st;
+    sd_sfo_read_state(dir, &st);
+    int at = sd_fl_index(&st, file);
+    if (at < 0) return SD_OK;
+    const uint8_t *mac = st.files + (uint32_t)at * 32u + 13;
+    int tagged = !memcmp(mac, "PRCP", 4);
+    sd_key_tag(key, tag);
+    sd_key_tag(zero, ztag);
+    if (!memcmp(key, zero, 16) && psp_read32(param + SD_SECURE_VERSION) != 1 &&
+        !(tagged && !memcmp(mac, ztag, 16)))
+        return SD_LOAD_BAD_PARAMS;
+    if ((st.params[0] & SD_FLAG_GAMEKEY) && tagged && memcmp(mac, tag, 16))
+        return SD_LOAD_BROKEN;
+    return SD_OK;
 }
 
 /* SAVEDATA_PARAMS[0]. A block shorter than 1536 bytes (SDK before 2.00)
@@ -426,7 +493,11 @@ static void sd_write_sfo(const char *dir, const char *dirname, uint32_t param) {
 
     static sd_sfo_state st;
     sd_sfo_read_state(dir, &st);
-    if (file[0]) sd_fl_update(&st, file, sd_mode_secure(mode));
+    /* The file's MAC slot: the key tag when the request carries a key
+     * (a short block has none, and gets zeros like the other MACs). */
+    uint8_t key[16], mac[16] = {0};
+    if (sd_request_key(param, key)) sd_key_tag(key, mac);
+    if (file[0]) sd_fl_update(&st, file, sd_mode_secure(mode), mac);
     memset(st.params, 0, sizeof st.params);
     st.params[0] = sd_sfo_flags(param);
 
@@ -842,7 +913,7 @@ static uint32_t sd_do_mode(uint32_t param) {
     case SD_LOAD:
     case SD_LISTLOAD:
     case SD_AUTOLOAD: {
-        int rc;
+        uint32_t rc;
         sd_dir(game, save, dir, sizeof dir);
         if (!sd_exists(dir)) rc = SD_LOAD_NO_DATA;
         else if (!sd_has_sfo(dir)) rc = SD_LOAD_BROKEN;
@@ -850,7 +921,9 @@ static uint32_t sd_do_mode(uint32_t param) {
         else {
             snprintf(guest, sizeof guest, "%s/%s", dir, file);
             if (!sd_exists(guest)) rc = SD_LOAD_FILE;
-            else {
+            else if ((rc = sd_load_key_check(param, dir, file)) != SD_OK) {
+                /* Refused: dataSize and the buffer stay as they were. */
+            } else {
                 if (buf && bufsz) {
                     int64_t n = sd_read_file(guest, buf, bufsz);
                     if (n < 0) return SD_LOAD_ACCESS;

@@ -316,6 +316,47 @@ static void fw660_sfo(void) {
     assert(run()==0); assert(psp_read32(fl+16)==0x8000u);
     for (unsigned i=0;i<48;i++) assert(psp_read8(ents+i)==0xA5);
 }
+/* key A = 00..0F, key B = FF..F0 (saveprobe's), 0 = all zero. */
+static void key(char which,unsigned version) {
+    for (unsigned i=0;i<16;i++)
+        psp_write8(p+1500+i,which=='A' ? i : which=='B' ? 0xFF-i : 0);
+    psp_write32(p+1516,version);
+}
+static uint32_t load(const char *save,char which,unsigned version) {
+    hw(0,save,""); key(which,version); psp_write32(p+124,0x5A5A); psp_write8(data,0);
+    return run();
+}
+static void fw660_keys(void) {
+    /* secureVersion 0 (A0 ... A0LEN1000, steps 5-36) and 2 (A2, 60-63):
+     * the right key loads, another is LOAD_DATA_BROKEN, the zero key
+     * LOAD_BAD_PARAMS; a refused load leaves dataSize alone. */
+    for (unsigned v=0;v<=2;v+=2) {
+        hw(1,"HWKEY","keyed"); key('A',v); assert(run()==0);
+        assert(load("HWKEY",'A',v)==0 && psp_read32(p+124)==6 && psp_read8(data)=='k');
+        assert(load("HWKEY",'B',v)==0x80110306u && psp_read32(p+124)==0x5A5A && !psp_read8(data));
+        assert(load("HWKEY",'0',v)==0x80110308u && psp_read32(p+124)==0x5A5A);
+    }
+    /* secureVersion 1 (A1, 56-59) opens with any key, the zero key too;
+     * 3 (A3, 64-67) with any key but the zero one. */
+    hw(1,"HWKEY1","v1"); key('A',1); assert(run()==0);
+    assert(load("HWKEY1",'B',1)==0 && load("HWKEY1",'0',1)==0 && psp_read32(p+124)==3);
+    hw(1,"HWKEY3","v3"); key('A',3); assert(run()==0);
+    assert(load("HWKEY3",'B',3)==0 && load("HWKEY3",'0',3)==0x80110308u);
+    /* The existence checks come first: a zero key on a missing save is
+     * LOAD_NO_DATA (steps 2-4, 47). */
+    assert(load("HWNOSUCH",'0',0)==0x80110307u);
+    /* The save side is held back (one step, P1), so what saves with the zero
+     * key loads with it; another key is still refused. */
+    hw(1,"HWZERO","zero"); key('0',0); assert(run()==0);
+    assert(load("HWZERO",'0',0)==0 && psp_read8(data)=='z');
+    assert(load("HWZERO",'A',0)==0x80110306u);
+    /* The rules are for secure files: a MAKEDATA save loads with any key. */
+    assert(load("HWPLAIN",'0',0)==0 && load("HWPLAIN",'B',0)==0);
+    /* A block without key fields (SDK before 2.00) is not checked. */
+    hw(1,"HWSHORT","short"); psp_write32(p,1500); assert(run()==0);
+    hw(0,"HWSHORT",""); psp_write32(p,1500); assert(run()==0 && psp_read8(data)=='s');
+    assert(load("HWSHORT",'B',0)==0);
+}
 int main(void) {
 #ifndef _WIN32
     snprintf(root,sizeof root,"/tmp/psprecomp-savedata-XXXXXX"); assert(mkdtemp(root));
@@ -324,7 +365,7 @@ int main(void) {
 #endif
     assert(psp_mem_init()==0); psp_cpu_reset(); psp_hle_init(); psp_io_set_root(root); psp_savedata_set_host(1);
     lifecycle(); roundtrip(); deletion(); errors(); request_safety(); headless(); scripts(); coverage();
-    fw660_status(); fw660_sfo();
+    fw660_status(); fw660_sfo(); fw660_keys();
     assert(psp_mem_bad_access==0); psp_mem_free();
     printf("savedata: lifecycle, independent slots, writeback, metadata, cancellation, overwrite, deletion, errors, recovery, scripts, focus, new-data artwork and foreign directories passed\n");
     return 0;
