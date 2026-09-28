@@ -821,9 +821,28 @@ static uint32_t sd_do_files(uint32_t param, const char *dir) {
     return SD_OK;
 }
 
-/* LIST(11): one entry per save dir under the game prefix, names reported
- * bare (TEST99901ABC reads ABC). Sorted, capped at maxCount. */
-static uint32_t sd_do_list(uint32_t param, const char *game) {
+/* saveName as a LIST pattern: '*' matches any run, '?' any one character,
+ * anything else itself. */
+static int sd_match(const char *pat, const char *s) {
+    const char *star = NULL, *resume = NULL;
+    while (*s) {
+        if (*pat == '*') { star = pat++; resume = s; }
+        else if (*pat == '?' || *pat == *s) { pat++; s++; }
+        else if (star) { pat = star + 1; s = ++resume; }
+        else return 0;
+    }
+    while (*pat == '*') pat++;
+    return !*pat;
+}
+
+/* LIST(11): the save dirs under the game prefix whose save part matches
+ * saveName as a pattern, names reported bare (TEST99901ABC reads ABC).
+ * Sorted, capped at maxCount. On fw 6.60, saveName '<>' and '' both list
+ * nothing although twelve saves of the game exist (saveprobe steps 51-52):
+ * neither matches a save part, so saveName is a filter, not ignored. The
+ * wildcards are inferred from the suite's LIST names ("A?C"); v2 of the
+ * probe tries '*', 'A0*' and 'A?'. */
+static uint32_t sd_do_list(uint32_t param, const char *game, const char *pattern) {
     uint32_t il = sd_optional(param, SD_IDLIST);
     char names[256][64];
     int n = psp_io_list_names("ms0:/PSP/SAVEDATA", names, 256);
@@ -833,7 +852,8 @@ static uint32_t sd_do_list(uint32_t param, const char *game) {
     uint32_t maxc = psp_read32(il + 0), pent = psp_read32(il + 8);
     uint32_t count = 0;
     for (int i = 0; i < n && count < maxc; i++) {
-        if (strncmp(names[i], game, glen) != 0) continue;
+        if (names[i][0] == '.' || strncmp(names[i], game, glen) != 0) continue;
+        if (!sd_match(pattern, names[i] + glen)) continue;
         if (pent) {
             /* IdListEntry: st_mode, three 16-byte datetimes, name[20] --
              * 72 bytes. Mode 0x11FF and the bare save name are suite-pinned. */
@@ -1035,7 +1055,7 @@ static uint32_t sd_do_mode(uint32_t param) {
         return sd_do_files(param, dir);
 
     case SD_LIST:
-        return sd_do_list(param, game);
+        return sd_do_list(param, game, save);
 
     default:
         return SCE_KERNEL_ERROR_NOTIMPLEMENTED;
@@ -1356,11 +1376,12 @@ static int sd_validate(uint32_t p) {
     sd_getstr(p,SD_GAMENAME,13,game,sizeof game); sd_getstr(p,SD_SAVENAME,20,save,sizeof save);
     sd_getstr(p,SD_FILENAME,13,file,sizeof file);
     uint32_t mode=psp_read32(p+SD_MODE);
-    char pattern[21]; snprintf(pattern,sizeof pattern,"%s",save);
-    if (mode==SD_LIST) for (char *c=pattern;*c;c++) if (*c=='*' || *c=='?') *c='x';
-    int wildcard=!strcmp(save,"<>") && (mode==SD_LISTLOAD || mode==SD_LISTSAVE || mode==SD_LISTDELETE);
+    /* LIST takes any saveName: it is a pattern, never a path, and fw 6.60
+     * accepts '<>' there (saveprobe step 51). */
+    int wildcard=(!strcmp(save,"<>") && (mode==SD_LISTLOAD || mode==SD_LISTSAVE || mode==SD_LISTDELETE)) ||
+        mode==SD_LIST;
     if (mode>SD_GETSIZE || !sd_component(game,mode==SD_LISTALLDEL || mode==SD_LIST) ||
-        (!sd_component(pattern,1) && !wildcard) || !sd_component(file,1)) return 0;
+        (!sd_component(save,1) && !wildcard) || !sd_component(file,1)) return 0;
     uint32_t data=psp_read32(p+SD_DATABUF),cap=psp_read32(p+SD_DATABUFSZ),n=psp_read32(p+SD_DATASZ);
     if (data && cap && !psp_mem_ptr(data,cap)) return 0;
     int writing=mode==SD_AUTOSAVE || mode==SD_SAVE || mode==SD_LISTSAVE ||

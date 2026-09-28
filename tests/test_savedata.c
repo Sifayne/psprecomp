@@ -388,6 +388,23 @@ static void fw660_sizes(void) {
     str(md+16,"HWSFO"); psp_write32(p+1412,data); psp_write32(p+1416,40000); psp_write32(p+1420,40000);
     assert(run()==0 && psp_read32(md+36)>=3 && psp_read32(ud)==5);
 }
+/* LIST with saveName pattern: the result count (entries at ents). */
+static int list_of(const char *pattern) {
+    const uint32_t il=0x0881A000;
+    hw(11,pattern,""); psp_write32(p+1524,il);
+    psp_write32(il,32); psp_write32(il+4,0xFFFFFFFFu); psp_write32(il+8,ents);
+    assert(run()==0);
+    return (int)psp_read32(il+4);
+}
+static void fw660_list(void) {
+    /* '<>' is accepted at InitStart and, like '', lists nothing, although
+     * the game has saves (steps 51-52): saveName filters the save part. */
+    assert(list_of("<>")==0 && list_of("")==0);
+    assert(list_of("HWKEY?")==2 && psp_read32(ents)==0x11FFu);
+    assert(!strcmp((const char *)psp_mem_ptr(ents+52,20),"HWKEY1"));
+    assert(!strcmp((const char *)psp_mem_ptr(ents+72+52,20),"HWKEY3"));
+    assert(list_of("HWSFO")==1 && list_of("HW*")==8 && list_of("*")>=12 && list_of("*1")==2);
+}
 int main(void) {
 #ifndef _WIN32
     snprintf(root,sizeof root,"/tmp/psprecomp-savedata-XXXXXX"); assert(mkdtemp(root));
@@ -396,8 +413,8 @@ int main(void) {
 #endif
     assert(psp_mem_init()==0); psp_cpu_reset(); psp_hle_init(); psp_io_set_root(root); psp_savedata_set_host(1);
     lifecycle(); roundtrip(); deletion(); errors(); request_safety(); headless(); scripts(); coverage();
-    fw660_status(); fw660_sfo(); fw660_keys(); fw660_cross_mode(); fw660_sizes();
+    fw660_status(); fw660_sfo(); fw660_keys(); fw660_cross_mode(); fw660_sizes(); fw660_list();
     assert(psp_mem_bad_access==0); psp_mem_free();
-    printf("savedata: lifecycle, independent slots, writeback, metadata, cancellation, overwrite, deletion, errors, recovery, scripts, focus, new-data artwork and foreign directories passed\n");
+    printf("savedata: lifecycle, independent slots, writeback, metadata, cancellation, overwrite, deletion, errors, recovery, scripts, focus, new-data artwork, foreign directories and the firmware 6.60 savedata rules passed\n");
     return 0;
 }
