@@ -50,7 +50,8 @@
 #define SAS_ERROR_NOISE_FREQ   0x80420011u
 /* sascore.expected: a volume outside -0x1000..0x1000 is refused with 18, and
  * all four -- the two channel volumes and the two reverb sends -- are
- * checked. */
+ * checked. 0x80000000 is the exception (see hle_SetVolume). CoreWithMix
+ * refuses a mix level with the same code. */
 #define SAS_ERROR_VOLUME       0x80420018u
 /* Not a sascore code at all: mixing in output mode 1 comes back as a plain
  * "not supported" from the layer below. */
@@ -275,7 +276,7 @@ void psp_sas_init(void) { psp_sas_reset(); }
 uint64_t psp_sas_frames(void)   { return g_frames_rendered; }
 uint64_t psp_sas_nonzero(void)  { return g_samples_nonzero; }
 
-static int clamp16(int v) {
+static int clamp16(int64_t v) {
     if (v >  32767) return  32767;
     if (v < -32768) return -32768;
     return v;
@@ -558,7 +559,7 @@ static void restart_source(sas_voice *v) {
  * 8, a voice 8 keyed on is heard and its height climbs like voice 7's
  * (sasprobe step 16, fw 6.60). Whether a count of 1 still renders voice 31
  * is not measured. */
-static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix_er,
+static void render(int64_t *mix_l, int64_t *mix_r, int64_t *mix_el, int64_t *mix_er,
                    uint32_t samples) {
     memset(mix_l,  0, samples * sizeof *mix_l);
     memset(mix_r,  0, samples * sizeof *mix_r);
@@ -611,10 +612,10 @@ static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix
             const int32_t env = v->env;
             s = (s * (env >> 18)) >> 12;
 
-            mix_l[i]  += (s * v->vol_l)  >> 12;
-            mix_r[i]  += (s * v->vol_r)  >> 12;
-            mix_el[i] += (s * v->vol_el) >> 12;
-            mix_er[i] += (s * v->vol_er) >> 12;
+            mix_l[i]  += shr_floor((int64_t)s * v->vol_l,  12);
+            mix_r[i]  += shr_floor((int64_t)s * v->vol_r,  12);
+            mix_el[i] += shr_floor((int64_t)s * v->vol_el, 12);
+            mix_er[i] += shr_floor((int64_t)s * v->vol_er, 12);
             step_envelope(v);
             if (!v->playing) break;   /* the envelope ended the voice */
 
@@ -631,22 +632,25 @@ static sas_voice *voice_arg(void) {
 }
 
 static void hle_Init(void) {
-    /* (sasCore, grain, maxVoices, outputMode, sampleRate). Checked in the order
-     * sascore.expected reports them; the sample rate is only checked for the
-     * two rates this library renders at, since the test's accepted list runs
-     * past what was read of it. */
+    /* (sasCore, grain, maxVoices, outputMode, sampleRate). Checked core,
+     * grain, then the rate, then the voice count and mode: firmware 6.60
+     * answers the rate's 80420004 to (256, 0 voices, mode 2, rate 0) and to
+     * (256, 32, mode 2, rate 0) and (256, 0 voices, mode 0, 48000) (sasprobe
+     * step 12). Which of the voice count and the mode is checked first is not
+     * measured. */
     const uint32_t core = psp_arg(0), grain = psp_arg(1), voices = psp_arg(2),
                    mode = psp_arg(3), rate = psp_arg(4);
     if (!core || (core & 63))          { psp_ret(SAS_ERROR_CORE); return; }
     if (!grain_ok(grain))              { psp_ret(SAS_ERROR_GRAIN); return; }
+    /* 44100 and nothing else. The accepted list this once read as "the two
+     * rates this renders at" is not hardware's: sascore.expected refuses
+     * 48000 along with every other rate it tries, and so does firmware 6.60
+     * (sasprobe step 10). */
+    if (rate != 44100) { psp_ret(SAS_ERROR_SAMPLE_RATE); return; }
     /* Checked, and then not kept: the count does not limit the voices
      * rendered (see render). */
     if (voices < 1 || voices > SAS_VOICES) { psp_ret(SAS_ERROR_MAX_VOICES); return; }
     if (mode > 1)                      { psp_ret(SAS_ERROR_OUTPUT_MODE); return; }
-    /* 44100 and nothing else. The accepted list this once read as "the two
-     * rates this renders at" is not hardware's: sascore.expected refuses
-     * 48000 along with every other rate it tries. */
-    if (rate != 44100) { psp_ret(SAS_ERROR_SAMPLE_RATE); return; }
     /* Init starts every voice over, whatever it was doing: a voice keyed on
      * and playing reads height 0 and ended afterwards, its key is gone
      * (KeyOff is refused), the next core is silent, and a paused voice is
@@ -681,11 +685,14 @@ static void hle_SetOutputmode(void) {
 static void hle_GetOutputmode(void) { psp_ret(g_output_mode); }
 
 static void hle_SetVoice(void) {
-    /* (sasCore, voice, vagAddr, size, loopmode) */
-    sas_voice *v = voice_arg();
-    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    /* (sasCore, voice, vagAddr, size, loopmode). The size is checked before
+     * the voice index: voice 32 with size 0 gets the size's 80420014 on
+     * firmware 6.60 (sasprobe step 42). Where the loop mode's check falls
+     * against the voice index's is not measured. */
     const uint32_t size = psp_arg(3);
     if (size == 0 || (size & 15)) { psp_ret(SAS_ERROR_SIZE); return; }
+    sas_voice *v = voice_arg();
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     /* The fifth argument is a loop *mode* here, not the sample position
      * __sceSasSetVoicePCM takes: vag.expected accepts 0 and 1 and refuses
      * everything else, -1 included, with the same code that call uses for a
@@ -747,12 +754,18 @@ static void hle_SetNoise(void) {
 static void hle_SetVolume(void) {
     /* (sasCore, voice, l, r, el, er) -- the last two are the reverb sends.
      * All four are bounded at plus or minus unity and all four are checked,
-     * whether or not this renderer uses them. */
+     * whether or not this renderer uses them. The bound is on the magnitude,
+     * taken the way abs() takes it: firmware 6.60 refuses 0x1001, -0x1001
+     * and 0x7FFFFFFF in each of the four places but accepts 0x80000000,
+     * whose negation is itself and still negative (sasprobe step 49). What
+     * that volume sounds like is not measured; it is kept as given, and the
+     * mix is wide enough not to overflow on it. */
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     for (int i = 2; i <= 5; i++) {
-        const int32_t vol = (int32_t)psp_arg(i);
-        if (vol < -0x1000 || vol > 0x1000) { psp_ret(SAS_ERROR_VOLUME); return; }
+        const uint32_t vol = psp_arg(i);
+        const int32_t mag = (int32_t)((vol & 0x80000000u) ? 0u - vol : vol);
+        if (mag > 0x1000) { psp_ret(SAS_ERROR_VOLUME); return; }
     }
     v->vol_l  = (int32_t)psp_arg(2);
     v->vol_r  = (int32_t)psp_arg(3);
@@ -892,11 +905,14 @@ static void hle_SetSimpleADSR(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* __sceSasSetSL(sasCore, voice, level): the sustain level on its own, the
- * same field __sceSasSetADSR's fourth argument carries. */
+/* __sceSasSetSL(sasCore, voice, level): the sustain level on its own. A level
+ * above the envelope's top, 0x40000000, is refused as an ADSR value and
+ * nothing is stored; the comparison is unsigned, so 0x80000000 and -1 are
+ * refused too (sasprobe step 51, fw 6.60). */
 static void hle_SetSL(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    if (psp_arg(2) > (uint32_t)ENV_MAX) { psp_ret(SAS_ERROR_ADSR_VALUE); return; }
     v->sustain_level = (int32_t)psp_arg(2);
     mirror_adsr(v);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -920,7 +936,9 @@ static void hle_SetKeyOn(void) {
 
 /* A voice whose key is not down has nothing to lift, and keyoff.expected
  * refuses that with the same code an already-on key-on gets -- including
- * while paused.
+ * while paused. A paused voice whose key *is* down is refused as well, and
+ * keeps its key: firmware 6.60 answers 80420016 and, once resumed, the voice
+ * is still at full height, with no release (sasprobe step 219).
  *
  * The key comes up here and now. Only the *release* waits for the next core:
  * pcm.expected and vag.expected both key a voice off and straight back on
@@ -930,7 +948,7 @@ static void hle_SetKeyOn(void) {
 static void hle_SetKeyOff(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
-    if (!v->on) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
+    if (!v->on || v->paused) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
     v->on = 0;
     v->keyoff_pending = 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -985,7 +1003,7 @@ static void hle_GetAllEnvelopeHeights(void) {
  * itself -- 12-bit, as everywhere else here -- is by analogy with the voice
  * volumes rather than measured. */
 static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_r) {
-    int32_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN], el[SAS_MAX_GRAIN], er[SAS_MAX_GRAIN];
+    int64_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN], el[SAS_MAX_GRAIN], er[SAS_MAX_GRAIN];
     const uint32_t n = g_grain;
     render(l, r, el, er, n);
 
@@ -998,7 +1016,7 @@ static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_
      * the voice's 0x1000, 0x0C00, 0x0800 and 0x0400 with the product shifted
      * down rather than rounded. */
     if (g_output_mode == 1) {
-        const int32_t *block[4] = { l, r, el, er };
+        const int64_t *block[4] = { l, r, el, er };
         for (int b = 0; b < 4; b++) {
             const uint32_t base = out_addr + (uint32_t)b * n * 2u;
             for (uint32_t i = 0; i < n; i++) {
@@ -1033,10 +1051,15 @@ static void hle_Core(void) {
 
 /* (sasCore, sampleBuffer, leftMix, rightMix). Refused outright in output mode
  * 1 -- outputmode.expected's last section gets 0x80000004 and a buffer
- * nothing has touched. */
+ * nothing has touched. A mix above 0x1000 on either side, compared unsigned,
+ * is refused with the volume code and the buffer is left as it was: -1,
+ * 0x1001, 0x2000 and 0x7FFFFFFF all are on firmware 6.60 (sasprobe step 207).
+ * Nothing is rendered then either; whether hardware's voices advance on a
+ * refused call is not measured. */
 static void hle_CoreWithMix(void) {
     uint32_t out = psp_arg(1);
     if (g_output_mode != 0) { psp_ret(SAS_ERROR_MIX_MODE); return; }
+    if (psp_arg(2) > 0x1000u || psp_arg(3) > 0x1000u) { psp_ret(SAS_ERROR_VOLUME); return; }
     if (out) mix_to_guest(out, 1, (int32_t)psp_arg(2), (int32_t)psp_arg(3));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
