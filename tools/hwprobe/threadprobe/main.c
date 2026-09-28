@@ -2882,10 +2882,10 @@ static void sec_tls(void) {
         rec("  created %d, then %s\n", n, hx(fail));
     }
 
-    /* kernobj.c:137-146 -- the vpl table since step 107; its 5 is ILLEGAL_PERM,
-     * on no measurement. */
-    ST("tlspl: partition 5");
-    {
+    /* kernobj.c:140-146 -- the vpl table since step 107; its 5 is ILLEGAL_PERM,
+     * on no measurement. Risky: kernobj.c:129-130 records that a vpl in
+     * partition 5 is said to crash hardware. */
+    if (!ST("tlspl: partition 5")) {
         SceUID x = sceKernelCreateTlspl("part5", 5, 0, 4, 1, NULL);
         rec("  5:%s\n", x > 0 ? "ok" : hx(x));
         if (x > 0) sceKernelDeleteTlspl(x);
@@ -3660,9 +3660,8 @@ static void sec_sysmem(void) {
 
     /* sysmem.c:264-270 -- an Addr block asked for 0x80 into a granule starts
      * at the granule and keeps the rounded size, so the drop is 0x1000;
-     * covering want + size would make it 0x1100. sysmem.c:214-224 -- 5 and 9
-     * follow the vpl table, unmeasured. Step 141 read total > max. */
-    ST("sysmem: total free drop for an Addr block 0x80 into a free granule; partitions 5 and 9; total minus max");
+     * covering want + size would make it 0x1100. Step 141 read total > max. */
+    ST("sysmem: total free drop for an Addr block 0x80 into a free granule; total minus max");
     {
         SceUID b0 = sceKernelAllocPartitionMemory(2, "a", PSP_SMEM_Low, 0x1000, NULL);
         w32 at = b0 > 0 ? (w32)sceKernelGetBlockHeadAddr(b0) : 0;
@@ -3672,12 +3671,17 @@ static void sec_sysmem(void) {
         SceSize after = sceKernelTotalFreeMemSize();
         rec("  Addr at +0x80: %s drop=%08X\n", cu(ab), ab > 0 ? (w32)(before - after) : 0);
         if (ab > 0) sceKernelFreePartitionMemory(ab);
+        rec("  total-max=%08X\n", (w32)(sceKernelTotalFreeMemSize() - sceKernelMaxFreeMemSize()));
+    }
+
+    /* sysmem.c:214-224 -- 5 and 9 follow the vpl table, unmeasured. Risky,
+     * like the tlspl partition 5 step. */
+    if (!ST("sysmem: partitions 5 and 9 (0x100 bytes)")) {
         SceUID p5 = sceKernelAllocPartitionMemory(5, "p5", PSP_SMEM_Low, 0x100, NULL);
         SceUID p9 = sceKernelAllocPartitionMemory(9, "p9", PSP_SMEM_Low, 0x100, NULL);
         rec("  partition 5: %s partition 9: %s\n", cu(p5), cu(p9));
         if (p5 > 0) sceKernelFreePartitionMemory(p5);
         if (p9 > 0) sceKernelFreePartitionMemory(p9);
-        rec("  total-max=%08X\n", (w32)(sceKernelTotalFreeMemSize() - sceKernelMaxFreeMemSize()));
     }
 }
 

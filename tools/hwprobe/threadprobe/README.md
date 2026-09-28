@@ -33,7 +33,7 @@ Each step's comment names the psprecomp file:line claim that the step checks.
 ## Version 3
 
 Version 3 keeps version 2's 158 steps and titles, so the logs line up in
-`compare.py`, and adds 22 steps, each at the end of its section. They are the
+`compare.py`, and adds 23 steps, each at the end of its section. They are the
 questions the analysis of the second hardware run left open
 (`fw660-run2/findings/threadprobe.md`):
 
@@ -49,17 +49,20 @@ questions the analysis of the second hardware run left open
 | delay | DelayThreadCB(0) with a pending notify and with a ready thread; DelayThread(n) for n = 0..100 with a ready thread, four times each |
 | dispatch | DelayThread(0) with dispatch off, ResumeDispatchThread(2) and (-1), SuspendDispatchThread with interrupts off; DelayThread and WaitSema with interrupts off |
 | attribute and stack | GetThreadStackFreeSize in NO_FILLSTACK threads over 0xCC and over 0xFF, and a CLEAR_STACK one |
-| TLS pools | partition 5 |
+| TLS pools | partition 5 (risky) |
 | alarms | a handler returning 1000 five times: first-hit lateness, gaps, each hit against the first |
 | vtimers | a handler that falls due while main is in DelayThread |
 | time | LibcGettimeofday's seconds against LibcTime and uptime, the timezone struct, two reads 20ms apart |
 | rtc | CheckValid of year 9999 and 10000; GetTick of 2023-02-30 and 2023-13-01 |
-| user memory | the drop for an Addr block 0x80 into a granule; partitions 5 and 9; total minus max |
+| user memory | the drop for an Addr block 0x80 into a granule, and total minus max; partitions 5 and 9 (risky) |
 
 The last step (StartThread with argp 0x10) switched the PSP off in version 2
 and is now `KNOWN_CRASH`: it logs "not run" unless built with
-`-DRUN_KNOWN_CRASHES`. The step that runs DelayThread and WaitSema with
-interrupts off could hang a PSP; starting the probe again skips it.
+`-DRUN_KNOWN_CRASHES`. Four new steps could hang or switch off a PSP: the
+CreateThread check order (a kernel-space entry), DelayThread and WaitSema with
+interrupts off, and the two partition 5 steps (psprecomp records that a vpl in
+partition 5 is said to crash hardware). Starting the probe again skips the
+step it stopped in.
 
 ## Build
 
