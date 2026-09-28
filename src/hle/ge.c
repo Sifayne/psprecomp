@@ -230,6 +230,16 @@ static int fx16_sat(float f) {
 #define GE_VIEWPORTXCENTER   0x45
 #define GE_VIEWPORTYCENTER   0x46
 #define GE_VIEWPORTZCENTER   0x47
+/* Skinning, morphing and patches: the numbers libpspgu's sceGuBoneMatrix,
+ * sceGuMorphWeight, sceGuPatchDivide, sceGuPatchPrim and sceGuPatchFrontFace
+ * write (PSPSDK, BSD). A bone is uploaded like the world matrix, twelve DATA
+ * words after a NUMBER of bone * 12. */
+#define GE_BONEMATRIXNUMBER  0x2A
+#define GE_BONEMATRIXDATA    0x2B
+#define GE_MORPHWEIGHT0      0x2C
+#define GE_PATCHDIVISION     0x36
+#define GE_PATCHPRIMITIVE    0x37
+#define GE_PATCHFACING       0x38
 #define GE_OFFSETX           0x4C
 #define GE_OFFSETY           0x4D
 #define GE_CULLFACEENABLE    0x1D
@@ -272,6 +282,8 @@ static int fx16_sat(float f) {
 #define VT_POS(v)     (((v) >> 7) & 3)
 #define VT_WEIGHT(v)  (((v) >> 9) & 3)
 #define VT_INDEX(v)   (((v) >> 11) & 3)
+#define VT_WCOUNT(v)  ((((v) >> 14) & 7) + 1)   /* weights per vertex, when VT_WEIGHT */
+#define VT_MORPH(v)   ((((v) >> 18) & 7) + 1)   /* vertex sets blended by morphing */
 #define VT_THROUGH(v) (((v) >> 23) & 1)
 
 #define MAX_QUEUES 8
@@ -366,6 +378,11 @@ static void note_colour(uint32_t c) {
  * matrix rather than skip a word of it. */
 static struct {
     float world[12], view[12], proj[16];
+    /* Eight bone matrices, 4 columns of 3 like the world matrix, and the
+     * eight morph weights. */
+    float bone[8 * 12];
+    int   bone_n;
+    float morph_w[8];
     /* Texture coordinate generation. TEX_MAP_MODE's low two bits choose where
      * texture coordinates come from -- 0 the vertex's own, 1 the generation
      * matrix, 2 the environment map -- and bits 8..9 choose what that matrix is
@@ -461,6 +478,9 @@ typedef struct {
 static struct {
     uint32_t fbp, fbw, fbfmt, vtype, vaddr, iaddr;
     uint32_t zbp, zbw;
+    /* PATCHDIVISION, PATCHPRIMITIVE (0 triangles, 1 lines, 2 points) and
+     * PATCHFACING. */
+    int      patch_du, patch_dv, patch_prim, patch_face;
     ge_target targets[GE_MAX_TARGETS];
     int       n_targets, cur_target;
     uint64_t  target_overflow;
@@ -914,12 +934,23 @@ uint32_t psp_ge_target(void) { return g_ge.fbp ? ge_fb_address(g_ge.fbp) : 0; }
 /* Size of one vertex in bytes, and the offsets within it. Components appear in
  * a fixed order (weights, texture, colour, normal, position) and each is
  * aligned to its own size, which is what makes the stride awkward enough to be
- * worth computing rather than assuming. */
+ * worth computing rather than assuming.
+ *
+ * With morphing (VT_MORPH > 1) the whole record repeats once per vertex set,
+ * weights included, and the stride returned is the full vertex's: geprobe 2
+ * scene 21 (fw 6.60) draws weights (1, 0) from records 0, 2 and 4 of a
+ * two-set array and (0, 1) from 1, 3 and 5. g_vl keeps the rest. */
+static struct {
+    int w_fmt, w_n;          /* weight format (VT_WEIGHT) and count; w_fmt 0: none */
+    int set_stride, morph_n; /* one vertex set's size, and how many sets */
+} g_vl;
+
 static int vertex_layout(uint32_t vtype, int *col_off, int *pos_off, int *tex_off, int *norm_off) {
     static const int tex_sz[4]   = { 0, 1, 2, 4 };
     static const int col_sz[8]   = { 0, 0, 0, 0, 2, 2, 2, 4 };
     static const int norm_sz[4]  = { 0, 1, 2, 4 };
     static const int pos_sz[4]   = { 0, 1, 2, 4 };
+    static const int w_sz[4]     = { 0, 1, 2, 4 };
 
     int off = 0, align = 1;
     int t = tex_sz[VT_TEX(vtype)] * 2;
@@ -927,7 +958,10 @@ static int vertex_layout(uint32_t vtype, int *col_off, int *pos_off, int *tex_of
     int n = norm_sz[VT_NORMAL(vtype)] * 3;
     int p = pos_sz[VT_POS(vtype)] * 3;
 
-    if (VT_WEIGHT(vtype)) return 0;          /* skinning: not handled */
+    g_vl.w_fmt = VT_WEIGHT(vtype);
+    g_vl.w_n = g_vl.w_fmt ? VT_WCOUNT(vtype) : 0;
+    g_vl.morph_n = VT_MORPH(vtype);
+    if (g_vl.w_fmt) { off = w_sz[g_vl.w_fmt] * g_vl.w_n; align = w_sz[g_vl.w_fmt]; }
 
     int ts = tex_sz[VT_TEX(vtype)];
     if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t;
@@ -945,7 +979,8 @@ static int vertex_layout(uint32_t vtype, int *col_off, int *pos_off, int *tex_of
     off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
     if (ps > align) align = ps;
 
-    return (off + align - 1) & ~(align - 1);  /* stride */
+    g_vl.set_stride = (off + align - 1) & ~(align - 1);
+    return g_vl.set_stride * g_vl.morph_n;    /* stride */
 }
 
 /* The address of element i of the current draw. Bits 11..12 of the vertex
@@ -1216,6 +1251,96 @@ static void mul_4x4(const float m[16], const float in[3], float out[4]) {
     out[2] = m[2]*in[0] + m[6]*in[1] + m[10]*in[2] + m[14];
     out[3] = m[3]*in[0] + m[7]*in[1] + m[11]*in[2] + m[15];
 }
+
+/* One vertex as the transform stage takes it, after skinning and morphing:
+ * model-space position and normal, colour, and texture coordinates in texels
+ * (read_uv_model's units). Patches are tessellated into these too. */
+typedef struct { float pos[3], nrm[3]; uint32_t rgba; float u, v; } ge_mvert;
+
+/* A vertex's skinning weights. Normalised like the other narrow fields: an
+ * 8-bit weight of 0x80 is 1.0 -- geprobe 2 scene 20 (fw 6.60) draws weights
+ * 0x80, 0x40+0x40 and 0xFF where 1.0, 0.5+0.5 and 1.99 put them -- and a
+ * 16-bit one of 0x8000 is assumed to be by the same rule. */
+static void read_weights(uint32_t a, float *w) {
+    for (int i = 0; i < g_vl.w_n; i++) {
+        switch (g_vl.w_fmt) {
+        case 1:  w[i] = (float)psp_read8(a + (uint32_t)i) / 128.0f; break;
+        case 2:  w[i] = (float)psp_read16(a + 2u * (uint32_t)i) / 32768.0f; break;
+        default: w[i] = psp_read_f32(a + 4u * (uint32_t)i); break;
+        }
+    }
+}
+
+/* One vertex set of a record: its fields, skinned when it carries weights.
+ * Skinning is the weighted sum of the vertex through each bone, ahead of the
+ * world matrix; the normal goes through the bones' rotation parts. */
+static int read_vertex_set(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
+                           int norm_off, int want_normal, ge_mvert *o) {
+    const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)g_vl.set_stride);
+    float p[3], n[3];
+    if (!read_pos_model_at(vp, a, vtype, pos_off, p)) return 0;
+    if (want_normal) read_normal_model_at(vp, a, vtype, norm_off, n);
+    else { n[0] = n[1] = 0.0f; n[2] = 1.0f; }
+    o->rgba = current_colour();
+    if (col_off >= 0 && VT_COLOR(vtype) == 7) o->rgba = psp_read32(a + (uint32_t)col_off);
+    psp_vertex uv;
+    read_uv_model_at(vp, a, vtype, tex_off, &uv);
+    o->u = uv.u; o->v = uv.v;
+    if (g_vl.w_fmt) {
+        float w[8];
+        read_weights(a, w);
+        float sp[3] = { 0, 0, 0 }, sn[3] = { 0, 0, 0 };
+        for (int i = 0; i < g_vl.w_n; i++) {
+            float t[3];
+            mul_4x3(&g_tl.bone[12 * i], p, t);
+            for (int k = 0; k < 3; k++) sp[k] += w[i] * t[k];
+            if (want_normal) {
+                mul_3x3(&g_tl.bone[12 * i], n, t);
+                for (int k = 0; k < 3; k++) sn[k] += w[i] * t[k];
+            }
+        }
+        memcpy(p, sp, sizeof p);
+        if (want_normal) memcpy(n, sn, sizeof n);
+    }
+    memcpy(o->pos, p, sizeof p);
+    memcpy(o->nrm, n, sizeof n);
+    return 1;
+}
+
+/* A whole record: its vertex sets blended by the morph weights, when there
+ * is more than one. Every field is blended, colour included -- scene 21's
+ * half-and-half triangle is half-way in colour as well as in place. */
+static int read_mvert(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
+                      int norm_off, int want_normal, ge_mvert *o) {
+    if (g_vl.morph_n <= 1)
+        return read_vertex_set(a, vtype, col_off, pos_off, tex_off, norm_off, want_normal, o);
+    float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, col[4] = { 0, 0, 0, 0 }, u = 0, v = 0;
+    for (int k = 0; k < g_vl.morph_n; k++) {
+        ge_mvert s1;
+        if (!read_vertex_set(a + (uint32_t)(k * g_vl.set_stride), vtype, col_off, pos_off, tex_off,
+                             norm_off, want_normal, &s1))
+            return 0;
+        const float w = g_tl.morph_w[k];
+        for (int i = 0; i < 3; i++) { pos[i] += w * s1.pos[i]; nrm[i] += w * s1.nrm[i]; }
+        for (int i = 0; i < 4; i++) col[i] += w * (float)((s1.rgba >> (8 * i)) & 0xFFu);
+        u += w * s1.u; v += w * s1.v;
+    }
+    memcpy(o->pos, pos, sizeof pos);
+    memcpy(o->nrm, nrm, sizeof nrm);
+    o->rgba = 0;
+    for (int i = 0; i < 4; i++) {
+        int c = (int)(col[i] + 0.5f);
+        if (c < 0) c = 0;
+        if (c > 255) c = 255;
+        o->rgba |= (uint32_t)c << (8 * i);
+    }
+    o->u = u; o->v = v;
+    return 1;
+}
+
+/* Set while a patch draws: draw_prim_transformed then takes vertex i from
+ * here rather than from the vertex array. */
+static const ge_mvert *g_mv_src;
 
 /* Clip space to screen. The viewport is the game's if it set one; the fallback
  * is the standard 480x272 arrangement, with y scaled negative because screen y
@@ -1818,7 +1943,8 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
     /* The backend's transform, when it offers one. Triangles only (points,
      * lines and sprites stay here), and not screen-space projections, whose
      * flag the GL backend reads to tell HUD from scene. */
-    if (be->draw_model && be->model_ok && !screen_space &&
+    const int blended = g_mv_src || g_vl.w_fmt || g_vl.morph_n > 1;
+    if (be->draw_model && be->model_ok && !screen_space && !blended &&
         (type == PSP_PRIM_TRIANGLES || type == PSP_PRIM_TRIANGLE_STRIP ||
          type == PSP_PRIM_TRIANGLE_FAN) && be->model_ok()) {
         psp_xform_state xs;
@@ -1905,11 +2031,26 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
 
         uint32_t decoded = 0;
         for (; decoded < n; decoded++) {
-            const uint32_t a = vertex_addr(done + decoded, stride);
             float model[3], world[3], eye[3], clip[4];
             const uint64_t _p0 = ge_prof_now();
-            const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)stride);
-            if (!read_pos_model_at(vp, a, g_ge.vtype, pos_off, model)) break;
+            /* A skinned, morphed or tessellated vertex arrives whole in mv;
+             * a plain one is read field by field below, as before. */
+            ge_mvert mv;
+            uint32_t a = 0;
+            const uint8_t *vp = NULL;
+            if (g_mv_src) {
+                mv = g_mv_src[done + decoded];
+                memcpy(model, mv.pos, sizeof model);
+            } else {
+                a = vertex_addr(done + decoded, stride);
+                if (blended) {
+                    if (!read_mvert(a, g_ge.vtype, col_off, pos_off, tex_off, norm_off, any_light, &mv)) break;
+                    memcpy(model, mv.pos, sizeof model);
+                } else {
+                    vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)stride);
+                    if (!read_pos_model_at(vp, a, g_ge.vtype, pos_off, model)) break;
+                }
+            }
             const uint64_t _p1 = ge_prof_now();
 
             mul_4x3(g_tl.world, model, world);
@@ -1921,7 +2062,8 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             o->screen_space = screen_space;
             o->rgba = current_colour();
             o->tex_q = 1.0f;
-            if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7) {
+            if (blended) o->rgba = mv.rgba;
+            else if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7) {
                 if (vp) memcpy(&o->rgba, vp + col_off, 4);
                 else    o->rgba = psp_read32(a + (uint32_t)col_off);
             }
@@ -1944,7 +2086,8 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 float ne[3] = { 0.0f, 0.0f, 1.0f };
                 if (any_light) {
                     float nm[3], nw[3];
-                    read_normal_model_at(vp, a, g_ge.vtype, norm_off, nm);
+                    if (blended) memcpy(nm, mv.nrm, sizeof nm);
+                    else read_normal_model_at(vp, a, g_ge.vtype, norm_off, nm);
                     mul_3x3(g_tl.world, nm, nw);
                     mul_3x3(g_tl.view,  nw, ne);
                 }
@@ -1953,7 +2096,8 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             }
             const uint64_t _p3 = ge_prof_now();
             note_colour(o->rgba);
-            read_uv_model_at(vp, a, g_ge.vtype, tex_off, o);
+            if (blended) { o->u = mv.u; o->v = mv.v; }
+            else read_uv_model_at(vp, a, g_ge.vtype, tex_off, o);
             if (g_tl.tex_map_mode == 1) {
                 /* The source row the matrix is applied to. GU_POSITION is the
                  * model-space position, GU_UV the vertex's own coordinates,
@@ -2365,6 +2509,180 @@ static void draw_prim(uint32_t type, uint32_t count) {
     }
 }
 
+/* Bezier and spline patches.
+ *
+ * BEZIER (0x05) and SPLINE (0x06) name a grid of control points at VADDR,
+ * ucount across and vcount down (PSPSDK's sceGuDrawBezier/sceGuDrawSpline:
+ * ucount in bits 0-7, vcount in 8-15, and for a spline the two edge modes in
+ * 16-17 and 18-19). The GE evaluates the surface on a grid set by
+ * PATCHDIVISION and draws it as PATCHPRIMITIVE says: triangles, lines along
+ * the grid, or its points. Every attribute the control points carry is
+ * evaluated with the same weights; a vertex type without texture
+ * coordinates gets the surface parameters as coordinates (geprobe 2 scene 22,
+ * fw 6.60, maps the probe texture once across a Bezier patch that has none).
+ *
+ * The control points go through read_mvert first, so a skinned or morphed
+ * control grid is skinned or morphed before it is evaluated. */
+
+/* Where along one direction the grid samples, and with what weights: each
+ * sample blends four consecutive control points starting at `first`. */
+typedef struct { int first; float w[4]; float param; } patch_sample;
+
+/* A Bezier direction: (count - 1) / 3 cubic pieces sharing end points, each
+ * cut into `div` steps. Returns the number of samples. */
+static int bezier_samples(int count, int div, patch_sample *out, int max) {
+    const int pieces = (count - 1) / 3;
+    int n = 0;
+    for (int pc = 0; pc < pieces; pc++) {
+        for (int i = pc ? 1 : 0; i <= div && n < max; i++) {
+            const float t = (float)i / (float)div, s1 = 1.0f - t;
+            patch_sample *o = &out[n++];
+            o->first = 3 * pc;
+            o->w[0] = s1 * s1 * s1;
+            o->w[1] = 3.0f * t * s1 * s1;
+            o->w[2] = 3.0f * t * t * s1;
+            o->w[3] = t * t * t;
+            o->param = (float)pc + t;
+        }
+    }
+    return n;
+}
+
+/* A spline direction: a cubic B-spline over `count` control points, count - 3
+ * spans each cut into `div` steps. Bit 0 of the edge mode opens the start and
+ * bit 1 the end (GU_OPEN_FILL is 1, GU_FILL_OPEN 2): an open end repeats its
+ * knot so the surface runs out to the edge control point, a filled one keeps
+ * the uniform knots and stops short of it. Scene 23's OPEN_OPEN patch spans
+ * its whole control grid and its FILL_FILL patch the middle third. */
+static int spline_samples(int count, int div, int edge, patch_sample *out, int max) {
+    float kn[64];
+    const int spans = count - 3;
+    if (spans < 1 || count + 4 > 64) return 0;
+    for (int k = 0; k < count + 4; k++) {
+        float t = (float)(k - 3);
+        if ((edge & 1) && t < 0.0f) t = 0.0f;
+        if ((edge & 2) && t > (float)spans) t = (float)spans;
+        kn[k] = t;
+    }
+    int n = 0;
+    for (int sp = 0; sp < spans; sp++) {
+        for (int i = sp ? 1 : 0; i <= div && n < max; i++) {
+            const float t = (float)sp + (float)i / (float)div;
+            const int k = sp + 3;                     /* kn[k] <= t <= kn[k+1] */
+            float N[4] = { 1, 0, 0, 0 }, left[4], right[4];
+            for (int j = 1; j <= 3; j++) {
+                left[j] = t - kn[k + 1 - j];
+                right[j] = kn[k + j] - t;
+                float saved = 0.0f;
+                for (int r = 0; r < j; r++) {
+                    const float den = right[r + 1] + left[j - r];
+                    const float tmp = den != 0.0f ? N[r] / den : 0.0f;
+                    N[r] = saved + right[r + 1] * tmp;
+                    saved = left[j - r] * tmp;
+                }
+                N[j] = saved;
+            }
+            patch_sample *o = &out[n++];
+            o->first = k - 3;
+            memcpy(o->w, N, sizeof o->w);
+            o->param = t;
+        }
+    }
+    return n;
+}
+
+enum { PATCH_MAX_SAMPLES = 256 };
+
+static void draw_patch(int spline, uint32_t arg) {
+    const int ucount = (int)(arg & 0xFF), vcount = (int)((arg >> 8) & 0xFF);
+    const int uedge = (int)((arg >> 16) & 3), vedge = (int)((arg >> 18) & 3);
+    if (!g_ge.vaddr || VT_THROUGH(g_ge.vtype) || ucount < 4 || vcount < 4) return;
+    int col_off = -1, pos_off = 0, tex_off = -1, norm_off = -1;
+    const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
+    if (!stride) return;
+    const int du = g_ge.patch_du > 0 ? g_ge.patch_du : 1, dv = g_ge.patch_dv > 0 ? g_ge.patch_dv : 1;
+
+    static patch_sample su[PATCH_MAX_SAMPLES], sv[PATCH_MAX_SAMPLES];
+    const int nu = spline ? spline_samples(ucount, du, uedge, su, PATCH_MAX_SAMPLES)
+                          : bezier_samples(ucount, du, su, PATCH_MAX_SAMPLES);
+    const int nv = spline ? spline_samples(vcount, dv, vedge, sv, PATCH_MAX_SAMPLES)
+                          : bezier_samples(vcount, dv, sv, PATCH_MAX_SAMPLES);
+    if (nu < 2 || nv < 2) return;
+
+    ge_mvert *cp = malloc(sizeof *cp * (size_t)(ucount * vcount));
+    ge_mvert *grid = malloc(sizeof *grid * (size_t)(nu * nv));
+    ge_mvert *list = malloc(sizeof *list * (size_t)(nu * nv * 6));
+    if (!cp || !grid || !list) { free(cp); free(grid); free(list); return; }
+    const int lit = g_tl.lighting && any_light_enabled();
+    int ok = 1;
+    for (int k = 0; k < ucount * vcount && ok; k++)
+        ok = read_mvert(vertex_addr((uint32_t)k, stride), g_ge.vtype, col_off, pos_off, tex_off,
+                        norm_off, lit, &cp[k]);
+    if (!ok) { free(cp); free(grid); free(list); return; }
+
+    for (int j = 0; j < nv; j++)
+        for (int i = 0; i < nu; i++) {
+            float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, col[4] = { 0, 0, 0, 0 }, u = 0, v = 0;
+            for (int b = 0; b < 4; b++)
+                for (int a = 0; a < 4; a++) {
+                    const float w = sv[j].w[b] * su[i].w[a];
+                    if (w == 0.0f) continue;
+                    const ge_mvert *c = &cp[(sv[j].first + b) * ucount + su[i].first + a];
+                    for (int k = 0; k < 3; k++) { pos[k] += w * c->pos[k]; nrm[k] += w * c->nrm[k]; }
+                    for (int k = 0; k < 4; k++) col[k] += w * (float)((c->rgba >> (8 * k)) & 0xFFu);
+                    u += w * c->u; v += w * c->v;
+                }
+            ge_mvert *o = &grid[j * nu + i];
+            memcpy(o->pos, pos, sizeof pos);
+            memcpy(o->nrm, nrm, sizeof nrm);
+            o->rgba = 0;
+            for (int k = 0; k < 4; k++) {
+                int c = (int)(col[k] + 0.5f);
+                if (c < 0) c = 0;
+                if (c > 255) c = 255;
+                o->rgba |= (uint32_t)c << (8 * k);
+            }
+            if (tex_off < 0) {
+                u = su[i].param * g_ge.tex_scale_u + g_ge.tex_offset_u;
+                v = sv[j].param * g_ge.tex_scale_v + g_ge.tex_offset_v;
+                u *= (float)g_ge.tex_w;
+                v *= (float)g_ge.tex_h;
+            }
+            o->u = u; o->v = v;
+        }
+
+    /* The grid goes out as the GE's own strips would: one per pair of rows,
+     * alternating between them, (0,j) (0,j+1) (1,j) (1,j+1) ... As lines that
+     * sequence is a zigzag -- each column's rung and a diagonal to the next
+     * -- with no line along the rows at all: geprobe 2 scene 22 (fw 6.60)
+     * draws its line patch exactly so (627 differing pixels against 1407 for
+     * a plain grid of rows and columns). Points are the grid itself. */
+    uint32_t n = 0, type;
+    if (g_ge.patch_prim == 2) {
+        type = PSP_PRIM_POINTS;
+        for (int k = 0; k < nu * nv; k++) list[n++] = grid[k];
+    } else {
+        type = g_ge.patch_prim == 1 ? PSP_PRIM_LINES : PSP_PRIM_TRIANGLES;
+        for (int j = 0; j + 1 < nv; j++)
+            for (int i = 0; i + 1 < nu; i++) {
+                const ge_mvert *s0 = &grid[j * nu + i], *s1 = &grid[(j + 1) * nu + i];
+                const ge_mvert *s2 = &grid[j * nu + i + 1], *s3 = &grid[(j + 1) * nu + i + 1];
+                if (type == PSP_PRIM_LINES) {
+                    list[n++] = *s0; list[n++] = *s1;
+                    list[n++] = *s1; list[n++] = *s2;
+                    if (i + 2 == nu) { list[n++] = *s2; list[n++] = *s3; }
+                } else {
+                    list[n++] = *s0; list[n++] = *s1; list[n++] = *s2;
+                    list[n++] = *s1; list[n++] = *s2; list[n++] = *s3;
+                }
+            }
+    }
+    g_mv_src = list;
+    draw_prim(type, n);
+    g_mv_src = NULL;
+    free(cp); free(grid); free(list);
+}
+
 /* Walk a list until END/FINISH, the stall address, or a step budget.
  *
  * The budget is not paranoia: a list whose JUMP forms a cycle is a normal
@@ -2462,9 +2780,8 @@ static void run_list_body(ge_queue *q) {
         }
         case GE_BEZIER:
         case GE_SPLINE:
-            /* Patches expand to triangles on hardware; counted as their own
-             * thing rather than folded into the triangle count. */
             g_ge.prims[3]++;
+            draw_patch(cmd == GE_SPLINE, arg);
             break;
 
         case GE_JUMP:
@@ -2587,6 +2904,21 @@ static void run_list_body(ge_queue *q) {
             if (g_tl.proj_n < 16) g_tl.proj[g_tl.proj_n++] = ge_float(arg);
             g_tl.proj_words++;
             break;
+        case GE_BONEMATRIXNUMBER: g_tl.bone_n = (int)(arg & 0x7F); break;
+        case GE_BONEMATRIXDATA:
+            if (g_tl.bone_n < 8 * 12) g_tl.bone[g_tl.bone_n++] = ge_float(arg);
+            break;
+        case GE_MORPHWEIGHT0:     case GE_MORPHWEIGHT0 + 1: case GE_MORPHWEIGHT0 + 2:
+        case GE_MORPHWEIGHT0 + 3: case GE_MORPHWEIGHT0 + 4: case GE_MORPHWEIGHT0 + 5:
+        case GE_MORPHWEIGHT0 + 6: case GE_MORPHWEIGHT0 + 7:
+            g_tl.morph_w[cmd - GE_MORPHWEIGHT0] = ge_float(arg);
+            break;
+        case GE_PATCHDIVISION:
+            g_ge.patch_du = (int)(arg & 0xFF);
+            g_ge.patch_dv = (int)((arg >> 8) & 0xFF);
+            break;
+        case GE_PATCHPRIMITIVE: g_ge.patch_prim = (int)(arg & 3); break;
+        case GE_PATCHFACING:    g_ge.patch_face = (int)(arg & 1); break;
 
         case GE_VIEWPORTXSCALE:  g_tl.vp_xs = ge_float(arg); g_tl.vp_set = 1; break;
         case GE_VIEWPORTYSCALE:  g_tl.vp_ys = ge_float(arg); g_tl.vp_set = 1; break;

@@ -1034,6 +1034,66 @@ static void identity_matrices(void) {
     }
 }
 
+static void put_f32(uint32_t a, float f) { uint32_t b; memcpy(&b, &f, 4); psp_write32(a, b); }
+
+/* Skinned, morphed and patch vertices reach the rasteriser where geprobe 2
+ * scenes 20-22 (fw 6.60) put them. Identity matrices and no viewport, so a
+ * model x of -0.5 lands at screen x 120 and +0.5 at 360. */
+static void test_skin_morph_patch(void) {
+    CHECK(psp_render_select("probe") == 0, "probe selectable for skin/morph test");
+
+    /* Morph: two sets per record, colour then position, 16 bytes each;
+     * weights 0.5 and 0.5 put the point half-way, colour included. */
+    psp_ge_reset();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 18));
+    identity_matrices();
+    cmd(0x2C, 0x3F0000); cmd(0x2D, 0x3F0000);        /* MORPHWEIGHT 0.5, 0.5 */
+    psp_write32(VERTS, 0xFF0000FFu);
+    put_f32(VERTS + 4, -0.5f); put_f32(VERTS + 8, 0.0f); put_f32(VERTS + 12, 0.0f);
+    psp_write32(VERTS + 16, 0xFF00FF00u);
+    put_f32(VERTS + 20, 0.5f); put_f32(VERTS + 24, 0.0f); put_f32(VERTS + 28, 0.0f);
+    g_probe_draws = 0;
+    cmd(0x04, (PSP_PRIM_POINTS << 16) | 1);
+    end_list();
+    CHECK(g_probe_draws == 1 && fabsf(g_probe_first.precise_x - 240.0f) < 0.01f,
+          "morphed point at x 240: %u draws, %.3f", g_probe_draws, g_probe_first.precise_x);
+    CHECK(g_probe_first.rgba == 0xFF008080u, "morphed colour 0xFF008080: %08X", g_probe_first.rgba);
+
+    /* Skinning: one float weight of 1.0 on bone 0, which moves x by 0.5. */
+    psp_ge_reset();
+    begin_list_vtype((3u << 9) | (7u << 2) | (3u << 7));
+    identity_matrices();
+    cmd(0x2A, 0);
+    for (int i = 0; i < 12; i++)
+        cmd(0x2B, i % 4 == 0 ? 0x3F8000 : i == 9 ? 0x3F0000 : 0);
+    put_f32(VERTS, 1.0f);
+    psp_write32(VERTS + 4, 0xFFFFFFFFu);
+    put_f32(VERTS + 8, 0.0f); put_f32(VERTS + 12, 0.0f); put_f32(VERTS + 16, 0.0f);
+    g_probe_draws = 0;
+    cmd(0x04, (PSP_PRIM_POINTS << 16) | 1);
+    end_list();
+    CHECK(g_probe_draws == 1 && fabsf(g_probe_first.precise_x - 360.0f) < 0.01f,
+          "skinned point at x 360: %u draws, %.3f", g_probe_draws, g_probe_first.precise_x);
+
+    /* A Bezier patch drawn as points with a 1x1 division is its four
+     * corner control points, the far one last. */
+    psp_ge_reset();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    identity_matrices();
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++)
+            float_vertex(j * 4 + i, -0.5f + (float)i / 3.0f, -0.5f + (float)j / 3.0f, 0.0f);
+    cmd(0x36, 1 | (1 << 8));                         /* PATCHDIVISION 1x1 */
+    cmd(0x37, 2);                                    /* PATCHPRIMITIVE points */
+    g_probe_draws = 0;
+    cmd(0x05, 4 | (4 << 8));                         /* BEZIER 4x4 */
+    end_list();
+    CHECK(g_probe_draws == 4 && fabsf(g_probe_first.precise_x - 360.0f) < 0.01f,
+          "Bezier corners: %u draws, last at x %.3f", g_probe_draws, g_probe_first.precise_x);
+
+    CHECK(psp_render_select("software") == 0, "software reselected after skin/morph test");
+}
+
 static void test_indexed_triangle_batch_boundary(void) {
     CHECK(psp_render_select("probe") == 0, "probe selectable for batch test");
 
@@ -1349,6 +1409,7 @@ int main(void) {
     test_backend_registration();
     test_indexed_triangle_batch_boundary();
     test_precise_vertex_payload();
+    test_skin_morph_patch();
     test_points_and_lines();
     test_alpha_only_clear();
     test_transformed_lines();
