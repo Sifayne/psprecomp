@@ -21,6 +21,7 @@
 #else
 #  include <dirent.h>
 #  include <sys/stat.h>
+#  include <time.h>
 #  include <unistd.h>
 #endif
 
@@ -73,6 +74,7 @@ typedef struct {
     DIR *dir;
 #endif
     char host[1024];     /* the directory's host path, to stat its entries */
+    int fat;             /* on the Memory Stick: entries stat the FAT way */
 } io_dir;
 
 static io_file g_file[MAX_FILES];
@@ -152,6 +154,13 @@ static void map_path(const char *guest, char *out, size_t cap) {
     if (have_dev) snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
     else if (g_cwd[0]) snprintf(out, cap, "%s/%s", g_cwd, p);
     else snprintf(out, cap, "%s/%s", g_root, p);
+}
+
+/* A Memory Stick path: FAT underneath, which shows in what open and stat
+ * report (see write_fat_stat). */
+static int is_ms_path(const char *guest) {
+    return !strncmp(guest, "ms0:", 4) || !strncmp(guest, "msstor0:", 8) ||
+           !strncmp(guest, "msstor0p1:", 10);
 }
 
 /* One ISO 9660 sector. Up here rather than with the reader below because
@@ -242,6 +251,21 @@ static void hle_Open(void) {
             }
         }
     }
+
+#ifndef _WIN32
+    /* A Memory Stick directory does not open as a file: EACCES, or EINVAL
+     * when the path ends in a slash (saveprobe steps 103-104, fw 6.60).
+     * Host fopen opens a directory for reading on Linux, and the read that
+     * followed returned 0 bytes. */
+    if (is_ms_path(guest)) {
+        struct stat st;
+        if (stat(host, &st) == 0 && S_ISDIR(st.st_mode)) {
+            const size_t n = strlen(guest);
+            psp_ret(n && (guest[n - 1] == '/' || guest[n - 1] == '\\') ? 0x80010016u : 0x8001000Du);
+            return;
+        }
+    }
+#endif
 
     /* Creating a file creates its parents: a save flow makes
      * ms0:/PSP/SAVEDATA/<id> under a tree that starts empty, and failing on
@@ -489,6 +513,41 @@ static void write_stat(uint32_t out, int is_dir, uint64_t size, uint32_t lba) {
      * and inventing a date would be less honest than reporting none. */
 }
 
+#ifndef _WIN32
+/* ScePspDateTime: year, month, day, hour, minute, second as u16, then
+ * microsecond as u32. */
+static void write_date(uint32_t at, time_t t, int time_of_day) {
+    struct tm tm;
+    if (!localtime_r(&t, &tm)) return;
+    psp_write16(at + 0, (uint16_t)(tm.tm_year + 1900));
+    psp_write16(at + 2, (uint16_t)(tm.tm_mon + 1));
+    psp_write16(at + 4, (uint16_t)tm.tm_mday);
+    psp_write16(at + 6, (uint16_t)(time_of_day ? tm.tm_hour : 0));
+    psp_write16(at + 8, (uint16_t)(time_of_day ? tm.tm_min : 0));
+    psp_write16(at + 10, (uint16_t)(time_of_day ? tm.tm_sec : 0));
+    psp_write32(at + 12, 0);
+}
+
+/* A Memory Stick file or directory as a PSP on firmware 6.60 stats it
+ * (saveprobe steps 105-107, sceIoGetstat and each sceIoDread d_stat alike):
+ * mode 0x21FF for a file and 0x11FF for a directory, attr 0x20 and 0x10, a
+ * directory's size 0, the creation and modification dates with their time
+ * of day and the access date alone at 00:00:00 (FAT keeps no access time),
+ * microseconds 0, and st_private left as the caller had it. The dates are
+ * the host file's: status change for creation, which Linux does not keep. */
+static void write_fat_stat(uint32_t out, const struct stat *st) {
+    const int dir = S_ISDIR(st->st_mode);
+    const uint64_t size = dir ? 0 : (uint64_t)st->st_size;
+    psp_write32(out + 0, (dir ? FIO_S_IFDIR : FIO_S_IFREG) | 0x01FFu);
+    psp_write32(out + 4, dir ? FIO_SO_IFDIR : FIO_SO_IFREG);
+    psp_write32(out + 8,  (uint32_t)size);
+    psp_write32(out + 12, (uint32_t)(size >> 32));
+    write_date(out + 16, st->st_ctime, 1);
+    write_date(out + 32, st->st_atime, 0);
+    write_date(out + 48, st->st_mtime, 1);
+}
+#endif
+
 static void hle_Getstat(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
@@ -513,6 +572,23 @@ static void hle_Getstat(void) {
     } else {
         map_path(guest, host, sizeof host);
     }
+
+#ifndef _WIN32
+    /* stat before fopen: Linux opens a directory for reading, and seeking to
+     * its end read as a size of 0x7FFFFFFFFFFFFFFF with the file's mode. */
+    {
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            const int dir = S_ISDIR(st.st_mode);
+            if (out) {
+                if (is_ms_path(guest)) write_fat_stat(out, &st);
+                else write_stat(out, dir, dir ? 0 : (uint64_t)st.st_size, 0);
+            }
+            psp_ret(SCE_KERNEL_ERROR_OK);
+            return;
+        }
+    }
+#endif
 
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -737,6 +813,7 @@ static void hle_Dopen(void) {
         if (!g_dir[i].dir) { psp_ret(0x80010002); return; }
 #endif
         g_dir[i].used = 1;
+        g_dir[i].fat = is_ms_path(guest);
         snprintf(g_dir[i].host, sizeof g_dir[i].host, "%s", host);
         psp_ret((uint32_t)(i + 1));
         return;
@@ -773,7 +850,7 @@ static void hle_Dread(void) {
     name = de->d_name;
 #endif
 
-    int is_dir = 0;
+    int is_dir = 0, fat_done = 0;
     uint64_t size = 0;
 #ifdef _WIN32
     is_dir = (g_dir[id].data.attrib & _A_SUBDIR) != 0;
@@ -786,12 +863,14 @@ static void hle_Dread(void) {
         if (stat(path, &st) == 0) {
             is_dir = S_ISDIR(st.st_mode);
             size = is_dir ? 0 : (uint64_t)st.st_size;
+            /* d_stat is what sceIoGetstat gives (saveprobe step 107). */
+            if (g_dir[id].fat) { write_fat_stat(dirent, &st); fat_done = 1; }
         }
     }
 #endif
 
     /* SceIoDirent: SceIoStat d_stat, char d_name[256], then d_private. */
-    write_stat(dirent, is_dir, size, 0);
+    if (!fat_done) write_stat(dirent, is_dir, size, 0);
     uint32_t at = dirent + PSP_STAT_LEN;
     uint32_t n = 0;
     for (; n < 255 && name[n]; n++) psp_write8(at + n, (uint8_t)name[n]);

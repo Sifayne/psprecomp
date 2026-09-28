@@ -695,6 +695,27 @@ static void test_io_dirs(void) {
     CHECK(call(GETSTAT, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), DST, 0, 0) == 0,
           "stat succeeds");
     CHECK(psp_read32(DST + 8) == 64, "stat reports the size, got %u", psp_read32(DST + 8));
+#ifndef _WIN32
+    /* The Memory Stick stats the FAT way (saveprobe steps 105-106, fw 6.60):
+     * modes 0x21FF and 0x11FF, attrs 0x20 and 0x10, a directory's size 0,
+     * dates filled with the access date at 00:00:00, st_private untouched.
+     * A directory does not open as a file (steps 103-104). */
+    for (uint32_t i = 0; i < 88; i++) psp_write8(DST + i, 0xEE);
+    CHECK(call(GETSTAT, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), DST, 0, 0) == 0 &&
+          psp_read32(DST) == 0x21FF && psp_read32(DST + 4) == 0x20 && psp_read32(DST + 8) == 64 &&
+          psp_read16(DST + 16) >= 1980 && psp_read16(DST + 38) == 0 && psp_read32(DST + 60) == 0 &&
+          psp_read32(DST + 64) == 0xEEEEEEEEu && psp_read32(DST + 84) == 0xEEEEEEEEu,
+          "an ms0 file stats as FAT, mode 0x%08X", psp_read32(DST));
+    CHECK(call(GETSTAT, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), DST, 0, 0) == 0 &&
+          psp_read32(DST) == 0x11FF && psp_read32(DST + 4) == 0x10 &&
+          psp_read32(DST + 8) == 0 && psp_read32(DST + 12) == 0,
+          "an ms0 directory stats as a directory of size 0, mode 0x%08X size high 0x%08X",
+          psp_read32(DST), psp_read32(DST + 12));
+    CHECK(call(OPEN, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0x0001, 0, 0) == 0x8001000Du,
+          "open of an ms0 directory is EACCES");
+    CHECK(call(OPEN, guest_name("ms0:/PSP/SAVEDATA/ZZZ/"), 0x0001, 0, 0) == 0x80010016u,
+          "open of an ms0 directory with a trailing slash is EINVAL");
+#endif
     fd = call(OPEN, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0x0001, 0, 0);
     CHECK((int32_t)fd >= 3, "reopen reads");
     for (uint32_t i = 0; i < 64; i++) psp_write8(DST + i, 0);
