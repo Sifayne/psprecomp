@@ -250,6 +250,16 @@ static long card_file(const char *save,const char *file,unsigned char *out,size_
     FILE *f=fopen(path,"rb"); if (!f) return -1;
     long n=(long)fread(out,1,cap,f); fclose(f); return n;
 }
+static void put_file(const char *save,const char *file,const void *b,size_t n) {
+    char path[512]; snprintf(path,sizeof path,"%s/ms/PSP/SAVEDATA/UITEST001%s",root,save);
+#ifndef _WIN32
+    mkdir(path,0700);
+#else
+    _mkdir(path);
+#endif
+    snprintf(path,sizeof path,"%s/ms/PSP/SAVEDATA/UITEST001%s/%s",root,save,file);
+    FILE *f=fopen(path,"wb"); assert(f); assert(fwrite(b,1,n,f)==n); fclose(f);
+}
 static const uint32_t fl=0x08817000, ents=0x08818000;
 /* setup() without the save-name list: AUTOSAVE would otherwise move an
  * overwrite to the list's first entry. */
@@ -359,12 +369,30 @@ static void fw660_keys(void) {
     assert(load("HWZERO",'0',1)==0 && psp_read8(data)=='z');
     /* MAKEDATA takes the zero key at secureVersion 0 (DPLAIN, step 40). */
     hw(14,"HWZPLAIN","zp"); key('0',0); assert(run()==0);
-    /* The rules are for secure files: a MAKEDATA save loads with any key. */
-    assert(load("HWPLAIN",'0',0)==0 && load("HWPLAIN",'B',0)==0);
-    /* A block without key fields (SDK before 2.00) is not checked. */
+    /* AUTOLOAD of a MAKEDATA save's plain file: the zero key is still
+     * LOAD_BAD_PARAMS (DPLAIN, step 72), and a real key reads 0x80110309,
+     * the file not being in SAVEDATA_FILE_LIST (step 73). */
+    assert(load("HWPLAIN",'0',0)==0x80110308u && load("HWPLAIN",'A',0)==0x80110309u);
+    /* The request's class must match the save's flags, whatever the key:
+     * a 0x21 save at secureVersion 1, a 0x01 save at 0 (A0, A1: 68-71).
+     * 2 against a 0x01 save, and 1 against a secureVersion 3 save, follow
+     * from the class (unmeasured). */
+    assert(load("HWKEY",'A',1)==0x80110306u && psp_read32(p+124)==0x5A5A);
+    assert(load("HWKEY1",'A',0)==0x80110306u && load("HWKEY1",'A',2)==0x80110306u);
+    assert(load("HWKEY3",'B',1)==0);
+    /* Blocks without key fields (SDK before 2.00) save with flags 0x01 and
+     * load back (PLAIN1480, PLAIN1500: steps 108-111), and so does a
+     * 1536-byte request of that class. */
     hw(1,"HWSHORT","short"); psp_write32(p,1500); assert(run()==0);
     hw(0,"HWSHORT",""); psp_write32(p,1500); assert(run()==0 && psp_read8(data)=='s');
-    assert(load("HWSHORT",'B',0)==0);
+    hw(0,"HWSHORT",""); psp_write32(p,1480); assert(run()==0);
+    assert(load("HWSHORT",'B',1)==0 && load("HWSHORT",'B',0)==0x80110306u);
+    /* A save from psprecomp's earlier SFO writer (no SAVEDATA_FILE_LIST, no
+     * SAVEDATA_PARAMS) still loads with any key. */
+    static const unsigned char legacy[52]={0,'P','S','F',1,1,0,0,0x24,0,0,0,0x30,0,0,0,1,0,0,0,
+        0,0,4,2,3,0,0,0,4,0,0,0,0,0,0,0,'C','A','T','E','G','O','R','Y',0,0,0,0,'M','S',0,0};
+    put_file("HWLEGACY","PARAM.SFO",legacy,sizeof legacy); put_file("HWLEGACY","DATA.BIN","legacy",7);
+    assert(load("HWLEGACY",'B',0)==0 && psp_read8(data)=='l' && load("HWLEGACY",'A',1)==0);
 }
 static void fw660_cross_mode(void) {
     /* READDATASECURE of a plain file is RW_FILE_NOT_FOUND (step 48) and
@@ -376,6 +404,10 @@ static void fw660_cross_mode(void) {
     assert(run()==0 && psp_read32(p+124)==6 && psp_read8(data)=='k');
     /* Same-mode reads still work both ways (DSEC, DPLAIN steps 39, 42). */
     hw(15,"HWKEY",""); key('A',0); psp_write8(data,0); assert(run()==0 && psp_read8(data)=='k');
+    /* READDATASECURE keeps the key: DSEC with key B is RW_DATA_BROKEN and
+     * leaves dataSize alone (step 74). */
+    hw(15,"HWKEY",""); key('B',0); psp_write32(p+124,0x5A5A);
+    assert(run()==0x80110326u && psp_read32(p+124)==0x5A5A);
     hw(16,"HWPLAIN",""); psp_write8(data,0); assert(run()==0 && psp_read8(data)=='p');
 }
 static void fw660_sizes(void) {
@@ -412,7 +444,7 @@ static void fw660_list(void) {
     assert(list_of("HWKEY?")==2 && psp_read32(ents)==0x11FFu);
     assert(!strcmp((const char *)psp_mem_ptr(ents+52,20),"HWKEY1"));
     assert(!strcmp((const char *)psp_mem_ptr(ents+72+52,20),"HWKEY3"));
-    assert(list_of("HWSFO")==1 && list_of("HW*")==9 && list_of("*")>=12 && list_of("*1")==2);
+    assert(list_of("HWSFO")==1 && list_of("HW*")==10 && list_of("*")>=12 && list_of("*1")==2);
 }
 int main(void) {
 #ifndef _WIN32

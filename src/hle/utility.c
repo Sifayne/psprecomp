@@ -347,8 +347,13 @@ static void sd_put32(uint8_t *b, uint32_t v) {
 
 /* The secure-state keys of a save's PARAM.SFO. Absent keys read as zero:
  * a save without the SFO, or one written by psprecomp's earlier six-key
- * writer, lists no secure files and carries flags 0. */
-typedef struct { uint8_t params[SD_PARAMS_LEN]; uint8_t files[SD_FL_LEN]; } sd_sfo_state;
+ * writer, lists no secure files and carries flags 0. has_list tells that
+ * legacy SFO apart from a hardware-format one whose list is empty. */
+typedef struct {
+    uint8_t params[SD_PARAMS_LEN];
+    uint8_t files[SD_FL_LEN];
+    int has_list;
+} sd_sfo_state;
 
 static const uint8_t *sd_sfo_value(const uint8_t *b, size_t n, const char *key, uint32_t *len) {
     if (n < 20 || sd_le32(b) != 0x46535000u) return NULL;
@@ -382,6 +387,7 @@ static void sd_sfo_read_state(const char *dir, sd_sfo_state *st) {
     if (v) memcpy(st->params, v, len < SD_PARAMS_LEN ? len : SD_PARAMS_LEN);
     v = sd_sfo_value(b, n, "SAVEDATA_FILE_LIST", &len);
     if (v) memcpy(st->files, v, len < SD_FL_LEN ? len : SD_FL_LEN);
+    st->has_list = v != NULL;
 }
 
 /* name[13] of a list entry: the file name cut to 12 characters. */
@@ -439,7 +445,10 @@ static int sd_mode_secure(uint32_t mode) {
  *     sceKernelSetCompiledSdkVersion660 (step 115), while the same request
  *     at secureVersion 1 saves (step 75, PLAINV1);
  *   - the LOAD family answers LOAD_BAD_PARAMS (A0..A3: steps 8, 12 ... 36,
- *     63 and 67; A1 and PLAINV1 open with it, steps 59 and 76).
+ *     63 and 67; A1 and PLAINV1 open with it, steps 59 and 76), for a
+ *     plain file too, ahead of the file-list check (DPLAIN, step 72), but
+ *     after the directory checks (a missing save reads LOAD_NO_DATA, steps
+ *     2-4, 47).
  * Measured at secureVersion 0 on the save side and at 0, 2 and 3 on the
  * load side; the save side at 2 and 3 follows the load side. The short
  * blocks carry no key and are never refused (steps 108-111). */
@@ -449,44 +458,57 @@ static int sd_zero_key(uint32_t param) {
     return !memcmp(key, zero, 16) && psp_read32(param + SD_SECURE_VERSION) != 1;
 }
 
-/* The LOAD family's key and secureVersion rules for a secure data file, as
- * a PSP on firmware 6.60 applies them to a 1536-byte block (saveprobe,
- * steps 5-36 and 56-67):
- *   - an all-zero key gives LOAD_BAD_PARAMS unless the request's
- *     secureVersion is 1 (sd_zero_key). It comes after the existence
- *     checks: a zero key on a missing save still reads LOAD_NO_DATA (steps
- *     2-4, 47);
- *   - a save whose SAVEDATA_PARAMS flags carry 0x20 (secureVersion 0 or 2)
- *     opens only with the key that made it, else LOAD_DATA_BROKEN (steps 7,
- *     11 ... 35, 62). Flags 0x01 saves (secureVersion 1 or 3) open with any
- *     key (steps 58, 66). That the stored flags decide, not the request's
- *     secureVersion, is an assumption: every probe load reused the save's.
- * The key is compared through the file's tag (sd_key_tag); a MAC slot
- * without one (a PSP's own save, or a short block's) is not checked. */
-static uint32_t sd_load_key_check(uint32_t param, const char *dir, const char *file) {
-    uint8_t key[16], tag[16];
-    if (!sd_request_key(param, key)) return SD_OK;
-    static sd_sfo_state st;
-    sd_sfo_read_state(dir, &st);
-    int at = sd_fl_index(&st, file);
-    if (at < 0) return SD_OK;
-    const uint8_t *mac = st.files + (uint32_t)at * 32u + 13;
-    int tagged = !memcmp(mac, "PRCP", 4);
-    sd_key_tag(key, tag);
-    if (sd_zero_key(param)) return SD_LOAD_BAD_PARAMS;
-    if ((st.params[0] & SD_FLAG_GAMEKEY) && tagged && memcmp(mac, tag, 16))
-        return SD_LOAD_BROKEN;
-    return SD_OK;
-}
-
 /* SAVEDATA_PARAMS[0]. A block shorter than 1536 bytes (SDK before 2.00)
  * has no key or secureVersion, so its save cannot be bound to a game key:
- * it gets the flags of the saves that open with any key. That choice is an
- * inference; no probe step used a short block. */
+ * it gets the flags of the saves that open with any key, as fw 6.60 writes
+ * them for 1480- and 1500-byte blocks (saveprobe steps 108 and 110). */
 static uint8_t sd_sfo_flags(uint32_t param) {
     if (psp_read32(param) < 1536) return 0x01;
     uint32_t ver = psp_read32(param + SD_SECURE_VERSION);
     return (ver == 1 || ver == 3) ? 0x01 : (uint8_t)(0x01 | SD_FLAG_GAMEKEY);
+}
+
+/* Whether a request is refused a secure file of a save whose PARAM.SFO
+ * state is st, as DATA_BROKEN. Firmware 6.60 decides it on two things:
+ *   - the class. A request whose secureVersion makes flags 0x21 (0 or 2)
+ *     opens only saves with flags 0x21, and one that makes 0x01 (1 or 3)
+ *     only saves with 0x01, whatever the key: A0 (flags 0x21) at
+ *     secureVersion 1 and A1 (0x01) at 0 are LOAD_DATA_BROKEN with the key
+ *     that made them (saveprobe steps 68-71). So the request's secureVersion
+ *     decides together with the saved flags. The pairs 0/2 and 1/3 across
+ *     each other, and the short blocks against a 0x21 save, are inferred
+ *     from the class and not measured;
+ *   - the key, for a 0x21 save: only the one that made it opens it (steps
+ *     7, 11 ... 35, 62; KEYPAIR rewritten with key B refuses key A, step
+ *     82). A 0x01 save opens with any key (steps 58, 66).
+ * The key is compared through the file's tag (sd_key_tag); a MAC slot
+ * without one (a PSP's own save, or a short block's) is not checked. */
+static int sd_key_refused(uint32_t param, const sd_sfo_state *st, const char *file) {
+    const int keyed = (st->params[0] & SD_FLAG_GAMEKEY) != 0;
+    if (keyed != ((sd_sfo_flags(param) & SD_FLAG_GAMEKEY) != 0)) return 1;
+    uint8_t key[16], tag[16];
+    const int at = sd_fl_index(st, file);
+    if (!keyed || at < 0 || !sd_request_key(param, key)) return 0;
+    const uint8_t *mac = st->files + (uint32_t)at * 32u + 13;
+    if (memcmp(mac, "PRCP", 4)) return 0;
+    sd_key_tag(key, tag);
+    return memcmp(mac, tag, 16) != 0;
+}
+
+/* The LOAD family's rules for a data file that exists, on firmware 6.60:
+ *   - the file must be in SAVEDATA_FILE_LIST: AUTOLOAD of a MAKEDATA save's
+ *     plain DATA.BIN is 0x80110309 (DPLAIN with key A, saveprobe step 73),
+ *     the code this file already gave a missing data file;
+ *   - then sd_key_refused, as LOAD_DATA_BROKEN.
+ * The zero-key rule comes before both (sd_do_mode). A PARAM.SFO from
+ * psprecomp's earlier writer has no list and no flags, so its saves load
+ * as they did when they were made. */
+static uint32_t sd_load_key_check(uint32_t param, const char *dir, const char *file) {
+    static sd_sfo_state st;
+    sd_sfo_read_state(dir, &st);
+    if (!st.has_list || !st.params[0]) return SD_OK;
+    if (!sd_fl_secure(&st, file)) return SD_LOAD_FILE;
+    return sd_key_refused(param, &st, file) ? SD_LOAD_BROKEN : SD_OK;
 }
 
 /* Write dir/PARAM.SFO for the request at param: the directory as named
@@ -653,18 +675,11 @@ static int sd_cmp_str(const void *a, const void *b) {
     return strcmp((const char *)a, (const char *)b);
 }
 
-/* Whether dir/file is secure: listed in the save's SAVEDATA_FILE_LIST,
- * where hardware records it. Secure modes still store plaintext, so the
- * list is the only on-card difference, and FILES needs it to tell a
- * secure DATA.BIN from a WRITEDATA-made OTHER.BIN. */
-static int sd_is_secure(const char *dir, const char *file) {
-    static sd_sfo_state st;
-    sd_sfo_read_state(dir, &st);
-    return sd_fl_secure(&st, file);
-}
-
 /* 0 secure, 1 normal, 2 system. PARAM.SFO is always system; otherwise the
- * save's secure-file list decides. */
+ * save's secure-file list decides, where hardware records the class.
+ * Secure modes still store plaintext, so the list is the only on-card
+ * difference, and FILES needs it to tell a secure DATA.BIN from a
+ * WRITEDATA-made OTHER.BIN. */
 static int sd_classify(const sd_sfo_state *st, const char *file) {
     if (!strcmp(file, "PARAM.SFO")) return 2;
     return sd_fl_secure(st, file) ? 0 : 1;
@@ -968,6 +983,9 @@ static uint32_t sd_do_mode(uint32_t param) {
         if (!sd_exists(dir)) rc = SD_LOAD_NO_DATA;
         else if (!sd_has_sfo(dir)) rc = SD_LOAD_BROKEN;
         else if (!file[0]) rc = SD_OK;
+        /* Before the data file's own checks (step 72). Whether it also comes
+         * before a missing data file is unmeasured. */
+        else if (sd_zero_key(param)) rc = SD_LOAD_BAD_PARAMS;
         else {
             snprintf(guest, sizeof guest, "%s/%s", dir, file);
             if (!sd_exists(guest)) rc = SD_LOAD_FILE;
@@ -1028,7 +1046,9 @@ static uint32_t sd_do_mode(uint32_t param) {
         /* A secure-made file that is gone reads as FILE_NOT_FOUND; a file
          * never made at all reads as NO_DATA. The suite removes DATA.BIN
          * from one fixture and never creates it in the other. */
-        int secure = sd_is_secure(dir, file);
+        static sd_sfo_state st;
+        sd_sfo_read_state(dir, &st);
+        int secure = sd_fl_secure(&st, file);
         if (!sd_exists(guest)) return secure ? SD_RW_FILE : SD_RW_NO_DATA;
         /* Across modes, fw 6.60 answers differently from the suite's
          * RW_DATA_BROKEN for both pairings (saveprobe steps 48-49):
@@ -1037,6 +1057,10 @@ static uint32_t sd_do_mode(uint32_t param) {
          * and its 16-byte header on hardware, the plaintext here until the
          * savedata crypto exists. */
         if (secmode && !secure) return SD_RW_FILE;
+        /* READDATASECURE keeps the LOAD family's key rule: DSEC, made with
+         * key A, reads RW_DATA_BROKEN with key B (step 74). The class half
+         * of sd_key_refused is inferred for this mode. */
+        if (secmode && st.params[0] && sd_key_refused(param, &st, file)) return SD_RW_BROKEN;
         if (buf && bufsz) {
             int64_t n = sd_read_file(guest, buf, bufsz);
             if (n<0) return SD_ERASE_ACCESS;
