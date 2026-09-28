@@ -79,13 +79,30 @@ static int fx16_floor(float f) {
     return i - (s < (float)i);
 }
 
-/* A transformed vertex's screen position onto the 1/16 grid: floored, not
- * rounded. geprobe 2 scene 15 (fw 6.60) draws fog quads whose projected
- * corners fall between sixteenths; with floored corners every covered pixel
- * of the frame is where the hardware put it, while rounding moves the edges
- * of 59 pixels. Scene 17's two interpenetrating triangles agree. */
+/* A transformed vertex's screen position onto the 1/16 grid, rounded to the
+ * nearest sixteenth. This goes with ge_recip below: the two were fitted
+ * together to the coverage of geprobe 2 (fw 6.60) scenes 15, 18, 20 and 21.
+ * With an exact 1/w, floored positions looked best (0, 21, 50 and 28 pixels
+ * off); with the hardware's short reciprocal and rounding it is 0, 2, 0 and
+ * 23, and scenes 16, 22 and 23 also improve. */
 static int screen_fx16(float f) {
-    return fx16_floor(f);
+    return fx16_floor(f + 0.5f / (float)PSP_SUBPX);
+}
+
+/* 1/w for a projected x and y as the transform unit appears to produce it:
+ * the reciprocal's mantissa truncated to 11 fraction bits. Only the scale of
+ * a projected vertex depends on it, so the error grows with distance from the
+ * viewport centre; geprobe 2's 3D scenes (fw 6.60) put edges up to 50 pixels
+ * off with an exact divide, and 9, 10 or 11 bits all fit them equally (see
+ * screen_fx16), so the exact width is open. A power of two is exact either
+ * way, which keeps w = 1 geometry where it was. Depth does not share it:
+ * scene 17's depth-buffer dump sits 5 units low on most pixels when z is
+ * divided by this reciprocal and centres on the exact one, so z keeps the
+ * exact divide (as do the perspective terms, for want of a measurement). */
+static float ge_recip(float w) {
+    int e;
+    const float m = frexpf(1.0f / w, &e);     /* [0.5, 1) */
+    return ldexpf((float)(int)(m * 4096.0f), e - 12);   /* toward zero */
 }
 
 /* A float through-mode coordinate, saturated to signed 12.4 (-2048 ..
@@ -1362,8 +1379,8 @@ static void ndc_to_screen(float nx, float ny, float nz, float *sx, float *sy, fl
 }
 
 static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
-    const float inv = 1.0f / clip[3];
-    ndc_to_screen(clip[0] * inv, clip[1] * inv, clip[2] * inv, sx, sy, sz);
+    const float r = ge_recip(clip[3]);
+    ndc_to_screen(clip[0] * r, clip[1] * r, clip[2] / clip[3], sx, sy, sz);
 }
 
 /* Transformed geometry, one primitive at a time.
@@ -1641,9 +1658,9 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
     unsigned any_out = 0;
     for (int i = 0; i < n; i++) {
         if (poly[i].c[3] == 0.0f) { g_clip_eye += 3; return; }
-        const float inv = 1.0f / poly[i].c[3];
+        const float inv = 1.0f / poly[i].c[3], r = ge_recip(poly[i].c[3]);
         float sx, sy, sz;
-        ndc_to_screen(poly[i].c[0] * inv, poly[i].c[1] * inv, poly[i].c[2] * inv, &sx, &sy, &sz);
+        ndc_to_screen(poly[i].c[0] * r, poly[i].c[1] * r, poly[i].c[2] * inv, &sx, &sy, &sz);
         if (g_tl.depth_clamp) {
             if (sz < 0.0f) sz = 0.0f;
             if (sz > 65535.0f) sz = 65535.0f;
@@ -2140,7 +2157,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             float sx, sy, sz;
             if (clip[3] > 1e-6f) to_screen(clip, &sx, &sy, &sz);
             else                 sx = sy = sz = 0.0f;
-            /* Floored to the 1/16 grid, as screen_fx16 explains. */
+            /* Onto the 1/16 grid, as screen_fx16 explains. */
             o->x = screen_fx16(sx);
             o->y = screen_fx16(sy);
             o->precise_x = sx; o->precise_y = sy; o->precise = 1;

@@ -1163,9 +1163,10 @@ static void test_precise_vertex_payload(void) {
     cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
     CHECK(g_probe_first.precise && fabsf(g_probe_first.precise_x-40.24f)<0.0001f,
           "GE retains pre-quantization projection %.8f",g_probe_first.precise_x);
-    /* Floored to 40.1875, not rounded to 40.25: geprobe 2 scene 15 on fw 6.60
-     * (see screen_fx16 in ge.c). */
-    CHECK(g_probe_first.x==643,"transformed geometry floors to 40.1875 pixels: %d",g_probe_first.x);
+    /* Rounded to 40.25: at w = 1 the short reciprocal is exact and the
+     * position goes to the nearest sixteenth (geprobe 2, fw 6.60; see
+     * screen_fx16 and ge_recip in ge.c). */
+    CHECK(g_probe_first.x==644,"transformed geometry rounds to 40.25 pixels: %d",g_probe_first.x);
     psp_ge_reset(); begin_list(); vertex(0,10,20,0xFFFFFFFF);
     cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
     CHECK(!g_probe_first.precise,"through-mode vertices keep the PSP coordinate contract");
