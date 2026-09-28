@@ -12,6 +12,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/clock.h"
+#include "psprecomp/sched.h"
 #include "crypto/sha1.h"
 
 #include <stdio.h>
@@ -1279,6 +1280,113 @@ static void test_pool_free_pointers(void) {
     call(psp_nid("sceKernelDeleteFpl"), fpl, 0, 0, 0);
 }
 
+/* ---- waits with real threads --------------------------------------------
+ *
+ * Thread bodies are C functions in the dispatch table, started through the
+ * firmware calls, with the host's main context as the module's main thread
+ * (priority 0x20, like the probe's). */
+#define TW_SEMA  0x08802000u
+#define TW_MBX   0x08802100u
+#define TW_NEG   0x08802200u
+#define TW_FLAG  0x08802300u
+#define TW_INFO  0x08806000u
+#define TW_TMO   0x08806100u
+#define TW_MSG   0x08806200u
+
+static uint32_t tw_obj, tw_tmo, tw_rc;
+static int      tw_ran;
+
+static void body_tw_sema(void) { tw_rc = call(psp_nid("sceKernelWaitSema"), tw_obj, 1, tw_tmo, 0); }
+static void body_tw_mbx(void)  { tw_rc = call(psp_nid("sceKernelReceiveMbx"), tw_obj, TW_MSG, 0, 0); }
+static void body_tw_neg(void)  { psp_cpu.r[PSP_REG_V0] = (uint32_t)-5; }
+static void body_tw_flag(void) { tw_ran = 1; }
+
+static uint32_t tw_start(uint32_t entry) {
+    const uint32_t th = call5(psp_nid("sceKernelCreateThread"), guest_name("tw"), entry,
+                              0x20, 0x1000, 0);
+    CHECK((int32_t)th > 0, "create a thread: %08X", th);
+    call(psp_nid("sceKernelStartThread"), th, 0, 0, 0);
+    return th;
+}
+
+static uint32_t tw_waiters(void) {
+    psp_write32(TW_INFO, 56);
+    call(psp_nid("sceKernelReferSemaStatus"), tw_obj, TW_INFO, 0, 0);
+    return psp_read32(TW_INFO + 52);
+}
+
+static void test_waits_with_threads(void) {
+    psp_register(TW_SEMA, body_tw_sema);
+    psp_register(TW_MBX, body_tw_mbx);
+    psp_register(TW_NEG, body_tw_neg);
+    psp_register(TW_FLAG, body_tw_flag);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t DELAY = psp_nid("sceKernelDelayThread");
+
+    /* ReleaseWaitThread takes the thread out of the object's queue then and
+     * there: the waiter count reads 1 -> 0 across the call (step 78). */
+    tw_obj = call5(psp_nid("sceKernelCreateSema"), guest_name("tws"), 0, 0, 1, 0);
+    tw_tmo = 0; tw_rc = 0xEEEEEEEEu;
+    uint32_t th = tw_start(TW_SEMA);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(tw_waiters() == 1, "waiting: %u waiters", tw_waiters());
+    CHECK(call(psp_nid("sceKernelReleaseWaitThread"), th, 0, 0, 0) == 0, "release");
+    CHECK(tw_waiters() == 0, "released: %u waiters, expected 0", tw_waiters());
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(tw_rc == SCE_KERNEL_ERROR_RELEASE_WAIT, "released wait returned %08X", tw_rc);
+
+    /* A timeout that runs out while the thread is suspended takes it out of
+     * the queue at the deadline, and the wait answers WAIT_TIMEOUT when it
+     * is resumed (step 59). */
+    psp_write32(TW_TMO, 1000);
+    tw_tmo = TW_TMO; tw_rc = 0xEEEEEEEEu;
+    th = tw_start(TW_SEMA);
+    call(DELAY, 100, 0, 0, 0);
+    CHECK(call(psp_nid("sceKernelSuspendThread"), th, 0, 0, 0) == 0, "suspend the waiter");
+    call(DELAY, 5000, 0, 0, 0);
+    CHECK(tw_waiters() == 0, "timed out while suspended: %u waiters, expected 0", tw_waiters());
+    call(psp_nid("sceKernelResumeThread"), th, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(tw_rc == SCE_KERNEL_ERROR_WAIT_TIMEOUT, "timed-out wait returned %08X", tw_rc);
+    call(psp_nid("sceKernelDeleteSema"), tw_obj, 0, 0, 0);
+
+    /* ReferThreadStatus names the wait: a mailbox is waitType 5, waitId the
+     * mailbox (step 17). */
+    tw_obj = call(psp_nid("sceKernelCreateMbx"), guest_name("twm"), 0, 0, 0);
+    th = tw_start(TW_MBX);
+    call(DELAY, 100, 0, 0, 0);
+    psp_write32(TW_INFO, 104);
+    call(psp_nid("sceKernelReferThreadStatus"), th, TW_INFO, 0, 0);
+    CHECK(psp_read32(TW_INFO + 68) == PSP_WAITTYPE_MBX && psp_read32(TW_INFO + 72) == tw_obj,
+          "mbx wait: waitType %X waitId %08X", psp_read32(TW_INFO + 68),
+          psp_read32(TW_INFO + 72));
+    call(psp_nid("sceKernelDeleteMbx"), tw_obj, 0, 0, 0);
+    call(DELAY, 100, 0, 0, 0);
+
+    /* An entry point that returns a negative value ends with 800200D2 as its
+     * exit status (step 54). */
+    th = tw_start(TW_NEG);
+    call(DELAY, 100, 0, 0, 0);
+    CHECK(call(psp_nid("sceKernelGetThreadExitStatus"), th, 0, 0, 0) == 0x800200D2u,
+          "exit status after returning -5: %08X",
+          call(psp_nid("sceKernelGetThreadExitStatus"), th, 0, 0, 0));
+
+    /* A file call gives up the CPU, even to a thread of the caller's own
+     * priority, and keeps its answer (step 86). */
+    tw_ran = 0;
+    tw_start(TW_FLAG);
+    const uint32_t fd = call(psp_nid("sceIoOpen"), guest_name("ms0:/no/such/file.bin"), 1, 0, 0);
+    CHECK(tw_ran == 1, "an equal-priority thread did not run inside sceIoOpen");
+    CHECK(fd == 0x80010002u, "open of a missing file answered %08X", fd);
+
+    psp_sched_drain(5);
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -1309,6 +1417,7 @@ int main(void) {
     test_display();
     test_time_calls();
     test_pool_free_pointers();
+    test_waits_with_threads();
 
     psp_mem_free();
 

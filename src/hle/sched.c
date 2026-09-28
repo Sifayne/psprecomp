@@ -784,9 +784,8 @@ int psp_sched_delay(uint64_t usec) {
  *
  * For a game: Armored Core posts its disc reads to equal-priority workers and
  * carries on, and the slice was what let those workers run. Hardware gives up
- * the CPU inside file I/O instead (threadprobe step 1: main's release=337 over
- * start-up I/O), which iofilemgr.c does not model yet; that, not a slice, is
- * the faithful fix if the game stalls. */
+ * the CPU inside file I/O instead (threadprobe step 86, fw 6.60), which
+ * iofilemgr.c's io_park models; that, not a slice, is what lets them run. */
 void psp_sched_tick(void) {
     if (!g_threading || !g_dispatch || psp_ktimer_in_handler()) return;
 

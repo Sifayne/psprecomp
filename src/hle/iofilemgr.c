@@ -10,6 +10,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/sched.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,8 @@ typedef struct {
      * name was used, and not something a read can work out from its arguments.
      */
     int      sector_mode;
+    /* Written since it was opened, so closing it flushes (see io_park). */
+    int      dirty;
 } io_file;
 
 typedef struct {
@@ -116,6 +119,7 @@ void psp_io_reset(void) {
         g_file[i].has_result = g_file[i].close_pending = 0;
         g_file[i].result = 0;
         g_file[i].sector_mode = 0;
+        g_file[i].dirty = 0;
     }
     memset(g_dir, 0, sizeof g_dir);
     g_cwd[0] = '\0';
@@ -176,7 +180,12 @@ static void mkdir_parents(const char *host);
 static int iso_lookup(const char *guest, uint64_t *base, uint64_t *len,
                       int *is_dir, FILE **out);
 
-static void hle_Open(void) {
+static void io_park(void);
+static void hle_open_body(void);
+/* See io_park: an open gives up the CPU whether or not it finds the file. */
+static void hle_Open(void) { hle_open_body(); io_park(); }
+
+static void hle_open_body(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     uint32_t flags = psp_arg(1);
@@ -189,7 +198,7 @@ static void hle_Open(void) {
             if (isdir) { fclose(img); psp_ret(0x80010014); return; }   /* EISDIR */
             for (int i = 0; i < MAX_FILES; i++) {
                 if (g_file[i].used) continue;
-                g_file[i].f = img; g_file[i].used = 1;
+                g_file[i].f = img; g_file[i].used = 1; g_file[i].dirty = 0;
                 g_file[i].base = base; g_file[i].len = len; g_file[i].pos = 0;
                 g_file[i].has_result = g_file[i].close_pending = 0;
                 g_file[i].sector_mode = is_raw_umd(guest);
@@ -221,6 +230,7 @@ static void hle_Open(void) {
             if (g_file[i].used) continue;
             g_file[i].f = f;
             g_file[i].used = 1;
+            g_file[i].dirty = 0;
             g_file[i].base = 0;
             g_file[i].pos  = 0;
             g_file[i].len  = (fseeko(f, 0, SEEK_END) == 0 && ftello(f) > 0)
@@ -305,6 +315,7 @@ static void hle_Open(void) {
         if (g_file[i].used) continue;
         g_file[i].f = f;
         g_file[i].used = 1;
+        g_file[i].dirty = 0;
         g_file[i].base = 0;
         g_file[i].pos  = 0;
         /* A host file's window is the whole file. Writable files start empty
@@ -319,6 +330,41 @@ static void hle_Open(void) {
     psp_ret(0x80010018);              /* too many open files */
 }
 
+/* A file system call gives up the CPU while its driver works.
+ *
+ * threadprobe step 86 (fw 6.60) makes Memory Stick calls from main (0x20)
+ * with a ready 0x20 thread W, and W runs inside open (for writing and for
+ * reading), write, read (32K and 16 bytes), getstat and remove, and inside a
+ * close that follows a write; main's releaseCount rises across each (51, 2,
+ * 50, 1, 1, 50 and 53, and 4 for that close). An lseek and a close with
+ * nothing written give nothing up (release+0, W runs after). Step 1's
+ * release=333 for main is the same thing during start-up I/O. psprecomp's
+ * calls never let go of the CPU, so a thread doing I/O kept it from every
+ * thread of its own priority and below until it next blocked.
+ *
+ * Modelled as the shortest delay: the caller stops being runnable, every
+ * ready thread gets its turn -- equal and lower priorities too, as they do
+ * while a real driver waits -- and the caller is ready again as soon as any
+ * firmware call notices a microsecond has passed. The hardware's counts are
+ * the driver's own waits and depend on the stick's directory layout; this
+ * counts one release per call. The disc (disc0:, umd0:) is not measured: it
+ * is parked the same way, on the grounds that a UMD read waits for a slower
+ * drive than a stick read does. Directory calls, mkdir, rmdir, rename and
+ * chstat are unmeasured and left as they were.
+ *
+ * $v0/$v1 are the call's answer and are kept across the park. Nothing is
+ * given up with dispatch or interrupts off, where a PSP could not wait, nor
+ * by the async calls, which reuse these handlers but return at once. */
+static int g_io_async;
+
+static void io_park(void) {
+    if (g_io_async || !psp_sched_can_wait()) return;
+    const uint32_t v0 = psp_cpu.r[PSP_REG_V0], v1 = psp_cpu.r[PSP_REG_V1];
+    (void)psp_sched_delay(1);
+    psp_cpu.r[PSP_REG_V0] = v0;
+    psp_cpu.r[PSP_REG_V1] = v1;
+}
+
 static io_file *fd_arg(void) {
     int32_t fd = (int32_t)psp_arg(0) - 3;
     if (fd < 0 || fd >= MAX_FILES || !g_file[fd].used) return NULL;
@@ -328,11 +374,16 @@ static io_file *fd_arg(void) {
 static void hle_Close(void) {
     io_file *h = fd_arg();
     if (!h) { psp_ret(0x80020323); return; }
+    const int flush = h->dirty;
     fclose(h->f);
     h->f = NULL;
     h->used = 0;
+    h->dirty = 0;
     psp_ret(0);
+    if (flush) io_park();
 }
+
+static void hle_read_body(io_file *h, uint32_t dst, uint32_t size);
 
 static void hle_Read(void) {
     io_file *h = fd_arg();
@@ -340,6 +391,11 @@ static void hle_Read(void) {
     if (!h) { psp_ret(0x80020323); return; }
     if (!size) { psp_ret(0); return; }
     if (h->sector_mode) size *= ISO_SECTOR;   /* the count is in sectors */
+    hle_read_body(h, dst, size);
+    io_park();
+}
+
+static void hle_read_body(io_file *h, uint32_t dst, uint32_t size) {
 
     /* Read through a host buffer and then place it, so a read that straddles
      * the end of a guest region is rejected by the memory layer rather than
@@ -408,7 +464,9 @@ static void hle_Write(void) {
     for (uint32_t i = 0; i < size; i++) tmp[i] = psp_read8(src + i);
     size_t put = fwrite(tmp, 1, size, h->f);
     free(tmp);
+    if (size) h->dirty = 1;
     psp_ret((uint32_t)put);
+    if (size) io_park();
 }
 
 /* sceIoLseek takes a 64-bit offset and returns one. Under o32 a 64-bit
@@ -548,7 +606,10 @@ static void write_fat_stat(uint32_t out, const struct stat *st) {
 }
 #endif
 
-static void hle_Getstat(void) {
+static void hle_getstat_body(void);
+static void hle_Getstat(void) { hle_getstat_body(); io_park(); }   /* io_park */
+
+static void hle_getstat_body(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     const uint32_t out = psp_arg(1);
@@ -943,6 +1004,7 @@ static void hle_Remove(void) {
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
     psp_ret(UNLINK_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
+    io_park();
 }
 
 static void hle_Chdir(void) {
@@ -1098,7 +1160,9 @@ static void async_done(io_file *h, int64_t value) {
  * the work is identical and the only difference is where the answer goes. A
  * second copy of the read path would be a second thing to keep correct. */
 static void hle_OpenAsync(void) {
+    g_io_async = 1;
     hle_Open();
+    g_io_async = 0;
     const int32_t fd = (int32_t)psp_cpu.r[PSP_REG_V0] - 3;
     if (fd >= 0 && fd < MAX_FILES && g_file[fd].used)
         async_done(&g_file[fd], (int64_t)(int32_t)psp_cpu.r[PSP_REG_V0]);
@@ -1108,7 +1172,9 @@ static void hle_OpenAsync(void) {
 static void hle_ReadAsync(void) {
     io_file *h = fd_arg();
     if (!h) { psp_ret(SCE_ERROR_BADF); return; }
+    g_io_async = 1;
     hle_Read();
+    g_io_async = 0;
     async_done(h, (int64_t)(int32_t)psp_cpu.r[PSP_REG_V0]);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1130,7 +1196,9 @@ static void hle_WriteAsync(void) {
     }
     io_file *h = fd_arg();
     if (!h) { psp_ret(SCE_ERROR_BADF); return; }
+    g_io_async = 1;
     hle_Write();
+    g_io_async = 0;
     async_done(h, (int64_t)(int32_t)psp_cpu.r[PSP_REG_V0]);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1175,6 +1243,7 @@ static void collect_async(io_file *h) {
         if (h->f) fclose(h->f);
         h->f = NULL;
         h->used = 0;
+        h->dirty = 0;
         h->close_pending = 0;
     }
     psp_ret(SCE_KERNEL_ERROR_OK);
