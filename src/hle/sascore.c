@@ -191,7 +191,14 @@ typedef struct {
      * A key-off lifts it immediately -- pcm and vag key a voice off and
      * straight back on with no core between and hardware restarts it -- while
      * the *release* it schedules waits for the next core, which is what
-     * `keyoff_pending` carries. `playing` outlives the key either way: the
+     * `keyoff_pending` carries. A key-on waits for the next core the same
+     * way, in `keyon_pending`, although its key goes down at once (so a
+     * second KeyOn is refused and a KeyOff accepted): until that core the
+     * height, the end flag and the sound are the old voice's. Firmware 6.60
+     * reads the old height straight after a KeyOff+KeyOn (001E0000, and
+     * 30000000 in the middle of a release) and the old end flag straight
+     * after a KeyOn (sasprobe steps 71, 73, 75 and 213); the struct shows the
+     * key-on as pending (step 29). `playing` outlives the key either way: the
      * release is still audible after the key is up, and a fresh key-on may
      * arrive while it still is. adsrcurve needs exactly that: it starts each
      * of its 53 sweeps with a key-off and one core, and a release that has
@@ -199,6 +206,7 @@ typedef struct {
      * refusal to `playing` instead left the old envelope running and the
      * sweep measured the previous section's curve. */
     int      on;
+    int      keyon_pending;
     int      keyoff_pending;
     int      playing;
     int      ended;
@@ -213,7 +221,8 @@ typedef struct {
      * four such cores, which is 96 + 128 + 128 + 128, the same 32 missing
      * once rather than per core. And pcm.expected's rendered output puts the
      * sample the voice starts from at output index 32, with the loop
-     * arriving 32 late to match. */
+     * arriving 32 late to match. sasprobe measured the same on firmware 6.60
+     * (steps 69-70), counting from the core that takes up the key-on. */
     int32_t  start_delay;
 } sas_voice;
 
@@ -550,6 +559,22 @@ static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix
 
     for (uint32_t vi = 0; vi < g_max_voices; vi++) {
         sas_voice *v = &g_voice[vi];
+        /* A key-on first, then a key-off: a KeyOn and a KeyOff with no core
+         * between leave the voice ended with height 0 after one core, as a
+         * key-on straight into its release does (sasprobe step 74). */
+        if (v->keyon_pending) {
+            v->keyon_pending = 0;
+            v->playing = 1;
+            v->ended = 0;
+            restart_source(v);
+            /* 32 samples before the voice goes live (item 44). A VAG's first
+             * decoded sample is heard one output later still, at 33, but
+             * that is the resampler's leading 0 (see vag_fetch), not a
+             * second delay. */
+            v->start_delay = 32;
+            v->env = 0;
+            v->env_state = ENV_ATTACK;
+        }
         if (v->keyoff_pending) {
             v->keyoff_pending = 0;
             v->on = 0;
@@ -877,17 +902,10 @@ static void hle_SetKeyOn(void) {
      * wearing a different hat: the test keys the voice *off* before pausing
      * it, and hardware still refuses. A paused voice takes no key. */
     if (v->on || v->paused) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
+    /* The key goes down now; the voice starts at the next core (see `on`). */
     v->on = 1;
+    v->keyon_pending = 1;
     v->keyoff_pending = 0;
-    v->playing = 1;
-    v->ended = 0;
-    restart_source(v);
-    /* 32 samples before the voice goes live (item 44). A VAG's first decoded
-     * sample is heard one output later still, at 33, but that is the
-     * resampler's leading 0 (see vag_fetch), not a second delay. */
-    v->start_delay = 32;
-    v->env = 0;
-    v->env_state = ENV_ATTACK;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
