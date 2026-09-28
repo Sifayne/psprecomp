@@ -34,7 +34,7 @@ PSP_MODULE_INFO("sasprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(512);
 
-#define PROBE_VERSION 1
+#define PROBE_VERSION 2
 
 typedef unsigned int w32;   /* PSPSDK's u32 is long; this prints with %X */
 
@@ -2051,21 +2051,23 @@ static void sec_badptr(void) {
     section("badptr");
     fresh();
     /* sascore.c:25-26,490: a null core refused with 80420005. */
-    step("badptr: __sceSasInit(NULL, 256, 32, 0, 44100) (claim 80420005; sascore.c:25-26,490)");
-    ret(__sceSasInit(NULL, 256, 32, 0, 44100));
-    /* sascore.c:846-848: psprecomp refuses a null buffer with 80420005. */
+    if (!step("badptr: __sceSasInit(NULL, 256, 32, 0, 44100) (claim 80420005; sascore.c:25-26,490)"))
+        ret(__sceSasInit(NULL, 256, 32, 0, 44100));
     /* sascore.c:420-422,557-558: a null PCM address is accepted. No key-on
      * follows either of these; the voice is pointed back at real data. */
-    step("badptr: SetVoicePCM(0, NULL, 16, -1) (claim accepted; sascore.c:420-422,557-558)");
-    ret(__sceSasSetVoicePCM(core, 0, NULL, 16, -1));
+    if (!step("badptr: SetVoicePCM(0, NULL, 16, -1) (claim accepted; sascore.c:420-422,557-558)"))
+        ret(__sceSasSetVoicePCM(core, 0, NULL, 16, -1));
     __sceSasSetVoicePCM(core, 0, PCM(0), 64, -1);
-    step("badptr: SetVoice(0, NULL, 32, 0)");
-    ret(__sceSasSetVoice(core, 0, NULL, 32, 0));
+    if (!step("badptr: SetVoice(0, NULL, 32, 0)"))
+        ret(__sceSasSetVoice(core, 0, NULL, 32, 0));
     __sceSasSetVoicePCM(core, 0, PCM(0), 64, -1);
-    step("badptr: __sceSasGetAllEnvelopeHeights(core, NULL) (psprecomp 80420005; sascore.c:846-848)");
-    ret(__sceSasGetAllEnvelopeHeights(core, NULL));
-    step("badptr: __sceSasCore(NULL, out)");
-    ret(__sceSasCore(NULL, g_out));
+    /* sascore.c:846-848: psprecomp refuses a null buffer with 80420005. On
+     * firmware 6.60 it switched the PSP off (sasprobe 1, 2026-09-28). */
+    if (!step("badptr: __sceSasGetAllEnvelopeHeights(core, NULL) (psprecomp 80420005; sascore.c:846-848)") &&
+        !KNOWN_CRASH("switched the PSP off on firmware 6.60 (sasprobe 1)"))
+        ret(__sceSasGetAllEnvelopeHeights(core, NULL));
+    if (!step("badptr: __sceSasCore(NULL, out)"))
+        ret(__sceSasCore(NULL, g_out));
 }
 
 /* ============================================================================ */

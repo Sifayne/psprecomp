@@ -10,22 +10,36 @@ the psprecomp one is ./ms/PSP/GAME/<name>/ after
     allegrexrecomp interp <name>.prx --dispatch --budget 4000000000 --drain 200
 
 The log is compared step by step (a step starts at a "[n] ..." line), so one
-difference does not shift every line after it. Binary files are compared by
+difference does not shift every line after it. A log holds every run of the
+probe, one after another; only the last run in each is compared, unless
+--run picks another (1 is the first, -1 the last). A probe that switched the
+PSP off is started again and skips that step, so its last run is the whole
+result. Binary files are compared by
 content: .bin as 32-bit words (reporting the input word too when
 vfpu_inputs.bin is present), .raw as pixels of a 480-wide frame. Standard
 library only."""
 import os, re, struct, sys
 
 STEP = re.compile(r"^\[(\d+)\] (.*)")
-HEADER = re.compile(r"^(==== .* firmware|log: )")
+RUN = re.compile(r"^==== \S+ \d+, firmware")
+HEADER = re.compile(r"^(==== .* firmware|log: |an earlier run stopped in )")
 
 
-def steps(path):
+def last_run(lines, run):
+    """The lines of one run: the last by default."""
+    starts = [i for i, l in enumerate(lines) if RUN.match(l)] or [0]
+    starts.append(len(lines))
+    k = run - 1 if run > 0 else len(starts) - 1 + run
+    k = max(0, min(k, len(starts) - 2))
+    return lines[starts[k]:starts[k + 1]]
+
+
+def steps(path, run=-1):
     """Map step title -> list of lines under it, in file order."""
     out, cur, order = {}, "(before the first step)", []
     out[cur] = []
     order.append(cur)
-    for line in open(path, errors="replace").read().splitlines():
+    for line in last_run(open(path, errors="replace").read().splitlines(), run):
         if HEADER.match(line):
             continue
         m = STEP.match(line)
@@ -40,8 +54,8 @@ def steps(path):
     return out, order
 
 
-def compare_logs(hw, pc, nlines):
-    a, order = steps(hw)
+def compare_logs(hw, pc, nlines, run):
+    a, order = steps(hw, run)
     b, _ = steps(pc)
     same = differ = missing = 0
     for title in order:
@@ -108,12 +122,14 @@ def main():
     ap.add_argument("hardware")
     ap.add_argument("psprecomp")
     ap.add_argument("--lines", type=int, default=6, help="differing lines shown per step")
+    ap.add_argument("--run", type=int, default=-1,
+                    help="which run of the hardware log: 1 is the first, -1 (default) the last")
     a = ap.parse_args()
     hw, pc = a.hardware, a.psprecomp
     for f in sorted(os.listdir(hw)):
         if f.endswith(".txt") and os.path.exists(os.path.join(pc, f)):
             print(f"==== {f}")
-            compare_logs(os.path.join(hw, f), os.path.join(pc, f), a.lines)
+            compare_logs(os.path.join(hw, f), os.path.join(pc, f), a.lines, a.run)
     inputs = None
     ip = os.path.join(hw, "vfpu_inputs.bin")
     if os.path.exists(ip):

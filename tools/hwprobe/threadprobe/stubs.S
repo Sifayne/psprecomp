@@ -2,14 +2,24 @@
  *
  * 1. Imports PSPSDK has no stubs for. The NIDs are the ones psprecomp's own
  *    registration table uses (src/hle/kernobj.c:2030-2034 for the TLS pool,
- *    src/hle/kernlock.c:341-342 for the mutex). They get an import entry of
- *    their own: adding them to libpspuser's ThreadManForUser entry would put
- *    them apart from the library's stubs, and psp-fixup-imports refuses an
- *    entry whose stubs are not contiguous. pspimport.s's IMPORT_START names
- *    the entry symbol after the library, which would clash with libpspuser's,
- *    so the entry is written out here in the same form under another symbol
- *    (IMPORT_FUNC only uses its first argument to name that symbol). The
- *    flags word is the one libpspuser's own ThreadManForUser entry carries.
+ *    src/hle/kernlock.c:341-342 for the mutex). Which library exports each
+ *    one on firmware 6.60 is from uofw's export tables (MIT):
+ *    src/kd/threadman/exports.exp and src/kd/usersystemlib/exports.exp.
+ *
+ *    sceKernelGetTlsAddr belongs to Kernel_Library, not ThreadManForUser.
+ *    The first build imported it from ThreadManForUser, which does not
+ *    export it on 6.60, so the call never reached the firmware; the probe's
+ *    first write through the value it came back with switched the PSP off.
+ *    psprecomp looks functions up by NID alone, so it ran there.
+ *
+ *    The imports get entries of their own: adding them to libpspuser's
+ *    entries would put them apart from the library's stubs, and
+ *    psp-fixup-imports refuses an entry whose stubs are not contiguous.
+ *    pspimport.s's IMPORT_START names the entry symbol after the library,
+ *    which would clash with libpspuser's, so the entry is written out here
+ *    in the same form under another symbol (IMPORT_FUNC only uses its first
+ *    argument to name that symbol). The flags words are the ones
+ *    libpspuser's own entries carry.
  *
  * 2. regs_entry, a thread entry point that records the register file exactly
  *    as the kernel handed it over -- before any compiled prologue touches it --
@@ -46,11 +56,13 @@ __stub_module_\sym:
 	TP_IMPORT_START "ThreadManForUser",tp_ThreadManForUser,0x40090000
 	IMPORT_FUNC	tp_ThreadManForUser,0x8DAFF657,sceKernelCreateTlspl
 	IMPORT_FUNC	tp_ThreadManForUser,0x32BF938E,sceKernelDeleteTlspl
-	IMPORT_FUNC	tp_ThreadManForUser,0xFA835CDE,sceKernelGetTlsAddr
 	IMPORT_FUNC	tp_ThreadManForUser,0x4A719FB2,sceKernelFreeTlspl
 	IMPORT_FUNC	tp_ThreadManForUser,0x721067F3,sceKernelReferTlsplStatus
 	IMPORT_FUNC	tp_ThreadManForUser,0xB7D098C6,sceKernelCreateMutex
 	IMPORT_FUNC	tp_ThreadManForUser,0xF8170FBE,sceKernelDeleteMutex
+
+	TP_IMPORT_START "Kernel_Library",tp_Kernel_Library,0x00090000
+	IMPORT_FUNC	tp_Kernel_Library,0xFA835CDE,sceKernelGetTlsAddr
 
 	.text
 	.globl	regs_entry

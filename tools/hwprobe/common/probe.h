@@ -14,7 +14,8 @@
  * Lines collect in memory and reach the file on probe_flush(), step(),
  * section(), or when the buffer fills. Each write opens, appends and closes,
  * so what was flushed survives the PSP switching itself off, and the last
- * line names the step that did it. */
+ * line names the step that did it. The next start of the same probe version
+ * reads that and skips the step (see step()). */
 #ifndef HWPROBE_PROBE_H
 #define HWPROBE_PROBE_H
 
@@ -32,8 +33,27 @@ const char *probe_dir(void);
 void out(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* To the log and the screen. */
 void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-/* Name the call about to be made and put the log on the memory stick first. */
-void step(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* Name the call about to be made and put the log on the memory stick first.
+ *
+ * Returns 1 when an earlier run of the same probe version stopped in a step
+ * with this title without reaching probe_done() -- the PSP switched off or
+ * hung there -- and logs that the step is skipped. A step that might take the
+ * PSP down (bad pointers, traps) is written `if (!step(...)) { ... }`, so
+ * starting the probe again after a crash carries on past it. Other steps
+ * ignore the result. */
+int step(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* What the last step() returned. */
+int probe_skip(void);
+
+/* For a step that is expected to switch the PSP off, because firmware 6.60
+ * was seen not to check that kind of pointer: logs "not run: <why>" and is 1,
+ * so `if (!step(...) && !KNOWN_CRASH("...")) { ... }` leaves the calls out.
+ * Build with -DRUN_KNOWN_CRASHES to make it 0 and run them. */
+#ifdef RUN_KNOWN_CRASHES
+#define KNOWN_CRASH(why) 0
+#else
+#define KNOWN_CRASH(why) (out("  not run: %s\n", (why)), 1)
+#endif
 /* "---- name ----", flushed. */
 void section(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void probe_flush(void);

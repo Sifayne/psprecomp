@@ -57,7 +57,7 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
  * left of the user partition. */
 PSP_HEAP_SIZE_KB(256);
 
-#define PROBE_VERSION 1
+#define PROBE_VERSION 2
 
 /* ---- imports PSPSDK has no prototype or stub for (imports.S) ------------- */
 
@@ -3292,9 +3292,11 @@ static void sec_pointers(void) {
     int r;
 
     /* threadman.c:1634-1635 and the other Refer*Status -- a NULL info
-     * pointer is ILLEGAL_ADDR (80020005) in psprecomp. */
-    step("ptr: Refer*Status with a NULL info pointer, every type");
-    {
+     * pointer is ILLEGAL_ADDR (80020005) in psprecomp. On firmware 6.60 this
+     * step switched the PSP off (syncprobe 1, 2026-09-28); which of the eight
+     * calls did it is not known, since the log is written per step. */
+    if (!step("ptr: Refer*Status with a NULL info pointer, every type") &&
+        !KNOWN_CRASH("switched the PSP off on firmware 6.60 (syncprobe 1)")) {
         SceUID s = sceKernelCreateSema("p", 0, 0, 1, NULL);
         out("  sema: %08X\n", (unsigned)sceKernelReferSemaStatus(s, NULL));
         sceKernelDeleteSema(s);
@@ -3323,24 +3325,33 @@ static void sec_pointers(void) {
 
     /* kernobj.c:426-435 -- FreeVpl(NULL) is ILLEGAL_MEMBLOCK_PTR; a pointer
      * that is not mapped memory is 800200D3. kernobj.c:1635-1638 -- the
-     * same split for FreeFpl. */
-    step("ptr: FreeVpl and FreeFpl with NULL and with 0x10");
+     * same split for FreeFpl. One call per step, so a call that switches
+     * the PSP off costs only itself: the next start skips it. */
     {
-        SceUID v = sceKernelCreateVpl("p", 2, 0, 0x100, NULL);
-        out("  vpl NULL: %08X\n", (unsigned)sceKernelFreeVpl(v, NULL));
-        out("  vpl 0x10: %08X\n", (unsigned)sceKernelFreeVpl(v, (void *)0x10));
-        out("  vpl uid 0, 0x10: %08X\n", (unsigned)sceKernelFreeVpl(0, (void *)0x10));
-        sceKernelDeleteVpl(v);
-        SceUID f = sceKernelCreateFpl("p", 2, 0, 0x10, 1, NULL);
-        out("  fpl NULL: %08X\n", (unsigned)sceKernelFreeFpl(f, NULL));
-        out("  fpl 0x10: %08X\n", (unsigned)sceKernelFreeFpl(f, (void *)0x10));
-        out("  fpl uid 0, 0x10: %08X\n", (unsigned)sceKernelFreeFpl(0, (void *)0x10));
-        sceKernelDeleteFpl(f);
+        static const struct { const char *what; int fpl, uid0; w32 ptr; } fr[] = {
+            { "FreeVpl(vpl, NULL)", 0, 0, 0 },    { "FreeVpl(vpl, 0x10)", 0, 0, 0x10 },
+            { "FreeVpl(0, 0x10)", 0, 1, 0x10 },   { "FreeFpl(fpl, NULL)", 1, 0, 0 },
+            { "FreeFpl(fpl, 0x10)", 1, 0, 0x10 }, { "FreeFpl(0, 0x10)", 1, 1, 0x10 },
+        };
+        for (int i = 0; i < (int)(sizeof fr / sizeof fr[0]); i++) {
+            if (step("ptr: %s", fr[i].what)) continue;
+            if (fr[i].fpl) {
+                SceUID f = sceKernelCreateFpl("p", 2, 0, 0x10, 1, NULL);
+                out("  = %08X\n", (unsigned)sceKernelFreeFpl(fr[i].uid0 ? 0 : f, (void *)fr[i].ptr));
+                sceKernelDeleteFpl(f);
+            } else {
+                SceUID v = sceKernelCreateVpl("p", 2, 0, 0x100, NULL);
+                out("  = %08X\n", (unsigned)sceKernelFreeVpl(fr[i].uid0 ? 0 : v, (void *)fr[i].ptr));
+                sceKernelDeleteVpl(v);
+            }
+        }
     }
 
-    /* kernobj.c:1244 -- SendMbx(NULL) is ILLEGAL_ADDR (80020005). */
-    step("ptr: SendMbx with a NULL message");
-    {
+    /* kernobj.c:1244 -- SendMbx(NULL) is ILLEGAL_ADDR (80020005). Sending
+     * writes the message's link word, the same kind of kernel access through
+     * a NULL pointer as the Refer*Status step above. */
+    if (!step("ptr: SendMbx with a NULL message") &&
+        !KNOWN_CRASH("the kernel would write through a NULL message, like the Refer*Status crash")) {
         SceUID m = sceKernelCreateMbx("p", 0, NULL);
         out("  = %08X\n", (unsigned)sceKernelSendMbx(m, NULL));
         mbx_state(m);
@@ -3349,14 +3360,13 @@ static void sec_pointers(void) {
 
     /* kernlock.c:440-445, 490-492 -- lwmutex/delete's "Invalid" case:
      * DeleteLwMutex(NULL) is 800200D3. */
-    step("ptr: DeleteLwMutex(NULL)");
-    out("  = %08X\n", (unsigned)sceKernelDeleteLwMutex(NULL));
+    if (!step("ptr: DeleteLwMutex(NULL)"))
+        out("  = %08X\n", (unsigned)sceKernelDeleteLwMutex(NULL));
 
     /* kernobj.c:1112-1129 -- mbx/send rewrites the last message's `next`
      * and reads the box back: next = itself gives first = that message. */
     g_ptrname = msgname;
-    step("ptr: mailbox m1 m2; set m2.next = m2; refer, poll twice");
-    {
+    if (!step("ptr: mailbox m1 m2; set m2.next = m2; refer, poll twice")) {
         SceUID m = sceKernelCreateMbx("tamper", 0, NULL);
         msg_prep(0, 0);
         msg_prep(1, 0);
@@ -3375,8 +3385,7 @@ static void sec_pointers(void) {
 
     /* kernobj.c:1288-1302 -- next = NULL: count still 2, first NULL, and a
      * receive answers 800200D3. */
-    step("ptr: mailbox m1 m2; set m2.next = NULL; refer, poll");
-    {
+    if (!step("ptr: mailbox m1 m2; set m2.next = NULL; refer, poll")) {
         SceUID m = sceKernelCreateMbx("tamper", 0, NULL);
         msg_prep(0, 0);
         msg_prep(1, 0);

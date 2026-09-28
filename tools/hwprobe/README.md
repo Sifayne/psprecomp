@@ -18,7 +18,17 @@ PPSSPP or pspautotests' sources.
 All but mpegprobe run without input: start one from the XMB, it writes
 `<name>.txt` (and sometimes `.bin` or `.raw` files) beside its EBOOT and
 returns to the XMB. The log is flushed before every step, so if the PSP
-switches off, the last line names the step that did it.
+switches off, the last line names the step that did it. Starting the probe
+again then skips that step and carries on; the log keeps every run, and the
+last one is the whole result. Steps already seen to switch a 6.60 PSP off log
+"not run" instead (build with `-DRUN_KNOWN_CRASHES` to try them anyway).
+
+Every import must come from the library that exports it on the PSP. psprecomp
+finds functions by NID alone, so an import from the wrong library works there
+but is never linked on hardware, and the call returns garbage. threadprobe's
+first build lost most of its run that way (sceKernelGetTlsAddr belongs to
+Kernel_Library). uofw's `exports.exp` files (MIT) list which library exports
+what on 6.60.
 
 ## Build
 

@@ -51,7 +51,7 @@ PSP_MODULE_INFO("vfpuprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(4096);
 
-#define PROBE_VERSION 1
+#define PROBE_VERSION 2
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -995,8 +995,11 @@ static void section_fpu(void) {
 
 static void section_fpu_trap(void) {
     section("12. fcr31 E cause bit");
-    step("fcr31 write 00020000 (the E cause bit) -- may trap, so it runs last");
-    out("  write 00020000 -> %08X\n", fcr31_rw(0x00020000u));
+    /* On firmware 6.60 this write switched the PSP off (vfpuprobe 1,
+     * 2026-09-28). */
+    if (!step("fcr31 write 00020000 (the E cause bit) -- may trap, so it runs last") &&
+        !KNOWN_CRASH("switched the PSP off on firmware 6.60 (vfpuprobe 1)"))
+        out("  write 00020000 -> %08X\n", fcr31_rw(0x00020000u));
 }
 
 /* ---- main ------------------------------------------------------------------ */

@@ -42,7 +42,7 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
  * all of it). */
 PSP_HEAP_SIZE_KB(256);
 
-#define PROBE_VERSION 1
+#define PROBE_VERSION 2
 
 typedef unsigned int w32;
 
@@ -96,15 +96,17 @@ static void rec_flush(void) {
     g_recn = 0;
 }
 
-static void ST(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void ST(const char *fmt, ...) {
+/* Returns 1 when the step is to be skipped because an earlier run of this
+ * version stopped in it (see step() in probe.h). */
+static int ST(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static int ST(const char *fmt, ...) {
     char buf[240];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     rec_flush();
-    step("%s", buf);
+    return step("%s", buf);
 }
 
 static void SEC(const char *name) {
@@ -3017,8 +3019,11 @@ static void sec_badptr(void) {
     nm_reset();
     int r;
 
-    ST("NULL info pointers: ReferThreadStatus, ReferCallbackStatus, ReferAlarmStatus, ReferVTimerStatus, ReferTlsplStatus");
-    {
+    /* syncprobe's Refer*Status calls with a NULL info pointer turned the PSP
+     * off on firmware 6.60 (syncprobe 1, 2026-09-28); these take the same
+     * path. */
+    if (!ST("NULL info pointers: ReferThreadStatus, ReferCallbackStatus, ReferAlarmStatus, ReferVTimerStatus, ReferTlsplStatus") &&
+        !KNOWN_CRASH("a NULL Refer*Status info pointer switched the PSP off in syncprobe")) {
         SceUID cb = sceKernelCreateCallback("bp_cb", h_count, NULL);
         SceUID al = sceKernelSetAlarm(10000000, h_alarm, NULL);
         SceUID vt = sceKernelCreateVTimer("bp_vt", NULL);
@@ -3033,8 +3038,8 @@ static void sec_badptr(void) {
         sceKernelDeleteTlspl(tl);
     }
 
-    ST("GetThreadmanIdList(THREAD, NULL, 4, &count)");
-    {
+    if (!ST("GetThreadmanIdList(THREAD, NULL, 4, &count)") &&
+        !KNOWN_CRASH("the kernel would write through a NULL buffer, like the Refer*Status crash")) {
         int cnt = 0x55AA;
         r = sceKernelGetThreadmanIdList(1, NULL, 4, &cnt);
         rec("  %s count>=2 %s\n", hx(r), cnt >= 2 && cnt != 0x55AA ? "yes" : "no");
@@ -3042,8 +3047,7 @@ static void sec_badptr(void) {
 
     /* threadman.c:1081-1100 (NULL name is ERROR for sema/flag/callback),
      * ktimer.c:257 (vtimer), kernobj.c:1771 (tlspl: NO_MEMORY). */
-    ST("NULL names: CreateThread, CreateCallback, CreateVTimer, CreateTlspl, AllocPartitionMemory");
-    {
+    if (!ST("NULL names: CreateThread, CreateCallback, CreateVTimer, CreateTlspl, AllocPartitionMemory")) {
         SceUID t = sceKernelCreateThread(NULL, script_entry, 0x30, 0x1000, 0, NULL);
         rec("  thread=%s", cu(t));
         if (t > 0) sceKernelDeleteThread(t);
@@ -3063,17 +3067,20 @@ static void sec_badptr(void) {
 
     /* ktimer.c:67-69, 84 -- a NULL handler is 800200D3. Set 10s out and
      * cancelled at once in case the firmware accepts it. */
-    ST("alarm: NULL handler (SetAlarm 10s), NULL clock (SetSysClockAlarm)");
-    {
+    if (!ST("alarm: NULL handler (SetAlarm 10s)")) {
         SceUID a = sceKernelSetAlarm(10000000, NULL, NULL);
         if (a > 0) sceKernelCancelAlarm(a);
+        rec("  NULL handler=%s\n", cu(a));
+    }
+    if (!ST("alarm: NULL clock (SetSysClockAlarm)") &&
+        !KNOWN_CRASH("the kernel would read a NULL clock, like the Refer*Status crash")) {
         SceUID a2 = sceKernelSetSysClockAlarm(NULL, h_alarm, NULL);
         if (a2 > 0) sceKernelCancelAlarm(a2);
-        rec("  NULL handler=%s NULL clock=%s\n", cu(a), cu(a2));
+        rec("  NULL clock=%s\n", cu(a2));
     }
 
-    ST("vtimer: SetVTimerTime(NULL), GetVTimerTime(NULL), SetVTimerHandler(NULL schedule)");
-    {
+    if (!ST("vtimer: SetVTimerTime(NULL), GetVTimerTime(NULL), SetVTimerHandler(NULL schedule)") &&
+        !KNOWN_CRASH("the kernel would use a NULL clock, like the Refer*Status crash")) {
         SceUID v = sceKernelCreateVTimer("bp_vt2", NULL);
         rec("  set=%s get=%s handler=%s\n", hx(sceKernelSetVTimerTime(v, NULL)),
             hx(sceKernelGetVTimerTime(v, NULL)), hx(sceKernelSetVTimerHandler(v, NULL, h_vt, NULL)));
@@ -3083,8 +3090,7 @@ static void sec_badptr(void) {
 
     /* threadman.c:1911-1917 -- a callback function with the top bit set is
      * 800200D3; NULL is accepted. Never notified either way. */
-    ST("callback: function NULL and 0xDEADBEEF");
-    {
+    if (!ST("callback: function NULL and 0xDEADBEEF")) {
         SceUID c1 = sceKernelCreateCallback("bp_null", NULL, NULL);
         SceUID c2 = sceKernelCreateCallback("bp_dead", (SceKernelCallbackFunction)0xDEADBEEF, NULL);
         rec("  NULL=%s DEADBEEF=%s\n", cu(c1), cu(c2));
@@ -3096,8 +3102,7 @@ static void sec_badptr(void) {
      * does not otherwise validate: 0 and 1 answer the first pool. Main holds
      * a block in the one pool first so a lookup that lands on it cannot wait;
      * a 0x30 thread releases main after 200ms in case it does anyway. */
-    ST("tlspl: GetTlsAddr with ids 0 and 1 while main holds a block of the only pool");
-    {
+    if (!ST("tlspl: GetTlsAddr with ids 0 and 1 while main holds a block of the only pool")) {
         fresh(); seq_clear();
         SceUID p = sceKernelCreateTlspl("lax", 2, 0, 0x10, 2, NULL);
         w32 mine = (w32)sceKernelGetTlsAddr(p);
@@ -3117,17 +3122,17 @@ static void sec_badptr(void) {
     }
 
     /* threadman.c:323-326 -- NULL with a length arrives as length 0. */
-    ST("start args: length 8 with a NULL pointer");
-    regs_case(8, NULL, 0, 0);
+    if (!ST("start args: length 8 with a NULL pointer"))
+        regs_case(8, NULL, 0, 0);
     /* threadman.c:352-362 -- a negative length is 800200d3 and the thread is
      * left unstarted. */
-    ST("start args: length -1 with a real pointer");
-    regs_case((SceSize)-1, g_argbuf, 0, 0);
+    if (!ST("start args: length -1 with a real pointer"))
+        regs_case((SceSize)-1, g_argbuf, 0, 0);
 
     /* threadman.c:352-373 -- an argument pointer the kernel cannot read is
      * 800200d3 and the thread stays unstarted. The last step of the probe. */
-    ST("StartThread with argp = 0x10 (small bad pointer), length 8");
-    regs_case(8, (void *)0x10, 0, 0);
+    if (!ST("StartThread with argp = 0x10 (small bad pointer), length 8"))
+        regs_case(8, (void *)0x10, 0, 0);
 }
 
 /* ======================================================================= */
