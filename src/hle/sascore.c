@@ -58,6 +58,10 @@
 #define SAS_ERROR_MIX_MODE     0x80000004u
 /* A negative ADSR rate -- setadsr.expected's "Value ffffffff". */
 #define SAS_ERROR_ADSR_VALUE   0x80420019u
+/* A wave duty outside 0..100, from __sceSasSetSteepWave and
+ * __sceSasSetTrianglarWave alike (sasprobe step 229, fw 6.60). Not in
+ * PSPSDK's list of codes. */
+#define SAS_ERROR_WAVE_DUTY    0x80420017u
 
 static int grain_ok(uint32_t g) { return g >= 64 && g <= SAS_MAX_GRAIN && (g % 32) == 0; }
 
@@ -140,13 +144,13 @@ static int curve_ok(uint32_t mode, int phase_is_attack, int phase_is_sustain) {
  * samples, which are read as they are. The game uses both -- its menu sounds
  * are VAG and its voice clips PCM -- and the PCM path was missing entirely,
  * so those voices were silent. */
-enum { SRC_NONE = 0, SRC_VAG, SRC_PCM, SRC_NOISE };
+enum { SRC_NONE = 0, SRC_VAG, SRC_PCM, SRC_NOISE, SRC_STEEP, SRC_TRIANGLE };
 typedef struct {
     int      kind;
     uint32_t addr;
     uint32_t size;          /* VAG: bytes; PCM: samples, 1..0x10000 */
     int32_t  loop;          /* VAG: loop mode 0/1; PCM: loop position, negative for none */
-    uint32_t param;         /* noise: the frequency, 0..63 */
+    uint32_t param;         /* noise: the frequency, 0..63; waves: the duty, 0..100 */
 } sas_source;
 
 typedef struct {
@@ -237,6 +241,9 @@ typedef struct {
     uint16_t noise;
     int32_t  noise_timer;
     int      noise_clock_reset;   /* SetNoise since the last key-on */
+
+    /* A wave's phase, as 44100 times its 16-bit phase (see wave_fetch). */
+    uint32_t wave_acc;
 } sas_voice;
 
 enum { VAG_NXT_UNREAD = 0, VAG_NXT_OK, VAG_NXT_END };
@@ -589,6 +596,44 @@ static int32_t noise_fetch(sas_voice *v) {
     return (int16_t)v->noise;
 }
 
+/* ---- steep and triangular waves --------------------------------------------
+ *
+ * __sceSasSetSteepWave and __sceSasSetTrianglarWave make the voice a
+ * generator whose frequency is its pitch in Hz, as PSPSDK's header says:
+ * SetPitch 441 gives a 100-sample period. The phase after n samples is
+ *
+ *     phi = floor(n * pitch * 65536 / 44100) mod 65536
+ *
+ * and at duty 50, firmware 6.60 plays (sasprobe steps 230-231, both
+ * wave_*50.bin captures exact):
+ *
+ *   steep       +8192 while phi < 32768, else -8192
+ *   triangular  phi below 16384, 32768 - phi up to 49152, and past that
+ *               floor(exact phase - 65536 - 1824.9)
+ *
+ * The last quarter's offset is what the data demand (anything in
+ * (1824.88, 1824.92]) and is unexplained. Only duty 50 is measured: every
+ * duty plays the duty-50 shape here, which is a known gap. The phase is kept
+ * exactly, as n * pitch * 65536 modulo 65536 * 44100, which also carries a
+ * pitch change mid-play without a jump. */
+
+#define WAVE_WRAP (65536u * 44100u)
+
+static int64_t floor_div(int64_t x, int64_t d) {
+    int64_t q = x / d;
+    if ((x % d) != 0 && x < 0) q--;
+    return q;
+}
+
+static int32_t wave_fetch(sas_voice *v) {
+    const uint32_t acc = v->wave_acc, phi = acc / 44100u;
+    v->wave_acc = (uint32_t)(((uint64_t)acc + (uint64_t)v->pitch * 65536u) % WAVE_WRAP);
+    if (v->src.kind == SRC_STEEP) return phi < 32768u ? 8192 : -8192;
+    if (phi < 16384u) return (int32_t)phi;
+    if (phi < 49152u) return 32768 - (int32_t)phi;
+    return (int32_t)floor_div(10 * (int64_t)acc - 10ll * WAVE_WRAP - 18249ll * 44100, 441000);
+}
+
 /* Take up the sample the setters last named, from its start, with the
  * resampler at rest. */
 static void restart_source(sas_voice *v) {
@@ -605,6 +650,7 @@ static void restart_source(sas_voice *v) {
     v->vag_cur = 0;
     v->vag_cur_ok = 1;
     v->vag_nxt_state = VAG_NXT_UNREAD;
+    v->wave_acc = 0;
     v->noise = 0;
     if (v->noise_clock_reset) {
         v->noise_clock_reset = 0;
@@ -619,6 +665,8 @@ static int fetch_sample(sas_voice *v, int32_t *s) {
     case SRC_PCM:   return pcm_fetch(v, s);
     case SRC_VAG:   return vag_fetch(v, s);
     case SRC_NOISE: *s = noise_fetch(v); return 1;
+    case SRC_STEEP:
+    case SRC_TRIANGLE: *s = wave_fetch(v); return 1;
     default:        return 0;
     }
 }
@@ -831,6 +879,21 @@ static void hle_SetNoise(void) {
     v->noise_clock_reset = 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
+
+/* __sceSasSetSteepWave / __sceSasSetTrianglarWave(sasCore, voice, duty): the
+ * voice plays a wave (see wave_fetch). A duty outside 0..100 is refused,
+ * -1 included (sasprobe step 229). Like SetNoise, what the next key-on
+ * plays; on a playing voice that is not measured. */
+static void set_wave(int kind) {
+    sas_voice *v = voice_arg();
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    if (psp_arg(2) > 100u) { psp_ret(SAS_ERROR_WAVE_DUTY); return; }
+    v->next.kind  = kind;
+    v->next.param = psp_arg(2);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+static void hle_SetSteepWave(void)      { set_wave(SRC_STEEP); }
+static void hle_SetTrianglarWave(void)  { set_wave(SRC_TRIANGLE); }
 
 static void hle_SetVolume(void) {
     /* (sasCore, voice, l, r, el, er) -- the last two are the reverb sends.
@@ -1174,6 +1237,9 @@ void psp_sas_register(void) {
                      hle_GetAllEnvelopeHeights);
     psp_hle_register(0xE1CD9561, "sceSasCore", "__sceSasSetVoicePCM",      hle_SetVoicePCM);
     psp_hle_register(0xB7660A23, "sceSasCore", "__sceSasSetNoise",          hle_SetNoise);
+    /* NIDs from PSPSDK's stub library, libpspsascore.a. */
+    psp_hle_register(0xD5EBBBCD, "sceSasCore", "__sceSasSetSteepWave",      hle_SetSteepWave);
+    psp_hle_register(0xA232CBE6, "sceSasCore", "__sceSasSetTrianglarWave",  hle_SetTrianglarWave);
     psp_hle_register(0x33D4AB37, "sceSasCore", "__sceSasRevType",           hle_accept);
     psp_hle_register(0x267A6DD2, "sceSasCore", "__sceSasRevParam",          hle_accept);
     psp_hle_register(0xD5A229C9, "sceSasCore", "__sceSasRevEVOL",           hle_accept);
