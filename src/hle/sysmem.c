@@ -41,6 +41,7 @@ typedef struct {
 static mem_block g_block[MAX_BLOCKS];
 static uint32_t  g_next_uid;
 static uint32_t  g_heap_lo, g_heap_hi;
+static uint32_t  g_sdk_version;   /* see hle_SetCompiledSdkVersion */
 
 /* Default user heap. Modules load at 0x08800000 and are a few megabytes, so
  * starting above them keeps the allocator from handing out memory the module
@@ -56,6 +57,7 @@ void psp_sysmem_reset(void) {
     g_next_uid = UID_BASE;
     g_heap_lo = DEFAULT_HEAP_LO;
     g_heap_hi = DEFAULT_HEAP_HI;
+    g_sdk_version = 0;
 }
 
 void psp_sysmem_init(void) { psp_sysmem_reset(); }
@@ -263,10 +265,15 @@ static void hle_GetBlockHeadAddr(void) {
     psp_ret(b ? b->addr : 0);
 }
 
-/* Version-reporting calls. These are advisory: the firmware records the value
- * and games do not read it back, so accepting and ignoring is correct rather
- * than merely convenient. */
-static void hle_SetCompiledSdkVersion(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* Version-reporting calls. The firmware records the SDK version, and
+ * sceKernelGetCompiledSdkVersion reads it back: 0 before any Set, then the
+ * value set (saveprobe step 114, fw 6.60: 0, then 06060010 after
+ * sceKernelSetCompiledSdkVersion660(0x06060010)). Only that variant and a
+ * valid value are measured; the other variants are taken to record theirs
+ * the same way, and no value is checked. The compiler version is not read
+ * back by anything. */
+static void hle_SetCompiledSdkVersion(void) { g_sdk_version = psp_arg(0); psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_GetCompiledSdkVersion(void) { psp_ret(g_sdk_version); }
 static void hle_SetCompilerVersion(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 /* sceKernelPrintf is a game's own debug output, which makes it one of the most
@@ -343,6 +350,10 @@ void psp_sysmem_register(void) {
      * would put a false name in the diagnostics and fail the SHA-1 check in
      * test_hle.c, which is right to reject it. */
     psp_hle_register_unnamed(0x91DE343C, "SysMemUserForUser", hle_SetCompiledSdkVersion);
+    /* The 6.60 variant, unnamed for the same reason: uofw's label
+     * `sceKernelSetCompiledSdkVersion660` hashes to 0x6E69DB0E. */
+    psp_hle_register_unnamed(0x358CA1BB, "SysMemUserForUser", hle_SetCompiledSdkVersion);
+    psp_hle_register(0xFC114573, "SysMemUserForUser", "sceKernelGetCompiledSdkVersion",hle_GetCompiledSdkVersion);
     psp_hle_register(0xF77D77CB, "SysMemUserForUser", "sceKernelSetCompilerVersion",   hle_SetCompilerVersion);
     psp_hle_register(0x13A5ABEF, "SysMemUserForUser", "sceKernelPrintf",               hle_Printf);
     psp_hle_register(0xF919F628, "SysMemUserForUser", "sceKernelTotalFreeMemSize",     hle_TotalFreeMemSize);

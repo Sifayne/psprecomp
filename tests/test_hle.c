@@ -183,6 +183,15 @@ static void test_sysmem(void) {
     call(NID_FREE, uid2, 0, 0, 0);
     call(NID_FREE, uid3, 0, 0, 0);
     CHECK(psp_sysmem_free() == before, "everything freed restores the heap");
+
+    /* The SDK version reads back what was set, 0 before (saveprobe step
+     * 114, fw 6.60; 0x358CA1BB is sceKernelSetCompiledSdkVersion660). */
+    const uint32_t NID_GETSDK = psp_nid("sceKernelGetCompiledSdkVersion");
+    CHECK(call(NID_GETSDK, 0, 0, 0, 0) == 0, "no SDK version before one is set");
+    CHECK(call(0x358CA1BB, 0x06060010, 0, 0, 0) == 0, "the 6.60 variant sets it");
+    CHECK(call(NID_GETSDK, 0, 0, 0, 0) == 0x06060010, "and it reads back");
+    psp_sysmem_reset();
+    CHECK(call(NID_GETSDK, 0, 0, 0, 0) == 0, "a reset clears it");
 }
 
 static void test_semaphores(void) {
