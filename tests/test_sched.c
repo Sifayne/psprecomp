@@ -542,6 +542,22 @@ static void test_suspend_is_a_flag_over_the_wait(void) {
           s_wait_rc);
 }
 
+/* A finished thread's slot is reused once its host thread is joined, so the
+ * table bounds threads alive at once rather than starts per run (threadprobe
+ * made 115 starts; the 130th of any run used to fail). */
+static void test_dead_slots_are_reused(void) {
+    q_run(Q_ROTATE);
+    int ran = 0;
+    for (int i = 0; i < 1500; i++) {
+        trivial_ran = 0;
+        if (psp_sched_spawn(UID_TRIVIAL + 0x100 + (uint32_t)i, ENTRY_TRIVIAL,
+                            FAKE_SP, 0, 0, 0, 32) != 0) break;
+        psp_sched_drain(5);
+        ran += trivial_ran;
+    }
+    CHECK(ran == 1500, "%d of 1500 sequential starts ran", ran);
+}
+
 int main(void) {
     psp_register(ENTRY_Q_C + 0x10, body_s_waiter);
     psp_register(ENTRY_Q_C + 0x20, body_s_main);
@@ -574,6 +590,7 @@ int main(void) {
     test_rotate_other_level();
     test_displaced_thread_keeps_its_place();
     test_suspend_is_a_flag_over_the_wait();
+    test_dead_slots_are_reused();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

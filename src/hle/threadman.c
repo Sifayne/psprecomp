@@ -36,7 +36,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_THREADS 128
+/* threadprobe step 7 (fw 6.60) creates 200 threads beside the ones already
+ * there and gets all 200; the table held 128, so the 127th failed. The real
+ * ceiling is unmeasured (at least 202 coexist); this is the size of the other
+ * tables' headroom for a thousand of anything. */
+#define MAX_THREADS 1024
 /* Every `Create 1024` case in the suite builds a thousand objects in a loop and
  * expects the thousandth to succeed, so a cap below that is not a resource
  * limit being modelled -- it is ours, and it shows up as `Failed at 128`. The
@@ -162,7 +166,7 @@ static psp_callback g_cb[MAX_CBS];
  *
  * A high-water mark rather than a live count, because the slots are not
  * compacted: a freed slot in the middle stays in range. */
-static int g_cb_hi, g_sema_hi, g_flag_hi;
+static int g_cb_hi, g_sema_hi, g_flag_hi, g_thread_hi;
 static uint32_t     g_next_uid;
 /* The thread the scheduler says is running, as a thread-manager object.
  *
@@ -178,7 +182,7 @@ void psp_threadman_reset(void) {
     memset(g_sema, 0, sizeof g_sema);
     memset(g_flag, 0, sizeof g_flag);
     memset(g_cb, 0, sizeof g_cb);
-    g_cb_hi = g_sema_hi = g_flag_hi = 0;
+    g_cb_hi = g_sema_hi = g_flag_hi = g_thread_hi = 0;
     g_next_uid = UID_BASE;
     g_warned_block = 0;
     /* The clock first: the scheduler's ready-queue stamps are guest times, and
@@ -203,7 +207,7 @@ void psp_threadman_init(void) {
  * which is exactly the kind of subtlety not worth inviting to save twelve
  * lines. */
 static psp_thread *find_thread(uint32_t id) {
-    for (int i = 0; i < MAX_THREADS; i++)
+    for (int i = 0; i < g_thread_hi; i++)
         if (g_thread[i].used && g_thread[i].uid == id) return &g_thread[i];
     return NULL;
 }
@@ -284,27 +288,47 @@ static void release_stack(psp_thread *t) {
     psp_sysmem_release(t->stack_base);
 }
 
+/* The attribute bits a user thread may not ask for (threadprobe step 5, fw
+ * 6.60: bits 8-12, 15-19 and 24-26 answer ILLEGAL_ATTR), and the ones that are
+ * kept and reported back. Everything else -- bits 0-7, 23 and 27-31 -- is
+ * accepted and dropped: ReferThreadStatus reports 0x800000FF | kept. */
+#define PSP_THREAD_ATTR_REFUSED 0x070F9F00u
+#define PSP_THREAD_ATTR_KEPT    0x00706000u
+
+/* sceKernelCreateThread(name, entry, priority, stackSize, attr, option)
+ *
+ * threadprobe (fw 6.60) steps 2, 3 and 5 measure three argument checks, which
+ * this used to skip entirely:
+ *   - priority 0x08..0x77, or ILLEGAL_PRIORITY. 0 is refused here, unlike
+ *     ChangeThreadPriority where it means the caller's (0, 1, 7, 0x78, 0x7F,
+ *     0x80 and -1 all fail; 8, 0x20, 0x77 succeed);
+ *   - a stack of at least 0x200, or ILLEGAL_STACK_SIZE (0, 1, 0x100, 0x1FF).
+ *     It is rounded up to 0x100 (0x201 reports 0x300, 0x1001 0x1100) without
+ *     wrapping, so -1 and 0x7FFFFFFF are refused as NO_MEMORY by the
+ *     allocator. This used to raise anything smaller to 0x200 instead;
+ *   - the attribute, above.
+ * The order when several are wrong at once is unmeasured; this checks them in
+ * the order the probe did. A NULL entry and a duplicate name are accepted
+ * (steps 4 and 6). */
 static void hle_CreateThread(void) {
-    /* (name, entry, priority, stackSize, attr, option) */
+    const uint32_t prio = psp_arg(2), size = psp_arg(3), attr = psp_arg(4);
+    if (prio < 0x08u || prio > 0x77u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY); return; }
+    if (size < 0x200u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE); return; }
+    if (attr & PSP_THREAD_ATTR_REFUSED) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+    const uint64_t rounded = ((uint64_t)size + 0xFFu) & ~(uint64_t)0xFFu;
+    if (rounded > 0xFFFFFFFFu) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
     psp_thread *t = NULL;
     for (int i = 0; i < MAX_THREADS; i++) if (!g_thread[i].used) { t = &g_thread[i]; break; }
     if (!t) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     memset(t, 0, sizeof *t);
     psp_str(psp_arg(0), t->name, sizeof t->name);
-    t->entry      = psp_arg(1);
-    t->priority      = psp_arg(2);
-    t->init_priority = psp_arg(2);
-    t->stack_size = psp_arg(3);
-    t->attr       = psp_arg(4);
-
-    /* The requested size, not a floor of our own. It used to be raised to
-     * 0x1000, which is observable twice over: sceKernelReferThreadStatus
-     * reports the size back (`stackSize=10000` for a create that asked for
-     * 0x10000, verbatim), and threads/start locates the argument block as an
-     * offset from the stack *base*, so a stack that is 0x800 too big moves
-     * every one of those offsets by 0x800. */
-    if (t->stack_size < 0x200) t->stack_size = 0x200;
+    t->entry         = psp_arg(1);
+    t->priority      = prio;
+    t->init_priority = prio;
+    t->stack_size    = (uint32_t)rounded;
+    t->attr          = attr & PSP_THREAD_ATTR_KEPT;
     /* Stacks grow down, so allocate from the top of the heap: a stack that
      * overflows then runs into free space rather than into another block --
      * unless the guest asked for the other end. threads/start creates a thread
@@ -318,6 +342,7 @@ static void hle_CreateThread(void) {
     t->uid = g_next_uid++;
     t->state = TH_DORMANT;
     t->used = 1;
+    if ((int)(t - g_thread) >= g_thread_hi) g_thread_hi = (int)(t - g_thread) + 1;
     psp_ret(t->uid);
 }
 
@@ -1109,7 +1134,7 @@ static void note_signalled(uint32_t uid) {
 void psp_threadman_dump_threads(FILE *out) {
     static const char *const ST[] = { "dormant", "ready", "running" };
     fprintf(out, "  threads created:\n");
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 0; i < g_thread_hi; i++) {
         const psp_thread *t = &g_thread[i];
         if (!t->uid) continue;          /* never allocated */
         fprintf(out, "    uid 0x%08X  entry 0x%08X  prio %-3u  %-9s  exit %u  %s%s%s\n",
@@ -1881,9 +1906,9 @@ static void hle_ReferThreadStatus(void) {
     if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
 
     /* The reported attribute is not the one the caller passed: hardware ORs in
-     * 0x800000FF. create.expected reports `attr=800000ff` for a thread created
-     * with 0 and `attr=807000ff` for one created with 0x700000 -- twenty-eight
-     * rows, one rule. */
+     * 0x800000FF over the bits it kept (PSP_THREAD_ATTR_KEPT; threadprobe step
+     * 5, fw 6.60). create.expected reports `attr=800000ff` for a thread created
+     * with 0 and `attr=807000ff` for one created with 0x700000. */
     const uint32_t attr = 0x800000FFu | t->attr;
 
     /* `status` is the kernel's own enumeration, not this file's TH_*, and a
@@ -1988,7 +2013,7 @@ static int thread_matches(const psp_thread *t, int type) {
 
 static void threadman_list(int type, uint32_t out, int max, int *count) {
     if (type == PSP_TMID_THREAD || (type >= PSP_TMID_SLEEPING && type <= PSP_TMID_DORMANT)) {
-        for (int i = 0; i < MAX_THREADS; i++)
+        for (int i = 0; i < g_thread_hi; i++)
             if (g_thread[i].used && thread_matches(&g_thread[i], type))
                 list_add(g_thread[i].uid, out, max, count);
         return;

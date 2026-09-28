@@ -162,6 +162,9 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 /* A thread priority outside 0x08..0x77. Zero is not in that range and is not
  * an error either -- it means "the priority I am running at". */
 #define SCE_KERNEL_ERROR_ILLEGAL_PRIORITY 0x80020193
+/* sceKernelCreateThread with a stack below 0x200 (threadprobe step 3, fw 6.60:
+ * 0, 1, 0x100 and 0x1FF). */
+#define SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE 0x80020194
 /* A sceKernelGetThreadmanIdList type outside 1..14 and 0x40..0x43. */
 #define SCE_KERNEL_ERROR_ILLEGAL_TYPE     0x800201BB
 #define SCE_KERNEL_ERROR_SUSPEND         0x800201A3

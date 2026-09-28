@@ -504,6 +504,45 @@ static void test_thread_rules(void) {
     CHECK(call(RES, d1, 0, 0, 0) == 0, "resume(1)");
     CHECK(call(SUSP, 0, 0, 0, 0) == 1, "dispatch is back on after resume(1)");
     call(RES, 1, 0, 0, 0);
+
+    /* CreateThread's argument checks (steps 2, 3, 5) and the stack rounding. */
+    const uint32_t CREATE = psp_nid("sceKernelCreateThread");
+    const uint32_t REFER  = psp_nid("sceKernelReferThreadStatus");
+    const uint32_t ENTRY  = 0x08801000u;
+    struct { uint32_t prio, size, attr, want; } bad[] = {
+        { 0x00, 0x1000, 0, SCE_KERNEL_ERROR_ILLEGAL_PRIORITY },
+        { 0x07, 0x1000, 0, SCE_KERNEL_ERROR_ILLEGAL_PRIORITY },
+        { 0x78, 0x1000, 0, SCE_KERNEL_ERROR_ILLEGAL_PRIORITY },
+        { 0xFFFFFFFFu, 0x1000, 0, SCE_KERNEL_ERROR_ILLEGAL_PRIORITY },
+        { 0x20, 0x1FF,  0, SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE },
+        { 0x20, 0,      0, SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE },
+        { 0x20, 0xFFFFFFFFu, 0, SCE_KERNEL_ERROR_NO_MEMORY },
+        { 0x20, 0x1000, 0x00000100u, SCE_KERNEL_ERROR_ILLEGAL_ATTR },
+        { 0x20, 0x1000, 0x00008000u, SCE_KERNEL_ERROR_ILLEGAL_ATTR },
+        { 0x20, 0x1000, 0x04000000u, SCE_KERNEL_ERROR_ILLEGAL_ATTR },
+    };
+    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) {
+        const uint32_t r = call5(CREATE, guest_name("bad"), ENTRY, bad[i].prio,
+                                 bad[i].size, bad[i].attr);
+        CHECK(r == bad[i].want, "create(prio %X, size %X, attr %X) = %08X, expected %08X",
+              bad[i].prio, bad[i].size, bad[i].attr, r, bad[i].want);
+    }
+    const uint32_t ok = call5(CREATE, guest_name("ok"), ENTRY, 0x08, 0x201,
+                              0x80804001u);
+    CHECK((int32_t)ok > 0, "create(8, 0x201, 0x80804001) = %08X", ok);
+    const uint32_t info = 0x08806000u;
+    psp_write32(info, 104);
+    CHECK(call(REFER, ok, info, 0, 0) == 0, "refer");
+    CHECK(psp_read32(info + 52) == 0x300, "stack 0x201 rounds to 0x%X, expected 0x300",
+          psp_read32(info + 52));
+    CHECK(psp_read32(info + 36) == 0x800040FFu, "attr reported %08X, expected 800040FF",
+          psp_read32(info + 36));
+
+    /* WakeupThread: 0 is ILLEGAL_THID, a thread never started is DORMANT
+     * (steps 29, 30). */
+    const uint32_t WAKE = psp_nid("sceKernelWakeupThread");
+    CHECK(call(WAKE, 0, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_THID, "wakeup(0)");
+    CHECK(call(WAKE, ok, 0, 0, 0) == SCE_KERNEL_ERROR_DORMANT, "wakeup(never started)");
 }
 
 static void test_guest_strings(void) {

@@ -11,7 +11,10 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MAX_SCHED_THREADS 130      /* the kernel's 128, plus the main context */
+/* Threads alive at once, plus the main context. Dead slots are reused (see
+ * psp_sched_spawn), so this bounds what is running, not what has run; the
+ * thread manager's table is the same size. */
+#define MAX_SCHED_THREADS 1026
 #define MAIN_SLOT         0        /* the context module_start runs on */
 #define PSP_HOST_STACK_SIZE (16u * 1024u * 1024u)
 
@@ -67,6 +70,10 @@ typedef struct {
 } sched_slot;
 
 static sched_slot      g_slot[MAX_SCHED_THREADS];
+/* One past the highest slot ever handed out. Every scan stops here: the
+ * reschedule after each firmware call walks the table twice, and a walk of
+ * all of it would cost that on every call a game makes. */
+static int             g_slot_hi = 1;
 static psp_os_mutex g_lock = PSP_OS_MUTEX_INIT;
 static psp_os_cond  g_turn = PSP_OS_COND_INIT;
 static int             g_running = MAIN_SLOT;
@@ -99,9 +106,9 @@ static PSP_THREAD_LOCAL int g_self = MAIN_SLOT;
 
 /* A live slot wins over a dead one carrying the same uid.
  *
- * Slots are never reused -- see psp_sched_spawn for why that stays true -- so a
- * thread that is terminated and started again owns *two* slots with one uid,
- * and this returned the corpse: its priority, its state, and its position in
+ * A dead slot stays until psp_sched_spawn reuses it, so a thread that is
+ * terminated and started again can own *two* slots with one uid, and this
+ * returned the corpse: its priority, its state, and its position in
  * every scan. threads/change restarts a thread after each priority change and
  * reads the priority back, which is where it showed
  * (`Before: Current=18` against hardware's `30`).
@@ -110,7 +117,7 @@ static PSP_THREAD_LOCAL int g_self = MAIN_SLOT;
  * thread is a thing callers legitimately ask about. */
 static int slot_of(uint32_t uid) {
     int dead = -1;
-    for (int i = 0; i < MAX_SCHED_THREADS; i++) {
+    for (int i = 0; i < g_slot_hi; i++) {
         if (!g_slot[i].used || g_slot[i].uid != uid) continue;
         if (g_slot[i].state != PSP_SCHED_DEAD) return i;
         if (dead < 0) dead = i;
@@ -160,6 +167,7 @@ void psp_sched_reset(void) {
     g_slot[MAIN_SLOT].state    = PSP_SCHED_RUNNING;
     g_slot[MAIN_SLOT].priority = 32;
     g_rq_seq     = 0;
+    g_slot_hi    = MAIN_SLOT + 1;
     g_running    = MAIN_SLOT;
     psp_os_unlock(&g_lock);
 }
@@ -201,7 +209,7 @@ static int ahead_of(int a, int b) {
 /* The slot the handoff would run now, or -1. */
 static int pick_locked(void) {
     int best = -1;
-    for (int i = 0; i < MAX_SCHED_THREADS; i++)
+    for (int i = 0; i < g_slot_hi; i++)
         if (runnable(i) && (best < 0 || ahead_of(i, best))) best = i;
     return best;
 }
@@ -210,7 +218,7 @@ static int pick_locked(void) {
  * with its own deadline -- so the order they join the queue in is the order
  * their timers would have fired on hardware, however late this runs. */
 static void expire_locked(uint64_t now) {
-    for (int i = 0; i < MAX_SCHED_THREADS; i++) {
+    for (int i = 0; i < g_slot_hi; i++) {
         sched_slot *t = &g_slot[i];
         if (!t->used || t->state != PSP_SCHED_SLEEPING || !t->wake_at ||
             t->wake_at > now) continue;
@@ -224,7 +232,7 @@ static void expire_locked(uint64_t now) {
 /* The earliest deadline any timed wait has, or 0 for none. */
 static uint64_t soonest_locked(void) {
     uint64_t soonest = 0;
-    for (int i = 0; i < MAX_SCHED_THREADS; i++)
+    for (int i = 0; i < g_slot_hi; i++)
         if (g_slot[i].used && g_slot[i].state == PSP_SCHED_SLEEPING &&
             g_slot[i].wake_at && (!soonest || g_slot[i].wake_at < soonest))
             soonest = g_slot[i].wake_at;
@@ -254,7 +262,7 @@ static int handoff_locked(void) {
      * walks the same array -- and it turns a silent corruption into a named
      * one, which is the whole reason the bug above took as long as it did. */
     int cur = -1, dup = -1;
-    for (int i = 0; i < MAX_SCHED_THREADS; i++) {
+    for (int i = 0; i < g_slot_hi; i++) {
         if (!g_slot[i].used || g_slot[i].state != PSP_SCHED_RUNNING) continue;
         if (cur < 0) cur = i; else { dup = i; break; }
     }
@@ -445,21 +453,40 @@ int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp, uint32_t k0,
 
     psp_os_lock(&g_lock);
 
-    /* A dead slot is *not* reused, and that is deliberate.
+    /* A dead slot is reused, but only once its host thread has been joined.
      *
-     * Reusing one looks obviously right -- the table is otherwise a high-water
-     * mark rather than a census -- and it is unsafe without joining the host
-     * thread first. The dead thread's host thread may still be parked in
-     * await_turn_locked, which refuses to proceed only while the slot reads
-     * DEAD; hand that slot to a new thread and the old one's wait *succeeds*,
-     * so two host threads run guest code at once against the single global
-     * psp_cpu. Measured: threads/create went to 131,929,071 bad memory
-     * accesses the moment reuse was allowed.
+     * Without the join it is unsafe. The dead thread's host thread may still be
+     * parked in await_turn_locked, which refuses to proceed only while the slot
+     * reads DEAD; hand that slot to a new thread and the old one's wait
+     * *succeeds*, so two host threads run guest code at once against the single
+     * global psp_cpu. Measured: threads/create went to 131,929,071 bad memory
+     * accesses the moment reuse was first allowed, without a join.
      *
-     * Making it safe needs the slot to carry its host thread to a join, which is a
-     * larger change than the leak justifies today. */
-    int idx = -1;
-    for (int i = 1; i < MAX_SCHED_THREADS; i++) if (!g_slot[i].used) { idx = i; break; }
+     * And it has to happen. With no reuse the table was a count of every start
+     * in the run, and threadprobe alone makes 115 of them; the 130th start of
+     * any run failed with NO_MEMORY however few threads were alive (findings
+     * G8). A dead slot is preferred to a fresh one so that the host threads,
+     * and the range every scan here walks, stay the size of what is alive. */
+    int idx = -1, dead = -1;
+    for (int i = 1; i < g_slot_hi; i++) {
+        if (!g_slot[i].used) { if (idx < 0) idx = i; }
+        else if (g_slot[i].state == PSP_SCHED_DEAD && dead < 0) dead = i;
+    }
+    if (dead >= 0) {
+        sched_slot *d = &g_slot[dead];
+        /* Claimed before the lock is dropped, so nothing else takes it; still
+         * DEAD, so its host thread, woken by the broadcast, leaves. */
+        d->used = 0;
+        if (d->started && !d->joined) {
+            psp_os_cond_broadcast(&g_turn);
+            psp_os_unlock(&g_lock);
+            psp_os_thread_join(&d->host);
+            psp_os_lock(&g_lock);
+            d->joined = 1;
+        }
+        idx = dead;
+    }
+    if (idx < 0 && g_slot_hi < MAX_SCHED_THREADS) idx = g_slot_hi++;
     if (idx < 0) { psp_os_unlock(&g_lock); return -1; }
 
     sched_slot *t = &g_slot[idx];
@@ -768,7 +795,7 @@ static int await_turn_deadline_locked(int me, uint64_t deadline_ns) {
 static void dump_locked(FILE *out, int from) {
     static const char *const ST[] = {
         "ready", "running", "blocked", "sleeping", "dead" };
-    for (int i = from; i < MAX_SCHED_THREADS; i++) {
+    for (int i = from; i < g_slot_hi; i++) {
         if (!g_slot[i].used || g_slot[i].state == PSP_SCHED_DEAD) continue;
         fprintf(out, "    uid 0x%08X  entry 0x%08X  prio %d  %s%s%s%s\n",
                 g_slot[i].uid, g_slot[i].entry, g_slot[i].priority,
@@ -781,7 +808,7 @@ static void dump_locked(FILE *out, int from) {
 
 static int live_locked(void) {
     int live = 0;
-    for (int i = 1; i < MAX_SCHED_THREADS; i++)
+    for (int i = 1; i < g_slot_hi; i++)
         if (g_slot[i].used && g_slot[i].state != PSP_SCHED_DEAD) live++;
     return live;
 }
@@ -793,7 +820,7 @@ void psp_sched_stop_all(const char *why) {
     g_stopping    = 1;
     psp_os_lock(&g_lock);
     const int me = g_running;
-    for (int i = 1; i < MAX_SCHED_THREADS; i++)
+    for (int i = 1; i < g_slot_hi; i++)
         if (g_slot[i].used) g_slot[i].state = PSP_SCHED_DEAD;
     g_slot[MAIN_SLOT].state = PSP_SCHED_RUNNING;
     g_running    = MAIN_SLOT;
@@ -815,7 +842,7 @@ int psp_sched_stopping(void) { return g_stopping; }
  * cancelled thread's slot may have been released while its host thread is
  * still parked, and it still has to be waited for. */
 void psp_sched_join_all(void) {
-    for (int i = 1; i < MAX_SCHED_THREADS; i++) {
+    for (int i = 1; i < g_slot_hi; i++) {
         if (!g_slot[i].started || g_slot[i].joined) continue;
         psp_os_thread_join(&g_slot[i].host);
         g_slot[i].joined = 1;
@@ -950,7 +977,7 @@ int psp_sched_rotate(int priority) {
     if (!g_threading) return 0;
     psp_os_lock(&g_lock);
     int head = -1;
-    for (int i = 0; i < MAX_SCHED_THREADS; i++)
+    for (int i = 0; i < g_slot_hi; i++)
         if (runnable(i) && g_slot[i].priority == priority &&
             (head < 0 || ahead_of(i, head))) head = i;
     if (head >= 0) ready_tail_locked(head, psp_clock_peek());
