@@ -563,15 +563,18 @@ static void hle_DeleteThread(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* With one thread running to completion there is nothing to schedule during a
- * delay, so it returns immediately. Time still advances for anything reading
- * the clock. */
-/* There is no clock, so a delay cannot be timed -- but it is nearly always a
- * thread being polite, and returning immediately starves everything else in a
- * game whose main loop delays. Yielding gives the other threads the token,
- * which is the useful half of the semantics. */
+/* Sleep for the given guest microseconds. The thread is not runnable for that
+ * long, which is what lets anything less urgent run -- a yield would leave it
+ * READY and the handoff would pick it straight back.
+ *
+ * A delay of 0 returns without rescheduling: threadprobe step 80 (fw 6.60) has
+ * main DelayThread(0) with a ready 0x20 thread and gets `m1 m2 W m3`, main
+ * carrying straight on; step 81's DelayThread(1) does park. Dispatch is
+ * checked first, as for a nonzero delay (step 83 measured 1000); whether a 0
+ * is refused while dispatch is off is unmeasured. */
 static void hle_DelayThread(void) {
     if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
+    if (psp_arg(0) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
     psp_thread *me = current_thread();
     if (me) me->wait_kind = WAIT_DELAY;
     psp_sched_delay(psp_arg(0));
@@ -1217,9 +1220,12 @@ static void hle_PollSema(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Give the rest of this priority level a turn. With round-robin handoff a
- * plain yield already does exactly that, and the priority argument only
- * selects a level we would reach anyway. */
+/* Rotate one priority's ready queue. The caller's own level (or 0, meaning it)
+ * is a yield: the caller goes to the tail. Another level is rotated without the
+ * caller stepping aside -- threadprobe step 66 (fw 6.60) rotates 0x30 from main
+ * with W1 W2 W3 ready there and gets `m1 m2 W2 W3 W1`: main carries on, and W1
+ * has moved behind the other two. This used to yield for every level, which
+ * rotated nothing but the caller's. */
 static void hle_RotateReadyQueue(void) {
     /* Zero means "my own level" and is always allowed. Anything else has to be
      * a priority a user thread could actually have: threads/rotate sweeps it
@@ -1230,7 +1236,9 @@ static void hle_RotateReadyQueue(void) {
         psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
         return;
     }
-    psp_sched_yield();
+    psp_thread *me = current_thread();
+    if (prio == 0 || !me || prio == (int32_t)me->priority) psp_sched_yield();
+    else                                                  psp_sched_rotate(prio);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

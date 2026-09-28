@@ -21,11 +21,13 @@
  *
  * What this is not
  * ----------------
- * There is no clock, and preemption is approximate: a thread gives way to its
- * equals every so many firmware calls (see psp_sched_tick) rather than on a
- * timer, because recompiled C is an ordinary host call stack and cannot be
- * interrupted part-way. A thread that spins without ever calling into the
- * kernel therefore still hangs -- reported, rather than silently.
+ * There is no timer interrupt. A PSP has no timeslice either -- one FIFO ready
+ * queue per priority, and a thread runs until it blocks or something more
+ * urgent becomes ready (threadprobe steps 16-83, fw 6.60) -- but the second of
+ * those can happen on a timer, and here it can only happen at a firmware call
+ * (see psp_sched_tick), because recompiled C is an ordinary host call stack
+ * and cannot be interrupted part-way. A thread that spins without ever calling
+ * into the kernel therefore still hangs -- reported, rather than silently.
  */
 #ifndef PSPRECOMP_SCHED_H
 #define PSPRECOMP_SCHED_H
@@ -132,11 +134,16 @@ void psp_sched_preempt(void);
  * for, which is the whole reason a game's main loop delays. */
 void psp_sched_delay(uint64_t usec);
 
-/* Charge the running thread one tick of its timeslice, and rotate to an equal
- * if it has used the slice up. Called from the firmware-call path: a PSP
- * preempts on a timer, and nothing here can interrupt recompiled C part-way, so
- * kernel calls are where a thread that never blocks gives way to its equals. */
+/* The reschedule point at the end of every firmware call: timed waits that
+ * have expired join their queues, and one more urgent than the caller runs.
+ * Never a switch to an equal -- there is no timeslice (threadprobe step 75). */
 void psp_sched_tick(void);
+
+/* sceKernelRotateReadyQueue of a priority other than the caller's own: the
+ * thread at the head of that priority's queue moves to its tail (threadprobe
+ * step 66, fw 6.60). Returns 1 if there was one. Rotating the caller's own
+ * level is a yield. */
+int  psp_sched_rotate(int priority);
 
 /* Make a parked thread runnable. No effect on one that is already ready.
  *
