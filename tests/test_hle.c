@@ -554,6 +554,19 @@ static void test_thread_rules(void) {
     const uint32_t WAKE = psp_nid("sceKernelWakeupThread");
     CHECK(call(WAKE, 0, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_THID, "wakeup(0)");
     CHECK(call(WAKE, ok, 0, 0, 0) == SCE_KERNEL_ERROR_DORMANT, "wakeup(never started)");
+
+    /* GetThreadmanIdType answers the id-list type (step 100); ReleaseWaitThread
+     * refuses 0 and a thread that is not waiting (step 70). */
+    const uint32_t IDTYPE = psp_nid("sceKernelGetThreadmanIdType");
+    const uint32_t sema = call5(psp_nid("sceKernelCreateSema"), guest_name("s"), 0, 0, 1, 0);
+    CHECK(call(IDTYPE, ok, 0, 0, 0) == 1, "type of a thread");
+    CHECK(call(IDTYPE, sema, 0, 0, 0) == 2, "type of a semaphore");
+    CHECK(call(IDTYPE, 0, 0, 0, 0) == 0x800200D2u, "type of 0");
+    call(psp_nid("sceKernelDeleteSema"), sema, 0, 0, 0);
+    CHECK(call(IDTYPE, sema, 0, 0, 0) == 0x800200D2u, "type of a deleted semaphore");
+    const uint32_t RELEASE = psp_nid("sceKernelReleaseWaitThread");
+    CHECK(call(RELEASE, 0, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_THID, "release(0)");
+    CHECK(call(RELEASE, ok, 0, 0, 0) == SCE_KERNEL_ERROR_NOT_WAIT, "release(dormant)");
 }
 
 static void test_guest_strings(void) {

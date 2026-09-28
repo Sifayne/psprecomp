@@ -96,6 +96,14 @@ int  psp_sched_block(uint32_t uid, psp_sched_state why, const char *what);
 #define PSP_SCHED_WOKEN     0
 #define PSP_SCHED_STRANDED (-1)   /* nothing runnable, and no deadline set */
 #define PSP_SCHED_EXPIRED  (-2)
+/* Forced out by sceKernelReleaseWaitThread: not a signal, and not a deadline.
+ * A wait that knows it answers RELEASE_WAIT (threadprobe step 70, fw 6.60);
+ * one that does not still leaves its queue, as it would for a timeout, rather
+ * than taking the release for the thing it was waiting on. */
+#define PSP_SCHED_RELEASED (-3)
+/* The wake reason (psp_sched_wake_as) that produces PSP_SCHED_RELEASED. Out of
+ * the range the objects' own reasons use. */
+#define PSP_SCHED_WAKE_RELEASE 0x100
 
 /* Park until woken *or* until `deadline_us` of guest time arrives.
  *
@@ -113,7 +121,8 @@ int  psp_sched_block(uint32_t uid, psp_sched_state why, const char *what);
  * for a zero-length timeout wants the shortest deadline that exists, not the
  * absence of one, so it should pass `psp_clock_peek() + 1`.
  *
- * Returns PSP_SCHED_WOKEN, PSP_SCHED_EXPIRED, or PSP_SCHED_STRANDED. */
+ * Returns PSP_SCHED_WOKEN, PSP_SCHED_EXPIRED, PSP_SCHED_RELEASED or
+ * PSP_SCHED_STRANDED. */
 int  psp_sched_block_until(uint32_t uid, psp_sched_state why, const char *what,
                            uint64_t deadline_us);
 
@@ -130,8 +139,11 @@ void psp_sched_preempt(void);
  * simply hand the CPU back and forth and anything below them still starves.
  *
  * Sleeping until a deadline makes the caller ineligible for as long as it asked
- * for, which is the whole reason a game's main loop delays. */
-void psp_sched_delay(uint64_t usec);
+ * for, which is the whole reason a game's main loop delays.
+ *
+ * Returns PSP_SCHED_EXPIRED when the time ran out, PSP_SCHED_RELEASED when
+ * sceKernelReleaseWaitThread cut it short, PSP_SCHED_WOKEN for any other wake. */
+int  psp_sched_delay(uint64_t usec);
 
 /* The reschedule point at the end of every firmware call: timed waits that
  * have expired join their queues, and one more urgent than the caller runs.

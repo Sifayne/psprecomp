@@ -176,8 +176,7 @@ static void alarm_list(int type, uint32_t out, int max, int *count) {
     if (type != PSP_TMID_ALARM) return;
     for (int i = 0; i < MAX_ALARMS; i++) {
         if (!g_alarm[i].alive) continue;
-        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_alarm[i].uid);
-        (*count)++;
+        psp_threadman_list_put(g_alarm[i].uid, out, max, count);
     }
 }
 
@@ -480,8 +479,7 @@ static void vtimer_list(int type, uint32_t out, int max, int *count) {
     if (type != PSP_TMID_VTIMER) return;
     for (int i = 0; i < g_vtimer_hi; i++) {
         if (!g_vtimer[i].alive) continue;
-        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_vtimer[i].uid);
-        (*count)++;
+        psp_threadman_list_put(g_vtimer[i].uid, out, max, count);
     }
 }
 

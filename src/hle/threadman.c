@@ -103,6 +103,12 @@ typedef struct {
     /* Threads parked in sceKernelWaitThreadEnd on this one. */
     uint32_t enders[MAX_SEMA_WAITERS];
     int      nenders;
+    /* The exit status of the thread this one was last released from
+     * sceKernelWaitThreadEnd by. Kept here, on the waiter, because the thread
+     * that ended may be freed before the waiter runs -- ExitDeleteThread and
+     * TerminateDeleteThread both do that -- and the wait still answers with
+     * its status (threadprobe step 44, fw 6.60: WaitThreadEnd=00000007). */
+    uint32_t end_status;
     int      used;
     jmp_buf  unwind;       /* where sceKernelExitThread returns to */
     int      unwind_set;
@@ -176,6 +182,8 @@ static uint32_t     g_next_uid;
 static psp_thread *current_thread(void);
 static psp_callback *find_cb(uint32_t id);
 static int          g_warned_block;
+/* psp_thread.end_status for the main context, which has no record. */
+static uint32_t     g_main_end_status;
 
 void psp_threadman_reset(void) {
     memset(g_thread, 0, sizeof g_thread);
@@ -196,6 +204,8 @@ void psp_threadman_reset(void) {
 
 static void on_thread_end(uint32_t uid, uint32_t status);
 static void thread_ended(psp_thread *t, uint32_t status);
+/* An emptied psp_thread.enders entry. Not 0, which is the main context. */
+#define NO_ENDER 0xFFFFFFFFu
 
 void psp_threadman_init(void) {
     psp_sched_set_end_hook(on_thread_end);
@@ -553,6 +563,71 @@ static void hle_ExitThread(void) {
 }
 
 static void hle_TerminateThread(void);
+static void release_stack(psp_thread *t);
+static void drop_callbacks_of(uint32_t thread_uid);
+
+/* sceKernelExitDeleteThread(status): ExitThread, and the thread's record and
+ * stack are freed as it goes. threadprobe step 44 (fw 6.60): its waiter gets
+ * the status (`WaitThreadEnd=00000007`), a refer afterwards answers
+ * UNKNOWN_THID, and the call does not return. It was unimplemented, so it
+ * returned 0 and the thread ran on past its own exit. */
+static void hle_ExitDeleteThread(void) {
+    uint32_t status = psp_arg(0);
+    if ((int32_t)status < 0) status = SCE_KERNEL_ERROR_ILLEGAL_PARTITION;  /* G13 */
+    const uint32_t me = psp_sched_current();
+    psp_thread *t = find_thread(me);
+    if (t) {
+        thread_ended(t, status);
+        release_stack(t);
+        drop_callbacks_of(t->uid);
+        t->used = 0;
+    }
+    psp_sched_exit(me);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* sceKernelReleaseWaitThread(thid): force a waiting thread out of its wait,
+ * which then returns RELEASE_WAIT. threadprobe step 70 (fw 6.60): a sleeping
+ * thread is released (0, and its SleepThread answers 800201AA); a ready one is
+ * NOT_WAIT; the caller itself is ILLEGAL_THID. 0 is taken to be ILLEGAL_THID
+ * too, as it is for the other calls that refuse the caller. Dormant,
+ * suspended and delaying targets are unmeasured: a dormant thread is not
+ * waiting (NOT_WAIT), a suspended waiter's wait ends underneath its
+ * suspension, and a delay ends like any other wait.
+ *
+ * The waits in threadman.c answer RELEASE_WAIT. Those in kernobj.c and
+ * kernlock.c do not know the reason: they leave their queue and answer
+ * WAIT_TIMEOUT (see PSP_SCHED_RELEASED). */
+static void hle_ReleaseWaitThread(void) {
+    const uint32_t id = psp_arg(0);
+    if (id == 0 || id == psp_sched_current()) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
+        return;
+    }
+    psp_thread *t = find_thread(id);
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    const psp_sched_state st = psp_sched_state_of(t->uid);
+    if (!t->ever_started || t->state == TH_DORMANT ||
+        (st != PSP_SCHED_BLOCKED && st != PSP_SCHED_SLEEPING)) {
+        psp_ret(SCE_KERNEL_ERROR_NOT_WAIT);
+        return;
+    }
+    /* No longer asleep or delaying, so a wakeup that follows is banked. */
+    t->wait_kind = WAIT_NONE;
+    const int urgent = psp_sched_wake_as(t->uid, PSP_SCHED_WAKE_RELEASE);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_preempt();
+}
+
+/* sceKernelCheckThreadStack() -- how much of the caller's stack is left below
+ * its $sp: $sp minus the stack's base. threadprobe step 85 (fw 6.60) reads
+ * 0xE88 from a thread whose $sp at entry was stk+EB0 and whose frame is 0x28.
+ * It was unimplemented and answered 0. The main context has no thread stack
+ * and answers 0. */
+static void hle_CheckThreadStack(void) {
+    const psp_thread *t = current_thread();
+    psp_ret(t && t->stack_base ? psp_cpu.r[PSP_REG_SP] - t->stack_base : 0);
+}
 
 /* Delete frees a thread; it does not stop one, and it refuses anything it would
  * have to stop. threads/terminate runs the same ten cases through terminate,
@@ -595,15 +670,35 @@ static void hle_DeleteThread(void) {
  * carrying straight on; step 81's DelayThread(1) does park. Dispatch is
  * checked first, as for a nonzero delay (step 83 measured 1000); whether a 0
  * is refused while dispatch is off is unmeasured. */
-static void hle_DelayThread(void) {
+static void delay_for(uint64_t us) {
     if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
-    if (psp_arg(0) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+    if (us == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
     psp_thread *me = current_thread();
     if (me) me->wait_kind = WAIT_DELAY;
-    psp_sched_delay(psp_arg(0));
+    const int rc = psp_sched_delay(us);
     me = current_thread();
     if (me) me->wait_kind = WAIT_NONE;
-    psp_ret(SCE_KERNEL_ERROR_OK);
+    psp_ret(rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
+                                     : SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_DelayThread(void) { delay_for(psp_arg(0)); }
+
+/* sceKernelDelaySysClockThread(SceKernelSysClock *) -- DelayThread with a
+ * 64-bit microsecond count read from the argument, and nothing written back
+ * to it (threadprobe step 82, fw 6.60: `elapsed>=5000 yes clock after:
+ * unchanged`). It was unimplemented, so it returned at once. A NULL pointer
+ * is unmeasured; it is refused as an illegal address. */
+static int sysclock_arg(uint64_t *us) {
+    const uint32_t p = psp_arg(0);
+    if (!p) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return 0; }
+    *us = (uint64_t)psp_read32(p) | ((uint64_t)psp_read32(p + 4) << 32);
+    return 1;
+}
+
+static void hle_DelaySysClockThread(void) {
+    uint64_t us;
+    if (sysclock_arg(&us)) delay_for(us);
 }
 
 /* A thread died by returning from its entry point. Records what it returned and
@@ -619,9 +714,22 @@ static void thread_ended(psp_thread *t, uint32_t status) {
     t->suspended   = 0;
     psp_kernobj_thread_ended(t->uid);
     psp_kernlock_thread_ended(t->uid);
-    for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++)
-        psp_sched_wake(t->enders[i]);
+    for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++) {
+        const uint32_t w = t->enders[i];
+        if (w == NO_ENDER) continue;
+        psp_thread *wr = find_thread(w);
+        if (wr) wr->end_status = status;
+        else if (w == 0) g_main_end_status = status;
+        psp_sched_wake(w);
+    }
     t->nenders = 0;
+}
+
+/* A waiter that gave up (timeout or release) takes itself off the list, or the
+ * end would wake it later out of whatever it was waiting on by then. */
+static void drop_ender(psp_thread *t, uint32_t w) {
+    for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++)
+        if (t->enders[i] == w) t->enders[i] = NO_ENDER;
 }
 
 static void on_thread_end(uint32_t uid, uint32_t status) {
@@ -674,9 +782,11 @@ static void hle_WaitThreadEnd(void) {
         t->enders[t->nenders++ % MAX_SEMA_WAITERS] = me;
         const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                              "sceKernelWaitThreadEnd", deadline);
-        if (rc == PSP_SCHED_EXPIRED) {
+        if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
+            if ((t = find_thread(thid)) != NULL) drop_ender(t, me);
             psp_wait_writeback(timeout, deadline);
-            psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+            psp_ret(rc == PSP_SCHED_EXPIRED ? SCE_KERNEL_ERROR_WAIT_TIMEOUT
+                                            : SCE_KERNEL_ERROR_RELEASE_WAIT);
             return;
         }
         if (rc != PSP_SCHED_WOKEN) {
@@ -684,12 +794,18 @@ static void hle_WaitThreadEnd(void) {
             psp_ret(SCE_KERNEL_ERROR_OK);
             return;
         }
-        /* Woken, and the thread is gone: terminate-and-delete freed it out from
-         * under this wait. Vanishing *during* the wait is not the same as never
-         * having been there -- threads/threadend answers `800201ac` to the
-         * first and `80020198` to the second, on consecutive lines. */
+        /* Woken, and the thread is gone: it was freed as it ended, by
+         * ExitDeleteThread or TerminateDeleteThread. The wait still answers
+         * with the status it ended with, which thread_ended left on the
+         * waiter: 7 for a thread that called ExitDeleteThread(7) (threadprobe
+         * step 44, fw 6.60), 800201AC for one terminated (step 49, and
+         * threads/threadend). This used to answer THREAD_TERMINATED for both. */
         t = find_thread(thid);
-        if (!t) { psp_ret(SCE_KERNEL_ERROR_THREAD_TERMINATED); return; }
+        if (!t) {
+            const psp_thread *mine = current_thread();
+            psp_ret(mine ? mine->end_status : g_main_end_status);
+            return;
+        }
     }
 
     psp_wait_writeback(timeout, deadline);
@@ -850,7 +966,14 @@ static void hle_SleepThread(void) {
     if (t->wakeup_count > 0) { t->wakeup_count--; psp_ret(SCE_KERNEL_ERROR_OK); return; }
 
     t->wait_kind = WAIT_SLEEP;
-    if (psp_sched_block(t->uid, PSP_SCHED_SLEEPING, "sceKernelSleepThread") != 0) {
+    const int rc = psp_sched_block(t->uid, PSP_SCHED_SLEEPING, "sceKernelSleepThread");
+    if (rc == PSP_SCHED_RELEASED) {             /* threadprobe step 70 */
+        t = current_thread();
+        if (t) t->wait_kind = WAIT_NONE;
+        psp_ret(SCE_KERNEL_ERROR_RELEASE_WAIT);
+        return;
+    }
+    if (rc != PSP_SCHED_WOKEN) {
         t->wait_kind = WAIT_NONE;
         wait_deadlock("sceKernelSleepThread");
         psp_ret(SCE_KERNEL_ERROR_OK);
@@ -1455,9 +1578,10 @@ static void hle_WaitSema(void) {
     psp_waitq_drop(&s->q, me);
     const int urgent = sema_release(s);
 
-    if (rc == PSP_SCHED_EXPIRED) {
+    if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
         psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+        psp_ret(rc == PSP_SCHED_EXPIRED ? SCE_KERNEL_ERROR_WAIT_TIMEOUT
+                                        : SCE_KERNEL_ERROR_RELEASE_WAIT);
         if (urgent) psp_sched_preempt();
         return;
     }
@@ -1739,9 +1863,10 @@ static void hle_WaitEventFlag(void) {
      * from the 5ms one next to it. */
     if (out && !no_wait) psp_write32(out, f->pattern);
 
-    if (rc == PSP_SCHED_EXPIRED) {
+    if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
         psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+        psp_ret(rc == PSP_SCHED_EXPIRED ? SCE_KERNEL_ERROR_WAIT_TIMEOUT
+                                        : SCE_KERNEL_ERROR_RELEASE_WAIT);
         return;
     }
 
@@ -1978,7 +2103,7 @@ static void hle_ReferThreadStatus(void) {
 
 /* ---- sceKernelGetThreadmanIdList ------------------------------------------ */
 
-#define MAX_LISTERS 8
+#define MAX_LISTERS 16
 static psp_uid_lister g_lister[MAX_LISTERS];
 static int            g_listers;
 
@@ -1986,8 +2111,15 @@ void psp_threadman_add_lister(psp_uid_lister fn) {
     if (g_listers < MAX_LISTERS) g_lister[g_listers++] = fn;
 }
 
-/* Append one uid, counting it whether or not there was room for it. */
-static void list_add(uint32_t uid, uint32_t out, int max, int *count) {
+/* Nonzero while sceKernelGetThreadmanIdType is asking the listers whether a
+ * uid is theirs; see psp_threadman_list_put. */
+static uint32_t g_query_uid;
+static int      g_query_hit;
+
+/* Append one uid, counting it whether or not there was room for it -- or,
+ * while a type query is running, only note whether it is the one asked for. */
+void psp_threadman_list_put(uint32_t uid, uint32_t out, int max, int *count) {
+    if (g_query_uid) { if (uid == g_query_uid) g_query_hit = 1; return; }
     if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, uid);
     (*count)++;
 }
@@ -2008,18 +2140,18 @@ static void threadman_list(int type, uint32_t out, int max, int *count) {
     if (type == PSP_TMID_THREAD || (type >= PSP_TMID_SLEEPING && type <= PSP_TMID_DORMANT)) {
         for (int i = 0; i < g_thread_hi; i++)
             if (g_thread[i].used && thread_matches(&g_thread[i], type))
-                list_add(g_thread[i].uid, out, max, count);
+                psp_threadman_list_put(g_thread[i].uid, out, max, count);
         return;
     }
     if (type == PSP_TMID_SEMA)
         for (int i = 0; i < g_sema_hi; i++)
-            if (g_sema[i].used) list_add(g_sema[i].uid, out, max, count);
+            if (g_sema[i].used) psp_threadman_list_put(g_sema[i].uid, out, max, count);
     if (type == PSP_TMID_EVENTFLAG)
         for (int i = 0; i < g_flag_hi; i++)
-            if (g_flag[i].used) list_add(g_flag[i].uid, out, max, count);
+            if (g_flag[i].used) psp_threadman_list_put(g_flag[i].uid, out, max, count);
     if (type == PSP_TMID_CALLBACK)
         for (int i = 0; i < g_cb_hi; i++)
-            if (g_cb[i].used) list_add(g_cb[i].uid, out, max, count);
+            if (g_cb[i].used) psp_threadman_list_put(g_cb[i].uid, out, max, count);
 }
 
 /* (type, buffer, entries, countOut)
@@ -2046,6 +2178,32 @@ static void hle_GetThreadmanIdList(void) {
 
     if (nout) psp_write32(nout, (uint32_t)count);
     psp_ret((uint32_t)(count < max ? count : max));
+}
+
+/* sceKernelGetThreadmanIdType(uid) -- the id-list type the uid would be listed
+ * under. threadprobe step 100 (fw 6.60) types one object of each kind: thread
+ * 1, sema 2, evf 3, mbx 4, vpl 5, fpl 6, msgpipe 7, callback 8, alarm 0x0A,
+ * vtimer 0x0B, mutex 0x0C, tlspl 0x0E; and 0 or a deleted id answers
+ * 0x800200D2 (ILLEGAL_ARGUMENT in PSPSDK's naming; see hle.h). It was
+ * unimplemented and answered 0.
+ *
+ * Asked of the same listers GetThreadmanIdList uses, so a kind of object is
+ * typed exactly where it is listed. */
+static void hle_GetThreadmanIdType(void) {
+    const uint32_t uid = psp_arg(0);
+    int found = 0;
+    if (uid) {
+        g_query_uid = uid;
+        for (int type = PSP_TMID_THREAD; type <= PSP_TMID_TLSPL && !found; type++) {
+            int count = 0;
+            g_query_hit = 0;
+            threadman_list(type, 0, 0, &count);
+            for (int i = 0; i < g_listers; i++) g_lister[i](type, 0, 0, &count);
+            if (g_query_hit) found = type;
+        }
+        g_query_uid = 0;
+    }
+    psp_ret(found ? (uint32_t)found : SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
 }
 
 static void hle_CreateCallback(void) {
@@ -2244,9 +2402,9 @@ static void hle_WaitThreadEndCB(void) { psp_threadman_cb_begin(); hle_WaitThread
  * handler *during* that delay -- `thread3 cbHandler called: 00000003` lands
  * between two of main's own lines -- where a delay that cannot be interrupted
  * runs it 100ms later, after everything else the test prints. */
-static void hle_DelayThreadCB(void) {
+static void delay_cb_for(uint64_t us) {
     if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
-    const uint64_t until = psp_clock_peek() + psp_arg(0);
+    const uint64_t until = psp_clock_peek() + us;
     for (;;) {
         psp_threadman_run_callbacks();
         psp_thread *t = current_thread();
@@ -2255,15 +2413,27 @@ static void hle_DelayThreadCB(void) {
 
         t->wait_kind = WAIT_DELAY;
         t->cb_wait   = 1;
-        psp_sched_delay(until - now);
+        const int rc = psp_sched_delay(until - now);
         t = current_thread();
         if (t) { t->wait_kind = WAIT_NONE; t->cb_wait = 0; }
+        if (rc == PSP_SCHED_RELEASED) {
+            if (t) t->cb_wake = 0;
+            psp_ret(SCE_KERNEL_ERROR_RELEASE_WAIT);
+            return;
+        }
         if (!t || !t->cb_wake) break;
         /* Woken to deliver rather than by the deadline: hand the handler over
          * and then sleep out what is left. */
         t->cb_wake = 0;
     }
     psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_DelayThreadCB(void) { delay_cb_for(psp_arg(0)); }
+
+static void hle_DelaySysClockThreadCB(void) {
+    uint64_t us;
+    if (sysclock_arg(&us)) delay_cb_for(us);
 }
 
 static void hle_WaitSemaCB(void) { psp_threadman_cb_begin(); hle_WaitSema(); psp_threadman_cb_end(); }
@@ -2286,6 +2456,11 @@ static void hle_SleepThreadCB(void) {
                                        "sceKernelSleepThreadCB");
         t = current_thread();
         if (t) { t->wait_kind = WAIT_NONE; t->cb_wait = 0; }
+        if (rc == PSP_SCHED_RELEASED) {
+            if (t) t->cb_wake = 0;
+            psp_ret(SCE_KERNEL_ERROR_RELEASE_WAIT);
+            return;
+        }
         if (rc != PSP_SCHED_WOKEN) {
             wait_deadlock("sceKernelSleepThreadCB");
             psp_ret(SCE_KERNEL_ERROR_OK);
@@ -2311,11 +2486,16 @@ void psp_threadman_register(void) {
     psp_hle_register(0x446D8DE6, "ThreadManForUser", "sceKernelCreateThread",            hle_CreateThread);
     psp_hle_register(0xF475845D, "ThreadManForUser", "sceKernelStartThread",             hle_StartThread);
     psp_hle_register(0xAA73C935, "ThreadManForUser", "sceKernelExitThread",              hle_ExitThread);
+    psp_hle_register(0x809CE29B, "ThreadManForUser", "sceKernelExitDeleteThread",        hle_ExitDeleteThread);
+    psp_hle_register(0x2C34E053, "ThreadManForUser", "sceKernelReleaseWaitThread",       hle_ReleaseWaitThread);
+    psp_hle_register(0xD13BDE95, "ThreadManForUser", "sceKernelCheckThreadStack",        hle_CheckThreadStack);
     psp_hle_register(0x9FA03CD3, "ThreadManForUser", "sceKernelDeleteThread",            hle_DeleteThread);
     psp_hle_register(0x616403BA, "ThreadManForUser", "sceKernelTerminateThread",         hle_TerminateThread);
     psp_hle_register(0x383F7BCC, "ThreadManForUser", "sceKernelTerminateDeleteThread",   hle_TerminateDeleteThread);
     psp_hle_register(0xCEADEB47, "ThreadManForUser", "sceKernelDelayThread",             hle_DelayThread);
     psp_hle_register(0x68DA9E36, "ThreadManForUser", "sceKernelDelayThreadCB",           hle_DelayThreadCB);
+    psp_hle_register(0xBD123D9E, "ThreadManForUser", "sceKernelDelaySysClockThread",     hle_DelaySysClockThread);
+    psp_hle_register(0x1181E963, "ThreadManForUser", "sceKernelDelaySysClockThreadCB",   hle_DelaySysClockThreadCB);
     psp_hle_register(0x278C0DF5, "ThreadManForUser", "sceKernelWaitThreadEnd",           hle_WaitThreadEnd);
     psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",        hle_GetSystemTimeWide);
     psp_hle_register(0x369ED59D, "ThreadManForUser", "sceKernelGetSystemTimeLow",         hle_GetSystemTimeLow);
@@ -2335,6 +2515,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0x27E22EC2, "ThreadManForUser", "sceKernelResumeDispatchThread",    hle_ResumeDispatchThread);
     psp_hle_register(0x17C1684E, "ThreadManForUser", "sceKernelReferThreadStatus",       hle_ReferThreadStatus);
     psp_hle_register(0x94416130, "ThreadManForUser", "sceKernelGetThreadmanIdList",      hle_GetThreadmanIdList);
+    psp_hle_register(0x57CF62DD, "ThreadManForUser", "sceKernelGetThreadmanIdType",      hle_GetThreadmanIdType);
 
     psp_hle_register(0xD6DA4BA1, "ThreadManForUser", "sceKernelCreateSema",              hle_CreateSema);
     psp_hle_register(0x28B6489C, "ThreadManForUser", "sceKernelDeleteSema",              hle_DeleteSema);

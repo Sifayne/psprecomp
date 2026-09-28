@@ -485,8 +485,7 @@ static void vpl_list(int type, uint32_t out, int max, int *count) {
     if (type != PSP_TMID_VPL) return;
     for (int i = 0; i < MAX_VPLS; i++) {
         if (!g_vpl[i].used) continue;
-        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_vpl[i].uid);
-        (*count)++;
+        psp_threadman_list_put(g_vpl[i].uid, out, max, count);
     }
 }
 
@@ -1024,8 +1023,7 @@ static void mpp_list(int type, uint32_t out, int max, int *count) {
     if (type != PSP_TMID_MSGPIPE) return;
     for (int i = 0; i < MAX_PIPES; i++) {
         if (!g_pipe[i].alive) continue;
-        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_pipe[i].uid);
-        (*count)++;
+        psp_threadman_list_put(g_pipe[i].uid, out, max, count);
     }
 }
 
@@ -1368,8 +1366,7 @@ static void mbx_list(int type, uint32_t out, int max, int *count) {
     if (type != PSP_TMID_MBX) return;
     for (int i = 0; i < MAX_MBXES; i++) {
         if (!g_mbx[i].alive) continue;
-        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_mbx[i].uid);
-        (*count)++;
+        psp_threadman_list_put(g_mbx[i].uid, out, max, count);
     }
 }
 
@@ -1680,8 +1677,7 @@ static void fpl_list(int type, uint32_t out, int max, int *count) {
     if (type != PSP_TMID_FPL) return;
     for (int i = 0; i < MAX_FPLS; i++) {
         if (!g_fpl[i].alive) continue;
-        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_fpl[i].uid);
-        (*count)++;
+        psp_threadman_list_put(g_fpl[i].uid, out, max, count);
     }
 }
 
@@ -2020,8 +2016,7 @@ static void tls_list(int type, uint32_t out, int max, int *count) {
     if (type != PSP_TMID_TLSPL) return;
     for (int i = 0; i < MAX_TLSPLS; i++) {
         if (!g_tls[i].alive) continue;
-        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_tls[i].uid);
-        (*count)++;
+        psp_threadman_list_put(g_tls[i].uid, out, max, count);
     }
 }
 

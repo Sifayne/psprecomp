@@ -169,6 +169,10 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_ILLEGAL_TYPE     0x800201BB
 #define SCE_KERNEL_ERROR_SUSPEND         0x800201A3
 #define SCE_KERNEL_ERROR_NOT_SUSPEND     0x800201A5
+/* sceKernelReleaseWaitThread on a thread that is not waiting, and what the
+ * wait it does release returns (threadprobe step 70, fw 6.60). */
+#define SCE_KERNEL_ERROR_NOT_WAIT        0x800201A6
+#define SCE_KERNEL_ERROR_RELEASE_WAIT    0x800201AA
 /* A poll that would have blocked. Distinct from an error: it is the ordinary
  * answer to "is this free?" when it is not. */
 #define SCE_KERNEL_ERROR_SEMA_ZERO       0x800201AD
@@ -548,17 +552,29 @@ uint32_t psp_threadman_next_uid(void);
 /* `out` is a *guest* address, or 0 for a caller that wants only the count. */
 typedef void (*psp_uid_lister)(int type, uint32_t out, int max, int *count);
 void psp_threadman_add_lister(psp_uid_lister fn);
+/* What a lister does with each uid it owns of the asked type: append it to
+ * `out` if there is room, and count it either way. Through one function rather
+ * than written out in each lister, because sceKernelGetThreadmanIdType asks
+ * the same listers a different question -- "is this uid one of yours?" -- and
+ * this is where that question is answered. */
+void psp_threadman_list_put(uint32_t uid, uint32_t out, int max, int *count);
 
 /* The types the kernel knows. 1..14 are object kinds; 0x40..0x43 select
  * threads by what they are doing. Anything else is ILLEGAL_TYPE -- measured,
  * threads/threadmanidlist sweeps 0, 15..24, 0x44..0x48 and a spread of large
- * values and refuses every one. */
+ * values and refuses every one.
+ *
+ * From 9 up these were one too high (alarm 11, vtimer 12, mutex 13, with a
+ * gap at 10). threadprobe steps 99-100 (fw 6.60) list and type an alarm as
+ * 0x0A, a vtimer 0x0B, a mutex 0x0C, an lwmutex under 0x0D and a tlspl 0x0E,
+ * with nothing under 9; PSPSDK's pspthreadman.h also has Alarm = 10 and
+ * VTimer = 11. */
 enum {
     PSP_TMID_THREAD = 1, PSP_TMID_SEMA = 2, PSP_TMID_EVENTFLAG = 3,
     PSP_TMID_MBX = 4, PSP_TMID_VPL = 5, PSP_TMID_FPL = 6, PSP_TMID_MSGPIPE = 7,
-    PSP_TMID_CALLBACK = 8, PSP_TMID_THREVENT = 9, PSP_TMID_UNUSED10 = 10,
-    PSP_TMID_ALARM = 11, PSP_TMID_VTIMER = 12, PSP_TMID_MUTEX = 13,
-    PSP_TMID_TLSPL = 14,
+    PSP_TMID_CALLBACK = 8, PSP_TMID_THREVENT = 9,
+    PSP_TMID_ALARM = 10, PSP_TMID_VTIMER = 11, PSP_TMID_MUTEX = 12,
+    PSP_TMID_LWMUTEX = 13, PSP_TMID_TLSPL = 14,
     PSP_TMID_SLEEPING = 0x40, PSP_TMID_DELAYING = 0x41,
     PSP_TMID_SUSPENDED = 0x42, PSP_TMID_DORMANT = 0x43,
 };

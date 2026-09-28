@@ -348,8 +348,7 @@ static void mutex_list(int type, uint32_t out, int max, int *count) {
     if (type != PSP_TMID_MUTEX) return;
     for (int i = 0; i < MAX_MUTEXES; i++) {
         if (!g_mutex[i].used) continue;
-        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_mutex[i].uid);
-        (*count)++;
+        psp_threadman_list_put(g_mutex[i].uid, out, max, count);
     }
 }
 
@@ -358,8 +357,11 @@ static void mutex_list(int type, uint32_t out, int max, int *count) {
  * counterparts, which waits correctly and delivers nothing. */
 static void hle_LockMutexCB(void) { psp_threadman_cb_begin(); hle_LockMutex(); psp_threadman_cb_end(); }
 
+static void lw_list(int type, uint32_t out, int max, int *count);
+
 void psp_kernlock_register(void) {
     psp_threadman_add_lister(mutex_list);
+    psp_threadman_add_lister(lw_list);
     psp_hle_register(0xB7D098C6, "ThreadManForUser", "sceKernelCreateMutex",      hle_CreateMutex);
     psp_hle_register(0xF8170FBE, "ThreadManForUser", "sceKernelDeleteMutex",      hle_DeleteMutex);
     psp_hle_register(0xB011B11F, "ThreadManForUser", "sceKernelLockMutex",        hle_LockMutex);
@@ -428,6 +430,14 @@ static psp_lwmutex *find_lw(uint32_t uid) {
     for (int i = 0; i < MAX_LWMUTEXES; i++)
         if (g_lw[i].used && g_lw[i].uid == uid) return &g_lw[i];
     return NULL;
+}
+
+/* Listed under 0x0D, which threadprobe steps 97-99 (fw 6.60) show counting one
+ * more after an lwmutex is created. They were not listed at all. */
+static void lw_list(int type, uint32_t out, int max, int *count) {
+    if (type != PSP_TMID_LWMUTEX) return;
+    for (int i = 0; i < MAX_LWMUTEXES; i++)
+        if (g_lw[i].used) psp_threadman_list_put(g_lw[i].uid, out, max, count);
 }
 
 /* Resolving a workarea has three answers, not two, and the tests separate them.

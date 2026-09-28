@@ -377,11 +377,16 @@ static int switch_away(int me, psp_sched_state why, const char *what,
         return PSP_SCHED_STRANDED;
     }
     const int woken = g_slot[me].woken;
+    const int released = woken && g_slot[me].wake_reason == PSP_SCHED_WAKE_RELEASE;
     g_slot[me].waiting_on = NULL;
     g_slot[me].wake_at    = 0;
     psp_os_unlock(&g_lock);
     /* Running again, and only the flag says why. A signal that arrived after
-     * the deadline still counts as a signal: it was delivered. */
+     * the deadline still counts as a signal: it was delivered. A forced
+     * release is neither, and has its own answer, so that a wait which does
+     * not know about it still leaves its queue rather than taking it for a
+     * signal. */
+    if (released) return PSP_SCHED_RELEASED;
     if (woken || !deadline_us) return PSP_SCHED_WOKEN;
     return PSP_SCHED_EXPIRED;
 }
@@ -640,8 +645,8 @@ static void yield_as(int displaced) {
  * which is what lets anything below it run. There is no clock here, so the
  * duration cannot be honoured -- but the *ineligibility* can, for one round.
  * That is the half of the semantics that matters. */
-void psp_sched_delay(uint64_t usec) {
-    if (!g_threading) return;
+int psp_sched_delay(uint64_t usec) {
+    if (!g_threading) return PSP_SCHED_EXPIRED;
     psp_os_lock(&g_lock);
     const int me = g_self;
 
@@ -661,15 +666,18 @@ void psp_sched_delay(uint64_t usec) {
         g_slot[me].wake_at = 0;
         g_running          = me;
         psp_os_unlock(&g_lock);
-        return;
+        return PSP_SCHED_EXPIRED;
     }
 
     if (await_turn_locked(me) != 0) {
         psp_os_unlock(&g_lock);
         if (me != MAIN_SLOT) psp_os_thread_exit();
-        return;
+        return PSP_SCHED_EXPIRED;
     }
+    const int woken = g_slot[me].woken, reason = g_slot[me].wake_reason;
     psp_os_unlock(&g_lock);
+    if (woken && reason == PSP_SCHED_WAKE_RELEASE) return PSP_SCHED_RELEASED;
+    return woken ? PSP_SCHED_WOKEN : PSP_SCHED_EXPIRED;
 }
 
 /* The reschedule every firmware call ends with.
