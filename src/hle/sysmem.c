@@ -199,23 +199,61 @@ void psp_sysmem_release(uint32_t addr) {
 
 /* ---- the calls ----------------------------------------------------------- */
 
+/* The allocator's own error codes, all measured by threadprobe steps 143-147
+ * (fw 6.60). The numbers are in PSPSDK's pspkerror.h (UNKNOWN_UID 800200CB,
+ * ILLEGAL_PARTITION 800200D6, ILLEGAL_MEMBLOCKTYPE 800200D8,
+ * MEMBLOCK_ALLOC_FAILED 800200D9; 800200E4 is not listed there). They are
+ * named here by what they mean to this allocator instead: hle.h spells
+ * ILLEGAL_PARTITION and UNKNOWN_UID with other numbers (see its note on
+ * misnamed codes), and a second #define of a name silently wins. A partition
+ * out of range is hle.h's SCE_KERNEL_ERROR_ILLEGAL_PARTITION, 800200D2. */
+#define SYSMEM_ERR_NOT_USER_PART 0x800200D6u  /* a partition, not the caller's */
+#define SYSMEM_ERR_BAD_TYPE      0x800200D8u
+#define SYSMEM_ERR_NO_ROOM       0x800200D9u
+#define SYSMEM_ERR_BAD_ALIGN     0x800200E4u
+#define SYSMEM_ERR_NOT_A_BLOCK   0x800200CBu
+
+/* threadprobe step 146 (fw 6.60): 2 and 6 are user partitions; 1, 3, 4 and 8
+ * exist but are not the caller's; 0, 7 and -1 are out of range. The same
+ * shape as the vpl table in kernobj.c, whose 5 and 9 this follows (neither
+ * was tried here). */
+static uint32_t partition_error(int32_t part) {
+    switch (part) {
+        case 2: case 6:                      return 0;
+        case 1: case 3: case 4: case 5:
+        case 8: case 9:                      return SYSMEM_ERR_NOT_USER_PART;
+        default:                             return SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
+    }
+}
+
 static void hle_AllocPartitionMemory(void) {
 
     /* (partitionid, name, type, size, addr) */
+    int32_t  part     = (int32_t)psp_arg(0);
     uint32_t name_ptr = psp_arg(1);
     uint32_t type     = psp_arg(2);
     uint32_t size     = psp_arg(3);
     uint32_t want     = psp_arg(4);
 
+    /* threadprobe step 150: a NULL name is 80020001. */
+    if (!name_ptr) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    const uint32_t pe = partition_error(part);
+    if (pe) { psp_ret(pe); return; }
+    /* Step 143: a type outside Low..HighAligned is ILLEGAL_MEMBLOCKTYPE (5 and
+     * -1), and size 0 is refused rather than rounded up to a granule. */
+    if (type > PSP_SMEM_HighAligned) { psp_ret(SYSMEM_ERR_BAD_TYPE); return; }
+    if (size == 0) { psp_ret(SYSMEM_ERR_NO_ROOM); return; }
+
     /* The hardware allocator works in 256-byte granules. Rounding up matters:
      * a game that allocates 100 bytes and then writes 256 is relying on it. */
     uint32_t rounded = (size + 0xFF) & ~0xFFu;
-    if (rounded == 0) rounded = 0x100;
+    if (rounded == 0) { psp_ret(SYSMEM_ERR_NO_ROOM); return; }
 
     uint32_t align = 0x100;
     if (type == PSP_SMEM_LowAligned || type == PSP_SMEM_HighAligned) {
-        align = want ? want : 0x100;
-        if (align & (align - 1)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
+        /* Step 144: 0x1000 and 0x10000 are honoured; 3 and 0 are refused. */
+        align = want;
+        if (!align || (align & (align - 1))) { psp_ret(SYSMEM_ERR_BAD_ALIGN); return; }
         if (align < 0x100) align = 0x100;
     }
 
@@ -226,18 +264,20 @@ static void hle_AllocPartitionMemory(void) {
     case PSP_SMEM_High:
     case PSP_SMEM_HighAligned: addr = place_high(rounded, align); break;
     case PSP_SMEM_Addr:
+        /* Step 145: asked for 0x80 into a free granule, the block starts at
+         * the granule. Whether it then also covers want + size is
+         * unmeasured; it keeps the rounded size. */
+        want &= ~0xFFu;
         if (want >= g_heap_lo && want + rounded <= g_heap_hi && !overlaps(want, rounded))
             addr = want;
         break;
-    default:
-        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR);
-        return;
     }
 
-    if (!addr) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    /* Step 147: more than the largest free run is MEMBLOCK_ALLOC_FAILED. */
+    if (!addr) { psp_ret(SYSMEM_ERR_NO_ROOM); return; }
 
     mem_block *b = alloc_slot();
-    if (!b) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    if (!b) { psp_ret(SYSMEM_ERR_NO_ROOM); return; }
 
     b->uid = g_next_uid++;
     b->addr = addr;
@@ -252,7 +292,8 @@ static void hle_AllocPartitionMemory(void) {
 
 static void hle_FreePartitionMemory(void) {
     mem_block *b = find_uid(psp_arg(0));
-    if (!b) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    /* Step 147: freeing a block twice is 800200CB (PSPSDK's UNKNOWN_UID). */
+    if (!b) { psp_ret(SYSMEM_ERR_NOT_A_BLOCK); return; }
     b->used = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -320,10 +361,30 @@ static void hle_Printf(void) {
  * its creates and read 0 for all of them.
  *
  * The two differ only in fragmentation: total is everything free, max is the
- * largest single block. This allocator hands out from both ends of one span,
- * so the largest contiguous run is the whole of it. */
+ * largest single run. They used to be one number here, on the argument that
+ * allocating from both ends of one span leaves a single run; threadprobe step
+ * 141 (fw 6.60) reads total > max, and a freed stack or a block between two
+ * live ones is a hole here as well. Step 147 allocates exactly max. */
+static uint32_t largest_free_run(void) {
+    uint32_t best = 0, at = g_heap_lo;
+    while (at < g_heap_hi) {
+        /* The first block at or above `at`, and the end of any that covers it. */
+        uint32_t next = g_heap_hi, cover = 0;
+        for (int i = 0; i < MAX_BLOCKS; i++) {
+            if (!g_block[i].used) continue;
+            const uint32_t b = g_block[i].addr, e = b + g_block[i].size;
+            if (b <= at && e > at) { if (e > cover) cover = e; }
+            else if (b > at && b < next) next = b;
+        }
+        if (cover) { at = cover; continue; }
+        if (next - at > best) best = next - at;
+        at = next;
+    }
+    return best;
+}
+
 static void hle_TotalFreeMemSize(void) { psp_ret(psp_sysmem_free()); }
-static void hle_MaxFreeMemSize(void)   { psp_ret(psp_sysmem_free()); }
+static void hle_MaxFreeMemSize(void)   { psp_ret(largest_free_run()); }
 
 /* The firmware version as 0xMMmmrr10: a PSP on 6.60 answers 06060010 (the
  * header line of every hwprobe log, 2026-09-28). psprecomp stands in for

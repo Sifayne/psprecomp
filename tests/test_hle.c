@@ -145,16 +145,17 @@ static void test_sysmem(void) {
     const uint32_t NID_HEAD  = psp_nid("sceKernelGetBlockHeadAddr");
 
     uint32_t before = psp_sysmem_free();
+    const uint32_t NM = guest_name("blk");
 
     /* Low placement. */
-    uint32_t uid = call5(NID_ALLOC, 2, 0, 0 /*Low*/, 0x1000, 0);
+    uint32_t uid = call5(NID_ALLOC, 2, NM, 0 /*Low*/, 0x1000, 0);
     CHECK(uid >= 0x00010000u, "low alloc returns a UID, got 0x%08X", uid);
     uint32_t lo = call(NID_HEAD, uid, 0, 0, 0);
     CHECK(lo != 0, "block has an address");
 
     /* High placement must land above the low one -- games depend on the
      * distinction, so it is not enough that both merely succeed. */
-    uint32_t uid2 = call5(NID_ALLOC, 2, 0, 1 /*High*/, 0x1000, 0);
+    uint32_t uid2 = call5(NID_ALLOC, 2, NM, 1 /*High*/, 0x1000, 0);
     uint32_t hi = call(NID_HEAD, uid2, 0, 0, 0);
     CHECK(hi > lo, "high allocation sits above the low one (lo=0x%08X hi=0x%08X)", lo, hi);
 
@@ -162,27 +163,50 @@ static void test_sysmem(void) {
     CHECK(lo + 0x1000 <= hi, "blocks do not overlap");
 
     /* Sizes round up to the hardware's 256-byte granule. */
-    uint32_t uid3 = call5(NID_ALLOC, 2, 0, 0, 100, 0);
+    uint32_t uid3 = call5(NID_ALLOC, 2, NM, 0, 100, 0);
     CHECK(uid3 >= 0x00010000u, "a 100-byte request succeeds");
     CHECK(psp_sysmem_free() % 0x100 == 0, "allocations are granule-rounded");
 
-    /* Freeing returns the memory. */
+    /* Freeing returns the memory, and leaves a hole: total counts it, the
+     * largest run does not (threadprobe step 141, fw 6.60: total > max). */
     uint32_t mid = psp_sysmem_free();
+    const uint32_t TOTAL = psp_nid("sceKernelTotalFreeMemSize");
+    const uint32_t MAX   = psp_nid("sceKernelMaxFreeMemSize");
     CHECK(call(NID_FREE, uid, 0, 0, 0) == 0, "free succeeds");
     CHECK(psp_sysmem_free() > mid, "freeing returns memory");
+    CHECK(call(TOTAL, 0, 0, 0, 0) > call(MAX, 0, 0, 0, 0),
+          "a hole below a live block: total %08X, max %08X",
+          call(TOTAL, 0, 0, 0, 0), call(MAX, 0, 0, 0, 0));
 
-    CHECK(call(NID_FREE, 0xDEADBEEF, 0, 0, 0) == SCE_KERNEL_ERROR_UNKNOWN_UID,
+    /* The allocator's own codes (threadprobe steps 143-147, fw 6.60). */
+    CHECK(call(NID_FREE, 0xDEADBEEF, 0, 0, 0) == 0x800200CBu,
           "freeing an unknown UID is refused");
+    CHECK(call(NID_FREE, uid, 0, 0, 0) == 0x800200CBu, "freeing twice is refused");
     CHECK(call(NID_HEAD, 0xDEADBEEF, 0, 0, 0) == 0,
           "an unknown UID has no address");
+    CHECK(call5(NID_ALLOC, 2, 0, 0, 0x100, 0) == SCE_KERNEL_ERROR_ERROR, "NULL name");
+    CHECK(call5(NID_ALLOC, 2, NM, 0, 0, 0) == 0x800200D9u, "size 0");
+    CHECK(call5(NID_ALLOC, 2, NM, 5, 0x100, 0) == 0x800200D8u, "type 5");
+    CHECK(call5(NID_ALLOC, 2, NM, 3, 0x100, 3) == 0x800200E4u, "alignment 3");
+    CHECK(call5(NID_ALLOC, 2, NM, 3, 0x100, 0) == 0x800200E4u, "alignment 0");
+    CHECK(call5(NID_ALLOC, 1, NM, 0, 0x100, 0) == 0x800200D6u, "partition 1");
+    CHECK(call5(NID_ALLOC, 7, NM, 0, 0x100, 0) == 0x800200D2u, "partition 7");
+
+    /* Addr placement starts at the granule the address falls in (step 145). */
+    const uint32_t at = call5(NID_ALLOC, 2, NM, 2 /*Addr*/, 0x100, lo + 0x80);
+    CHECK((int32_t)at > 0 && call(NID_HEAD, at, 0, 0, 0) == lo,
+          "Addr at +0x80 of a free granule: head %08X, expected %08X",
+          call(NID_HEAD, at, 0, 0, 0), lo);
+    call(NID_FREE, at, 0, 0, 0);
 
     /* An impossible request fails rather than returning a bogus block. */
-    uint32_t huge = call5(NID_ALLOC, 2, 0, 0, 0x7F000000u, 0);
-    CHECK(huge == SCE_KERNEL_ERROR_NO_MEMORY, "an oversized request fails, got 0x%08X", huge);
+    uint32_t huge = call5(NID_ALLOC, 2, NM, 0, 0x7F000000u, 0);
+    CHECK(huge == 0x800200D9u, "an oversized request fails, got 0x%08X", huge);
 
     call(NID_FREE, uid2, 0, 0, 0);
     call(NID_FREE, uid3, 0, 0, 0);
     CHECK(psp_sysmem_free() == before, "everything freed restores the heap");
+    CHECK(call(MAX, 0, 0, 0, 0) == before, "and one run again");
 
     /* The SDK version reads back what was set, 0 before (saveprobe step
      * 114, fw 6.60; 0x358CA1BB is sceKernelSetCompiledSdkVersion660). */
