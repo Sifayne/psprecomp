@@ -1,5 +1,5 @@
 TARGET = saveprobe
-OBJS = main.o probe.o
+OBJS = main.o probe.o imports.o
 VPATH = ../common
 INCDIR = ../common
 CFLAGS = -O2 -G0 -Wall -std=gnu99
