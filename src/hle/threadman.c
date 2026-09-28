@@ -447,10 +447,9 @@ static void hle_StartThread(void) {
 
     /* A fresh thread's stack is filled with 0xFF, not left as it was found.
      *
-     * That is the pattern sceKernelGetThreadStackFreeSize walks looking for --
-     * this file already noted that we do not paint one -- and it is directly
-     * observable: a short argument block on hardware reads back with 0xFF above
-     * it. Verified against the game before shipping, which is not idle: filling
+     * That is the pattern sceKernelGetThreadStackFreeSize walks looking for
+     * (threadprobe step 85), and it is directly observable: a short argument
+     * block on hardware reads back with 0xFF above it. Verified against the game before shipping, which is not idle: filling
      * a stack changes what every uninitialised local reads.
      *
      * PSP_THREAD_ATTR_NO_FILLSTACK turns it off, and threads/start proves the
