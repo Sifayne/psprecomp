@@ -1312,6 +1312,48 @@ static void test_hardware_transformed_anchor_fog(void) {
           pixel(127, 178), pixel(252, 203), pixel(93, 259));
 }
 
+/* BBOX and BJUMP as geprobe 4 scene 24 (fw 6.60) measured them: a box whose
+ * corners all project beyond one edge of the screen is skipped; one behind
+ * the camera (negative w) projects mirrored onto the screen and is not. */
+static int bbox_marker_drawn(float bx, float bz, float w) {
+    psp_ge_reset();
+    clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    identity_matrices();
+    /* The projection's w row: w = -z * w_per_z + w (identity keeps w = 1). */
+    for (int i = 0; i < 8; i++)
+        float_vertex(i, bx + ((i & 1) ? 0.1f : -0.1f), (i & 2) ? 0.1f : -0.1f, bz + ((i & 4) ? 0.1f : -0.1f));
+    if (w != 1.0f) {
+        /* Replace the projection with one whose w is the constant `w`. */
+        cmd(0x3E, 0);
+        for (int i = 0; i < 16; i++) {
+            float f = (i % 5 == 0 && i != 15) ? 1.0f : (i == 15 ? w : 0.0f);
+            uint32_t bits; memcpy(&bits, &f, 4);
+            cmd(0x3F, bits >> 8);
+        }
+    }
+    cmd(0x07, 8);                                    /* BBOX: 8 corners */
+    const uint32_t bj = g_pc;
+    cmd(0x10, (LIST >> 8) & 0xFF0000);               /* BASE */
+    cmd(0x09, 0);                                    /* BJUMP, patched below */
+    cmd(0x12, VTYPE_2D);
+    cmd(0x01, (VERTS + 20 * 12) & 0xFFFFFF);
+    vertex(20, 10, 10, 0xFF00FF00u);
+    vertex(21, 20, 20, 0xFF00FF00u);
+    cmd(0x04, (6u << 16) | 2);
+    psp_write32(LIST + bj + 4, (0x09u << 24) | ((LIST + g_pc) & 0xFFFFFF));
+    end_list();
+    return pixel(15, 15) == 0x00FF00u;
+}
+
+static void test_bbox_jump(void) {
+    CHECK(bbox_marker_drawn(0.0f, 0.0f, 1.0f), "a box in view is drawn");
+    CHECK(!bbox_marker_drawn(3.0f, 0.0f, 1.0f), "a box right of the screen is skipped");
+    CHECK(!bbox_marker_drawn(-3.0f, 0.0f, 1.0f), "a box left of the screen is skipped");
+    CHECK(bbox_marker_drawn(0.0f, 0.0f, -1.0f), "a box behind the camera (w < 0) is drawn");
+    CHECK(bbox_marker_drawn(0.0f, 50.0f, 1.0f), "depth does not count: a box far out in z is drawn");
+}
+
 static void test_hardware_dither(void) {
     psp_ge_reset(); clear_fb(); begin_list();
     vertex(0, 10, 210, 0xFF7F7F7F); vertex(1, 240, 240, 0xFF7F7F7F);
@@ -1486,6 +1528,7 @@ int main(void) {
     test_line_interpolation_and_clipping();
     test_hardware_shading();
     test_hardware_transformed_anchor_fog();
+    test_bbox_jump();
     test_hardware_dither();
     test_hardware_blend();
     test_hardware_texfunc();

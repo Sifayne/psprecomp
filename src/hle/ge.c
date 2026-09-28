@@ -119,6 +119,7 @@ static int fx16_sat(float f) {
 #define GE_PRIM         0x04
 #define GE_BEZIER       0x05
 #define GE_SPLINE       0x06
+#define GE_BBOX         0x07
 #define GE_JUMP         0x08
 #define GE_BJUMP        0x09
 #define GE_CALL         0x0A
@@ -494,7 +495,10 @@ static struct {
     ge_target targets[GE_MAX_TARGETS];
     int       n_targets, cur_target;
     uint64_t  target_overflow;
-    int      sc_x0, sc_y0, sc_x1, sc_y1;
+    int      sc_x0, sc_y0, sc_x1, sc_y1, sc_set;
+    /* The last BBOX's verdict: set when every corner of the box fell beyond
+     * one edge of the scissor, which is when BJUMP jumps. */
+    int      bbox_hidden;
     /* Texture state, recorded so the sampler can be built against what this
      * game uses rather than against the whole hardware surface. */
     uint32_t tex_addr, tex_stride, tex_w, tex_h, tex_enable;
@@ -2755,6 +2759,45 @@ static void ge_callback(int cbid, int finish, uint32_t id) {
     psp_cpu = save;
 }
 
+/* BBOX (0x07): the next `count` vertices at VADDR, of the current vertex
+ * type, are the corners of a box the following BJUMP skips when it cannot be
+ * seen. geprobe 4 scene 24 (fw 6.60) runs eight boxes of eight corners under
+ * a 60-degree perspective: only the one far right of the screen and the one
+ * far above it are skipped. One wholly behind the camera, one beyond the far
+ * plane, one through the near plane and two across or near an edge are all
+ * drawn -- so nothing about depth or the camera counts, only where x and y
+ * land after the divide (a corner behind the camera divides by a negative w
+ * and lands mirrored, on screen for that box). The box is hidden when all its
+ * corners are beyond the same edge. The edges are the scissor's here; the
+ * probe's scissor is the screen, so the scissor and the viewport's extent are
+ * not told apart, but a box inside the 4096-pixel drawing area and off screen
+ * is skipped. Not measured: whether BBOX advances VADDR as PRIM does (it is
+ * left alone), skinned or morphed corners (the first vertex set, unskinned,
+ * is used), and through-mode boxes (taken as visible). */
+static int bbox_hidden(uint32_t count) {
+    int col_off, pos_off, tex_off, norm_off;
+    const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
+    if (!stride || !count || VT_THROUGH(g_ge.vtype)) return 0;
+    const int x0 = g_ge.sc_set ? g_ge.sc_x0 : 0,   y0 = g_ge.sc_set ? g_ge.sc_y0 : 0;
+    const int x1 = g_ge.sc_set ? g_ge.sc_x1 : 479, y1 = g_ge.sc_set ? g_ge.sc_y1 : 271;
+    int left = 1, right = 1, above = 1, below = 1;
+    for (uint32_t i = 0; i < count; i++) {
+        float m[3], w[3], e[3], c[4];
+        if (!read_pos_model(vertex_addr(i, stride), g_ge.vtype, pos_off, m)) return 0;
+        mul_4x3(g_tl.world, m, w);
+        mul_4x3(g_tl.view, w, e);
+        mul_4x4(g_tl.proj, e, c);
+        if (c[3] == 0.0f || !isfinite(c[0] / c[3]) || !isfinite(c[1] / c[3])) return 0;
+        int x, y;
+        clip_to_fx16(c, &x, &y);
+        left  &= x < x0 * PSP_SUBPX;
+        right &= x >= (x1 + 1) * PSP_SUBPX;
+        above &= y < y0 * PSP_SUBPX;
+        below &= y >= (y1 + 1) * PSP_SUBPX;
+    }
+    return left || right || above || below;
+}
+
 static void run_list(ge_queue *q) {
     if (g_ge_walking) return;
     g_ge_walking = 1;
@@ -2832,11 +2875,15 @@ static void run_list_body(ge_queue *q) {
         case GE_RET:
             if (sp > 0) q->list = stack[--sp];
             break;
+        case GE_BBOX:
+            g_ge.bbox_hidden = bbox_hidden(arg & 0xFFFF);
+            break;
         case GE_BJUMP:
-            /* Conditional on the bounding-box test, which needs geometry we do
-             * not process. Not taking it means we walk the enclosed commands
-             * rather than skipping them -- the conservative direction, since
-             * skipping would under-report what the game drew. */
+            /* Jumps when the last BBOX found its box hidden (bbox_hidden). It
+             * is read only once the stall address has passed it, so the
+             * placeholder libgu's sceGuBeginObject writes is never taken:
+             * sceGuEndObject has patched it by then. */
+            if (g_ge.bbox_hidden) q->list = (q->base | (arg & 0xFFFFFC));
             break;
 
         case GE_FINISH:
@@ -3270,6 +3317,7 @@ static void run_list_body(ge_queue *q) {
         case GE_SCISSOR1: g_ge.sc_x0 = (int)(arg & 0x3FF); g_ge.sc_y0 = (int)((arg >> 10) & 0x3FF); break;
         case GE_SCISSOR2:
             g_ge.sc_x1 = (int)(arg & 0x3FF); g_ge.sc_y1 = (int)((arg >> 10) & 0x3FF);
+            g_ge.sc_set = 1;
             psp_render_current()->set_scissor(g_ge.sc_x0, g_ge.sc_y0, g_ge.sc_x1, g_ge.sc_y1);
             break;
         case GE_TGENMATRIXNUMBER: g_tl.tgen_n = (int)(arg & 0xF); break;
