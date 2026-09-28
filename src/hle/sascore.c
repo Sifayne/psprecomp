@@ -230,7 +230,6 @@ enum { VAG_NXT_UNREAD = 0, VAG_NXT_OK, VAG_NXT_END };
 
 static sas_voice g_voice[SAS_VOICES];
 static uint32_t  g_grain = 256;
-static uint32_t  g_max_voices = SAS_VOICES;
 static uint32_t  g_output_mode;
 static uint32_t  g_sample_rate = 44100;
 static uint64_t  g_frames_rendered;
@@ -260,7 +259,6 @@ static void reset_voices(void) {
 void psp_sas_reset(void) {
     reset_voices();
     g_grain = 256;
-    g_max_voices = SAS_VOICES;
     g_output_mode = 0;
     g_sample_rate = 44100;
     g_frames_rendered = 0;
@@ -549,7 +547,12 @@ static void restart_source(sas_voice *v) {
     v->vag_nxt_state = VAG_NXT_UNREAD;
 }
 
-/* Render `samples` stereo frames, summing every active voice. */
+/* Render `samples` stereo frames, summing every active voice.
+ *
+ * All 32 of them, whatever __sceSasInit's voice count said: with a count of
+ * 8, a voice 8 keyed on is heard and its height climbs like voice 7's
+ * (sasprobe step 16, fw 6.60). Whether a count of 1 still renders voice 31
+ * is not measured. */
 static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix_er,
                    uint32_t samples) {
     memset(mix_l,  0, samples * sizeof *mix_l);
@@ -557,7 +560,7 @@ static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix
     memset(mix_el, 0, samples * sizeof *mix_el);
     memset(mix_er, 0, samples * sizeof *mix_er);
 
-    for (uint32_t vi = 0; vi < g_max_voices; vi++) {
+    for (uint32_t vi = 0; vi < SAS_VOICES; vi++) {
         sas_voice *v = &g_voice[vi];
         /* A key-on first, then a key-off: a KeyOn and a KeyOff with no core
          * between leave the voice ended with height 0 after one core, as a
@@ -631,6 +634,8 @@ static void hle_Init(void) {
                    mode = psp_arg(3), rate = psp_arg(4);
     if (!core || (core & 63))          { psp_ret(SAS_ERROR_CORE); return; }
     if (!grain_ok(grain))              { psp_ret(SAS_ERROR_GRAIN); return; }
+    /* Checked, and then not kept: the count does not limit the voices
+     * rendered (see render). */
     if (voices < 1 || voices > SAS_VOICES) { psp_ret(SAS_ERROR_MAX_VOICES); return; }
     if (mode > 1)                      { psp_ret(SAS_ERROR_OUTPUT_MODE); return; }
     /* 44100 and nothing else. The accepted list this once read as "the two
@@ -644,7 +649,6 @@ static void hle_Init(void) {
      * whole struct with the defaults (steps 4-5). */
     reset_voices();
     g_grain       = grain;
-    g_max_voices  = voices;
     g_output_mode = mode;
     g_sample_rate = rate;
     psp_ret(SCE_KERNEL_ERROR_OK);
