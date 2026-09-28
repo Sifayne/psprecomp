@@ -210,6 +210,8 @@ static int fx16_floor(float f) {
 #define GE_OFFSETY           0x4D
 #define GE_CULLFACEENABLE    0x1D
 #define GE_CULL              0x9B
+/* SHADE: sceGuShadeModel sends GU_SMOOTH (1) or GU_FLAT (0), PSPSDK pspgu.h. */
+#define GE_SHADE             0x50
 #define GE_MASKRGB           0xD8
 #define GE_MASKALPHA         0xD9
 #define GE_ZTESTENABLE       0x23
@@ -1488,6 +1490,10 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
     if (flip) area = -area;
     if (g_tl.cull_enable && area != 0 && ((area < 0) == (g_tl.cull_ccw != 0))) { g_culled += 3; return; }
 
+    /* A flat triangle is its last vertex's colour; the clip's cut vertices
+     * would otherwise hand the rasterizer an interpolated one as the last. */
+    if (g_tl.blend.shade_flat)
+        for (int i = 0; i < n; i++) p[i].rgba = tri[2].v.rgba;
     for (int i = 1; i + 1 < n; i++) {
         const psp_vertex t[3] = { p[0], p[i], p[i + 1] };
         be->draw(PSP_PRIM_TRIANGLES, t, 3);
@@ -2508,6 +2514,9 @@ static void run_list_body(ge_queue *q) {
             break;
         case GE_CULLFACEENABLE: g_tl.cull_enable = (int)(arg & 1); break;
         case GE_CULL:           g_tl.cull_ccw    = (int)(arg & 1); break;
+        /* Stored inverted, so the reset state (all zero) stays Gouraud, as it
+         * was before this register was decoded. */
+        case GE_SHADE:          g_tl.blend.shade_flat = !(arg & 1); break;
         /* ---- texture state -------------------------------------------------
          *
          * Recorded, not yet sampled. What the sampler has to support is a

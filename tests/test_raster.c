@@ -1114,7 +1114,16 @@ static void test_line_interpolation_and_clipping(void) {
     psp_render_walk_line(&a, &b, 10, 0, 19, 9, collect_line, &s);
     CHECK(s.count == 10 && s.first.x == 168 && s.last.x == 312,
           "huge offscreen line clips to ten samples, got %d", s.count);
-    CHECK((s.first.rgba & 255) == 127, "scissor must not reset colour interpolation");
+    /* The colour gradient is floored to 1/1024 a step (geprobe step 1, fw
+     * 6.60), so over two million steps it is zero; a 4000-step line, the
+     * longest the 12.4 grid holds, keeps 65/1024 and reads 127 mid-way. */
+    CHECK((s.first.rgba & 255) == 0, "a sub-1/1024 gradient does not move the colour");
+    a.x = -16 * 2000; b.x = 16 * 2000;
+    s = (line_samples){0};
+    psp_render_walk_line(&a, &b, 10, 0, 19, 9, collect_line, &s);
+    CHECK(s.count == 10 && s.first.x == 168 && (s.first.rgba & 255) == 127,
+          "scissor must not reset colour interpolation: %d samples, %08X",
+          s.count, s.first.rgba);
     a.x = a.y = 0; b.x = b.y = 64; b.inv_w = 0.5f; b.u = 8; b.z = 100;
     s = (line_samples){0};
     psp_render_walk_line(&a, &b, 2, 2, 2, 2, collect_line, &s);
@@ -1127,6 +1136,33 @@ static void test_line_interpolation_and_clipping(void) {
     b.x = -64; b.y = -64;
     psp_render_walk_line(&a, &b, 0, 0, 10, 10, collect_line, &s);
     CHECK(!s.count, "negative coordinates floor and descending boundary excludes origin");
+}
+
+/* Colour interpolation against geprobe's hardware frames (step 1, fw 6.60):
+ * the Gouraud triangle, the flat one and a line of the geometry scene, with
+ * the pixels the PSP wrote. */
+static void test_hardware_shading(void) {
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, 20, 20, 0xFF0000FF); vertex(1, 200, 30, 0xFF00FF00); vertex(2, 60, 180, 0xFFFF0000);
+    cmd(0x04, (PSP_PRIM_TRIANGLES << 16) | 3); end_list();
+    CHECK(pixel(120, 60) == 0x388144 && pixel(64, 64) == 0x432F8B && pixel(50, 100) == 0x7F0E70,
+          "Gouraud plane: %06X %06X %06X, hardware 388144 432F8B 7F0E70",
+          pixel(120, 60), pixel(64, 64), pixel(50, 100));
+
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, 20, 230, 0xFF0000FF); vertex(1, 120, 230, 0xFF00FF00); vertex(2, 70, 265, 0xFFFF0000);
+    cmd(0x50, 0);                                  /* SHADE: flat */
+    cmd(0x04, (PSP_PRIM_TRIANGLES << 16) | 3); end_list();
+    CHECK(pixel(70, 250) == 0xFF0000 && pixel(40, 240) == 0xFF0000,
+          "flat triangle takes its last vertex: %06X %06X", pixel(70, 250), pixel(40, 240));
+
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, 140, 230, 0xFFFFFFFF); vertex(1, 230, 265, 0xFF0000FF);
+    cmd(0x04, (PSP_PRIM_LINES << 16) | 2); end_list();
+    CHECK(pixel(140, 230) == 0xFDFDFF && pixel(150, 234) == 0xE1E1FF &&
+          pixel(180, 245) == 0x8C8CFF && pixel(229, 264) == 0x0101FF && !pixel(150, 233),
+          "line minor axis and colour at i + 1/2: %06X %06X %06X %06X",
+          pixel(140, 230), pixel(150, 234), pixel(180, 245), pixel(229, 264));
 }
 
 int main(void) {
@@ -1162,6 +1198,7 @@ int main(void) {
     test_alpha_only_clear();
     test_transformed_lines();
     test_line_interpolation_and_clipping();
+    test_hardware_shading();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);
