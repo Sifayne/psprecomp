@@ -342,8 +342,9 @@ destination term so GL's final round reproduces the GE floor. Draws that write
 alpha and equations where that transformation is invalid retain the ordinary
 path. A 1/256-pixel vertical bias converts GL's lower-left half-open edge rule
 to the PSP's top-edge ownership after Y is flipped, removing missing rows from
-half-pixel UI rectangles. Host-default dithering is explicitly disabled while
-GE dither state remains unimplemented.
+half-pixel UI rectangles. Host-default dithering is explicitly disabled: the
+GL backend does not reproduce the GE's dither matrix, which the software
+renderer now applies (`src/render.c`, measured by `tools/hwprobe/geprobe`).
 
 On the selected 14,806-command hangar capture these rules raise exact pixels
 from 62,870 to 122,818 of 130,560 and reduce normalized RMSE from 0.005718 to

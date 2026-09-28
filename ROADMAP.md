@@ -259,8 +259,7 @@ Gaps found in the code while checking this file, none of them on a phase above:
 
 - [ ] **GE features** — skinned (weighted) vertices are dropped, Bezier and
       spline patches are counted but not drawn, bounding-box conditional jumps
-      are never taken, `sceGeSetCallback` handlers are accepted but never
-      called, and dithering is not implemented (`src/hle/ge.c`). The GL
+      are never taken (`src/hle/ge.c`). The GL
       backend's own gaps are listed in [`docs/RENDERER.md`](docs/RENDERER.md).
 - [ ] **Preemption** — a thread yields only at firmware calls, so one that
       spins without calling the kernel hangs (reported, not silent).
