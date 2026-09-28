@@ -526,8 +526,64 @@ static void test_vrot(void) {
     CHECK_F(psp_cpu.v[14], -1.0f, "vrot.p: writes only two lanes");
 }
 
+/* ---- control state --------------------------------------------------------
+ *
+ * The reset values and the per-thread ownership, as a PSP on firmware 6.60
+ * reports them (vfpuprobe, the lines before step 1 and step 147). */
+static void test_control_state(void) {
+    static const uint32_t want[16] = {
+        0x000000E4, 0x000000E4, 0x00000000, 0x0000003F,
+        0x00000000, 0x00000000, 0x00000000, 0x7772CEAB,
+        0x3F800001, 0x3F800002, 0x3F800004, 0x3F800008,
+        0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000,
+    };
+
+    /* A fresh thread: the whole register file, then the control words. */
+    psp_cpu_reset_thread();
+    for (int i = 0; i < 16; i++)
+        CHECK(psp_mfvc(i) == want[i], "fresh thread: control %d is %08X, want %08X",
+              i, psp_mfvc(i), want[i]);
+    CHECK(psp_cpu.r[PSP_REG_AT] == 0xDEADBEEFu && psp_cpu.r[PSP_REG_S7] == 0xDEADBEEFu &&
+          psp_cpu.r[PSP_REG_T9] == 0xDEADBEEFu,
+          "fresh thread: unset general registers hold DEADBEEF");
+    CHECK(psp_cpu.r[PSP_REG_ZERO] == 0 && psp_cpu.r[PSP_REG_K1] == 0,
+          "fresh thread: $zero and $k1 are zero");
+    CHECK(psp_cpu.fcr31 == 0x00000E00u, "fresh thread: FCR31 %08X", psp_cpu.fcr31);
+    CHECK(psp_f32_to_bits(psp_cpu.f[7]) == 0x7F800001u &&
+          psp_f32_to_bits(psp_cpu.v[77]) == 0x7F800001u,
+          "fresh thread: float and vector registers hold 7F800001");
+
+    /* The first VFPU op after a reset sees the identity prefix, not zero --
+     * zero is the swizzle x,x,x,x and used to broadcast lane 0. */
+    const float a[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    float out[4];
+    set_quad(0x00, a);
+    psp_vunary(PSP_VU_MOV, 0x04, 0x00, 4);
+    get_quad(0x04, out);
+    for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i], "first op after reset: no swizzle");
+
+    /* Per thread: the state travels with psp_cpu, which is what a thread
+     * switch saves and restores. A prefix pending in one thread and the
+     * generator state it seeded are invisible to another. */
+    psp_mtvc(PSP_VFPU_RCX0, 0x3F812345u);
+    psp_vfpu_set_prefix(0, 0x1B);
+    psp_cpu.vfpu_cc = 0x15u;
+    const psp_cpu_state main_ctx = psp_cpu;
+    psp_cpu_reset_thread();
+    CHECK(!psp_vfpu_prefix_pending(), "another thread sees no pending prefix");
+    CHECK(psp_mfvc(PSP_VFPU_CC) == 0x3Fu && psp_mfvc(PSP_VFPU_RCX0) == 0x3F800001u,
+          "another thread sees its own CC and rcx");
+    psp_cpu = main_ctx;
+    CHECK(psp_vfpu_prefix_pending() && psp_mfvc(PSP_VFPU_PFXS) == 0x1Bu,
+          "switching back restores the pending prefix");
+    CHECK(psp_mfvc(PSP_VFPU_CC) == 0x15u && psp_mfvc(PSP_VFPU_RCX0) == 0x3F812345u,
+          "switching back restores CC and rcx");
+    psp_vfpu_reset();
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
+    test_control_state();
     psp_cpu_reset();
     psp_vfpu_reset();
 

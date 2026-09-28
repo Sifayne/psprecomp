@@ -8,7 +8,11 @@
 #include <stdio.h>
 #include <string.h>
 
-static uint32_t g_prefix[3];      /* vpfxs, vpfxt, vpfxd */
+/* vpfxs, vpfxt, vpfxd: control registers 0..2, which are thread context and so
+ * live in psp_cpu (see cpu.h). */
+#define PFXS (psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS])
+#define PFXT (psp_cpu.vfpu_ctrl[PSP_VFPU_PFXT])
+#define PFXD (psp_cpu.vfpu_ctrl[PSP_VFPU_PFXD])
 static uint64_t g_traps;
 
 /* The identity prefixes.
@@ -33,24 +37,19 @@ static uint64_t g_traps;
 static float sat0(float v) { return v <= 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 static float sat1(float v) { return v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v); }
 
-static void reset_ctrl(void);
-
 void psp_vfpu_reset(void) {
-    g_prefix[0] = g_prefix[1] = PFX_ST_NONE;
-    g_prefix[2] = PFX_D_NONE;
-    psp_cpu.vfpu_cc = 0x3Fu;      /* all six condition bits set; see cpu.c */
-    reset_ctrl();
+    psp_cpu_reset_vfpu_ctrl();    /* prefixes, CC, rev and rcx; see cpu.c */
     g_traps = 0;
 }
 
 void psp_vfpu_set_prefix(int which, uint32_t value) {
     if (which < 0 || which > 2) return;
-    g_prefix[which] = value;
+    psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS + which] = value;
 }
 
 int psp_vfpu_prefix_pending(void) {
-    return g_prefix[0] != PFX_ST_NONE || g_prefix[1] != PFX_ST_NONE
-        || g_prefix[2] != PFX_D_NONE;
+    return PFXS != PFX_ST_NONE || PFXT != PFX_ST_NONE
+        || PFXD != PFX_D_NONE;
 }
 
 /* A prefix lasts exactly one instruction.
@@ -59,8 +58,8 @@ int psp_vfpu_prefix_pending(void) {
  * ignores a pending swizzle but must still clear it, or it would be applied to
  * whatever came next instead. */
 static void eat_prefixes(void) {
-    g_prefix[0] = g_prefix[1] = PFX_ST_NONE;
-    g_prefix[2] = PFX_D_NONE;
+    PFXS = PFXT = PFX_ST_NONE;
+    PFXD = PFX_D_NONE;
 }
 
 uint64_t psp_vfpu_trap_count(void) { return g_traps; }
@@ -177,7 +176,7 @@ static int read_src(uint32_t vreg, int size, uint32_t pfx, float out[4]) {
 static void write_dst(uint32_t vreg, int size, const float in[4]) {
     int r[4];
     const int n = psp_vfpu_regs(vreg, size, r);
-    const uint32_t pfx = g_prefix[2];
+    const uint32_t pfx = PFXD;
 
     if (pfx == PFX_D_NONE) {
         for (int i = 0; i < n; i++) psp_cpu.v[r[i]] = in[i];
@@ -287,34 +286,13 @@ float psp_vfpu_dot(const float a[4], const float b[4]) {
 
 /* ---- VFPU control registers ----------------------------------------------- */
 
-/* Everything past the prefixes and the condition codes: the revision word and
- * the random-number state. Kept together here because nothing reads them yet
- * and giving each a home of its own would be inventing structure. */
-static uint32_t g_vfpu_ctrl_rest[16];
-
-/* Their power-on values. Index 7 is the revision word and 8..15 are the
- * random-number generator's state, which is why they are not zero -- each RCX
- * register holds a 1.0f pattern with a distinct low bit, and vrnd derives its
- * stream from them. Nothing reads any of this yet; it is set because the
- * condition codes next door turned out to matter and there is no reason to
- * think these are the exception. */
-static void reset_ctrl(void) {
-    for (int i = 0; i < 16; i++) g_vfpu_ctrl_rest[i] = 0;
-    g_vfpu_ctrl_rest[7]  = 0x7772CEABu;          /* revision */
-    g_vfpu_ctrl_rest[8]  = 0x3F800001u;          /* RCX0 */
-    g_vfpu_ctrl_rest[9]  = 0x3F800002u;
-    g_vfpu_ctrl_rest[10] = 0x3F800004u;
-    g_vfpu_ctrl_rest[11] = 0x3F800008u;
-    for (int i = 12; i < 16; i++) g_vfpu_ctrl_rest[i] = 0x3F800000u;
-}
-
+/* All sixteen are per-thread state in psp_cpu.vfpu_ctrl (the condition codes in
+ * psp_cpu.vfpu_cc), reset by psp_cpu_reset_vfpu_ctrl. They used to be file
+ * statics here and were never initialised outside the unit tests: every thread
+ * shared one set, and a program read rev and rcx as zero. */
 uint32_t psp_mfvc(int index) {
-    switch (index) {
-    case 0: case 1: case 2: return g_prefix[index];
-    case 3:                 return psp_cpu.vfpu_cc;
-    default:
-        return (index >= 0 && index < 16) ? g_vfpu_ctrl_rest[index] : 0;
-    }
+    if (index == PSP_VFPU_CC) return psp_cpu.vfpu_cc;
+    return (index >= 0 && index < 16) ? psp_cpu.vfpu_ctrl[index] : 0;
 }
 
 void psp_mtvc(int index, uint32_t value) {
@@ -322,10 +300,10 @@ void psp_mtvc(int index, uint32_t value) {
     /* Writing a prefix here is the same as executing vpfxs/vpfxt/vpfxd: the
      * next VFPU op consumes it and clears it. Storing it anywhere else would
      * make the two views of the same register disagree. */
-    case 0: case 1: case 2: g_prefix[index] = value & 0xFFFFFFu; break;
+    case 0: case 1: case 2: psp_cpu.vfpu_ctrl[index] = value & 0xFFFFFFu; break;
     case 3:                 psp_cpu.vfpu_cc = value;            break;
     default:
-        if (index >= 0 && index < 16) g_vfpu_ctrl_rest[index] = value;
+        if (index >= 0 && index < 16) psp_cpu.vfpu_ctrl[index] = value;
         break;
     }
 }
@@ -421,7 +399,7 @@ void psp_svr_q(uint32_t vt, uint32_t addr) {
  * single lane is *zero*, because the constant for size 1 is 0 and not 1. */
 static void reduce(uint32_t vd, uint32_t vs, int size, float k) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
+    read_src(vs, size, PFXS, sv);
 
     /* A dot against a constant vector, which is literally what the hardware
      * does -- and the reason a single-lane vavg is zero, since the constant
@@ -478,10 +456,10 @@ void psp_vcolor(uint32_t vd, uint32_t vs, int fmt, int size) {
 
 void psp_vcmov(uint32_t vd, uint32_t vs, int cc_sel, int want, int size) {
     float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    const int n = read_src(vs, size, g_prefix[0], s);
+    const int n = read_src(vs, size, PFXS, s);
     /* The destination is read as the second operand, T prefix and all: a lane
      * that is not moved keeps its old value, so this is a read-modify-write. */
-    read_src(vd, size, g_prefix[1], d);
+    read_src(vd, size, PFXT, d);
 
     const uint32_t cc = psp_cpu.vfpu_cc;
     if (cc_sel < 6) {
@@ -503,8 +481,8 @@ void psp_vcmov(uint32_t vd, uint32_t vs, int cc_sel, int want, int size) {
  * here as the products themselves, which is what they are. */
 void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, t[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], s);
-    read_src(vt, size, g_prefix[1], t);
+    read_src(vs, size, PFXS, s);
+    read_src(vt, size, PFXT, t);
 
     float d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     if (size == 4) {                                     /* vqmul.q */
@@ -543,8 +521,8 @@ void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    const int n = read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    const int n = read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     /* The last lane of the source is a forced 1: that is the whole difference
      * from vdot, and it is what makes this the homogeneous form. */
@@ -556,8 +534,8 @@ void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     /* s is forced to yzx and t to zxy, then multiplied lane by lane. There is
      * no subtraction: this is half a cross product, and a full one is two of
@@ -574,8 +552,8 @@ void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     /* t's first two lanes are forced to yx and s's second is negated, so the
      * dot comes out as s0*t1 - s1*t0. Lanes beyond the pair contribute as they
@@ -591,8 +569,8 @@ void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 void psp_vcmp_val(uint32_t vd, uint32_t vs, uint32_t vt, int kind, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    const int n = read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    const int n = read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     float d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     for (int i = 0; i < n; i++) {
@@ -629,7 +607,7 @@ void psp_vcmp_val(uint32_t vd, uint32_t vs, uint32_t vt, int kind, int size) {
  * through untouched. */
 void psp_vwbn(uint32_t vd, uint32_t vs, int exp, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
+    read_src(vs, size, PFXS, sv);
 
     const uint32_t e = (uint32_t)(exp & 0xFF);
     const uint32_t b = psp_f32_to_bits(sv[0]);
@@ -655,8 +633,8 @@ void psp_vwbn(uint32_t vd, uint32_t vs, int exp, int size) {
 
 void psp_vsbn(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     /* vt's first lane is read as an *integer* exponent, biased on the way in. */
     const uint32_t exp = (uint32_t)(uint8_t)(127 + (int32_t)psp_f32_to_bits(tv[0]));
@@ -685,7 +663,7 @@ void psp_vsbn(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  * worse description of the arithmetic. */
 void psp_vfpu9(uint32_t vd, uint32_t vs, int kind, int size) {
     float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    const int n = read_src(vs, size, g_prefix[0], s);
+    const int n = read_src(vs, size, PFXS, s);
 
     /* The two swizzles the sorts and butterflies use. */
     const float yxwz[4] = { s[1], s[0], s[3], s[2] };
@@ -754,7 +732,7 @@ static void read_bits(uint32_t vs, int size, uint32_t out[4]);
  * cast, and silently wrong for every other n. Those entries are gone. */
 void psp_vf2i(uint32_t vd, uint32_t vs, int mode, int scale, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    const int n = read_src(vs, size, g_prefix[0], sv);
+    const int n = read_src(vs, size, PFXS, sv);
     const double mult = (double)(1u << (scale & 0x1F));
 
     uint32_t d[4] = { 0, 0, 0, 0 };
@@ -785,7 +763,7 @@ void psp_vf2i(uint32_t vd, uint32_t vs, int mode, int scale, int size) {
     int r[4];
     const int dn = psp_vfpu_regs(vd, size, r);
     for (int i = 0; i < dn; i++)
-        if (!((g_prefix[2] >> (8 + i)) & 1))
+        if (!((PFXD >> (8 + i)) & 1))
             psp_cpu.v[r[i]] = psp_bits_to_f32(d[i]);
     eat_prefixes();
 }
@@ -927,7 +905,7 @@ void psp_vh2f(uint32_t vd, uint32_t vs, int size) {
 
 void psp_vf2h(uint32_t vd, uint32_t vs, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
+    read_src(vs, size, PFXS, sv);
     const int oz = (size <= 2) ? 1 : 2;
     uint32_t d[4] = { 0, 0, 0, 0 };
     for (int i = 0; i < oz; i++)
@@ -944,8 +922,8 @@ void psp_vf2h(uint32_t vd, uint32_t vs, int size) {
          * or vt, and a lane-by-lane read/write would then feed results back  \
          * into later lanes. read_src copies, so this holds for free. */     \
         float sv[4], tv[4], out[4];                                          \
-        const int n = read_src(vs, size, g_prefix[0], sv);                   \
-        read_src(vt, size, g_prefix[1], tv);                                 \
+        const int n = read_src(vs, size, PFXS, sv);                          \
+        read_src(vt, size, PFXT, tv);                                        \
         for (int i = 0; i < n; i++) {                                        \
             float a = sv[i], b = tv[i];                                      \
             out[i] = (expr);                                                 \
@@ -964,8 +942,8 @@ BINOP(vmax, a > b ? a : b)
 /* Dot product: sums all lanes into a single destination lane. */
 void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     /* Four lanes always: the unused ones are zero and contribute nothing, and
      * going through the one unit is what makes the rounding match. */
@@ -983,8 +961,8 @@ void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 /* Scale: every lane of vs multiplied by the scalar in vt. */
 void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4], tv[4], out[4];
-    const int n = read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, 1, g_prefix[1], tv);
+    const int n = read_src(vs, size, PFXS, sv);
+    read_src(vt, 1, PFXT, tv);
 
     const float k = tv[0];
     for (int i = 0; i < n; i++) out[i] = sv[i] * k;
@@ -996,7 +974,7 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
     float sv[4], out[4];
-    const int n = read_src(vs, size, g_prefix[0], sv);
+    const int n = read_src(vs, size, PFXS, sv);
 
     for (int i = 0; i < n; i++) {
         const float a = sv[i];
@@ -1483,8 +1461,8 @@ void psp_vfpu_dump_cmps(FILE *out) {
 
 void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
     float sv[4], tv[4];
-    const int n = read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    const int n = read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     uint32_t cc = 0;
     int all = 1, any = 0;

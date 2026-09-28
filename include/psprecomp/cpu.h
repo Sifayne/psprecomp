@@ -50,7 +50,18 @@ typedef struct {
     /* VFPU register file: 8 matrices x 4 rows x 4 columns = 128 floats.
      * Indexed linearly here; vfpu.h provides the matrix/row/column views. */
     float    v[128];
-    uint32_t vfpu_cc;          /* VFPU condition codes (vcmp results) */
+    uint32_t vfpu_cc;          /* VFPU condition codes (vcmp results); control register 3 */
+    /* The other VFPU control registers, indexed as mfvc/mtvc number them: 0..2
+     * the source, target and destination prefixes, 4..6 reserved, 7 the
+     * revision word, 8..15 the random generator's state rcx0..rcx7. Slot 3 is
+     * unused -- the condition codes are vfpu_cc above.
+     *
+     * They are thread context, so they live here and are swapped with the rest
+     * of the struct. Measured (vfpuprobe steps 147 and 154, fw 6.60): a thread
+     * started while main's CC held 0x15 read CC 0x3F and the reset prefixes,
+     * rev and rcx, and its first two vrndi equalled main's first two -- the
+     * generator state is per thread too. */
+    uint32_t vfpu_ctrl[16];
 } psp_cpu_state;
 
 extern psp_cpu_state psp_cpu;
@@ -68,16 +79,28 @@ void psp_cpu_reset(void);
  *
  * The hardware does not hand out a zeroed register file. A new thread context
  * starts with every COP1 and VFPU register holding 0x7F800001 -- a signalling
- * NaN -- and that is observable: a test that writes one lane of a vector and
- * stores all four prints `nan` for the other three, where a zeroed file prints
- * 0.000000. pspautotests cpu/vfpu/vavg is exactly that shape.
- *
- * The general-purpose registers get 0xDEADBEEF on hardware. That is *not* done
- * here: nothing measured needs it, and seeding every GPR with a value that
- * looks like a plausible pointer would turn "the guest used an uninitialised
- * register" from a zero-page fault into a wild write. Recorded rather than
- * copied. */
+ * NaN -- FCR31 at 0x00000E00, and the VFPU control registers at their reset
+ * values (psp_cpu_reset_vfpu_ctrl). All of it measured on a thread created by
+ * sceKernelCreateThread (vfpuprobe step 147, fw 6.60), and the main thread
+ * reads the same control values before its first VFPU instruction. */
 void psp_cpu_reset_fp(void);
+
+/* The VFPU control registers alone, at reset: prefixes 0xE4/0xE4/0, CC 0x3F,
+ * revision 0x7772CEAB, rcx0..7 3F800001 3F800002 3F800004 3F800008 3F800000
+ * x4, the reserved slots 0. Part of psp_cpu_reset_fp; psp_vfpu_reset uses it
+ * to reset the control state without touching the register file. */
+void psp_cpu_reset_vfpu_ctrl(void);
+
+/* The whole register file of a freshly created thread, before the creator's
+ * values ($a0, $a1, $sp, $gp, $k0, $ra) are filled in by the caller.
+ *
+ * Every general register the thread did not get from its creator holds
+ * 0xDEADBEEF on hardware, except $k1, which is 0 (vfpuprobe step 147,
+ * fw 6.60: at, v0, v1, a2, a3, t0-t9, s0-s7 all read DEADBEEF). $fp read as
+ * something that is neither 0 nor DEADBEEF; the callers set it to the initial
+ * $sp, the simplest value that fits, and the probe did not print it. */
+void psp_cpu_reset_thread(void);
+#define PSP_GPR_FRESH 0xDEADBEEFu
 
 /* The FPU control registers, as the hardware presents them.
  *
@@ -118,6 +141,13 @@ static inline void psp_fcr_write(unsigned n, uint32_t v) {
 #define PSP_FCR31_C (1u << 23)
 
 static inline int  psp_fpu_cond(void)      { return (psp_cpu.fcr31 & PSP_FCR31_C) != 0; }
+
+/* VFPU control register indices, as mfvc/mtvc number them (the field minus
+ * 128). */
+enum {
+    PSP_VFPU_PFXS = 0, PSP_VFPU_PFXT = 1, PSP_VFPU_PFXD = 2, PSP_VFPU_CC = 3,
+    PSP_VFPU_REV = 7, PSP_VFPU_RCX0 = 8
+};
 
 /* VFPU condition code `cc` (0..5: one per lane, then any, then all) -- set by
  * vcmp, tested by bvt/bvf and their likely forms. The code index is the

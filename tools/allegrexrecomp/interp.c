@@ -849,11 +849,11 @@ static int run_thread_now(uint32_t entry, uint32_t sp, uint32_t a0, uint32_t a1)
     /* The thread's own register file: arguments from StartThread, its own
      * stack, and the sentinel to return to. Everything is restored after, so
      * the starter's registers survive the call. */
-    memset(&psp_cpu, 0, sizeof psp_cpu);
-    psp_cpu_reset_fp();
+    psp_cpu_reset_thread();
     R(PSP_REG_A0) = a0;
     R(PSP_REG_A1) = a1;
     R(PSP_REG_SP) = sp;
+    R(PSP_REG_FP) = sp;
     /* $gp is per-module, not per-thread, and the starter is in the same module
      * as the thread it starts -- so inheriting it is both correct and the only
      * source available here. Zero would point the small-data area at address 0. */

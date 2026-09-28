@@ -18,17 +18,40 @@ const char *const psp_reg_names[PSP_NUM_GPR] = {
  * rather than an infinity, and it is signalling rather than quiet. */
 #define PSP_FP_INIT 0x7F800001u
 
+void psp_cpu_reset_vfpu_ctrl(void) {
+    /* Measured on the main thread before its first VFPU instruction and on a
+     * freshly created thread (vfpuprobe, the lines before step 1 and step 147,
+     * fw 6.60): pfxs 000000E4 pfxt 000000E4 pfxd 00000000 cc 0000003F, the
+     * reserved 4..6 zero, rev 7772CEAB, rcx0-7 3F800001 3F800002 3F800004
+     * 3F800008 3F800000 3F800000 3F800000 3F800000.
+     *
+     * The prefixes matter most. They used to start at zero, which as a source
+     * prefix is the swizzle x,x,x,x: the first VFPU instruction of every
+     * program broadcast lane x until something consumed the prefix. */
+    memset(psp_cpu.vfpu_ctrl, 0, sizeof psp_cpu.vfpu_ctrl);
+    psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS] = 0xE4u;
+    psp_cpu.vfpu_ctrl[PSP_VFPU_PFXT] = 0xE4u;
+    psp_cpu.vfpu_ctrl[PSP_VFPU_PFXD] = 0x00u;
+    psp_cpu.vfpu_ctrl[PSP_VFPU_REV]  = 0x7772CEABu;
+    for (int i = 0; i < 8; i++)
+        psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + i] = 0x3F800000u | (i < 4 ? 1u << i : 0u);
+    /* The condition codes come up with all six bits *set*, not clear: 0x3F on
+     * both threads above. */
+    psp_cpu.vfpu_cc = 0x3Fu;
+}
+
 void psp_cpu_reset_fp(void) {
     psp_cpu.fcr31 = PSP_FCR31_RESET;
     for (int i = 0; i < 32; i++)  memcpy(&psp_cpu.f[i], &(uint32_t){PSP_FP_INIT}, 4);
     for (int i = 0; i < 128; i++) memcpy(&psp_cpu.v[i], &(uint32_t){PSP_FP_INIT}, 4);
-    /* The VFPU condition codes come up with all six bits *set*, not clear.
-     *
-     * That is observable and was observed: pspautotests cpu/vfpu/vector does a
-     * `vcmp.t` -- which writes bits 0..2 and the any/all pair, and leaves bit 3
-     * alone -- and then reads bit 3 back as 1, having never written it. From a
-     * zeroed register it reads 0, and 25 of that test's lines turn on it. */
-    psp_cpu.vfpu_cc = 0x3Fu;
+    psp_cpu_reset_vfpu_ctrl();
+}
+
+void psp_cpu_reset_thread(void) {
+    memset(&psp_cpu, 0, sizeof psp_cpu);
+    for (int i = 1; i < PSP_NUM_GPR; i++) psp_cpu.r[i] = PSP_GPR_FRESH;
+    psp_cpu.r[PSP_REG_K1] = 0;
+    psp_cpu_reset_fp();
 }
 
 void psp_cpu_reset(void) {

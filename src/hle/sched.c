@@ -371,11 +371,11 @@ static void thread_main(void *arg) {
      * nothing in the instruction stream ever names it. A module built with a
      * small-data area addresses that area as an offset from $gp, so a thread
      * starting with zero sends every such access to around address 0. */
-    memset(&psp_cpu, 0, sizeof psp_cpu);
-    psp_cpu_reset_fp();      /* a fresh thread's float/vector registers are NaN */
+    psp_cpu_reset_thread();  /* DEADBEEF GPRs, NaN float/vector registers */
     psp_cpu.r[PSP_REG_A0] = t->a0;
     psp_cpu.r[PSP_REG_A1] = t->a1;
     psp_cpu.r[PSP_REG_SP] = t->sp;
+    psp_cpu.r[PSP_REG_FP] = t->sp;
     psp_cpu.r[PSP_REG_K0] = t->k0;
     psp_cpu.r[PSP_REG_GP] = t->gp;
     psp_cpu.r[PSP_REG_RA] = 0;
