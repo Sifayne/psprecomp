@@ -140,12 +140,13 @@ static int curve_ok(uint32_t mode, int phase_is_attack, int phase_is_sustain) {
  * samples, which are read as they are. The game uses both -- its menu sounds
  * are VAG and its voice clips PCM -- and the PCM path was missing entirely,
  * so those voices were silent. */
-enum { SRC_NONE = 0, SRC_VAG, SRC_PCM };
+enum { SRC_NONE = 0, SRC_VAG, SRC_PCM, SRC_NOISE };
 typedef struct {
     int      kind;
     uint32_t addr;
     uint32_t size;          /* VAG: bytes; PCM: samples, 1..0x10000 */
     int32_t  loop;          /* VAG: loop mode 0/1; PCM: loop position, negative for none */
+    uint32_t param;         /* noise: the frequency, 0..63 */
 } sas_source;
 
 typedef struct {
@@ -230,6 +231,12 @@ typedef struct {
      * arriving 32 late to match. sasprobe measured the same on firmware 6.60
      * (steps 69-70), counting from the core that takes up the key-on. */
     int32_t  start_delay;
+
+    /* The noise generator (see noise_fetch): the register, which each
+     * key-on clears, and its clock, which only SetNoise (and Init) restart. */
+    uint16_t noise;
+    int32_t  noise_timer;
+    int      noise_clock_reset;   /* SetNoise since the last key-on */
 } sas_voice;
 
 enum { VAG_NXT_UNREAD = 0, VAG_NXT_OK, VAG_NXT_END };
@@ -535,6 +542,53 @@ static void vag_advance(sas_voice *v) {
     v->frac &= 0xFFFu;
 }
 
+/* ---- noise ---------------------------------------------------------------
+ *
+ * __sceSasSetNoise's generator, as firmware 6.60 plays it (sasprobe steps
+ * 192-199; noise_f*.bin, all seven exact). A 16-bit register starts at 0,
+ * and on each tick of its clock shifts left one bit, taking in
+ *
+ *     1 ^ bit 9 ^ bit 10 ^ bit 11 ^ bit 14     (of the value before the shift)
+ *
+ * which is exact over all 496 ticks of the frequency-63 capture and the only
+ * recurrence of order 15 or less that is. The voice plays the register as a
+ * signed 16-bit sample, through the envelope and volumes like any other.
+ *
+ * The clock: frequency f splits into a shift f >> 2 and a step f & 3. A
+ * counter starts at half its reload value plus 4 (see below for when), and
+ * each output sample either ticks and reloads it, if it has gone negative,
+ * or takes 4 + step off it. With a reload of 0x20000 >> shift, that ticks
+ * every 2 + (0x20000 >> shift) / (4 + step) samples. Three frequencies pin
+ * it: 63 ticks every 2 samples from the voice's second, 48 every 10 from its
+ * seventh, and 32 every 130 from its 67th; 0, 1, 8 and 16 never tick in the
+ * 991 samples captured, which this agrees with. Every other frequency's
+ * timing is this counter's extrapolation, not a measurement.
+ *
+ * What restarts which is pinned only loosely, by step 199. After an Init
+ * and a SetNoise, frequency 32 plays exactly its first capture again. Keyed
+ * off and straight back on after that capture, it starts from 0 again --
+ * the first samples are silent although the register had reached 0xFF --
+ * and yet the four cores differ from the first run: the register is
+ * cleared by the key-on and the clock is not. Here the clock restarts when
+ * a key-on takes up a SetNoise, since its starting value depends on the
+ * frequency. Whether it runs while the voice is not rendering, and whether
+ * the generator is per voice rather than one for the whole library, is not
+ * measured. */
+
+static uint32_t noise_reload(uint32_t freq) { return 0x20000u >> (freq >> 2); }
+
+static int32_t noise_fetch(sas_voice *v) {
+    if (v->noise_timer < 0) {
+        const uint32_t n = v->noise;
+        const uint32_t in = 1u ^ (((n >> 9) ^ (n >> 10) ^ (n >> 11) ^ (n >> 14)) & 1u);
+        v->noise = (uint16_t)((n << 1) | in);
+        v->noise_timer = (int32_t)noise_reload(v->src.param);
+    } else {
+        v->noise_timer -= 4 + (int32_t)(v->src.param & 3u);
+    }
+    return (int16_t)v->noise;
+}
+
 /* Take up the sample the setters last named, from its start, with the
  * resampler at rest. */
 static void restart_source(sas_voice *v) {
@@ -551,6 +605,30 @@ static void restart_source(sas_voice *v) {
     v->vag_cur = 0;
     v->vag_cur_ok = 1;
     v->vag_nxt_state = VAG_NXT_UNREAD;
+    v->noise = 0;
+    if (v->noise_clock_reset) {
+        v->noise_clock_reset = 0;
+        v->noise_timer = (int32_t)(noise_reload(v->src.param) / 2u + 4u);
+    }
+}
+
+/* The voice's next output sample, before the envelope; 0 when the voice has
+ * run out of sample. */
+static int fetch_sample(sas_voice *v, int32_t *s) {
+    switch (v->src.kind) {
+    case SRC_PCM:   return pcm_fetch(v, s);
+    case SRC_VAG:   return vag_fetch(v, s);
+    case SRC_NOISE: *s = noise_fetch(v); return 1;
+    default:        return 0;
+    }
+}
+
+static void advance_source(sas_voice *v) {
+    switch (v->src.kind) {
+    case SRC_PCM: pcm_advance(v); break;
+    case SRC_VAG: vag_advance(v); break;
+    default:      break;
+    }
 }
 
 /* Render `samples` stereo frames, summing every active voice.
@@ -593,13 +671,12 @@ static void render(int64_t *mix_l, int64_t *mix_r, int64_t *mix_el, int64_t *mix
         }
         if (!v->playing || v->paused) continue;
         if (v->src.kind == SRC_NONE || (v->src.kind == SRC_VAG && !v->src.addr)) continue;
-        const int pcm = v->src.kind == SRC_PCM;
 
         for (uint32_t i = 0; i < samples; i++) {
             if (v->start_delay > 0) { v->start_delay--; continue; }
 
             int32_t s;
-            if (!(pcm ? pcm_fetch(v, &s) : vag_fetch(v, &s))) { end_voice(v); break; }
+            if (!fetch_sample(v, &s)) { end_voice(v); break; }
 
             /* Read the envelope, then step it -- in that order. The first
              * sample of a voice is multiplied by a height of zero and comes
@@ -619,7 +696,7 @@ static void render(int64_t *mix_l, int64_t *mix_r, int64_t *mix_el, int64_t *mix
             step_envelope(v);
             if (!v->playing) break;   /* the envelope ended the voice */
 
-            if (pcm) pcm_advance(v); else vag_advance(v);
+            advance_source(v);
         }
     }
 }
@@ -741,13 +818,17 @@ static void hle_SetPitch(void) {
 }
 
 /* __sceSasSetNoise(sasCore, voice, freq): the voice plays noise instead of
- * its sample. The frequency is checked here -- 0..63 -- and the generator
- * itself is not implemented, so the setting is accepted and the voice keeps
- * playing what it was given. */
+ * its sample (see noise_fetch), frequency 0..63. Like SetVoice it names what
+ * the next key-on plays, and a SetVoicePCM after it goes back to the sample
+ * (sasprobe step 200). What a SetNoise on a playing voice does is not
+ * measured; it waits for the key-on here, as SetVoice does. */
 static void hle_SetNoise(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     if (psp_arg(2) > 63u) { psp_ret(SAS_ERROR_NOISE_FREQ); return; }
+    v->next.kind  = SRC_NOISE;
+    v->next.param = psp_arg(2);
+    v->noise_clock_reset = 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
