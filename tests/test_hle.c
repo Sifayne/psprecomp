@@ -1176,6 +1176,23 @@ static void test_sas_round3_rules(void) {
                   at[i][0], sas_left((uint32_t)at[i][0]), at[i][1]);
     }
 
+    /* SetNoise(63) on a voice playing 48 (step 279): the tick already due
+     * at 2, then one every 4 samples -- 63's spacing, 48's table. */
+    sas_fresh();
+    call(psp_nid("__sceSasSetNoise"), SAS_CORE, 0, 48, 0);
+    sas_flat_voice(0);
+    call(psp_nid("__sceSasSetKeyOn"), SAS_CORE, 0, 0, 0);
+    sas_core();
+    call(psp_nid("__sceSasSetNoise"), SAS_CORE, 0, 63, 0);
+    sas_core();
+    {
+        static const int at[7][2] = { { 1, -2948 }, { 2, -5895 }, { 5, -5895 }, { 6, -11789 },
+                                      { 9, -11789 }, { 10, -23578 }, { 14, 18380 } };
+        for (int i = 0; i < 7; i++)
+            CHECK(sas_left((uint32_t)at[i][0]) == at[i][1], "noise 48 to 63: L[%d] = %d, want %d",
+                  at[i][0], sas_left((uint32_t)at[i][0]), at[i][1]);
+    }
+
     /* The re-key fade (steps 177, 275): KeyOff and KeyOn with no core
      * between. The old voice plays sample 0, then fades over 20 samples by
      * 0.625 a sample; the new one starts at 32 as ever. */

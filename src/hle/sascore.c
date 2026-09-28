@@ -250,6 +250,7 @@ typedef struct {
     uint16_t noise;
     int32_t  noise_cnt;     /* samples left to the next half-tick */
     uint32_t noise_j;       /* that half-tick's place in the eight-tick table */
+    uint8_t  noise_tbl;     /* the table, as the key-on's frequency picked it */
 
     /* A wave's phase, as 44100 times its 16-bit phase (see wave_fetch). */
     uint32_t wave_acc;
@@ -590,18 +591,21 @@ static void vag_advance(sas_voice *v) {
  * frequencies, out to frequency 0, which first ticks at frame 16418 and then
  * every 32770 samples (step 211). At k = 15, frequencies 60-63,
  * the register moves after the voice's sample 0 and every second sample
- * after that, whatever m is (steps 271-274).
+ * after that, whatever m is (steps 271-274), which with step 279 below reads
+ * as half-ticks 2 samples apart and a table of all ones.
  *
  * Each voice has its own generator (steps 281-283: two voices keyed on
  * together tick independently, each from its own start), and each key-on
  * starts both the register and the clock over, whether or not a SetNoise
  * came before it (steps 278 and 280; the "different" re-key of round 1's
  * step 199 was the re-key fade, see rekey_fade). A SetNoise on a voice that
- * is playing noise changes its frequency at once, with no key-on (step 279):
- * the half-tick already due still comes when it was due and ticks, and the
- * new frequency's spacing follows. That step went from 48 to 63 and ticked
- * every 4 samples after the switch where a fresh 63 ticks every 2, which
- * this does not reproduce: here the new frequency's own spacing follows. */
+ * is playing noise changes its frequency at once, with no key-on, and that
+ * changes the spacing but not the table, which stays the one the key-on's
+ * frequency picked. Step 279 went from 48 to 63: the half-tick already due
+ * came when it was due, 2 samples into the next core, and ticked, and then
+ * the register moved every 4 samples -- 63's spacing of 2 with 48's 0x55 --
+ * where a voice keyed on at 63 moves every 2. That one switch is all that
+ * is measured of it. */
 
 static const uint8_t NOISE_TABLE[4] = { 0x55, 0x75, 0x77, 0x7F };
 
@@ -614,6 +618,7 @@ static void noise_restart(sas_voice *v) {
     const uint32_t k = v->src.param >> 2;
     v->noise = 0;
     v->noise_j = 0;
+    v->noise_tbl = k >= 15 ? 0xFF : NOISE_TABLE[v->src.param & 3u];
     v->noise_cnt = k >= 15 ? 1 : noise_half(v->src.param) + 1;
 }
 
@@ -623,7 +628,7 @@ static void noise_advance(sas_voice *v) {
     v->noise_cnt = noise_half(v->src.param);
     const uint32_t j = v->noise_j;
     v->noise_j = (j + 1u) & 7u;
-    if ((v->src.param >> 2) < 15u && !((NOISE_TABLE[v->src.param & 3u] >> j) & 1u)) return;
+    if (!((v->noise_tbl >> j) & 1u)) return;
     const uint32_t n = v->noise;
     const uint32_t in = 1u ^ (((n >> 9) ^ (n >> 10) ^ (n >> 11) ^ (n >> 14)) & 1u);
     v->noise = (uint16_t)((n << 1) | in);
