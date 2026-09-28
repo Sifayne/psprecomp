@@ -502,7 +502,49 @@ static void test_displaced_thread_keeps_its_place(void) {
     CHECK(strcmp(q_order, "A0HA1B") == 0, "ran %s, expected A0HA1B", q_order);
 }
 
+/* Suspension is a flag over the wait, not a replacement for it (threadprobe
+ * steps 36, 52-54, fw 6.60): resuming a waiter leaves it waiting, a wake
+ * delivered while suspended completes the wait without running the thread,
+ * and a resume of a ready, more urgent thread says so, for the caller to
+ * switch to it. */
+static int s_wait_rc;
+
+static void body_s_waiter(void) {
+    s_wait_rc = psp_sched_block(psp_sched_current(), PSP_SCHED_BLOCKED, "test-suspend");
+    q_tag("W");
+}
+
+static void body_s_main(void) {
+    CHECK(psp_sched_suspend(UID_Q_A) == 1, "suspend of a waiter failed");
+    CHECK(psp_sched_resume(UID_Q_A) == 0, "resuming a waiter asked for a switch");
+    CHECK(psp_sched_state_of(UID_Q_A) == PSP_SCHED_BLOCKED,
+          "resuming a waiter ended its wait (state %d)", psp_sched_state_of(UID_Q_A));
+    psp_sched_suspend(UID_Q_A);
+    CHECK(psp_sched_wake(UID_Q_A) == 0, "a suspended thread counted as urgent");
+    CHECK(psp_sched_state_of(UID_Q_A) == PSP_SCHED_READY,
+          "a wake while suspended did not end the wait");
+    q_tag("M1");
+    psp_sched_yield();                     /* must come straight back */
+    CHECK(psp_sched_resume(UID_Q_A) == 1, "resuming a ready, more urgent thread "
+                                          "did not ask for a switch");
+    psp_sched_preempt();
+    q_tag("M2");
+}
+
+static void test_suspend_is_a_flag_over_the_wait(void) {
+    q_run(Q_ROTATE);
+    s_wait_rc = -99;
+    psp_sched_spawn(UID_Q_A, ENTRY_Q_C + 0x10, FAKE_SP, 0, 0, 0, 32);
+    psp_sched_spawn(UID_Q_B, ENTRY_Q_C + 0x20, FAKE_SP, 0, 0, 0, 48);
+    CHECK(psp_sched_drain(5) == 0, "threads still alive");
+    CHECK(strcmp(q_order, "M1WM2") == 0, "ran %s, expected M1WM2", q_order);
+    CHECK(s_wait_rc == PSP_SCHED_WOKEN, "the suspended waiter's wait returned %d",
+          s_wait_rc);
+}
+
 int main(void) {
+    psp_register(ENTRY_Q_C + 0x10, body_s_waiter);
+    psp_register(ENTRY_Q_C + 0x20, body_s_main);
     psp_register(ENTRY_Q_A,      body_q_a);
     psp_register(ENTRY_Q_B,      body_q_b);
     psp_register(ENTRY_Q_C,      body_q_c);
@@ -531,6 +573,7 @@ int main(void) {
     test_no_timeslice_between_equals();
     test_rotate_other_level();
     test_displaced_thread_keeps_its_place();
+    test_suspend_is_a_flag_over_the_wait();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

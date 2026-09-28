@@ -51,6 +51,15 @@ typedef struct {
     /* The counter value when the current wait began, which orders two waits
      * with the same deadline the way they were entered. */
     int64_t         park_seq;
+    /* sceKernelSuspendThread. A flag over the state, not a state: a thread
+     * suspended in a wait is still in that wait, and the wait can still end
+     * underneath it. threadprobe (fw 6.60) reports status 0x0C (WAITING |
+     * SUSPEND) with waitType and waitId intact for a suspended waiter (step
+     * 36); a suspended sleeper is still asleep after its resume (step 53,
+     * status 4); and one woken while suspended has had its wakeup delivered
+     * and reports 8, merely SUSPEND (step 54). So the handoff skips a flagged
+     * slot, and everything else treats it as whatever its state says. */
+    int             suspended;
     psp_cpu_state   ctx;           /* valid whenever this slot is not running */
     psp_os_thread   host;
     int             started;
@@ -176,7 +185,8 @@ static void ready_head_locked(int i) {
 }
 
 static int runnable(int i) {
-    return g_slot[i].used && g_slot[i].state == PSP_SCHED_READY;
+    return g_slot[i].used && g_slot[i].state == PSP_SCHED_READY &&
+           !g_slot[i].suspended;
 }
 
 /* Whether slot a runs before slot b: priority first, then queue position. */
@@ -708,8 +718,10 @@ static int wake_slot(uint32_t uid, int reason) {
         /* The token is not handed over here, because a waker usually has more
          * to do -- it may be releasing several waiters at once, and switching
          * part-way through would leave the rest for later. The caller is told
-         * instead, and switches when it is finished. */
-        urgent = g_running >= 0 && g_slot[s].priority < g_slot[g_running].priority;
+         * instead, and switches when it is finished. A suspended thread's wait
+         * ends all the same (threadprobe step 54), but it cannot run. */
+        urgent = !g_slot[s].suspended && g_running >= 0 &&
+                 g_slot[s].priority < g_slot[g_running].priority;
     }
     psp_os_unlock(&g_lock);
     return urgent;
@@ -749,6 +761,22 @@ static int await_turn_deadline_locked(int me, uint64_t deadline_ns) {
     }
     psp_cpu = g_slot[me].ctx;
     return 0;
+}
+
+/* One line per live thread: its state, whether it is suspended on top of it,
+ * and what it is parked on. `from` skips the main context. */
+static void dump_locked(FILE *out, int from) {
+    static const char *const ST[] = {
+        "ready", "running", "blocked", "sleeping", "dead" };
+    for (int i = from; i < MAX_SCHED_THREADS; i++) {
+        if (!g_slot[i].used || g_slot[i].state == PSP_SCHED_DEAD) continue;
+        fprintf(out, "    uid 0x%08X  entry 0x%08X  prio %d  %s%s%s%s\n",
+                g_slot[i].uid, g_slot[i].entry, g_slot[i].priority,
+                ST[g_slot[i].state],
+                g_slot[i].suspended ? " (suspended)" : "",
+                g_slot[i].waiting_on ? " on " : "",
+                g_slot[i].waiting_on ? g_slot[i].waiting_on : "");
+    }
 }
 
 static int live_locked(void) {
@@ -836,26 +864,10 @@ int psp_sched_drain(int timeout_s) {
          * lock is already held. */
         fprintf(stderr, "psprecomp: guest threads still running after %ds; "
                         "%d alive, not waiting further:\n", timeout_s, live);
-        for (int i = 0; i < MAX_SCHED_THREADS; i++) {
-            if (!g_slot[i].used || g_slot[i].state == PSP_SCHED_DEAD) continue;
-            static const char *const ST[] = {
-                "ready", "running", "blocked", "sleeping", "dead", "suspended" };
-            fprintf(stderr, "    uid 0x%08X  entry 0x%08X  prio %d  %s%s%s\n",
-                    g_slot[i].uid, g_slot[i].entry, g_slot[i].priority,
-                    ST[g_slot[i].state],
-                    g_slot[i].waiting_on ? " on " : "",
-                    g_slot[i].waiting_on ? g_slot[i].waiting_on : "");
-        }
+        dump_locked(stderr, 0);
     } else if (stalled && live) {
         fprintf(stderr, "psprecomp: deadlock -- %d thread(s) alive, none runnable:\n", live);
-        for (int i = 1; i < MAX_SCHED_THREADS; i++) {
-            if (!g_slot[i].used || g_slot[i].state == PSP_SCHED_DEAD) continue;
-            fprintf(stderr, "    uid 0x%08X  entry 0x%08X  %s%s%s\n",
-                    g_slot[i].uid, g_slot[i].entry,
-                    g_slot[i].state == PSP_SCHED_SLEEPING ? "sleeping" : "blocked",
-                    g_slot[i].waiting_on ? " on " : "",
-                    g_slot[i].waiting_on ? g_slot[i].waiting_on : "");
-        }
+        dump_locked(stderr, 1);
     }
 
     g_slot[MAIN_SLOT].state = PSP_SCHED_RUNNING;
@@ -870,16 +882,7 @@ int psp_sched_drain(int timeout_s) {
  * semaphore nobody is going to signal. */
 void psp_sched_dump_threads(FILE *out) {
     psp_os_lock(&g_lock);
-    for (int i = 0; i < MAX_SCHED_THREADS; i++) {
-        if (!g_slot[i].used || g_slot[i].state == PSP_SCHED_DEAD) continue;
-        static const char *const ST[] = {
-            "ready", "running", "blocked", "sleeping", "dead", "suspended" };
-        fprintf(out, "    uid 0x%08X  entry 0x%08X  prio %d  %s%s%s\n",
-                g_slot[i].uid, g_slot[i].entry, g_slot[i].priority,
-                ST[g_slot[i].state],
-                g_slot[i].waiting_on ? " on " : "",
-                g_slot[i].waiting_on ? g_slot[i].waiting_on : "");
-    }
+    dump_locked(out, 0);
     psp_os_unlock(&g_lock);
 }
 
@@ -960,23 +963,20 @@ int psp_sched_suspend(uint32_t uid) {
     psp_os_lock(&g_lock);
     const int s = slot_of(uid);
     if (s < 0) { psp_os_unlock(&g_lock); return 0; }
-    /* A thread that has finished stays finished. Marking a dead slot SUSPENDED
-     * puts it back in the live count, where nothing can ever clear it -- the
-     * drain then waits out its whole deadline for a thread that ended long ago,
-     * and the test it belongs to never flushes its output. */
+    /* A thread that has finished stays finished, and is not flagged. */
     if (g_slot[s].state == PSP_SCHED_DEAD) { psp_os_unlock(&g_lock); return 1; }
-    const int running = (s == g_running);
-    if (!running) {
-        /* Somebody else: mark it and let it stay off the ready scan. Whatever
-         * it was parked on is forgotten, because a resume is what restarts it
-         * and re-testing the old condition is the resumed thread's business. */
-        g_slot[s].state      = PSP_SCHED_SUSPENDED;
-        g_slot[s].waiting_on = NULL;
-        g_slot[s].wake_at    = 0;
-    }
+    /* The flag and nothing else. The wait it may be in -- what it is parked
+     * on, its deadline, its place in the object's queue -- is left alone,
+     * because on hardware it is still in that wait (threadprobe steps 36, 53;
+     * see sched_slot.suspended). This used to replace the wait with a
+     * SUSPENDED state and forget it, so a resume ended a sleep that only a
+     * wakeup should have. */
+    g_slot[s].suspended = 1;
+    const int running = (s == g_running && s == g_self);
     psp_os_unlock(&g_lock);
-    /* Ourselves: give up the token and do not come back until resumed. */
-    if (running) (void)switch_away(s, PSP_SCHED_SUSPENDED, "sceKernelSuspendThread", 0);
+    /* Ourselves (sceKernelSuspendThread refuses this, so only the runtime can
+     * ask): stay READY, and the handoff will not pick us until resumed. */
+    if (running) yield_as(0);
     return 1;
 }
 
@@ -984,13 +984,21 @@ int psp_sched_resume(uint32_t uid) {
     if (!g_threading) return 0;
     psp_os_lock(&g_lock);
     const int s = slot_of(uid);
-    if (s < 0) { psp_os_unlock(&g_lock); return 0; }
-    if (g_slot[s].state == PSP_SCHED_SUSPENDED) {
-        ready_tail_locked(s, psp_clock_peek());
-        g_slot[s].woken = 1;
+    int urgent = 0;
+    if (s >= 0 && g_slot[s].suspended) {
+        g_slot[s].suspended = 0;
+        /* Back into its ready queue at the tail, if its wait is over (or it
+         * never had one); still waiting otherwise. Resuming a more urgent
+         * thread runs it inside the call (threadprobe steps 52 and 54: `m1 W
+         * m2`, `m2 Ws m3`), which the caller does with the answer. */
+        if (g_slot[s].state == PSP_SCHED_READY) {
+            ready_tail_locked(s, psp_clock_peek());
+            urgent = g_running >= 0 &&
+                     g_slot[s].priority < g_slot[g_running].priority;
+        }
     }
     psp_os_unlock(&g_lock);
-    return 1;
+    return urgent;
 }
 
 psp_sched_state psp_sched_state_of(uint32_t uid) {

@@ -48,7 +48,8 @@
 #define MAX_CBS     2048
 #define UID_BASE    0x00040000u
 
-enum { TH_DORMANT = 0, TH_READY, TH_RUNNING, TH_SUSPENDED };
+/* Suspension is not among these: it is a flag over them (psp_thread.suspended). */
+enum { TH_DORMANT = 0, TH_READY, TH_RUNNING };
 enum { WAIT_NONE = 0, WAIT_SLEEP, WAIT_DELAY };
 
 /* What sceKernelReferThreadStatus reports in its `status` field. These are the
@@ -85,6 +86,10 @@ typedef struct {
      * them as different types -- so the distinction has to be kept here, where
      * the difference was made. */
     int      wait_kind;
+    /* sceKernelSuspendThread, as a flag over the thread's state rather than a
+     * state of its own: a suspended waiter is still waiting (threadprobe steps
+     * 36, 53, 54, fw 6.60). See sched_slot.suspended. */
+    int      suspended;
     /* Parked in a wait whose name ends in CB, and woken by a notify rather than
      * by what it was actually waiting for. A CB wait is not "deliver callbacks
      * on the way in": a notify raised by another thread ends the wait long
@@ -593,6 +598,7 @@ static void hle_DelayThread(void) {
 static void thread_ended(psp_thread *t, uint32_t status) {
     t->exit_status = status;
     t->state       = TH_DORMANT;
+    t->suspended   = 0;
     psp_kernobj_thread_ended(t->uid);
     psp_kernlock_thread_ended(t->uid);
     for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++)
@@ -736,9 +742,10 @@ static void hle_SuspendThread(void) {
     psp_thread *t = find_thread(id);
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
     /* Never started, or already finished. */
-    if (t->state == TH_DORMANT)   { psp_ret(SCE_KERNEL_ERROR_DORMANT); return; }
-    if (t->state == TH_SUSPENDED) { psp_ret(SCE_KERNEL_ERROR_SUSPEND); return; }
-    t->state = TH_SUSPENDED;
+    if (t->state == TH_DORMANT) { psp_ret(SCE_KERNEL_ERROR_DORMANT); return; }
+    if (t->suspended)           { psp_ret(SCE_KERNEL_ERROR_SUSPEND); return; }
+    /* A flag, and whatever wait the thread is in carries on underneath it. */
+    t->suspended = 1;
     psp_sched_suspend(t->uid);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -753,10 +760,15 @@ static void hle_ResumeThread(void) {
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
     /* Resuming anything that is not suspended is an error, including a thread
      * that is merely ready -- the call is not idempotent. */
-    if (t->state != TH_SUSPENDED) { psp_ret(SCE_KERNEL_ERROR_NOT_SUSPEND); return; }
-    t->state = TH_READY;
-    psp_sched_resume(t->uid);
+    if (!t->suspended) { psp_ret(SCE_KERNEL_ERROR_NOT_SUSPEND); return; }
+    t->suspended = 0;
+    /* A reschedule point: a resumed thread that is ready and outranks the
+     * caller runs inside the call (threadprobe steps 52 and 54, fw 6.60: `m1 W
+     * m2` and `m2 Ws m3`). One still in its wait stays there -- a resumed
+     * sleeper sleeps on until woken (step 53). */
+    const int urgent = psp_sched_resume(t->uid);
     psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_preempt();
 }
 
 static void hle_ChangeThreadPriority(void) {
@@ -826,18 +838,45 @@ static void hle_SleepThread(void) {
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
-    /* Woken by name, so the wakeup this consumed is spent. */
+    /* Woken by name. The wakeup went straight to this sleep and was never
+     * banked, so there is nothing to take off the count. */
     t = current_thread();
     if (t) t->wait_kind = WAIT_NONE;
-    if (t && t->wakeup_count > 0) t->wakeup_count--;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Wake a thread in sceKernelSleepThread, or bank the wakeup for its next one.
+ *
+ * threadprobe (fw 6.60): 0 and the caller's own id are ILLEGAL_THID, checked
+ * before the id is looked up (steps 29, 68, 69) -- a thread cannot bank a
+ * wakeup for itself, so main's SleepThread in step 68 really sleeps. A thread
+ * that was never started, or has finished, is DORMANT (steps 30, 37).
+ *
+ * A wakeup reaches a sleeper directly and is not counted: step 54 wakes a
+ * suspended sleeper and reads `wakeup=0` before it has run again. Only a
+ * thread that is not asleep has one banked. Any other wait (a delay, a
+ * semaphore) is not ended by a wakeup; it is banked like the rest. */
 static void hle_WakeupThread(void) {
-    psp_thread *t = find_thread(psp_arg(0));
+    const uint32_t id = psp_arg(0);
+    if (id == 0 || id == psp_sched_current()) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
+        return;
+    }
+    psp_thread *t = find_thread(id);
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
-    t->wakeup_count++;
-    const int urgent = psp_sched_wake(t->uid);
+    if (!t->ever_started || t->state == TH_DORMANT) {
+        psp_ret(SCE_KERNEL_ERROR_DORMANT);
+        return;
+    }
+    int urgent = 0;
+    if (t->wait_kind == WAIT_SLEEP) {
+        /* Delivered: the sleep is over, and a second wakeup before the thread
+         * runs again banks rather than landing on a sleep that has ended. */
+        t->wait_kind = WAIT_NONE;
+        urgent = psp_sched_wake(t->uid);
+    } else {
+        t->wakeup_count++;
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_preempt();
 }
@@ -1852,15 +1891,20 @@ static void hle_ReferThreadStatus(void) {
             case PSP_SCHED_READY:     status = PSP_THREAD_STATUS_READY;   break;
             case PSP_SCHED_BLOCKED:
             case PSP_SCHED_SLEEPING:  status = PSP_THREAD_STATUS_WAITING; break;
-            case PSP_SCHED_SUSPENDED: status = PSP_THREAD_STATUS_SUSPEND; break;
             /* No live slot: threading is off, or it was never spawned. Fall
              * back to what this file knows. */
             case PSP_SCHED_DEAD:
-                status = t->state == TH_RUNNING   ? PSP_THREAD_STATUS_RUNNING
-                       : t->state == TH_SUSPENDED ? PSP_THREAD_STATUS_SUSPEND
-                                                  : PSP_THREAD_STATUS_READY;
+                status = t->state == TH_RUNNING ? PSP_THREAD_STATUS_RUNNING
+                                                : PSP_THREAD_STATUS_READY;
                 break;
         }
+        /* Suspension sits on top: WAITING|SUSPEND (0x0C) for a suspended
+         * waiter, and SUSPEND alone -- not READY|SUSPEND -- once its wait is
+         * over or when it had none (threadprobe steps 36, 53, 54, fw 6.60). */
+        if (t->suspended)
+            status = status == PSP_THREAD_STATUS_WAITING
+                   ? (PSP_THREAD_STATUS_WAITING | PSP_THREAD_STATUS_SUSPEND)
+                   : PSP_THREAD_STATUS_SUSPEND;
     }
 
     /* Three different answers for `exitStatus`, and none of them is zero:
@@ -1922,7 +1966,7 @@ static int thread_matches(const psp_thread *t, int type) {
     switch (type) {
         case PSP_TMID_THREAD:    return 1;
         case PSP_TMID_DORMANT:   return dormant;
-        case PSP_TMID_SUSPENDED: return !dormant && t->state == TH_SUSPENDED;
+        case PSP_TMID_SUSPENDED: return !dormant && t->suspended;
         case PSP_TMID_SLEEPING:  return !dormant && t->wait_kind == WAIT_SLEEP;
         case PSP_TMID_DELAYING:  return !dormant && t->wait_kind == WAIT_DELAY;
         default:                 return 0;
@@ -2019,6 +2063,9 @@ uint32_t psp_threadman_notify_callback(uint32_t cbid, uint32_t arg) {
     psp_thread *owner = find_thread(c->thread);
     if (owner && owner->cb_wait) {
         owner->cb_wake = 1;
+        /* Its sleep is interrupted, so a wakeup that arrives before it parks
+         * again is banked rather than delivered to a sleep that has ended. */
+        owner->wait_kind = WAIT_NONE;
         psp_sched_wake(owner->uid);
     }
     return SCE_KERNEL_ERROR_OK;
@@ -2215,7 +2262,7 @@ static void hle_SleepThreadCB(void) {
         }
         /* Woken to deliver, not woken by name: run the handler and park again. */
         if (t && t->cb_wake) { t->cb_wake = 0; continue; }
-        if (t && t->wakeup_count > 0) t->wakeup_count--;
+        /* Woken by name, directly; see hle_WakeupThread. */
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }

@@ -47,9 +47,8 @@ typedef enum {
     PSP_SCHED_BLOCKED,     /* waiting on a kernel object */
     PSP_SCHED_SLEEPING,    /* a deadline, or an explicit wakeup */
     PSP_SCHED_DEAD,
-    /* sceKernelSuspendThread. Distinct from blocked: nothing it is waiting for
-     * can release it, only sceKernelResumeThread, so a signal must not. */
-    PSP_SCHED_SUSPENDED,
+    /* There is no SUSPENDED state: suspension is a flag over any of the
+     * above (see psp_sched_suspend). */
 } psp_sched_state;
 
 void psp_sched_init(void);
@@ -273,11 +272,15 @@ void psp_sched_set_priority(uint32_t uid, int priority);
 
 /* Suspend and resume, which are not block and wake.
  *
- * A suspended thread is waiting for nothing, so nothing it was parked on may
- * release it -- only a resume. Suspending the *running* thread gives up the
- * token, so this does not return until something resumes it.
+ * Suspension is a flag on top of whatever the thread is doing. A suspended
+ * thread that is waiting stays in its wait, and the wait can still end -- a
+ * wakeup, a signal or a deadline completes it -- but the thread does not run
+ * until it is resumed (threadprobe steps 36, 53, 54, fw 6.60). Resuming does
+ * not end a wait either.
  *
- * Returns 1 if the thread existed. */
+ * suspend returns 1 if the thread existed. resume returns 1 when the resumed
+ * thread is ready to run and outranks the caller: resuming is a reschedule
+ * point (steps 52, 54), and the caller should psp_sched_preempt. */
 int  psp_sched_suspend(uint32_t uid);
 int  psp_sched_resume(uint32_t uid);
 
