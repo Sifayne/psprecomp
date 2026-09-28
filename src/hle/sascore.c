@@ -150,7 +150,8 @@ static int curve_ok(uint32_t mode, int phase_is_attack, int phase_is_sustain) {
  * a 16-byte block at a time; __sceSasSetVoicePCM hands it raw signed 16-bit
  * samples, which are read as they are. The game uses both -- its menu sounds
  * are VAG and its voice clips PCM -- and the PCM path was missing entirely,
- * so those voices were silent. */
+ * so those voices were silent. __sceSasSetNoise and the two wave calls make
+ * the voice a generator instead. */
 enum { SRC_NONE = 0, SRC_VAG, SRC_PCM, SRC_NOISE, SRC_STEEP, SRC_TRIANGLE };
 typedef struct {
     int      kind;
@@ -187,13 +188,13 @@ typedef struct {
     int      vag_cur_ok;    /* 0 once the window has run past the stream */
     int      vag_nxt_state; /* VAG_NXT_* */
 
-    uint32_t pitch;         /* 0x1000 == 1.0 */
+    uint32_t pitch;         /* 0x1000 == 1.0; a wave's frequency in Hz */
     uint32_t frac;          /* resampling accumulator, 12-bit fraction */
 
     int32_t  vol_l, vol_r;      /* 0x1000 == unity */
     int32_t  vol_el, vol_er;    /* the two reverb sends, same scale */
     int      env_state;
-    int32_t  env;           /* 0 .. 0x40000000 */
+    int32_t  env;           /* 0 .. 0x40000000; a direct decay may hold it higher */
     int32_t  attack_rate, decay_rate, sustain_level, release_rate;
     /* The sustain phase runs its own curve at its own rate, like the other
      * three: sasprobe's sustain sweeps (steps 113-119, fw 6.60) climb and
@@ -979,7 +980,7 @@ static void hle_SetADSRmode(void) {
     if ((flags & 8) && !curve_ok(r,  0, 0)) { psp_ret(SAS_ERROR_ADSR_MODE); return; }
     if (flags & 1) v->mode_attack  = a & 7u;
     if (flags & 2) v->mode_decay   = d & 7u;
-    if (flags & 4) v->mode_sustain = su & 7u;   /* stored; the shapes are findings item 45 */
+    if (flags & 4) v->mode_sustain = su & 7u;
     if (flags & 8) v->mode_release = r & 7u;
     mirror_adsr(v);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -1150,9 +1151,9 @@ static void hle_GetAllEnvelopeHeights(void) {
 /* `mix_l`/`mix_r` scale what is already in the buffer, not what is rendered
  * into it: outputmode.expected's mix sections pass 0 for both and get the
  * rendered samples back unchanged, which is only possible if the zero applies
- * to the other side. Zero is the only pair the corpus passes, so the scale
- * itself -- 12-bit, as everywhere else here -- is by analogy with the voice
- * volumes rather than measured. */
+ * to the other side. The scale is 12-bit, as everywhere else here: firmware
+ * 6.60 turns a buffer of 1000/-2000 into 500/-500 at 0x800/0x400, and adds a
+ * voice of 2000 to it to make 2500/1000 at 0x800 (sasprobe steps 207-208). */
 static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_r) {
     int64_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN], el[SAS_MAX_GRAIN], er[SAS_MAX_GRAIN];
     const uint32_t n = g_grain;
