@@ -462,8 +462,10 @@ static void step_envelope(sas_voice *v) {
  * sasprobe's PCM and pitch captures (steps 172-191, fw 6.60) pin it: at
  * 0x800 a ramp of 4, 8, 12 ... plays 0 10 8 14 12 18, which no nearest-sample
  * fetch gives, and the eleven pitch_*.bin captures, pitch_change.bin and the
- * six pcm_loop_* ones come out exact. The rounding is measured on rising
- * slopes only; a falling slope rounds up here too, which is not measured.
+ * six pcm_loop_* ones come out exact. A falling slope rounds up too, toward
+ * the earlier sample: at pitch 0x100 a ramp stepping down by 4 plays 96 96
+ * 96 95 95 95 95 94, where rounding down would reach 95 a sample after 96
+ * (sasprobe 3 step 201, fw 6.60; pitch_0100_fall.bin exact).
  *
  * The two kinds differ in three ways, all measured:
  *   - A PCM voice's pitch stops at 0x1000: 0x1800, 0x2000 and 0x4000 play
@@ -847,8 +849,9 @@ static void pause_fade(int64_t *const mix[4], const sas_voice *v, uint32_t sampl
  *
  * All 32 of them, whatever __sceSasInit's voice count said: with a count of
  * 8, a voice 8 keyed on is heard and its height climbs like voice 7's
- * (sasprobe step 16, fw 6.60). Whether a count of 1 still renders voice 31
- * is not measured. */
+ * (sasprobe step 16, fw 6.60), and with a count of 1, voices 0, 8, 16 and 31
+ * all play -- constants 1, 10, 100 and 4096 sum to 4207 -- and report
+ * height 0x40000000 and not ended (sasprobe 3 step 17). */
 static void render(int64_t *mix_l, int64_t *mix_r, int64_t *mix_el, int64_t *mix_er,
                    uint32_t samples) {
     memset(mix_l,  0, samples * sizeof *mix_l);
@@ -1003,9 +1006,12 @@ static void hle_SetVoice(void) {
      * everything else, -1 included, with the same code that call uses for a
      * bad position. */
     if (psp_arg(4) > 1u) { psp_ret(SAS_ERROR_LOOP_POS); return; }
-    /* Played from the next key-on, not now (see sas_voice). Whether the old
-     * stream picks up the new size or loop mode at its own loop point is not
-     * measured. */
+    /* Played from the next key-on, not now (see sas_voice). The old stream
+     * does not take up the new size or loop mode at its own loop point
+     * either: after a SetVoice to a 2-block one-shot, a 4-block loop goes
+     * on through its loop point five more times until a KeyOff and KeyOn two
+     * cores later, which fade it out and then play the new blocks once
+     * (sasprobe 3 step 179, fw 6.60; step 188 is the same for SetVoicePCM). */
     v->next.kind = SRC_VAG;
     v->next.addr = psp_arg(2);
     v->next.size = size;
