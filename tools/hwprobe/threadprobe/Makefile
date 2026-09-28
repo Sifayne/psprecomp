@@ -12,6 +12,6 @@ LDFLAGS =
 # psprtc comes in with the default libraries.
 LIBS = -lpsppower
 EXTRA_TARGETS = EBOOT.PBP
-PSP_EBOOT_TITLE = Thread probe
+PSP_EBOOT_TITLE = Thread probe v$(shell sed -n 's/^.define PROBE_VERSION //p' main.c)
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak
