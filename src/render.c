@@ -679,38 +679,44 @@ static uint32_t clamp255(int v) { return v < 0 ? 0u : (v > 255 ? 255u : (uint32_
 
 /* One blend term: a channel scaled by its factor.
  *
- * gpu/commands/blend draws 64 boxes -- every factor against a fixed zero,
- * the doubling variants over a spread of alphas, every equation -- and reads
- * the pixel back. The arithmetic that reproduces all 192 channel values is
+ * geprobe step 11 (fw 6.60) blends three source colours over a gradient under
+ * twelve factor and equation pairs, and one rule reproduces all of its
+ * 130560 pixels:
  *
- *     term = ((c + 1) * f) >> 8
+ *     term = ((2c + 1) * (2|f| + 1)) >> 10, negated when f < 0
  *
- * and no divide by 255 does: "Zero + Inverse src alpha" wants 28 from 64 x 111
- * (exact 27.86) while "Inverse src alpha + Zero" wants 55 from 128 x 111
- * (exact 55.72), which no single rounding of c*f/255 gives and this does.
- * The doubling factors are twice the plain term, clamped -- 0xFF707070 under
- * double source alpha reads 0xE0, exactly 2x, so the factor is not saturated
- * at 255 as this used to do -- and the inverse-doubling ones take 255 - 2a,
- * clamped at zero, as an ordinary factor: 0x40808080 reads 0x3F, 0x7FFFFFFF
- * reads 0x01, and anything with alpha at 0x80 or above reads black. */
-static uint32_t blend_term(uint32_t c, uint32_t f) { return ((c + 1u) * f) >> 8; }
+ * with c and f in 0..255 units. The ((c + 1) * f) >> 8 this used before came
+ * from gpu/commands/blend's 192 channel values, which this rule also gives
+ * ("Zero + Inverse src alpha" 28 from 64 x 111, "Inverse src alpha + Zero" 55
+ * from 128 x 111); on step 11's own inputs it is wrong on up to a third of the
+ * samples of a row -- FIX 0x80 over FIX 0x80 with s = 64, d = 5 is 34, not 35.
+ *
+ * The doubled factors are neither clamped nor floored at zero. Double alpha
+ * is 2a, up to 510 (0xFF707070 reads 0xE0, as before), and one minus double
+ * alpha is 255 - 2a, signed: step 11's row 5, source 0x80C08040 at alpha
+ * 0x80, reads B = 191 over a destination B of 171 and up, which is
+ * 192 - T(d, -1), where a factor clamped at zero leaves 192. */
+static int blend_term(int c, int f) {
+    const int m = ((2 * c + 1) * (2 * (f < 0 ? -f : f) + 1)) >> 10;
+    return f < 0 ? -m : m;
+}
 
-static uint32_t blend_scaled(int code, int i, uint32_t src, uint32_t dst, int is_src) {
-    const uint32_t c = is_src ? chan(src, i) : chan(dst, i);
-    const uint32_t sa = chan(src, 3), da = chan(dst, 3);
-    uint32_t v;
+static int blend_scaled(int code, int i, uint32_t src, uint32_t dst, int is_src) {
+    const int c = (int)(is_src ? chan(src, i) : chan(dst, i));
+    const int other = (int)(is_src ? chan(dst, i) : chan(src, i));
+    const int sa = (int)chan(src, 3), da = (int)chan(dst, 3);
     switch (code) {
-    case 0:  return blend_term(c, is_src ? chan(dst, i) : chan(src, i));
-    case 1:  return blend_term(c, 255u - (is_src ? chan(dst, i) : chan(src, i)));
+    case 0:  return blend_term(c, other);
+    case 1:  return blend_term(c, 255 - other);
     case 2:  return blend_term(c, sa);
-    case 3:  return blend_term(c, 255u - sa);
+    case 3:  return blend_term(c, 255 - sa);
     case 4:  return blend_term(c, da);
-    case 5:  return blend_term(c, 255u - da);
-    case 6:  v = 2u * blend_term(c, sa); return v > 255u ? 255u : v;
-    case 7:  return blend_term(c, sa >= 128u ? 0u : 255u - 2u * sa);
-    case 8:  v = 2u * blend_term(c, da); return v > 255u ? 255u : v;
-    case 9:  return blend_term(c, da >= 128u ? 0u : 255u - 2u * da);
-    default: return blend_term(c, chan(is_src ? g_bs.fixa : g_bs.fixb, i));
+    case 5:  return blend_term(c, 255 - da);
+    case 6:  return blend_term(c, 2 * sa);
+    case 7:  return blend_term(c, 255 - 2 * sa);
+    case 8:  return blend_term(c, 2 * da);
+    case 9:  return blend_term(c, 255 - 2 * da);
+    default: return blend_term(c, (int)chan(is_src ? g_bs.fixa : g_bs.fixb, i));
     }
 }
 
@@ -718,8 +724,8 @@ static uint32_t blend(uint32_t src, uint32_t dst) {
     uint32_t out = 0;
     for (int i = 0; i < 4; i++) {
         const int s = (int)chan(src, i), d = (int)chan(dst, i);
-        const int ss = (int)blend_scaled(g_bs.src, i, src, dst, 1);
-        const int dd = (int)blend_scaled(g_bs.dst, i, src, dst, 0);
+        const int ss = blend_scaled(g_bs.src, i, src, dst, 1);
+        const int dd = blend_scaled(g_bs.dst, i, src, dst, 0);
         int v;
         switch (g_bs.eq) {
         case 1:  v = ss - dd; break;

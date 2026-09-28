@@ -1179,6 +1179,30 @@ static void test_hardware_dither(void) {
           pixel(12, 212), pixel(13, 212), pixel(12, 213), pixel(13, 214));
 }
 
+/* Blend arithmetic on geprobe step 11's inputs (fw 6.60): a one-pixel sprite
+ * over a destination written straight into the framebuffer. */
+static uint32_t blend_one(uint32_t dst, uint32_t src, uint32_t mode, uint32_t fixa, uint32_t fixb) {
+    psp_ge_reset(); clear_fb();
+    psp_write32(FB + (uint32_t)(20 * 480 + 20) * 4, dst);
+    begin_list();
+    vertex(0, 20, 20, src); vertex(1, 21, 21, src);
+    cmd(0x21, 1); cmd(0xDF, mode); cmd(0xE0, fixa); cmd(0xE1, fixb);
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    return pixel(20, 20);
+}
+
+static void test_hardware_blend(void) {
+    /* FIX 0x80 + FIX 0x80: 64 over 5 is 34 (((c + 1) * f) >> 8 said 35). */
+    uint32_t p = blend_one(0x05, 0xFF000040, 10 | 10 << 4, 0x808080, 0x808080);
+    CHECK((p & 0xFF) == 34, "FIX/FIX 64 over 5: %u, hardware 34", p & 0xFF);
+    /* DOUBLE_SRC_ALPHA / ONE_MINUS_DOUBLE_SRC_ALPHA at alpha 0x80: the
+     * destination factor is -1, so B 0xC0 over B 171 reads 191, over 170 192. */
+    p = blend_one(0x00AB0000, 0x80C08040, 6 | 7 << 4, 0, 0);
+    CHECK((p >> 16) == 191, "negative doubled factor subtracts: B %u, hardware 191", p >> 16);
+    p = blend_one(0x00AA0000, 0x80C08040, 6 | 7 << 4, 0, 0);
+    CHECK((p >> 16) == 192, "negative doubled factor on 170: B %u, hardware 192", p >> 16);
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -1214,6 +1238,7 @@ int main(void) {
     test_line_interpolation_and_clipping();
     test_hardware_shading();
     test_hardware_dither();
+    test_hardware_blend();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);
