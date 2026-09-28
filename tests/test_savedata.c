@@ -27,6 +27,10 @@ static void setup(unsigned mode,const char *name,const char *value) {
     psp_write32(p+116,data); psp_write32(p+120,64); psp_write32(p+124,(uint32_t)strlen(value)+1);
     str(p+128,"Test game"); str(p+256,value); str(p+384,"Pilot name\nAC name\nMission progress");
     psp_write32(p+1480,8); str(data,value);
+    /* A game key (saveprobe's key A, 00..0F) at secureVersion 0: fw 6.60
+     * refuses a SAVE-family request with the zero key there (saveprobe
+     * step 1), so a 1536-byte block that saves carries one. */
+    for (unsigned i=0;i<16;i++) psp_write8(p+1500+i,(uint8_t)i);
 }
 static void start(void) {
     assert(call(0x50C4CD57,p)==0);
@@ -327,6 +331,7 @@ static uint32_t load(const char *save,char which,unsigned version) {
     return run();
 }
 static void fw660_keys(void) {
+    unsigned char b0[8192];
     /* secureVersion 0 (A0 ... A0LEN1000, steps 5-36) and 2 (A2, 60-63):
      * the right key loads, another is LOAD_DATA_BROKEN, the zero key
      * LOAD_BAD_PARAMS; a refused load leaves dataSize alone. */
@@ -345,11 +350,15 @@ static void fw660_keys(void) {
     /* The existence checks come first: a zero key on a missing save is
      * LOAD_NO_DATA (steps 2-4, 47). */
     assert(load("HWNOSUCH",'0',0)==0x80110307u);
-    /* The save side is held back (one step, P1), so what saves with the zero
-     * key loads with it; another key is still refused. */
-    hw(1,"HWZERO","zero"); key('0',0); assert(run()==0);
-    assert(load("HWZERO",'0',0)==0 && psp_read8(data)=='z');
-    assert(load("HWZERO",'A',0)==0x80110306u);
+    /* The save side: AUTOSAVE with the zero key is SAVE_BAD_PARAMS and
+     * writes nothing (PLAIN, PLAINEND, PLAIN660: steps 1, 112, 115), except
+     * at secureVersion 1, which saves and loads with it (PLAINV1, 75-76). */
+    hw(1,"HWZERO","zero"); key('0',0); assert(run()==0x80110388u);
+    assert(card_file("HWZERO","PARAM.SFO",b0,sizeof b0)<0 && load("HWZERO",'0',0)==0x80110307u);
+    hw(1,"HWZERO","zero"); key('0',1); assert(run()==0);
+    assert(load("HWZERO",'0',1)==0 && psp_read8(data)=='z');
+    /* MAKEDATA takes the zero key at secureVersion 0 (DPLAIN, step 40). */
+    hw(14,"HWZPLAIN","zp"); key('0',0); assert(run()==0);
     /* The rules are for secure files: a MAKEDATA save loads with any key. */
     assert(load("HWPLAIN",'0',0)==0 && load("HWPLAIN",'B',0)==0);
     /* A block without key fields (SDK before 2.00) is not checked. */
@@ -403,7 +412,7 @@ static void fw660_list(void) {
     assert(list_of("HWKEY?")==2 && psp_read32(ents)==0x11FFu);
     assert(!strcmp((const char *)psp_mem_ptr(ents+52,20),"HWKEY1"));
     assert(!strcmp((const char *)psp_mem_ptr(ents+72+52,20),"HWKEY3"));
-    assert(list_of("HWSFO")==1 && list_of("HW*")==8 && list_of("*")>=12 && list_of("*1")==2);
+    assert(list_of("HWSFO")==1 && list_of("HW*")==9 && list_of("*")>=12 && list_of("*1")==2);
 }
 int main(void) {
 #ifndef _WIN32

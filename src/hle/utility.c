@@ -142,6 +142,7 @@ static void savedata_log(uint32_t param) {
 #define SD_LOAD_BROKEN     0x80110306u   /* LOAD_DATA_BROKEN */
 #define SD_LOAD_BAD_PARAMS 0x80110308u   /* LOAD_BAD_PARAMS */
 #define SD_RW_BROKEN       0x80110326u   /* RW_DATA_BROKEN */
+#define SD_SAVE_BAD_PARAMS 0x80110388u   /* SAVE_BAD_PARAMS */
 #define SD_LOAD_ACCESS     0x80110305u   /* LOAD_ACCESS_ERROR: read failed */
 #define SD_SAVE_ACCESS     0x80110385u   /* SAVE_ACCESS_ERROR: write, list */
 #define SD_DELETE_ACCESS   0x80110345u   /* DELETE_ACCESS_ERROR */
@@ -431,27 +432,39 @@ static int sd_mode_secure(uint32_t mode) {
            mode == SD_MAKEDATASECURE || mode == SD_WRITEDATASECURE;
 }
 
+/* The zero-key rule: a 1536-byte request whose key is all zero is refused
+ * unless its secureVersion is 1. Firmware 6.60 applies it on both sides:
+ *   - AUTOSAVE answers SAVE_BAD_PARAMS and writes nothing, first thing in a
+ *     run and late in one (saveprobe steps 1 and 112) and after
+ *     sceKernelSetCompiledSdkVersion660 (step 115), while the same request
+ *     at secureVersion 1 saves (step 75, PLAINV1);
+ *   - the LOAD family answers LOAD_BAD_PARAMS (A0..A3: steps 8, 12 ... 36,
+ *     63 and 67; A1 and PLAINV1 open with it, steps 59 and 76).
+ * Measured at secureVersion 0 on the save side and at 0, 2 and 3 on the
+ * load side; the save side at 2 and 3 follows the load side. The short
+ * blocks carry no key and are never refused (steps 108-111). */
+static int sd_zero_key(uint32_t param) {
+    uint8_t key[16], zero[16] = {0};
+    if (!sd_request_key(param, key)) return 0;
+    return !memcmp(key, zero, 16) && psp_read32(param + SD_SECURE_VERSION) != 1;
+}
+
 /* The LOAD family's key and secureVersion rules for a secure data file, as
  * a PSP on firmware 6.60 applies them to a 1536-byte block (saveprobe,
  * steps 5-36 and 56-67):
  *   - an all-zero key gives LOAD_BAD_PARAMS unless the request's
- *     secureVersion is 1 (A0..A3: steps 8, 12 ... 36, 63 and 67; A1 opens
- *     with it, step 59). It comes after the existence checks: a zero key on
- *     a missing save still reads LOAD_NO_DATA (steps 2-4, 47);
+ *     secureVersion is 1 (sd_zero_key). It comes after the existence
+ *     checks: a zero key on a missing save still reads LOAD_NO_DATA (steps
+ *     2-4, 47);
  *   - a save whose SAVEDATA_PARAMS flags carry 0x20 (secureVersion 0 or 2)
  *     opens only with the key that made it, else LOAD_DATA_BROKEN (steps 7,
  *     11 ... 35, 62). Flags 0x01 saves (secureVersion 1 or 3) open with any
  *     key (steps 58, 66). That the stored flags decide, not the request's
  *     secureVersion, is an assumption: every probe load reused the save's.
- * The save side is not applied: hardware refused one zero-key AUTOSAVE at
- * secureVersion 0 (step 1, SAVE_BAD_PARAMS), but that rests on one step and
- * a false positive would stop a game saving. So a save psprecomp let through
- * with the zero key must load with it too: the zero-key rule skips a save
- * whose tag is the zero key's.
  * The key is compared through the file's tag (sd_key_tag); a MAC slot
  * without one (a PSP's own save, or a short block's) is not checked. */
 static uint32_t sd_load_key_check(uint32_t param, const char *dir, const char *file) {
-    uint8_t key[16], tag[16], zero[16] = {0}, ztag[16];
+    uint8_t key[16], tag[16];
     if (!sd_request_key(param, key)) return SD_OK;
     static sd_sfo_state st;
     sd_sfo_read_state(dir, &st);
@@ -460,10 +473,7 @@ static uint32_t sd_load_key_check(uint32_t param, const char *dir, const char *f
     const uint8_t *mac = st.files + (uint32_t)at * 32u + 13;
     int tagged = !memcmp(mac, "PRCP", 4);
     sd_key_tag(key, tag);
-    sd_key_tag(zero, ztag);
-    if (!memcmp(key, zero, 16) && psp_read32(param + SD_SECURE_VERSION) != 1 &&
-        !(tagged && !memcmp(mac, ztag, 16)))
-        return SD_LOAD_BAD_PARAMS;
+    if (sd_zero_key(param)) return SD_LOAD_BAD_PARAMS;
     if ((st.params[0] & SD_FLAG_GAMEKEY) && tagged && memcmp(mac, tag, 16))
         return SD_LOAD_BROKEN;
     return SD_OK;
@@ -912,6 +922,12 @@ static uint32_t sd_do_mode(uint32_t param) {
          * free list entry, else the first entry (AUTOSAVE flow, matching the
          * suite: ABC free beats F1/M2/L3). */
         const char *target = save;
+        /* The SAVE family refuses the zero key before it writes anything
+         * (sd_zero_key; saveprobe steps 1, 112 and 115 leave no directory).
+         * MAKEDATA takes it: DPLAIN was made and written with the zero key at
+         * secureVersion 0 (steps 40-41). */
+        if ((mode == SD_AUTOSAVE || mode == SD_SAVE || mode == SD_LISTSAVE) && sd_zero_key(param))
+            return SD_SAVE_BAD_PARAMS;
         sd_dir(game, save, dir, sizeof dir);
         if (mode == SD_AUTOSAVE && save[0] && sd_exists(dir)) {
             uint32_t list = psp_read32(param + SD_SAVENAMELIST);
