@@ -1130,7 +1130,8 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  *
  * vsin, vcos, vasin, vexp2, vlog2, vrcp, vsqrt, vrsq and their negated forms
  * are the PSP's own fixed-point algorithms, not libm. What vfpuprobe measured
- * over 26,800 inputs per op (steps 2-12, fw 6.60), and what is reproduced:
+ * over 26,800 inputs per op (steps 2-12, fw 6.60) and v3's dumps of each core
+ * (steps 193-200, every 3rd, 5th or 7th argument), and what is reproduced:
  *
  *   - every result is *truncated* to a 22-bit significand -- the low two
  *     mantissa bits are clear -- and one below 2^-126 is 0; an operand whose
@@ -1145,19 +1146,21 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  *   - vasin is piecewise quadratic over 128 segments of [0,1], exact at the
  *     knots; the coefficients below are fitted to the hardware's dense grid.
  *     |x| > 1 is 7F800001 with x's sign;
- *   - vexp2 splits x = n + f with f in [0,1) -- (0,1] for a negative x, so
- *     vexp2(-1) is 3EFFFFFC -- and is 2^n times 2^f;
+ *   - vexp2 splits |x| into n + f, f on a 23-bit grid; a negative x uses f's
+ *     ones' complement, so vexp2(-1) is 3EFFFFFC, just below 1/2;
  *   - vlog2 has 22 fraction bits for x >= 1 (truncated to 23 significant
  *     bits) but only 15 below 1, where vlog2(3F7FFFFF) is -0.
  *
- * What is not: the cores. Each op above is the exact function of its
- * reduced argument, floored or truncated where the hardware visibly is. The
- * hardware's own approximations differ from that, noisily, by at most one
- * unit of their resolution: 2^-22 absolute for vsin, vcos, vasin and vlog2
- * of x >= 1, 2^-15 for vlog2 below 1, one 22-bit ulp for the rest. So this
- * matches 82-93% of results bit for bit (vasin 97%) and the rest within that
- * unit, where libm matched 3-57%. Exhaustive dumps of each core would make
- * it exact. */
+ * vrcp, vsqrt, vrsq, vexp2 and vlog2 are bit exact: their cores are the
+ * hardware's own, from tables fitted to the dumps (the shared core, below).
+ * The one gap is vlog2 of x >= 4 (see there).
+ *
+ * vsin, vcos and vasin are not. Their cores do not have that shape at any
+ * segmentation tried, so each is the exact function of its reduced argument,
+ * floored or truncated where the hardware visibly is (vasin: a quadratic per
+ * segment fitted to the dumps). The hardware differs from that, noisily, by
+ * at most one unit of 2^-22 absolute: 78-85% of the dumped results and
+ * 82-97% of the swept ones match bit for bit. */
 #define VINF_BITS 0x7F800000u
 #define VONE_BITS 0x3F800000u
 
@@ -1174,14 +1177,6 @@ static uint32_t pack_trunc(uint64_t q, int scale, int bits) {
     if (e < -126) return 0;
     const uint64_t sig = nb > bits ? q >> (nb - bits) : q << (bits - nb);
     return ((uint32_t)(e + 127) << 23) | ((uint32_t)(sig << (24 - bits)) & 0x007FFFFFu);
-}
-
-/* A positive double truncated to 22 significant bits, the same way. */
-static uint32_t pack_trunc_double(double v) {
-    if (!(v > 0.0)) return 0;
-    int ex;
-    const double mant = frexp(v, &ex);                 /* [0.5, 1) */
-    return pack_trunc((uint64_t)ldexp(mant, 22), ex - 22, 22);
 }
 
 static int is_nan_bits(uint32_t b) { return (b & 0x7FFFFFFFu) > 0x7F800000u; }
@@ -1369,57 +1364,153 @@ static uint32_t vfpu_asin(uint32_t b) {
     return pack_trunc((uint64_t)floor(v * 1073741824.0), -30, 22) | sign;
 }
 
-static uint32_t vfpu_exp2(uint32_t b) {
-    const int e = (int)((b >> 23) & 0xFF);
-    if (is_nan_bits(b)) return VNAN_BITS;
-    if (e == 255) return (b >> 31) ? 0 : VINF_BITS;
-    if (e == 0) return VONE_BITS;
-    const double x = (double)psp_bits_to_f32(b);
-    if (x >= 128.0) return VINF_BITS;
-    if (x < -127.0) return 0;
-    double n = floor(x), f = x - n;
-    if (f == 0.0 && x < 0.0) { n -= 1.0; f = 1.0; }   /* a negative integer: n-1, f = 1 */
-    /* core(1) is just below 2 -- the 1 is reached from below. f also rounds to
-     * 1 for a negative x smaller than 2^-53, and vexp2(-2^-126) is 3F7FFFFC. */
-    const double core = f == 1.0 ? 2.0 - 1.0 / 8388608.0 : exp2(f);
-    return pack_trunc_double(ldexp(core, (int)n));
+/* ---- the shared core ------------------------------------------------------
+ *
+ * vrcp, vsqrt, vrsq, vexp2 and vlog2 evaluate one kind of piecewise core on a
+ * 23-bit reduced argument X: its top 7 bits pick a segment, the low 16 are u,
+ * and at 24 fraction bits
+ *
+ *     Z = floor(D * u / 2^16) + V(|(u >> 6) - 512|)
+ *
+ * of which the result keeps Z >> 2. V is the segment's quadratic correction,
+ * a function of the distance of u's top ten bits from the segment's middle.
+ * vfpu_cores.h holds, per segment, D, V(0) and the steps V(k+1) - V(k) as
+ * 1- or 2-bit fields; tools/hwprobe/vfpuprobe/gencores.py fits them to
+ * vfpuprobe v3's core dumps (steps 196-200) and the run-1 sweeps (fw 6.60)
+ * and reproduces every one of those results. Arguments the dumps skipped
+ * rest on the fit: holding the sweeps out, it predicted 99.96% of them. */
+#include "vfpu_cores.h"
+
+static uint32_t popcount32(uint32_t v) {
+    v = v - ((v >> 1) & 0x55555555u);
+    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+    return (((v + (v >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24;
 }
 
+/* The sum of the `bits`-bit fields packed in w. */
+static uint32_t field_sum(uint32_t w, int bits) {
+    return bits == 1 ? popcount32(w)
+                     : popcount32(w & 0x55555555u) + 2u * popcount32(w & 0xAAAAAAAAu);
+}
+
+/* floor(v / 2^s), whatever v's sign. */
+static int64_t floor_shr(int64_t v, int s) {
+    return v >= 0 ? v >> s : -((-v + ((int64_t)1 << s) - 1) >> s);
+}
+
+/* V(k) of one segment: V(0) plus sgn times the first k steps. */
+static int64_t core_v(const uint32_t *steps, int bits, int sgn, int32_t v0, uint32_t k) {
+    const uint32_t per = 32u / (uint32_t)bits;
+    uint32_t sum = 0, j = 0;
+    for (; j < k / per; j++) sum += field_sum(steps[j], bits);
+    const uint32_t rem = (k % per) * (uint32_t)bits;
+    if (rem) sum += field_sum(steps[j] & ((1u << rem) - 1u), bits);
+    return (int64_t)v0 + (int64_t)sgn * (int64_t)sum;
+}
+
+typedef struct {
+    const int32_t (*dv)[2];
+    const uint32_t *steps;
+    int words, bits, sgn;
+} vfpu_core;
+
+#define VFPU_CORE(N) { VFPU_CORE_##N##_DV, &VFPU_CORE_##N##_STEPS[0][0], \
+                       (int)(sizeof VFPU_CORE_##N##_STEPS[0] / sizeof(uint32_t)), \
+                       VFPU_CORE_##N##_BITS, VFPU_CORE_##N##_SGN }
+static const vfpu_core CORE_RCP  = VFPU_CORE(RCP);
+static const vfpu_core CORE_EXP2 = VFPU_CORE(EXP2);
+static const vfpu_core CORE_LOG2 = VFPU_CORE(LOG2);
+static const vfpu_core CORE_SQRT = VFPU_CORE(SQRT);
+static const vfpu_core CORE_RSQ  = VFPU_CORE(RSQ);
+
+static int64_t core_seg_v(const vfpu_core *c, uint32_t seg, uint32_t k) {
+    return core_v(c->steps + seg * (uint32_t)c->words, c->bits, c->sgn, c->dv[seg][1], k);
+}
+
+/* Z >> 2 for the 23-bit argument x. */
+static int64_t core_eval(const vfpu_core *c, uint32_t x) {
+    const uint32_t seg = (x >> 16) & 0x7Fu, u = x & 0xFFFFu, g = u >> 6;
+    const int64_t z = floor_shr((int64_t)c->dv[seg][0] * u, 16)
+                    + core_seg_v(c, seg, g >= 512 ? g - 512 : 512 - g);
+    return floor_shr(z, 2);
+}
+
+/* A 22-bit significand y (2^21 <= y <= 2^22) at biased exponent `field`,
+ * flushed to 0 below the normals. */
+static uint32_t pack22(int field, int64_t y) {
+    if (y >= (1 << 22)) { y >>= 1; field++; }
+    if (field <= 0)   return 0;
+    if (field >= 255) return VINF_BITS;
+    return ((uint32_t)field << 23) | ((uint32_t)(y << 2) & 0x007FFFFFu);
+}
+
+/* vexp2: |x| on a 23-bit fraction grid, truncated (v3 dumps x = 0.5 + i*2^-24
+ * in pairs). A negative x takes the ones' complement of that fraction: 2^x is
+ * 2^(-1-n) * core(~f), so vexp2(-1) is 3EFFFFFC and vexp2(-2^-126) 3F7FFFFC
+ * (sweep steps 2-12; the rule reproduces every negative sweep input). */
+static uint32_t vfpu_exp2(uint32_t b) {
+    const uint32_t sign = b & 0x80000000u;
+    const int e = (int)((b >> 23) & 0xFF);
+    if (is_nan_bits(b)) return VNAN_BITS;
+    if (e == 255) return sign ? 0 : VINF_BITS;
+    if (e == 0) return VONE_BITS;
+    if (e >= 127 + 7) return sign ? 0 : VINF_BITS;             /* |x| >= 128 */
+    const uint32_t m24 = (b & 0x007FFFFFu) | 0x00800000u;
+    const int ex = e - 127;
+    const uint32_t f = ex >= 0 ? m24 << ex : (ex > -32 ? m24 >> -ex : 0);
+    const int n = (int)(f >> 23);
+    if (sign) return pack22(127 - 1 - n, core_eval(&CORE_EXP2, ~f & 0x007FFFFFu));
+    return pack22(127 + n, core_eval(&CORE_EXP2, f & 0x007FFFFFu));
+}
+
+/* vlog2: for x >= 1 the exponent plus the core at 22 fraction bits, the sum
+ * truncated to 23 significant bits. Exact for x < 4; above, the hardware's
+ * fraction is often one unit of that 23rd bit lower, by a rule the sweeps
+ * alone do not settle: 1,286 of the 2,510 swept x >= 4 match.
+ *
+ * Below 1 the hardware leaves out the quadratic correction: the magnitude is
+ * 1 - log2(m) from the segment's knot value and D / 256 alone, at 17 bits,
+ * of which 15 are kept, plus the exponent's -1 - e. That reproduces all of
+ * the 1,198,373 x in [0.5, 1) of v3 step 197 and the 4,615 swept x < 1. */
 static uint32_t vfpu_log2(uint32_t b) {
     const int e = (int)((b >> 23) & 0xFF);
     if (e == 0) return 0xFF800000u;
     if (is_nan_bits(b) || (b >> 31)) return VNAN_BITS;
     if (e == 255) return VINF_BITS;
     const int ex = e - 127;
-    const double lm = log2((double)((b & 0x007FFFFFu) | 0x00800000u) / 8388608.0);
+    const uint32_t m = b & 0x007FFFFFu;
     if (ex >= 0) {
-        const int64_t tot = ((int64_t)ex << 22) + (int64_t)floor(lm * 4194304.0);
+        const int64_t tot = ((int64_t)ex << 22) + core_eval(&CORE_LOG2, m);
         return tot > 0 ? pack_trunc((uint64_t)tot, -22, 23) : 0;
     }
-    const int64_t tot = ((int64_t)-ex << 15) - (int64_t)floor(lm * 32768.0 + 0.5);
+    const uint32_t seg = m >> 16, u = m & 0xFFFFu;
+    const int64_t knot = core_seg_v(&CORE_LOG2, seg, 512);          /* V at u = 0 */
+    const int64_t d8 = floor_shr(CORE_LOG2.dv[seg][0], 8);
+    const int64_t mag = ((int64_t)1 << 17) - floor_shr(knot, 7)
+                      + floor_shr(-2 * d8 * (int64_t)u, 16);
+    const int64_t tot = ((int64_t)(-ex - 1) << 15) + floor_shr(mag, 2);
     return tot == 0 ? 0x80000000u : (pack_trunc((uint64_t)tot, -15, 24) | 0x80000000u);
 }
 
 static uint32_t vfpu_rcp(uint32_t b) {
     const uint32_t sign = b & 0x80000000u;
     const int e = (int)((b >> 23) & 0xFF);
+    const uint32_t m = b & 0x007FFFFFu;
     if (is_nan_bits(b)) return VNAN_BITS | sign;
     if (e == 255) return sign;
     if (e == 0) return VINF_BITS | sign;
-    const uint64_t m24 = (b & 0x007FFFFFu) | 0x00800000u;
-    return pack_trunc((1ull << 47) / m24, 103 - e, 22) | sign;
+    if (m == 0) return pack22(254 - e, 1 << 21) | sign;          /* a power of two */
+    return pack22(253 - e, core_eval(&CORE_RCP, m)) | sign;
 }
 
-/* The operand as m * 2^ex with ex even, m in [2^23, 2^25). */
-static void mant_even(uint32_t b, uint64_t *m, int *ex) {
-    *m  = (b & 0x007FFFFFu) | 0x00800000u;
-    *ex = (int)((b >> 23) & 0xFF) - 150;
-    if (*ex & 1) { *m <<= 1; *ex -= 1; }
+/* The roots' argument: x's mantissa with its exponent's parity above it, the
+ * last bit dropped; q is floor((e - 127) / 2). */
+static uint32_t root_arg(uint32_t b, int *q) {
+    const int ex = (int)((b >> 23) & 0xFF) - 127;
+    const uint32_t odd = (uint32_t)ex & 1u;
+    *q = (ex - (int)odd) / 2;
+    return ((odd << 23) | (b & 0x007FFFFFu)) >> 1;
 }
-
-/* floor(sqrt(n)) for n < 2^48: the double root is correctly rounded, and
- * sqrt(k^2 - 1) is k - 1/2k, many of its ulps short of the integer k. */
-static uint64_t isqrt48(uint64_t n) { return (uint64_t)sqrt((double)n); }
 
 static uint32_t vfpu_sqrt(uint32_t b) {
     const int e = (int)((b >> 23) & 0xFF);
@@ -1427,11 +1518,9 @@ static uint32_t vfpu_sqrt(uint32_t b) {
     if (e == 0) return 0;
     if (b >> 31) return VNAN_BITS;
     if (e == 255) return VINF_BITS;
-    uint64_t m; int ex;
-    mant_even(b, &m, &ex);
-    /* floor(sqrt(m * 2^48)) keeps 36 bits; its top 22, which are all the
-     * result keeps, are floor(sqrt(m * 2^20)). */
-    return pack_trunc(isqrt48(m << 20), ex / 2 - 24 + 14, 22);
+    int q;
+    const uint32_t x = root_arg(b, &q);
+    return pack22(127 + q, core_eval(&CORE_SQRT, x));
 }
 
 static uint32_t vfpu_rsq(uint32_t b) {
@@ -1441,13 +1530,9 @@ static uint32_t vfpu_rsq(uint32_t b) {
     if (e == 0) return VINF_BITS | sign;
     if (sign) return VNAN_BITS | 0x80000000u;
     if (e == 255) return 0;
-    uint64_t m; int ex;
-    mant_even(b, &m, &ex);
-    /* floor(sqrt(2^112 / m)), top 22 bits: floor(sqrt(2^68 / m)), with the
-     * division done in two steps to stay inside 64 bits. */
-    const uint64_t hi = (1ull << 44) / m, rem = (1ull << 44) % m;
-    const uint64_t n = (hi << 24) + (rem << 24) / m;
-    return pack_trunc(isqrt48(n), -56 - ex / 2 + 22, 22);
+    int q;
+    const uint32_t x = root_arg(b, &q);
+    return pack22(126 - q, core_eval(&CORE_RSQ, x));        /* 1/sqrt(4^k) carries up */
 }
 
 /* ---- unary element-wise ops (VFPU4) -------------------------------------- */

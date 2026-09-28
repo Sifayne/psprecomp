@@ -722,9 +722,9 @@ static void test_units_and_conversions(void) {
 
 /* ---- the transcendental unit -----------------------------------------------
  *
- * Words from vfpuprobe's dumps (steps 2-12 and 120-127, fw 6.60). The exact
- * rows are ones the model reproduces; the last two are where its cores are
- * one unit in the 22nd bit off the hardware's, and are held to that. */
+ * Words from vfpuprobe's dumps (steps 2-12 and 120-127, v3 steps 193-200,
+ * fw 6.60). The exact rows are ones the model reproduces; the last three are
+ * where it is a unit off the hardware's, and are held to that. */
 static void test_transcendentals(void) {
     psp_vfpu_reset();
     static const struct { int op; uint32_t in, out; } exact[] = {
@@ -759,6 +759,23 @@ static void test_transcendentals(void) {
         { PSP_VU_RSQ,  0x40000000, 0x3F3504F0 },
         { PSP_VU_SQRT, 0x40000000, 0x3FB504F0 },
         { PSP_VU_SQRT, 0x807FFFFF, 0x00000000 },
+        { PSP_VU_SQRT, 0xFF800000, 0x7F800001 },   /* sqrt(-inf)            */
+        /* v3 core dumps (steps 196-200) and sweeps: the fitted cores, where
+         * the exact functions they replaced were one unit off. */
+        { PSP_VU_RCP,  0x3FF87206, 0x3F03E460 },
+        { PSP_VU_RCP,  0x3FCFB9AB, 0x3F1DBF30 },
+        { PSP_VU_SQRT, 0x4055AA25, 0x3FE9E054 },
+        { PSP_VU_SQRT, 0x3FBD2B6A, 0x3F9B9B88 },
+        { PSP_VU_RSQ,  0x40577C24, 0x3F0B83E4 },
+        { PSP_VU_RSQ,  0x3FAF1EE4, 0x3F5ADD70 },
+        { PSP_VU_EXP2, 0x3F8F8268, 0x400B36F4 },
+        { PSP_VU_EXP2, 0x3FE9FD89, 0x40633C7C },
+        { PSP_VU_EXP2, 0xC02EC000, 0x3E1A4B14 },   /* ones' complement of f */
+        { PSP_VU_EXP2, 0xC2145433, 0x2CF1D13C },
+        { PSP_VU_LOG2, 0x3FA8DB02, 0x3ECC9E48 },
+        { PSP_VU_LOG2, 0x3FFA9C40, 0x3F78242C },
+        { PSP_VU_LOG2, 0x2F4027F0, 0xC201A7C8 },   /* below 1: linear part  */
+        { PSP_VU_LOG2, 0x2CA6100C, 0xC2167F60 },
     };
     int r[4];
     psp_vfpu_regs(0x00, 1, r);
@@ -772,6 +789,7 @@ static void test_transcendentals(void) {
     static const struct { int op; uint32_t in, out; } near[] = {
         { PSP_VU_SIN,  0x501502F9, 0xBEFC7DA0 },   /* 1e10 reduces to a non-zero angle */
         { PSP_VU_ASIN, 0x3F7FFFFF, 0x3F7FFFE8 },
+        { PSP_VU_LOG2, 0x4081C4A1, 0x40014442 },   /* x >= 4: rule unsettled */
     };
     for (size_t i = 0; i < sizeof near / sizeof near[0]; i++) {
         psp_cpu.v[r[0]] = psp_bits_to_f32(near[i].in);
