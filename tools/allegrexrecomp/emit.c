@@ -350,33 +350,40 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
                 ind, in->fd,
                 in->op == A_ADD_S ? "add" : in->op == A_SUB_S ? "sub" :
                 in->op == A_MUL_S ? "mul" : "div",
-                in->fs, in->ft); return;
+                in->fs, in->ft); goto fpu_trap;
     case A_MOV_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_cpu.f[%u];\n", ind, in->fd, in->fs); return;
     case A_NEG_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_fneg_cop1(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); return;
+        fprintf(f, "%spsp_cpu.f[%u] = psp_fneg_cop1(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); goto fpu_trap;
     case A_ABS_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_fabs_cop1(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); return;
+        fprintf(f, "%spsp_cpu.f[%u] = psp_fabs_cop1(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); goto fpu_trap;
     case A_SQRT_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_fsqrt_cop1(psp_cpu.f[%u]);\n",
-                ind, in->fd, in->fs); return;
+                ind, in->fd, in->fs); goto fpu_trap;
     case A_CVT_S_W:
         fprintf(f, "%spsp_cpu.f[%u] = psp_cvt_s_w(psp_f32_to_bits(psp_cpu.f[%u]));\n",
-                ind, in->fd, in->fs); return;
+                ind, in->fd, in->fs); goto fpu_trap;
     /* See the interpreter: the rounding mode is the only difference, and
      * cvt.w.s reads it from FCR31 at run time rather than at emit time. */
     case A_CVT_W_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[%u], "
-                   "(int)(psp_cpu.fcr31 & 3)));\n", ind, in->fd, in->fs); return;
+                   "(int)(psp_cpu.fcr31 & 3)));\n", ind, in->fd, in->fs); goto fpu_trap;
     case A_TRUNC_W_S: case A_ROUND_W_S: case A_CEIL_W_S: case A_FLOOR_W_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[%u], %s));\n",
                 ind, in->fd, in->fs,
                 in->op == A_TRUNC_W_S ? "PSP_RM_RZ" :
                 in->op == A_ROUND_W_S ? "PSP_RM_RN" :
-                in->op == A_CEIL_W_S  ? "PSP_RM_RP" : "PSP_RM_RM"); return;
+                in->op == A_CEIL_W_S  ? "PSP_RM_RP" : "PSP_RM_RM"); goto fpu_trap;
     case A_C_COND_S:
         fprintf(f, "%spsp_fpu_set_cond(psp_fcmp(%u, psp_cpu.f[%u], psp_cpu.f[%u]));\n",
-                ind, in->fcond, in->fs, in->ft); return;
+                ind, in->fcond, in->fs, in->ft); goto fpu_trap;
+
+    /* An operation that set a cause bit whose enable is on is an FPU
+     * exception, fatal on the hardware (see psp_fpu_trap_pending). */
+    fpu_trap:
+        fprintf(f, "%sif (psp_fpu_trap_pending()) psp_unimplemented(0x%08Xu, \"FPU exception\");\n",
+                ind, in->addr);
+        return;
 
     /* --- COP0. There is no privileged state to model. --- */
     case A_MFC0: case A_CFC0: case A_MFIC:

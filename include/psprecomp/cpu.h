@@ -125,10 +125,24 @@ void psp_cpu_reset_thread(void);
 #define PSP_FCR0_VALUE      0x00003351u
 #define PSP_FCR31_WRITABLE  0x0181FFFFu
 /* Power-on FCR31: the overflow, divide-by-zero and invalid *enables* are set
- * (a fresh thread reads 00000E00, vfpuprobe step 147, fw 6.60). Whether an
- * operation that raises an enabled exception traps -- 1/0 in an untouched
- * thread -- was not measured, and nothing here makes it trap. */
+ * (a fresh thread reads 00000E00, vfpuprobe step 147, fw 6.60; so does the
+ * main thread, v3 step 161). */
 #define PSP_FCR31_RESET     0x00000E00u
+
+/* An FPU exception is taken when a cause bit is set together with its enable
+ * (cause bits 12-16 against enables 7-11, I U O Z V), or when the E cause bit
+ * is. On the hardware each of these switched the PSP off (vfpuprobe v3 steps
+ * 188-192, fw 6.60): ctc1 of the E bit; 1/0, 0/0 and max*max in a fresh
+ * thread under its own 00000E00; and ctc1 of 00008400, the Z cause with the
+ * Z enable. So under the power-on enables a division by zero, an invalid
+ * operation or an overflow is fatal, and the guest thread stops here too:
+ * the caller checks this after each COP1 operation. The destination is
+ * written before the stop; MIPS leaves it alone, and nothing runs after. */
+#define PSP_FCR31_E 0x00020000u
+static inline int psp_fcr31_traps(uint32_t v) {
+    return ((v >> 12) & (v >> 7) & 0x1Fu) != 0u || (v & PSP_FCR31_E) != 0u;
+}
+static inline int psp_fpu_trap_pending(void) { return psp_fcr31_traps(psp_cpu.fcr31); }
 
 static inline uint32_t psp_fcr_read(unsigned n) {
     if (n == 31) return psp_cpu.fcr31;
@@ -136,17 +150,12 @@ static inline uint32_t psp_fcr_read(unsigned n) {
     return 0;
 }
 /* Returns nonzero, and stores nothing, when the write itself is an FPU
- * exception: writing the E cause bit (bit 17, "unimplemented operation",
- * which has no enable) with ctc1 powered a PSP off (vfpuprobe step 160, fw
- * 6.60), as MIPS says it raises the exception at once. The caller stops the
- * thread. MIPS says the same of any cause bit written with its enable set;
- * that is not done here, because this FPU records causes under the default
- * enables without trapping, so a guest's cfc1/ctc1 round trip would stop on a
- * state the hardware may never reach. */
-#define PSP_FCR31_E 0x00020000u
+ * exception: the E cause bit (bit 17, "unimplemented operation", which has
+ * no enable; vfpuprobe step 160) or any cause bit with its enable set (v3
+ * step 192: 00008400), as MIPS says. The caller stops the thread. */
 static inline int psp_fcr_write(unsigned n, uint32_t v) {
     if (n != 31) return 0;
-    if (v & PSP_FCR31_E) return 1;
+    if (psp_fcr31_traps(v)) return 1;
     psp_cpu.fcr31 = v & PSP_FCR31_WRITABLE;
     return 0;
 }

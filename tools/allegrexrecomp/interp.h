@@ -40,7 +40,7 @@ typedef enum {
     I_TRAP_BREAK,
     I_TRAP_BRANCH_IN_SLOT, /* a control transfer inside a delay slot */
     I_TRAP_BADPC,     /* pc left mapped memory */
-    I_TRAP_FPU,       /* an FPU exception: ctc1 wrote FCR31's E cause bit */
+    I_TRAP_FPU,       /* an FPU exception: a cause bit with its enable, or E */
     I_EXIT,           /* the guest called sceKernelExitGame -- a clean finish */
     I_STOPPED,        /* the scheduler was stopped from outside: the drain gave up */
 } psp_interp_status;

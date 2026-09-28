@@ -471,6 +471,27 @@ static void test_fpu(void) {
     CHECK(psp_fcr_write(31, 0x0001F000u) == 0 && psp_cpu.fcr31 == 0x0001F000u,
           "ctc1 of the other cause bits stores them, fcr31 %08X", psp_cpu.fcr31);
     CHECK(psp_fcr_write(1, 0x00020000u) == 0, "only fcr31 has an E bit");
+
+    /* A cause bit written together with its enable is one too (v3 step 192,
+     * 00008400), and so is an operation that raises an enabled exception
+     * (steps 189-191: 1/0, 0/0 and max*max under the power-on 00000E00). */
+    psp_cpu.fcr31 = 0x00000E00u;
+    CHECK(psp_fcr_write(31, 0x00008400u) != 0 && psp_cpu.fcr31 == 0x00000E00u,
+          "ctc1 of the Z cause with the Z enable is refused, fcr31 %08X", psp_cpu.fcr31);
+    CHECK(psp_fcr_write(31, 0x00004400u) == 0 && !psp_fpu_trap_pending(),
+          "ctc1 of the O cause with only the Z enable stores it, fcr31 %08X", psp_cpu.fcr31);
+    static const struct { char op; uint32_t a, b; int traps; } enabled[] = {
+        { '/', 0x3F800000, 0x00000000, 1 }, { '/', 0x00000000, 0x00000000, 1 },
+        { '*', 0x7F7FFFFF, 0x7F7FFFFF, 1 }, { '/', 0x3F800000, 0x40400000, 0 },
+        { '*', 0x1E3CE508, 0x1E3CE508, 0 }, { 'q', 0xBF800000, 0x00000000, 1 },
+    };
+    for (size_t i = 0; i < sizeof enabled / sizeof enabled[0]; i++) {
+        psp_cpu.fcr31 = 0x00000E00u;
+        (void)fpu_apply(enabled[i].op, enabled[i].a, enabled[i].b);
+        CHECK(psp_fpu_trap_pending() == enabled[i].traps,
+              "%c %08X %08X under 00000E00: trap %d, want %d", enabled[i].op, enabled[i].a,
+              enabled[i].b, psp_fpu_trap_pending(), enabled[i].traps);
+    }
     psp_cpu.fcr31 = 0;
 }
 

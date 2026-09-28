@@ -299,6 +299,10 @@ static psp_interp_status exec_simple(const a_insn *in) {
         return I_RUNNING;
 
     /* --- COP1, single precision only --- */
+    /* An operation that sets a cause bit whose enable is on is an FPU
+     * exception, fatal on the hardware (see psp_fpu_trap_pending); emit.c
+     * checks the same after the same operations. */
+#define FPU_DONE (psp_fpu_trap_pending() ? I_TRAP_FPU : I_RUNNING)
     case A_MTC1: psp_cpu.f[in->fs] = psp_bits_to_f32(R(in->rt));      return I_RUNNING;
     case A_MFC1: setr(in->rt, psp_f32_to_bits(psp_cpu.f[in->fs]));    return I_RUNNING;
     /* `fs` names *which* control register -- it was being ignored. */
@@ -315,46 +319,48 @@ static psp_interp_status exec_simple(const a_insn *in) {
      * Cause field. See recomp_rt.h for what the hardware measured. */
     case A_ADD_S:
         psp_cpu.f[in->fd] = psp_fadd(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
-        return I_RUNNING;
+        return FPU_DONE;
     case A_SUB_S:
         psp_cpu.f[in->fd] = psp_fsub(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
-        return I_RUNNING;
+        return FPU_DONE;
     case A_MUL_S:
         psp_cpu.f[in->fd] = psp_fmul(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
-        return I_RUNNING;
+        return FPU_DONE;
     case A_DIV_S:
         psp_cpu.f[in->fd] = psp_fdiv(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
-        return I_RUNNING;
+        return FPU_DONE;
     case A_MOV_S: psp_cpu.f[in->fd] =  psp_cpu.f[in->fs];                    return I_RUNNING;
-    case A_NEG_S: psp_cpu.f[in->fd] = psp_fneg_cop1(psp_cpu.f[in->fs]);      return I_RUNNING;
-    case A_ABS_S: psp_cpu.f[in->fd] = psp_fabs_cop1(psp_cpu.f[in->fs]);      return I_RUNNING;
+    case A_NEG_S: psp_cpu.f[in->fd] = psp_fneg_cop1(psp_cpu.f[in->fs]);      return FPU_DONE;
+    case A_ABS_S: psp_cpu.f[in->fd] = psp_fabs_cop1(psp_cpu.f[in->fs]);      return FPU_DONE;
     case A_SQRT_S:
         psp_cpu.f[in->fd] = psp_fsqrt_cop1(psp_cpu.f[in->fs]);
-        return I_RUNNING;
+        return FPU_DONE;
     case A_CVT_S_W:
         psp_cpu.f[in->fd] = psp_cvt_s_w(psp_f32_to_bits(psp_cpu.f[in->fs]));
-        return I_RUNNING;
+        return FPU_DONE;
     /* The rounding mode is the only thing separating these. cvt.w.s takes it
      * from FCR31; the other four name it in the opcode. */
     case A_CVT_W_S:
         psp_cpu.f[in->fd] = psp_bits_to_f32(
             psp_f32_to_i32(psp_cpu.f[in->fs], (int)(psp_cpu.fcr31 & 3)));
-        return I_RUNNING;
+        return FPU_DONE;
     case A_TRUNC_W_S:
         psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RZ));
-        return I_RUNNING;
+        return FPU_DONE;
     case A_ROUND_W_S:
         psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RN));
-        return I_RUNNING;
+        return FPU_DONE;
     case A_CEIL_W_S:
         psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RP));
-        return I_RUNNING;
+        return FPU_DONE;
     case A_FLOOR_W_S:
         psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RM));
-        return I_RUNNING;
+        return FPU_DONE;
     case A_C_COND_S:
         psp_fpu_set_cond(psp_fcmp(in->fcond, psp_cpu.f[in->fs], psp_cpu.f[in->ft]));
-        return I_RUNNING;
+        return FPU_DONE;
+
+#undef FPU_DONE
 
     /* --- COP0. There is no privileged state to model. --- */
     case A_MFC0: case A_CFC0: case A_MFIC: setr(in->rt, 0); return I_RUNNING;
