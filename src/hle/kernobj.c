@@ -137,18 +137,12 @@ static uint32_t vpl_partition_error(int32_t part) {
     }
 }
 
-/* tlspl does not share it. Partitions 8 and 9 are ILLEGAL_PERM to a vpl and an
- * fpl -- vpl/create.expected and fpl/create.expected both say so -- and
- * ILLEGAL_PARTITION to a tlspl, which is the answer everything out of range
- * gets. So the two services validate the same argument against different
- * tables, and only the 1..7 window is common. Partition 5 is the one value no
- * tlspl test covers; it keeps vpl's answer for want of any evidence. */
+/* tlspl shares it. threadprobe step 107 (fw 6.60) answers -1, 0, 7 and 10
+ * with ILLEGAL_PARTITION and 1, 3, 4, 8 and 9 with ILLEGAL_PERM, the vpl
+ * table exactly. This used to give 8 and 9 ILLEGAL_PARTITION, read from the
+ * tlspl captures; the PSP says otherwise. Partition 5 is still unmeasured. */
 static uint32_t tlspl_partition_error(int32_t part) {
-    switch (part) {
-        case 2: case 6:                      return SCE_KERNEL_ERROR_OK;
-        case 1: case 3: case 4: case 5:      return SCE_KERNEL_ERROR_ILLEGAL_PERM;
-        default:                             return SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
-    }
+    return vpl_partition_error(part);
 }
 
 static void vpl_init(psp_vpl *v);
@@ -1877,6 +1871,22 @@ static uint32_t tls_block_of(const psp_tlspl *t, uint32_t owner) {
     return 0;
 }
 
+/* The pool GetTlsAddr answers for an id that names none. Hardware does not
+ * validate this one call's id: it takes the pool whose index is `id >> 3`.
+ * threads/tls/get has 0 and 1 answer the first pool and 0xF the second, and
+ * threadprobe step 155 (fw 6.60) has ids 0 and 1 hand main its own block of
+ * the only pool, index 0, without taking a second one. ReferTlsplStatus on
+ * the same ids answers 800201D0, so the laxity is GetTlsAddr's alone. Our
+ * uids start at 0x40000 (threadman.c UID_BASE), far above the 16 << 3 ids
+ * this can match. */
+static psp_tlspl *find_tls_lax(uint32_t id) {
+    psp_tlspl *t = find_tls(id);
+    if (t || id >= MAX_TLSPLS * 8u) return t;
+    for (int i = 0; i < MAX_TLSPLS; i++)
+        if (g_tls[i].alive && g_tls[i].index == id >> 3) return &g_tls[i];
+    return NULL;
+}
+
 /* sceKernelGetTlsAddr(uid)
  *
  * A pool with no free block does not answer NULL -- it *waits*. tls/priority
@@ -1889,24 +1899,12 @@ static uint32_t tls_block_of(const psp_tlspl *t, uint32_t owner) {
  * read: with 0x100 set, threads of priority 0x30, 0x34 and 0x31 come back in
  * the order 1, 3, 2. */
 static void hle_GetTlsAddr(void) {
-    psp_tlspl *t = find_tls(psp_arg(0));
+    psp_tlspl *t = find_tls_lax(psp_arg(0));
     if (!t) { psp_ret(0); return; }
     const uint32_t id = t->uid, me = tls_me();
 
     const uint32_t mine = tls_block_of(t, me);
     if (mine) { psp_ret(mine); return; }
-    /* The six lines threads/tls/get still differs by are here, and are left
-     * alone on purpose: hardware does not validate this uid at all. It indexes
-     * the object table by `uid >> 3`, so with two pools alive at slots 0 and 1,
-     * uid 0 and uid 1 both answer the first pool's base and 0xF answers the
-     * second's, while 0x10 and above fail. sceKernelReferTlsplStatus on the
-     * same uids answers 800201D0, so the laxity is this one call's.
-     *
-     * Reproducing it needs uids that encode their slot in a shared object
-     * table, which is a change to every object type at once. A fallback that
-     * tries `index == uid >> 3` when the exact match misses would fit this
-     * test and is not the mechanism -- it would be dead code the moment uids
-     * did encode a slot. Worth doing for a better reason than six lines. */
 
     /* The search starts where the last one stopped rather than at block zero,
      * so a block that has just been freed is not the one handed straight back.
