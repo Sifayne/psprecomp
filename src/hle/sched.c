@@ -63,6 +63,9 @@ typedef struct {
      * and reports 8, merely SUSPEND (step 54). So the handoff skips a flagged
      * slot, and everything else treats it as whatever its state says. */
     int             suspended;
+    /* What sceKernelReferThreadStatus reports it has used; see charge_locked. */
+    uint64_t        run_us, run_since;
+    uint32_t        releases, thread_preempts, intr_preempts;
     psp_cpu_state   ctx;           /* valid whenever this slot is not running */
     psp_os_thread   host;
     int             started;
@@ -239,6 +242,35 @@ static uint64_t soonest_locked(void) {
     return soonest;
 }
 
+/* ---- what a thread has used ------------------------------------------------
+ *
+ * sceKernelReferThreadStatus reports a thread's run time and three counts, and
+ * threadprobe (fw 6.60) shows all of them moving: runClocks is nonzero for
+ * any thread that has run, even one still in its first turn (step 13), and 0
+ * for one that never has; releaseCount is 1 after one block (steps 9-12, 34)
+ * and 0 for a thread that has not yet given up the CPU (step 13);
+ * threadPreemptCount is 1 for main after starting a more urgent thread (step
+ * 1). They were written as zeros.
+ *
+ * Run time is charged when a slot stops holding the token, and a turn is
+ * worth at least 1us: guest time only moves at firmware calls, and a thread
+ * that ran without making one did still run. */
+static void charge_locked(int i, uint64_t now) {
+    if (i < 0) return;
+    const uint64_t d = now > g_slot[i].run_since ? now - g_slot[i].run_since : 0;
+    g_slot[i].run_us += d ? d : 1;
+}
+
+/* The one place the token changes hands, so the one place run time is kept.
+ * `stopped` is when the outgoing thread stopped running. */
+static void give_token_locked(int to, uint64_t stopped) {
+    if (to != g_running) {
+        charge_locked(g_running, stopped);
+        if (to >= 0) g_slot[to].run_since = psp_clock_peek();
+    }
+    g_running = to;
+}
+
 /* ---- handing the token over ------------------------------------------------
  *
  * Called with the lock held. Picks the most urgent ready thread and wakes
@@ -271,10 +303,13 @@ static int handoff_locked(void) {
                         "uid 0x%08X are both RUNNING\n",
                 g_slot[cur].uid, g_slot[dup].uid);
 
+    /* The moment the outgoing thread stopped, before any idle time below. */
+    const uint64_t t0 = psp_clock_peek();
+
     /* Anything whose delay has expired is runnable again. psp_sched_tick
      * notices most expiries at the firmware call where they fall due; this
      * catches the rest. */
-    expire_locked(psp_clock_peek());
+    expire_locked(t0);
     int best = pick_locked();
 
     /* Nothing is runnable, but something may be sleeping on a deadline that has
@@ -297,13 +332,13 @@ static int handoff_locked(void) {
          * broadcast is what lets the main context notice inside its drain --
          * a guest thread that wakes here finds g_running still not its own and
          * goes back to waiting, which is the point. */
-        g_running = -1;
+        give_token_locked(-1, t0);
         psp_os_cond_broadcast(&g_turn);
         return -1;
     }
 
     g_slot[best].state = PSP_SCHED_RUNNING;
-    g_running = best;
+    give_token_locked(best, t0);
     psp_os_cond_broadcast(&g_turn);
     return best;
 }
@@ -365,10 +400,12 @@ static int switch_away(int me, psp_sched_state why, const char *what,
         g_slot[me].state      = PSP_SCHED_RUNNING;
         g_slot[me].waiting_on = NULL;
         g_slot[me].wake_at    = 0;
-        g_running             = me;
+        give_token_locked(me, psp_clock_peek());
         psp_os_unlock(&g_lock);
         return PSP_SCHED_STRANDED;
     }
+    /* Parked: the thread gave up the CPU (releaseCount; see charge_locked). */
+    g_slot[me].releases++;
 
     if (await_turn_locked(me) != 0) {          /* killed by psp_sched_stop_all */
         g_slot[me].waiting_on = NULL;
@@ -577,6 +614,7 @@ int psp_sched_block_until(uint32_t uid, psp_sched_state why, const char *what,
     return switch_away(self_slot(uid), why, what, deadline_us);
 }
 
+enum { YIELD = 0, PREEMPT_THREAD = 1, PREEMPT_INTR = 2 };
 static void yield_as(int displaced);
 
 /* Give way to a thread that outranks us, staying at the head of our own
@@ -593,9 +631,9 @@ static void yield_as(int displaced);
  * report, and it reported it as `[r]` where hardware says `[x]`.
  * threads/mutex/unlock2 is the whole difference in one line, `Unlocked, ran: 4`,
  * and matches with this. */
-void psp_sched_preempt(void) { yield_as(1); }
+void psp_sched_preempt(void) { yield_as(PREEMPT_THREAD); }
 
-void psp_sched_yield(void) { yield_as(0); }
+void psp_sched_yield(void) { yield_as(YIELD); }
 
 static void yield_as(int displaced) {
     if (!g_threading) return;
@@ -616,11 +654,22 @@ static void yield_as(int displaced) {
      * finds at least the caller. Handled rather than assumed, because the cost
      * is three lines and the failure mode it guards against -- running on with
      * the token held by nobody -- is the bug this file was fixed for. */
-    if (handoff_locked() < 0) {
+    const int to = handoff_locked();
+    if (to < 0) {
         g_slot[me].state = PSP_SCHED_RUNNING;
-        g_running        = me;
+        give_token_locked(me, psp_clock_peek());
         psp_os_unlock(&g_lock);
         return;
+    }
+    /* Counted only when another thread did run. A displacement at a timer's
+     * expiry happens at the end of an interrupt on hardware, so it is an
+     * interrupt preemption; one caused by a system call is a thread
+     * preemption; a yield is the thread giving the CPU up. Only the thread
+     * preemption is measured (threadprobe step 1). */
+    if (to != me) {
+        if (displaced == PREEMPT_INTR)        g_slot[me].intr_preempts++;
+        else if (displaced == PREEMPT_THREAD) g_slot[me].thread_preempts++;
+        else                                  g_slot[me].releases++;
     }
 
     if (await_turn_locked(me) != 0) {          /* killed by psp_sched_stop_all */
@@ -664,10 +713,11 @@ int psp_sched_delay(uint64_t usec) {
     if (handoff_locked() < 0) {                /* nobody else at all: carry on */
         g_slot[me].state   = PSP_SCHED_RUNNING;
         g_slot[me].wake_at = 0;
-        g_running          = me;
+        give_token_locked(me, psp_clock_peek());
         psp_os_unlock(&g_lock);
         return PSP_SCHED_EXPIRED;
     }
+    g_slot[me].releases++;                     /* see switch_away */
 
     if (await_turn_locked(me) != 0) {
         psp_os_unlock(&g_lock);
@@ -712,13 +762,18 @@ void psp_sched_tick(void) {
     const int me = g_running;
     int urgent = 0;
     if (me >= 0 && me == g_self) {
+        const int before = pick_locked();
         expire_locked(psp_clock_peek());
         const int best = pick_locked();
-        urgent = best >= 0 && g_slot[best].priority < g_slot[me].priority;
+        if (best >= 0 && g_slot[best].priority < g_slot[me].priority)
+            urgent = best != before ? PREEMPT_INTR : PREEMPT_THREAD;
     }
     psp_os_unlock(&g_lock);
 
-    if (urgent) psp_sched_preempt();
+    /* A thread whose delay just ran out preempts as a timer interrupt would;
+     * one readied earlier, while it could not (dispatch was off), as the
+     * system call that readied it would have. */
+    if (urgent) yield_as(urgent);
 }
 
 static int wake_slot(uint32_t uid, int reason);
@@ -831,7 +886,7 @@ void psp_sched_stop_all(const char *why) {
     for (int i = 1; i < g_slot_hi; i++)
         if (g_slot[i].used) g_slot[i].state = PSP_SCHED_DEAD;
     g_slot[MAIN_SLOT].state = PSP_SCHED_RUNNING;
-    g_running    = MAIN_SLOT;
+    give_token_locked(MAIN_SLOT, psp_clock_peek());
     psp_os_cond_broadcast(&g_turn);
     psp_os_unlock(&g_lock);
     if (me != MAIN_SLOT) psp_os_thread_exit();
@@ -906,7 +961,7 @@ int psp_sched_drain(int timeout_s) {
     }
 
     g_slot[MAIN_SLOT].state = PSP_SCHED_RUNNING;
-    g_running = MAIN_SLOT;
+    give_token_locked(MAIN_SLOT, psp_clock_peek());
     psp_os_unlock(&g_lock);
     return live;
 }
@@ -1011,7 +1066,7 @@ int psp_sched_suspend(uint32_t uid) {
     psp_os_unlock(&g_lock);
     /* Ourselves (sceKernelSuspendThread refuses this, so only the runtime can
      * ask): stay READY, and the handoff will not pick us until resumed. */
-    if (running) yield_as(0);
+    if (running) yield_as(YIELD);
     return 1;
 }
 
@@ -1034,6 +1089,27 @@ int psp_sched_resume(uint32_t uid) {
     }
     psp_os_unlock(&g_lock);
     return urgent;
+}
+
+int psp_sched_stats_of(uint32_t uid, psp_sched_stats *out) {
+    memset(out, 0, sizeof *out);
+    psp_os_lock(&g_lock);
+    const int s = slot_of(uid);
+    if (s >= 0) {
+        out->run_us          = g_slot[s].run_us;
+        out->releases        = g_slot[s].releases;
+        out->thread_preempts = g_slot[s].thread_preempts;
+        out->intr_preempts   = g_slot[s].intr_preempts;
+        /* The turn in progress counts too (threadprobe step 13 reads its own
+         * runClocks as nonzero during its first turn). */
+        if (s == g_running) {
+            const uint64_t now = psp_clock_peek();
+            const uint64_t d = now > g_slot[s].run_since ? now - g_slot[s].run_since : 0;
+            out->run_us += d ? d : 1;
+        }
+    }
+    psp_os_unlock(&g_lock);
+    return s >= 0;
 }
 
 psp_sched_state psp_sched_state_of(uint32_t uid) {

@@ -109,6 +109,14 @@ typedef struct {
      * TerminateDeleteThread both do that -- and the wait still answers with
      * its status (threadprobe step 44, fw 6.60: WaitThreadEnd=00000007). */
     uint32_t end_status;
+    /* What sceKernelReferThreadStatus reports as waitType and waitId for a
+     * wait other than a sleep or a delay (those come from wait_kind). Set for
+     * the length of the wait; see wait_mark. */
+    uint32_t wait_type, wait_id;
+    /* What the thread had used when it ended, kept because its scheduler slot
+     * is reused once it is dead (psp_sched_stats_of). */
+    psp_sched_stats final_stats;
+    int      has_final_stats;
     int      used;
     jmp_buf  unwind;       /* where sceKernelExitThread returns to */
     int      unwind_set;
@@ -206,6 +214,16 @@ static void on_thread_end(uint32_t uid, uint32_t status);
 static void thread_ended(psp_thread *t, uint32_t status);
 /* An emptied psp_thread.enders entry. Not 0, which is the main context. */
 #define NO_ENDER 0xFFFFFFFFu
+
+/* ReferThreadStatus waitType values, threadprobe steps 9-12 (fw 6.60): Sleep
+ * 1, Delay 2, WaitSema 3 (waitId the semaphore), WaitEventFlag 4 (the flag),
+ * WaitThreadEnd 9 (the thread waited for). They were all reported as 0. The
+ * waits in kernobj.c and kernlock.c are unmeasured and still report 0. */
+#define WAITTYPE_SLEEP     1u
+#define WAITTYPE_DELAY     2u
+#define WAITTYPE_SEMA      3u
+#define WAITTYPE_EVF       4u
+#define WAITTYPE_THREADEND 9u
 
 void psp_threadman_init(void) {
     psp_sched_set_end_hook(on_thread_end);
@@ -528,6 +546,7 @@ static void hle_StartThread(void) {
     const int was_state   = t->state;
     t->state = TH_READY;
     t->ever_started = 1;
+    t->has_final_stats = 0;
     /* The control block sits in the 0x100 bytes at the top of the stack, which
      * is the same reservation the argument block stops below. */
     const uint32_t k0 = t->stack_base ? t->stack_base + t->stack_size - 0x100u : 0;
@@ -712,6 +731,14 @@ static void thread_ended(psp_thread *t, uint32_t status) {
     t->exit_status = status;
     t->state       = TH_DORMANT;
     t->suspended   = 0;
+    /* Its counters, as they stand at the end. A thread that ends itself --
+     * returning from its entry, or ExitThread -- gives up the CPU in doing so:
+     * threadprobe step 37 reads release=1 for a thread that only ran and
+     * returned, and step 9 release=2 for one that slept once and then
+     * returned. Terminated by another thread, it gave up nothing itself. */
+    psp_sched_stats_of(t->uid, &t->final_stats);
+    if (t->uid == psp_sched_current()) t->final_stats.releases++;
+    t->has_final_stats = 1;
     psp_kernobj_thread_ended(t->uid);
     psp_kernlock_thread_ended(t->uid);
     for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++) {
@@ -723,6 +750,13 @@ static void thread_ended(psp_thread *t, uint32_t status) {
         psp_sched_wake(w);
     }
     t->nenders = 0;
+}
+
+/* Record what the current thread is about to wait on, or (0, 0) once the
+ * wait is over, for ReferThreadStatus. */
+static void wait_mark(uint32_t type, uint32_t id) {
+    psp_thread *t = current_thread();
+    if (t) { t->wait_type = type; t->wait_id = id; }
 }
 
 /* A waiter that gave up (timeout or release) takes itself off the list, or the
@@ -780,8 +814,10 @@ static void hle_WaitThreadEnd(void) {
     while (t->state != TH_DORMANT) {
         const uint32_t me = psp_sched_current();
         t->enders[t->nenders++ % MAX_SEMA_WAITERS] = me;
+        wait_mark(WAITTYPE_THREADEND, thid);
         const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                              "sceKernelWaitThreadEnd", deadline);
+        wait_mark(0, 0);
         if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
             if ((t = find_thread(thid)) != NULL) drop_ender(t, me);
             psp_wait_writeback(timeout, deadline);
@@ -1546,8 +1582,10 @@ static void hle_WaitSema(void) {
         return;
     }
 
+    wait_mark(WAITTYPE_SEMA, id);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, s->waitdesc,
                                          deadline);
+    wait_mark(0, 0);
     if (rc == PSP_SCHED_WOKEN) {
         const int why = psp_sched_wake_reason();
         if (why == PSP_WAIT_WOKE_SATISFIED || why == PSP_WAIT_WOKE_CANCELLED) {
@@ -1823,8 +1861,10 @@ static void hle_WaitEventFlag(void) {
         return;
     }
 
+    wait_mark(WAITTYPE_EVF, id);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, f->waitdesc,
                                          deadline);
+    wait_mark(0, 0);
     /* Released or cancelled: the waker already wrote the pattern. */
     if (rc == PSP_SCHED_WOKEN) {
         const int why = psp_sched_wake_reason();
@@ -2013,9 +2053,9 @@ static void hle_ReferCallbackStatus(void) {
  *
  * The size is not a guess -- threads/refer.expected reports `=> 104` for a
  * caller that asks for more than the structure holds. The layout is the SDK's
- * SceKernelThreadInfo, and the fields past exitStatus (run clocks, preemption
- * counts) are written as zero rather than invented: the test itself has them
- * commented out with the note that getting them right would be slow. */
+ * SceKernelThreadInfo. The fields past exitStatus (run clocks, preemption and
+ * release counts) used to be written as zero; threadprobe (fw 6.60) shows them
+ * moving, and they now come from the scheduler (psp_sched_stats_of). */
 static void hle_ReferThreadStatus(void) {
     const uint32_t id   = psp_arg(0) ? psp_arg(0) : psp_sched_current();
     const uint32_t info = psp_arg(1);
@@ -2077,13 +2117,35 @@ static void hle_ReferThreadStatus(void) {
      * and that is not a priority. */
     const int slot_pri = psp_sched_priority(t->uid);
 
+    /* What it is waiting on, while it is (threadprobe steps 9-12, and 36:
+     * kept under a suspension). A wait that has ended -- the thread woken but
+     * not yet run -- reports none. */
+    uint32_t wait_type = 0, wait_id = 0;
+    if (!dormant) {
+        const psp_sched_state st = psp_sched_state_of(t->uid);
+        if (st == PSP_SCHED_BLOCKED || st == PSP_SCHED_SLEEPING) {
+            if (t->wait_kind == WAIT_SLEEP)      wait_type = WAITTYPE_SLEEP;
+            else if (t->wait_kind == WAIT_DELAY) wait_type = WAITTYPE_DELAY;
+            else { wait_type = t->wait_type; wait_id = t->wait_id; }
+        }
+    }
+
+    /* runClocks, then the interrupt-preemption, thread-preemption and release
+     * counts; see psp_sched_stats_of. A finished thread reports what it had
+     * when it ended, one never started zeros. */
+    psp_sched_stats st;
+    if (t->has_final_stats) st = t->final_stats;
+    else if (t->ever_started) psp_sched_stats_of(t->uid, &st);
+    else memset(&st, 0, sizeof st);
+
     const uint32_t words[26] = {
         104, 0,0,0,0,0,0,0,0,                        /* size, then name[32] */
         attr, status, t->entry, t->stack_base, t->stack_size,
         psp_cpu.r[PSP_REG_GP], t->init_priority,
         slot_pri > 0x7F ? t->priority : (uint32_t)slot_pri,
-        0 /*waitType*/, 0 /*waitId*/, (uint32_t)t->wakeup_count, exit_status,
-        0,0,0,0,0,          /* run clocks and preemption counts, left at zero */
+        wait_type, wait_id, (uint32_t)t->wakeup_count, exit_status,
+        (uint32_t)st.run_us, (uint32_t)(st.run_us >> 32),
+        st.intr_preempts, st.thread_preempts, st.releases,
     };
     uint8_t buf[104];
     for (int w = 0; w < 26; w++)

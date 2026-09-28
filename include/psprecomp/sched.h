@@ -261,6 +261,18 @@ int      psp_sched_priority(uint32_t uid);
  * no live slot, which covers both "finished" and "never started". */
 psp_sched_state psp_sched_state_of(uint32_t uid);
 
+/* What a thread has used, for sceKernelReferThreadStatus: guest microseconds
+ * on the CPU (at least 1 a turn, the current turn included), and how often it
+ * gave the CPU up (block, delay or yield), was displaced by a thread made
+ * ready by a system call, or by one a timer made ready. Zeros, and 0 returned,
+ * for a uid with no slot. A slot is reused once its thread is dead and
+ * joined, so the thread manager keeps its own copy of a finished thread's. */
+typedef struct {
+    uint64_t run_us;
+    uint32_t releases, thread_preempts, intr_preempts;
+} psp_sched_stats;
+int psp_sched_stats_of(uint32_t uid, psp_sched_stats *out);
+
 /* ---- why a wait ended -----------------------------------------------------
  *
  * Being woken does not say what happened, and for some objects two different

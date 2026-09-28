@@ -558,7 +558,39 @@ static void test_dead_slots_are_reused(void) {
     CHECK(ran == 1500, "%d of 1500 sequential starts ran", ran);
 }
 
+/* ReferThreadStatus's counters (threadprobe steps 1, 9-13, fw 6.60): run time
+ * is nonzero during a first turn, a delay is one release, and a thread that
+ * starts a more urgent one has been preempted once. */
+static psp_sched_stats st_first, st_after;
+
+static void body_st_hi(void) { }
+
+static void body_st(void) {
+    psp_sched_stats_of(psp_sched_current(), &st_first);
+    psp_sched_delay(1000);
+    psp_sched_spawn(UID_Q_HI, ENTRY_Q_C + 0x40, FAKE_SP, 0, 0, 0, 16);
+    psp_sched_stats_of(psp_sched_current(), &st_after);
+}
+
+static void test_thread_counters(void) {
+    q_run(Q_ROTATE);
+    psp_sched_spawn(UID_Q_A, ENTRY_Q_C + 0x30, FAKE_SP, 0, 0, 0, 32);
+    psp_sched_stats none;
+    CHECK(psp_sched_stats_of(UID_Q_B, &none) == 0 && none.run_us == 0,
+          "a uid with no slot has counters");
+    CHECK(psp_sched_drain(5) == 0, "threads still alive");
+    CHECK(st_first.run_us > 0 && st_first.releases == 0,
+          "first turn: run %llu, releases %u",
+          (unsigned long long)st_first.run_us, st_first.releases);
+    CHECK(st_after.releases == 1 && st_after.thread_preempts == 1 &&
+          st_after.intr_preempts == 0,
+          "after a delay and a preempting start: releases %u, thread %u, intr %u",
+          st_after.releases, st_after.thread_preempts, st_after.intr_preempts);
+}
+
 int main(void) {
+    psp_register(ENTRY_Q_C + 0x30, body_st);
+    psp_register(ENTRY_Q_C + 0x40, body_st_hi);
     psp_register(ENTRY_Q_C + 0x10, body_s_waiter);
     psp_register(ENTRY_Q_C + 0x20, body_s_main);
     psp_register(ENTRY_Q_A,      body_q_a);
@@ -591,6 +623,7 @@ int main(void) {
     test_displaced_thread_keeps_its_place();
     test_suspend_is_a_flag_over_the_wait();
     test_dead_slots_are_reused();
+    test_thread_counters();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);
