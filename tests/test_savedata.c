@@ -225,6 +225,17 @@ static void coverage(void) {
     setup(5,"SLOT00","mismatch"); start(); update(); assert(finish()==2); check_file("SLOT00","replaced");
     psp_savedata_set_script(NULL); psp_savedata_set_host(1);
 }
+/* What a PSP on firmware 6.60 does, from tools/hwprobe/saveprobe (run
+ * fw660-run1). Each block names the steps it reproduces. */
+static void fw660_status(void) {
+    /* Status 1, 2, 3 and then 0 at the first poll a frame after
+     * ShutdownStart, in every step; 4 only to a poll in the same frame. */
+    setup(0,"SLOT00",""); start(); update();
+    assert(call(0x8874DBE0,0)==3); assert(call(0x9790B33C,0)==0);
+    call(0x984C27E7,0); /* sceDisplayWaitVblankStart */
+    assert(call(0x8874DBE0,0)==0);
+    assert(psp_read32(p+28)==0);
+}
 int main(void) {
 #ifndef _WIN32
     snprintf(root,sizeof root,"/tmp/psprecomp-savedata-XXXXXX"); assert(mkdtemp(root));
@@ -233,6 +244,7 @@ int main(void) {
 #endif
     assert(psp_mem_init()==0); psp_cpu_reset(); psp_hle_init(); psp_io_set_root(root); psp_savedata_set_host(1);
     lifecycle(); roundtrip(); deletion(); errors(); request_safety(); headless(); scripts(); coverage();
+    fw660_status();
     assert(psp_mem_bad_access==0); psp_mem_free();
     printf("savedata: lifecycle, independent slots, writeback, metadata, cancellation, overwrite, deletion, errors, recovery, scripts, focus, new-data artwork and foreign directories passed\n");
     return 0;

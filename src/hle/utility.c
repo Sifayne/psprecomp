@@ -33,6 +33,7 @@
 #define PSP_UTILITY_DIALOG_FINISHED 4
 static int g_savedata_state, g_savedata_done, g_savedata_interactive;
 static uint32_t g_savedata_param;
+static uint64_t g_savedata_shutdown_vblank;   /* vblank count at ShutdownStart */
 static unsigned char sd_request[1536];
 static int sd_request_valid(void);
 static int sd_io_error;
@@ -1218,7 +1219,8 @@ static int sd_request_valid(void) {
 static void hle_SavedataInitStart(void) {
     /* Shutdown is synchronous here. Some games start the next utility without
      * polling FINISHED/NONE after ShutdownStart; a completed shutdown must not
-     * prevent that next request. GetStatus still exposes FINISHED to pollers. */
+     * prevent that next request. GetStatus exposes FINISHED only within the
+     * frame of the ShutdownStart (see hle_SavedataGetStatus). */
     if (g_savedata_state==PSP_UTILITY_DIALOG_FINISHED)
         g_savedata_state=PSP_UTILITY_DIALOG_NONE;
     if (g_savedata_state!=PSP_UTILITY_DIALOG_NONE) {
@@ -1264,7 +1266,16 @@ static void hle_SavedataInitStart(void) {
     }
     psp_ret(0);
 }
+/* After ShutdownStart a PSP on firmware 6.60 reads 0 at the next vblank:
+ * saveprobe polls once per frame and logs status 1, 2, 3, 0 in every one of
+ * its 67 steps, never 4. Whether 4 is visible at all inside that frame is
+ * unmeasured, so FINISHED is still reported once to a poll in the same frame
+ * as the ShutdownStart (a caller that polls without waiting sees 4 then 0);
+ * once the vblank counter has moved, the utility reads NONE directly. */
 static void hle_SavedataGetStatus(void) {
+    if (g_savedata_state==PSP_UTILITY_DIALOG_FINISHED &&
+        psp_display_vblanks()!=g_savedata_shutdown_vblank)
+        g_savedata_state=PSP_UTILITY_DIALOG_NONE;
     int now=g_savedata_state;
     if (savedata_log_on() && now!=sd_status_logged) { fprintf(stderr,"savedata: status=%d\n",now); sd_status_logged=now; }
     if (now==PSP_UTILITY_DIALOG_INIT) g_savedata_state=PSP_UTILITY_DIALOG_VISIBLE;
@@ -1315,6 +1326,7 @@ static void hle_SavedataShutdownStart(void) {
         psp_write32(g_savedata_param+SD_RESULT,sd_request_valid()?sd_do_mode(g_savedata_param):SD_BAD_PARAM); g_savedata_done=1;
     }
     g_savedata_state=PSP_UTILITY_DIALOG_FINISHED;
+    g_savedata_shutdown_vblank=psp_display_vblanks();
     psp_ret(0);
 }
 void psp_utility_register(void) {
