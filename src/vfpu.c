@@ -1119,6 +1119,330 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     eat_prefixes();
 }
 
+/* ---- the transcendental unit --------------------------------------------
+ *
+ * vsin, vcos, vasin, vexp2, vlog2, vrcp, vsqrt, vrsq and their negated forms
+ * are the PSP's own fixed-point algorithms, not libm. What vfpuprobe measured
+ * over 26,800 inputs per op (steps 2-12, fw 6.60), and what is reproduced:
+ *
+ *   - every result is *truncated* to a 22-bit significand -- the low two
+ *     mantissa bits are clear -- and one below 2^-126 is 0; an operand whose
+ *     exponent is 0 is a signed zero; the NaN result is 7F800001;
+ *   - vnsin is vsin with the sign flipped, vnrcp likewise vrcp, and vrexp2(x)
+ *     is vexp2(-x), NaNs included;
+ *   - vsin/vcos reduce |x| in quarter turns to 25-bit fixed point (2 quadrant
+ *     bits, 23 fraction bits, truncated); an odd quadrant reflects, quadrants
+ *     2 and 3 negate, vsin then takes sign(x) and vcos adds a quarter turn
+ *     first. So vsin(2) is -0, vcos(1) is -0 and vsin(1e-10) is 0. Exponents
+ *     2^33..2^40 shift by e-127-32 rather than e-127: vsin(1e10) = BEFC7DA0;
+ *   - vasin is piecewise quadratic over 128 segments of [0,1], exact at the
+ *     knots; the coefficients below are fitted to the hardware's dense grid.
+ *     |x| > 1 is 7F800001 with x's sign;
+ *   - vexp2 splits x = n + f with f in [0,1) -- (0,1] for a negative x, so
+ *     vexp2(-1) is 3EFFFFFC -- and is 2^n times 2^f;
+ *   - vlog2 has 22 fraction bits for x >= 1 (truncated to 23 significant
+ *     bits) but only 15 below 1, where vlog2(3F7FFFFF) is -0.
+ *
+ * What is not: the cores. Each op above is the exact function of its
+ * reduced argument, floored or truncated where the hardware visibly is. The
+ * hardware's own approximations differ from that, noisily, by at most one
+ * unit of their resolution: 2^-22 absolute for vsin, vcos, vasin and vlog2
+ * of x >= 1, 2^-15 for vlog2 below 1, one 22-bit ulp for the rest. So this
+ * matches 82-93% of results bit for bit (vasin 97%) and the rest within that
+ * unit, where libm matched 3-57%. Exhaustive dumps of each core would make
+ * it exact. */
+#define VINF_BITS 0x7F800000u
+#define VONE_BITS 0x3F800000u
+
+static int bit_length64(uint64_t v) {
+    return v >> 32 ? 64 - (int)psp_clz((uint32_t)(v >> 32)) : 32 - (int)psp_clz((uint32_t)v);
+}
+
+/* q * 2^scale as a float with a `bits`-bit significand, truncated. */
+static uint32_t pack_trunc(uint64_t q, int scale, int bits) {
+    if (q == 0) return 0;
+    const int nb = bit_length64(q);
+    const int e = nb - 1 + scale;
+    if (e > 127)  return VINF_BITS;
+    if (e < -126) return 0;
+    const uint64_t sig = nb > bits ? q >> (nb - bits) : q << (bits - nb);
+    return ((uint32_t)(e + 127) << 23) | ((uint32_t)(sig << (24 - bits)) & 0x007FFFFFu);
+}
+
+/* A positive double truncated to 22 significant bits, the same way. */
+static uint32_t pack_trunc_double(double v) {
+    if (!(v > 0.0)) return 0;
+    int ex;
+    const double mant = frexp(v, &ex);                 /* [0.5, 1) */
+    return pack_trunc((uint64_t)ldexp(mant, 22), ex - 22, 22);
+}
+
+static int is_nan_bits(uint32_t b) { return (b & 0x7FFFFFFFu) > 0x7F800000u; }
+
+/* |x| in quarter turns as 25-bit fixed point, 23 fraction bits. */
+static uint32_t quarter_fixed(uint32_t b) {
+    const int e = (int)((b >> 23) & 0xFF);
+    if (e == 0) return 0;
+    const uint64_t m24 = (b & 0x007FFFFFu) | 0x00800000u;
+    int sh = e - 127;
+    uint64_t x;
+    if (sh < 0)        x = -sh < 32 ? m24 >> -sh : 0;
+    else if (sh <= 32) x = m24 << sh;
+    else               x = sh - 32 < 32 ? m24 << (sh - 32) : 0;
+    return (uint32_t)(x & ((1u << 25) - 1));
+}
+
+/* sin(pi/2 * r / 2^23) for r in [0, 2^23], floored at 2^-28. */
+static uint32_t sin_core(uint32_t r) {
+    if (r == 0) return 0;
+    if (r == 1u << 23) return VONE_BITS;
+    const double y = sin(1.5707963267948966 * ((double)r / 8388608.0));
+    return pack_trunc((uint64_t)floor(y * 268435456.0), -28, 22);
+}
+
+static uint32_t vfpu_trig(uint32_t b, int cosine) {
+    const uint32_t sign = b & 0x80000000u;
+    if (((b >> 23) & 0xFF) == 0xFF) return cosine ? VNAN_BITS : (VNAN_BITS | sign);
+    uint32_t x = quarter_fixed(b);
+    if (cosine) x = (x + (1u << 23)) & ((1u << 25) - 1);
+    const uint32_t q = x >> 23;
+    uint32_t r = x & 0x007FFFFFu;
+    if (q & 1) r = (1u << 23) - r;
+    uint32_t res = sin_core(r);
+    if (q >= 2) res ^= 0x80000000u;
+    if (!cosine && sign) res ^= 0x80000000u;
+    return res;
+}
+
+static const double VASIN_SEG[128][3] = {   /* c2, c1, c0 over u in [0,1) */
+    { 7.977272878269432e-10, 0.004973642695892187, -1.3557759486977372e-10 },
+    { 2.239941320235124e-07, 0.004973722510308927, 0.00497364244732326 },
+    { 3.7571225004260335e-07, 0.004974178562346371, 0.009947588132892362 },
+    { 5.176192835815376e-07, 0.004974948036627613, 0.014922141534794372 },
+    { 6.709674563227998e-07, 0.004976009206137086, 0.019897606754358355 },
+    { 8.252383016626318e-07, 0.004977374561553881, 0.024874289265388816 },
+    { 9.910733091762347e-07, 0.004979045952067669, 0.029852491164324348 },
+    { 1.1254144280660903e-06, 0.004981031081993881, 0.0348325264635347 },
+    { 1.2863285155162732e-06, 0.004983326229886745, 0.03981468034571787 },
+    { 1.4250984624333923e-06, 0.004985933948473562, 0.04479929238127237 },
+    { 1.5781390777699025e-06, 0.004988843534752986, 0.04978664992117665 },
+    { 1.723306220718324e-06, 0.004992073042351029, 0.05477707849967347 },
+    { 1.8605998917378182e-06, 0.004995632989733875, 0.059770872633831205 },
+    { 2.0195456110411225e-06, 0.004999483332914589, 0.06476836257121144 },
+    { 2.152410454033625e-06, 0.005003668883021496, 0.06976986926345023 },
+    { 2.3620416503505815e-06, 0.005008109582836151, 0.07477569759999274 },
+    { 2.487033021338233e-06, 0.005012969175974376, 0.07978616479565125 },
+    { 2.683869825502489e-06, 0.0050180502720291245, 0.08480163130782342 },
+    { 2.88070662949524e-06, 0.005023505358012049, 0.0898223769215731 },
+    { 3.042112808962316e-06, 0.005029304416310148, 0.09484876015668563 },
+    { 3.2045031723828204e-06, 0.005035444924952109, 0.0998811010882582 },
+    { 3.3147317828297044e-06, 0.0050419706801265885, 0.10491974319651406 },
+    { 3.5233787952331347e-06, 0.005048750969893759, 0.10996503666643026 },
+    { 3.6936426309421238e-06, 0.005055914414802479, 0.11501730431036568 },
+    { 3.864890650705498e-06, 0.0050634333346772495, 0.12007691019951877 },
+    { 4.062711639103372e-06, 0.005071279803296485, 0.12514421011641305 },
+    { 4.131604520359871e-06, 0.005079585947365472, 0.1302195622271429 },
+    { 4.4465434071494455e-06, 0.005088092495905438, 0.13530329860154822 },
+    { 4.794944550413182e-06, 0.005096885811064755, 0.14039584883595407 },
+    { 4.80281802262516e-06, 0.005106405331008393, 0.14549751796589555 },
+    { 5.037053819655802e-06, 0.005116098190362753, 0.15060871713424748 },
+    { 5.233890623672213e-06, 0.005126218800697525, 0.15572983054184694 },
+    { 5.45041110868186e-06, 0.005136651643412503, 0.16086125745984925 },
+    { 5.61969076003165e-06, 0.005147622588741495, 0.16600335674635278 },
+    { 5.75550815511178e-06, 0.005158970599572981, 0.17115661440372973 },
+    { 5.977933743802303e-06, 0.005170708839369328, 0.1763213472162116 },
+    { 6.208232804943466e-06, 0.005182822545369362, 0.1814980278996861 },
+    { 6.438531865809075e-06, 0.005195403738779617, 0.18668707596259237 },
+    { 6.727881967769912e-06, 0.00520839336855871, 0.19188894240725773 },
+    { 7.058567798807825e-06, 0.005221713315099746, 0.19710407559101562 },
+    { 7.1727331453115245e-06, 0.005235782717772784, 0.20233286648096815 },
+    { 7.298708700010058e-06, 0.005250307797647432, 0.2075758322658186 },
+    { 7.601837377923604e-06, 0.005265146586179311, 0.21283344639959242 },
+    { 7.765211925941722e-06, 0.005280585603940331, 0.21810618645758595 },
+    { 8.07424570882094e-06, 0.0052964352724843055, 0.22339454348611404 },
+    { 8.355722338585754e-06, 0.005312775310717164, 0.22869905257372689 },
+    { 8.554527510736394e-06, 0.005329777704795968, 0.2340201866208463 },
+    { 8.938359278739216e-06, 0.005347132682800598, 0.23935850987247406 },
+    { 9.233614485498817e-06, 0.005365130209947262, 0.24471459023354616 },
+    { 9.365495143994834e-06, 0.005383854433971226, 0.2500889197345613 },
+    { 9.385178825257173e-06, 0.00540328690142038, 0.2554821193648813 },
+    { 1.0066234167610824e-05, 0.00542267508058937, 0.2608948183871646 },
+    { 1.0180399513324144e-05, 0.005443237883388035, 0.26632755884076054 },
+    { 1.0959873258356002e-05, 0.005463822584280167, 0.2717810334681974 },
+    { 1.103860798003238e-05, 0.005485715757828559, 0.27725579082904356 },
+    { 1.1247254992803523e-05, 0.005508156875830469, 0.28275255675901473 },
+    { 1.188500623766345e-05, 0.005530940243826643, 0.28827201145229214 },
+    { 1.2062159362235653e-05, 0.005554834017443284, 0.2938148550327842 },
+    { 1.2542441164231478e-05, 0.005579224065853288, 0.2993817771674435 },
+    { 1.2648733038725623e-05, 0.005604703359928598, 0.3049735626200037 },
+    { 1.3062090327723206e-05, 0.005630782514164446, 0.31059093722618064 },
+    { 1.3664410947863297e-05, 0.005657439384421417, 0.31623479413297295 },
+    { 1.4069894765278028e-05, 0.005685134568819366, 0.3219059051866997 },
+    { 1.4632848024750014e-05, 0.005713607258595096, 0.32760509943937505 },
+    { 1.5077699202185826e-05, 0.005743020828294505, 0.3333333436057543 },
+    { 1.5463499338865538e-05, 0.005773479847469851, 0.33909145566578164 },
+    { 1.5825679058368985e-05, 0.005805047057853454, 0.34488038781749725 },
+    { 1.6349264958176603e-05, 0.005837364462506538, 0.3507012652292836 },
+    { 1.718778974341359e-05, 0.005870498247805997, 0.3565550188162012 },
+    { 1.779798383618809e-05, 0.005904916885344906, 0.36244269501191057 },
+    { 1.8227088070164463e-05, 0.005940732080008645, 0.3683654348547616 },
+    { 1.8778231121718432e-05, 0.005977579929757406, 0.3743243539173416 },
+    { 1.9447476256463945e-05, 0.006015599942674375, 0.38032074418722434 },
+    { 2.0506458261950746e-05, 0.006054553208090647, 0.38635580280124865 },
+    { 2.1014297217514962e-05, 0.006095394630550057, 0.3924308202707119 },
+    { 2.1545756588264266e-05, 0.00613758684557954, 0.39854720705433905 },
+    { 2.2470889567952063e-05, 0.006180918745704967, 0.40470640006080155 },
+    { 2.3218869424598566e-05, 0.006226087379258501, 0.4109098387822527 },
+    { 2.4014090113285307e-05, 0.006272798229174567, 0.4171591570871904 },
+    { 2.4888045523800512e-05, 0.00632113199854064, 0.4234560428512112 },
+    { 2.58249887120634e-05, 0.0063712914292661, 0.42980211112029304 },
+    { 2.660446245668627e-05, 0.0064234408800817, 0.43619923479662875 },
+    { 2.7978383350886454e-05, 0.0064771136017155945, 0.4426493171690914 },
+    { 2.8738173415459135e-05, 0.006533494797776026, 0.44915443904874774 },
+    { 3.007666368316198e-05, 0.0065914991593337, 0.4557166754645832 },
+    { 3.141515395066074e-05, 0.006651915755927383, 0.46233825706968146 },
+    { 3.27536442202453e-05, 0.006714856784533388, 0.46902158908676717 },
+    { 3.389136094920843e-05, 0.006780602491553345, 0.47576920898829245 },
+    { 3.533614309148056e-05, 0.00684897695409524, 0.48258370185661154 },
+    { 3.708405391336332e-05, 0.006920072931500352, 0.48946802393447764 },
+    { 3.880834431888348e-05, 0.006994362093961163, 0.49642517919756957 },
+    { 4.007597333732755e-05, 0.007072427078420394, 0.5034582753914676 },
+    { 4.2343533320866044e-05, 0.007153166582956826, 0.5105709036806421 },
+    { 4.411506455917823e-05, 0.0072385440546912025, 0.5177665690519494 },
+    { 4.656371440414339e-05, 0.007327545291991071, 0.5250492180833142 },
+    { 4.899661730484565e-05, 0.007420713564436271, 0.5324233192162372 },
+    { 5.131141812091875e-05, 0.007519338645187394, 0.539893045144923 },
+    { 5.442143962834955e-05, 0.007622133221542332, 0.547463788459668 },
+    { 5.742910599731177e-05, 0.007731004642135509, 0.5551403315566771 },
+    { 6.012970695018412e-05, 0.007846325912711765, 0.5629287010868027 },
+    { 6.412943081243458e-05, 0.00796733232228488, 0.570835164579937 },
+    { 6.80346730063434e-05, 0.008095539022157285, 0.578866582044753 },
+    { 7.260916033653639e-05, 0.008231519299518106, 0.5870302580950557 },
+    { 7.677422711561225e-05, 0.008376828657214156, 0.5953342987164874 },
+    { 8.198646569008785e-05, 0.008531048324946987, 0.6037879633583647 },
+    { 8.785220245533572e-05, 0.008695637847616988, 0.6124010077447963 },
+    { 9.373368616605557e-05, 0.00887268418744057, 0.621184430378264 },
+    { 0.00010190635027502064, 0.009061155427474833, 0.6301508957387497 },
+    { 0.00010971683466731781, 0.009265472030245789, 0.6393139297133019 },
+    { 0.00011939333196218666, 0.00948575258993178, 0.6486891018470871 },
+    { 0.00013055791549718054, 0.009724431977798797, 0.6582942999307343 },
+    { 0.00014267518916487022, 0.009985504996788658, 0.6681493225481494 },
+    { 0.00015707576976232353, 0.010271147185679484, 0.6782774901857569 },
+    { 0.00017423206561573924, 0.010585467512762696, 0.6887057291341889 },
+    { 0.00019461648505948774, 0.010933846512077117, 0.6994653507159843 },
+    { 0.00021881953850598108, 0.011322547038641696, 0.7105938602158165 },
+    { -0.00023953464378094748, 0.01224811748823502, 0.7221352046488243 },
+    { -0.00020256869195046768, 0.012744994109382393, 0.7341437104808785 },
+    { -0.00015567429171415998, 0.013315631878263713, 0.7466861048965148 },
+    { -9.378880047214144e-05, 0.013979529940799363, 0.7598460831509293 },
+    { -1.1196077423274042e-05, 0.014765528825536986, 0.7737318968748286 },
+    { 0.0001042605184525013, 0.01571560693353178, 0.7884862808005121 },
+    { -0.0002128356996583564, 0.01738162872345937, 0.8043061369343811 },
+    { 5.981476806362325e-05, 0.018892844764071517, 0.8214749528404611 },
+    { 5.299634116445441e-05, 0.021416503209448195, 0.8404276128646887 },
+    { 9.448166602256599e-05, 0.025321799043038003, 0.8618971665454238 },
+    { 0.00022718116594845904, 0.032829956865655305, 0.8873134812088332 },
+    { -2.4313282057061473e-05, 0.07965363166895745, 0.9203707300841631 },
+};
+
+static uint32_t vfpu_asin(uint32_t b) {
+    const uint32_t sign = b & 0x80000000u;
+    const int e = (int)((b >> 23) & 0xFF);
+    if (is_nan_bits(b)) return VNAN_BITS | sign;
+    if (e == 0) return sign;
+    if ((b & 0x7FFFFFFFu) > VONE_BITS) return VNAN_BITS | sign;
+    if (e >= 127) return VONE_BITS | sign;                      /* exactly 1 */
+    const uint32_t m24 = (b & 0x007FFFFFu) | 0x00800000u;
+    const uint32_t x = 127 - e < 32 ? m24 >> (127 - e) : 0;     /* 23-bit fixed point */
+    if (x == 0) return sign;
+    const uint32_t seg = x >> 16 < 127 ? x >> 16 : 127;
+    const double u = (double)(x - (seg << 16)) / 65536.0;
+    const double *c = VASIN_SEG[seg];
+    const double v = (c[0] * u + c[1]) * u + c[2];
+    return pack_trunc((uint64_t)floor(v * 1073741824.0), -30, 22) | sign;
+}
+
+static uint32_t vfpu_exp2(uint32_t b) {
+    const int e = (int)((b >> 23) & 0xFF);
+    if (is_nan_bits(b)) return VNAN_BITS;
+    if (e == 255) return (b >> 31) ? 0 : VINF_BITS;
+    if (e == 0) return VONE_BITS;
+    const double x = (double)psp_bits_to_f32(b);
+    if (x >= 128.0) return VINF_BITS;
+    if (x < -127.0) return 0;
+    double n = floor(x), f = x - n;
+    if (f == 0.0 && x < 0.0) { n -= 1.0; f = 1.0; }   /* a negative integer: n-1, f = 1 */
+    /* core(1) is just below 2 -- the 1 is reached from below. f also rounds to
+     * 1 for a negative x smaller than 2^-53, and vexp2(-2^-126) is 3F7FFFFC. */
+    const double core = f == 1.0 ? 2.0 - 1.0 / 8388608.0 : exp2(f);
+    return pack_trunc_double(ldexp(core, (int)n));
+}
+
+static uint32_t vfpu_log2(uint32_t b) {
+    const int e = (int)((b >> 23) & 0xFF);
+    if (e == 0) return 0xFF800000u;
+    if (is_nan_bits(b) || (b >> 31)) return VNAN_BITS;
+    if (e == 255) return VINF_BITS;
+    const int ex = e - 127;
+    const double lm = log2((double)((b & 0x007FFFFFu) | 0x00800000u) / 8388608.0);
+    if (ex >= 0) {
+        const int64_t tot = ((int64_t)ex << 22) + (int64_t)floor(lm * 4194304.0);
+        return tot > 0 ? pack_trunc((uint64_t)tot, -22, 23) : 0;
+    }
+    const int64_t tot = ((int64_t)-ex << 15) - (int64_t)floor(lm * 32768.0 + 0.5);
+    return tot == 0 ? 0x80000000u : (pack_trunc((uint64_t)tot, -15, 24) | 0x80000000u);
+}
+
+static uint32_t vfpu_rcp(uint32_t b) {
+    const uint32_t sign = b & 0x80000000u;
+    const int e = (int)((b >> 23) & 0xFF);
+    if (is_nan_bits(b)) return VNAN_BITS | sign;
+    if (e == 255) return sign;
+    if (e == 0) return VINF_BITS | sign;
+    const uint64_t m24 = (b & 0x007FFFFFu) | 0x00800000u;
+    return pack_trunc((1ull << 47) / m24, 103 - e, 22) | sign;
+}
+
+/* The operand as m * 2^ex with ex even, m in [2^23, 2^25). */
+static void mant_even(uint32_t b, uint64_t *m, int *ex) {
+    *m  = (b & 0x007FFFFFu) | 0x00800000u;
+    *ex = (int)((b >> 23) & 0xFF) - 150;
+    if (*ex & 1) { *m <<= 1; *ex -= 1; }
+}
+
+/* floor(sqrt(n)) for n < 2^48: the double root is correctly rounded, and
+ * sqrt(k^2 - 1) is k - 1/2k, many of its ulps short of the integer k. */
+static uint64_t isqrt48(uint64_t n) { return (uint64_t)sqrt((double)n); }
+
+static uint32_t vfpu_sqrt(uint32_t b) {
+    const int e = (int)((b >> 23) & 0xFF);
+    if (is_nan_bits(b)) return VNAN_BITS;
+    if (e == 0) return 0;
+    if (b >> 31) return VNAN_BITS;
+    if (e == 255) return VINF_BITS;
+    uint64_t m; int ex;
+    mant_even(b, &m, &ex);
+    /* floor(sqrt(m * 2^48)) keeps 36 bits; its top 22, which are all the
+     * result keeps, are floor(sqrt(m * 2^20)). */
+    return pack_trunc(isqrt48(m << 20), ex / 2 - 24 + 14, 22);
+}
+
+static uint32_t vfpu_rsq(uint32_t b) {
+    const uint32_t sign = b & 0x80000000u;
+    const int e = (int)((b >> 23) & 0xFF);
+    if (is_nan_bits(b)) return VNAN_BITS | sign;
+    if (e == 0) return VINF_BITS | sign;
+    if (sign) return VNAN_BITS | 0x80000000u;
+    if (e == 255) return 0;
+    uint64_t m; int ex;
+    mant_even(b, &m, &ex);
+    /* floor(sqrt(2^112 / m)), top 22 bits: floor(sqrt(2^68 / m)), with the
+     * division done in two steps to stay inside 64 bits. */
+    const uint64_t hi = (1ull << 44) / m, rem = (1ull << 44) % m;
+    const uint64_t n = (hi << 24) + (rem << 24) / m;
+    return pack_trunc(isqrt48(n), -56 - ex / 2 + 22, 22);
+}
+
 /* ---- unary element-wise ops (VFPU4) -------------------------------------- */
 
 void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
@@ -1137,51 +1461,19 @@ void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
         case PSP_VU_NEG:  r = psp_bits_to_f32(psp_f32_to_bits(a) ^ 0x80000000u); break;
         case PSP_VU_ZERO: r = 0.0f;         break;
         case PSP_VU_ONE:  r = 1.0f;         break;
-        case PSP_VU_RCP:  r = 1.0f / a;     break;
-        case PSP_VU_NRCP: r = -1.0f / a;    break;
-
-        /* The square roots classify their argument before computing anything,
-         * and the classes are not what the C library would do. psp_fsqrt is a
-         * general geometry helper, so the instruction's zero, denormal,
-         * negative, infinity and NaN rules live here rather than in it.
-         *
-         * Ordinary values already agree to the last bit; only the edges did
-         * not, and they were 28 lines of cpu/vfpu/vector. */
-        case PSP_VU_SQRT: {
-            const uint32_t b = psp_f32_to_bits(a);
-            if ((b & 0x7FFFFFFFu) <= 0x007FFFFFu)
-                r = 0.0f;                                   /* zero, denormal, either sign */
-            else if (b >> 31)
-                r = psp_bits_to_f32(0x7F800001u);           /* negative -> NaN */
-            else if ((b >> 23) == 255u)
-                r = psp_bits_to_f32(0x7F800000u + ((b & 0x007FFFFFu) != 0u));
-            else
-                r = psp_fsqrt(a);
-            break;
-        }
-        case PSP_VU_RSQ: {
-            const uint32_t b = psp_f32_to_bits(a);
-            if ((b & 0x7FFFFFFFu) <= 0x007FFFFFu)
-                r = psp_bits_to_f32(0x7F800000u | (b & 0x80000000u)); /* +-0 -> +-inf */
-            else if (b >> 31)
-                r = psp_bits_to_f32(0xFF800001u);           /* negative -> negative NaN */
-            else if ((b >> 23) == 255u)
-                r = psp_bits_to_f32((b & 0x007FFFFFu) ? 0x7F800001u : 0u); /* inf -> 0 */
-            else
-                r = 1.0f / psp_fsqrt(a);
-            break;
-        }
+        case PSP_VU_RCP:  r = psp_bits_to_f32(vfpu_rcp(psp_f32_to_bits(a)));               break;
+        case PSP_VU_NRCP: r = psp_bits_to_f32(vfpu_rcp(psp_f32_to_bits(a)) ^ 0x80000000u); break;
+        case PSP_VU_SQRT: r = psp_bits_to_f32(vfpu_sqrt(psp_f32_to_bits(a)));              break;
+        case PSP_VU_RSQ:  r = psp_bits_to_f32(vfpu_rsq(psp_f32_to_bits(a)));               break;
         /* The PSP's trig takes its argument in *quarter turns*: vsin(x) is
-         * sin(x * pi/2), not sin(x). Treating it as radians gives a result
-         * that is smooth, plausible, and wrong -- rotations end up at the
-         * wrong angle rather than visibly broken. */
-        case PSP_VU_SIN:  r = sinf(a * 1.5707963267948966f);  break;
-        case PSP_VU_COS:  r = cosf(a * 1.5707963267948966f);  break;
-        case PSP_VU_NSIN: r = -sinf(a * 1.5707963267948966f); break;
-        case PSP_VU_ASIN: r = asinf(a) * 0.6366197723675814f; break;  /* 2/pi */
-        case PSP_VU_EXP2: r = powf(2.0f, a);   break;
-        case PSP_VU_REXP2:r = 1.0f / powf(2.0f, a); break;
-        case PSP_VU_LOG2: r = logf(a) * 1.4426950408889634f; break;   /* 1/ln2 */
+         * sin(x * pi/2), not sin(x). */
+        case PSP_VU_SIN:  r = psp_bits_to_f32(vfpu_trig(psp_f32_to_bits(a), 0));           break;
+        case PSP_VU_COS:  r = psp_bits_to_f32(vfpu_trig(psp_f32_to_bits(a), 1));           break;
+        case PSP_VU_NSIN: r = psp_bits_to_f32(vfpu_trig(psp_f32_to_bits(a), 0) ^ 0x80000000u); break;
+        case PSP_VU_ASIN: r = psp_bits_to_f32(vfpu_asin(psp_f32_to_bits(a)));              break;
+        case PSP_VU_EXP2: r = psp_bits_to_f32(vfpu_exp2(psp_f32_to_bits(a)));              break;
+        case PSP_VU_REXP2:r = psp_bits_to_f32(vfpu_exp2(psp_f32_to_bits(a) ^ 0x80000000u)); break;
+        case PSP_VU_LOG2: r = psp_bits_to_f32(vfpu_log2(psp_f32_to_bits(a)));              break;
         case PSP_VU_SAT0: r = sat0(a);      break;
         case PSP_VU_SAT1: r = sat1(a);      break;
         default:
@@ -1398,9 +1690,13 @@ void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm, int size) {
     const unsigned cl = imm & 3;
     const unsigned sl = (imm >> 2) & 3;
 
-    float s = sinf(arg * 1.5707963267948966f);
-    const float c = cosf(arg * 1.5707963267948966f);
-    if (imm & 0x10) s = -s;
+    /* The same sine and cosine as vsin and vcos, bit for bit: vfpuprobe steps
+     * 120-127 (fw 6.60) give cos(1 quarter turn) as -0 and sin(1/2) as
+     * 3F3504F0, as vcos and vsin do. The negation is of the sign bit, so a
+     * zero sine negates to -0 and a NaN to FF800001. */
+    const uint32_t ab = psp_f32_to_bits(arg);
+    const float s = psp_bits_to_f32(vfpu_trig(ab, 0) ^ ((imm & 0x10) ? 0x80000000u : 0u));
+    const float c = psp_bits_to_f32(vfpu_trig(ab, 1));
 
     const int n = psp_vfpu_regs(vd, size, d);
     float out[4];

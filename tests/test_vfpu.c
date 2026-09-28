@@ -713,6 +713,84 @@ static void test_units_and_conversions(void) {
     psp_vfpu_reset();
 }
 
+/* ---- the transcendental unit -----------------------------------------------
+ *
+ * Words from vfpuprobe's dumps (steps 2-12 and 120-127, fw 6.60). The exact
+ * rows are ones the model reproduces; the last two are where its cores are
+ * one unit in the 22nd bit off the hardware's, and are held to that. */
+static void test_transcendentals(void) {
+    psp_vfpu_reset();
+    static const struct { int op; uint32_t in, out; } exact[] = {
+        { PSP_VU_SIN,  0x40000000, 0x80000000 },   /* vsin(2) is -0         */
+        { PSP_VU_SIN,  0xC0000000, 0x00000000 },
+        { PSP_VU_COS,  0x3F800000, 0x80000000 },   /* vcos(1) is -0         */
+        { PSP_VU_COS,  0x40400000, 0x00000000 },
+        { PSP_VU_COS,  0x3F7FFFFF, 0x34480000 },   /* the 2^-24 bit is lost */
+        { PSP_VU_SIN,  0x3F000000, 0x3F3504F0 },   /* truncated, not 3F3504F3 */
+        { PSP_VU_SIN,  0x2EDBE6FF, 0x00000000 },   /* vsin(1e-10)           */
+        { PSP_VU_NSIN, 0x3F000000, 0xBF3504F0 },
+        { PSP_VU_ASIN, 0x3F7F8000, 0x3F7AE7A4 },   /* not asin's 0.96020    */
+        { PSP_VU_ASIN, 0x3F000000, 0x3EAAAAA8 },
+        { PSP_VU_ASIN, 0x3F800001, 0x7F800001 },
+        { PSP_VU_EXP2, 0xBF800000, 0x3EFFFFFC },   /* vexp2(-1)             */
+        { PSP_VU_EXP2, 0xC2C80000, 0x0D7FFFFC },   /* vexp2(-100)           */
+        { PSP_VU_EXP2, 0x42FE0000, 0x7F000000 },   /* vexp2(127)            */
+        { PSP_VU_EXP2, 0xC3000000, 0x00000000 },   /* vexp2(-128)           */
+        { PSP_VU_EXP2, 0x80800000, 0x3F7FFFFC },   /* vexp2(-2^-126)        */
+        { PSP_VU_REXP2,0x2EDBE6FF, 0x3F7FFFFC },
+        { PSP_VU_LOG2, 0x407FFFFF, 0x3FFFFFFE },
+        { PSP_VU_LOG2, 0x7F7FFFFF, 0x42FFFFFE },
+        { PSP_VU_LOG2, 0x3F800001, 0x00000000 },
+        { PSP_VU_LOG2, 0x3DCCCCCD, 0xC0549A80 },   /* 15 fraction bits below 1 */
+        { PSP_VU_LOG2, 0x3F7FFFFF, 0x80000000 },
+        { PSP_VU_LOG2, 0xBF800000, 0x7F800001 },
+        { PSP_VU_RCP,  0x807FFFFF, 0xFF800000 },
+        { PSP_VU_RCP,  0x7F7FFFFF, 0x00000000 },
+        { PSP_VU_RCP,  0x40400000, 0x3EAAAAA8 },
+        { PSP_VU_NRCP, 0x40400000, 0xBEAAAAA8 },
+        { PSP_VU_RSQ,  0xBF800000, 0xFF800001 },
+        { PSP_VU_RSQ,  0x40000000, 0x3F3504F0 },
+        { PSP_VU_SQRT, 0x40000000, 0x3FB504F0 },
+        { PSP_VU_SQRT, 0x807FFFFF, 0x00000000 },
+    };
+    int r[4];
+    psp_vfpu_regs(0x00, 1, r);
+    for (size_t i = 0; i < sizeof exact / sizeof exact[0]; i++) {
+        psp_cpu.v[r[0]] = psp_bits_to_f32(exact[i].in);
+        psp_vunary(exact[i].op, 0x00, 0x00, 1);
+        const uint32_t got = psp_f32_to_bits(psp_cpu.v[r[0]]);
+        CHECK(got == exact[i].out, "op %d of %08X: %08X, want %08X",
+              exact[i].op, exact[i].in, got, exact[i].out);
+    }
+    static const struct { int op; uint32_t in, out; } near[] = {
+        { PSP_VU_SIN,  0x501502F9, 0xBEFC7DA0 },   /* 1e10 reduces to a non-zero angle */
+        { PSP_VU_ASIN, 0x3F7FFFFF, 0x3F7FFFE8 },
+    };
+    for (size_t i = 0; i < sizeof near / sizeof near[0]; i++) {
+        psp_cpu.v[r[0]] = psp_bits_to_f32(near[i].in);
+        psp_vunary(near[i].op, 0x00, 0x00, 1);
+        const uint32_t got = psp_f32_to_bits(psp_cpu.v[r[0]]);
+        const uint32_t d = got > near[i].out ? got - near[i].out : near[i].out - got;
+        CHECK(d <= 4, "op %d of %08X: %08X, want %08X within 4", near[i].op, near[i].in,
+              got, near[i].out);
+    }
+
+    /* vrot is the same sine and cosine (steps 120 and 122). */
+    set_bits(0x00, 0x3E800000, 0, 0, 0);
+    psp_vrot(0x08, 0x00, 0x04, 2);                         /* [c, s] */
+    int d[4];
+    psp_vfpu_regs(0x08, 2, d);
+    CHECK(psp_f32_to_bits(psp_cpu.v[d[0]]) == 0x3F6C835Cu &&
+          psp_f32_to_bits(psp_cpu.v[d[1]]) == 0x3EC3EF14u, "vrot.p [c,s] of 1/4: %08X %08X",
+          psp_f32_to_bits(psp_cpu.v[d[0]]), psp_f32_to_bits(psp_cpu.v[d[1]]));
+    set_bits(0x00, 0x00000000, 0, 0, 0);
+    psp_vrot(0x08, 0x00, 0x14, 2);                         /* [c, -s] */
+    CHECK(psp_f32_to_bits(psp_cpu.v[d[0]]) == 0x3F800000u &&
+          psp_f32_to_bits(psp_cpu.v[d[1]]) == 0x80000000u, "vrot.p [c,-s] of 0: %08X %08X",
+          psp_f32_to_bits(psp_cpu.v[d[0]]), psp_f32_to_bits(psp_cpu.v[d[1]]));
+    psp_vfpu_reset();
+}
+
 /* ---- the random generator --------------------------------------------------
  *
  * What vfpuprobe measured (steps 154-159, fw 6.60): the seeding, the output
@@ -856,6 +934,7 @@ int main(void) {
     test_special_values();
     test_random();
     test_units_and_conversions();
+    test_transcendentals();
 
     psp_mem_free();
 
