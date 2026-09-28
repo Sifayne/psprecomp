@@ -219,12 +219,13 @@ static void drop_callbacks_of(uint32_t thread_uid);
 /* ReferThreadStatus waitType values, threadprobe steps 9-12 (fw 6.60): Sleep
  * 1, Delay 2, WaitSema 3 (waitId the semaphore), WaitEventFlag 4 (the flag),
  * WaitThreadEnd 9 (the thread waited for). They were all reported as 0. The
- * waits in kernobj.c and kernlock.c are unmeasured and still report 0. */
-#define WAITTYPE_SLEEP     1u
-#define WAITTYPE_DELAY     2u
-#define WAITTYPE_SEMA      3u
-#define WAITTYPE_EVF       4u
-#define WAITTYPE_THREADEND 9u
+ * waits in kernobj.c and kernlock.c mark theirs through
+ * psp_threadman_wait_mark (hle.h has the values). */
+#define WAITTYPE_SLEEP     PSP_WAITTYPE_SLEEP
+#define WAITTYPE_DELAY     PSP_WAITTYPE_DELAY
+#define WAITTYPE_SEMA      PSP_WAITTYPE_SEMA
+#define WAITTYPE_EVF       PSP_WAITTYPE_EVF
+#define WAITTYPE_THREADEND PSP_WAITTYPE_THREADEND
 
 void psp_threadman_init(void) {
     psp_sched_set_end_hook(on_thread_end);
@@ -777,6 +778,7 @@ static void wait_mark(uint32_t type, uint32_t id) {
     psp_thread *t = current_thread();
     if (t) { t->wait_type = type; t->wait_id = id; }
 }
+void psp_threadman_wait_mark(uint32_t type, uint32_t id) { wait_mark(type, id); }
 
 /* A waiter that gave up (timeout or release) takes itself off the list, or the
  * end would wake it later out of whatever it was waiting on by then. */

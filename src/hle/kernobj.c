@@ -376,8 +376,10 @@ static void vpl_allocate(int may_block, int has_timeout) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
         return;
     }
+    psp_threadman_wait_mark(PSP_WAITTYPE_VPL, v->uid);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, v->waitdesc,
                                          deadline);
+    psp_threadman_wait_mark(0, 0);
     /* Cancelled rather than deleted: the object is still there, so looking it
      * up says nothing, and only the waker knew. */
     if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
@@ -951,9 +953,11 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
     }
 
     if (urgent) psp_sched_preempt();
+    psp_threadman_wait_mark(PSP_WAITTYPE_MSGPIPE, p->uid);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                          sending ? p->senddesc : p->recvdesc,
                                          deadline);
+    psp_threadman_wait_mark(0, 0);
     /* Checked before the pipe is looked up again, because a pipe deleted
      * between our release and our turn on the CPU does not undo the transfer.
      * The other side moved the bytes on our behalf, took us out of the queue,
@@ -1312,8 +1316,10 @@ static void mbx_receive(int may_block, int has_timeout) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
         return;
     }
+    psp_threadman_wait_mark(PSP_WAITTYPE_MBX, m->uid);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, m->waitdesc,
                                          deadline);
+    psp_threadman_wait_mark(0, 0);
     /* Cancelled rather than deleted: the object is still there, so looking it
      * up says nothing, and only the waker knew. */
     if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
@@ -1598,8 +1604,10 @@ static void fpl_allocate(int may_block, int has_timeout) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
         return;
     }
+    psp_threadman_wait_mark(PSP_WAITTYPE_FPL, f->uid);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, f->waitdesc,
                                          deadline);
+    psp_threadman_wait_mark(0, 0);
     /* Both of these are decided before the pool is looked up again, because
      * neither answer depends on whether it is still there. A block already
      * handed over is not taken back by the delete that follows, and a cancel
@@ -1942,8 +1950,10 @@ static void hle_GetTlsAddr(void) {
 
     if (!psp_sched_can_wait()) { psp_ret(0); return; }
     if (psp_waitq_add(&t->q, me, 0, 0, 0) != 0) { psp_ret(0); return; }
+    psp_threadman_wait_mark(PSP_WAITTYPE_TLSPL, t->uid);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                          "sceKernelGetTlsAddr", 0);
+    psp_threadman_wait_mark(0, 0);
     t = find_tls(id);
     if (!t) { psp_ret(0); return; }              /* deleted under us */
     if (rc != PSP_SCHED_WOKEN) { psp_waitq_drop(&t->q, me); psp_ret(0); return; }

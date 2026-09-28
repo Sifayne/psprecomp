@@ -578,6 +578,22 @@ enum {
     PSP_TMID_SLEEPING = 0x40, PSP_TMID_DELAYING = 0x41,
     PSP_TMID_SUSPENDED = 0x42, PSP_TMID_DORMANT = 0x43,
 };
+/* What sceKernelReferThreadStatus reports as waitType for a thread waiting
+ * on each object kind, and waitId the object's uid. threadprobe (fw 6.60)
+ * steps 9-12 measured sleep 1, delay 2, sema 3, evf 4 and thread end 9; step
+ * 17 of version 3 measured mbx 5, vpl 6, fpl 7, msgpipe 8, mutex 0x0C,
+ * lwmutex 0x0D and tlspl 0x0E. From mbx on, each is its id-list type plus 1
+ * up to msgpipe and equal to it from mutex on. */
+enum {
+    PSP_WAITTYPE_SLEEP = 1, PSP_WAITTYPE_DELAY = 2, PSP_WAITTYPE_SEMA = 3,
+    PSP_WAITTYPE_EVF = 4, PSP_WAITTYPE_MBX = 5, PSP_WAITTYPE_VPL = 6,
+    PSP_WAITTYPE_FPL = 7, PSP_WAITTYPE_MSGPIPE = 8, PSP_WAITTYPE_THREADEND = 9,
+    PSP_WAITTYPE_MUTEX = 0x0C, PSP_WAITTYPE_LWMUTEX = 0x0D,
+    PSP_WAITTYPE_TLSPL = 0x0E,
+};
+/* Record what the current thread is about to wait on, for ReferThreadStatus,
+ * and (0, 0) once the wait is over. */
+void     psp_threadman_wait_mark(uint32_t type, uint32_t id);
 void     psp_threadman_write_name(uint32_t dst, const char *name);
 /* Copy a Refer*Status result into the caller's block. `img` is the whole
  * struct as the kernel builds it, first word = its own size; hardware copies

@@ -200,8 +200,10 @@ static void mutex_lock(int may_block, int has_timeout) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
         return;
     }
+    psp_threadman_wait_mark(PSP_WAITTYPE_MUTEX, m->uid);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, m->waitdesc,
                                          deadline);
+    psp_threadman_wait_mark(0, 0);
 
     /* Cancelled rather than deleted: the object is still there, so looking it
      * up says nothing, and only the waker knew. */
@@ -625,8 +627,10 @@ static void lw_lock(int may_block, int has_timeout, int flatten) {
     }
     psp_write32(wa + LW_WAITING, (uint32_t)psp_waitq_count(&m->q));
 
+    psp_threadman_wait_mark(PSP_WAITTYPE_LWMUTEX, m->uid);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, m->waitdesc,
                                          deadline);
+    psp_threadman_wait_mark(0, 0);
 
     if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
         psp_wait_writeback(tmo_ptr, deadline);
