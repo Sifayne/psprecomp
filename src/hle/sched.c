@@ -16,6 +16,8 @@
  * thread manager's table is the same size. */
 #define MAX_SCHED_THREADS 1026
 #define MAIN_SLOT         0        /* the context module_start runs on */
+/* Timer handlers one idle handoff may run before it gives up; see there. */
+#define IDLE_TIMER_CAP    100000
 #define PSP_HOST_STACK_SIZE (16u * 1024u * 1024u)
 
 typedef struct {
@@ -318,8 +320,32 @@ static int handoff_locked(void) {
      * time to the earliest deadline and let that thread go -- which is what a
      * kernel with a real timer would do, arriving at the same instant by a
      * different route. */
+    /* An alarm or vtimer falling due first is an interrupt arriving while the
+     * CPU idles, and its handler runs at that moment rather than at the next
+     * firmware call some thread makes: threadprobe step 115 (fw 6.60) sets a
+     * 2ms alarm, delays 10ms, and the handler has run before the delay ends.
+     * It runs here, on the outgoing thread's host thread, whose registers are
+     * already saved and which still holds the token; the lock is dropped for
+     * it because the handler makes firmware calls. Whatever it readies is
+     * picked up below. Without this a program whose threads all wait on
+     * something only a timer handler provides was declared stranded. The cap
+     * only stops a periodic handler that never readies anyone from spinning
+     * guest time on for ever. */
+    int timer_runs = 0;
     while (best < 0) {
         const uint64_t soonest = soonest_locked();
+        const uint64_t timer = timer_runs < IDLE_TIMER_CAP && !psp_ktimer_in_handler()
+                             ? psp_ktimer_next_due() : 0;
+        if (timer && (!soonest || timer <= soonest)) {
+            psp_clock_advance_to(timer);
+            psp_os_unlock(&g_lock);
+            const int ran = psp_ktimer_fire_idle();
+            psp_os_lock(&g_lock);
+            timer_runs = ran ? timer_runs + ran : IDLE_TIMER_CAP;
+            expire_locked(psp_clock_peek());
+            best = pick_locked();
+            continue;
+        }
         if (!soonest) break;
         psp_clock_advance_to(soonest);
         expire_locked(psp_clock_peek());
@@ -639,6 +665,10 @@ static void yield_as(int displaced) {
     if (!g_threading) return;
     /* Dispatch suspended: the guest asked not to be switched away from. */
     if (!g_dispatch) return;
+    /* A timer handler runs on no thread and returns to whatever it
+     * interrupted; a thread it readied gets the CPU when it has returned (see
+     * psp_ktimer_tick), not from inside it. */
+    if (psp_ktimer_in_handler()) return;
     /* A yield differs from a block only in that the caller stays runnable --
      * so a lone thread that yields simply gets the token straight back. */
     psp_os_lock(&g_lock);

@@ -637,6 +637,13 @@ void psp_sysmem_reserve_module(uint32_t lo, uint32_t hi);
  * sceKernelGetThreadId has to report and cannot work out for itself. */
 int psp_ktimer_in_handler(void);
 
+/* For the scheduler's idle path, where no thread will make the firmware call
+ * that would notice a timer: the guest moment the next alarm or vtimer
+ * handler is due (0 for none), and a call that runs whatever is due now and
+ * returns how many handlers ran. */
+uint64_t psp_ktimer_next_due(void);
+int      psp_ktimer_fire_idle(void);
+
 /* Raw allocation for use by other HLE subsystems (thread stacks, mostly).
  * Returns 0 on failure. These bypass the UID table because nothing in the
  * guest ever refers to them. */
