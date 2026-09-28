@@ -30,6 +30,10 @@ first build lost most of its run that way (sceKernelGetTlsAddr belongs to
 Kernel_Library). uofw's `exports.exp` files (MIT) list which library exports
 what on 6.60.
 
+Logs from Sif's PSP (firmware 6.60) are kept beside each probe: `fw660.txt`
+from version 1, `fw660-vN.txt` from version N. psprecomp's comments cite their
+step numbers. compare.py reads the last run in a log (`--run` picks another).
+
 ## Build
 
 With the pspdev toolchain on `PATH` (the prebuilt release from
