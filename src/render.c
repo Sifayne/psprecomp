@@ -1258,9 +1258,15 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
      * standard mapping answers those with (1,0) and (0,1) at the top-left and
      * was one line wrong on every orientation with one flip. */
     const int transposed = (b->x < a->x) != (b->y < a->y);
-    const float du = (b->u - a->u) / (float)(transposed ? (b->y - a->y) : (b->x - a->x));
-    const float dv = (b->v - a->v) / (float)(transposed ? (b->x - a->x) : (b->y - a->y));
-    /* du and dv are texels per sixteenth of a pixel. */
+    /* du and dv are texels per sixteenth of a pixel, truncated toward zero to
+     * 2^-16 of a texel. geprobe step 12 (fw 6.60) maps v 0..16 over 56 rows,
+     * and where a pixel centre lands exactly on v = 1.0 -- (440,11) -- the PSP
+     * reads row 0, the texel below; the exact quotient reads row 1. Any
+     * precision from 2^-8 to 2^-20 per pixel fits that sprite. Truncation
+     * leaves power-of-two steps exact, which the 1:1 and the 2:1 and 4:1
+     * minified sprites of the same scene need. */
+    const float du = ldexpf(truncf(ldexpf((b->u - a->u) / (float)(transposed ? (b->y - a->y) : (b->x - a->x)), 16)), -16);
+    const float dv = ldexpf(truncf(ldexpf((b->v - a->v) / (float)(transposed ? (b->x - a->x) : (b->y - a->y)), 16)), -16);
     int lod16 = 0;
     if (textured) {
         const float rx = fabsf(du) * 16.0f, ry = fabsf(dv) * 16.0f;

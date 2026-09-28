@@ -1287,6 +1287,23 @@ static void test_hardware_through_saturation(void) {
     CHECK(g_sat_frame[2][0] == g_sat_frame[0][0], "x = 1e12 saturates too: %06X", g_sat_frame[2][0]);
 }
 
+/* The sprite texel step, geprobe step 12 (fw 6.60): v 0..16 over the 56 rows
+ * of (416,8)-(472,64). Row 11's centre lands exactly on v = 1.0 and the PSP
+ * reads the texel below it, row 0. */
+static void test_hardware_sprite_step(void) {
+    psp_ge_reset(); clear_fb();
+    upload_ramp_texture(16, 16);
+    begin_list_vtype(VTYPE_2D_TEXF);
+    texture_state(TEX, 16, 4, 4, 3, 0, 0);
+    cmd(0xC7, 1u);                                 /* TEXWRAP: clamp u, repeat v */
+    vertex_uvf(0, 416, 8, 15.9f, 0.0f, 0xFFFFFFFFu);
+    vertex_uvf(1, 472, 64, 16.1f, 16.0f, 0xFFFFFFFFu);
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    CHECK(pixel(440, 10) == ramp_texel(15, 0) && pixel(440, 11) == ramp_texel(15, 0) &&
+          pixel(440, 12) == ramp_texel(15, 1),
+          "v = 1.0 exactly takes row 0: %06X %06X %06X", pixel(440, 10), pixel(440, 11), pixel(440, 12));
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -1326,6 +1343,7 @@ int main(void) {
     test_hardware_texfunc();
     test_hardware_colour_logic_mask();
     test_hardware_through_saturation();
+    test_hardware_sprite_step();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);
