@@ -896,6 +896,40 @@ static void hle_GetSystemTime(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* A SysClock is a microsecond count, so the conversions are the identity and
+ * a division by 10^6 (threadprobe step 132, fw 6.60: 1234567 us is clock
+ * 0x0012D687; clock 1234567 is 1 s 234567 us; 0x9_12345678 is 0x9830 s
+ * 0x1EA78 us; the Wide form of 7654321 is 7 s 654321 us). All four were
+ * unimplemented, answering 0 and writing nothing. */
+static void hle_USec2SysClock(void) {
+    const uint32_t us = psp_arg(0), out = psp_arg(1);
+    if (out) { psp_write32(out, us); psp_write32(out + 4, 0); }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_USec2SysClockWide(void) {
+    psp_cpu.r[PSP_REG_V0] = psp_arg(0);
+    psp_cpu.r[PSP_REG_V1] = 0;
+}
+
+static void sysclock_split(uint64_t clk, uint32_t sec_out, uint32_t usec_out) {
+    if (sec_out)  psp_write32(sec_out,  (uint32_t)(clk / 1000000u));
+    if (usec_out) psp_write32(usec_out, (uint32_t)(clk % 1000000u));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* (const SceKernelSysClock *, u32 *sec, u32 *usec) */
+static void hle_SysClock2USec(void) {
+    const uint32_t in = psp_arg(0);
+    const uint64_t clk = in ? (uint64_t)psp_read32(in) | ((uint64_t)psp_read32(in + 4) << 32) : 0;
+    sysclock_split(clk, psp_arg(1), psp_arg(2));
+}
+
+/* (s64 clock in $a0:$a1, u32 *sec, u32 *usec) */
+static void hle_SysClock2USecWide(void) {
+    sysclock_split((uint64_t)psp_arg(0) | ((uint64_t)psp_arg(1) << 32), psp_arg(2), psp_arg(3));
+}
+
 /* Suspend, resume and priority all have to reach the scheduler.
  *
  * Each of these used to write a thread-manager field and stop. That was
@@ -2593,6 +2627,10 @@ void psp_threadman_register(void) {
     psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",        hle_GetSystemTimeWide);
     psp_hle_register(0x369ED59D, "ThreadManForUser", "sceKernelGetSystemTimeLow",         hle_GetSystemTimeLow);
     psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",            hle_GetSystemTime);
+    psp_hle_register(0x110DEC9A, "ThreadManForUser", "sceKernelUSec2SysClock",            hle_USec2SysClock);
+    psp_hle_register(0xC8CD158C, "ThreadManForUser", "sceKernelUSec2SysClockWide",        hle_USec2SysClockWide);
+    psp_hle_register(0xBA6B92E2, "ThreadManForUser", "sceKernelSysClock2USec",            hle_SysClock2USec);
+    psp_hle_register(0xE1619D7C, "ThreadManForUser", "sceKernelSysClock2USecWide",        hle_SysClock2USecWide);
     psp_hle_register(0x293B45B8, "ThreadManForUser", "sceKernelGetThreadId",             hle_GetThreadId);
     psp_hle_register(0x9944F31F, "ThreadManForUser", "sceKernelSuspendThread",           hle_SuspendThread);
     psp_hle_register(0x75156E8F, "ThreadManForUser", "sceKernelResumeThread",            hle_ResumeThread);
