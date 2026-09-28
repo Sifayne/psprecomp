@@ -360,9 +360,7 @@ static void fake_thread_entry(void) {
  * arrives as a NULL pointer -- neither is what passing them through gives.
  *
  * The third rule that file measures, that the block is copied onto the thread's
- * own stack, is deliberately *not* implemented; threadman.c says why and what
- * it costs. There is no test for it here, because a test for behaviour that was
- * knowingly left out is a test that has to be wrong. */
+ * own stack, is checked at the end (threadprobe step 19 confirms it on fw 6.60). */
 static void test_thread_argument_block(void) {
     psp_sysmem_reset();
     psp_threadman_reset();
@@ -415,6 +413,19 @@ static void test_thread_argument_block(void) {
     CHECK(psp_read32(g_thread_argp) == 0x00004567,
           "the copy holds the caller's bytes, got 0x%08X",
           psp_read32(g_thread_argp));
+    /* $sp starts 0x40 below the copy, and the top 16 words of the stack are the
+     * kernel's: uid, 0, base, 0 x 11, then two 0xFFFFFFFF words (threadprobe
+     * steps 19-25, fw 6.60). The copy of 4 bytes sits at top - 0x110. */
+    CHECK(g_thread_sp == g_thread_argp - 0x40,
+          "$sp 0x%08X, expected 0x40 below the copy at 0x%08X",
+          g_thread_sp, g_thread_argp);
+    const uint32_t top = g_thread_argp + 0x110;
+    CHECK(psp_read32(top - 0x40) == cid, "top-0x40 holds the uid");
+    CHECK(psp_read32(top - 0x3C) == 0 && psp_read32(top - 0x0C) == 0,
+          "the words between the kernel's are zero, got %08X %08X",
+          psp_read32(top - 0x3C), psp_read32(top - 0x0C));
+    CHECK(psp_read32(top - 8) == 0xFFFFFFFFu && psp_read32(top - 4) == 0xFFFFFFFFu,
+          "the last two words are 0xFFFFFFFF");
 
     /* And the stack the thread ran on is 0xFF, not whatever was there. Read
      * below the thread's own $sp, which it never wrote. */

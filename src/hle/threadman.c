@@ -346,34 +346,21 @@ static void hle_CreateThread(void) {
     psp_ret(t->uid);
 }
 
-/* What a thread is started with, and the one part of it that is held back.
+/* What a thread is started with.
  *
- * threads/semaphores/semaphores measures three rules and this implements two.
+ * threads/semaphores/semaphores measures three rules. A NULL pointer with a
+ * non-zero length arrives as length **0**, and a zero length with a real
+ * pointer arrives as a **NULL pointer**: each cancels the other out, and
+ * neither is what passing the arguments straight through gives. That is this
+ * function.
  *
- * The two: a NULL pointer with a non-zero length arrives as length **0**, and a
- * zero length with a real pointer arrives as a **NULL pointer**. Each cancels
- * the other out, in both directions, and neither is what passing the arguments
- * straight through gives.
- *
- * The third is that the block is *copied* onto the thread's own stack, and the
- * evidence for it is not in doubt. A one-byte start of the global 0x4567 reads
- * back on hardware as **0xFFFFFF67** -- one byte of data with this stack's 0xFF
- * fill above it -- which no reading of the original address can produce. A
- * variable holding 7, handed to a thread that writes 3 through the pointer,
- * still reads 7 afterwards.
- *
- * **It is not implemented, because it takes Armored Core from 633 GE lists to
- * 3.** Measured directly, and narrowed: performing the copy is harmless, and
- * handing the thread the copy's *address* is what breaks it. Copying 256 bytes
- * instead of four does not help, so the game is not merely reading past the
- * length it declared. What it does do is start three workers in a row from one
- * shared slot, rewriting the word between each -- so with the original pointer
- * all three read the last value, and with copies each reads its own, which is
- * the correct behaviour and the one the game does not survive.
- *
- * That points at something else being wrong upstream rather than at the rule,
- * and shipping a rule that is right in principle and breaks the only real
- * program available is the wrong trade. See docs/findings/autotests.md. */
+ * The third is that the block is *copied* onto the thread's own stack and the
+ * thread is handed the copy, which hle_StartThread does. A one-byte start of
+ * the global 0x4567 reads back on hardware as 0xFFFFFF67 -- one byte of data
+ * with the stack's 0xFF fill above it -- and threadprobe step 19 (fw 6.60)
+ * confirms it directly: the thread writes through its pointer and the
+ * caller's buffer is unchanged. A comment here used to say the copy was held
+ * back for Armored Core's sake; the code below has made it for some time. */
 static uint32_t start_arg_block(uint32_t *arglen, uint32_t argp) {
     if (!argp || !*arglen) { *arglen = 0; return 0; }
     return argp;
@@ -442,19 +429,21 @@ static void hle_StartThread(void) {
      * stack area first and then reports `stack not set to FF, instead:
      * cccccccc` -- a line that only appears because the fill did *not* happen.
      *
-     * Then the kernel's own two words at the very top and one at the very
-     * bottom, which the same test reads back through sceKernelReferThreadStatus
-     * and checks by hand:
+     * Then the kernel's own words: one at the very bottom, and the top 16
+     * words of the stack, which threadprobe steps 19 and 25 (fw 6.60) dump with
+     * and without NO_FILLSTACK and read the same both times:
      *
-     *     stack[0]        == thread id
-     *     stackEnd[-16]   == thread id
-     *     stackEnd[-14]   == stack base
-     *     stackEnd[-2..-1] == 0xFFFFFFFF
+     *     stack[0]          == thread id
+     *     stackEnd[-16]     == thread id
+     *     stackEnd[-14]     == stack base
+     *     stackEnd[-2..-1]  == 0xFFFFFFFF
+     *     everything else in stackEnd[-16..-3] == 0
      *
-     * The last pair look like the fill and are not: they are still there when
-     * PSP_THREAD_ATTR_NO_FILLSTACK suppressed it, which is how that test
-     * distinguishes them -- so they are written here rather than left to the
-     * memset.
+     * The zeros are the kernel's too: this used to leave the 0xFF fill between
+     * the four words (0xCC in step 25, whose thread scribbles over the stack
+     * first), and hardware has none. The last pair look like the fill and are
+     * not, for the same reason. What the rest of the 0x100 area above the
+     * argument block holds was not logged.
      *
      * That is the k0 area a PSP keeps at the top of every thread stack, and the
      * top 0x100 bytes of the stack are reserved for it -- which is also where
@@ -467,6 +456,8 @@ static void hle_StartThread(void) {
         }
         if (p) {
             const uint32_t top = t->stack_base + t->stack_size;
+            for (uint32_t a = top - 16 * 4; a < top - 2 * 4; a += 4)
+                psp_write32(a, 0);
             psp_write32(t->stack_base, t->uid);
             psp_write32(top - 16 * 4, t->uid);
             psp_write32(top - 14 * 4, t->stack_base);
@@ -488,21 +479,23 @@ static void hle_StartThread(void) {
      * which is `top - 0x100 - roundup(len, 16)` in every case. The 0x100 is the
      * k0 area reserved above, so the two measurements agree with each other.
      *
-     * $sp then starts below the copy rather than at a fixed offset from the top
-     * -- the argument block is on the stack, so it has to be out of reach of
-     * the frames. */
+     * $sp starts 0x40 below the copy, or 0x40 below the k0 area when there are
+     * no arguments: threadprobe steps 19-24 (fw 6.60) read sp = stk+EB0, E70,
+     * E60, 8C0 and EC0 in a 0x1000 stack for 8, 80, 90, 0x600 and 0 bytes. It
+     * used to start at the copy itself. */
     const uint32_t stack_top = t->stack_base + t->stack_size - 0x100u;
-    uint32_t sp = stack_top;
+    uint32_t block = stack_top;
     if (arglen) {
-        sp = stack_top - ((arglen + 15u) & ~15u);
-        void *dst = psp_mem_ptr(sp, arglen);
+        block = stack_top - ((arglen + 15u) & ~15u);
+        void *dst = psp_mem_ptr(block, arglen);
         void *src = psp_mem_ptr(argp, arglen);
         if (dst && src) {
             memcpy(dst, src, arglen);
-            psp_mem_mark_write(sp, arglen);
-            argp = sp;
+            psp_mem_mark_write(block, arglen);
+            argp = block;
         }
     }
+    const uint32_t sp = block - 0x40u;
 
     /* The thread becomes runnable; it does not run here.
      *
