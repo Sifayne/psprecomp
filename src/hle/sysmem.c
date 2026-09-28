@@ -214,13 +214,14 @@ void psp_sysmem_release(uint32_t addr) {
 #define SYSMEM_ERR_NOT_A_BLOCK   0x800200CBu
 
 /* threadprobe step 146 (fw 6.60): 2 and 6 are user partitions; 1, 3, 4 and 8
- * exist but are not the caller's; 0, 7 and -1 are out of range. The same
- * shape as the vpl table in kernobj.c, whose 5 and 9 this follows (neither
- * was tried here). */
+ * exist but are not the caller's; 0, 7 and -1 are out of range. Step 170: 5
+ * gives a block and 9 is not the caller's. This refused 5, following the vpl
+ * table in kernobj.c. Where a partition-5 block lies on a PSP is unmeasured;
+ * here it comes from the same heap as 2 and 6. */
 static uint32_t partition_error(int32_t part) {
     switch (part) {
-        case 2: case 6:                      return 0;
-        case 1: case 3: case 4: case 5:
+        case 2: case 5: case 6:              return 0;
+        case 1: case 3: case 4:
         case 8: case 9:                      return SYSMEM_ERR_NOT_USER_PART;
         default:                             return SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
     }
@@ -265,8 +266,11 @@ static void hle_AllocPartitionMemory(void) {
     case PSP_SMEM_HighAligned: addr = place_high(rounded, align); break;
     case PSP_SMEM_Addr:
         /* Step 145: asked for 0x80 into a free granule, the block starts at
-         * the granule. Whether it then also covers want + size is
-         * unmeasured; it keeps the rounded size. */
+         * the granule. Step 169 (fw 6.60): and it runs to the end of the
+         * granule holding want + size -- 0x1000 bytes asked for at +0x80
+         * took 0x1100 from the total free. This kept the rounded size, 0x1000,
+         * which left the last 0x80 bytes the caller asked for outside it. */
+        rounded = ((want + size + 0xFFu) & ~0xFFu) - (want & ~0xFFu);
         want &= ~0xFFu;
         if (want >= g_heap_lo && want + rounded <= g_heap_hi && !overlaps(want, rounded))
             addr = want;

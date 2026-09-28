@@ -193,12 +193,24 @@ static void test_sysmem(void) {
     CHECK(call5(NID_ALLOC, 1, NM, 0, 0x100, 0) == 0x800200D6u, "partition 1");
     CHECK(call5(NID_ALLOC, 7, NM, 0, 0x100, 0) == 0x800200D2u, "partition 7");
 
-    /* Addr placement starts at the granule the address falls in (step 145). */
+    /* Addr placement starts at the granule the address falls in (step 145)
+     * and runs to the end of the one holding want + size (step 169: 0x1000
+     * at +0x80 took 0x1100). */
+    const uint32_t free_before = call(TOTAL, 0, 0, 0, 0);
     const uint32_t at = call5(NID_ALLOC, 2, NM, 2 /*Addr*/, 0x100, lo + 0x80);
     CHECK((int32_t)at > 0 && call(NID_HEAD, at, 0, 0, 0) == lo,
           "Addr at +0x80 of a free granule: head %08X, expected %08X",
           call(NID_HEAD, at, 0, 0, 0), lo);
+    CHECK(free_before - call(TOTAL, 0, 0, 0, 0) == 0x200,
+          "Addr 0x100 at +0x80 took %X, expected 0x200",
+          free_before - call(TOTAL, 0, 0, 0, 0));
     call(NID_FREE, at, 0, 0, 0);
+
+    /* Partition 5 gives a block and 9 is not the caller's (step 170). */
+    const uint32_t p5 = call5(NID_ALLOC, 5, NM, 0, 0x100, 0);
+    CHECK((int32_t)p5 > 0, "partition 5: %08X", p5);
+    call(NID_FREE, p5, 0, 0, 0);
+    CHECK(call5(NID_ALLOC, 9, NM, 0, 0x100, 0) == 0x800200D6u, "partition 9");
 
     /* An impossible request fails rather than returning a bogus block. */
     uint32_t huge = call5(NID_ALLOC, 2, NM, 0, 0x7F000000u, 0);
@@ -1278,6 +1290,11 @@ static void test_pool_free_pointers(void) {
 
     call(psp_nid("sceKernelDeleteVpl"), vpl, 0, 0, 0);
     call(psp_nid("sceKernelDeleteFpl"), fpl, 0, 0, 0);
+
+    /* A tlspl may live in partition 5 (threadprobe step 131, fw 6.60). */
+    const uint32_t tls = call7(psp_nid("sceKernelCreateTlspl"), name, 5, 0, 4, 1, 0, 0);
+    CHECK((int32_t)tls > 0, "tlspl in partition 5: %08X", tls);
+    call(psp_nid("sceKernelDeleteTlspl"), tls, 0, 0, 0);
 }
 
 /* ---- waits with real threads --------------------------------------------

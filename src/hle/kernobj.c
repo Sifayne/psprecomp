@@ -137,11 +137,14 @@ static uint32_t vpl_partition_error(int32_t part) {
     }
 }
 
-/* tlspl shares it. threadprobe step 107 (fw 6.60) answers -1, 0, 7 and 10
- * with ILLEGAL_PARTITION and 1, 3, 4, 8 and 9 with ILLEGAL_PERM, the vpl
- * table exactly. This used to give 8 and 9 ILLEGAL_PARTITION, read from the
- * tlspl captures; the PSP says otherwise. Partition 5 is still unmeasured. */
+/* tlspl shares it but for 5. threadprobe step 107 (fw 6.60) answers -1, 0,
+ * 7 and 10 with ILLEGAL_PARTITION and 1, 3, 4, 8 and 9 with ILLEGAL_PERM, the
+ * vpl table exactly. This used to give 8 and 9 ILLEGAL_PARTITION, read from
+ * the tlspl captures; the PSP says otherwise. Partition 5 creates a pool
+ * (step 131), where this answered ILLEGAL_PERM; a vpl there is unmeasured
+ * and keeps the table's answer. */
 static uint32_t tlspl_partition_error(int32_t part) {
+    if (part == 5) return SCE_KERNEL_ERROR_OK;
     return vpl_partition_error(part);
 }
 
