@@ -1017,7 +1017,7 @@ static void test_sas_adpcm(void) {
     /* Before key-on nothing should be playing. */
     const uint32_t OUT = 0x08850000u;
     for (uint32_t i = 0; i < 64 * 4; i += 4) psp_write32(OUT + i, 0);
-    call(psp_nid("__sceSasCore"), 0, OUT, 0, 0);
+    call(psp_nid("__sceSasCore"), CORE, OUT, 0, 0);
     CHECK(psp_sas_nonzero() == 0, "silence before key-on");
 
     /* An envelope, explicitly. A voice with no attack rate stays at zero
@@ -1029,7 +1029,7 @@ static void test_sas_adpcm(void) {
           "adsr set");
 
     CHECK(call(psp_nid("__sceSasSetKeyOn"), 0, 0, 0, 0) == 0, "key on");
-    call(psp_nid("__sceSasCore"), 0, OUT, 0, 0);
+    call(psp_nid("__sceSasCore"), CORE, OUT, 0, 0);
 
     CHECK(psp_sas_frames() == 2, "two frames rendered, got %llu",
           (unsigned long long)psp_sas_frames());

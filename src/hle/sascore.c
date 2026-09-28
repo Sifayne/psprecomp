@@ -909,9 +909,13 @@ static void hle_SetVolume(void) {
      * whether or not this renderer uses them. The bound is on the magnitude,
      * taken the way abs() takes it: firmware 6.60 refuses 0x1001, -0x1001
      * and 0x7FFFFFFF in each of the four places but accepts 0x80000000,
-     * whose negation is itself and still negative (sasprobe step 49). What
-     * that volume sounds like is not measured; it is kept as given, and the
-     * mix is wide enough not to overflow on it. */
+     * whose negation is itself and still negative (sasprobe step 49).
+     *
+     * Each is kept as 16 bits, two to a word of the voice's struct (0x111,
+     * 0x222 read back as 02220111), so 0x80000000 is kept as 0 and plays
+     * silence: a constant 1000 or -1000 comes out 0 on that side and in that
+     * send, with the struct word reading 10000000 (sasprobe 3 steps 290-291,
+     * fw 6.60). */
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     for (int i = 2; i <= 5; i++) {
@@ -919,10 +923,10 @@ static void hle_SetVolume(void) {
         const int32_t mag = (int32_t)((vol & 0x80000000u) ? 0u - vol : vol);
         if (mag > 0x1000) { psp_ret(SAS_ERROR_VOLUME); return; }
     }
-    v->vol_l  = (int32_t)psp_arg(2);
-    v->vol_r  = (int32_t)psp_arg(3);
-    v->vol_el = (int32_t)psp_arg(4);
-    v->vol_er = (int32_t)psp_arg(5);
+    v->vol_l  = (int16_t)psp_arg(2);
+    v->vol_r  = (int16_t)psp_arg(3);
+    v->vol_el = (int16_t)psp_arg(4);
+    v->vol_er = (int16_t)psp_arg(5);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1194,9 +1198,18 @@ static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_
     g_frames_rendered++;
 }
 
+/* A null core is refused by __sceSasCore as by Init, with 80420005 (sasprobe
+ * 3 step 355, fw 6.60). The unaligned case Init also refuses is assumed the
+ * same here, and CoreWithMix is given the same check; neither is measured. */
+static int core_bad(void) {
+    const uint32_t core = psp_arg(0);
+    return !core || (core & 63u);
+}
+
 static void hle_Core(void) {
     /* (sasCore, sampleBuffer) */
     uint32_t out = psp_arg(1);
+    if (core_bad()) { psp_ret(SAS_ERROR_CORE); return; }
     if (out) mix_to_guest(out, 0, 0, 0);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1206,10 +1219,12 @@ static void hle_Core(void) {
  * nothing has touched. A mix above 0x1000 on either side, compared unsigned,
  * is refused with the volume code and the buffer is left as it was: -1,
  * 0x1001, 0x2000 and 0x7FFFFFFF all are on firmware 6.60 (sasprobe step 207).
- * Nothing is rendered then either; whether hardware's voices advance on a
- * refused call is not measured. */
+ * Nothing is rendered then either, and the voices do not advance: a voice
+ * playing a ramp picks up after a refused call exactly where it left off
+ * (sasprobe 3 steps 295-296, fw 6.60). */
 static void hle_CoreWithMix(void) {
     uint32_t out = psp_arg(1);
+    if (core_bad()) { psp_ret(SAS_ERROR_CORE); return; }
     if (g_output_mode != 0) { psp_ret(SAS_ERROR_MIX_MODE); return; }
     if (psp_arg(2) > 0x1000u || psp_arg(3) > 0x1000u) { psp_ret(SAS_ERROR_VOLUME); return; }
     if (out) mix_to_guest(out, 1, (int32_t)psp_arg(2), (int32_t)psp_arg(3));
@@ -1230,13 +1245,13 @@ static void hle_RevType(void) {
 }
 
 /* __sceSasRevParam(sasCore, delay, feedback): both unsigned, the delay
- * checked first. Delay 128 is refused (with 129 and -1), though PSPSDK's
- * header allows 0..128; feedback 129 and -1 are refused (step 225). Whether
- * feedback 128 passes is not measured -- (128, 128) stops at the delay --
- * and PSPSDK's 0..128 is kept for it. */
+ * checked first, and both 0..127, though PSPSDK's header allows 0..128:
+ * delay 128, 129 and -1 are refused, and so are feedback 128 (alone, as
+ * (0, 128) and (127, 128)), 129 and -1 (sasprobe step 225, and sasprobe 3
+ * step 319, fw 6.60). */
 static void hle_RevParam(void) {
     if (psp_arg(1) > 127u) { psp_ret(SAS_ERROR_REV_DELAY); return; }
-    if (psp_arg(2) > 128u) { psp_ret(SAS_ERROR_REV_FEEDBACK); return; }
+    if (psp_arg(2) > 127u) { psp_ret(SAS_ERROR_REV_FEEDBACK); return; }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
