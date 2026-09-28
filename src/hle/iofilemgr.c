@@ -354,11 +354,13 @@ static void hle_open_body(void) {
  *
  * $v0/$v1 are the call's answer and are kept across the park. Nothing is
  * given up with dispatch or interrupts off, where a PSP could not wait, nor
- * by the async calls, which reuse these handlers but return at once. */
+ * by the async calls, which reuse these handlers but return at once, nor
+ * inside an alarm or vtimer handler, which runs on no thread and has nothing
+ * to park. */
 static int g_io_async;
 
 static void io_park(void) {
-    if (g_io_async || !psp_sched_can_wait()) return;
+    if (g_io_async || !psp_sched_can_wait() || psp_ktimer_in_handler()) return;
     const uint32_t v0 = psp_cpu.r[PSP_REG_V0], v1 = psp_cpu.r[PSP_REG_V1];
     (void)psp_sched_delay(1);
     psp_cpu.r[PSP_REG_V0] = v0;
