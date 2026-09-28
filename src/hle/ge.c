@@ -79,30 +79,23 @@ static int fx16_floor(float f) {
     return i - (s < (float)i);
 }
 
-/* A transformed vertex's screen position onto the 1/16 grid, rounded to the
- * nearest sixteenth. This goes with ge_recip below: the two were fitted
- * together to the coverage of geprobe 2 (fw 6.60) scenes 15, 18, 20 and 21.
- * With an exact 1/w, floored positions looked best (0, 21, 50 and 28 pixels
- * off); with the hardware's short reciprocal and rounding it is 0, 2, 0 and
- * 23, and scenes 16, 22 and 23 also improve. */
-static int screen_fx16(float f) {
-    return fx16_floor(f + 0.5f / (float)PSP_SUBPX);
-}
-
-/* 1/w for a projected x and y as the transform unit appears to produce it:
- * the reciprocal's mantissa truncated to 11 fraction bits. Only the scale of
- * a projected vertex depends on it, so the error grows with distance from the
- * viewport centre; geprobe 2's 3D scenes (fw 6.60) put edges up to 50 pixels
- * off with an exact divide, and 9, 10 or 11 bits all fit them equally (see
- * screen_fx16), so the exact width is open. A power of two is exact either
- * way, which keeps w = 1 geometry where it was. Depth does not share it:
- * scene 17's depth-buffer dump sits 5 units low on most pixels when z is
- * divided by this reciprocal and centres on the exact one, so z keeps the
- * exact divide (as do the perspective terms, for want of a measurement). */
-static float ge_recip(float w) {
-    int e;
-    const float m = frexpf(1.0f / w, &e);     /* [0.5, 1) */
-    return ldexpf((float)(int)(m * 4096.0f), e - 12);   /* toward zero */
+/* One axis of a transformed vertex onto the 1/16 grid: the viewport centre
+ * (less the screen offset) plus ndc * scale, taken to sixteenths toward zero,
+ * that is toward the centre -- left of it and above it a position rounds up,
+ * right of it and below it down -- with an exact 1/w. geprobe 2 (fw 6.60)
+ * scene 20's Gouraud triangles pin every corner to one sixteenth through
+ * their colours, and all thirty sit exactly there; a short reciprocal or
+ * rounding (the earlier fit to edges alone) moves a third of them by one
+ * sixteenth and 2432 pixels of the scene by one step of colour. Scenes 15
+ * and 21 pin 18 more corners the same way. One corner disagrees: scene
+ * 15's nearest quad (w = 1.5) has its left edge at 127.0 where this gives
+ * 126.9375 (exactly -1809.08 sixteenths from the centre); a reciprocal cut
+ * to 14-16 bits would move it there but moves a scene 20 corner off. */
+static int screen_axis_fx16(float ndc, float scale, float centre) {
+    float t = ndc * scale * (float)PSP_SUBPX;
+    if (!(t > -1073741824.0f)) t = -1073741824.0f;   /* NaN too */
+    if (t > 1073741824.0f) t = 1073741824.0f;
+    return fx16_floor(centre + 0.5f / (float)PSP_SUBPX) + (int)t;
 }
 
 /* A float through-mode coordinate, saturated to signed 12.4 (-2048 ..
@@ -1379,8 +1372,20 @@ static void ndc_to_screen(float nx, float ny, float nz, float *sx, float *sy, fl
 }
 
 static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
-    const float r = ge_recip(clip[3]);
-    ndc_to_screen(clip[0] * r, clip[1] * r, clip[2] / clip[3], sx, sy, sz);
+    const float inv = 1.0f / clip[3];
+    ndc_to_screen(clip[0] * inv, clip[1] * inv, clip[2] * inv, sx, sy, sz);
+}
+
+/* The same projection onto the rasterizer's grid, as screen_axis_fx16 says. */
+static void clip_to_fx16(const float clip[4], int *x, int *y) {
+    const float inv = 1.0f / clip[3];
+    if (g_tl.vp_set) {
+        *x = screen_axis_fx16(clip[0] * inv, g_tl.vp_xs, g_tl.vp_xc - g_tl.off_x);
+        *y = screen_axis_fx16(clip[1] * inv, g_tl.vp_ys, g_tl.vp_yc - g_tl.off_y);
+    } else {
+        *x = screen_axis_fx16(clip[0] * inv, 240.0f, 240.0f);
+        *y = screen_axis_fx16(clip[1] * inv, -136.0f, 136.0f);
+    }
 }
 
 /* Transformed geometry, one primitive at a time.
@@ -1621,8 +1626,7 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
             g_clip_guard += (uint64_t)n; return;
         }
         v[i] = p[i].v;
-        v[i].x = screen_fx16(x);
-        v[i].y = screen_fx16(y);
+        clip_to_fx16(p[i].c, &v[i].x, &v[i].y);
         v[i].precise_x = x; v[i].precise_y = y; v[i].precise = 1;
         v[i].z = g_tl.depth_clamp ? fmaxf(0, fminf(65535, z)) : z;
         v[i].inv_w = 1.0f / p[i].c[3];
@@ -1658,17 +1662,16 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
     unsigned any_out = 0;
     for (int i = 0; i < n; i++) {
         if (poly[i].c[3] == 0.0f) { g_clip_eye += 3; return; }
-        const float inv = 1.0f / poly[i].c[3], r = ge_recip(poly[i].c[3]);
+        const float inv = 1.0f / poly[i].c[3];
         float sx, sy, sz;
-        ndc_to_screen(poly[i].c[0] * r, poly[i].c[1] * r, poly[i].c[2] * inv, &sx, &sy, &sz);
+        ndc_to_screen(poly[i].c[0] * inv, poly[i].c[1] * inv, poly[i].c[2] * inv, &sx, &sy, &sz);
         if (g_tl.depth_clamp) {
             if (sz < 0.0f) sz = 0.0f;
             if (sz > 65535.0f) sz = 65535.0f;
         }
         if (sx < -ox || sx >= 4096.0f - ox || sy < -oy || sy >= 4096.0f - oy) any_out = 1;
         p[i] = poly[i].v;
-        p[i].x = screen_fx16(sx);
-        p[i].y = screen_fx16(sy);
+        clip_to_fx16(poly[i].c, &p[i].x, &p[i].y);
         p[i].precise_x = sx; p[i].precise_y = sy; p[i].precise = 1;
         p[i].z = sz;
         /* Keep the divide's missing term with the screen-space vertex.  UVs
@@ -2157,9 +2160,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             float sx, sy, sz;
             if (clip[3] > 1e-6f) to_screen(clip, &sx, &sy, &sz);
             else                 sx = sy = sz = 0.0f;
-            /* Onto the 1/16 grid, as screen_fx16 explains. */
-            o->x = screen_fx16(sx);
-            o->y = screen_fx16(sy);
+            /* Onto the 1/16 grid, as screen_axis_fx16 explains. */
+            if (clip[3] > 1e-6f) clip_to_fx16(clip, &o->x, &o->y);
+            else                 o->x = o->y = 0;
             o->precise_x = sx; o->precise_y = sy; o->precise = 1;
             o->z = sz;
             o->inv_w = clip[3] > 1e-6f ? 1.0f / clip[3] : 1.0f;

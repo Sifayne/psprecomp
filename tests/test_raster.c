@@ -1163,10 +1163,23 @@ static void test_precise_vertex_payload(void) {
     cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
     CHECK(g_probe_first.precise && fabsf(g_probe_first.precise_x-40.24f)<0.0001f,
           "GE retains pre-quantization projection %.8f",g_probe_first.precise_x);
-    /* Rounded to 40.25: at w = 1 the short reciprocal is exact and the
-     * position goes to the nearest sixteenth (geprobe 2, fw 6.60; see
-     * screen_fx16 and ge_recip in ge.c). */
-    CHECK(g_probe_first.x==644,"transformed geometry rounds to 40.25 pixels: %d",g_probe_first.x);
+    /* 40.25: left of the viewport centre a position goes to the sixteenth
+     * nearer the centre (geprobe 2, fw 6.60; see screen_axis_fx16 in ge.c). */
+    CHECK(g_probe_first.x==644,"transformed geometry goes to 40.25 pixels: %d",g_probe_first.x);
+    /* 40.21 also goes up, where rounding would give 40.1875; right of the
+     * centre, 300.05 goes down to 300.0 where rounding would give 300.0625. */
+    psp_ge_reset();
+    begin_list_vtype((7u<<2)|(3u<<7));
+    identity_matrices();
+    float_vertex(0,(40.21f-240.0f)/240.0f,0,0);
+    cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
+    CHECK(g_probe_first.x==644,"40.21 goes toward the centre, to 40.25: %d",g_probe_first.x);
+    psp_ge_reset();
+    begin_list_vtype((7u<<2)|(3u<<7));
+    identity_matrices();
+    float_vertex(0,(300.05f-240.0f)/240.0f,0,0);
+    cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
+    CHECK(g_probe_first.x==4800,"300.05 goes toward the centre, to 300.0: %d",g_probe_first.x);
     psp_ge_reset(); begin_list(); vertex(0,10,20,0xFFFFFFFF);
     cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
     CHECK(!g_probe_first.precise,"through-mode vertices keep the PSP coordinate contract");
