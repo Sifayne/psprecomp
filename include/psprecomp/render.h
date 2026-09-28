@@ -141,6 +141,13 @@ typedef struct {
      * triangle reads 00FF0000 throughout). Pushed with the rest of the draw
      * state because the GE reads it per primitive, as it does these. */
     int      shade_flat;
+    /* Dither, DTE (0x20) and DITH1..4 (0xE2..0xE5): with it on, each of R,
+     * G and B becomes clamp(c + m[y & 3][x & 3]) before the write, in every
+     * framebuffer format, 8888 included, and alpha is not dithered (geprobe
+     * steps 5-10, fw 6.60). Row n is DITH(n+1), and element j is the signed
+     * nibble at bits 4j..4j+3 of it. */
+    int      dither;
+    int8_t   dither_m[4][4];
 } psp_blend_state;
 
 /* GE primitive types, from the PRIM argument's type field. */

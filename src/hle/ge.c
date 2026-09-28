@@ -212,6 +212,9 @@ static int fx16_floor(float f) {
 #define GE_CULL              0x9B
 /* SHADE: sceGuShadeModel sends GU_SMOOTH (1) or GU_FLAT (0), PSPSDK pspgu.h. */
 #define GE_SHADE             0x50
+/* Dither: DTE and the four matrix rows DITH1..4 (uofw include/ge_user.h). */
+#define GE_DITHERENABLE      0x20
+#define GE_DITHER0           0xE2
 #define GE_MASKRGB           0xD8
 #define GE_MASKALPHA         0xD9
 #define GE_ZTESTENABLE       0x23
@@ -2120,6 +2123,9 @@ static void push_pixel_state_body(void) {
         if (g_tl.clear_mode) {
             b.enable = 0; b.alpha_test = 0; b.stencil_test = 0;
             b.write_colour = g_tl.clear_colour;
+            /* A clear is left undithered, as it always was here. Not
+             * measured: geprobe disables dither before every clear. */
+            b.dither = 0;
         }
         psp_render_current()->set_blend(&b);
     }
@@ -2517,6 +2523,14 @@ static void run_list_body(ge_queue *q) {
         /* Stored inverted, so the reset state (all zero) stays Gouraud, as it
          * was before this register was decoded. */
         case GE_SHADE:          g_tl.blend.shade_flat = !(arg & 1); break;
+        case GE_DITHERENABLE:   g_tl.blend.dither = (int)(arg & 1); break;
+        /* One matrix row each, four signed nibbles, element 0 lowest:
+         * sceGuSetDither's row {-4, 0, -3, 1} arrives as 0x001D0C. */
+        case GE_DITHER0: case GE_DITHER0 + 1: case GE_DITHER0 + 2: case GE_DITHER0 + 3:
+            for (int j = 0; j < 4; j++)
+                g_tl.blend.dither_m[cmd - GE_DITHER0][j] =
+                    (int8_t)((int)((arg >> (4 * j)) & 0xF) - (int)(((arg >> (4 * j)) & 0x8) << 1));
+            break;
         /* ---- texture state -------------------------------------------------
          *
          * Recorded, not yet sampled. What the sampler has to support is a

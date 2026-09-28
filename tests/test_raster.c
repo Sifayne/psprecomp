@@ -1165,6 +1165,20 @@ static void test_hardware_shading(void) {
           pixel(140, 230), pixel(150, 234), pixel(180, 245), pixel(229, 264));
 }
 
+/* Dither on an 8888 target, geprobe step 10 (fw 6.60): a flat 7F sprite
+ * under the probe's extreme matrix, rows {7,-8,7,-8} {-8,7,-8,7} {0,1,2,3}. */
+static void test_hardware_dither(void) {
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, 10, 210, 0xFF7F7F7F); vertex(1, 240, 240, 0xFF7F7F7F);
+    cmd(0xE2, 0x8787); cmd(0xE3, 0x7878); cmd(0xE4, 0x3210); cmd(0xE5, 0xCDEF);
+    cmd(0x20, 1);                                  /* dither on */
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    CHECK(pixel(12, 212) == 0x868686 && pixel(13, 212) == 0x777777 &&
+          pixel(12, 213) == 0x777777 && pixel(13, 214) == 0x808080,
+          "dither offsets: %06X %06X %06X %06X, hardware 868686 777777 777777 808080",
+          pixel(12, 212), pixel(13, 212), pixel(12, 213), pixel(13, 214));
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -1199,6 +1213,7 @@ int main(void) {
     test_transformed_lines();
     test_line_interpolation_and_clipping();
     test_hardware_shading();
+    test_hardware_dither();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

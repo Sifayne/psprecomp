@@ -873,6 +873,16 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
         return;
     }
     if (g_bs.enable) { rgba = blend(rgba, get_pixel(x, y)); g_px_blend++; }
+    /* Dither: an offset per screen position, then the 16-bit formats keep
+     * the top bits as always (pack16). geprobe step 10 (fw 6.60) dithers
+     * 8888 too: its grey ramp, 7F and 80 at (240,136) and (241,136), reads
+     * 86 and 78 there under the probe's +7/-8 matrix row. Placed after the
+     * blend; the order against blending is not measured. */
+    if (g_bs.dither) {
+        const int d = g_bs.dither_m[y & 3][x & 3];
+        rgba = (rgba & 0xFF000000u) | clamp255((int)chan(rgba, 0) + d)
+             | clamp255((int)chan(rgba, 1) + d) << 8 | clamp255((int)chan(rgba, 2) + d) << 16;
+    }
     if (watched) {
         g_pw_left--;
         fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d arrived %08X wrote %08X  z %.0f  blend %d src %d dst %d eq %d fix %06X/%06X  tex %08X %dx%d fmt %d func %d tcc %d  pixels so far %llu\n",
