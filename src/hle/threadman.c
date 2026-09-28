@@ -194,6 +194,7 @@ static int          g_warned_block;
 static uint32_t     g_main_end_status;
 
 void psp_threadman_reset(void) {
+    psp_waitq_reset();
     memset(g_thread, 0, sizeof g_thread);
     memset(g_sema, 0, sizeof g_sema);
     memset(g_flag, 0, sizeof g_flag);
@@ -227,8 +228,12 @@ static void drop_callbacks_of(uint32_t thread_uid);
 #define WAITTYPE_EVF       PSP_WAITTYPE_EVF
 #define WAITTYPE_THREADEND PSP_WAITTYPE_THREADEND
 
+/* A timed wait ran out: out of its object's queue now (see psp_waitq_leave). */
+static void on_wait_expired(uint32_t uid) { (void)psp_waitq_leave(uid); }
+
 void psp_threadman_init(void) {
     psp_sched_set_end_hook(on_thread_end);
+    psp_sched_set_expire_hook(on_wait_expired);
     psp_threadman_reset();
 }
 
@@ -648,6 +653,9 @@ static void hle_ReleaseWaitThread(void) {
     }
     /* No longer asleep or delaying, so a wakeup that follows is banked. */
     t->wait_kind = WAIT_NONE;
+    /* Out of the object's queue now, not when it next runs: threadprobe step
+     * 78 (fw 6.60) reads each object's waiter count 1 -> 0 across this call. */
+    (void)psp_waitq_leave(t->uid);
     const int urgent = psp_sched_wake_as(t->uid, PSP_SCHED_WAKE_RELEASE);
     psp_ret(SCE_KERNEL_ERROR_OK);
     if (urgent) psp_sched_preempt();

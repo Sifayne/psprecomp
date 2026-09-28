@@ -124,6 +124,10 @@ typedef struct {
 typedef struct {
     psp_waiter w[PSP_WAITQ_MAX];   /* kept in arrival order */
     int        n;
+    /* A guest word the object keeps equal to the number of waiters, or 0.
+     * Only an lwmutex has one: the count lives in its workarea, where the
+     * guest reads it directly. psp_waitq_leave updates it. */
+    uint32_t   mirror;
 } psp_waitq;
 
 /* Append a waiter. Returns 0, or -1 if the queue is full. */
@@ -144,6 +148,29 @@ int  psp_waitq_pick(const psp_waitq *q, uint32_t attr);
 psp_waiter psp_waitq_take(psp_waitq *q, int i);
 
 int  psp_waitq_count(const psp_waitq *q);
+
+/* Take a thread out of whatever object queue it is parked in, at the moment
+ * its wait ends without the object's say: its timeout ran out, or
+ * sceKernelReleaseWaitThread forced it out. Hardware does this then and
+ * there, not when the thread next runs: threadprobe step 59 (fw 6.60) reads
+ * a semaphore's waiter count as 0 once a suspended waiter's timeout has
+ * passed, and step 78 reads 1 -> 0 across ReleaseWaitThread for sema, evf,
+ * mbx, vpl, fpl, msgpipe, mutex, lwmutex and TLS waits. A queue kept the entry
+ * until its thread ran and dropped it, so every count in between was one too
+ * high, and a signal in between could still pick the thread.
+ *
+ * What the entry had been handed goes with it: a message pipe waiter's byte
+ * count is written to its out-parameter, and an lwmutex's workarea count is
+ * rewritten. The thread's own code still calls psp_waitq_drop when it runs,
+ * which then finds nothing. Returns 1 if the thread was in a queue.
+ *
+ * Which queue a thread is in is recorded when psp_waitq_add adds the calling
+ * thread itself, and forgotten when its entry is taken or dropped. Adds of
+ * other threads' uids (the copies event flags and semaphores work on) are not
+ * recorded. */
+int  psp_waitq_leave(uint32_t uid);
+/* Forget every parked thread, with the objects: psp_threadman_reset. */
+void psp_waitq_reset(void);
 
 /* Wake everyone and empty the queue, for delete and cancel -- where no waiter
  * is being *satisfied* and each has to discover for itself that its object is

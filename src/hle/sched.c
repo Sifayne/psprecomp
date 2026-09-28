@@ -84,6 +84,7 @@ static psp_os_cond  g_turn = PSP_OS_COND_INIT;
 static int             g_running = MAIN_SLOT;
 static void          (*g_end_hook)(uint32_t uid, uint32_t status);
 static void          (*g_thread_hook)(void);
+static void          (*g_expire_hook)(uint32_t uid);
 static int             g_threading = 1;
 /* The tie-break counter behind every ready stamp; see sched_slot.rq_time. */
 static int64_t         g_rq_seq;
@@ -231,6 +232,7 @@ static void expire_locked(uint64_t now) {
         t->rq_time = (int64_t)t->wake_at;
         t->rq_seq  = t->park_seq;
         t->wake_at = 0;
+        if (g_expire_hook) g_expire_hook(t->uid);
     }
 }
 
@@ -850,6 +852,7 @@ static int wake_slot(uint32_t uid, int reason) {
 void psp_sched_set_thread_hook(void (*fn)(void)) { g_thread_hook = fn; }
 
 void psp_sched_set_end_hook(void (*fn)(uint32_t uid, uint32_t status)) { g_end_hook = fn; }
+void psp_sched_set_expire_hook(void (*fn)(uint32_t uid)) { g_expire_hook = fn; }
 
 void psp_sched_exit(uint32_t uid) {
     if (!g_threading) return;         /* returns to the caller, as it used to */

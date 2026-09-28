@@ -197,6 +197,13 @@ void psp_sched_set_thread_hook(void (*fn)(void));
  * thread manager supplies the meaning. */
 void psp_sched_set_end_hook(void (*fn)(uint32_t uid, uint32_t status));
 
+/* Called when a timed wait's deadline passes and the thread becomes ready
+ * again, at that moment rather than when the thread next runs. The thread
+ * manager takes it out of its object's queue then (psp_waitq_leave), as a
+ * PSP's timer interrupt does. Runs with the scheduler's lock held, so it must
+ * not call back into the scheduler. */
+void psp_sched_set_expire_hook(void (*fn)(uint32_t uid));
+
 /* Stop the whole guest: every thread is marked dead and the main context is
  * given the token back.
  *

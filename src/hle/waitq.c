@@ -8,10 +8,38 @@
 
 #include <string.h>
 
+/* Which queue each parked thread is in; see psp_waitq_leave. One entry per
+ * waiting thread, kept packed. */
+#define WAITQ_PARKED_MAX 512
+static struct { uint32_t uid; psp_waitq *q; } g_parked[WAITQ_PARKED_MAX];
+static int g_nparked;
+
+static int parked_find(uint32_t uid) {
+    for (int i = 0; i < g_nparked; i++) if (g_parked[i].uid == uid) return i;
+    return -1;
+}
+
+static void parked_set(uint32_t uid, psp_waitq *q) {
+    int i = parked_find(uid);
+    if (i < 0) {
+        if (g_nparked >= WAITQ_PARKED_MAX) return;
+        i = g_nparked++;
+    }
+    g_parked[i].uid = uid;
+    g_parked[i].q   = q;
+}
+
+static void parked_clear(uint32_t uid, const psp_waitq *q) {
+    const int i = parked_find(uid);
+    if (i < 0 || g_parked[i].q != q) return;
+    g_parked[i] = g_parked[--g_nparked];
+}
+
 int psp_waitq_add(psp_waitq *q, uint32_t uid, uint32_t need, uint32_t mode,
                   uint32_t out) {
     if (q->n >= PSP_WAITQ_MAX) return -1;
     q->w[q->n++] = (psp_waiter){ uid, need, mode, out, 0, 0 };
+    if (uid == psp_sched_current()) parked_set(uid, q);
     return 0;
 }
 
@@ -21,8 +49,26 @@ int psp_waitq_drop(psp_waitq *q, uint32_t uid) {
         memmove(&q->w[i], &q->w[i + 1],
                 (size_t)(q->n - i - 1) * sizeof q->w[0]);
         q->n--;
+        parked_clear(uid, q);
         return 1;
     }
+    return 0;
+}
+
+void psp_waitq_reset(void) { g_nparked = 0; }
+
+int psp_waitq_leave(uint32_t uid) {
+    const int p = parked_find(uid);
+    if (p < 0) return 0;
+    psp_waitq *q = g_parked[p].q;
+    for (int i = 0; i < q->n; i++) {
+        if (q->w[i].uid != uid) continue;
+        if (q->w[i].nout) psp_write32(q->w[i].nout, q->w[i].done);
+        (void)psp_waitq_drop(q, uid);
+        if (q->mirror) psp_write32(q->mirror, (uint32_t)q->n);
+        return 1;
+    }
+    g_parked[p] = g_parked[--g_nparked];
     return 0;
 }
 
@@ -46,6 +92,7 @@ psp_waiter psp_waitq_take(psp_waitq *q, int i) {
     const psp_waiter w = q->w[i];
     memmove(&q->w[i], &q->w[i + 1], (size_t)(q->n - i - 1) * sizeof q->w[0]);
     q->n--;
+    parked_clear(w.uid, q);
     return w;
 }
 
@@ -53,7 +100,10 @@ int psp_waitq_count(const psp_waitq *q) { return q->n; }
 
 static int release_all_as(psp_waitq *q, int reason) {
     int urgent = 0;
-    for (int i = 0; i < q->n; i++) urgent |= psp_sched_wake_as(q->w[i].uid, reason);
+    for (int i = 0; i < q->n; i++) {
+        parked_clear(q->w[i].uid, q);
+        urgent |= psp_sched_wake_as(q->w[i].uid, reason);
+    }
     q->n = 0;
     return urgent;
 }

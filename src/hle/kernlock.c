@@ -506,6 +506,9 @@ static void hle_CreateLwMutex(void) {
     m->init_count = init;
     m->uid        = psp_threadman_next_uid();
     m->used       = 1;
+    /* The waiter count lives in the workarea, and a waiter that times out or
+     * is released leaves before it runs again (psp_waitq_leave). */
+    m->q.mirror   = wa + LW_WAITING;
     char nm[sizeof m->name];
     memcpy(nm, m->name, sizeof nm);
     snprintf(m->waitdesc, sizeof m->waitdesc, "sceKernelLockLwMutex(%s)", nm);
@@ -534,6 +537,7 @@ static void hle_DeleteLwMutex(void) {
     }
     const int urgent = psp_waitq_release_all(&m->q);
     m->used = 0;
+    m->q.mirror = 0;
     /* syncprobe steps 113, 122, 220 (fw 6.60): the workarea reads back
      * count 0, thread -1, waiting 0, uid -1 after a delete (attr and pads
      * were 0 before and after, so whether they are written is not known).
