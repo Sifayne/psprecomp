@@ -79,18 +79,31 @@ static int fx16_floor(float f) {
     return i - (s < (float)i);
 }
 
+/* 1/w for x and y: the reciprocal's mantissa cut to 14 bits, toward zero.
+ * With an exact 1/w, one corner of scene 15 (w = 1.5, -1809.08 sixteenths
+ * from the centre) and one of scene 18 (w = 5, -28945.4) land a sixteenth
+ * further out than the hardware draws them, 608 and 350 pixels; 14 bits
+ * puts both where it does and is the only width that does (13 moves others,
+ * 15 and up leave scene 15's). The cost is one skinned corner of scene 20
+ * (-1500.014 sixteenths at w = 5), 49 pixels, which an exact 1/w keeps --
+ * how the hardware skins may account for that. A power of two is exact
+ * either way. Depth keeps the exact divide: scene 17's depth dump fits
+ * worse with this one. */
+static float ge_recip(float w) {
+    int e;
+    const float m = frexpf(1.0f / w, &e);                  /* [0.5, 1) */
+    return ldexpf((float)(int)(m * 16384.0f), e - 14);
+}
+
 /* One axis of a transformed vertex onto the 1/16 grid: the viewport centre
  * (less the screen offset) plus ndc * scale, taken to sixteenths toward zero,
  * that is toward the centre -- left of it and above it a position rounds up,
- * right of it and below it down -- with an exact 1/w. geprobe 2 (fw 6.60)
- * scene 20's Gouraud triangles pin every corner to one sixteenth through
- * their colours, and all thirty sit exactly there; a short reciprocal or
- * rounding (the earlier fit to edges alone) moves a third of them by one
- * sixteenth and 2432 pixels of the scene by one step of colour. Scenes 15
- * and 21 pin 18 more corners the same way. One corner disagrees: scene
- * 15's nearest quad (w = 1.5) has its left edge at 127.0 where this gives
- * 126.9375 (exactly -1809.08 sixteenths from the centre); a reciprocal cut
- * to 14-16 bits would move it there but moves a scene 20 corner off. */
+ * right of it and below it down. ndc is the clip coordinate times ge_recip's
+ * 1/w. geprobe 2 (fw 6.60) scene 20's Gouraud triangles pin every corner to
+ * one sixteenth through their colours; scenes 15 and 21 pin 18 more. A
+ * short reciprocal with rounding (the earlier fit to edges alone) moved a
+ * third of them by one sixteenth and 2432 pixels of scene 20 by one step of
+ * colour. */
 static int screen_axis_fx16(float ndc, float scale, float centre) {
     float t = ndc * scale * (float)PSP_SUBPX;
     if (!(t > -1073741824.0f)) t = -1073741824.0f;   /* NaN too */
@@ -1382,7 +1395,7 @@ static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
 
 /* The same projection onto the rasterizer's grid, as screen_axis_fx16 says. */
 static void clip_to_fx16(const float clip[4], int *x, int *y) {
-    const float inv = 1.0f / clip[3];
+    const float inv = ge_recip(clip[3]);
     if (g_tl.vp_set) {
         *x = screen_axis_fx16(clip[0] * inv, g_tl.vp_xs, g_tl.vp_xc - g_tl.off_x);
         *y = screen_axis_fx16(clip[1] * inv, g_tl.vp_ys, g_tl.vp_yc - g_tl.off_y);
