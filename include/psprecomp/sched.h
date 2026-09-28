@@ -97,9 +97,9 @@ int  psp_sched_block(uint32_t uid, psp_sched_state why, const char *what);
 #define PSP_SCHED_STRANDED (-1)   /* nothing runnable, and no deadline set */
 #define PSP_SCHED_EXPIRED  (-2)
 /* Forced out by sceKernelReleaseWaitThread: not a signal, and not a deadline.
- * A wait that knows it answers RELEASE_WAIT (threadprobe step 70, fw 6.60);
- * one that does not still leaves its queue, as it would for a timeout, rather
- * than taking the release for the thing it was waiting on. */
+ * The wait leaves its queue, as it would for a timeout, and answers
+ * RELEASE_WAIT (threadprobe step 70, fw 6.60) rather than taking the release
+ * for the thing it was waiting on. */
 #define PSP_SCHED_RELEASED (-3)
 /* The wake reason (psp_sched_wake_as) that produces PSP_SCHED_RELEASED. Out of
  * the range the objects' own reasons use. */

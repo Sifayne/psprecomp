@@ -619,9 +619,10 @@ static void hle_ExitDeleteThread(void) {
  * waiting (NOT_WAIT), a suspended waiter's wait ends underneath its
  * suspension, and a delay ends like any other wait.
  *
- * The waits in threadman.c answer RELEASE_WAIT. Those in kernobj.c and
- * kernlock.c do not know the reason: they leave their queue and answer
- * WAIT_TIMEOUT (see PSP_SCHED_RELEASED). */
+ * Every wait that parks answers RELEASE_WAIT and leaves its object's queue:
+ * those here, and the mutex, lwmutex, mbx, vpl, fpl and message-pipe waits in
+ * kernlock.c and kernobj.c (see PSP_SCHED_RELEASED). A released GetTlsAddr
+ * returns NULL; that one is unmeasured. */
 static void hle_ReleaseWaitThread(void) {
     const uint32_t id = psp_arg(0);
     if (id == 0 || id == psp_sched_current()) {

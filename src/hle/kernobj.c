@@ -18,6 +18,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* What a wait that is still queued answers once it stops waiting: forced out
+ * by sceKernelReleaseWaitThread it is RELEASE_WAIT (threadprobe step 70, fw
+ * 6.60), otherwise its deadline passed. Either way the caller has already left
+ * the queue and written the timeout back. */
+static uint32_t wait_end_code(int rc) {
+    return rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
+                                    : SCE_KERNEL_ERROR_WAIT_TIMEOUT;
+}
+
 /* ---- vpl: the variable-size pool ------------------------------------------
  *
  * Three numbers decide every `freeSize` the tests print, and all three are
@@ -399,7 +408,7 @@ static void vpl_allocate(int may_block, int has_timeout) {
     }
     psp_waitq_drop(&v->q, me);
     psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+    psp_ret(wait_end_code(rc));
 }
 
 static void hle_AllocateVpl(void)    { vpl_allocate(1, 1); }
@@ -981,7 +990,7 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
         if (q->w[k].uid == me && out) { psp_write32(out, q->w[k].done); break; }
     psp_waitq_drop(q, me);
     psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+    psp_ret(wait_end_code(rc));
 }
 
 static void hle_SendMsgPipe(void)       { mpp_transfer(1, 1, 1); }
@@ -1326,7 +1335,7 @@ static void mbx_receive(int may_block, int has_timeout) {
     }
     psp_waitq_drop(&m->q, me);
     psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+    psp_ret(wait_end_code(rc));
 }
 
 static void hle_ReceiveMbx(void) { mbx_receive(1, 1); }
@@ -1616,7 +1625,7 @@ static void fpl_allocate(int may_block, int has_timeout) {
     }
     psp_waitq_drop(&f->q, me);
     psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+    psp_ret(wait_end_code(rc));
 }
 
 static void hle_AllocateFpl(void)    { fpl_allocate(1, 1); }

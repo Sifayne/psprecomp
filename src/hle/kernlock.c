@@ -234,9 +234,12 @@ static void mutex_lock(int may_block, int has_timeout) {
     }
 
     psp_waitq_drop(&m->q, me);
-    if (rc == PSP_SCHED_EXPIRED) {
+    if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
+        /* Forced out by sceKernelReleaseWaitThread: RELEASE_WAIT, as the
+         * sleep in threadprobe step 70 (fw 6.60) answers. */
         psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+        psp_ret(rc == PSP_SCHED_EXPIRED ? SCE_KERNEL_ERROR_WAIT_TIMEOUT
+                                        : SCE_KERNEL_ERROR_RELEASE_WAIT);
         return;
     }
     psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
@@ -642,7 +645,10 @@ static void lw_lock(int may_block, int has_timeout, int flatten) {
     psp_waitq_drop(&m->q, me);
     psp_write32(wa + LW_WAITING, (uint32_t)psp_waitq_count(&m->q));
     psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+    /* Forced out by sceKernelReleaseWaitThread: RELEASE_WAIT (threadprobe
+     * step 70, fw 6.60), not a timeout. */
+    psp_ret(rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
+                                     : SCE_KERNEL_ERROR_WAIT_TIMEOUT);
 #undef LW_FAIL
 }
 
