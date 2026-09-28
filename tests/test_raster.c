@@ -1219,6 +1219,46 @@ static void test_hardware_texfunc(void) {
           pixel(30, 30));
 }
 
+/* Colour test, logic op and pixel mask, geprobe step 19 (fw 6.60): a
+ * one-pixel sprite over a destination written straight into the framebuffer,
+ * with the state commands passed in; returns the whole word, stencil byte
+ * included. */
+static uint32_t draw_one_with(uint32_t dst, uint32_t src, const uint32_t *state, int n) {
+    psp_ge_reset(); clear_fb();
+    psp_write32(FB + (uint32_t)(20 * 480 + 20) * 4, dst);
+    begin_list();
+    vertex(0, 20, 20, src); vertex(1, 21, 21, src);
+    for (int i = 0; i < n; i++) cmd(state[i] >> 24, state[i] & 0xFFFFFFu);
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    return psp_read32(FB + (uint32_t)(20 * 480 + 20) * 4);
+}
+
+static void test_hardware_colour_logic_mask(void) {
+    /* LOE on, LOP n: source 0xA55A3C over 0x402010; the stencil byte stays. */
+    static const struct { int op; uint32_t want; const char *name; } L[] = {
+        { 0, 0x000000, "CLEAR" }, { 1, 0x000010, "AND" },   { 6, 0xE57A2C, "XOR" },
+        { 7, 0xE57A3C, "OR" },    { 8, 0x1A85C3, "NOR" },   { 9, 0x1A85D3, "EQUIV" },
+        { 10, 0xBFDFEF, "INVERTED" }, { 14, 0xFFFFEF, "NAND" },
+    };
+    for (unsigned i = 0; i < sizeof L / sizeof L[0]; i++) {
+        const uint32_t st[] = { 0x28u << 24 | 1, 0xE6u << 24 | (uint32_t)L[i].op };
+        const uint32_t p = draw_one_with(0x33402010, 0xC3A55A3C, st, 2);
+        CHECK(p == (0x33000000u | L[i].want), "logic op %s: %08X, hardware %08X",
+              L[i].name, p, 0x33000000u | L[i].want);
+    }
+    /* PMSK1 0x00F0F0, PMSK2 0xFF: a set bit keeps the framebuffer's bit. */
+    const uint32_t pm[] = { 0xE8u << 24 | 0x00F0F0, 0xE9u << 24 | 0xFF };
+    uint32_t p = draw_one_with(0x00402010, 0x7FFFFFFF, pm, 2);
+    CHECK(p == 0x00FF2F1F, "pixel mask 0xFF00F0F0: %08X, hardware 00FF2F1F", p);
+    /* CTE on, NOTEQUAL 0x808080 / 0xF0F0F0: 0x8A8F80 is dropped, 0x908080 is
+     * drawn. */
+    const uint32_t ct[] = { 0x27u << 24 | 1, 0xD8u << 24 | 3, 0xD9u << 24 | 0x808080, 0xDAu << 24 | 0xF0F0F0 };
+    p = draw_one_with(0x00402010, 0xFF808F8A, ct, 4);
+    CHECK(p == 0x00402010, "colour test drops 0x8A8F80: %08X", p);
+    p = draw_one_with(0x00402010, 0xFF808090, ct, 4);
+    CHECK((p & 0xFFFFFF) == 0x808090, "colour test passes 0x908080: %08X", p);
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -1256,6 +1296,7 @@ int main(void) {
     test_hardware_dither();
     test_hardware_blend();
     test_hardware_texfunc();
+    test_hardware_colour_logic_mask();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

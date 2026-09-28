@@ -573,23 +573,34 @@ static uint32_t apply_texfunc(uint32_t tex, uint32_t col) {
 /* The framebuffer's alpha byte is the stencil buffer. An ordinary draw leaves
  * it as it was -- gpu/texfunc fills 44444444, draws, and reads 44ffffff back
  * -- and only a clear that asks for the stencil, or a stencil operation (not
- * modelled), writes it. */
+ * modelled), writes it.
+ *
+ * The pixel mask (PMSK1/PMSK2) is applied last, on the packed word: a set bit
+ * keeps the framebuffer's bit. geprobe step 19 (fw 6.60) draws 0x7FFFFFFF
+ * under mask 0xFF00F0F0 over 0x00402010 and reads 0x00FF2F1F back. A 16-bit
+ * target takes the mask through the same packing as the colour, so each field
+ * keeps the top bits of its mask byte (not measured on 16-bit targets). */
 static void put_pixel(int x, int y, uint32_t rgba, int stencil) {
     if (!g_fb_addr || !g_fb_stride) return;
     if (x < g_sc_x0 || y < g_sc_y0 || x > g_sc_x1 || y > g_sc_y1) return;
     if (g_fb_fmt != 3) {
+        const uint32_t at16 = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
         if (stencil >= 0) rgba = (rgba & 0x00FFFFFFu) | ((uint32_t)stencil << 24);
-        else if (!g_bs.write_alpha && g_fb_fmt != 0) {
-            const uint32_t at16 = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
+        else if (!g_bs.write_alpha && g_fb_fmt != 0)
             rgba = (rgba & 0x00FFFFFFu) | (expand16((uint32_t)psp_read16(at16), g_fb_fmt) & 0xFF000000u);
+        uint32_t px = pack16(rgba, g_fb_fmt);
+        if (g_bs.pixel_mask) {
+            const uint32_t keep = pack16(g_bs.pixel_mask, g_fb_fmt);
+            px = ((uint32_t)psp_read16(at16) & keep) | (px & ~keep);
         }
-        psp_write16(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2, (uint16_t)pack16(rgba, g_fb_fmt));
+        psp_write16(at16, (uint16_t)px);
         g_pixels++;
         return;
     }
     const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4;
     if (stencil >= 0)           rgba = (rgba & 0x00FFFFFFu) | ((uint32_t)stencil << 24);
     else if (!g_bs.write_alpha) rgba = (rgba & 0x00FFFFFFu) | (psp_read32(at) & 0xFF000000u);
+    if (g_bs.pixel_mask) rgba = (psp_read32(at) & g_bs.pixel_mask) | (rgba & ~g_bs.pixel_mask);
     psp_write32(at, rgba);
     g_pixels++;
 }
@@ -785,17 +796,65 @@ static uint32_t stencil_op(int op, uint32_t cur) {
 }
 
 /* A stencil operation on a pixel whose colour is not written: only the alpha
- * byte changes. A 5650 target has no stencil and the write is dropped. */
+ * byte changes. A 5650 target has no stencil and the write is dropped.
+ * PMSK2 is applied to it as to any other alpha write; that a masked stencil
+ * bit is kept is the reading of step 19's colour result, not a measurement. */
 static void write_stencil_only(int x, int y, uint32_t value) {
     if (!g_fb_addr || !g_fb_stride || g_fb_fmt == 0) return;
+    const uint32_t keep = 0x00FFFFFFu | g_bs.pixel_mask;
     if (g_fb_fmt != 3) {
         const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
-        const uint32_t px = expand16((uint32_t)psp_read16(at), g_fb_fmt) & 0x00FFFFFFu;
-        psp_write16(at, (uint16_t)pack16(px | (value << 24), g_fb_fmt));
+        const uint32_t old = (uint32_t)psp_read16(at);
+        const uint32_t px = pack16((expand16(old, g_fb_fmt) & 0x00FFFFFFu) | (value << 24), g_fb_fmt);
+        const uint32_t k16 = pack16(keep, g_fb_fmt);
+        psp_write16(at, (uint16_t)((old & k16) | (px & ~k16)));
         return;
     }
     const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4;
-    psp_write32(at, (psp_read32(at) & 0x00FFFFFFu) | (value << 24));
+    const uint32_t old = psp_read32(at);
+    psp_write32(at, (old & keep) | ((value << 24) & ~keep));
+}
+
+/* Colour test (CTE 0x27, CTEST 0xD8, CREF 0xD9, CMSK 0xDA): the masked RGB
+ * word against the masked reference, with only four functions. geprobe
+ * step 19 (fw 6.60) runs NOTEQUAL 0x808080 / 0xF0F0F0 over a ramp and drops
+ * exactly the fragments whose three channels all sit in 0x80..0x8F. */
+static int colour_pass(uint32_t rgba) {
+    if (!g_bs.colour_test) return 1;
+    const uint32_t c = rgba & g_bs.colour_mask & 0x00FFFFFFu;
+    const uint32_t r = g_bs.colour_ref & g_bs.colour_mask & 0x00FFFFFFu;
+    switch (g_bs.colour_func & 3) {
+    case 0:  return 0;
+    case 2:  return c == r;
+    case 3:  return c != r;
+    default: return 1;
+    }
+}
+
+/* Logic op (LOE 0x28, LOP 0xE6), source s against destination d, in the
+ * PSPSDK GU_* order. geprobe step 19 (fw 6.60) combines 0xA55A3C with
+ * 0x402010 and reads CLEAR 000000, AND 000010, XOR E57A2C, OR E57A3C,
+ * NOR 1A85C3, EQUIV 1A85D3, INVERTED BFDFEF (~d), NAND FFFFEF; the other
+ * eight follow the same table and are not measured. */
+static uint32_t logic_op(int op, uint32_t s, uint32_t d) {
+    switch (op & 15) {
+    case 0:  return 0;              /* CLEAR */
+    case 1:  return s & d;          /* AND */
+    case 2:  return s & ~d;         /* AND_REVERSE */
+    case 3:  return s;              /* COPY */
+    case 4:  return ~s & d;         /* AND_INVERTED */
+    case 5:  return d;              /* NOOP */
+    case 6:  return s ^ d;          /* XOR */
+    case 7:  return s | d;          /* OR */
+    case 8:  return ~(s | d);       /* NOR */
+    case 9:  return ~(s ^ d);       /* EQUIV */
+    case 10: return ~d;             /* INVERTED */
+    case 11: return s | ~d;         /* OR_REVERSE */
+    case 12: return ~s;             /* COPY_INVERTED */
+    case 13: return ~s | d;         /* OR_INVERTED */
+    case 14: return ~(s & d);       /* NAND */
+    default: return 0xFFFFFFFFu;    /* SET */
+    }
 }
 
 static int alpha_pass(uint32_t rgba) {
@@ -863,6 +922,11 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
                              x, y, g_fb_addr, g_cur_prim, rgba, g_tex.addr, g_tex.w, g_tex.h, g_tex.fmt, (unsigned long long)g_pixels);
         return;
     }
+    if (!colour_pass(rgba)) {
+        if (watched) fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d COLOUR-TEST-KILLED %08X  ref %06X mask %06X func %d  pixels so far %llu\n",
+                             x, y, g_fb_addr, g_cur_prim, rgba, g_bs.colour_ref, g_bs.colour_mask, g_bs.colour_func, (unsigned long long)g_pixels);
+        return;
+    }
     /* The stencil test runs before the depth test, and each outcome has its
      * operation: fail, pass-but-depth-fails, pass. Only the last writes colour,
      * all three may write the stencil. gpu/commands/blend runs REPLACE with
@@ -905,6 +969,11 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
         rgba = (rgba & 0xFF000000u) | clamp255((int)chan(rgba, 0) + d)
              | clamp255((int)chan(rgba, 1) + d) << 8 | clamp255((int)chan(rgba, 2) + d) << 16;
     }
+    /* The logic op works on RGB only: step 19's alpha byte (the stencil) is
+     * untouched by all eight ops it runs. Its order against the dither is not
+     * measured. */
+    if (g_bs.logic_enable)
+        rgba = (rgba & 0xFF000000u) | (logic_op(g_bs.logic_op, rgba, get_pixel(x, y)) & 0x00FFFFFFu);
     if (watched) {
         g_pw_left--;
         fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d arrived %08X wrote %08X  z %.0f  blend %d src %d dst %d eq %d fix %06X/%06X  tex %08X %dx%d fmt %d func %d tcc %d  pixels so far %llu\n",

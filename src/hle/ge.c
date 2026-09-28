@@ -215,8 +215,18 @@ static int fx16_floor(float f) {
 /* Dither: DTE and the four matrix rows DITH1..4 (uofw include/ge_user.h). */
 #define GE_DITHERENABLE      0x20
 #define GE_DITHER0           0xE2
-#define GE_MASKRGB           0xD8
-#define GE_MASKALPHA         0xD9
+/* Colour test, logic op and pixel mask (uofw include/ge_user.h). 0xD8/0xD9
+ * were named as RGB/alpha masks here; they are the colour-test function and
+ * reference, and geprobe step 19 (fw 6.60) shows sceGuPixelMask sending
+ * 0xE8/0xE9 instead. */
+#define GE_COLORTESTENABLE   0x27
+#define GE_LOGICOPENABLE     0x28
+#define GE_COLORTEST         0xD8
+#define GE_COLORREF          0xD9
+#define GE_COLORTESTMASK     0xDA
+#define GE_LOGICOP           0xE6
+#define GE_PIXELMASKRGB      0xE8
+#define GE_PIXELMASKALPHA    0xE9
 #define GE_ZTESTENABLE       0x23
 #define GE_ZTEST             0xDE
 #define GE_ZWRITEDISABLE     0xE7
@@ -2126,6 +2136,10 @@ static void push_pixel_state_body(void) {
             /* A clear is left undithered, as it always was here. Not
              * measured: geprobe disables dither before every clear. */
             b.dither = 0;
+            /* Likewise the colour test, logic op and pixel mask: a clear
+             * writes as it did before they were decoded. Not measured;
+             * geprobe turns them off before it clears. */
+            b.colour_test = 0; b.logic_enable = 0; b.pixel_mask = 0;
         }
         psp_render_current()->set_blend(&b);
     }
@@ -2512,11 +2526,17 @@ static void run_list_body(ge_queue *q) {
         case GE_OFFSETX: g_tl.off_x = (float)(arg & 0xFFFFFu) / 16.0f; break;
         case GE_OFFSETY: g_tl.off_y = (float)(arg & 0xFFFFFu) / 16.0f; break;
 
-        case GE_MASKRGB:
-        case GE_MASKALPHA:
-            if (drawlog_aux())
-                fprintf(stderr, "msk: %s arg=%06X\n",
-                        cmd == GE_MASKRGB ? "MASKRGB  " : "MASKALPHA", arg);
+        case GE_COLORTESTENABLE: g_tl.blend.colour_test  = (int)(arg & 1); break;
+        case GE_COLORTEST:       g_tl.blend.colour_func  = (int)(arg & 3); break;
+        case GE_COLORREF:        g_tl.blend.colour_ref   = arg & 0xFFFFFFu; break;
+        case GE_COLORTESTMASK:   g_tl.blend.colour_mask  = arg & 0xFFFFFFu; break;
+        case GE_LOGICOPENABLE:   g_tl.blend.logic_enable = (int)(arg & 1); break;
+        case GE_LOGICOP:         g_tl.blend.logic_op     = (int)(arg & 15); break;
+        case GE_PIXELMASKRGB:
+            g_tl.blend.pixel_mask = (g_tl.blend.pixel_mask & 0xFF000000u) | (arg & 0xFFFFFFu);
+            break;
+        case GE_PIXELMASKALPHA:
+            g_tl.blend.pixel_mask = (g_tl.blend.pixel_mask & 0x00FFFFFFu) | ((arg & 0xFFu) << 24);
             break;
         case GE_CULLFACEENABLE: g_tl.cull_enable = (int)(arg & 1); break;
         case GE_CULL:           g_tl.cull_ccw    = (int)(arg & 1); break;

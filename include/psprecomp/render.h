@@ -148,6 +148,19 @@ typedef struct {
      * nibble at bits 4j..4j+3 of it. */
     int      dither;
     int8_t   dither_m[4][4];
+    /* The colour test, CTE (0x27) with CTEST/CREF/CMSK (0xD8-0xDA): a
+     * fragment passes when (rgb & mask) OP (ref & mask), OP 0 never, 1
+     * always, 2 equal, 3 not equal, compared as one 24-bit word. */
+    int      colour_test, colour_func;
+    uint32_t colour_ref, colour_mask;
+    /* The logic op, LOE (0x28) and LOP (0xE6): the sixteen PSPSDK GU_CLEAR
+     * .. GU_SET codes, applied to RGB against the framebuffer after blending;
+     * the alpha/stencil byte is left alone. */
+    int      logic_enable, logic_op;
+    /* PMSK1 | PMSK2 << 24 (0xE8, 0xE9), in 0xAABBGGRR: a set bit keeps the
+     * framebuffer's bit (geprobe step 19, fw 6.60: 0xFF00F0F0 with 0x7FFFFFFF
+     * over 0x00402010 reads 0x00FF2F1F). */
+    uint32_t pixel_mask;
 } psp_blend_state;
 
 /* GE primitive types, from the PRIM argument's type field. */
