@@ -79,6 +79,15 @@ static int fx16_floor(float f) {
     return i - (s < (float)i);
 }
 
+/* A transformed vertex's screen position onto the 1/16 grid: floored, not
+ * rounded. geprobe 2 scene 15 (fw 6.60) draws fog quads whose projected
+ * corners fall between sixteenths; with floored corners every covered pixel
+ * of the frame is where the hardware put it, while rounding moves the edges
+ * of 59 pixels. Scene 17's two interpenetrating triangles agree. */
+static int screen_fx16(float f) {
+    return fx16_floor(f);
+}
+
 /* A float through-mode coordinate, saturated to signed 12.4 (-2048 ..
  * 2047.9375 pixels). geprobe step 18 (fw 6.60) draws a triangle with a
  * vertex at x = 5000 exactly as if it were at x = 2048: every pixel's
@@ -1458,8 +1467,8 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
             g_clip_guard += (uint64_t)n; return;
         }
         v[i] = p[i].v;
-        v[i].x = fx16_floor(x + 1.0f / (2 * PSP_SUBPX));
-        v[i].y = fx16_floor(y + 1.0f / (2 * PSP_SUBPX));
+        v[i].x = screen_fx16(x);
+        v[i].y = screen_fx16(y);
         v[i].precise_x = x; v[i].precise_y = y; v[i].precise = 1;
         v[i].z = g_tl.depth_clamp ? fmaxf(0, fminf(65535, z)) : z;
         v[i].inv_w = 1.0f / p[i].c[3];
@@ -1504,8 +1513,8 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
         }
         if (sx < -ox || sx >= 4096.0f - ox || sy < -oy || sy >= 4096.0f - oy) any_out = 1;
         p[i] = poly[i].v;
-        p[i].x = fx16_floor(sx + 1.0f / (2 * PSP_SUBPX));
-        p[i].y = fx16_floor(sy + 1.0f / (2 * PSP_SUBPX));
+        p[i].x = screen_fx16(sx);
+        p[i].y = screen_fx16(sy);
         p[i].precise_x = sx; p[i].precise_y = sy; p[i].precise = 1;
         p[i].z = sz;
         /* Keep the divide's missing term with the screen-space vertex.  UVs
@@ -1969,11 +1978,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             float sx, sy, sz;
             if (clip[3] > 1e-6f) to_screen(clip, &sx, &sy, &sz);
             else                 sx = sy = sz = 0.0f;
-            /* Rounded to the nearest 1/16. Hardware's exact rule past the
-             * fourth bit is unmeasured here; what gpu/textures/size measures
-             * is that the far edge lands on the pixel it should. */
-            o->x = fx16_floor(sx + 1.0f / (2 * PSP_SUBPX));
-            o->y = fx16_floor(sy + 1.0f / (2 * PSP_SUBPX));
+            /* Floored to the 1/16 grid, as screen_fx16 explains. */
+            o->x = screen_fx16(sx);
+            o->y = screen_fx16(sy);
             o->precise_x = sx; o->precise_y = sy; o->precise = 1;
             o->z = sz;
             o->inv_w = clip[3] > 1e-6f ? 1.0f / clip[3] : 1.0f;
