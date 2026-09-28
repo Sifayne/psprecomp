@@ -1337,7 +1337,11 @@ static int read_vertex_set(uint32_t a, uint32_t vtype, int col_off, int pos_off,
 
 /* A whole record: its vertex sets blended by the morph weights, when there
  * is more than one. Every field is blended, colour included -- scene 21's
- * half-and-half triangle is half-way in colour as well as in place. */
+ * half-and-half triangle is half-way in colour as well as in place. The
+ * blended colour is truncated, not rounded: scene 21's triangles weighted
+ * 0.5/0.5 and 0.25/1.0 (127.5 and 63.75 per channel) differ from the
+ * hardware on 1170 fewer pixels so (1620 -> 450). What is left is in those
+ * two triangles and not pinned down; the whole-weight ones are exact. */
 static int read_mvert(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
                       int norm_off, int want_normal, ge_mvert *o) {
     if (g_vl.morph_n <= 1)
@@ -1357,7 +1361,7 @@ static int read_mvert(uint32_t a, uint32_t vtype, int col_off, int pos_off, int 
     memcpy(o->nrm, nrm, sizeof nrm);
     o->rgba = 0;
     for (int i = 0; i < 4; i++) {
-        int c = (int)(col[i] + 0.5f);
+        int c = (int)col[i];
         if (c < 0) c = 0;
         if (c > 255) c = 255;
         o->rgba |= (uint32_t)c << (8 * i);

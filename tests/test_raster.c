@@ -1070,7 +1070,8 @@ static void test_skin_morph_patch(void) {
     CHECK(psp_render_select("probe") == 0, "probe selectable for skin/morph test");
 
     /* Morph: two sets per record, colour then position, 16 bytes each;
-     * weights 0.5 and 0.5 put the point half-way, colour included. */
+     * weights 0.5 and 0.5 put the point half-way, colour included, and the
+     * colour's 127.5 truncates to 127 (geprobe 2 scene 21, fw 6.60). */
     psp_ge_reset();
     begin_list_vtype((7u << 2) | (3u << 7) | (1u << 18));
     identity_matrices();
@@ -1084,7 +1085,7 @@ static void test_skin_morph_patch(void) {
     end_list();
     CHECK(g_probe_draws == 1 && fabsf(g_probe_first.precise_x - 240.0f) < 0.01f,
           "morphed point at x 240: %u draws, %.3f", g_probe_draws, g_probe_first.precise_x);
-    CHECK(g_probe_first.rgba == 0xFF008080u, "morphed colour 0xFF008080: %08X", g_probe_first.rgba);
+    CHECK(g_probe_first.rgba == 0xFF007F7Fu, "morphed colour 0xFF007F7F: %08X", g_probe_first.rgba);
 
     /* Skinning: one float weight of 1.0 on bone 0, which moves x by 0.5. */
     psp_ge_reset();
