@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #define MAX_ISO_ENTRIES 4096
 
@@ -45,6 +46,7 @@ static int usage(void) {
         "  allegrexrecomp funcs   <file> [--list]\n"
         "  allegrexrecomp emit    <file> <outdir> [prefix] [--replace <addrs>|@<file>]\n"
         "  allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs] [--dispatch] [--drain <s>]\n"
+        "                         [--argv0 <guest path>]\n"
         "  allegrexrecomp decrypt <file> [--keys <path>]\n"
         "  allegrexrecomp kirk1   <file> [out] [--keys <path>]\n"
         "\n"
@@ -1035,9 +1037,29 @@ static int interp_bind_imports(const psp_blob *b, const elf_info *e,
     return bound;
 }   /* never mapped: the run stops here */
 
+/* The path a PSP would pass as the module's argument when it started it from
+ * the Memory Stick: ms0:/PSP/GAME/<name>/EBOOT.PBP, with <name> the host
+ * file's name without its extension, or its directory's name when the file
+ * is itself an EBOOT.PBP. */
+static void interp_default_argv0(const char *host, char *out, size_t cap) {
+    const char *base = strrchr(host, '/');
+    base = base ? base + 1 : host;
+    const char *name = base;
+    size_t len = strlen(base);
+    const char *dot = strrchr(base, '.');
+    if (dot && dot != base) len = (size_t)(dot - base);
+    if (!strcasecmp(base, "EBOOT.PBP") && base > host) {
+        const char *end = base - 1;              /* the '/' before EBOOT.PBP */
+        const char *start = end;
+        while (start > host && start[-1] != '/') start--;
+        if (end > start) { name = start; len = (size_t)(end - start); }
+    }
+    snprintf(out, cap, "ms0:/PSP/GAME/%.*s/EBOOT.PBP", (int)len, name);
+}
+
 static int cmd_interp(const char *path, uint32_t from, int have_from,
                       uint64_t budget, int trace, int trace_regs, int dispatch,
-                      int drain_s) {
+                      int drain_s, const char *argv0) {
     psp_blob b;
     if (psp_blob_read(path, &b) != 0) { fprintf(stderr, "cannot read %s\n", path); return 1; }
 
@@ -1098,6 +1120,23 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     const uint32_t stack = psp_sysmem_alloc(INTERP_STACK_SIZE, 1);
     if (!stack) { fprintf(stderr, "cannot allocate a guest stack\n"); goto fail; }
     psp_cpu.r[PSP_REG_SP] = (stack + INTERP_STACK_SIZE - 64) & ~15u;
+    /* The module's argument block: its own path. threadprobe step 2 (fw 6.60)
+     * has main() see argc=1 and argv[0]="ms0:/PSP/GAME/threadprobe/EBOOT.PBP"
+     * -- the loader hands module_start (length with the NUL, pointer) and
+     * crt0 passes the pair on to StartThread, which copies it to the top of
+     * the main thread's stack; that copy is what puts main's stack 0x30 below
+     * where it was here (step 92). This started the module with $a0 = $a1 = 0.
+     * Not for --from, which starts at an arbitrary function. */
+    if (!have_from) {
+        char def[512];
+        if (!argv0) { interp_default_argv0(path, def, sizeof def); argv0 = def; }
+        const uint32_t len = (uint32_t)strlen(argv0) + 1;
+        const uint32_t at = (stack + INTERP_STACK_SIZE - 64 - len) & ~15u;
+        for (uint32_t i = 0; i < len; i++) psp_write8(at + i, (uint8_t)argv0[i]);
+        psp_cpu.r[PSP_REG_A0] = len;
+        psp_cpu.r[PSP_REG_A1] = at;
+        psp_cpu.r[PSP_REG_SP] = at - 64;
+    }
     /* A module with a small-data area reads it through $gp and never loads the
      * register itself; the value comes from the module info. */
     psp_cpu.r[PSP_REG_GP] = li.gp;
@@ -1389,8 +1428,11 @@ int main(int argc, char **argv) {
          * with no output at all. psp_sched_drain's own default of 60 is for the
          * game, which is supposed to still be going. */
         int drain_s = 10;
+        const char *argv0 = NULL;
         for (int i = 3; i < argc; i++) {
-            if (!strcmp(argv[i], "--from") && i + 1 < argc) {
+            if (!strcmp(argv[i], "--argv0") && i + 1 < argc) {
+                argv0 = argv[++i];
+            } else if (!strcmp(argv[i], "--from") && i + 1 < argc) {
                 from = (uint32_t)strtoul(argv[++i], NULL, 0); have_from = 1;
             } else if (!strcmp(argv[i], "--budget") && i + 1 < argc) {
                 budget = strtoull(argv[++i], NULL, 0);
@@ -1408,7 +1450,7 @@ int main(int argc, char **argv) {
             }
         }
         return cmd_interp(argv[2], from, have_from, budget, trace, regs,
-                          dispatch, drain_s);
+                          dispatch, drain_s, argv0);
     }
     if (!strcmp(cmd, "decrypt")) return cmd_decrypt(argv[2], keypath);
     if (!strcmp(cmd, "kirk1")) {
