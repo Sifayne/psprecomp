@@ -445,6 +445,15 @@ static void fw660_sizes(void) {
      * the request adds its two clusters to utilityData. */
     str(md+16,"HWSFO"); psp_write32(p+1412,data); psp_write32(p+1416,40000); psp_write32(p+1420,40000);
     assert(run()==0 && psp_read32(md+36)>=3 && psp_read32(ud)==5);
+    /* The data file counts with its 16-byte secure header: dataSize 32768
+     * is two clusters, 4 in all (SZNEW, step 92). */
+    psp_write32(p+1412,0); psp_write32(p+124,32768); psp_write32(p+120,32768);
+    assert(run()==0 && psp_read32(ud)==4);
+    /* GETSIZE of a save that does not exist: RW_NO_DATA, sizeInfo still
+     * filled (step 97). */
+    hw(22,"HWNOSUCH",""); psp_write32(p+1532,fr);
+    for (unsigned i=0;i<60;i++) psp_write8(fr+i,0);
+    assert(run()==0x80110327u && psp_read32(fr+16)==0x8000u && psp_read32(fr+20)>0);
 }
 /* LIST with saveName pattern: the result count (entries at ents). */
 static int list_of(const char *pattern) {

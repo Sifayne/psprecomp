@@ -652,13 +652,19 @@ static void sd_kb_str(uint64_t kb, uint32_t addr) {
 }
 
 /* Sum of file clusters under a save dir, +1 for the directory itself when
- * asked: msData counts files-plus-dir (4 for three files, read off
- * sizes.expected). utilityData is not measured this way; see
- * sd_fill_sizes. */
+ * asked. msData counts the files plus the directory on fw 6.60: 3 for A0
+ * (an 80-byte DATA.BIN and PARAM.SFO), 4 for ICON (the same and a 215-byte
+ * ICON0.PNG), 5 for BIG (a 65553-byte DATA.BIN) (saveprobe steps 92, 95,
+ * 96). A secure file is counted at its size on a PSP's card, 16 bytes over
+ * the plaintext stored here (sd_fill_sizes); that step is inferred, as no
+ * probe save sits on a cluster boundary. utilityData is not measured this
+ * way; see sd_fill_sizes. */
 static uint32_t sd_dir_clusters(const char *dir, int with_dir, uint64_t *bytes_out) {
     char names[256][64];
     int n = psp_io_list_names(dir, names, 256);
     if (n < 0) { if (bytes_out) *bytes_out = 0; return 0; }
+    static sd_sfo_state st;
+    sd_sfo_read_state(dir, &st);
     uint32_t clusters = with_dir ? 1 : 0;
     uint64_t bytes = 0;
     for (int i = 0; i < n; i++) {
@@ -666,6 +672,7 @@ static uint32_t sd_dir_clusters(const char *dir, int with_dir, uint64_t *bytes_o
         snprintf(child, sizeof child, "%s/%s", dir, names[i]);
         uint64_t sz = 0; int is_dir = 0;
         if (psp_io_path_info(child, &sz, &is_dir) == 0 && !is_dir) {
+            if (sd_fl_secure(&st, names[i])) sz += 16;
             clusters += sd_clusters(sz);
             bytes += sz;
         }
@@ -762,15 +769,17 @@ static uint32_t sd_fill_sizes(uint32_t param) {
     /* utilityData is the space the requested save takes, worked out from
      * the request rather than the card: fw 6.60 answered 3 clusters (96 KB)
      * for a save that did not exist, with a 256-byte data file, while the
-     * card held at least 12 saves (saveprobe step 50). That is the data
-     * file, the 4912-byte PARAM.SFO and, inferred, one for the directory;
-     * sidecars are counted the same way. Whether a secure file's 16 extra
-     * bytes count (dataSize 32768 vs 32769) is unmeasured. */
+     * card held at least 12 saves (saveprobe step 50). That is one cluster
+     * for the directory, the 4912-byte PARAM.SFO, and the data file with
+     * its 16-byte secure header: dataSize 32768 takes two clusters and the
+     * whole answer is 4 (steps 92-93), 65537 takes three and the answer is
+     * 5 (step 96). Sidecars are counted at their size: a 64-byte save with
+     * a 215-byte ICON0 is 4 (step 95). */
     if (utild) {
         char file[14];
         sd_getstr(param, SD_FILENAME, 13, file, sizeof file);
         uint32_t cl = 1 + sd_clusters(SD_SFO_SIZE);
-        if (file[0]) cl += sd_clusters(psp_read32(param + SD_DATASZ));
+        if (file[0]) cl += sd_clusters((uint64_t)psp_read32(param + SD_DATASZ) + 16u);
         for (uint32_t off = SD_ICON0; off <= SD_SND0; off += 16) {
             uint32_t buf = psp_read32(param + off), bsz = psp_read32(param + off + 4),
                      sz = psp_read32(param + off + 8);
@@ -788,7 +797,10 @@ static uint32_t sd_fill_sizes(uint32_t param) {
         sd_write_u32(sinfo + 20, freecl);
         sd_write_u32(sinfo + 24, (uint32_t)freekb);
         sd_kb_str(freekb, sinfo + 28);
-        /* Needed in whole KB for this save; a 16-byte fixture needs none. */
+        /* Needed in whole KB for this save; a 16-byte fixture needs none.
+         * fw 6.60 answered 0 and '' for both with entries of 32768 and
+         * 100000 bytes and dataSize 0 (saveprobe steps 97-98): the entries
+         * are not summed. Whether dataSize counts is unmeasured. */
         sd_write_u32(sinfo + 36, datasz / 1024u);
         sd_write_str(sinfo + 40, "", 8);
         sd_write_u32(sinfo + 48, datasz / 1024u);
@@ -1095,8 +1107,12 @@ static uint32_t sd_do_mode(uint32_t param) {
 
     case SD_SIZES: return sd_fill_sizes(param);
     case SD_GETSIZE:
+        /* sizeInfo is filled either way; a save that does not exist is
+         * RW_NO_DATA (SZNEW, saveprobe step 97; BIG, which exists, reads 0
+         * in step 98). */
         sd_fill_sizes(param);
-        return SD_OK;
+        sd_dir(game, save, dir, sizeof dir);
+        return sd_exists(dir) ? SD_OK : SD_RW_NO_DATA;
 
     case SD_FILES:
         sd_dir(game, save, dir, sizeof dir);
