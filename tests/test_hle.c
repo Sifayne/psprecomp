@@ -613,16 +613,19 @@ static void test_io_dirs(void) {
     CHECK(same, "round trip is byte-exact");
     CHECK(call(CLOSE, fd, 0, 0, 0) == 0, "close succeeds");
 
-    /* Enumeration finds the file by name. */
+    /* Enumeration finds the file by name. SceIoDirent is the 88-byte
+     * SceIoStat and then d_name, so the name is at +88 and the size at +8. */
     uint32_t dd = call(DOPEN, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0, 0, 0);
     CHECK((int32_t)dd >= 1, "dopen succeeds");
     int found = 0;
+    uint32_t found_size = 0;
     while (call(DREAD, dd, DIR, 0, 0) == 1) {
         char name[260];
-        psp_str(DIR + 52, name, sizeof name);
-        if (!strcmp(name, "DATA.BIN")) found = 1;
+        psp_str(DIR + 88, name, sizeof name);
+        if (!strcmp(name, "DATA.BIN")) { found = 1; found_size = psp_read32(DIR + 8); }
     }
     CHECK(found, "dread enumerates DATA.BIN");
+    CHECK(found_size == 64, "dread reports the entry's size, got %u", found_size);
     CHECK(call(DCLOSE, dd, 0, 0, 0) == 0, "dclose succeeds");
 
     CHECK(call(REMOVE, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0, 0, 0) == 0,

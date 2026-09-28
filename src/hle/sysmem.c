@@ -318,6 +318,11 @@ static void hle_Printf(void) {
 static void hle_TotalFreeMemSize(void) { psp_ret(psp_sysmem_free()); }
 static void hle_MaxFreeMemSize(void)   { psp_ret(psp_sysmem_free()); }
 
+/* The firmware version as 0xMMmmrr10: a PSP on 6.60 answers 06060010 (the
+ * header line of every hwprobe log, 2026-09-28). psprecomp stands in for
+ * that firmware. Unregistered, it returned 0. */
+static void hle_DevkitVersion(void) { psp_ret(0x06060010u); }
+
 void psp_sysmem_register(void) {
     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every
      * pair below, so a mistyped NID cannot survive. */
@@ -342,4 +347,5 @@ void psp_sysmem_register(void) {
     psp_hle_register(0x13A5ABEF, "SysMemUserForUser", "sceKernelPrintf",               hle_Printf);
     psp_hle_register(0xF919F628, "SysMemUserForUser", "sceKernelTotalFreeMemSize",     hle_TotalFreeMemSize);
     psp_hle_register(0xA291F107, "SysMemUserForUser", "sceKernelMaxFreeMemSize",       hle_MaxFreeMemSize);
+    psp_hle_register(0x3FC9AE6A, "SysMemUserForUser", "sceKernelDevkitVersion",        hle_DevkitVersion);
 }

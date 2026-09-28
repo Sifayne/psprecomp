@@ -72,6 +72,7 @@ typedef struct {
 #else
     DIR *dir;
 #endif
+    char host[1024];     /* the directory's host path, to stat its entries */
 } io_dir;
 
 static io_file g_file[MAX_FILES];
@@ -736,15 +737,18 @@ static void hle_Dopen(void) {
         if (!g_dir[i].dir) { psp_ret(0x80010002); return; }
 #endif
         g_dir[i].used = 1;
+        snprintf(g_dir[i].host, sizeof g_dir[i].host, "%s", host);
         psp_ret((uint32_t)(i + 1));
         return;
     }
     psp_ret(0x80010018);
 }
 
-/* Fill a SceIoDirent. Only the name is populated: games use Dread to enumerate
- * save slots and asset directories by name, and a wrong stat block would be
- * worse than an empty one. */
+/* Fill a SceIoDirent: the entry's SceIoStat (88 bytes, as sceIoGetstat
+ * writes it) and then d_name at +88. The name used to go at +52, from a
+ * wrong idea of the stat's size, so every name read back empty: saveprobe
+ * on a PSP (firmware 6.60) listed its save files by name where psprecomp
+ * listed blanks. */
 static void hle_Dread(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
     uint32_t dirent = psp_arg(1);
@@ -769,11 +773,29 @@ static void hle_Dread(void) {
     name = de->d_name;
 #endif
 
-    /* SceIoDirent: a 52-byte SceIoStat, then char d_name[256]. */
-    for (int i = 0; i < 52; i++) psp_write8(dirent + (uint32_t)i, 0);
-    uint32_t at = dirent + 52;
-    for (uint32_t i = 0; i < 255 && name[i]; i++) psp_write8(at + i, (uint8_t)name[i]);
-    psp_write8(at + (uint32_t)strlen(name), 0);
+    int is_dir = 0;
+    uint64_t size = 0;
+#ifdef _WIN32
+    is_dir = (g_dir[id].data.attrib & _A_SUBDIR) != 0;
+    size = is_dir ? 0 : (uint64_t)g_dir[id].data.size;
+#else
+    {
+        char path[1300];
+        struct stat st;
+        snprintf(path, sizeof path, "%s/%s", g_dir[id].host, name);
+        if (stat(path, &st) == 0) {
+            is_dir = S_ISDIR(st.st_mode);
+            size = is_dir ? 0 : (uint64_t)st.st_size;
+        }
+    }
+#endif
+
+    /* SceIoDirent: SceIoStat d_stat, char d_name[256], then d_private. */
+    write_stat(dirent, is_dir, size, 0);
+    uint32_t at = dirent + PSP_STAT_LEN;
+    uint32_t n = 0;
+    for (; n < 255 && name[n]; n++) psp_write8(at + n, (uint8_t)name[n]);
+    psp_write8(at + n, 0);
 
     psp_ret(1);                       /* more entries may follow */
 }
