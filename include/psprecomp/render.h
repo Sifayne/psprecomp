@@ -66,6 +66,14 @@ typedef struct {
      * Zero-initialized and through-mode vertices use x/y unless precise is set. */
     float    precise_x, precise_y;
     int      precise;
+    /* Lit colour channels past 255. Lighting can sum to more than a channel
+     * holds, and the hardware keeps the excess through interpolation and
+     * clamps each pixel, not each vertex: geprobe 2 scene 16 (fw 6.60) fits
+     * its fans' pixels to planes through centre vertices of 401,346,291 and
+     * 302,465,302. When hi_set, hi[0..2] are the red, green and blue the
+     * rasterizer interpolates and rgba holds them clamped. */
+    uint16_t hi[3];
+    int      hi_set;
 } psp_vertex;
 
 /* The bound texture, as the GE describes it.

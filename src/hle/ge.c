@@ -1029,6 +1029,7 @@ static uint32_t current_colour(void) {
 
 static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
                        int tex_off, psp_vertex *out) {
+    out->hi_set = 0;
     out->rgba = current_colour();
     out->u = out->v = 0.0f;
     out->inv_w = out->tex_q = 1.0f; /* through mode is affine in screen space */
@@ -1545,6 +1546,14 @@ static void lerp_clip(const clipvert *a, const clipvert *b, float t, clipvert *o
         r |= (uint32_t)q << (8 * k);
     }
     o->v.rgba = r;
+    if (a->v.hi_set || b->v.hi_set) {
+        for (int k = 0; k < 3; k++) {
+            const float ha = a->v.hi_set ? a->v.hi[k] : (float)((a->v.rgba >> (8 * k)) & 0xFFu);
+            const float hb = b->v.hi_set ? b->v.hi[k] : (float)((b->v.rgba >> (8 * k)) & 0xFFu);
+            o->v.hi[k] = (uint16_t)(ha + (hb - ha) * t + 0.5f);
+        }
+        o->v.hi_set = 1;
+    }
     int fg = (int)((float)a->v.fog + ((float)b->v.fog - (float)a->v.fog) * t + 0.5f);
     if (fg < 0) fg = 0;
     if (fg > 255) fg = 255;
@@ -1740,7 +1749,7 @@ static void lights_to_eye(void) {
 static inline int any_light_enabled(void) {
     return g_tl.light[0].enable || g_tl.light[1].enable || g_tl.light[2].enable || g_tl.light[3].enable;
 }
-static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba) {
+static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, psp_vertex *hi) {
     const float vc[3] = { (float)(*rgba & 0xFFu) / 255.0f,
                           (float)((*rgba >> 8) & 0xFFu) / 255.0f,
                           (float)((*rgba >> 16) & 0xFFu) / 255.0f };
@@ -1811,12 +1820,17 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba) {
      * is supplying the ambient. */
     uint32_t c = (g_tl.mat_update & 1) ? (*rgba & 0xFF000000u)
                                        : ((uint32_t)(g_tl.mat_alpha & 0xFF) << 24);
+    /* Clamped here only for rgba; past 255 the unclamped value goes on to the
+     * rasterizer (psp_vertex.hi). */
+    hi->hi_set = 0;
     for (int k = 0; k < 3; k++) {
         float f = out[k];
         if (f < 0.0f) f = 0.0f;
-        if (f > 1.0f) f = 1.0f;
-        int q = (int)(f * 255.0f + 0.5f);
-        c |= (uint32_t)q << (8 * k);
+        if (f > 256.0f) f = 256.0f;
+        const int q = (int)(f * 255.0f + 0.5f);
+        hi->hi[k] = (uint16_t)q;
+        if (q > 255) hi->hi_set = 1;
+        c |= (uint32_t)(q > 255 ? 255 : q) << (8 * k);
     }
     *rgba = c;
 }
@@ -2060,6 +2074,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
 
             psp_vertex *o = &v[decoded];
             o->screen_space = screen_space;
+            o->hi_set = 0;
             o->rgba = current_colour();
             o->tex_q = 1.0f;
             if (blended) o->rgba = mv.rgba;
@@ -2091,7 +2106,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                     mul_3x3(g_tl.world, nm, nw);
                     mul_3x3(g_tl.view,  nw, ne);
                 }
-                light_vertex(eye, ne, &o->rgba);
+                light_vertex(eye, ne, &o->rgba, o);
                 g_lit_verts++;
             }
             const uint64_t _p3 = ge_prof_now();

@@ -1158,11 +1158,16 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                 k0 = k;
         }
         for (int i = 0; i < 4; i++) {
-            const int64_t c0 = chan(a->rgba, i), c1 = chan(b->rgba, i), c2 = chan(c->rgba, i);
+            /* A lit channel past 255 is interpolated as it is and clamped per
+             * pixel by plane_chan (psp_vertex.hi). */
+            const int64_t c0 = (i < 3 && a->hi_set) ? a->hi[i] : chan(a->rgba, i);
+            const int64_t c1 = (i < 3 && b->hi_set) ? b->hi[i] : chan(b->rgba, i);
+            const int64_t c2 = (i < 3 && c->hi_set) ? c->hi[i] : chan(c->rgba, i);
             const int64_t nx = (c1 - c0) * (c->y - a->y) - (c2 - c0) * (b->y - a->y);
             const int64_t ny = (c2 - c0) * (b->x - a->x) - (c1 - c0) * (c->x - a->x);
             const int64_t gx = grad1024(nx * 16384, area), gy = grad1024(ny * 16384, area);
-            col_acc[i] = (int64_t)chan(vs[k0]->rgba, i) * 16384
+            const int64_t ck = (i < 3 && vs[k0]->hi_set) ? vs[k0]->hi[i] : chan(vs[k0]->rgba, i);
+            col_acc[i] = ck * 16384
                        + gx * (px - vs[k0]->x) + gy * (py - vs[k0]->y);
             col_dx[i] = gx * SUBPX;
             col_dy[i] = gy * SUBPX;
