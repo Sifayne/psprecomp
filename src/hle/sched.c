@@ -1046,7 +1046,7 @@ int psp_sched_terminate(uint32_t uid) {
     return 1;
 }
 
-int psp_sched_can_wait(void) { return g_dispatch; }
+int psp_sched_can_wait(void) { return g_dispatch && psp_intr_enabled(); }
 
 int psp_sched_set_dispatch(int on) {
     const int was = g_dispatch;

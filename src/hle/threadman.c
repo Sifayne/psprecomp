@@ -1151,19 +1151,20 @@ static void hle_CancelWakeupThread(void) {
  * resume returns (`m1 m2 W m3`): turning dispatch back on is a reschedule
  * point.
  *
- * This answered CPUDI (0x80020066) to the second suspend, from a comment that
- * said these do not nest. The name in PSPSDK is "CPU interrupts disabled", so
- * that answer presumably belongs to a suspend made with interrupts off, which
- * nothing here models; unmeasured. A resume with anything but 0 or 1 still
- * answers it, also unmeasured. */
+ * CPUDI (0x80020066, "CPU interrupts disabled" in PSPSDK) is the answer to a
+ * suspend made inside sceKernelCpuSuspendIntr, and dispatch is left as it was
+ * (threadprobe step 97, fw 6.60). A resume takes any nonzero state as "on":
+ * ResumeDispatchThread(2) and (-1) both answer 0 and the next suspend answers
+ * 1 (step 97). This used to refuse anything above 1 with CPUDI and leave
+ * dispatch off. A resume with interrupts off is unmeasured. */
 static void hle_SuspendDispatchThread(void) {
+    if (!psp_intr_enabled()) { psp_ret(SCE_KERNEL_ERROR_CPUDI); return; }
     psp_ret((uint32_t)psp_sched_set_dispatch(0));
 }
 
 static void hle_ResumeDispatchThread(void) {
     const uint32_t state = psp_arg(0);
-    if (state > 1) { psp_ret(SCE_KERNEL_ERROR_CPUDI); return; }
-    psp_sched_set_dispatch((int)state);
+    psp_sched_set_dispatch(state != 0);
     psp_ret(SCE_KERNEL_ERROR_OK);
     /* Anything more urgent that became ready while dispatch was off runs now.
      * The reschedule after every firmware call would do it too; asking here

@@ -61,6 +61,8 @@ static void hle_CpuResumeIntr(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+int psp_intr_enabled(void) { return g_intr_enabled != 0; }
+
 /* ---- UtilsForUser -------------------------------------------------------- */
 
 /* Cache maintenance. There is no cache to write back -- the recompiled code

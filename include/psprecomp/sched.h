@@ -332,7 +332,11 @@ int  psp_sched_set_dispatch(int on);
  * *would* have succeeded is refused too, and so is one whose arguments are
  * illegal -- threads/scheduling/dispatch answers CAN_NOT_WAIT for a semaphore
  * that has been signalled and for a count above the maximum alike. So the check
- * belongs at the very top of a blocking call, before anything is validated. */
+ * belongs at the very top of a blocking call, before anything is validated.
+ *
+ * Nor while interrupts are off: threadprobe step 98 (fw 6.60) has
+ * DelayThread(1000) and a WaitSema with a 1000us timeout both answer
+ * CAN_NOT_WAIT inside sceKernelCpuSuspendIntr, the timeout left untouched. */
 int  psp_sched_can_wait(void);
 
 /* Stop a thread outright: sceKernelTerminateThread.

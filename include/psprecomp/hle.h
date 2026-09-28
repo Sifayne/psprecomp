@@ -390,6 +390,10 @@ int psp_io_list_names(const char *guest, char names[][64], int cap);
 void psp_misc_init(void);
 void psp_misc_register(void);
 void psp_misc_reset(void);
+/* Whether sceKernelCpuSuspendIntr has interrupts off. With them off a thread
+ * can neither wait nor turn dispatch off (threadprobe steps 97-98, fw 6.60);
+ * see psp_sched_can_wait. */
+int  psp_intr_enabled(void);
 
 /* ---- sceNet / sceNetAdhoc / sceNetAdhocctl / sceWlanDrv ------------------ */
 void psp_net_register(void);

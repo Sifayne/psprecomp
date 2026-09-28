@@ -552,6 +552,26 @@ static void test_thread_rules(void) {
     CHECK(call(SUSP, 0, 0, 0, 0) == 1, "dispatch is back on after resume(1)");
     call(RES, 1, 0, 0, 0);
 
+    /* Any nonzero state turns it back on (step 97). */
+    call(SUSP, 0, 0, 0, 0);
+    CHECK(call(RES, 2, 0, 0, 0) == 0, "resume(2)");
+    CHECK(call(SUSP, 0, 0, 0, 0) == 1, "dispatch is on after resume(2)");
+    CHECK(call(RES, 0xFFFFFFFFu, 0, 0, 0) == 0, "resume(-1)");
+    CHECK(call(SUSP, 0, 0, 0, 0) == 1, "dispatch is on after resume(-1)");
+    call(RES, 1, 0, 0, 0);
+
+    /* With interrupts off nothing waits and dispatch cannot be suspended
+     * (steps 97, 98). */
+    const uint32_t INTR_OFF = psp_nid("sceKernelCpuSuspendIntr");
+    const uint32_t INTR_ON  = psp_nid("sceKernelCpuResumeIntr");
+    const uint32_t cookie = call(INTR_OFF, 0, 0, 0, 0);
+    CHECK(call(SUSP, 0, 0, 0, 0) == SCE_KERNEL_ERROR_CPUDI, "suspend dispatch, interrupts off");
+    CHECK(call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0) ==
+          SCE_KERNEL_ERROR_CAN_NOT_WAIT, "a delay with interrupts off");
+    call(INTR_ON, cookie, 0, 0, 0);
+    CHECK(call(SUSP, 0, 0, 0, 0) == 1, "dispatch still on after the refused suspend");
+    call(RES, 1, 0, 0, 0);
+
     /* CreateThread's argument checks (steps 2, 3, 5) and the stack rounding. */
     const uint32_t CREATE = psp_nid("sceKernelCreateThread");
     const uint32_t REFER  = psp_nid("sceKernelReferThreadStatus");
