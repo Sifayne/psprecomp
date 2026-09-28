@@ -607,7 +607,9 @@ static void sd_write_sfo(const char *dir, const char *dirname, uint32_t param) {
 
 /* Icon/sound sidecars: ICON0.PNG, ICON1.PMF, PIC1.PNG, SND0.AT3. Written
  * when the param carries a buffer, skipped when it does not -- the tests
- * pass NULL throughout, the game may not. */
+ * pass NULL throughout, the game may not. They go to the card as given,
+ * with no secure header and outside SAVEDATA_FILE_LIST: fw 6.60 wrote a
+ * 215-byte ICON0 as the same 215 bytes (saveprobe step 90). */
 static void sd_write_sidecars(const char *dir, uint32_t param) {
     static const struct { uint32_t off; const char *name; } side[] = {
         { SD_ICON0, "ICON0.PNG" }, { SD_ICON1, "ICON1.PMF" },
@@ -885,8 +887,11 @@ static int sd_match(const char *pat, const char *s) {
  * Sorted, capped at maxCount. On fw 6.60, saveName '<>' and '' both list
  * nothing although twelve saves of the game exist (saveprobe steps 51-52):
  * neither matches a save part, so saveName is a filter, not ignored. The
- * wildcards are inferred from the suite's LIST names ("A?C"); v2 of the
- * probe tries '*', 'A0*' and 'A?'. */
+ * wildcards are hardware's: '*' lists all 19 saves, 'A0*' the 7 that start
+ * so, 'A?' A0 to A3, and 'A0' only A0 (steps 99-102). A PSP lists them in
+ * the card's directory order, which follows where FAT put each entry (not
+ * even creation order after saves were deleted), so the order here stays
+ * sorted: no host file system keeps anything that could stand in for it. */
 static uint32_t sd_do_list(uint32_t param, const char *game, const char *pattern) {
     uint32_t il = sd_optional(param, SD_IDLIST);
     char names[256][64];
@@ -1101,7 +1106,10 @@ static uint32_t sd_do_mode(uint32_t param) {
         if (sd_io_error) return SD_ERASE_ACCESS;
         /* PARAM.SFO is rewritten too, with the file's class: DSEC's SFO
          * changed between its MAKEDATASECURE and its WRITEDATASECURE
-         * (saveprobe steps 37-38, CRC CC490645 -> 03F941FA). */
+         * (saveprobe steps 37-38, CRC CC490645 -> 03F941FA). A second
+         * secure file joins the list after the first and leaves the first
+         * file as it was: TWO's list reads DATA.BIN DATA2.BIN, DATA.BIN
+         * keeps its CRC, and both read back (steps 85-89). */
         sd_write_sfo(dir, dir + strlen("ms0:/PSP/SAVEDATA/"), param);
         return sd_io_error ? SD_ERASE_ACCESS : SD_OK;
 
