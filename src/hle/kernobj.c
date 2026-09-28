@@ -1243,11 +1243,11 @@ static void hle_SendMbx(void) {
     /* A packet belongs to one queue at a time. mbx/send sends the same one
      * twice and the second is refused with the count left at 1. */
     if (mbx_holds(m, msg)) { psp_ret(SCE_KERNEL_ERROR_MBX_CORRUPT); return; }
-    /* And nothing is appended to a ring the guest has already broken. Where a
-     * *receive* from such a mailbox has two distinguishable failures, a send
-     * has one observable effect: mbx/refer breaks the ring, sends another
-     * message, and reads the count back unchanged. */
-    if (m->count && !mbx_first(m)) { psp_ret(SCE_KERNEL_ERROR_MBX_CORRUPT); return; }
+    /* And nothing is appended to a ring the guest has already broken: with
+     * the last packet's `next` set to NULL there is no head, and firmware 6.60
+     * refuses the send with 800200D3 -- the code a receive gives for the same
+     * box -- and leaves the count as it was (syncprobe step 235). */
+    if (m->count && !mbx_first(m)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
 
     /* A waiting receiver takes it without it ever joining the queue -- and
      * "never joining" is observable, because the packet's `next` is the
