@@ -2924,8 +2924,13 @@ static void enqueue(int head) {
 
     memset(q, 0, sizeof *q);
     q->id    = g_next_id++;
-    q->list  = psp_arg(0) & ~3u;
-    q->stall = psp_arg(1) & ~3u;
+    /* Addresses are cut to 28 bits, as the GE sees them. libgu passes the
+     * list and stall with the uncached bit (0x40000000) set, but JUMP and CALL
+     * targets built from BASE carry no such bit, so a list that had jumped
+     * never met its stall and ran on into stale words: each geprobe frame
+     * showed the previous scene until this (hardware run, 2026-09-28). */
+    q->list  = psp_arg(0) & 0x0FFFFFFCu;
+    q->stall = psp_arg(1) & 0x0FFFFFFCu;
     /* Recorded here, at submission, and not after the queue has been serviced:
      * the deferred GE runs a list as words are released, so by the end of
      * enqueue q->list has advanced and pointing a replay at it runs off into
@@ -2974,7 +2979,7 @@ static void hle_ListEnQueueHead(void) { enqueue(1); }
 static void hle_ListUpdateStallAddr(void) {
     ge_queue *q = find_queue(psp_arg(0));
     if (!q) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
-    q->stall = psp_arg(1) & ~3u;
+    q->stall = psp_arg(1) & 0x0FFFFFFCu;
     /* Resume immediately: the hardware consumes newly-released words while
      * the CPU builds, and the buffer may be reused by the next list as soon
      * as this one is Sync'd -- executing the tail only at Sync would run
@@ -3542,8 +3547,8 @@ void psp_ge_replay_list(uint32_t list, uint32_t stall, uint32_t base) {
     if (!q) return;
     memset(q, 0, sizeof *q);
     q->used = 1; q->id = 0x10000u + (uint32_t)(q - g_queue);
-    q->list = list & ~3u;
-    q->stall = stall & ~3u;
+    q->list = list & 0x0FFFFFFCu;
+    q->stall = stall & 0x0FFFFFFCu;
     q->base = base;
     q->origin = list & ~3u;
     g_ge.lists++;

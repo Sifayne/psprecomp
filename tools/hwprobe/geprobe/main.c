@@ -33,7 +33,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 1
+#define PROBE_VERSION 2
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -110,6 +110,9 @@ static void scene_begin(int psm, w32 clear) {
     sceGumMatrixMode(GU_TEXTURE);
     sceGumLoadIdentity();
     sceGumMatrixMode(GU_MODEL);
+    /* sceGum* only edits libgu's copies; this sends them to the GE. Version 1
+     * left it out, so every 3D scene drew nothing on either side. */
+    sceGumUpdateMatrix();
 }
 
 /* Sample points, the same for every scene: a coarse grid plus a few spots
@@ -560,9 +563,11 @@ static void scene_tests(void) {
     rect2d(120, 112, 350, 142, 0xFF00FF00);
     sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INVERT);
     rect2d(300, 112, 470, 142, 0xFFFF0000);
+    /* Half over the band (stencil 0x55, 0x56, 0xAA, ...) and half below it
+     * (stencil 0 from the clear). Version 1 drew it wholly below the band. */
     sceGuStencilFunc(GU_EQUAL, 0x56, 0xFF);
     sceGuStencilOp(GU_KEEP, GU_KEEP, GU_KEEP);
-    rect2d(10, 146, 470, 176, 0xFFFFFFFF);
+    rect2d(10, 127, 470, 157, 0xFFFFFFFF);
     sceGuDisable(GU_STENCIL_TEST);
 
     sceGuEnable(GU_COLOR_LOGIC_OP);
