@@ -312,6 +312,59 @@ static void test_no_drift_from_emitter(void) {
     psp_mem_free();
 }
 
+/* An mfvc of CC as the very next word after a vcmp reads CC from before that
+ * vcmp; one word later, the new CC (vfpuprobe v3 step 117, fw 6.60). */
+static void test_mfvc_right_after_vcmp(void) {
+    static const uint32_t prog[] = {
+        0x6C008084,  /* vcmp.q TR, C000, C000   CC = 3F                      */
+        0x6C008080,  /* vcmp.q FL, C000, C000   CC = 00                      */
+        0x48620083,  /* mfvc $v0, $131          straight after: 3F           */
+        0x48630083,  /* mfvc $v1, $131          one later: 00                */
+        0x6C008084,  /* vcmp.q TR                                            */
+        0x00000000,  /* nop                                                  */
+        0x48640083,  /* mfvc $a0, $131          two later: 3F                */
+        0x03E00008,  /* jr $ra                                               */
+        0x00000000,
+    };
+    CHECK(psp_mem_init() == 0, "memory init for mfvc latency");
+    psp_interp it = run(prog, sizeof prog / sizeof prog[0], 100);
+    (void)it;
+    CHECK(R(V0) == 0x3Fu && R(V1) == 0x00u && R(A0) == 0x3Fu,
+          "mfvc after vcmp: v0 %02X v1 %02X a0 %02X, want 3F 00 3F", R(V0), R(V1), R(A0));
+    psp_mem_free();
+}
+
+/* A COP1 operation raising an exception whose enable is set stops the
+ * program: 1/0 under the power-on 00000E00 switched a PSP off (v3 step 189). */
+static void test_fpu_enabled_exception_traps(void) {
+    static const uint32_t prog[] = {
+        0x3C013F80,  /* lui $at, 0x3F80                                      */
+        0x44812000,  /* mtc1 $at, $f4          1.0                           */
+        0x44803000,  /* mtc1 $zero, $f6        0.0                           */
+        0x46062103,  /* div.s $f4, $f4, $f6                                  */
+        0x24020001,  /* addiu $v0, $zero, 1    not reached                   */
+        0x03E00008,  /* jr $ra                                               */
+        0x00000000,
+    };
+    CHECK(psp_mem_init() == 0, "memory init for fpu trap");
+    memset(&psp_cpu, 0, sizeof psp_cpu);
+    load(CODE, prog, sizeof prog / sizeof prog[0]);
+    psp_cpu.fcr31 = 0x00000E00u;
+    psp_interp it;
+    psp_interp_init(&it, CODE, DONE, 100);
+    const psp_interp_status st = psp_interp_run(&it);
+    CHECK(st == I_TRAP_FPU && R(V0) == 0,
+          "1/0 with Z enabled: %s, v0 %u", psp_interp_status_str(st), R(V0));
+    memset(&psp_cpu, 0, sizeof psp_cpu);
+    load(CODE, prog, sizeof prog / sizeof prog[0]);
+    psp_interp_init(&it, CODE, DONE, 100);
+    const psp_interp_status st2 = psp_interp_run(&it);
+    CHECK(st2 != I_TRAP_FPU && R(V0) == 1 && psp_cpu.fcr31 == 0x00008020u,
+          "1/0 with nothing enabled runs on: %s, v0 %u fcr31 %08X",
+          psp_interp_status_str(st2), R(V0), psp_cpu.fcr31);
+    psp_mem_free();
+}
+
 /* ---- HLE re-entry: --dispatch ---------------------------------------------- */
 
 /* The two handlers below are what a firmware function looks like to the
@@ -549,6 +602,8 @@ int main(void) {
 
     psp_mem_free();
     test_no_drift_from_emitter();
+    test_mfvc_right_after_vcmp();
+    test_fpu_enabled_exception_traps();
 
     if (failures) {
         printf("%d failure(s)\n", failures);

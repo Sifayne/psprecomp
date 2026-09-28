@@ -42,6 +42,16 @@ static void setr(unsigned idx, uint32_t v) {
     if (idx != 0) psp_cpu.r[idx] = v;
 }
 
+/* Is the word before `addr` a vcmp? Read quietly: an unmapped word is not. */
+static int follows_vcmp(uint32_t addr) {
+    const uint8_t *p = psp_mem_ptr(addr - 4, 4);
+    if (!p) return 0;
+    a_insn prev;
+    a_decode((uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
+             (uint32_t)p[3] << 24, addr - 4, &prev);
+    return prev.op == A_VCMP;
+}
+
 /* ---- the firmware boundary ------------------------------------------------
  *
  * See interp.h. Thunks are dense and 4-aligned inside .sceStub.text, so a flat
@@ -370,7 +380,15 @@ static psp_interp_status exec_simple(const a_insn *in) {
     case A_MFV: setr(in->rt, psp_mfv(in->vd));  return I_RUNNING;
     /* The control-register forms address the same 8-bit field, offset by
      * 128 -- which is the bit the decoder splits them on. */
-    case A_MFVC: setr(in->rt, psp_mfvc((int)(in->raw & 0xFF) - 128)); return I_RUNNING;
+    /* CC read straight after a vcmp is the CC from before it (vfpuprobe v3
+     * step 117). Decided from the word before, not from what ran before,
+     * so that emit.c can make the same decision. */
+    case A_MFVC:
+        if ((in->raw & 0xFF) == 128 + 3 && follows_vcmp(in->addr))
+            setr(in->rt, psp_mfvc_cc_after_vcmp());
+        else
+            setr(in->rt, psp_mfvc((int)(in->raw & 0xFF) - 128));
+        return I_RUNNING;
     case A_MTVC: psp_mtvc((int)(in->raw & 0xFF) - 128, R(in->rt));    return I_RUNNING;
     case A_MTV: psp_mtv(in->vd, R(in->rt));     return I_RUNNING;
 

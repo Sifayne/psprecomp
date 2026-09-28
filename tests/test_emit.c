@@ -311,6 +311,59 @@ static void test_vfpu_branch_condition(void) {
     a_analysis_free(&an);
 }
 
+/* ---- CC latency and FPU traps -----------------------------------------------
+ *
+ * An mfvc of CC as the word straight after a vcmp reads CC from before that
+ * vcmp (vfpuprobe v3 step 117, fw 6.60); one word later it reads the new
+ * value. And a COP1 operation that raises an enabled exception stops the
+ * program (v3 steps 189-191), so each one is followed by the check. */
+
+#define CL_BASE 0x08850000u
+
+static const uint32_t CL_CODE[] = {
+    0x6C008080,  /* +00  vcmp.q FL, C000, C000                              */
+    0x48620083,  /* +04  mfvc  $v0, $131      straight after: the old CC    */
+    0x48630083,  /* +08  mfvc  $v1, $131      one later: the new CC         */
+    0x46062103,  /* +0C  div.s $f4, $f4, $f6                                */
+    0x03E00008,  /* +10  jr    $ra                                          */
+    0x00000000,  /* +14  nop                                                */
+};
+
+static void test_cc_latency_and_fpu_trap(void) {
+    uint8_t code[sizeof CL_CODE];
+    for (size_t i = 0; i < sizeof CL_CODE / sizeof CL_CODE[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(CL_CODE[i]);
+        code[i * 4 + 1] = (uint8_t)(CL_CODE[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(CL_CODE[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(CL_CODE[i] >> 24);
+    }
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = CL_BASE;
+    an.size = (uint32_t)sizeof code;
+    const uint32_t seed = CL_BASE;
+    CHECK(a_discover(&an, &seed, 1, 1) == 0, "cc latency: discovery runs");
+
+    emit_opts o = {0};
+    o.outdir = ".";
+    o.prefix = "t_cl";
+    o.module = "synthetic";
+    CHECK(a_emit(&an, &o) == 0, "cc latency: emission succeeds");
+
+    char *src = slurp("./t_cl_funcs.c", NULL);
+    CHECK(src != NULL, "cc latency: generated .c is readable");
+    if (!src) { a_analysis_free(&an); return; }
+    CHECK(strstr(src, "r_v0 = psp_mfvc_cc_after_vcmp();") != NULL,
+          "cc latency: the mfvc right after vcmp reads the old CC");
+    CHECK(strstr(src, "r_v1 = psp_mfvc(3);") != NULL,
+          "cc latency: the next mfvc reads CC itself");
+    CHECK(strstr(src, "if (psp_fpu_trap_pending()) psp_unimplemented(0x0885000Cu, \"FPU exception\");") != NULL,
+          "fpu trap: div.s is followed by the enabled-exception check");
+    free(src);
+    a_analysis_free(&an);
+}
+
 /* A replaced function keeps its body under __orig and gives up its public name.
  *
  * The contract has four halves and all four matter: the body still exists (so a
@@ -515,6 +568,7 @@ int main(void) {
     test_return_delay_slot_not_owned();
     test_indirect_call_is_not_terminal();
     test_vfpu_branch_condition();
+    test_cc_latency_and_fpu_trap();
     test_replace_leaves_the_symbol_to_the_host();
     test_replace_absent_changes_nothing();
 

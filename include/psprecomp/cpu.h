@@ -53,8 +53,9 @@ typedef struct {
     uint32_t vfpu_cc;          /* VFPU condition codes (vcmp results); control register 3 */
     /* The other VFPU control registers, indexed as mfvc/mtvc number them: 0..2
      * the source, target and destination prefixes, 4..6 reserved, 7 the
-     * revision word, 8..15 the random generator's state rcx0..rcx7. Slot 3 is
-     * unused -- the condition codes are vfpu_cc above.
+     * revision word, 8..15 the random generator's state rcx0..rcx7. The
+     * condition codes are vfpu_cc above; slot 3 holds CC as it was before the
+     * last vcmp, which is what an mfvc right after that vcmp reads.
      *
      * They are thread context, so they live here and are swapped with the rest
      * of the struct. Measured (vfpuprobe steps 147 and 154, fw 6.60): a thread

@@ -79,6 +79,14 @@ static uint32_t fetch(const a_analysis *an, uint32_t addr) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* Is the word before `addr` a vcmp? */
+static int follows_vcmp(const a_analysis *an, uint32_t addr) {
+    if (addr < an->base + 4 || addr >= an->base + an->size) return 0;
+    a_insn prev;
+    a_decode(fetch(an, addr - 4), addr - 4, &prev);
+    return prev.op == A_VCMP;
+}
+
 static int is_import(const a_analysis *an, uint32_t addr) {
     return an->stub_size && addr >= an->stub_addr &&
            addr < an->stub_addr + an->stub_size;
@@ -398,9 +406,15 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_MFV:
         if (DEST_ZERO(in->rt)) break;
         fprintf(f, "%s%s = psp_mfv(%u);\n", ind, rt, in->vd); return;
+    /* CC read straight after a vcmp is the CC from before it (vfpuprobe v3
+     * step 117); decided from the word before, as the interpreter does. */
     case A_MFVC:
         if (DEST_ZERO(in->rt)) break;
-        fprintf(f, "%s%s = psp_mfvc(%d);\n", ind, rt, (int)(in->raw & 0xFF) - 128); return;
+        if ((in->raw & 0xFF) == 128 + 3 && follows_vcmp(c->an, in->addr))
+            fprintf(f, "%s%s = psp_mfvc_cc_after_vcmp();\n", ind, rt);
+        else
+            fprintf(f, "%s%s = psp_mfvc(%d);\n", ind, rt, (int)(in->raw & 0xFF) - 128);
+        return;
     case A_MTVC:
         fprintf(f, "%spsp_mtvc(%d, %s);\n", ind, (int)(in->raw & 0xFF) - 128, rt); return;
     case A_MTV:

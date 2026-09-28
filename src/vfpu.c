@@ -343,6 +343,8 @@ uint32_t psp_mfvc(int index) {
     return (index >= 0 && index < 16) ? psp_cpu.vfpu_ctrl[index] : 0;
 }
 
+uint32_t psp_mfvc_cc_after_vcmp(void) { return psp_cpu.vfpu_ctrl[PSP_VFPU_CC]; }
+
 void psp_mtvc(int index, uint32_t value) {
     switch (index) {
     /* Writing a prefix here is the same as executing vpfxs/vpfxt/vpfxd: the
@@ -1966,12 +1968,17 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
      * and a program can rely on that -- cpu/vfpu/vector sets it with a quad
      * compare and then reads it back after a triple one. Overwriting the whole
      * register cleared it, which cost 25 lines and looked like a vcmov bug.
+     * Confirmed on firmware 6.60 with the CC read 16 instructions later
+     * (vfpuprobe v3 step 118): TR.q then FL.t gives 08, TR.q then NE.s on
+     * equal values 0E, FL.q then TR.p 33.
      *
-     * Not yet confirmed on hardware: vfpuprobe step 105 read CC with an mfvc
-     * straight after each vcmp.q/.t, and on firmware 6.60 that read returns
-     * the *previous* CC, so the step measured the pipeline, not this rule. */
+     * An mfvc of CC as the very next instruction reads the value from
+     * *before* this vcmp; one instruction later it reads the new one, for
+     * every size and both directions (v3 step 117). The old value is kept in
+     * the otherwise unused control slot 3 for psp_mfvc_cc_after_vcmp. */
     const uint32_t affected = (1u << 4) | (1u << 5) | ((1u << n) - 1u);
     const uint32_t before = psp_cpu.vfpu_cc;
+    psp_cpu.vfpu_ctrl[PSP_VFPU_CC] = before;
     psp_cpu.vfpu_cc = (psp_cpu.vfpu_cc & ~affected) | (cc & affected);
 
     /* Recorded after the write, so the operands and the codes they produced
