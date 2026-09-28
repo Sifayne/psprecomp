@@ -161,12 +161,11 @@ typedef struct {
     int      env_state;
     int32_t  env;           /* 0 .. 0x40000000 */
     int32_t  attack_rate, decay_rate, sustain_level, release_rate;
-    /* The sustain *rate* is stored and mirrored but does not drive anything
-     * here: this renderer's sustain phase holds. __sceSasSetADSR's fourth
-     * value is filed under it by hardware -- setadsr.expected reads it back
-     * from sustainRate, not sustainLevel -- while the same value is what this
-     * envelope needs as the decay's target for pcm and vag to come out
-     * exact. Item 45's four unresolved decay sweeps sit on that seam. */
+    /* The sustain phase runs its own curve at its own rate, like the other
+     * three: sasprobe's sustain sweeps (steps 113-119, fw 6.60) climb and
+     * fall at exactly sustain_rate per sample, and SetSimpleADSR's sustain
+     * keeps falling after the decay (step 132). __sceSasSetADSR's fourth
+     * value is this rate, not the level; SetSL sets the level. */
     int32_t  sustain_rate;
     uint32_t mode_attack, mode_decay, mode_sustain, mode_release;
 
@@ -305,86 +304,94 @@ static int decode_block(sas_voice *v) {
     return 1;
 }
 
-/* One sample of one phase, by the phase's curve.
+/* x >> n rounding towards minus infinity whatever the sign, which C leaves
+ * to the compiler for a negative x. */
+static int64_t shr_floor(int64_t x, int n) {
+    return x >= 0 ? (x >> n) : -((-x - 1) >> n) - 1;
+}
+
+/* One sample of one phase, by the phase's curve. Every shape is the one
+ * sasprobe measured on firmware 6.60 (steps 79-132: 54 sweeps, the height
+ * after every core and the end flag, all reproduced), and none of them looks
+ * at where the phase is heading:
  *
- * The shapes are adsrcurve.expected's, and findings item 45 records how far
- * each is pinned. The linear pair is exactly plus or minus the rate. Bent is
- * the rate below three-quarter height and a quarter above, which is every
- * core of its sweep but the one where it crosses. Exponent falling is the
- * height scaled by the rate with a floor of one. Exponent rising approaches
- * the top geometrically and behaves as though bit 16 of the rate were set,
- * which is within a hundredth of a percent and no closer. Direct jumps to
- * where the phase ends. Exponent-rev is refused by attack and driven by
- * nothing else in the corpus, so it falls back to the linear decrease it
- * sits beside. */
-static int32_t curve_step(uint32_t mode, int32_t h, int32_t rate, int32_t target, int rising) {
+ *   linear inc/dec  h +/- rate
+ *   bent            h + rate up to three-quarter height, rate/4 past it
+ *   exponent-rev    h - ceil(h * rate / 2^32)
+ *   exponent        h + 0x4000 + ((0x40000000 - h) * rate >> 32)
+ *   direct          h = rate
+ *
+ * Direct *is* the rate, in every phase: a direct decay of 0x20000000 holds at
+ * 0x20000000 and one of 0 ends the voice (steps 109-110), a direct sustain of
+ * 0x8000000 holds there (118), and a direct release of 0x10000000 holds and
+ * never ends (128). Worked in 64 bits because h + rate passes INT32_MAX. */
+static int64_t curve_step(uint32_t mode, int64_t h, int32_t rate) {
     switch (mode & 7u) {
     case CURVE_LINEAR_INC:  return h + rate;
     case CURVE_LINEAR_DEC:  return h - rate;
     /* At three-quarter height exactly the step is still the full rate: the
-      * bend is on the way *past* the knee, not at it. adsrcurve's crossing
-      * core moves 0x028C0000 where a full core moves 0x02800000, which is 33
-      * full steps and 31 quarter ones -- one more full step than a strict
-      * comparison gives, and the only split of 64 that lands on hardware's
-      * number. */
+     * bend is on the way *past* the knee, not at it (sasprobe step 115). */
     case CURVE_LINEAR_BENT: return h + ((h <= (ENV_MAX / 4) * 3) ? rate : (rate >> 2));
-    case CURVE_EXP_REV: {
-        /* The falling exponential. The parity rule names which is which: the
-         * odd curves are the falling shapes, so a decay or a release takes
-         * mode 3 and an attack takes mode 4. The step is the height scaled by
-         * the rate, rounded *up* -- from the top at rate 9 hardware steps 3 a
-         * sample where truncation would step 2, a product that is exact keeps
-         * its value, and rounding up is what stops a small height from never
-         * falling at all. Exact on twelve of adsrcurve's fourteen decay
-         * sweeps; the two others differ only where the height meets the
-         * sustain level. */
-        const int64_t step = (((int64_t)h * (uint32_t)rate) + 0xFFFFFFFFll) >> 32;
-        return h - (int32_t)step;
-    }
-    case CURVE_EXP:
-        if (rising) {
-            /* A fixed 0x4000 a sample plus the room left, scaled by the rate.
-             * The fixed part is why a small rate climbs in a straight line --
-             * rate 0 and rate 1 both step exactly 0x4000, with no curvature
-             * anywhere in their sweeps -- and the scaled part is what bends
-             * the large ones. Exact on all twelve attack sweeps. */
-            const int64_t room = (int64_t)ENV_MAX - h;
-            return h + 0x4000 + (int32_t)((room * (uint32_t)rate) >> 32);
-        }
-        /* Even curves are the rising shapes and a falling phase will not
-         * accept one; if one arrives anyway, fall back rather than climb. */
-        return h - rate;
-    case CURVE_DIRECT:      return target;
-    default:                return rising ? h + rate : h - rate;
+    /* Rounded *up* (steps 102-105, 108 and 124-126 all need it), which is
+     * also what stops a small height from never falling at all. h is never
+     * negative when a step starts: every phase clamps at zero. */
+    case CURVE_EXP_REV:     return h - ((h * (int64_t)rate + 0xFFFFFFFFll) >> 32);
+    /* A fixed 0x4000 a sample plus the room left, scaled by the rate: the
+     * fixed part is why rate 0 and rate 1 climb in a straight line. The room
+     * is negative above the top (a direct decay can leave it there), and
+     * the shift then rounds down, as hardware's does. */
+    case CURVE_EXP:         return h + 0x4000 + shr_floor(((int64_t)ENV_MAX - h) * rate, 32);
+    case CURVE_DIRECT:      return rate;
+    default:                return h;   /* SetADSRmode refuses anything above 5 */
     }
 }
 
-/* Advance the envelope by one sample and return its current level, 0..0x40000000. */
-static int32_t step_envelope(sas_voice *v) {
+static void end_voice(sas_voice *v) {
+    v->env_state = ENV_OFF;
+    v->playing = 0;
+    v->on = 0;
+    v->ended = 1;
+}
+
+/* Advance the envelope by one sample. What each phase does with the step,
+ * from the same sweeps:
+ *
+ *   attack   at or past the top: clamp to the top, and decay from the next
+ *            sample
+ *   decay    below zero: clamp to zero. At or below the sustain level: go to
+ *            sustain -- with *no* clamp to the level. A decay of exponent-rev
+ *            0x1000000 towards 0x10000000 holds at 0FF32863, the step that
+ *            crossed it (106), and a key-off there releases from that height
+ *            (130).
+ *   sustain  above the top: clamp. At or below zero: zero, and the voice
+ *            ends, end flag and all (101, 111, 114, 116, 119). A sustain
+ *            that climbs goes all the way to the top (113, 115, 117).
+ *   release  the same as sustain. */
+static void step_envelope(sas_voice *v) {
+    int64_t h;
     switch (v->env_state) {
     case ENV_ATTACK:
-        v->env = curve_step(v->mode_attack, v->env, v->attack_rate, ENV_MAX, 1);
-        if (v->env >= ENV_MAX) { v->env = ENV_MAX; v->env_state = ENV_DECAY; }
+        h = curve_step(v->mode_attack, v->env, v->attack_rate);
+        if (h >= ENV_MAX) { h = ENV_MAX; v->env_state = ENV_DECAY; }
         break;
     case ENV_DECAY:
-        /* Direct is instant: the phase is over, and the height it was going
-         * to ramp towards is the height it already has. That is what lets a
-         * voice with a full-rate attack and a direct decay hold at the top --
-         * pcm and vag both do exactly that and stay at full scale -- while a
-         * decay with a real curve runs all the way to the sustain level. */
-        if (v->mode_decay == CURVE_DIRECT) { v->env_state = ENV_SUSTAIN; break; }
-        v->env = curve_step(v->mode_decay, v->env, v->decay_rate, v->sustain_level, 0);
-        if (v->env <= v->sustain_level) { v->env = v->sustain_level; v->env_state = ENV_SUSTAIN; }
-        break;
-    case ENV_RELEASE:
-        v->env = curve_step(v->mode_release, v->env, v->release_rate, 0, 0);
-        if (v->env <= 0) { v->env = 0; v->env_state = ENV_OFF; v->playing = 0; v->on = 0; v->ended = 1; }
+        h = curve_step(v->mode_decay, v->env, v->decay_rate);
+        if (h < 0) h = 0;
+        if (h <= v->sustain_level) v->env_state = ENV_SUSTAIN;
         break;
     case ENV_SUSTAIN:
-    default:
+    case ENV_RELEASE: {
+        const int sus = v->env_state == ENV_SUSTAIN;
+        h = curve_step(sus ? v->mode_sustain : v->mode_release, v->env,
+                       sus ? v->sustain_rate : v->release_rate);
+        if (h > ENV_MAX) h = ENV_MAX;
+        if (h <= 0) { v->env = 0; end_voice(v); return; }
         break;
     }
-    return v->env;
+    default:
+        return;
+    }
+    v->env = (int32_t)h;
 }
 
 /* Render `samples` stereo frames, summing every active voice. */
@@ -447,6 +454,7 @@ static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix
             mix_el[i] += (s * v->vol_el) >> 12;
             mix_er[i] += (s * v->vol_er) >> 12;
             step_envelope(v);
+            if (!v->playing) break;   /* the envelope ended the voice */
 
             /* Pitch is a 12-bit fixed-point step: 0x1000 plays at the source
              * rate, 0x2000 an octave up. */
