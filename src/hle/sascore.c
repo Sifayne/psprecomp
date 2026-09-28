@@ -1368,25 +1368,27 @@ static void hle_GetAllEnvelopeHeights(void) {
  *         APF1 (D1 per side, G1) and then APF2 (D2, G2)
  *   out   y * 31 * EVOL >> 16                (y * 31 / 16 at EVOL 0x1000)
  *
- * The gains are those the data leaves: hall's I, W, V0, G1 and G2 are the
- * only values that fit, the others a value inside a narrow range that fits
- * exactly (medium's I also fits at a few far-off values; 28912, shared with
- * small and pipe, is kept). Every type but echo and delay has G1 = 2 * D2.
+ * The gains are those the data leaves. Pipe's all, and hall's I, W, V0, G1
+ * and G2, are the only values that fit; every other is one of a few
+ * neighbours that all fit exactly. Of those, G1 is taken as 2 * D2, which
+ * is among them for all seven types that have an APF2, and the rest as the
+ * one with the most low zero bits (medium's I also fits at a few far-off
+ * values; 28912, shared with small and pipe, is kept).
  *
  * Echo and delay are one type as far as the data goes -- identical captures
  * at RevParam(16, 64) -- and are the only ones RevParam moves: a single line
  * a side through which the pulse comes back every 16d + 4 steps, scaled by
  * W = -256 * feedback (-16384 exactly at 64; nothing at 0), read at 16d + 7,
- * with a faint APF1 (D1 16d + 24 left, 16d + 20 right, G1 6 -- 5 to 8 all
+ * with a faint APF1 (D1 16d + 24 left, 16d + 20 right, G1 8 -- 5 to 8 all
  * fit) and no APF2. Delays 16 and 8, feedback 64 and 0, all exact. The hall
  * burst at RevParam(64, 64) is what the (16, 64) fit gives, so the other
  * types are taken not to use it.
  *
  * Not measured, and chosen here: which side's send feeds which line (the
  * captures fed both the same); EVOL other than 0x1000 (taken as a straight
- * product); VON, which only gates the wet signal here -- dry is never
- * touched, as dry voices were heard after the probe's VON(0, 0) -- and the
- * defaults after an Init (off, EVOL 0, VON 0); clamping of a send past 16
+ * product); VON, which only gates the wet signal here and leaves the dry
+ * mix alone (every capture used VON(1, 1)); the defaults after an Init
+ * (off, EVOL 0, VON 0); clamping of a send past 16
  * bits (clamped); output mode 1, which writes the sends out raw and gets no
  * wet signal here. */
 
@@ -1473,7 +1475,7 @@ static rev_type rev_params(void) {
     if (g_rev.type != 6 && g_rev.type != 7) return REV_TYPES[g_rev.type];
     const int16_t d = (int16_t)(16 * g_rev.delay);
     const rev_type e = {
-        32768, -256 * (int32_t)g_rev.feedback, { 32768, 0, 0, 0 }, 6, 0,
+        32768, -256 * (int32_t)g_rev.feedback, { 32768, 0, 0, 0 }, 8, 0,
         { (int16_t)(d + 24), (int16_t)(d + 20) }, 0, 1, 1,
         { { { (int16_t)(d + 4), (int16_t)(d + 4) } }, { { (int16_t)(d + 4), (int16_t)(d + 4) } } },
         { { { 0, 0, (int16_t)(d + 7) } }, { { 0, 0, (int16_t)(d + 7) } } } };
