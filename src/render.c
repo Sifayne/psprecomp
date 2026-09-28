@@ -1126,30 +1126,41 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      *     c(px, py) = cA + gx * (px - xA) + gy * (py - yA)
      *
      * at the pixel centre, where A is the leftmost vertex (ties: the upper
-     * one) among those inside the scissor, or among all three when none is;
-     * gx and gy are the exact screen gradients floored to 1/1024 (grad1024);
-     * the result is floored and clamped. It reproduces every triangle of
-     * steps 1-11, 18 and 19, alpha included. The rounded barycentric blend
-     * this replaces was one step off on most Gouraud pixels; anchoring at the
-     * first or the topmost vertex fails steps 1-10; step 18's triangle with a
-     * vertex at x = -100 matches only when anchored at its leftmost on-screen
-     * vertex. Which vertex anchors when all three are off-screen is not
-     * measured.
+     * one); gx and gy are the exact screen gradients floored to 1/1024
+     * (grad1024); the result is floored and clamped. It reproduces every
+     * triangle of geprobe 1 steps 1-11, 18 and 19, alpha included. The
+     * rounded barycentric blend this replaces was one step off on most
+     * Gouraud pixels; anchoring at the first or the topmost vertex fails
+     * steps 1-10.
      *
-     * Flat shading (SHADE clear) skips all of this: the whole triangle is
-     * last_rgba. Measured on a triangle list; a strip's triangle takes its
+     * Which vertices compete depends on the mode. Transformed triangles take
+     * the leftmost of all three: geprobe 2 scene 15's fogged floor has a
+     * corner at (-388, 371) and its colour and fog match on every pixel when
+     * anchored there, where its one on-screen corner leaves 7337 off.
+     * Through-mode triangles take the leftmost among the vertices inside the
+     * scissor, or among all three when none is: geprobe 1 step 18's triangle
+     * with corners at (-100, 200) and (100, 600) matches only when anchored
+     * at its third, (200, 150). What makes the two differ is not known.
+     * (A transformed vertex is one the GE projected: psp_vertex.precise.)
+     *
+     * The fog coefficient is a fifth plane through the same anchor, by the
+     * same rule: scene 15's floor and quads, every pixel.
+     *
+     * Flat shading (SHADE clear) skips the colour planes: the whole triangle
+     * is last_rgba. Measured on a triangle list; a strip's triangle takes its
      * own third vertex by the same rule, which is not measured.
      *
      * Kept in 1/16384ths of a channel (1/1024 of a step times the 1/16 grid)
      * so every pixel is exact integer arithmetic. */
-    int64_t col_acc[4] = { 0, 0, 0, 0 }, col_dx[4] = { 0, 0, 0, 0 }, col_dy[4] = { 0, 0, 0, 0 };
+    int64_t col_acc[5] = { 0, 0, 0, 0, 0 }, col_dx[5] = { 0, 0, 0, 0, 0 }, col_dy[5] = { 0, 0, 0, 0, 0 };
     const int flat = g_bs.shade_flat;
-    if (!flat) {
+    {
         const psp_vertex *vs[3] = { a, b, c };
         int inside[3], any = 0, k0 = -1;
         for (int k = 0; k < 3; k++) {
-            inside[k] = vs[k]->x >= g_sc_x0 * SUBPX && vs[k]->x < (g_sc_x1 + 1) * SUBPX &&
-                        vs[k]->y >= g_sc_y0 * SUBPX && vs[k]->y < (g_sc_y1 + 1) * SUBPX;
+            inside[k] = vs[k]->precise ||
+                        (vs[k]->x >= g_sc_x0 * SUBPX && vs[k]->x < (g_sc_x1 + 1) * SUBPX &&
+                         vs[k]->y >= g_sc_y0 * SUBPX && vs[k]->y < (g_sc_y1 + 1) * SUBPX);
             any |= inside[k];
         }
         for (int k = 0; k < 3; k++) {
@@ -1157,16 +1168,21 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             if (k0 < 0 || vs[k]->x < vs[k0]->x || (vs[k]->x == vs[k0]->x && vs[k]->y < vs[k0]->y))
                 k0 = k;
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = flat ? 4 : 0; i < 5; i++) {
             /* A lit channel past 255 is interpolated as it is and clamped per
              * pixel by plane_chan (psp_vertex.hi). */
-            const int64_t c0 = (i < 3 && a->hi_set) ? a->hi[i] : chan(a->rgba, i);
-            const int64_t c1 = (i < 3 && b->hi_set) ? b->hi[i] : chan(b->rgba, i);
-            const int64_t c2 = (i < 3 && c->hi_set) ? c->hi[i] : chan(c->rgba, i);
+            int64_t c0, c1, c2, ck;
+            if (i == 4) {
+                c0 = a->fog; c1 = b->fog; c2 = c->fog; ck = vs[k0]->fog;
+            } else {
+                c0 = (i < 3 && a->hi_set) ? a->hi[i] : chan(a->rgba, i);
+                c1 = (i < 3 && b->hi_set) ? b->hi[i] : chan(b->rgba, i);
+                c2 = (i < 3 && c->hi_set) ? c->hi[i] : chan(c->rgba, i);
+                ck = (i < 3 && vs[k0]->hi_set) ? vs[k0]->hi[i] : chan(vs[k0]->rgba, i);
+            }
             const int64_t nx = (c1 - c0) * (c->y - a->y) - (c2 - c0) * (b->y - a->y);
             const int64_t ny = (c2 - c0) * (b->x - a->x) - (c1 - c0) * (c->x - a->x);
             const int64_t gx = grad1024(nx * 16384, area), gy = grad1024(ny * 16384, area);
-            const int64_t ck = (i < 3 && vs[k0]->hi_set) ? vs[k0]->hi[i] : chan(vs[k0]->rgba, i);
             col_acc[i] = ck * 16384
                        + gx * (px - vs[k0]->x) + gy * (py - vs[k0]->y);
             col_dx[i] = gx * SUBPX;
@@ -1203,7 +1219,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
 
     for (int y = miny; y <= maxy; y++) {
         int64_t w0 = row0, w1 = row1, w2 = row2;
-        int64_t acc[4] = { col_acc[0], col_acc[1], col_acc[2], col_acc[3] };
+        int64_t acc[5] = { col_acc[0], col_acc[1], col_acc[2], col_acc[3], col_acc[4] };
         for (int x = minx; x <= maxx; x++) {
             if (w0 + bias0 >= 0 && w1 + bias1 >= 0 && w2 + bias2 >= 0) {
                 const float l0 = (float)w0 * inv;
@@ -1212,9 +1228,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
 
                 const float z = l0 * a->z + l1 * b->z + l2 * c->z;
 
-                float fgf = l0 * (float)a->fog + l1 * (float)b->fog + l2 * (float)c->fog;
-                if (fgf < 0.0f) fgf = 0.0f; else if (fgf > 255.0f) fgf = 255.0f;
-                const int fg = (int)(fgf + 0.5f);
+                const int fg = (int)plane_chan(acc[4]);
 
                 uint32_t col = last_rgba;
                 if (!flat)
@@ -1248,10 +1262,10 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                 shade_pixel(x, y, z, col);
             }
             w0 -= d0y * SUBPX; w1 -= d1y * SUBPX; w2 -= d2y * SUBPX;
-            for (int i = 0; i < 4; i++) acc[i] += col_dx[i];
+            for (int i = 0; i < 5; i++) acc[i] += col_dx[i];
         }
         row0 += d0x * SUBPX; row1 += d1x * SUBPX; row2 += d2x * SUBPX;
-        for (int i = 0; i < 4; i++) col_acc[i] += col_dy[i];
+        for (int i = 0; i < 5; i++) col_acc[i] += col_dy[i];
     }
 }
 

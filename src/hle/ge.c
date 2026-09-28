@@ -2105,7 +2105,10 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             /* Fog. The coefficient is (end - depth) * range with depth the
              * eye-space distance -- w of the clip position for a standard
              * projection, -z of the eye position here -- clamped to 0..1 and
-             * quantised to the hardware's byte, 255 unfogged. gpu/commands/fog
+             * quantised to the hardware's byte, 255 unfogged: floor(f * 256),
+             * clamped. geprobe 2 scene 15 (fw 6.60) fogs six quads at f of
+             * 0.861 ... 0.028 and reads 220, 177, 135, 92, 49 and 7, where
+             * rounding f * 255 gives 50 for the fifth. gpu/commands/fog
              * fixes the rest: near == far makes sceGuFog's range 1/0, and the
              * hardware reads the infinite product as fully fogged, whichever
              * sign ("Basic" and "Both neg" both read the fog colour); "Near
@@ -2114,7 +2117,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             if (g_tl.fog_enable) {
                 const float f = (g_tl.fog_end + eye[2]) * g_tl.fog_range;
                 if (!isfinite(f) || f <= 0.0f) o->fog = 0;
-                else if (f < 1.0f)             o->fog = (int)(f * 255.0f + 0.5f);
+                else if (f < 1.0f)             o->fog = (int)(f * 256.0f) > 255 ? 255 : (int)(f * 256.0f);
                 g_fog_verts++;
             }
             if (g_tl.lighting) {

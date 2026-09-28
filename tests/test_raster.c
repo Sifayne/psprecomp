@@ -1284,6 +1284,34 @@ static void test_hardware_shading(void) {
 
 /* Dither on an 8888 target, geprobe step 10 (fw 6.60): a flat 7F sprite
  * under the probe's extreme matrix, rows {7,-8,7,-8} {-8,7,-8,7} {0,1,2,3}. */
+/* geprobe 2 scene 15 (fw 6.60): the fogged floor, one transformed triangle
+ * with two corners off screen, white to green and fog 255 to 0. Its colour
+ * and fog planes are anchored at the leftmost corner, (-388.125, 371.5),
+ * not at the one on screen; these pixels are the hardware's and each is one
+ * step off in some channel with the on-screen anchor. */
+static void test_hardware_transformed_anchor_fog(void) {
+    psp_ge_reset();
+    clear_fb();
+    const psp_render_backend *be = psp_render_current();
+    psp_blend_state blend = { .write_colour = 1 };
+    be->set_target(FB, 480, 3);
+    be->set_scissor(0, 0, 479, 271);
+    be->set_texture(&(psp_tex_state){ 0 });
+    be->set_depth(0, 1, 0);
+    be->set_blend(&blend);
+    be->set_fog(1, 0xFF8040u);
+    psp_vertex tri[3] = {
+        { .x = -6210, .y = 5944, .rgba = 0xFFFFFFFFu, .inv_w = 1, .tex_q = 1, .fog = 255, .precise = 1 },
+        { .x = 13890, .y = 5944, .rgba = 0xFFFFFFFFu, .inv_w = 1, .tex_q = 1, .fog = 255, .precise = 1 },
+        { .x =  3464, .y = 2317, .rgba = 0xFF00FF00u, .inv_w = 1, .tex_q = 1, .fog = 0,   .precise = 1 },
+    };
+    be->draw(PSP_PRIM_TRIANGLES, tri, 3);
+    be->set_fog(0, 0);
+    CHECK(pixel(127, 178) == 0xDE933C && pixel(252, 203) == 0xCEA141 && pixel(93, 259) == 0xBFC061,
+          "fogged floor: %06X %06X %06X, hardware DE933C CEA141 BFC061",
+          pixel(127, 178), pixel(252, 203), pixel(93, 259));
+}
+
 static void test_hardware_dither(void) {
     psp_ge_reset(); clear_fb(); begin_list();
     vertex(0, 10, 210, 0xFF7F7F7F); vertex(1, 240, 240, 0xFF7F7F7F);
@@ -1457,6 +1485,7 @@ int main(void) {
     test_transformed_lines();
     test_line_interpolation_and_clipping();
     test_hardware_shading();
+    test_hardware_transformed_anchor_fog();
     test_hardware_dither();
     test_hardware_blend();
     test_hardware_texfunc();
