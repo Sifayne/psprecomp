@@ -12,7 +12,8 @@
  * skinning, Bezier and spline patches, bounding-box jumps, GE callbacks -- and
  * at the features it does implement from pspautotests captures (texture
  * functions, filtering, fog, lighting, blending, clipping), so both get a
- * hardware reference from this project's own PSP.
+ * hardware reference from this project's own PSP. Scenes 25 on (version 5)
+ * each isolate one rule the earlier scenes left open.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -33,7 +34,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 4
+#define PROBE_VERSION 5
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -787,6 +788,531 @@ static void scene_bbox(void) {
     g_keep = 0;
 }
 
+/* ---- geprobe 5: what scenes 15-24 left open ------------------------------
+ *
+ * Each scene below isolates one rule that the 3D scenes show only mixed with
+ * others (fw660-run4/findings/geprobe.md): the specular and powered-diffuse
+ * curves, how precisely patches, morphing and skinning place vertices and
+ * colours, depth interpolation, far-off and 16-bit through-mode positions,
+ * sprite texel mapping, the logic ops scene 19 left out, the pixel mask on
+ * stencil writes and on 16-bit targets, and what a clear does with the mask,
+ * the logic op, dither and the tests. */
+
+typedef struct { float nx, ny, nz; float x, y, z; } NV;               /* normal + position */
+typedef struct { float x, y, z; } BP3;                                 /* bounding-box corner */
+typedef struct { w32 color; short x, y, z, pad; } CV16;                /* colour + 16-bit position */
+#define FMT_NV3D   (GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
+#define FMT_CV16_2D (GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D)
+/* sceGuLight's `components` 8 is light kind 2, powered diffuse: PSPSDK's
+ * libgu maps 6 (diffuse and specular) to kind 1, 8 to kind 2, the rest to 0. */
+#define LIGHT_POWERED_DIFFUSE 8
+
+/* Unit normals (sin, 0, cos): with the light and the eye both on +Z, N.L and
+ * N.H are 1, 0.995, 0.99, 0.98 ... 0.45. The last two are the 0.9 normal
+ * scaled by 2 and by 0.5, to see whether the GE normalises. */
+static const float SPEC_N[18][3] = {
+    { 0.0f, 0.0f, 1.0f },                { 0.0998749211f, 0.0f, 0.995000005f },
+    { 0.141067356f, 0.0f, 0.99000001f }, { 0.198997483f, 0.0f, 0.980000019f },
+    { 0.24310492f, 0.0f, 0.970000029f }, { 0.280000001f, 0.0f, 0.959999979f },
+    { 0.312249899f, 0.0f, 0.949999988f }, { 0.341174453f, 0.0f, 0.939999998f },
+    { 0.391918361f, 0.0f, 0.920000017f }, { 0.4358899f, 0.0f, 0.899999976f },
+    { 0.493051708f, 0.0f, 0.870000005f }, { 0.557763398f, 0.0f, 0.829999983f },
+    { 0.62577951f, 0.0f, 0.779999971f },  { 0.714142859f, 0.0f, 0.699999988f },
+    { 0.800000012f, 0.0f, 0.600000024f }, { 0.893028557f, 0.0f, 0.449999988f },
+    { 0.87177980f, 0.0f, 1.8f },          { 0.21794495f, 0.0f, 0.45f },
+};
+
+static NV g_nv[6 * 18];
+
+static void nquad(NV *v, float x0, float y0, float x1, float y1, float z, const float n[3]) {
+    const NV a = { n[0], n[1], n[2], x0, y0, z }, b = { n[0], n[1], n[2], x1, y0, z };
+    const NV c = { n[0], n[1], n[2], x0, y1, z }, d = { n[0], n[1], n[2], x1, y1, z };
+    v[0] = a; v[1] = b; v[2] = c; v[3] = b; v[4] = d; v[5] = c;
+}
+
+/* One row of 18 quads at z = -6, one per normal, top edge at y0. */
+static void spec_row(float y0) {
+    for (int i = 0; i < 18; i++) {
+        const float x0 = -5.9f + i * 0.66f;
+        nquad(g_nv + 6 * i, x0, y0, x0 + 0.58f, y0 - 0.38f, -6.0f, SPEC_N[i]);
+    }
+    sceGuDrawArray(GU_TRIANGLES, FMT_NV3D, 6 * 18, NULL, gumem(g_nv, sizeof g_nv));
+}
+
+/* Scene 16's specular reads as if the exponent were about 1.28 times the
+ * coefficient, and its diffuse-only fans are one step off in places. Here
+ * every quad has one normal, a white light and a white material, so each
+ * quad is one flat value: 255 * f(c) for the column's c. Rows 0-7 specular
+ * alone with coefficients 1 to 32, rows 8-9 powered diffuse with 4 and 12,
+ * row 10 plain diffuse; then two wide quads of one normal each, which a fixed
+ * eye direction lights evenly and an eye at the origin does not. */
+static void scene_specular(void) {
+    if (step("scene %02d: specular and diffuse curves", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_LIGHTING);
+    sceGuLightMode(GU_SINGLE_COLOR);
+    sceGuAmbient(0xFF000000);
+    sceGuColorMaterial(0);
+    sceGuModelColor(0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF);
+    sceGuAmbientColor(0xFF000000);            /* material ambient black, alpha 0xFF */
+    ScePspFVector3 dir = { 0.0f, 0.0f, 1.0f };
+    sceGuEnable(GU_LIGHT0);
+    sceGuLightColor(0, GU_AMBIENT, 0x000000);
+
+    static const float K[8] = { 1.0f, 2.0f, 4.0f, 8.0f, 12.0f, 16.0f, 24.0f, 32.0f };
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE_AND_SPECULAR, &dir);
+    sceGuLightColor(0, GU_DIFFUSE, 0x000000);
+    sceGuLightColor(0, GU_SPECULAR, 0xFFFFFF);
+    for (int r = 0; r < 8; r++) {
+        sceGuSpecular(K[r]);
+        spec_row(3.3f - r * 0.45f);
+    }
+    sceGuLight(0, GU_DIRECTIONAL, LIGHT_POWERED_DIFFUSE, &dir);
+    sceGuLightColor(0, GU_DIFFUSE, 0xFFFFFF);
+    sceGuLightColor(0, GU_SPECULAR, 0x000000);
+    sceGuSpecular(4.0f);
+    spec_row(3.3f - 8 * 0.45f);
+    sceGuSpecular(12.0f);
+    spec_row(3.3f - 9 * 0.45f);
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE, &dir);
+    spec_row(3.3f - 10 * 0.45f);
+
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE_AND_SPECULAR, &dir);
+    sceGuLightColor(0, GU_DIFFUSE, 0x000000);
+    sceGuLightColor(0, GU_SPECULAR, 0xFFFFFF);
+    sceGuSpecular(12.0f);
+    nquad(g_nv, -5.9f, -1.9f, 5.9f, -2.5f, -6.0f, SPEC_N[6]);
+    nquad(g_nv + 6, -5.9f, -2.65f, 5.9f, -3.25f, -6.0f, SPEC_N[2]);
+    sceGuDrawArray(GU_TRIANGLES, FMT_NV3D, 12, NULL, gumem(g_nv, 12 * sizeof(NV)));
+    scene_end("specular", GU_PSM_8888, 0);
+}
+
+/* Evenly spaced control points on the plane z = -6. Plain, their colours are
+ * linear in u and v, so the exact surface and its colours are bilinear and
+ * every vertex a patch generates has an exact position and colour. `bump`
+ * makes the four inner control colours white and the rest black instead. */
+static void flat_grid(CV *v, float cx, float cy, float s, int bump) {
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++) {
+            const int inner = (i == 1 || i == 2) && (j == 1 || j == 2);
+            const w32 c = bump ? (inner ? 0xFFFFFFFFu : 0xFF000000u)
+                               : 0xFF400000u | (w32)(i * 85) | (w32)(j * 85) << 8;
+            v[j * 4 + i] = (CV){ c, cx + (i - 1.5f) * s, cy + (j - 1.5f) * s, -6.0f };
+        }
+}
+
+/* One triangle at awkward positions and depths, Gouraud red/green/blue. */
+static void awkward_tri(CV *v, float x) {
+    v[0] = (CV){ 0xFF0000FF, x + 0.123f, -1.537f, -5.9f };
+    v[1] = (CV){ 0xFF00FF00, x + 1.271f, -1.611f, -6.3f };
+    v[2] = (CV){ 0xFFFF0000, x + 0.577f, -2.29f,  -5.7f };
+}
+
+/* Patches (scenes 22-23), morphing (21) and skinning (20) each came out a
+ * step of colour or a sixteenth of position off in places. Row 1: Bezier
+ * patches over a flat_grid, divisions 1 to 4, and the same grid as an
+ * open/open spline, division 4. Row 2: scene 22's curved grid at divisions 1
+ * and 2, the white-bump colours at division 4, the curved grid as an
+ * open/open spline at division 2. Row 3: one quad per pair of morph weights,
+ * both vertex sets in the same place, so each quad is one flat colour, the
+ * blend of 0xFF03FE81 and 0xFF7C0100. Row 4: one triangle unskinned, then the
+ * same shape skinned through identity bones with one float weight of 1, two
+ * of 0.5, and one 8-bit weight of 0x80; then two morphed in position. */
+static void scene_precision(void) {
+    if (step("scene %02d: patch, morph and skin precision", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    CV g[16];
+    sceGuPatchPrim(GU_TRIANGLE_STRIP);
+    for (int i = 0; i < 4; i++) {
+        flat_grid(g, -4.8f + i * 2.4f, 2.5f, 0.4f, 0);
+        sceGuPatchDivide(i + 1, i + 1);
+        sceGuDrawBezier(FMT_CV3D, 4, 4, NULL, gumem(g, sizeof g));
+    }
+    flat_grid(g, 4.8f, 2.5f, 0.4f, 0);
+    sceGuPatchDivide(4, 4);
+    sceGuDrawSpline(FMT_CV3D, 4, 4, GU_OPEN_OPEN, GU_OPEN_OPEN, NULL, gumem(g, sizeof g));
+
+    patch_grid(g, 4, 4, -3.6f, 0.5f, 0.4f);
+    sceGuPatchDivide(1, 1);
+    sceGuDrawBezier(FMT_CV3D, 4, 4, NULL, gumem(g, sizeof g));
+    patch_grid(g, 4, 4, -1.2f, 0.5f, 0.4f);
+    sceGuPatchDivide(2, 2);
+    sceGuDrawBezier(FMT_CV3D, 4, 4, NULL, gumem(g, sizeof g));
+    flat_grid(g, 1.2f, 0.5f, 0.4f, 1);
+    sceGuPatchDivide(4, 4);
+    sceGuDrawBezier(FMT_CV3D, 4, 4, NULL, gumem(g, sizeof g));
+    patch_grid(g, 4, 4, 3.6f, 0.5f, 0.4f);
+    sceGuPatchDivide(2, 2);
+    sceGuDrawSpline(FMT_CV3D, 4, 4, GU_OPEN_OPEN, GU_OPEN_OPEN, NULL, gumem(g, sizeof g));
+
+    static const float MW[10][2] = {
+        { 1.0f, 0.0f }, { 0.875f, 0.125f }, { 0.75f, 0.25f }, { 0.625f, 0.375f }, { 0.5f, 0.5f },
+        { 0.375f, 0.625f }, { 0.25f, 0.75f }, { 0.125f, 0.875f }, { 0.3f, 0.3f }, { 0.9f, 0.9f } };
+    for (int i = 0; i < 10; i++) {
+        const float x0 = -5.8f + i * 1.15f, x1 = x0 + 0.95f, y0 = -0.6f, y1 = -1.2f;
+        const float P[6][2] = { { x0, y0 }, { x1, y0 }, { x0, y1 }, { x1, y0 }, { x1, y1 }, { x0, y1 } };
+        CV mv[12];
+        for (int k = 0; k < 6; k++) {
+            mv[2 * k]     = (CV){ 0xFF03FE81, P[k][0], P[k][1], -6.0f };
+            mv[2 * k + 1] = (CV){ 0xFF7C0100, P[k][0], P[k][1], -6.0f };
+        }
+        sceGuMorphWeight(0, MW[i][0]);
+        sceGuMorphWeight(1, MW[i][1]);
+        sceGuDrawArray(GU_TRIANGLES, GU_VERTICES(2) | FMT_CV3D, 6, NULL, gumem(mv, sizeof mv));
+    }
+
+    ScePspFMatrix4 id;
+    memset(&id, 0, sizeof id);
+    id.x.x = id.y.y = id.z.z = id.w.w = 1.0f;
+    sceGuBoneMatrix(0, &id);
+    sceGuBoneMatrix(1, &id);
+    CV t[3];
+    awkward_tri(t, -5.6f);
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV3D, 3, NULL, gumem(t, sizeof t));
+    typedef struct { float w; w32 color; float x, y, z; } W1V;
+    awkward_tri(t, -3.7f);
+    W1V w1[3];
+    for (int k = 0; k < 3; k++) w1[k] = (W1V){ 1.0f, t[k].color, t[k].x, t[k].y, t[k].z };
+    sceGuDrawArray(GU_TRIANGLES, GU_WEIGHTS(1) | GU_WEIGHT_32BITF | FMT_CV3D, 3, NULL, gumem(w1, sizeof w1));
+    awkward_tri(t, -1.8f);
+    W2V w2[3];
+    for (int k = 0; k < 3; k++) w2[k] = (W2V){ { 0.5f, 0.5f }, t[k].color, t[k].x, t[k].y, t[k].z };
+    sceGuDrawArray(GU_TRIANGLES, GU_WEIGHTS(2) | GU_WEIGHT_32BITF | FMT_CV3D, 3, NULL, gumem(w2, sizeof w2));
+    typedef struct { unsigned char w, pad[3]; w32 color; float x, y, z; } W1B;
+    awkward_tri(t, 0.1f);
+    W1B wb[3];
+    for (int k = 0; k < 3; k++) wb[k] = (W1B){ 0x80, { 0, 0, 0 }, t[k].color, t[k].x, t[k].y, t[k].z };
+    sceGuDrawArray(GU_TRIANGLES, GU_WEIGHTS(1) | GU_WEIGHT_8BIT | FMT_CV3D, 3, NULL, gumem(wb, sizeof wb));
+    static const float PW[2][2] = { { 0.5f, 0.5f }, { 0.3f, 0.7f } };
+    for (int i = 0; i < 2; i++) {
+        awkward_tri(t, 2.0f + i * 1.9f);
+        CV mv[6];
+        for (int k = 0; k < 3; k++) {
+            mv[2 * k] = t[k];
+            mv[2 * k + 1] = (CV){ t[k].color, t[k].x - 0.37f, t[k].y + 0.21f, t[k].z };
+        }
+        sceGuMorphWeight(0, PW[i][0]);
+        sceGuMorphWeight(1, PW[i][1]);
+        sceGuDrawArray(GU_TRIANGLES, GU_VERTICES(2) | FMT_CV3D, 3, NULL, gumem(mv, sizeof mv));
+    }
+    scene_end("precision", GU_PSM_8888, 0);
+}
+
+/* Scene 17's depth buffer is a step off along some rows. Through mode puts
+ * z in the buffer as given, so its triangles show the interpolation alone:
+ * a full-range one, a nearly flat one, a constant one and one steep in y;
+ * then lines with z. On the right, 3D quads at one depth, sloping in y and
+ * sloping in x, and a 3D line. Depth test ALWAYS, writes on; the depth
+ * buffer is saved too. */
+static void scene_depthplanes(void) {
+    if (step("scene %02d: depth interpolation", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);                 /* writes on */
+    CV t[12] = {
+        { 0xFF0000FF, 10, 10, 0 },      { 0xFF0000FF, 230, 10, 65535 },  { 0xFF0000FF, 10, 90, 30000 },
+        { 0xFF00FF00, 230, 20, 1000 },  { 0xFF00FF00, 230, 100, 1003 },  { 0xFF00FF00, 20, 100, 1010 },
+        { 0xFFFF0000, 10, 110, 12345 }, { 0xFFFF0000, 230, 110, 12345 }, { 0xFFFF0000, 120, 170, 12345 },
+        { 0xFFFFFF00, 10, 175, 0 },     { 0xFFFFFF00, 230, 175, 0 },     { 0xFFFFFF00, 120, 200, 65535 } };
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV2D, 12, NULL, gumem(t, sizeof t));
+    CV l[6] = { { 0xFFFFFFFF, 10, 210, 0 },     { 0xFFFFFFFF, 230, 215, 65535 },
+                { 0xFFFFFFFF, 10, 225, 65535 }, { 0xFFFFFFFF, 230, 225, 0 },
+                { 0xFFFFFFFF, 230, 235, 0 },    { 0xFFFFFFFF, 10, 262, 40000 } };
+    sceGuDrawArray(GU_LINES, FMT_CV2D, 6, NULL, gumem(l, sizeof l));
+
+    quad3d(0.3f, -2.0f, 0.9f, 2.0f, -5.0f, 0xFF0000FF, 0xFF0000FF);
+    CV q[12] = {
+        { 0xFF00FF00, 1.2f, -1.8f, -4.5f }, { 0xFF00FF00, 1.7f, -1.8f, -4.5f }, { 0xFF00FF00, 1.2f, 1.8f, -5.5f },
+        { 0xFF00FF00, 1.7f, -1.8f, -4.5f }, { 0xFF00FF00, 1.7f, 1.8f, -5.5f },  { 0xFF00FF00, 1.2f, 1.8f, -5.5f },
+        { 0xFFFF0000, 2.2f, -1.8f, -5.5f }, { 0xFFFF0000, 3.8f, -1.8f, -4.5f }, { 0xFFFF0000, 2.2f, 1.8f, -5.5f },
+        { 0xFFFF0000, 3.8f, -1.8f, -4.5f }, { 0xFFFF0000, 3.8f, 1.8f, -4.5f },  { 0xFFFF0000, 2.2f, 1.8f, -5.5f } };
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV3D, 12, NULL, gumem(q, sizeof q));
+    CV l3[2] = { { 0xFFFFFFFF, 0.4f, -2.35f, -5.0f }, { 0xFFFFFFFF, 3.6f, -2.45f, -6.0f } };
+    sceGuDrawArray(GU_LINES, FMT_CV3D, 2, NULL, gumem(l3, sizeof l3));
+    scene_end("depthplanes", GU_PSM_8888, 1);
+}
+
+/* Positions far off screen and 16-bit through-mode ones, sprites mapping 2
+ * texels onto 7 and 70 pixels (flipped too), and texture coordinates along
+ * lines. Top band: a through-mode triangle with a vertex at x = -5000 (float)
+ * and one at x = 5000; second band: the same two with 16-bit positions.
+ * Then 16-bit sprites at x -10, 4100 and -4086 and float ones at 4100 and
+ * -10, one row each at the left edge (whether 16-bit positions are signed,
+ * and whether either wraps at 4096); a 3D textured line to their right. */
+static void scene_positions(void) {
+    if (step("scene %02d: far-off and 16-bit positions, 2-texel sprites, line uv", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    tri2d(-5000, 5, 0xFF0000FF, 230, 60, 0xFF00FF00, 230, 5, 0xFFFF0000);
+    tri2d(250, 5, 0xFFFF0000, 250, 60, 0xFF00FF00, 5000, 5, 0xFF0000FF);
+    CV16 s[6] = { { 0xFF0000FF, -5000, 65, 0, 0 }, { 0xFF00FF00, 230, 120, 0, 0 }, { 0xFFFF0000, 230, 65, 0, 0 },
+                  { 0xFFFF0000, 250, 65, 0, 0 },   { 0xFF00FF00, 250, 120, 0, 0 }, { 0xFF0000FF, 5000, 65, 0, 0 } };
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV16_2D, 6, NULL, gumem(s, sizeof s));
+    CV16 sp[6] = { { 0xFF0000FF, -10, 125, 0, 0 },   { 0xFF0000FF, 30, 133, 0, 0 },
+                   { 0xFF00FF00, 4100, 135, 0, 0 },  { 0xFF00FF00, 4130, 143, 0, 0 },
+                   { 0xFFFF0000, -4086, 145, 0, 0 }, { 0xFFFF0000, -4056, 153, 0, 0 } };
+    sceGuDrawArray(GU_SPRITES, FMT_CV16_2D, 6, NULL, gumem(sp, sizeof sp));
+    rect2d(4100, 155, 4130, 163, 0xFF00FFFF);
+    rect2d(-10, 165, 30, 173, 0xFFFF00FF);
+
+    tex8888(GU_NEAREST, GU_NEAREST);
+    TCV l3[2] = { { 0, 8, 0xFFFFFFFF, 0.4f, 0.35f, -4.0f }, { 16, 8, 0xFFFFFFFF, 4.2f, -0.9f, -8.0f } };
+    sceGuDrawArray(GU_LINES, FMT_TCV3D, 2, NULL, gumem(l3, sizeof l3));
+    /* 2 texels (4..6) onto 7 pixels: plain, u flipped, v flipped, both, and
+     * the corners given bottom-right first; nearest, then linear. */
+    for (int f = 0; f < 2; f++) {
+        if (f) tex8888(GU_LINEAR, GU_LINEAR);
+        const float y = 180 + f * 10;
+        tsprite(10, y, 17, y + 7, 4, 4, 6, 6, 0xFFFFFFFF);
+        tsprite(22, y, 29, y + 7, 6, 4, 4, 6, 0xFFFFFFFF);
+        tsprite(34, y, 41, y + 7, 4, 6, 6, 4, 0xFFFFFFFF);
+        tsprite(46, y, 53, y + 7, 6, 6, 4, 4, 0xFFFFFFFF);
+        tsprite(65, y + 7, 58, y, 4, 4, 6, 6, 0xFFFFFFFF);
+    }
+    /* 2 texels onto 70 pixels: linear, linear flipped, nearest, nearest flipped. */
+    tsprite(10, 205, 80, 219, 4, 4, 6, 6, 0xFFFFFFFF);
+    tsprite(90, 205, 160, 219, 6, 6, 4, 4, 0xFFFFFFFF);
+    tex8888(GU_NEAREST, GU_NEAREST);
+    tsprite(170, 205, 240, 219, 4, 4, 6, 6, 0xFFFFFFFF);
+    tsprite(250, 205, 320, 219, 6, 6, 4, 4, 0xFFFFFFFF);
+    /* Lines with texture coordinates: across, diagonal, right to left. */
+    TCV tl[6] = { { 0, 8, 0xFFFFFFFF, 10, 226, 0 },  { 16, 8, 0xFFFFFFFF, 470, 226, 0 },
+                  { 0, 0, 0xFFFFFFFF, 10, 232, 0 },  { 16, 16, 0xFFFFFFFF, 470, 268, 0 },
+                  { 0, 4, 0xFFFFFFFF, 470, 240, 0 }, { 16, 4, 0xFFFFFFFF, 10, 250, 0 } };
+    sceGuDrawArray(GU_LINES, FMT_TCV2D, 6, NULL, gumem(tl, sizeof tl));
+    sceGuDisable(GU_TEXTURE_2D);
+    scene_end("positions", GU_PSM_8888, 0);
+}
+
+/* A clear confined by the scissor to one band, with one state switched on.
+ * Returns with the state off again and the scissor full. */
+static void clear_band(int y0, int y1, int what, int flags) {
+    sceGuScissor(10, y0, 470, y1);
+    switch (what) {
+    case 0: sceGuPixelMask(0x00FF00FF); break;
+    case 1: sceGuEnable(GU_COLOR_LOGIC_OP); sceGuLogicalOp(GU_XOR); break;
+    case 2: sceGuSetDither(&DITHER_EXTREME); sceGuEnable(GU_DITHER); break;
+    case 3: sceGuEnable(GU_COLOR_TEST); sceGuColorFunc(GU_NOTEQUAL, 0x808080, 0xFFFFFF);
+            sceGuEnable(GU_ALPHA_TEST); sceGuAlphaFunc(GU_GREATER, 0x80, 0xFF); break;
+    case 4: sceGuPixelMask(0xF0000000); break;
+    case 5: sceGuEnable(GU_BLEND); sceGuBlendFunc(GU_ADD, GU_FIX, GU_FIX, 0x808080, 0x808080); break;
+    }
+    sceGuClearColor(0x80808080);
+    sceGuClearStencil(0xAB);
+    sceGuClear(flags);
+    sceGuPixelMask(0);
+    sceGuDisable(GU_COLOR_LOGIC_OP);
+    sceGuDisable(GU_DITHER);
+    sceGuDisable(GU_COLOR_TEST);
+    sceGuDisable(GU_ALPHA_TEST);
+    sceGuDisable(GU_BLEND);
+    sceGuScissor(0, 0, SCR_W, SCR_H);
+}
+
+/* Six clears over what is there, one band each: pixel mask 0x00FF00FF, logic
+ * op XOR, dither (the extreme matrix), colour and alpha tests that the clear
+ * colour 0x80808080 fails, pixel mask 0xF0000000 on a stencil clear to 0xAB,
+ * and blending. */
+static void clear_bands(int y0) {
+    for (int i = 0; i < 6; i++)
+        clear_band(y0 + i * 13, y0 + i * 13 + 13, i,
+                   i == 4 ? GU_STENCIL_BUFFER_BIT : GU_COLOR_BUFFER_BIT);
+}
+
+/* Stencil writes under PMSK2: stencil 0x5A everywhere first, then REPLACE
+ * 0xAB with the alpha mask 0xF0, INCR with 0x0F and INVERT with 0x3C. */
+static void pmsk2_stencil(int y0, int y1) {
+    sceGuEnable(GU_STENCIL_TEST);
+    sceGuStencilFunc(GU_ALWAYS, 0x5A, 0xFF);
+    sceGuStencilOp(GU_KEEP, GU_KEEP, GU_REPLACE);
+    rect2d(10, y0, 470, y1, 0x00FFFFFF);
+    sceGuStencilFunc(GU_ALWAYS, 0xAB, 0xFF);
+    sceGuPixelMask(0xF0000000);
+    rect2d(10, y0, 160, y1, 0x00FFFFFF);
+    sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INCR);
+    sceGuPixelMask(0x0F000000);
+    rect2d(160, y0, 310, y1, 0x00FFFFFF);
+    sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INVERT);
+    sceGuPixelMask(0x3C000000);
+    rect2d(310, y0, 470, y1, 0x00FFFFFF);
+    sceGuPixelMask(0);
+    sceGuDisable(GU_STENCIL_TEST);
+}
+
+/* Scene 19's follow-ups on 8888: the eight logic ops it left out, over two
+ * gradients; its stencil band (y 112-142) again with EQUAL 0x56 and EQUAL
+ * 0x55 rectangles wholly inside it (version 2 put the one rectangle half
+ * below it); stencil writes under PMSK2; and clears with the mask, logic
+ * op, dither, tests and blending on. */
+static void scene_tests2(void) {
+    if (step("scene %02d: other logic ops, stencil band, PMSK2 with stencil ops, clears", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0x80402010);
+    grad2d(10, 10, 470, 50, 0xFF000000, 0xFFFFFFFF);
+    grad2d(10, 50, 470, 90, 0x00FF8040, 0xFF4080FF);
+    sceGuEnable(GU_COLOR_LOGIC_OP);
+    static const int L2[] = { GU_AND_REVERSE, GU_COPY, GU_AND_INVERTED, GU_NOOP,
+                              GU_OR_REVERSE, GU_COPY_INVERTED, GU_OR_INVERTED, GU_SET };
+    for (int i = 0; i < 8; i++) {
+        sceGuLogicalOp(L2[i]);
+        rect2d(10 + i * 57, 14, 62 + i * 57, 86, 0xC3A55A3C);
+    }
+    sceGuDisable(GU_COLOR_LOGIC_OP);
+
+    sceGuEnable(GU_STENCIL_TEST);
+    sceGuStencilFunc(GU_ALWAYS, 0x55, 0xFF);
+    sceGuStencilOp(GU_KEEP, GU_KEEP, GU_REPLACE);
+    rect2d(10, 112, 240, 142, 0xFF0000FF);
+    sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INCR);
+    rect2d(120, 112, 350, 142, 0xFF00FF00);
+    sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INVERT);
+    rect2d(300, 112, 470, 142, 0xFFFF0000);
+    sceGuStencilOp(GU_KEEP, GU_KEEP, GU_KEEP);
+    sceGuStencilFunc(GU_EQUAL, 0x56, 0xFF);
+    rect2d(10, 116, 470, 126, 0xFFFFFFFF);
+    sceGuStencilFunc(GU_EQUAL, 0x55, 0xFF);
+    rect2d(10, 128, 470, 138, 0xFF00FFFF);
+    sceGuDisable(GU_STENCIL_TEST);
+
+    pmsk2_stencil(150, 175);
+    grad2d(10, 185, 470, 263, 0xFF000000, 0xFFFFFFFF);
+    clear_bands(185);
+    scene_end("tests2", GU_PSM_8888, 0);
+}
+
+/* The pixel mask, colour test, logic ops, clears and PMSK2 on a 16-bit
+ * target, over a grey gradient. Rows: four pixel masks (0x00F8FCF8, the
+ * bits 5650 keeps; 0x00070307, the bits it drops; 0x00808080; 0xFFFF0000)
+ * writing white, then black; colour test EQUAL 0x808080 under masks
+ * 0xF0F0F0 and 0xFFFFFF and NOTEQUAL under 0xF0F0F0 on a black-to-white
+ * gradient over red; logic ops XOR, AND, OR, INVERTED; the six clears of
+ * scene 29; stencil writes under PMSK2. Dither is off except in its clear. */
+static void scene_masks16(int psm, const char *name) {
+    if (step("scene %02d: %s", g_scene, name)) return;
+    scene_begin(psm, 0x00000000);
+    grad2d(0, 0, 480, 272, 0xFF000000, 0xFFFFFFFF);
+    static const w32 M[4] = { 0x00F8FCF8, 0x00070307, 0x00808080, 0xFFFF0000 };
+    for (int i = 0; i < 4; i++) {
+        sceGuPixelMask(M[i]);
+        rect2d(8 + i * 116, 8, 120 + i * 116, 30, 0xFFFFFFFF);
+        rect2d(8 + i * 116, 32, 120 + i * 116, 54, 0x00000000);
+    }
+    sceGuPixelMask(0);
+    rect2d(8, 60, 472, 90, 0xFF0000FF);
+    sceGuEnable(GU_COLOR_TEST);
+    sceGuColorFunc(GU_EQUAL, 0x808080, 0xF0F0F0);
+    grad2d(8, 60, 472, 70, 0xFF000000, 0xFFFFFFFF);
+    sceGuColorFunc(GU_EQUAL, 0x808080, 0xFFFFFF);
+    grad2d(8, 70, 472, 80, 0xFF000000, 0xFFFFFFFF);
+    sceGuColorFunc(GU_NOTEQUAL, 0x808080, 0xF0F0F0);
+    grad2d(8, 80, 472, 90, 0xFF000000, 0xFFFFFFFF);
+    sceGuDisable(GU_COLOR_TEST);
+    sceGuEnable(GU_COLOR_LOGIC_OP);
+    static const int L4[4] = { GU_XOR, GU_AND, GU_OR, GU_INVERTED };
+    for (int i = 0; i < 4; i++) {
+        sceGuLogicalOp(L4[i]);
+        rect2d(8 + i * 116, 96, 120 + i * 116, 120, 0xC3A55A3C);
+    }
+    sceGuDisable(GU_COLOR_LOGIC_OP);
+    clear_bands(126);
+    pmsk2_stencil(210, 262);
+    scene_end(name, psm, 0);
+}
+
+/* ---- more bounding boxes ------------------------------------------------- */
+
+static void box_corners(BP3 *b, float cx, float cy, float cz, float h) {
+    for (int i = 0; i < 8; i++)
+        b[i] = (BP3){ cx + ((i & 1) ? h : -h), cy + ((i & 2) ? h : -h), cz + ((i & 4) ? h : -h) };
+}
+
+/* As bbox_object, with the marker anywhere. */
+static void bbox_object_at(float cx, float cy, float cz, float h,
+                           float mx0, float my0, float mx1, float my1, w32 color) {
+    BP3 box[8];
+    box_corners(box, cx, cy, cz, h);
+    CV mark[2] = { { color, mx0, my0, 0 }, { color, mx1, my1, 0 } };
+    void *bv = gumem(box, sizeof box);
+    void *mv = gumem(mark, sizeof mark);
+    sceGuBeginObject(GU_VERTEX_32BITF | GU_TRANSFORM_3D, 8, NULL, bv);
+    sceGuDrawArray(GU_SPRITES, FMT_CV2D, 2, NULL, mv);
+    sceGuEndObject();
+}
+
+/* BBOX by hand: vertex type, BASE, VADDR, then BBOX with the count. */
+static void bbox_raw(const void *box, int count) {
+    const w32 a = (w32)box;
+    sceGuSendCommandi(18, GU_VERTEX_32BITF | GU_TRANSFORM_3D);   /* VTYPE */
+    sceGuSendCommandi(16, (a >> 8) & 0x0F0000);                    /* BASE: address bits 24-27 */
+    sceGuSendCommandi(1, a & 0xFFFFFF);                             /* VADDR */
+    sceGuSendCommandi(7, count);                                    /* BBOX */
+}
+
+/* Run 4 answered for eight boxes; these ask what those left open. Boxes 0-2
+ * are wholly or partly behind the camera and far to one side: does the test
+ * divide by a negative w (and mirror them), or treat them otherwise? 3 and 4
+ * sit in the middle of the screen with the scissor cut to the top-left
+ * corner (away from the box, then over part of it): is it the scissor that
+ * the corners are tested against? 5 is on screen but, with the viewport cut
+ * to half size, outside the clip volume (|x| > w): the clip volume or the
+ * screen? 6 draws its marker with a PRIM straight after BBOX and no VADDR:
+ * the marker's vertices follow the box's, so it is drawn only if BBOX moved
+ * VADDR past them. 7 is a hidden box whose marker is drawn with no BJUMP:
+ * BBOX by itself should not stop a draw. */
+static void scene_bbox2(void) {
+    static const struct { float cx, cy, cz, h; int kind; w32 color; const char *what; } B[8] = {
+        { 20.0f, 0.0f,   5.0f, 0.5f, 0, 0xFFFFFFFF, "behind the camera, far right" },
+        { 0.0f,  30.0f,  5.0f, 0.5f, 0, 0xFF0000FF, "behind the camera, far above" },
+        { 20.0f, 0.0f,   0.0f, 0.5f, 0, 0xFF00FF00, "far right, across the camera plane" },
+        { 0.0f,  0.0f,  -5.0f, 0.5f, 1, 0xFFFF0000, "in view, scissor 0-100 away from it" },
+        { 0.0f,  0.0f,  -5.0f, 0.5f, 2, 0xFF00FFFF, "in view, scissor 0-245 over part of it" },
+        { 7.0f,  0.0f,  -5.0f, 0.3f, 3, 0xFFFF00FF, "on screen, outside a half-size viewport's clip volume" },
+        { 0.0f,  0.0f,  -5.0f, 0.5f, 4, 0xFFFFFF00, "PRIM right after BBOX, no VADDR" },
+        { 20.0f, 0.0f,  -5.0f, 0.5f, 5, 0xFF808080, "hidden, marker drawn without BJUMP" },
+    };
+    for (int i = 0; i < 8; i++) {
+        if (step("scene %02d: bounding box %d, %s", g_scene, i, B[i].what)) continue;
+        scene_begin(GU_PSM_8888, 0xFF000000);
+        float mx0 = 10 + i * 58, my0 = 220, mx1 = 60 + i * 58, my1 = 262;
+        switch (B[i].kind) {
+        case 1:
+        case 2:
+            mx0 = 20; my0 = 20; mx1 = 80; my1 = 80;
+            if (B[i].kind == 1) sceGuScissor(0, 0, 100, 100); else sceGuScissor(0, 0, 245, 140);
+            bbox_object_at(B[i].cx, B[i].cy, B[i].cz, B[i].h, mx0, my0, mx1, my1, B[i].color);
+            break;
+        case 3:
+            sceGuViewport(2048, 2048, SCR_W / 2, SCR_H / 2);
+            bbox_object_at(B[i].cx, B[i].cy, B[i].cz, B[i].h, mx0, my0, mx1, my1, B[i].color);
+            break;
+        case 4: {
+            struct { BP3 box[8]; CV mark[2]; } d;
+            box_corners(d.box, B[i].cx, B[i].cy, B[i].cz, B[i].h);
+            d.mark[0] = (CV){ B[i].color, mx0, my0, 0 };
+            d.mark[1] = (CV){ B[i].color, mx1, my1, 0 };
+            bbox_raw(gumem(&d, sizeof d), 8);
+            sceGuSendCommandi(18, FMT_CV2D);                         /* VTYPE */
+            sceGuSendCommandi(4, (GU_SPRITES << 16) | 2);            /* PRIM, VADDR untouched */
+            break;
+        }
+        case 5: {
+            BP3 box[8];
+            box_corners(box, B[i].cx, B[i].cy, B[i].cz, B[i].h);
+            bbox_raw(gumem(box, sizeof box), 8);
+            rect2d(mx0, my0, mx1, my1, B[i].color);
+            break;
+        }
+        default:
+            bbox_object_at(B[i].cx, B[i].cy, B[i].cz, B[i].h, mx0, my0, mx1, my1, B[i].color);
+            break;
+        }
+        sceGuFinish();
+        int r = ge_wait();
+        const w32 *px = (const w32 *)VRAM_UNCACHED + (int)((my0 + my1) / 2) * FB_W + (int)((mx0 + mx1) / 2);
+        out("  wait %08X; marker %s (pixel %08X)\n", (unsigned)r,
+            (*px & 0xFFFFFF) == (B[i].color & 0xFFFFFF) ? "drawn" : "not drawn", *px);
+    }
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -811,6 +1337,34 @@ static void log_events(void) {
     out("  %d callback(s)\n", g_nev);
     for (int i = 0; i < g_nev; i++)
         out("    %s arg %08X phase %d\n", K[g_ev[i][0]], (w32)g_ev[i][1], g_ev[i][2]);
+}
+
+/* Raw lists for the steps split out of step 35 and after it: a static
+ * buffer on its own cache lines, written through the cache and then written
+ * back and invalidated, so memory holds the list and no cache line holds an
+ * older copy of it. The callback data is static too. */
+#define UNCACHED(p) ((void *)((w32)(p) | 0x40000000u))
+static unsigned int g_raw[512] __attribute__((aligned(64)));
+static CV g_rawv[2] __attribute__((aligned(64)));
+static PspGeCallbackData g_cb;
+static int g_cbid = -1, g_lid = -1, g_raw_ready;
+
+static void raw_build_signals(void) {
+    static const unsigned int L[7] = {
+        0x0E010044, 0x0C000000,     /* SIGNAL, behaviour 1 (suspend), id 0x0044; END */
+        0x0E020055, 0x0C000000,     /* SIGNAL, behaviour 2 (continue), id 0x0055; END */
+        0x0F000066, 0x0C000000,     /* FINISH 0x66; END */
+        0 };
+    memset(g_raw, 0, sizeof g_raw);
+    for (int k = 0; k < 7; k++) g_raw[k] = L[k];
+    sceKernelDcacheWritebackInvalidateRange(g_raw, sizeof g_raw);
+    g_raw_ready = 1;
+}
+
+static int words_intact(const volatile unsigned int *p, const unsigned int *w, int n) {
+    for (int i = 0; i < n; i++)
+        if (p[i] != w[i]) return 0;
+    return 1;
 }
 
 static void section_callbacks(void) {
@@ -841,7 +1395,8 @@ static void section_callbacks(void) {
         sceGuSetCallback(GU_CALLBACK_FINISH, NULL);
     }
 
-    if (!step("sceGe: SetCallback, a raw list with SIGNAL and FINISH, EnQueue, ListSync")) {
+    if (!step("sceGe: SetCallback, a raw list with SIGNAL and FINISH, EnQueue, ListSync") &&
+        !KNOWN_CRASH("switched fw 6.60 off in geprobe 4; split into the steps below")) {
         g_nev = 0; g_phase = 0;
         PspGeCallbackData cb;
         memset(&cb, 0, sizeof cb);
@@ -876,6 +1431,240 @@ static void section_callbacks(void) {
         s = sceGeListSync(lid, 1);
         out("  sceGeListSync(peek) after = %08X\n", (unsigned)s);
         if (cbid >= 0) { r = sceGeUnsetCallback(cbid); out("  sceGeUnsetCallback = %08X\n", (unsigned)r); }
+    }
+
+    /* geprobe 5: step 35 split up. In geprobe 4 fw 6.60 switched itself off
+     * in it (version 1 had run it) and took the step's log lines with it:
+     * they reach the memory stick only at the next step. One thing in it
+     * depends on what ran before: its list sits in a 64-byte block from
+     * memalign, 16 bytes into a 64-byte cache line whose first half holds the
+     * block's malloc header (psprecomp puts it there with the same heap
+     * calls). The header is written through the cache and the list through the
+     * uncached alias, so the cache keeps a dirty line with the old contents of
+     * the list's memory, and if it is written back before the GE fetches the
+     * list (by eviction, or by the driver writing back the cache), the GE
+     * runs whatever was there. Here the list sits in a static 64-byte-aligned
+     * buffer written back from the cache, the callback data outlives the
+     * call, and each call is its own step; the last steps repeat version 4's
+     * code exactly with the log flushed after every call, and check whether
+     * such a block's words survive a cache write-back. */
+    if (!step("sceGe raw list, split: sceGeSetCallback")) {
+        memset(&g_cb, 0, sizeof g_cb);
+        g_cb.signal_func = ge_signal_cb;
+        g_cb.signal_arg  = (void *)0x5A;
+        g_cb.finish_func = ge_finish_cb;
+        g_cb.finish_arg  = (void *)0xA5;
+        g_cbid = sceGeSetCallback(&g_cb);
+        out("  sceGeSetCallback %s\n", g_cbid >= 0 ? "ok (id >= 0)" : "error");
+        if (g_cbid < 0) ret(g_cbid);
+    }
+    if (!step("sceGe raw list, split: DrawSync(wait), the list in a static buffer written back from the cache")) {
+        out("  sceGeDrawSync(wait) = %08X\n", (w32)sceGeDrawSync(0));
+        raw_build_signals();
+        out("  list ready\n");
+    }
+    if (!step("sceGe raw list, split: EnQueue (SIGNAL suspend 0x44, SIGNAL continue 0x55, FINISH 0x66)")) {
+        if (g_cbid < 0 || !g_raw_ready) {
+            out("  not run: no callback or no list (a step above did not run)\n");
+        } else {
+            g_nev = 0; g_phase = 1;
+            g_lid = sceGeListEnQueue(UNCACHED(g_raw), NULL, g_cbid, NULL);
+            g_phase = 2;
+            out("  sceGeListEnQueue %s\n", g_lid >= 0 ? "ok (id >= 0)" : "error");
+            if (g_lid < 0) ret(g_lid);
+            out("  %d callback(s) before it returned\n", g_nev);
+        }
+    }
+    if (!step("sceGe raw list, split: ListSync(wait), ListSync(peek), DrawSync(wait), ListSync(peek)")) {
+        if (g_lid < 0) {
+            out("  not run: no list\n");
+        } else {
+            int s = sceGeListSync(g_lid, 0);
+            g_phase = 3;
+            out("  sceGeListSync(wait) = %08X\n", (w32)s);
+            s = sceGeListSync(g_lid, 1);
+            out("  sceGeListSync(peek) = %08X\n", (w32)s);
+            s = sceGeDrawSync(0);
+            g_phase = 4;
+            out("  sceGeDrawSync(wait) = %08X\n", (w32)s);
+            s = sceGeListSync(g_lid, 1);
+            out("  sceGeListSync(peek) = %08X\n", (w32)s);
+        }
+    }
+    if (!step("sceGe raw list, split: the callbacks, then sceGeUnsetCallback")) {
+        sceKernelDelayThread(20000);
+        log_events();
+        if (g_cbid >= 0) {
+            r = sceGeUnsetCallback(g_cbid);
+            out("  sceGeUnsetCallback = %08X\n", (w32)r);
+            g_cbid = -1;
+        }
+    }
+
+    /* PAUSE (SIGNAL behaviour 3), as sceGuSignal(GU_SIGNAL_PAUSE) writes it:
+     * SIGNAL, END, FINISH, END. Which handler runs, whether the list stops
+     * there until sceGeContinue, and what it reports meanwhile. Phase 1 is
+     * inside EnQueue, 2 before sceGeContinue, 4 after it. */
+    if (!step("sceGe PAUSE: SIGNAL pause 0x77 and FINISH 0x78, SIGNAL continue 0x79, FINISH 0x7A; sceGeContinue")) {
+        g_nev = 0; g_phase = 0;
+        const int cbid = sceGeSetCallback(&g_cb);
+        if (cbid < 0) {
+            out("  sceGeSetCallback error\n");
+            ret(cbid);
+        } else {
+            int k = 0;
+            g_raw[k++] = 0x0E030077; g_raw[k++] = 0x0C000000;   /* SIGNAL pause 0x77, END */
+            g_raw[k++] = 0x0F000078; g_raw[k++] = 0x0C000000;   /* FINISH 0x78, END */
+            g_raw[k++] = 0x0E020079; g_raw[k++] = 0x0C000000;   /* SIGNAL continue 0x79, END */
+            g_raw[k++] = 0x0F00007A; g_raw[k++] = 0x0C000000;   /* FINISH 0x7A, END */
+            g_raw[k++] = 0;
+            sceKernelDcacheWritebackInvalidateRange(g_raw, sizeof g_raw);
+            g_phase = 1;
+            const int lid = sceGeListEnQueue(UNCACHED(g_raw), NULL, cbid, NULL);
+            g_phase = 2;
+            out("  sceGeListEnQueue %s\n", lid >= 0 ? "ok (id >= 0)" : "error");
+            if (lid < 0) {
+                ret(lid);
+            } else {
+                sceKernelDelayThread(20000);
+                const int ls = sceGeListSync(lid, 1), ds = sceGeDrawSync(1);
+                out("  after 20 ms: %d callback(s); sceGeListSync(peek) = %08X, sceGeDrawSync(peek) = %08X\n",
+                    g_nev, (w32)ls, (w32)ds);
+                g_phase = 3;
+                r = sceGeContinue();
+                g_phase = 4;
+                out("  sceGeContinue = %08X\n", (w32)r);
+                sceKernelDelayThread(20000);
+                out("  after 20 ms more: sceGeListSync(peek) = %08X\n", (w32)sceGeListSync(lid, 1));
+                out("  wait %08X\n", (w32)ge_wait());
+                log_events();
+            }
+            r = sceGeUnsetCallback(cbid);
+            out("  sceGeUnsetCallback = %08X\n", (w32)r);
+        }
+    }
+
+    /* A list with no stall that keeps the GE busy for a while: 200 full-screen
+     * sprites, a SIGNAL (continue) before the first, another before the
+     * 101st, FINISH after the last. Run 1's short list ran entirely inside
+     * EnQueue (phase 1); does this one, or does EnQueue return first? */
+    if (!step("sceGe long list without a stall: SIGNAL 0x01, 100 sprites, SIGNAL 0x02, 100 sprites, FINISH 0x03")) {
+        g_nev = 0; g_phase = 0;
+        const int cbid = sceGeSetCallback(&g_cb);
+        if (cbid < 0) {
+            out("  sceGeSetCallback error\n");
+            ret(cbid);
+        } else {
+            g_rawv[0] = (CV){ 0xFF203040, 0, 0, 0 };
+            g_rawv[1] = (CV){ 0xFF203040, SCR_W, SCR_H, 0 };
+            const w32 va = (w32)g_rawv;
+            int k = 0;
+            g_raw[k++] = 0x12000000 | FMT_CV2D;                 /* VTYPE */
+            g_raw[k++] = 0x10000000 | ((va >> 8) & 0x0F0000);   /* BASE */
+            g_raw[k++] = 0x0E020001; g_raw[k++] = 0x0C000000;   /* SIGNAL continue 0x01, END */
+            for (int i = 0; i < 200; i++) {
+                if (i == 100) { g_raw[k++] = 0x0E020002; g_raw[k++] = 0x0C000000; }
+                g_raw[k++] = 0x01000000 | (va & 0xFFFFFF);                  /* VADDR */
+                g_raw[k++] = 0x04000000 | (GU_SPRITES << 16) | 2;           /* PRIM */
+            }
+            g_raw[k++] = 0x0F000003; g_raw[k++] = 0x0C000000;   /* FINISH 0x03, END */
+            g_raw[k++] = 0;
+            sceKernelDcacheWritebackInvalidateRange(g_rawv, sizeof g_rawv);
+            sceKernelDcacheWritebackInvalidateRange(g_raw, sizeof g_raw);
+            g_phase = 1;
+            const int lid = sceGeListEnQueue(UNCACHED(g_raw), NULL, cbid, NULL);
+            g_phase = 2;
+            const int peek = lid >= 0 ? sceGeListSync(lid, 1) : 0;
+            g_phase = 3;
+            out("  sceGeListEnQueue %s; sceGeListSync(peek) as it returns = %08X\n",
+                lid >= 0 ? "ok (id >= 0)" : "error", (w32)peek);
+            if (lid < 0) ret(lid);
+            out("  wait %08X\n", (w32)ge_wait());
+            log_events();
+            r = sceGeUnsetCallback(cbid);
+            out("  sceGeUnsetCallback = %08X\n", (w32)r);
+        }
+    }
+
+    /* How many callback slots a program gets (libgu holds one) and the error
+     * past the last. */
+    if (!step("sceGeSetCallback until it fails, then sceGeUnsetCallback on each")) {
+        int ids[40], n = 0, e = 0;
+        while (n < 40) {
+            const int id = sceGeSetCallback(&g_cb);
+            if (id < 0) { e = id; break; }
+            ids[n++] = id;
+        }
+        out("  %d accepted", n);
+        if (e) out(", then %08X", (w32)e);
+        out("\n");
+        int bad = 0;
+        for (int i = 0; i < n; i++)
+            if (sceGeUnsetCallback(ids[i]) != 0) bad++;
+        out("  sceGeUnsetCallback: %d error(s)\n", bad);
+    }
+
+    /* Version 4's step 35 again, call for call, with the log flushed after
+     * each one so it names where the PSP stops if it does; then whether the
+     * list's words still read as written once the cache is written back. */
+    if (!step("sceGe raw list as geprobe 4 built it (memalign, uncached writes), log flushed after each call")) {
+        g_nev = 0; g_phase = 0;
+        PspGeCallbackData cb;
+        memset(&cb, 0, sizeof cb);
+        cb.signal_func = ge_signal_cb;
+        cb.signal_arg  = (void *)0x5A;
+        cb.finish_func = ge_finish_cb;
+        cb.finish_arg  = (void *)0xA5;
+        int cbid = sceGeSetCallback(&cb);
+        out("  sceGeSetCallback %s\n", cbid >= 0 ? "ok (id >= 0)" : "error");
+        if (cbid < 0) ret(cbid);
+        probe_flush();
+        unsigned int *raw = (unsigned int *)((unsigned int)memalign(16, 64) | 0x40000000u);
+        static const unsigned int WORDS[7] = {
+            0x0E010044, 0x0C000000, 0x0E020055, 0x0C000000, 0x0F000066, 0x0C000000, 0 };
+        for (int k = 0; k < 7; k++) raw[k] = WORDS[k];
+        out("  list written\n");
+        probe_flush();
+        g_phase = 1;
+        int lid = sceGeListEnQueue(raw, NULL, cbid, NULL);
+        g_phase = 2;
+        out("  sceGeListEnQueue %s\n", lid >= 0 ? "ok (id >= 0)" : "error");
+        if (lid < 0) ret(lid);
+        probe_flush();
+        int s = sceGeListSync(lid, 0);
+        g_phase = 3;
+        out("  sceGeListSync(wait) = %08X\n", (w32)s);
+        probe_flush();
+        s = sceGeDrawSync(0);
+        out("  sceGeDrawSync(wait) = %08X\n", (w32)s);
+        probe_flush();
+        sceKernelDelayThread(20000);
+        log_events();
+        s = sceGeListSync(lid, 1);
+        out("  sceGeListSync(peek) after = %08X\n", (w32)s);
+        if (cbid >= 0) { r = sceGeUnsetCallback(cbid); out("  sceGeUnsetCallback = %08X\n", (w32)r); }
+        probe_flush();
+        out("  list words %s\n", words_intact(raw, WORDS, 7) ? "as written" : "changed");
+        sceKernelDcacheWritebackAll();
+        out("  after sceKernelDcacheWritebackAll: list words %s\n",
+            words_intact(raw, WORDS, 7) ? "as written" : "changed");
+    }
+
+    /* The same without the GE: a fresh memalign(16, 64) block written through
+     * the uncached alias, then the cache written back. Words that change came
+     * from a dirty cache line over the block. */
+    if (!step("memalign(16, 64) written through the uncached alias, then sceKernelDcacheWritebackAll")) {
+        unsigned int *blk = (unsigned int *)((unsigned int)memalign(16, 64) | 0x40000000u);
+        static const unsigned int PAT[16] = {
+            0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666, 0x77777777, 0x88888888,
+            0x99999999, 0xAAAAAAAA, 0xBBBBBBBB, 0xCCCCCCCC, 0xDDDDDDDD, 0xEEEEEEEE, 0x12345678, 0x9ABCDEF0 };
+        for (int k = 0; k < 16; k++) blk[k] = PAT[k];
+        const int before = words_intact(blk, PAT, 16);
+        sceKernelDcacheWritebackAll();
+        int changed = 0;
+        for (int k = 0; k < 16; k++) changed += blk[k] != PAT[k];
+        out("  before the write-back %s; after it %d of 16 words changed\n",
+            before ? "as written" : "already changed", changed);
     }
 }
 
@@ -925,6 +1714,15 @@ int main(int argc, char **argv) {
     g_scene = 22; scene_bezier();
     g_scene = 23; scene_spline();
     g_scene = 24; scene_bbox();
+    g_scene = 25; scene_specular();
+    g_scene = 26; scene_precision();
+    g_scene = 27; scene_depthplanes();
+    g_scene = 28; scene_positions();
+    g_scene = 29; scene_tests2();
+    g_scene = 30; scene_masks16(GU_PSM_5650, "masks_5650");
+    g_scene = 31; scene_masks16(GU_PSM_5551, "masks_5551");
+    g_scene = 32; scene_masks16(GU_PSM_4444, "masks_4444");
+    g_scene = 33; scene_bbox2();
 
     section_callbacks();
 
