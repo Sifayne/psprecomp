@@ -302,7 +302,8 @@ static psp_interp_status exec_simple(const a_insn *in) {
     case A_MTC1: psp_cpu.f[in->fs] = psp_bits_to_f32(R(in->rt));      return I_RUNNING;
     case A_MFC1: setr(in->rt, psp_f32_to_bits(psp_cpu.f[in->fs]));    return I_RUNNING;
     /* `fs` names *which* control register -- it was being ignored. */
-    case A_CTC1: psp_fcr_write(in->fs, R(in->rt));                    return I_RUNNING;
+    case A_CTC1:
+        return psp_fcr_write(in->fs, R(in->rt)) ? I_TRAP_FPU : I_RUNNING;
     case A_CFC1: setr(in->rt, psp_fcr_read(in->fs));                  return I_RUNNING;
     case A_LWC1: psp_cpu.f[in->ft] = psp_read_f32(R(in->rs) + in->imm); return I_RUNNING;
     case A_SWC1:
@@ -310,7 +311,8 @@ static psp_interp_status exec_simple(const a_insn *in) {
         trace_mem('F', R(in->rs) + in->imm, psp_f32_to_bits(psp_cpu.f[in->ft]));
         return I_RUNNING;
     /* Through psp_f* rather than the bare operator: FCR31's rounding mode and
-     * flush-to-zero change the result. Default state is a plain float op. */
+     * flush-to-zero change the result, and every one of these writes the
+     * Cause field. See recomp_rt.h for what the hardware measured. */
     case A_ADD_S:
         psp_cpu.f[in->fd] = psp_fadd(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
         return I_RUNNING;
@@ -324,13 +326,13 @@ static psp_interp_status exec_simple(const a_insn *in) {
         psp_cpu.f[in->fd] = psp_fdiv(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
         return I_RUNNING;
     case A_MOV_S: psp_cpu.f[in->fd] =  psp_cpu.f[in->fs];                    return I_RUNNING;
-    case A_NEG_S: psp_cpu.f[in->fd] = -psp_cpu.f[in->fs];                    return I_RUNNING;
-    case A_ABS_S: psp_cpu.f[in->fd] = psp_fabs (psp_cpu.f[in->fs]);          return I_RUNNING;
+    case A_NEG_S: psp_cpu.f[in->fd] = psp_fneg_cop1(psp_cpu.f[in->fs]);      return I_RUNNING;
+    case A_ABS_S: psp_cpu.f[in->fd] = psp_fabs_cop1(psp_cpu.f[in->fs]);      return I_RUNNING;
     case A_SQRT_S:
         psp_cpu.f[in->fd] = psp_fsqrt_cop1(psp_cpu.f[in->fs]);
         return I_RUNNING;
     case A_CVT_S_W:
-        psp_cpu.f[in->fd] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[in->fs]);
+        psp_cpu.f[in->fd] = psp_cvt_s_w(psp_f32_to_bits(psp_cpu.f[in->fs]));
         return I_RUNNING;
     /* The rounding mode is the only thing separating these. cvt.w.s takes it
      * from FCR31; the other four name it in the opcode. */
@@ -1099,6 +1101,7 @@ const char *psp_interp_status_str(psp_interp_status s) {
     case I_TRAP_BREAK:   return "break";
     case I_TRAP_BRANCH_IN_SLOT: return "control transfer in a delay slot";
     case I_TRAP_BADPC:   return "pc left mapped memory";
+    case I_TRAP_FPU:     return "FPU exception";
     case I_EXIT:         return "guest called sceKernelExitGame";
     case I_STOPPED:      return "stopped by the scheduler";
     }

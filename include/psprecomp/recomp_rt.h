@@ -225,20 +225,31 @@ static inline uint32_t psp_f32_to_bits(float v) {
  * copies of a float conversion is exactly the drift the differential oracle
  * cannot see -- it runs the same helper on both sides -- so there is one.
  *
- * The narrowing is the round-to-nearest-even algorithm the PSP's own toolchain
- * uses (float_to_half_fast3), including its clamp of anything too large to
- * infinity rather than to the largest finite half. */
+ * What the hardware does (vfpuprobe steps 27-30, fw 6.60):
+ *
+ *   - half subnormals do not exist either way. vh2f of 03FF is 00000000, and
+ *     vf2h of anything that lands below 2^-14 is a signed zero: 2^-24, 2^-25,
+ *     1.5 * 2^-24 and 387FC000 (the largest half subnormal) all give 0000;
+ *   - a NaN or infinity becomes sign | 7C00 | the float's *low* ten mantissa
+ *     bits: 7FC00000 -> 7C00 (a quiet NaN turns into +inf), 7F800001 -> 7C01,
+ *     FF800001 -> FC01. It used to give 7FFF;
+ *   - vh2f of an all-ones exponent ORs the half's mantissa in at the bottom
+ *     rather than shifting it up (7C01 -> 7F800001);
+ *   - 65520, the exact midpoint between 65504 and 65536, gives 7BFF, not
+ *     infinity, and 1e10 gives 7C00.
+ *
+ * The rounding is to nearest with a tie going toward zero, which is the
+ * smallest change from nearest-even that fits 65520 -- it moves nothing but
+ * exact ties. Truncation would fit the data as well; the probe had no other
+ * tie and no value just below one. Converting 3F801000 and 3F803000 would
+ * settle it. Rounding happens before the flush, so a value within half a
+ * subnormal step of 2^-14 still becomes 0400; also unmeasured. */
 static inline float psp_half_to_f32(uint16_t h) {
     const uint32_t sign = (uint32_t)(h >> 15) << 31;
     const uint32_t exp  = (h >> 10) & 0x1F;
     const uint32_t man  = h & 0x3FF;
     uint32_t bits;
-    if (exp == 0)       bits = sign | (man ? ((127 - 15 + 1) << 23) | (man << 13) : 0);
-    /* An exponent of all ones does *not* shift the mantissa up. Hardware ORs
-     * the half's mantissa in at the bottom: vh2f of the half 0x7F80 gives
-     * 0x7F800380, not the 0x7FF00000 a shift would produce. Pinned by
-     * pspautotests cpu/vfpu/convert; the normal and subnormal cases below do
-     * shift, as usual. */
+    if (exp == 0)       bits = sign;
     else if (exp == 31) bits = sign | 0x7F800000u | man;
     else                bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
     union { uint32_t u; float f; } c;
@@ -249,27 +260,17 @@ static inline float psp_half_to_f32(uint16_t h) {
 static inline uint16_t psp_f32_to_half(float v) {
     union { uint32_t u; float f; } c;
     c.f = v;
-    const uint32_t sign = c.u & 0x80000000u;
-    c.u ^= sign;
+    const uint32_t sign = (c.u >> 16) & 0x8000u;
+    const uint32_t a    = c.u & 0x7FFFFFFFu;
+    if (a >= 0x7F800000u) return (uint16_t)(sign | 0x7C00u | (a & 0x3FFu));
 
-    uint32_t out;
-    if (c.u >= 0x7F800000u) {
-        /* NaN saturates the mantissa rather than becoming a quiet NaN: the
-         * hardware answer is 0x7FFF, where the software algorithm the PSP
-         * toolchain uses gives 0x7E00. Only the positive case is pinned by
-         * cpu/vfpu/convert; the sign is carried through on the assumption it
-         * behaves like every other path here. */
-        out = (c.u > 0x7F800000u) ? 0x7FFFu : 0x7C00u;
-    } else {
-        union { uint32_t u; float f; } magic;
-        magic.u = 15u << 23;                  /* 2^-112 */
-        c.u &= ~0xFFFu;
-        c.f *= magic.f;
-        c.u -= ~0xFFFu;
-        if (c.u > (31u << 23)) c.u = 31u << 23;   /* clamp to infinity */
-        out = c.u >> 13;
-    }
-    return (uint16_t)(out | (sign >> 16));
+    const int32_t e = (int32_t)(a >> 23) - 127 + 15;
+    if (e >= 31) return (uint16_t)(sign | 0x7C00u);            /* 2^16 and up */
+    if (e <= 0)                                                /* below 2^-14 */
+        return (uint16_t)(sign | (a > 0x387FE000u ? 0x0400u : 0u));
+    uint32_t h = ((uint32_t)e << 10) | ((a >> 13) & 0x3FFu);
+    if ((a & 0x1FFFu) > 0x1000u) h++;         /* nearest; a tie goes toward zero */
+    return (uint16_t)(sign | h);
 }
 
 static inline float psp_fabs(float v)  { return v < 0.0f ? -v : v; }
@@ -303,73 +304,70 @@ static inline float psp_fsqrt(float v) {
     return v <= 0.0f ? 0.0f : sqrtf(v);
 }
 
-/* COP1 float-to-integer, with the rounding mode named explicitly.
+/* ---- the COP1 FPU -----------------------------------------------------------
  *
- * MIPS has five of these and they differ only in how they round:
+ * IEEE 754 single precision, with the PSP's departures. Each of these is what
+ * a PSP on firmware 6.60 did in vfpuprobe steps 150-153:
  *
- *   round.w.s  RN  to nearest, ties to even
- *   trunc.w.s  RZ  toward zero
- *   ceil.w.s   RP  toward +inf
- *   floor.w.s  RM  toward -inf
- *   cvt.w.s        whatever FCR31's RM field currently says
+ *   - an invalid operation -- sqrt(-1), 0/0, inf-inf -- gives 7FC00000, where
+ *     the host gives FFC00000 and the old sqrt gave 7FBFFFFF;
+ *   - a NaN operand passes through quieted (7F800001 + 1 -> 7FC00001) and
+ *     raises V only if it was signalling: NaN * NaN of two quiet NaNs raises
+ *     nothing (fcr 00000000), which a comment here used to deny;
+ *   - add and sub overflow raises O without I (max+max -> 7F800000, fcr
+ *     00004010; 7F7FFFFF and 00004011 under RZ); mul raises O|I (00005014);
+ *   - mul and div raise U for every tiny result, exact or not: den * 1 ->
+ *     00400000 with 00002008, tiny * tiny -> 000116C2 with 0000300C. add and
+ *     sub never do -- a tiny sum is always exact -- and den + 0 raises nothing;
+ *   - FS flushes exactly those underflowing mul/div results, to a signed zero,
+ *     raising U and no I (tiny * tiny -> 0, fcr 01002008). It flushes no
+ *     operand and no sum: den + 0 is 00000001 and den + min 00C00000;
+ *   - sqrt honours RM and raises nothing but V (sqrt 2 is 3FB504F3, and
+ *     3FB504F4 under RP, with no I);
+ *   - cvt.s.w honours RM and raises I when inexact (7FFFFFFF -> 4F000000, fcr
+ *     00001004); the float-to-integer conversions raise I when inexact and
+ *     give 7FFFFFFF or 80000000 with V for NaN, infinities and out of range;
+ *   - neg.s and abs.s quiet a NaN, keep its sign and raise V for a signalling
+ *     one (neg 7F800001 -> 7FC00001, neg 7FC00000 -> 7FC00000, abs FFC00000 ->
+ *     FFC00000); mov.s copies bits and raises nothing;
+ *   - of the sixteen compare predicates only olt, ole, lt and le raise V, and
+ *     they do for any NaN; the rest raise nothing even for a signalling NaN.
  *
- * Three of the five were decoded and implemented nowhere, and `cvt.w.s` was
- * aliased to truncation -- which is right only when the rounding mode happens
- * to be RZ, and the PSP comes up in RN.
+ * Generalised rather than measured: div overflow raises O|I like mul, inf/0
+ * raises nothing, a qNaN meeting an sNaN returns the first operand quieted,
+ * and neg/abs/compare rewrite the Cause field like the arithmetic ops.
  *
- * The saturation is not incidental. A C cast of an out-of-range float to int
- * is undefined behaviour, and on x86 it yields 0x80000000 for *everything*
- * out of range including large positives, where MIPS answers 0x7FFFFFFF. The
- * range test is against 2^31 exactly, done in float, so it does not depend on
- * the conversion it is guarding. */
+ * Directed rounding is emulated rather than delegated to fesetround(), which
+ * needs `#pragma STDC FENV_ACCESS ON` -- GCC does not implement it, so -O2 is
+ * free to move arithmetic across the mode change. Instead: compute in double,
+ * which is exact for float add, sub and mul, then round once to float in the
+ * requested direction. For division the double quotient is not exact, but
+ * binary64 carries 53 bits against the 2p+2 = 50 needed to decide a binary32
+ * quotient, so rounding it to float still lands where a correctly-rounded
+ * float division would. */
 enum { PSP_RM_RN = 0, PSP_RM_RZ = 1, PSP_RM_RP = 2, PSP_RM_RM = 3 };
-
-static inline uint32_t psp_f32_to_i32(float v, int rm) {
-    if (v != v) return 0x7FFFFFFFu;                    /* NaN */
-    float r;
-    switch (rm & 3) {
-    case PSP_RM_RZ: r = (v < 0.0f) ? -psp_floorf(-v) : psp_floorf(v); break;
-    case PSP_RM_RP: r = psp_ceilf(v);                                 break;
-    case PSP_RM_RM: r = psp_floorf(v);                                break;
-    default: {                                         /* RN, ties to even */
-        const float f = psp_floorf(v), d = v - f;
-        if (d > 0.5f)                          r = f + 1.0f;
-        else if (d < 0.5f)                     r = f;
-        else                                   r = (psp_fmodf2(f) != 0.0f) ? f + 1.0f : f;
-        break; }
-    }
-    if (r >=  2147483648.0f) return 0x7FFFFFFFu;
-    if (r <  -2147483648.0f) return 0x80000000u;
-    return (uint32_t)(int32_t)r;
-}
-
-/* ---- FCR31's effect on arithmetic ---------------------------------------
- *
- * Two fields of the control/status register change what add/sub/mul/div
- * *produce*, not merely what they record: the rounding mode (RM, bits 0..1)
- * and flush-to-zero (FS, bit 24). cpu/fpu/fpu measures both -- one multiply
- * gives four different answers under the four rounding modes, and a denormal
- * result becomes zero when FS is set.
- *
- * The host FPU always rounds to nearest-even, so a directed mode is emulated
- * rather than delegated. Not with fesetround(): honouring it requires
- * `#pragma STDC FENV_ACCESS ON`, which GCC does not actually implement, so an
- * optimiser is free to move arithmetic across the mode change -- and the
- * generated C is compiled at -O2. Getting a wrong answer from a compiler
- * reordering is worse than the arithmetic being slightly slower.
- *
- * Instead: compute in double, which is wide enough to be *exact* for float
- * add, sub and mul, then round once to float in the requested direction. For
- * division the double quotient is not exact, but binary64 carries 53 bits
- * against the 2p+2 = 50 needed to decide a binary32 quotient, so rounding it
- * to float still lands on the same value a correctly-rounded float division
- * would -- there is no double-rounding error for any of the four.
- *
- * The default state is RN with FS clear, which is what the PSP boots into and
- * what every game stays in, so that path stays a plain float operation and
- * pays nothing. */
 #define PSP_FCR31_FS      (1u << 24)
 #define PSP_FPU_DEFAULT(f) (((f) & (PSP_FCR31_FS | 3u)) == 0u)
+
+/* The five IEEE exceptions, in the order FCR31 packs them: Cause at 12..16,
+ * rewritten by every operation, and Flags at 2..6, sticky until software
+ * clears them (1+1 with flags 7C set leaves 0000007C). */
+#define PSP_FE_I  1u
+#define PSP_FE_U  2u
+#define PSP_FE_O  4u
+#define PSP_FE_Z  8u
+#define PSP_FE_V  16u
+#define PSP_FCR31_CAUSE 0x0001F000u
+
+static inline void psp_fpu_raise(uint32_t c) {
+    psp_cpu.fcr31 = (psp_cpu.fcr31 & ~PSP_FCR31_CAUSE) | (c << 12) | (c << 2);
+}
+
+/* The NaN an invalid operation makes, and the two kinds of NaN operand: bit
+ * 22 set is quiet, clear is signalling (7F800001 is quieted to 7FC00001). */
+#define PSP_FPU_QNAN 0x7FC00000u
+static inline int psp_fnan_bits(uint32_t b)  { return (b & 0x7FFFFFFFu) > 0x7F800000u; }
+static inline int psp_fsnan_bits(uint32_t b) { return psp_fnan_bits(b) && !(b & 0x00400000u); }
 
 /* One ULP along the real line. ±0 steps to the smallest denormal of the
  * target sign rather than across it, which is why zero is special-cased. */
@@ -388,8 +386,7 @@ static inline float psp_nextdown(float v) {
  *
  * Overflow falls out of this rather than needing a case: an exact value past
  * FLT_MAX rounds to +inf under RN, and stepping one ULP down from +inf is
- * FLT_MAX -- which is exactly what RZ and RM are supposed to give. NaN
- * survives because every comparison against it is false. */
+ * FLT_MAX -- which is exactly what RZ and RM are supposed to give. */
 static inline float psp_round_mode(double exact, int rm) {
     const float n = (float)exact;                  /* nearest, ties to even */
     if ((rm & 3) == PSP_RM_RN) return n;
@@ -405,107 +402,178 @@ static inline float psp_round_mode(double exact, int rm) {
     }
 }
 
-static inline float psp_fpu_arith(double exact, uint32_t fcr31) {
-    float r = psp_round_mode(exact, (int)(fcr31 & 3u));
-    if (fcr31 & PSP_FCR31_FS) {                    /* denormal -> zero, sign kept */
-        const uint32_t b = psp_f32_to_bits(r);
-        if ((b & 0x7F800000u) == 0u) r = psp_bits_to_f32(b & 0x80000000u);
+/* COP1 float-to-integer, with the rounding mode named explicitly.
+ *
+ * MIPS has five of these and they differ only in how they round:
+ *
+ *   round.w.s  RN  to nearest, ties to even
+ *   trunc.w.s  RZ  toward zero
+ *   ceil.w.s   RP  toward +inf
+ *   floor.w.s  RM  toward -inf
+ *   cvt.w.s        whatever FCR31's RM field currently says
+ *
+ * and the four named ones ignore FCR31 (step 151: round.w 2.5 is 2 under
+ * every mode). NaN, +inf and anything at or past 2^31 give 7FFFFFFF with V;
+ * -inf gives 80000000 with V, and so, by the same rule, does anything below
+ * -2^31. Otherwise I says whether the value had a fraction (a denormal is 0
+ * with I). The range test is in float against 2^31 exactly, so it does not
+ * depend on the conversion it is guarding -- a C cast of an out-of-range
+ * float is undefined, and on x86 yields 80000000 for large positives too. */
+static inline uint32_t psp_f32_to_i32(float v, int rm) {
+    if (v != v) { psp_fpu_raise(PSP_FE_V); return 0x7FFFFFFFu; }
+    float r;
+    switch (rm & 3) {
+    case PSP_RM_RZ: r = (v < 0.0f) ? -psp_floorf(-v) : psp_floorf(v); break;
+    case PSP_RM_RP: r = psp_ceilf(v);                                 break;
+    case PSP_RM_RM: r = psp_floorf(v);                                break;
+    default: {                                         /* RN, ties to even */
+        const float f = psp_floorf(v), d = v - f;
+        if (d > 0.5f)                          r = f + 1.0f;
+        else if (d < 0.5f)                     r = f;
+        else                                   r = (psp_fmodf2(f) != 0.0f) ? f + 1.0f : f;
+        break; }
     }
+    if (r >=  2147483648.0f) { psp_fpu_raise(PSP_FE_V); return 0x7FFFFFFFu; }
+    if (r <  -2147483648.0f) { psp_fpu_raise(PSP_FE_V); return 0x80000000u; }
+    psp_fpu_raise(r != v ? PSP_FE_I : 0u);
+    return (uint32_t)(int32_t)r;
+}
+
+/* cvt.s.w: every int32 is exact in a double, so this is one directed
+ * rounding (2^24+1 is 4B800001 under RP, CB800001 negated under RM). */
+static inline float psp_cvt_s_w(uint32_t w) {
+    const double exact = (double)(int32_t)w;
+    const float r = psp_round_mode(exact, (int)(psp_cpu.fcr31 & 3u));
+    psp_fpu_raise((double)r != exact ? PSP_FE_I : 0u);
     return r;
 }
 
-/* The five IEEE exceptions, in the order FCR31 packs them. The same five bits
- * appear twice: Cause at 12..16, rewritten by every operation, and Flags at
- * 2..6, sticky until software clears them. That the two fields share an order
- * is what makes the update one shift each.
- *
- * The encoding was not assumed -- it is what cpu/fpu/fcr measures. Each of its
- * four situations pins it exactly:
- *
- *   sqrt(-1), 0/0, NaN*NaN  -> 0x00010040 = V   at cause 16, flag 6
- *   FLT_MAX * FLT_MAX       -> 0x00005014 = O|I at cause 14,12 flag 4,2
- *   1.0 / FLT_MAX           -> 0x0000300C = U|I
- *   1.0 / 3.0               -> 0x00001004 = I
- */
-#define PSP_FE_I  1u
-#define PSP_FE_U  2u
-#define PSP_FE_O  4u
-#define PSP_FE_Z  8u
-#define PSP_FE_V  16u
-#define PSP_FCR31_CAUSE 0x0001F000u
+/* A NaN operand to a two-operand op: the result is that NaN quieted, the
+ * first operand's if both are NaN, and V only if one was signalling. Returns
+ * 0, touching nothing, when neither operand is a NaN. */
+static inline int psp_fpu_nan_operand(float a, float b, float *out) {
+    const uint32_t ab = psp_f32_to_bits(a), bb = psp_f32_to_bits(b);
+    if (!psp_fnan_bits(ab) && !psp_fnan_bits(bb)) return 0;
+    psp_fpu_raise((psp_fsnan_bits(ab) || psp_fsnan_bits(bb)) ? PSP_FE_V : 0u);
+    *out = psp_bits_to_f32((psp_fnan_bits(ab) ? ab : bb) | 0x00400000u);
+    return 1;
+}
 
-/* Which exceptions this result raised. `exact` is the infinitely-precise
- * answer as a double, which for all four operations is either exact or close
- * enough to decide every one of these. */
-static inline uint32_t psp_fpu_except(double exact, float r, int div_by_zero) {
-    if (r != r) return PSP_FE_V;                    /* any NaN result is invalid */
-    const uint32_t rb = psp_f32_to_bits(r) & 0x7F800000u;
-    if (rb == 0x7F800000u) {                        /* infinite result */
-        if (div_by_zero) return PSP_FE_Z;
-        /* Infinite because the operands were, or because we overflowed? Only
-         * the second is an exception, and `exact` distinguishes them: a double
-         * holds FLT_MAX*FLT_MAX finitely. */
-        return (exact == exact && exact - exact != exact - exact)
-             ? 0u : (PSP_FE_O | PSP_FE_I);
+/* Round an operation's exact answer under RM and record what it raised.
+ * `muldiv` selects the mul/div rules: O comes with I, a tiny result raises U
+ * even when exact, and FS flushes it. */
+static inline float psp_fpu_result(double exact, int muldiv) {
+    const uint32_t fcr = psp_cpu.fcr31;
+    if (exact != exact) {                                   /* inf-inf, 0*inf, 0/0 */
+        psp_fpu_raise(PSP_FE_V);
+        return psp_bits_to_f32(PSP_FPU_QNAN);
     }
-    uint32_t c = ((double)r != exact) ? PSP_FE_I : 0u;
-    /* Tiny *and* inexact is underflow. A denormal that is exactly
-     * representable has lost nothing and raises neither. */
-    if (rb == 0u && (c & PSP_FE_I) && exact != 0.0) c |= PSP_FE_U;
-    return c;
-}
+    const float r = psp_round_mode(exact, (int)(fcr & 3u));
+    if (exact - exact != 0.0) { psp_fpu_raise(0u); return r; }   /* an infinite operand */
 
-static inline void psp_fpu_raise(uint32_t c) {
-    psp_cpu.fcr31 = (psp_cpu.fcr31 & ~PSP_FCR31_CAUSE) | (c << 12) | (c << 2);
-}
-
-/* One operation: round it under the current mode, flush it if FS says so, and
- * record what it raised. Kept in one place because every caller needs all
- * three and doing two of them is a subtly wrong FPU. */
-static inline float psp_fpu_op(double exact, int div_by_zero) {
-    const float r = psp_fpu_arith(exact, psp_cpu.fcr31);
-    psp_fpu_raise(psp_fpu_except(exact, r, div_by_zero));
+    const uint32_t rb  = psp_f32_to_bits(r);
+    const double   mag = exact < 0.0 ? -exact : exact;
+    if ((rb & 0x7F800000u) == 0x7F800000u || mag >= 0x1p128) {  /* overflow, any mode */
+        psp_fpu_raise(muldiv ? (PSP_FE_O | PSP_FE_I) : PSP_FE_O);
+        return r;
+    }
+    const uint32_t inexact = (double)r != exact ? PSP_FE_I : 0u;
+    if (muldiv && (rb & 0x7F800000u) == 0u && exact != 0.0) {   /* tiny */
+        if (fcr & PSP_FCR31_FS) {
+            psp_fpu_raise(PSP_FE_U);
+            return psp_bits_to_f32(rb & 0x80000000u);
+        }
+        psp_fpu_raise(PSP_FE_U | inexact);
+        return r;
+    }
+    psp_fpu_raise(inexact);
     return r;
+}
+
+static inline float psp_fadd(float a, float b) {
+    float n;
+    if (psp_fpu_nan_operand(a, b, &n)) return n;
+    return psp_fpu_result((double)a + (double)b, 0);
+}
+static inline float psp_fsub(float a, float b) {
+    float n;
+    if (psp_fpu_nan_operand(a, b, &n)) return n;
+    return psp_fpu_result((double)a - (double)b, 0);
+}
+static inline float psp_fmul(float a, float b) {
+    float n;
+    if (psp_fpu_nan_operand(a, b, &n)) return n;
+    return psp_fpu_result((double)a * (double)b, 1);
+}
+static inline float psp_fdiv(float a, float b) {
+    float n;
+    if (psp_fpu_nan_operand(a, b, &n)) return n;
+    const uint32_t ab = psp_f32_to_bits(a), bb = psp_f32_to_bits(b);
+    if ((bb & 0x7FFFFFFFu) == 0u && (ab & 0x7FFFFFFFu) != 0u &&
+        (ab & 0x7F800000u) != 0x7F800000u) {                /* finite / 0: Z */
+        psp_fpu_raise(PSP_FE_Z);
+        return psp_bits_to_f32(((ab ^ bb) & 0x80000000u) | 0x7F800000u);
+    }
+    return psp_fpu_result((double)a / (double)b, 1);
 }
 
 /* sqrt.s. Separate from psp_fsqrt, whose non-positive-input rule is useful to
  * general geometry code but does not implement the instruction's edge cases.
  *
- * Exactness is decidable without an exact square root: r is the correctly
- * rounded result, so r*r is a 24x24-bit product and therefore exact in a
- * double. If it reproduces the operand, nothing was lost.
- *
- * Not modelled: the rounding mode does not reach psp_fsqrt's iteration. No
- * test covers it and inventing a directed square root to go untested is worse
- * than the gap. */
+ * The host's sqrtf is correctly rounded to nearest; the directed modes step
+ * from it. r*r is a 24x24-bit product, exact in a double, so comparing it with
+ * the operand says which side of the true root r lies on. -0 is -0, +inf is
+ * +inf, and any other negative is 7FC00000 with V. */
 static inline float psp_fsqrt_cop1(float v) {
     const uint32_t b = psp_f32_to_bits(v);
-    if (v != v)             { psp_fpu_raise(PSP_FE_V); return v; }
-    if (b == 0x7F800000u)   { psp_fpu_raise(0u);       return v; }   /* +inf */
-    if (b & 0x80000000u) {                                           /* any negative, -0 aside */
-        if ((b & 0x7FFFFFFFu) == 0u) { psp_fpu_raise(0u); return v; }
-        psp_fpu_raise(PSP_FE_V);
-        return psp_bits_to_f32(0x7FBFFFFFu);
+    if (psp_fnan_bits(b)) {
+        psp_fpu_raise(psp_fsnan_bits(b) ? PSP_FE_V : 0u);
+        return psp_bits_to_f32(b | 0x00400000u);
     }
-    const float r = psp_fsqrt(v);
-    psp_fpu_raise(((double)r * (double)r != (double)v) ? PSP_FE_I : 0u);
+    if ((b & 0x7FFFFFFFu) == 0u || b == 0x7F800000u) { psp_fpu_raise(0u); return v; }
+    if (b & 0x80000000u) { psp_fpu_raise(PSP_FE_V); return psp_bits_to_f32(PSP_FPU_QNAN); }
+    float r = sqrtf(v);
+    const double sq = (double)r * (double)r, x = (double)v;
+    switch (psp_cpu.fcr31 & 3u) {
+    case PSP_RM_RP:              if (sq < x) r = psp_nextup(r);   break;
+    case PSP_RM_RZ: case PSP_RM_RM: if (sq > x) r = psp_nextdown(r); break;
+    default: break;
+    }
+    psp_fpu_raise(0u);
     return r;
 }
 
-static inline float psp_fadd(float a, float b) { return psp_fpu_op((double)a + (double)b, 0); }
-static inline float psp_fsub(float a, float b) { return psp_fpu_op((double)a - (double)b, 0); }
-static inline float psp_fmul(float a, float b) { return psp_fpu_op((double)a * (double)b, 0); }
-static inline float psp_fdiv(float a, float b) {
-    return psp_fpu_op((double)a / (double)b, b == 0.0f && a == a && a != 0.0f);
+/* neg.s and abs.s: sign-bit operations on numbers, arithmetic on NaNs. */
+static inline float psp_fneg_cop1(float v) {
+    const uint32_t b = psp_f32_to_bits(v);
+    if (psp_fnan_bits(b)) {
+        psp_fpu_raise(psp_fsnan_bits(b) ? PSP_FE_V : 0u);
+        return psp_bits_to_f32(b | 0x00400000u);
+    }
+    psp_fpu_raise(0u);
+    return psp_bits_to_f32(b ^ 0x80000000u);
+}
+static inline float psp_fabs_cop1(float v) {
+    const uint32_t b = psp_f32_to_bits(v);
+    if (psp_fnan_bits(b)) {
+        psp_fpu_raise(psp_fsnan_bits(b) ? PSP_FE_V : 0u);
+        return psp_bits_to_f32(b | 0x00400000u);
+    }
+    psp_fpu_raise(0u);
+    return psp_bits_to_f32(b & 0x7FFFFFFFu);
 }
 
 /* `c.<cond>.s` condition codes. The distinction that matters is *ordered* vs
  * *unordered*: with a NaN operand the ordered forms are false and the
  * unordered forms are true. Comparisons involving NaN are false in C, so the
- * NaN case is tested explicitly rather than assumed. */
+ * NaN case is tested explicitly rather than assumed. Every FCC result was
+ * confirmed on hardware (step 153); only the V rule above is PSP-specific --
+ * MIPS would have codes 8..15 signal and 0..7 signal only for an sNaN. */
 static inline int psp_fcmp(unsigned cond, float a, float b) {
     const int unordered = (a != a) || (b != b);   /* either is NaN */
-    switch (cond & 0xF) {
+    const unsigned c = cond & 0xF;
+    psp_fpu_raise(unordered && (c == 0x4 || c == 0x6 || c == 0xC || c == 0xE) ? PSP_FE_V : 0u);
+    switch (c) {
     case 0x0: case 0x8: return 0;                              /* F, SF */
     case 0x1: case 0x9: return unordered;                      /* UN, NGLE */
     case 0x2: case 0xA: return !unordered && a == b;           /* EQ, SEQ */

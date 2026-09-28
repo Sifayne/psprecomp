@@ -638,6 +638,81 @@ static void test_special_values(void) {
     psp_vfpu_reset();
 }
 
+/* ---- cross products, matrix rounding, vcst, half floats -------------------
+ *
+ * vfpuprobe steps 27-30, 50, 65 and 107 (fw 6.60). */
+static void test_units_and_conversions(void) {
+    psp_vfpu_reset();
+
+    /* vcrsp.t: each lane a two-term dot, so an infinity meets no padding
+     * zero (step 65). */
+    set_bits(0x00, 0x7F800000, 0x3F800000, 0x40000000, 0x00000000);
+    set_bits(0x04, 0x3F800000, 0x40000000, 0x40400000, 0x00000000);
+    set_bits(0x08, 0x5A5A5A5A, 0x5A5A5A5A, 0x5A5A5A5A, 0x5A5A5A5A);
+    psp_vcrsp(0x08, 0x00, 0x04, 3);
+    CHECK(quad_is(0x08, 0xBF800000, 0xFF800000, 0x7F800000, 0x5A5A5A5A), "vcrsp.t cross-inf");
+    set_bits(0x00, 0x007FFFFF, 0x80000001, 0xBF800000, 0xFF800000);
+    set_bits(0x04, 0x00000000, 0x3F800000, 0x7FC00000, 0x7F800000);
+    psp_vcrsp(0x08, 0x00, 0x04, 3);
+    CHECK(quad_is(0x08, 0x7F800001, 0x7F800001, 0x00000000, 0x5A5A5A5A), "vcrsp.t sqrt-edge");
+
+    /* vmmul.q M300, M100, M200 over the probe's A and B, one rounding per
+     * element: 43055555, not the running sum's 43055556 (step 107). */
+    static const uint32_t A[16] = {
+        0x3F800000, 0x40000000, 0x40400000, 0x40800000, 0x40A00000, 0x40C00000, 0x40E00000, 0x41000000,
+        0x41100000, 0x41200000, 0x41300000, 0x41400000, 0x41500000, 0x41600000, 0x41700000, 0x41800000,
+    };
+    static const uint32_t B[16] = {
+        0xC0400000, 0x40800000, 0x00000000, 0x3F000000, 0x40400000, 0xBF800000, 0x40C00000, 0x40000000,
+        0xC0000000, 0x40A00000, 0x3F800000, 0xC0400000, 0x3EAAAAAB, 0x00000000, 0x40E00000, 0x40400000,
+    };
+    static const uint32_t M3[16] = {
+        0x41BC0000, 0x41C80000, 0x41D40000, 0x41E00000, 0x429C0000, 0x42B00000, 0x42C40000, 0x42D80000,
+        0xC0E00000, 0xC0C00000, 0xC0A00000, 0xC0800000, 0x42CCAAAA, 0x42E15555, 0x42F60000, 0x43055555,
+    };
+    for (int c = 0; c < 4; c++) {         /* memory is column-major */
+        set_bits(0x04 | (uint32_t)c, A[4 * c], A[4 * c + 1], A[4 * c + 2], A[4 * c + 3]);
+        set_bits(0x08 | (uint32_t)c, B[4 * c], B[4 * c + 1], B[4 * c + 2], B[4 * c + 3]);
+    }
+    psp_vmmul(0x0C, 0x24, 0x08, 4);       /* vs carries the transpose bit */
+    for (int c = 0; c < 4; c++)
+        CHECK(quad_is(0x0C | (uint32_t)c, M3[4 * c], M3[4 * c + 1], M3[4 * c + 2], M3[4 * c + 3]),
+              "vmmul.q column %d (step 107)", c);
+
+    /* vcst 6 is 1/pi correctly rounded (step 50). */
+    psp_vcst(0x00, 6, 1);
+    int r0[4];
+    psp_vfpu_regs(0x00, 1, r0);
+    CHECK(psp_f32_to_bits(psp_cpu.v[r0[0]]) == 0x3EA2F983u, "vcst 6: %08X",
+          psp_f32_to_bits(psp_cpu.v[r0[0]]));
+
+    /* Half floats (steps 27-30): no subnormals either way, NaN and inf keep
+     * the low mantissa bits, and 65520 stays finite. */
+    static const uint32_t f2h[][2] = {
+        { 0x3F800000, 0x3C00 }, { 0xC0200000, 0xC100 }, { 0x477FE000, 0x7BFF },
+        { 0x477FF000, 0x7BFF }, { 0x322BCC77, 0x0000 }, { 0x7F800000, 0x7C00 },
+        { 0x7FC00000, 0x7C00 }, { 0xFFC00000, 0xFC00 }, { 0x80000000, 0x8000 },
+        { 0x38800000, 0x0400 }, { 0x33800000, 0x0000 }, { 0x7F800001, 0x7C01 },
+        { 0x477FEF00, 0x7BFF }, { 0x501502F9, 0x7C00 }, { 0xD01502F9, 0xFC00 },
+        { 0x3EAAAAAB, 0x3555 }, { 0x33000000, 0x0000 }, { 0x33C00000, 0x0000 },
+        { 0x387FC000, 0x0000 }, { 0xFF800001, 0xFC01 },
+    };
+    for (size_t i = 0; i < sizeof f2h / sizeof f2h[0]; i++) {
+        const uint16_t got = psp_f32_to_half(psp_bits_to_f32(f2h[i][0]));
+        CHECK(got == f2h[i][1], "vf2h %08X: %04X, want %04X", f2h[i][0], got, f2h[i][1]);
+    }
+    static const uint32_t h2f[][2] = {
+        { 0x3C00, 0x3F800000 }, { 0xC000, 0xC0000000 }, { 0x7C00, 0x7F800000 },
+        { 0xFC00, 0xFF800000 }, { 0x0400, 0x38800000 }, { 0x7BFF, 0x477FE000 },
+        { 0x8000, 0x80000000 }, { 0x03FF, 0x00000000 },
+    };
+    for (size_t i = 0; i < sizeof h2f / sizeof h2f[0]; i++) {
+        const uint32_t got = psp_f32_to_bits(psp_half_to_f32((uint16_t)h2f[i][0]));
+        CHECK(got == h2f[i][1], "vh2f %04X: %08X, want %08X", h2f[i][0], got, h2f[i][1]);
+    }
+    psp_vfpu_reset();
+}
+
 /* ---- the random generator --------------------------------------------------
  *
  * What vfpuprobe measured (steps 154-159, fw 6.60): the seeding, the output
@@ -780,6 +855,7 @@ int main(void) {
     test_vrot();
     test_special_values();
     test_random();
+    test_units_and_conversions();
 
     psp_mem_free();
 

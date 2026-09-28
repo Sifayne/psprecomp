@@ -124,8 +124,10 @@ void psp_cpu_reset_thread(void);
  * with nothing preserved. */
 #define PSP_FCR0_VALUE      0x00003351u
 #define PSP_FCR31_WRITABLE  0x0181FFFFu
-/* Power-on FCR31: the overflow, divide-by-zero and invalid *enables* are set.
- * Nothing here traps, so this matters only because it is observable. */
+/* Power-on FCR31: the overflow, divide-by-zero and invalid *enables* are set
+ * (a fresh thread reads 00000E00, vfpuprobe step 147, fw 6.60). Whether an
+ * operation that raises an enabled exception traps -- 1/0 in an untouched
+ * thread -- was not measured, and nothing here makes it trap. */
 #define PSP_FCR31_RESET     0x00000E00u
 
 static inline uint32_t psp_fcr_read(unsigned n) {
@@ -133,8 +135,20 @@ static inline uint32_t psp_fcr_read(unsigned n) {
     if (n == 0)  return PSP_FCR0_VALUE;
     return 0;
 }
-static inline void psp_fcr_write(unsigned n, uint32_t v) {
-    if (n == 31) psp_cpu.fcr31 = v & PSP_FCR31_WRITABLE;
+/* Returns nonzero, and stores nothing, when the write itself is an FPU
+ * exception: writing the E cause bit (bit 17, "unimplemented operation",
+ * which has no enable) with ctc1 powered a PSP off (vfpuprobe step 160, fw
+ * 6.60), as MIPS says it raises the exception at once. The caller stops the
+ * thread. MIPS says the same of any cause bit written with its enable set;
+ * that is not done here, because this FPU records causes under the default
+ * enables without trapping, so a guest's cfc1/ctc1 round trip would stop on a
+ * state the hardware may never reach. */
+#define PSP_FCR31_E 0x00020000u
+static inline int psp_fcr_write(unsigned n, uint32_t v) {
+    if (n != 31) return 0;
+    if (v & PSP_FCR31_E) return 1;
+    psp_cpu.fcr31 = v & PSP_FCR31_WRITABLE;
+    return 0;
 }
 
 /* FPU condition flag (fcr31 bit 23) — set by c.cond.s, tested by bc1t/bc1f. */

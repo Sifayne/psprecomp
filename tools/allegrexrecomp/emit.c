@@ -331,7 +331,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         if (DEST_ZERO(in->rt)) break;
         fprintf(f, "%s%s = psp_f32_to_bits(psp_cpu.f[%u]);\n", ind, rt, in->fs); return;
     /* `fs` names which control register; see psp_fcr_read/write. */
-    case A_CTC1: fprintf(f, "%spsp_fcr_write(%u, %s);\n", ind, in->fs, rt); return;
+    /* A write that is itself an FPU exception stops the program, as the
+     * interpreter's I_TRAP_FPU does. */
+    case A_CTC1:
+        fprintf(f, "%sif (psp_fcr_write(%u, %s)) psp_unimplemented(0x%08Xu, \"FPU exception\");\n",
+                ind, in->fs, rt, in->addr); return;
     case A_CFC1:
         if (DEST_ZERO(in->rt)) break;
         fprintf(f, "%s%s = psp_fcr_read(%u);\n", ind, rt, in->fs); return;
@@ -350,14 +354,14 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_MOV_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_cpu.f[%u];\n", ind, in->fd, in->fs); return;
     case A_NEG_S:
-        fprintf(f, "%spsp_cpu.f[%u] = -psp_cpu.f[%u];\n", ind, in->fd, in->fs); return;
+        fprintf(f, "%spsp_cpu.f[%u] = psp_fneg_cop1(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); return;
     case A_ABS_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_fabs(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); return;
+        fprintf(f, "%spsp_cpu.f[%u] = psp_fabs_cop1(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); return;
     case A_SQRT_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_fsqrt_cop1(psp_cpu.f[%u]);\n",
                 ind, in->fd, in->fs); return;
     case A_CVT_S_W:
-        fprintf(f, "%spsp_cpu.f[%u] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[%u]);\n",
+        fprintf(f, "%spsp_cpu.f[%u] = psp_cvt_s_w(psp_f32_to_bits(psp_cpu.f[%u]));\n",
                 ind, in->fd, in->fs); return;
     /* See the interpreter: the rounding mode is the only difference, and
      * cvt.w.s reads it from FCR31 at run time rather than at emit time. */

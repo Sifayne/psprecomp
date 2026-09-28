@@ -625,9 +625,12 @@ void psp_vcmov(uint32_t vd, uint32_t vs, int cc_sel, int want, int size) {
 }
 
 /* One encoding, two operations, told apart by the operand width: a triple is
- * the cross product and a quad is the quaternion product. Hardware expresses
- * both as dot products against a forced swizzle-and-negate of t; written out
- * here as the products themselves, which is what they are. */
+ * the cross product and a quad is the quaternion product. Both go through the
+ * dot-product unit. The cross product's lanes are two-term dots with no padding
+ * terms: vfpuprobe step 65 (fw 6.60) gives (inf,1,2) x (1,2,3) as
+ * [BF800000 FF800000 7F800000], the plain cross product, where padding with a
+ * zero lane made an inf * 0 NaN of lane 0; and the sqrt-edge row's lane 2 is 0,
+ * not a NaN from s[3] * t[2]. */
 void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, t[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     read_src(vs, size, PFXS, s);
@@ -644,24 +647,12 @@ void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
         d[2] = psp_vfpu_dot(s, t2);
         d[3] = psp_vfpu_dot(s, t3);
     } else {                                             /* vcrsp.t */
-        const float t0[4] = { 0.0f,  t[2], -t[1], 0.0f };
-        const float t1[4] = { -t[2], 0.0f,  t[0], 0.0f };
-        d[0] = psp_vfpu_dot(s, t0);
-        d[1] = psp_vfpu_dot(s, t1);
-        /* The third lane comes out of the same forced-swizzle dot as the other
-         * two, which for a triple (t[3] and s[3] zero) is the cross term.
-         *
-         * Infinities are flushed to zero first, and only for this lane. That
-         * looks arbitrary and is what the hardware does: inf * 0 in the dot
-         * would be a NaN, and the PSP answers with the finite part instead.
-         * Nine lines of cpu/vfpu/vector turn on it. */
-        const float ts[4] = { t[1], -t[0], t[3], t[2] };
-        float fs[4], ft[4];
-        for (int i = 0; i < 4; i++) {
-            fs[i] = (s[i]  >  3.4028235e38f || s[i]  < -3.4028235e38f) ? 0.0f : s[i];
-            ft[i] = (ts[i] >  3.4028235e38f || ts[i] < -3.4028235e38f) ? 0.0f : ts[i];
-        }
-        d[2] = psp_vfpu_dot(fs, ft);
+        const float a0[4] = { s[1], s[2], 0.0f, 0.0f }, b0[4] = { t[2], -t[1], 0.0f, 0.0f };
+        const float a1[4] = { s[2], s[0], 0.0f, 0.0f }, b1[4] = { t[0], -t[2], 0.0f, 0.0f };
+        const float a2[4] = { s[0], s[1], 0.0f, 0.0f }, b2[4] = { t[1], -t[0], 0.0f, 0.0f };
+        d[0] = psp_vfpu_dot(a0, b0);
+        d[1] = psp_vfpu_dot(a1, b1);
+        d[2] = psp_vfpu_dot(a2, b2);
     }
 
     write_dst(vd, size, d);
@@ -1308,7 +1299,8 @@ void psp_vcst(uint32_t vd, uint32_t which, int size) {
         0.70710678f,            /* sqrt(1/2)          */
         1.12837917f,            /* 2/sqrt(pi)         */
         0.63661977f,            /* 2/pi               */
-        0.31830989f,            /* 1/pi               */
+        0.318309886f,           /* 1/pi, 3EA2F983: the old literal 0.31830989f
+                                 * rounded to 3EA2F984 (vfpuprobe step 50) */
         0.78539816f,            /* pi/4               */
         1.57079633f,            /* pi/2               */
         3.14159265f,            /* pi                 */
@@ -1461,12 +1453,14 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size, int homogeneous) 
     float in[4], out[4];
     for (int i = 0; i < size; i++) in[i] = psp_cpu.v[t[i]];
 
+    /* Each lane is one pass through the dot-product unit, the implicit 1 of
+     * the homogeneous form included, as vhdp does it. */
     const int n = homogeneous ? size - 1 : size;
     for (int r = 0; r < size; r++) {
-        float sum = 0.0f;
-        for (int c = 0; c < n; c++) sum += m[r][c] * in[c];
-        if (homogeneous) sum += m[r][size - 1];
-        out[r] = sum;
+        float a[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, b[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (int c = 0; c < n; c++) { a[c] = m[r][c]; b[c] = in[c]; }
+        if (homogeneous) { a[n] = m[r][size - 1]; b[n] = 1.0f; }
+        out[r] = psp_vfpu_dot(a, b);
     }
     /* vd may be one of the sources, so write only after the whole result is
      * computed. */
@@ -1495,11 +1489,13 @@ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     matrix_read(vs, size, a);
     matrix_read(vt, size, b);
 
+    /* Every element is a dot product, rounded once: vfpuprobe steps 107 and
+     * 110 (fw 6.60) give 43055555 where a running float sum gave 43055556. */
     for (int c = 0; c < size; c++)
         for (int r = 0; r < size; r++) {
-            float sum = 0.0f;
-            for (int k = 0; k < size; k++) sum += a[r][k] * b[c][k];
-            out[c][r] = sum;
+            float x[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, y[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            for (int k = 0; k < size; k++) { x[k] = a[r][k]; y[k] = b[c][k]; }
+            out[c][r] = psp_vfpu_dot(x, y);
         }
     matrix_write(vd, size, out);
     eat_prefixes();
