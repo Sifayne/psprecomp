@@ -218,25 +218,29 @@ static uint32_t  g_sample_rate = 44100;
 static uint64_t  g_frames_rendered;
 static uint64_t  g_samples_nonzero;
 
-void psp_sas_reset(void) {
+/* Every voice back to the state __sceSasInit leaves it in: off, unpaused,
+ * no sample, and the defaults hardware writes into each voice of the struct
+ * (sasprobe step 4, fw 6.60): rates and sustain level 0, curves linear
+ * increase for the attack and linear decrease for the rest, pitch 0x1000,
+ * all four volumes 0x1000. Zero curves would mean linear *increase* for all
+ * four, which would make a decay climb. */
+static void reset_voices(void) {
     memset(g_voice, 0, sizeof g_voice);
-    /* A game that never calls __sceSasSetADSRmode gets the shapes this file
-     * had before there were modes: a rising attack and falling everything
-     * else. Zero would mean linear *increase* for all four, which would make
-     * a decay climb. */
     for (int i = 0; i < SAS_VOICES; i++) {
         g_voice[i].mode_attack  = CURVE_LINEAR_INC;
         g_voice[i].mode_decay   = CURVE_LINEAR_DEC;
         g_voice[i].mode_sustain = CURVE_LINEAR_DEC;
         g_voice[i].mode_release = CURVE_LINEAR_DEC;
-    }
-    for (int i = 0; i < SAS_VOICES; i++) {
-        g_voice[i].pitch = 0x1000;
+        g_voice[i].pitch  = 0x1000;
         g_voice[i].vol_l  = 0x1000;
         g_voice[i].vol_r  = 0x1000;
         g_voice[i].vol_el = 0x1000;
         g_voice[i].vol_er = 0x1000;
     }
+}
+
+void psp_sas_reset(void) {
+    reset_voices();
     g_grain = 256;
     g_max_voices = SAS_VOICES;
     g_output_mode = 0;
@@ -595,6 +599,12 @@ static void hle_Init(void) {
      * rates this renders at" is not hardware's: sascore.expected refuses
      * 48000 along with every other rate it tries. */
     if (rate != 44100) { psp_ret(SAS_ERROR_SAMPLE_RATE); return; }
+    /* Init starts every voice over, whatever it was doing: a voice keyed on
+     * and playing reads height 0 and ended afterwards, its key is gone
+     * (KeyOff is refused), the next core is silent, and a paused voice is
+     * unpaused (sasprobe steps 15 and 222, fw 6.60). Every Init rewrites the
+     * whole struct with the defaults (steps 4-5). */
+    reset_voices();
     g_grain       = grain;
     g_max_voices  = voices;
     g_output_mode = mode;
