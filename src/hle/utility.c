@@ -4,6 +4,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/cpu.h"
 #include "psprecomp/os.h"
+#include "psprecomp/sched.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +34,10 @@
 #define PSP_UTILITY_DIALOG_FINISHED 4
 static int g_savedata_state, g_savedata_done, g_savedata_interactive;
 static uint32_t g_savedata_param;
-static uint64_t g_savedata_shutdown_vblank;   /* vblank count at ShutdownStart */
+/* At ShutdownStart: the vblank count, the calling thread and how often it had
+ * given up the CPU (see hle_SavedataGetStatus). */
+static uint64_t g_savedata_shutdown_vblank;
+static uint32_t g_savedata_shutdown_thread, g_savedata_shutdown_releases;
 static unsigned char sd_request[1536];
 static int sd_request_valid(void);
 static int sd_io_error;
@@ -1449,8 +1453,9 @@ static int sd_request_valid(void) {
 static void hle_SavedataInitStart(void) {
     /* Shutdown is synchronous here. Some games start the next utility without
      * polling FINISHED/NONE after ShutdownStart; a completed shutdown must not
-     * prevent that next request. GetStatus exposes FINISHED only within the
-     * frame of the ShutdownStart (see hle_SavedataGetStatus). */
+     * prevent that next request. GetStatus exposes FINISHED until the caller
+     * stands aside (see hle_SavedataGetStatus); what InitStart answers while
+     * a PSP still reads 4 is unmeasured. */
     if (g_savedata_state==PSP_UTILITY_DIALOG_FINISHED)
         g_savedata_state=PSP_UTILITY_DIALOG_NONE;
     if (g_savedata_state!=PSP_UTILITY_DIALOG_NONE) {
@@ -1496,20 +1501,32 @@ static void hle_SavedataInitStart(void) {
     }
     psp_ret(0);
 }
-/* After ShutdownStart a PSP on firmware 6.60 reads 0 at the next vblank:
- * saveprobe polls once per frame and logs status 1, 2, 3, 0 in every one of
- * its 67 steps, never 4. Whether 4 is visible at all inside that frame is
- * unmeasured, so FINISHED is still reported once to a poll in the same frame
- * as the ShutdownStart (a caller that polls without waiting sees 4 then 0);
- * once the vblank counter has moved, the utility reads NONE directly. */
+/* After ShutdownStart a PSP on firmware 6.60 reads 4 until the caller waits,
+ * and 0 after that:
+ *   - polled once per frame, status goes 1, 2, 3, 0 in every step of
+ *     saveprobe (runs 1 and 2), never 4: the vblank wait was enough;
+ *   - polled back to back, it stays 4 for the whole 2 s the probe allows,
+ *     over a million polls and no vblank wait (steps 77-78).
+ * The shutdown finishes in the firmware's own thread, which runs only when
+ * the caller stands aside. So FINISHED holds until a vblank has passed or
+ * the thread that called ShutdownStart has given up the CPU (a delay, a
+ * blocking wait, a yield another thread took), which also covers a poll
+ * from any other thread. A zero-length sceKernelDelayThread does not count:
+ * it does not stand aside on fw 6.60 (threadprobe step 80). */
+static int sd_shutdown_done(void) {
+    if (psp_display_vblanks()!=g_savedata_shutdown_vblank) return 1;
+    const uint32_t me=psp_sched_current();
+    if (me!=g_savedata_shutdown_thread) return 1;
+    psp_sched_stats st;
+    psp_sched_stats_of(me,&st);
+    return st.releases!=g_savedata_shutdown_releases;
+}
 static void hle_SavedataGetStatus(void) {
-    if (g_savedata_state==PSP_UTILITY_DIALOG_FINISHED &&
-        psp_display_vblanks()!=g_savedata_shutdown_vblank)
+    if (g_savedata_state==PSP_UTILITY_DIALOG_FINISHED && sd_shutdown_done())
         g_savedata_state=PSP_UTILITY_DIALOG_NONE;
     int now=g_savedata_state;
     if (savedata_log_on() && now!=sd_status_logged) { fprintf(stderr,"savedata: status=%d\n",now); sd_status_logged=now; }
     if (now==PSP_UTILITY_DIALOG_INIT) g_savedata_state=PSP_UTILITY_DIALOG_VISIBLE;
-    else if (now==PSP_UTILITY_DIALOG_FINISHED) g_savedata_state=PSP_UTILITY_DIALOG_NONE;
     psp_ret((uint32_t)now);
 }
 static void hle_SavedataUpdate(void) {
@@ -1557,6 +1574,10 @@ static void hle_SavedataShutdownStart(void) {
     }
     g_savedata_state=PSP_UTILITY_DIALOG_FINISHED;
     g_savedata_shutdown_vblank=psp_display_vblanks();
+    g_savedata_shutdown_thread=psp_sched_current();
+    psp_sched_stats st;
+    psp_sched_stats_of(g_savedata_shutdown_thread,&st);
+    g_savedata_shutdown_releases=st.releases;
     psp_ret(0);
 }
 void psp_utility_register(void) {

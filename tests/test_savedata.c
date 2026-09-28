@@ -39,6 +39,7 @@ static void start(void) {
     psp_savedata_snapshot(&view);
 }
 static void update(void) { assert(call(0xD4B95FFB,1)==0); psp_savedata_snapshot(&view); }
+static void vblank(void) { call(0x984C27E7,0); }   /* sceDisplayWaitVblankStart */
 static void respond(int action,int index) {
     psp_savedata_snapshot(&view);
     assert(psp_savedata_respond(view.session,view.revision,action,index)); update();
@@ -47,7 +48,8 @@ static uint32_t finish(void) {
     if (view.active) respond(PSP_SAVEDATA_ACCEPT,0);
     uint32_t result=psp_read32(p+28);
     assert(call(0x8874DBE0,0)==3); assert(call(0x9790B33C,0)==0);
-    assert(call(0x8874DBE0,0)==4); assert(call(0x8874DBE0,0)==0);
+    assert(call(0x8874DBE0,0)==4); assert(call(0x8874DBE0,0)==4); vblank();
+    assert(call(0x8874DBE0,0)==0);
     return result;
 }
 static void check_file(const char *name,const char *value) {
@@ -75,7 +77,8 @@ static void lifecycle(void) {
     check_file("SLOT00",NULL);
     setup(5,"","shutdown"); start();
     assert(call(0x9790B33C,0)==0); assert(psp_read32(p+28)==1);
-    assert(call(0x8874DBE0,0)==4); assert(call(0x8874DBE0,0)==0);
+    assert(call(0x8874DBE0,0)==4); assert(call(0x8874DBE0,0)==4); vblank();
+    assert(call(0x8874DBE0,0)==0);
     check_file("SLOT00",NULL);
     assert(!psp_savedata_respond(id,rev,PSP_SAVEDATA_ACCEPT,0));
     /* ACLR does not poll FINISHED after its startup memory-stick query. */
@@ -209,7 +212,8 @@ static void coverage(void) {
     setup(5,"SLOT00","must not land"); start(); respond(PSP_SAVEDATA_SELECT,0);
     respond(PSP_SAVEDATA_ACCEPT,0); assert(view.stage==PSP_SAVEDATA_CONFIRM);
     assert(call(0x9790B33C,0)==0); assert(psp_read32(p+28)==1);
-    assert(call(0x8874DBE0,0)==4); assert(call(0x8874DBE0,0)==0);
+    assert(call(0x8874DBE0,0)==4); assert(call(0x8874DBE0,0)==4); vblank();
+    assert(call(0x8874DBE0,0)==0);
     check_file("SLOT00","replaced");
     /* A foreign directory with an unrepresentable name is skipped, not fatal. */
     snprintf(path,sizeof path,"%s/ms/PSP/SAVEDATA/FOREIGN_DIRECTORY_WITH_A_VERY_LONG_NAME_INDEED_0123456789",root);
@@ -233,12 +237,22 @@ static void coverage(void) {
  * fw660-run1). Each block names the steps it reproduces. */
 static void fw660_status(void) {
     /* Status 1, 2, 3 and then 0 at the first poll a frame after
-     * ShutdownStart, in every step; 4 only to a poll in the same frame. */
+     * ShutdownStart, in every step. */
     setup(0,"SLOT00",""); start(); update();
     assert(call(0x8874DBE0,0)==3); assert(call(0x9790B33C,0)==0);
-    call(0x984C27E7,0); /* sceDisplayWaitVblankStart */
+    vblank();
     assert(call(0x8874DBE0,0)==0);
     assert(psp_read32(p+28)==0);
+    /* Polled back to back, 4 holds (over a million polls in 2 s, steps
+     * 77-78) until the caller stands aside: a vblank wait, or a delay. */
+    setup(0,"SLOT00",""); start(); update();
+    assert(call(0x8874DBE0,0)==3); assert(call(0x9790B33C,0)==0);
+    for (int i=0;i<100000;i++) assert(call(0x8874DBE0,0)==4);
+    call(0x9C6EAAD7,0);                 /* sceDisplayGetVcount: not a wait */
+    call(0xCEADEB47,0);                 /* sceKernelDelayThread(0): nor this */
+    assert(call(0x8874DBE0,0)==4);
+    call(0xCEADEB47,1000);
+    assert(call(0x8874DBE0,0)==0);
 }
 /* A noninteractive request, start to finish. */
 static uint32_t run(void) { start(); update(); return finish(); }
