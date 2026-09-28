@@ -978,11 +978,15 @@ static uint32_t sd_do_mode(uint32_t param) {
         /* A secure-made file that is gone reads as FILE_NOT_FOUND; a file
          * never made at all reads as NO_DATA. The suite removes DATA.BIN
          * from one fixture and never creates it in the other. */
-        if (!sd_exists(guest))
-            return sd_is_secure(dir, file) ? SD_RW_FILE : SD_RW_NO_DATA;
-        /* Secure-made files only open through secure modes and vice versa:
-         * the suite reads both pairings and gets RW_DATA_BROKEN for each. */
-        if (sd_is_secure(dir, file) != secmode) return SD_RW_BROKEN;
+        int secure = sd_is_secure(dir, file);
+        if (!sd_exists(guest)) return secure ? SD_RW_FILE : SD_RW_NO_DATA;
+        /* Across modes, fw 6.60 answers differently from the suite's
+         * RW_DATA_BROKEN for both pairings (saveprobe steps 48-49):
+         * READDATASECURE of a plain file is RW_FILE_NOT_FOUND, and READDATA
+         * of a secure one succeeds with the file as stored -- ciphertext
+         * and its 16-byte header on hardware, the plaintext here until the
+         * savedata crypto exists. */
+        if (secmode && !secure) return SD_RW_FILE;
         if (buf && bufsz) {
             int64_t n = sd_read_file(guest, buf, bufsz);
             if (n<0) return SD_ERASE_ACCESS;

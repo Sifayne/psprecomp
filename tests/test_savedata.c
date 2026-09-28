@@ -357,6 +357,18 @@ static void fw660_keys(void) {
     hw(0,"HWSHORT",""); psp_write32(p,1500); assert(run()==0 && psp_read8(data)=='s');
     assert(load("HWSHORT",'B',0)==0);
 }
+static void fw660_cross_mode(void) {
+    /* READDATASECURE of a plain file is RW_FILE_NOT_FOUND (step 48) and
+     * leaves dataSize alone; READDATA of a secure file reads it (step 49;
+     * the stored bytes, which are plaintext here). */
+    hw(15,"HWPLAIN",""); psp_write32(p+124,0x5A5A);
+    assert(run()==0x80110329u && psp_read32(p+124)==0x5A5A);
+    hw(16,"HWKEY",""); key('B',0); psp_write8(data,0);
+    assert(run()==0 && psp_read32(p+124)==6 && psp_read8(data)=='k');
+    /* Same-mode reads still work both ways (DSEC, DPLAIN steps 39, 42). */
+    hw(15,"HWKEY",""); key('A',0); psp_write8(data,0); assert(run()==0 && psp_read8(data)=='k');
+    hw(16,"HWPLAIN",""); psp_write8(data,0); assert(run()==0 && psp_read8(data)=='p');
+}
 int main(void) {
 #ifndef _WIN32
     snprintf(root,sizeof root,"/tmp/psprecomp-savedata-XXXXXX"); assert(mkdtemp(root));
@@ -365,7 +377,7 @@ int main(void) {
 #endif
     assert(psp_mem_init()==0); psp_cpu_reset(); psp_hle_init(); psp_io_set_root(root); psp_savedata_set_host(1);
     lifecycle(); roundtrip(); deletion(); errors(); request_safety(); headless(); scripts(); coverage();
-    fw660_status(); fw660_sfo(); fw660_keys();
+    fw660_status(); fw660_sfo(); fw660_keys(); fw660_cross_mode();
     assert(psp_mem_bad_access==0); psp_mem_free();
     printf("savedata: lifecycle, independent slots, writeback, metadata, cancellation, overwrite, deletion, errors, recovery, scripts, focus, new-data artwork and foreign directories passed\n");
     return 0;
