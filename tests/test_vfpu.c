@@ -686,8 +686,8 @@ static void test_units_and_conversions(void) {
     CHECK(psp_f32_to_bits(psp_cpu.v[r0[0]]) == 0x3EA2F983u, "vcst 6: %08X",
           psp_f32_to_bits(psp_cpu.v[r0[0]]));
 
-    /* Half floats (steps 27-30): no subnormals either way, NaN and inf keep
-     * the low mantissa bits, and 65520 stays finite. */
+    /* Half floats (steps 27-30, v3 step 50): no subnormals either way, NaN
+     * and inf keep the low mantissa bits, and the mantissa is truncated. */
     static const uint32_t f2h[][2] = {
         { 0x3F800000, 0x3C00 }, { 0xC0200000, 0xC100 }, { 0x477FE000, 0x7BFF },
         { 0x477FF000, 0x7BFF }, { 0x322BCC77, 0x0000 }, { 0x7F800000, 0x7C00 },
@@ -696,6 +696,13 @@ static void test_units_and_conversions(void) {
         { 0x477FEF00, 0x7BFF }, { 0x501502F9, 0x7C00 }, { 0xD01502F9, 0xFC00 },
         { 0x3EAAAAAB, 0x3555 }, { 0x33000000, 0x0000 }, { 0x33C00000, 0x0000 },
         { 0x387FC000, 0x0000 }, { 0xFF800001, 0xFC01 },
+        /* Truncation (v3 step 50): ties, near-ties and just below 2^16. */
+        { 0x3F801000, 0x3C00 }, { 0x3F803000, 0x3C01 }, { 0x3F801008, 0x3C00 },
+        { 0x3F801FF8, 0x3C00 }, { 0xBF803000, 0xBC01 }, { 0x3FFFF000, 0x3FFF },
+        { 0x3FFFF800, 0x3FFF }, { 0x40003000, 0x4001 }, { 0x477FF001, 0x7BFF },
+        { 0x477FF800, 0x7BFF }, { 0x477FFFFF, 0x7BFF }, { 0x47800000, 0x7C00 },
+        { 0x387FE000, 0x0000 }, { 0x387FFFFF, 0x0000 }, { 0x38801000, 0x0400 },
+        { 0x38803000, 0x0401 }, { 0x38801001, 0x0400 },
     };
     for (size_t i = 0; i < sizeof f2h / sizeof f2h[0]; i++) {
         const uint16_t got = psp_f32_to_half(psp_bits_to_f32(f2h[i][0]));

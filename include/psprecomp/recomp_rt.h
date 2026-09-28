@@ -238,12 +238,11 @@ static inline uint32_t psp_f32_to_bits(float v) {
  *   - 65520, the exact midpoint between 65504 and 65536, gives 7BFF, not
  *     infinity, and 1e10 gives 7C00.
  *
- * The rounding is to nearest with a tie going toward zero, which is the
- * smallest change from nearest-even that fits 65520 -- it moves nothing but
- * exact ties. Truncation would fit the data as well; the probe had no other
- * tie and no value just below one. Converting 3F801000 and 3F803000 would
- * settle it. Rounding happens before the flush, so a value within half a
- * subnormal step of 2^-14 still becomes 0400; also unmeasured. */
+ * The mantissa is truncated, toward zero: 3F801000 and 3F803000 (ties) give
+ * 3C00 and 3C01, 3F801FF8 (just below a tie) 3C00, 3FFFF000 3FFF, 477FF001
+ * to 477FFFFF 7BFF and only 2^16 itself 7C00; everything below 2^-14 is
+ * a zero, 387FFFFF included, and 38801000 is 0400 (vfpuprobe v3 step 50,
+ * fw 6.60; the same with the sign set). */
 static inline float psp_half_to_f32(uint16_t h) {
     const uint32_t sign = (uint32_t)(h >> 15) << 31;
     const uint32_t exp  = (h >> 10) & 0x1F;
@@ -266,11 +265,8 @@ static inline uint16_t psp_f32_to_half(float v) {
 
     const int32_t e = (int32_t)(a >> 23) - 127 + 15;
     if (e >= 31) return (uint16_t)(sign | 0x7C00u);            /* 2^16 and up */
-    if (e <= 0)                                                /* below 2^-14 */
-        return (uint16_t)(sign | (a > 0x387FE000u ? 0x0400u : 0u));
-    uint32_t h = ((uint32_t)e << 10) | ((a >> 13) & 0x3FFu);
-    if ((a & 0x1FFFu) > 0x1000u) h++;         /* nearest; a tie goes toward zero */
-    return (uint16_t)(sign | h);
+    if (e <= 0) return (uint16_t)sign;                         /* below 2^-14 */
+    return (uint16_t)(sign | ((uint32_t)e << 10) | ((a >> 13) & 0x3FFu));
 }
 
 static inline float psp_fabs(float v)  { return v < 0.0f ? -v : v; }
