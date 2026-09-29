@@ -3176,7 +3176,13 @@ static void run_list_body(ge_queue *q) {
             /* Behaviours 1-3 (PSPSDK pspgu.h GU_SIGNAL_WAIT, NOWAIT, PAUSE)
              * call the signal handler; the list then carries on, the PAUSE
              * variant through its FINISH/END pair below. The jump/call/ret
-             * and other behaviours are not modelled and call nobody. */
+             * and other behaviours are not modelled and call nobody. A
+             * PAUSE is marked here, before its handler runs, so that a
+             * sceGeContinue from that handler finds it (cont_early);
+             * without the mark the handler's call did nothing and the list
+             * paused anyway. Which of the two the PSP does is not measured
+             * (geprobe 6 asks). */
+            if (((arg >> 16) & 0xFF) == GE_SIGNAL_HANDLER_PAUSE) q->signal = GE_SIGNAL_HANDLER_PAUSE;
             if (((arg >> 16) & 0xFF) >= 1 && ((arg >> 16) & 0xFF) <= 3 &&
                 ge_raise(q->cbid, 0, arg))
                 return;
