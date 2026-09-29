@@ -465,6 +465,25 @@ float blend (`src/render.c` sw_tri, `src/hle/ge.c` ge_screen_z):
   slopes in x, the nearest of scene 17's second triangle); the rule that
   picks it is not known. A GPU backend shares the vertex depths and
   interpolates them itself.
+- **Open:** scene 28's 3D line ends at x 363.625 and the PSP leaves out
+  pixel 363, whose centre is short of that end. The line-strip patches of
+  scenes 22 and 23 draw such last pixels more often than not, so the rule is
+  still the centre's; geprobe 6 draws lines ending on every sixteenth.
+
+## Texture coordinates on sprites and lines
+
+Where a pixel centre lands exactly on a texel boundary, the step decides
+which texel is read (geprobe step 12 and geprobe 5 scene 28, fw 6.60):
+
+- **A sprite** ramps u from its left edge and v from its top edge (swapped
+  when the sprite is transposed), whichever vertex gave that edge, by a step
+  of texels a sixteenth truncated toward zero to 2^-16. Two texels onto
+  seven pixels with the corners given bottom-right first read the far texel
+  at the boundary; ramping from the first vertex read the near one.
+- **A through-mode line** takes u and v at the pixel centre's projection,
+  like colour and depth, by a step truncated to 2^-24 a sixteenth: at an
+  exact boundary it reads the texel before. A 3D line divides by w at the
+  same point.
 
 ## Known differences
 

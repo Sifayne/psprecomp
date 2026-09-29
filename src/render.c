@@ -1381,8 +1381,19 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
      * precision from 2^-8 to 2^-20 per pixel fits that sprite. Truncation
      * leaves power-of-two steps exact, which the 1:1 and the 2:1 and 4:1
      * minified sprites of the same scene need. */
-    const float du = ldexpf(truncf(ldexpf((b->u - a->u) / (float)(transposed ? (b->y - a->y) : (b->x - a->x)), 16)), -16);
-    const float dv = ldexpf(truncf(ldexpf((b->v - a->v) / (float)(transposed ? (b->x - a->x) : (b->y - a->y)), 16)), -16);
+    /* Each ramp starts at the top or left edge, whichever vertex gave it
+     * that: geprobe 5 scene 28 (fw 6.60) maps 2 texels onto 7 pixels with
+     * the corners given bottom-right first, and where a pixel centre lands
+     * on the texel boundary the PSP reads the texel on the far side of it
+     * from that vertex's, which a ramp truncated from the top-left gives and
+     * one from the first vertex does not (it read the near one; 14 pixels).
+     * Given top-left first, as everything before it was, nothing changes.
+     * uo and vo are the vertices the u and v ramps start from. */
+    const psp_vertex *left = a->x <= b->x ? a : b, *top = a->y <= b->y ? a : b;
+    const psp_vertex *uo = transposed ? top : left, *vo = transposed ? left : top;
+    const psp_vertex *ue = uo == a ? b : a, *ve = vo == a ? b : a;
+    const float du = ldexpf(truncf(ldexpf((ue->u - uo->u) / (float)(transposed ? y1 - y0 : x1 - x0), 16)), -16);
+    const float dv = ldexpf(truncf(ldexpf((ve->v - vo->v) / (float)(transposed ? x1 - x0 : y1 - y0), 16)), -16);
     int lod16 = 0;
     if (textured) {
         const float rx = fabsf(du) * 16.0f, ry = fabsf(dv) * 16.0f;
@@ -1393,14 +1404,14 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
         /* Pixel centres, in 1/16 units, against the exact corner: at 1:1 a
          * corner lands exactly on a texel boundary and the rounding decides
          * which side of it to read. */
-        const float ty = (float)(y * SUBPX + SUBPX_HALF - a->y);
-        const float tv_row = transposed ? 0.0f : a->v + dv * ty;
-        const float tu_row = transposed ? a->u + du * ty : 0.0f;
+        const float ty = (float)(y * SUBPX + SUBPX_HALF - y0);
+        const float tv_row = transposed ? 0.0f : vo->v + dv * ty;
+        const float tu_row = transposed ? uo->u + du * ty : 0.0f;
         for (int x = px0; x < px1; x++) {
             if (!textured) { g_px_flat++; shade_pixel(x, y, a->z, apply_fog(b->rgba, b->fog)); continue; }
-            const float tx = (float)(x * SUBPX + SUBPX_HALF - a->x);
-            const float tu = transposed ? tu_row : a->u + du * tx;
-            const float tv = transposed ? a->v + dv * tx : tv_row;
+            const float tx = (float)(x * SUBPX + SUBPX_HALF - x0);
+            const float tu = transposed ? tu_row : uo->u + du * tx;
+            const float tv = transposed ? vo->v + dv * tx : tv_row;
             g_px_tex++;
             shade_pixel(x, y, a->z,
                         apply_fog(apply_texfunc(sample_mip(tu, tv, lod16), b->rgba), b->fog));
@@ -1464,6 +1475,16 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
      * the depth of its centre's projection, where stepping 122 whole steps
      * from 258.81 put six a row off and every depth up to 18 off.
      *
+     * Open: scene 28's 3D line ends at 5818/16, 363.625, and the PSP leaves
+     * out pixel 363 though its centre is short of the end. Counting whole
+     * pixels of length instead fixes it but leaves out last pixels the PSP
+     * draws on scenes 22 and 23's line-strip patches: pixels it covers and
+     * psprecomp does not go from 13 to 30 and from 31 to 71. Dropping a last
+     * pixel whose diamond holds the end fixes it with less harm (17 and 42).
+     * The patches' vertices are psprecomp's own and may sit a sixteenth off
+     * the PSP's, so neither count is conclusive; geprobe 6 draws lines
+     * ending on every sixteenth.
+     *
      * Major index k = 0..n-1: pixel M0 + sm*k along the major axis, its
      * centre c0 + 16*sm*k; the minor pixel is
      * floor((m_a*|dM| + dm*sm*(centre - M_a)) / (16*|dM|)). Both are
@@ -1502,10 +1523,21 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
     const int64_t za = !(a->z > 0.0f) ? 0 : (a->z >= 65535.0f ? 65535 : (int64_t)a->z);
     const int64_t zb = !(b->z > 0.0f) ? 0 : (b->z >= 65535.0f ? 65535 : (int64_t)b->z);
     const int64_t zg = grad1024((zb - za) * 1024 * 16, adM);
+    /* Fog and texture coordinates at the same point. Unprojected (through
+     * mode), the texture coordinates go by a fixed step, texels a sixteenth,
+     * truncated toward zero to 2^-24 (2^-20 a pixel). geprobe 5 scene 28's
+     * three through-mode textured lines (fw 6.60) read the hardware's texel
+     * on every pixel this way. Taken at the step's start they read the texel
+     * before it wherever a boundary fell inside the step; with an exact step
+     * at the centre they read the one after it at the 9 pixels whose centre
+     * lands exactly on a boundary; a sprite's coarser 2^-16 step truncates
+     * too far and reads the one before (31 pixels). */
+    const int affine = a->inv_w == 1.0f && b->inv_w == 1.0f && a->tex_q == 1.0f && b->tex_q == 1.0f;
+    const float lu = (float)ldexp(trunc(ldexp((double)(b->u - a->u) / (double)adM, 24)), -24);
+    const float lv = (float)ldexp(trunc(ldexp((double)(b->v - a->v) / (double)adM, 24)), -24);
     for (int64_t k = first; k <= last; k++) {
         const int64_t dist16 = sm * (c0 - Ma) + 16 * k;            /* > 0 */
-        /* Fog and texture coordinates as before: at the step's start. */
-        const float t = (float)((double)(dist16 - 8) / (double)adM), s = 1.0f - t;
+        const float t = (float)((double)dist16 / (double)adM), s = 1.0f - t;
         const int64_t Mp = M0 + sm * k, mp = floor_div(pm + dmk * k, smd);
         psp_vertex v = *a;
         v.x = (int)(xmajor ? Mp : mp) * PSP_SUBPX + PSP_SUBPX / 2;
@@ -1515,9 +1547,14 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
         for (int c = 0; c < 4; c++)
             v.rgba |= plane_chan(cv[c] * 16384 + cg[c] * dist16) << (8 * c);
         v.fog = (int)(s * (float)a->fog + t * (float)b->fog + 0.5f);
-        const float den = s * a->tex_q * a->inv_w + t * b->tex_q * b->inv_w;
-        v.u = den ? (s * a->u * a->inv_w + t * b->u * b->inv_w) / den : 0;
-        v.v = den ? (s * a->v * a->inv_w + t * b->v * b->inv_w) / den : 0;
+        if (affine) {
+            v.u = a->u + lu * (float)dist16;
+            v.v = a->v + lv * (float)dist16;
+        } else {
+            const float den = s * a->tex_q * a->inv_w + t * b->tex_q * b->inv_w;
+            v.u = den ? (s * a->u * a->inv_w + t * b->u * b->inv_w) / den : 0;
+            v.v = den ? (s * a->v * a->inv_w + t * b->v * b->inv_w) / den : 0;
+        }
         v.inv_w = v.tex_q = 1.0f;
         emit(&v, opaque);
     }

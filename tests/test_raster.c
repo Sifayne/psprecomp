@@ -1355,9 +1355,10 @@ static void test_line_interpolation_and_clipping(void) {
     s = (line_samples){0};
     psp_render_walk_line(&a, &b, 2, 2, 2, 2, collect_line, &s);
     CHECK(s.count == 1 && s.first.x == 40 && s.first.y == 40, "diagonal scissor sample");
-    /* Depth at the step's centre, 2.5 of 4 steps, like colour: geprobe 5
-     * scene 27 (fw 6.60). */
-    CHECK(s.first.z == 62 && s.first.u > 2.666f && s.first.u < 2.667f &&
+    /* Depth and the perspective-divided u at the step's centre, 2.5 of 4
+     * steps, like colour: geprobe 5 scenes 27 and 28 (fw 6.60). u is
+     * (2.5/4 * 8 * 0.5) / (1.5/4 + 2.5/4 * 0.5) = 3.636. */
+    CHECK(s.first.z == 62 && s.first.u > 3.636f && s.first.u < 3.637f &&
           s.first.inv_w == 1 && s.first.tex_q == 1, "line perspective and depth interpolation");
     s = (line_samples){0};
     psp_render_walk_line(&a, &a, 0, 0, 10, 10, collect_line, &s);
@@ -1630,6 +1631,37 @@ static void test_hardware_sprite_step(void) {
           "v = 1.0 exactly takes row 0: %06X %06X %06X", pixel(440, 10), pixel(440, 11), pixel(440, 12));
 }
 
+/* Texel boundaries that land exactly on a pixel centre, geprobe 5 scene 28
+ * (fw 6.60). A sprite mapping u and v 4..6 onto 7 pixels with its corners
+ * given bottom-right first reads texel 5 at the centre where u = 5 exactly,
+ * its ramp starting from the top-left corner (from the first vertex it read
+ * texel 4). A through-mode line from x 10 to 470 with u 0..16 reads texel 1
+ * at x 67, where u = 2 exactly: its step, truncated, falls just short. At
+ * x 96 the centre's u is 3.009 and the PSP reads texel 3; the left edge's,
+ * where psprecomp used to take it, is 2.991. */
+static void test_hardware_texel_boundaries(void) {
+    psp_ge_reset(); clear_fb();
+    upload_ramp_texture(16, 16);
+    begin_list_vtype(VTYPE_2D_TEXF);
+    texture_state(TEX, 16, 4, 4, 3, 0, 0);
+    vertex_uvf(0, 65, 187, 4.0f, 4.0f, 0xFFFFFFFFu);
+    vertex_uvf(1, 58, 180, 6.0f, 6.0f, 0xFFFFFFFFu);
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    CHECK(pixel(60, 183) == ramp_texel(5, 5) && pixel(61, 183) == ramp_texel(5, 5) &&
+          pixel(62, 183) == ramp_texel(4, 5) && pixel(61, 184) == ramp_texel(5, 4),
+          "reversed sprite at u = 5: %06X %06X %06X %06X", pixel(60, 183), pixel(61, 183),
+          pixel(62, 183), pixel(61, 184));
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype(VTYPE_2D_TEXF);
+    texture_state(TEX, 16, 4, 4, 3, 0, 0);
+    vertex_uvf(0, 10, 226, 0.0f, 8.0f, 0xFFFFFFFFu);
+    vertex_uvf(1, 470, 226, 16.0f, 8.0f, 0xFFFFFFFFu);
+    cmd(0x04, (PSP_PRIM_LINES << 16) | 2); end_list();
+    CHECK(pixel(67, 226) == ramp_texel(1, 8) && pixel(68, 226) == ramp_texel(2, 8) &&
+          pixel(96, 226) == ramp_texel(3, 8),
+          "line at u = 2 and 3.009: %06X %06X %06X", pixel(67, 226), pixel(68, 226), pixel(96, 226));
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -1679,6 +1711,7 @@ int main(void) {
     test_hardware_colour_logic_mask();
     test_hardware_through_saturation();
     test_hardware_sprite_step();
+    test_hardware_texel_boundaries();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);
