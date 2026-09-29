@@ -579,7 +579,9 @@ static uint32_t apply_texfunc(uint32_t tex, uint32_t col) {
  * keeps the framebuffer's bit. geprobe step 19 (fw 6.60) draws 0x7FFFFFFF
  * under mask 0xFF00F0F0 over 0x00402010 and reads 0x00FF2F1F back. A 16-bit
  * target takes the mask through the same packing as the colour, so each field
- * keeps the top bits of its mask byte (not measured on 16-bit targets). */
+ * keeps the top bits of its mask byte: geprobe 5 scenes 30-32 (fw 6.60) draw
+ * white and black under 0x00F8FCF8, 0x00070307, 0x00808080 and 0xFFFF0000 on
+ * 5650, 5551 and 4444, and PMSK2 0xF0, 0x0F and 0x3C over stencil writes. */
 static void put_pixel(int x, int y, uint32_t rgba, int stencil) {
     if (!g_fb_addr || !g_fb_stride) return;
     if (x < g_sc_x0 || y < g_sc_y0 || x > g_sc_x1 || y > g_sc_y1) return;
@@ -814,21 +816,28 @@ static int stencil_pass(uint32_t cur) {
     }
 }
 
+/* INCR and DECR count in the target's own stencil width: one step of a 4444
+ * target's nibble (0x11 once expanded) and the whole bit of a 5551 target.
+ * geprobe 5 scenes 31 and 32 (fw 6.60) INCR a stencil of 0x5A written
+ * before: 4444 reads 6 where 0x55 + 1 would pack back to 5, and 5551 reads
+ * 1 where 0x00 + 1 would pack back to 0. */
 static uint32_t stencil_op(int op, uint32_t cur) {
+    const uint32_t step = g_fb_fmt == 2 ? 0x11u : (g_fb_fmt == 1 ? 0xFFu : 1u);
     switch (op) {
     case 1:  return 0u;                                  /* ZERO    */
     case 2:  return (uint32_t)g_bs.stencil_ref & 0xFFu;  /* REPLACE */
     case 3:  return ~cur & 0xFFu;                        /* INVERT  */
-    case 4:  return cur < 255u ? cur + 1u : 255u;        /* INCR    */
-    case 5:  return cur > 0u ? cur - 1u : 0u;            /* DECR    */
+    case 4:  return cur <= 255u - step ? cur + step : 255u;   /* INCR */
+    case 5:  return cur >= step ? cur - step : 0u;            /* DECR */
     default: return cur;                                 /* KEEP    */
     }
 }
 
 /* A stencil operation on a pixel whose colour is not written: only the alpha
  * byte changes. A 5650 target has no stencil and the write is dropped.
- * PMSK2 is applied to it as to any other alpha write; that a masked stencil
- * bit is kept is the reading of step 19's colour result, not a measurement. */
+ * PMSK2 is applied to it as to any other alpha write, a set bit keeping the
+ * old stencil bit: geprobe 5 scenes 29, 31 and 32 (fw 6.60) REPLACE, INCR and
+ * INVERT under PMSK2 0xF0, 0x0F and 0x3C on 8888, 5551 and 4444. */
 static void write_stencil_only(int x, int y, uint32_t value) {
     if (!g_fb_addr || !g_fb_stride || g_fb_fmt == 0) return;
     const uint32_t keep = 0x00FFFFFFu | g_bs.pixel_mask;
