@@ -1167,7 +1167,13 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * Through-mode triangles take the leftmost among the vertices inside the
      * scissor, or among all three when none is: geprobe 1 step 18's triangle
      * with corners at (-100, 200) and (100, 600) matches only when anchored
-     * at its third, (200, 150). What makes the two differ is not known.
+     * at its third, (200, 150). "Inside" looks at the pixel coordinate's low
+     * ten bits only, the scissor registers' width: geprobe 5 scene 28's
+     * triangle with a corner saturated to x = -2048 (0 in ten bits) matches
+     * only when anchored there, where its two on-screen corners leave 12007
+     * pixels off, and the -100 above is 924 in ten bits, outside. That is a
+     * fit to these two, not a mechanism anyone has seen. What makes
+     * transformed triangles differ is not known.
      * (A transformed vertex is one the GE projected: psp_vertex.precise.)
      *
      * The fog coefficient is a fifth plane through the same anchor, by the
@@ -1186,9 +1192,9 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
         const psp_vertex *vs[3] = { a, b, c };
         int inside[3], any = 0, k0 = -1;
         for (int k = 0; k < 3; k++) {
+            const int wx = (vs[k]->x >> 4) & 1023, wy = (vs[k]->y >> 4) & 1023;
             inside[k] = vs[k]->precise ||
-                        (vs[k]->x >= g_sc_x0 * SUBPX && vs[k]->x < (g_sc_x1 + 1) * SUBPX &&
-                         vs[k]->y >= g_sc_y0 * SUBPX && vs[k]->y < (g_sc_y1 + 1) * SUBPX);
+                        (wx >= g_sc_x0 && wx <= g_sc_x1 && wy >= g_sc_y0 && wy <= g_sc_y1);
             any |= inside[k];
         }
         for (int k = 0; k < 3; k++) {

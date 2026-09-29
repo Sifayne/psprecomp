@@ -923,6 +923,20 @@ static void test_depth_plane(void) {
               P[i][0], P[i][1], depth_at(P[i][0], P[i][1]), P[i][2]);
 }
 
+/* A 16-bit through-mode vertex far off screen saturates to the 12.4 range
+ * and anchors the colour plane: geprobe 5 scene 28 (fw 6.60), its second
+ * band, with the pixels the PSP wrote. */
+static void test_far_vertex_16bit(void) {
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, -5000, 65, 0xFF0000FFu); vertex(1, 230, 120, 0xFF00FF00u); vertex(2, 230, 65, 0xFFFF0000u);
+    cmd(0x04, (3u << 16) | 3);
+    end_list();
+    CHECK(pixel(0, 112) == 0x07DC18 && pixel(100, 112) == 0x12DC0D && pixel(200, 112) == 0x1EDC02 &&
+          pixel(0, 114) == 0,
+          "far 16-bit vertex: %06X %06X %06X %06X, hardware 07DC18 12DC0D 1EDC02 000000",
+          pixel(0, 112), pixel(100, 112), pixel(200, 112), pixel(0, 114));
+}
+
 static void float_vertex(int i, float x, float y, float z);
 
 static void cmd_float(uint8_t op, float f) {
@@ -1646,6 +1660,7 @@ int main(void) {
     test_depth_plane();
     test_transformed_depth();
     test_line_between_centres();
+    test_far_vertex_16bit();
     test_backend_selection();
     test_backend_registration();
     test_indexed_triangle_batch_boundary();

@@ -1147,8 +1147,11 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
 
     switch (VT_POS(vtype)) {
     case 2:   /* 16-bit: whole pixels, onto the 1/16 grid */
-        out->x = (int)(int16_t)psp_read16(addr + (uint32_t)pos_off) * PSP_SUBPX;
-        out->y = (int)(int16_t)psp_read16(addr + (uint32_t)pos_off + 2) * PSP_SUBPX;
+        /* Saturated to 12.4 like a float's (fx16_sat): geprobe 5 (fw 6.60)
+         * scene 28 draws its 16-bit triangles with vertices at x -5000 and
+         * 5000 pixel for pixel as it draws the same ones given as floats. */
+        out->x = fx16_sat((float)(int16_t)psp_read16(addr + (uint32_t)pos_off));
+        out->y = fx16_sat((float)(int16_t)psp_read16(addr + (uint32_t)pos_off + 2));
         /* Through-mode depth is already a window value, and unsigned: the
          * screen z range is 0..65535, not -32768..32767. */
         out->z = (float)(uint16_t)psp_read16(addr + (uint32_t)pos_off + 4);
