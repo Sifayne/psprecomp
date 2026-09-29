@@ -414,7 +414,12 @@ psprecomp's model (`src/hle/ge.c`, "When the GE runs"):
   boundary. When no thread can run, the GE finishes what it has.
 - **Peeks.** The peeks report the truth for a list that is running, paused or
   queued behind one: 2, 4 or 1. A list waiting at its stall still reads done,
-  as before; see the comment at `hle_ListSync`.
+  as before; see the comment at `hle_ListSync`. geprobe 6 asks what a stalled
+  list reads.
+- **Pause.** A PAUSE holds the list at its FINISH until `sceGeContinue`. A
+  `sceGeContinue` from the PAUSE's own signal handler, which runs before the
+  pause takes hold, lets the list through instead. That case is not measured;
+  geprobe 6's last step asks.
 - **Backends.** Pixel costs come from the software renderer's counter. Under
   any other backend the GE charges commands and vertices only, so it runs
   faster there.
@@ -495,8 +500,29 @@ which texel is read (geprobe step 12 and geprobe 5 scene 28, fw 6.60):
   is overwritten before the GE reads it. geprobe 5 step 61 shows it directly:
   such a block reads back changed in 16 of 16 words after
   `sceKernelDcacheWritebackAll`. On the PSP the step switched fw 6.60 off.
-  psprecomp has no cache and runs it. The step stays a known crash in the
-  probe.
+  psprecomp has no cache and runs it, and step 61 reads 0 words changed.
+  Modelling the cache is out of scope: the step is `KNOWN_CRASH` from geprobe 6
+  on, and step 61 stays a difference.
+
+## Still open after geprobe 5
+
+What geprobe 5 (fw 6.60) still shows psprecomp getting wrong, with the
+geprobe 6 scene aimed at each. Details and confidence are in
+`fw660-run5/findings/geprobe.md`.
+
+- **Lighting away from the axes** (scene 16, 16930 pixels, 1 or 2 low on the
+  PSP). Scene 25, whose light and normals lie in the x-z plane, is exact.
+  Scene 34 changes one thing per row; scene 35 covers point and spot lights.
+- **Colour gradient precision** (scene 17's colour, 81 pixels; scene 20, 54).
+  A finer 1/area fixes the one and breaks the other. Scene 39.
+- **Morph colour blends** (scene 21, 450 pixels of +1): not a kept fraction,
+  not rounding. Scene 40.
+- **Patch vertices** at divisions that are not powers of 2, and splines
+  (scenes 22, 23 and 26: 3452, 2118 and 2263 pixels). Scene 38 draws them as
+  points.
+- **3D depth anchor** (scene 17's depth buffer, 303; scene 27's, 1867). Scene
+  36.
+- **Line ends** (scene 28, 1 pixel). Scene 37.
 
 ## Validation
 
