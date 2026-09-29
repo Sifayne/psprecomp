@@ -439,6 +439,28 @@ passed straight through):
 - PRIM and BBOX move VADDR past the vertices they read (geprobe 5 scene 33,
   and libgu's `sceGuDrawArrayN`), where before VADDR stayed put.
 
+## Depth values
+
+The software backend writes the depth geprobe 5 (fw 6.60) measured, not a
+float blend (`src/render.c` sw_tri, `src/hle/ge.c` ge_screen_z):
+
+- **A transformed vertex's depth** is computed in the GE's own 24-bit float
+  (16 significant bits, cut toward zero) from clip z to the viewport: clip z
+  a product and a sum at a time, the divide by w, the scale, the centre. The
+  rasterizer takes the integer part. Scenes 17 and 27 pin six vertex depths
+  this way; the float computation had four of them off by up to 0.8. x and y
+  keep their own rule (screen_axis_fx16), which was measured separately.
+- **Across a triangle** depth is a plane, like colour: anchored at the same
+  vertex, with gradients from the numerator times 1/area, where 1/area is
+  also a 24-bit float, then floored to 1/1024 a pixel. Scene 27's four
+  through-mode triangles match on every pixel.
+- **Open:** three of scene 27's and 17's six 3D triangles match only with
+  the plane anchored at another vertex (the right-hand one of the quad that
+  slopes in x, the nearest of scene 17's second triangle); the rule that
+  picks it is not known. Lines interpolate depth by a different rule, also
+  not known (scene 27's lines are off by 91 or 149 along whole rows). A GPU
+  backend shares the vertex depths and interpolates them itself.
+
 ## Known differences
 
 - **The data cache is not modelled.** geprobe 4's step 35, repeated as

@@ -1053,6 +1053,24 @@ static int64_t grad1024(int64_t num, int64_t den) {
     return num > 0 ? (num - 1) / den : -((den - 1 - num) / den);
 }
 
+/* v / 2^s, floored (s >= 1). */
+static int64_t floor_shr(int64_t v, int s) {
+    return v >= 0 ? v >> s : -((-v + ((int64_t)1 << s) - 1) >> s);
+}
+
+/* 1/area (area > 0) as the GE's triangle setup has it: the GE's own float,
+ * 16 significant bits, cut toward zero (ge24 in src/hle/ge.c). Returned as
+ * q / 2^sh, q < 2^16 except for a power of two, where it is exact. Depth
+ * gradients go through it (sw_tri); geprobe 5 (fw 6.60) scene 27's four
+ * through-mode triangles pin the width: 15 to 17 bits reproduce all 30300
+ * of their pixels, 14 and 18 do not, and the exact 1/area leaves 653. */
+static void area_rcp(int64_t area, int64_t *q, int *sh) {
+    int L = 0;
+    while (L < 62 && (area >> L) != 0) L++;
+    *sh = 16 + L - 1;
+    *q = (int64_t)(((uint64_t)1 << *sh) / (uint64_t)area);
+}
+
 /* Floored, clamped to a channel: the plane's value in 1/16384ths. */
 static uint32_t plane_chan(int64_t acc) {
     const int64_t v = acc >> 14;
@@ -1162,6 +1180,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * Kept in 1/16384ths of a channel (1/1024 of a step times the 1/16 grid)
      * so every pixel is exact integer arithmetic. */
     int64_t col_acc[5] = { 0, 0, 0, 0, 0 }, col_dx[5] = { 0, 0, 0, 0, 0 }, col_dy[5] = { 0, 0, 0, 0, 0 };
+    int64_t z_acc = 0, z_dx = 0, z_dy = 0;
     const int flat = g_bs.shade_flat;
     {
         const psp_vertex *vs[3] = { a, b, c };
@@ -1197,13 +1216,41 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             col_dx[i] = gx * SUBPX;
             col_dy[i] = gy * SUBPX;
         }
+        /* Depth is a plane too, through the same anchor, in the same
+         * 1/16384 units; what differs is the gradient: the numerator times
+         * area_rcp's short 1/area, floored to 1/1024 a pixel. The vertex
+         * depths are integers -- through mode's as given, a transformed
+         * vertex's floored from ge_screen_z. geprobe 5 (fw 6.60) scene 27's
+         * through-mode triangles (full range, nearly flat, constant, steep
+         * in y) match on every pixel; the barycentric float blend this
+         * replaces left the constant 12345 at 12344 on 60 of them and was a
+         * step off on 3000 more. Of the 3D triangles of scenes 27 and 17,
+         * three match on every interior pixel; the other three (scene 27's
+         * quad sloping in x, both halves, and the second of scene 17's
+         * interpenetrating pair) match only when anchored at another vertex,
+         * by a rule not yet known (docs/RENDERER.md). */
+        {
+            int64_t rq; int rsh;
+            area_rcp(area, &rq, &rsh);
+            int64_t zv[3];
+            for (int k = 0; k < 3; k++) {
+                const float z = vs[k]->z;
+                zv[k] = !(z > 0.0f) ? 0 : (z >= 65535.0f ? 65535 : (int64_t)z);
+            }
+            const int64_t nx = (zv[1] - zv[0]) * (c->y - a->y) - (zv[2] - zv[0]) * (b->y - a->y);
+            const int64_t ny = (zv[2] - zv[0]) * (b->x - a->x) - (zv[1] - zv[0]) * (c->x - a->x);
+            const int64_t gx = floor_shr(nx * rq, rsh - 14), gy = floor_shr(ny * rq, rsh - 14);
+            z_acc = zv[k0] * 16384 + gx * (px - vs[k0]->x) + gy * (py - vs[k0]->y);
+            z_dx = gx * SUBPX;
+            z_dy = gy * SUBPX;
+        }
     }
 
-    /* The edge functions are already the barycentric numerators, so depth
-     * and texture coordinates come out of the same three values the
-     * coverage test computes.
+    /* The edge functions are already the barycentric numerators, so texture
+     * coordinates come out of the same three values the coverage test
+     * computes.
      *
-     * Depth and fog are affine in screen space. Texture coordinates
+     * Texture coordinates
      * are not: transformed vertices retain reciprocal clip W (and a texture
      * projection Q), so the textured branch below performs the homogeneous
      * divide the PSP uses on oblique geometry. Through-mode vertices carry
@@ -1229,13 +1276,15 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     for (int y = miny; y <= maxy; y++) {
         int64_t w0 = row0, w1 = row1, w2 = row2;
         int64_t acc[5] = { col_acc[0], col_acc[1], col_acc[2], col_acc[3], col_acc[4] };
+        int64_t zacc = z_acc;
         for (int x = minx; x <= maxx; x++) {
             if (w0 + bias0 >= 0 && w1 + bias1 >= 0 && w2 + bias2 >= 0) {
                 const float l0 = (float)w0 * inv;
                 const float l1 = (float)w1 * inv;
                 const float l2 = (float)w2 * inv;
 
-                const float z = l0 * a->z + l1 * b->z + l2 * c->z;
+                const int64_t zi = zacc >> 14;
+                const float z = zi < 0 ? 0.0f : (zi > 65535 ? 65535.0f : (float)zi);
 
                 const int fg = (int)plane_chan(acc[4]);
 
@@ -1272,9 +1321,11 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             }
             w0 -= d0y * SUBPX; w1 -= d1y * SUBPX; w2 -= d2y * SUBPX;
             for (int i = 0; i < 5; i++) acc[i] += col_dx[i];
+            zacc += z_dx;
         }
         row0 += d0x * SUBPX; row1 += d1x * SUBPX; row2 += d2x * SUBPX;
         for (int i = 0; i < 5; i++) col_acc[i] += col_dy[i];
+        z_acc += z_dy;
     }
 }
 

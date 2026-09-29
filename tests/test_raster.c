@@ -889,6 +889,78 @@ static void test_depth_in_vram(void) {
           "zeroed VRAM rejects nothing under GEQUAL: 0x%08X", pixel(150, 100));
 }
 
+/* The depth at (x, y), through the VRAM layout test_depth_in_vram describes. */
+static uint16_t depth_at(int x, int y) {
+    const uint32_t l = 0x88000u + (uint32_t)(y * 512 + x) * 2;
+    const uint32_t mid = (l >> 5) & 0x1F, rot = ((mid << 1) | (mid >> 4)) & 0x1F;
+    return psp_read16(0x04000000u + (((l & ~(0x1Fu << 5)) | (rot << 5)) ^ 0x2040u));
+}
+
+/* Depth across a triangle is a plane with a short 1/area (render.c
+ * area_rcp). geprobe 5 (fw 6.60) scene 27's four through-mode triangles,
+ * drawn the same way, and pixels of each that the float blend this replaced
+ * had one off, with what the hardware wrote there. */
+static void test_depth_plane(void) {
+    static const int T[12][3] = {
+        { 10, 10, 0 },      { 230, 10, 65535 },  { 10, 90, 30000 },
+        { 230, 20, 1000 },  { 230, 100, 1003 },  { 20, 100, 1010 },
+        { 10, 110, 12345 }, { 230, 110, 12345 }, { 120, 170, 12345 },
+        { 10, 175, 0 },     { 230, 175, 0 },     { 120, 200, 65535 } };
+    static const int P[][3] = {
+        { 49, 11, 12328 },  { 40, 26, 15272 },   { 128, 42, 47486 },  { 31, 80, 32841 },
+        { 208, 29, 1000 },  { 215, 63, 1001 },   { 208, 83, 1002 },   { 223, 98, 1002 },
+        { 16, 111, 12345 }, { 212, 113, 12345 }, { 209, 119, 12345 }, { 159, 141, 12345 },
+        { 43, 181, 17038 }, { 74, 186, 30145 },  { 140, 189, 38009 }, { 126, 197, 58980 } };
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    depth_state(1);                  /* ALWAYS, writes on */
+    for (int i = 0; i < 12; i++) vertex_z(i, T[i][0], T[i][1], T[i][2], 0xFFFFFFFFu);
+    cmd(0x04, (3u << 16) | 12);      /* PRIM: triangles */
+    end_list();
+    for (unsigned i = 0; i < sizeof P / sizeof P[0]; i++)
+        CHECK(depth_at(P[i][0], P[i][1]) == P[i][2], "depth at (%d,%d): %u, hardware %d",
+              P[i][0], P[i][1], depth_at(P[i][0], P[i][1]), P[i][2]);
+}
+
+static void float_vertex(int i, float x, float y, float z);
+
+static void cmd_float(uint8_t op, float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    cmd(op, bits >> 8);
+}
+
+/* A transformed vertex's depth is computed in the GE's 16-bit-significand
+ * float (ge.c ge_screen_z). geprobe 5 (fw 6.60) scenes 17 and 27 under
+ * sceGumPerspective(60, 480/272, 1, 100) and sceGuDepthRange(65535, 0): eye
+ * z -4.5, -5.5 and -8 give 14049, 11374 and 7612, where a float computation
+ * gives 14048.22, 11373.64 and 7612.5. */
+static void test_transformed_depth(void) {
+    static const float PROJ[16] = { 0.981491089f, 0, 0, 0, 0, 1.73202515f, 0, 0,
+                                    0, 0, -1.02017212f, -1, 0, 0, -2.0201416f, 0 };
+    static const struct { float z; int depth; } Z[] = { { -4.5f, 14049 }, { -5.5f, 11374 }, { -8.0f, 7612 } };
+    for (unsigned k = 0; k < sizeof Z / sizeof Z[0]; k++) {
+        psp_ge_reset(); clear_fb();
+        begin_list_vtype((7u << 2) | (3u << 7));
+        for (int m = 0; m < 2; m++) {                          /* world, view: identity */
+            cmd((uint8_t)(0x3A + 2 * m), 0);
+            for (int i = 0; i < 12; i++) cmd((uint8_t)(0x3B + 2 * m), i % 4 == 0 ? 0x3F8000 : 0);
+        }
+        cmd(0x3E, 0);
+        for (int i = 0; i < 16; i++) cmd_float(0x3F, PROJ[i]);
+        cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+        cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+        cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+        depth_state(1);                                        /* ALWAYS, writes on */
+        float_vertex(0, -1, -1, Z[k].z); float_vertex(1, 1, -1, Z[k].z); float_vertex(2, 0, 1, Z[k].z);
+        cmd(0x04, (3u << 16) | 3);
+        end_list();
+        CHECK(depth_at(240, 140) == Z[k].depth, "eye z %.1f: depth %u, hardware %d",
+              (double)Z[k].z, depth_at(240, 140), Z[k].depth);
+    }
+}
+
 /* The backend interface itself. The software path is the reference every other
  * backend is diffed against, so selection has to be predictable: an unknown
  * name must not silently leave you rendering into nothing. */
@@ -1542,6 +1614,8 @@ int main(void) {
     test_clear_mode_clears_depth();
     test_depth_test_still_rejects();
     test_depth_in_vram();
+    test_depth_plane();
+    test_transformed_depth();
     test_backend_selection();
     test_backend_registration();
     test_indexed_triangle_batch_boundary();

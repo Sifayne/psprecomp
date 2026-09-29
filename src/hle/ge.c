@@ -1329,6 +1329,23 @@ static void mul_3x3(const float m[12], const float in[3], float out[3]) {
     out[2] = m[2]*in[0] + m[5]*in[1] + m[8]*in[2];
 }
 
+/* The GE's own float: sign, exponent and 16 significant bits, cut toward
+ * zero. The depth path below computes in it (ge_depth_row, ge_screen_z). */
+static double ge24(double v) {
+    if (v == 0.0 || !isfinite(v)) return v;
+    int e;
+    const double m = frexp(v, &e);
+    return ldexp(trunc(m * 65536.0), e - 16);
+}
+
+/* One row of the projection, eye to clip, a product and a sum at a time in
+ * ge24: the z and w a transformed vertex's depth comes from. */
+static float ge_depth_row(const float m[16], int row, const float in[3]) {
+    double t = ge24(ge24((double)m[row] * in[0]) + ge24((double)m[4 + row] * in[1]));
+    t = ge24(t + ge24((double)m[8 + row] * in[2]));
+    return (float)ge24(t + m[12 + row]);
+}
+
 static void mul_4x4(const float m[16], const float in[3], float out[4]) {
     out[0] = m[0]*in[0] + m[4]*in[1] + m[8] *in[2] + m[12];
     out[1] = m[1]*in[0] + m[5]*in[1] + m[9] *in[2] + m[13];
@@ -1448,9 +1465,29 @@ static void ndc_to_screen(float nx, float ny, float nz, float *sx, float *sy, fl
                                : (nz * 0.5f + 0.5f) * 65535.0f;
 }
 
+/* Screen depth from clip z and w, in ge24 throughout: the divide, the scale,
+ * the centre. geprobe 5 (fw 6.60) scenes 17 and 27 pin six vertex depths
+ * through their depth planes (eye z -4, -4.5, -5, -5.5, -6 and -8 under one
+ * perspective): 15887, 14049, 12577, 11374, 10371 and 7612, where a float
+ * computation gives 15887.0, 14048.22, 12577.20, 11373.64, 10370.67 and
+ * 7612.5. Cutting every product, sum and quotient to 16 significant bits
+ * toward zero -- clip z and w included (ge_depth_row) -- and the result to an
+ * integer by the rasterizer (sw_tri) gives all six (w is the float one cut
+ * to ge24, which for a perspective is what the row gives; flooring instead
+ * of cutting toward zero fits these positive values too); rounding, a fused
+ * multiply-add, a reciprocal in place of the divide, or any other width tried
+ * (10 to 24 bits) misses at least one. x and y keep their own measured rule
+ * (screen_axis_fx16). */
+static float ge_screen_z(float cz, float w) {
+    if (g_tl.vp_zs == 0.0f) return ((cz / w) * 0.5f + 0.5f) * 65535.0f;
+    const double ndc = ge24((double)cz / ge24(w));
+    return (float)ge24(ge24(ndc * g_tl.vp_zs) + g_tl.vp_zc);
+}
+
 static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
     const float inv = 1.0f / clip[3];
     ndc_to_screen(clip[0] * inv, clip[1] * inv, clip[2] * inv, sx, sy, sz);
+    *sz = ge_screen_z(clip[2], clip[3]);
 }
 
 /* The same projection onto the rasterizer's grid, as screen_axis_fx16 says. */
@@ -1742,6 +1779,7 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
         const float inv = 1.0f / poly[i].c[3];
         float sx, sy, sz;
         ndc_to_screen(poly[i].c[0] * inv, poly[i].c[1] * inv, poly[i].c[2] * inv, &sx, &sy, &sz);
+        sz = ge_screen_z(poly[i].c[2], poly[i].c[3]);
         if (g_tl.depth_clamp) {
             if (sz < 0.0f) sz = 0.0f;
             if (sz > 65535.0f) sz = 65535.0f;
@@ -2195,6 +2233,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             mul_4x3(g_tl.world, model, world);
             mul_4x3(g_tl.view,  world, eye);
             mul_4x4(g_tl.proj,  eye,   clip);
+            /* z as the GE forms it, for depth (ge_screen_z); w stays as it is
+             * for x and y, whose rule was measured with it. */
+            clip[2] = ge_depth_row(g_tl.proj, 2, eye);
             const uint64_t _p2 = ge_prof_now();
 
             psp_vertex *o = &v[decoded];
