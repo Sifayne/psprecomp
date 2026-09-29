@@ -222,6 +222,12 @@ void psp_hle_call(uint32_t nid) {
      * clock deterministic, which is what the oracle needs, because both sides
      * make the same calls in the same order. */
     psp_clock_tick();
+    /* And the GE, which works alongside the CPU, catches up with that time
+     * before the call: a handler it owes runs here, as the interrupt would
+     * have while the caller was on its way in (src/hle/ge.c, "When the GE
+     * runs"). Before the call and not after, so that a call which blocks
+     * until a GE handler has run finds it already run. */
+    psp_ge_tick();
 
     for (int i = 0; i < g_count; i++) {
         if (g_entry[i].nid == nid) {

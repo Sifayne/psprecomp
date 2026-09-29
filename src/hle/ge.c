@@ -31,6 +31,7 @@
 #include <windows.h>
 #endif
 #include "psprecomp/hle.h"
+#include "psprecomp/clock.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/render.h"
 #include "psprecomp/sched.h"
@@ -333,9 +334,60 @@ typedef struct {
     int      used;
     int      done;
     int      cbid;      /* sceGeSetCallback id given at EnQueue; -1 none */
+    int      paused;    /* stopped at a PAUSE until sceGeContinue */
+    int      cont_early;/* sceGeContinue arrived before the pause took hold */
 } ge_queue;
 
 static ge_queue g_queue[MAX_QUEUES];
+
+/* When the GE runs.
+ *
+ * The GE works alongside the CPU, and geprobe 5 (fw 6.60) shows how far
+ * behind it: a list of a few commands has run, callbacks and all, before
+ * sceGeListEnQueue returns (steps 54-56), but 200 full-screen sprites have
+ * not -- ListSync(peek) reads 2, DRAWING, as EnQueue returns, and only the
+ * first SIGNAL's handler has run (step 58). Words released by
+ * sceGeListUpdateStallAddr run after that call returns: libgu's sceGuFinish
+ * releases one small sprite and the FINISH, and the finish handler runs after
+ * sceGuFinish, in sceGuSync (step 50).
+ *
+ * Guest time here moves only at firmware calls (a tick each), waits and
+ * vblanks, so that is when the GE catches up too, like the timers in
+ * ktimer.c: the GE keeps its own time, g_ge_t, in GE_UNITS_PER_US units per
+ * guest microsecond, and every command it starts costs GE_COMMAND_UNITS,
+ * plus the pixels it wrote and GE_VERTEX_UNITS a vertex. It starts a command only while g_ge_t is
+ * behind the moment it is allowed to reach: the current time at a firmware
+ * call (psp_ge_tick), GE_KICK_WINDOW_US past it inside EnQueue and Continue,
+ * and no limit in a Sync that waits, at a frame boundary, or when every
+ * thread is blocked (psp_ge_idle_run). A million pixels a microsecond is far
+ * faster than the hardware, on purpose: the CPU here takes no time between
+ * firmware calls, so the GE is given as little room as possible to fall
+ * behind it, while the step 58 list (about 13 million pixels) still does. */
+#define GE_UNITS_PER_US   (1ull << 20)
+#define GE_VERTEX_UNITS   16ull
+#define GE_COMMAND_UNITS  16ull
+#define GE_KICK_WINDOW_US 1ull
+static uint64_t g_ge_t;        /* the GE's own time, in units */
+static uint64_t g_ge_limit;    /* a walk starts no command at or past this; 0: no limit */
+static int      g_ge_backlog;  /* released words may be waiting for the GE */
+
+/* A handler the GE has asked for between firmware calls, waiting to run.
+ *
+ * Inside EnQueue and Continue, and in a Sync that waits, handlers run as the
+ * GE reaches them. When the GE catches up at a firmware call, a SIGNAL or
+ * FINISH it reaches is held here instead, and the GE waits on it; the handler
+ * runs at the next firmware call made with interrupts enabled, which is when
+ * the interrupt would have been taken. geprobe 5 step 50 (fw 6.60) is the
+ * measurement: libgu's sceGuFinish releases a sprite and the FINISH, then
+ * suspends and resumes interrupts, and the finish handler runs after it has
+ * returned; here the FINISH is reached at the suspend and the handler held
+ * past the resume to sceGuSync. The two SIGNALs of the same step are
+ * reached one firmware call after their release and run at the call after
+ * that, still before sceGuFinish, as on the PSP. */
+static struct { int valid, cbid, finish; uint32_t id; } g_ge_pend;
+static int g_ge_defer;         /* hold handlers in g_ge_pend (a catch-up) */
+
+static uint64_t ge_now(void) { return psp_clock_peek() * GE_UNITS_PER_US; }
 
 /* sceGeSetCallback's registrations: PSPSDK pspge.h's PspGeCallbackData,
  * copied at registration, indexed by the id it returns. */
@@ -597,6 +649,10 @@ static void ge_note_thread(void) {
 
 void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
+    g_ge_t = g_ge_limit = 0;
+    g_ge_backlog = 0;
+    memset(&g_ge_pend, 0, sizeof g_ge_pend);
+    g_ge_defer = 0;
     memset(g_ge_cb, 0, sizeof g_ge_cb);
     memset(&g_ge, 0, sizeof g_ge);
     g_ge.fbfmt = 3;
@@ -2786,6 +2842,9 @@ static void run_list_body(ge_queue *q);
  * back into sceGe; a walk it would start is left to the one already running,
  * which reads the stall afresh on every word, or to the next Sync. */
 static int g_ge_walking;
+/* Set while a handler runs outside a walk (one held for a firmware call): a
+ * firmware call it makes does not start the GE again inside it. */
+static int g_ge_in_cb;
 
 /* A SIGNAL or FINISH interrupt handler, called the way the firmware calls it:
  * (id, arg), id being the command's low 16 bits and arg the one registered
@@ -2807,6 +2866,30 @@ static void ge_callback(int cbid, int finish, uint32_t id) {
     psp_dispatch(fn);
     psp_sched_set_dispatch(was);
     psp_cpu = save;
+}
+
+/* The GE reaching a SIGNAL or FINISH: the handler runs now, or, during a
+ * catch-up, is held in g_ge_pend. Returns nonzero when the walk has to stop
+ * and wait for it. A list with no handler for it does not wait. */
+static int ge_raise(int cbid, int finish, uint32_t id) {
+    if (cbid < 0 || cbid >= GE_MAX_CALLBACKS || !g_ge_cb[cbid].used ||
+        !(finish ? g_ge_cb[cbid].finish_func : g_ge_cb[cbid].signal_func)) return 0;
+    if (!g_ge_defer) { ge_callback(cbid, finish, id); return 0; }
+    g_ge_pend.valid = 1; g_ge_pend.cbid = cbid; g_ge_pend.finish = finish; g_ge_pend.id = id;
+    return 1;
+}
+
+/* Run a held handler. `force` runs it whatever the interrupt state (a wait on
+ * the GE, which has to see handlers in order); otherwise only with interrupts
+ * enabled. Returns nonzero if one is still held. */
+static int ge_deliver(int force) {
+    if (!g_ge_pend.valid) return 0;
+    if (!force && !psp_intr_enabled()) return 1;
+    g_ge_pend.valid = 0;
+    g_ge_in_cb = 1;
+    ge_callback(g_ge_pend.cbid, g_ge_pend.finish, g_ge_pend.id);
+    g_ge_in_cb = 0;
+    return 0;
 }
 
 /* BBOX (0x07): the next `count` vertices at VADDR, of the current vertex
@@ -2880,7 +2963,7 @@ static void advance_vertices(uint32_t count) {
 }
 
 static void run_list(ge_queue *q) {
-    if (g_ge_walking) return;
+    if (g_ge_walking || q->paused) return;
     g_ge_walking = 1;
     const uint64_t _r0 = ge_prof_now();
     run_list_body(q);
@@ -2907,6 +2990,7 @@ static void run_list_body(ge_queue *q) {
     uint32_t lp_addr = 0, lp_end = 0;
     while (budget--) {
         if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
+        if (g_ge_limit && g_ge_t >= g_ge_limit) break; /* out of time for now */
 
         uint32_t word;
         if (q->list != lp_addr || q->list + 4 > lp_end || !lp) {
@@ -2922,6 +3006,7 @@ static void run_list_body(ge_queue *q) {
         const uint64_t _c0 = ge_prof_now();
         q->list += 4;
         g_ge.commands++;
+        g_ge_t += GE_COMMAND_UNITS;
 
         switch (cmd) {
         case GE_NOP:
@@ -2937,15 +3022,20 @@ static void run_list_body(ge_queue *q) {
                 ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
             g_ge.targets[g_ge.cur_target].prims++;
             g_ge.vertices += count;
+            const uint64_t px0 = psp_render_pixels();
             draw_prim(type, count);
             advance_vertices(count);
+            g_ge_t += (psp_render_pixels() - px0) + GE_VERTEX_UNITS * count;
             break;
         }
         case GE_BEZIER:
-        case GE_SPLINE:
+        case GE_SPLINE: {
             g_ge.prims[3]++;
+            const uint64_t px0 = psp_render_pixels();
             draw_patch(cmd == GE_SPLINE, arg);
+            g_ge_t += (psp_render_pixels() - px0) + GE_VERTEX_UNITS * (arg & 0xFF) * ((arg >> 8) & 0xFF);
             break;
+        }
 
         case GE_JUMP:
             q->list = (q->base | (arg & 0xFFFFFC));
@@ -2971,16 +3061,20 @@ static void run_list_body(ge_queue *q) {
 
         case GE_FINISH:
             if (q->signal == GE_SIGNAL_HANDLER_PAUSE) {
-                /* sceGuSignal(GU_SIGNAL_PAUSE) deliberately places a
-                 * FINISH/END pair after SIGNAL/END. Hardware pauses here for
-                 * the signal callback, then sceGeContinue resumes after the
-                 * END. The signal handler already ran at the SIGNAL and
-                 * sceGeContinue is not modelled, so flush the completed work
-                 * and resume immediately rather than truncating the remainder
-                 * of the list. This FINISH is not the list's own, so it calls
-                 * no finish handler (not measured). */
+                /* sceGuSignal(GU_SIGNAL_PAUSE) writes SIGNAL, END, FINISH,
+                 * END. geprobe 5 step 57 (fw 6.60): the signal handler runs
+                 * at the SIGNAL, inside EnQueue; then the list stops until
+                 * sceGeContinue -- 20 ms on, one handler has run,
+                 * ListSync(peek) reads 4 and DrawSync(peek) 2 -- and this
+                 * FINISH calls no finish handler. After sceGeContinue the
+                 * rest runs, inside the call as a new list would. It stops
+                 * here, at the FINISH, and resumes at the END after it. A
+                 * sceGeContinue that came first (from the signal handler)
+                 * lets it through; not measured. */
                 psp_render_current()->finish();
-                break;
+                if (q->cont_early) { q->cont_early = 0; break; }
+                q->paused = 1;
+                return;
             }
             g_ge.finishes++;
             q->done = 1;
@@ -2994,7 +3088,7 @@ static void run_list_body(ge_queue *q) {
             psp_render_current()->finish();
             /* The list is done before its handler runs, so a handler that
              * asks after it is told so. Not measured. */
-            ge_callback(q->cbid, 1, arg);
+            ge_raise(q->cbid, 1, arg);
             return;
 
         case GE_END: {
@@ -3028,8 +3122,9 @@ static void run_list_body(ge_queue *q) {
              * call the signal handler; the list then carries on, the PAUSE
              * variant through its FINISH/END pair below. The jump/call/ret
              * and other behaviours are not modelled and call nobody. */
-            if (((arg >> 16) & 0xFF) >= 1 && ((arg >> 16) & 0xFF) <= 3)
-                ge_callback(q->cbid, 0, arg);
+            if (((arg >> 16) & 0xFF) >= 1 && ((arg >> 16) & 0xFF) <= 3 &&
+                ge_raise(q->cbid, 0, arg))
+                return;
             break;
 
         case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -3526,6 +3621,10 @@ static ge_queue *find_queue(uint32_t id) {
 
 
 static ge_queue *oldest_pending(void);
+static int  ge_has_work(void);
+static void ge_release(int was_busy);
+static void ge_run_until(uint64_t limit);
+static void ge_after_wait(void);
 
 static void enqueue(int head) {
     /* (list, stall, cbid, arg) */
@@ -3573,21 +3672,23 @@ static void enqueue(int head) {
     q->cbid  = (int)psp_arg(2);
     (void)head;
 
-    /* A list with nothing ahead of it runs here, as far as its stall allows;
-     * one queued behind another waits for Sync(WAIT)/DrawSync(WAIT), which
-     * drain in id order. geprobe step 26 (fw 6.60) enqueues a seven-word
-     * list with no stall and both its SIGNALs and its FINISH have called
-     * their handlers before sceGeListEnQueue returns. That replaces the
-     * earlier rule here, that a list is still pending at Sync time, for a
-     * short list at least: how much of a long one runs before EnQueue
-     * returns is not measured, and here all of it does. A libgu DIRECT list
-     * is enqueued with its stall at its start and runs nothing yet.
+    /* The GE starts on the queue here and runs it for GE_KICK_WINDOW_US
+     * of its own time before EnQueue returns (see g_ge_t): geprobe step 26
+     * and geprobe 5 steps 54-56 (fw 6.60) enqueue a seven-word list with no
+     * stall, and both its SIGNALs and its FINISH have called their handlers
+     * before sceGeListEnQueue returns; geprobe 5 step 58's 200 full-screen
+     * sprites are still running when it returns (ListSync(peek) 2), with
+     * only the first SIGNAL's handler run. The rest runs at later firmware
+     * calls, or in the Sync that waits for it. A list queued behind another
+     * waits its turn. A libgu DIRECT list is enqueued with its stall at its
+     * start and runs nothing yet.
      *
-     * UpdateStallAddr resumes a stalled list immediately, like the hardware
-     * consuming newly-released words while the CPU builds. This half is
-     * load-bearing, not an optimisation: pspgu reuses one list buffer
-     * across tests, so executing the tail only at Sync would run the new
-     * list's words under the old id (simple.prx's 8 grey pixels).
+     * UpdateStallAddr releases words that run from the next firmware call
+     * on. That the tail of one list has run before the next firmware call
+     * is load-bearing: pspgu reuses one list buffer across tests, so a tail
+     * left for Sync would run the new list's words under the old id
+     * (simple.prx's 8 grey pixels), and the new list's EnQueue is such a
+     * call.
      *
      * Sync(WAIT) on a still-pending list yields once -- an equal-priority
      * thread runs there on hardware, which is pspautotests' checkpoint [r]
@@ -3603,12 +3704,14 @@ static void enqueue(int head) {
      * pspgu's helpers poll it on tiny internal lists that have finished on
      * hardware by the time anyone asks).
      *
-     * Not yet modelled: head-vs-tail ordering, BREAK/pause state 4,
-     * DeQueue, GetCmd/GetMtx/GetStack (unimplemented, read 0), and the
-     * queue-full code (hardware 0x80000022). Full worker thread only when
-     * something streams via stall and needs real overlap. */
+     * Not yet modelled: head-vs-tail ordering, BREAK, DeQueue,
+     * GetCmd/GetMtx/GetStack (unimplemented, read 0), and the queue-full
+     * code (hardware 0x80000022). */
     g_ge.lists++;
-    if (q == oldest_pending()) run_list(q);
+    if (q == oldest_pending()) {
+        ge_release(0);
+        ge_run_until(ge_now() + GE_KICK_WINDOW_US * GE_UNITS_PER_US);
+    }
     psp_ret(q->id);
 }
 
@@ -3618,18 +3721,18 @@ static void hle_ListEnQueueHead(void) { enqueue(1); }
 static void hle_ListUpdateStallAddr(void) {
     ge_queue *q = find_queue(psp_arg(0));
     if (!q) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    const int busy = ge_has_work();
     q->stall = psp_arg(1) & 0x0FFFFFFCu;
-    /* Resume immediately: the hardware consumes newly-released words while
-     * the CPU builds, and the buffer may be reused by the next list as soon
-     * as this one is Sync'd -- executing the tail only at Sync would run
-     * the new list's words under the old id. A list enqueued without a stall
-     * has no stall to update: it ran in EnQueue, or waits its turn at Sync. */
-    if (!q->done) run_list(q);
+    /* The words run from the next firmware call on (psp_ge_tick), not in
+     * this one: geprobe 5 step 50 (fw 6.60), libgu's finish handler runs
+     * after sceGuFinish's stall update has returned. */
+    if (!q->done) ge_release(busy);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* List/Draw status, as pspautotests' status_str reads it: 0 DONE, 1 QUEUED,
- * 2 DRAWING, 3 STALL. BREAK/pause (4) is not modelled and reports DRAWING. */
+ * 2 DRAWING, 3 STALL, 4 PAUSED (geprobe 5 step 57, fw 6.60). BREAK is not
+ * modelled. */
 #define GE_SYNC_DONE 0
 #define GE_SYNC_WAIT 0
 static ge_queue *oldest_pending(void) {
@@ -3643,6 +3746,7 @@ static ge_queue *oldest_pending(void) {
 static int list_status(ge_queue *q) {
     if (!q || !q->used) return 0x80000100;
     if (q->done) return GE_SYNC_DONE;
+    if (q->paused) return 4;                                   /* PAUSED */
     if (q != oldest_pending()) return 1;                       /* QUEUED */
     if (q->stall && q->list == q->stall) return 3;              /* STALL */
     return 2;                                                  /* DRAWING */
@@ -3658,6 +3762,7 @@ static void drain_one(ge_queue *q) {
 /* Drain every pending list up to and including the target, in id order --
  * the order hardware executes them. */
 static void drain_through(uint32_t id) {
+    if (!g_ge_walking) ge_deliver(1);
     for (;;) {
         ge_queue *q = oldest_pending();
         if (!q || q->id > id) break;
@@ -3668,12 +3773,75 @@ static void drain_through(uint32_t id) {
 }
 
 static void drain_all(void) {
+    if (!g_ge_walking) ge_deliver(1);
     for (;;) {
         ge_queue *q = oldest_pending();
         if (!q) break;
         drain_one(q);
         if (!q->done) break;      /* stalled head blocks the rest */
     }
+}
+
+/* Whether the GE has words it could run now: the list at the head of the
+ * queue is neither paused nor waiting at its stall. */
+static int ge_has_work(void) {
+    if (g_ge_pend.valid) return 1;
+    const ge_queue *q = oldest_pending();
+    return q && !q->paused && !(q->stall && q->list == q->stall);
+}
+
+/* Words were released (EnQueue, a stall update, Continue). An idle GE starts
+ * on them now; a busy one gets to them after what it has. `was_busy` is
+ * ge_has_work() from before the release. */
+static void ge_release(int was_busy) {
+    const uint64_t now = ge_now();
+    if (!was_busy && g_ge_t < now) g_ge_t = now;
+    g_ge_backlog = 1;
+}
+
+/* Run the queue, in order, until the GE's time reaches `limit`, a list
+ * stalls or pauses, or the queue is empty. */
+static void ge_run_until(uint64_t limit) {
+    if (g_ge_walking || g_ge_in_cb) return;
+    if (ge_deliver(!g_ge_defer)) return;   /* still waiting on a handler */
+    g_ge_limit = limit ? limit : 1;
+    for (;;) {
+        ge_queue *q = oldest_pending();
+        if (!q) break;
+        drain_one(q);
+        if (!q->done || g_ge_t >= limit || g_ge_pend.valid) break;
+    }
+    g_ge_limit = 0;
+    if (!ge_has_work()) g_ge_backlog = 0;
+}
+
+/* After a Sync has waited for the GE, it is idle at the present moment: the
+ * wait costs the caller no guest time. */
+static void ge_after_wait(void) {
+    g_ge_t = ge_now();
+    if (!ge_has_work()) g_ge_backlog = 0;
+}
+
+/* At every firmware call (hle.c): the GE catches up to the present. */
+void psp_ge_tick(void) {
+    if (!g_ge_backlog || g_ge_walking || g_ge_in_cb) return;
+    g_ge_defer = 1;
+    ge_run_until(ge_now());
+    g_ge_defer = 0;
+}
+
+/* From the scheduler when no thread can run: the GE finishes what it has, as
+ * it would while the CPU idles, so a thread waiting for something a GE handler
+ * provides is not left stranded. Returns whether anything ran. */
+int psp_ge_idle_run(void) {
+    if (!g_ge_backlog || g_ge_walking || g_ge_in_cb) return 0;
+    if (!ge_has_work()) { g_ge_backlog = 0; return 0; }
+    const uint64_t c0 = g_ge.commands;
+    const int held = g_ge_pend.valid;
+    ge_deliver(1);
+    drain_all();
+    ge_after_wait();
+    return held || g_ge.commands != c0;
 }
 
 /* Flush for paths that present or inspect pixels without going through Sync
@@ -4173,7 +4341,12 @@ static void view_log_frame_mark(void) {
         fprintf(g_view_log, "F %u\n", psp_ctrl_polls());
 }
 
-void psp_ge_drain_all(void) { drain_all(); cap_frame_boundary(); view_log_frame_mark(); }
+void psp_ge_drain_all(void) {
+    drain_all();
+    if (!g_ge_walking) ge_after_wait();
+    cap_frame_boundary();
+    view_log_frame_mark();
+}
 
 /* Replay one captured list. Deliberately not sceGeListEnQueue: that reads its
  * arguments from guest registers and hands back an id nobody here has any use
@@ -4205,21 +4378,29 @@ void psp_ge_current_target(uint32_t *addr, uint32_t *stride, int *fmt) {
 static void hle_ListSync(void) {
     ge_queue *q = find_queue(psp_arg(0));
     if (!q) { psp_ret(0x80000100); return; }
+    if (psp_arg(1) == GE_SYNC_WAIT && !g_ge_walking) ge_deliver(1);
     if (q->done) { psp_ret(GE_SYNC_DONE); return; }
-    /* NOWAIT reports DONE even when pending. That is the pre-existing lie,
-     * kept deliberately: pspgu's own helpers (ClutLoad and friends) poll
-     * NOWAIT on their tiny internal lists, which on hardware have already
-     * finished by the time anyone asks. Reporting them pending steers pspgu
-     * down paths it never takes on hardware and moves pixels (simple.prx).
-     * True pending-aware NOWAIT needs BREAK-aware states plus real GE
-     * timing; until then only WAIT tells the truth. */
-    if (psp_arg(1) != GE_SYNC_WAIT) { psp_ret(GE_SYNC_DONE); return; }
+    /* NOWAIT tells the truth for a list the GE is still running or has
+     * paused, and for one queued behind such a list: geprobe 5 steps 57 and
+     * 58 (fw 6.60) read 4 while paused and 2 as a long list's EnQueue
+     * returns. For a list waiting at its stall it still reports DONE: pspgu's
+     * own helpers (ClutLoad and friends) poll NOWAIT on their tiny internal
+     * lists, which on hardware have already finished by the time anyone
+     * asks, and reporting them pending steers pspgu down paths it never
+     * takes on hardware and moves pixels (simple.prx). */
+    if (psp_arg(1) != GE_SYNC_WAIT) {
+        const ge_queue *h = oldest_pending();
+        const int live = h && (h->paused || ge_has_work());
+        psp_ret(live ? (uint32_t)list_status(q) : GE_SYNC_DONE);
+        return;
+    }
     /* WAIT on a pending list: give up the CPU once -- an equal-priority
      * thread runs here on hardware, which is the checkpoint [r] -- then
      * complete synchronously. A lone thread yields to itself and carries
      * on, so the game is unaffected. */
     psp_sched_yield();
     drain_through(q->id);
+    ge_after_wait();
     psp_ret(q->done ? GE_SYNC_DONE : list_status(q));
 }
 
@@ -4233,11 +4414,19 @@ static void retire_done(void) {
 }
 
 static void hle_DrawSync(void) {
-    /* NOWAIT: same standing lie as ListSync -- DONE, see above. */
-    if (psp_arg(0) != GE_SYNC_WAIT) { psp_ret(GE_SYNC_DONE); return; }
+    /* NOWAIT: 2 while the GE is running or paused (geprobe 5 step 57, fw
+     * 6.60: 2 during a pause), and otherwise the standing lie of ListSync,
+     * DONE even with a list waiting at its stall. */
+    if (psp_arg(0) != GE_SYNC_WAIT) {
+        const ge_queue *h = oldest_pending();
+        psp_ret(h && (h->paused || ge_has_work()) ? 2u : GE_SYNC_DONE);
+        return;
+    }
+    if (!g_ge_walking) ge_deliver(1);     /* a wait sees the handlers it owes run */
     if (!oldest_pending()) { retire_done(); psp_ret(GE_SYNC_DONE); return; }
     psp_sched_yield();
     drain_all();
+    ge_after_wait();
     retire_done();
     /* DONE even if a stalled list remains: Break is still a stub that reports
      * success without clearing anything, so reporting busy afterwards would
@@ -4246,12 +4435,30 @@ static void hle_DrawSync(void) {
 }
 
 static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
-static void hle_Continue(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
+/* sceGeContinue: a paused list goes on, run inside the call as EnQueue runs a
+ * new one -- geprobe 5 step 57 (fw 6.60): the SIGNAL and FINISH after the
+ * pause call their handlers before sceGeContinue returns, which reads 0.
+ * Called before the pause has taken hold (from the PAUSE's own signal
+ * handler), it lets the list through the pause instead; with nothing paused
+ * or about to be, it does nothing. Neither case, nor any error code, is
+ * measured. */
+static void hle_Continue(void) {
+    ge_queue *q = oldest_pending();
+    if (q && q->paused) {
+        q->paused = 0;
+        ge_release(0);
+        ge_run_until(ge_now() + GE_KICK_WINDOW_US * GE_UNITS_PER_US);
+    } else if (q && q->signal == GE_SIGNAL_HANDLER_PAUSE) {
+        q->cont_early = 1;
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 /* sceGeSetCallback(PspGeCallbackData *): signal_func, signal_arg,
- * finish_func, finish_arg, copied now; the id goes to sceGeListEnQueue. A
- * full table answers 0x80000022, out of memory; neither the table's size
- * nor that code is measured. */
+ * finish_func, finish_arg, copied now; the id goes to sceGeListEnQueue. The
+ * table holds 16 and a full one answers 0x80000022: geprobe 5 step 59 (fw
+ * 6.60) registers 15 beside libgu's own and the 16th is refused with it. */
 static void hle_SetCallback(void) {
     const uint32_t p = psp_arg(0);
     for (int i = 0; i < GE_MAX_CALLBACKS; i++) {

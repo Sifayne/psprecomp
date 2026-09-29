@@ -376,6 +376,82 @@ writes were disabled, fixed in `shade_pixel()`.
 - History-dependent render-target size/format changes, dithering, broader
   scene/hardware coverage and fractional point/line edge cases.
 
+## When the GE runs
+
+The GE works alongside the CPU, and a game can see how far behind it is: in
+when its signal and finish handlers run, and in what `sceGeListSync` and
+`sceGeDrawSync` report when asked without waiting. geprobe 5 (fw 6.60)
+measured it:
+
+- A list of a few commands, enqueued with no stall, has run with all its
+  handlers before `sceGeListEnQueue` returns (steps 54-56).
+- 200 full-screen sprites, enqueued the same way, are still being drawn when
+  EnQueue returns. `ListSync(peek)` reads 2 (drawing), and only the handler of
+  the first SIGNAL, which comes before the sprites, has run (step 58).
+- Words released by `sceGeListUpdateStallAddr` run after that call returns.
+  libgu's `sceGuFinish` releases one small sprite and the FINISH, and the
+  finish handler runs after `sceGuFinish` has returned, in `sceGuSync`
+  (step 50, the same in runs 1, 4 and 5).
+- A SIGNAL with the PAUSE behaviour stops the list until `sceGeContinue`.
+  Twenty milliseconds later only its own handler has run, and the peeks read
+  4 (paused) and 2 (drawing). The FINISH that libgu writes after the pause
+  calls no handler. The rest of the list runs inside `sceGeContinue` (step 57).
+
+psprecomp's model (`src/hle/ge.c`, "When the GE runs"):
+
+- **Time.** Guest time moves only at firmware calls, waits and vblanks, and
+  the GE keeps its own time on that clock. Each command costs a little, plus
+  the pixels it writes and a charge for each vertex. The GE runs about a
+  million pixels a guest microsecond, far faster than the hardware, because
+  the CPU here takes no time between firmware calls; the step 58 list, about
+  13 million pixels, still outlasts EnQueue.
+- **Where it runs.** EnQueue and Continue let the GE run a microsecond of its
+  time before they return, with handlers called as it reaches them. Every
+  firmware call first lets the GE catch up to the present. A SIGNAL or FINISH
+  it reaches while catching up waits, with the GE, until the next firmware
+  call made with interrupts enabled, which is when the interrupt would have
+  been taken. A Sync that waits runs everything, and so does a frame
+  boundary. When no thread can run, the GE finishes what it has.
+- **Peeks.** The peeks report the truth for a list that is running, paused or
+  queued behind one: 2, 4 or 1. A list waiting at its stall still reads done,
+  as before; see the comment at `hle_ListSync`.
+- **Backends.** Pixel costs come from the software renderer's counter. Under
+  any other backend the GE charges commands and vertices only, so it runs
+  faster there.
+
+What this can change for a game, compared with the model it replaces (every
+list ran to its stall inside the call that released it, and a PAUSE was
+passed straight through):
+
+- Handlers for words released by a stall update, which is every libgu DIRECT
+  list, run at a later firmware call and no longer inside the update. For
+  the usual `sceGuFinish` then `sceGuSync`, the finish handler now runs
+  inside the Sync, before it returns.
+- A guest that spins on a flag set by a GE handler without making any
+  firmware call never sees it set. psprecomp cannot interrupt recompiled
+  code, which is already true of alarms and vtimers (`src/hle/ktimer.c`).
+  With any firmware call in the loop, the GE progresses and the handler runs.
+- Peeks that read done may now read 2 or 4. A heavy list enqueued without a
+  stall can still be drawing when EnQueue returns.
+- A game that pauses a list and never calls `sceGeContinue` now leaves it
+  paused, as the PSP does. A Sync that waits on a paused list gives up after
+  one yield rather than blocking for ever.
+- PRIM and BBOX move VADDR past the vertices they read (geprobe 5 scene 33,
+  and libgu's `sceGuDrawArrayN`), where before VADDR stayed put.
+
+## Known differences
+
+- **The data cache is not modelled.** geprobe 4's step 35, repeated as
+  geprobe 5's step 60, builds its list in a `memalign(16, 64)` block through
+  the uncached alias. The block's cache line also holds the heap header, which
+  was written through the cache. The cache therefore holds a dirty line with
+  the list's old contents, and when the driver writes the cache back the list
+  is overwritten before the GE reads it. geprobe 5 step 61 shows it directly:
+  such a block reads back changed in 16 of 16 words after
+  `sceKernelDcacheWritebackAll`. On the PSP the step switched fw 6.60 off.
+  psprecomp has no cache and runs it. The step stays a known crash in the
+  probe.
+
 ## Validation
 
 The host's expanded scene suite uses `PSPRECOMP_GE_CAPTURE_POLLS=740,915,...`

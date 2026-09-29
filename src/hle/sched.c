@@ -333,8 +333,24 @@ static int handoff_locked(void) {
      * something only a timer handler provides was declared stranded. The cap
      * only stops a periodic handler that never readies anyone from spinning
      * guest time on for ever. */
-    int timer_runs = 0;
+    int timer_runs = 0, ge_ran = 0;
     while (best < 0) {
+        /* The GE, likewise, finishes what it was given while the CPU idles
+         * (src/hle/ge.c, "When the GE runs"); its handlers may ready a
+         * thread. It works at the present moment, so it goes first, and once:
+         * it runs until every list is done, stalled or paused, and running it
+         * again would only walk a list that never ends a second time. */
+        if (!ge_ran) {
+            ge_ran = 1;
+            psp_os_unlock(&g_lock);
+            const int ran = psp_ge_idle_run();
+            psp_os_lock(&g_lock);
+            if (ran) {
+                expire_locked(psp_clock_peek());
+                best = pick_locked();
+                continue;
+            }
+        }
         const uint64_t soonest = soonest_locked();
         const uint64_t timer = timer_runs < IDLE_TIMER_CAP && !psp_ktimer_in_handler()
                              ? psp_ktimer_next_due() : 0;

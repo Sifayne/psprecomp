@@ -330,6 +330,11 @@ uint32_t psp_ge_target(void);
 /* Run every queued list to FINISH/stall, in order. For present paths and
  * tests that must see finished pixels without going through Sync. */
 void psp_ge_drain_all(void);
+/* The GE catching up with guest time, at every firmware call (hle.c); and,
+ * from the scheduler's idle path, finishing what it has. The latter returns
+ * whether anything ran. See "When the GE runs" in src/hle/ge.c. */
+void psp_ge_tick(void);
+int  psp_ge_idle_run(void);
 
 /* The GE's register state, for capture and replay. Commands are differential,
  * so a frame only means anything against the state it started from -- a replay

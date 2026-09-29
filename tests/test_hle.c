@@ -895,11 +895,10 @@ static void test_ge_display_list(void) {
           "eDRAM is 2 MB");
 }
 
-/* GU_SIGNAL_PAUSE is followed by a FINISH/END pair where hardware pauses for
- * the callback. It then resumes the same display list after that END. The HLE
- * calls the signal handler at the SIGNAL and does not model sceGeContinue, so
- * it resumes immediately, but it must still execute the commands through the
- * list's real final FINISH. */
+/* GU_SIGNAL_PAUSE is followed by a FINISH/END pair, and the list stops there
+ * until sceGeContinue: geprobe 5 step 57 (fw 6.60) reads ListSync(peek) 4
+ * and DrawSync(peek) 2 while it waits, and the rest of the list runs inside
+ * sceGeContinue. */
 static void test_ge_signal_pause(void) {
     psp_ge_reset();
 
@@ -915,13 +914,18 @@ static void test_ge_signal_pause(void) {
     uint64_t before = psp_ge_command_count();
     uint32_t qid = call(psp_nid("sceGeListEnQueue"), LIST, 0, 0, 0);
     CHECK(qid != 0, "signal PAUSE list enqueued, got 0x%08X", qid);
-    CHECK(call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0) == 0,
-          "signal PAUSE list drains");
-
-    uint64_t executed = psp_ge_command_count() - before;
-    CHECK(executed == 6,
-          "SIGNAL PAUSE resumes through final FINISH: executed %llu commands, want 6",
-          (unsigned long long)executed);
+    CHECK(psp_ge_command_count() - before == 3, "stops at the pause's FINISH: %llu command(s)",
+          (unsigned long long)(psp_ge_command_count() - before));
+    uint32_t ls = call(psp_nid("sceGeListSync"), qid, 1, 0, 0);
+    uint32_t ds = call(psp_nid("sceGeDrawSync"), 1, 0, 0, 0);
+    CHECK(ls == 4 && ds == 2, "paused: ListSync(peek) 0x%08X DrawSync(peek) 0x%08X, hardware 4 and 2", ls, ds);
+    CHECK(psp_ge_command_count() - before == 3, "still paused after two firmware calls");
+    CHECK(call(psp_nid("sceGeContinue"), 0, 0, 0, 0) == 0, "sceGeContinue reads 0");
+    CHECK(psp_ge_command_count() - before == 6,
+          "the rest runs inside sceGeContinue: %llu command(s), want 6",
+          (unsigned long long)(psp_ge_command_count() - before));
+    CHECK(call(psp_nid("sceGeListSync"), qid, 1, 0, 0) == 0, "done after Continue");
+    CHECK(call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0) == 0, "signal PAUSE list drains");
 }
 
 /* GE callbacks, geprobe step 26 (fw 6.60): sceGeSetCallback with signal_arg
@@ -976,6 +980,48 @@ static void test_ge_callbacks(void) {
     call(psp_nid("sceGeListEnQueue"), LIST, 0, cbid, 0);
     call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0);
     CHECK(g_gecb_n == 0, "an unset callback is not called: %d call(s)", g_gecb_n);
+}
+
+/* A list that keeps the GE busy is still running when EnQueue returns:
+ * geprobe 5 step 58 (fw 6.60) enqueues SIGNAL 0x01, 100 full-screen sprites,
+ * SIGNAL 0x02, 100 more and FINISH 0x03 with no stall; only the first
+ * handler has run when EnQueue returns, ListSync(peek) reads 2, and the rest
+ * come later. Here 40 sprites (5.2 million pixels) do the same. */
+static void test_ge_long_list(void) {
+    psp_ge_reset();
+    g_gecb_n = 0;
+    psp_register(0x08A00000u, gecb_signal);
+    psp_register(0x08A00100u, gecb_finish);
+    const uint32_t CB = 0x08836000u, LIST = 0x08836100u, V = 0x08838000u;
+    psp_write32(CB + 0, 0x08A00000u); psp_write32(CB + 4, 0x5A);
+    psp_write32(CB + 8, 0x08A00100u); psp_write32(CB + 12, 0xA5);
+    const uint32_t cbid = call(psp_nid("sceGeSetCallback"), CB, 0, 0, 0);
+    /* Two corners of a full-screen sprite: 8888 colour, 16-bit position. */
+    psp_write32(V + 0, 0xFF203040u); psp_write16(V + 4, 0);   psp_write16(V + 6, 0);   psp_write16(V + 8, 0);
+    psp_write32(V + 12, 0xFF203040u); psp_write16(V + 16, 480); psp_write16(V + 18, 272); psp_write16(V + 20, 0);
+    uint32_t n = 0;
+#define W_(x) psp_write32(LIST + 4 * n++, (x))
+    W_(0x10000000u | ((V >> 8) & 0xFF0000));            /* BASE */
+    W_(0x9C000000u | 0x000000);                          /* FBP: VRAM start */
+    W_(0x9D000000u | 0x040000 | 512);                    /* FBW, address bits 24-31 */
+    W_(0x12000000u | (7u << 2) | (2u << 7) | (1u << 23)); /* VTYPE: 8888, s16, through */
+    W_(0x0E020001u); W_(0x0C000000u);                    /* SIGNAL 0x01, END */
+    for (int i = 0; i < 40; i++) {
+        W_(0x01000000u | (V & 0xFFFFFF));                /* VADDR */
+        W_(0x04000000u | (6u << 16) | 2);                /* PRIM sprites */
+    }
+    W_(0x0E020002u); W_(0x0C000000u);                    /* SIGNAL 0x02, END */
+    W_(0x0F000003u); W_(0x0C000000u);                    /* FINISH 0x03, END */
+#undef W_
+    const uint32_t qid = call(psp_nid("sceGeListEnQueue"), LIST, 0, cbid, 0);
+    CHECK(g_gecb_n == 1 && g_gecb[0][1] == 0x01, "only SIGNAL 0x01 inside EnQueue: %d handler(s)", g_gecb_n);
+    const uint32_t peek = call(psp_nid("sceGeListSync"), qid, 1, 0, 0);
+    CHECK(peek == 2, "ListSync(peek) as EnQueue returns: 0x%08X, hardware 2", peek);
+    CHECK(call(psp_nid("sceGeDrawSync"), 1, 0, 0, 0) == 2, "DrawSync(peek) while it runs: 2");
+    CHECK(call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0) == 0, "DrawSync(wait) reads 0");
+    CHECK(g_gecb_n == 3 && g_gecb[1][1] == 0x02 && g_gecb[2][0] == 2 && g_gecb[2][1] == 0x03,
+          "SIGNAL 0x02 and FINISH 0x03 by the end of the wait: %d handler(s)", g_gecb_n);
+    call(psp_nid("sceGeUnsetCallback"), cbid, 0, 0, 0);
 }
 
 /* A list that jumps to itself must terminate rather than hang the host -- this
@@ -1620,6 +1666,7 @@ int main(void) {
     test_ge_display_list();
     test_ge_signal_pause();
     test_ge_callbacks();
+    test_ge_long_list();
     test_ge_infinite_list();
     test_sas_adpcm();
     test_sas_hardware_rules();
