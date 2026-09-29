@@ -2816,14 +2816,28 @@ static void ge_callback(int cbid, int finish, uint32_t id) {
  * far above it are skipped. One wholly behind the camera, one beyond the far
  * plane, one through the near plane and two across or near an edge are all
  * drawn -- so nothing about depth or the camera counts, only where x and y
- * land after the divide (a corner behind the camera divides by a negative w
- * and lands mirrored, on screen for that box). The box is hidden when all its
- * corners are beyond the same edge. The edges are the scissor's here; the
- * probe's scissor is the screen, so the scissor and the viewport's extent are
- * not told apart, but a box inside the 4096-pixel drawing area and off screen
- * is skipped. Not measured: whether BBOX advances VADDR as PRIM does (it is
- * left alone), skinned or morphed corners (the first vertex set, unskinned,
- * is used), and through-mode boxes (taken as visible). */
+ * land after the divide. The box is hidden when all its corners are beyond
+ * the same edge.
+ *
+ * geprobe 5 scene 33 (fw 6.60) settles more:
+ *  - The divide is by |w|: a corner behind the camera is not mirrored. The
+ *    box across the camera plane far right (corners at w = 0.5 and -0.5) is
+ *    skipped, which a mirrored divide would spread from far left to far
+ *    right and draw; the two wholly behind the camera and far to one side
+ *    are skipped as well. Scene 24's box straight behind the camera lands on
+ *    screen either way. That the hardware takes |w| rather than, say, the
+ *    side each corner's x points to is the simplest reading, not a
+ *    measurement.
+ *  - The edges are the scissor's: a box in view is skipped with the scissor
+ *    cut to a corner away from it, and drawn with the scissor over part of
+ *    it; one outside a half-size viewport's clip volume but on screen is
+ *    drawn.
+ *  - BBOX moves VADDR past its corners as PRIM does (see advance_vertices):
+ *    a PRIM straight after it with no VADDR draws the vertices that follow
+ *    the box.
+ *  - BBOX alone does not stop a draw; only BJUMP acts on its result.
+ * Not measured: skinned or morphed corners (the first vertex set, unskinned,
+ * is used), indexed boxes, and through-mode boxes (taken as visible). */
 static int bbox_hidden(uint32_t count) {
     int col_off, pos_off, tex_off, norm_off;
     const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
@@ -2837,6 +2851,7 @@ static int bbox_hidden(uint32_t count) {
         mul_4x3(g_tl.world, m, w);
         mul_4x3(g_tl.view, w, e);
         mul_4x4(g_tl.proj, e, c);
+        c[3] = fabsf(c[3]);
         if (c[3] == 0.0f || !isfinite(c[0] / c[3]) || !isfinite(c[1] / c[3])) return 0;
         int x, y;
         clip_to_fx16(c, &x, &y);
@@ -2846,6 +2861,22 @@ static int bbox_hidden(uint32_t count) {
         below &= y >= (y1 + 1) * PSP_SUBPX;
     }
     return left || right || above || below;
+}
+
+/* PRIM and BBOX leave the vertex pointer past what they read: VADDR moves on
+ * by count vertices, or IADDR by count indices when the type is indexed.
+ * geprobe 5 scene 33 (fw 6.60) measures it for BBOX, whose box is followed
+ * by a PRIM with no VADDR of its own that draws the vertices after the box.
+ * libgu's sceGuDrawArrayN depends on it for PRIM: it sends VADDR once and
+ * then one PRIM per primitive. The indexed case is not measured. */
+static void advance_vertices(uint32_t count) {
+    int col_off, pos_off, tex_off, norm_off;
+    const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
+    switch (VT_INDEX(g_ge.vtype)) {
+    case 1:  g_ge.iaddr += count;      break;
+    case 2:  g_ge.iaddr += 2u * count; break;
+    default: g_ge.vaddr += count * (uint32_t)stride; break;
+    }
 }
 
 static void run_list(ge_queue *q) {
@@ -2907,6 +2938,7 @@ static void run_list_body(ge_queue *q) {
             g_ge.targets[g_ge.cur_target].prims++;
             g_ge.vertices += count;
             draw_prim(type, count);
+            advance_vertices(count);
             break;
         }
         case GE_BEZIER:
@@ -2927,6 +2959,7 @@ static void run_list_body(ge_queue *q) {
             break;
         case GE_BBOX:
             g_ge.bbox_hidden = bbox_hidden(arg & 0xFFFF);
+            advance_vertices(arg & 0xFFFF);
             break;
         case GE_BJUMP:
             /* Jumps when the last BBOX found its box hidden (bbox_hidden). It

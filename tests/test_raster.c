@@ -199,6 +199,29 @@ static void test_transformed_is_skipped(void) {
           (unsigned long long)psp_ge_pixels());
 }
 
+/* PRIM and BBOX leave VADDR past the vertices they read. geprobe 5 scene 33
+ * (fw 6.60) draws a marker with a PRIM straight after BBOX and no VADDR, and
+ * the marker is the vertices after the box; libgu's sceGuDrawArrayN sends
+ * one VADDR for several PRIMs. */
+static void test_vertex_pointer_advances(void) {
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    vertex(0, 0, 0, 0xFFFFFFFFu);            /* the "box": BBOX reads these two */
+    vertex(1, 479, 271, 0xFFFFFFFFu);
+    vertex(2, 10, 10, 0xFF0000FFu);          /* first PRIM */
+    vertex(3, 20, 20, 0xFF0000FFu);
+    vertex(4, 30, 10, 0xFF00FF00u);          /* second PRIM, no VADDR between */
+    vertex(5, 40, 20, 0xFF00FF00u);
+    cmd(0x07, 2);                    /* BBOX, 2 vertices */
+    cmd(0x04, (6u << 16) | 2);       /* PRIM sprites */
+    cmd(0x04, (6u << 16) | 2);       /* PRIM sprites */
+    end_list();
+    CHECK(pixel(15, 15) == 0x000000FFu, "PRIM after BBOX reads past the box: 0x%08X", pixel(15, 15));
+    CHECK(pixel(35, 15) == 0x0000FF00u, "second PRIM reads past the first: 0x%08X", pixel(35, 15));
+    CHECK(pixel(100, 100) == 0, "the box itself is not drawn: 0x%08X", pixel(100, 100));
+}
+
 static void test_triangle_strip(void) {
     psp_ge_reset();
     clear_fb();
@@ -1504,6 +1527,7 @@ int main(void) {
     test_clipping();
     test_transformed_is_skipped();
     test_triangle_strip();
+    test_vertex_pointer_advances();
     test_texture_1to1();
     test_texture_minified_samples_centre();
     test_texture_perspective_interpolation();
