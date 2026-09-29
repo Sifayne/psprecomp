@@ -1753,6 +1753,18 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
  *    Below the cutoff the light contributes nothing.
  *  - Directional lights ignore attenuation and take their position field as
  *    a direction.
+ *
+ * Two more from geprobe 5 scene 25 (fw 6.60), which lights one flat quad per
+ * normal with white lights and materials, 198 values, all matched:
+ *  - The powers (specular, powered diffuse) are ge_pow's, a piecewise-linear
+ *    log2 and exp2, not pow(): N.H = 0.9 with coefficient 4 reads 153
+ *    (0.6), where 0.9^4 = 0.656 would give 167. The two wide quads read one
+ *    value from edge to edge, so the eye direction is the fixed +Z above,
+ *    and normals are normalised (the 0.9 normal scaled by 2 and by 0.5
+ *    reads as the unit one).
+ *  - A lit channel goes to 8 bits as floor(256 * value), 1.0 being a full
+ *    255 light on a 255 material: N.L = 0.99 reads 253, where rounding
+ *    255 * 0.99 gives 252 and 0.6 reads 153, not 154.
  */
 /* Lighting happens in eye space, and the fixed eye direction above is the
  * evidence: a constant (0,0,1) is only meaningful where the viewer looks down
@@ -1785,6 +1797,22 @@ static void lights_to_eye(void) {
         else                         mul_4x3(g_tl.view, g_tl.light[i].pos, g_light_eye[i].pos);
         mul_3x3(g_tl.view, g_tl.light[i].dir, g_light_eye[i].dir);
     }
+}
+
+/* x^k as the GE's lighting computes it (geprobe 5 scene 25, fw 6.60): a log2
+ * that reads a float's exponent and mantissa as e + (m - 1), m in [1, 2), and
+ * the matching exp2, 2^n * (1 + f) for the integer and fractional parts of the
+ * product. With k = 1 it is x itself; N.H = 0.9 gives 0.8, 0.6, 0.35, 0.2 and
+ * 0.1125 for k = 2, 4, 8, 12 and 16, which is what the hardware drew. Only
+ * specular and powered diffuse are measured; the spot exponent keeps powf. */
+static float ge_pow(float x, float k) {
+    if (!(x > 0.0f)) return 0.0f;
+    int e;
+    const float m = frexpf(x, &e);                          /* [0.5, 1) */
+    const float y = k * ((float)(e - 1) + (2.0f * m - 1.0f));
+    if (!(y > -126.0f)) return 0.0f;
+    const float n = floorf(y);
+    return ldexpf(1.0f + (y - n), (int)n);
 }
 
 static inline int any_light_enabled(void) {
@@ -1839,7 +1867,7 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
 
         const float ndl = n[0]*L[0] + n[1]*L[1] + n[2]*L[2];
         float dfac = ndl > 0.0f ? ndl : 0.0f;
-        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = powf(dfac, g_tl.mat_spec_coef);
+        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = ge_pow(dfac, g_tl.mat_spec_coef);
 
         float sfac = 0.0f;
         if (g_tl.light[i].kind == 1 && ndl >= 0.0f) {
@@ -1847,7 +1875,7 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
             const float hlen = sqrtf(H[0]*H[0] + H[1]*H[1] + H[2]*H[2]);
             if (hlen > 1e-20f) { H[0] /= hlen; H[1] /= hlen; H[2] /= hlen; }
             const float ndh = n[0]*H[0] + n[1]*H[1] + n[2]*H[2];
-            sfac = (ndh > 0.0f) ? powf(ndh, g_tl.mat_spec_coef) : 0.0f;
+            sfac = ge_pow(ndh, g_tl.mat_spec_coef);
         }
 
         for (int k = 0; k < 3; k++)
@@ -1861,14 +1889,14 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
      * is supplying the ambient. */
     uint32_t c = (g_tl.mat_update & 1) ? (*rgba & 0xFF000000u)
                                        : ((uint32_t)(g_tl.mat_alpha & 0xFF) << 24);
-    /* Clamped here only for rgba; past 255 the unclamped value goes on to the
-     * rasterizer (psp_vertex.hi). */
+    /* floor(256 * value), see above. Clamped here only for rgba; past 255
+     * the unclamped value goes on to the rasterizer (psp_vertex.hi). */
     hi->hi_set = 0;
     for (int k = 0; k < 3; k++) {
         float f = out[k];
         if (f < 0.0f) f = 0.0f;
-        if (f > 256.0f) f = 256.0f;
-        const int q = (int)(f * 255.0f + 0.5f);
+        if (f > 255.99f) f = 255.99f;
+        const int q = (int)(f * 256.0f);
         hi->hi[k] = (uint16_t)q;
         if (q > 255) hi->hi_set = 1;
         c |= (uint32_t)(q > 255 ? 255 : q) << (8 * k);
