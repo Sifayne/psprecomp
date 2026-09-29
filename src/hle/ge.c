@@ -2827,9 +2827,20 @@ static void draw_patch(int spline, uint32_t arg) {
             ge_mvert *o = &grid[j * nu + i];
             memcpy(o->pos, pos, sizeof pos);
             memcpy(o->nrm, nrm, sizeof nrm);
+            /* A generated vertex's colour is the blend rounded up to a whole
+             * step (after cutting the sum to 2^-16, below which it is this
+             * evaluation's float noise, not the PSP's value). geprobe 5 (fw
+             * 6.60) scene 22's first patch, whose colours come to 63.75,
+             * 127.5, 158.008 and 191.25, fits planes through 64, 128, 159 and
+             * 192 on the PSP; rounding gave 191 and 158, and differed from
+             * scenes 22, 23 and 26 on 18760, 10128 and 4188 pixels, this on
+             * 3452, 2118 and 2263. Plain truncation, which a morph's blend
+             * takes (read_mvert), is worse still. What is left is mostly the
+             * 3x7 patch, whose 1/3 and 1/7 steps the PSP evaluates with a
+             * precision of its own. */
             o->rgba = 0;
             for (int k = 0; k < 4; k++) {
-                int c = (int)(col[k] + 0.5f);
+                int c = (int)ceil(floor((double)col[k] * 65536.0) / 65536.0);
                 if (c < 0) c = 0;
                 if (c > 255) c = 255;
                 o->rgba |= (uint32_t)c << (8 * k);
