@@ -2397,13 +2397,18 @@ static void push_pixel_state_body(void) {
         if (g_tl.clear_mode) {
             b.enable = 0; b.alpha_test = 0; b.stencil_test = 0;
             b.write_colour = g_tl.clear_colour;
-            /* A clear is left undithered, as it always was here. Not
-             * measured: geprobe disables dither before every clear. */
-            b.dither = 0;
-            /* Likewise the colour test, logic op and pixel mask: a clear
-             * writes as it did before they were decoded. Not measured;
-             * geprobe turns them off before it clears. */
-            b.colour_test = 0; b.logic_enable = 0; b.pixel_mask = 0;
+            /* What a clear keeps and drops, from geprobe 5 scenes 29-32
+             * (fw 6.60), which clear one band each with a state on, on
+             * 8888, 5650, 5551 and 4444: blending, the logic op (XOR) and
+             * the colour and alpha tests (which the clear colour fails)
+             * change nothing, but dither and the pixel mask apply as to a
+             * draw. The dither matrix offsets the clear colour per pixel
+             * (0x80 under the extreme matrix reads 7D 7C 7F 7F ... on the
+             * first row of 8888), and PMSK1 keeps the colour bits it
+             * covers and PMSK2 the stencil bits (0xAB under 0xF0 on a
+             * stencil of 0 reads 0x0B, and on 5551 and 4444 the alpha
+             * field keeps its old value). */
+            b.colour_test = 0; b.logic_enable = 0;
         }
         psp_render_current()->set_blend(&b);
     }
