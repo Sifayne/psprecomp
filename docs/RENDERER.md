@@ -454,12 +454,17 @@ float blend (`src/render.c` sw_tri, `src/hle/ge.c` ge_screen_z):
   vertex, with gradients from the numerator times 1/area, where 1/area is
   also a 24-bit float, then floored to 1/1024 a pixel. Scene 27's four
   through-mode triangles match on every pixel.
+- **Along a line** (psp_render_walk_line) one pixel is drawn per
+  major-axis column whose centre lies on the segment, and its row, colour
+  and depth are those of the centre's projection onto the line, on gradients
+  floored to 1/1024 a pixel. For whole-pixel endpoints that is the step
+  centre geprobe step 1 measured; scene 27's 3D line, whose ends fall
+  between centres, matches on every pixel only this way.
 - **Open:** three of scene 27's and 17's six 3D triangles match only with
   the plane anchored at another vertex (the right-hand one of the quad that
   slopes in x, the nearest of scene 17's second triangle); the rule that
-  picks it is not known. Lines interpolate depth by a different rule, also
-  not known (scene 27's lines are off by 91 or 149 along whole rows). A GPU
-  backend shares the vertex depths and interpolates them itself.
+  picks it is not known. A GPU backend shares the vertex depths and
+  interpolates them itself.
 
 ## Known differences
 

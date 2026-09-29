@@ -1341,7 +1341,9 @@ static void test_line_interpolation_and_clipping(void) {
     s = (line_samples){0};
     psp_render_walk_line(&a, &b, 2, 2, 2, 2, collect_line, &s);
     CHECK(s.count == 1 && s.first.x == 40 && s.first.y == 40, "diagonal scissor sample");
-    CHECK(s.first.z == 50 && s.first.u > 2.666f && s.first.u < 2.667f &&
+    /* Depth at the step's centre, 2.5 of 4 steps, like colour: geprobe 5
+     * scene 27 (fw 6.60). */
+    CHECK(s.first.z == 62 && s.first.u > 2.666f && s.first.u < 2.667f &&
           s.first.inv_w == 1 && s.first.tex_q == 1, "line perspective and depth interpolation");
     s = (line_samples){0};
     psp_render_walk_line(&a, &a, 0, 0, 10, 10, collect_line, &s);
@@ -1349,6 +1351,33 @@ static void test_line_interpolation_and_clipping(void) {
     b.x = -64; b.y = -64;
     psp_render_walk_line(&a, &b, 0, 0, 10, 10, collect_line, &s);
     CHECK(!s.count, "negative coordinates floor and descending boundary excludes origin");
+}
+
+/* A line with endpoints between pixel centres: geprobe 5 scene 27's 3D line
+ * (fw 6.60), 258.81 to 381.31 across, its depths 12577 to 10371. The
+ * hardware starts at pixel 259, puts each column on the row of its centre's
+ * projection and writes the depth there. */
+typedef struct { int n, first; int y[4]; float z[4]; } line_picks;
+static void pick_line(const psp_vertex *v, void *data) {
+    line_picks *p = data;
+    static const int want[4] = { 259, 264, 272, 380 };
+    const int x = v->x >> 4;
+    if (!p->n++) p->first = x;
+    for (int i = 0; i < 4; i++)
+        if (x == want[i]) { p->y[i] = v->y >> 4; p->z[i] = v->z; }
+}
+
+static void test_line_between_centres(void) {
+    psp_vertex a = { .x = 4141, .y = 3947, .z = 12577.5f, .rgba = 0xFFFFFFFF, .inv_w = 1, .tex_q = 1 };
+    psp_vertex b = a; b.x = 6101; b.y = 3714; b.z = 10371.0f;
+    line_picks p = {0};
+    psp_render_walk_line(&a, &b, 0, 0, 479, 271, pick_line, &p);
+    CHECK(p.n == 122 && p.first == 259, "pixels %d from %d, hardware 122 from 259", p.n, p.first);
+    CHECK(p.y[1] == 246 && p.y[2] == 245 && p.y[3] == 232,
+          "rows at 264, 272, 380: %d %d %d, hardware 246 245 232", p.y[1], p.y[2], p.y[3]);
+    CHECK(p.z[0] == 12564 && p.z[1] == 12474 && p.z[2] == 12330 && p.z[3] == 10385,
+          "depths %.0f %.0f %.0f %.0f, hardware 12564 12474 12330 10385",
+          (double)p.z[0], (double)p.z[1], (double)p.z[2], (double)p.z[3]);
 }
 
 /* Colour interpolation against geprobe's hardware frames (step 1, fw 6.60):
@@ -1616,6 +1645,7 @@ int main(void) {
     test_depth_in_vram();
     test_depth_plane();
     test_transformed_depth();
+    test_line_between_centres();
     test_backend_selection();
     test_backend_registration();
     test_indexed_triangle_batch_boundary();

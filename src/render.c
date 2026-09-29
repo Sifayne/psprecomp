@@ -1446,41 +1446,68 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
                           psp_line_pixel_fn emit, void *opaque) {
     const int64_t dx = (int64_t)b->x - a->x, dy = (int64_t)b->y - a->y;
     const int64_t ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
-    const int64_t steps = (ax > ay ? ax : ay) / PSP_SUBPX;
-    if (!steps || x0 > x1 || y0 > y1) return;
-    /* The far endpoint is excluded. Along the major axis, at integer
-     * boundaries a decreasing coordinate owns the pixel immediately before
-     * it, including at i=0; reversing an integer horizontal/vertical interval
-     * keeps its coverage. The minor coordinate is taken at the major step's
-     * centre, floor(m0 + d * (i + 1/2) / steps): geprobe step 1 (fw 6.60)
-     * draws (140,230)-(230,265) through (150,234), where i alone gives 233.
-     * Both are the form floor((p + d*i) / s), so one clip serves either. */
+    if ((ax > ay ? ax : ay) < PSP_SUBPX || x0 > x1 || y0 > y1) return;
+    /* One pixel per major-axis column (or row) whose centre lies on the
+     * segment, start included, end excluded; the minor coordinate, colour
+     * and depth are taken where that centre projects onto the line. For
+     * whole-pixel endpoints that is step i's centre, i + 1/2: geprobe step 1
+     * (fw 6.60) draws (140,230)-(230,265) through (150,234), where i alone
+     * gives 233. geprobe 5 scene 27's 3D line, from x 4141/16 to 6101/16,
+     * shows the general case: the hardware starts at the first centre past
+     * 258.81, pixel 259, and each of its 122 columns sits on the row and at
+     * the depth of its centre's projection, where stepping 122 whole steps
+     * from 258.81 put six a row off and every depth up to 18 off.
+     *
+     * Major index k = 0..n-1: pixel M0 + sm*k along the major axis, its
+     * centre c0 + 16*sm*k; the minor pixel is
+     * floor((m_a*|dM| + dm*sm*(centre - M_a)) / (16*|dM|)). Both are
+     * floor((p + d*k) / s), so one clip serves either. */
     const int xmajor = ax >= ay;
-    const int64_t scale = steps * PSP_SUBPX;
-    const int64_t mx = ((int64_t)a->x - (dx < 0)) * steps, my = ((int64_t)a->y - (dy < 0)) * steps;
-    const int64_t nx = 2 * (int64_t)a->x * steps + dx, ny = 2 * (int64_t)a->y * steps + dy;
-    const int64_t px = xmajor ? mx : nx, pdx = xmajor ? dx : 2 * dx, sx = xmajor ? scale : 2 * scale;
-    const int64_t py = xmajor ? ny : my, pdy = xmajor ? 2 * dy : dy, sy = xmajor ? 2 * scale : scale;
-    int64_t first = 0, last = steps - 1;
-    if (!line_clip_axis(px, pdx, sx, x0, x1, &first, &last) ||
-        !line_clip_axis(py, pdy, sy, y0, y1, &first, &last)) return;
-    /* Colour at the same centre, on the triangle's gradient rule: the step
-     * floored to 1/1024 (grad1024), the value floored. Step 1's white-to-blue
-     * line reads FDFDFF at its first pixel: 255 - 2902/1024 * 1/2 = 253.6. */
-    int64_t cg[4], c0[4];
+    const int64_t Ma = xmajor ? a->x : a->y, ma = xmajor ? a->y : a->x;
+    const int64_t dM = xmajor ? dx : dy, dm = xmajor ? dy : dx, adM = dM < 0 ? -dM : dM;
+    const int64_t sm = dM < 0 ? -1 : 1;
+    /* First and one-past-last major pixels: centres in [Ma, Mb) going up,
+     * (Mb, Ma] going down. */
+    const int64_t Mb = Ma + dM;
+    const int64_t M0 = sm > 0 ? floor_div(Ma - 8 + 15, 16) : floor_div(Ma - 8, 16);
+    const int64_t Mend = sm > 0 ? floor_div(Mb - 8 + 15, 16) : floor_div(Mb - 8, 16);
+    const int64_t n = sm > 0 ? Mend - M0 : M0 - Mend;
+    if (n <= 0) return;
+    const int64_t c0 = 16 * M0 + 8;                         /* centre of k = 0 */
+    const int64_t pm = ma * adM + dm * sm * (c0 - Ma), dmk = 16 * dm, smd = 16 * adM;
+    int64_t first = 0, last = n - 1;
+    if (!line_clip_axis(xmajor ? M0 : pm, xmajor ? sm : dmk, xmajor ? 1 : smd, x0, x1, &first, &last) ||
+        !line_clip_axis(xmajor ? pm : M0, xmajor ? dmk : sm, xmajor ? smd : 1, y0, y1, &first, &last))
+        return;
+    /* Colour and depth at the projected centre, on the triangle's gradient
+     * rule: the gradient a pixel, floored to 1/1024 (grad1024), times the
+     * distance from the start, the value floored. Step 1's white-to-blue
+     * line reads FDFDFF at its first pixel: 255 - 2902/1024 * 1/2 = 253.6.
+     * Depth goes from the integer vertex depths: scene 27's three
+     * through-mode lines match at every step, and its 3D line on every one
+     * of its pixels; taken at the step's start, as it was, each read half a
+     * step short, 149 or 91 off. The distance is kept in sixteenths
+     * (dist16), so the sums are in 1/16384ths. */
+    int64_t cg[4], cv[4];
     for (int c = 0; c < 4; c++) {
-        c0[c] = chan(a->rgba, c);
-        cg[c] = grad1024(((int64_t)chan(b->rgba, c) - c0[c]) * 1024, steps);
+        cv[c] = chan(a->rgba, c);
+        cg[c] = grad1024(((int64_t)chan(b->rgba, c) - cv[c]) * 1024 * 16, adM);
     }
-    for (int64_t i = first; i <= last; i++) {
-        const float t = (float)((double)i / (double)steps), s = 1.0f - t;
+    const int64_t za = !(a->z > 0.0f) ? 0 : (a->z >= 65535.0f ? 65535 : (int64_t)a->z);
+    const int64_t zb = !(b->z > 0.0f) ? 0 : (b->z >= 65535.0f ? 65535 : (int64_t)b->z);
+    const int64_t zg = grad1024((zb - za) * 1024 * 16, adM);
+    for (int64_t k = first; k <= last; k++) {
+        const int64_t dist16 = sm * (c0 - Ma) + 16 * k;            /* > 0 */
+        /* Fog and texture coordinates as before: at the step's start. */
+        const float t = (float)((double)(dist16 - 8) / (double)adM), s = 1.0f - t;
+        const int64_t Mp = M0 + sm * k, mp = floor_div(pm + dmk * k, smd);
         psp_vertex v = *a;
-        v.x = (int)floor_div(px + pdx * i, sx) * PSP_SUBPX + PSP_SUBPX / 2;
-        v.y = (int)floor_div(py + pdy * i, sy) * PSP_SUBPX + PSP_SUBPX / 2;
-        v.z = s * a->z + t * b->z;
+        v.x = (int)(xmajor ? Mp : mp) * PSP_SUBPX + PSP_SUBPX / 2;
+        v.y = (int)(xmajor ? mp : Mp) * PSP_SUBPX + PSP_SUBPX / 2;
+        v.z = (float)floor_div(za * 16384 + zg * dist16, 16384);
         v.rgba = 0;
         for (int c = 0; c < 4; c++)
-            v.rgba |= plane_chan((c0[c] * 2048 + cg[c] * (2 * i + 1)) * 8) << (8 * c);
+            v.rgba |= plane_chan(cv[c] * 16384 + cg[c] * dist16) << (8 * c);
         v.fog = (int)(s * (float)a->fog + t * (float)b->fog + 0.5f);
         const float den = s * a->tex_q * a->inv_w + t * b->tex_q * b->inv_w;
         v.u = den ? (s * a->u * a->inv_w + t * b->u * b->inv_w) / den : 0;

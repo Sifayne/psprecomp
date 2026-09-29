@@ -325,10 +325,12 @@ int psp_render_lod16(const psp_tex_state *t, float rho);
 /* One-pixel primitives use explicit coverage, not the host API's line rules.
  * Walk a half-open segment, clipped to inclusive pixel bounds. Each callback
  * receives a pixel-centred vertex with already interpolated colour, depth,
- * fog and divided texture coordinates (inv_w = tex_q = 1). Position and
- * colour follow the hardware (geprobe step 1, fw 6.60): one pixel per
- * major-axis step, the minor coordinate and the colour taken at the step's
- * centre, i + 1/2, the colour on a gradient floored to 1/1024 a step. */
+ * fog and divided texture coordinates (inv_w = tex_q = 1). Position, colour
+ * and depth follow the hardware (geprobe step 1 and geprobe 5 scene 27, fw
+ * 6.60): one pixel per major-axis column whose centre lies on the segment,
+ * the minor coordinate, colour and depth taken where that centre projects
+ * onto it (for whole-pixel endpoints, step i's centre, i + 1/2), colour and
+ * depth on gradients floored to 1/1024 a pixel. */
 typedef void (*psp_line_pixel_fn)(const psp_vertex *sample, void *opaque);
 void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
                           int x0, int y0, int x1, int y1,
