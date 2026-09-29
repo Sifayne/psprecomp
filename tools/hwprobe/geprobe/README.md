@@ -33,6 +33,15 @@ blending, depth, clipping, the per-pixel tests).
 | 29 | (v5) the eight logic ops scene 19 left out; scene 19's stencil band with EQUAL rectangles wholly inside y 112-142; stencil writes under PMSK2 (REPLACE, INCR, INVERT); clears with the pixel mask, logic op, dither, colour and alpha tests, PMSK2 on a stencil clear, and blending | 8888 |
 | 30-32 | (v5) on 5650, 5551 and 4444: four pixel masks writing white and black, the colour test, four logic ops, the clears of scene 29, stencil writes under PMSK2 | 5650, 5551, 4444 |
 | 33 | (v5) more bounding boxes, one list and step each, no dump: behind the camera and far to the side, across the camera plane, against a small scissor, outside a half-size viewport's clip volume but on screen, a PRIM straight after BBOX with no VADDR (does BBOX advance it), a hidden box drawn without BJUMP | - |
+| 34 | (v6) lighting arithmetic: one flat quad per normal, 9 rows of scene 16's 12 fan normals under one change each (raw, normalised normals, normalised light, y-z normals, a coloured light, a coloured material, scene 16's lower-left fan exactly, specular 12 and 1) | 8888 |
+| 35 | (v6) point and spot lights on grids of points, one pixel per lit vertex: a point light with attenuation, a spot (exponent 4, cutoff 0.9), a point light's specular, a spot (exponent 1.5, cutoff 0.5) | 8888 |
+| 36 | (v6) 3D depth planes: four triangle shapes, each given from each of its corners and in both windings; plus the depth buffer | 8888 |
+| 37 | (v6) through-mode lines whose ends fall on every sixteenth: across both ways with the end's and the start's fraction, shallow diagonals to x fractions 0.625 and 0.4375, steep lines down and up | 8888 |
+| 38 | (v6) patches drawn as points, each generated vertex one pixel: Bezier at divisions 3, 5, 6, 7, 12 and splines, over a flat grid with bilinear and alternating colours and over scene 22's curved grid | 8888 |
+| 39 | (v6) colour gradient precision: through-mode triangles 5 to 211 pixels wide, at whole and fractional corners; scene 17's 3D quads at several widths; scene 20's red-green-blue triangle | 8888 |
+| 40 | (v6) morph weights over colour gradients whose two sets differ by 1 (does a blend keep the fraction), with the unmorphed gradients for reference | 8888 |
+| 41 | (v6) bounding boxes at the camera, one list and step each, no dump: across the camera plane at four distances from the axis, behind the camera, between the camera and the near plane, across the near plane | - |
+| 42 | (v6) indexed draws by hand: whether PRIM moves IADDR, VADDR or both (16- and 8-bit indices, and unindexed), and whether an indexed BBOX moves them | 8888 |
 
 After the scenes it records which GE callbacks run, with which arguments and
 when, through libgu (signal and finish) and through a raw `sceGe` list.
@@ -50,6 +59,17 @@ runs inside `EnQueue`); how many callbacks `sceGeSetCallback` takes and the
 error after; version 4's raw-list step again, call for call with the log
 flushed after each call, and last a check, without the GE, of whether such a
 `memalign` block's words survive a cache write-back.
+
+Firmware 6.60 switched itself off in that repeated step in version 5, just
+after `EnQueue`, and the check after it found all 16 words of such a block
+replaced by the write-back; version 6 no longer runs it ("not run"). New in
+version 6, after the others: `sceGeContinue` with nothing paused; a list
+queued with its stall address at its start, and one with it just after a
+SIGNAL, each then moved to the end with `sceGeListUpdateStallAddr` (what the
+peeks say meanwhile, and when the handlers run); how long 100 sprites take at
+480x272, 64x64 and 16x16, from the system clock read in the handlers; and
+last, since it may not come back, a PAUSE whose own signal handler calls
+`sceGeContinue`.
 
 ## Build
 

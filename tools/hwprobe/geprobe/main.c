@@ -13,7 +13,8 @@
  * at the features it does implement from pspautotests captures (texture
  * functions, filtering, fog, lighting, blending, clipping), so both get a
  * hardware reference from this project's own PSP. Scenes 25 on (version 5)
- * each isolate one rule the earlier scenes left open.
+ * each isolate one rule the earlier scenes left open, and scenes 34 on
+ * (version 6) what geprobe 5 left open in turn.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -34,7 +35,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 5
+#define PROBE_VERSION 6
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -887,16 +888,20 @@ static void scene_specular(void) {
     scene_end("specular", GU_PSM_8888, 0);
 }
 
-/* Evenly spaced control points on the plane z = -6. Plain, their colours are
- * linear in u and v, so the exact surface and its colours are bilinear and
- * every vertex a patch generates has an exact position and colour. `bump`
- * makes the four inner control colours white and the rest black instead. */
-static void flat_grid(CV *v, float cx, float cy, float s, int bump) {
+/* Evenly spaced control points on the plane z = -6. Plain (mode 0), their
+ * colours are linear in u and v, so the exact surface and its colours are
+ * bilinear and every vertex a patch generates has an exact position and
+ * colour. Mode 1 makes the four inner control colours white and the rest
+ * black instead; mode 2 (geprobe 6) gives them patch_grid's colours, blue
+ * alternating between 64 and 255. */
+static void flat_grid(CV *v, float cx, float cy, float s, int mode) {
     for (int j = 0; j < 4; j++)
         for (int i = 0; i < 4; i++) {
             const int inner = (i == 1 || i == 2) && (j == 1 || j == 2);
-            const w32 c = bump ? (inner ? 0xFFFFFFFFu : 0xFF000000u)
-                               : 0xFF400000u | (w32)(i * 85) | (w32)(j * 85) << 8;
+            const w32 c = mode == 1 ? (inner ? 0xFFFFFFFFu : 0xFF000000u)
+                        : mode == 2 ? 0xFF000000u | (w32)(i * 85) | (w32)(j * 85) << 8 |
+                                      (w32)(((i + j) & 1) ? 255 : 64) << 16
+                                    : 0xFF400000u | (w32)(i * 85) | (w32)(j * 85) << 8;
             v[j * 4 + i] = (CV){ c, cx + (i - 1.5f) * s, cy + (j - 1.5f) * s, -6.0f };
         }
 }
@@ -1313,6 +1318,450 @@ static void scene_bbox2(void) {
     }
 }
 
+/* ---- geprobe 6: what geprobe 5 left open ---------------------------------
+ *
+ * fw660-run5/findings/geprobe.md lists what the version 5 scenes left
+ * unsettled: how precisely the GE lights a vertex whose normal or light is
+ * off the axes (scene 16's fans come out 1 or 2 below psprecomp's), point and
+ * spot lights, which vertex a 3D triangle's depth plane starts from, where a
+ * line with fractional ends stops, the colours a patch generates at
+ * divisions that are not powers of 2, how precise a colour gradient is,
+ * whether a morph blend keeps a colour's fraction, bounding boxes across the
+ * camera plane, and whether indexed draws move IADDR. */
+
+/* A marker's centre pixel: drawn in its colour or not. */
+static void report_marker(const char *what, float x0, float y0, float x1, float y1, w32 color) {
+    const w32 *px = (const w32 *)VRAM_UNCACHED + (int)((y0 + y1) / 2) * FB_W + (int)((x0 + x1) / 2);
+    out("  %s: %s (pixel %08X)\n", what, (*px & 0xFFFFFF) == (color & 0xFFFFFF) ? "drawn" : "not drawn", *px);
+}
+
+/* Scene 16's fan normals ((i - 6)/6, ((5i mod 7) - 3)/3, 1), unnormalised,
+ * computed as lit_fan computes them. */
+static void fan_normal(int i, float n[3]) {
+    n[0] = (float)(i - 6) / 6.0f;
+    n[1] = (float)((i * 5) % 7 - 3) / 3.0f;
+    n[2] = 1.0f;
+}
+
+/* The same normalised, and (0, sin, cos) of i * 7 degrees. */
+static const float FAN_NN[12][3] = {
+    { -0.577350269f, -0.577350269f, 0.577350269f }, { -0.569802882f, 0.455842306f, 0.683763459f },
+    { -0.554700196f, 0.0f, 0.832050294f },          { -0.384110640f, -0.512147520f, 0.768221280f },
+    { -0.229415734f, 0.688247202f, 0.688247202f },  { -0.156173762f, 0.312347524f, 0.937042571f },
+    { 0.0f, -0.316227766f, 0.948683298f },          { 0.117041147f, -0.702246883f, 0.702246883f },
+    { 0.267261242f, 0.534522484f, 0.801783726f },   { 0.447213595f, 0.0f, 0.894427191f },
+    { 0.485071250f, -0.485071250f, 0.727606875f },  { 0.507673083f, 0.609207699f, 0.609207699f },
+};
+static const float YZ_N[12][3] = {
+    { 0.0f, 0.0f, 1.0f },                 { 0.0f, 0.121869343f, 0.992546152f },
+    { 0.0f, 0.241921896f, 0.970295726f }, { 0.0f, 0.358367950f, 0.933580426f },
+    { 0.0f, 0.469471563f, 0.882947593f }, { 0.0f, 0.573576436f, 0.819152044f },
+    { 0.0f, 0.669130606f, 0.743144825f }, { 0.0f, 0.754709580f, 0.656059029f },
+    { 0.0f, 0.829037573f, 0.559192903f }, { 0.0f, 0.891006524f, 0.453990500f },
+    { 0.0f, 0.939692621f, 0.342020143f }, { 0.0f, 0.974370065f, 0.224951054f },
+};
+
+/* Row r of 12 flat quads at z = -6, one normal each: 0 scene 16's fan
+ * normals, 1 the same normalised, 2 YZ_N. */
+static void lit_row(int r, int normals) {
+    for (int i = 0; i < 12; i++) {
+        float n[3];
+        if (normals == 1)      { n[0] = FAN_NN[i][0]; n[1] = FAN_NN[i][1]; n[2] = FAN_NN[i][2]; }
+        else if (normals == 2) { n[0] = YZ_N[i][0];   n[1] = YZ_N[i][1];   n[2] = YZ_N[i][2]; }
+        else fan_normal(i, n);
+        const float x0 = -5.7f + i * 0.95f, y0 = 3.1f - r * 0.72f;
+        nquad(g_nv + 6 * i, x0, y0, x0 + 0.8f, y0 - 0.55f, -6.0f, n);
+    }
+    sceGuDrawArray(GU_TRIANGLES, FMT_NV3D, 72, NULL, gumem(g_nv, 72 * sizeof(NV)));
+}
+
+/* Light 0 white diffuse only, a white material, no ambient anywhere: a quad
+ * lit by it is 255 times the light's factor (scene 25's set-up). */
+static void lit_white(void) {
+    sceGuAmbient(0xFF000000);
+    sceGuColorMaterial(0);
+    sceGuModelColor(0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF);
+    sceGuAmbientColor(0xFF000000);            /* material ambient black, alpha 0xFF */
+    sceGuLightColor(0, GU_AMBIENT, 0x000000);
+    sceGuLightColor(0, GU_DIFFUSE, 0xFFFFFF);
+    sceGuLightColor(0, GU_SPECULAR, 0x000000);
+}
+
+/* Scene 16's fans are 1 or 2 below psprecomp where scene 25, with the light
+ * and the normals in the x-z plane, is exact. One flat quad per normal, each
+ * row one change from row 0: row 0 scene 16's light (0.3, 0.5, 1) and fan
+ * normals, white; 1 the normals normalised; 2 the light normalised; 3 the
+ * light on +z and normals in the y-z plane; 4 the light's diffuse 0x80C0FF;
+ * 5 the material's diffuse 0x80C0FF; 6 all of scene 16's lower-left fan
+ * (ambient, emissive, light ambient, colours); 7 and 8 specular alone,
+ * coefficients 12 and 1. */
+static void scene_lightmath(void) {
+    if (step("scene %02d: lighting arithmetic, one flat quad per normal", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_LIGHTING);
+    sceGuLightMode(GU_SINGLE_COLOR);
+    sceGuEnable(GU_LIGHT0);
+    ScePspFVector3 dir = { 0.3f, 0.5f, 1.0f }, zdir = { 0.0f, 0.0f, 1.0f };
+    ScePspFVector3 ndir = { 0.259160528f, 0.431934213f, 0.863868426f };
+    lit_white();
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE, &dir);
+    lit_row(0, 0);
+    lit_row(1, 1);
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE, &ndir);
+    lit_row(2, 0);
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE, &zdir);
+    lit_row(3, 2);
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE, &dir);
+    sceGuLightColor(0, GU_DIFFUSE, 0x80C0FF);
+    lit_row(4, 0);
+    sceGuLightColor(0, GU_DIFFUSE, 0xFFFFFF);
+    sceGuModelColor(0x000000, 0x000000, 0x80C0FF, 0xFFFFFF);
+    sceGuAmbientColor(0xFF000000);
+    lit_row(5, 0);
+    sceGuAmbient(0xFF202020);
+    sceGuLight(0, GU_DIRECTIONAL, GU_AMBIENT_AND_DIFFUSE, &dir);
+    sceGuLightColor(0, GU_AMBIENT, 0xFF101010);
+    sceGuLightColor(0, GU_DIFFUSE, 0xFFFFC080);
+    sceGuModelColor(0xFF000040, 0xFF404040, 0xFF8080FF, 0xFFFFFFFF);
+    lit_row(6, 0);
+    lit_white();
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE_AND_SPECULAR, &dir);
+    sceGuLightColor(0, GU_DIFFUSE, 0x000000);
+    sceGuLightColor(0, GU_SPECULAR, 0xFFFFFF);
+    sceGuSpecular(12.0f);
+    lit_row(7, 0);
+    sceGuSpecular(1.0f);
+    lit_row(8, 0);
+    scene_end("lightmath", GU_PSM_8888, 0);
+}
+
+static NV g_pts[200];
+
+/* 20 x 10 points 0.25 apart around (cx, cy) on z = -6, facing +z: one pixel
+ * per vertex, so each shows one vertex's lit colour. */
+static void lit_points(float cx, float cy) {
+    for (int r = 0; r < 10; r++)
+        for (int c = 0; c < 20; c++)
+            g_pts[r * 20 + c] = (NV){ 0.0f, 0.0f, 1.0f, cx + (c - 9.5f) * 0.25f, cy + (r - 4.5f) * 0.25f, -6.0f };
+    sceGuDrawArray(GU_POINTS, FMT_NV3D, 200, NULL, gumem(g_pts, sizeof g_pts));
+}
+
+/* Scene 16's point and spot lights, white, on a grid of points each (the
+ * clear is pure red, which no point lit white can be): top left a point
+ * light 1.5 in front of the plane with attenuation (0.5, 0.3, 0.1); top
+ * right a spot 3 in front, exponent 4, cutoff 0.9; bottom left the point
+ * light's specular alone, coefficient 8, no attenuation; bottom right a spot
+ * with exponent 1.5, cutoff 0.5 and scene 16's attenuation. Each light sits
+ * 0.45 right of and 0.35 below its grid's centre. The spots' direction is
+ * +z, towards the camera: scene 16's spot, pointed at its fan (-z), lit
+ * nothing on fw 6.60, so the GE compares the direction with the one from the
+ * vertex to the light. */
+static void scene_locallights(void) {
+    if (step("scene %02d: point and spot lights, one point per vertex", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF0000FF);
+    sceGuEnable(GU_LIGHTING);
+    sceGuLightMode(GU_SINGLE_COLOR);
+    sceGuEnable(GU_LIGHT0);
+    lit_white();
+    ScePspFVector3 p0 = { -2.55f, 1.35f, -4.5f }, p1 = { 3.45f, 1.35f, -3.0f };
+    ScePspFVector3 p2 = { -2.55f, -2.05f, -4.5f }, p3 = { 3.45f, -2.05f, -3.0f };
+    ScePspFVector3 up = { 0.0f, 0.0f, 1.0f };
+    sceGuLight(0, GU_POINTLIGHT, GU_DIFFUSE, &p0);
+    sceGuLightAtt(0, 0.5f, 0.3f, 0.1f);
+    lit_points(-3.0f, 1.7f);
+    sceGuLight(0, GU_SPOTLIGHT, GU_DIFFUSE, &p1);
+    sceGuLightAtt(0, 1.0f, 0.0f, 0.0f);
+    sceGuLightSpot(0, &up, 4.0f, 0.9f);
+    lit_points(3.0f, 1.7f);
+    sceGuLight(0, GU_POINTLIGHT, GU_DIFFUSE_AND_SPECULAR, &p2);
+    sceGuLightColor(0, GU_DIFFUSE, 0x000000);
+    sceGuLightColor(0, GU_SPECULAR, 0xFFFFFF);
+    sceGuSpecular(8.0f);
+    lit_points(-3.0f, -1.7f);
+    sceGuLight(0, GU_SPOTLIGHT, GU_DIFFUSE, &p3);
+    sceGuLightColor(0, GU_DIFFUSE, 0xFFFFFF);
+    sceGuLightColor(0, GU_SPECULAR, 0x000000);
+    sceGuLightAtt(0, 0.5f, 0.3f, 0.1f);
+    sceGuLightSpot(0, &up, 1.5f, 0.5f);
+    lit_points(3.0f, -1.7f);
+    scene_end("locallights", GU_PSM_8888, 0);
+}
+
+/* Four triangles in the unit square, (u, v, z) per corner: z sloping in x,
+ * in y, in both, and a skewed one sloping in both. */
+static const float DEPTH_SHAPES[4][3][3] = {
+    { { 0.0f, 0.0f, -5.0f }, { 1.0f, 0.0f, -5.6f }, { 0.0f, 1.0f, -5.0f } },
+    { { 0.0f, 0.0f, -5.0f }, { 1.0f, 0.0f, -5.0f }, { 0.0f, 1.0f, -5.7f } },
+    { { 0.0f, 0.0f, -5.0f }, { 1.0f, 0.0f, -5.4f }, { 0.0f, 1.0f, -5.5f } },
+    { { 0.0f, 0.0f, -5.2f }, { 1.0f, 0.3f, -5.5f }, { 0.4f, 1.0f, -4.9f } },
+};
+
+/* Scenes 17 and 27's 3D depth is a step off in places whichever way
+ * psprecomp anchors the plane. One row per shape (0.9 across), six copies
+ * each: the corners given starting from each of the three, then the same in
+ * the other winding. Depth test ALWAYS, writes on; the depth buffer is saved
+ * too. */
+static void scene_depthanchor(void) {
+    if (step("scene %02d: 3D depth planes, each shape from each corner and in both windings", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);                 /* writes on */
+    static CV t[4 * 6 * 3];
+    int n = 0;
+    for (int s = 0; s < 4; s++)
+        for (int k = 0; k < 6; k++) {
+            const float X = -3.75f + k * 1.5f, Y = 2.2f - s * 1.25f;
+            const w32 c = 0xFF800000u | (w32)(0x40 + s * 0x30) | (w32)(0x40 + k * 0x20) << 8;
+            for (int j = 0; j < 3; j++) {
+                const int v = k < 3 ? (k + j) % 3 : (k + 3 - j) % 3;
+                t[n++] = (CV){ c, X + DEPTH_SHAPES[s][v][0] * 0.9f, Y - DEPTH_SHAPES[s][v][1] * 0.9f,
+                               DEPTH_SHAPES[s][v][2] };
+            }
+        }
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV3D, n, NULL, gumem(t, n * sizeof(CV)));
+    scene_end("depthanchor", GU_PSM_8888, 1);
+}
+
+static CV g_lines[2 * 192];
+static int g_nl;
+
+/* A through-mode line, red at its start and green at its end. */
+static void line2d(float x0, float y0, float x1, float y1) {
+    g_lines[g_nl++] = (CV){ 0xFF0000FF, x0, y0, 0 };
+    g_lines[g_nl++] = (CV){ 0xFF00FF00, x1, y1, 0 };
+}
+
+/* Scene 28's 3D line stops a pixel from where psprecomp stops it, at an end
+ * of 5818/16. Through-mode lines whose ends fall on every sixteenth, one
+ * per row k (fraction k/16), y = 6 + 8k: going right with the end's
+ * fraction, then the start's; going left likewise; going right and slightly
+ * down to x fractions 0.625 and 0.4375 with the end's y fraction k/16, and
+ * the same two reversed. Then steep lines, one per column k: going down with
+ * the end's fraction, going up with it, going down and up with the start's. */
+static void scene_lineends(void) {
+    if (step("scene %02d: line ends on every sixteenth", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    g_nl = 0;
+    for (int k = 0; k < 16; k++) {
+        const float f = k / 16.0f, y = 6 + 8 * k;
+        line2d(10, y, 60 + f, y);
+        line2d(70 + f, y, 120, y);
+        line2d(180, y, 130 + f, y);
+        line2d(240 + f, y, 190, y);
+        line2d(250, y, 290.625f, y + 3 + f);
+        line2d(300, y, 340.4375f, y + 3 + f);
+        line2d(390.625f, y + 3 + f, 350, y);
+        line2d(440.4375f, y + 3 + f, 400, y);
+    }
+    for (int k = 0; k < 16; k++) {
+        const float f = k / 16.0f, xl = 10 + 14 * k, xr = 250 + 14 * k;
+        line2d(xl, 135, xl + 2, 180 + f);
+        line2d(xr, 180, xr + 2, 135 + f);
+        line2d(xl, 190 + f, xl + 3, 235);
+        line2d(xr, 240 + f, xr + 3, 195);
+    }
+    sceGuDrawArray(GU_LINES, FMT_CV2D, g_nl, NULL, gumem(g_lines, g_nl * sizeof(CV)));
+    scene_end("lineends", GU_PSM_8888, 0);
+}
+
+/* Patches drawn as points, so each generated vertex is one pixel in its own
+ * colour, unblended with its neighbours: Bezier at divisions 3, 5, 6, 7 and
+ * 12, and splines (fill/fill at 3 and 5, open/open at 3). Row 1 over a
+ * flat_grid (bilinear colours), row 2 the same grid with blue alternating,
+ * row 3 scene 22's curved grid, smaller. */
+static void scene_patchpoints(void) {
+    if (step("scene %02d: patch vertices as points, divisions 3 to 12", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    static const struct { int div, spline, edge; } C[8] = {
+        { 3, 0, 0 }, { 5, 0, 0 }, { 6, 0, 0 }, { 7, 0, 0 }, { 12, 0, 0 },
+        { 3, 1, GU_FILL_FILL }, { 5, 1, GU_FILL_FILL }, { 3, 1, GU_OPEN_OPEN } };
+    CV g[16];
+    sceGuPatchPrim(GU_POINTS);
+    for (int row = 0; row < 3; row++)
+        for (int i = 0; i < 8; i++) {
+            const float cx = -5.075f + i * 1.45f;
+            if (row < 2) flat_grid(g, cx, 2.3f - row * 2.1f, 0.4f, row ? 2 : 0);
+            else patch_grid(g, 4, 4, cx * 0.7f, -1.9f, 0.3f);
+            sceGuPatchDivide(C[i].div, C[i].div);
+            if (C[i].spline) sceGuDrawSpline(FMT_CV3D, 4, 4, C[i].edge, C[i].edge, NULL, gumem(g, sizeof g));
+            else sceGuDrawBezier(FMT_CV3D, 4, 4, NULL, gumem(g, sizeof g));
+        }
+    sceGuPatchPrim(GU_TRIANGLE_STRIP);
+    scene_end("patchpoints", GU_PSM_8888, 0);
+}
+
+/* How precisely a colour gradient steps. Scene 17's quads are a step off
+ * where a finer gradient would fix them, scene 20's triangles a step off
+ * where a coarser one would. Through mode, one row per width 5 to 211:
+ * a triangle whose colour changes in x only (red 255 to 0, green 0 to 255,
+ * blue 0x40 to 0xC0), at whole-pixel corners on the left and at fractional
+ * ones on the right. Below, in 3D at z = -5: scene 17's magenta-to-yellow
+ * quads, ten 0.6 wide, then ten 0.3 to 1.2 wide, then scene 20's
+ * red-green-blue triangle ten times along a row. */
+static void scene_gradients(void) {
+    if (step("scene %02d: colour gradient precision", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    static const short W[14] = { 5, 7, 11, 17, 23, 31, 47, 63, 85, 113, 150, 180, 199, 211 };
+    const w32 c0 = 0xFF4000FF, c1 = 0xFFC0FF00;
+    for (int i = 0; i < 14; i++) {
+        const float y = 4 + 12 * i;
+        tri2d(10, y, c0, 10 + W[i], y, c1, 10, y + 10, c0);
+        tri2d(250.3125f, y + 0.5625f, c0, 250.75f + W[i], y + 0.5625f, c1, 250.3125f, y + 10.5625f, c0);
+    }
+    for (int i = 0; i < 10; i++)
+        quad3d(-4.6f + i * 0.9f, -1.35f, -4.0f + i * 0.9f, -0.9f, -5.0f, 0xFFFF00FF, 0xFFFFFF00);
+    float x = -4.6f;
+    for (int i = 0; i < 10; i++) {
+        const float w = 0.3f + 0.1f * i;
+        quad3d(x, -1.95f, x + w, -1.5f, -5.0f, 0xFFFF00FF, 0xFFFFFF00);
+        x += w + 0.15f;
+    }
+    CV t[30];
+    for (int i = 0; i < 10; i++) {
+        const float tx = -4.6f + i * 0.95f;
+        t[3 * i]     = (CV){ 0xFF0000FF, tx, -2.75f, -5.0f };
+        t[3 * i + 1] = (CV){ 0xFF00FF00, tx + 0.8f, -2.75f, -5.0f };
+        t[3 * i + 2] = (CV){ 0xFFFF0000, tx + 0.4f, -2.05f, -5.0f };
+    }
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV3D, 30, NULL, gumem(t, sizeof t));
+    scene_end("gradients", GU_PSM_8888, 0);
+}
+
+/* Whether a morph blend keeps a colour's fraction. One wide quad per row at
+ * z = -6, both vertex sets in the same place, left colour 0xFF40FF00 and
+ * 0xFF41FE01, right 0xFFC000FF and 0xFFBF01FE: weights 1/0, 0/1, 0.5/0.5,
+ * 0.25/0.75, 0.75/0.25, 0.3/0.7. Then, unmorphed, the first set's gradient
+ * and the gradient that 0.5/0.5 truncated at the corners gives (0xFF40FE00
+ * to 0xFFBF00FE). */
+static void scene_morphgrad(void) {
+    if (step("scene %02d: morph blends of colour gradients", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    static const float MW[6][2] = {
+        { 1.0f, 0.0f }, { 0.0f, 1.0f }, { 0.5f, 0.5f }, { 0.25f, 0.75f }, { 0.75f, 0.25f }, { 0.3f, 0.7f } };
+    const w32 L0 = 0xFF40FF00, R0 = 0xFFC000FF, L1 = 0xFF41FE01, R1 = 0xFFBF01FE;
+    for (int r = 0; r < 8; r++) {
+        const float y0 = 2.9f - r * 0.75f, y1 = y0 - 0.6f;
+        if (r == 6) { quad3d(-5.0f, y1, 5.0f, y0, -6.0f, L0, R0); continue; }
+        if (r == 7) { quad3d(-5.0f, y1, 5.0f, y0, -6.0f, 0xFF40FE00, 0xFFBF00FE); continue; }
+        const float P[6][2] = { { -5, y0 }, { 5, y0 }, { -5, y1 }, { 5, y0 }, { 5, y1 }, { -5, y1 } };
+        CV mv[12];
+        for (int k = 0; k < 6; k++) {
+            const int right = P[k][0] > 0;
+            mv[2 * k]     = (CV){ right ? R0 : L0, P[k][0], P[k][1], -6.0f };
+            mv[2 * k + 1] = (CV){ right ? R1 : L1, P[k][0], P[k][1], -6.0f };
+        }
+        sceGuMorphWeight(0, MW[r][0]);
+        sceGuMorphWeight(1, MW[r][1]);
+        sceGuDrawArray(GU_TRIANGLES, GU_VERTICES(2) | FMT_CV3D, 6, NULL, gumem(mv, sizeof mv));
+    }
+    scene_end("morphgrad", GU_PSM_8888, 0);
+}
+
+/* Bounding boxes at the camera, one list and step each, no dump: across the
+ * camera plane (z -0.5 to 0.5) at x 0.5, 2, 5 and 10; behind the camera just
+ * off the axis; between the camera and the near plane; across the near
+ * plane; behind the camera and wide. */
+static void scene_bbox3(void) {
+    static const struct { float cx, cy, cz, h; w32 color; const char *what; } B[8] = {
+        { 0.5f,  0.0f,  0.0f, 0.5f, 0xFFFFFFFF, "across the camera plane, x 0.5" },
+        { 2.0f,  0.0f,  0.0f, 0.5f, 0xFF0000FF, "across the camera plane, x 2" },
+        { 5.0f,  0.0f,  0.0f, 0.5f, 0xFF00FF00, "across the camera plane, x 5" },
+        { 10.0f, 0.0f,  0.0f, 0.5f, 0xFFFF0000, "across the camera plane, x 10" },
+        { 0.3f,  0.2f,  3.0f, 0.5f, 0xFF00FFFF, "behind the camera, just off the axis" },
+        { 0.0f,  0.0f, -0.5f, 0.3f, 0xFFFF00FF, "between the camera and the near plane" },
+        { 0.0f,  0.0f, -1.1f, 0.3f, 0xFFFFFF00, "across the near plane" },
+        { 0.0f,  0.0f,  2.0f, 1.5f, 0xFF808080, "behind the camera, wide" },
+    };
+    for (int i = 0; i < 8; i++) {
+        if (step("scene %02d: bounding box %d, %s", g_scene, i, B[i].what)) continue;
+        scene_begin(GU_PSM_8888, 0xFF000000);
+        const float mx0 = 10 + i * 58, my0 = 220, mx1 = 60 + i * 58, my1 = 262;
+        bbox_object_at(B[i].cx, B[i].cy, B[i].cz, B[i].h, mx0, my0, mx1, my1, B[i].color);
+        sceGuFinish();
+        out("  wait %08X\n", (w32)ge_wait());
+        report_marker("marker", mx0, my0, mx1, my1, B[i].color);
+    }
+}
+
+/* A sprite marker in slot 0-7 of a row starting at y. */
+static void mark(CV *v, int slot, float y, w32 color) {
+    v[0] = (CV){ color, 10 + slot * 58, y, 0 };
+    v[1] = (CV){ color, 60 + slot * 58, y + 40, 0 };
+}
+
+static void send_addr(int cmd, w32 a) {
+    sceGuSendCommandi(16, (a >> 8) & 0x0F0000);                    /* BASE: address bits 24-27 */
+    sceGuSendCommandi(cmd, a & 0xFFFFFF);                            /* VADDR (1) or IADDR (2) */
+}
+
+/* Scene 33 showed that BBOX and PRIM move VADDR past the vertices they read.
+ * Indexed draws, by hand: rows 1 and 2 (16- and 8-bit indices 0, 1, 4, 5 over
+ * four sprites A-D in slots 0-3) draw PRIM 2 then PRIM 2 with no address in
+ * between. The second draws A again if neither address moved, B if only
+ * VADDR moved (by two vertices), C if only IADDR moved, D if both did. Row 3
+ * is the same unindexed (A then B). Row 4: an indexed BBOX (indices 0-9 over
+ * 8 corners, then sprites) followed by an indexed PRIM 2: the sprite in
+ * slot 0 if IADDR moved past the box's 8 indices and VADDR stayed, slot 1
+ * if only VADDR moved past the corners, slot 2 if both moved. */
+static void scene_indices(void) {
+    if (step("scene %02d: indexed draws: do PRIM and BBOX move IADDR", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    static const w32 COL[4] = { 0xFFFFFFFF, 0xFF0000FF, 0xFF00FF00, 0xFFFF0000 };
+    static const unsigned short I16[4] = { 0, 1, 4, 5 };
+    static const unsigned char I8[4] = { 0, 1, 4, 5 };
+    for (int row = 0; row < 2; row++) {
+        CV v[8];
+        for (int m = 0; m < 4; m++) mark(v + 2 * m, m, 10 + row * 50, COL[m]);
+        const w32 va = (w32)gumem(v, sizeof v);
+        const w32 ia = row ? (w32)gumem(I8, sizeof I8) : (w32)gumem(I16, sizeof I16);
+        sceGuSendCommandi(18, FMT_CV2D | (row ? GU_INDEX_8BIT : GU_INDEX_16BIT));   /* VTYPE */
+        send_addr(1, va);
+        send_addr(2, ia);
+        sceGuSendCommandi(4, (GU_SPRITES << 16) | 2);                                 /* PRIM */
+        sceGuSendCommandi(4, (GU_SPRITES << 16) | 2);                                 /* PRIM again */
+    }
+    CV u[4];
+    mark(u, 0, 110, COL[0]);
+    mark(u + 2, 1, 110, COL[1]);
+    sceGuSendCommandi(18, FMT_CV2D);
+    send_addr(1, (w32)gumem(u, sizeof u));
+    sceGuSendCommandi(4, (GU_SPRITES << 16) | 2);
+    sceGuSendCommandi(4, (GU_SPRITES << 16) | 2);
+
+    /* Corners at bytes 0-95; the sprite for "VADDR moved" at 96 (index 0 past
+     * the corners), for "IADDR moved" at 128 (index 8 as a 16-byte vertex),
+     * for both at 224 (index 8 past the corners). */
+    struct { BP3 box[8]; CV m1[2]; CV m2[2]; CV pad[4]; CV m3[2]; } d;
+    memset(&d, 0, sizeof d);
+    box_corners(d.box, 0.0f, 0.0f, -5.0f, 0.5f);
+    mark(d.m2, 0, 160, COL[0]);
+    mark(d.m1, 1, 160, COL[1]);
+    mark(d.m3, 2, 160, COL[2]);
+    static const unsigned short IB[10] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const w32 da = (w32)gumem(&d, sizeof d), ib = (w32)gumem(IB, sizeof IB);
+    sceGuSendCommandi(18, GU_VERTEX_32BITF | GU_TRANSFORM_3D | GU_INDEX_16BIT);
+    send_addr(1, da);
+    send_addr(2, ib);
+    sceGuSendCommandi(7, 8);                                                          /* BBOX */
+    sceGuSendCommandi(18, FMT_CV2D | GU_INDEX_16BIT);
+    sceGuSendCommandi(4, (GU_SPRITES << 16) | 2);
+    scene_end("indices", GU_PSM_8888, 0);
+
+    static const char *const WHAT[4] = { "A (first PRIM)", "B (VADDR moved)", "C (IADDR moved)", "D (both moved)" };
+    char s[64];
+    for (int row = 0; row < 2; row++)
+        for (int m = 0; m < 4; m++) {
+            snprintf(s, sizeof s, "%s indices, %s", row ? "8-bit" : "16-bit", WHAT[m]);
+            report_marker(s, 10 + m * 58, 10 + row * 50, 60 + m * 58, 50 + row * 50, COL[m]);
+        }
+    report_marker("unindexed, A", 10, 110, 60, 150, COL[0]);
+    report_marker("unindexed, B", 68, 110, 118, 150, COL[1]);
+    report_marker("after indexed BBOX, IADDR moved", 10, 160, 60, 200, COL[0]);
+    report_marker("after indexed BBOX, VADDR moved", 68, 160, 118, 200, COL[1]);
+    report_marker("after indexed BBOX, both moved", 126, 160, 176, 200, COL[2]);
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -1365,6 +1814,60 @@ static int words_intact(const volatile unsigned int *p, const unsigned int *w, i
     for (int i = 0; i < n; i++)
         if (p[i] != w[i]) return 0;
     return 1;
+}
+
+/* geprobe 6's handlers: one that reads the system clock (timing), one that
+ * calls sceGeContinue from the PAUSE signal 0x7B. */
+static volatile w32 g_t[8];
+static volatile int g_nt;
+static PspGeCallbackData g_cbt;
+static void ge_time_cb(int id, void *arg) {
+    (void)id; (void)arg;
+    const int i = g_nt;
+    if (i < 8) { g_t[i] = sceKernelGetSystemTimeLow(); g_nt = i + 1; }
+}
+static volatile int g_cont;
+static void ge_signal_continue_cb(int id, void *arg) {
+    note(3, id | ((int)arg & 0xFF) << 16);
+    if (id == 0x7B) g_cont = sceGeContinue();
+}
+
+/* SIGNAL continue 0x21, FINISH 0x22, queued with the stall `at` words in;
+ * peeks, 10 ms, then the stall moved to the end. */
+static void stall_step(int at) {
+    g_nev = 0; g_phase = 0;
+    const int cbid = sceGeSetCallback(&g_cb);
+    if (cbid < 0) {
+        out("  sceGeSetCallback error\n");
+        ret(cbid);
+        return;
+    }
+    int k = 0;
+    g_raw[k++] = 0x0E020021; g_raw[k++] = 0x0C000000;   /* SIGNAL continue 0x21, END */
+    g_raw[k++] = 0x0F000022; g_raw[k++] = 0x0C000000;   /* FINISH 0x22, END */
+    g_raw[k++] = 0;
+    sceKernelDcacheWritebackInvalidateRange(g_raw, sizeof g_raw);
+    g_phase = 1;
+    const int lid = sceGeListEnQueue(UNCACHED(g_raw), UNCACHED(g_raw + at), cbid, NULL);
+    g_phase = 2;
+    out("  sceGeListEnQueue %s; %d callback(s) before it returned\n", lid >= 0 ? "ok (id >= 0)" : "error", g_nev);
+    if (lid < 0) {
+        ret(lid);
+    } else {
+        out("  sceGeListSync(peek) = %08X, sceGeDrawSync(peek) = %08X\n",
+            (w32)sceGeListSync(lid, 1), (w32)sceGeDrawSync(1));
+        sceKernelDelayThread(10000);
+        out("  after 10 ms: %d callback(s); sceGeListSync(peek) = %08X, sceGeDrawSync(peek) = %08X\n",
+            g_nev, (w32)sceGeListSync(lid, 1), (w32)sceGeDrawSync(1));
+        g_phase = 3;
+        const int u = sceGeListUpdateStallAddr(lid, UNCACHED(g_raw + 4));
+        g_phase = 4;
+        out("  sceGeListUpdateStallAddr = %08X; %d callback(s) by its return; sceGeListSync(peek) = %08X\n",
+            (w32)u, g_nev, (w32)sceGeListSync(lid, 1));
+        out("  wait %08X\n", (w32)ge_wait());
+        log_events();
+    }
+    out("  sceGeUnsetCallback = %08X\n", (w32)sceGeUnsetCallback(cbid));
 }
 
 static void section_callbacks(void) {
@@ -1606,8 +2109,13 @@ static void section_callbacks(void) {
 
     /* Version 4's step 35 again, call for call, with the log flushed after
      * each one so it names where the PSP stops if it does; then whether the
-     * list's words still read as written once the cache is written back. */
-    if (!step("sceGe raw list as geprobe 4 built it (memalign, uncached writes), log flushed after each call")) {
+     * list's words still read as written once the cache is written back.
+     * geprobe 5 on fw 6.60 logged "sceGeListEnQueue ok" and stopped there,
+     * and the next step found all 16 words of such a block replaced by a
+     * cache write-back. */
+    if (!step("sceGe raw list as geprobe 4 built it (memalign, uncached writes), log flushed after each call") &&
+        !KNOWN_CRASH("switched fw 6.60 off after EnQueue in geprobe 5: the list shares a dirty cache line "
+                     "with its malloc header, whose write-back replaces it (next step)")) {
         g_nev = 0; g_phase = 0;
         PspGeCallbackData cb;
         memset(&cb, 0, sizeof cb);
@@ -1666,6 +2174,122 @@ static void section_callbacks(void) {
         out("  before the write-back %s; after it %d of 16 words changed\n",
             before ? "as written" : "already changed", changed);
     }
+
+    /* geprobe 6. What sceGeContinue answers when no list is paused. */
+    if (!step("sceGeContinue with nothing paused")) {
+        out("  sceGeDrawSync(peek) = %08X\n", (w32)sceGeDrawSync(1));
+        r = sceGeContinue();
+        out("  sceGeContinue = %08X; sceGeDrawSync(peek) after = %08X\n", (w32)r, (w32)sceGeDrawSync(1));
+    }
+
+    /* A list queued with a stall address: at its start, then just after its
+     * SIGNAL. What the peeks report while it waits, whether the part before
+     * the stall runs (and its handler) before EnQueue returns, and when the
+     * rest runs once sceGeListUpdateStallAddr moves the stall to the end. */
+    if (!step("sceGe stall at the list's start (SIGNAL 0x21, FINISH 0x22), then sceGeListUpdateStallAddr to its end"))
+        stall_step(0);
+    if (!step("sceGe stall just after the SIGNAL 0x21, then sceGeListUpdateStallAddr to the end"))
+        stall_step(2);
+
+    /* How long lists take: 100 sprites between SIGNAL 0x01 and SIGNAL 0x02,
+     * then FINISH 0x03, at three sizes; the handlers read the system clock.
+     * psprecomp's run gives its own timing model's answer. */
+    if (!step("sceGe timing: 100 sprites between SIGNALs, 480x272, 64x64 and 16x16; microseconds to each callback")) {
+        memset(&g_cbt, 0, sizeof g_cbt);
+        g_cbt.signal_func = ge_time_cb;
+        g_cbt.finish_func = ge_time_cb;
+        const int cbid = sceGeSetCallback(&g_cbt);
+        if (cbid < 0) {
+            out("  sceGeSetCallback error\n");
+            ret(cbid);
+        } else {
+            static const short SZ[3][2] = { { SCR_W, SCR_H }, { 64, 64 }, { 16, 16 } };
+            for (int s = 0; s < 3; s++) {
+                g_rawv[0] = (CV){ 0xFF302010, 0, 0, 0 };
+                g_rawv[1] = (CV){ 0xFF302010, SZ[s][0], SZ[s][1], 0 };
+                const w32 va = (w32)g_rawv;
+                int k = 0;
+                g_raw[k++] = 0x12000000 | FMT_CV2D;                 /* VTYPE */
+                g_raw[k++] = 0x10000000 | ((va >> 8) & 0x0F0000);   /* BASE */
+                g_raw[k++] = 0x0E020001; g_raw[k++] = 0x0C000000;   /* SIGNAL continue 0x01, END */
+                for (int i = 0; i < 100; i++) {
+                    g_raw[k++] = 0x01000000 | (va & 0xFFFFFF);                  /* VADDR */
+                    g_raw[k++] = 0x04000000 | (GU_SPRITES << 16) | 2;           /* PRIM */
+                }
+                g_raw[k++] = 0x0E020002; g_raw[k++] = 0x0C000000;   /* SIGNAL continue 0x02, END */
+                g_raw[k++] = 0x0F000003; g_raw[k++] = 0x0C000000;   /* FINISH 0x03, END */
+                g_raw[k++] = 0;
+                sceKernelDcacheWritebackInvalidateRange(g_rawv, sizeof g_rawv);
+                sceKernelDcacheWritebackInvalidateRange(g_raw, sizeof g_raw);
+                g_nt = 0;
+                const w32 t0 = sceKernelGetSystemTimeLow();
+                const int lid = sceGeListEnQueue(UNCACHED(g_raw), NULL, cbid, NULL);
+                const w32 t1 = sceKernelGetSystemTimeLow();
+                const int nt1 = g_nt;
+                const int ds = sceGeDrawSync(0);
+                const w32 t2 = sceKernelGetSystemTimeLow();
+                out("  %dx%d: EnQueue %s after %u us (%d callback(s) by then), DrawSync = %08X after %u us;"
+                    " callbacks at", SZ[s][0], SZ[s][1], lid >= 0 ? "returned" : "failed", (unsigned)(t1 - t0),
+                    nt1, (w32)ds, (unsigned)(t2 - t0));
+                for (int i = 0; i < g_nt; i++) out(" %u", (unsigned)(g_t[i] - t0));
+                out(" us\n");
+                if (lid < 0) { ret(lid); break; }
+            }
+            r = sceGeUnsetCallback(cbid);
+            out("  sceGeUnsetCallback = %08X\n", (w32)r);
+        }
+    }
+
+    /* Last, as it may not come back: PAUSE whose signal handler calls
+     * sceGeContinue itself (in geprobe 5 the handler ran inside EnQueue and
+     * the list waited for sceGeContinue from the thread). If the list is
+     * still paused 20 ms on, the thread continues it. */
+    if (!step("sceGe PAUSE 0x7B with sceGeContinue in its signal handler; FINISH 0x7C, SIGNAL 0x7D, FINISH 0x7E")) {
+        static PspGeCallbackData cbc;
+        memset(&cbc, 0, sizeof cbc);
+        cbc.signal_func = ge_signal_continue_cb;
+        cbc.signal_arg  = (void *)0x5A;
+        cbc.finish_func = ge_finish_cb;
+        cbc.finish_arg  = (void *)0xA5;
+        g_nev = 0; g_phase = 0; g_cont = 0x7FFFFFFF;
+        const int cbid = sceGeSetCallback(&cbc);
+        if (cbid < 0) {
+            out("  sceGeSetCallback error\n");
+            ret(cbid);
+        } else {
+            int k = 0;
+            g_raw[k++] = 0x0E03007B; g_raw[k++] = 0x0C000000;   /* SIGNAL pause 0x7B, END */
+            g_raw[k++] = 0x0F00007C; g_raw[k++] = 0x0C000000;   /* FINISH 0x7C, END */
+            g_raw[k++] = 0x0E02007D; g_raw[k++] = 0x0C000000;   /* SIGNAL continue 0x7D, END */
+            g_raw[k++] = 0x0F00007E; g_raw[k++] = 0x0C000000;   /* FINISH 0x7E, END */
+            g_raw[k++] = 0;
+            sceKernelDcacheWritebackInvalidateRange(g_raw, sizeof g_raw);
+            g_phase = 1;
+            const int lid = sceGeListEnQueue(UNCACHED(g_raw), NULL, cbid, NULL);
+            g_phase = 2;
+            out("  sceGeListEnQueue %s; %d callback(s) before it returned\n",
+                lid >= 0 ? "ok (id >= 0)" : "error", g_nev);
+            if (lid < 0) {
+                ret(lid);
+            } else {
+                sceKernelDelayThread(20000);
+                const int ls = sceGeListSync(lid, 1);
+                out("  after 20 ms: %d callback(s); the handler's sceGeContinue = %08X;"
+                    " sceGeListSync(peek) = %08X, sceGeDrawSync(peek) = %08X\n",
+                    g_nev, (w32)g_cont, (w32)ls, (w32)sceGeDrawSync(1));
+                if (ls == 4) {
+                    g_phase = 3;
+                    r = sceGeContinue();
+                    g_phase = 4;
+                    out("  still paused: sceGeContinue = %08X\n", (w32)r);
+                }
+                out("  wait %08X\n", (w32)ge_wait());
+                log_events();
+            }
+            r = sceGeUnsetCallback(cbid);
+            out("  sceGeUnsetCallback = %08X\n", (w32)r);
+        }
+    }
 }
 
 /* ---- main ---------------------------------------------------------------- */
@@ -1723,6 +2347,15 @@ int main(int argc, char **argv) {
     g_scene = 31; scene_masks16(GU_PSM_5551, "masks_5551");
     g_scene = 32; scene_masks16(GU_PSM_4444, "masks_4444");
     g_scene = 33; scene_bbox2();
+    g_scene = 34; scene_lightmath();
+    g_scene = 35; scene_locallights();
+    g_scene = 36; scene_depthanchor();
+    g_scene = 37; scene_lineends();
+    g_scene = 38; scene_patchpoints();
+    g_scene = 39; scene_gradients();
+    g_scene = 40; scene_morphgrad();
+    g_scene = 41; scene_bbox3();
+    g_scene = 42; scene_indices();
 
     section_callbacks();
 
