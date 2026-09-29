@@ -1,0 +1,1028 @@
+
+==== threadprobe 3, firmware (sceKernelDevkitVersion) 06060010 ====
+log: ms0:/PSP/GAME/threadprobe/threadprobe.txt
+
+---- basics ----
+[1] main thread: GetThreadId, GetThreadCurrentPriority, ReferThreadStatus(0)
+  GetThreadId: valid
+  GetThreadCurrentPriority = 00000020
+  ReferThreadStatus(0) = 00000000
+    size=104 name="user_main" attr=800040FF status=00000001
+    entry=user stack=user(&FF=00) stackSize=00040000 gp=gp
+    init=20 cur=20 waitType=00000000 waitId=0 wakeup=0 exit=800201A4
+    runClocks=nz intrPreempt=0 threadPreempt=1 release=333
+  ReferThreadStatus(own id) = 00000000, same entry/stack as (0): yes
+[2] main: argc, and each argv string's length, device, file name and place on main's stack
+  argc=1
+  argv[0]: length 35, device "ms0", file "EBOOT.PBP", at stk+3FED0, next string right after: -
+  strings with their NULs: 36 bytes
+
+---- create ----
+[3] create: priority 0, 1, 7, 8, 0x20, 0x77, 0x78, 0x7F, 0x80, -1
+  prio 00000000: 80020193
+  prio 00000001: 80020193
+  prio 00000007: 80020193
+  prio 00000008: uid init=08 cur=08
+  prio 00000020: uid init=20 cur=20
+  prio 00000077: uid init=77 cur=77
+  prio 00000078: 80020193
+  prio 0000007F: 80020193
+  prio 00000080: 80020193
+  prio FFFFFFFF: 80020193
+[4] create: stack size 0, 1, 0x100, 0x1FF, 0x200, 0x201, 0x1001, 0x10000, 0x7FFFFFFF, -1
+  size 00000000: 80020194
+  size 00000001: 80020194
+  size 00000100: 80020194
+  size 000001FF: 80020194
+  size 00000200: uid stackSize=00000200 stack&FF=00
+  size 00000201: uid stackSize=00000300 stack&FF=00
+  size 00001001: uid stackSize=00001100 stack&FF=00
+  size 00010000: uid stackSize=00010000 stack&FF=00
+  size 7FFFFFFF: 80020190
+  size FFFFFFFF: 80020190
+[5] create: names of length 0, 1, 31, 32 and 40, and a duplicate name
+  len 0: uid name words 00000000 00000000 .. 00000000 00000000
+  len 1: uid name words 00000061 00000000 .. 00000000 00000000
+  len 31: uid name words 64636261 68676665 .. 31307A79 00343332
+  len 32: uid name words 64636261 68676665 .. 31307A79 00343332
+  len 40: uid name words 64636261 68676665 .. 31307A79 00343332
+  duplicate: uid uid
+[6] create: attribute 0, 0x700000, then each single bit (ret / reported attr)
+  attr 00000000: uid attr=800000FF
+  attr 00700000: uid attr=807000FF
+  b00:800000FF b01:800000FF b02:800000FF b03:800000FF
+  b04:800000FF b05:800000FF b06:800000FF b07:800000FF
+  b08:80020191 b09:80020191 b10:80020191 b11:80020191
+  b12:80020191 b13:800020FF b14:800040FF b15:80020191
+  b16:80020191 b17:80020191 b18:80020191 b19:80020191
+  b20:801000FF b21:802000FF b22:804000FF b23:800000FF
+  b24:80020191 b25:80020191 b26:80020191 b27:800000FF
+  b28:800000FF b29:800000FF b30:800000FF b31:800000FF
+[7] create: entry NULL
+  entry NULL: uid
+[8] create: 200 dormant threads with 0x200-byte stacks (how many succeed)
+  created 200 of 200, first failure 00000000, delete failures 0
+[9] create: check order with two or more bad arguments (NULL name, priority 0, stack 0x100, attr 0x100, entry 0x88000000)
+  name+prio       80020193
+  name+size       80020194
+  name+attr       80020191
+  prio+size       80020193
+  prio+attr       80020191
+  size+attr       80020191
+  prio+size+attr  80020191
+  kentry          800200D3
+  kentry+prio     800200D3
+  name+kentry     800200D3
+
+---- refer ----
+[10] ReferThreadStatus on a dormant thread with size field 0, 1, 4, 5, 80, 82, 84, 104, 108, 200
+  room   0: ret=00000000/00000000 written-to=0 size=00000000 word80=EEEEEEEE
+  room   1: ret=00000000/00000000 written-to=1 size=00000068 word80=EEEEEEEE
+  room   4: ret=00000000/00000000 written-to=1 size=00000068 word80=EEEEEEEE
+  room   5: ret=00000000/00000000 written-to=5 size=00000068 word80=EEEEEEEE
+  room  80: ret=00000000/00000000 written-to=80 size=00000068 word80=EEEEEEEE
+  room  82: ret=00000000/00000000 written-to=82 size=00000068 word80=EEEE01A2
+  room  84: ret=00000000/00000000 written-to=84 size=00000068 word80=800201A2
+  room 104: ret=00000000/00000000 written-to=104 size=00000068 word80=800201A2
+  room 108: ret=00000000/00000000 written-to=104 size=00000068 word80=800201A2
+  room 200: ret=00000000/00000000 written-to=104 size=00000068 word80=800201A2
+[11] ReferThreadStatus: every field of a thread asleep in SleepThread
+  sleeping: refer=00000000
+    size=104 name="rf_sleep" attr=800000FF status=00000004
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000001 waitId=0 wakeup=0 exit=800201A4
+    runClocks=nz intrPreempt=0 threadPreempt=0 release=1
+  after it returned 0x42: refer=00000000
+    size=104 name="rf_sleep" attr=800000FF status=00000010
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000000 waitId=0 wakeup=0 exit=00000042
+    runClocks=nz intrPreempt=0 threadPreempt=0 release=2
+[12] ReferThreadStatus: a thread in DelayThread(1s)
+  delaying: refer=00000000
+    size=104 name="rf_delay" attr=800000FF status=00000004
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000002 waitId=0 wakeup=0 exit=800201A4
+    runClocks=nz intrPreempt=0 threadPreempt=0 release=1
+[13] ReferThreadStatus: a thread in WaitSema, and one in WaitEventFlag
+  waiting on sema: refer=00000000
+    size=104 name="rf_sema" attr=800000FF status=00000004
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000003 waitId=sema wakeup=0 exit=800201A4
+    runClocks=nz intrPreempt=0 threadPreempt=0 release=1
+  waiting on event flag: refer=00000000
+    size=104 name="rf_evf" attr=800000FF status=00000004
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000004 waitId=evf wakeup=0 exit=800201A4
+    runClocks=nz intrPreempt=0 threadPreempt=0 release=1
+[14] ReferThreadStatus: a thread in WaitThreadEnd on a sleeping thread
+  waiting for thread end: refer=00000000
+    size=104 name="rf_waitend" attr=800000FF status=00000004
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000009 waitId=rf_target wakeup=0 exit=800201A4
+    runClocks=nz intrPreempt=0 threadPreempt=0 release=1
+[15] ReferThreadStatus(0) from inside a running 0x10 thread
+  refer(0) from itself = 00000000
+    size=104 name="rf_self" attr=800000FF status=00000001
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=10 cur=10 waitType=00000000 waitId=0 wakeup=0 exit=800201A4
+    runClocks=nz intrPreempt=0 threadPreempt=0 release=0
+[16] ReferThreadStatus: unknown id (a deleted thread)
+  deleted: 80020198
+[17] ReferThreadStatus: waitType and waitId of threads waiting on a mbx, vpl, fpl, msgpipe, mutex, lwmutex and TLS pool
+  w_mbx      refer=00000000 status=00000004 waitType=00000005 waitId=mbx
+  w_vpl      refer=00000000 status=00000004 waitType=00000006 waitId=vpl
+  w_fpl      refer=00000000 status=00000004 waitType=00000007 waitId=fpl
+  w_msgpipe  refer=00000000 status=00000004 waitType=00000008 waitId=msgpipe
+  w_mutex    refer=00000000 status=00000004 waitType=0000000C waitId=mutex
+  w_lwmutex  refer=00000000 status=00000004 waitType=0000000D waitId=lwmutex
+  w_tlspl    refer=00000000 status=00000004 waitType=0000000E waitId=tlspl
+  seq: mbx=800201B5 vpl=800201B5 fpl=800201B5 msgpipe=800201B5 mutex=800201B5 lwmutex=800201B5 tlspl=00000000
+
+---- start ----
+[18] StartThread: id 0, a deleted thread's id, a thread already started
+  id 0: 80020197
+  deleted: 80020198
+  already started (ready): 800201A4
+[19] StartThread ordering: a 0x20 thread started by main (0x20)
+  start=00000000
+  seq: m1 m2 W m3
+[20] StartThread ordering: a 0x30 thread started by main (0x20)
+  start=00000000
+  seq: m1 m2 W m3
+[21] StartThread ordering: a 0x10 thread started by main (0x20)
+  start=00000000
+  seq: m1 W m2
+[22] start args: 8 bytes; full register file at entry, stack words
+  start=00000000 end=00000077
+    a0=00000008 a1=stk+EF0 argwords=11111111 22222222 mainbuf[0] now 11111111
+    sp=stk+EB0 k0=stk+F00 gp=main's ra=user
+    nonzero GPRs (excluding a0 a1 k0 gp sp ra): mask 43FFFFCE; k1=0 hi=nz lo=nz
+    fcr31=00000E00
+    f00..: 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001
+    f08..: 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001
+    f16..: 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001
+    f24..: 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001 7F800001
+    stack[0]=uid stack[1]=FFFFFFFF stack[+0x100]=FFFFFFFF
+    top-40: uid 00000000 base 00000000
+    top-30: 00000000 00000000 00000000 00000000
+    top-20: 00000000 00000000 00000000 00000000
+    top-10: 00000000 00000000 FFFFFFFF FFFFFFFF
+[23] start args: 1 byte of a word holding 0x4567
+  start=00000000 end=00000077
+    a0=00000001 a1=stk+EF0 argwords=FFFFFF67 FFFFFFFF mainbuf[0] now 00004567
+    sp=stk+EB0 k0=stk+F00 gp=main's ra=user
+    caller's word now 00004567
+[24] start args: 80 bytes
+  start=00000000 end=00000077
+    a0=00000050 a1=stk+EB0 argwords=11111111 22222222 mainbuf[0] now 11111111
+    sp=stk+E70 k0=stk+F00 gp=main's ra=user
+[25] start args: 90 bytes
+  start=00000000 end=00000077
+    a0=0000005A a1=stk+EA0 argwords=11111111 22222222 mainbuf[0] now 11111111
+    sp=stk+E60 k0=stk+F00 gp=main's ra=user
+[26] start args: 0x600 bytes
+  start=00000000 end=00000077
+    a0=00000600 a1=stk+900 argwords=11111111 22222222 mainbuf[0] now 11111111
+    sp=stk+8C0 k0=stk+F00 gp=main's ra=user
+[27] start args: length 0 with a real pointer
+  start=00000000 end=00000077
+    a0=00000000 a1=NULL argwords=EEEEEEEE EEEEEEEE mainbuf[0] now 11111111
+    sp=stk+EC0 k0=stk+F00 gp=main's ra=user
+[28] stack: NO_FILLSTACK thread whose stack main scribbled with 0xCC before starting it
+  create=uid start=00000000
+    stack[0]=uid stack[1]=CCCCCCCC stack[+0x100]=CCCCCCCC
+    top-40: uid 00000000 base 00000000
+    top-30: 00000000 00000000 00000000 00000000
+    top-20: 00000000 00000000 00000000 00000000
+    top-10: 00000000 00000000 FFFFFFFF FFFFFFFF
+[29] stack: marker written into a finished thread's stack, then the thread deleted (CLEAR_STACK and not)
+  attr 00000000: create=uid start=00000000 delete=00000000 marker after delete=12345678
+  attr 00200000: create=uid start=00000000 delete=00000000 marker after delete=00000000
+[30] stack: LOW_STACK attribute versus a PSP_SMEM_Low block
+  block=uid default=uid low=uid
+  default stack above block: yes; low stack above block: yes; low below default: yes
+[31] StartThread: restart a finished thread, and restart a terminated one
+  finished: end=00000003 restart=00000000 end=00000003
+  never ran, terminated: terminate=00000000 restart=00000000 end=00000003
+  seq: run run run
+[32] self: a 0x10 thread applies delete/wait/start/resume/exit-status/wakeup/priority/suspend/terminate to 0 and to itself
+  own id valid                 00000001
+  DeleteThread(0)              800201A4
+  DeleteThread(self)           800201A4
+  WaitThreadEnd(0)             80020197
+  WaitThreadEnd(self)          80020197
+  StartThread(self)            800201A4
+  ResumeThread(0)              80020197
+  ResumeThread(self)           80020197
+  GetThreadExitStatus(0)       80020198
+  GetThreadExitStatus(self)    800201A4
+  WakeupThread(0)              80020197
+  CancelWakeupThread(0)        00000000
+  WakeupThread(self)           80020197
+  CancelWakeupThread(self)     00000000
+  ChangeThreadPriority(0,0x11) 00000000
+    current priority           00000011
+  ChangeThreadPriority(self,0x10) 00000000
+    current priority           00000010
+  SuspendThread(0)             80020197
+  SuspendThread(self)          80020197
+  TerminateThread(0)           80020197
+  TerminateThread(self)        80020197
+  TerminateDeleteThread(0)     80020197
+  TerminateDeleteThread(self)  80020197
+  reached the end              0000600D
+
+---- thread states x calls ----
+[33] states: created (never started)
+  refer=00000000
+    size=104 name="m_created" attr=800000FF status=00000010
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000000 waitId=0 wakeup=0 exit=800201A2
+    runClocks=0 intrPreempt=0 threadPreempt=0 release=0
+  GetThreadExitStatus=800201A2
+  WaitThreadEnd(timeout 0)=800201A2 timeout-after=unchanged
+  ChangeThreadPriority(0x31)=800201A2 cur=30 restore=00000000
+  WakeupThread=800201A2 then CancelWakeupThread=00000000
+  SuspendThread=800201A2 ResumeThread=800201A5 ResumeThread again=800201A5
+  DeleteThread=00000000
+  TerminateThread=80020198
+  TerminateDeleteThread=80020198
+  then refer=80020198
+[34] states: deleted (the id of the thread above)
+  refer=80020198
+  GetThreadExitStatus=80020198
+  WaitThreadEnd(timeout 0)=80020198 timeout-after=unchanged
+  ChangeThreadPriority(0x31)=80020198 cur=FFFFFFFF restore=00000000
+  WakeupThread=80020198 then CancelWakeupThread=80020198
+  SuspendThread=80020198 ResumeThread=80020198 ResumeThread again=80020198
+  DeleteThread=80020198
+  TerminateThread=80020198
+  TerminateDeleteThread=80020198
+  then refer=80020198
+[35] states: created, TerminateDeleteThread directly
+  TerminateDeleteThread=00000000
+[36] states: ready (0x30, started, has not run)
+  refer=00000000
+    size=104 name="m_ready" attr=800000FF status=00000002
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000000 waitId=0 wakeup=0 exit=800201A4
+    runClocks=0 intrPreempt=0 threadPreempt=0 release=0
+  GetThreadExitStatus=800201A4
+  ChangeThreadPriority(0x31)=00000000 cur=31 restore=00000000
+  WakeupThread=00000000 then CancelWakeupThread=00000001
+  SuspendThread=00000000 ResumeThread=00000000 ResumeThread again=800201A5
+  StartThread=800201A4
+  DeleteThread=800201A4
+  TerminateThread=00000000
+    after terminate: refer=00000000 status=00000010 exit=800201AC GetThreadExitStatus=800201AC
+  TerminateDeleteThread=00000000
+  then refer=80020198
+[37] states: waiting (in WaitSema with a 10s timeout)
+  refer=00000000
+    size=104 name="m_wait" attr=800000FF status=00000004
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000003 waitId=sema wakeup=0 exit=800201A4
+    runClocks=nz intrPreempt=0 threadPreempt=0 release=1
+  GetThreadExitStatus=800201A4
+  ChangeThreadPriority(0x31)=00000000 cur=31 restore=00000000
+  WakeupThread=00000000 then CancelWakeupThread=00000001
+  SuspendThread=00000000 ResumeThread=00000000 ResumeThread again=800201A5
+  StartThread=800201A4
+  DeleteThread=800201A4
+  TerminateThread=00000000
+    after terminate: refer=00000000 status=00000010 exit=800201AC GetThreadExitStatus=800201AC
+  TerminateDeleteThread=00000000
+  then refer=80020198
+[38] states: suspended (started, then suspended before it ran)
+  SuspendThread=00000000
+  refer=00000000
+    size=104 name="m_susp" attr=800000FF status=00000008
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000000 waitId=0 wakeup=0 exit=800201A4
+    runClocks=0 intrPreempt=0 threadPreempt=0 release=0
+  GetThreadExitStatus=800201A4
+  ChangeThreadPriority(0x31)=00000000 cur=31 restore=00000000
+  WakeupThread=00000000 then CancelWakeupThread=00000001
+  SuspendThread=800201A3 ResumeThread=00000000 SuspendThread again=00000000
+  StartThread=800201A4
+  DeleteThread=800201A4
+  TerminateThread=00000000
+    after terminate: refer=00000000 status=00000010 exit=800201AC GetThreadExitStatus=800201AC
+  TerminateDeleteThread=00000000
+  then refer=80020198
+[39] states: waiting and suspended
+  SuspendThread=00000000
+  refer=00000000
+    size=104 name="m_wsusp" attr=800000FF status=0000000C
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000003 waitId=sema wakeup=0 exit=800201A4
+    runClocks=nz intrPreempt=0 threadPreempt=0 release=1
+  GetThreadExitStatus=800201A4
+  ChangeThreadPriority(0x31)=00000000 cur=31 restore=00000000
+  WakeupThread=00000000 then CancelWakeupThread=00000001
+  SuspendThread=800201A3 ResumeThread=00000000 SuspendThread again=00000000
+  StartThread=800201A4
+  DeleteThread=800201A4
+  TerminateThread=00000000
+    after terminate: refer=00000000 status=00000010 exit=800201AC GetThreadExitStatus=800201AC
+  TerminateDeleteThread=00000000
+  then refer=80020198
+[40] states: finished (returned 0x42)
+  refer=00000000
+    size=104 name="m_done" attr=800000FF status=00000010
+    entry=fn stack=user(&FF=00) stackSize=00002000 gp=gp
+    init=30 cur=30 waitType=00000000 waitId=0 wakeup=0 exit=00000042
+    runClocks=nz intrPreempt=0 threadPreempt=0 release=1
+  GetThreadExitStatus=00000042
+  WaitThreadEnd(timeout 0)=00000042 timeout-after=unchanged
+  ChangeThreadPriority(0x31)=800201A2 cur=30 restore=00000000
+  WakeupThread=800201A2 then CancelWakeupThread=00000000
+  SuspendThread=800201A2 ResumeThread=800201A5 ResumeThread again=800201A5
+  DeleteThread=00000000
+  TerminateThread=80020198
+  TerminateDeleteThread=80020198
+  then refer=80020198
+[41] states: finished, TerminateDeleteThread directly
+  TerminateDeleteThread=00000000
+[42] states: TerminateDeleteThread straight on ready, waiting, suspended, waiting+suspended
+  ready: 00000000 refer after=80020198
+  waiting: 00000000
+  suspended: 00000000
+  waiting+suspended: 00000000
+[43] states: GetThreadExitStatus and ReferThreadStatus on main (running), and on id 0
+  GetThreadExitStatus(main)=800201A4 (0)=80020198
+  refer(main)=00000000 status=00000001 exit=800201A4
+
+---- exit and WaitThreadEnd ----
+[44] exit: entry returns 5; WaitThreadEnd, GetThreadExitStatus, refer
+  WaitThreadEnd=00000005 GetThreadExitStatus=00000005
+  after: status=00000010 init=30 cur=30 wakeup=0 exit=00000005
+[45] exit: ExitThread(0x1234)
+  WaitThreadEnd=00001234 GetThreadExitStatus=00001234
+  seq: (none)
+[46] exit: ExitThread(-5)
+  WaitThreadEnd=800200D2 GetThreadExitStatus=800200D2
+  seq: (none)
+[47] exit: ExitDeleteThread(7) while main waits for it
+  WaitThreadEnd=00000007 then refer=80020198 GetThreadExitStatus=80020198
+  seq: (none)
+[48] WaitThreadEnd: id 0, main's own id, a deleted id, a never-started thread (timeout 1000)
+  0: 80020197 timeout-after=unchanged
+  own: 80020197 timeout-after=unchanged
+  deleted: 80020198 timeout-after=unchanged
+  never started: 800201A2 timeout-after=unchanged
+[49] WaitThreadEnd: a sleeping thread, timeout 5000us
+  800201A8 timeout-after=0
+[50] WaitThreadEnd: a thread that returns 9 after a 2000us delay, timeout 100000us, then again
+  00000009 timeout-after: >0 yes, <=98000 yes
+  again (already ended): 00000009 timeout-after=unchanged
+  again with no timeout: 00000009
+[51] WaitThreadEnd: a 0x28 waiter on a sleeping thread that main terminates
+  terminate=00000000
+  seq: W m1 m2 H=800201AC m3
+[52] WaitThreadEnd: a 0x28 waiter on a sleeping thread that main terminate-deletes
+  terminate-delete=00000000
+  seq: W m1 m2 H=800201AC m3
+[53] WaitThreadEnd with timeout 0, then 1us, on a ready 0x20 thread
+  timeout 0: 800201A8 after=unchanged; timeout 1: 800201A8 after=0
+  seq: m1 m2 n1 W n2 Ws
+[54] exit: entry returns -5, and returns 0x80020001; WaitThreadEnd, GetThreadExitStatus, refer
+  returns -5: WaitThreadEnd=800200D2 GetThreadExitStatus=800200D2
+  after: status=00000010 init=30 cur=30 wakeup=0 exit=800200D2
+  returns 80020001: WaitThreadEnd=800200D2 GetThreadExitStatus=800200D2
+  after: status=00000010 init=30 cur=30 wakeup=0 exit=800200D2
+
+---- suspend and resume ordering ----
+[55] suspend a ready 0x30 thread, main delays, then resumes it
+  suspend=00000000 resume=00000000
+  seq: m1 m2 W
+[56] suspend a ready 0x30 thread, raise it to 0x10 while suspended, resume it
+  suspend=00000000 priority=00000000 resume=00000000
+  seq: m1 W m2
+[57] suspend a sleeping 0x10 thread, resume it, main delays, then wakes it
+  suspended sleeper: status=0000000C init=10 cur=10 wakeup=0 exit=800201A4
+  resumed: status=00000004 init=10 cur=10 wakeup=0 exit=800201A4
+  suspend=00000000 resume=00000000 wakeup=00000000
+  seq: m1 m2 Ws m3
+[58] suspend a sleeping 0x10 thread, wake it while suspended, then resume it
+  woken while suspended: status=00000008 init=10 cur=10 wakeup=0 exit=800201A4
+  suspend=00000000 wakeup=00000000 resume=00000000
+  seq: m1 m2 Ws m3
+[59] suspend a 0x30 thread waiting on a semaphore (10ms timeout), let the timeout pass, resume
+  suspended, 30ms later: status=00000008 init=30 cur=30 wakeup=0 exit=800201A4
+  sema: count=0 waiters=0
+  suspend=00000000 resume=00000000
+  seq: m1 m2 W=800201A8
+[60] suspend a 0x30 thread waiting on a semaphore, signal it while suspended, resume
+  suspended, signalled: status=00000008 init=30 cur=30 wakeup=0 exit=800201A4
+  sema: count=0 waiters=0
+  suspend=00000000 signal=00000000 resume=00000000
+  seq: m1 m2 W
+
+---- priority ----
+[61] ChangeThreadPriority on a sleeping 0x30 thread: 0, 1, 7, 8, 0x10, 0x77, 0x78, 0x7F, 0x80, -1, -2
+  00000000: 00000000 init=30 cur=20
+  00000001: 80020193 init=30 cur=20
+  00000007: 80020193 init=30 cur=20
+  00000008: 00000000 init=30 cur=08
+  00000010: 00000000 init=30 cur=10
+  00000077: 00000000 init=30 cur=77
+  00000078: 80020193 init=30 cur=77
+  0000007F: 80020193 init=30 cur=77
+  00000080: 80020193 init=30 cur=77
+  FFFFFFFF: 80020193 init=30 cur=77
+  FFFFFFFE: 80020193 init=30 cur=77
+[62] ChangeThreadPriority(t, 0) after main set itself to 0x1E
+  main->1E=00000000 t->0=00000000 t cur=1E main->20=00000000 main now 20
+[63] ChangeThreadPriority: a deleted id, and main to its own priority
+  deleted: 80020198
+  main 0x20 -> 0x20: 00000000
+[64] priority after terminate and restart: created 0x30, changed to 0x2A while sleeping
+  changed: status=00000004 init=30 cur=2A wakeup=0 exit=800201A4
+  terminated: status=00000010 init=30 cur=2A wakeup=0 exit=800201AC
+  restarted (not yet run): status=00000002 init=30 cur=30 wakeup=0 exit=800201A4
+  change=00000000 terminate=00000000 restart=00000000
+[65] reschedule: raise a ready 0x30 thread to 0x10 while an equal 0x20 thread is ready
+  change=00000000
+  seq: m1 B m2 A m3
+[66] reschedule: main lowers itself to 0x30 with a ready 0x28 thread
+  lower=00000000 restore=00000000
+  seq: m1 W m2
+[67] reschedule: main sets its own priority to 0x20 (unchanged) with a ready 0x20 thread
+  change=00000000
+  seq: m1 W m2 m3
+[68] reschedule: main raises itself to 0x1F, then back to 0x20, with a ready 0x20 thread
+  raise=00000000 restore=00000000
+  seq: m1 m2 W m3 m4
+[69] reschedule: a ready 0x30 thread changed to 0x20 (equal to main)
+  change=00000000
+  seq: m1 m2 W m3
+
+---- rotate ready queue ----
+[70] RotateThreadReadyQueue: 0, 7, 8, 0x20, 0x77, 0x78, 0x7F, 0x80, -1 with nobody else ready
+  00000000: 00000000
+  00000007: 80020193
+  00000008: 00000000
+  00000020: 00000000
+  00000077: 00000000
+  00000078: 80020193
+  0000007F: 80020193
+  00000080: 80020193
+  FFFFFFFF: 80020193
+[71] rotate own level: two ready 0x20 threads, the first rotates too
+  rotate=00000000
+  seq: m1 W1 W2 m2 W1b m3
+[72] rotate another level: three ready 0x30 threads, main rotates 0x30
+  rotate=00000000
+  seq: m1 m2 W2 W3 W1
+
+---- sleep and wakeup ----
+[73] banked wakeups: ready 0x30 thread woken 3x, cancelled, woken 2x, then runs three sleeps
+  after 3 wakeups: status=00000002 init=30 cur=30 wakeup=3 exit=800201A4
+  wakeups=00000000 00000000 00000000 cancel=00000003 cancel again=00000000
+  after 2 more: status=00000002 init=30 cur=30 wakeup=2 exit=800201A4
+  after it ran: status=00000004 init=30 cur=30 wakeup=0 exit=800201A4
+  last wakeup=00000000
+  seq: s1 s2 m1 s3
+[74] main: WakeupThread(own id) x2, CancelWakeupThread(0), wake once more, SleepThread (safety waker at 100ms)
+  wake=80020197 80020197 cancel(0)=00000000 wake=80020197 sleep=00000000 cancel(0) after=00000000
+  seq: m-after-sleep
+[75] WakeupThread(0) from main, then CancelWakeupThread(0); WakeupThread on a deleted id
+  wakeup(0)=80020197 cancel(0)=00000000 deleted=80020198 cancel(deleted)=80020198
+[76] ReleaseWaitThread on a sleeping 0x30 thread, on a ready one, on main
+  sleeper after release: status=00000010 init=30 cur=30 wakeup=0 exit=00000000
+  sleeping=00000000 ready=800201A6 main=80020197
+  seq: Ws=800201AA
+[77] ReleaseWaitThread on a dormant thread, a suspended ready one, one in DelayThread(1s), one waiting and suspended
+  dormant=800201A6 suspended ready=800201A6
+  delay     release=00000000 waiters -1->-1  delay=800201AA  timeout-after=-
+  waiting+suspended, released: status=00000008 init=30 cur=30 wakeup=0 exit=800201A4
+  waiting+suspended: suspend=00000000 release=00000000 resume=00000000 timeout-after=reduced
+  seq: m1 m2 sema=800201AA
+[78] ReleaseWaitThread on 0x30 threads waiting (1s) on a sema, evf, mbx, vpl, fpl, msgpipe, mutex, lwmutex, TLS pool, thread end
+  sema      release=00000000 waiters 1->0  sema=800201AA  timeout-after=reduced
+  evf       release=00000000 waiters 1->0  evf=800201AA  timeout-after=reduced
+  mbx       release=00000000 waiters 1->0  mbx=800201AA  timeout-after=reduced
+  vpl       release=00000000 waiters 1->0  vpl=800201AA  timeout-after=reduced
+  fpl       release=00000000 waiters 1->0  fpl=800201AA  timeout-after=reduced
+  msgpipe   release=00000000 waiters 1->0  msgpipe=800201AA  timeout-after=reduced
+  mutex     release=00000000 waiters 1->0  mutex=800201AA  timeout-after=reduced
+  lwmutex   release=00000000 waiters 1->0  lwmutex=800201AA  timeout-after=reduced
+  tlspl     release=00000000 waiters 1->0  tlspl=00000000  timeout-after=-
+  threadend release=00000000 waiters -1->-1  threadend=800201AA  timeout-after=reduced
+
+---- preemption and wake order ----
+[79] preempt by start: main (0x20) starts a 0x10 thread while an equal 0x20 thread is ready
+  seq: m1 B m2 A m3
+[80] preempt by wakeup: main wakes a sleeping 0x10 thread while an equal 0x20 thread is ready
+  wakeup=00000000
+  seq: m1 B m2 A m3
+[81] wakeup of an equal-priority (0x20) sleeper
+  wakeup=00000000
+  seq: m1 m2 Ws m3
+[82] preempt by SignalSema: a 0x10 thread waiting on the semaphore
+  signal=00000000
+  seq: m1 W m2
+[83] timeslice: two ready 0x30 threads, the first spins 20ms on GetSystemTimeLow
+  seq: A0 A1 B
+[84] counters: a 0x30 thread spins 30ms while main wakes twice from 5ms delays; its and main's preempt and release counts
+  W: refer=00000000 threadPreempt=0 intrPreempt=nz release=0
+  main across its two delays: threadPreempt+0 intrPreempt+0 release+2
+  seq: m1 m2 m3 W
+[85] timeslice: two ready 0x30 threads, the first spins 200ms on GetSystemTimeLow
+  seq: A0 A1 B
+[86] sceIo from main (0x20) with a ready 0x20 thread: did it run inside open, write, close, open, read, lseek, read, close, getstat, remove; main's releaseCount across each
+  open(w)    = fd  seq: m W c  release+51
+  write 32K  = 00008000  seq: m W c  release+2
+  close      = 00000000  seq: m W c  release+4
+  open(r)    = fd  seq: m W c  release+50
+  read 32K   = 00008000  seq: m W c  release+1
+  lseek 0    = 00000000  seq: m c W  release+0
+  read 16    = 00000010  seq: m W c  release+1
+  close      = 00000000  seq: m c W  release+0
+  getstat    = 00000000  seq: m W c  release+50
+  remove     = 00000000  seq: m W c  release+53
+
+---- delay ----
+[87] delay: three 0x30 threads each delay 20ms (started A, B, C); main spins 45ms, then waits
+  seq: A B C
+[88] delay: 0x30 threads delay 30ms, 20ms, 10ms (started A, B, C); main spins 45ms, then waits
+  seq: C B A
+[89] delay: A (0x30) delays 10ms, B (0x2C) delays 20ms; main spins 45ms, then waits
+  seq: B A
+[90] delay: A (0x30) 30ms, B and C (0x28) 10ms each; main just waits
+  seq: B C A
+[91] delay: main DelayThread(0) with a ready 0x20 thread
+  delay(0)=00000000
+  seq: m1 m2 W m3
+[92] delay: main DelayThread(1) with a ready 0x20 thread
+  delay(1)=00000000
+  seq: m1 m2 W m3
+[93] delay: elapsed system time across DelayThread(10000) and DelaySysClockThread(5000)
+  DelayThread(10000)=00000000 elapsed>=10000 yes
+  DelaySysClockThread(5000)=00000000 elapsed>=5000 yes clock after: unchanged
+[94] delay: DelayThreadCB(0) with a pending callback notify, then with a ready 0x20 thread
+  DelayThreadCB(0)=00000000 delivered=1; with a ready thread=00000000
+  seq: m1 h m2 n1 n2 W n3
+[95] delay: DelayThread(n) for n = 0, 1, 2, 5, 10, 50, 100 with a ready 0x20 thread, 4 times each: how often it ran before main came back
+  n=  0: 0 of 4
+  n=  1: 4 of 4
+  n=  2: 4 of 4
+  n=  5: 4 of 4
+  n= 10: 4 of 4
+  n= 50: 4 of 4
+  n=100: 4 of 4
+
+---- dispatch ----
+[96] SuspendDispatchThread twice, waits and a 0x10 start while suspended, then resume
+  suspend=00000001 suspend again=00000000
+  while suspended: DelayThread=800201A7 WaitSema(count 1)=800201A7 timeout-after=unchanged WaitSema(5 > max)=800201A7 PollSema=00000000
+  StartThread(0x10)=00000000 Rotate(0)=00000000
+  resume(second)=00000000 resume(first)=00000000; check suspend=00000001 resume=00000000
+  seq: m1 m2 W m3
+[97] dispatch: DelayThread(0) while suspended; ResumeDispatchThread(2) and (-1); SuspendDispatchThread with interrupts suspended
+  while suspended: DelayThread(0)=800201A7; resume=00000000
+  ResumeDispatchThread(2)=00000000, then suspend answers 00000001; ResumeDispatchThread(-1)=00000000, then suspend answers 00000001; afterwards suspend answers 00000001
+  interrupts suspended: SuspendDispatchThread=80020066 ResumeDispatchThread=-
+[98] dispatch: DelayThread(1000), and WaitSema with a 1000us timeout, with interrupts suspended
+  DelayThread=800201A7 WaitSema=800201A7 timeout-after=unchanged
+
+---- thread attribute and stack ----
+[99] ChangeCurrentThreadAttr: a VFPU thread adds, then removes, each single bit
+  add    b00..: 80020191 80020191 80020191 80020191 80020191 80020191 80020191 80020191
+  add    b08..: 80020191 80020191 80020191 80020191 80020191 80020191 00000000 80020191
+  add    b16..: 80020191 80020191 80020191 80020191 80020191 80020191 80020191 80020191
+  add    b24..: 80020191 80020191 80020191 80020191 80020191 80020191 80020191 80020191
+  remove b00..: 80020191 80020191 80020191 80020191 80020191 80020191 80020191 80020191
+  remove b08..: 80020191 80020191 80020191 80020191 80020191 80020191 00000000 80020191
+  remove b16..: 80020191 80020191 80020191 80020191 80020191 80020191 80020191 80020191
+  remove b24..: 80020191 80020191 80020191 80020191 80020191 80020191 80020191 80020191
+  attr afterwards: refer=00000000 attr=800000FF
+[100] GetThreadStackFreeSize: main (0), a created 0x1000 thread, a running 0x1000 thread, a deleted id; CheckThreadStack
+  main(0)=0003EA9C main(id)=0003EA9C created=00000FF0
+  running itself: (0)=00000E80 (id)=00000E80 CheckThreadStack=00000E80
+  after it finished=00000E80
+  deleted=80020198 main CheckThreadStack=0003FC80
+[101] GetThreadStackFreeSize from inside running 0x1000 threads: plain, NO_FILLSTACK over 0xCC, NO_FILLSTACK over 0xFF, CLEAR_STACK
+  plain      create=uid (0)=00000E80 CheckThreadStack=00000E80
+  nofill+CC  create=uid (0)=00000000 CheckThreadStack=00000E80
+  nofill+FF  create=uid (0)=00000E80 CheckThreadStack=00000E80
+  clear      create=uid (0)=00000E80 CheckThreadStack=00000E80
+
+---- callbacks ----
+[102] callback: create in main, refer, count
+  create=uid
+  refer=00000000 size=56 name="cbA" thread=main func=fn common=given count=0 arg=00000000
+  GetCallbackCount=00000000
+[103] callback: notify 0x11, 0x22, 0x33; count; refer; CheckCallback twice
+  notify=00000000 00000000 00000000 count=00000003
+  refer=00000000 size=56 name="cbA" thread=main func=fn common=given count=3 arg=00000033
+  CheckCallback=00000001 then 00000000 hits=1
+    hit 0: arg1=00000003 arg2=00000033 common=given thread=main
+  refer=00000000 size=56 name="cbA" thread=main func=fn common=given count=0 arg=00000000
+[104] callback: notify 0x44 then CancelCallback
+  notify=00000000 cancel=00000000 count=00000000
+  refer=00000000 size=56 name="cbA" thread=main func=fn common=given count=0 arg=00000000
+  CheckCallback=00000000 hits=1
+[105] callback: handler returns 1; then notify, count, refer, delete
+  notify=00000000 CheckCallback=00000001 hits+1
+  then notify=800201A1 count=800201A1
+  refer=800201A1
+  delete=800201A1
+[106] callback: after delete; and id 0
+  delete=00000000 notify=800201A1 count=800201A1 cancel=800201A1 delete again=800201A1
+  refer=800201A1
+  id 0: notify=800201A1 count=800201A1 cancel=800201A1 delete=800201A1
+  refer=800201A1
+[107] callback: owned by a 0x30 thread in SleepThreadCB; main notifies, checks, delays, wakes it
+  worker's callback: uid
+  notify=00000000 main CheckCallback=00000000 hits after check=0; owner status after handler=00000004 wakeup=00000000
+    hit 0: arg1=00000001 arg2=00000007 common=00000001 thread=cbowner
+  seq: W0 m1 h m2 m3 Wslept
+  refer=800201A1
+  after the owner is deleted: delete callback=800201A1
+[108] callback: owner in DelayThreadCB(50ms); main notifies, delays 5ms, then waits for it
+  notify=00000000 hits=1
+  seq: m1 h m2 Wd
+[109] callback: which CB waits deliver a pending notify (WaitSemaCB, WaitThreadEndCB, DelayThreadCB)
+  WaitSemaCB(count 0)                  = 800201BD timeout-after=unchanged delivered=0 pending=1
+  WaitSemaCB(count 2 > max 1)          = 800201BD timeout-after=unchanged delivered=0 pending=1
+  WaitSemaCB(deleted sema)             = 80020199 timeout-after=unchanged delivered=0 pending=1
+  WaitSemaCB(available)                = 00000000 timeout-after=unchanged delivered=1 pending=0
+  WaitSemaCB(times out, 1000us)        = 800201A8 timeout-after=0 delivered=1 pending=0
+  WaitSemaCB(timeout 0)                = 800201A8 timeout-after=unchanged delivered=1 pending=0
+  WaitThreadEndCB(finished, returned 5) = 00000005 timeout-after=unchanged delivered=1 pending=0
+  WaitThreadEndCB(0)                   = 80020197 timeout-after=unchanged delivered=0 pending=1
+  WaitThreadEndCB(sleeping, 2000us)    = 800201A8 timeout-after=0 delivered=1 pending=0
+  DelayThreadCB(1000)                  = 00000000 timeout-after=unchanged delivered=1 pending=0
+  DelayThread(1000) (not CB)           = 00000000 timeout-after=unchanged delivered=0 pending=1
+[110] callback: handler notifies itself once; CheckCallback three times
+  check=00000001 hits=1; check=00000001 hits=2; check=00000000 hits=2
+[111] callback: scePowerRegisterCallback(-1, cb) notifies it?
+  register=00000000 count=00000001 CheckCallback=00000001 hits=1 first-arg=00000001
+  unregister=00000000 delete=00000000
+  main CheckCallback with nothing pending=00000000
+
+---- thread manager id lists ----
+[112] GetThreadmanIdList: invalid types 0, 15, 16, 0x3F, 0x44, 0x80, -1; size -1; NULL buffer size 0; size 1
+  type 00000000: 800201BB count word=000055AA
+  type 0000000F: 800201BB count word=000055AA
+  type 00000010: 800201BB count word=000055AA
+  type 0000003F: 800201BB count word=000055AA
+  type 00000044: 800201BB count word=000055AA
+  type 00000080: 800201BB count word=000055AA
+  type FFFFFFFF: 800201BB count word=000055AA
+  size -1: 800200D3 count word=000055AA
+  NULL, size 0: 00000000 count>=2 yes
+  size 1: 00000001 count>1 yes
+[113] GetThreadmanIdList: baseline count for types 1..14 and 0x40..0x43
+  type 01: ok count=11
+  type 02: ok count=29
+  type 03: ok count=30
+  type 04: ok count=2
+  type 05: ok count=3
+  type 06: ok count=6
+  type 07: ok count=0
+  type 08: ok count=1
+  type 09: ok count=0
+  type 0A: ok count=0
+  type 0B: ok count=0
+  type 0C: ok count=11
+  type 0D: ok count=10
+  type 0E: ok count=0
+  type 40: ok count=1
+  type 41: ok count=0
+  type 42: ok count=0
+  type 43: ok count=1
+[114] GetThreadmanIdList: one object of each kind, and threads sleeping, delaying, suspended, dormant
+  sema     uid
+  evf      uid
+  mbx      uid
+  vpl      uid
+  fpl      uid
+  msgpipe  uid
+  callback uid
+  alarm    uid
+  vtimer   uid
+  mutex    uid
+  lwmutex  00000000
+  tlspl    uid
+  t_sleep  uid
+  t_delay  uid
+  t_susp   uid
+  t_dormant uid
+[115] GetThreadmanIdList: per type, count change and which of the new objects are listed
+  type 01: ok delta=+4 ret==min(count,128) yes has: t_sleep t_delay t_susp t_dormant main
+  type 02: ok delta=+1 ret==min(count,128) yes has: sema
+  type 03: ok delta=+1 ret==min(count,128) yes has: evf
+  type 04: ok delta=+1 ret==min(count,128) yes has: mbx
+  type 05: ok delta=+1 ret==min(count,128) yes has: vpl
+  type 06: ok delta=+1 ret==min(count,128) yes has: fpl
+  type 07: ok delta=+1 ret==min(count,128) yes has: msgpipe
+  type 08: ok delta=+1 ret==min(count,128) yes has: callback
+  type 09: ok delta=+0 ret==min(count,128) yes has: -
+  type 0A: ok delta=+1 ret==min(count,128) yes has: alarm
+  type 0B: ok delta=+1 ret==min(count,128) yes has: vtimer
+  type 0C: ok delta=+1 ret==min(count,128) yes has: mutex
+  type 0D: ok delta=+1 ret==min(count,128) yes has: -
+  type 0E: ok delta=+1 ret==min(count,128) yes has: tlspl
+  type 40: ok delta=+1 ret==min(count,128) yes has: t_sleep
+  type 41: ok delta=+1 ret==min(count,128) yes has: t_delay
+  type 42: ok delta=+1 ret==min(count,128) yes has: t_susp
+  type 43: ok delta=+1 ret==min(count,128) yes has: t_dormant
+[116] GetThreadmanIdType of each object, main, 0 and a deleted id
+  sema      00000002
+  evf       00000003
+  mbx       00000004
+  vpl       00000005
+  fpl       00000006
+  msgpipe   00000007
+  callback  00000008
+  alarm     0000000A
+  vtimer    0000000B
+  mutex     0000000C
+  tlspl     0000000E
+  t_sleep   00000001
+  t_delay   00000001
+  t_susp    00000001
+  t_dormant 00000001
+  main      00000001
+  zero      800200D2
+  deleted sema: 800200D2
+
+---- TLS pools ----
+[117] tlspl: create (partition 2, attr 0, 3 blocks of 0x10), refer
+  create=uid
+  refer=00000000 size=60 name="tls" +36..: 00000000 00000000 00000010 00000003 00000003 00000000 EEEEEEEE
+[118] tlspl: GetTlsAddr twice; then free/get four times (offsets from the first block)
+  first=ok second=+0
+  refer=00000000 size=60 name="tls" +36..: 00000000 00000000 00000010 00000003 00000002 00000000 EEEEEEEE
+  free=00000000 get=+16
+  free=00000000 get=+32
+  free=00000000 get=+0
+  free=00000000 get=+16
+[119] tlspl: write 0xCCCCCCCC into the block, get again, free, read, get, read
+  same block=yes read=CCCCCCCC free=00000000 read after free=00000000 next get=+16 read=00000000
+[120] tlspl: free twice in a row, free on a deleted pool id
+  free=00000000 free=00000000 deleted: free=800201D0 get=00000000 refer=800201D0 delete=800201D0
+[121] tlspl: index of a second pool, and of a third after the first is deleted
+  second: uid  refer=00000000 size=60 name="tls2" +36..: 00000000 00000001 00000010 00000001 00000001 00000000 EEEEEEEE
+  delete first=00000000
+  third: uid  refer=00000000 size=60 name="tls3" +36..: 00000000 00000000 00000010 00000001 00000001 00000000 EEEEEEEE
+[122] tlspl: create with each single attribute bit
+  b00..: ok ok ok ok ok ok ok ok
+  b08..: ok 80020191 80020191 80020191 80020191 80020191 ok 80020191
+  b16..: 80020191 80020191 80020191 80020191 80020191 80020191 80020191 80020191
+  b24..: 80020191 80020191 80020191 80020191 80020191 80020191 80020191 80020191
+[123] tlspl: partitions -1, 0, 1, 2, 3, 4, 6, 7, 8, 9, 10
+  -1:800200D2 0:800200D2 1:800200D1 2:ok 3:800200D1 4:800200D1 6:ok 7:800200D2 8:800200D1 9:800200D1 10:800200D2
+[124] tlspl: block size / count 0/1, 1/0, -1/1, 1/-1, 0x100/0x1000, 0x100/0x10000, 0x100/0x1000000
+  00000000 x 00000001: 800201B7
+  00000001 x 00000000: 800201B7
+  FFFFFFFF x 00000001: 800201B7
+  00000001 x FFFFFFFF: 800201B7
+  00000100 x 00001000: uid
+  00000100 x 00010000: uid
+  00000100 x 01000000: 800201B7
+[125] tlspl: option alignment 0x100, 1, 0, 3 with 1-byte blocks (distance between two threads' blocks)
+  align 100: ok, other thread's block at +256, main's block &0xFF=00
+  align 1: ok, other thread's block at +4, main's block &0xFF=00
+  align 0: ok, other thread's block at +4, main's block &0xFF=00
+  align 3: 800200D2
+[126] tlspl: one block held by main; waiters arrive 0x34, 0x30, 0x31; FIFO pool; main frees
+  create=uid main's block ok
+  refer=00000000 size=60 name="tq" +36..: 00000000 00000000 00000010 00000001 00000000 00000003 EEEEEEEE
+  free=00000000
+  seq: m-free W34 W30 W31
+  delete=00000000
+[127] tlspl: the same with attribute 0x100 (priority order)
+  create=uid main's block ok
+  refer=00000000 size=60 name="tq" +36..: 00000100 00000000 00000010 00000001 00000000 00000003 EEEEEEEE
+  free=00000000
+  seq: m-free W30 W31 W34
+  delete=00000000
+[128] tlspl: delete while a 0x10 thread holds a block (main holds one too), then after it exits
+  main's block ok; delete while lent=800201D2; after the holder exited=00000000
+[129] tlspl: delete while a 0x30 thread waits for the only block
+  refer=00000000 size=60 name="waitdel" +36..: 00000000 00000000 00000010 00000001 00000000 00000001 EEEEEEEE
+  main's block ok; delete=00000000
+  seq: m1 m2 W=00000000
+[130] tlspl: create pools until one fails (at most 40)
+  refer=00000000 size=60 name="many" +36..: 00000000 0000000F 00000004 00000001 00000001 00000000 EEEEEEEE
+  created 16, then 800201D1
+[131] tlspl: partition 5
+  5:ok
+
+---- alarms ----
+[132] alarm: SetAlarm(2000us), refer, delay 10ms
+  set=uid
+  refer=00000000 size=20 schedule-set_time in [2000, 2000+5000): yes handler=fn common=given
+  hits=1 common=given GetThreadId in handler=80020064 fired>=2000us after set: yes fired before the 10ms delay ended: yes
+  after it fired: cancel=8002019F  refer=8002019F
+[133] alarm: handler returns 1000, 1000, then 0; main spins 20ms
+  set=uid hits=3 gaps>=1000: no yes cancel after=8002019F
+[134] alarm: cancel before it fires (20ms), cancel again, delay 30ms
+  set=uid cancel=00000000 again=8002019F hits=0
+[135] alarm: SetSysClockAlarm({2000, 0}), delay 10ms
+  set=uid  refer=00000000 size=20 schedule-set_time in [2000, 2000+5000): yes handler=fn common=given
+  hits=1 cancel after=8002019F
+[136] alarm: SetAlarm(0), SetAlarm(1); delay 1ms
+  SetAlarm(0)=uid hits right after=0 after 1ms=1; SetAlarm(1)=uid hits=2
+[137] alarm: ReferAlarmStatus with size field 0, 1, 4, 5, 20, 24
+  room  0: ret=00000000/00000000 written-to=0 size=00000000
+  room  1: ret=00000000/00000000 written-to=1 size=00000014
+  room  4: ret=00000000/00000000 written-to=1 size=00000014
+  room  5: ret=00000000/00000000 written-to=5 size=00000014
+  room 20: ret=00000000/00000000 written-to=20 size=00000014
+  room 24: ret=00000000/00000000 written-to=20 size=00000014
+  cancel=00000000
+[138] alarm: cancel and refer with id 0 and a cancelled id
+  cancel(0)=8002019F refer(0)=8002019F cancelled: refer=8002019F
+[139] alarm: handler returns 1000 five times, then 0; main spins 20ms: lateness of the first hit, each gap, each hit against hit 0
+  set=uid hits=6
+  hit 0 after set: 1000..1049
+  hit 1: gap 950..999; from hit 0, k*1000 +-50
+  hit 2: gap 1000..1049; from hit 0, k*1000 +-50
+  hit 3: gap 1000..1049; from hit 0, k*1000 +-50
+  hit 4: gap 1000..1049; from hit 0, k*1000 +-50
+  hit 5: gap 950..999; from hit 0, k*1000 +-50
+  cancel after=8002019F
+
+---- vtimers ----
+[140] vtimer: create, refer, reads before it is started
+  create=uid
+  refer=00000000 size=72 name="vt" active=0 base=0 current=00000000_00000000
+    schedule=00000000_00000000 handler=0 common=00000000
+  TimeWide=00000000_00000000 BaseWide=0 GetVTimerTime=00000000 00000000_00000000 GetVTimerBase=00000000 0
+[141] vtimer: start twice, delay 5ms, read, stop twice, reads while stopped
+  start=00000000 again=00000001
+  refer=00000000 size=72 name="vt" active=1 base=near-systime current=(running)
+    schedule=00000000_00000000 handler=0 common=00000000
+  after 5ms: time>=5000 yes base near systime yes
+  stop=00000001 again=00000000
+  refer=00000000 size=72 name="vt" active=0 base=0 current=in [5000, 5000+100ms)
+    schedule=00000000_00000000 handler=0 common=00000000
+  frozen while stopped: yes BaseWide=0
+[142] vtimer: SetVTimerTime(1000000) while stopped; SetVTimerTimeWide(2000000) returns the old value
+  SetVTimerTime=00000000 clock after: the old time TimeWide=00000000_000F4240
+  SetVTimerTimeWide=00000000_000F4240 TimeWide=00000000_001E8480 BaseWide=0
+  refer=00000000 size=72 name="vt" active=0 base=0 current=00000000_001E8480
+    schedule=00000000_00000000 handler=0 common=00000000
+[143] vtimer: start from 2000000, delay 3ms, stop
+  time>=2003000 yes time<2100000 yes
+[144] vtimer: time 0, handler at 5000 returning 2000 then 0; start, main spins 20ms
+  SetVTimerHandler=00000000
+  refer=00000000 size=72 name="vt" active=0 base=0 current=00000000_00000000
+    schedule=00000000_00001388 handler=h_vt common=given
+  hits=2 common=given
+    hit 0: uid ok=1 scheduled=00000000_00001388 real>=scheduled yes
+    hit 1: uid ok=1 scheduled=00000000_00001B58 real>=scheduled yes
+  refer=00000000 size=72 name="vt" active=0 base=0 current=in [20000, 20000+100ms)
+    schedule=00000000_00001B58 handler=0 common=given
+[145] vtimer: time 0, SetVTimerHandlerWide at 3000 returning 0; start, main spins 10ms
+  SetVTimerHandlerWide=00000000 hits=1 common=other
+    hit 0: uid ok=1 scheduled=(not a time: hi user lo user) real>=scheduled no
+  refer=00000000 size=72 name="vt" active=0 base=0 current=in [10000, 10000+100ms)
+    schedule=00000000_00000BB8 handler=0 common=given
+[146] vtimer: CancelVTimerHandler
+  cancel=00000000 again=00000000
+  refer=00000000 size=72 name="vt" active=0 base=0 current=in [10000, 10000+100ms)
+    schedule=00000000_7FFFFFFF handler=0 common=given
+[147] vtimer: handler deletes its own vtimer
+  hits=1 delete from handler=80020064; then refer=00000000 stop=00000001 delete=00000000
+[148] vtimer: id 0 and a deleted id
+  start: 0=800201BF deleted=800201BE; stop: 0=800201BF deleted=800201BE
+  TimeWide: 0=FFFFFFFF_FFFFFFFF deleted=FFFFFFFF_FFFFFFFF; BaseWide: 0=FFFFFFFF_FFFFFFFF deleted=FFFFFFFF_FFFFFFFF
+  GetVTimerTime(deleted)=800201BE SetVTimerTimeWide(deleted)=FFFFFFFF_FFFFFFFF refer=800201BE delete=800201BE cancel handler=800201BE delete(0)=800201BE
+  delete vt=00000000
+[149] vtimer: handler at 2000 while main sits in DelayThread(10ms): the vtimer's time when it ran
+  SetVTimerHandler=00000000 hits=1 ran at vtimer time 2000..2999
+  delete=00000000
+
+---- system time and clocks ----
+[150] time: GetSystemTimeWide / Low / GetSystemTime agree and move forward
+  Low within [Wide1, Wide2]: yes  GetSystemTime=00000000 within: yes  Wide2>Wide1: yes
+[151] time: USec2SysClock, USec2SysClockWide, SysClock2USec, SysClock2USecWide on fixed values
+  USec2SysClock(1234567)=00000000 -> 00000000_0012D687
+  USec2SysClockWide(1234567)=00000000_0012D687
+  SysClock2USec(1234567)=00000000 -> 1 s 234567 us
+  SysClock2USec(0x9_12345678)=00000000 -> 00009830 s 0001EA78 us
+  SysClock2USecWide(7654321)=00000000 -> 7 s 654321 us
+[152] time: LibcClock across DelayThread(20000); LibcTime; LibcGettimeofday
+  LibcClock advanced >=20000: yes, <1000000: yes
+  LibcTime: ret==out yes, after 2001 yes
+  LibcGettimeofday=00000000 sec after 2001 no usec<1000000 yes usec nonzero yes
+[153] time: sceRtcGetTickResolution, GetCurrentTick across DelayThread(2000), tick epoch
+  resolution=000F4240
+  GetCurrentTick=00000000 00000000 advanced>=2000 yes <1000000 yes after 1970 yes
+  GetCurrentClock(tz 0)=00000000 year>=2020 yes
+[154] time: LibcGettimeofday seconds against LibcTime and uptime; a timezone struct; two reads across DelayThread(20000)
+  ret=00000000 tv_sec: under a day; within 2s of LibcTime no; within 2s of uptime no
+  timezone words: 00000000 00000000
+  second read=00000000: advanced >=20000us yes, <1000000us yes
+
+---- rtc arithmetic (none of it in psprecomp) ----
+[155] rtc: IsLeapYear 1900 2000 2004 2023; GetDaysInMonth 2000/2 1900/2 2023/4 2023/13 2023/0
+  leap: 00000000 00000001 00000001 00000000
+  days: 0000001D 0000001C 0000001E 800001FF 800001FF
+[156] rtc: GetDayOfWeek 2000-01-01, 1970-01-01, 2026-09-27, 2023-02-30, 2023-13-01
+  00000006 00000004 00000000 00000004 00000001
+[157] rtc: CheckValid on a good date and on bad year/month/day/hour/minute/second/microsecond
+  ok:00000000 y0:FFFFFFFF m13:FFFFFFFE d32:FFFFFFFD feb30:FFFFFFFD h24:FFFFFFFC mi60:FFFFFFFB s60:FFFFFFFA us1M:FFFFFFF9
+[158] rtc: GetTick of 2000-01-01 00:00:00; SetTick back; GetTime_t; SetTime_t(0)
+  GetTick=00000000 tick=00E01D00_3A63A000
+  SetTick(tick + 1 day + 1us)=00000000
+    -> 2000-01-02 00:00:00.000001
+  GetTime_t=00000000 -> 386D4380
+  SetTime_t(0)=00000000
+    -> 1970-01-01 00:00:01.000000
+[159] rtc: TickAdd Ticks(+1000) Microseconds(+1) Seconds(+1) Minutes(-1) Hours(25) Days(-1) Weeks(1) Months(1) Years(1) from 2000-01-31
+  base=00E01F5B_B9A0E000
+  Ticks+1000     00000000 delta=00000000_000003E8
+  Micro+1        00000000 delta=00000000_00000001
+  Seconds+1      00000000 delta=00000000_000F4240
+  Minutes-1      00000000 delta=FFFFFFFF_FC6C7900
+  Hours+25       00000000 delta=00000014_F46B0400
+  Days-1         00000000 delta=FFFFFFEB_E228A000
+  Weeks+1        00000000 delta=0000008C_D0E3A000
+  Months+1       00000000 delta=00000247_6165E000
+  Years+1        00000000 delta=00001CC2_A9EB4000
+    Jan 31 + 1 month -> 2000-02-29 00:00:00.000000
+[160] rtc: CompareTick less, equal, greater; FormatRFC3339 of 2000-01-01 at +0 and +540 minutes
+  compare: FFFFFFFF 00000000 00000001
+  RFC3339 +0: 00000000 "2000-01-01T00:00:00.00Z"
+  RFC3339 +540: 00000000 "2000-01-01T09:00:00.00+09:00"
+[161] rtc: CheckValid of 9999-12-31 23:59:59.999999 and of year 10000; GetTick of 2023-02-30 and 2023-13-01
+  9999-12-31: 00000000  year 10000: FFFFFFFF
+  GetTick 2023-02-30 vs 2023-03-02: 00000000 same tick
+  GetTick 2023-13-01 vs 2024-01-01: 00000000 FFFFFD90_62EB6000
+
+---- user memory ----
+[162] sysmem: TotalFreeMemSize versus MaxFreeMemSize
+  total>=max yes total==max no max>=1MB yes
+[163] sysmem: total free drop for sizes 1, 0x100, 0x101, 0x10000; head alignment
+  size 00001: uid drop=00000100 head&FF=00
+  size 00100: uid drop=00000100 head&FF=00
+  size 00101: uid drop=00000200 head&FF=00
+  size 10000: uid drop=00010000 head&FF=00
+[164] sysmem: size 0; types 5 and -1; two Low blocks of 1 byte (distance); High above Low
+  size 0: 800200D9
+  type 5: 800200D8
+  type -1: 800200D8
+  low2-low1=+256 high>low2 yes
+[165] sysmem: LowAligned 0x1000, HighAligned 0x10000, LowAligned 3, LowAligned 0
+  type 3 align 01000: uid aligned yes
+  type 4 align 10000: uid aligned yes
+  type 3 align 00003: 800200E4 aligned -
+  type 3 align 00000: 800200E4 aligned -
+[166] sysmem: Addr type at a just-freed block's address, and 0x80 past it
+  at freed address: uid same yes
+  at +0x80: uid head-at=+0
+[167] sysmem: partitions 0, 1, 3, 4, 6, 7, 8, -1 (0x100 bytes)
+  0:800200D2 1:800200D6 3:800200D6 4:800200D6 6:uid 7:800200D2 8:800200D6 -1:800200D2
+[168] sysmem: allocate MaxFreeMemSize, then max+0x100; free twice; head of a freed block
+  max: uid total drop==max yes max after<max yes
+  free=00000000 max+0x100: 800200D9
+  free again=800200CB head of freed=00000000
+[169] sysmem: total free drop for an Addr block 0x80 into a free granule; total minus max
+  Addr at +0x80: uid drop=00001100
+  total-max=0003F000
+[170] sysmem: partitions 5 and 9 (0x100 bytes)
+  partition 5: uid partition 9: 800200D6
+
+---- NULL and bad pointers (last, in case one crashes) ----
+[171] NULL info pointers: ReferThreadStatus, ReferCallbackStatus, ReferAlarmStatus, ReferVTimerStatus, ReferTlsplStatus
+  not run: a NULL Refer*Status info pointer switched the PSP off in syncprobe
+[172] GetThreadmanIdList(THREAD, NULL, 4, &count)
+  not run: the kernel would write through a NULL buffer, like the Refer*Status crash
+[173] NULL names: CreateThread, CreateCallback, CreateVTimer, CreateTlspl, AllocPartitionMemory
+  thread=80020001 callback=80020001 vtimer=80020001 tlspl=80020190 block=80020001
+[174] alarm: NULL handler (SetAlarm 10s)
+  NULL handler=800200D3
+[175] alarm: NULL clock (SetSysClockAlarm)
+  not run: the kernel would read a NULL clock, like the Refer*Status crash
+[176] vtimer: SetVTimerTime(NULL), GetVTimerTime(NULL), SetVTimerHandler(NULL schedule)
+  not run: the kernel would use a NULL clock, like the Refer*Status crash
+[177] callback: function NULL and 0xDEADBEEF
+  NULL=uid DEADBEEF=800200D3
+[178] tlspl: GetTlsAddr with ids 0 and 1 while main holds a block of the only pool
+  pool=uid main's block ok; id 0 -> main's block; id 1 -> main's block
+  refer=00000000 size=60 name="lax" +36..: 00000000 00000000 00000010 00000002 00000001 00000000 EEEEEEEE
+  seq: (none)
+  delete=00000000
+[179] start args: length 8 with a NULL pointer
+  start=00000000 end=00000077
+    a0=00000000 a1=NULL argwords=EEEEEEEE EEEEEEEE mainbuf[0] now 11111111
+    sp=stk+EC0 k0=stk+F00 gp=main's ra=user
+[180] start args: length -1 with a real pointer
+  start=800200D3 end=800201A2
+    after the refused start: status=00000010
+[181] StartThread with argp = 0x10 (small bad pointer), length 8
+  not run: argp 0x10 switched the PSP off in threadprobe 2
+
+---- summary ----
+  successful StartThread calls: 183
+  count delta per id-list type 1..14: +0 +0 +0 +0 +0 +0 +0 +0 +0 +0 +0 +0 +0 +0
+  threads other than main and exit_cb: SceUmdManMount(status 4) SceUmdManTask(status 4) SceUmdManTaskSPKStop(status 10) ScePowerMain(status 4) ScePowerBattery(status 4) SceFatmsMedia(status 4) SceHpRemote(status 4) SceWlanMac(status 4) SceWlanHal(status 4)
+
+==== threadprobe done ====
