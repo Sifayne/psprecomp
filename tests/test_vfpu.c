@@ -723,8 +723,8 @@ static void test_units_and_conversions(void) {
 /* ---- the transcendental unit -----------------------------------------------
  *
  * Words from vfpuprobe's dumps (steps 2-12 and 120-127, v3 steps 193-200,
- * fw 6.60). The exact rows are ones the model reproduces; the last three are
- * where it is a unit off the hardware's, and are held to that. */
+ * fw 6.60). The exact rows are ones the model reproduces; the last one is
+ * where it is a unit off the hardware's, and is held to that. */
 static void test_transcendentals(void) {
     psp_vfpu_reset();
     static const struct { int op; uint32_t in, out; } exact[] = {
@@ -776,6 +776,21 @@ static void test_transcendentals(void) {
         { PSP_VU_LOG2, 0x3FFA9C40, 0x3F78242C },
         { PSP_VU_LOG2, 0x2F4027F0, 0xC201A7C8 },   /* below 1: linear part  */
         { PSP_VU_LOG2, 0x2CA6100C, 0xC2167F60 },
+        /* v3 steps 193-195 and the sweeps: vsin's and vasin's fitted cores,
+         * where the exact functions they replaced were a unit off or more. */
+        { PSP_VU_SIN,  0x501502F9, 0xBEFC7DA0 },   /* 1e10 reduces to a non-zero angle */
+        { PSP_VU_SIN,  0x3EA80000, 0x3EFC5D24 },   /* r = 42 * 2^16: the segment below's grid */
+        { PSP_VU_SIN,  0x3C000280, 0x3C491278 },   /* under 2^E: the 2^-27 grid */
+        { PSP_VU_SIN,  0x3AC33A0C, 0x3B195340 },
+        { PSP_VU_SIN,  0xD3EB00D1, 0x3C24252C },
+        { PSP_VU_SIN,  0xC0018000, 0x3D16C32C },
+        { PSP_VU_COS,  0xBF7E6000, 0x3C235C20 },
+        { PSP_VU_COS,  0x3F47E000, 0x3EACDB78 },
+        { PSP_VU_ASIN, 0x3F7FFFFF, 0x3F7FFFE8 },
+        { PSP_VU_ASIN, 0x3BC91200, 0x3B8001B2 },   /* past 2^(E+1): 23 bits */
+        { PSP_VU_ASIN, 0xBD5E3759, 0xBD0D8956 },
+        { PSP_VU_ASIN, 0xB67DC96D, 0xB61DE000 },
+        { PSP_VU_ASIN, 0xBF401367, 0xBF0A491C },
     };
     int r[4];
     psp_vfpu_regs(0x00, 1, r);
@@ -787,8 +802,6 @@ static void test_transcendentals(void) {
               exact[i].op, exact[i].in, got, exact[i].out);
     }
     static const struct { int op; uint32_t in, out; } near[] = {
-        { PSP_VU_SIN,  0x501502F9, 0xBEFC7DA0 },   /* 1e10 reduces to a non-zero angle */
-        { PSP_VU_ASIN, 0x3F7FFFFF, 0x3F7FFFE8 },
         { PSP_VU_LOG2, 0x4081C4A1, 0x40014442 },   /* x >= 4: rule unsettled */
     };
     for (size_t i = 0; i < sizeof near / sizeof near[0]; i++) {

@@ -29,6 +29,23 @@ whose curve is steeper). A distance the samples leave open (the dumps step
 u by 3 or 5, which aliases with some slopes) takes the value closest to a
 quadratic through the rest, within the range the samples allow.
 
+vsin/vcos (steps 193-194) and vasin (step 195) are the same core with two
+differences. The result does not have a fixed exponent, so each segment
+carries one: E, the exponent of the value at the segment's start. Z is at
+2^(E-23) and the result is exactly Y * 2^(E-21), Y = Z >> 2, normalised:
+fewer than 22 significant bits where the values fall below 2^E, 23 where
+vasin's climb past 2^(E+1) (the low mantissa bit is then the only clear
+one). The data show E as the finest grid a segment's results sit on, and
+that is where it is read from. vasin's argument is x in 23-bit fixed point
+(segment 0 has E = -9, one below segment 1's); vsin's is the complement of
+the reduced quarter turn r, X = 2^23 - r, so the core is a cosine and the
+segment holding r = k * 2^16 is the one ending there (its result is on that
+segment's grid, not the next one's). X = 0, r = 2^23, gives Z = 2^24: 1.0.
+
+vasin's V does not keep one direction: it rises with the distance except in
+segments 116-120, 122 and 127, where it falls, and its steps reach 4 there.
+They are stored as signed 4-bit fields.
+
 --check reports how many dump and sweep samples the fitted tables
 reproduce. --holdout fits on the dumps alone and checks the sweeps, which
 the fit has not seen.
@@ -147,9 +164,112 @@ def samples_root(rundir, op, sweeps=True):
     return X[keep], Y[keep]
 
 
+def seg_exps(X, out):
+    """per segment, E such that the finest grid its results sit on is 2^(E-21)"""
+    e = ((out >> 23) & 0xFF).astype(np.int64) - 127
+    m = ((out & 0x7FFFFF) | 0x800000).astype(np.int64)
+    tz = np.zeros_like(m)
+    for b in range(24):
+        tz += ((m & ((1 << (b + 1)) - 1)) == 0)
+    E = np.full(1 << SEGBITS, 1 << 20, dtype=np.int64)
+    np.minimum.at(E, X >> UBITS, e - 23 + tz)
+    return E + 21
+
+
+def seg_y(X, out, E):
+    """Y with out = Y * 2^(E-21) for X's segment; every sample must be on its grid"""
+    e = ((out >> 23) & 0xFF).astype(np.int64) - 127
+    m = ((out & 0x7FFFFF) | 0x800000).astype(np.int64)
+    sh = e - E[X >> UBITS] - 2
+    Y = np.where(sh >= 0, m << np.clip(sh, 0, 40), m >> np.clip(-sh, 0, 40))
+    exact = np.where(sh >= 0, True, (Y << np.clip(-sh, 0, 40)) == m)
+    if not exact.all():
+        raise ValueError('%d results off their segment\'s grid' % int((~exact).sum()))
+    return Y
+
+
+def quarter_fixed(xb):
+    """|x| in quarter turns, 25-bit fixed point (2 quadrant bits), truncated;
+    exponents 2^33..2^40 shift by e-127-32"""
+    e = ((xb >> 23) & 0xFF).astype(np.int64)
+    m24 = (xb & 0x7FFFFF).astype(np.int64) | 0x800000
+    sh = e - 127
+    x = np.where(sh < 0, np.where(sh > -32, m24 >> np.clip(-sh, 0, 31), 0),
+                 np.where(sh <= 32, m24 << np.clip(sh, 0, 32),
+                          np.where(sh < 64, m24 << np.clip(sh - 32, 0, 31), 0)))
+    return np.where(e == 0, 0, x) & ((1 << 25) - 1)
+
+
+def trig_arg(xb, cosine):
+    """the core's argument 2^23 - r, r the quarter turn reflected into
+    [0, 2^23], and whether the result is negated"""
+    x = quarter_fixed(xb)
+    if cosine:
+        x = (x + (1 << 23)) & ((1 << 25) - 1)
+    q = x >> 23
+    r = np.where(q & 1, (1 << 23) - (x & 0x7FFFFF), x & 0x7FFFFF)
+    neg = (q >= 2) ^ ((xb >> 31 != 0) & (not cosine))
+    return (1 << 23) - r, neg
+
+
+def samples_sin(rundir, sweeps=True):
+    """vsin's dump is r = 3k, then x = 1 + 31k*2^-23 (r = 2^23 - 31k), then
+    x = 0.5 + i*2^-24 (r = 2^22 + i/2); vcos's dump repeats the second part
+    and its own strip is r = 2^22 - i/2. Sweeps: vsin, vcos and vnsin."""
+    core = load(rundir, 'vfpu_core_vsin.bin').astype(np.int64)
+    cos = load(rundir, 'vfpu_core_vcos.bin').astype(np.int64)
+    n0, n1 = 2796203, 270601
+    k = np.arange(n0, dtype=np.int64); i1 = np.arange(n1, dtype=np.int64)
+    i2 = np.arange(len(core) - n0 - n1, dtype=np.int64)
+    r = [3 * k, (1 << 23) - 31 * i1, (1 << 22) + (i2 >> 1), (1 << 22) - (i2 >> 1)]
+    X = [(1 << 23) - v for v in r]
+    O = [core[:n0], core[n0:n0 + n1], core[n0 + n1:], cos[n1:]]
+    if sweeps:
+        inp = load(rundir, 'vfpu_inputs.bin').astype(np.int64)
+        for name, cosine in (('vfpu_vsin.bin', 0), ('vfpu_vcos.bin', 1), ('vfpu_vnsin.bin', 0)):
+            out = load(rundir, name).astype(np.int64)
+            ok = normal(inp) & normal(out)
+            x, _ = trig_arg(inp[ok], cosine)
+            X.append(x); O.append(out[ok] & 0x7FFFFFFF)
+    return core_samples(X, O, 4, (1 << 23) - 1)
+
+
+def core_samples(X, O, ndump, xmax):
+    """(X, Y, E) for the cores with an exponent per segment; E is read off
+    the first ndump parts (the dumps), and r = 0 (vsin) or x = 0 (vasin),
+    zeros rather than the core, are dropped"""
+    X = [np.asarray(x, dtype=np.int64) for x in X]
+    keep = [(x >= 0) & (x <= xmax) & normal(o) for x, o in zip(X, O)]
+    X = [x[k] for x, k in zip(X, keep)]; O = [o[k] for o, k in zip(O, keep)]
+    E = seg_exps(np.concatenate(X[:ndump]), np.concatenate(O[:ndump]))
+    X = np.concatenate(X); O = np.concatenate(O)
+    return X, seg_y(X, O, E), E
+
+
+def samples_asin(rundir, sweeps=True):
+    """the dump is x = 3k * 2^-23, then x = 0.5 + i*2^-24 (X = 2^22 + i/2)"""
+    core = load(rundir, 'vfpu_core_vasin.bin').astype(np.int64)
+    n0 = 2796203
+    i2 = np.arange(len(core) - n0, dtype=np.int64)
+    X = [3 * np.arange(n0, dtype=np.int64), (1 << 22) + (i2 >> 1)]
+    O = [core[:n0], core[n0:]]
+    if sweeps:
+        inp = load(rundir, 'vfpu_inputs.bin').astype(np.int64)
+        out = load(rundir, 'vfpu_vasin.bin').astype(np.int64)
+        ok = normal(inp) & normal(out) & ((inp & 0x7FFFFFFF) < 0x3F800000)
+        e = (inp[ok] >> 23) & 0xFF
+        m24 = (inp[ok] & 0x7FFFFF) | 0x800000
+        X.append(np.where(127 - e < 32, m24 >> np.clip(127 - e, 1, 31), 0))
+        O.append(out[ok] & 0x7FFFFFFF)
+    X, Y, E = core_samples(X, O, 2, (1 << 23) - 1)
+    keep = X > 0
+    return X[keep], Y[keep], E
+
+
 OPS = {'rcp': samples_rcp, 'exp2': samples_exp2, 'log2': samples_log2,
        'sqrt': lambda d, sweeps=True: samples_root(d, 'vsqrt', sweeps),
-       'rsq': lambda d, sweeps=True: samples_root(d, 'vrsq', sweeps)}
+       'rsq': lambda d, sweeps=True: samples_root(d, 'vrsq', sweeps),
+       'sin': samples_sin, 'asin': samples_asin}
 
 
 # ---- the fit ------------------------------------------------------------------
@@ -248,22 +368,34 @@ def predict(tables, X):
 
 # ---- C output -----------------------------------------------------------------
 
-def emit(name, tables, f):
+def emit(name, tables, f, exps=None):
     """per segment: D, V(0), and the steps V(k+1) - V(k), k = 0..511, as
-    BITS-bit fields packed from the low end of each word"""
+    BITS-bit fields packed from the low end of each word; 4-bit fields,
+    used where the direction changes from segment to segment, are signed.
+    With exps, also each segment's exponent E."""
     sgns = {t[2] for t in tables}
-    assert len(sgns) == 1, 'mixed step signs'
-    sgn = sgns.pop()
+    sgn = sgns.pop() if len(sgns) == 1 else 1
     steps = [(t[1][1:] - t[1][:-1]) * sgn for t in tables]
-    top = max(int(st.max()) for st in steps)
-    assert min(int(st.min()) for st in steps) >= 0
-    bits = 1 if top <= 1 else 2
-    assert top < (1 << bits)
+    top = max(int(np.abs(st).max()) for st in steps)
+    if min(int(st.min()) for st in steps) < 0:
+        bits = 4
+        assert top < 8
+    else:
+        bits = 1 if top <= 1 else 2
+        assert top < (1 << bits)
     nw = HALF * bits // 32
     N = name.upper()
-    f.write('/* %s: %d segments; V moves by %+d times each step. */\n' % (name, len(tables), sgn))
+    if bits == 4:
+        f.write('/* %s: %d segments; each step moves V by its signed field. */\n' % (name, len(tables)))
+    else:
+        f.write('/* %s: %d segments; V moves by %+d times each step. */\n' % (name, len(tables), sgn))
     f.write('#define VFPU_CORE_%s_SGN %d\n' % (N, sgn))
     f.write('#define VFPU_CORE_%s_BITS %d\n' % (N, bits))
+    if exps is not None:
+        f.write('static const int8_t VFPU_CORE_%s_EXP[%d] = {\n' % (N, len(tables)))
+        for i in range(0, len(tables), 16):
+            f.write('    ' + ' '.join('%d,' % int(x) for x in exps[i:i + 16]) + '\n')
+        f.write('};\n')
     f.write('static const int32_t VFPU_CORE_%s_DV[%d][2] = {\n' % (N, len(tables)))
     for i in range(0, len(tables), 4):
         f.write('   ' + ''.join(' {%d,%d},' % (t[0], int(t[1][0])) for t in tables[i:i + 4]) + '\n')
@@ -273,7 +405,7 @@ def emit(name, tables, f):
         words = [0] * nw
         for i, v in enumerate(st):
             b = i * bits
-            words[b >> 5] |= int(v) << (b & 31)
+            words[b >> 5] |= (int(v) & ((1 << bits) - 1)) << (b & 31)
         f.write('    {')
         for j in range(0, nw, 8):
             f.write(('' if j == 0 else '\n     ') + ','.join('0x%08X' % w for w in words[j:j + 8]) + ',')
@@ -292,12 +424,12 @@ def main():
     fitted = {}
     for name in a.ops.split(','):
         get = OPS[name]
-        X, Y = get(a.rundir, sweeps=not a.holdout)
+        X, Y, *E = get(a.rundir, sweeps=not a.holdout)
         t = fit(X, Y)
-        fitted[name] = t
+        fitted[name] = (t, E[0] if E else None)
         amb = sum(x[3] for x in t)
         if a.check or a.holdout:
-            Xa, Ya = get(a.rundir, sweeps=True)
+            Xa, Ya, *_ = get(a.rundir, sweeps=True)
             p = predict(t, Xa)
             print('%-5s fitted on %d samples, %d distances open; all samples %d/%d exact'
                   % (name, len(X), amb, int((p == Ya).sum()), len(Ya)))
@@ -305,8 +437,8 @@ def main():
         with open(a.out, 'w') as f:
             f.write('/* Generated by tools/hwprobe/vfpuprobe/gencores.py from vfpuprobe v3\n'
                     ' * core dumps and run-1 sweeps (fw 6.60). Do not edit. */\n\n')
-            for name, t in fitted.items():
-                emit(name, t, f)
+            for name, (t, E) in fitted.items():
+                emit(name, t, f, E)
 
 
 if __name__ == '__main__':

@@ -1135,7 +1135,8 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  *
  *   - every result is *truncated* to a 22-bit significand -- the low two
  *     mantissa bits are clear -- and one below 2^-126 is 0; an operand whose
- *     exponent is 0 is a signed zero; the NaN result is 7F800001;
+ *     exponent is 0 is a signed zero; the NaN result is 7F800001 (vsin's
+ *     and vasin's cores keep a fixed point per segment instead, see there);
  *   - vnsin is vsin with the sign flipped, vnrcp likewise vrcp, and vrexp2(x)
  *     is vexp2(-x), NaNs included;
  *   - vsin/vcos reduce |x| in quarter turns to 25-bit fixed point (2 quadrant
@@ -1143,24 +1144,16 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  *     2 and 3 negate, vsin then takes sign(x) and vcos adds a quarter turn
  *     first. So vsin(2) is -0, vcos(1) is -0 and vsin(1e-10) is 0. Exponents
  *     2^33..2^40 shift by e-127-32 rather than e-127: vsin(1e10) = BEFC7DA0;
- *   - vasin is piecewise quadratic over 128 segments of [0,1], exact at the
- *     knots; the coefficients below are fitted to the hardware's dense grid.
- *     |x| > 1 is 7F800001 with x's sign;
+ *   - vasin takes x in 23-bit fixed point, truncated; |x| > 1 is 7F800001
+ *     with x's sign;
  *   - vexp2 splits |x| into n + f, f on a 23-bit grid; a negative x uses f's
  *     ones' complement, so vexp2(-1) is 3EFFFFFC, just below 1/2;
  *   - vlog2 has 22 fraction bits for x >= 1 (truncated to 23 significant
  *     bits) but only 15 below 1, where vlog2(3F7FFFFF) is -0.
  *
- * vrcp, vsqrt, vrsq, vexp2 and vlog2 are bit exact: their cores are the
- * hardware's own, from tables fitted to the dumps (the shared core, below).
- * The one gap is vlog2 of x >= 4 (see there).
- *
- * vsin, vcos and vasin are not. Their cores do not have that shape at any
- * segmentation tried, so each is the exact function of its reduced argument,
- * floored or truncated where the hardware visibly is (vasin: a quadratic per
- * segment fitted to the dumps). The hardware differs from that, noisily, by
- * at most one unit of 2^-22 absolute: 78-85% of the dumped results and
- * 82-97% of the swept ones match bit for bit. */
+ * All of them are bit exact: their cores are the hardware's own, from tables
+ * fitted to the dumps (the shared core, below). The one gap is vlog2 of
+ * x >= 4 (see there). */
 #define VINF_BITS 0x7F800000u
 #define VONE_BITS 0x3F800000u
 
@@ -1194,176 +1187,6 @@ static uint32_t quarter_fixed(uint32_t b) {
     return (uint32_t)(x & ((1u << 25) - 1));
 }
 
-/* sin(pi/2 * r / 2^23) for r in [0, 2^23], floored at 2^-28. */
-static uint32_t sin_core(uint32_t r) {
-    if (r == 0) return 0;
-    if (r == 1u << 23) return VONE_BITS;
-    const double y = sin(1.5707963267948966 * ((double)r / 8388608.0));
-    return pack_trunc((uint64_t)floor(y * 268435456.0), -28, 22);
-}
-
-static uint32_t vfpu_trig(uint32_t b, int cosine) {
-    const uint32_t sign = b & 0x80000000u;
-    if (((b >> 23) & 0xFF) == 0xFF) return cosine ? VNAN_BITS : (VNAN_BITS | sign);
-    uint32_t x = quarter_fixed(b);
-    if (cosine) x = (x + (1u << 23)) & ((1u << 25) - 1);
-    const uint32_t q = x >> 23;
-    uint32_t r = x & 0x007FFFFFu;
-    if (q & 1) r = (1u << 23) - r;
-    uint32_t res = sin_core(r);
-    if (q >= 2) res ^= 0x80000000u;
-    if (!cosine && sign) res ^= 0x80000000u;
-    return res;
-}
-
-static const double VASIN_SEG[128][3] = {   /* c2, c1, c0 over u in [0,1) */
-    { 7.977272878269432e-10, 0.004973642695892187, -1.3557759486977372e-10 },
-    { 2.239941320235124e-07, 0.004973722510308927, 0.00497364244732326 },
-    { 3.7571225004260335e-07, 0.004974178562346371, 0.009947588132892362 },
-    { 5.176192835815376e-07, 0.004974948036627613, 0.014922141534794372 },
-    { 6.709674563227998e-07, 0.004976009206137086, 0.019897606754358355 },
-    { 8.252383016626318e-07, 0.004977374561553881, 0.024874289265388816 },
-    { 9.910733091762347e-07, 0.004979045952067669, 0.029852491164324348 },
-    { 1.1254144280660903e-06, 0.004981031081993881, 0.0348325264635347 },
-    { 1.2863285155162732e-06, 0.004983326229886745, 0.03981468034571787 },
-    { 1.4250984624333923e-06, 0.004985933948473562, 0.04479929238127237 },
-    { 1.5781390777699025e-06, 0.004988843534752986, 0.04978664992117665 },
-    { 1.723306220718324e-06, 0.004992073042351029, 0.05477707849967347 },
-    { 1.8605998917378182e-06, 0.004995632989733875, 0.059770872633831205 },
-    { 2.0195456110411225e-06, 0.004999483332914589, 0.06476836257121144 },
-    { 2.152410454033625e-06, 0.005003668883021496, 0.06976986926345023 },
-    { 2.3620416503505815e-06, 0.005008109582836151, 0.07477569759999274 },
-    { 2.487033021338233e-06, 0.005012969175974376, 0.07978616479565125 },
-    { 2.683869825502489e-06, 0.0050180502720291245, 0.08480163130782342 },
-    { 2.88070662949524e-06, 0.005023505358012049, 0.0898223769215731 },
-    { 3.042112808962316e-06, 0.005029304416310148, 0.09484876015668563 },
-    { 3.2045031723828204e-06, 0.005035444924952109, 0.0998811010882582 },
-    { 3.3147317828297044e-06, 0.0050419706801265885, 0.10491974319651406 },
-    { 3.5233787952331347e-06, 0.005048750969893759, 0.10996503666643026 },
-    { 3.6936426309421238e-06, 0.005055914414802479, 0.11501730431036568 },
-    { 3.864890650705498e-06, 0.0050634333346772495, 0.12007691019951877 },
-    { 4.062711639103372e-06, 0.005071279803296485, 0.12514421011641305 },
-    { 4.131604520359871e-06, 0.005079585947365472, 0.1302195622271429 },
-    { 4.4465434071494455e-06, 0.005088092495905438, 0.13530329860154822 },
-    { 4.794944550413182e-06, 0.005096885811064755, 0.14039584883595407 },
-    { 4.80281802262516e-06, 0.005106405331008393, 0.14549751796589555 },
-    { 5.037053819655802e-06, 0.005116098190362753, 0.15060871713424748 },
-    { 5.233890623672213e-06, 0.005126218800697525, 0.15572983054184694 },
-    { 5.45041110868186e-06, 0.005136651643412503, 0.16086125745984925 },
-    { 5.61969076003165e-06, 0.005147622588741495, 0.16600335674635278 },
-    { 5.75550815511178e-06, 0.005158970599572981, 0.17115661440372973 },
-    { 5.977933743802303e-06, 0.005170708839369328, 0.1763213472162116 },
-    { 6.208232804943466e-06, 0.005182822545369362, 0.1814980278996861 },
-    { 6.438531865809075e-06, 0.005195403738779617, 0.18668707596259237 },
-    { 6.727881967769912e-06, 0.00520839336855871, 0.19188894240725773 },
-    { 7.058567798807825e-06, 0.005221713315099746, 0.19710407559101562 },
-    { 7.1727331453115245e-06, 0.005235782717772784, 0.20233286648096815 },
-    { 7.298708700010058e-06, 0.005250307797647432, 0.2075758322658186 },
-    { 7.601837377923604e-06, 0.005265146586179311, 0.21283344639959242 },
-    { 7.765211925941722e-06, 0.005280585603940331, 0.21810618645758595 },
-    { 8.07424570882094e-06, 0.0052964352724843055, 0.22339454348611404 },
-    { 8.355722338585754e-06, 0.005312775310717164, 0.22869905257372689 },
-    { 8.554527510736394e-06, 0.005329777704795968, 0.2340201866208463 },
-    { 8.938359278739216e-06, 0.005347132682800598, 0.23935850987247406 },
-    { 9.233614485498817e-06, 0.005365130209947262, 0.24471459023354616 },
-    { 9.365495143994834e-06, 0.005383854433971226, 0.2500889197345613 },
-    { 9.385178825257173e-06, 0.00540328690142038, 0.2554821193648813 },
-    { 1.0066234167610824e-05, 0.00542267508058937, 0.2608948183871646 },
-    { 1.0180399513324144e-05, 0.005443237883388035, 0.26632755884076054 },
-    { 1.0959873258356002e-05, 0.005463822584280167, 0.2717810334681974 },
-    { 1.103860798003238e-05, 0.005485715757828559, 0.27725579082904356 },
-    { 1.1247254992803523e-05, 0.005508156875830469, 0.28275255675901473 },
-    { 1.188500623766345e-05, 0.005530940243826643, 0.28827201145229214 },
-    { 1.2062159362235653e-05, 0.005554834017443284, 0.2938148550327842 },
-    { 1.2542441164231478e-05, 0.005579224065853288, 0.2993817771674435 },
-    { 1.2648733038725623e-05, 0.005604703359928598, 0.3049735626200037 },
-    { 1.3062090327723206e-05, 0.005630782514164446, 0.31059093722618064 },
-    { 1.3664410947863297e-05, 0.005657439384421417, 0.31623479413297295 },
-    { 1.4069894765278028e-05, 0.005685134568819366, 0.3219059051866997 },
-    { 1.4632848024750014e-05, 0.005713607258595096, 0.32760509943937505 },
-    { 1.5077699202185826e-05, 0.005743020828294505, 0.3333333436057543 },
-    { 1.5463499338865538e-05, 0.005773479847469851, 0.33909145566578164 },
-    { 1.5825679058368985e-05, 0.005805047057853454, 0.34488038781749725 },
-    { 1.6349264958176603e-05, 0.005837364462506538, 0.3507012652292836 },
-    { 1.718778974341359e-05, 0.005870498247805997, 0.3565550188162012 },
-    { 1.779798383618809e-05, 0.005904916885344906, 0.36244269501191057 },
-    { 1.8227088070164463e-05, 0.005940732080008645, 0.3683654348547616 },
-    { 1.8778231121718432e-05, 0.005977579929757406, 0.3743243539173416 },
-    { 1.9447476256463945e-05, 0.006015599942674375, 0.38032074418722434 },
-    { 2.0506458261950746e-05, 0.006054553208090647, 0.38635580280124865 },
-    { 2.1014297217514962e-05, 0.006095394630550057, 0.3924308202707119 },
-    { 2.1545756588264266e-05, 0.00613758684557954, 0.39854720705433905 },
-    { 2.2470889567952063e-05, 0.006180918745704967, 0.40470640006080155 },
-    { 2.3218869424598566e-05, 0.006226087379258501, 0.4109098387822527 },
-    { 2.4014090113285307e-05, 0.006272798229174567, 0.4171591570871904 },
-    { 2.4888045523800512e-05, 0.00632113199854064, 0.4234560428512112 },
-    { 2.58249887120634e-05, 0.0063712914292661, 0.42980211112029304 },
-    { 2.660446245668627e-05, 0.0064234408800817, 0.43619923479662875 },
-    { 2.7978383350886454e-05, 0.0064771136017155945, 0.4426493171690914 },
-    { 2.8738173415459135e-05, 0.006533494797776026, 0.44915443904874774 },
-    { 3.007666368316198e-05, 0.0065914991593337, 0.4557166754645832 },
-    { 3.141515395066074e-05, 0.006651915755927383, 0.46233825706968146 },
-    { 3.27536442202453e-05, 0.006714856784533388, 0.46902158908676717 },
-    { 3.389136094920843e-05, 0.006780602491553345, 0.47576920898829245 },
-    { 3.533614309148056e-05, 0.00684897695409524, 0.48258370185661154 },
-    { 3.708405391336332e-05, 0.006920072931500352, 0.48946802393447764 },
-    { 3.880834431888348e-05, 0.006994362093961163, 0.49642517919756957 },
-    { 4.007597333732755e-05, 0.007072427078420394, 0.5034582753914676 },
-    { 4.2343533320866044e-05, 0.007153166582956826, 0.5105709036806421 },
-    { 4.411506455917823e-05, 0.0072385440546912025, 0.5177665690519494 },
-    { 4.656371440414339e-05, 0.007327545291991071, 0.5250492180833142 },
-    { 4.899661730484565e-05, 0.007420713564436271, 0.5324233192162372 },
-    { 5.131141812091875e-05, 0.007519338645187394, 0.539893045144923 },
-    { 5.442143962834955e-05, 0.007622133221542332, 0.547463788459668 },
-    { 5.742910599731177e-05, 0.007731004642135509, 0.5551403315566771 },
-    { 6.012970695018412e-05, 0.007846325912711765, 0.5629287010868027 },
-    { 6.412943081243458e-05, 0.00796733232228488, 0.570835164579937 },
-    { 6.80346730063434e-05, 0.008095539022157285, 0.578866582044753 },
-    { 7.260916033653639e-05, 0.008231519299518106, 0.5870302580950557 },
-    { 7.677422711561225e-05, 0.008376828657214156, 0.5953342987164874 },
-    { 8.198646569008785e-05, 0.008531048324946987, 0.6037879633583647 },
-    { 8.785220245533572e-05, 0.008695637847616988, 0.6124010077447963 },
-    { 9.373368616605557e-05, 0.00887268418744057, 0.621184430378264 },
-    { 0.00010190635027502064, 0.009061155427474833, 0.6301508957387497 },
-    { 0.00010971683466731781, 0.009265472030245789, 0.6393139297133019 },
-    { 0.00011939333196218666, 0.00948575258993178, 0.6486891018470871 },
-    { 0.00013055791549718054, 0.009724431977798797, 0.6582942999307343 },
-    { 0.00014267518916487022, 0.009985504996788658, 0.6681493225481494 },
-    { 0.00015707576976232353, 0.010271147185679484, 0.6782774901857569 },
-    { 0.00017423206561573924, 0.010585467512762696, 0.6887057291341889 },
-    { 0.00019461648505948774, 0.010933846512077117, 0.6994653507159843 },
-    { 0.00021881953850598108, 0.011322547038641696, 0.7105938602158165 },
-    { -0.00023953464378094748, 0.01224811748823502, 0.7221352046488243 },
-    { -0.00020256869195046768, 0.012744994109382393, 0.7341437104808785 },
-    { -0.00015567429171415998, 0.013315631878263713, 0.7466861048965148 },
-    { -9.378880047214144e-05, 0.013979529940799363, 0.7598460831509293 },
-    { -1.1196077423274042e-05, 0.014765528825536986, 0.7737318968748286 },
-    { 0.0001042605184525013, 0.01571560693353178, 0.7884862808005121 },
-    { -0.0002128356996583564, 0.01738162872345937, 0.8043061369343811 },
-    { 5.981476806362325e-05, 0.018892844764071517, 0.8214749528404611 },
-    { 5.299634116445441e-05, 0.021416503209448195, 0.8404276128646887 },
-    { 9.448166602256599e-05, 0.025321799043038003, 0.8618971665454238 },
-    { 0.00022718116594845904, 0.032829956865655305, 0.8873134812088332 },
-    { -2.4313282057061473e-05, 0.07965363166895745, 0.9203707300841631 },
-};
-
-static uint32_t vfpu_asin(uint32_t b) {
-    const uint32_t sign = b & 0x80000000u;
-    const int e = (int)((b >> 23) & 0xFF);
-    if (is_nan_bits(b)) return VNAN_BITS | sign;
-    if (e == 0) return sign;
-    if ((b & 0x7FFFFFFFu) > VONE_BITS) return VNAN_BITS | sign;
-    if (e >= 127) return VONE_BITS | sign;                      /* exactly 1 */
-    const uint32_t m24 = (b & 0x007FFFFFu) | 0x00800000u;
-    const uint32_t x = 127 - e < 32 ? m24 >> (127 - e) : 0;     /* 23-bit fixed point */
-    if (x == 0) return sign;
-    const uint32_t seg = x >> 16 < 127 ? x >> 16 : 127;
-    const double u = (double)(x - (seg << 16)) / 65536.0;
-    const double *c = VASIN_SEG[seg];
-    const double v = (c[0] * u + c[1]) * u + c[2];
-    return pack_trunc((uint64_t)floor(v * 1073741824.0), -30, 22) | sign;
-}
-
 /* ---- the shared core ------------------------------------------------------
  *
  * vrcp, vsqrt, vrsq, vexp2 and vlog2 evaluate one kind of piecewise core on a
@@ -1375,10 +1198,16 @@ static uint32_t vfpu_asin(uint32_t b) {
  * of which the result keeps Z >> 2. V is the segment's quadratic correction,
  * a function of the distance of u's top ten bits from the segment's middle.
  * vfpu_cores.h holds, per segment, D, V(0) and the steps V(k+1) - V(k) as
- * 1- or 2-bit fields; tools/hwprobe/vfpuprobe/gencores.py fits them to
- * vfpuprobe v3's core dumps (steps 196-200) and the run-1 sweeps (fw 6.60)
+ * 1- or 2-bit fields (signed 4-bit ones for vasin, whose V turns direction
+ * from segment to segment); tools/hwprobe/vfpuprobe/gencores.py fits them to
+ * vfpuprobe v3's core dumps (steps 193-200) and the run-1 sweeps (fw 6.60)
  * and reproduces every one of those results. Arguments the dumps skipped
- * rest on the fit: holding the sweeps out, it predicted 99.96% of them. */
+ * rest on the fit: holding the sweeps out, it predicted 99.96% of them for
+ * the first five, 99.85% for vsin, vcos and vnsin, and all of vasin's.
+ *
+ * vsin and vasin are the same core with an exponent E per segment, since
+ * their results range over many binades: Z is at 2^(E-23) and the result is
+ * Y = Z >> 2 at 2^(E-21), exactly, whatever its own exponent (see below). */
 #include "vfpu_cores.h"
 
 static uint32_t popcount32(uint32_t v) {
@@ -1387,10 +1216,12 @@ static uint32_t popcount32(uint32_t v) {
     return (((v + (v >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24;
 }
 
-/* The sum of the `bits`-bit fields packed in w. */
-static uint32_t field_sum(uint32_t w, int bits) {
-    return bits == 1 ? popcount32(w)
-                     : popcount32(w & 0x55555555u) + 2u * popcount32(w & 0xAAAAAAAAu);
+/* The sum of the `bits`-bit fields packed in w; 4-bit fields are signed. */
+static int32_t field_sum(uint32_t w, int bits) {
+    if (bits == 1) return (int32_t)popcount32(w);
+    if (bits == 2) return (int32_t)(popcount32(w & 0x55555555u) + 2u * popcount32(w & 0xAAAAAAAAu));
+    const uint32_t n = (w & 0x0F0F0F0Fu) + ((w >> 4) & 0x0F0F0F0Fu);
+    return (int32_t)((n * 0x01010101u) >> 24) - 16 * (int32_t)popcount32(w & 0x88888888u);
 }
 
 /* floor(v / 2^s), whatever v's sign. */
@@ -1401,11 +1232,12 @@ static int64_t floor_shr(int64_t v, int s) {
 /* V(k) of one segment: V(0) plus sgn times the first k steps. */
 static int64_t core_v(const uint32_t *steps, int bits, int sgn, int32_t v0, uint32_t k) {
     const uint32_t per = 32u / (uint32_t)bits;
-    uint32_t sum = 0, j = 0;
+    int64_t sum = 0;
+    uint32_t j = 0;
     for (; j < k / per; j++) sum += field_sum(steps[j], bits);
     const uint32_t rem = (k % per) * (uint32_t)bits;
     if (rem) sum += field_sum(steps[j] & ((1u << rem) - 1u), bits);
-    return (int64_t)v0 + (int64_t)sgn * (int64_t)sum;
+    return (int64_t)v0 + (int64_t)sgn * sum;
 }
 
 typedef struct {
@@ -1422,6 +1254,8 @@ static const vfpu_core CORE_EXP2 = VFPU_CORE(EXP2);
 static const vfpu_core CORE_LOG2 = VFPU_CORE(LOG2);
 static const vfpu_core CORE_SQRT = VFPU_CORE(SQRT);
 static const vfpu_core CORE_RSQ  = VFPU_CORE(RSQ);
+static const vfpu_core CORE_SIN  = VFPU_CORE(SIN);
+static const vfpu_core CORE_ASIN = VFPU_CORE(ASIN);
 
 static int64_t core_seg_v(const vfpu_core *c, uint32_t seg, uint32_t k) {
     return core_v(c->steps + seg * (uint32_t)c->words, c->bits, c->sgn, c->dv[seg][1], k);
@@ -1442,6 +1276,54 @@ static uint32_t pack22(int field, int64_t y) {
     if (field <= 0)   return 0;
     if (field >= 255) return VINF_BITS;
     return ((uint32_t)field << 23) | ((uint32_t)(y << 2) & 0x007FFFFFu);
+}
+
+/* vsin and vcos: the core is a cosine. Its argument is the complement of the
+ * reflected quarter turn, X = 2^23 - r, and each segment's E is the exponent
+ * of its value at u = 0, the largest. So an r on a segment boundary, k * 2^16,
+ * is the end of the segment below rather than the start of the one above:
+ * vsin(3EA80000), r = 42 * 2^16, is 3EFC5D24, on the 2^-23 grid of the
+ * segment ending there, not the 2^-22 of the next. And values that fall
+ * below 2^E keep fewer than 22 bits: vsin(3C000280), r = 2^16 + 5, is
+ * 3C491278, on its segment's 2^-27 grid where its own binade has 2^-28
+ * (vfpuprobe v3 step 193). X = 0, vsin(1), comes out as Z = 2^24: exactly
+ * 1.0. r = 0 is 0. */
+static uint32_t sin_core(uint32_t r) {
+    if (r == 0) return 0;
+    const uint32_t x = (1u << 23) - r;
+    return pack_trunc((uint64_t)core_eval(&CORE_SIN, x), VFPU_CORE_SIN_EXP[x >> 16] - 21, 24);
+}
+
+static uint32_t vfpu_trig(uint32_t b, int cosine) {
+    const uint32_t sign = b & 0x80000000u;
+    if (((b >> 23) & 0xFF) == 0xFF) return cosine ? VNAN_BITS : (VNAN_BITS | sign);
+    uint32_t x = quarter_fixed(b);
+    if (cosine) x = (x + (1u << 23)) & ((1u << 25) - 1);
+    const uint32_t q = x >> 23;
+    uint32_t r = x & 0x007FFFFFu;
+    if (q & 1) r = (1u << 23) - r;
+    uint32_t res = sin_core(r);
+    if (q >= 2) res ^= 0x80000000u;
+    if (!cosine && sign) res ^= 0x80000000u;
+    return res;
+}
+
+/* vasin: the core of x in 23-bit fixed point, with E the exponent of each
+ * segment's value at u = 0, its smallest (segment 0's is -9, one below
+ * segment 1's). Where the values climb past 2^(E+1), Y passes 2^22 and the
+ * result keeps all its 23 bits, the low mantissa bit alone clear: vasin of
+ * 3BC91200 is 3B8001B2 (vfpuprobe v3 step 195). */
+static uint32_t vfpu_asin(uint32_t b) {
+    const uint32_t sign = b & 0x80000000u;
+    const int e = (int)((b >> 23) & 0xFF);
+    if (is_nan_bits(b)) return VNAN_BITS | sign;
+    if (e == 0) return sign;
+    if ((b & 0x7FFFFFFFu) > VONE_BITS) return VNAN_BITS | sign;
+    if (e >= 127) return VONE_BITS | sign;                      /* exactly 1 */
+    const uint32_t m24 = (b & 0x007FFFFFu) | 0x00800000u;
+    const uint32_t x = 127 - e < 32 ? m24 >> (127 - e) : 0;     /* 23-bit fixed point */
+    if (x == 0) return sign;
+    return pack_trunc((uint64_t)core_eval(&CORE_ASIN, x), VFPU_CORE_ASIN_EXP[x >> 16] - 21, 24) | sign;
 }
 
 /* vexp2: |x| on a 23-bit fraction grid, truncated (v3 dumps x = 0.5 + i*2^-24
