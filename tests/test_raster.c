@@ -1272,7 +1272,9 @@ static void test_precise_vertex_payload(void) {
     identity_matrices();
     float_vertex(0,(40.24f-240.0f)/240.0f,0,0);
     cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
-    CHECK(g_probe_first.precise && fabsf(g_probe_first.precise_x-40.24f)<0.0001f,
+    /* Before the 1/16 grid, in the GE's arithmetic: the eye x cut to 16
+     * significant bits (ge_proj_row in ge.c) puts 40.24 at 40.2429. */
+    CHECK(g_probe_first.precise && fabsf(g_probe_first.precise_x-40.2429f)<0.0001f,
           "GE retains pre-quantization projection %.8f",g_probe_first.precise_x);
     /* 40.25: left of the viewport centre a position goes to the sixteenth
      * nearer the centre (geprobe 2, fw 6.60; see screen_axis_fx16 in ge.c). */

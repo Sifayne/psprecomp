@@ -80,16 +80,17 @@ static int fx16_floor(float f) {
     return i - (s < (float)i);
 }
 
-/* 1/w for x and y: the reciprocal's mantissa cut to 14 bits, toward zero.
- * With an exact 1/w, one corner of scene 15 (w = 1.5, -1809.08 sixteenths
+/* 1/w for x and y of a tessellated vertex: the reciprocal's mantissa cut to
+ * 14 bits, toward zero, on the float clip position. Every vertex took this
+ * until geprobe 7; one the GE reads from memory now takes the GE's own
+ * arithmetic (clip_to_fx16). Patch vertices keep this because psprecomp's
+ * tessellation is not the GE's: the GE's rule on them takes scene 22 from
+ * 612 pixels off to 954 and scene 23 from 1878 to 1925 (scene 26: 1190 to
+ * 1032, a gain on one patch and a loss on another). With an exact 1/w and
+ * float arithmetic, one corner of scene 15 (w = 1.5, -1809.08 sixteenths
  * from the centre) and one of scene 18 (w = 5, -28945.4) land a sixteenth
- * further out than the hardware draws them, 608 and 350 pixels; 14 bits
- * puts both where it does and is the only width that does (13 moves others,
- * 15 and up leave scene 15's). The cost is one skinned corner of scene 20
- * (-1500.014 sixteenths at w = 5), 49 pixels, which an exact 1/w keeps --
- * how the hardware skins may account for that. A power of two is exact
- * either way. Depth has a reciprocal of its own (ge_screen_z): scene 17's
- * depth dump fits worse with this one. */
+ * further out than the hardware draws them; 14 bits was the only width
+ * that put both where it does. */
 static float ge_recip(float w) {
     int e;
     const float m = frexpf(1.0f / w, &e);                  /* [0.5, 1) */
@@ -99,12 +100,12 @@ static float ge_recip(float w) {
 /* One axis of a transformed vertex onto the 1/16 grid: the viewport centre
  * (less the screen offset) plus ndc * scale, taken to sixteenths toward zero,
  * that is toward the centre -- left of it and above it a position rounds up,
- * right of it and below it down. ndc is the clip coordinate times ge_recip's
- * 1/w. geprobe 2 (fw 6.60) scene 20's Gouraud triangles pin every corner to
- * one sixteenth through their colours; scenes 15 and 21 pin 18 more. A
- * short reciprocal with rounding (the earlier fit to edges alone) moved a
- * third of them by one sixteenth and 2432 pixels of scene 20 by one step of
- * colour. */
+ * right of it and below it down. ndc is the clip coordinate over w, as
+ * clip_to_fx16 forms it. geprobe 2 (fw 6.60) scene 20's Gouraud triangles
+ * pin every corner to one sixteenth through their colours; scenes 15 and 21
+ * pin 18 more. A short reciprocal with rounding (the earlier fit to edges
+ * alone) moved a third of them by one sixteenth and 2432 pixels of scene 20
+ * by one step of colour. */
 static int screen_axis_fx16(float ndc, float scale, float centre) {
     float t = ndc * scale * (float)PSP_SUBPX;
     if (!(t > -1073741824.0f)) t = -1073741824.0f;   /* NaN too */
@@ -1552,15 +1553,43 @@ static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
     *sz = ge_screen_z(clip[2], clip[3]);
 }
 
-/* The same projection onto the rasterizer's grid, as screen_axis_fx16 says. */
+/* The same projection onto the rasterizer's grid, as screen_axis_fx16 says.
+ *
+ * A vertex the GE read from memory (plain, skinned or morphed) comes here
+ * with clip x, y and w from ge_proj_row; 1/w is cut to 24 bits, as for
+ * depth (ge_screen_z), and each quotient to ge24. geprobe 7 (fw 6.60) scene
+ * 48 shows why: six of its corners sit a sixteenth further from the centre
+ * than ge_recip's rule put them -- each one's triangle has a depth plane
+ * 100 to 500 pixels off that matches once the corner moves, and the colour
+ * dump's six differing pixels are at those corners. Of 49,920 variants
+ * searched (the eye coordinates, the products, w, the quotient and the
+ * scaled position each cut to 16 to 24 bits or left alone, a reciprocal of
+ * 13 to 24 bits truncated or rounded, exact, or a divide), every one that
+ * puts the 198 coordinates of scene 48's depth-confirmed corners where the
+ * hardware has them, scene 15's corner at -1808 and scene 18's at -28944
+ * cuts the eye coordinates to 16 bits, and with this reciprocal the
+ * quotient too. Against run 7: scene 16 497 -> 369 pixels off, scene 36's
+ * depth 696 -> 56, scene 39 217 -> 7, scene 48 6 -> 0 and its depth
+ * 1898 -> 958; skinned and morphed scenes 20 and 21 stay at 101 and 400.
+ * A tessellated vertex keeps ge_recip's rule on the float clip position
+ * (ge_recip says why). */
 static void clip_to_fx16(const float clip[4], int *x, int *y) {
-    const float inv = ge_recip(clip[3]);
-    if (g_tl.vp_set) {
-        *x = screen_axis_fx16(clip[0] * inv, g_tl.vp_xs, g_tl.vp_xc - g_tl.off_x);
-        *y = screen_axis_fx16(clip[1] * inv, g_tl.vp_ys, g_tl.vp_yc - g_tl.off_y);
+    float nx, ny;
+    if (g_mv_src) {
+        const float inv = ge_recip(clip[3]);
+        nx = clip[0] * inv;
+        ny = clip[1] * inv;
     } else {
-        *x = screen_axis_fx16(clip[0] * inv, 240.0f, 240.0f);
-        *y = screen_axis_fx16(clip[1] * inv, -136.0f, 136.0f);
+        const double inv = ge_cut(1.0 / (double)clip[3], 24, 0);
+        nx = (float)ge24((double)clip[0] * inv);
+        ny = (float)ge24((double)clip[1] * inv);
+    }
+    if (g_tl.vp_set) {
+        *x = screen_axis_fx16(nx, g_tl.vp_xs, g_tl.vp_xc - g_tl.off_x);
+        *y = screen_axis_fx16(ny, g_tl.vp_ys, g_tl.vp_yc - g_tl.off_y);
+    } else {
+        *x = screen_axis_fx16(nx, 240.0f, 240.0f);
+        *y = screen_axis_fx16(ny, -136.0f, 136.0f);
     }
 }
 
@@ -2342,9 +2371,15 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             mul_4x3(g_tl.world, model, world);
             mul_4x3(g_tl.view,  world, eye);
             mul_4x4(g_tl.proj,  eye,   clip);
-            /* z as the GE forms it, for depth (ge_screen_z); w stays as it is
-             * for x and y, whose rule was measured with it. */
+            /* z as the GE forms it, for depth (ge_screen_z), and x, y and w
+             * too for a vertex it read (clip_to_fx16); a tessellated one
+             * keeps the float x, y and w ge_recip's rule was measured with. */
             clip[2] = ge_proj_row(g_tl.proj, 2, eye);
+            if (!g_mv_src) {
+                clip[0] = ge_proj_row(g_tl.proj, 0, eye);
+                clip[1] = ge_proj_row(g_tl.proj, 1, eye);
+                clip[3] = ge_proj_row(g_tl.proj, 3, eye);
+            }
             const uint64_t _p2 = ge_prof_now();
 
             psp_vertex *o = &v[decoded];
@@ -3132,8 +3167,10 @@ static int bbox_hidden(uint32_t count) {
         if (!read_pos_model(vertex_addr(i, stride), g_ge.vtype, pos_off, m)) return 0;
         mul_4x3(g_tl.world, m, w);
         mul_4x3(g_tl.view, w, e);
-        mul_4x4(g_tl.proj, e, c);
-        c[3] = fabsf(c[3]);
+        c[0] = ge_proj_row(g_tl.proj, 0, e);
+        c[1] = ge_proj_row(g_tl.proj, 1, e);
+        c[2] = 0.0f;
+        c[3] = fabsf(ge_proj_row(g_tl.proj, 3, e));
         if (c[3] == 0.0f || !isfinite(c[0] / c[3]) || !isfinite(c[1] / c[3])) return 0;
         int x, y;
         clip_to_fx16(c, &x, &y);
