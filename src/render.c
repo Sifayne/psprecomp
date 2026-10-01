@@ -1202,11 +1202,16 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * is last_rgba. Measured on a triangle list; a strip's triangle takes its
      * own third vertex by the same rule, which is not measured.
      *
+     * A lit triangle's secondary colour (psp_vertex.spec) is three more planes
+     * by the same rule, 5 to 7, added to the colour per pixel and clamped.
+     *
      * Kept in 1/16384ths of a channel (1/1024 of a step times the 1/16 grid)
      * so every pixel is exact integer arithmetic. */
-    int64_t col_acc[5] = { 0, 0, 0, 0, 0 }, col_dx[5] = { 0, 0, 0, 0, 0 }, col_dy[5] = { 0, 0, 0, 0, 0 };
+    int64_t col_acc[8] = { 0 }, col_dx[8] = { 0 }, col_dy[8] = { 0 };
     int64_t z_acc = 0, z_dx = 0, z_dy = 0;
     const int flat = g_bs.shade_flat;
+    const int sec = !flat && (a->spec_set || b->spec_set || c->spec_set);
+    const int nplanes = sec ? 8 : 5;
     {
         const psp_vertex *vs[3] = { a, b, c };
         int inside[3], any = 0, k0 = -1;
@@ -1223,17 +1228,18 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
         }
         int64_t rq; int rsh;
         area_rcp(area, &rq, &rsh);
-        for (int i = flat ? 4 : 0; i < 5; i++) {
-            /* A lit channel past 255 is interpolated as it is and clamped per
-             * pixel by plane_chan (psp_vertex.hi). */
+        for (int i = flat ? 4 : 0; i < nplanes; i++) {
             int64_t c0, c1, c2, ck;
             if (i == 4) {
                 c0 = a->fog; c1 = b->fog; c2 = c->fog; ck = vs[k0]->fog;
+            } else if (i > 4) {
+                c0 = a->spec_set ? chan(a->spec, i - 5) : 0;
+                c1 = b->spec_set ? chan(b->spec, i - 5) : 0;
+                c2 = c->spec_set ? chan(c->spec, i - 5) : 0;
+                ck = vs[k0]->spec_set ? chan(vs[k0]->spec, i - 5) : 0;
             } else {
-                c0 = (i < 3 && a->hi_set) ? a->hi[i] : chan(a->rgba, i);
-                c1 = (i < 3 && b->hi_set) ? b->hi[i] : chan(b->rgba, i);
-                c2 = (i < 3 && c->hi_set) ? c->hi[i] : chan(c->rgba, i);
-                ck = (i < 3 && vs[k0]->hi_set) ? vs[k0]->hi[i] : chan(vs[k0]->rgba, i);
+                c0 = chan(a->rgba, i); c1 = chan(b->rgba, i); c2 = chan(c->rgba, i);
+                ck = chan(vs[k0]->rgba, i);
             }
             const int64_t nx = (c1 - c0) * (c->y - a->y) - (c2 - c0) * (b->y - a->y);
             const int64_t ny = (c2 - c0) * (b->x - a->x) - (c1 - c0) * (c->x - a->x);
@@ -1306,7 +1312,8 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
 
     for (int y = miny; y <= maxy; y++) {
         int64_t w0 = row0, w1 = row1, w2 = row2;
-        int64_t acc[5] = { col_acc[0], col_acc[1], col_acc[2], col_acc[3], col_acc[4] };
+        int64_t acc[8];
+        for (int i = 0; i < nplanes; i++) acc[i] = col_acc[i];
         int64_t zacc = z_acc;
         for (int x = minx; x <= maxx; x++) {
             if (w0 + bias0 >= 0 && w1 + bias1 >= 0 && w2 + bias2 >= 0) {
@@ -1347,15 +1354,22 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                     col = apply_texfunc(texel, col);
                     g_px_tex++;
                 } else g_px_flat++;
+                /* After the texture function, which is what the mode is for;
+                 * scene 16 is untextured, so that order is not measured. */
+                if (sec)
+                    for (int k = 0; k < 3; k++) {
+                        const uint32_t v = chan(col, k) + plane_chan(acc[5 + k]);
+                        col = (col & ~(0xFFu << (8 * k))) | (v > 255 ? 255u : v) << (8 * k);
+                    }
                 col = apply_fog(col, fg);
                 shade_pixel(x, y, z, col);
             }
             w0 -= d0y * SUBPX; w1 -= d1y * SUBPX; w2 -= d2y * SUBPX;
-            for (int i = 0; i < 5; i++) acc[i] += col_dx[i];
+            for (int i = 0; i < nplanes; i++) acc[i] += col_dx[i];
             zacc += z_dx;
         }
         row0 += d0x * SUBPX; row1 += d1x * SUBPX; row2 += d2x * SUBPX;
-        for (int i = 0; i < 5; i++) col_acc[i] += col_dy[i];
+        for (int i = 0; i < nplanes; i++) col_acc[i] += col_dy[i];
         z_acc += z_dy;
     }
 }

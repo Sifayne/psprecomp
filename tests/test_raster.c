@@ -378,11 +378,12 @@ static void test_texture_minified_samples_centre(void) {
         }
 }
 
-/* A lit vertex past 255 keeps its excess through interpolation and each pixel
- * is clamped, not the vertex (geprobe 2 scene 16, fw 6.60). Red 510 at the
- * left corner and 0 at the others is 255 over the left half of the base and
- * about 170 a third of the way in; clamped first it would be 255 and 85. */
-static void test_unclamped_lit_colour(void) {
+/* A lit vertex's secondary (specular) colour is interpolated on its own and
+ * added to the pixel, the sum clamped there and not at the vertex (geprobe 7
+ * scene 16, fw 6.60). Red 255 in both colours at the left corner and 0 at the
+ * others is 255 over the left half of the base and about 160 a third of the
+ * way in; the two summed and clamped at the vertex would give 255 and 80. */
+static void test_secondary_colour(void) {
     psp_ge_reset();
     clear_fb();
     const psp_render_backend *be = psp_render_current();
@@ -395,14 +396,14 @@ static void test_unclamped_lit_colour(void) {
     be->set_fog(0, 0);
     psp_vertex tri[3] = {
         { .x =  40 * PSP_SUBPX, .y = 100 * PSP_SUBPX, .rgba = 0xFF0000FFu, .inv_w = 1, .tex_q = 1,
-          .fog = 255, .hi = { 510, 0, 0 }, .hi_set = 1 },
+          .fog = 255, .spec = 0x0000FFu, .spec_set = 1 },
         { .x = 340 * PSP_SUBPX, .y = 100 * PSP_SUBPX, .rgba = 0xFF000000u, .inv_w = 1, .tex_q = 1, .fog = 255 },
         { .x =  40 * PSP_SUBPX, .y = 130 * PSP_SUBPX, .rgba = 0xFF000000u, .inv_w = 1, .tex_q = 1, .fog = 255 },
     };
     be->draw(PSP_PRIM_TRIANGLES, tri, 3);
-    CHECK((pixel(100, 100) & 0xFF) == 255, "unclamped red saturates near the corner: %06X", pixel(100, 100));
+    CHECK((pixel(100, 100) & 0xFF) == 255, "the summed red saturates near the corner: %06X", pixel(100, 100));
     const uint32_t r = pixel(240, 100) & 0xFF;
-    CHECK(r >= 158 && r <= 163, "the plane from 510, not from 255, at (240,100): %u", r);
+    CHECK(r >= 158 && r <= 163, "two planes from 255 summed, not one from 255, at (240,100): %u", r);
 }
 
 /* World geometry must not use the through-mode affine UV rule.  These three
@@ -1678,7 +1679,7 @@ int main(void) {
     test_texture_1to1();
     test_texture_minified_samples_centre();
     test_texture_perspective_interpolation();
-    test_unclamped_lit_colour();
+    test_secondary_colour();
     test_sprite_texture_samples_centre();
     test_texture_wrap();
     test_texture_bilinear_midpoint();

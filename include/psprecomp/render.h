@@ -66,14 +66,20 @@ typedef struct {
      * Zero-initialized and through-mode vertices use x/y unless precise is set. */
     float    precise_x, precise_y;
     int      precise;
-    /* Lit colour channels past 255. Lighting can sum to more than a channel
-     * holds, and the hardware keeps the excess through interpolation and
-     * clamps each pixel, not each vertex: geprobe 2 scene 16 (fw 6.60) fits
-     * its fans' pixels to planes through centre vertices of 401,346,291 and
-     * 302,465,302. When hi_set, hi[0..2] are the red, green and blue the
-     * rasterizer interpolates and rgba holds them clamped. */
-    uint16_t hi[3];
-    int      hi_set;
+    /* The secondary colour, 0x00BBGGRR, valid when spec_set: in lighting's
+     * separate-specular mode (LIGHTMODE 1) the specular terms land here and
+     * the rest in rgba, each clamped to 255 per vertex. The rasterizer
+     * interpolates it as three more planes and adds it to the pixel's colour,
+     * clamping the sum: geprobe 7 (fw 6.60) scene 16's two specular fans,
+     * whose centre vertex sums past 255, match on every pixel in 46 of their
+     * 72 triangle channels that way and are a few pixels off in the rest
+     * (slips the single-colour fans below them show too). As one plane through
+     * the unclamped sum, which is what this replaced, 9 fit whatever the
+     * corners (each searched within 4), and those 9 are 255 throughout. In
+     * single-colour mode the specular joins rgba before the clamp and
+     * spec_set is clear. */
+    uint32_t spec;
+    int      spec_set;
 } psp_vertex;
 
 /* The bound texture, as the GE describes it.

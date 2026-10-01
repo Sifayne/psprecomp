@@ -1156,7 +1156,7 @@ static uint32_t current_colour(void) {
 
 static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
                        int tex_off, psp_vertex *out) {
-    out->hi_set = 0;
+    out->spec = 0; out->spec_set = 0;
     out->rgba = current_colour();
     out->u = out->v = 0.0f;
     out->inv_w = out->tex_q = 1.0f; /* through mode is affine in screen space */
@@ -1737,13 +1737,15 @@ static void lerp_clip(const clipvert *a, const clipvert *b, float t, clipvert *o
         r |= (uint32_t)q << (8 * k);
     }
     o->v.rgba = r;
-    if (a->v.hi_set || b->v.hi_set) {
+    if (a->v.spec_set || b->v.spec_set) {
+        const uint32_t sa = a->v.spec_set ? a->v.spec : 0, sb = b->v.spec_set ? b->v.spec : 0;
+        uint32_t sr = 0;
         for (int k = 0; k < 3; k++) {
-            const float ha = a->v.hi_set ? a->v.hi[k] : (float)((a->v.rgba >> (8 * k)) & 0xFFu);
-            const float hb = b->v.hi_set ? b->v.hi[k] : (float)((b->v.rgba >> (8 * k)) & 0xFFu);
-            o->v.hi[k] = (uint16_t)(ha + (hb - ha) * t + 0.5f);
+            const float ca = (float)((sa >> (8 * k)) & 0xFFu), cb = (float)((sb >> (8 * k)) & 0xFFu);
+            sr |= (uint32_t)(int)(ca + (cb - ca) * t + 0.5f) << (8 * k);
         }
-        o->v.hi_set = 1;
+        o->v.spec = sr;
+        o->v.spec_set = 1;
     }
     int fg = (int)((float)a->v.fog + ((float)b->v.fog - (float)a->v.fog) * t + 0.5f);
     if (fg < 0) fg = 0;
@@ -1913,7 +1915,23 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
  *    reads as the unit one).
  *  - A lit channel goes to 8 bits as floor(256 * value), 1.0 being a full
  *    255 light on a 255 material: N.L = 0.99 reads 253, where rounding
- *    255 * 0.99 gives 252 and 0.6 reads 153, not 154.
+ *    255 * 0.99 gives 252 and 0.6 reads 153, not 154. That is the byte
+ *    arithmetic at lit_mul, below, seen through a white light.
+ *
+ * And the sum, from geprobe 7 (fw 6.60), scenes 16 and 43:
+ *  - Each light adds lit_mul(spot, lit_mul(attenuation, term)), the term
+ *    being its ambient plus its diffuse, and its specular separately; the
+ *    factors are bytes too (lit_byte). Geprobe 6 scene 35's attenuated and
+ *    spot-lit points fit this on 789 of 800; the 11 others are a step off
+ *    where the spot or specular power lands next to a byte boundary.
+ *  - Single-colour mode (LIGHTMODE 0) adds the specular in and clamps the
+ *    total to 255 per vertex: scene 16's bottom right fan, whose rims sum
+ *    past 255 in blue, is 630 pixels off with the excess carried to the
+ *    pixel and 92 with it clamped here, the 92 being slips its unclamped
+ *    neighbour shows too.
+ *  - Separate-specular mode keeps the specular apart, clamped on its own,
+ *    as the vertex's secondary colour (psp_vertex.spec), which the
+ *    rasterizer interpolates and adds per pixel.
  */
 /* Lighting happens in eye space, and the fixed eye direction above is the
  * evidence: a constant (0,0,1) is only meaningful where the viewer looks down
@@ -1955,8 +1973,9 @@ static void lights_to_eye(void) {
  * 0.1125 for k = 2, 4, 8, 12 and 16, which is what the hardware drew. The
  * spot exponent goes through it too (geprobe 6 scene 35, fw 6.60): of 200
  * points lit by a spot of exponent 4, 174 read ge_pow's value and 122
- * powf's, and with exponent 1.5, 144 and 88; the misses are a step either
- * way, the noise described at light_vertex. */
+ * powf's, and with exponent 1.5, 144 and 88. With the byte arithmetic of
+ * geprobe 7 (lit_mul) 197 and all 200 read it, and the three left are a
+ * step off next to a byte boundary: ge_pow's own precision, not known. */
 static float ge_pow(float x, float k) {
     if (!(x > 0.0f)) return 0.0f;
     int e;
@@ -1970,18 +1989,43 @@ static float ge_pow(float x, float k) {
 static inline int any_light_enabled(void) {
     return g_tl.light[0].enable || g_tl.light[1].enable || g_tl.light[2].enable || g_tl.light[3].enable;
 }
-static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, psp_vertex *hi) {
-    const float vc[3] = { (float)(*rgba & 0xFFu) / 255.0f,
-                          (float)((*rgba >> 8) & 0xFFu) / 255.0f,
-                          (float)((*rgba >> 16) & 0xFFu) / 255.0f };
+
+/* The lit colour's arithmetic is in bytes (geprobe 7 scene 43, fw 6.60). A
+ * byte x stands for (x + 1/2)/256, and the product of two is
+ *
+ *     lit_mul(a, b) = floor((a + 1/2)(b + 1/2) / 256),
+ *
+ * so 255 times x is x, and 192 times 1 is 1 where the exact 192/255 * 1/255
+ * would floor to 0. Scene 43 steps every byte through a 255, 192 and 128
+ * partner, as light or as material, and all 1536 values fit; light and
+ * material give the same table either way round. N.L and the other factors
+ * become bytes first, floor(256 x) up to 255 (lit_byte): row E steps N.L
+ * under a 0x80C0FF light and its 768 values fit only so, where an exact
+ * N.L times the colour misses 75. A light's diffuse term is
+ * lit_mul(N.L, lit_mul(light, material)), and every value of geprobe 6
+ * scene 34 fits it, coloured rows included (12737 pixels were off). */
+static inline int lit_mul(int a, int b) { return ((2 * a + 1) * (2 * b + 1)) >> 10; }
+static inline int lit_byte(float x) {
+    if (!(x > 0.0f)) return 0;
+    const float q = x * 256.0f;
+    return q >= 255.0f ? 255 : (int)q;
+}
+static inline int lit_colour_byte(float c) { return (int)lrintf(c * 255.0f); }
+
+static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, psp_vertex *lit) {
+    const int vc[3] = { (int)(*rgba & 0xFFu), (int)((*rgba >> 8) & 0xFFu), (int)((*rgba >> 16) & 0xFFu) };
     /* MATERIAL_COLOR picks which material components the vertex colour
      * supplies: bit 0 ambient, bit 1 diffuse, bit 2 specular. */
-    const float *m_amb = (g_tl.mat_update & 1) ? vc : g_tl.mat_ambient;
-    const float *m_dif = (g_tl.mat_update & 2) ? vc : g_tl.mat_diffuse;
-    const float *m_spc = (g_tl.mat_update & 4) ? vc : g_tl.mat_specular;
+    int m_amb[3], m_dif[3], m_spc[3];
+    for (int k = 0; k < 3; k++) {
+        m_amb[k] = (g_tl.mat_update & 1) ? vc[k] : lit_colour_byte(g_tl.mat_ambient[k]);
+        m_dif[k] = (g_tl.mat_update & 2) ? vc[k] : lit_colour_byte(g_tl.mat_diffuse[k]);
+        m_spc[k] = (g_tl.mat_update & 4) ? vc[k] : lit_colour_byte(g_tl.mat_specular[k]);
+    }
 
-    float out[3];
-    for (int k = 0; k < 3; k++) out[k] = g_tl.mat_emissive[k] + g_tl.global_amb[k] * m_amb[k];
+    int out[3], sec[3] = { 0, 0, 0 };
+    for (int k = 0; k < 3; k++)
+        out[k] = lit_colour_byte(g_tl.mat_emissive[k]) + lit_mul(lit_colour_byte(g_tl.global_amb[k]), m_amb[k]);
 
     /* With every light disabled the colour is emissive plus ambient and the
      * normal never enters: skip normalising it and the loop. Same result. */
@@ -1992,7 +2036,7 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
 
     for (int i = 0; i < 4; i++) {
         if (!g_tl.light[i].enable) continue;
-        float L[3], att = 1.0f;
+        float L[3], att = 1.0f, spot = 1.0f;
         if (g_tl.light[i].type == 0) {
             L[0] = g_light_eye[i].pos[0]; L[1] = g_light_eye[i].pos[1]; L[2] = g_light_eye[i].pos[2];
         } else {
@@ -2012,10 +2056,9 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
             const float dlen = sqrtf(D[0]*D[0] + D[1]*D[1] + D[2]*D[2]);
             if (dlen > 1e-20f) { D[0] /= dlen; D[1] /= dlen; D[2] /= dlen; }
             const float sdot = L[0]*D[0] + L[1]*D[1] + L[2]*D[2];
-            if (!(sdot >= g_tl.light[i].cutoff)) att = 0.0f;
-            else att *= ge_pow(sdot, g_tl.light[i].exponent);
+            if (!(sdot >= g_tl.light[i].cutoff)) continue;
+            spot = ge_pow(sdot, g_tl.light[i].exponent);
         }
-        if (att == 0.0f) continue;
 
         const float ndl = n[0]*L[0] + n[1]*L[1] + n[2]*L[2];
         float dfac = ndl > 0.0f ? ndl : 0.0f;
@@ -2030,10 +2073,15 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
             sfac = ge_pow(ndh, g_tl.mat_spec_coef);
         }
 
-        for (int k = 0; k < 3; k++)
-            out[k] += att * (g_tl.light[i].amb[k]  * m_amb[k]
-                           + g_tl.light[i].dif[k]  * m_dif[k] * dfac
-                           + g_tl.light[i].spec[k] * m_spc[k] * sfac);
+        const int vd = lit_byte(dfac), vs = lit_byte(sfac);
+        const int va = att >= 1.0f ? 255 : lit_byte(att), vsp = spot >= 1.0f ? 255 : lit_byte(spot);
+        for (int k = 0; k < 3; k++) {
+            const int t = lit_mul(lit_colour_byte(g_tl.light[i].amb[k]), m_amb[k])
+                        + lit_mul(vd, lit_mul(lit_colour_byte(g_tl.light[i].dif[k]), m_dif[k]));
+            const int ts = lit_mul(vs, lit_mul(lit_colour_byte(g_tl.light[i].spec[k]), m_spc[k]));
+            out[k] += lit_mul(vsp, lit_mul(va, t));
+            sec[k] += lit_mul(vsp, lit_mul(va, ts));
+        }
     }
 
     }
@@ -2041,19 +2089,15 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
      * is supplying the ambient. */
     uint32_t c = (g_tl.mat_update & 1) ? (*rgba & 0xFF000000u)
                                        : ((uint32_t)(g_tl.mat_alpha & 0xFF) << 24);
-    /* floor(256 * value), see above. Clamped here only for rgba; past 255
-     * the unclamped value goes on to the rasterizer (psp_vertex.hi). */
-    hi->hi_set = 0;
+    uint32_t s = 0;
     for (int k = 0; k < 3; k++) {
-        float f = out[k];
-        if (f < 0.0f) f = 0.0f;
-        if (f > 255.99f) f = 255.99f;
-        const int q = (int)(f * 256.0f);
-        hi->hi[k] = (uint16_t)q;
-        if (q > 255) hi->hi_set = 1;
-        c |= (uint32_t)(q > 255 ? 255 : q) << (8 * k);
+        if (!g_tl.light_mode) { out[k] += sec[k]; sec[k] = 0; }
+        c |= (uint32_t)(out[k] > 255 ? 255 : out[k]) << (8 * k);
+        s |= (uint32_t)(sec[k] > 255 ? 255 : sec[k]) << (8 * k);
     }
     *rgba = c;
+    lit->spec = s;
+    lit->spec_set = s != 0;
 }
 
 enum { GE_VERTEX_BATCH = 256 };
@@ -2298,7 +2342,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
 
             psp_vertex *o = &v[decoded];
             o->screen_space = screen_space;
-            o->hi_set = 0;
+            o->spec = 0; o->spec_set = 0;
             o->rgba = current_colour();
             o->tex_q = 1.0f;
             if (blended) o->rgba = mv.rgba;
