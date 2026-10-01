@@ -10,6 +10,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/sched.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,7 @@
 #else
 #  include <dirent.h>
 #  include <sys/stat.h>
+#  include <time.h>
 #  include <unistd.h>
 #endif
 
@@ -60,6 +62,8 @@ typedef struct {
      * name was used, and not something a read can work out from its arguments.
      */
     int      sector_mode;
+    /* Written since it was opened, so closing it flushes (see io_park). */
+    int      dirty;
 } io_file;
 
 typedef struct {
@@ -72,6 +76,8 @@ typedef struct {
 #else
     DIR *dir;
 #endif
+    char host[1024];     /* the directory's host path, to stat its entries */
+    int fat;             /* on the Memory Stick: entries stat the FAT way */
 } io_dir;
 
 static io_file g_file[MAX_FILES];
@@ -113,6 +119,7 @@ void psp_io_reset(void) {
         g_file[i].has_result = g_file[i].close_pending = 0;
         g_file[i].result = 0;
         g_file[i].sector_mode = 0;
+        g_file[i].dirty = 0;
     }
     memset(g_dir, 0, sizeof g_dir);
     g_cwd[0] = '\0';
@@ -153,6 +160,13 @@ static void map_path(const char *guest, char *out, size_t cap) {
     else snprintf(out, cap, "%s/%s", g_root, p);
 }
 
+/* A Memory Stick path: FAT underneath, which shows in what open and stat
+ * report (see write_fat_stat). */
+static int is_ms_path(const char *guest) {
+    return !strncmp(guest, "ms0:", 4) || !strncmp(guest, "msstor0:", 8) ||
+           !strncmp(guest, "msstor0p1:", 10);
+}
+
 /* One ISO 9660 sector. Up here rather than with the reader below because
  * sceIoGetstat reports a file's start sector and needs it too. */
 #define ISO_SECTOR 2048u
@@ -166,7 +180,12 @@ static void mkdir_parents(const char *host);
 static int iso_lookup(const char *guest, uint64_t *base, uint64_t *len,
                       int *is_dir, FILE **out);
 
-static void hle_Open(void) {
+static void io_park(void);
+static void hle_open_body(void);
+/* See io_park: an open gives up the CPU whether or not it finds the file. */
+static void hle_Open(void) { hle_open_body(); io_park(); }
+
+static void hle_open_body(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     uint32_t flags = psp_arg(1);
@@ -179,7 +198,7 @@ static void hle_Open(void) {
             if (isdir) { fclose(img); psp_ret(0x80010014); return; }   /* EISDIR */
             for (int i = 0; i < MAX_FILES; i++) {
                 if (g_file[i].used) continue;
-                g_file[i].f = img; g_file[i].used = 1;
+                g_file[i].f = img; g_file[i].used = 1; g_file[i].dirty = 0;
                 g_file[i].base = base; g_file[i].len = len; g_file[i].pos = 0;
                 g_file[i].has_result = g_file[i].close_pending = 0;
                 g_file[i].sector_mode = is_raw_umd(guest);
@@ -211,6 +230,7 @@ static void hle_Open(void) {
             if (g_file[i].used) continue;
             g_file[i].f = f;
             g_file[i].used = 1;
+            g_file[i].dirty = 0;
             g_file[i].base = 0;
             g_file[i].pos  = 0;
             g_file[i].len  = (fseeko(f, 0, SEEK_END) == 0 && ftello(f) > 0)
@@ -241,6 +261,21 @@ static void hle_Open(void) {
             }
         }
     }
+
+#ifndef _WIN32
+    /* A Memory Stick directory does not open as a file: EACCES, or EINVAL
+     * when the path ends in a slash (saveprobe steps 103-104, fw 6.60).
+     * Host fopen opens a directory for reading on Linux, and the read that
+     * followed returned 0 bytes. */
+    if (is_ms_path(guest)) {
+        struct stat st;
+        if (stat(host, &st) == 0 && S_ISDIR(st.st_mode)) {
+            const size_t n = strlen(guest);
+            psp_ret(n && (guest[n - 1] == '/' || guest[n - 1] == '\\') ? 0x80010016u : 0x8001000Du);
+            return;
+        }
+    }
+#endif
 
     /* Creating a file creates its parents: a save flow makes
      * ms0:/PSP/SAVEDATA/<id> under a tree that starts empty, and failing on
@@ -280,6 +315,7 @@ static void hle_Open(void) {
         if (g_file[i].used) continue;
         g_file[i].f = f;
         g_file[i].used = 1;
+        g_file[i].dirty = 0;
         g_file[i].base = 0;
         g_file[i].pos  = 0;
         /* A host file's window is the whole file. Writable files start empty
@@ -294,6 +330,43 @@ static void hle_Open(void) {
     psp_ret(0x80010018);              /* too many open files */
 }
 
+/* A file system call gives up the CPU while its driver works.
+ *
+ * threadprobe step 86 (fw 6.60) makes Memory Stick calls from main (0x20)
+ * with a ready 0x20 thread W, and W runs inside open (for writing and for
+ * reading), write, read (32K and 16 bytes), getstat and remove, and inside a
+ * close that follows a write; main's releaseCount rises across each (51, 2,
+ * 50, 1, 1, 50 and 53, and 4 for that close). An lseek and a close with
+ * nothing written give nothing up (release+0, W runs after). Step 1's
+ * release=333 for main is the same thing during start-up I/O. psprecomp's
+ * calls never let go of the CPU, so a thread doing I/O kept it from every
+ * thread of its own priority and below until it next blocked.
+ *
+ * Modelled as the shortest delay: the caller stops being runnable, every
+ * ready thread gets its turn -- equal and lower priorities too, as they do
+ * while a real driver waits -- and the caller is ready again as soon as any
+ * firmware call notices a microsecond has passed. The hardware's counts are
+ * the driver's own waits and depend on the stick's directory layout; this
+ * counts one release per call. The disc (disc0:, umd0:) is not measured: it
+ * is parked the same way, on the grounds that a UMD read waits for a slower
+ * drive than a stick read does. Directory calls, mkdir, rmdir, rename and
+ * chstat are unmeasured and left as they were.
+ *
+ * $v0/$v1 are the call's answer and are kept across the park. Nothing is
+ * given up with dispatch or interrupts off, where a PSP could not wait, nor
+ * by the async calls, which reuse these handlers but return at once, nor
+ * inside an alarm or vtimer handler, which runs on no thread and has nothing
+ * to park. */
+static int g_io_async;
+
+static void io_park(void) {
+    if (g_io_async || !psp_sched_can_wait() || psp_ktimer_in_handler()) return;
+    const uint32_t v0 = psp_cpu.r[PSP_REG_V0], v1 = psp_cpu.r[PSP_REG_V1];
+    (void)psp_sched_delay(1);
+    psp_cpu.r[PSP_REG_V0] = v0;
+    psp_cpu.r[PSP_REG_V1] = v1;
+}
+
 static io_file *fd_arg(void) {
     int32_t fd = (int32_t)psp_arg(0) - 3;
     if (fd < 0 || fd >= MAX_FILES || !g_file[fd].used) return NULL;
@@ -303,11 +376,16 @@ static io_file *fd_arg(void) {
 static void hle_Close(void) {
     io_file *h = fd_arg();
     if (!h) { psp_ret(0x80020323); return; }
+    const int flush = h->dirty;
     fclose(h->f);
     h->f = NULL;
     h->used = 0;
+    h->dirty = 0;
     psp_ret(0);
+    if (flush) io_park();
 }
+
+static void hle_read_body(io_file *h, uint32_t dst, uint32_t size);
 
 static void hle_Read(void) {
     io_file *h = fd_arg();
@@ -315,6 +393,11 @@ static void hle_Read(void) {
     if (!h) { psp_ret(0x80020323); return; }
     if (!size) { psp_ret(0); return; }
     if (h->sector_mode) size *= ISO_SECTOR;   /* the count is in sectors */
+    hle_read_body(h, dst, size);
+    io_park();
+}
+
+static void hle_read_body(io_file *h, uint32_t dst, uint32_t size) {
 
     /* Read through a host buffer and then place it, so a read that straddles
      * the end of a guest region is rejected by the memory layer rather than
@@ -383,7 +466,9 @@ static void hle_Write(void) {
     for (uint32_t i = 0; i < size; i++) tmp[i] = psp_read8(src + i);
     size_t put = fwrite(tmp, 1, size, h->f);
     free(tmp);
+    if (size) h->dirty = 1;
     psp_ret((uint32_t)put);
+    if (size) io_park();
 }
 
 /* sceIoLseek takes a 64-bit offset and returns one. Under o32 a 64-bit
@@ -488,7 +573,45 @@ static void write_stat(uint32_t out, int is_dir, uint64_t size, uint32_t lba) {
      * and inventing a date would be less honest than reporting none. */
 }
 
-static void hle_Getstat(void) {
+#ifndef _WIN32
+/* ScePspDateTime: year, month, day, hour, minute, second as u16, then
+ * microsecond as u32. */
+static void write_date(uint32_t at, time_t t, int time_of_day) {
+    struct tm tm;
+    if (!localtime_r(&t, &tm)) return;
+    psp_write16(at + 0, (uint16_t)(tm.tm_year + 1900));
+    psp_write16(at + 2, (uint16_t)(tm.tm_mon + 1));
+    psp_write16(at + 4, (uint16_t)tm.tm_mday);
+    psp_write16(at + 6, (uint16_t)(time_of_day ? tm.tm_hour : 0));
+    psp_write16(at + 8, (uint16_t)(time_of_day ? tm.tm_min : 0));
+    psp_write16(at + 10, (uint16_t)(time_of_day ? tm.tm_sec : 0));
+    psp_write32(at + 12, 0);
+}
+
+/* A Memory Stick file or directory as a PSP on firmware 6.60 stats it
+ * (saveprobe steps 105-107, sceIoGetstat and each sceIoDread d_stat alike):
+ * mode 0x21FF for a file and 0x11FF for a directory, attr 0x20 and 0x10, a
+ * directory's size 0, the creation and modification dates with their time
+ * of day and the access date alone at 00:00:00 (FAT keeps no access time),
+ * microseconds 0, and st_private left as the caller had it. The dates are
+ * the host file's: status change for creation, which Linux does not keep. */
+static void write_fat_stat(uint32_t out, const struct stat *st) {
+    const int dir = S_ISDIR(st->st_mode);
+    const uint64_t size = dir ? 0 : (uint64_t)st->st_size;
+    psp_write32(out + 0, (dir ? FIO_S_IFDIR : FIO_S_IFREG) | 0x01FFu);
+    psp_write32(out + 4, dir ? FIO_SO_IFDIR : FIO_SO_IFREG);
+    psp_write32(out + 8,  (uint32_t)size);
+    psp_write32(out + 12, (uint32_t)(size >> 32));
+    write_date(out + 16, st->st_ctime, 1);
+    write_date(out + 32, st->st_atime, 0);
+    write_date(out + 48, st->st_mtime, 1);
+}
+#endif
+
+static void hle_getstat_body(void);
+static void hle_Getstat(void) { hle_getstat_body(); io_park(); }   /* io_park */
+
+static void hle_getstat_body(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     const uint32_t out = psp_arg(1);
@@ -512,6 +635,23 @@ static void hle_Getstat(void) {
     } else {
         map_path(guest, host, sizeof host);
     }
+
+#ifndef _WIN32
+    /* stat before fopen: Linux opens a directory for reading, and seeking to
+     * its end read as a size of 0x7FFFFFFFFFFFFFFF with the file's mode. */
+    {
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            const int dir = S_ISDIR(st.st_mode);
+            if (out) {
+                if (is_ms_path(guest)) write_fat_stat(out, &st);
+                else write_stat(out, dir, dir ? 0 : (uint64_t)st.st_size, 0);
+            }
+            psp_ret(SCE_KERNEL_ERROR_OK);
+            return;
+        }
+    }
+#endif
 
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -736,15 +876,19 @@ static void hle_Dopen(void) {
         if (!g_dir[i].dir) { psp_ret(0x80010002); return; }
 #endif
         g_dir[i].used = 1;
+        g_dir[i].fat = is_ms_path(guest);
+        snprintf(g_dir[i].host, sizeof g_dir[i].host, "%s", host);
         psp_ret((uint32_t)(i + 1));
         return;
     }
     psp_ret(0x80010018);
 }
 
-/* Fill a SceIoDirent. Only the name is populated: games use Dread to enumerate
- * save slots and asset directories by name, and a wrong stat block would be
- * worse than an empty one. */
+/* Fill a SceIoDirent: the entry's SceIoStat (88 bytes, as sceIoGetstat
+ * writes it) and then d_name at +88. The name used to go at +52, from a
+ * wrong idea of the stat's size, so every name read back empty: saveprobe
+ * on a PSP (firmware 6.60) listed its save files by name where psprecomp
+ * listed blanks. */
 static void hle_Dread(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
     uint32_t dirent = psp_arg(1);
@@ -769,11 +913,31 @@ static void hle_Dread(void) {
     name = de->d_name;
 #endif
 
-    /* SceIoDirent: a 52-byte SceIoStat, then char d_name[256]. */
-    for (int i = 0; i < 52; i++) psp_write8(dirent + (uint32_t)i, 0);
-    uint32_t at = dirent + 52;
-    for (uint32_t i = 0; i < 255 && name[i]; i++) psp_write8(at + i, (uint8_t)name[i]);
-    psp_write8(at + (uint32_t)strlen(name), 0);
+    int is_dir = 0, fat_done = 0;
+    uint64_t size = 0;
+#ifdef _WIN32
+    is_dir = (g_dir[id].data.attrib & _A_SUBDIR) != 0;
+    size = is_dir ? 0 : (uint64_t)g_dir[id].data.size;
+#else
+    {
+        char path[1300];
+        struct stat st;
+        snprintf(path, sizeof path, "%s/%s", g_dir[id].host, name);
+        if (stat(path, &st) == 0) {
+            is_dir = S_ISDIR(st.st_mode);
+            size = is_dir ? 0 : (uint64_t)st.st_size;
+            /* d_stat is what sceIoGetstat gives (saveprobe step 107). */
+            if (g_dir[id].fat) { write_fat_stat(dirent, &st); fat_done = 1; }
+        }
+    }
+#endif
+
+    /* SceIoDirent: SceIoStat d_stat, char d_name[256], then d_private. */
+    if (!fat_done) write_stat(dirent, is_dir, size, 0);
+    uint32_t at = dirent + PSP_STAT_LEN;
+    uint32_t n = 0;
+    for (; n < 255 && name[n]; n++) psp_write8(at + n, (uint8_t)name[n]);
+    psp_write8(at + n, 0);
 
     psp_ret(1);                       /* more entries may follow */
 }
@@ -842,6 +1006,7 @@ static void hle_Remove(void) {
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
     psp_ret(UNLINK_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
+    io_park();
 }
 
 static void hle_Chdir(void) {
@@ -997,7 +1162,9 @@ static void async_done(io_file *h, int64_t value) {
  * the work is identical and the only difference is where the answer goes. A
  * second copy of the read path would be a second thing to keep correct. */
 static void hle_OpenAsync(void) {
+    g_io_async = 1;
     hle_Open();
+    g_io_async = 0;
     const int32_t fd = (int32_t)psp_cpu.r[PSP_REG_V0] - 3;
     if (fd >= 0 && fd < MAX_FILES && g_file[fd].used)
         async_done(&g_file[fd], (int64_t)(int32_t)psp_cpu.r[PSP_REG_V0]);
@@ -1007,7 +1174,9 @@ static void hle_OpenAsync(void) {
 static void hle_ReadAsync(void) {
     io_file *h = fd_arg();
     if (!h) { psp_ret(SCE_ERROR_BADF); return; }
+    g_io_async = 1;
     hle_Read();
+    g_io_async = 0;
     async_done(h, (int64_t)(int32_t)psp_cpu.r[PSP_REG_V0]);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1029,7 +1198,9 @@ static void hle_WriteAsync(void) {
     }
     io_file *h = fd_arg();
     if (!h) { psp_ret(SCE_ERROR_BADF); return; }
+    g_io_async = 1;
     hle_Write();
+    g_io_async = 0;
     async_done(h, (int64_t)(int32_t)psp_cpu.r[PSP_REG_V0]);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1074,6 +1245,7 @@ static void collect_async(io_file *h) {
         if (h->f) fclose(h->f);
         h->f = NULL;
         h->used = 0;
+        h->dirty = 0;
         h->close_pending = 0;
     }
     psp_ret(SCE_KERNEL_ERROR_OK);

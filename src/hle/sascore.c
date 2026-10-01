@@ -50,13 +50,25 @@
 #define SAS_ERROR_NOISE_FREQ   0x80420011u
 /* sascore.expected: a volume outside -0x1000..0x1000 is refused with 18, and
  * all four -- the two channel volumes and the two reverb sends -- are
- * checked. */
+ * checked. 0x80000000 is the exception (see hle_SetVolume). CoreWithMix
+ * refuses a mix level with the same code. */
 #define SAS_ERROR_VOLUME       0x80420018u
 /* Not a sascore code at all: mixing in output mode 1 comes back as a plain
  * "not supported" from the layer below. */
 #define SAS_ERROR_MIX_MODE     0x80000004u
 /* A negative ADSR rate -- setadsr.expected's "Value ffffffff". */
 #define SAS_ERROR_ADSR_VALUE   0x80420019u
+/* A wave duty outside 0..100, from __sceSasSetSteepWave and
+ * __sceSasSetTrianglarWave alike (sasprobe step 229, fw 6.60). Not in
+ * PSPSDK's list of codes. */
+#define SAS_ERROR_WAVE_DUTY    0x80420017u
+/* The reverb calls' codes, PSPSDK's FX_TYPE, FX_FEEDBACK, FX_DELAY and
+ * FX_VOLUME_VAL; which call refuses what with each is sasprobe's (steps
+ * 224-226, fw 6.60). */
+#define SAS_ERROR_REV_TYPE     0x80420020u
+#define SAS_ERROR_REV_FEEDBACK 0x80420021u
+#define SAS_ERROR_REV_DELAY    0x80420022u
+#define SAS_ERROR_REV_VOLUME   0x80420023u
 
 static int grain_ok(uint32_t g) { return g >= 64 && g <= SAS_MAX_GRAIN && (g % 32) == 0; }
 
@@ -93,14 +105,19 @@ static int grain_ok(uint32_t g) { return g >= 64 && g <= SAS_MAX_GRAIN && (g % 3
  * documented pairs read (115, 52) here and (115, -52) elsewhere.
  *
  * Entries past the ninth are measured rather than derived -- they are the
- * module's own data, whatever sits after the table. W[19] is the one value
- * the corpus underdetermines: filter 14 clamps, so anything from 82 to 85
- * gives its output. Nothing an encoder emits reaches past filter 4. */
+ * module's own data, whatever sits after the table, so another firmware may
+ * differ. sasprobe fits both weights of every filter from its output on
+ * firmware 6.60 (steps 133-148): each has exactly one fit, and all sixteen
+ * are this table's. W[19], filter 14's second weight, is 6: the corpus's
+ * filter-14 run clamps before that weight shows and allowed 82 to 85, but
+ * sasprobe's input reaches it first, and 85 oscillates where hardware
+ * saturates at 32767 (step 147). Nothing an encoder emits reaches past
+ * filter 4. */
 static const int VAG_W[21] = {
     /* first  weights, 0..4 */    0, 60, 115,  98, 122,
     /* second weights, 0..4 */    0,  0,  52,  55,  60,
     /* past the table          */ 0,  0,   0,   2, 125,
-                                  0, 91,   0, 216,  85, 151,
+                                  0, 91,   0, 216,   6, 151,
 };
 
 enum { ENV_OFF = 0, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
@@ -129,44 +146,61 @@ static int curve_ok(uint32_t mode, int phase_is_attack, int phase_is_sustain) {
     return phase_is_attack ? ((m & 1u) == 0u) : ((m & 1u) == 1u);
 }
 
+/* What a voice plays. __sceSasSetVoice hands it VAG ADPCM, which is decoded
+ * a 16-byte block at a time; __sceSasSetVoicePCM hands it raw signed 16-bit
+ * samples, which are read as they are. The game uses both -- its menu sounds
+ * are VAG and its voice clips PCM -- and the PCM path was missing entirely,
+ * so those voices were silent. __sceSasSetNoise and the two wave calls make
+ * the voice a generator instead. */
+enum { SRC_NONE = 0, SRC_VAG, SRC_PCM, SRC_NOISE, SRC_STEEP, SRC_TRIANGLE };
+typedef struct {
+    int      kind;
+    uint32_t addr;
+    uint32_t size;          /* VAG: bytes; PCM: samples, 1..0x10000 */
+    int32_t  loop;          /* VAG: loop mode 0/1; PCM: loop position, negative for none */
+    uint32_t param;         /* noise: the frequency, 0..63; waves: the duty, 0..100 */
+} sas_source;
 
 typedef struct {
-    /* A voice plays one of two things. __sceSasSetVoice hands it VAG ADPCM,
-     * which is decoded a 16-byte block at a time; __sceSasSetVoicePCM hands
-     * it raw signed 16-bit samples, which are read as they are. The game uses
-     * both -- its menu sounds are VAG and its voice clips PCM -- and the PCM
-     * path was missing entirely, so those voices were silent. */
-    int      is_pcm;
-    uint32_t pcm_addr;
-    int32_t  pcm_size;      /* samples */
-    int32_t  pcm_loop;      /* first sample of the loop; negative means none */
-    int32_t  pcm_pos;       /* the sample about to be played */
+    /* The sample the setters name and the sample that is playing are two
+     * things. A SetVoice or SetVoicePCM on a playing voice does not touch
+     * what it plays: firmware 6.60 goes on looping the old VAG blocks
+     * (sasprobe step 171) and the old PCM loop (step 178) after the call, for
+     * as long as the probe listened. `next` is what the setters wrote, and a
+     * key-on makes it `src`. */
+    sas_source next;
+    sas_source src;
 
-    uint32_t vag_addr;      /* guest address of the sample data */
-    uint32_t vag_size;
-    int      loop;          /* loop mode: a block flagged 3 jumps back */
+    int32_t  pcm_pos;       /* the resampler's sample index; -1 past the end */
+    int      pcm_adv;       /* the last step consumed a sample (see pcm_fetch) */
+
     uint32_t loop_start;    /* byte offset of the block flagged 6, else 0 */
-    int      last_block;    /* the block just decoded ended the sample */
+    int      vag_end;       /* the stream has ended: no more blocks */
     uint32_t pos;           /* byte offset of the current 16-byte block */
     int      sample_idx;    /* 0..27 within the block */
     int      hist1, hist2;  /* ADPCM history */
     int16_t  decoded[28];
     int      decoded_valid;
+    /* The VAG resampler's two-sample window, u[I] and u[I+1] of the stream
+     * with a 0 in front (see vag_fetch). `vag_nxt` is read from the stream
+     * only when an output first needs it. */
+    int32_t  vag_cur, vag_nxt;
+    int      vag_cur_ok;    /* 0 once the window has run past the stream */
+    int      vag_nxt_state; /* VAG_NXT_* */
 
-    uint32_t pitch;         /* 0x1000 == 1.0 */
+    uint32_t pitch;         /* 0x1000 == 1.0; a wave's frequency in Hz */
     uint32_t frac;          /* resampling accumulator, 12-bit fraction */
 
     int32_t  vol_l, vol_r;      /* 0x1000 == unity */
     int32_t  vol_el, vol_er;    /* the two reverb sends, same scale */
     int      env_state;
-    int32_t  env;           /* 0 .. 0x40000000 */
+    int32_t  env;           /* 0 .. 0x40000000; a direct decay may hold it higher */
     int32_t  attack_rate, decay_rate, sustain_level, release_rate;
-    /* The sustain *rate* is stored and mirrored but does not drive anything
-     * here: this renderer's sustain phase holds. __sceSasSetADSR's fourth
-     * value is filed under it by hardware -- setadsr.expected reads it back
-     * from sustainRate, not sustainLevel -- while the same value is what this
-     * envelope needs as the decay's target for pcm and vag to come out
-     * exact. Item 45's four unresolved decay sweeps sit on that seam. */
+    /* The sustain phase runs its own curve at its own rate, like the other
+     * three: sasprobe's sustain sweeps (steps 113-119, fw 6.60) climb and
+     * fall at exactly sustain_rate per sample, and SetSimpleADSR's sustain
+     * keeps falling after the decay (step 132). __sceSasSetADSR's fourth
+     * value is this rate, not the level; SetSL sets the level. */
     int32_t  sustain_rate;
     uint32_t mode_attack, mode_decay, mode_sustain, mode_release;
 
@@ -176,7 +210,14 @@ typedef struct {
      * A key-off lifts it immediately -- pcm and vag key a voice off and
      * straight back on with no core between and hardware restarts it -- while
      * the *release* it schedules waits for the next core, which is what
-     * `keyoff_pending` carries. `playing` outlives the key either way: the
+     * `keyoff_pending` carries. A key-on waits for the next core the same
+     * way, in `keyon_pending`, although its key goes down at once (so a
+     * second KeyOn is refused and a KeyOff accepted): until that core the
+     * height, the end flag and the sound are the old voice's. Firmware 6.60
+     * reads the old height straight after a KeyOff+KeyOn (001E0000, and
+     * 30000000 in the middle of a release) and the old end flag straight
+     * after a KeyOn (sasprobe steps 71, 73, 75 and 213); the struct shows the
+     * key-on as pending (step 29). `playing` outlives the key either way: the
      * release is still audible after the key is up, and a fresh key-on may
      * arrive while it still is. adsrcurve needs exactly that: it starts each
      * of its 53 sweeps with a key-off and one core, and a release that has
@@ -184,10 +225,12 @@ typedef struct {
      * refusal to `playing` instead left the old envelope running and the
      * sweep measured the previous section's curve. */
     int      on;
+    int      keyon_pending;
     int      keyoff_pending;
     int      playing;
     int      ended;
     int      paused;
+    int      pause_faded;   /* the pause's fade has played (see pause_fade) */
     /* Samples still to wait before this voice starts. Keying on does not
      * take effect at once: hardware holds the voice for 32 samples, and
      * both the sound and the envelope begin together at the end of it.
@@ -198,40 +241,57 @@ typedef struct {
      * four such cores, which is 96 + 128 + 128 + 128, the same 32 missing
      * once rather than per core. And pcm.expected's rendered output puts the
      * sample the voice starts from at output index 32, with the loop
-     * arriving 32 late to match. */
+     * arriving 32 late to match. sasprobe measured the same on firmware 6.60
+     * (steps 69-70), counting from the core that takes up the key-on. */
     int32_t  start_delay;
-    int32_t  src_delay;   /* extra samples before the first source sample */
+
+    /* The noise generator (see noise_advance): the register and its clock,
+     * both of which each key-on restarts. */
+    uint16_t noise;
+    int32_t  noise_cnt;     /* samples left to the next half-tick */
+    uint32_t noise_j;       /* that half-tick's place in the eight-tick table */
+    uint8_t  noise_tbl;     /* the table, as the key-on's frequency picked it */
+
+    /* A wave's phase, as 44100 times its 16-bit phase (see wave_fetch). */
+    uint32_t wave_acc;
 } sas_voice;
+
+enum { VAG_NXT_UNREAD = 0, VAG_NXT_OK, VAG_NXT_END };
 
 static sas_voice g_voice[SAS_VOICES];
 static uint32_t  g_grain = 256;
-static uint32_t  g_max_voices = SAS_VOICES;
 static uint32_t  g_output_mode;
 static uint32_t  g_sample_rate = 44100;
 static uint64_t  g_frames_rendered;
 static uint64_t  g_samples_nonzero;
 
-void psp_sas_reset(void) {
+/* Every voice back to the state __sceSasInit leaves it in: off, unpaused,
+ * no sample, and the defaults hardware writes into each voice of the struct
+ * (sasprobe step 4, fw 6.60): rates and sustain level 0, curves linear
+ * increase for the attack and linear decrease for the rest, pitch 0x1000,
+ * all four volumes 0x1000. Zero curves would mean linear *increase* for all
+ * four, which would make a decay climb. */
+static void reset_voices(void) {
     memset(g_voice, 0, sizeof g_voice);
-    /* A game that never calls __sceSasSetADSRmode gets the shapes this file
-     * had before there were modes: a rising attack and falling everything
-     * else. Zero would mean linear *increase* for all four, which would make
-     * a decay climb. */
     for (int i = 0; i < SAS_VOICES; i++) {
         g_voice[i].mode_attack  = CURVE_LINEAR_INC;
         g_voice[i].mode_decay   = CURVE_LINEAR_DEC;
         g_voice[i].mode_sustain = CURVE_LINEAR_DEC;
         g_voice[i].mode_release = CURVE_LINEAR_DEC;
-    }
-    for (int i = 0; i < SAS_VOICES; i++) {
-        g_voice[i].pitch = 0x1000;
+        g_voice[i].pitch  = 0x1000;
         g_voice[i].vol_l  = 0x1000;
         g_voice[i].vol_r  = 0x1000;
         g_voice[i].vol_el = 0x1000;
         g_voice[i].vol_er = 0x1000;
     }
+}
+
+static void rev_reset(void);
+
+void psp_sas_reset(void) {
+    reset_voices();
+    rev_reset();
     g_grain = 256;
-    g_max_voices = SAS_VOICES;
     g_output_mode = 0;
     g_sample_rate = 44100;
     g_frames_rendered = 0;
@@ -243,41 +303,40 @@ void psp_sas_init(void) { psp_sas_reset(); }
 uint64_t psp_sas_frames(void)   { return g_frames_rendered; }
 uint64_t psp_sas_nonzero(void)  { return g_samples_nonzero; }
 
-static int clamp16(int v) {
+static int clamp16(int64_t v) {
     if (v >  32767) return  32767;
     if (v < -32768) return -32768;
     return v;
 }
 
 /* Decode the 16-byte ADPCM block at the voice's current position into its
- * 28-sample buffer. Returns 0 when the voice has ended.
+ * 28-sample buffer. Returns 0 when the stream has ended.
  *
- * Where a voice ends is measured where the corpus reaches, and conventional
- * where it does not. audio/sascore/vag.expected plays a 16-block sample in
- * loop mode 1 with every block after the first carrying one flag value, and
- * 16 blocks are 448 samples, inside its one 512-sample grain -- so with flags
- * 0, 1, 7, 0x41 and 0x87 the voice reports ended, and the only thing that is
- * measured by that is that **the buffer end ends a voice whatever the loop
- * mode**, and that the flagged block is decoded (its samples are printed).
- * Two flag facts are measured: exactly 3 keeps the voice playing -- a loop
- * end that jumps back -- and 0x41 does not end it: the same test plays
- * music.vag with its file header still in front, so block 0's flag byte is
- * the 'A' of "VAGp", and the voice is still playing a grain later. So the
- * check is on exact values, not bit 0. Exactly 1 and exactly 7 ending the
- * voice after their block, and 6 marking the loop start, are the format's
- * convention and not reached by any test here.
+ * The flag byte, as firmware 6.60 plays it (sasprobe steps 152-170, all 19
+ * vag_flags*.bin captures exact):
  *
- * This used to restart from byte 0 at both the buffer end and flag 7 whenever
- * loop mode was set. Armored Core starts its menu sounds with loop mode set,
- * so its "decide" sound played forever, and the game waits for that sound to
- * finish before it leaves the title screen: NEW GAME hung on a sound effect. */
+ *   7     ends the stream *before* its block: the block is never played, in
+ *         either loop mode (steps 162-164)
+ *   3     in loop mode 1, continues at the loop start after its block; in
+ *         loop mode 0 it is ignored (156, 159)
+ *   6     marks the loop start (the last block flagged 6, else block 0)
+ *   else  ignored -- 1, 2, 4, 5, 0x41 and 0x87 all play straight through
+ *         (154-155, 165-170). So a block flagged 1 does not end the sample.
+ *
+ * and the end of the buffer ends the voice whatever the loop mode (152-153).
+ * That last one is the one that matters most in practice: this used to
+ * restart from byte 0 at the buffer end whenever loop mode was set, and
+ * Armored Core starts its menu sounds with loop mode set, so its "decide"
+ * sound played forever -- and the game waits for that sound to finish before
+ * it leaves the title screen: NEW GAME hung on a sound effect. */
 static int decode_block(sas_voice *v) {
-    if (v->last_block) return 0;
-    if (v->pos + 16 > v->vag_size) return 0;
+    if (v->vag_end) return 0;
+    if (v->pos + 16 > v->src.size) { v->vag_end = 1; return 0; }
 
-    uint32_t at = v->vag_addr + v->pos;
+    uint32_t at = v->src.addr + v->pos;
     uint8_t hdr   = psp_read8(at);
     uint8_t flags = psp_read8(at + 1);
+    if (flags == 7) { v->vag_end = 1; return 0; }
 
     int shift  = hdr & 0x0F;
     int filter = (hdr >> 4) & 0x0F;      /* all sixteen are real; see VAG_W */
@@ -299,104 +358,532 @@ static int decode_block(sas_voice *v) {
 
     if (flags == 6) v->loop_start = v->pos;
     v->pos += 16;
-    if (flags == 3 && v->loop) v->pos = v->loop_start;
-    else if (flags == 1 || flags == 3 || flags == 7) v->last_block = 1;
+    if (flags == 3 && v->src.loop) v->pos = v->loop_start;
     v->decoded_valid = 1;
     return 1;
 }
 
-/* One sample of one phase, by the phase's curve.
+/* x >> n rounding towards minus infinity whatever the sign, which C leaves
+ * to the compiler for a negative x. */
+static int64_t shr_floor(int64_t x, int n) {
+    return x >= 0 ? (x >> n) : -((-x - 1) >> n) - 1;
+}
+
+/* One sample of one phase, by the phase's curve. Every shape is the one
+ * sasprobe measured on firmware 6.60 (steps 79-132: 54 sweeps, the height
+ * after every core and the end flag, all reproduced), and none of them looks
+ * at where the phase is heading:
  *
- * The shapes are adsrcurve.expected's, and findings item 45 records how far
- * each is pinned. The linear pair is exactly plus or minus the rate. Bent is
- * the rate below three-quarter height and a quarter above, which is every
- * core of its sweep but the one where it crosses. Exponent falling is the
- * height scaled by the rate with a floor of one. Exponent rising approaches
- * the top geometrically and behaves as though bit 16 of the rate were set,
- * which is within a hundredth of a percent and no closer. Direct jumps to
- * where the phase ends. Exponent-rev is refused by attack and driven by
- * nothing else in the corpus, so it falls back to the linear decrease it
- * sits beside. */
-static int32_t curve_step(uint32_t mode, int32_t h, int32_t rate, int32_t target, int rising) {
+ *   linear inc/dec  h +/- rate
+ *   bent            h + rate up to three-quarter height, rate/4 past it
+ *   exponent-rev    h - ceil(h * rate / 2^32)
+ *   exponent        h + 0x4000 + ((0x40000000 - h) * rate >> 32)
+ *   direct          h = rate
+ *
+ * Direct *is* the rate, in every phase: a direct decay of 0x20000000 holds at
+ * 0x20000000 and one of 0 ends the voice (steps 109-110), a direct sustain of
+ * 0x8000000 holds there (118), and a direct release of 0x10000000 holds and
+ * never ends (128). Worked in 64 bits because h + rate passes INT32_MAX. */
+static int64_t curve_step(uint32_t mode, int64_t h, int32_t rate) {
     switch (mode & 7u) {
     case CURVE_LINEAR_INC:  return h + rate;
     case CURVE_LINEAR_DEC:  return h - rate;
     /* At three-quarter height exactly the step is still the full rate: the
-      * bend is on the way *past* the knee, not at it. adsrcurve's crossing
-      * core moves 0x028C0000 where a full core moves 0x02800000, which is 33
-      * full steps and 31 quarter ones -- one more full step than a strict
-      * comparison gives, and the only split of 64 that lands on hardware's
-      * number. */
+     * bend is on the way *past* the knee, not at it (sasprobe step 115). */
     case CURVE_LINEAR_BENT: return h + ((h <= (ENV_MAX / 4) * 3) ? rate : (rate >> 2));
-    case CURVE_EXP_REV: {
-        /* The falling exponential. The parity rule names which is which: the
-         * odd curves are the falling shapes, so a decay or a release takes
-         * mode 3 and an attack takes mode 4. The step is the height scaled by
-         * the rate, rounded *up* -- from the top at rate 9 hardware steps 3 a
-         * sample where truncation would step 2, a product that is exact keeps
-         * its value, and rounding up is what stops a small height from never
-         * falling at all. Exact on twelve of adsrcurve's fourteen decay
-         * sweeps; the two others differ only where the height meets the
-         * sustain level. */
-        const int64_t step = (((int64_t)h * (uint32_t)rate) + 0xFFFFFFFFll) >> 32;
-        return h - (int32_t)step;
-    }
-    case CURVE_EXP:
-        if (rising) {
-            /* A fixed 0x4000 a sample plus the room left, scaled by the rate.
-             * The fixed part is why a small rate climbs in a straight line --
-             * rate 0 and rate 1 both step exactly 0x4000, with no curvature
-             * anywhere in their sweeps -- and the scaled part is what bends
-             * the large ones. Exact on all twelve attack sweeps. */
-            const int64_t room = (int64_t)ENV_MAX - h;
-            return h + 0x4000 + (int32_t)((room * (uint32_t)rate) >> 32);
-        }
-        /* Even curves are the rising shapes and a falling phase will not
-         * accept one; if one arrives anyway, fall back rather than climb. */
-        return h - rate;
-    case CURVE_DIRECT:      return target;
-    default:                return rising ? h + rate : h - rate;
+    /* Rounded *up* (steps 102-105, 108 and 124-126 all need it), which is
+     * also what stops a small height from never falling at all. h is never
+     * negative when a step starts: every phase clamps at zero. */
+    case CURVE_EXP_REV:     return h - ((h * (int64_t)rate + 0xFFFFFFFFll) >> 32);
+    /* A fixed 0x4000 a sample plus the room left, scaled by the rate: the
+     * fixed part is why rate 0 and rate 1 climb in a straight line. The room
+     * is negative above the top (a direct decay can leave it there), and
+     * the shift then rounds down, as hardware's does. */
+    case CURVE_EXP:         return h + 0x4000 + shr_floor(((int64_t)ENV_MAX - h) * rate, 32);
+    case CURVE_DIRECT:      return rate;
+    default:                return h;   /* SetADSRmode refuses anything above 5 */
     }
 }
 
-/* Advance the envelope by one sample and return its current level, 0..0x40000000. */
-static int32_t step_envelope(sas_voice *v) {
+static void end_voice(sas_voice *v) {
+    v->env_state = ENV_OFF;
+    v->playing = 0;
+    v->on = 0;
+    v->ended = 1;
+}
+
+/* Advance the envelope by one sample. What each phase does with the step,
+ * from the same sweeps:
+ *
+ *   attack   at or past the top: clamp to the top, and decay from the next
+ *            sample
+ *   decay    below zero: clamp to zero. At or below the sustain level: go to
+ *            sustain -- with *no* clamp to the level. A decay of exponent-rev
+ *            0x1000000 towards 0x10000000 holds at 0FF32863, the step that
+ *            crossed it (106), and a key-off there releases from that height
+ *            (130).
+ *   sustain  above the top: clamp. At or below zero: zero, and the voice
+ *            ends, end flag and all (101, 111, 114, 116, 119). A sustain
+ *            that climbs goes all the way to the top (113, 115, 117).
+ *   release  the same as sustain. */
+static void step_envelope(sas_voice *v) {
+    int64_t h;
     switch (v->env_state) {
     case ENV_ATTACK:
-        v->env = curve_step(v->mode_attack, v->env, v->attack_rate, ENV_MAX, 1);
-        if (v->env >= ENV_MAX) { v->env = ENV_MAX; v->env_state = ENV_DECAY; }
+        h = curve_step(v->mode_attack, v->env, v->attack_rate);
+        if (h >= ENV_MAX) { h = ENV_MAX; v->env_state = ENV_DECAY; }
         break;
     case ENV_DECAY:
-        /* Direct is instant: the phase is over, and the height it was going
-         * to ramp towards is the height it already has. That is what lets a
-         * voice with a full-rate attack and a direct decay hold at the top --
-         * pcm and vag both do exactly that and stay at full scale -- while a
-         * decay with a real curve runs all the way to the sustain level. */
-        if (v->mode_decay == CURVE_DIRECT) { v->env_state = ENV_SUSTAIN; break; }
-        v->env = curve_step(v->mode_decay, v->env, v->decay_rate, v->sustain_level, 0);
-        if (v->env <= v->sustain_level) { v->env = v->sustain_level; v->env_state = ENV_SUSTAIN; }
-        break;
-    case ENV_RELEASE:
-        v->env = curve_step(v->mode_release, v->env, v->release_rate, 0, 0);
-        if (v->env <= 0) { v->env = 0; v->env_state = ENV_OFF; v->playing = 0; v->on = 0; v->ended = 1; }
+        h = curve_step(v->mode_decay, v->env, v->decay_rate);
+        if (h < 0) h = 0;
+        if (h <= v->sustain_level) v->env_state = ENV_SUSTAIN;
         break;
     case ENV_SUSTAIN:
-    default:
+    case ENV_RELEASE: {
+        const int sus = v->env_state == ENV_SUSTAIN;
+        h = curve_step(sus ? v->mode_sustain : v->mode_release, v->env,
+                       sus ? v->sustain_rate : v->release_rate);
+        if (h > ENV_MAX) h = ENV_MAX;
+        if (h <= 0) { v->env = 0; end_voice(v); return; }
         break;
     }
-    return v->env;
+    default:
+        return;
+    }
+    v->env = (int32_t)h;
 }
 
-/* Render `samples` stereo frames, summing every active voice. */
-static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix_er,
+/* ---- the resampler ------------------------------------------------------
+ *
+ * Every pitch interpolates. The output is a straight line between two source
+ * samples a and b at the voice's 12-bit fraction f, rounded up:
+ *
+ *     out = a + ceil((b - a) * f / 4096)
+ *
+ * sasprobe's PCM and pitch captures (steps 172-191, fw 6.60) pin it: at
+ * 0x800 a ramp of 4, 8, 12 ... plays 0 10 8 14 12 18, which no nearest-sample
+ * fetch gives, and the eleven pitch_*.bin captures, pitch_change.bin and the
+ * six pcm_loop_* ones come out exact. A falling slope rounds up too, toward
+ * the earlier sample: at pitch 0x100 a ramp stepping down by 4 plays 96 96
+ * 96 95 95 95 95 94, where rounding down would reach 95 a sample after 96
+ * (sasprobe 3 step 201, fw 6.60; pitch_0100_fall.bin exact).
+ *
+ * The two kinds differ in three ways, all measured:
+ *   - A PCM voice's pitch stops at 0x1000: 0x1800, 0x2000 and 0x4000 play
+ *     exactly as 0x1000 does (steps 182-185, 191). A VAG voice's does not:
+ *     0x2000 skips every other sample (step 151).
+ *   - A VAG voice interpolates over its decoded stream with a 0 in front, the
+ *     history the ADPCM decode starts from. That 0 is why a VAG's first
+ *     sample is heard one output after a PCM's (33 against 32), and why the
+ *     offset scales with the pitch instead of being a fixed extra sample.
+ *   - A PCM voice looks one sample ahead whenever the last step consumed
+ *     nothing (pcm_fetch), which is what puts 10 between 0 and 8 above.
+ *
+ * Both end the same way: when the sample the interpolator needs next is past
+ * the end, the voice ends. So the last sample of a one-shot is never heard
+ * -- a 100-sample PCM plays samples 0-98 (steps 172, 179) and a VAG's last
+ * block plays 27 of its 28 (step 75, vag_flags*.bin) -- and the end flag
+ * rises one sample earlier than a player that heard it. */
+
+static int32_t ceil_frac(int32_t d, uint32_t f) {
+    return (int32_t)-shr_floor(-(int64_t)d * (int64_t)f, 12);
+}
+
+/* The sample after `i` in a PCM voice: the next one, the loop position past
+ * the end, or -1 when there is none. A loop position outside the sample
+ * (SetVoicePCM accepts any negative one) is no loop (step 179). */
+static int32_t pcm_next(const sas_voice *v, int32_t i) {
+    if (i < 0) return -1;
+    const int32_t size = (int32_t)v->src.size, loop = v->src.loop;
+    if (i + 1 < size) return i + 1;
+    return (loop >= 0 && loop < size) ? loop : -1;
+}
+
+/* A PCM voice whose address is zero is accepted by hardware (pcm.expected,
+ * "Zero: OK"); it plays silence here rather than reading address zero. */
+static int32_t pcm_at(const sas_voice *v, int32_t i) {
+    return v->src.addr ? (int16_t)psp_read16(v->src.addr + (uint32_t)i * 2u) : 0;
+}
+
+static uint32_t pcm_pitch(const sas_voice *v) { return v->pitch < 0x1000u ? v->pitch : 0x1000u; }
+
+/* The PCM resampler keeps an index I, the fraction f and whether the last
+ * step consumed a sample. It interpolates from I when it did and from the
+ * sample after I when it did not. Pitch 0 plays silence (step 190). Returns
+ * 0 when the voice has run out. */
+static int pcm_fetch(const sas_voice *v, int32_t *out) {
+    const int32_t j = v->pcm_adv ? v->pcm_pos : pcm_next(v, v->pcm_pos);
+    const int32_t k = pcm_next(v, j);
+    if (j < 0 || k < 0) return 0;
+    if (pcm_pitch(v) == 0) { *out = 0; return 1; }
+    const int32_t a = pcm_at(v, j);
+    *out = a + ceil_frac(pcm_at(v, k) - a, v->frac);
+    return 1;
+}
+
+static void pcm_advance(sas_voice *v) {
+    v->frac += pcm_pitch(v);
+    v->pcm_adv = v->frac >= 0x1000u;
+    if (v->pcm_adv) {
+        v->frac -= 0x1000u;
+        v->pcm_pos = pcm_next(v, v->pcm_pos);
+    }
+}
+
+/* The next decoded sample of a VAG voice's stream; 0 at its end. */
+static int vag_stream_next(sas_voice *v, int32_t *s) {
+    if (!v->decoded_valid || v->sample_idx >= 28) {
+        if (!decode_block(v)) return 0;
+        v->sample_idx = 0;
+    }
+    *s = v->decoded[v->sample_idx++];
+    return 1;
+}
+
+static void vag_read_nxt(sas_voice *v) {
+    if (v->vag_nxt_state == VAG_NXT_UNREAD)
+        v->vag_nxt_state = vag_stream_next(v, &v->vag_nxt) ? VAG_NXT_OK : VAG_NXT_END;
+}
+
+static int vag_fetch(sas_voice *v, int32_t *out) {
+    if (!v->vag_cur_ok) return 0;
+    vag_read_nxt(v);
+    if (v->vag_nxt_state != VAG_NXT_OK) return 0;
+    *out = v->vag_cur + ceil_frac(v->vag_nxt - v->vag_cur, v->frac);
+    return 1;
+}
+
+static void vag_advance(sas_voice *v) {
+    v->frac += v->pitch;
+    for (uint32_t n = v->frac >> 12; n > 0 && v->vag_cur_ok; n--) {
+        vag_read_nxt(v);
+        v->vag_cur_ok = v->vag_nxt_state == VAG_NXT_OK;
+        v->vag_cur = v->vag_nxt;
+        v->vag_nxt_state = VAG_NXT_UNREAD;
+    }
+    v->frac &= 0xFFFu;
+}
+
+/* ---- noise ---------------------------------------------------------------
+ *
+ * __sceSasSetNoise's generator, as firmware 6.60 plays it. A 16-bit register
+ * starts at 0, and on each tick of its clock shifts left one bit, taking in
+ *
+ *     1 ^ bit 9 ^ bit 10 ^ bit 11 ^ bit 14     (of the value before the shift)
+ *
+ * which is exact over all 496 ticks of the frequency-63 capture and the only
+ * recurrence of order 15 or less that is (sasprobe step 198, fw 6.60). The
+ * voice plays the register as a signed 16-bit sample, through the envelope
+ * and volumes like any other.
+ *
+ * The clock, from the first ticks of all 64 frequencies (steps 211-274 of
+ * sasprobe 3, run 4). Frequency f splits into k = f >> 2 and m = f & 3. For
+ * k up to 14 the clock runs in half-ticks H = 2^(14-k) + 1 samples apart,
+ * the first after the voice's sample H (its first sample being 0, 32 frames
+ * into the key-on core). Half-tick j, counting from 0 there, moves the
+ * register if bit j % 8 of
+ *
+ *     m = 0: 0x55   1: 0x75   2: 0x77   3: 0x7F
+ *
+ * is set: every other half-tick at m = 0, and one, three or five more of
+ * every eight at m = 1, 2, 3 -- gaps of 2,2,1,1,2 half-ticks at m = 1, 1,1,2
+ * at m = 2 and six 1s and a 2 at m = 3. That is exact for all 60 of those
+ * frequencies, out to frequency 0, which first ticks at frame 16418 and then
+ * every 32770 samples (step 211). At k = 15, frequencies 60-63,
+ * the register moves after the voice's sample 0 and every second sample
+ * after that, whatever m is (steps 271-274), which with step 279 below reads
+ * as half-ticks 2 samples apart and a table of all ones.
+ *
+ * Each voice has its own generator (steps 281-283: two voices keyed on
+ * together tick independently, each from its own start), and each key-on
+ * starts both the register and the clock over, whether or not a SetNoise
+ * came before it (steps 278 and 280; the "different" re-key of round 1's
+ * step 199 was the re-key fade, see rekey_fade). A SetNoise on a voice that
+ * is playing noise changes its frequency at once, with no key-on, and that
+ * changes the spacing but not the table, which stays the one the key-on's
+ * frequency picked. Step 279 went from 48 to 63: the half-tick already due
+ * came when it was due, 2 samples into the next core, and ticked, and then
+ * the register moved every 4 samples -- 63's spacing of 2 with 48's 0x55 --
+ * where a voice keyed on at 63 moves every 2. That one switch is all that
+ * is measured of it. */
+
+static const uint8_t NOISE_TABLE[4] = { 0x55, 0x75, 0x77, 0x7F };
+
+static int32_t noise_half(uint32_t freq) {
+    const uint32_t k = freq >> 2;
+    return k >= 15 ? 2 : (int32_t)(1u << (14u - k)) + 1;
+}
+
+static void noise_restart(sas_voice *v) {
+    const uint32_t k = v->src.param >> 2;
+    v->noise = 0;
+    v->noise_j = 0;
+    v->noise_tbl = k >= 15 ? 0xFF : NOISE_TABLE[v->src.param & 3u];
+    v->noise_cnt = k >= 15 ? 1 : noise_half(v->src.param) + 1;
+}
+
+/* Called once per output sample, after the sample is taken. */
+static void noise_advance(sas_voice *v) {
+    if (--v->noise_cnt > 0) return;
+    v->noise_cnt = noise_half(v->src.param);
+    const uint32_t j = v->noise_j;
+    v->noise_j = (j + 1u) & 7u;
+    if (!((v->noise_tbl >> j) & 1u)) return;
+    const uint32_t n = v->noise;
+    const uint32_t in = 1u ^ (((n >> 9) ^ (n >> 10) ^ (n >> 11) ^ (n >> 14)) & 1u);
+    v->noise = (uint16_t)((n << 1) | in);
+}
+
+/* ---- steep and triangular waves --------------------------------------------
+ *
+ * __sceSasSetSteepWave and __sceSasSetTrianglarWave make the voice a
+ * generator whose frequency is its pitch in Hz, as PSPSDK's header says:
+ * SetPitch 441 gives a 100-sample period. The phase is kept exactly, as
+ * acc = n * pitch * 65536 modulo P = 65536 * 44100, so u = acc / P is the
+ * fraction of the period after n samples; a pitch change mid-play carries on
+ * from the same phase. With d = duty / 100, firmware 6.60 plays (sasprobe
+ * steps 335-350 of version 3, run 4; all sixteen wave_*.bin captures):
+ *
+ *   steep       +8192 while u < d, else -8192. Duty 0 is -8192 throughout
+ *               and duty 100 +8192.
+ *   triangular  three straight lines through (0, 0), (d/2, 16384),
+ *               (1 - d/2, -16384) and (1, 0):
+ *                 u < d/2        floor(u * 32768 / d)
+ *                 up to 1 - d/2  floor(A - x / (2 (1 - d))), x = (u - d/2) * 65536
+ *                 past that      floor((acc - P - C) * 32768 / (d P))
+ *
+ * Two constants in that are not the geometry's. The last segment sits
+ * C = 0x04CC0000 lower in acc than the line through (1, 0) -- 1824.9 in
+ * 16-bit phase, which is 3 P modulo 2^32, so the look of a 32-bit overflow
+ * somewhere -- at duties 25, 50 and 75 alike, and duty 100 subtracts C but
+ * not P (its values climb to 31527 before the wrap to 0). And the falling
+ * line's intercept A is 16384 + 1 - 2d, a hair over: the tri25 captures
+ * allow 16384.5011 to 16384.5066 and tri75 16383.36 to 16383.52, and
+ * 1 - 2d + 1/256 is taken. Duty 50 falls as 16384 - floor(x) instead, A just
+ * under 16385, and duty 0 as 16384 - floor(u * 32768.7): its slope is 1.00002
+ * times the geometry's, and 327687 / 655360 is the only such ratio in steps
+ * of 1/655360 that fits (step 344). All of that is fitted, not understood;
+ * with it all sixteen wave captures come out exact. Other duties run the
+ * same formulas, unmeasured. */
+
+#define WAVE_WRAP (65536u * 44100u)
+#define WAVE_C    0x04CC0000ll
+
+static int64_t floor_div(int64_t x, int64_t d) {
+    int64_t q = x / d;
+    if ((x % d) != 0 && x < 0) q--;
+    return q;
+}
+
+static int32_t wave_value(const sas_voice *v) {
+    const int64_t acc = v->wave_acc, P = WAVE_WRAP, duty = v->src.param;
+    if (v->src.kind == SRC_STEEP) return acc * 100 < duty * P ? 8192 : -8192;
+    if (duty > 0 && acc * 200 < duty * P)
+        return (int32_t)floor_div(acc * 3276800, duty * P);
+    if (duty == 0) return 16384 - (int32_t)(acc * 327687 / (44100ll * 655360));
+    if (acc * 200 < (200 - duty) * P) {
+        const int64_t x200 = acc * 200 - duty * P;    /* x * 200 * 44100 */
+        if (duty == 50) return 16384 - (int32_t)floor_div(x200, 200 * 44100);
+        /* A = 16384 + 1 - 2d + 1/256 */
+        return (int32_t)floor_div((1638500 - 2 * duty) * 176400 * (100 - duty) * 256
+                                      + 176400 * (100 - duty) * 100 - x200 * 25600,
+                                  176400 * (100 - duty) * 25600);
+    }
+    return (int32_t)floor_div((acc - (duty < 100 ? P : 0) - WAVE_C) * 3276800, duty * P);
+}
+
+static void wave_advance(sas_voice *v) {
+    v->wave_acc = (uint32_t)(((uint64_t)v->wave_acc + (uint64_t)v->pitch * 65536u) % WAVE_WRAP);
+}
+
+/* Take up the sample the setters last named, from its start, with the
+ * resampler at rest. */
+static void restart_source(sas_voice *v) {
+    v->src = v->next;
+    v->frac = 0;
+    v->pcm_pos = 0;
+    v->pcm_adv = 1;
+    v->pos = 0;
+    v->loop_start = 0;
+    v->vag_end = 0;
+    v->sample_idx = 0;
+    v->hist1 = v->hist2 = 0;
+    v->decoded_valid = 0;
+    v->vag_cur = 0;
+    v->vag_cur_ok = 1;
+    v->vag_nxt_state = VAG_NXT_UNREAD;
+    v->wave_acc = 0;
+    noise_restart(v);
+}
+
+/* The voice's next output sample, before the envelope; 0 when the voice has
+ * run out of sample. */
+static int fetch_sample(sas_voice *v, int32_t *s) {
+    switch (v->src.kind) {
+    case SRC_PCM:   return pcm_fetch(v, s);
+    case SRC_VAG:   return vag_fetch(v, s);
+    case SRC_NOISE: *s = (int16_t)v->noise; return 1;
+    case SRC_STEEP:
+    case SRC_TRIANGLE: *s = wave_value(v); return 1;
+    default:        return 0;
+    }
+}
+
+static void advance_source(sas_voice *v) {
+    switch (v->src.kind) {
+    case SRC_PCM:      pcm_advance(v); break;
+    case SRC_VAG:      vag_advance(v); break;
+    case SRC_NOISE:    noise_advance(v); break;
+    case SRC_STEEP:
+    case SRC_TRIANGLE: wave_advance(v); break;
+    default:           break;
+    }
+}
+
+/* The source sample the resampler would start its next output from -- the
+ * left end of its window, not interpolated. What a pause holds (see
+ * pause_fade). */
+static int32_t window_sample(sas_voice *v) {
+    switch (v->src.kind) {
+    case SRC_PCM: {
+        const int32_t j = v->pcm_adv ? v->pcm_pos : pcm_next(v, v->pcm_pos);
+        return j < 0 ? 0 : pcm_at(v, j);
+    }
+    case SRC_VAG:   return v->vag_cur_ok ? v->vag_cur : 0;
+    case SRC_NOISE: return (int16_t)v->noise;
+    case SRC_STEEP:
+    case SRC_TRIANGLE: return wave_value(v);
+    default:        return 0;
+    }
+}
+
+/* ---- the fades ------------------------------------------------------------
+ *
+ * Two things cut a sounding voice off, and hardware fades both over 20
+ * samples rather than stopping dead (sasprobe 3, run 4):
+ *
+ *   - A pause (steps 305 and 310-312). The first core after SetPause plays
+ *     the voice's next sample as usual, then 20 samples of the *held* source
+ *     sample fading, then silence; later paused cores are silent. Nothing
+ *     moves meanwhile -- not the envelope (its height reads the same through
+ *     the pause) and not the source: on resume the voice plays that first
+ *     sample again and carries on (196 at the pause and 196 again at the
+ *     resume in pause_ramp.bin; 964, then 964 970 968 974 at pitch 0x800).
+ *     The held sample is the left end of the resampler's window one step on,
+ *     uninterpolated: 904 of the ramp where 900 was playing at pitch 0x1000,
+ *     968 where 964 was playing at 0x800.
+ *   - A key-on taken up while the voice still sounds -- a KeyOff and KeyOn
+ *     with no core between, or a KeyOn on a voice in its release (steps
+ *     170, 177 and 275-278). The old voice plays sample 0 of that core as
+ *     usual and goes on playing samples 1-20 -- its source advancing, noise
+ *     ticking -- through the same fade, and the new voice starts at 32 as
+ *     it always does. Round 1 read the noise re-key of step 199 as a clock
+ *     that ran on; it was this fade.
+ *
+ * The fade's gain after k samples is G_k = floor(16384 * 0.625^k), 16384
+ * 10240 6400 4000 2500 1562 ... 3 2 1, reaching 0 at k = 21 -- equally, an
+ * exponent-rev curve at rate 0x60000000 run from 2^30, taken >> 16. Each
+ * faded sample is
+ *
+ *     g = env12 * G_k >> 12,  gch = g * vol >> 12,  out = s * gch >> 14
+ *
+ * per channel, with env12 the height >> 18. That is exact on 32767 and
+ * -32768 at volumes 0x1000 and 0x800 (310-311), on the envelope-scaled ramp
+ * (305, height 0x0E000000) and on both re-key captures; whether the envelope
+ * or the volume is applied first cannot be told from them. */
+
+#define FADE_SAMPLES 20
+
+static int32_t fade_gain(int k) {
+    int64_t h = (int64_t)1 << 30;
+    while (k-- > 0) h = curve_step(CURVE_EXP_REV, h, 0x60000000);
+    return (int32_t)(h >> 16);
+}
+
+static void mix_faded(int64_t *const mix[4], uint32_t i, const sas_voice *v, int32_t s, int k) {
+    const int32_t vol[4] = { v->vol_l, v->vol_r, v->vol_el, v->vol_er };
+    const int64_t g = shr_floor((int64_t)(v->env >> 18) * fade_gain(k), 12);
+    for (int c = 0; c < 4; c++)
+        mix[c][i] += shr_floor((int64_t)s * shr_floor(g * vol[c], 12), 14);
+}
+
+static void mix_normal(int64_t *const mix[4], uint32_t i, const sas_voice *v, int32_t s) {
+    /* Envelope is 30-bit; bring it down to a 12-bit multiplier before
+     * applying, so the product stays inside 32 bits. */
+    s = (s * (v->env >> 18)) >> 12;
+    mix[0][i] += shr_floor((int64_t)s * v->vol_l,  12);
+    mix[1][i] += shr_floor((int64_t)s * v->vol_r,  12);
+    mix[2][i] += shr_floor((int64_t)s * v->vol_el, 12);
+    mix[3][i] += shr_floor((int64_t)s * v->vol_er, 12);
+}
+
+static int voice_audible(const sas_voice *v) {
+    return v->playing && v->start_delay == 0 && v->src.kind != SRC_NONE &&
+           !(v->src.kind == SRC_VAG && !v->src.addr);
+}
+
+/* The old voice's last 21 samples, played on a copy of it: the key-on that
+ * follows starts the voice over anyway. */
+static void rekey_fade(int64_t *const mix[4], const sas_voice *old, uint32_t samples) {
+    sas_voice c = *old;
+    if (!voice_audible(&c)) return;
+    for (uint32_t i = 0; i <= FADE_SAMPLES && i < samples; i++) {
+        int32_t s;
+        if (!fetch_sample(&c, &s)) return;
+        if (i == 0) mix_normal(mix, i, &c, s);
+        else        mix_faded(mix, i, &c, s, (int)i);
+        step_envelope(&c);
+        if (!c.playing) return;
+        advance_source(&c);
+    }
+}
+
+/* The first paused core of a voice: its sample 0 as usual, then the held
+ * sample fading. The voice itself does not move. */
+static void pause_fade(int64_t *const mix[4], const sas_voice *v, uint32_t samples) {
+    sas_voice c = *v;
+    int32_t s;
+    if (!voice_audible(&c) || !fetch_sample(&c, &s)) return;
+    mix_normal(mix, 0, &c, s);
+    advance_source(&c);
+    s = window_sample(&c);
+    for (uint32_t i = 1; i <= FADE_SAMPLES && i < samples; i++) mix_faded(mix, i, &c, s, (int)i);
+}
+
+/* Render `samples` stereo frames, summing every active voice.
+ *
+ * All 32 of them, whatever __sceSasInit's voice count said: with a count of
+ * 8, a voice 8 keyed on is heard and its height climbs like voice 7's
+ * (sasprobe step 16, fw 6.60), and with a count of 1, voices 0, 8, 16 and 31
+ * all play -- constants 1, 10, 100 and 4096 sum to 4207 -- and report
+ * height 0x40000000 and not ended (sasprobe 3 step 17). */
+static void render(int64_t *mix_l, int64_t *mix_r, int64_t *mix_el, int64_t *mix_er,
                    uint32_t samples) {
     memset(mix_l,  0, samples * sizeof *mix_l);
     memset(mix_r,  0, samples * sizeof *mix_r);
     memset(mix_el, 0, samples * sizeof *mix_el);
     memset(mix_er, 0, samples * sizeof *mix_er);
 
-    for (uint32_t vi = 0; vi < g_max_voices; vi++) {
+    int64_t *const mix[4] = { mix_l, mix_r, mix_el, mix_er };
+    for (uint32_t vi = 0; vi < SAS_VOICES; vi++) {
         sas_voice *v = &g_voice[vi];
+        /* A key-on first, then a key-off: a KeyOn and a KeyOff with no core
+         * between leave the voice ended with height 0 after one core, as a
+         * key-on straight into its release does (sasprobe step 74). */
+        if (v->keyon_pending) {
+            v->keyon_pending = 0;
+            if (!v->paused) rekey_fade(mix, v, samples);
+            v->playing = 1;
+            v->ended = 0;
+            restart_source(v);
+            /* 32 samples before the voice goes live (item 44). A VAG's first
+             * decoded sample is heard one output later still, at 33, but
+             * that is the resampler's leading 0 (see vag_fetch), not a
+             * second delay. */
+            v->start_delay = 32;
+            v->env = 0;
+            v->env_state = ENV_ATTACK;
+        }
         if (v->keyoff_pending) {
             v->keyoff_pending = 0;
             v->on = 0;
@@ -404,71 +891,42 @@ static void render(int32_t *mix_l, int32_t *mix_r, int32_t *mix_el, int32_t *mix
                 v->env_state = ENV_RELEASE;
             }
         }
-        if (!v->playing || v->paused) continue;
-        if (!v->is_pcm && !v->vag_addr) continue;
+        if (!v->playing) continue;
+        if (v->paused) {
+            if (!v->pause_faded) pause_fade(mix, v, samples);
+            v->pause_faded = 1;
+            continue;
+        }
+        if (v->src.kind == SRC_NONE || (v->src.kind == SRC_VAG && !v->src.addr)) continue;
+        /* A sustain or release that has fallen below 0x8000 ends at the next
+         * core. Exponent-rev 0x1000000 from 0x20000000 in the sustain reads
+         * 0x6A2A after core 9 and 0, ended, after core 10 (sasprobe 3 step
+         * 136, fw 6.60), where the curve alone would fall only to 0x26AA; the
+         * decay has no such floor (step 112 reads 0xED). Whether the check is
+         * once a core, as here, or a lower floor each sample (any in 0x26AB
+         * to 0x6A2A fits) is not settled. */
+        if ((v->env_state == ENV_SUSTAIN || v->env_state == ENV_RELEASE) && v->env < 0x8000) {
+            v->env = 0;
+            end_voice(v);
+            continue;
+        }
 
         for (uint32_t i = 0; i < samples; i++) {
             if (v->start_delay > 0) { v->start_delay--; continue; }
 
             int32_t s;
-            int fetched = 1;
-            if (v->src_delay > 0) {
-                v->src_delay--;
-                fetched = 0;
-                s = 0;
-            } else if (v->is_pcm) {
-                /* A PCM voice whose address is zero is accepted by hardware
-                 * (pcm.expected, "Zero: OK"); it plays silence here rather
-                 * than reading whatever is at address zero. */
-                s = (v->pcm_addr && v->pcm_pos < v->pcm_size)
-                        ? (int16_t)psp_read16(v->pcm_addr + (uint32_t)v->pcm_pos * 2u)
-                        : 0;
-            } else {
-                if (!v->decoded_valid || v->sample_idx >= 28) {
-                    v->sample_idx = 0;
-                    if (!decode_block(v)) { v->playing = 0; v->on = 0; v->ended = 1; break; }
-                }
-                s = v->decoded[v->sample_idx];
-            }
+            if (!fetch_sample(v, &s)) { end_voice(v); break; }
 
             /* Read the envelope, then step it -- in that order. The first
              * sample of a voice is multiplied by a height of zero and comes
              * out silent however loud the source is, which is what pcm and
              * vag show at [020]: a full-scale sample reading 0000. Stepping
-             * first shifted every voice one sample earlier than hardware.
-             *
-             * Envelope is 30-bit; bring it down to a 12-bit multiplier before
-             * applying, so the product stays inside 32 bits. */
-            const int32_t env = v->env;
-            s = (s * (env >> 18)) >> 12;
-
-            mix_l[i]  += (s * v->vol_l)  >> 12;
-            mix_r[i]  += (s * v->vol_r)  >> 12;
-            mix_el[i] += (s * v->vol_el) >> 12;
-            mix_er[i] += (s * v->vol_er) >> 12;
+             * first shifted every voice one sample earlier than hardware. */
+            mix_normal(mix, i, v, s);
             step_envelope(v);
+            if (!v->playing) break;   /* the envelope ended the voice */
 
-            /* Pitch is a 12-bit fixed-point step: 0x1000 plays at the source
-             * rate, 0x2000 an octave up. */
-            if (!fetched) continue;   /* nothing read, so nothing to advance */
-            v->frac += v->pitch;
-            while (v->frac >= 0x1000) {
-                v->frac -= 0x1000;
-                if (v->is_pcm) {
-                    v->pcm_pos++;
-                    if (v->pcm_pos >= v->pcm_size) {
-                        if (v->pcm_loop >= 0 && v->pcm_loop < v->pcm_size) v->pcm_pos = v->pcm_loop;
-                        else { v->playing = 0; v->on = 0; v->ended = 1; break; }
-                    }
-                } else {
-                    v->sample_idx++;
-                    if (v->sample_idx >= 28) {
-                        v->sample_idx = 0;
-                        if (!decode_block(v)) { v->playing = 0; v->on = 0; v->ended = 1; break; }
-                    }
-                }
-            }
-            if (!v->playing) break;
+            advance_source(v);
         }
     }
 }
@@ -481,22 +939,38 @@ static sas_voice *voice_arg(void) {
 }
 
 static void hle_Init(void) {
-    /* (sasCore, grain, maxVoices, outputMode, sampleRate). Checked in the order
-     * sascore.expected reports them; the sample rate is only checked for the
-     * two rates this library renders at, since the test's accepted list runs
-     * past what was read of it. */
+    /* (sasCore, grain, maxVoices, outputMode, sampleRate). Checked core,
+     * grain, then the rate, then the voice count and mode: firmware 6.60
+     * answers the rate's 80420004 to (256, 0 voices, mode 2, rate 0) and to
+     * (256, 32, mode 2, rate 0) and (256, 0 voices, mode 0, 48000) (sasprobe
+     * step 12). Which of the voice count and the mode is checked first is not
+     * measured. */
     const uint32_t core = psp_arg(0), grain = psp_arg(1), voices = psp_arg(2),
                    mode = psp_arg(3), rate = psp_arg(4);
     if (!core || (core & 63))          { psp_ret(SAS_ERROR_CORE); return; }
     if (!grain_ok(grain))              { psp_ret(SAS_ERROR_GRAIN); return; }
-    if (voices < 1 || voices > SAS_VOICES) { psp_ret(SAS_ERROR_MAX_VOICES); return; }
-    if (mode > 1)                      { psp_ret(SAS_ERROR_OUTPUT_MODE); return; }
     /* 44100 and nothing else. The accepted list this once read as "the two
      * rates this renders at" is not hardware's: sascore.expected refuses
-     * 48000 along with every other rate it tries. */
+     * 48000 along with every other rate it tries, and so does firmware 6.60
+     * (sasprobe step 10). */
     if (rate != 44100) { psp_ret(SAS_ERROR_SAMPLE_RATE); return; }
+    /* Checked, and then not kept: the count does not limit the voices
+     * rendered (see render). */
+    if (voices < 1 || voices > SAS_VOICES) { psp_ret(SAS_ERROR_MAX_VOICES); return; }
+    if (mode > 1)                      { psp_ret(SAS_ERROR_OUTPUT_MODE); return; }
+    /* Init starts every voice over, whatever it was doing: a voice keyed on
+     * and playing reads height 0 and ended afterwards, its key is gone
+     * (KeyOff is refused), the next core is silent, and a paused voice is
+     * unpaused (sasprobe steps 15 and 222, fw 6.60). Every Init rewrites the
+     * whole struct with the defaults (steps 4-5). */
+    reset_voices();
+    /* The effect goes back to off with its lines silent. That every capture
+     * after an Init and a RevType starts from silence is measured (steps
+     * 321-333: "0 samples not silent" before each key-on, after the long
+     * tails of the type before); which of the two calls clears it, and what
+     * EVOL and VON read after an Init, is not. */
+    rev_reset();
     g_grain       = grain;
-    g_max_voices  = voices;
     g_output_mode = mode;
     g_sample_rate = rate;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -524,26 +998,29 @@ static void hle_SetOutputmode(void) {
 static void hle_GetOutputmode(void) { psp_ret(g_output_mode); }
 
 static void hle_SetVoice(void) {
-    /* (sasCore, voice, vagAddr, size, loopmode) */
-    sas_voice *v = voice_arg();
-    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    /* (sasCore, voice, vagAddr, size, loopmode). The size is checked before
+     * the voice index: voice 32 with size 0 gets the size's 80420014 on
+     * firmware 6.60 (sasprobe step 42). Where the loop mode's check falls
+     * against the voice index's is not measured. */
     const uint32_t size = psp_arg(3);
     if (size == 0 || (size & 15)) { psp_ret(SAS_ERROR_SIZE); return; }
+    sas_voice *v = voice_arg();
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     /* The fifth argument is a loop *mode* here, not the sample position
      * __sceSasSetVoicePCM takes: vag.expected accepts 0 and 1 and refuses
      * everything else, -1 included, with the same code that call uses for a
      * bad position. */
     if (psp_arg(4) > 1u) { psp_ret(SAS_ERROR_LOOP_POS); return; }
-    v->is_pcm   = 0;
-    v->vag_addr = psp_arg(2);
-    v->vag_size = size;
-    v->loop     = (int)psp_arg(4);
-    v->pos = 0;
-    v->loop_start = 0;
-    v->last_block = 0;
-    v->sample_idx = 0;
-    v->hist1 = v->hist2 = 0;
-    v->decoded_valid = 0;
+    /* Played from the next key-on, not now (see sas_voice). The old stream
+     * does not take up the new size or loop mode at its own loop point
+     * either: after a SetVoice to a 2-block one-shot, a 4-block loop goes
+     * on through its loop point five more times until a KeyOff and KeyOn two
+     * cores later, which fade it out and then play the new blocks once
+     * (sasprobe 3 step 179, fw 6.60; step 188 is the same for SetVoicePCM). */
+    v->next.kind = SRC_VAG;
+    v->next.addr = psp_arg(2);
+    v->next.size = size;
+    v->next.loop = (int32_t)psp_arg(4);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -563,13 +1040,11 @@ static void hle_SetVoicePCM(void) {
     const int32_t loop = (int32_t)psp_arg(4);
     if (size <= 0 || size > 0x10000) { psp_ret(SAS_ERROR_PCM_SIZE); return; }
     if (loop >= size) { psp_ret(SAS_ERROR_LOOP_POS); return; }
-    v->is_pcm   = 1;
-    v->pcm_addr = psp_arg(2);
-    v->pcm_size = size;
-    v->pcm_loop = loop;
-    v->pcm_pos  = 0;
-    v->vag_addr = 0;
-    v->decoded_valid = 0;
+    /* Played from the next key-on, not now (see sas_voice). */
+    v->next.kind = SRC_PCM;
+    v->next.addr = psp_arg(2);
+    v->next.size = (uint32_t)size;
+    v->next.loop = loop;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -582,30 +1057,61 @@ static void hle_SetPitch(void) {
 }
 
 /* __sceSasSetNoise(sasCore, voice, freq): the voice plays noise instead of
- * its sample. The frequency is checked here -- 0..63 -- and the generator
- * itself is not implemented, so the setting is accepted and the voice keeps
- * playing what it was given. */
+ * its sample (see noise_advance), frequency 0..63. Like SetVoice it names
+ * what the next key-on plays, and a SetVoicePCM after it goes back to the
+ * sample (sasprobe step 200). A voice already playing noise takes the new
+ * frequency at once, without a key-on (sasprobe 3 step 279, fw 6.60); what
+ * it does to a voice playing a sample is not measured, and that waits for
+ * the key-on here. */
 static void hle_SetNoise(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     if (psp_arg(2) > 63u) { psp_ret(SAS_ERROR_NOISE_FREQ); return; }
+    v->next.kind  = SRC_NOISE;
+    v->next.param = psp_arg(2);
+    if (v->src.kind == SRC_NOISE) v->src.param = psp_arg(2);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
+
+/* __sceSasSetSteepWave / __sceSasSetTrianglarWave(sasCore, voice, duty): the
+ * voice plays a wave (see wave_fetch). A duty outside 0..100 is refused,
+ * -1 included (sasprobe step 229). Like SetNoise, what the next key-on
+ * plays; on a playing voice that is not measured. */
+static void set_wave(int kind) {
+    sas_voice *v = voice_arg();
+    if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    if (psp_arg(2) > 100u) { psp_ret(SAS_ERROR_WAVE_DUTY); return; }
+    v->next.kind  = kind;
+    v->next.param = psp_arg(2);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+static void hle_SetSteepWave(void)      { set_wave(SRC_STEEP); }
+static void hle_SetTrianglarWave(void)  { set_wave(SRC_TRIANGLE); }
 
 static void hle_SetVolume(void) {
     /* (sasCore, voice, l, r, el, er) -- the last two are the reverb sends.
      * All four are bounded at plus or minus unity and all four are checked,
-     * whether or not this renderer uses them. */
+     * whether or not this renderer uses them. The bound is on the magnitude,
+     * taken the way abs() takes it: firmware 6.60 refuses 0x1001, -0x1001
+     * and 0x7FFFFFFF in each of the four places but accepts 0x80000000,
+     * whose negation is itself and still negative (sasprobe step 49).
+     *
+     * Each is kept as 16 bits, two to a word of the voice's struct (0x111,
+     * 0x222 read back as 02220111), so 0x80000000 is kept as 0 and plays
+     * silence: a constant 1000 or -1000 comes out 0 on that side and in that
+     * send, with the struct word reading 10000000 (sasprobe 3 steps 290-291,
+     * fw 6.60). */
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     for (int i = 2; i <= 5; i++) {
-        const int32_t vol = (int32_t)psp_arg(i);
-        if (vol < -0x1000 || vol > 0x1000) { psp_ret(SAS_ERROR_VOLUME); return; }
+        const uint32_t vol = psp_arg(i);
+        const int32_t mag = (int32_t)((vol & 0x80000000u) ? 0u - vol : vol);
+        if (mag > 0x1000) { psp_ret(SAS_ERROR_VOLUME); return; }
     }
-    v->vol_l  = (int32_t)psp_arg(2);
-    v->vol_r  = (int32_t)psp_arg(3);
-    v->vol_el = (int32_t)psp_arg(4);
-    v->vol_er = (int32_t)psp_arg(5);
+    v->vol_l  = (int16_t)psp_arg(2);
+    v->vol_r  = (int16_t)psp_arg(3);
+    v->vol_el = (int16_t)psp_arg(4);
+    v->vol_er = (int16_t)psp_arg(5);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -663,7 +1169,7 @@ static void hle_SetADSRmode(void) {
     if ((flags & 8) && !curve_ok(r,  0, 0)) { psp_ret(SAS_ERROR_ADSR_MODE); return; }
     if (flags & 1) v->mode_attack  = a & 7u;
     if (flags & 2) v->mode_decay   = d & 7u;
-    if (flags & 4) v->mode_sustain = su & 7u;   /* stored; the shapes are findings item 45 */
+    if (flags & 4) v->mode_sustain = su & 7u;
     if (flags & 8) v->mode_release = r & 7u;
     mirror_adsr(v);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -740,11 +1246,14 @@ static void hle_SetSimpleADSR(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* __sceSasSetSL(sasCore, voice, level): the sustain level on its own, the
- * same field __sceSasSetADSR's fourth argument carries. */
+/* __sceSasSetSL(sasCore, voice, level): the sustain level on its own. A level
+ * above the envelope's top, 0x40000000, is refused as an ADSR value and
+ * nothing is stored; the comparison is unsigned, so 0x80000000 and -1 are
+ * refused too (sasprobe step 51, fw 6.60). */
 static void hle_SetSL(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
+    if (psp_arg(2) > (uint32_t)ENV_MAX) { psp_ret(SAS_ERROR_ADSR_VALUE); return; }
     v->sustain_level = (int32_t)psp_arg(2);
     mirror_adsr(v);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -759,41 +1268,18 @@ static void hle_SetKeyOn(void) {
      * wearing a different hat: the test keys the voice *off* before pausing
      * it, and hardware still refuses. A paused voice takes no key. */
     if (v->on || v->paused) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
+    /* The key goes down now; the voice starts at the next core (see `on`). */
     v->on = 1;
+    v->keyon_pending = 1;
     v->keyoff_pending = 0;
-    v->playing = 1;
-    v->ended = 0;
-    v->pos = 0;
-    v->last_block = 0;
-    v->sample_idx = 0;
-    v->frac = 0;
-    v->hist1 = v->hist2 = 0;
-    v->decoded_valid = 0;
-    v->pcm_pos = 0;
-    /* 32 samples before the first one is heard (item 44) -- and 33 for a
-     * VAG, whose first decoded sample lands at output 33 where a PCM voice's
-     * lands at 32. vag.expected's data sweeps are the whole of the evidence:
-     * the sample values match from the first nibble, one output sample later
-     * than this used to place them. Reading a block header costs the ADPCM
-     * path a sample that the PCM path does not spend. */
-    /* Two delays, not one. The voice goes live 32 samples after the key-on
-     * (item 44) and its envelope starts running there whatever it is playing.
-     * A VAG's first decoded sample then lands one sample later still, at 33
-     * where a PCM voice's lands at 32 -- vag.expected's data sweeps match
-     * from the first nibble at that offset, and the sample at 33 comes out at
-     * full scale, which is only possible if the envelope had already taken
-     * its first step during the sample the ADPCM path spends on the block
-     * header. */
-    v->start_delay = 32;
-    v->src_delay   = v->is_pcm ? 0 : 1;
-    v->env = 0;
-    v->env_state = ENV_ATTACK;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* A voice whose key is not down has nothing to lift, and keyoff.expected
  * refuses that with the same code an already-on key-on gets -- including
- * while paused.
+ * while paused. A paused voice whose key *is* down is refused as well, and
+ * keeps its key: firmware 6.60 answers 80420016 and, once resumed, the voice
+ * is still at full height, with no release (sasprobe step 219).
  *
  * The key comes up here and now. Only the *release* waits for the next core:
  * pcm.expected and vag.expected both key a voice off and straight back on
@@ -803,7 +1289,7 @@ static void hle_SetKeyOn(void) {
 static void hle_SetKeyOff(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
-    if (!v->on) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
+    if (!v->on || v->paused) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
     v->on = 0;
     v->keyoff_pending = 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -814,7 +1300,10 @@ static void hle_SetPause(void) {
     uint32_t mask = psp_arg(1);
     int pause = (int)psp_arg(2);
     for (int i = 0; i < SAS_VOICES; i++)
-        if (mask & (1u << i)) g_voice[i].paused = pause;
+        if (mask & (1u << i)) {
+            g_voice[i].paused = pause;
+            if (!pause) g_voice[i].pause_faded = 0;
+        }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -851,14 +1340,200 @@ static void hle_GetAllEnvelopeHeights(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* ---- reverb -------------------------------------------------------------
+ *
+ * The wet signal the two send volumes feed. Everything below is fitted to
+ * sasprobe 3's impulse responses on firmware 6.60 -- a 32767 pulse through
+ * each of the nine types, 64 cores each (steps 321-331) -- and reproduces
+ * every one of those eleven captures bit for bit, and run 1's and run 4's
+ * hall burst (step 318, 8000 at RevParam(64, 64)) as well. It is a model
+ * that computes the same numbers, not a description of the firmware's
+ * buffer layout, and nothing in it comes from anywhere but those captures.
+ *
+ * Half rate: each pair of frames is one step, taking the sends of the odd
+ * frame and adding the wet sample to the even one; the odd frames get
+ * nothing. A one-frame pulse on an odd frame gives exactly the two-frame
+ * pulse's response, one on an even frame gives silence (steps 332-333), and
+ * no odd frame of any capture is touched. The pairs run from the start of
+ * each core, whose grain is always even.
+ *
+ * Per side, in 16-bit steps with every product floored (>> 15):
+ *
+ *   in    = send * 7936 >> 15                (32767 -> 7935, 8000 -> 1937)
+ *   line  X(t) = ((acc - P) * I >> 15) + P,  acc = in + (X(t - wall) * W >> 15),
+ *                                            P = X(t - prev)
+ *         one or two lines (A, B) a side, each fed by its own side's send
+ *   comb  c = sum(V_k * X_line(t - tau_k)) >> 15, summed before the shift
+ *   APF   r = w(t - D); w = x - (G * r >> 15); y = (G * w >> 15) + r,
+ *         APF1 (D1 per side, G1) and then APF2 (D2, G2)
+ *   out   y * 31 * EVOL >> 16                (y * 31 / 16 at EVOL 0x1000)
+ *
+ * The gains are those the data leaves. Pipe's all, and hall's I, W, V0, G1
+ * and G2, are the only values that fit; every other is one of a few
+ * neighbours that all fit exactly. Of those, G1 is taken as 2 * D2, which
+ * is among them for all seven types that have an APF2, and the rest as the
+ * one with the most low zero bits (medium's I also fits at a few far-off
+ * values; 28912, shared with small and pipe, is kept).
+ *
+ * Echo and delay are one type as far as the data goes -- identical captures
+ * at RevParam(16, 64) -- and are the only ones RevParam moves: a single line
+ * a side through which the pulse comes back every 16d + 4 steps, scaled by
+ * W = -256 * feedback (-16384 exactly at 64; nothing at 0), read at 16d + 7,
+ * with a faint APF1 (D1 16d + 24 left, 16d + 20 right, G1 8 -- 5 to 8 all
+ * fit) and no APF2. Delays 16 and 8, feedback 64 and 0, all exact. The hall
+ * burst at RevParam(64, 64) is what the (16, 64) fit gives, so the other
+ * types are taken not to use it.
+ *
+ * Not measured, and chosen here: which side's send feeds which line (the
+ * captures fed both the same); EVOL other than 0x1000 (taken as a straight
+ * product); VON, which only gates the wet signal here and leaves the dry
+ * mix alone (every capture used VON(1, 1)); the defaults after an Init
+ * (off, EVOL 0, VON 0); clamping of a send past 16
+ * bits (clamped); output mode 1, which writes the sends out raw and gets no
+ * wet signal here. */
+
+#define REV_BUF 4096u   /* a power of two past the longest delay, space's 2784 */
+
+typedef struct { int16_t wall, prev; } rev_line;
+typedef struct { uint8_t line, gain; int16_t delay; } rev_tap;   /* line A 0, B 1 */
+
+typedef struct {
+    int32_t iir, wall_gain;       /* I and W */
+    int32_t tap_gain[4];          /* V0..V3 */
+    int32_t g1, g2;
+    int16_t d1[2], d2;            /* d2 0: no APF2 */
+    uint8_t nlines, ntaps;        /* per side */
+    rev_line line[2][2];          /* [side][A, B] */
+    rev_tap  tap[2][4];           /* [side][k] */
+} rev_type;
+
+/* Types 0-5 and 8, from steps 321-326 and 329. Echo and delay (6, 7) are
+ * built from RevParam by rev_params. */
+static const rev_type REV_TYPES[9] = {
+    [0] = { /* room */
+        28032, -17792, { 21688, -16688, 0, 0 }, 182, 21248, { 436, 310 }, 91, 1, 2,
+        { { { 416, 416 } }, { { 380, 380 } } },
+        { { { 0, 0, 230 }, { 0, 1, 354 } }, { { 0, 0, 268 }, { 0, 1, 324 } } } },
+    [1] = { /* small */
+        28912, -25600, { 17424, -16144, 20392, -17184 }, 74, 20160, { 180, 128 }, 37, 2, 4,
+        { { { 205, 205 }, { 200, 200 } }, { { 217, 217 }, { 190, 190 } } },
+        { { { 0, 0, 45 }, { 0, 1, 138 }, { 1, 2, 64 }, { 1, 3, 114 } },
+          { { 0, 0, 89 }, { 0, 1, 215 }, { 1, 2, 108 }, { 1, 3, 181 } } } },
+    [2] = { /* medium */
+        28912, -19264, { 17680, -16656, 20392, -17184 }, 254, 20160, { 612, 434 }, 127, 2, 4,
+        { { { 445, 445 }, { 408, 408 } }, { { 457, 457 }, { 382, 382 } } },
+        { { { 0, 0, 221 }, { 0, 1, 394 }, { 1, 2, 224 }, { 1, 3, 354 } },
+          { { 0, 0, 297 }, { 0, 1, 375 }, { 1, 2, 268 }, { 1, 3, 341 } } } },
+    [3] = { /* large */
+        28512, -22912, { 17680, -16656, 20392, -17184 }, 338, 21184, { 796, 568 }, 169, 2, 4,
+        { { { 751, 751 }, { 674, 674 } }, { { 716, 716 }, { 638, 638 } } },
+        { { { 0, 0, 237 }, { 0, 1, 490 }, { 1, 2, 242 }, { 1, 3, 546 } },
+          { { 0, 0, 313 }, { 0, 1, 535 }, { 1, 2, 284 }, { 1, 3, 485 } } } },
+    [4] = { /* hall */
+        24576, -16384, { 20480, 19456, -18432, -17408 }, 626, 23552, { 1472, 1050 }, 313, 2, 4,
+        { { { 1018, 1022 }, { 1022, 1022 } }, { { 1016, 1018 }, { 1024, 1024 } } },
+        { { { 0, 0, 248 }, { 0, 1, 1022 }, { 1, 2, 508 }, { 1, 3, 960 } },
+          { { 0, 0, 254 }, { 0, 1, 1018 }, { 1, 2, 512 }, { 1, 3, 756 } } } },
+    [5] = { /* space */
+        32256, -20480, { 20480, -19456, -20480, 19456 }, 1122, 21504, { 2784, 1954 }, 561, 2, 4,
+        { { { 1188, 1188 }, { 1432, 1432 } }, { { 1090, 1090 }, { 1396, 1396 } } },
+        { { { 0, 0, 450 }, { 0, 1, 788 }, { 1, 2, 698 }, { 1, 3, 1016 } },
+          { { 0, 0, 502 }, { 0, 1, 895 }, { 1, 2, 296 }, { 1, 3, 1016 } } } },
+    [8] = { /* pipe: the only type whose lines read P at another delay than W */
+        28912, -31488, { 17680, -16656, 20392, -17184 }, 38, 21696, { 88, 64 }, 19, 2, 4,
+        { { { 54, 183 }, { 25, 193 } }, { { 59, 197 }, { 69, 216 } } },
+        { { { 0, 0, 169 }, { 0, 1, 183 }, { 1, 2, 140 }, { 1, 3, 193 } },
+          { { 0, 0, 109 }, { 0, 1, 197 }, { 1, 2, 208 }, { 1, 3, 216 } } } },
+};
+
+static struct {
+    int32_t  type;                /* -1: off */
+    uint32_t delay, feedback;
+    uint32_t evol_l, evol_r;
+    uint32_t von_dry, von_wet;
+    uint32_t t;                   /* steps taken since the lines were cleared */
+    int32_t  line[2][2][REV_BUF]; /* [side][A, B] */
+    int32_t  apf1[2][REV_BUF], apf2[2][REV_BUF];
+} g_rev;
+
+static void rev_clear(void) {
+    memset(g_rev.line, 0, sizeof g_rev.line);
+    memset(g_rev.apf1, 0, sizeof g_rev.apf1);
+    memset(g_rev.apf2, 0, sizeof g_rev.apf2);
+    g_rev.t = 0;
+}
+
+static void rev_reset(void) {
+    g_rev.type = -1;
+    g_rev.delay = g_rev.feedback = 0;
+    g_rev.evol_l = g_rev.evol_r = 0;
+    g_rev.von_dry = g_rev.von_wet = 0;
+    rev_clear();
+}
+
+static rev_type rev_params(void) {
+    if (g_rev.type != 6 && g_rev.type != 7) return REV_TYPES[g_rev.type];
+    const int16_t d = (int16_t)(16 * g_rev.delay);
+    const rev_type e = {
+        32768, -256 * (int32_t)g_rev.feedback, { 32768, 0, 0, 0 }, 8, 0,
+        { (int16_t)(d + 24), (int16_t)(d + 20) }, 0, 1, 1,
+        { { { (int16_t)(d + 4), (int16_t)(d + 4) } }, { { (int16_t)(d + 4), (int16_t)(d + 4) } } },
+        { { { 0, 0, (int16_t)(d + 7) } }, { { 0, 0, (int16_t)(d + 7) } } } };
+    return e;
+}
+
+static int64_t rev_apf(int32_t *w, uint32_t t, int d, int32_t g, int64_t x) {
+    const int64_t r = w[(t - (uint32_t)d) & (REV_BUF - 1)];
+    const int64_t v = x - shr_floor(g * r, 15);
+    w[t & (REV_BUF - 1)] = (int32_t)v;
+    return shr_floor(g * v, 15) + r;
+}
+
+/* One step of one side: the send in, the APFs' output out. */
+static int64_t rev_side(const rev_type *p, int s, int32_t send, uint32_t t) {
+    const uint32_t m = REV_BUF - 1;
+    const int64_t in = shr_floor((int64_t)send * 7936, 15);
+    for (int k = 0; k < p->nlines; k++) {
+        int32_t *x = g_rev.line[s][k];
+        const int64_t acc  = in + shr_floor((int64_t)x[(t - (uint32_t)p->line[s][k].wall) & m] *
+                                            p->wall_gain, 15);
+        const int64_t prev = x[(t - (uint32_t)p->line[s][k].prev) & m];
+        x[t & m] = (int32_t)(shr_floor((acc - prev) * p->iir, 15) + prev);
+    }
+    int64_t sum = 0;
+    for (int k = 0; k < p->ntaps; k++) {
+        const rev_tap *tp = &p->tap[s][k];
+        sum += (int64_t)g_rev.line[s][tp->line][(t - (uint32_t)tp->delay) & m] *
+               p->tap_gain[tp->gain];
+    }
+    int64_t y = rev_apf(g_rev.apf1[s], t, p->d1[s], p->g1, shr_floor(sum, 15));
+    if (p->d2) y = rev_apf(g_rev.apf2[s], t, p->d2, p->g2, y);
+    return y;
+}
+
+/* The wet signal of one core, added to the dry mix `l`/`r` from the sends. */
+static void rev_render(int64_t *l, int64_t *r, const int64_t *el, const int64_t *er,
+                       uint32_t n) {
+    if (g_rev.type < 0) return;
+    const rev_type p = rev_params();
+    for (uint32_t i = 0; i + 1 < n; i += 2) {
+        const uint32_t t = g_rev.t++;
+        const int64_t yl = rev_side(&p, 0, clamp16(el[i + 1]), t);
+        const int64_t yr = rev_side(&p, 1, clamp16(er[i + 1]), t);
+        if (!g_rev.von_wet) continue;
+        l[i] += shr_floor(yl * 31 * (int64_t)g_rev.evol_l, 16);
+        r[i] += shr_floor(yr * 31 * (int64_t)g_rev.evol_r, 16);
+    }
+}
+
 /* `mix_l`/`mix_r` scale what is already in the buffer, not what is rendered
  * into it: outputmode.expected's mix sections pass 0 for both and get the
  * rendered samples back unchanged, which is only possible if the zero applies
- * to the other side. Zero is the only pair the corpus passes, so the scale
- * itself -- 12-bit, as everywhere else here -- is by analogy with the voice
- * volumes rather than measured. */
+ * to the other side. The scale is 12-bit, as everywhere else here: firmware
+ * 6.60 turns a buffer of 1000/-2000 into 500/-500 at 0x800/0x400, and adds a
+ * voice of 2000 to it to make 2500/1000 at 0x800 (sasprobe steps 207-208). */
 static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_r) {
-    int32_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN], el[SAS_MAX_GRAIN], er[SAS_MAX_GRAIN];
+    int64_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN], el[SAS_MAX_GRAIN], er[SAS_MAX_GRAIN];
     const uint32_t n = g_grain;
     render(l, r, el, er, n);
 
@@ -871,7 +1546,7 @@ static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_
      * the voice's 0x1000, 0x0C00, 0x0800 and 0x0400 with the product shifted
      * down rather than rounded. */
     if (g_output_mode == 1) {
-        const int32_t *block[4] = { l, r, el, er };
+        const int64_t *block[4] = { l, r, el, er };
         for (int b = 0; b < 4; b++) {
             const uint32_t base = out_addr + (uint32_t)b * n * 2u;
             for (uint32_t i = 0; i < n; i++) {
@@ -884,6 +1559,7 @@ static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_
         return;
     }
 
+    rev_render(l, r, el, er, n);
     for (uint32_t i = 0; i < n; i++) {
         int32_t sl = clamp16(l[i]), sr = clamp16(r[i]);
         if (add) {
@@ -897,26 +1573,80 @@ static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_
     g_frames_rendered++;
 }
 
+/* A null core is refused by __sceSasCore as by Init, with 80420005 (sasprobe
+ * 3 step 355, fw 6.60). The unaligned case Init also refuses is assumed the
+ * same here, and CoreWithMix is given the same check; neither is measured. */
+static int core_bad(void) {
+    const uint32_t core = psp_arg(0);
+    return !core || (core & 63u);
+}
+
 static void hle_Core(void) {
     /* (sasCore, sampleBuffer) */
     uint32_t out = psp_arg(1);
+    if (core_bad()) { psp_ret(SAS_ERROR_CORE); return; }
     if (out) mix_to_guest(out, 0, 0, 0);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* (sasCore, sampleBuffer, leftMix, rightMix). Refused outright in output mode
  * 1 -- outputmode.expected's last section gets 0x80000004 and a buffer
- * nothing has touched. */
+ * nothing has touched. A mix above 0x1000 on either side, compared unsigned,
+ * is refused with the volume code and the buffer is left as it was: -1,
+ * 0x1001, 0x2000 and 0x7FFFFFFF all are on firmware 6.60 (sasprobe step 207).
+ * Nothing is rendered then either, and the voices do not advance: a voice
+ * playing a ramp picks up after a refused call exactly where it left off
+ * (sasprobe 3 steps 295-296, fw 6.60). */
 static void hle_CoreWithMix(void) {
     uint32_t out = psp_arg(1);
+    if (core_bad()) { psp_ret(SAS_ERROR_CORE); return; }
     if (g_output_mode != 0) { psp_ret(SAS_ERROR_MIX_MODE); return; }
+    if (psp_arg(2) > 0x1000u || psp_arg(3) > 0x1000u) { psp_ret(SAS_ERROR_VOLUME); return; }
     if (out) mix_to_guest(out, 1, (int32_t)psp_arg(2), (int32_t)psp_arg(3));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Reverb and noise: accepted and recorded so a game's setup sequence completes.
- * The dry mix is what carries the music and effects; reverb is a refinement. */
-static void hle_accept(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* Reverb: the four calls check their arguments as firmware 6.60 does, and
+ * set what rev_render plays (see the reverb section above).
+ *
+ * __sceSasRevType(sasCore, type): -1..8, signed (step 224). A new type
+ * starts from silent lines; the same type again is taken to leave them be. */
+static void hle_RevType(void) {
+    const int32_t type = (int32_t)psp_arg(1);
+    if (type < -1 || type > 8) { psp_ret(SAS_ERROR_REV_TYPE); return; }
+    if (type != g_rev.type) rev_clear();
+    g_rev.type = type;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* __sceSasRevParam(sasCore, delay, feedback): both unsigned, the delay
+ * checked first, and both 0..127, though PSPSDK's header allows 0..128:
+ * delay 128, 129 and -1 are refused, and so are feedback 128 (alone, as
+ * (0, 128) and (127, 128)), 129 and -1 (sasprobe step 225, and sasprobe 3
+ * step 319, fw 6.60). */
+static void hle_RevParam(void) {
+    if (psp_arg(1) > 127u) { psp_ret(SAS_ERROR_REV_DELAY); return; }
+    if (psp_arg(2) > 127u) { psp_ret(SAS_ERROR_REV_FEEDBACK); return; }
+    g_rev.delay    = psp_arg(1);
+    g_rev.feedback = psp_arg(2);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* __sceSasRevEVOL(sasCore, left, right): each at most 0x1000, unsigned, so
+ * every negative volume is refused too -- unlike SetVolume's (step 226). */
+static void hle_RevEVOL(void) {
+    if (psp_arg(1) > 0x1000u || psp_arg(2) > 0x1000u) { psp_ret(SAS_ERROR_REV_VOLUME); return; }
+    g_rev.evol_l = psp_arg(1);
+    g_rev.evol_r = psp_arg(2);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* __sceSasRevVON(sasCore, dry, wet): anything is accepted (step 227). */
+static void hle_RevVON(void) {
+    g_rev.von_dry = psp_arg(1);
+    g_rev.von_wet = psp_arg(2);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 void psp_sas_register(void) {
     psp_hle_register(0x42778A9F, "sceSasCore", "__sceSasInit",              hle_Init);
@@ -943,8 +1673,11 @@ void psp_sas_register(void) {
                      hle_GetAllEnvelopeHeights);
     psp_hle_register(0xE1CD9561, "sceSasCore", "__sceSasSetVoicePCM",      hle_SetVoicePCM);
     psp_hle_register(0xB7660A23, "sceSasCore", "__sceSasSetNoise",          hle_SetNoise);
-    psp_hle_register(0x33D4AB37, "sceSasCore", "__sceSasRevType",           hle_accept);
-    psp_hle_register(0x267A6DD2, "sceSasCore", "__sceSasRevParam",          hle_accept);
-    psp_hle_register(0xD5A229C9, "sceSasCore", "__sceSasRevEVOL",           hle_accept);
-    psp_hle_register(0xF983B186, "sceSasCore", "__sceSasRevVON",            hle_accept);
+    /* NIDs from PSPSDK's stub library, libpspsascore.a. */
+    psp_hle_register(0xD5EBBBCD, "sceSasCore", "__sceSasSetSteepWave",      hle_SetSteepWave);
+    psp_hle_register(0xA232CBE6, "sceSasCore", "__sceSasSetTrianglarWave",  hle_SetTrianglarWave);
+    psp_hle_register(0x33D4AB37, "sceSasCore", "__sceSasRevType",           hle_RevType);
+    psp_hle_register(0x267A6DD2, "sceSasCore", "__sceSasRevParam",          hle_RevParam);
+    psp_hle_register(0xD5A229C9, "sceSasCore", "__sceSasRevEVOL",           hle_RevEVOL);
+    psp_hle_register(0xF983B186, "sceSasCore", "__sceSasRevVON",            hle_RevVON);
 }

@@ -1,0 +1,1349 @@
+
+==== syncprobe 1, firmware (sceKernelDevkitVersion) 06060010 ====
+log: ms0:/PSP/GAME/syncprobe/syncprobe.txt
+main thread priority 20
+
+---- semaphore: create ----
+[1] sema: CreateSema attr sweep, init 0 max 1
+  attr 00000: uid
+  attr 00001: uid
+  attr 00100: uid
+  attr 001FF: uid
+  attr 00200: 80020191
+  attr 00400: 80020191
+  attr 00800: 80020191
+  attr 00900: 80020191
+  attr 01000: 80020191
+  attr 02000: 80020191
+  attr 04000: 80020191
+  attr 08000: 80020191
+  attr 10000: 80020191
+[2] sema: CreateSema init/max combinations, ReferSemaStatus of each
+  init 0 max 0: uid -> init=0 cur=0 max=0
+  init 1 max 1: uid -> init=1 cur=1 max=1
+  init 2 max 1: uid -> init=2 cur=2 max=1
+  init -1 max 1: uid -> init=-1 cur=-1 max=1
+  init 0 max -1: uid -> init=0 cur=0 max=-1
+  init 1 max -1: uid -> init=1 cur=1 max=-1
+  init 5 max 5: uid -> init=5 cur=5 max=5
+  init 0 max 2147483647: uid -> init=0 cur=0 max=2147483647
+  init -5 max -1: uid -> init=-5 cur=-5 max=-1
+[3] sema: CreateSema with a 40-character name, ReferSemaStatus
+  = uid
+  refer: 00000000
+  size=38 name="0123456789abcdefghijklmnopqrstu" attr=000001FF init=3 cur=3 max=7 wait=0
+[4] sema: CreateSema with NULL name
+  = 80020001
+
+---- semaphore: signal, wait, poll, refer (one thread) ----
+[5] sema: CreateSema init 1 max 3
+  = uid
+[6] sema: WaitSema 1 on count 1, timeout 500ms
+  = 00000000 tmo=full
+[7] sema: WaitSema 4 on max 3, timeout 500ms
+  = 800201BD tmo=full
+[8] sema: WaitSema 0 and -1, timeout 500ms
+  0: 800201BD tmo=full
+  -1: 800201BD tmo=full
+[9] sema: WaitSema 1 on count 0, timeout 5ms
+  = 800201A8 tmo=zero
+[10] sema: WaitSema 1 on count 0, timeout 0
+  = 800201A8 tmo=00000000
+[11] sema: SignalSema 1 on count 0
+  = 00000000
+  cur=1 wait=0
+[12] sema: SignalSema 3 on count 1 max 3 (would overflow)
+  = 800201AE
+  cur=1 wait=0
+[13] sema: SignalSema 2 on count 1 max 3 (reaches max)
+  = 00000000
+  cur=3 wait=0
+[14] sema: SignalSema 1 on a full semaphore
+  = 800201AE
+  cur=3 wait=0
+[15] sema: SignalSema 0, then -1
+  0: 00000000
+  cur=3 wait=0
+  -1: 00000000
+  cur=2 wait=0
+[16] sema: CreateSema init 3 max 3; PollSema 2
+  = uid
+  = 00000000
+  cur=1 wait=0
+[17] sema: PollSema 2 and 4 (above max) on a count of 1
+  2: 800201AD
+  4: 800201BD
+  cur=1 wait=0
+[18] sema: PollSema 0 and -1 while signalled
+  0: 800201BD
+  -1: 800201BD
+  cur=1 wait=0
+[19] sema: PollSema 1, three times
+  00000000  800201AD  800201AD
+  cur=0 wait=0
+[20] sema: PollSema 0, 1, -1 while empty
+  0: 800201BD
+  1: 800201AD
+  -1: 800201BD
+[21] sema: PollSema uid 0 with 0 and with 1
+  0: 800201BD
+  1: 80020199
+[22] sema: WaitSema uid 0 with 0 and 1, SignalSema uid 0, timeout 1ms
+  wait 0: 800201BD
+  wait 1: 80020199
+  signal: 80020199
+[23] sema: ReferSemaStatus with size field 0 (init 2 max 3)
+  = 00000000
+  size=0 name="................................" attr=A5A5A5A5 init=-1515870811 cur=-1515870811 max=-1515870811 wait=-1515870811
+[24] sema: ReferSemaStatus with size field 4
+  = 00000000
+  size=38 name="................................" attr=A5A5A5A5 init=-1515870811 cur=-1515870811 max=-1515870811 wait=-1515870811
+[25] sema: ReferSemaStatus with size field 56
+  = 00000000
+  size=38 name="refer" attr=00000000 init=2 cur=2 max=3 wait=0
+[26] sema: ReferSemaStatus with size field 100
+  = 00000000
+  size=38 name="refer" attr=00000000 init=2 cur=2 max=3 wait=0
+[27] sema: SignalSema, PollSema, ReferSemaStatus on an event flag's uid
+  signal: 80020199
+  poll: 80020199
+  refer: 80020199
+[28] sema: WaitSemaCB 1 after SignalSema 1, timeout 500ms
+  = 00000000 tmo=full
+[29] sema: DeleteSema, then every call on the deleted uid
+  delete: 00000000
+  delete again: 80020199
+  signal: 80020199
+  poll: 80020199
+  wait: 80020199
+  refer: 80020199
+  cancel: 80020199
+
+---- semaphore: waiters ----
+[30] sema: attr 0, 4 waiters for 1 queue A(16) B(13) C(18) D(14)
+  = uid
+  cur=0 wait=4
+[31] sema: SignalSema 1, four times, settling after each
+  signal: 00000000
+  signal: 00000000
+  signal: 00000000
+  signal: 00000000
+  order: ABCD
+  A: ret=00000000 tmo=part
+  B: ret=00000000 tmo=part
+  C: ret=00000000 tmo=part
+  D: ret=00000000 tmo=part
+  cur=0 wait=0
+[32] sema: attr 100, 4 waiters for 1 queue A(16) B(13) C(18) D(14)
+  = uid
+  cur=0 wait=4
+[33] sema: SignalSema 1, four times, settling after each
+  signal: 00000000
+  signal: 00000000
+  signal: 00000000
+  signal: 00000000
+  order: BDAC
+  A: ret=00000000 tmo=part
+  B: ret=00000000 tmo=part
+  C: ret=00000000 tmo=part
+  D: ret=00000000 tmo=part
+  cur=0 wait=0
+[34] sema: FIFO, count 1; A(15) waits for 5 with a 100ms timeout, then B(14) for 1
+  cur=1 wait=2
+[35] sema: main sleeps 300ms so A's timeout runs out
+  order: BA
+  A: ret=800201A8 tmo=zero
+  B: ret=00000000 tmo=part
+  cur=0 wait=0
+[36] sema: priority, count 1; A(14) waits for 5, B(16) waits for 1
+  cur=1 wait=2
+  order: (none)
+[37] sema: SignalSema 4 (count 5), then SignalSema 1
+  signal 4: 00000000
+  cur=0 wait=1
+  signal 1: 00000000
+  order: AB
+  A: ret=00000000 tmo=part
+  B: ret=00000000 tmo=part
+  cur=0 wait=0
+[38] sema: max 1 with A waiting for 1: SignalSema 2; then idle max 1: SignalSema 2
+  with waiter: 00000000
+  order: A
+  A: ret=00000000 tmo=part
+  cur=1 wait=0
+  idle: 800201AE
+  cur=0 wait=0
+[39] sema: max 5, A waits for 3; SignalSema 1 twice, then 1 more
+  cur=2 wait=1
+  order: (none)
+  third: 00000000
+  order: A
+  A: ret=00000000 tmo=part
+  cur=0 wait=0
+[40] sema: count 0 with A waiting for 2: PollSema 0, 1, 2
+  0: 800201BD
+  1: 800201AD
+  2: 800201AD
+[41] sema: SignalSema 1 (count 1, A still short), then PollSema 1
+  cur=1 wait=1
+  poll 1: 800201AD
+  cur=1 wait=1
+[42] sema: SignalSema 1 again, then main WaitSema 1 behind A, timeout 10ms
+  = 800201A8 tmo=zero
+  cur=0 wait=0
+  order: A
+  A: ret=00000000 tmo=part
+[43] sema: DeleteSema with three waiters A B C, all priority 18
+  = 00000000
+  order: ABC
+  A: ret=800201B5 tmo=part
+  B: ret=800201B5 tmo=part
+  C: ret=800201B5 tmo=part
+[44] sema: CancelSema(new count 2) with three waiters A B C (priority 18), max 5
+  = 00000000 waiters=3
+  order: ABC
+  A: ret=800201A9 tmo=part
+  B: ret=800201A9 tmo=part
+  C: ret=800201A9 tmo=part
+  cur=2 wait=0
+[45] sema: CancelSema with new count -1, 0, 6 (above max), and a NULL count pointer
+  -1: 00000000 waiters=0  cur=0 wait=0
+  0: 00000000 waiters=0  cur=0 wait=0
+  6: 800201BD waiters=99  cur=0 wait=0
+  1, NULL: 00000000  cur=1 wait=0
+
+---- event flag: create ----
+[46] evf: CreateEventFlag attr sweep
+  attr 0000: uid
+  attr 0001: uid
+  attr 0010: uid
+  attr 0100: 80020191
+  attr 0122: 80020191
+  attr 0200: uid
+  attr 0222: uid
+  attr 02FF: uid
+  attr 0300: 80020191
+  attr 0400: 80020191
+  attr 0900: 80020191
+  attr 1200: 80020191
+[47] evf: CreateEventFlag attr 200 init 12345678, ReferEventFlagStatus
+  = uid
+  refer: 00000000
+  size=34 name="init" attr=00000200 init=12345678 cur=12345678 wait=0
+  refer size 0: 00000000
+  size=0 name="................................" attr=A5A5A5A5 init=A5A5A5A5 cur=A5A5A5A5 wait=-1515870811
+[48] evf: CreateEventFlag with NULL name
+  = 80020001
+
+---- event flag: set, clear, poll, wait (one thread) ----
+[49] evf: CreateEventFlag attr 0 init 0000FFFF
+  = uid
+[50] evf: PollEventFlag FFFFFFFF AND, 1 OR, 10000 OR
+  FFFFFFFF and: 800201AF out=0000FFFF
+  1 or: 00000000 out=0000FFFF
+  10000 or: 800201AF out=0000FFFF
+[51] evf: PollEventFlag mode sweep for bit 0
+  mode 02: 80020195 out=DEADBEEF
+  mode 04: 80020195 out=DEADBEEF
+  mode 08: 80020195 out=DEADBEEF
+  mode 10: 00000000 out=0000FFFF
+  mode 11: 00000000 out=0000FFFF
+  mode 20: 00000000 out=0000FFFF
+  mode 21: 00000000 out=0000FFFF
+  mode 30: 80020195 out=DEADBEEF
+  mode 31: 80020195 out=DEADBEEF
+  mode 40: 80020195 out=DEADBEEF
+  mode 80: 80020195 out=DEADBEEF
+  mode FF: 80020195 out=DEADBEEF
+[52] evf: PollEventFlag with no bits: good uid, uid 0, bad mode; uid 0 with bits
+  bits 0: 800201B1 out=DEADBEEF
+  bits 0 uid 0: 800201B1 out=DEADBEEF
+  bits 0 mode 04: 80020195 out=DEADBEEF
+  bits 1 uid 0: 8002019A out=DEADBEEF
+[53] evf: from FFFFFFFF, poll bit 0 OR|CLEAR, then OR|CLEARALL
+  or|clear: 00000000 out=FFFFFFFF
+  cur=FFFFFFFE wait=0
+  or|clearall: 00000000 out=FFFFFFFF
+  cur=00000000 wait=0
+[54] evf: pattern 0F, poll 03 AND|CLEAR, then 30 AND|CLEAR, then NULL out
+  03 and|clear: 00000000 out=0000000F
+  cur=0000000C wait=0
+  30 and|clear: 800201AF out=0000000C
+  cur=0000000C wait=0
+  NULL out: 00000000
+[55] evf: SetEventFlag FF, ClearEventFlag F0, SetEventFlag 0
+  set FF: 00000000
+  clear F0: 00000000
+  cur=000000F0 wait=0
+  set 0: 00000000
+  cur=000000F0 wait=0
+[56] evf: WaitEventFlag for bit 0, pattern F0, timeout 0
+  = 800201A8 out=DEADBEEF tmo=00000000
+[57] evf: WaitEventFlag for bit 0, pattern F0, timeout 5ms
+  = 800201A8 out=000000F0 tmo=zero
+[58] evf: WaitEventFlag for 30 AND|CLEAR, pattern F0, timeout 500ms
+  = 00000000 out=000000F0 tmo=full
+  cur=000000C0 wait=0
+[59] evf: WaitEventFlag bad mode 04, bits 0, bits 0 on uid 0, bits 1 on uid 0
+  mode 04: 80020195 out=DEADBEEF tmo=full
+  bits 0: 800201B1 out=DEADBEEF tmo=full
+  bits 0 uid 0: 800201B1 out=DEADBEEF tmo=full
+  bits 0 uid 0 mode 04: 80020195 out=DEADBEEF
+  bits 1 uid 0: 8002019A out=DEADBEEF tmo=full
+[60] evf: SetEventFlag, PollEventFlag, ReferEventFlagStatus on a semaphore's uid
+  set: 8002019A
+  poll: 8002019A out=DEADBEEF
+  refer: 8002019A
+[61] evf: DeleteEventFlag, then every call on the deleted uid
+  delete: 00000000
+  delete again: 8002019A
+  set: 8002019A
+  clear: 8002019A
+  poll: 8002019A out=DEADBEEF
+  wait: 8002019A out=DEADBEEF
+  cancel: 8002019A
+
+---- event flag: waiters ----
+[62] evf: attr 0, A waits bit 1; then B waits bit 2, main polls and waits for bit 2
+  main poll 2: 800201B0 out=DEADBEEF
+  main wait 2: 800201B0 out=DEADBEEF tmo=full
+  cur=00000000 wait=1
+[63] evf: SetEventFlag 1
+  = 00000000
+  order: BA
+  A: ret=00000000 tmo=part out=00000001
+  B: ret=800201B0 tmo=full out=DEADBEEF
+  cur=00000001 wait=0
+[64] evf: attr 200, A(16) B(13) C(18) wait bit 1 OR|CLEAR; SetEventFlag 1 three times
+  cur=00000000 wait=3
+  set: 00000000
+  cur=00000000 wait=2
+  set: 00000000
+  cur=00000000 wait=1
+  set: 00000000
+  cur=00000000 wait=0
+  order: ABC
+  A: ret=00000000 tmo=part out=00000001
+  B: ret=00000000 tmo=part out=00000001
+  C: ret=00000000 tmo=part out=00000001
+[65] evf: attr 200, prio 18: A 1 AND, B 2 AND, C 3 AND, D 4 OR; SetEventFlag 3, then 4
+  set 3: 00000000
+  cur=00000003 wait=1
+  order: ABC
+  set 4: 00000000
+  order: ABCD
+  A: ret=00000000 tmo=part out=00000003
+  B: ret=00000000 tmo=part out=00000003
+  C: ret=00000000 tmo=part out=00000003
+  D: ret=00000000 tmo=part out=00000007
+  cur=00000007 wait=0
+[66] evf: attr 200, A waits 3 AND, B waits 1 OR|CLEAR; SetEventFlag 1, then 2
+  cur=00000000 wait=1
+  order: B
+  order: BA
+  A: ret=00000000 tmo=part out=00000003
+  B: ret=00000000 tmo=part out=00000001
+  cur=00000003 wait=0
+[67] evf: attr 200, A waits 1 OR|CLEAR then B waits 1 OR; SetEventFlag 1
+  order: A
+  A: ret=00000000 tmo=part out=00000001
+  B: still waiting
+  cur=00000000 wait=1
+[68] evf: attr 200, A waits 1 OR then B waits 1 OR|CLEAR; SetEventFlag 1
+  order: AB
+  A: ret=00000000 tmo=part out=00000001
+  B: ret=00000000 tmo=part out=00000001
+  cur=00000000 wait=0
+[69] evf: A waits 1 OR|CLEARALL; SetEventFlag F1
+  order: A
+  A: ret=00000000 tmo=part out=000000F1
+  cur=00000000 wait=0
+[70] evf: DeleteEventFlag with waiters A B (prio 18) on pattern 0C
+  = 00000000
+  order: AB
+  A: ret=800201B5 tmo=part out=0000000C
+  B: ret=800201B5 tmo=part out=0000000C
+[71] evf: CancelEventFlag(new pattern 55) with waiters A B (prio 18) on pattern 0C
+  = 00000000 waiters=2
+  order: AB
+  A: ret=800201A9 tmo=part out=00000055
+  B: ret=800201A9 tmo=part out=00000055
+  cur=00000055 wait=0
+
+---- mutex: create ----
+[72] mutex: CreateMutex attr sweep
+  attr 00000: uid
+  attr 00001: uid
+  attr 00100: uid
+  attr 00200: uid
+  attr 00400: 80020191
+  attr 00800: uid
+  attr 00B00: uid
+  attr 00BFF: uid
+  attr 00C00: 80020191
+  attr 01000: 80020191
+  attr 02000: 80020191
+  attr 04000: 80020191
+  attr 08000: 80020191
+  attr 10000: 80020191
+[73] mutex: CreateMutex init counts, ReferMutexStatus of each
+  attr 000 init 1: uid
+  cur=1 owner=main wait=0
+  attr 000 init 2: 800201BD
+  attr 000 init -1: 800201BD
+  attr 200 init 2: uid
+  cur=2 owner=main wait=0
+  attr 200 init -1: 800201BD
+  attr 200 init 2147483647: uid
+  cur=2147483647 owner=main wait=0
+[74] mutex: ReferMutexStatus of a free mutex (attr 0x100), sizes 56 and 0
+  = 00000000
+  size=38 name="refer" attr=00000100 init=0 cur=0 owner=-1 wait=0
+  size 0: 00000000
+  size=0 name="................................" attr=A5A5A5A5 init=-1515870811 cur=-1515870811 owner=A5A5A5A5 wait=-1515870811
+[75] mutex: CreateMutex with NULL name
+  = 80020001
+
+---- mutex: lock, unlock (one thread) ----
+[76] mutex: CreateMutex attr 0 init 0
+  = uid
+[77] mutex: LockMutex 1, timeout 500ms
+  = 00000000 tmo=full
+  size=38 name="ops" attr=00000000 init=0 cur=1 owner=main wait=0
+[78] mutex: LockMutex 1 again, timeout 500ms; TryLockMutex 1
+  lock: 800201C8 tmo=full
+  trylock: 800201C8
+[79] mutex: LockMutex 0, 2, -1 and TryLockMutex 0, 2 while held
+  lock 0: 800201BD
+  lock 2: 800201BD
+  lock -1: 800201BD
+  trylock 0: 800201BD
+  trylock 2: 800201BD
+[80] mutex: UnlockMutex 2, 0, then 1, then 1 again
+  unlock 2: 800201BD
+  unlock 0: 800201BD
+  unlock 1: 00000000
+  cur=0 owner=-1 wait=0
+  unlock 1: 800201C5
+[81] mutex: TryLockMutex 1 on a free mutex, UnlockMutex 1
+  trylock: 00000000
+  cur=1 owner=main wait=0
+  unlock: 00000000
+[82] mutex: CreateMutex attr 200 (recursive) init 0; LockMutex 1, then 2
+  = uid
+  lock 1: 00000000
+  lock 2: 00000000
+  cur=3 owner=main wait=0
+[83] mutex: UnlockMutex 4 on a count of 3, then 3
+  unlock 4: 800201C7
+  cur=3 owner=main wait=0
+  unlock 3: 00000000
+  cur=0 owner=-1 wait=0
+[84] mutex: recursive, count 1: LockMutex 7FFFFFFF, then 7FFFFFFE, then 1
+  lock 7FFFFFFF: 800201C6
+  cur=1 owner=main wait=0
+  lock 7FFFFFFE: 00000000
+  cur=2147483647 owner=main wait=0
+  lock 1: 800201C6
+  trylock 1: 800201C6
+  unlock 7FFFFFFF: 00000000
+  cur=0 owner=-1 wait=0
+[85] mutex: CancelMutex on a free non-recursive mutex with 1, 3, 0, -1, -3
+  1: 00000000 waiters=0  cur=1 owner=main wait=0
+  3: 800201BD waiters=99  cur=1 owner=main wait=0
+  0: 00000000 waiters=0  cur=0 owner=-1 wait=0
+  -1: 00000000 waiters=0  cur=0 owner=-1 wait=0
+  -3: 00000000 waiters=0  cur=0 owner=-1 wait=0
+[86] mutex: CancelMutex on a recursive mutex with 5, and with a NULL count pointer
+  5: 00000000 waiters=0  cur=5 owner=main wait=0
+  0, NULL: 00000000  cur=0 owner=-1 wait=0
+[87] mutex: every call on uid 0 and on a deleted mutex
+  lock 0: 800201C3
+  trylock 0: 800201C3
+  unlock 0: 800201C3
+  lock deleted: 800201C3
+  unlock deleted: 800201C3
+  cancel deleted: 800201C3
+  refer deleted: 800201C3
+  delete deleted: 800201C3
+  lock count 0 on uid 0: 800201C3
+
+---- mutex: owners and waiters ----
+[88] mutex: A locks a free mutex and holds it; main unlocks, trylocks, locks with 5ms
+  size=38 name="owned" attr=00000000 init=0 cur=1 owner=WA wait=0
+  unlock: 800201C5
+  trylock: 800201C4
+  lock: 800201A8 tmo=zero
+  cur=1 owner=WA wait=0
+[89] mutex: B(17) locks and waits; A lets go
+  cur=1 owner=WA wait=1
+  order: AB
+  A: ret=00000000 tmo=full post=00000000
+  B: ret=00000000 tmo=part
+  cur=1 owner=WB wait=0
+[90] mutex: A locks a free mutex and exits holding it; main refers, trylocks, unlocks
+  order: A
+  A: ret=00000000 tmo=full
+  size=38 name="orphan" attr=00000000 init=0 cur=0 owner=-1 wait=0
+  trylock: 00000000
+  unlock: 00000000
+[91] mutex: after the thread is deleted: refer, trylock
+  cur=0 owner=-1 wait=0
+  trylock: 00000000
+  cur=1 owner=main wait=0
+[92] mutex: attr 0 held by main; A(16) B(13) C(18) D(14) lock 1, each unlocking at once
+  cur=1 owner=main wait=4
+[93] mutex: main UnlockMutex 1
+  = 00000000
+  order: ABCD
+  A: ret=00000000 tmo=part post=00000000
+  B: ret=00000000 tmo=part post=00000000
+  C: ret=00000000 tmo=part post=00000000
+  D: ret=00000000 tmo=part post=00000000
+  cur=0 owner=-1 wait=0
+[94] mutex: attr 100 held by main; A(16) B(13) C(18) D(14) lock 1, each unlocking at once
+  cur=1 owner=main wait=4
+[95] mutex: main UnlockMutex 1
+  = 00000000
+  order: BDAC
+  A: ret=00000000 tmo=part post=00000000
+  B: ret=00000000 tmo=part post=00000000
+  C: ret=00000000 tmo=part post=00000000
+  D: ret=00000000 tmo=part post=00000000
+  cur=0 owner=-1 wait=0
+[96] mutex: recursive, held by main; A locks 3 and holds; main unlocks
+  cur=1 owner=main wait=1
+  unlock: 00000000
+  order: A
+  size=38 name="handoff" attr=00000200 init=1 cur=3 owner=WA wait=0
+  order: A
+  A: ret=00000000 tmo=part post=00000000
+  cur=0 owner=-1 wait=0
+[97] mutex: A holds; B C (prio 18) wait; main CancelMutex 1
+  cur=1 owner=WA wait=2
+  = 00000000 waiters=2
+  cur=1 owner=main wait=0
+[98] mutex: A lets go of the cancelled mutex; main unlocks
+  order: ABC
+  A: ret=00000000 tmo=full post=800201C5
+  B: ret=800201A9 tmo=part
+  C: ret=800201A9 tmo=part
+  cur=1 owner=main wait=0
+  main unlock: 00000000
+  cur=0 owner=-1 wait=0
+[99] mutex: held by main, A B (prio 18) wait; DeleteMutex
+  cur=1 owner=main wait=2
+  = 00000000
+  order: AB
+  A: ret=800201B5 tmo=part
+  B: ret=800201B5 tmo=part
+
+---- lwmutex: create ----
+[100] lw: CreateLwMutex attr sweep, workarea after each
+  attr 0000: 00000000
+  wa: count=0 thread=0 attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+  attr 0100: 00000000
+  attr 0200: 00000000
+  attr 0300: 00000000
+  attr 03FF: 00000000
+  attr 0400: 80020191
+  wa: count=-842150451 thread=CDCDCDCD attr=CDCDCDCD wait=-842150451 uid=CDCDCDCD pad=CDCDCDCD CDCDCDCD CDCDCDCD
+  attr 0800: 80020191
+  wa: count=-842150451 thread=CDCDCDCD attr=CDCDCDCD wait=-842150451 uid=CDCDCDCD pad=CDCDCDCD CDCDCDCD CDCDCDCD
+  attr 1000: 80020191
+  wa: count=-842150451 thread=CDCDCDCD attr=CDCDCDCD wait=-842150451 uid=CDCDCDCD pad=CDCDCDCD CDCDCDCD CDCDCDCD
+[101] lw: CreateLwMutex init counts, workarea after each
+  attr 000 init 1: 00000000
+  wa: count=1 thread=main attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+  attr 000 init 2: 800201BD
+  wa: count=-842150451 thread=CDCDCDCD attr=CDCDCDCD wait=-842150451 uid=CDCDCDCD pad=CDCDCDCD CDCDCDCD CDCDCDCD
+  attr 000 init -1: 800201BD
+  wa: count=-842150451 thread=CDCDCDCD attr=CDCDCDCD wait=-842150451 uid=CDCDCDCD pad=CDCDCDCD CDCDCDCD CDCDCDCD
+  attr 200 init 2: 00000000
+  wa: count=2 thread=main attr=200 wait=0 uid=uid pad=00000000 00000000 00000000
+  attr 200 init -1: 800201BD
+  wa: count=-842150451 thread=CDCDCDCD attr=CDCDCDCD wait=-842150451 uid=CDCDCDCD pad=CDCDCDCD CDCDCDCD CDCDCDCD
+[102] lw: ReferLwMutexStatus and ReferLwMutexStatusByID of a free lwmutex (attr 100)
+  refer: 00000000
+  size=40 name="refer" attr=00000100 uid=uid=obj wa=wa0 init=0 cur=0 owner=-1 wait=0
+  by id: 00000000
+  same bytes as by workarea: yes
+  size 0: 00000000
+  size=0 name="................................" attr=A5A5A5A5 uid=A5A5A5A5 wa=A5A5A5A5 init=-1515870811 cur=-1515870811 owner=A5A5A5A5 wait=-1515870811
+[103] lw: CreateLwMutex with NULL name
+  = 80020001
+  wa: count=-842150451 thread=CDCDCDCD attr=CDCDCDCD wait=-842150451 uid=CDCDCDCD pad=CDCDCDCD CDCDCDCD CDCDCDCD
+
+---- lwmutex: lock, unlock (one thread) ----
+[104] lw: CreateLwMutex attr 0 init 0
+  = 00000000
+  wa: count=0 thread=0 attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+[105] lw: LockLwMutex 1, timeout 500ms
+  = 00000000 tmo=full
+  wa: count=1 thread=main attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+  refer: 00000000
+  size=40 name="ops" attr=00000000 uid=uid=obj wa=wa0 init=0 cur=1 owner=main wait=0
+[106] lw: LockLwMutex 1 again (timeout 500ms), TryLockLwMutex 1, TryLockLwMutex_600 1
+  lock: 800201CF tmo=full
+  try: 800201C4
+  try600: 800201CF
+[107] lw: counts 0, 2, -1 through Lock, TryLock and TryLock_600 while held
+  0: lock 800201BD try 800201C4 try600 800201BD
+  2: lock 800201CF try 800201C4 try600 800201CF
+  -1: lock 800201BD try 800201C4 try600 800201BD
+[108] lw: UnlockLwMutex 2, 0, then 1, then 1 again
+  unlock 2: 800201BD
+  unlock 0: 800201BD
+  unlock 1: 00000000
+  wa: count=0 thread=0 attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+  unlock 1: 800201CC
+  refer: 00000000
+  size=40 name="ops" attr=00000000 uid=uid=obj wa=wa0 init=0 cur=0 owner=-1 wait=0
+[109] lw: TryLockLwMutex 1 and TryLockLwMutex_600 1 on a free lwmutex
+  try: 00000000
+  wa: count=1 thread=main attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+  unlock: 00000000
+  try600: 00000000
+  wa: count=1 thread=main attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+  unlock: 00000000
+[110] lw: CreateLwMutex attr 200 (recursive); LockLwMutex 1, then 2
+  = 00000000
+  lock 1: 00000000
+  lock 2: 00000000
+  wa: count=3 thread=main attr=200 wait=0 uid=uid pad=00000000 00000000 00000000
+[111] lw: UnlockLwMutex 4 on a count of 3, then 3
+  unlock 4: 800201CE
+  unlock 3: 00000000
+  wa: count=0 thread=0 attr=200 wait=0 uid=uid pad=00000000 00000000 00000000
+[112] lw: recursive, count 1: LockLwMutex 7FFFFFFF, then 7FFFFFFE; TryLock 1 both kinds
+  lock 7FFFFFFF: 800201CD
+  lock 7FFFFFFE: 00000000
+  wa: count=2147483647 thread=main attr=200 wait=0 uid=uid pad=00000000 00000000 00000000
+  try: 800201C4
+  try600: 800201CD
+  unlock 7FFFFFFF: 00000000
+  wa: count=0 thread=0 attr=200 wait=0 uid=uid pad=00000000 00000000 00000000
+[113] lw: DeleteLwMutex, then every call on the deleted workarea
+  delete: 00000000
+  wa: count=0 thread=-1 attr=0 wait=0 uid=FFFFFFFF pad=00000000 00000000 00000000
+  lock: 800201CA
+  try: 800201C4
+  try600: 800201CA
+  unlock: 800201CA
+  refer: 800201CA
+  refer by id: 800201CA
+  delete again: 800201CA
+  wa: count=0 thread=-1 attr=0 wait=0 uid=FFFFFFFF pad=00000000 00000000 00000000
+[114] lw: forged workarea (uid 0, pad DEADBEEF): lock, unlock, try, refer
+  lock: 00000000
+  forged: count=1 thread=main attr=0 wait=0 uid=0 pad=DEADBEEF DEADBEEF DEADBEEF
+  unlock: 00000000
+  forged: count=0 thread=0 attr=0 wait=0 uid=0 pad=DEADBEEF DEADBEEF DEADBEEF
+  try600: 00000000
+  unlock: 00000000
+  refer: 800201CA
+[115] lw: copy of a live workarea: lock, unlock, refer, delete
+  lock copy: 00000000
+  copy: count=1 thread=main attr=0 wait=0 uid=uid of wa2 pad=00000000 00000000 00000000
+  orig: count=0 thread=0 attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+  unlock copy: 00000000
+  refer copy: 00000000
+  delete copy: 800201CA
+  delete orig: 00000000
+
+---- lwmutex: owners and waiters ----
+[116] lw: A locks and holds; main unlocks, trys, locks with 5ms
+  wa: count=1 thread=WA attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+  unlock: 800201CC
+  try: 800201C4
+  try600: 800201CB
+  lock: 800201A8 tmo=zero
+  wa: count=1 thread=WA attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+[117] lw: B(17) waits; workarea and status; A lets go
+  wa: count=1 thread=WA attr=0 wait=1 uid=uid pad=00000000 00000000 00000000
+  refer: 00000000
+  size=40 name="owned" attr=00000000 uid=uid=obj wa=wa0 init=0 cur=1 owner=WA wait=1
+  order: AB
+  A: ret=00000000 tmo=full post=00000000
+  B: ret=00000000 tmo=part
+  wa: count=1 thread=WB attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+[118] lw: attr 0 held by main; A(16) B(13) C(18) D(14) lock 1, each unlocking at once
+  wa: count=1 thread=main attr=0 wait=4 uid=uid pad=00000000 00000000 00000000
+[119] lw: main UnlockLwMutex 1
+  = 00000000
+  order: ABCD
+  A: ret=00000000 tmo=part post=00000000
+  B: ret=00000000 tmo=part post=00000000
+  C: ret=00000000 tmo=part post=00000000
+  D: ret=00000000 tmo=part post=00000000
+  wa: count=0 thread=0 attr=0 wait=0 uid=uid pad=00000000 00000000 00000000
+[120] lw: attr 100 held by main; A(16) B(13) C(18) D(14) lock 1, each unlocking at once
+  wa: count=1 thread=main attr=100 wait=4 uid=uid pad=00000000 00000000 00000000
+[121] lw: main UnlockLwMutex 1
+  = 00000000
+  order: BDAC
+  A: ret=00000000 tmo=part post=00000000
+  B: ret=00000000 tmo=part post=00000000
+  C: ret=00000000 tmo=part post=00000000
+  D: ret=00000000 tmo=part post=00000000
+  wa: count=0 thread=0 attr=100 wait=0 uid=uid pad=00000000 00000000 00000000
+[122] lw: held by main, A B (prio 18) wait; DeleteLwMutex
+  wa: count=1 thread=main attr=0 wait=2 uid=uid pad=00000000 00000000 00000000
+  = 00000000
+  order: AB
+  A: ret=800201B5 tmo=part
+  B: ret=800201B5 tmo=part
+  wa: count=0 thread=-1 attr=0 wait=0 uid=FFFFFFFF pad=00000000 00000000 00000000
+
+---- mailbox: create ----
+[123] mbx: CreateMbx attr sweep
+  attr 0000: uid
+  attr 0100: uid
+  attr 0200: 80020191
+  attr 0400: uid
+  attr 0500: uid
+  attr 05FF: uid
+  attr 0600: 80020191
+  attr 0800: 80020191
+  attr 1000: 80020191
+  attr 4000: 80020191
+[124] mbx: CreateMbx with NULL name
+  = 80020001
+
+---- mailbox: send, receive, links (one thread) ----
+[125] mbx: CreateMbx attr 0
+  = uid
+[126] mbx: PollMbx on an empty mailbox
+  poll: 800201B2 got=DEAD
+[127] mbx: SendMbx m1 (next poisoned DEADBEEF)
+  = 00000000
+  links: m1->m1 m2->DEAD
+  count=1 first=m1 wait=0
+[128] mbx: SendMbx m1 a second time
+  = 800201C9
+  links: m1->m1 m2->DEAD
+  count=1 first=m1 wait=0
+[129] mbx: SendMbx m2, then m3
+  m2: 00000000
+  links: m1->m2 m2->m1 m3->DEAD
+  count=2 first=m1 wait=0
+  m3: 00000000
+  links: m1->m2 m2->m3 m3->m1
+[130] mbx: ReferMbxStatus with size 52, then size 0
+  = 00000000
+  size=34 name="ops" attr=00000000 wait=0 count=3 first=m1
+  size 0: 00000000
+  size=0 name="................................" attr=A5A5A5A5 wait=-1515870811 count=-1515870811 first=A5A5A5A5
+[131] mbx: PollMbx three times, links after each
+  poll: 00000000 got=m1
+  links: m1->m2 m2->m3 m3->m2
+  count=2 first=m2 wait=0
+  poll: 00000000 got=m2
+  links: m1->m2 m2->m3 m3->m3
+  count=1 first=m3 wait=0
+  poll: 00000000 got=m3
+  links: m1->m2 m2->m3 m3->m3
+  count=0 first=NULL wait=0
+[132] mbx: ReceiveMbx on empty, timeout 5ms; SendMbx m4, ReceiveMbx timeout 500ms
+  empty: 800201A8 got=DEAD tmo=zero
+  full: 00000000 got=m4 tmo=full
+[133] mbx: attr 400, send m1 prio 3, m2 prio 1, m3 prio 2, m4 prio 1, m5 prio 0
+  = uid
+  links: m1->m5 m2->m4 m3->m1 m4->m3 m5->m2
+  count=5 first=m5 wait=0
+[134] mbx: PollMbx five times
+  received: m5 m2 m4 m3 m1 800201B2
+[135] mbx: every call on uid 0 and on a deleted mailbox
+  send 0: 8002019B
+  poll 0: 8002019B got=DEAD
+  send deleted: 8002019B
+  poll deleted: 8002019B got=DEAD
+  receive deleted: 8002019B
+  cancel deleted: 8002019B
+  refer deleted: 8002019B
+  delete deleted: 8002019B
+
+---- mailbox: receivers ----
+[136] mbx: A waits in ReceiveMbx; SendMbx m1 (next DEADBEEF)
+  count=0 first=NULL wait=1
+  = 00000000
+  order: A
+  A: ret=00000000 tmo=part got=m1
+  links: m1->DEAD
+  count=0 first=NULL wait=0
+[137] mbx: attr 0, A(16) B(13) C(18) D(14) receive; send m1..m4 one at a time
+  count=0 first=NULL wait=4
+  send m1: 00000000
+  send m2: 00000000
+  send m3: 00000000
+  send m4: 00000000
+  order: ABCD
+  A: ret=00000000 tmo=part got=m1
+  B: ret=00000000 tmo=part got=m2
+  C: ret=00000000 tmo=part got=m3
+  D: ret=00000000 tmo=part got=m4
+  count=0 first=NULL wait=0
+[138] mbx: attr 100, A(16) B(13) C(18) D(14) receive; send m1..m4 one at a time
+  count=0 first=NULL wait=4
+  send m1: 00000000
+  send m2: 00000000
+  send m3: 00000000
+  send m4: 00000000
+  order: BDAC
+  A: ret=00000000 tmo=part got=m3
+  B: ret=00000000 tmo=part got=m1
+  C: ret=00000000 tmo=part got=m4
+  D: ret=00000000 tmo=part got=m2
+  count=0 first=NULL wait=0
+[139] mbx: A B (prio 18) wait; CancelReceiveMbx
+  = 00000000 waiters=2
+  order: AB
+  A: ret=800201A9 tmo=part got=DEAD
+  B: ret=800201A9 tmo=part got=DEAD
+  count=0 first=NULL wait=0
+[140] mbx: A B (prio 18) wait; DeleteMbx
+  = 00000000
+  order: AB
+  A: ret=800201B5 tmo=part got=DEAD
+  B: ret=800201B5 tmo=part got=DEAD
+
+---- message pipe: create ----
+[141] mpp: CreateMsgPipe partition sweep, size 0x100
+  partition 2: uid
+  partition 6: uid
+  partition 1: 800200D1
+  partition 3: 800200D1
+  partition 4: 800200D1
+  partition 8: 800200D1
+  partition 9: 800200D1
+  partition 0: 800200D2
+  partition 7: 800200D2
+  partition 10: 800200D2
+  partition -1: 800200D2
+[142] mpp: CreateMsgPipe attr sweep
+  attr 0000: uid
+  attr 0100: uid
+  attr 01FF: uid
+  attr 0200: 80020191
+  attr 03FF: 80020191
+  attr 0400: 80020191
+  attr 0800: 80020191
+  attr 1000: uid
+  attr 2000: 80020191
+  attr 4000: uid
+  attr 51FF: uid
+  attr 8000: 80020191
+[143] mpp: CreateMsgPipe sizes 0, 1, 0x1001, 0x10000; ReferMsgPipeStatus
+  size 0: uid  free=0 sendwait=0 recvwait=0
+  size 1: uid  free=1 sendwait=0 recvwait=0
+  size 1001: uid  free=1001 sendwait=0 recvwait=0
+  size 10000: uid  free=10000 sendwait=0 recvwait=0
+[144] mpp: CreateMsgPipe with NULL name
+  = 80020190
+
+---- message pipe: send, receive (one thread) ----
+[145] mpp: CreateMsgPipe size 0x100 attr 0
+  = uid
+[146] mpp: SendMsgPipe 0x40 bytes (full), then 1 byte
+  0x40: 00000000 bytes=00000040 tmo=full
+  free=C0 sendwait=0 recvwait=0
+  1: 00000000 bytes=00000001
+  free=BF sendwait=0 recvwait=0
+[147] mpp: ReceiveMsgPipe 0x41, compare the bytes
+  = 00000000 bytes=00000041 tmo=full match=yes
+  free=100 sendwait=0 recvwait=0
+[148] mpp: TrySendMsgPipe 1 byte with modes -1, 2, 3, 9, 0x101, 0x1001
+  mode FFFFFFFF: 80020195 bytes=00001337
+  mode 2: 80020195 bytes=00001337
+  mode 3: 80020195 bytes=00001337
+  mode 9: 80020195 bytes=00001337
+  mode 101: 80020195 bytes=00001337
+  mode 1001: 80020195 bytes=00001337
+[149] mpp: TrySendMsgPipe lengths -1, 0x101, 0; TryReceiveMsgPipe -1, 0x101, 0
+  send -1: 800200D3 bytes=00001337
+  send 0x101: 800201BC bytes=00001337
+  send 0: 00000000 bytes=00000000
+  recv -1: 800200D3 bytes=00001337
+  recv 0x101: 800201BC bytes=00001337
+  recv 0: 00000000 bytes=00000000
+[150] mpp: fill: TrySend 0xC0; TrySend 0x80 full-wait, then 0x80 ASAP, then 1 ASAP
+  0xC0: 00000000 bytes=000000C0
+  0x80 full: 800201B3 bytes=00001337
+  0x80 asap: 00000000 bytes=00000040
+  1 asap: 800201B3 bytes=00000000
+  free=0 sendwait=0 recvwait=0
+[151] mpp: SendMsgPipe 1 byte to a full pipe, timeout 5ms
+  = 800201A8 bytes=00000000 tmo=zero
+[152] mpp: wrap: receive 0x80, send 0x60, receive 0xE0 and compare
+  recv 0x80: 00000000 bytes=00000080
+  first 0x80 match=yes
+  send 0x60: 00000000 bytes=00000060
+  free=20 sendwait=0 recvwait=0
+  recv 0xE0: 00000000 bytes=000000E0
+  match=yes
+  free=100 sendwait=0 recvwait=0
+[153] mpp: empty: TryReceive 1 full-wait, 1 ASAP; Receive 1 full-wait timeout 5ms
+  try full: 800201B4 bytes=00001337
+  try asap: 800201B4 bytes=00000000
+  wait: 800201A8 bytes=00000000 tmo=zero
+[154] mpp: 3 bytes in: Receive 10 ASAP (timeout 500ms), TryReceive 10 full-wait
+  asap: 00000000 bytes=00000003 tmo=full
+  try full: 800201B4 bytes=00001337
+  free=FD sendwait=0 recvwait=0
+[155] mpp: ReferMsgPipeStatus with size 56, then size 0
+  = 00000000
+  size=38 name="ops" attr=00000000 buf=00000100 free=000000FD sendwait=0 recvwait=0
+  size 0: 00000000
+  size=0 name="................................" attr=A5A5A5A5 buf=A5A5A5A5 free=A5A5A5A5 sendwait=-1515870811 recvwait=-1515870811
+[156] mpp: CancelMsgPipe with 3 bytes buffered and no waiters
+  = 00000000 send=0 recv=0
+  free=100 sendwait=0 recvwait=0
+[157] mpp: no buffer: TrySend 1, TrySend 0x1000, TrySend 0, TryReceive 1, Send 1 timeout 5ms
+  send 1: 800201B3 bytes=00001337
+  send 0x1000: 800201B3 bytes=00001337
+  send 0: 00000000 bytes=00000000
+  recv 1: 800201B4 bytes=00001337
+  send wait: 800201A8 bytes=00000000 tmo=zero
+[158] mpp: every call on uid 0 and on a deleted pipe
+  send 0: 8002019E
+  send deleted: 8002019E
+  recv deleted: 8002019E
+  cancel deleted: 8002019E
+  refer deleted: 8002019E
+  delete deleted: 8002019E
+
+---- message pipe: senders and receivers ----
+[159] mpp: attr 0, receivers A(16) B(13) C(18) want 4; send 1111, 2222, 3333
+  free=100 sendwait=0 recvwait=3
+  order: ABC
+  A: ret=00000000 tmo=part bytes=00000004 data="1111"
+  B: ret=00000000 tmo=part bytes=00000004 data="2222"
+  C: ret=00000000 tmo=part bytes=00000004 data="3333"
+  free=100 sendwait=0 recvwait=0
+[160] mpp: attr 1000, receivers A(16) B(13) C(18) want 4; send 1111, 2222, 3333
+  free=100 sendwait=0 recvwait=3
+  order: BAC
+  A: ret=00000000 tmo=part bytes=00000004 data="2222"
+  B: ret=00000000 tmo=part bytes=00000004 data="1111"
+  C: ret=00000000 tmo=part bytes=00000004 data="3333"
+  free=100 sendwait=0 recvwait=0
+[161] mpp: attr 100, receivers A(16) B(13) C(18) want 4; send 1111, 2222, 3333
+  free=100 sendwait=0 recvwait=3
+  order: ABC
+  A: ret=00000000 tmo=part bytes=00000004 data="1111"
+  B: ret=00000000 tmo=part bytes=00000004 data="2222"
+  C: ret=00000000 tmo=part bytes=00000004 data="3333"
+  free=100 sendwait=0 recvwait=0
+[162] mpp: attr 0, 4-byte pipe full; senders A(16) B(13) C(18) send 4; receive 4 at a time
+  free=0 sendwait=3 recvwait=0
+  received: 0000 AAAA BBBB CCCC
+  order: ABC
+  A: ret=00000000 tmo=part out=00000004
+  B: ret=00000000 tmo=part out=00000004
+  C: ret=00000000 tmo=part out=00000004
+  free=4 sendwait=0 recvwait=0
+[163] mpp: attr 100, 4-byte pipe full; senders A(16) B(13) C(18) send 4; receive 4 at a time
+  free=0 sendwait=3 recvwait=0
+  received: 0000 BBBB AAAA CCCC
+  order: BAC
+  A: ret=00000000 tmo=part out=00000004
+  B: ret=00000000 tmo=part out=00000004
+  C: ret=00000000 tmo=part out=00000004
+  free=4 sendwait=0 recvwait=0
+[164] mpp: attr 1000, 4-byte pipe full; senders A(16) B(13) C(18) send 4; receive 4 at a time
+  free=0 sendwait=3 recvwait=0
+  received: 0000 AAAA BBBB CCCC
+  order: ABC
+  A: ret=00000000 tmo=part out=00000004
+  B: ret=00000000 tmo=part out=00000004
+  C: ret=00000000 tmo=part out=00000004
+  free=4 sendwait=0 recvwait=0
+[165] mpp: buffer 100, A B C (prio 18) receive 4; main sends msg 1ms g2m sg3 (3 each, 50ms)
+  send msg: 00000000 bytes=00000003
+  send 1ms: 00000000 bytes=00000003
+  send g2m: 00000000 bytes=00000003
+  send sg3: 00000000 bytes=00000003
+  order: ABC
+  A: ret=00000000 tmo=part bytes=00000004 data="msg1"
+  B: ret=00000000 tmo=part bytes=00000004 data="msg2"
+  C: ret=00000000 tmo=part bytes=00000004 data="msg3"
+  free=100 sendwait=0 recvwait=0
+[166] mpp: buffer 0, A B C (prio 18) receive 4; main sends msg 1ms g2m sg3 (3 each, 50ms)
+  send msg: 00000000 bytes=00000003
+  send 1ms: 00000000 bytes=00000003
+  send g2m: 00000000 bytes=00000003
+  send sg3: 00000000 bytes=00000003
+  order: ABC
+  A: ret=00000000 tmo=part bytes=00000004 data="msg1"
+  B: ret=00000000 tmo=part bytes=00000004 data="msg2"
+  C: ret=00000000 tmo=part bytes=00000004 data="msg3"
+  free=0 sendwait=0 recvwait=0
+[167] mpp: 4-byte pipe holding xyz; A sends 2 bytes full-wait; then main receives
+  free=1 sendwait=1 recvwait=0
+  recv 3: 00000000 bytes=00000003 data="xyz"
+  recv 4 asap: 00000000 bytes=00000002 data="AA"
+  order: A
+  A: ret=00000000 tmo=part out=00000002
+[168] mpp: 4-byte pipe holding xyz: TrySend 2 bytes ASAP
+  asap: 00000000 bytes=00000001
+  free=0 sendwait=0 recvwait=0
+[169] mpp: no buffer, A sends 0x100 full-wait; main TryReceive 0x80 twice
+  free=0 sendwait=1 recvwait=0
+  recv 0x80: 00000000 bytes=00000080
+  recv 0x80: 00000000 bytes=00000080
+  order: A
+  A: ret=00000000 tmo=part out=00000100
+  free=0 sendwait=0 recvwait=0
+[170] mpp: no buffer, A receives 8 full-wait; main TrySend 8
+  send 8: 00000000 bytes=00000008
+  order: A
+  A: ret=00000000 tmo=part bytes=00000008 data="handoff!"
+[171] mpp: A B (prio 18) receive 4 from an empty 0x10 pipe; CancelMsgPipe
+  = 00000000 send=0 recv=2
+  order: AB
+  A: ret=800201A9 tmo=part out=00000000
+  B: ret=800201A9 tmo=part out=00000000
+  free=10 sendwait=0 recvwait=0
+[172] mpp: A receives 4 from an empty pipe, B sends 4 to a full 4-byte one; DeleteMsgPipe both
+  delete recv pipe: 00000000
+  delete send pipe: 00000000
+  order: AB
+  A: ret=800201B5 tmo=part out=00000000
+  B: ret=800201B5 tmo=part out=00000000
+
+---- vpl: create ----
+[173] vpl: CreateVpl partition sweep, size 0x100
+  partition 2: uid
+  partition 6: uid
+  partition 1: 800200D1
+  partition 3: 800200D1
+  partition 4: 800200D1
+  partition 8: 800200D1
+  partition 9: 800200D1
+  partition 0: 800200D2
+  partition 7: 800200D2
+  partition 10: 800200D2
+  partition -1: 800200D2
+  partition -5: 800200D2
+[174] vpl: CreateVpl attr sweep
+  attr 00000: uid
+  attr 00001: uid
+  attr 00100: uid
+  attr 00200: uid
+  attr 00300: uid
+  attr 003FF: uid
+  attr 00400: 80020191
+  attr 00800: 80020191
+  attr 01000: 80020191
+  attr 02000: 80020191
+  attr 04000: uid
+  attr 043FF: uid
+  attr 08000: 80020191
+  attr 10000: 80020191
+[175] vpl: CreateVpl size sweep, ReferVplStatus of each
+  size 0: 800201B7
+  size 1: uid  pool=E0 free=E0 wait=0
+  size 20: uid  pool=E0 free=E0 wait=0
+  size 21: uid  pool=E0 free=E0 wait=0
+  size 28: uid  pool=E0 free=E0 wait=0
+  size 31: uid  pool=18 free=18 wait=0
+  size 32: uid  pool=18 free=18 wait=0
+  size 36: uid  pool=18 free=18 wait=0
+  size 38: uid  pool=18 free=18 wait=0
+  size 39: uid  pool=20 free=20 wait=0
+  size 3A: uid  pool=20 free=20 wait=0
+  size 40: uid  pool=20 free=20 wait=0
+  size 100: uid  pool=E0 free=E0 wait=0
+  size 1000: uid  pool=FE0 free=FE0 wait=0
+  size 10000: uid  pool=FFE0 free=FFE0 wait=0
+[176] vpl: CreateVpl sizes 0x02000000, 0x10000000, 0x80000000, 0xFFFFFFF8
+  size 02000000: 80020190
+  size 10000000: 80020190
+  size 80000000: 80020190
+  size FFFFFFF8: 80020190
+[177] vpl: ReferVplStatus of a 0x1000 pool (attr 100), sizes 52 and 0
+  = 00000000
+  size=34 name="refer" attr=00000100 pool=00000FE0 free=00000FE0 wait=0
+  size 0: 00000000
+  size=0 name="................................" attr=A5A5A5A5 pool=A5A5A5A5 free=A5A5A5A5 wait=-1515870811
+[178] vpl: CreateVpl with NULL name
+  = 80020001
+
+---- vpl: allocate, free, layout (one thread) ----
+[179] vpl: CreateVpl 0x10000
+  = uid
+  pool=FFE0 free=FFE0 wait=0
+[180] vpl: TryAllocateVpl 1, 16, 8 and 0x100; free space used by each
+  1: 00000000 at +0 cost 10
+  10: 00000000 at -18 cost 18
+  8: 00000000 at -28 cost 10
+  100: 00000000 at -130 cost 108
+  blk: at +0 hdr next=-FFE8 size/8=2
+  blk: at -18 hdr next=-FFE8 size/8=3
+  blk: at -28 hdr next=-FFE8 size/8=2
+  blk: at -130 hdr next=-FFE8 size/8=21
+  acct at -FFF0: -FFF0 -FFF0 -FFE9 0000FFF8 00000028 +8 +8 00001FD4
+[181] vpl: TryAllocateVpl 0, -1, 0x10000; AllocateVpl 0x10000 timeout 500ms
+  0: 800201B7
+  -1: 800201B7
+  0x10000: 800201B7
+  wait 0x10000: 800201B7 tmo=full
+[182] vpl: TryAllocateVpl 0xFF00 (does not fit); AllocateVpl 0xFF00 timeout 5ms
+  try: 80020190
+  wait: 800201A8 got=DEAD tmo=zero
+[183] vpl: FreeVpl bad pointers: twice, stack, block+8, another pool's, uid 0
+  free blk1: 00000000
+  free blk1 again: 800201B6
+  free stack: 800201B6
+  free blk3+8: 800201B6
+  free other pool's: 800201B6
+  free with uid 0: 8002019C
+  pool=FFE0 free=FEB8 wait=0
+[184] vpl: 0x100 pool: allocate a b c of 0x10, accounting
+  a: at +0 hdr next=-E0 size/8=3
+  b: at -18 hdr next=-E0 size/8=3
+  c: at -30 hdr next=-E0 size/8=3
+  acct at -E8: -E8 -E8 -E1 000000F8 00000009 +10 +10 00000013
+  pool=E0 free=98 wait=0
+[185] vpl: free b, accounting; free a, accounting; allocate 8
+  free b: 00000000
+  acct at -E8: -E8 -E8 -E1 000000F8 00000006 -D0 -20 00000013
+  free a: 00000000
+  acct at -E8: -E8 -E8 -E1 000000F8 00000003 -20 -20 00000013
+  alloc 8: 00000000 at -40
+  acct at -E8: -E8 -E8 -E1 000000F8 00000005 +10 -20 00000011
+[186] vpl: free c, allocate 0x20, allocate 0x10, free all
+  free c: 00000000
+  alloc 0x20: 00000000 at -10
+  alloc 0x10: 00000000 at -28
+  acct at -E8: -E8 -E8 -E1 000000F8 0000000A -D0 -38 00000011
+  pool=E0 free=E0 wait=0
+[187] vpl: 0x1000 pool: allocate x y z of 0x20, free x y z, allocate 0x20
+  x at +0, y at -28, z at -50
+  alloc 0x20: 00000000 at +0
+[188] vpl: same pool: allocate x y z of 0x20 again, free z y x, allocate 0x20
+  x at +0, y at -28, z at -50
+  alloc 0x20: 00000000 at +0
+[189] vpl: 0x1000 pool: A 0x100, B 0x10, C 0x100, D 0x10; free A and C; allocate 0x80 twice
+  A at +0, B at -18, C at -120, D at -138
+  alloc 0x80: 00000000 at -A0
+  alloc 0x80: 00000000 at +80
+  acct at -EF8: -EF8 -EF8 -EF1 00000FF8 00000028 -128 -128 000001B4
+[190] vpl: three 0x100 pools created in order; where their first blocks are
+  pool2 +100, pool3 +200 (from pool1's block)
+
+---- vpl: waiters ----
+[191] vpl: attr 0, 0x1000 pool full of 0x100 blocks; A(16) B(13) C(18) D(14) want 0x100
+  blocks: 15
+  pool=FE0 free=68 wait=0
+  pool=FE0 free=68 wait=4
+[192] vpl: free one block at a time, four times
+  free: 00000000
+  free: 00000000
+  free: 00000000
+  free: 00000000
+  order: ABCD
+  A: ret=00000000 tmo=part got=+0
+  B: ret=00000000 tmo=part got=-108
+  C: ret=00000000 tmo=part got=-210
+  D: ret=00000000 tmo=part got=-318
+  pool=FE0 free=68 wait=0
+[193] vpl: attr 100, 0x1000 pool full of 0x100 blocks; A(16) B(13) C(18) D(14) want 0x100
+  blocks: 15
+  pool=FE0 free=68 wait=0
+  pool=FE0 free=68 wait=4
+[194] vpl: free one block at a time, four times
+  free: 00000000
+  free: 00000000
+  free: 00000000
+  free: 00000000
+  order: BDAC
+  A: ret=00000000 tmo=part got=-210
+  B: ret=00000000 tmo=part got=+0
+  C: ret=00000000 tmo=part got=-318
+  D: ret=00000000 tmo=part got=-108
+  pool=FE0 free=68 wait=0
+[195] vpl: FIFO, full pool; A wants 0x200, then B 0x80; free one 0x100 block
+  free: 00000000
+  pool=FE0 free=170 wait=2
+  order: (none)
+[196] vpl: main TryAllocateVpl 0x10 with the waiters queued
+  = 00000000 at +F0
+  pool=FE0 free=158 wait=2
+[197] vpl: free two more blocks
+  order: BA
+  A: ret=00000000 tmo=part got=-118
+  B: ret=00000000 tmo=part got=-1A0
+  pool=FE0 free=D8 wait=0
+[198] vpl: full pool, A B (prio 18) want 0x100; CancelVpl
+  = 00000000 waiters=2
+  order: AB
+  A: ret=800201A9 tmo=part got=DEAD
+  B: ret=800201A9 tmo=part got=DEAD
+  pool=FE0 free=68 wait=0
+[199] vpl: full pool, A B (prio 18) want 0x100; DeleteVpl
+  = 00000000
+  order: AB
+  A: ret=800201B5 tmo=part got=DEAD
+  B: ret=800201B5 tmo=part got=DEAD
+
+---- fpl: create ----
+[200] fpl: CreateFpl partition sweep
+  partition 2: uid
+  partition 6: uid
+  partition 1: 800200D1
+  partition 3: 800200D1
+  partition 8: 800200D1
+  partition 0: 800200D2
+  partition 7: 800200D2
+  partition -1: 800200D2
+[201] fpl: CreateFpl attr sweep
+  attr 00000: uid
+  attr 00001: uid
+  attr 00100: uid
+  attr 001FF: uid
+  attr 00200: 80020191
+  attr 00300: 80020191
+  attr 00400: 80020191
+  attr 00800: 80020191
+  attr 01000: 80020191
+  attr 02000: 80020191
+  attr 04000: uid
+  attr 041FF: uid
+  attr 08000: 80020191
+  attr 10000: 80020191
+[202] fpl: CreateFpl block size / count combinations
+  bsize 0 count 4: 800201B7
+  bsize 10 count 0: 800201B7
+  bsize FFFFFFFF count 4: 800201B7
+  bsize 10 count FFFFFFFF: 800201B7
+  bsize 100 count 4000000: 800201B7
+  bsize 10 count 400: uid -> bsize=10 blocks=400 free=400
+  bsize 10 count 2000: uid -> bsize=10 blocks=2000 free=2000
+  bsize 2F count 2F: uid -> bsize=2F blocks=2F free=2F
+  bsize 1 count 1: uid -> bsize=1 blocks=1 free=1
+[203] fpl: CreateFpl option alignment sweep (block 0x10, 4 blocks)
+  align 0: uid
+  align 1: uid
+  align 2: uid
+  align 4: uid
+  align 8: uid
+  align 20: uid
+  align 1000: uid
+  align 3: 800200D2
+  align 5: 800200D2
+  align 6: 800200D2
+  align 7: 800200D2
+  align C: 800200D2
+  align FFFFFFFF: 800200D2
+[204] fpl: ReferFplStatus of a pool (attr 100, 0x2F x 3), sizes 56 and 0
+  = 00000000
+  size=38 name="refer" attr=00000100 bsize=0000002F blocks=00000003 free=3 wait=0
+  size 0: 00000000
+  size=0 name="................................" attr=A5A5A5A5 bsize=A5A5A5A5 blocks=A5A5A5A5 free=-1515870811 wait=-1515870811
+[205] fpl: CreateFpl with NULL name
+  = 80020190
+
+---- fpl: allocate, free, layout (one thread) ----
+[206] fpl: 0x10 x 4 pool: allocate #1 #2 #3, free #1, allocate #4 #5, then one too many
+  = uid
+  #1 at +0, #2 at +10, #3 at +20
+  free #1: 00000000
+  #4: 00000000 at +30
+  #5: 00000000 at +0
+  #6: 80020190 at DEAD
+  free=0 wait=0
+[207] fpl: free #3 then #2, allocate twice
+  #7: 00000000 at +20
+  #8: 00000000 at +10
+[208] fpl: AllocateFpl on an empty pool, timeout 5ms
+  = 800201A8 got=DEAD tmo=zero
+[209] fpl: FreeFpl bad pointers: twice, stack, block+4, another pool's, uid 0
+  free #7: 00000000
+  free #7 again: 800201B6
+  free stack: 800201B6
+  free #8+4: 800201B6
+  free other pool's: 800201B6
+  free with uid 0: 8002019D
+  free=1 wait=0
+[210] fpl: spacing of two blocks for block sizes and alignments
+  0x10 no opt: uid, second block at +10
+  0x10 align 32: uid, second block at +20
+  0x10 align 0: uid, second block at +10
+  1 no opt: uid, second block at +4
+  1 align 1: uid, second block at +4
+  0x11 no opt: uid, second block at +14
+  0x11 align 8: uid, second block at +18
+  0x2F no opt: uid, second block at +30
+
+---- fpl: waiters ----
+[211] fpl: attr 0, 1-block pool held by main; A(16) B(13) C(18) D(14) allocate, free at once
+  free=0 wait=4
+[212] fpl: main FreeFpl
+  = 00000000
+  order: ABCD
+  A: ret=00000000 tmo=part got=+0 post=00000000
+  B: ret=00000000 tmo=part got=+0 post=00000000
+  C: ret=00000000 tmo=part got=+0 post=00000000
+  D: ret=00000000 tmo=part got=+0 post=00000000
+  free=1 wait=0
+[213] fpl: attr 100, 1-block pool held by main; A(16) B(13) C(18) D(14) allocate, free at once
+  free=0 wait=4
+[214] fpl: main FreeFpl
+  = 00000000
+  order: BDAC
+  A: ret=00000000 tmo=part got=+0 post=00000000
+  B: ret=00000000 tmo=part got=+0 post=00000000
+  C: ret=00000000 tmo=part got=+0 post=00000000
+  D: ret=00000000 tmo=part got=+0 post=00000000
+  free=1 wait=0
+[215] fpl: empty pool, A B (prio 18) allocate; CancelFpl
+  = 00000000 waiters=2
+  order: AB
+  A: ret=800201A9 tmo=part got=DEAD
+  B: ret=800201A9 tmo=part got=DEAD
+  free=0 wait=0
+[216] fpl: empty pool, A B (prio 18) allocate; DeleteFpl
+  = 00000000
+  order: AB
+  A: ret=800201B5 tmo=part got=DEAD
+  B: ret=800201B5 tmo=part got=DEAD
+
+---- release, then delete before the waiter runs ----
+[217] rd: sema, A(30) waits; SignalSema 1 then DeleteSema
+  signal=00000000 delete=00000000
+  order: A
+  A: ret=00000000 tmo=part
+[218] rd: event flag, A(30) waits bit 1; SetEventFlag 1 then DeleteEventFlag
+  set=00000000 delete=00000000
+  order: A
+  A: ret=00000000 tmo=part out=00000001
+[219] rd: mutex held by main, A(30) waits; UnlockMutex then DeleteMutex
+  unlock=00000000 delete=00000000
+  order: A
+  A: ret=00000000 tmo=part
+[220] rd: lwmutex held by main, A(30) waits; UnlockLwMutex then DeleteLwMutex
+  unlock=00000000 delete=00000000
+  order: A
+  A: ret=00000000 tmo=part
+  wa: count=0 thread=-1 attr=0 wait=0 uid=FFFFFFFF pad=00000000 00000000 00000000
+[221] rd: mailbox, A(30) receives; SendMbx m1 then DeleteMbx
+  send=00000000 delete=00000000
+  order: A
+  A: ret=00000000 tmo=part got=m1
+[222] rd: full vpl, A(30) wants 0x100; FreeVpl then DeleteVpl
+  free=00000000 delete=00000000
+  order: A
+  A: ret=00000000 tmo=part got=+0
+[223] rd: empty fpl, A(30) allocates; FreeFpl then DeleteFpl
+  free=00000000 delete=00000000
+  order: A
+  A: ret=00000000 tmo=part got=+0
+[224] rd: no-buffer pipe, A(30) B(30) send 4; TryReceive 8 then DeleteMsgPipe
+  receive=00000000 bytes=00000008 data="AAAABBBB" delete=00000000
+  order: AB
+  A: ret=00000000 tmo=part out=00000004
+  B: ret=00000000 tmo=part out=00000004
+
+---- NULL and bad pointers ----
+[225] ptr: Refer*Status with a NULL info pointer, every type

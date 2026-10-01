@@ -162,10 +162,17 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 /* A thread priority outside 0x08..0x77. Zero is not in that range and is not
  * an error either -- it means "the priority I am running at". */
 #define SCE_KERNEL_ERROR_ILLEGAL_PRIORITY 0x80020193
+/* sceKernelCreateThread with a stack below 0x200 (threadprobe step 3, fw 6.60:
+ * 0, 1, 0x100 and 0x1FF). */
+#define SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE 0x80020194
 /* A sceKernelGetThreadmanIdList type outside 1..14 and 0x40..0x43. */
 #define SCE_KERNEL_ERROR_ILLEGAL_TYPE     0x800201BB
 #define SCE_KERNEL_ERROR_SUSPEND         0x800201A3
 #define SCE_KERNEL_ERROR_NOT_SUSPEND     0x800201A5
+/* sceKernelReleaseWaitThread on a thread that is not waiting, and what the
+ * wait it does release returns (threadprobe step 70, fw 6.60). */
+#define SCE_KERNEL_ERROR_NOT_WAIT        0x800201A6
+#define SCE_KERNEL_ERROR_RELEASE_WAIT    0x800201AA
 /* A poll that would have blocked. Distinct from an error: it is the ordinary
  * answer to "is this free?" when it is not. */
 #define SCE_KERNEL_ERROR_SEMA_ZERO       0x800201AD
@@ -323,6 +330,13 @@ uint32_t psp_ge_target(void);
 /* Run every queued list to FINISH/stall, in order. For present paths and
  * tests that must see finished pixels without going through Sync. */
 void psp_ge_drain_all(void);
+/* The GE catching up with guest time, at every firmware call (hle.c); and,
+ * from the scheduler's idle path, going on until the first handler it
+ * reaches or until_us (0: no limit). The latter returns whether a handler
+ * ran, the guest clock moved to its moment. See "When the GE runs" in
+ * src/hle/ge.c. */
+void psp_ge_tick(void);
+int  psp_ge_idle_run(uint64_t until_us);
 
 /* The GE's register state, for capture and replay. Commands are differential,
  * so a frame only means anything against the state it started from -- a replay
@@ -383,6 +397,10 @@ int psp_io_list_names(const char *guest, char names[][64], int cap);
 void psp_misc_init(void);
 void psp_misc_register(void);
 void psp_misc_reset(void);
+/* Whether sceKernelCpuSuspendIntr has interrupts off. With them off a thread
+ * can neither wait nor turn dispatch off (threadprobe steps 97-98, fw 6.60);
+ * see psp_sched_can_wait. */
+int  psp_intr_enabled(void);
 
 /* ---- sceNet / sceNetAdhoc / sceNetAdhocctl / sceWlanDrv ------------------ */
 void psp_net_register(void);
@@ -545,21 +563,63 @@ uint32_t psp_threadman_next_uid(void);
 /* `out` is a *guest* address, or 0 for a caller that wants only the count. */
 typedef void (*psp_uid_lister)(int type, uint32_t out, int max, int *count);
 void psp_threadman_add_lister(psp_uid_lister fn);
+/* What a lister does with each uid it owns of the asked type: append it to
+ * `out` if there is room, and count it either way. Through one function rather
+ * than written out in each lister, because sceKernelGetThreadmanIdType asks
+ * the same listers a different question -- "is this uid one of yours?" -- and
+ * this is where that question is answered. */
+void psp_threadman_list_put(uint32_t uid, uint32_t out, int max, int *count);
 
 /* The types the kernel knows. 1..14 are object kinds; 0x40..0x43 select
  * threads by what they are doing. Anything else is ILLEGAL_TYPE -- measured,
  * threads/threadmanidlist sweeps 0, 15..24, 0x44..0x48 and a spread of large
- * values and refuses every one. */
+ * values and refuses every one.
+ *
+ * From 9 up these were one too high (alarm 11, vtimer 12, mutex 13, with a
+ * gap at 10). threadprobe steps 99-100 (fw 6.60) list and type an alarm as
+ * 0x0A, a vtimer 0x0B, a mutex 0x0C, an lwmutex under 0x0D and a tlspl 0x0E,
+ * with nothing under 9; PSPSDK's pspthreadman.h also has Alarm = 10 and
+ * VTimer = 11. */
 enum {
     PSP_TMID_THREAD = 1, PSP_TMID_SEMA = 2, PSP_TMID_EVENTFLAG = 3,
     PSP_TMID_MBX = 4, PSP_TMID_VPL = 5, PSP_TMID_FPL = 6, PSP_TMID_MSGPIPE = 7,
-    PSP_TMID_CALLBACK = 8, PSP_TMID_THREVENT = 9, PSP_TMID_UNUSED10 = 10,
-    PSP_TMID_ALARM = 11, PSP_TMID_VTIMER = 12, PSP_TMID_MUTEX = 13,
-    PSP_TMID_TLSPL = 14,
+    PSP_TMID_CALLBACK = 8, PSP_TMID_THREVENT = 9,
+    PSP_TMID_ALARM = 10, PSP_TMID_VTIMER = 11, PSP_TMID_MUTEX = 12,
+    PSP_TMID_LWMUTEX = 13, PSP_TMID_TLSPL = 14,
     PSP_TMID_SLEEPING = 0x40, PSP_TMID_DELAYING = 0x41,
     PSP_TMID_SUSPENDED = 0x42, PSP_TMID_DORMANT = 0x43,
 };
+/* What sceKernelReferThreadStatus reports as waitType for a thread waiting
+ * on each object kind, and waitId the object's uid. threadprobe (fw 6.60)
+ * steps 9-12 measured sleep 1, delay 2, sema 3, evf 4 and thread end 9; step
+ * 17 of version 3 measured mbx 5, vpl 6, fpl 7, msgpipe 8, mutex 0x0C,
+ * lwmutex 0x0D and tlspl 0x0E. From mbx on, each is its id-list type plus 1
+ * up to msgpipe and equal to it from mutex on. */
+enum {
+    PSP_WAITTYPE_SLEEP = 1, PSP_WAITTYPE_DELAY = 2, PSP_WAITTYPE_SEMA = 3,
+    PSP_WAITTYPE_EVF = 4, PSP_WAITTYPE_MBX = 5, PSP_WAITTYPE_VPL = 6,
+    PSP_WAITTYPE_FPL = 7, PSP_WAITTYPE_MSGPIPE = 8, PSP_WAITTYPE_THREADEND = 9,
+    PSP_WAITTYPE_MUTEX = 0x0C, PSP_WAITTYPE_LWMUTEX = 0x0D,
+    PSP_WAITTYPE_TLSPL = 0x0E,
+};
+/* Record what the current thread is about to wait on, for ReferThreadStatus,
+ * and (0, 0) once the wait is over. */
+void     psp_threadman_wait_mark(uint32_t type, uint32_t id);
 void     psp_threadman_write_name(uint32_t dst, const char *name);
+/* Copy a Refer*Status result into the caller's block. `img` is the whole
+ * struct as the kernel builds it, first word = its own size; hardware copies
+ * min(the caller's size word, len) bytes of it (syncprobe step 24: size 4
+ * gets only the size word). A size of 0 therefore gets nothing. */
+void     psp_refer_put(uint32_t info, const uint8_t *img, uint32_t len);
+static inline void psp_refer_img32(uint8_t *img, uint32_t off, uint32_t v) {
+    img[off] = (uint8_t)v; img[off + 1] = (uint8_t)(v >> 8);
+    img[off + 2] = (uint8_t)(v >> 16); img[off + 3] = (uint8_t)(v >> 24);
+}
+/* The 32-byte name at offset 4, truncated to 31 characters. */
+static inline void psp_refer_imgname(uint8_t *img, const char *name) {
+    for (int i = 0; i < 32; i++) img[4 + i] = 0;
+    for (int i = 0; i < 31 && name[i]; i++) img[4 + i] = (uint8_t)name[i];
+}
 
 void psp_kernlock_register(void);
 void psp_kernlock_register_lw(void);
@@ -575,10 +635,12 @@ void psp_ktimer_reset(void);
  * path, which is the only place guest time is observed to move. */
 void psp_ktimer_tick(void);
 void psp_kernobj_reset(void);
-/* A thread has ended: return anything it still holds. Only thread-local
- * storage cares -- a pool block or a mutex outlives its owner, a tls block by
- * definition does not. */
+/* A thread has ended: return anything it still holds. Thread-local storage
+ * does, and so does a mutex -- syncprobe step 90 (fw 6.60): a mutex whose
+ * owner exits reads back free (owner -1) and the next TryLock succeeds. A
+ * pool block outlives its owner. */
 void psp_kernobj_thread_ended(uint32_t uid);
+void psp_kernlock_thread_ended(uint32_t uid);
 void psp_kernlock_reset(void);
 
 void psp_threadman_init(void);
@@ -601,6 +663,13 @@ void psp_sysmem_reserve_module(uint32_t lo, uint32_t hi);
  * caller is on no thread at all -- see the header of src/hle/ktimer.c -- which
  * sceKernelGetThreadId has to report and cannot work out for itself. */
 int psp_ktimer_in_handler(void);
+
+/* For the scheduler's idle path, where no thread will make the firmware call
+ * that would notice a timer: the guest moment the next alarm or vtimer
+ * handler is due (0 for none), and a call that runs whatever is due now and
+ * returns how many handlers ran. */
+uint64_t psp_ktimer_next_due(void);
+int      psp_ktimer_fire_idle(void);
 
 /* Raw allocation for use by other HLE subsystems (thread stacks, mostly).
  * Returns 0 on failure. These bypass the UID table because nothing in the

@@ -79,6 +79,14 @@ static uint32_t fetch(const a_analysis *an, uint32_t addr) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* Is the word before `addr` a vcmp? */
+static int follows_vcmp(const a_analysis *an, uint32_t addr) {
+    if (addr < an->base + 4 || addr >= an->base + an->size) return 0;
+    a_insn prev;
+    a_decode(fetch(an, addr - 4), addr - 4, &prev);
+    return prev.op == A_VCMP;
+}
+
 static int is_import(const a_analysis *an, uint32_t addr) {
     return an->stub_size && addr >= an->stub_addr &&
            addr < an->stub_addr + an->stub_size;
@@ -331,7 +339,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         if (DEST_ZERO(in->rt)) break;
         fprintf(f, "%s%s = psp_f32_to_bits(psp_cpu.f[%u]);\n", ind, rt, in->fs); return;
     /* `fs` names which control register; see psp_fcr_read/write. */
-    case A_CTC1: fprintf(f, "%spsp_fcr_write(%u, %s);\n", ind, in->fs, rt); return;
+    /* A write that is itself an FPU exception stops the program, as the
+     * interpreter's I_TRAP_FPU does. */
+    case A_CTC1:
+        fprintf(f, "%sif (psp_fcr_write(%u, %s)) psp_unimplemented(0x%08Xu, \"FPU exception\");\n",
+                ind, in->fs, rt, in->addr); return;
     case A_CFC1:
         if (DEST_ZERO(in->rt)) break;
         fprintf(f, "%s%s = psp_fcr_read(%u);\n", ind, rt, in->fs); return;
@@ -346,33 +358,40 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
                 ind, in->fd,
                 in->op == A_ADD_S ? "add" : in->op == A_SUB_S ? "sub" :
                 in->op == A_MUL_S ? "mul" : "div",
-                in->fs, in->ft); return;
+                in->fs, in->ft); goto fpu_trap;
     case A_MOV_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_cpu.f[%u];\n", ind, in->fd, in->fs); return;
     case A_NEG_S:
-        fprintf(f, "%spsp_cpu.f[%u] = -psp_cpu.f[%u];\n", ind, in->fd, in->fs); return;
+        fprintf(f, "%spsp_cpu.f[%u] = psp_fneg_cop1(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); goto fpu_trap;
     case A_ABS_S:
-        fprintf(f, "%spsp_cpu.f[%u] = psp_fabs(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); return;
+        fprintf(f, "%spsp_cpu.f[%u] = psp_fabs_cop1(psp_cpu.f[%u]);\n", ind, in->fd, in->fs); goto fpu_trap;
     case A_SQRT_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_fsqrt_cop1(psp_cpu.f[%u]);\n",
-                ind, in->fd, in->fs); return;
+                ind, in->fd, in->fs); goto fpu_trap;
     case A_CVT_S_W:
-        fprintf(f, "%spsp_cpu.f[%u] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[%u]);\n",
-                ind, in->fd, in->fs); return;
+        fprintf(f, "%spsp_cpu.f[%u] = psp_cvt_s_w(psp_f32_to_bits(psp_cpu.f[%u]));\n",
+                ind, in->fd, in->fs); goto fpu_trap;
     /* See the interpreter: the rounding mode is the only difference, and
      * cvt.w.s reads it from FCR31 at run time rather than at emit time. */
     case A_CVT_W_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[%u], "
-                   "(int)(psp_cpu.fcr31 & 3)));\n", ind, in->fd, in->fs); return;
+                   "(int)(psp_cpu.fcr31 & 3)));\n", ind, in->fd, in->fs); goto fpu_trap;
     case A_TRUNC_W_S: case A_ROUND_W_S: case A_CEIL_W_S: case A_FLOOR_W_S:
         fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[%u], %s));\n",
                 ind, in->fd, in->fs,
                 in->op == A_TRUNC_W_S ? "PSP_RM_RZ" :
                 in->op == A_ROUND_W_S ? "PSP_RM_RN" :
-                in->op == A_CEIL_W_S  ? "PSP_RM_RP" : "PSP_RM_RM"); return;
+                in->op == A_CEIL_W_S  ? "PSP_RM_RP" : "PSP_RM_RM"); goto fpu_trap;
     case A_C_COND_S:
         fprintf(f, "%spsp_fpu_set_cond(psp_fcmp(%u, psp_cpu.f[%u], psp_cpu.f[%u]));\n",
-                ind, in->fcond, in->fs, in->ft); return;
+                ind, in->fcond, in->fs, in->ft); goto fpu_trap;
+
+    /* An operation that set a cause bit whose enable is on is an FPU
+     * exception, fatal on the hardware (see psp_fpu_trap_pending). */
+    fpu_trap:
+        fprintf(f, "%sif (psp_fpu_trap_pending()) psp_unimplemented(0x%08Xu, \"FPU exception\");\n",
+                ind, in->addr);
+        return;
 
     /* --- COP0. There is no privileged state to model. --- */
     case A_MFC0: case A_CFC0: case A_MFIC:
@@ -387,9 +406,15 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_MFV:
         if (DEST_ZERO(in->rt)) break;
         fprintf(f, "%s%s = psp_mfv(%u);\n", ind, rt, in->vd); return;
+    /* CC read straight after a vcmp is the CC from before it (vfpuprobe v3
+     * step 117); decided from the word before, as the interpreter does. */
     case A_MFVC:
         if (DEST_ZERO(in->rt)) break;
-        fprintf(f, "%s%s = psp_mfvc(%d);\n", ind, rt, (int)(in->raw & 0xFF) - 128); return;
+        if ((in->raw & 0xFF) == 128 + 3 && follows_vcmp(c->an, in->addr))
+            fprintf(f, "%s%s = psp_mfvc_cc_after_vcmp();\n", ind, rt);
+        else
+            fprintf(f, "%s%s = psp_mfvc(%d);\n", ind, rt, (int)(in->raw & 0xFF) - 128);
+        return;
     case A_MTVC:
         fprintf(f, "%spsp_mtvc(%d, %s);\n", ind, (int)(in->raw & 0xFF) - 128, rt); return;
     case A_MTV:
@@ -505,6 +530,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         return;
     }
 
+    case A_VRNDS:
+        fprintf(f, "%spsp_vrnds(%u, %u);\n", ind, in->vs, in->vsize); return;
+    case A_VRNDI: case A_VRNDF1: case A_VRNDF2:
+        fprintf(f, "%spsp_vrnd(%u, %d, %u);\n", ind, in->vd,
+                in->op == A_VRNDI ? 0 : in->op == A_VRNDF1 ? 1 : 2, in->vsize); return;
     /* Matrix ops that need no multiply. `vsize` is the matrix order here. */
     case A_VF2H:
         fprintf(f, "%spsp_vf2h(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize); return;

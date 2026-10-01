@@ -21,11 +21,13 @@
  *
  * What this is not
  * ----------------
- * There is no clock, and preemption is approximate: a thread gives way to its
- * equals every so many firmware calls (see psp_sched_tick) rather than on a
- * timer, because recompiled C is an ordinary host call stack and cannot be
- * interrupted part-way. A thread that spins without ever calling into the
- * kernel therefore still hangs -- reported, rather than silently.
+ * There is no timer interrupt. A PSP has no timeslice either -- one FIFO ready
+ * queue per priority, and a thread runs until it blocks or something more
+ * urgent becomes ready (threadprobe steps 16-83, fw 6.60) -- but the second of
+ * those can happen on a timer, and here it can only happen at a firmware call
+ * (see psp_sched_tick), because recompiled C is an ordinary host call stack
+ * and cannot be interrupted part-way. A thread that spins without ever calling
+ * into the kernel therefore still hangs -- reported, rather than silently.
  */
 #ifndef PSPRECOMP_SCHED_H
 #define PSPRECOMP_SCHED_H
@@ -45,9 +47,8 @@ typedef enum {
     PSP_SCHED_BLOCKED,     /* waiting on a kernel object */
     PSP_SCHED_SLEEPING,    /* a deadline, or an explicit wakeup */
     PSP_SCHED_DEAD,
-    /* sceKernelSuspendThread. Distinct from blocked: nothing it is waiting for
-     * can release it, only sceKernelResumeThread, so a signal must not. */
-    PSP_SCHED_SUSPENDED,
+    /* There is no SUSPENDED state: suspension is a flag over any of the
+     * above (see psp_sched_suspend). */
 } psp_sched_state;
 
 void psp_sched_init(void);
@@ -95,6 +96,14 @@ int  psp_sched_block(uint32_t uid, psp_sched_state why, const char *what);
 #define PSP_SCHED_WOKEN     0
 #define PSP_SCHED_STRANDED (-1)   /* nothing runnable, and no deadline set */
 #define PSP_SCHED_EXPIRED  (-2)
+/* Forced out by sceKernelReleaseWaitThread: not a signal, and not a deadline.
+ * The wait leaves its queue, as it would for a timeout, and answers
+ * RELEASE_WAIT (threadprobe step 70, fw 6.60) rather than taking the release
+ * for the thing it was waiting on. */
+#define PSP_SCHED_RELEASED (-3)
+/* The wake reason (psp_sched_wake_as) that produces PSP_SCHED_RELEASED. Out of
+ * the range the objects' own reasons use. */
+#define PSP_SCHED_WAKE_RELEASE 0x100
 
 /* Park until woken *or* until `deadline_us` of guest time arrives.
  *
@@ -112,7 +121,8 @@ int  psp_sched_block(uint32_t uid, psp_sched_state why, const char *what);
  * for a zero-length timeout wants the shortest deadline that exists, not the
  * absence of one, so it should pass `psp_clock_peek() + 1`.
  *
- * Returns PSP_SCHED_WOKEN, PSP_SCHED_EXPIRED, or PSP_SCHED_STRANDED. */
+ * Returns PSP_SCHED_WOKEN, PSP_SCHED_EXPIRED, PSP_SCHED_RELEASED or
+ * PSP_SCHED_STRANDED. */
 int  psp_sched_block_until(uint32_t uid, psp_sched_state why, const char *what,
                            uint64_t deadline_us);
 
@@ -129,14 +139,22 @@ void psp_sched_preempt(void);
  * simply hand the CPU back and forth and anything below them still starves.
  *
  * Sleeping until a deadline makes the caller ineligible for as long as it asked
- * for, which is the whole reason a game's main loop delays. */
-void psp_sched_delay(uint64_t usec);
+ * for, which is the whole reason a game's main loop delays.
+ *
+ * Returns PSP_SCHED_EXPIRED when the time ran out, PSP_SCHED_RELEASED when
+ * sceKernelReleaseWaitThread cut it short, PSP_SCHED_WOKEN for any other wake. */
+int  psp_sched_delay(uint64_t usec);
 
-/* Charge the running thread one tick of its timeslice, and rotate to an equal
- * if it has used the slice up. Called from the firmware-call path: a PSP
- * preempts on a timer, and nothing here can interrupt recompiled C part-way, so
- * kernel calls are where a thread that never blocks gives way to its equals. */
+/* The reschedule point at the end of every firmware call: timed waits that
+ * have expired join their queues, and one more urgent than the caller runs.
+ * Never a switch to an equal -- there is no timeslice (threadprobe step 75). */
 void psp_sched_tick(void);
+
+/* sceKernelRotateReadyQueue of a priority other than the caller's own: the
+ * thread at the head of that priority's queue moves to its tail (threadprobe
+ * step 66, fw 6.60). Returns 1 if there was one. Rotating the caller's own
+ * level is a yield. */
+int  psp_sched_rotate(int priority);
 
 /* Make a parked thread runnable. No effect on one that is already ready.
  *
@@ -178,6 +196,13 @@ void psp_sched_set_thread_hook(void (*fn)(void));
  * The scheduler knows a thread has died but not what a thread means, so the
  * thread manager supplies the meaning. */
 void psp_sched_set_end_hook(void (*fn)(uint32_t uid, uint32_t status));
+
+/* Called when a timed wait's deadline passes and the thread becomes ready
+ * again, at that moment rather than when the thread next runs. The thread
+ * manager takes it out of its object's queue then (psp_waitq_leave), as a
+ * PSP's timer interrupt does. Runs with the scheduler's lock held, so it must
+ * not call back into the scheduler. */
+void psp_sched_set_expire_hook(void (*fn)(uint32_t uid));
 
 /* Stop the whole guest: every thread is marked dead and the main context is
  * given the token back.
@@ -243,6 +268,18 @@ int      psp_sched_priority(uint32_t uid);
  * no live slot, which covers both "finished" and "never started". */
 psp_sched_state psp_sched_state_of(uint32_t uid);
 
+/* What a thread has used, for sceKernelReferThreadStatus: guest microseconds
+ * on the CPU (at least 1 a turn, the current turn included), and how often it
+ * gave the CPU up (block, delay or yield), was displaced by a thread made
+ * ready by a system call, or by one a timer made ready. Zeros, and 0 returned,
+ * for a uid with no slot. A slot is reused once its thread is dead and
+ * joined, so the thread manager keeps its own copy of a finished thread's. */
+typedef struct {
+    uint64_t run_us;
+    uint32_t releases, thread_preempts, intr_preempts;
+} psp_sched_stats;
+int psp_sched_stats_of(uint32_t uid, psp_sched_stats *out);
+
 /* ---- why a wait ended -----------------------------------------------------
  *
  * Being woken does not say what happened, and for some objects two different
@@ -266,11 +303,15 @@ void psp_sched_set_priority(uint32_t uid, int priority);
 
 /* Suspend and resume, which are not block and wake.
  *
- * A suspended thread is waiting for nothing, so nothing it was parked on may
- * release it -- only a resume. Suspending the *running* thread gives up the
- * token, so this does not return until something resumes it.
+ * Suspension is a flag on top of whatever the thread is doing. A suspended
+ * thread that is waiting stays in its wait, and the wait can still end -- a
+ * wakeup, a signal or a deadline completes it -- but the thread does not run
+ * until it is resumed (threadprobe steps 36, 53, 54, fw 6.60). Resuming does
+ * not end a wait either.
  *
- * Returns 1 if the thread existed. */
+ * suspend returns 1 if the thread existed. resume returns 1 when the resumed
+ * thread is ready to run and outranks the caller: resuming is a reschedule
+ * point (steps 52, 54), and the caller should psp_sched_preempt. */
 int  psp_sched_suspend(uint32_t uid);
 int  psp_sched_resume(uint32_t uid);
 
@@ -278,9 +319,11 @@ int  psp_sched_resume(uint32_t uid);
  *
  * A guest asks for this around a critical section it needs to finish
  * uninterrupted, and pspautotests' scheduling/dispatch is an entire test of it.
- * While off, the timeslice does not fire and a yield does nothing; the current
- * thread keeps the CPU until it turns dispatch back on. Returns the previous
- * setting, which is what the guest passes back to restore it. */
+ * While off, nothing preempts and a yield does nothing; the current thread
+ * keeps the CPU until it turns dispatch back on, and a more urgent thread
+ * readied meanwhile runs then (threadprobe step 83, fw 6.60). Returns the
+ * previous setting, which is what the guest passes back to restore it -- so a
+ * nested suspend returns 0 and its resume leaves dispatch off. */
 int  psp_sched_set_dispatch(int on);
 
 /* Whether a thread may block at all right now.
@@ -289,7 +332,11 @@ int  psp_sched_set_dispatch(int on);
  * *would* have succeeded is refused too, and so is one whose arguments are
  * illegal -- threads/scheduling/dispatch answers CAN_NOT_WAIT for a semaphore
  * that has been signalled and for a count above the maximum alike. So the check
- * belongs at the very top of a blocking call, before anything is validated. */
+ * belongs at the very top of a blocking call, before anything is validated.
+ *
+ * Nor while interrupts are off: threadprobe step 98 (fw 6.60) has
+ * DelayThread(1000) and a WaitSema with a 1000us timeout both answer
+ * CAN_NOT_WAIT inside sceKernelCpuSuspendIntr, the timeout left untouched. */
 int  psp_sched_can_wait(void);
 
 /* Stop a thread outright: sceKernelTerminateThread.

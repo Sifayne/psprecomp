@@ -31,6 +31,8 @@
 #include <windows.h>
 #endif
 #include "psprecomp/hle.h"
+#include "psprecomp/clock.h"
+#include "psprecomp/dispatch.h"
 #include "psprecomp/render.h"
 #include "psprecomp/sched.h"
 
@@ -78,6 +80,51 @@ static int fx16_floor(float f) {
     return i - (s < (float)i);
 }
 
+/* 1/w for x and y of a tessellated vertex: the reciprocal's mantissa cut to
+ * 14 bits, toward zero, on the float clip position. Every vertex took this
+ * until geprobe 7; one the GE reads from memory now takes the GE's own
+ * arithmetic (clip_to_fx16). Patch vertices keep this because psprecomp's
+ * tessellation is not the GE's: the GE's rule on them takes scene 22 from
+ * 612 pixels off to 954 and scene 23 from 1878 to 1925 (scene 26: 1190 to
+ * 1032, a gain on one patch and a loss on another). With an exact 1/w and
+ * float arithmetic, one corner of scene 15 (w = 1.5, -1809.08 sixteenths
+ * from the centre) and one of scene 18 (w = 5, -28945.4) land a sixteenth
+ * further out than the hardware draws them; 14 bits was the only width
+ * that put both where it does. */
+static float ge_recip(float w) {
+    int e;
+    const float m = frexpf(1.0f / w, &e);                  /* [0.5, 1) */
+    return ldexpf((float)(int)(m * 16384.0f), e - 14);
+}
+
+/* One axis of a transformed vertex onto the 1/16 grid: the viewport centre
+ * (less the screen offset) plus ndc * scale, taken to sixteenths toward zero,
+ * that is toward the centre -- left of it and above it a position rounds up,
+ * right of it and below it down. ndc is the clip coordinate over w, as
+ * clip_to_fx16 forms it. geprobe 2 (fw 6.60) scene 20's Gouraud triangles
+ * pin every corner to one sixteenth through their colours; scenes 15 and 21
+ * pin 18 more. A short reciprocal with rounding (the earlier fit to edges
+ * alone) moved a third of them by one sixteenth and 2432 pixels of scene 20
+ * by one step of colour. */
+static int screen_axis_fx16(float ndc, float scale, float centre) {
+    float t = ndc * scale * (float)PSP_SUBPX;
+    if (!(t > -1073741824.0f)) t = -1073741824.0f;   /* NaN too */
+    if (t > 1073741824.0f) t = 1073741824.0f;
+    return fx16_floor(centre + 0.5f / (float)PSP_SUBPX) + (int)t;
+}
+
+/* A float through-mode coordinate, saturated to signed 12.4 (-2048 ..
+ * 2047.9375 pixels). geprobe step 18 (fw 6.60) draws a triangle with a
+ * vertex at x = 5000 exactly as if it were at x = 2048: every pixel's
+ * coverage and colour match. The lower bound is assumed by symmetry, not
+ * measured. Clamping the float first also keeps an out-of-range value from
+ * reaching the int conversion; NaN goes to the lower bound. */
+static int fx16_sat(float f) {
+    if (f >= 2048.0f) return 2048 * PSP_SUBPX - 1;
+    if (!(f > -2048.0f)) return -2048 * PSP_SUBPX;
+    return fx16_floor(f);
+}
+
 /* Display-list opcodes. Only the ones the walk needs to be correct about are
  * named; everything else is counted rather than guessed at, because a
  * misidentified state command silently changes rendering. */
@@ -87,6 +134,7 @@ static int fx16_floor(float f) {
 #define GE_PRIM         0x04
 #define GE_BEZIER       0x05
 #define GE_SPLINE       0x06
+#define GE_BBOX         0x07
 #define GE_JUMP         0x08
 #define GE_BJUMP        0x09
 #define GE_CALL         0x0A
@@ -182,6 +230,8 @@ static int fx16_floor(float f) {
 
 #define GE_FBP          0x9C
 #define GE_FBW          0x9D
+#define GE_ZBP          0x9E
+#define GE_ZBW          0x9F
 
 /* Transform and lighting state.
  *
@@ -206,12 +256,37 @@ static int fx16_floor(float f) {
 #define GE_VIEWPORTXCENTER   0x45
 #define GE_VIEWPORTYCENTER   0x46
 #define GE_VIEWPORTZCENTER   0x47
+/* Skinning, morphing and patches: the numbers libpspgu's sceGuBoneMatrix,
+ * sceGuMorphWeight, sceGuPatchDivide, sceGuPatchPrim and sceGuPatchFrontFace
+ * write (PSPSDK, BSD). A bone is uploaded like the world matrix, twelve DATA
+ * words after a NUMBER of bone * 12. */
+#define GE_BONEMATRIXNUMBER  0x2A
+#define GE_BONEMATRIXDATA    0x2B
+#define GE_MORPHWEIGHT0      0x2C
+#define GE_PATCHDIVISION     0x36
+#define GE_PATCHPRIMITIVE    0x37
+#define GE_PATCHFACING       0x38
 #define GE_OFFSETX           0x4C
 #define GE_OFFSETY           0x4D
 #define GE_CULLFACEENABLE    0x1D
 #define GE_CULL              0x9B
-#define GE_MASKRGB           0xD8
-#define GE_MASKALPHA         0xD9
+/* SHADE: sceGuShadeModel sends GU_SMOOTH (1) or GU_FLAT (0), PSPSDK pspgu.h. */
+#define GE_SHADE             0x50
+/* Dither: DTE and the four matrix rows DITH1..4 (uofw include/ge_user.h). */
+#define GE_DITHERENABLE      0x20
+#define GE_DITHER0           0xE2
+/* Colour test, logic op and pixel mask (uofw include/ge_user.h). 0xD8/0xD9
+ * were named as RGB/alpha masks here; they are the colour-test function and
+ * reference, and geprobe step 19 (fw 6.60) shows sceGuPixelMask sending
+ * 0xE8/0xE9 instead. */
+#define GE_COLORTESTENABLE   0x27
+#define GE_LOGICOPENABLE     0x28
+#define GE_COLORTEST         0xD8
+#define GE_COLORREF          0xD9
+#define GE_COLORTESTMASK     0xDA
+#define GE_LOGICOP           0xE6
+#define GE_PIXELMASKRGB      0xE8
+#define GE_PIXELMASKALPHA    0xE9
 #define GE_ZTESTENABLE       0x23
 #define GE_ZTEST             0xDE
 #define GE_ZWRITEDISABLE     0xE7
@@ -233,6 +308,8 @@ static int fx16_floor(float f) {
 #define VT_POS(v)     (((v) >> 7) & 3)
 #define VT_WEIGHT(v)  (((v) >> 9) & 3)
 #define VT_INDEX(v)   (((v) >> 11) & 3)
+#define VT_WCOUNT(v)  ((((v) >> 14) & 7) + 1)   /* weights per vertex, when VT_WEIGHT */
+#define VT_MORPH(v)   ((((v) >> 18) & 7) + 1)   /* vertex sets blended by morphing */
 #define VT_THROUGH(v) (((v) >> 23) & 1)
 
 #define MAX_QUEUES 8
@@ -257,9 +334,110 @@ typedef struct {
     int      signal;    /* pending PAUSE through its FINISH/END pair */
     int      used;
     int      done;
+    int      cbid;      /* sceGeSetCallback id given at EnQueue; -1 none */
+    int      paused;    /* stopped at a PAUSE until sceGeContinue */
+    int      cont_early;/* sceGeContinue arrived before the pause took hold */
 } ge_queue;
 
 static ge_queue g_queue[MAX_QUEUES];
+
+/* When the GE runs.
+ *
+ * The GE works alongside the CPU, and geprobe 5 and 6 (fw 6.60) show how far
+ * behind it: a list of a few commands has run, callbacks and all, before
+ * sceGeListEnQueue returns (geprobe 5 steps 54-56), but 200 full-screen
+ * sprites have not -- ListSync(peek) reads 2, DRAWING, as EnQueue returns,
+ * and only the first SIGNAL's handler has run (step 58). Words released by
+ * sceGeListUpdateStallAddr run inside that call when they can: a SIGNAL and
+ * a FINISH released from a stall have both called their handlers by the time
+ * it returns, and ListSync(peek) then reads 0 (geprobe 6 steps 79 and 80).
+ * libgu's finish handler still runs after sceGuFinish, in sceGuSync (geprobe
+ * 5 step 50), because a FINISH waits for the drawing before it to end, and
+ * the clear and sprites before it are still being drawn.
+ *
+ * Two parts, as geprobe 6 step 81 shows them. It times 100 sprites between
+ * SIGNAL 1 and SIGNAL 2, then FINISH, at three sizes, from handlers that read
+ * the system clock (microseconds after the call before EnQueue):
+ *
+ *     480x272   SIGNAL 1 at 51, SIGNAL 2 at 35609, FINISH at 62409
+ *      64x64    SIGNAL 1 at 46, SIGNAL 2 at  1130, FINISH at  1952
+ *      16x16    SIGNAL 1 at 41, SIGNAL 2 at   126, FINISH at   138
+ *
+ * The drawing (the back end) takes 623.6 and 19.06 microseconds a sprite at
+ * the two larger sizes: 209.2 pixels a microsecond, with nothing to spare for
+ * a cost per primitive (GE_PIXEL_UNITS). The command processor (the front
+ * end) runs ahead of it and calls a SIGNAL's handler when it reaches it: at
+ * both larger sizes SIGNAL 2 comes 43.0 sprites' drawing before FINISH, so up
+ * to 43 drawing commands wait between the two (GE_FIFO_PRIMS). At 16x16 the
+ * front end is the slower part: 85 microseconds for 100 VADDR and PRIM pairs
+ * between the SIGNALs, 0.85 a sprite. How that splits between a command word,
+ * a primitive's set-up and a vertex is not measured; GE_COMMAND_UNITS,
+ * GE_PRIM_UNITS and GE_VERTEX_UNITS divide it as 0.1 a word, 0.6 a PRIM and
+ * 0.025 a vertex, so a long strip is not charged as if each vertex were a
+ * sprite. A FINISH waits for the back end to finish; then it calls its
+ * handler and the list is done. The 16x16 sprites draw faster than 209.2 a
+ * microsecond (0.97 a sprite, not 1.22), which this leaves out: small
+ * primitives are charged up to a quarter too much.
+ *
+ * The clock is the guest's (clock.h): virtual microseconds, a tick per
+ * firmware call or clock read, a frame per vblank, and a jump to the next
+ * deadline when every thread waits. sceKernelGetSystemTimeLow reads it, and
+ * so do the stamps of step 81. The GE keeps its own time on that clock,
+ * g_ge_t for the front end and g_ge_back for the back end, in
+ * GE_UNITS_PER_US units a microsecond. It starts a command only while g_ge_t
+ * is behind the moment it may reach: the present at a firmware call
+ * (psp_ge_tick), GE_KICK_WINDOW_US past it inside EnQueue, UpdateStallAddr
+ * and Continue, the next deadline when every thread waits
+ * (psp_ge_idle_run), and no limit in a Sync that waits or at a frame
+ * boundary. The kick window is the 11-17 microseconds by which step 81's
+ * EnQueue returns after its first SIGNAL's handler; the GE starts on a list
+ * GE_ENQUEUE_US into the EnQueue call, which returns at the window's end.
+ *
+ * When a handler runs, the guest clock is moved up to the GE's time for it,
+ * where the caller is waiting on the GE anyway: in a Sync that waits, while
+ * every thread waits, and inside the kick window. A Sync that waits so takes
+ * as long as the GE does: step 81's DrawSync returns at 62474 on the PSP.
+ * Only the drain at a frame boundary (psp_ge_drain_all), which is no wait,
+ * still lets the GE's work cost no time. */
+#define GE_UNITS_PER_US   (1ull << 20)
+#define GE_COMMAND_UNITS  (GE_UNITS_PER_US / 10)
+#define GE_PRIM_UNITS     (GE_UNITS_PER_US * 6 / 10)
+#define GE_VERTEX_UNITS   (GE_UNITS_PER_US / 40)
+#define GE_PIXEL_UNITS    5012ull      /* 2^20 / 209.2 */
+#define GE_FIFO_PRIMS     43
+#define GE_KICK_WINDOW_US 11ull
+#define GE_ENQUEUE_US     40ull
+static uint64_t g_ge_t;        /* the front end's time, in units */
+static uint64_t g_ge_back;     /* when the back end has drawn all it was given */
+static uint64_t g_ge_fifo[GE_FIFO_PRIMS];   /* when each of the last drawing commands is drawn */
+static unsigned g_ge_fifo_i;
+static uint64_t g_ge_limit;    /* a walk starts no command at or past this; 0: no limit */
+static int      g_ge_backlog;  /* released words may be waiting for the GE */
+static int      g_ge_follow;   /* the guest clock follows the GE to each handler */
+
+/* A handler the GE has asked for between firmware calls, waiting to run.
+ *
+ * Inside EnQueue, UpdateStallAddr and Continue, and in a Sync that waits,
+ * handlers run as the GE reaches them. When the GE catches up at a firmware
+ * call, a SIGNAL or FINISH it reaches is held here instead, and the GE waits
+ * on it; the handler runs at the next firmware call made with interrupts
+ * enabled, which is when the interrupt would have been taken. geprobe 5 step
+ * 50 (fw 6.60) is the measurement: libgu's sceGuFinish releases a sprite and
+ * the FINISH, then suspends and resumes interrupts, and the finish handler
+ * runs after it has returned. `at` is the GE's time when it reached it; one
+ * reached while every thread waits is held until the clock gets there. */
+static struct { int valid, cbid, finish; uint32_t id; uint64_t at; } g_ge_pend;
+static int g_ge_defer;         /* hold handlers in g_ge_pend (a catch-up) */
+
+static uint64_t ge_now(void) { return psp_clock_peek() * GE_UNITS_PER_US; }
+
+/* sceGeSetCallback's registrations: PSPSDK pspge.h's PspGeCallbackData,
+ * copied at registration, indexed by the id it returns. */
+#define GE_MAX_CALLBACKS 16
+static struct {
+    int      used;
+    uint32_t signal_func, signal_arg, finish_func, finish_arg;
+} g_ge_cb[GE_MAX_CALLBACKS];
 
 /* Display-list capture, defined at the end of the file with the rest of it;
  * declared here because both the list runner and the enqueue path call into
@@ -318,6 +496,11 @@ static void note_colour(uint32_t c) {
  * matrix rather than skip a word of it. */
 static struct {
     float world[12], view[12], proj[16];
+    /* Eight bone matrices, 4 columns of 3 like the world matrix, and the
+     * eight morph weights. */
+    float bone[8 * 12];
+    int   bone_n;
+    float morph_w[8];
     /* Texture coordinate generation. TEX_MAP_MODE's low two bits choose where
      * texture coordinates come from -- 0 the vertex's own, 1 the generation
      * matrix, 2 the environment map -- and bits 8..9 choose what that matrix is
@@ -412,10 +595,17 @@ typedef struct {
 
 static struct {
     uint32_t fbp, fbw, fbfmt, vtype, vaddr, iaddr;
+    uint32_t zbp, zbw;
+    /* PATCHDIVISION, PATCHPRIMITIVE (0 triangles, 1 lines, 2 points) and
+     * PATCHFACING. */
+    int      patch_du, patch_dv, patch_prim, patch_face;
     ge_target targets[GE_MAX_TARGETS];
     int       n_targets, cur_target;
     uint64_t  target_overflow;
-    int      sc_x0, sc_y0, sc_x1, sc_y1;
+    int      sc_x0, sc_y0, sc_x1, sc_y1, sc_set;
+    /* The last BBOX's verdict: set when every corner of the box fell beyond
+     * one edge of the scissor, which is when BJUMP jumps. */
+    int      bbox_hidden;
     /* Texture state, recorded so the sampler can be built against what this
      * game uses rather than against the whole hardware surface. */
     uint32_t tex_addr, tex_stride, tex_w, tex_h, tex_enable;
@@ -501,6 +691,14 @@ static void ge_note_thread(void) {
 
 void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
+    g_ge_t = g_ge_limit = g_ge_back = 0;
+    memset(g_ge_fifo, 0, sizeof g_ge_fifo);
+    g_ge_fifo_i = 0;
+    g_ge_backlog = 0;
+    g_ge_follow = 0;
+    memset(&g_ge_pend, 0, sizeof g_ge_pend);
+    g_ge_defer = 0;
+    memset(g_ge_cb, 0, sizeof g_ge_cb);
     memset(&g_ge, 0, sizeof g_ge);
     g_ge.fbfmt = 3;
     g_ge.tex_scale_u = g_ge.tex_scale_v = 1.0f;
@@ -864,12 +1062,23 @@ uint32_t psp_ge_target(void) { return g_ge.fbp ? ge_fb_address(g_ge.fbp) : 0; }
 /* Size of one vertex in bytes, and the offsets within it. Components appear in
  * a fixed order (weights, texture, colour, normal, position) and each is
  * aligned to its own size, which is what makes the stride awkward enough to be
- * worth computing rather than assuming. */
+ * worth computing rather than assuming.
+ *
+ * With morphing (VT_MORPH > 1) the whole record repeats once per vertex set,
+ * weights included, and the stride returned is the full vertex's: geprobe 2
+ * scene 21 (fw 6.60) draws weights (1, 0) from records 0, 2 and 4 of a
+ * two-set array and (0, 1) from 1, 3 and 5. g_vl keeps the rest. */
+static struct {
+    int w_fmt, w_n;          /* weight format (VT_WEIGHT) and count; w_fmt 0: none */
+    int set_stride, morph_n; /* one vertex set's size, and how many sets */
+} g_vl;
+
 static int vertex_layout(uint32_t vtype, int *col_off, int *pos_off, int *tex_off, int *norm_off) {
     static const int tex_sz[4]   = { 0, 1, 2, 4 };
     static const int col_sz[8]   = { 0, 0, 0, 0, 2, 2, 2, 4 };
     static const int norm_sz[4]  = { 0, 1, 2, 4 };
     static const int pos_sz[4]   = { 0, 1, 2, 4 };
+    static const int w_sz[4]     = { 0, 1, 2, 4 };
 
     int off = 0, align = 1;
     int t = tex_sz[VT_TEX(vtype)] * 2;
@@ -877,7 +1086,10 @@ static int vertex_layout(uint32_t vtype, int *col_off, int *pos_off, int *tex_of
     int n = norm_sz[VT_NORMAL(vtype)] * 3;
     int p = pos_sz[VT_POS(vtype)] * 3;
 
-    if (VT_WEIGHT(vtype)) return 0;          /* skinning: not handled */
+    g_vl.w_fmt = VT_WEIGHT(vtype);
+    g_vl.w_n = g_vl.w_fmt ? VT_WCOUNT(vtype) : 0;
+    g_vl.morph_n = VT_MORPH(vtype);
+    if (g_vl.w_fmt) { off = w_sz[g_vl.w_fmt] * g_vl.w_n; align = w_sz[g_vl.w_fmt]; }
 
     int ts = tex_sz[VT_TEX(vtype)];
     if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t;
@@ -895,7 +1107,8 @@ static int vertex_layout(uint32_t vtype, int *col_off, int *pos_off, int *tex_of
     off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
     if (ps > align) align = ps;
 
-    return (off + align - 1) & ~(align - 1);  /* stride */
+    g_vl.set_stride = (off + align - 1) & ~(align - 1);
+    return g_vl.set_stride * g_vl.morph_n;    /* stride */
 }
 
 /* The address of element i of the current draw. Bits 11..12 of the vertex
@@ -944,6 +1157,7 @@ static uint32_t current_colour(void) {
 
 static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
                        int tex_off, psp_vertex *out) {
+    out->spec = 0; out->spec_set = 0;
     out->rgba = current_colour();
     out->u = out->v = 0.0f;
     out->inv_w = out->tex_q = 1.0f; /* through mode is affine in screen space */
@@ -978,15 +1192,18 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
 
     switch (VT_POS(vtype)) {
     case 2:   /* 16-bit: whole pixels, onto the 1/16 grid */
-        out->x = (int)(int16_t)psp_read16(addr + (uint32_t)pos_off) * PSP_SUBPX;
-        out->y = (int)(int16_t)psp_read16(addr + (uint32_t)pos_off + 2) * PSP_SUBPX;
+        /* Saturated to 12.4 like a float's (fx16_sat): geprobe 5 (fw 6.60)
+         * scene 28 draws its 16-bit triangles with vertices at x -5000 and
+         * 5000 pixel for pixel as it draws the same ones given as floats. */
+        out->x = fx16_sat((float)(int16_t)psp_read16(addr + (uint32_t)pos_off));
+        out->y = fx16_sat((float)(int16_t)psp_read16(addr + (uint32_t)pos_off + 2));
         /* Through-mode depth is already a window value, and unsigned: the
          * screen z range is 0..65535, not -32768..32767. */
         out->z = (float)(uint16_t)psp_read16(addr + (uint32_t)pos_off + 4);
         return 1;
-    case 3: { /* float: floored onto the 1/16 grid, fraction kept */
-        out->x = fx16_floor(psp_read_f32(addr + (uint32_t)pos_off));
-        out->y = fx16_floor(psp_read_f32(addr + (uint32_t)pos_off + 4));
+    case 3: { /* float: floored onto the 1/16 grid, fraction kept, saturated */
+        out->x = fx16_sat(psp_read_f32(addr + (uint32_t)pos_off));
+        out->y = fx16_sat(psp_read_f32(addr + (uint32_t)pos_off + 4));
         out->z = psp_read_f32(addr + (uint32_t)pos_off + 8);
         return 1;
     }
@@ -1160,12 +1377,130 @@ static void mul_3x3(const float m[12], const float in[3], float out[3]) {
     out[2] = m[2]*in[0] + m[5]*in[1] + m[8]*in[2];
 }
 
+/* v with its significand cut to `bits` bits, toward zero or (round) to
+ * nearest. */
+static double ge_cut(double v, int bits, int round) {
+    if (v == 0.0 || !isfinite(v)) return v;
+    int e;
+    const double m = ldexp(frexp(v, &e), bits);
+    return ldexp(round ? floor(m + 0.5) : trunc(m), e - bits);
+}
+
+/* The GE's own float: sign, exponent and 16 significant bits, cut toward
+ * zero. The projection below computes in it (ge_proj_row, ge_screen_z). */
+static double ge24(double v) { return ge_cut(v, 16, 0); }
+
+/* One row of the projection, eye to clip, as the GE forms it: each eye
+ * coordinate cut to ge24, each product cut to ge24, the three products and
+ * the translation summed without a cut: geprobe 7 scene 45's fit for the
+ * depth row (ge_screen_z), where summing a step at a time in ge24, as
+ * before, does worse. */
+static float ge_proj_row(const float m[16], int row, const float in[3]) {
+    const double x = ge24(in[0]), y = ge24(in[1]), z = ge24(in[2]);
+    return (float)(ge24((double)m[row] * x) + ge24((double)m[4 + row] * y) +
+                   ge24((double)m[8 + row] * z) + m[12 + row]);
+}
+
 static void mul_4x4(const float m[16], const float in[3], float out[4]) {
     out[0] = m[0]*in[0] + m[4]*in[1] + m[8] *in[2] + m[12];
     out[1] = m[1]*in[0] + m[5]*in[1] + m[9] *in[2] + m[13];
     out[2] = m[2]*in[0] + m[6]*in[1] + m[10]*in[2] + m[14];
     out[3] = m[3]*in[0] + m[7]*in[1] + m[11]*in[2] + m[15];
 }
+
+/* One vertex as the transform stage takes it, after skinning and morphing:
+ * model-space position and normal, colour, and texture coordinates in texels
+ * (read_uv_model's units). Patches are tessellated into these too. */
+typedef struct { float pos[3], nrm[3]; uint32_t rgba; float u, v; } ge_mvert;
+
+/* A vertex's skinning weights. Normalised like the other narrow fields: an
+ * 8-bit weight of 0x80 is 1.0 -- geprobe 2 scene 20 (fw 6.60) draws weights
+ * 0x80, 0x40+0x40 and 0xFF where 1.0, 0.5+0.5 and 1.99 put them -- and a
+ * 16-bit one of 0x8000 is assumed to be by the same rule. */
+static void read_weights(uint32_t a, float *w) {
+    for (int i = 0; i < g_vl.w_n; i++) {
+        switch (g_vl.w_fmt) {
+        case 1:  w[i] = (float)psp_read8(a + (uint32_t)i) / 128.0f; break;
+        case 2:  w[i] = (float)psp_read16(a + 2u * (uint32_t)i) / 32768.0f; break;
+        default: w[i] = psp_read_f32(a + 4u * (uint32_t)i); break;
+        }
+    }
+}
+
+/* One vertex set of a record: its fields, skinned when it carries weights.
+ * Skinning is the weighted sum of the vertex through each bone, ahead of the
+ * world matrix; the normal goes through the bones' rotation parts. */
+static int read_vertex_set(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
+                           int norm_off, int want_normal, ge_mvert *o) {
+    const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)g_vl.set_stride);
+    float p[3], n[3];
+    if (!read_pos_model_at(vp, a, vtype, pos_off, p)) return 0;
+    if (want_normal) read_normal_model_at(vp, a, vtype, norm_off, n);
+    else { n[0] = n[1] = 0.0f; n[2] = 1.0f; }
+    o->rgba = current_colour();
+    if (col_off >= 0 && VT_COLOR(vtype) == 7) o->rgba = psp_read32(a + (uint32_t)col_off);
+    psp_vertex uv;
+    read_uv_model_at(vp, a, vtype, tex_off, &uv);
+    o->u = uv.u; o->v = uv.v;
+    if (g_vl.w_fmt) {
+        float w[8];
+        read_weights(a, w);
+        float sp[3] = { 0, 0, 0 }, sn[3] = { 0, 0, 0 };
+        for (int i = 0; i < g_vl.w_n; i++) {
+            float t[3];
+            mul_4x3(&g_tl.bone[12 * i], p, t);
+            for (int k = 0; k < 3; k++) sp[k] += w[i] * t[k];
+            if (want_normal) {
+                mul_3x3(&g_tl.bone[12 * i], n, t);
+                for (int k = 0; k < 3; k++) sn[k] += w[i] * t[k];
+            }
+        }
+        memcpy(p, sp, sizeof p);
+        if (want_normal) memcpy(n, sn, sizeof n);
+    }
+    memcpy(o->pos, p, sizeof p);
+    memcpy(o->nrm, n, sizeof n);
+    return 1;
+}
+
+/* A whole record: its vertex sets blended by the morph weights, when there
+ * is more than one. Every field is blended, colour included -- scene 21's
+ * half-and-half triangle is half-way in colour as well as in place. The
+ * blended colour is truncated, not rounded: scene 21's triangles weighted
+ * 0.5/0.5 and 0.25/1.0 (127.5 and 63.75 per channel) differ from the
+ * hardware on 1170 fewer pixels so (1620 -> 450). What is left is in those
+ * two triangles and not pinned down; the whole-weight ones are exact. */
+static int read_mvert(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
+                      int norm_off, int want_normal, ge_mvert *o) {
+    if (g_vl.morph_n <= 1)
+        return read_vertex_set(a, vtype, col_off, pos_off, tex_off, norm_off, want_normal, o);
+    float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, col[4] = { 0, 0, 0, 0 }, u = 0, v = 0;
+    for (int k = 0; k < g_vl.morph_n; k++) {
+        ge_mvert s1;
+        if (!read_vertex_set(a + (uint32_t)(k * g_vl.set_stride), vtype, col_off, pos_off, tex_off,
+                             norm_off, want_normal, &s1))
+            return 0;
+        const float w = g_tl.morph_w[k];
+        for (int i = 0; i < 3; i++) { pos[i] += w * s1.pos[i]; nrm[i] += w * s1.nrm[i]; }
+        for (int i = 0; i < 4; i++) col[i] += w * (float)((s1.rgba >> (8 * i)) & 0xFFu);
+        u += w * s1.u; v += w * s1.v;
+    }
+    memcpy(o->pos, pos, sizeof pos);
+    memcpy(o->nrm, nrm, sizeof nrm);
+    o->rgba = 0;
+    for (int i = 0; i < 4; i++) {
+        int c = (int)col[i];
+        if (c < 0) c = 0;
+        if (c > 255) c = 255;
+        o->rgba |= (uint32_t)c << (8 * i);
+    }
+    o->u = u; o->v = v;
+    return 1;
+}
+
+/* Set while a patch draws: draw_prim_transformed then takes vertex i from
+ * here rather than from the vertex array. */
+static const ge_mvert *g_mv_src;
 
 /* Clip space to screen. The viewport is the game's if it set one; the fallback
  * is the standard 480x272 arrangement, with y scaled negative because screen y
@@ -1185,9 +1520,77 @@ static void ndc_to_screen(float nx, float ny, float nz, float *sx, float *sy, fl
                                : (nz * 0.5f + 0.5f) * 65535.0f;
 }
 
+/* Screen depth from clip z and w: clip z as ge_proj_row forms it, times 1/w
+ * (w cut to ge24, its reciprocal to 24 bits, both toward zero), the product
+ * cut to 18 bits, then the scale and the centre with the sum rounded to 16
+ * bits, and the result to an integer by the rasterizer (sw_tri), which
+ * floors it. geprobe 7 (fw 6.60) scene 45 draws 3840 points, each at its own
+ * eye depth from -1.05 to -99, and reads their depths back (3720 outside
+ * the dump's unreadable columns): this fits 2883, where the 17-bit rounded
+ * reciprocal of the float w it replaces fit 1703 (2137 of the scene's depth
+ * pixels off -> 837). It keeps the eleven depths geprobes 5 and 6 pinned
+ * that one on: scenes 17 and 27's eye z -4, -4.5, -5, -5.5, -6 and -8 as
+ * 15887, 14049, 12577, 11374, 10371 and 7612, scene 36's -4.9, -5.2,
+ * -5.4, -5.6 and -5.7 as 12848, 12068, 11597, 11159 and 10952. It is the
+ * best of 460,800 variants searched (the eye z cut to 16 or 17 bits, each
+ * later step cut to 16 to 24 bits or not, truncated or rounded, a divide
+ * or a 16- to 24-bit reciprocal, the viewport scale before or after the
+ * divide, the integer floored or rounded); its ties differ only in cutting
+ * the sum at 20 bits or more. The misses are a step either way, low where
+ * the fraction this leaves is small and high where it is large, so the
+ * GE's arithmetic is up to half a step from this somewhere the family does
+ * not reach. geprobe 7 scene 48 reads one more: eye z -5.3 as 11829, where
+ * this gives 11828.75. */
+static float ge_screen_z(float cz, float w) {
+    if (g_tl.vp_zs == 0.0f) return ((cz / w) * 0.5f + 0.5f) * 65535.0f;
+    const double ndc = ge_cut((double)cz * ge_cut(1.0 / ge24(w), 24, 0), 18, 0);
+    return (float)ge_cut((double)g_tl.vp_zc + (double)g_tl.vp_zs * ndc, 16, 1);
+}
+
 static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
     const float inv = 1.0f / clip[3];
     ndc_to_screen(clip[0] * inv, clip[1] * inv, clip[2] * inv, sx, sy, sz);
+    *sz = ge_screen_z(clip[2], clip[3]);
+}
+
+/* The same projection onto the rasterizer's grid, as screen_axis_fx16 says.
+ *
+ * A vertex the GE read from memory (plain, skinned or morphed) comes here
+ * with clip x, y and w from ge_proj_row; 1/w is cut to 24 bits, as for
+ * depth (ge_screen_z), and each quotient to ge24. geprobe 7 (fw 6.60) scene
+ * 48 shows why: six of its corners sit a sixteenth further from the centre
+ * than ge_recip's rule put them -- each one's triangle has a depth plane
+ * 100 to 500 pixels off that matches once the corner moves, and the colour
+ * dump's six differing pixels are at those corners. Of 49,920 variants
+ * searched (the eye coordinates, the products, w, the quotient and the
+ * scaled position each cut to 16 to 24 bits or left alone, a reciprocal of
+ * 13 to 24 bits truncated or rounded, exact, or a divide), every one that
+ * puts the 198 coordinates of scene 48's depth-confirmed corners where the
+ * hardware has them, scene 15's corner at -1808 and scene 18's at -28944
+ * cuts the eye coordinates to 16 bits, and with this reciprocal the
+ * quotient too. Against run 7: scene 16 497 -> 369 pixels off, scene 36's
+ * depth 696 -> 56, scene 39 217 -> 7, scene 48 6 -> 0 and its depth
+ * 1898 -> 958; skinned and morphed scenes 20 and 21 stay at 101 and 400.
+ * A tessellated vertex keeps ge_recip's rule on the float clip position
+ * (ge_recip says why). */
+static void clip_to_fx16(const float clip[4], int *x, int *y) {
+    float nx, ny;
+    if (g_mv_src) {
+        const float inv = ge_recip(clip[3]);
+        nx = clip[0] * inv;
+        ny = clip[1] * inv;
+    } else {
+        const double inv = ge_cut(1.0 / (double)clip[3], 24, 0);
+        nx = (float)ge24((double)clip[0] * inv);
+        ny = (float)ge24((double)clip[1] * inv);
+    }
+    if (g_tl.vp_set) {
+        *x = screen_axis_fx16(nx, g_tl.vp_xs, g_tl.vp_xc - g_tl.off_x);
+        *y = screen_axis_fx16(ny, g_tl.vp_ys, g_tl.vp_yc - g_tl.off_y);
+    } else {
+        *x = screen_axis_fx16(nx, 240.0f, 240.0f);
+        *y = screen_axis_fx16(ny, -136.0f, 136.0f);
+    }
 }
 
 /* Transformed geometry, one primitive at a time.
@@ -1370,6 +1773,16 @@ static void lerp_clip(const clipvert *a, const clipvert *b, float t, clipvert *o
         r |= (uint32_t)q << (8 * k);
     }
     o->v.rgba = r;
+    if (a->v.spec_set || b->v.spec_set) {
+        const uint32_t sa = a->v.spec_set ? a->v.spec : 0, sb = b->v.spec_set ? b->v.spec : 0;
+        uint32_t sr = 0;
+        for (int k = 0; k < 3; k++) {
+            const float ca = (float)((sa >> (8 * k)) & 0xFFu), cb = (float)((sb >> (8 * k)) & 0xFFu);
+            sr |= (uint32_t)(int)(ca + (cb - ca) * t + 0.5f) << (8 * k);
+        }
+        o->v.spec = sr;
+        o->v.spec_set = 1;
+    }
     int fg = (int)((float)a->v.fog + ((float)b->v.fog - (float)a->v.fog) * t + 0.5f);
     if (fg < 0) fg = 0;
     if (fg > 255) fg = 255;
@@ -1420,8 +1833,7 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
             g_clip_guard += (uint64_t)n; return;
         }
         v[i] = p[i].v;
-        v[i].x = fx16_floor(x + 1.0f / (2 * PSP_SUBPX));
-        v[i].y = fx16_floor(y + 1.0f / (2 * PSP_SUBPX));
+        clip_to_fx16(p[i].c, &v[i].x, &v[i].y);
         v[i].precise_x = x; v[i].precise_y = y; v[i].precise = 1;
         v[i].z = g_tl.depth_clamp ? fmaxf(0, fminf(65535, z)) : z;
         v[i].inv_w = 1.0f / p[i].c[3];
@@ -1460,14 +1872,14 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
         const float inv = 1.0f / poly[i].c[3];
         float sx, sy, sz;
         ndc_to_screen(poly[i].c[0] * inv, poly[i].c[1] * inv, poly[i].c[2] * inv, &sx, &sy, &sz);
+        sz = ge_screen_z(poly[i].c[2], poly[i].c[3]);
         if (g_tl.depth_clamp) {
             if (sz < 0.0f) sz = 0.0f;
             if (sz > 65535.0f) sz = 65535.0f;
         }
         if (sx < -ox || sx >= 4096.0f - ox || sy < -oy || sy >= 4096.0f - oy) any_out = 1;
         p[i] = poly[i].v;
-        p[i].x = fx16_floor(sx + 1.0f / (2 * PSP_SUBPX));
-        p[i].y = fx16_floor(sy + 1.0f / (2 * PSP_SUBPX));
+        clip_to_fx16(poly[i].c, &p[i].x, &p[i].y);
         p[i].precise_x = sx; p[i].precise_y = sy; p[i].precise = 1;
         p[i].z = sz;
         /* Keep the divide's missing term with the screen-space vertex.  UVs
@@ -1488,6 +1900,10 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
     if (flip) area = -area;
     if (g_tl.cull_enable && area != 0 && ((area < 0) == (g_tl.cull_ccw != 0))) { g_culled += 3; return; }
 
+    /* A flat triangle is its last vertex's colour; the clip's cut vertices
+     * would otherwise hand the rasterizer an interpolated one as the last. */
+    if (g_tl.blend.shade_flat)
+        for (int i = 0; i < n; i++) p[i].rgba = tri[2].v.rgba;
     for (int i = 1; i + 1 < n; i++) {
         const psp_vertex t[3] = { p[0], p[i], p[i + 1] };
         be->draw(PSP_PRIM_TRIANGLES, t, 3);
@@ -1524,6 +1940,36 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
  *    Below the cutoff the light contributes nothing.
  *  - Directional lights ignore attenuation and take their position field as
  *    a direction.
+ *
+ * Two more from geprobe 5 scene 25 (fw 6.60), which lights one flat quad per
+ * normal with white lights and materials, 198 values, all matched:
+ *  - The powers (specular, powered diffuse) are ge_pow's, a piecewise-linear
+ *    log2 and exp2, not pow(): N.H = 0.9 with coefficient 4 reads 153
+ *    (0.6), where 0.9^4 = 0.656 would give 167. The two wide quads read one
+ *    value from edge to edge, so the eye direction is the fixed +Z above,
+ *    and normals are normalised (the 0.9 normal scaled by 2 and by 0.5
+ *    reads as the unit one).
+ *  - A lit channel goes to 8 bits as floor(256 * value), 1.0 being a full
+ *    255 light on a 255 material: N.L = 0.99 reads 253, where rounding
+ *    255 * 0.99 gives 252 and 0.6 reads 153, not 154. That is the byte
+ *    arithmetic at lit_mul, below, seen through a white light.
+ *
+ * And the sum, from geprobe 7 (fw 6.60), scenes 16 and 43:
+ *  - Each light adds lit_mul(spot, lit_mul(attenuation, term)), the term
+ *    being its ambient plus its diffuse, and its specular separately; the
+ *    factors are bytes too (lit_byte). Geprobe 6 scene 35's attenuated and
+ *    spot-lit points fit this on 790 of 800 (run 7). The 10 others are a
+ *    step low, each where ge_pow's spot or specular power lands just below
+ *    a byte boundary (within 0.04 of one): the GE's power comes out a hair
+ *    higher there.
+ *  - Single-colour mode (LIGHTMODE 0) adds the specular in and clamps the
+ *    total to 255 per vertex: scene 16's bottom right fan, whose rims sum
+ *    past 255 in blue, is 630 pixels off with the excess carried to the
+ *    pixel and 92 with it clamped here, the 92 being slips its unclamped
+ *    neighbour shows too.
+ *  - Separate-specular mode keeps the specular apart, clamped on its own,
+ *    as the vertex's secondary colour (psp_vertex.spec), which the
+ *    rasterizer interpolates and adds per pixel.
  */
 /* Lighting happens in eye space, and the fixed eye direction above is the
  * evidence: a constant (0,0,1) is only meaningful where the viewer looks down
@@ -1558,21 +2004,66 @@ static void lights_to_eye(void) {
     }
 }
 
+/* x^k as the GE's lighting computes it (geprobe 5 scene 25, fw 6.60): a log2
+ * that reads a float's exponent and mantissa as e + (m - 1), m in [1, 2), and
+ * the matching exp2, 2^n * (1 + f) for the integer and fractional parts of the
+ * product. With k = 1 it is x itself; N.H = 0.9 gives 0.8, 0.6, 0.35, 0.2 and
+ * 0.1125 for k = 2, 4, 8, 12 and 16, which is what the hardware drew. The
+ * spot exponent goes through it too (geprobe 6 scene 35, fw 6.60): of 200
+ * points lit by a spot of exponent 4, 174 read ge_pow's value and 122
+ * powf's, and with exponent 1.5, 144 and 88. With the byte arithmetic of
+ * geprobe 7 (lit_mul) 197 and all 200 read it, and the three left are a
+ * step off next to a byte boundary: ge_pow's own precision, not known. */
+static float ge_pow(float x, float k) {
+    if (!(x > 0.0f)) return 0.0f;
+    int e;
+    const float m = frexpf(x, &e);                          /* [0.5, 1) */
+    const float y = k * ((float)(e - 1) + (2.0f * m - 1.0f));
+    if (!(y > -126.0f)) return 0.0f;
+    const float n = floorf(y);
+    return ldexpf(1.0f + (y - n), (int)n);
+}
+
 static inline int any_light_enabled(void) {
     return g_tl.light[0].enable || g_tl.light[1].enable || g_tl.light[2].enable || g_tl.light[3].enable;
 }
-static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba) {
-    const float vc[3] = { (float)(*rgba & 0xFFu) / 255.0f,
-                          (float)((*rgba >> 8) & 0xFFu) / 255.0f,
-                          (float)((*rgba >> 16) & 0xFFu) / 255.0f };
+
+/* The lit colour's arithmetic is in bytes (geprobe 7 scene 43, fw 6.60). A
+ * byte x stands for (x + 1/2)/256, and the product of two is
+ *
+ *     lit_mul(a, b) = floor((a + 1/2)(b + 1/2) / 256),
+ *
+ * so 255 times x is x, and 192 times 1 is 1 where the exact 192/255 * 1/255
+ * would floor to 0. Scene 43 steps every byte through a 255, 192 and 128
+ * partner, as light or as material, and all 1536 values fit; light and
+ * material give the same table either way round. N.L and the other factors
+ * become bytes first, floor(256 x) up to 255 (lit_byte): row E steps N.L
+ * under a 0x80C0FF light and its 768 values fit only so, where an exact
+ * N.L times the colour misses 75. A light's diffuse term is
+ * lit_mul(N.L, lit_mul(light, material)), and every value of geprobe 6
+ * scene 34 fits it, coloured rows included (12737 pixels were off). */
+static inline int lit_mul(int a, int b) { return ((2 * a + 1) * (2 * b + 1)) >> 10; }
+static inline int lit_byte(float x) {
+    if (!(x > 0.0f)) return 0;
+    const float q = x * 256.0f;
+    return q >= 255.0f ? 255 : (int)q;
+}
+static inline int lit_colour_byte(float c) { return (int)lrintf(c * 255.0f); }
+
+static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, psp_vertex *lit) {
+    const int vc[3] = { (int)(*rgba & 0xFFu), (int)((*rgba >> 8) & 0xFFu), (int)((*rgba >> 16) & 0xFFu) };
     /* MATERIAL_COLOR picks which material components the vertex colour
      * supplies: bit 0 ambient, bit 1 diffuse, bit 2 specular. */
-    const float *m_amb = (g_tl.mat_update & 1) ? vc : g_tl.mat_ambient;
-    const float *m_dif = (g_tl.mat_update & 2) ? vc : g_tl.mat_diffuse;
-    const float *m_spc = (g_tl.mat_update & 4) ? vc : g_tl.mat_specular;
+    int m_amb[3], m_dif[3], m_spc[3];
+    for (int k = 0; k < 3; k++) {
+        m_amb[k] = (g_tl.mat_update & 1) ? vc[k] : lit_colour_byte(g_tl.mat_ambient[k]);
+        m_dif[k] = (g_tl.mat_update & 2) ? vc[k] : lit_colour_byte(g_tl.mat_diffuse[k]);
+        m_spc[k] = (g_tl.mat_update & 4) ? vc[k] : lit_colour_byte(g_tl.mat_specular[k]);
+    }
 
-    float out[3];
-    for (int k = 0; k < 3; k++) out[k] = g_tl.mat_emissive[k] + g_tl.global_amb[k] * m_amb[k];
+    int out[3], sec[3] = { 0, 0, 0 };
+    for (int k = 0; k < 3; k++)
+        out[k] = lit_colour_byte(g_tl.mat_emissive[k]) + lit_mul(lit_colour_byte(g_tl.global_amb[k]), m_amb[k]);
 
     /* With every light disabled the colour is emissive plus ambient and the
      * normal never enters: skip normalising it and the loop. Same result. */
@@ -1583,7 +2074,7 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba) {
 
     for (int i = 0; i < 4; i++) {
         if (!g_tl.light[i].enable) continue;
-        float L[3], att = 1.0f;
+        float L[3], att = 1.0f, spot = 1.0f;
         if (g_tl.light[i].type == 0) {
             L[0] = g_light_eye[i].pos[0]; L[1] = g_light_eye[i].pos[1]; L[2] = g_light_eye[i].pos[2];
         } else {
@@ -1603,14 +2094,13 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba) {
             const float dlen = sqrtf(D[0]*D[0] + D[1]*D[1] + D[2]*D[2]);
             if (dlen > 1e-20f) { D[0] /= dlen; D[1] /= dlen; D[2] /= dlen; }
             const float sdot = L[0]*D[0] + L[1]*D[1] + L[2]*D[2];
-            if (!(sdot >= g_tl.light[i].cutoff)) att = 0.0f;
-            else att *= powf(sdot, g_tl.light[i].exponent);
+            if (!(sdot >= g_tl.light[i].cutoff)) continue;
+            spot = ge_pow(sdot, g_tl.light[i].exponent);
         }
-        if (att == 0.0f) continue;
 
         const float ndl = n[0]*L[0] + n[1]*L[1] + n[2]*L[2];
         float dfac = ndl > 0.0f ? ndl : 0.0f;
-        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = powf(dfac, g_tl.mat_spec_coef);
+        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = ge_pow(dfac, g_tl.mat_spec_coef);
 
         float sfac = 0.0f;
         if (g_tl.light[i].kind == 1 && ndl >= 0.0f) {
@@ -1618,13 +2108,18 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba) {
             const float hlen = sqrtf(H[0]*H[0] + H[1]*H[1] + H[2]*H[2]);
             if (hlen > 1e-20f) { H[0] /= hlen; H[1] /= hlen; H[2] /= hlen; }
             const float ndh = n[0]*H[0] + n[1]*H[1] + n[2]*H[2];
-            sfac = (ndh > 0.0f) ? powf(ndh, g_tl.mat_spec_coef) : 0.0f;
+            sfac = ge_pow(ndh, g_tl.mat_spec_coef);
         }
 
-        for (int k = 0; k < 3; k++)
-            out[k] += att * (g_tl.light[i].amb[k]  * m_amb[k]
-                           + g_tl.light[i].dif[k]  * m_dif[k] * dfac
-                           + g_tl.light[i].spec[k] * m_spc[k] * sfac);
+        const int vd = lit_byte(dfac), vs = lit_byte(sfac);
+        const int va = att >= 1.0f ? 255 : lit_byte(att), vsp = spot >= 1.0f ? 255 : lit_byte(spot);
+        for (int k = 0; k < 3; k++) {
+            const int t = lit_mul(lit_colour_byte(g_tl.light[i].amb[k]), m_amb[k])
+                        + lit_mul(vd, lit_mul(lit_colour_byte(g_tl.light[i].dif[k]), m_dif[k]));
+            const int ts = lit_mul(vs, lit_mul(lit_colour_byte(g_tl.light[i].spec[k]), m_spc[k]));
+            out[k] += lit_mul(vsp, lit_mul(va, t));
+            sec[k] += lit_mul(vsp, lit_mul(va, ts));
+        }
     }
 
     }
@@ -1632,14 +2127,15 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba) {
      * is supplying the ambient. */
     uint32_t c = (g_tl.mat_update & 1) ? (*rgba & 0xFF000000u)
                                        : ((uint32_t)(g_tl.mat_alpha & 0xFF) << 24);
+    uint32_t s = 0;
     for (int k = 0; k < 3; k++) {
-        float f = out[k];
-        if (f < 0.0f) f = 0.0f;
-        if (f > 1.0f) f = 1.0f;
-        int q = (int)(f * 255.0f + 0.5f);
-        c |= (uint32_t)q << (8 * k);
+        if (!g_tl.light_mode) { out[k] += sec[k]; sec[k] = 0; }
+        c |= (uint32_t)(out[k] > 255 ? 255 : out[k]) << (8 * k);
+        s |= (uint32_t)(sec[k] > 255 ? 255 : sec[k]) << (8 * k);
     }
     *rgba = c;
+    lit->spec = s;
+    lit->spec_set = s != 0;
 }
 
 enum { GE_VERTEX_BATCH = 256 };
@@ -1764,7 +2260,8 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
     /* The backend's transform, when it offers one. Triangles only (points,
      * lines and sprites stay here), and not screen-space projections, whose
      * flag the GL backend reads to tell HUD from scene. */
-    if (be->draw_model && be->model_ok && !screen_space &&
+    const int blended = g_mv_src || g_vl.w_fmt || g_vl.morph_n > 1;
+    if (be->draw_model && be->model_ok && !screen_space && !blended &&
         (type == PSP_PRIM_TRIANGLES || type == PSP_PRIM_TRIANGLE_STRIP ||
          type == PSP_PRIM_TRIANGLE_FAN) && be->model_ok()) {
         psp_xform_state xs;
@@ -1851,30 +2348,59 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
 
         uint32_t decoded = 0;
         for (; decoded < n; decoded++) {
-            const uint32_t a = vertex_addr(done + decoded, stride);
             float model[3], world[3], eye[3], clip[4];
             const uint64_t _p0 = ge_prof_now();
-            const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)stride);
-            if (!read_pos_model_at(vp, a, g_ge.vtype, pos_off, model)) break;
+            /* A skinned, morphed or tessellated vertex arrives whole in mv;
+             * a plain one is read field by field below, as before. */
+            ge_mvert mv;
+            uint32_t a = 0;
+            const uint8_t *vp = NULL;
+            if (g_mv_src) {
+                mv = g_mv_src[done + decoded];
+                memcpy(model, mv.pos, sizeof model);
+            } else {
+                a = vertex_addr(done + decoded, stride);
+                if (blended) {
+                    if (!read_mvert(a, g_ge.vtype, col_off, pos_off, tex_off, norm_off, any_light, &mv)) break;
+                    memcpy(model, mv.pos, sizeof model);
+                } else {
+                    vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)stride);
+                    if (!read_pos_model_at(vp, a, g_ge.vtype, pos_off, model)) break;
+                }
+            }
             const uint64_t _p1 = ge_prof_now();
 
             mul_4x3(g_tl.world, model, world);
             mul_4x3(g_tl.view,  world, eye);
             mul_4x4(g_tl.proj,  eye,   clip);
+            /* z as the GE forms it, for depth (ge_screen_z), and x, y and w
+             * too for a vertex it read (clip_to_fx16); a tessellated one
+             * keeps the float x, y and w ge_recip's rule was measured with. */
+            clip[2] = ge_proj_row(g_tl.proj, 2, eye);
+            if (!g_mv_src) {
+                clip[0] = ge_proj_row(g_tl.proj, 0, eye);
+                clip[1] = ge_proj_row(g_tl.proj, 1, eye);
+                clip[3] = ge_proj_row(g_tl.proj, 3, eye);
+            }
             const uint64_t _p2 = ge_prof_now();
 
             psp_vertex *o = &v[decoded];
             o->screen_space = screen_space;
+            o->spec = 0; o->spec_set = 0;
             o->rgba = current_colour();
             o->tex_q = 1.0f;
-            if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7) {
+            if (blended) o->rgba = mv.rgba;
+            else if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7) {
                 if (vp) memcpy(&o->rgba, vp + col_off, 4);
                 else    o->rgba = psp_read32(a + (uint32_t)col_off);
             }
             /* Fog. The coefficient is (end - depth) * range with depth the
              * eye-space distance -- w of the clip position for a standard
              * projection, -z of the eye position here -- clamped to 0..1 and
-             * quantised to the hardware's byte, 255 unfogged. gpu/commands/fog
+             * quantised to the hardware's byte, 255 unfogged: floor(f * 256),
+             * clamped. geprobe 2 scene 15 (fw 6.60) fogs six quads at f of
+             * 0.861 ... 0.028 and reads 220, 177, 135, 92, 49 and 7, where
+             * rounding f * 255 gives 50 for the fifth. gpu/commands/fog
              * fixes the rest: near == far makes sceGuFog's range 1/0, and the
              * hardware reads the infinite product as fully fogged, whichever
              * sign ("Basic" and "Both neg" both read the fog colour); "Near
@@ -1883,23 +2409,25 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             if (g_tl.fog_enable) {
                 const float f = (g_tl.fog_end + eye[2]) * g_tl.fog_range;
                 if (!isfinite(f) || f <= 0.0f) o->fog = 0;
-                else if (f < 1.0f)             o->fog = (int)(f * 255.0f + 0.5f);
+                else if (f < 1.0f)             o->fog = (int)(f * 256.0f) > 255 ? 255 : (int)(f * 256.0f);
                 g_fog_verts++;
             }
             if (g_tl.lighting) {
                 float ne[3] = { 0.0f, 0.0f, 1.0f };
                 if (any_light) {
                     float nm[3], nw[3];
-                    read_normal_model_at(vp, a, g_ge.vtype, norm_off, nm);
+                    if (blended) memcpy(nm, mv.nrm, sizeof nm);
+                    else read_normal_model_at(vp, a, g_ge.vtype, norm_off, nm);
                     mul_3x3(g_tl.world, nm, nw);
                     mul_3x3(g_tl.view,  nw, ne);
                 }
-                light_vertex(eye, ne, &o->rgba);
+                light_vertex(eye, ne, &o->rgba, o);
                 g_lit_verts++;
             }
             const uint64_t _p3 = ge_prof_now();
             note_colour(o->rgba);
-            read_uv_model_at(vp, a, g_ge.vtype, tex_off, o);
+            if (blended) { o->u = mv.u; o->v = mv.v; }
+            else read_uv_model_at(vp, a, g_ge.vtype, tex_off, o);
             if (g_tl.tex_map_mode == 1) {
                 /* The source row the matrix is applied to. GU_POSITION is the
                  * model-space position, GU_UV the vertex's own coordinates,
@@ -1927,11 +2455,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             float sx, sy, sz;
             if (clip[3] > 1e-6f) to_screen(clip, &sx, &sy, &sz);
             else                 sx = sy = sz = 0.0f;
-            /* Rounded to the nearest 1/16. Hardware's exact rule past the
-             * fourth bit is unmeasured here; what gpu/textures/size measures
-             * is that the far edge lands on the pixel it should. */
-            o->x = fx16_floor(sx + 1.0f / (2 * PSP_SUBPX));
-            o->y = fx16_floor(sy + 1.0f / (2 * PSP_SUBPX));
+            /* Onto the 1/16 grid, as screen_axis_fx16 explains. */
+            if (clip[3] > 1e-6f) clip_to_fx16(clip, &o->x, &o->y);
+            else                 o->x = o->y = 0;
             o->precise_x = sx; o->precise_y = sy; o->precise = 1;
             o->z = sz;
             o->inv_w = clip[3] > 1e-6f ? 1.0f / clip[3] : 1.0f;
@@ -2114,6 +2640,18 @@ static void push_pixel_state_body(void) {
         if (g_tl.clear_mode) {
             b.enable = 0; b.alpha_test = 0; b.stencil_test = 0;
             b.write_colour = g_tl.clear_colour;
+            /* What a clear keeps and drops, from geprobe 5 scenes 29-32
+             * (fw 6.60), which clear one band each with a state on, on
+             * 8888, 5650, 5551 and 4444: blending, the logic op (XOR) and
+             * the colour and alpha tests (which the clear colour fails)
+             * change nothing, but dither and the pixel mask apply as to a
+             * draw. The dither matrix offsets the clear colour per pixel
+             * (0x80 under the extreme matrix reads 7D 7C 7F 7F ... on the
+             * first row of 8888), and PMSK1 keeps the colour bits it
+             * covers and PMSK2 the stencil bits (0xAB under 0xF0 on a
+             * stencil of 0 reads 0x0B, and on 5551 and 4444 the alpha
+             * field keeps its old value). */
+            b.colour_test = 0; b.logic_enable = 0;
         }
         psp_render_current()->set_blend(&b);
     }
@@ -2306,16 +2844,382 @@ static void draw_prim(uint32_t type, uint32_t count) {
     }
 }
 
+/* Bezier and spline patches.
+ *
+ * BEZIER (0x05) and SPLINE (0x06) name a grid of control points at VADDR,
+ * ucount across and vcount down (PSPSDK's sceGuDrawBezier/sceGuDrawSpline:
+ * ucount in bits 0-7, vcount in 8-15, and for a spline the two edge modes in
+ * 16-17 and 18-19). The GE evaluates the surface on a grid set by
+ * PATCHDIVISION and draws it as PATCHPRIMITIVE says: triangles, lines along
+ * the grid, or its points. Every attribute the control points carry is
+ * evaluated with the same weights; a vertex type without texture
+ * coordinates gets the surface parameters as coordinates (geprobe 2 scene 22,
+ * fw 6.60, maps the probe texture once across a Bezier patch that has none).
+ *
+ * The control points go through read_mvert first, so a skinned or morphed
+ * control grid is skinned or morphed before it is evaluated. */
+
+/* Where along one direction the grid samples, and with what weights: each
+ * sample blends four consecutive control points starting at `first`. The
+ * weights are exact (double): the PSP's own rounding is in patch_param and
+ * in the colour (draw_patch), and float weights moved scene 22 by 300
+ * pixels on their own. */
+typedef struct { int first; double w[4]; float param; } patch_sample;
+
+/* Step i of div along a piece, as the GE places it (geprobe 7 scene 44, fw
+ * 6.60): on a 1/256 grid, cut toward the nearer end -- floor(256 i/div)/256
+ * up to the middle and 1 - floor(256 (div - i)/div)/256 past it, so a piece
+ * reads the same from either end. Scene 44 lights one control column and row
+ * of a patch drawn as points, so each point's colour is one weight, 255
+ * times: of its 42 Bezier and open spline samples (168 weights) all fit
+ * this, 28 the exact i/div, and 29 the grid floored throughout. The points
+ * move with it: Bezier 7's fifth column sits a pixel right of i/div's. */
+static double patch_param(int i, int div) {
+    return 2 * i <= div ? floor(256.0 * i / div) / 256.0
+                        : 1.0 - floor(256.0 * (div - i) / div) / 256.0;
+}
+
+/* A Bezier direction: (count - 1) / 3 cubic pieces sharing end points, each
+ * cut into `div` steps. Returns the number of samples. */
+static int bezier_samples(int count, int div, patch_sample *out, int max) {
+    const int pieces = (count - 1) / 3;
+    int n = 0;
+    for (int pc = 0; pc < pieces; pc++) {
+        for (int i = pc ? 1 : 0; i <= div && n < max; i++) {
+            const double t = patch_param(i, div), s1 = 1.0 - t;
+            patch_sample *o = &out[n++];
+            o->first = 3 * pc;
+            o->w[0] = s1 * s1 * s1;
+            o->w[1] = 3.0 * t * s1 * s1;
+            o->w[2] = 3.0 * t * t * s1;
+            o->w[3] = t * t * t;
+            o->param = (float)pc + (float)t;
+        }
+    }
+    return n;
+}
+
+/* A spline direction: a cubic B-spline over `count` control points, count - 3
+ * spans each cut into `div` steps. Bit 0 of the edge mode opens the start and
+ * bit 1 the end (GU_OPEN_FILL is 1, GU_FILL_OPEN 2): an open end repeats its
+ * knot so the surface runs out to the edge control point, a filled one keeps
+ * the uniform knots and stops short of it. Scene 23's OPEN_OPEN patch spans
+ * its whole control grid and its FILL_FILL patch the middle third. */
+static int spline_samples(int count, int div, int edge, patch_sample *out, int max) {
+    float kn[64];
+    const int spans = count - 3;
+    if (spans < 1 || count + 4 > 64) return 0;
+    for (int k = 0; k < count + 4; k++) {
+        float t = (float)(k - 3);
+        if ((edge & 1) && t < 0.0f) t = 0.0f;
+        if ((edge & 2) && t > (float)spans) t = (float)spans;
+        kn[k] = t;
+    }
+    int n = 0;
+    for (int sp = 0; sp < spans; sp++) {
+        for (int i = sp ? 1 : 0; i <= div && n < max; i++) {
+            /* The same grid as a Bezier's: geprobe 6 scene 38's splines go
+             * from 105 pixels off to 28 with it, and scene 44's from 96 to
+             * 74. Their weights are not settled: scene 44's fill/fill
+             * splines read their two inner weights a step off the uniform
+             * B-spline's at most samples. The one rule found that fits all
+             * 40 of their readings, with t^2 and t^3 cut to 1/256, takes
+             * scene 23 from 1878 pixels off to 2036 and scene 38 from 28 to
+             * 87, so it is not used (docs/RENDERER.md). */
+            const double t = (double)sp + patch_param(i, div);
+            const int k = sp + 3;                     /* kn[k] <= t <= kn[k+1] */
+            double N[4] = { 1, 0, 0, 0 }, left[4], right[4];
+            for (int j = 1; j <= 3; j++) {
+                left[j] = t - kn[k + 1 - j];
+                right[j] = kn[k + j] - t;
+                double saved = 0.0;
+                for (int r = 0; r < j; r++) {
+                    const double den = right[r + 1] + left[j - r];
+                    const double tmp = den != 0.0 ? N[r] / den : 0.0;
+                    N[r] = saved + right[r + 1] * tmp;
+                    saved = left[j - r] * tmp;
+                }
+                N[j] = saved;
+            }
+            patch_sample *o = &out[n++];
+            o->first = k - 3;
+            for (int q = 0; q < 4; q++) o->w[q] = N[q];
+            o->param = (float)t;
+        }
+    }
+    return n;
+}
+
+enum { PATCH_MAX_SAMPLES = 256 };
+
+static void draw_patch(int spline, uint32_t arg) {
+    const int ucount = (int)(arg & 0xFF), vcount = (int)((arg >> 8) & 0xFF);
+    const int uedge = (int)((arg >> 16) & 3), vedge = (int)((arg >> 18) & 3);
+    if (!g_ge.vaddr || VT_THROUGH(g_ge.vtype) || ucount < 4 || vcount < 4) return;
+    int col_off = -1, pos_off = 0, tex_off = -1, norm_off = -1;
+    const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
+    if (!stride) return;
+    const int du = g_ge.patch_du > 0 ? g_ge.patch_du : 1, dv = g_ge.patch_dv > 0 ? g_ge.patch_dv : 1;
+
+    static patch_sample su[PATCH_MAX_SAMPLES], sv[PATCH_MAX_SAMPLES];
+    const int nu = spline ? spline_samples(ucount, du, uedge, su, PATCH_MAX_SAMPLES)
+                          : bezier_samples(ucount, du, su, PATCH_MAX_SAMPLES);
+    const int nv = spline ? spline_samples(vcount, dv, vedge, sv, PATCH_MAX_SAMPLES)
+                          : bezier_samples(vcount, dv, sv, PATCH_MAX_SAMPLES);
+    if (nu < 2 || nv < 2) return;
+
+    ge_mvert *cp = malloc(sizeof *cp * (size_t)(ucount * vcount));
+    ge_mvert *grid = malloc(sizeof *grid * (size_t)(nu * nv));
+    ge_mvert *list = malloc(sizeof *list * (size_t)(nu * nv * 6));
+    if (!cp || !grid || !list) { free(cp); free(grid); free(list); return; }
+    const int lit = g_tl.lighting && any_light_enabled();
+    int ok = 1;
+    for (int k = 0; k < ucount * vcount && ok; k++)
+        ok = read_mvert(vertex_addr((uint32_t)k, stride), g_ge.vtype, col_off, pos_off, tex_off,
+                        norm_off, lit, &cp[k]);
+    if (!ok) { free(cp); free(grid); free(list); return; }
+
+    for (int j = 0; j < nv; j++)
+        for (int i = 0; i < nu; i++) {
+            float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, u = 0, v = 0;
+            double col[4] = { 0, 0, 0, 0 };
+            for (int b = 0; b < 4; b++)
+                for (int a = 0; a < 4; a++) {
+                    const double wd = sv[j].w[b] * su[i].w[a];
+                    const float w = (float)wd;
+                    if (wd == 0.0) continue;
+                    const ge_mvert *c = &cp[(sv[j].first + b) * ucount + su[i].first + a];
+                    for (int k = 0; k < 3; k++) { pos[k] += w * c->pos[k]; nrm[k] += w * c->nrm[k]; }
+                    for (int k = 0; k < 4; k++) col[k] += wd * (double)((c->rgba >> (8 * k)) & 0xFFu);
+                    u += w * c->u; v += w * c->v;
+                }
+            ge_mvert *o = &grid[j * nu + i];
+            memcpy(o->pos, pos, sizeof pos);
+            memcpy(o->nrm, nrm, sizeof nrm);
+            /* A generated vertex's colour is the blend cut to 1/256 of a step
+             * and rounded up to a whole one. geprobe 5 (fw 6.60) scene 22's
+             * first patch, whose colours come to 63.75, 127.5, 158.008 and
+             * 191.25, fits planes through 64, 128, 159 and 192 on the PSP;
+             * rounding gave 191 and 158. The cut is geprobe 7 scene 44's: a
+             * weight of 13.0008 (Bezier 7, step 1, weight 2) reads 13, not
+             * 14, and with it all 168 of its Bezier weights fit; cut finer,
+             * at 2^-16 as this used to, 166. Plain truncation, which a
+             * morph's blend takes (read_mvert), is worse still. */
+            o->rgba = 0;
+            for (int k = 0; k < 4; k++) {
+                int c = (int)floor(col[k] + 255.0 / 256.0);
+                if (c < 0) c = 0;
+                if (c > 255) c = 255;
+                o->rgba |= (uint32_t)c << (8 * k);
+            }
+            if (tex_off < 0) {
+                u = su[i].param * g_ge.tex_scale_u + g_ge.tex_offset_u;
+                v = sv[j].param * g_ge.tex_scale_v + g_ge.tex_offset_v;
+                u *= (float)g_ge.tex_w;
+                v *= (float)g_ge.tex_h;
+            }
+            o->u = u; o->v = v;
+        }
+
+    /* The grid goes out as the GE's own strips would: one per pair of rows,
+     * alternating between them, (0,j) (0,j+1) (1,j) (1,j+1) ... As lines that
+     * sequence is a zigzag -- each column's rung and a diagonal to the next
+     * -- with no line along the rows at all: geprobe 2 scene 22 (fw 6.60)
+     * draws its line patch exactly so (627 differing pixels against 1407 for
+     * a plain grid of rows and columns). Points are the grid itself. */
+    uint32_t n = 0, type;
+    if (g_ge.patch_prim == 2) {
+        type = PSP_PRIM_POINTS;
+        for (int k = 0; k < nu * nv; k++) list[n++] = grid[k];
+    } else {
+        type = g_ge.patch_prim == 1 ? PSP_PRIM_LINES : PSP_PRIM_TRIANGLES;
+        for (int j = 0; j + 1 < nv; j++)
+            for (int i = 0; i + 1 < nu; i++) {
+                const ge_mvert *s0 = &grid[j * nu + i], *s1 = &grid[(j + 1) * nu + i];
+                const ge_mvert *s2 = &grid[j * nu + i + 1], *s3 = &grid[(j + 1) * nu + i + 1];
+                if (type == PSP_PRIM_LINES) {
+                    list[n++] = *s0; list[n++] = *s1;
+                    list[n++] = *s1; list[n++] = *s2;
+                    if (i + 2 == nu) { list[n++] = *s2; list[n++] = *s3; }
+                } else {
+                    list[n++] = *s0; list[n++] = *s1; list[n++] = *s2;
+                    list[n++] = *s1; list[n++] = *s2; list[n++] = *s3;
+                }
+            }
+    }
+    g_mv_src = list;
+    draw_prim(type, n);
+    g_mv_src = NULL;
+    free(cp); free(grid); free(list);
+}
+
 /* Walk a list until END/FINISH, the stall address, or a step budget.
  *
  * The budget is not paranoia: a list whose JUMP forms a cycle is a normal
  * intermediate state while the CPU is still writing, and without a bound a
  * malformed or partially-written list hangs the host with no diagnostic. */
 static void run_list_body(ge_queue *q);
+
+/* Set while a list is being walked. A GE callback is guest code and may call
+ * back into sceGe; a walk it would start is left to the one already running,
+ * which reads the stall afresh on every word, or to the next Sync. */
+static int g_ge_walking;
+/* Set while a handler runs outside a walk (one held for a firmware call): a
+ * firmware call it makes does not start the GE again inside it. */
+static int g_ge_in_cb;
+
+/* A SIGNAL or FINISH interrupt handler, called the way the firmware calls it:
+ * (id, arg), id being the command's low 16 bits and arg the one registered
+ * with sceGeSetCallback. geprobe step 26 (fw 6.60): SIGNAL 0x0E010044
+ * and 0x0E020055 then FINISH 0x0F000066 under signal_arg 0x5A, finish_arg
+ * 0xA5 reach the handlers as (0x44, 0x5A), (0x55, 0x5A), (0x66, 0xA5).
+ * On hardware they run in interrupt context; here on the thread driving the
+ * list, with dispatch off so a handler cannot block or be switched away. */
+static void ge_callback(int cbid, int finish, uint32_t id) {
+    if (cbid < 0 || cbid >= GE_MAX_CALLBACKS || !g_ge_cb[cbid].used) return;
+    const uint32_t fn  = finish ? g_ge_cb[cbid].finish_func : g_ge_cb[cbid].signal_func;
+    const uint32_t arg = finish ? g_ge_cb[cbid].finish_arg  : g_ge_cb[cbid].signal_arg;
+    if (!fn) return;
+    const psp_cpu_state save = psp_cpu;
+    const int was = psp_sched_set_dispatch(0);
+    psp_cpu.r[PSP_REG_A0] = id & 0xFFFFu;
+    psp_cpu.r[PSP_REG_A1] = arg;
+    psp_cpu.r[PSP_REG_RA] = 0;
+    psp_dispatch(fn);
+    psp_sched_set_dispatch(was);
+    psp_cpu = save;
+}
+
+/* The GE reaching a SIGNAL or FINISH: the handler runs now, or, during a
+ * catch-up, is held in g_ge_pend. Returns nonzero when the walk has to stop
+ * and wait for it. A list with no handler for it does not wait. */
+/* The guest clock moved up to GE time `at`, for a handler that runs there
+ * (see "When the GE runs"). Never back. */
+static void ge_clock_to(uint64_t at) {
+    const uint64_t us = at / GE_UNITS_PER_US;
+    if (us > psp_clock_peek()) psp_clock_advance_to(us);
+}
+
+static int ge_raise(int cbid, int finish, uint32_t id) {
+    if (cbid < 0 || cbid >= GE_MAX_CALLBACKS || !g_ge_cb[cbid].used ||
+        !(finish ? g_ge_cb[cbid].finish_func : g_ge_cb[cbid].signal_func)) return 0;
+    if (!g_ge_defer) {
+        if (g_ge_follow) ge_clock_to(g_ge_t);
+        ge_callback(cbid, finish, id);
+        return 0;
+    }
+    g_ge_pend.valid = 1; g_ge_pend.cbid = cbid; g_ge_pend.finish = finish; g_ge_pend.id = id;
+    g_ge_pend.at = g_ge_t;
+    return 1;
+}
+
+/* Run a held handler. `force` runs it whatever the interrupt state (a wait on
+ * the GE, which has to see handlers in order), moving the clock up to when
+ * the GE reached it; otherwise only with interrupts enabled and once the
+ * clock has got there. Returns nonzero if one is still held. */
+static int ge_deliver(int force) {
+    if (!g_ge_pend.valid) return 0;
+    if (!force && (!psp_intr_enabled() || g_ge_pend.at > ge_now())) return 1;
+    g_ge_pend.valid = 0;
+    if (force) ge_clock_to(g_ge_pend.at);
+    g_ge_in_cb = 1;
+    ge_callback(g_ge_pend.cbid, g_ge_pend.finish, g_ge_pend.id);
+    g_ge_in_cb = 0;
+    return 0;
+}
+
+/* BBOX (0x07): the next `count` vertices at VADDR, of the current vertex
+ * type, are the corners of a box the following BJUMP skips when it cannot be
+ * seen. geprobe 4 scene 24 (fw 6.60) runs eight boxes of eight corners under
+ * a 60-degree perspective: only the one far right of the screen and the one
+ * far above it are skipped. One wholly behind the camera, one beyond the far
+ * plane, one through the near plane and two across or near an edge are all
+ * drawn -- so nothing about depth or the camera counts, only where x and y
+ * land after the divide. The box is hidden when all its corners are beyond
+ * the same edge.
+ *
+ * geprobe 5 scene 33 (fw 6.60) settles more:
+ *  - The divide is by |w|: a corner behind the camera is not mirrored. The
+ *    box across the camera plane far right (corners at w = 0.5 and -0.5) is
+ *    skipped, which a mirrored divide would spread from far left to far
+ *    right and draw; the two wholly behind the camera and far to one side
+ *    are skipped as well. Scene 24's box straight behind the camera lands on
+ *    screen either way. That the hardware takes |w| rather than, say, the
+ *    side each corner's x points to is the simplest reading, not a
+ *    measurement.
+ *  - The edges are the scissor's: a box in view is skipped with the scissor
+ *    cut to a corner away from it, and drawn with the scissor over part of
+ *    it; one outside a half-size viewport's clip volume but on screen is
+ *    drawn.
+ *  - BBOX moves VADDR past its corners as PRIM does (see advance_vertices):
+ *    a PRIM straight after it with no VADDR draws the vertices that follow
+ *    the box.
+ *  - BBOX alone does not stop a draw; only BJUMP acts on its result.
+ * Not measured: skinned or morphed corners (the first vertex set, unskinned,
+ * is used), indexed boxes, and through-mode boxes (taken as visible). */
+static int bbox_hidden(uint32_t count) {
+    int col_off, pos_off, tex_off, norm_off;
+    const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
+    if (!stride || !count || VT_THROUGH(g_ge.vtype)) return 0;
+    const int x0 = g_ge.sc_set ? g_ge.sc_x0 : 0,   y0 = g_ge.sc_set ? g_ge.sc_y0 : 0;
+    const int x1 = g_ge.sc_set ? g_ge.sc_x1 : 479, y1 = g_ge.sc_set ? g_ge.sc_y1 : 271;
+    int left = 1, right = 1, above = 1, below = 1;
+    for (uint32_t i = 0; i < count; i++) {
+        float m[3], w[3], e[3], c[4];
+        if (!read_pos_model(vertex_addr(i, stride), g_ge.vtype, pos_off, m)) return 0;
+        mul_4x3(g_tl.world, m, w);
+        mul_4x3(g_tl.view, w, e);
+        c[0] = ge_proj_row(g_tl.proj, 0, e);
+        c[1] = ge_proj_row(g_tl.proj, 1, e);
+        c[2] = 0.0f;
+        c[3] = fabsf(ge_proj_row(g_tl.proj, 3, e));
+        if (c[3] == 0.0f || !isfinite(c[0] / c[3]) || !isfinite(c[1] / c[3])) return 0;
+        int x, y;
+        clip_to_fx16(c, &x, &y);
+        left  &= x < x0 * PSP_SUBPX;
+        right &= x >= (x1 + 1) * PSP_SUBPX;
+        above &= y < y0 * PSP_SUBPX;
+        below &= y >= (y1 + 1) * PSP_SUBPX;
+    }
+    return left || right || above || below;
+}
+
+/* PRIM and BBOX leave the vertex pointer past what they read: VADDR moves on
+ * by count vertices, or IADDR by count indices when the type is indexed.
+ * geprobe 5 scene 33 (fw 6.60) measures it for BBOX, whose box is followed
+ * by a PRIM with no VADDR of its own that draws the vertices after the box.
+ * libgu's sceGuDrawArrayN depends on it for PRIM: it sends VADDR once and
+ * then one PRIM per primitive. geprobe 6 scene 42 (fw 6.60) measures the
+ * indexed case, with 8- and 16-bit indices: PRIM and BBOX move IADDR on by
+ * count indices and leave VADDR where it was. */
+static void advance_vertices(uint32_t count) {
+    int col_off, pos_off, tex_off, norm_off;
+    const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
+    switch (VT_INDEX(g_ge.vtype)) {
+    case 1:  g_ge.iaddr += count;      break;
+    case 2:  g_ge.iaddr += 2u * count; break;
+    default: g_ge.vaddr += count * (uint32_t)stride; break;
+    }
+}
+
+/* A drawing command handed from the front end to the back end, `pixels`
+ * pixels of drawing. With GE_FIFO_PRIMS commands already waiting, the front
+ * end waits for the oldest to be drawn. */
+static void ge_back_push(uint64_t pixels) {
+    uint64_t *slot = &g_ge_fifo[g_ge_fifo_i];
+    if (*slot > g_ge_t) g_ge_t = *slot;
+    g_ge_back = (g_ge_back > g_ge_t ? g_ge_back : g_ge_t) + pixels * GE_PIXEL_UNITS;
+    *slot = g_ge_back;
+    g_ge_fifo_i = (g_ge_fifo_i + 1) % GE_FIFO_PRIMS;
+}
+
 static void run_list(ge_queue *q) {
+    if (g_ge_walking || q->paused) return;
+    g_ge_walking = 1;
     const uint64_t _r0 = ge_prof_now();
     run_list_body(q);
     if (g_prof_on > 0) { g_prof_m[3] += ge_prof_now() - _r0; g_prof_lists++; }
+    g_ge_walking = 0;
 }
 static void run_list_body(ge_queue *q) {
     ge_note_thread();
@@ -2337,6 +3241,7 @@ static void run_list_body(ge_queue *q) {
     uint32_t lp_addr = 0, lp_end = 0;
     while (budget--) {
         if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
+        if (g_ge_limit && g_ge_t >= g_ge_limit) break; /* out of time for now */
 
         uint32_t word;
         if (q->list != lp_addr || q->list + 4 > lp_end || !lp) {
@@ -2349,9 +3254,17 @@ static void run_list_body(ge_queue *q) {
         else word = psp_read32(q->list);
         uint32_t cmd  = word >> 24;
         uint32_t arg  = word & 0x00FFFFFF;
+        /* A FINISH waits for the drawing before it (see "When the GE
+         * runs"); if that ends past the time the GE may reach, it is left
+         * for later, unread. */
+        if (cmd == GE_FINISH && g_ge_back > g_ge_t) {
+            g_ge_t = g_ge_back;
+            if (g_ge_limit && g_ge_t >= g_ge_limit) break;
+        }
         const uint64_t _c0 = ge_prof_now();
         q->list += 4;
         g_ge.commands++;
+        g_ge_t += GE_COMMAND_UNITS;
 
         switch (cmd) {
         case GE_NOP:
@@ -2367,15 +3280,22 @@ static void run_list_body(ge_queue *q) {
                 ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
             g_ge.targets[g_ge.cur_target].prims++;
             g_ge.vertices += count;
+            const uint64_t px0 = psp_render_pixels();
             draw_prim(type, count);
+            advance_vertices(count);
+            g_ge_t += GE_PRIM_UNITS + GE_VERTEX_UNITS * count;
+            ge_back_push(psp_render_pixels() - px0);
             break;
         }
         case GE_BEZIER:
-        case GE_SPLINE:
-            /* Patches expand to triangles on hardware; counted as their own
-             * thing rather than folded into the triangle count. */
+        case GE_SPLINE: {
             g_ge.prims[3]++;
+            const uint64_t px0 = psp_render_pixels();
+            draw_patch(cmd == GE_SPLINE, arg);
+            g_ge_t += GE_PRIM_UNITS + GE_VERTEX_UNITS * (arg & 0xFF) * ((arg >> 8) & 0xFF);
+            ge_back_push(psp_render_pixels() - px0);
             break;
+        }
 
         case GE_JUMP:
             q->list = (q->base | (arg & 0xFFFFFC));
@@ -2387,23 +3307,34 @@ static void run_list_body(ge_queue *q) {
         case GE_RET:
             if (sp > 0) q->list = stack[--sp];
             break;
+        case GE_BBOX:
+            g_ge.bbox_hidden = bbox_hidden(arg & 0xFFFF);
+            advance_vertices(arg & 0xFFFF);
+            break;
         case GE_BJUMP:
-            /* Conditional on the bounding-box test, which needs geometry we do
-             * not process. Not taking it means we walk the enclosed commands
-             * rather than skipping them -- the conservative direction, since
-             * skipping would under-report what the game drew. */
+            /* Jumps when the last BBOX found its box hidden (bbox_hidden). It
+             * is read only once the stall address has passed it, so the
+             * placeholder libgu's sceGuBeginObject writes is never taken:
+             * sceGuEndObject has patched it by then. */
+            if (g_ge.bbox_hidden) q->list = (q->base | (arg & 0xFFFFFC));
             break;
 
         case GE_FINISH:
             if (q->signal == GE_SIGNAL_HANDLER_PAUSE) {
-                /* sceGuSignal(GU_SIGNAL_PAUSE) deliberately places a
-                 * FINISH/END pair after SIGNAL/END. Hardware pauses here for
-                 * the signal callback, then sceGeContinue resumes after the
-                 * END. Callbacks are not modelled yet, so flush the completed
-                 * work and resume immediately rather than truncating the
-                 * remainder of the list. */
+                /* sceGuSignal(GU_SIGNAL_PAUSE) writes SIGNAL, END, FINISH,
+                 * END. geprobe 5 step 57 (fw 6.60): the signal handler runs
+                 * at the SIGNAL, inside EnQueue; then the list stops until
+                 * sceGeContinue -- 20 ms on, one handler has run,
+                 * ListSync(peek) reads 4 and DrawSync(peek) 2 -- and this
+                 * FINISH calls no finish handler. After sceGeContinue the
+                 * rest runs, inside the call as a new list would. It stops
+                 * here, at the FINISH, and resumes at the END after it. A
+                 * sceGeContinue that came first (from the signal handler)
+                 * lets it through; not measured. */
                 psp_render_current()->finish();
-                break;
+                if (q->cont_early) { q->cont_early = 0; break; }
+                q->paused = 1;
+                return;
             }
             g_ge.finishes++;
             q->done = 1;
@@ -2415,6 +3346,9 @@ static void run_list_body(ge_queue *q) {
              * has nothing to batch. A backend that accumulates geometry has no
              * flush point without this, so its batch spans a whole frame. */
             psp_render_current()->finish();
+            /* The list is done before its handler runs, so a handler that
+             * asks after it is told so. Not measured. */
+            ge_raise(q->cbid, 1, arg);
             return;
 
         case GE_END: {
@@ -2444,8 +3378,19 @@ static void run_list_body(ge_queue *q) {
         }
 
         case GE_SIGNAL:
-            /* Raises a callback on hardware. Callbacks are not delivered yet
-             * (no scheduler), so this is recorded and ignored. */
+            /* Behaviours 1-3 (PSPSDK pspgu.h GU_SIGNAL_WAIT, NOWAIT, PAUSE)
+             * call the signal handler; the list then carries on, the PAUSE
+             * variant through its FINISH/END pair below. The jump/call/ret
+             * and other behaviours are not modelled and call nobody. A
+             * PAUSE is marked here, before its handler runs, so that a
+             * sceGeContinue from that handler finds it (cont_early);
+             * without the mark the handler's call did nothing and the list
+             * paused anyway. Which of the two the PSP does is not measured
+             * (geprobe 6 asks). */
+            if (((arg >> 16) & 0xFF) == GE_SIGNAL_HANDLER_PAUSE) q->signal = GE_SIGNAL_HANDLER_PAUSE;
+            if (((arg >> 16) & 0xFF) >= 1 && ((arg >> 16) & 0xFF) <= 3 &&
+                ge_raise(q->cbid, 0, arg))
+                return;
             break;
 
         case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -2488,6 +3433,21 @@ static void run_list_body(ge_queue *q) {
             if (g_tl.proj_n < 16) g_tl.proj[g_tl.proj_n++] = ge_float(arg);
             g_tl.proj_words++;
             break;
+        case GE_BONEMATRIXNUMBER: g_tl.bone_n = (int)(arg & 0x7F); break;
+        case GE_BONEMATRIXDATA:
+            if (g_tl.bone_n < 8 * 12) g_tl.bone[g_tl.bone_n++] = ge_float(arg);
+            break;
+        case GE_MORPHWEIGHT0:     case GE_MORPHWEIGHT0 + 1: case GE_MORPHWEIGHT0 + 2:
+        case GE_MORPHWEIGHT0 + 3: case GE_MORPHWEIGHT0 + 4: case GE_MORPHWEIGHT0 + 5:
+        case GE_MORPHWEIGHT0 + 6: case GE_MORPHWEIGHT0 + 7:
+            g_tl.morph_w[cmd - GE_MORPHWEIGHT0] = ge_float(arg);
+            break;
+        case GE_PATCHDIVISION:
+            g_ge.patch_du = (int)(arg & 0xFF);
+            g_ge.patch_dv = (int)((arg >> 8) & 0xFF);
+            break;
+        case GE_PATCHPRIMITIVE: g_ge.patch_prim = (int)(arg & 3); break;
+        case GE_PATCHFACING:    g_ge.patch_face = (int)(arg & 1); break;
 
         case GE_VIEWPORTXSCALE:  g_tl.vp_xs = ge_float(arg); g_tl.vp_set = 1; break;
         case GE_VIEWPORTYSCALE:  g_tl.vp_ys = ge_float(arg); g_tl.vp_set = 1; break;
@@ -2500,14 +3460,31 @@ static void run_list_body(ge_queue *q) {
         case GE_OFFSETX: g_tl.off_x = (float)(arg & 0xFFFFFu) / 16.0f; break;
         case GE_OFFSETY: g_tl.off_y = (float)(arg & 0xFFFFFu) / 16.0f; break;
 
-        case GE_MASKRGB:
-        case GE_MASKALPHA:
-            if (drawlog_aux())
-                fprintf(stderr, "msk: %s arg=%06X\n",
-                        cmd == GE_MASKRGB ? "MASKRGB  " : "MASKALPHA", arg);
+        case GE_COLORTESTENABLE: g_tl.blend.colour_test  = (int)(arg & 1); break;
+        case GE_COLORTEST:       g_tl.blend.colour_func  = (int)(arg & 3); break;
+        case GE_COLORREF:        g_tl.blend.colour_ref   = arg & 0xFFFFFFu; break;
+        case GE_COLORTESTMASK:   g_tl.blend.colour_mask  = arg & 0xFFFFFFu; break;
+        case GE_LOGICOPENABLE:   g_tl.blend.logic_enable = (int)(arg & 1); break;
+        case GE_LOGICOP:         g_tl.blend.logic_op     = (int)(arg & 15); break;
+        case GE_PIXELMASKRGB:
+            g_tl.blend.pixel_mask = (g_tl.blend.pixel_mask & 0xFF000000u) | (arg & 0xFFFFFFu);
+            break;
+        case GE_PIXELMASKALPHA:
+            g_tl.blend.pixel_mask = (g_tl.blend.pixel_mask & 0x00FFFFFFu) | ((arg & 0xFFu) << 24);
             break;
         case GE_CULLFACEENABLE: g_tl.cull_enable = (int)(arg & 1); break;
         case GE_CULL:           g_tl.cull_ccw    = (int)(arg & 1); break;
+        /* Stored inverted, so the reset state (all zero) stays Gouraud, as it
+         * was before this register was decoded. */
+        case GE_SHADE:          g_tl.blend.shade_flat = !(arg & 1); break;
+        case GE_DITHERENABLE:   g_tl.blend.dither = (int)(arg & 1); break;
+        /* One matrix row each, four signed nibbles, element 0 lowest:
+         * sceGuSetDither's row {-4, 0, -3, 1} arrives as 0x001D0C. */
+        case GE_DITHER0: case GE_DITHER0 + 1: case GE_DITHER0 + 2: case GE_DITHER0 + 3:
+            for (int j = 0; j < 4; j++)
+                g_tl.blend.dither_m[cmd - GE_DITHER0][j] =
+                    (int8_t)((int)((arg >> (4 * j)) & 0xF) - (int)(((arg >> (4 * j)) & 0x8) << 1));
+            break;
         /* ---- texture state -------------------------------------------------
          *
          * Recorded, not yet sampled. What the sampler has to support is a
@@ -2784,6 +3761,7 @@ static void run_list_body(ge_queue *q) {
         case GE_SCISSOR1: g_ge.sc_x0 = (int)(arg & 0x3FF); g_ge.sc_y0 = (int)((arg >> 10) & 0x3FF); break;
         case GE_SCISSOR2:
             g_ge.sc_x1 = (int)(arg & 0x3FF); g_ge.sc_y1 = (int)((arg >> 10) & 0x3FF);
+            g_ge.sc_set = 1;
             psp_render_current()->set_scissor(g_ge.sc_x0, g_ge.sc_y0, g_ge.sc_x1, g_ge.sc_y1);
             break;
         case GE_TGENMATRIXNUMBER: g_tl.tgen_n = (int)(arg & 0xF); break;
@@ -2869,6 +3847,18 @@ static void run_list_body(ge_queue *q) {
             psp_render_current()->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
             break;
 
+        /* The depth buffer: low 24 bits of the address in ZBP, the high byte
+         * and the stride in ZBW, the same split as FBP/FBW. */
+        case GE_ZBP:
+            g_ge.zbp = (g_ge.zbp & 0xFF000000u) | arg;
+            psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
+            break;
+        case GE_ZBW:
+            g_ge.zbw = arg & 0xFFFF;
+            g_ge.zbp = (g_ge.zbp & 0x00FFFFFFu) | ((arg & 0xFF0000) << 8);
+            psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
+            break;
+
         case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
         case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)); break;
 
@@ -2896,14 +3886,22 @@ static ge_queue *find_queue(uint32_t id) {
 }
 
 
+static ge_queue *oldest_pending(void);
+static int  ge_has_work(void);
+static void ge_release(int was_busy);
+static void ge_run_until(uint64_t limit);
+static void ge_after_wait(void);
+static void ge_kick(void);
+
 static void enqueue(int head) {
     /* (list, stall, cbid, arg) */
     ge_queue *q = NULL;
     for (int i = 0; i < MAX_QUEUES; i++) if (!g_queue[i].used) { q = &g_queue[i]; break; }
 
     /* A slot is only worth keeping while its list can still be referred to. A
-     * finished list is kept so that a late sceGeListUpdateStallAddr can still
-     * resolve its id, but it is holding a slot it no longer needs -- so when
+     * finished list is kept until DrawSync(WAIT) retires it, so that a late
+     * sceGeListUpdateStallAddr or ListSync can still resolve its id, but it
+     * is holding a slot it no longer needs -- so when
      * the pool is full, the oldest finished list is what to give up. Ids come
      * from a monotonic counter and are never reused, so a stale id resolves to
      * "unknown uid" rather than to somebody else's list.
@@ -2924,8 +3922,13 @@ static void enqueue(int head) {
 
     memset(q, 0, sizeof *q);
     q->id    = g_next_id++;
-    q->list  = psp_arg(0) & ~3u;
-    q->stall = psp_arg(1) & ~3u;
+    /* Addresses are cut to 28 bits, as the GE sees them. libgu passes the
+     * list and stall with the uncached bit (0x40000000) set, but JUMP and CALL
+     * targets built from BASE carry no such bit, so a list that had jumped
+     * never met its stall and ran on into stale words: each geprobe frame
+     * showed the previous scene until this (hardware run, 2026-09-28). */
+    q->list  = psp_arg(0) & 0x0FFFFFFCu;
+    q->stall = psp_arg(1) & 0x0FFFFFFCu;
     /* Recorded here, at submission, and not after the queue has been serviced:
      * the deferred GE runs a list as words are released, so by the end of
      * enqueue q->list has advanced and pointing a replay at it runs off into
@@ -2933,18 +3936,26 @@ static void enqueue(int head) {
      * 2^23 commands and never found an END. */
     cap_note_list(q);
     q->used  = 1;
+    q->cbid  = (int)psp_arg(2);
     (void)head;
 
-    /* Deferred: EnQueue queues without running; the work drains on
-     * Sync(WAIT)/DrawSync(WAIT) in id order, or earlier as UpdateStallAddr
-     * releases words (below). Previously the list ran inside EnQueue, which
-     * is observably wrong: on hardware it is still pending at Sync time.
+    /* The GE starts on the queue here and runs it for GE_KICK_WINDOW_US
+     * of its own time before EnQueue returns (see g_ge_t): geprobe step 26
+     * and geprobe 5 steps 54-56 (fw 6.60) enqueue a seven-word list with no
+     * stall, and both its SIGNALs and its FINISH have called their handlers
+     * before sceGeListEnQueue returns; geprobe 5 step 58's 200 full-screen
+     * sprites are still running when it returns (ListSync(peek) 2), with
+     * only the first SIGNAL's handler run. The rest runs at later firmware
+     * calls, or in the Sync that waits for it. A list queued behind another
+     * waits its turn. A libgu DIRECT list is enqueued with its stall at its
+     * start and runs nothing yet.
      *
-     * UpdateStallAddr resumes a stalled list immediately, like the hardware
-     * consuming newly-released words while the CPU builds. This half is
-     * load-bearing, not an optimisation: pspgu reuses one list buffer
-     * across tests, so executing the tail only at Sync would run the new
-     * list's words under the old id (simple.prx's 8 grey pixels).
+     * UpdateStallAddr releases words that run from the next firmware call
+     * on. That the tail of one list has run before the next firmware call
+     * is load-bearing: pspgu reuses one list buffer across tests, so a tail
+     * left for Sync would run the new list's words under the old id
+     * (simple.prx's 8 grey pixels), and the new list's EnQueue is such a
+     * call.
      *
      * Sync(WAIT) on a still-pending list yields once -- an equal-priority
      * thread runs there on hardware, which is pspautotests' checkpoint [r]
@@ -2956,15 +3967,26 @@ static void enqueue(int head) {
      * (557KB vs 128B per test), not with GE state, so no GE-Sync model
      * reproduces both and none is attempted -- that prefix is timing noise
      * (strip it for gpu verdicts) while WAIT/NOWAIT blocking is honoured.
-     * NOWAIT reports DONE even when pending (the pre-existing lie, kept:
-     * pspgu's helpers poll it on tiny internal lists that have finished on
-     * hardware by the time anyone asks).
+     * NOWAIT reports the list's status as it is: geprobe 6 steps 79 and 80
+     * (fw 6.60) peek 2 on a list held at its stall, for both ListSync and
+     * DrawSync, even 10 ms later. Tiny lists that pspgu's helpers poll
+     * have finished by then because the kick window ran them.
      *
-     * Not yet modelled: head-vs-tail ordering, BREAK/pause state 4,
-     * DeQueue, GetCmd/GetMtx/GetStack (unimplemented, read 0), and the
-     * queue-full code (hardware 0x80000022). Full worker thread only when
-     * something streams via stall and needs real overlap. */
+     * Not yet modelled: head-vs-tail ordering, BREAK, DeQueue,
+     * GetCmd/GetMtx/GetStack (unimplemented, read 0), and the queue-full
+     * code (hardware 0x80000022). */
     g_ge.lists++;
+    /* The call itself takes time: step 81's first SIGNAL, the list's first
+     * word, calls its handler 41-51 microseconds after the call is made,
+     * and the call returns 11-17 after that (GE_ENQUEUE_US, then the kick
+     * window). */
+    const uint64_t start = psp_clock_peek() + GE_ENQUEUE_US;
+    psp_clock_advance_to(start);
+    if (q == oldest_pending()) {
+        ge_release(0);
+        ge_kick();
+    }
+    psp_clock_advance_to(start + GE_KICK_WINDOW_US);
     psp_ret(q->id);
 }
 
@@ -2974,18 +3996,25 @@ static void hle_ListEnQueueHead(void) { enqueue(1); }
 static void hle_ListUpdateStallAddr(void) {
     ge_queue *q = find_queue(psp_arg(0));
     if (!q) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
-    q->stall = psp_arg(1) & ~3u;
-    /* Resume immediately: the hardware consumes newly-released words while
-     * the CPU builds, and the buffer may be reused by the next list as soon
-     * as this one is Sync'd -- executing the tail only at Sync would run
-     * the new list's words under the old id. Stall==0 (no stall) lists have
-     * nothing released yet and stay fully deferred to Sync. */
-    if (!q->done) run_list(q);
+    const int busy = ge_has_work();
+    q->stall = psp_arg(1) & 0x0FFFFFFCu;
+    /* The words run inside the call, for the kick window, as EnQueue's do:
+     * geprobe 6 steps 79 and 80 (fw 6.60) release a SIGNAL and a FINISH
+     * from a stall, and both handlers have run by the return. libgu's
+     * sceGuFinish still sees its finish handler run later, in sceGuSync
+     * (geprobe 5 step 50), because the FINISH waits for the drawing before
+     * it. */
+    if (!q->done) {
+        ge_release(busy);
+        if (q == oldest_pending()) ge_kick();
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* List/Draw status, as pspautotests' status_str reads it: 0 DONE, 1 QUEUED,
- * 2 DRAWING, 3 STALL. BREAK/pause (4) is not modelled and reports DRAWING. */
+ * 2 DRAWING, 4 PAUSED (geprobe 5 step 57, fw 6.60). A list held at its
+ * stall reads 2, not 3 (geprobe 6 steps 79 and 80). BREAK is not
+ * modelled. */
 #define GE_SYNC_DONE 0
 #define GE_SYNC_WAIT 0
 static ge_queue *oldest_pending(void) {
@@ -2999,9 +4028,12 @@ static ge_queue *oldest_pending(void) {
 static int list_status(ge_queue *q) {
     if (!q || !q->used) return 0x80000100;
     if (q->done) return GE_SYNC_DONE;
+    if (q->paused) return 4;                                   /* PAUSED */
     if (q != oldest_pending()) return 1;                       /* QUEUED */
-    if (q->stall && q->list == q->stall) return 3;              /* STALL */
-    return 2;                                                  /* DRAWING */
+    /* DRAWING, waiting at its stall too: geprobe 6 steps 79 and 80 (fw
+     * 6.60) peek 2 on a list stalled at its start and after a SIGNAL, as
+     * EnQueue returns and 10 ms later. */
+    return 2;
 }
 
 /* Drain one list as far as its stall allows. run_list stops at the stall
@@ -3014,6 +4046,7 @@ static void drain_one(ge_queue *q) {
 /* Drain every pending list up to and including the target, in id order --
  * the order hardware executes them. */
 static void drain_through(uint32_t id) {
+    if (!g_ge_walking) ge_deliver(1);
     for (;;) {
         ge_queue *q = oldest_pending();
         if (!q || q->id > id) break;
@@ -3024,12 +4057,99 @@ static void drain_through(uint32_t id) {
 }
 
 static void drain_all(void) {
+    if (!g_ge_walking) ge_deliver(1);
     for (;;) {
         ge_queue *q = oldest_pending();
         if (!q) break;
         drain_one(q);
         if (!q->done) break;      /* stalled head blocks the rest */
     }
+}
+
+/* Whether the GE has words it could run now: the list at the head of the
+ * queue is neither paused nor waiting at its stall. */
+static int ge_has_work(void) {
+    if (g_ge_pend.valid) return 1;
+    const ge_queue *q = oldest_pending();
+    return q && !q->paused && !(q->stall && q->list == q->stall);
+}
+
+/* Words were released (EnQueue, a stall update, Continue). An idle GE starts
+ * on them now; a busy one gets to them after what it has. `was_busy` is
+ * ge_has_work() from before the release. */
+static void ge_release(int was_busy) {
+    const uint64_t now = ge_now();
+    if (!was_busy && g_ge_t < now) g_ge_t = now;
+    g_ge_backlog = 1;
+}
+
+/* Run the queue, in order, until the GE's time reaches `limit`, a list
+ * stalls or pauses, or the queue is empty. */
+static void ge_run_until(uint64_t limit) {
+    if (g_ge_walking || g_ge_in_cb) return;
+    if (ge_deliver(!g_ge_defer)) return;   /* still waiting on a handler */
+    g_ge_limit = limit ? limit : 1;
+    for (;;) {
+        ge_queue *q = oldest_pending();
+        if (!q) break;
+        drain_one(q);
+        if (!q->done || g_ge_t >= limit || g_ge_pend.valid) break;
+    }
+    g_ge_limit = 0;
+    if (!ge_has_work()) g_ge_backlog = 0;
+}
+
+/* After a Sync has waited for the GE, its front end is idle at the present
+ * moment, waiting for words; the back end may still be drawing what came
+ * before a stall. */
+static void ge_after_wait(void) {
+    g_ge_t = ge_now();
+    if (!ge_has_work()) g_ge_backlog = 0;
+}
+
+/* Inside EnQueue, UpdateStallAddr and Continue: the GE runs for the kick
+ * window, handlers and all, the clock following it to each handler. */
+static void ge_kick(void) {
+    g_ge_follow = 1;
+    ge_run_until(ge_now() + GE_KICK_WINDOW_US * GE_UNITS_PER_US);
+    g_ge_follow = 0;
+}
+
+/* A Sync that waits: the caller is blocked until the GE is through (or
+ * stalled), so the clock follows it to each handler and to where it stops.
+ * `all` waits for every list, otherwise for the lists up to `id`. */
+static void ge_wait_drain(int all, uint32_t id) {
+    g_ge_follow = 1;
+    if (all) drain_all(); else drain_through(id);
+    g_ge_follow = 0;
+    ge_clock_to(g_ge_t);
+    ge_after_wait();
+}
+
+/* At every firmware call (hle.c): the GE catches up to the present. */
+void psp_ge_tick(void) {
+    if (!g_ge_backlog || g_ge_walking || g_ge_in_cb) return;
+    g_ge_defer = 1;
+    ge_run_until(ge_now());
+    g_ge_defer = 0;
+}
+
+/* From the scheduler when no thread can run, up to `until_us`, the next
+ * deadline (0: none): the GE goes on as it would while the CPU idles, and
+ * the first handler it reaches by then runs, the clock moved up to it, so a
+ * thread waiting for something a GE handler provides is not left stranded.
+ * Returns whether a handler ran; the scheduler then looks again. */
+int psp_ge_idle_run(uint64_t until_us) {
+    if (!g_ge_backlog || g_ge_walking || g_ge_in_cb) return 0;
+    if (!ge_has_work()) { g_ge_backlog = 0; return 0; }
+    const uint64_t until = until_us ? until_us * GE_UNITS_PER_US : UINT64_MAX;
+    if (!g_ge_pend.valid) {
+        g_ge_defer = 1;
+        ge_run_until(until);
+        g_ge_defer = 0;
+    }
+    if (g_ge_pend.valid && g_ge_pend.at <= until) { ge_deliver(1); return 1; }
+    return 0;
 }
 
 /* Flush for paths that present or inspect pixels without going through Sync
@@ -3529,7 +4649,19 @@ static void view_log_frame_mark(void) {
         fprintf(g_view_log, "F %u\n", psp_ctrl_polls());
 }
 
-void psp_ge_drain_all(void) { drain_all(); cap_frame_boundary(); view_log_frame_mark(); }
+void psp_ge_drain_all(void) {
+    drain_all();
+    if (!g_ge_walking) {
+        /* Not a wait: what the GE did here cost no time, as before the GE
+         * was timed. */
+        ge_after_wait();
+        const uint64_t now = ge_now();
+        if (g_ge_back > now) g_ge_back = now;
+        for (int i = 0; i < GE_FIFO_PRIMS; i++) if (g_ge_fifo[i] > now) g_ge_fifo[i] = now;
+    }
+    cap_frame_boundary();
+    view_log_frame_mark();
+}
 
 /* Replay one captured list. Deliberately not sceGeListEnQueue: that reads its
  * arguments from guest registers and hands back an id nobody here has any use
@@ -3541,9 +4673,9 @@ void psp_ge_replay_list(uint32_t list, uint32_t stall, uint32_t base) {
     if (!q) { for (int i = 0; i < MAX_QUEUES; i++) if (g_queue[i].done) { q = &g_queue[i]; break; } }
     if (!q) return;
     memset(q, 0, sizeof *q);
-    q->used = 1; q->id = 0x10000u + (uint32_t)(q - g_queue);
-    q->list = list & ~3u;
-    q->stall = stall & ~3u;
+    q->used = 1; q->id = 0x10000u + (uint32_t)(q - g_queue); q->cbid = -1;
+    q->list = list & 0x0FFFFFFCu;
+    q->stall = stall & 0x0FFFFFFCu;
     q->base = base;
     q->origin = list & ~3u;
     g_ge.lists++;
@@ -3561,30 +4693,49 @@ void psp_ge_current_target(uint32_t *addr, uint32_t *stride, int *fmt) {
 static void hle_ListSync(void) {
     ge_queue *q = find_queue(psp_arg(0));
     if (!q) { psp_ret(0x80000100); return; }
+    if (psp_arg(1) == GE_SYNC_WAIT && !g_ge_walking) ge_deliver(1);
     if (q->done) { psp_ret(GE_SYNC_DONE); return; }
-    /* NOWAIT reports DONE even when pending. That is the pre-existing lie,
-     * kept deliberately: pspgu's own helpers (ClutLoad and friends) poll
-     * NOWAIT on their tiny internal lists, which on hardware have already
-     * finished by the time anyone asks. Reporting them pending steers pspgu
-     * down paths it never takes on hardware and moves pixels (simple.prx).
-     * True pending-aware NOWAIT needs BREAK-aware states plus real GE
-     * timing; until then only WAIT tells the truth. */
-    if (psp_arg(1) != GE_SYNC_WAIT) { psp_ret(GE_SYNC_DONE); return; }
+    /* NOWAIT tells the truth: 4 while paused, 1 queued behind another list,
+     * 2 otherwise -- running, or waiting at its stall: geprobe 5 steps 57
+     * and 58 and geprobe 6 steps 79 and 80 (fw 6.60). It used to read DONE
+     * at a stall, for pspgu's helpers, which poll it on tiny internal lists
+     * that on hardware have finished by the time anyone asks; they now
+     * finish inside the stall update that releases them, as on the PSP. */
+    if (psp_arg(1) != GE_SYNC_WAIT) {
+        psp_ret((uint32_t)list_status(q));
+        return;
+    }
     /* WAIT on a pending list: give up the CPU once -- an equal-priority
      * thread runs here on hardware, which is the checkpoint [r] -- then
-     * complete synchronously. A lone thread yields to itself and carries
-     * on, so the game is unaffected. */
+     * complete, taking as long as the GE does. A lone thread yields to
+     * itself and carries on, so the game is unaffected. */
     psp_sched_yield();
-    drain_through(q->id);
+    ge_wait_drain(0, q->id);
     psp_ret(q->done ? GE_SYNC_DONE : list_status(q));
 }
 
+/* A finished list's id stops resolving once DrawSync(WAIT) has returned:
+ * geprobe step 26 (fw 6.60) reads 0 from ListSync(wait) on its completed list,
+ * 0 from DrawSync(wait), then 0x80000100 from ListSync(peek). Whether
+ * ListSync(wait) alone already retires it is not measured. */
+static void retire_done(void) {
+    for (int i = 0; i < MAX_QUEUES; i++)
+        if (g_queue[i].used && g_queue[i].done) g_queue[i].used = 0;
+}
+
 static void hle_DrawSync(void) {
-    /* NOWAIT: same standing lie as ListSync -- DONE, see above. */
-    if (psp_arg(0) != GE_SYNC_WAIT) { psp_ret(GE_SYNC_DONE); return; }
-    if (!oldest_pending()) { psp_ret(GE_SYNC_DONE); return; }
+    /* NOWAIT: 2 while any list is pending -- running, paused (geprobe 5
+     * step 57, fw 6.60) or waiting at its stall (geprobe 6 steps 79 and
+     * 80). */
+    if (psp_arg(0) != GE_SYNC_WAIT) {
+        psp_ret(oldest_pending() ? 2u : GE_SYNC_DONE);
+        return;
+    }
+    if (!g_ge_walking) ge_deliver(1);     /* a wait sees the handlers it owes run */
+    if (!oldest_pending()) { retire_done(); psp_ret(GE_SYNC_DONE); return; }
     psp_sched_yield();
-    drain_all();
+    ge_wait_drain(1, 0);
+    retire_done();
     /* DONE even if a stalled list remains: Break is still a stub that reports
      * success without clearing anything, so reporting busy afterwards would
      * contradict our own Break. Revisit with real BREAK state. */
@@ -3592,10 +4743,50 @@ static void hle_DrawSync(void) {
 }
 
 static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
-static void hle_Continue(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
-static void hle_SetCallback(void)   { psp_ret(0); }
-static void hle_UnsetCallback(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* sceGeContinue: a paused list goes on, run inside the call as EnQueue runs a
+ * new one -- geprobe 5 step 57 (fw 6.60): the SIGNAL and FINISH after the
+ * pause call their handlers before sceGeContinue returns, which reads 0.
+ * Called before the pause has taken hold (from the PAUSE's own signal
+ * handler), it lets the list through the pause instead; with nothing paused
+ * or about to be, it does nothing. Neither case, nor any error code, is
+ * measured. */
+static void hle_Continue(void) {
+    ge_queue *q = oldest_pending();
+    if (q && q->paused) {
+        q->paused = 0;
+        ge_release(0);
+        ge_kick();
+    } else if (q && q->signal == GE_SIGNAL_HANDLER_PAUSE) {
+        q->cont_early = 1;
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* sceGeSetCallback(PspGeCallbackData *): signal_func, signal_arg,
+ * finish_func, finish_arg, copied now; the id goes to sceGeListEnQueue. The
+ * table holds 16 and a full one answers 0x80000022: geprobe 5 step 59 (fw
+ * 6.60) registers 15 beside libgu's own and the 16th is refused with it. */
+static void hle_SetCallback(void) {
+    const uint32_t p = psp_arg(0);
+    for (int i = 0; i < GE_MAX_CALLBACKS; i++) {
+        if (g_ge_cb[i].used) continue;
+        g_ge_cb[i].used        = 1;
+        g_ge_cb[i].signal_func = psp_read32(p);
+        g_ge_cb[i].signal_arg  = psp_read32(p + 4);
+        g_ge_cb[i].finish_func = psp_read32(p + 8);
+        g_ge_cb[i].finish_arg  = psp_read32(p + 12);
+        psp_ret((uint32_t)i);
+        return;
+    }
+    psp_ret(0x80000022u);
+}
+
+static void hle_UnsetCallback(void) {
+    const uint32_t id = psp_arg(0);
+    if (id < GE_MAX_CALLBACKS) g_ge_cb[id].used = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 /* eDRAM is the GPU-visible VRAM window: 2 MB at 0x04000000. */
 static void hle_EdramGetAddr(void) { psp_ret(PSP_VRAM_BASE); }

@@ -42,6 +42,16 @@ static void setr(unsigned idx, uint32_t v) {
     if (idx != 0) psp_cpu.r[idx] = v;
 }
 
+/* Is the word before `addr` a vcmp? Read quietly: an unmapped word is not. */
+static int follows_vcmp(uint32_t addr) {
+    const uint8_t *p = psp_mem_ptr(addr - 4, 4);
+    if (!p) return 0;
+    a_insn prev;
+    a_decode((uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
+             (uint32_t)p[3] << 24, addr - 4, &prev);
+    return prev.op == A_VCMP;
+}
+
 /* ---- the firmware boundary ------------------------------------------------
  *
  * See interp.h. Thunks are dense and 4-aligned inside .sceStub.text, so a flat
@@ -299,10 +309,15 @@ static psp_interp_status exec_simple(const a_insn *in) {
         return I_RUNNING;
 
     /* --- COP1, single precision only --- */
+    /* An operation that sets a cause bit whose enable is on is an FPU
+     * exception, fatal on the hardware (see psp_fpu_trap_pending); emit.c
+     * checks the same after the same operations. */
+#define FPU_DONE (psp_fpu_trap_pending() ? I_TRAP_FPU : I_RUNNING)
     case A_MTC1: psp_cpu.f[in->fs] = psp_bits_to_f32(R(in->rt));      return I_RUNNING;
     case A_MFC1: setr(in->rt, psp_f32_to_bits(psp_cpu.f[in->fs]));    return I_RUNNING;
     /* `fs` names *which* control register -- it was being ignored. */
-    case A_CTC1: psp_fcr_write(in->fs, R(in->rt));                    return I_RUNNING;
+    case A_CTC1:
+        return psp_fcr_write(in->fs, R(in->rt)) ? I_TRAP_FPU : I_RUNNING;
     case A_CFC1: setr(in->rt, psp_fcr_read(in->fs));                  return I_RUNNING;
     case A_LWC1: psp_cpu.f[in->ft] = psp_read_f32(R(in->rs) + in->imm); return I_RUNNING;
     case A_SWC1:
@@ -310,49 +325,52 @@ static psp_interp_status exec_simple(const a_insn *in) {
         trace_mem('F', R(in->rs) + in->imm, psp_f32_to_bits(psp_cpu.f[in->ft]));
         return I_RUNNING;
     /* Through psp_f* rather than the bare operator: FCR31's rounding mode and
-     * flush-to-zero change the result. Default state is a plain float op. */
+     * flush-to-zero change the result, and every one of these writes the
+     * Cause field. See recomp_rt.h for what the hardware measured. */
     case A_ADD_S:
         psp_cpu.f[in->fd] = psp_fadd(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
-        return I_RUNNING;
+        return FPU_DONE;
     case A_SUB_S:
         psp_cpu.f[in->fd] = psp_fsub(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
-        return I_RUNNING;
+        return FPU_DONE;
     case A_MUL_S:
         psp_cpu.f[in->fd] = psp_fmul(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
-        return I_RUNNING;
+        return FPU_DONE;
     case A_DIV_S:
         psp_cpu.f[in->fd] = psp_fdiv(psp_cpu.f[in->fs], psp_cpu.f[in->ft]);
-        return I_RUNNING;
+        return FPU_DONE;
     case A_MOV_S: psp_cpu.f[in->fd] =  psp_cpu.f[in->fs];                    return I_RUNNING;
-    case A_NEG_S: psp_cpu.f[in->fd] = -psp_cpu.f[in->fs];                    return I_RUNNING;
-    case A_ABS_S: psp_cpu.f[in->fd] = psp_fabs (psp_cpu.f[in->fs]);          return I_RUNNING;
+    case A_NEG_S: psp_cpu.f[in->fd] = psp_fneg_cop1(psp_cpu.f[in->fs]);      return FPU_DONE;
+    case A_ABS_S: psp_cpu.f[in->fd] = psp_fabs_cop1(psp_cpu.f[in->fs]);      return FPU_DONE;
     case A_SQRT_S:
         psp_cpu.f[in->fd] = psp_fsqrt_cop1(psp_cpu.f[in->fs]);
-        return I_RUNNING;
+        return FPU_DONE;
     case A_CVT_S_W:
-        psp_cpu.f[in->fd] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[in->fs]);
-        return I_RUNNING;
+        psp_cpu.f[in->fd] = psp_cvt_s_w(psp_f32_to_bits(psp_cpu.f[in->fs]));
+        return FPU_DONE;
     /* The rounding mode is the only thing separating these. cvt.w.s takes it
      * from FCR31; the other four name it in the opcode. */
     case A_CVT_W_S:
         psp_cpu.f[in->fd] = psp_bits_to_f32(
             psp_f32_to_i32(psp_cpu.f[in->fs], (int)(psp_cpu.fcr31 & 3)));
-        return I_RUNNING;
+        return FPU_DONE;
     case A_TRUNC_W_S:
         psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RZ));
-        return I_RUNNING;
+        return FPU_DONE;
     case A_ROUND_W_S:
         psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RN));
-        return I_RUNNING;
+        return FPU_DONE;
     case A_CEIL_W_S:
         psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RP));
-        return I_RUNNING;
+        return FPU_DONE;
     case A_FLOOR_W_S:
         psp_cpu.f[in->fd] = psp_bits_to_f32(psp_f32_to_i32(psp_cpu.f[in->fs], PSP_RM_RM));
-        return I_RUNNING;
+        return FPU_DONE;
     case A_C_COND_S:
         psp_fpu_set_cond(psp_fcmp(in->fcond, psp_cpu.f[in->fs], psp_cpu.f[in->ft]));
-        return I_RUNNING;
+        return FPU_DONE;
+
+#undef FPU_DONE
 
     /* --- COP0. There is no privileged state to model. --- */
     case A_MFC0: case A_CFC0: case A_MFIC: setr(in->rt, 0); return I_RUNNING;
@@ -362,7 +380,15 @@ static psp_interp_status exec_simple(const a_insn *in) {
     case A_MFV: setr(in->rt, psp_mfv(in->vd));  return I_RUNNING;
     /* The control-register forms address the same 8-bit field, offset by
      * 128 -- which is the bit the decoder splits them on. */
-    case A_MFVC: setr(in->rt, psp_mfvc((int)(in->raw & 0xFF) - 128)); return I_RUNNING;
+    /* CC read straight after a vcmp is the CC from before it (vfpuprobe v3
+     * step 117). Decided from the word before, not from what ran before,
+     * so that emit.c can make the same decision. */
+    case A_MFVC:
+        if ((in->raw & 0xFF) == 128 + 3 && follows_vcmp(in->addr))
+            setr(in->rt, psp_mfvc_cc_after_vcmp());
+        else
+            setr(in->rt, psp_mfvc((int)(in->raw & 0xFF) - 128));
+        return I_RUNNING;
     case A_MTVC: psp_mtvc((int)(in->raw & 0xFF) - 128, R(in->rt));    return I_RUNNING;
     case A_MTV: psp_mtv(in->vd, R(in->rt));     return I_RUNNING;
 
@@ -426,6 +452,11 @@ static psp_interp_status exec_simple(const a_insn *in) {
      * as 0xDFD421B0, and reading vd from it names v48. */
     case A_VIIM: psp_vimm(in->vt, (float)in->imm);       return I_RUNNING;
     case A_VFIM: psp_vimm(in->vt, a_half_to_float((uint16_t)in->imm)); return I_RUNNING;
+
+    case A_VRNDS:  psp_vrnds(in->vs, in->vsize);     return I_RUNNING;
+    case A_VRNDI:  psp_vrnd(in->vd, 0, in->vsize);   return I_RUNNING;
+    case A_VRNDF1: psp_vrnd(in->vd, 1, in->vsize);   return I_RUNNING;
+    case A_VRNDF2: psp_vrnd(in->vd, 2, in->vsize);   return I_RUNNING;
 
     case A_VF2H: psp_vf2h(in->vd, in->vs, in->vsize); return I_RUNNING;
     case A_VH2F: psp_vh2f(in->vd, in->vs, in->vsize); return I_RUNNING;
@@ -849,11 +880,11 @@ static int run_thread_now(uint32_t entry, uint32_t sp, uint32_t a0, uint32_t a1)
     /* The thread's own register file: arguments from StartThread, its own
      * stack, and the sentinel to return to. Everything is restored after, so
      * the starter's registers survive the call. */
-    memset(&psp_cpu, 0, sizeof psp_cpu);
-    psp_cpu_reset_fp();
+    psp_cpu_reset_thread();
     R(PSP_REG_A0) = a0;
     R(PSP_REG_A1) = a1;
     R(PSP_REG_SP) = sp;
+    R(PSP_REG_FP) = sp;
     /* $gp is per-module, not per-thread, and the starter is in the same module
      * as the thread it starts -- so inheriting it is both correct and the only
      * source available here. Zero would point the small-data area at address 0. */
@@ -1094,6 +1125,7 @@ const char *psp_interp_status_str(psp_interp_status s) {
     case I_TRAP_BREAK:   return "break";
     case I_TRAP_BRANCH_IN_SLOT: return "control transfer in a delay slot";
     case I_TRAP_BADPC:   return "pc left mapped memory";
+    case I_TRAP_FPU:     return "FPU exception";
     case I_EXIT:         return "guest called sceKernelExitGame";
     case I_STOPPED:      return "stopped by the scheduler";
     }

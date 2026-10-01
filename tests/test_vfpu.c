@@ -526,8 +526,471 @@ static void test_vrot(void) {
     CHECK_F(psp_cpu.v[14], -1.0f, "vrot.p: writes only two lanes");
 }
 
+/* ---- special values -------------------------------------------------------
+ *
+ * Rows of vfpuprobe section 5 as a PSP on firmware 6.60 printed them: operand
+ * quads s and t in, the destination quad out, bit for bit. */
+static void set_bits(uint32_t vreg, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    const uint32_t w[4] = { a, b, c, d };
+    int r[4];
+    psp_vfpu_regs(vreg, 4, r);
+    for (int i = 0; i < 4; i++) psp_cpu.v[r[i]] = psp_bits_to_f32(w[i]);
+}
+static int quad_is(uint32_t vreg, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    const uint32_t w[4] = { a, b, c, d };
+    int r[4], ok = 1;
+    psp_vfpu_regs(vreg, 4, r);
+    for (int i = 0; i < 4; i++) {
+        const uint32_t got = psp_f32_to_bits(psp_cpu.v[r[i]]);
+        if (got != w[i]) {
+            printf("    lane %d: got %08X, want %08X\n", i, got, w[i]);
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+typedef void (*vbinop)(uint32_t, uint32_t, uint32_t, int);
+static int binop_is(vbinop op, const uint32_t s[4], const uint32_t t[4],
+                    uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    set_bits(0x00, s[0], s[1], s[2], s[3]);
+    set_bits(0x04, t[0], t[1], t[2], t[3]);
+    op(0x08, 0x00, 0x04, 4);
+    return quad_is(0x08, a, b, c, d);
+}
+
+static void test_special_values(void) {
+    psp_vfpu_reset();
+    static const uint32_t NANINF_S[4] = { 0x7FC00000, 0x80000000, 0x7F800000, 0xFF800000 };
+    static const uint32_t NANINF_T[4] = { 0x3F800000, 0x00000000, 0xFF800000, 0xFF800000 };
+    static const uint32_t DEN_S[4]    = { 0x000116C2, 0x800116C2, 0x006CE3EE, 0x40400000 };
+    static const uint32_t DEN_T[4]    = { 0x000116C2, 0x3F800000, 0x006CE3EE, 0x3EAAAAAB };
+    static const uint32_t SNAN_S[4]   = { 0x7F800001, 0xFFC00000, 0x3F800000, 0x40000000 };
+    static const uint32_t SNAN_T[4]   = { 0x40000000, 0x3F800000, 0x7FC00001, 0x80000000 };
+    static const uint32_t ZERO_S[4]   = { 0x00000000, 0x80000000, 0x00000000, 0x80000000 };
+    static const uint32_t ZERO_T[4]   = { 0x00000000, 0x00000000, 0x80000000, 0x80000000 };
+    static const uint32_t EDGE_S[4]   = { 0x007FFFFF, 0x80000001, 0xBF800000, 0xFF800000 };
+    static const uint32_t EDGE_T[4]   = { 0x00000000, 0x3F800000, 0x7FC00000, 0x7F800000 };
+
+    /* One NaN, 7F800001, positive from vadd and signed by the operands in
+     * vmul/vdiv; denormal operands are zeros and tiny results flush. */
+    CHECK(binop_is(psp_vadd, NANINF_S, NANINF_T, 0x7F800001, 0x00000000, 0x7F800001, 0xFF800000),
+          "vadd nan-inf (step 51)");
+    CHECK(binop_is(psp_vadd, DEN_S, DEN_T, 0x00000000, 0x3F800000, 0x00000000, 0x40555555),
+          "vadd denormal (step 51)");
+    CHECK(binop_is(psp_vadd, SNAN_S, SNAN_T, 0x7F800001, 0x7F800001, 0x7F800001, 0x40000000),
+          "vadd snan (step 51)");
+    CHECK(binop_is(psp_vmul, SNAN_S, SNAN_T, 0x7F800001, 0xFF800001, 0x7F800001, 0x80000000),
+          "vmul snan (step 53)");
+    CHECK(binop_is(psp_vmul, EDGE_S, EDGE_T, 0x00000000, 0x80000000, 0xFF800001, 0xFF800000),
+          "vmul sqrt-edge (step 53)");
+    CHECK(binop_is(psp_vdiv, ZERO_S, ZERO_T, 0x7F800001, 0xFF800001, 0xFF800001, 0x7F800001),
+          "vdiv zeros (step 54)");
+    CHECK(binop_is(psp_vdiv, DEN_S, DEN_T, 0x7F800001, 0x80000000, 0x7F800001, 0x41100000),
+          "vdiv denormal (step 54)");
+
+    /* The sign-magnitude order, bits kept, ties to t. */
+    CHECK(binop_is(psp_vmin, SNAN_S, SNAN_T, 0x40000000, 0xFFC00000, 0x3F800000, 0x80000000),
+          "vmin snan (step 55)");
+    CHECK(binop_is(psp_vmin, EDGE_S, EDGE_T, 0x00000000, 0x80000001, 0xBF800000, 0xFF800000),
+          "vmin sqrt-edge (step 55)");
+    CHECK(binop_is(psp_vmax, NANINF_S, NANINF_T, 0x7FC00000, 0x00000000, 0x7F800000, 0xFF800000),
+          "vmax nan-inf (step 56)");
+    set_bits(0x00, EDGE_S[0], EDGE_S[1], EDGE_S[2], EDGE_S[3]);
+    set_bits(0x04, EDGE_T[0], EDGE_T[1], EDGE_T[2], EDGE_T[3]);
+    psp_vcmp_val(0x08, 0x00, 0x04, 0, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0xBF800000, 0xBF800000, 0xBF800000),
+          "vscmp sqrt-edge (step 57)");
+
+    /* vabs and vsgn on the bits. */
+    set_bits(0x00, 0x00000000, 0x80000000, 0xFFC00000, 0x7F800001);
+    psp_vunary(PSP_VU_ABS, 0x08, 0x00, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0x00000000, 0x7FC00000, 0x7F800001), "vabs (step 69)");
+    set_bits(0x00, DEN_S[0], DEN_S[1], DEN_S[2], DEN_S[3]);
+    psp_vfpu9(0x08, 0x00, 10, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0x00000000, 0x00000000, 0x3F800000), "vsgn denormal (step 71)");
+
+    /* The sorts: ties give both lanes one value. */
+    set_bits(0x00, ZERO_S[0], ZERO_S[1], ZERO_S[2], ZERO_S[3]);
+    psp_vfpu9(0x08, 0x00, 0, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0x00000000, 0x00000000, 0x00000000), "vsrt1 zeros (step 77)");
+    psp_vfpu9(0x08, 0x00, 1, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0x80000000, 0x80000000, 0x00000000), "vsrt2 zeros (step 78)");
+    psp_vfpu9(0x08, 0x00, 9, 4);
+    CHECK(quad_is(0x08, 0x80000000, 0x00000000, 0x00000000, 0x80000000), "vsrt4 zeros (step 80)");
+    set_bits(0x00, NANINF_S[0], NANINF_S[1], NANINF_S[2], NANINF_S[3]);
+    psp_vfpu9(0x08, 0x00, 9, 4);
+    CHECK(quad_is(0x08, 0x7FC00000, 0x7F800000, 0x80000000, 0xFF800000), "vsrt4 nan-inf (step 80)");
+    set_bits(0x00, DEN_S[0], DEN_S[1], DEN_S[2], DEN_S[3]);
+    psp_vfpu9(0x08, 0x00, 3, 4);
+    CHECK(quad_is(0x08, 0x00000000, 0x40400000, 0x00000000, 0xC0400000), "vbfy2 denormal (step 82)");
+
+    /* vcmp: a denormal is zero. */
+    int s[4], t[4];
+    psp_vfpu_regs(0x00, 1, s);
+    psp_vfpu_regs(0x04, 1, t);
+    psp_cpu.v[s[0]] = psp_bits_to_f32(0x00000001u);
+    psp_cpu.v[t[0]] = psp_bits_to_f32(0x80000000u);
+    psp_vcmp(1 /* EQ */, 0x00, 0x04, 1);
+    CHECK(psp_cpu.vfpu_cc & 1u, "vcmp EQ: 00000001 equals -0 (step 90)");
+    psp_vcmp(8 /* EZ */, 0x00, 0x04, 1);
+    CHECK(psp_cpu.vfpu_cc & 1u, "vcmp EZ: 00000001 is zero (step 97)");
+    psp_vfpu_reset();
+}
+
+/* ---- cross products, matrix rounding, vcst, half floats -------------------
+ *
+ * vfpuprobe steps 27-30, 50, 65 and 107 (fw 6.60). */
+static void test_units_and_conversions(void) {
+    psp_vfpu_reset();
+
+    /* vcrsp.t: each lane a two-term dot, so an infinity meets no padding
+     * zero (step 65). */
+    set_bits(0x00, 0x7F800000, 0x3F800000, 0x40000000, 0x00000000);
+    set_bits(0x04, 0x3F800000, 0x40000000, 0x40400000, 0x00000000);
+    set_bits(0x08, 0x5A5A5A5A, 0x5A5A5A5A, 0x5A5A5A5A, 0x5A5A5A5A);
+    psp_vcrsp(0x08, 0x00, 0x04, 3);
+    CHECK(quad_is(0x08, 0xBF800000, 0xFF800000, 0x7F800000, 0x5A5A5A5A), "vcrsp.t cross-inf");
+    set_bits(0x00, 0x007FFFFF, 0x80000001, 0xBF800000, 0xFF800000);
+    set_bits(0x04, 0x00000000, 0x3F800000, 0x7FC00000, 0x7F800000);
+    psp_vcrsp(0x08, 0x00, 0x04, 3);
+    CHECK(quad_is(0x08, 0x7F800001, 0x7F800001, 0x00000000, 0x5A5A5A5A), "vcrsp.t sqrt-edge");
+
+    /* vmmul.q M300, M100, M200 over the probe's A and B, one rounding per
+     * element: 43055555, not the running sum's 43055556 (step 107). */
+    static const uint32_t A[16] = {
+        0x3F800000, 0x40000000, 0x40400000, 0x40800000, 0x40A00000, 0x40C00000, 0x40E00000, 0x41000000,
+        0x41100000, 0x41200000, 0x41300000, 0x41400000, 0x41500000, 0x41600000, 0x41700000, 0x41800000,
+    };
+    static const uint32_t B[16] = {
+        0xC0400000, 0x40800000, 0x00000000, 0x3F000000, 0x40400000, 0xBF800000, 0x40C00000, 0x40000000,
+        0xC0000000, 0x40A00000, 0x3F800000, 0xC0400000, 0x3EAAAAAB, 0x00000000, 0x40E00000, 0x40400000,
+    };
+    static const uint32_t M3[16] = {
+        0x41BC0000, 0x41C80000, 0x41D40000, 0x41E00000, 0x429C0000, 0x42B00000, 0x42C40000, 0x42D80000,
+        0xC0E00000, 0xC0C00000, 0xC0A00000, 0xC0800000, 0x42CCAAAA, 0x42E15555, 0x42F60000, 0x43055555,
+    };
+    for (int c = 0; c < 4; c++) {         /* memory is column-major */
+        set_bits(0x04 | (uint32_t)c, A[4 * c], A[4 * c + 1], A[4 * c + 2], A[4 * c + 3]);
+        set_bits(0x08 | (uint32_t)c, B[4 * c], B[4 * c + 1], B[4 * c + 2], B[4 * c + 3]);
+    }
+    psp_vmmul(0x0C, 0x24, 0x08, 4);       /* vs carries the transpose bit */
+    for (int c = 0; c < 4; c++)
+        CHECK(quad_is(0x0C | (uint32_t)c, M3[4 * c], M3[4 * c + 1], M3[4 * c + 2], M3[4 * c + 3]),
+              "vmmul.q column %d (step 107)", c);
+
+    /* vcst 6 is 1/pi correctly rounded (step 50). */
+    psp_vcst(0x00, 6, 1);
+    int r0[4];
+    psp_vfpu_regs(0x00, 1, r0);
+    CHECK(psp_f32_to_bits(psp_cpu.v[r0[0]]) == 0x3EA2F983u, "vcst 6: %08X",
+          psp_f32_to_bits(psp_cpu.v[r0[0]]));
+
+    /* Half floats (steps 27-30, v3 step 50): no subnormals either way, NaN
+     * and inf keep the low mantissa bits, and the mantissa is truncated. */
+    static const uint32_t f2h[][2] = {
+        { 0x3F800000, 0x3C00 }, { 0xC0200000, 0xC100 }, { 0x477FE000, 0x7BFF },
+        { 0x477FF000, 0x7BFF }, { 0x322BCC77, 0x0000 }, { 0x7F800000, 0x7C00 },
+        { 0x7FC00000, 0x7C00 }, { 0xFFC00000, 0xFC00 }, { 0x80000000, 0x8000 },
+        { 0x38800000, 0x0400 }, { 0x33800000, 0x0000 }, { 0x7F800001, 0x7C01 },
+        { 0x477FEF00, 0x7BFF }, { 0x501502F9, 0x7C00 }, { 0xD01502F9, 0xFC00 },
+        { 0x3EAAAAAB, 0x3555 }, { 0x33000000, 0x0000 }, { 0x33C00000, 0x0000 },
+        { 0x387FC000, 0x0000 }, { 0xFF800001, 0xFC01 },
+        /* Truncation (v3 step 50): ties, near-ties and just below 2^16. */
+        { 0x3F801000, 0x3C00 }, { 0x3F803000, 0x3C01 }, { 0x3F801008, 0x3C00 },
+        { 0x3F801FF8, 0x3C00 }, { 0xBF803000, 0xBC01 }, { 0x3FFFF000, 0x3FFF },
+        { 0x3FFFF800, 0x3FFF }, { 0x40003000, 0x4001 }, { 0x477FF001, 0x7BFF },
+        { 0x477FF800, 0x7BFF }, { 0x477FFFFF, 0x7BFF }, { 0x47800000, 0x7C00 },
+        { 0x387FE000, 0x0000 }, { 0x387FFFFF, 0x0000 }, { 0x38801000, 0x0400 },
+        { 0x38803000, 0x0401 }, { 0x38801001, 0x0400 },
+    };
+    for (size_t i = 0; i < sizeof f2h / sizeof f2h[0]; i++) {
+        const uint16_t got = psp_f32_to_half(psp_bits_to_f32(f2h[i][0]));
+        CHECK(got == f2h[i][1], "vf2h %08X: %04X, want %04X", f2h[i][0], got, f2h[i][1]);
+    }
+    static const uint32_t h2f[][2] = {
+        { 0x3C00, 0x3F800000 }, { 0xC000, 0xC0000000 }, { 0x7C00, 0x7F800000 },
+        { 0xFC00, 0xFF800000 }, { 0x0400, 0x38800000 }, { 0x7BFF, 0x477FE000 },
+        { 0x8000, 0x80000000 }, { 0x03FF, 0x00000000 },
+    };
+    for (size_t i = 0; i < sizeof h2f / sizeof h2f[0]; i++) {
+        const uint32_t got = psp_f32_to_bits(psp_half_to_f32((uint16_t)h2f[i][0]));
+        CHECK(got == h2f[i][1], "vh2f %04X: %08X, want %08X", h2f[i][0], got, h2f[i][1]);
+    }
+    psp_vfpu_reset();
+}
+
+/* ---- the transcendental unit -----------------------------------------------
+ *
+ * Words from vfpuprobe's dumps (steps 2-12 and 120-127, v3 steps 193-200,
+ * fw 6.60). The exact rows are ones the model reproduces; the last three are
+ * where it is a unit off the hardware's, and are held to that. */
+static void test_transcendentals(void) {
+    psp_vfpu_reset();
+    static const struct { int op; uint32_t in, out; } exact[] = {
+        { PSP_VU_SIN,  0x40000000, 0x80000000 },   /* vsin(2) is -0         */
+        { PSP_VU_SIN,  0xC0000000, 0x00000000 },
+        { PSP_VU_COS,  0x3F800000, 0x80000000 },   /* vcos(1) is -0         */
+        { PSP_VU_COS,  0x40400000, 0x00000000 },
+        { PSP_VU_COS,  0x3F7FFFFF, 0x34480000 },   /* the 2^-24 bit is lost */
+        { PSP_VU_SIN,  0x3F000000, 0x3F3504F0 },   /* truncated, not 3F3504F3 */
+        { PSP_VU_SIN,  0x2EDBE6FF, 0x00000000 },   /* vsin(1e-10)           */
+        { PSP_VU_NSIN, 0x3F000000, 0xBF3504F0 },
+        { PSP_VU_ASIN, 0x3F7F8000, 0x3F7AE7A4 },   /* not asin's 0.96020    */
+        { PSP_VU_ASIN, 0x3F000000, 0x3EAAAAA8 },
+        { PSP_VU_ASIN, 0x3F800001, 0x7F800001 },
+        { PSP_VU_EXP2, 0xBF800000, 0x3EFFFFFC },   /* vexp2(-1)             */
+        { PSP_VU_EXP2, 0xC2C80000, 0x0D7FFFFC },   /* vexp2(-100)           */
+        { PSP_VU_EXP2, 0x42FE0000, 0x7F000000 },   /* vexp2(127)            */
+        { PSP_VU_EXP2, 0xC3000000, 0x00000000 },   /* vexp2(-128)           */
+        { PSP_VU_EXP2, 0x80800000, 0x3F7FFFFC },   /* vexp2(-2^-126)        */
+        { PSP_VU_REXP2,0x2EDBE6FF, 0x3F7FFFFC },
+        { PSP_VU_LOG2, 0x407FFFFF, 0x3FFFFFFE },
+        { PSP_VU_LOG2, 0x7F7FFFFF, 0x42FFFFFE },
+        { PSP_VU_LOG2, 0x3F800001, 0x00000000 },
+        { PSP_VU_LOG2, 0x3DCCCCCD, 0xC0549A80 },   /* 15 fraction bits below 1 */
+        { PSP_VU_LOG2, 0x3F7FFFFF, 0x80000000 },
+        { PSP_VU_LOG2, 0xBF800000, 0x7F800001 },
+        { PSP_VU_RCP,  0x807FFFFF, 0xFF800000 },
+        { PSP_VU_RCP,  0x7F7FFFFF, 0x00000000 },
+        { PSP_VU_RCP,  0x40400000, 0x3EAAAAA8 },
+        { PSP_VU_NRCP, 0x40400000, 0xBEAAAAA8 },
+        { PSP_VU_RSQ,  0xBF800000, 0xFF800001 },
+        { PSP_VU_RSQ,  0x40000000, 0x3F3504F0 },
+        { PSP_VU_SQRT, 0x40000000, 0x3FB504F0 },
+        { PSP_VU_SQRT, 0x807FFFFF, 0x00000000 },
+        { PSP_VU_SQRT, 0xFF800000, 0x7F800001 },   /* sqrt(-inf)            */
+        /* v3 core dumps (steps 196-200) and sweeps: the fitted cores, where
+         * the exact functions they replaced were one unit off. */
+        { PSP_VU_RCP,  0x3FF87206, 0x3F03E460 },
+        { PSP_VU_RCP,  0x3FCFB9AB, 0x3F1DBF30 },
+        { PSP_VU_SQRT, 0x4055AA25, 0x3FE9E054 },
+        { PSP_VU_SQRT, 0x3FBD2B6A, 0x3F9B9B88 },
+        { PSP_VU_RSQ,  0x40577C24, 0x3F0B83E4 },
+        { PSP_VU_RSQ,  0x3FAF1EE4, 0x3F5ADD70 },
+        { PSP_VU_EXP2, 0x3F8F8268, 0x400B36F4 },
+        { PSP_VU_EXP2, 0x3FE9FD89, 0x40633C7C },
+        { PSP_VU_EXP2, 0xC02EC000, 0x3E1A4B14 },   /* ones' complement of f */
+        { PSP_VU_EXP2, 0xC2145433, 0x2CF1D13C },
+        { PSP_VU_LOG2, 0x3FA8DB02, 0x3ECC9E48 },
+        { PSP_VU_LOG2, 0x3FFA9C40, 0x3F78242C },
+        { PSP_VU_LOG2, 0x2F4027F0, 0xC201A7C8 },   /* below 1: linear part  */
+        { PSP_VU_LOG2, 0x2CA6100C, 0xC2167F60 },
+    };
+    int r[4];
+    psp_vfpu_regs(0x00, 1, r);
+    for (size_t i = 0; i < sizeof exact / sizeof exact[0]; i++) {
+        psp_cpu.v[r[0]] = psp_bits_to_f32(exact[i].in);
+        psp_vunary(exact[i].op, 0x00, 0x00, 1);
+        const uint32_t got = psp_f32_to_bits(psp_cpu.v[r[0]]);
+        CHECK(got == exact[i].out, "op %d of %08X: %08X, want %08X",
+              exact[i].op, exact[i].in, got, exact[i].out);
+    }
+    static const struct { int op; uint32_t in, out; } near[] = {
+        { PSP_VU_SIN,  0x501502F9, 0xBEFC7DA0 },   /* 1e10 reduces to a non-zero angle */
+        { PSP_VU_ASIN, 0x3F7FFFFF, 0x3F7FFFE8 },
+        { PSP_VU_LOG2, 0x4081C4A1, 0x40014442 },   /* x >= 4: rule unsettled */
+    };
+    for (size_t i = 0; i < sizeof near / sizeof near[0]; i++) {
+        psp_cpu.v[r[0]] = psp_bits_to_f32(near[i].in);
+        psp_vunary(near[i].op, 0x00, 0x00, 1);
+        const uint32_t got = psp_f32_to_bits(psp_cpu.v[r[0]]);
+        const uint32_t d = got > near[i].out ? got - near[i].out : near[i].out - got;
+        CHECK(d <= 4, "op %d of %08X: %08X, want %08X within 4", near[i].op, near[i].in,
+              got, near[i].out);
+    }
+
+    /* vrot is the same sine and cosine (steps 120 and 122). */
+    set_bits(0x00, 0x3E800000, 0, 0, 0);
+    psp_vrot(0x08, 0x00, 0x04, 2);                         /* [c, s] */
+    int d[4];
+    psp_vfpu_regs(0x08, 2, d);
+    CHECK(psp_f32_to_bits(psp_cpu.v[d[0]]) == 0x3F6C835Cu &&
+          psp_f32_to_bits(psp_cpu.v[d[1]]) == 0x3EC3EF14u, "vrot.p [c,s] of 1/4: %08X %08X",
+          psp_f32_to_bits(psp_cpu.v[d[0]]), psp_f32_to_bits(psp_cpu.v[d[1]]));
+    set_bits(0x00, 0x00000000, 0, 0, 0);
+    psp_vrot(0x08, 0x00, 0x14, 2);                         /* [c, -s] */
+    CHECK(psp_f32_to_bits(psp_cpu.v[d[0]]) == 0x3F800000u &&
+          psp_f32_to_bits(psp_cpu.v[d[1]]) == 0x80000000u, "vrot.p [c,-s] of 0: %08X %08X",
+          psp_f32_to_bits(psp_cpu.v[d[0]]), psp_f32_to_bits(psp_cpu.v[d[1]]));
+    psp_vfpu_reset();
+}
+
+/* ---- the random generator --------------------------------------------------
+ *
+ * What vfpuprobe measured (steps 154-159, fw 6.60): the seeding, the output
+ * forms, and the streams the model reproduces exactly -- from the reset state
+ * and from seeds 0, 1 and 12345678 -- and, with the carry rule fitted to
+ * v3 steps 179-187, from FFFFFFFF and 3F800000, rcx included. */
+static void draw_quad(int kind, uint32_t out[4]) {
+    int q[4];
+    psp_vfpu_regs(0x00, 4, q);
+    psp_vrnd(0x00, kind, 4);
+    for (int i = 0; i < 4; i++) out[i] = psp_f32_to_bits(psp_cpu.v[q[i]]);
+}
+
+static void test_random(void) {
+    psp_vfpu_reset();
+    int r[4];
+    psp_vfpu_regs(0x08, 1, r);
+
+    psp_cpu.v[r[0]] = psp_bits_to_f32(0x12345678u);
+    psp_vrnds(0x08, 1);
+    static const uint32_t seeded[8] = {
+        0x3F885678, 0x3F875678, 0x3F865678, 0x3F855678,
+        0x3F841234, 0x3F831234, 0x3F821234, 0x3F811234,
+    };
+    for (int i = 0; i < 8; i++)
+        CHECK(psp_mfvc(PSP_VFPU_RCX0 + i) == seeded[i], "vrnds 12345678: rcx%d %08X, want %08X",
+              i, psp_mfvc(PSP_VFPU_RCX0 + i), seeded[i]);
+    psp_cpu.v[r[0]] = psp_bits_to_f32(0x3F800000u);
+    psp_vrnds(0x08, 1);
+    CHECK(psp_mfvc(PSP_VFPU_RCX0 + 0) == 0x3F800000u && psp_mfvc(PSP_VFPU_RCX0 + 5) == 0x3F883F80u,
+          "vrnds 3F800000: rcx0 %08X rcx5 %08X", psp_mfvc(PSP_VFPU_RCX0), psp_mfvc(PSP_VFPU_RCX0 + 5));
+
+    /* From the reset state, before anything seeds it (step 154). */
+    uint32_t got[4];
+    psp_vfpu_reset();
+    draw_quad(0, got);
+    CHECK(got[0] == 0x00094E24u && got[1] == 0x245A1029u && got[2] == 0xECF210C2u &&
+          got[3] == 0x91ABC47Bu, "vrndi from reset: %08X %08X %08X %08X",
+          got[0], got[1], got[2], got[3]);
+
+    /* Seeds 0, 1 and 12345678, eight draws as two quads, in all three forms:
+     * the float forms take the same stream's low 23 bits. */
+    static const struct { uint32_t seed, raw[8]; } streams[] = {
+        { 0x00000000, { 0x00000001, 0x00010DCE, 0x1C5983F7, 0xC35937CC,
+                        0x2E130A5D, 0xE723057A, 0xE3CC94B3, 0x63132A58 } },
+        { 0x00000001, { 0x00052DF3, 0x20618A01, 0x6125E0A7, 0x4068A3E1,
+                        0x761C1DCB, 0x103BF1B8, 0x88C5605C, 0x93D08434 } },
+        { 0x12345678, { 0x632F0A9E, 0x9CB065E1, 0xA483C0E3, 0x752E3534,
+                        0xE235C17D, 0x89248F57, 0xD8FA70D8, 0x213C6031 } },
+        { 0xFFFFFFFF, { 0x0002D24F, 0xDFB0959D, 0xEA156854, 0x4A6BEDED,
+                        0xEF2BFD71, 0x831EC646, 0xCA27FC91, 0x5CFC70F2 } },
+        { 0x3F800000, { 0x2703E7C1, 0x430D7FAB, 0xFBA263FD, 0xF225DFEF,
+                        0xBD70ECE5, 0xC0463FBF, 0x76501414, 0x16E87BF7 } },
+    };
+    for (unsigned sidx = 0; sidx < sizeof streams / sizeof streams[0]; sidx++) {
+        for (int kind = 0; kind < 3; kind++) {
+            psp_cpu.v[r[0]] = psp_bits_to_f32(streams[sidx].seed);
+            psp_vrnds(0x08, 1);
+            for (int half = 0; half < 2; half++) {
+                draw_quad(kind, got);
+                for (int i = 0; i < 4; i++) {
+                    const uint32_t raw = streams[sidx].raw[4 * half + i];
+                    const uint32_t want = kind == 0 ? raw
+                        : (kind == 1 ? 0x3F800000u : 0x40000000u) | (raw & 0x7FFFFFu);
+                    CHECK(got[i] == want, "seed %08X kind %d draw %d: %08X, want %08X",
+                          streams[sidx].seed, kind, 4 * half + i, got[i], want);
+                }
+            }
+        }
+    }
+
+    /* The carry lives in rcx0's nibble after a draw (step 182): from
+     * FFFFFFFF it is 2 after the first draw and 1 after the next two, and
+     * the eight rcx read exactly these. Step 183: from 3F800000, 1 after the
+     * third draw and 0 after the fourth. */
+    static const uint32_t ff_rcx[3][8] = {
+        { 0x3F82F234, 0x3F80E01F, 0x3F80FFFF, 0x3F80FFFC, 0x3F80FFFE, 0x3F800003, 0x3F80FFFF, 0x3F80FFFF },
+        { 0x3F8197A5, 0x3F80FDFF, 0x3F80FFFC, 0x3F80FFF9, 0x3F80E3A8, 0x3F80FC07, 0x3F80FFFF, 0x3F80FFFF },
+        { 0x3F81D022, 0x3F809843, 0x3F80FFF9, 0x3F80FFEF, 0x3F807559, 0x3F8074BB, 0x3F80FFFF, 0x3F80FFFF },
+    };
+    psp_cpu.v[r[0]] = psp_bits_to_f32(0xFFFFFFFFu);
+    psp_vrnds(0x08, 1);
+    for (int d = 0; d < 3; d++) {
+        psp_vrnd(0x00, 0, 1);
+        for (int i = 0; i < 8; i++)
+            CHECK(psp_mfvc(PSP_VFPU_RCX0 + i) == ff_rcx[d][i],
+                  "seed FFFFFFFF draw %d: rcx%d %08X, want %08X", d + 1, i,
+                  psp_mfvc(PSP_VFPU_RCX0 + i), ff_rcx[d][i]);
+    }
+    psp_cpu.v[r[0]] = psp_bits_to_f32(0x3F800000u);
+    psp_vrnds(0x08, 1);
+    for (int d = 0; d < 4; d++) psp_vrnd(0x00, 0, 1);
+    CHECK(psp_mfvc(PSP_VFPU_RCX0) == 0x3F8037CCu && psp_mfvc(PSP_VFPU_RCX0 + 3) == 0x3F800001u &&
+          psp_mfvc(PSP_VFPU_RCX0 + 7) == 0x3F802580u,
+          "seed 3F800000 after 4 draws: rcx0 %08X rcx3 %08X rcx7 %08X", psp_mfvc(PSP_VFPU_RCX0),
+          psp_mfvc(PSP_VFPU_RCX0 + 3), psp_mfvc(PSP_VFPU_RCX0 + 7));
+
+    /* mtvc keeps an rcx register's 20 state bits under 3F800000, and only
+     * that register (step 185). */
+    static const uint32_t mt[][2] = {
+        { 0xFFFFFFFF, 0x3F8FFFFF }, { 0x00000000, 0x3F800000 },
+        { 0x12345678, 0x3F845678 }, { 0x3F800000, 0x3F800000 },
+    };
+    for (int reg = 0; reg < 8; reg++)
+        for (size_t k = 0; k < sizeof mt / sizeof mt[0]; k++) {
+            psp_cpu.v[r[0]] = psp_bits_to_f32(0u);
+            psp_vrnds(0x08, 1);
+            psp_mtvc(PSP_VFPU_RCX0 + reg, mt[k][0]);
+            for (int i = 0; i < 8; i++) {
+                const uint32_t want = i == reg ? mt[k][1] : 0x3F800000u;
+                CHECK(psp_mfvc(PSP_VFPU_RCX0 + i) == want, "mtvc rcx%d %08X: rcx%d %08X, want %08X",
+                      reg, mt[k][0], i, psp_mfvc(PSP_VFPU_RCX0 + i), want);
+            }
+        }
+    psp_vfpu_reset();
+}
+
+/* ---- control state --------------------------------------------------------
+ *
+ * The reset values and the per-thread ownership, as a PSP on firmware 6.60
+ * reports them (vfpuprobe, the lines before step 1 and step 147). */
+static void test_control_state(void) {
+    static const uint32_t want[16] = {
+        0x000000E4, 0x000000E4, 0x00000000, 0x0000003F,
+        0x00000000, 0x00000000, 0x00000000, 0x7772CEAB,
+        0x3F800001, 0x3F800002, 0x3F800004, 0x3F800008,
+        0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000,
+    };
+
+    /* A fresh thread: the whole register file, then the control words. */
+    psp_cpu_reset_thread();
+    for (int i = 0; i < 16; i++)
+        CHECK(psp_mfvc(i) == want[i], "fresh thread: control %d is %08X, want %08X",
+              i, psp_mfvc(i), want[i]);
+    CHECK(psp_cpu.r[PSP_REG_AT] == 0xDEADBEEFu && psp_cpu.r[PSP_REG_S7] == 0xDEADBEEFu &&
+          psp_cpu.r[PSP_REG_T9] == 0xDEADBEEFu,
+          "fresh thread: unset general registers hold DEADBEEF");
+    CHECK(psp_cpu.r[PSP_REG_ZERO] == 0 && psp_cpu.r[PSP_REG_K1] == 0,
+          "fresh thread: $zero and $k1 are zero");
+    CHECK(psp_cpu.fcr31 == 0x00000E00u, "fresh thread: FCR31 %08X", psp_cpu.fcr31);
+    CHECK(psp_f32_to_bits(psp_cpu.f[7]) == 0x7F800001u &&
+          psp_f32_to_bits(psp_cpu.v[77]) == 0x7F800001u,
+          "fresh thread: float and vector registers hold 7F800001");
+
+    /* The first VFPU op after a reset sees the identity prefix, not zero --
+     * zero is the swizzle x,x,x,x and used to broadcast lane 0. */
+    const float a[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    float out[4];
+    set_quad(0x00, a);
+    psp_vunary(PSP_VU_MOV, 0x04, 0x00, 4);
+    get_quad(0x04, out);
+    for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i], "first op after reset: no swizzle");
+
+    /* Per thread: the state travels with psp_cpu, which is what a thread
+     * switch saves and restores. A prefix pending in one thread and the
+     * generator state it seeded are invisible to another. */
+    psp_mtvc(PSP_VFPU_RCX0, 0x3F812345u);
+    psp_vfpu_set_prefix(0, 0x1B);
+    psp_cpu.vfpu_cc = 0x15u;
+    const psp_cpu_state main_ctx = psp_cpu;
+    psp_cpu_reset_thread();
+    CHECK(!psp_vfpu_prefix_pending(), "another thread sees no pending prefix");
+    CHECK(psp_mfvc(PSP_VFPU_CC) == 0x3Fu && psp_mfvc(PSP_VFPU_RCX0) == 0x3F800001u,
+          "another thread sees its own CC and rcx");
+    psp_cpu = main_ctx;
+    CHECK(psp_vfpu_prefix_pending() && psp_mfvc(PSP_VFPU_PFXS) == 0x1Bu,
+          "switching back restores the pending prefix");
+    CHECK(psp_mfvc(PSP_VFPU_CC) == 0x15u && psp_mfvc(PSP_VFPU_RCX0) == 0x3F812345u,
+          "switching back restores CC and rcx");
+    psp_vfpu_reset();
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
+    test_control_state();
     psp_cpu_reset();
     psp_vfpu_reset();
 
@@ -540,6 +1003,10 @@ int main(void) {
     test_matrix_ops();
     test_matrix_transform();
     test_vrot();
+    test_special_values();
+    test_random();
+    test_units_and_conversions();
+    test_transcendentals();
 
     psp_mem_free();
 

@@ -66,6 +66,20 @@ typedef struct {
      * Zero-initialized and through-mode vertices use x/y unless precise is set. */
     float    precise_x, precise_y;
     int      precise;
+    /* The secondary colour, 0x00BBGGRR, valid when spec_set: in lighting's
+     * separate-specular mode (LIGHTMODE 1) the specular terms land here and
+     * the rest in rgba, each clamped to 255 per vertex. The rasterizer
+     * interpolates it as three more planes and adds it to the pixel's colour,
+     * clamping the sum: geprobe 7 (fw 6.60) scene 16's two specular fans,
+     * whose centre vertex sums past 255, match on every pixel in 46 of their
+     * 72 triangle channels that way and are a few pixels off in the rest
+     * (slips the single-colour fans below them show too). As one plane through
+     * the unclamped sum, which is what this replaced, 9 fit whatever the
+     * corners (each searched within 4), and those 9 are 255 throughout. In
+     * single-colour mode the specular joins rgba before the clamp and
+     * spec_set is clear. */
+    uint32_t spec;
+    int      spec_set;
 } psp_vertex;
 
 /* The bound texture, as the GE describes it.
@@ -136,6 +150,31 @@ typedef struct {
      * writes it. With the test off the byte is left alone. */
     int      stencil_test, stencil_func, stencil_ref, stencil_mask;
     int      op_sfail, op_zfail, op_zpass;
+    /* SHADE (0x50) clear: a triangle is one colour, its last vertex's, the
+     * third as draw() receives it (geprobe step 1, fw 6.60: the flat red
+     * triangle reads 00FF0000 throughout). Pushed with the rest of the draw
+     * state because the GE reads it per primitive, as it does these. */
+    int      shade_flat;
+    /* Dither, DTE (0x20) and DITH1..4 (0xE2..0xE5): with it on, each of R,
+     * G and B becomes clamp(c + m[y & 3][x & 3]) before the write, in every
+     * framebuffer format, 8888 included, and alpha is not dithered (geprobe
+     * steps 5-10, fw 6.60). Row n is DITH(n+1), and element j is the signed
+     * nibble at bits 4j..4j+3 of it. */
+    int      dither;
+    int8_t   dither_m[4][4];
+    /* The colour test, CTE (0x27) with CTEST/CREF/CMSK (0xD8-0xDA): a
+     * fragment passes when (rgb & mask) OP (ref & mask), OP 0 never, 1
+     * always, 2 equal, 3 not equal, compared as one 24-bit word. */
+    int      colour_test, colour_func;
+    uint32_t colour_ref, colour_mask;
+    /* The logic op, LOE (0x28) and LOP (0xE6): the sixteen PSPSDK GU_CLEAR
+     * .. GU_SET codes, applied to RGB against the framebuffer after blending;
+     * the alpha/stencil byte is left alone. */
+    int      logic_enable, logic_op;
+    /* PMSK1 | PMSK2 << 24 (0xE8, 0xE9), in 0xAABBGGRR: a set bit keeps the
+     * framebuffer's bit (geprobe step 19, fw 6.60: 0xFF00F0F0 with 0x7FFFFFFF
+     * over 0x00402010 reads 0x00FF2F1F). */
+    uint32_t pixel_mask;
 } psp_blend_state;
 
 /* GE primitive types, from the PRIM argument's type field. */
@@ -292,7 +331,12 @@ int psp_render_lod16(const psp_tex_state *t, float rho);
 /* One-pixel primitives use explicit coverage, not the host API's line rules.
  * Walk a half-open segment, clipped to inclusive pixel bounds. Each callback
  * receives a pixel-centred vertex with already interpolated colour, depth,
- * fog and divided texture coordinates (inv_w = tex_q = 1). */
+ * fog and divided texture coordinates (inv_w = tex_q = 1). Position, colour
+ * and depth follow the hardware (geprobe step 1 and geprobe 5 scene 27, fw
+ * 6.60): one pixel per major-axis column whose centre lies on the segment,
+ * the minor coordinate, colour and depth taken where that centre projects
+ * onto it (for whole-pixel endpoints, step i's centre, i + 1/2), colour and
+ * depth on gradients floored to 1/1024 a pixel. */
 typedef void (*psp_line_pixel_fn)(const psp_vertex *sample, void *opaque);
 void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
                           int x0, int y0, int x1, int y1,
@@ -339,10 +383,13 @@ uint64_t psp_render_filter_split(void);
 uint64_t psp_render_raster_ns(void);
 void     psp_render_reset_pixels(void);
 
-/* Return the depth buffer to its start-of-run contents. The game clears depth
- * itself through the GE -- a clear-mode draw with the depth bit set -- so this
- * is only the value in place before its first such draw, not a per-frame clear.
- * psp_ge_reset calls it. */
+/* ZBP / ZBW: where the depth buffer lives in VRAM and its row stride in
+ * pixels. The software backend keeps depth there, 16 bits a pixel. */
+void     psp_render_set_depth_buffer(uint32_t addr, uint32_t stride);
+
+/* Return the depth-buffer registers to their start-of-run values. The depth
+ * itself is guest VRAM; the game clears it through the GE -- a clear-mode
+ * draw with the depth bit set. psp_ge_reset calls it. */
 void     psp_render_reset_depth(void);
 
 #endif

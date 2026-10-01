@@ -8,7 +8,11 @@
 #include <stdio.h>
 #include <string.h>
 
-static uint32_t g_prefix[3];      /* vpfxs, vpfxt, vpfxd */
+/* vpfxs, vpfxt, vpfxd: control registers 0..2, which are thread context and so
+ * live in psp_cpu (see cpu.h). */
+#define PFXS (psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS])
+#define PFXT (psp_cpu.vfpu_ctrl[PSP_VFPU_PFXT])
+#define PFXD (psp_cpu.vfpu_ctrl[PSP_VFPU_PFXD])
 static uint64_t g_traps;
 
 /* The identity prefixes.
@@ -33,24 +37,19 @@ static uint64_t g_traps;
 static float sat0(float v) { return v <= 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 static float sat1(float v) { return v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v); }
 
-static void reset_ctrl(void);
-
 void psp_vfpu_reset(void) {
-    g_prefix[0] = g_prefix[1] = PFX_ST_NONE;
-    g_prefix[2] = PFX_D_NONE;
-    psp_cpu.vfpu_cc = 0x3Fu;      /* all six condition bits set; see cpu.c */
-    reset_ctrl();
+    psp_cpu_reset_vfpu_ctrl();    /* prefixes, CC, rev and rcx; see cpu.c */
     g_traps = 0;
 }
 
 void psp_vfpu_set_prefix(int which, uint32_t value) {
     if (which < 0 || which > 2) return;
-    g_prefix[which] = value;
+    psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS + which] = value;
 }
 
 int psp_vfpu_prefix_pending(void) {
-    return g_prefix[0] != PFX_ST_NONE || g_prefix[1] != PFX_ST_NONE
-        || g_prefix[2] != PFX_D_NONE;
+    return PFXS != PFX_ST_NONE || PFXT != PFX_ST_NONE
+        || PFXD != PFX_D_NONE;
 }
 
 /* A prefix lasts exactly one instruction.
@@ -59,8 +58,8 @@ int psp_vfpu_prefix_pending(void) {
  * ignores a pending swizzle but must still clear it, or it would be applied to
  * whatever came next instead. */
 static void eat_prefixes(void) {
-    g_prefix[0] = g_prefix[1] = PFX_ST_NONE;
-    g_prefix[2] = PFX_D_NONE;
+    PFXS = PFXT = PFX_ST_NONE;
+    PFXD = PFX_D_NONE;
 }
 
 uint64_t psp_vfpu_trap_count(void) { return g_traps; }
@@ -177,7 +176,7 @@ static int read_src(uint32_t vreg, int size, uint32_t pfx, float out[4]) {
 static void write_dst(uint32_t vreg, int size, const float in[4]) {
     int r[4];
     const int n = psp_vfpu_regs(vreg, size, r);
-    const uint32_t pfx = g_prefix[2];
+    const uint32_t pfx = PFXD;
 
     if (pfx == PFX_D_NONE) {
         for (int i = 0; i < n; i++) psp_cpu.v[r[i]] = in[i];
@@ -193,6 +192,54 @@ static void write_dst(uint32_t vreg, int size, const float in[4]) {
         }
         psp_cpu.v[r[i]] = v;
     }
+}
+
+/* ---- special values -------------------------------------------------------
+ *
+ * The VFPU's arithmetic is not the host's IEEE arithmetic at the edges, and
+ * vfpuprobe on firmware 6.60 pins down how (steps 41-42, 51-84, 89-104):
+ *
+ *   - an operand whose exponent field is 0 -- a zero or a denormal -- is a
+ *     signed zero: 1e-40/1e-40 is 7F800001, 3 * 1e-40 is 0, vcmp EZ says a
+ *     denormal is zero, vf2iu turns 00000001 into 0;
+ *   - a result below 2^-126 is flushed to a signed zero: 1e-38 + 1e-38 is 0,
+ *     not the normal 00D9C7DC;
+ *   - every NaN result is the one pattern 7F800001. Its sign is fixed per
+ *     operation, not propagated: vadd/vsub/vbfy/vocp give +, vmul/vdiv/vscl/
+ *     vcrs give sign(a) ^ sign(b) -- vmul of FFC00000 and 1.0 is FF800001,
+ *     vadd of the same is 7F800001, vdiv of -0 by +0 is FF800001.
+ *
+ * vin/vout wrap each lane of those operations. vmov, vneg, vabs, vmin/vmax and
+ * vsat move bits and keep denormals and NaN payloads as they are, as the
+ * hardware does. The dot-product unit below applies the same rules itself. */
+#define VNAN_BITS 0x7F800001u
+
+static inline float vin(float f) {
+    const uint32_t b = psp_f32_to_bits(f);
+    return (b & 0x7F800000u) ? f : psp_bits_to_f32(b & 0x80000000u);
+}
+
+/* `nan_sign` is 0 or 0x80000000: the sign the operation gives a NaN. */
+static inline float vout(float r, uint32_t nan_sign) {
+    const uint32_t b = psp_f32_to_bits(r);
+    const uint32_t e = b & 0x7F800000u;
+    if (e == 0x7F800000u)
+        return (b & 0x007FFFFFu) ? psp_bits_to_f32(VNAN_BITS | nan_sign) : r;
+    return e ? r : psp_bits_to_f32(b & 0x80000000u);
+}
+
+static inline uint32_t sign_of(float f) { return psp_f32_to_bits(f) & 0x80000000u; }
+
+/* The order vmin, vmax, vscmp and the sorts use: the bits read as a
+ * sign-magnitude integer, with an exponent of 0 as zero. A NaN therefore
+ * orders by its bits -- +NaN above +inf, -NaN below -inf -- and -0 equals +0
+ * (steps 55-57, 69, 71, 77-80). Host `<` said false for every NaN, so vmin of
+ * 2 and 7F800001 depended on the operand order. */
+static inline int32_t vkey(float f) {
+    const uint32_t b = psp_f32_to_bits(f);
+    if (!(b & 0x7F800000u)) return 0;
+    const int32_t m = (int32_t)(b & 0x7FFFFFFFu);
+    return (b >> 31) ? -m : m;
 }
 
 /* ---- the dot-product unit -------------------------------------------------
@@ -287,47 +334,134 @@ float psp_vfpu_dot(const float a[4], const float b[4]) {
 
 /* ---- VFPU control registers ----------------------------------------------- */
 
-/* Everything past the prefixes and the condition codes: the revision word and
- * the random-number state. Kept together here because nothing reads them yet
- * and giving each a home of its own would be inventing structure. */
-static uint32_t g_vfpu_ctrl_rest[16];
-
-/* Their power-on values. Index 7 is the revision word and 8..15 are the
- * random-number generator's state, which is why they are not zero -- each RCX
- * register holds a 1.0f pattern with a distinct low bit, and vrnd derives its
- * stream from them. Nothing reads any of this yet; it is set because the
- * condition codes next door turned out to matter and there is no reason to
- * think these are the exception. */
-static void reset_ctrl(void) {
-    for (int i = 0; i < 16; i++) g_vfpu_ctrl_rest[i] = 0;
-    g_vfpu_ctrl_rest[7]  = 0x7772CEABu;          /* revision */
-    g_vfpu_ctrl_rest[8]  = 0x3F800001u;          /* RCX0 */
-    g_vfpu_ctrl_rest[9]  = 0x3F800002u;
-    g_vfpu_ctrl_rest[10] = 0x3F800004u;
-    g_vfpu_ctrl_rest[11] = 0x3F800008u;
-    for (int i = 12; i < 16; i++) g_vfpu_ctrl_rest[i] = 0x3F800000u;
-}
-
+/* All sixteen are per-thread state in psp_cpu.vfpu_ctrl (the condition codes in
+ * psp_cpu.vfpu_cc), reset by psp_cpu_reset_vfpu_ctrl. They used to be file
+ * statics here and were never initialised outside the unit tests: every thread
+ * shared one set, and a program read rev and rcx as zero. */
 uint32_t psp_mfvc(int index) {
-    switch (index) {
-    case 0: case 1: case 2: return g_prefix[index];
-    case 3:                 return psp_cpu.vfpu_cc;
-    default:
-        return (index >= 0 && index < 16) ? g_vfpu_ctrl_rest[index] : 0;
-    }
+    if (index == PSP_VFPU_CC) return psp_cpu.vfpu_cc;
+    return (index >= 0 && index < 16) ? psp_cpu.vfpu_ctrl[index] : 0;
 }
+
+uint32_t psp_mfvc_cc_after_vcmp(void) { return psp_cpu.vfpu_ctrl[PSP_VFPU_CC]; }
 
 void psp_mtvc(int index, uint32_t value) {
     switch (index) {
     /* Writing a prefix here is the same as executing vpfxs/vpfxt/vpfxd: the
      * next VFPU op consumes it and clears it. Storing it anywhere else would
      * make the two views of the same register disagree. */
-    case 0: case 1: case 2: g_prefix[index] = value & 0xFFFFFFu; break;
+    case 0: case 1: case 2: psp_cpu.vfpu_ctrl[index] = value & 0xFFFFFFu; break;
     case 3:                 psp_cpu.vfpu_cc = value;            break;
+    /* An rcx register keeps only its 20 state bits and reads back as a
+     * 1.0f-shaped word: FFFFFFFF -> 3F8FFFFF, 12345678 -> 3F845678,
+     * 3F800000 -> 3F800000, each write touching only its own register
+     * (vfpuprobe v3 step 185, fw 6.60). */
+    case 8: case 9: case 10: case 11: case 12: case 13: case 14: case 15:
+        psp_cpu.vfpu_ctrl[index] = 0x3F800000u | (value & 0xFFFFFu);
+        break;
     default:
-        if (index >= 0 && index < 16) g_vfpu_ctrl_rest[index] = value;
+        if (index >= 0 && index < 16) psp_cpu.vfpu_ctrl[index] = value;
         break;
     }
+}
+
+/* ---- the random generator: vrnds, vrndi, vrndf1, vrndf2 ------------------
+ *
+ * The state is the eight rcx control registers, each a 1.0f-shaped word whose
+ * low 20 bits carry state (bits 16..19 and 0..15). Measured on firmware 6.60
+ * (vfpuprobe steps 147 and 154-159, v3 steps 174-187) and reproduced exactly:
+ *
+ *   - vrnds S writes rcx_i = 0x3F800000 | ((S >> 4i) & 0xF) << 16
+ *                           | (i < 4 ? S & 0xFFFF : S >> 16),
+ *     for all five seeds probed (0, 1, 12345678, FFFFFFFF, 3F800000);
+ *   - vrndf1 is 0x3F800000 | (r & 0x7FFFFF) and vrndf2 0x40000000 |
+ *     (r & 0x7FFFFF), where r is the value vrndi would have returned: all
+ *     three advance one stream, one step per lane;
+ *   - the state is per thread and reset with the other control registers.
+ *
+ * Read that way the 160 state bits are five 32-bit words, and vrnds sets all
+ * five to S: x = rcx0|rcx4 (low halves), y = rcx1|rcx5, z = rcx2|rcx6,
+ * w = rcx3|rcx7, and c = the eight nibbles, rcx_i's at bits 4i. The reset
+ * state is x=1 y=2 z=4 w=8 c=0. Each draw is then
+ *
+ *     x = 69069x + 1;  y = xorshift(y; <<13, >>17, <<5);
+ *     t = z + 2w + c;  z = w;  w = t;          result x + y + w
+ *     c = max(((2z + w + c) >> 32) - 1, 0)      (with the old z, w, c)
+ *
+ * and after the draw the nibbles hold c: all zero but rcx0's, which is 0, 1
+ * or 2. This is fitted, not read from a document. The carry is an odd rule
+ * (the sum it comes from is not the one that makes t), but it is the one
+ * rule over this state that reproduces every draw the probe logged with the
+ * eight rcx read back after it (1,624 distinct transitions): from seeds 0,
+ * 1, 12345678, FFFFFFFF and 3F800000 (vfpuprobe v3 steps 179-183), from
+ * every one-bit seed (step 186, 512 draws) and from seed 0 with each of the
+ * 160 state bits flipped by mtvc (step 187, 2,048 draws) -- state and
+ * result, running free from the seed. The plain carry t >> 32 gets 198 of
+ * the 1,624 wrong. */
+static uint32_t rcx_word(int lo) {
+    return (psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + lo] & 0xFFFFu) |
+           (psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + lo + 4] & 0xFFFFu) << 16;
+}
+static void rcx_set_word(int lo, uint32_t v) {
+    uint32_t *r = &psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + lo];
+    r[0] = (r[0] & ~0xFFFFu) | (v & 0xFFFFu);
+    r[4] = (r[4] & ~0xFFFFu) | (v >> 16);
+}
+static uint32_t rcx_nibbles(void) {
+    uint32_t c = 0;
+    for (int i = 0; i < 8; i++)
+        c |= ((psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + i] >> 16) & 0xFu) << (4 * i);
+    return c;
+}
+static void rcx_set_nibbles(uint32_t c) {
+    for (int i = 0; i < 8; i++) {
+        uint32_t *r = &psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + i];
+        *r = (*r & ~0xF0000u) | ((c >> (4 * i)) & 0xFu) << 16;
+    }
+}
+
+static uint32_t vrnd_next(void) {
+    uint32_t x = rcx_word(0), y = rcx_word(1), z = rcx_word(2), w = rcx_word(3);
+    const uint32_t c = rcx_nibbles();
+    x = 69069u * x + 1u;
+    y ^= y << 13; y ^= y >> 17; y ^= y << 5;
+    const uint32_t t = z + 2u * w + c;
+    const uint32_t hi = (uint32_t)((2ull * z + w + c) >> 32);
+    z = w;
+    w = t;
+    rcx_set_word(0, x); rcx_set_word(1, y); rcx_set_word(2, z); rcx_set_word(3, w);
+    rcx_set_nibbles(hi ? hi - 1u : 0u);
+    return x + y + w;
+}
+
+void psp_vrnds(uint32_t vs, int size) {
+    float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    read_src(vs, size, PFXS, sv);
+    const uint32_t s = psp_f32_to_bits(sv[0]);
+    for (int i = 0; i < 8; i++)
+        psp_cpu.vfpu_ctrl[PSP_VFPU_RCX0 + i] = 0x3F800000u | ((s >> (4 * i)) & 0xFu) << 16
+                                             | (i < 4 ? s & 0xFFFFu : s >> 16);
+    eat_prefixes();
+}
+
+void psp_vrnd(uint32_t vd, int kind, int size) {
+    int r[4];
+    const int n = psp_vfpu_regs(vd, size, r);
+    float out[4];
+    for (int i = 0; i < n; i++) {
+        const uint32_t v = vrnd_next();
+        out[i] = psp_bits_to_f32(kind == 0 ? v
+                                 : (kind == 1 ? 0x3F800000u : 0x40000000u) | (v & 0x7FFFFFu));
+    }
+    if (kind == 0) {
+        /* An integer: the destination prefix masks lanes but does not
+         * saturate, as for vf2i. */
+        for (int i = 0; i < n; i++)
+            if (!((PFXD >> (8 + i)) & 1)) psp_cpu.v[r[i]] = out[i];
+    } else {
+        write_dst(vd, size, out);
+    }
+    eat_prefixes();
 }
 
 /* ---- integer/vector moves ------------------------------------------------ */
@@ -421,7 +555,7 @@ void psp_svr_q(uint32_t vt, uint32_t addr) {
  * single lane is *zero*, because the constant for size 1 is 0 and not 1. */
 static void reduce(uint32_t vd, uint32_t vs, int size, float k) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
+    read_src(vs, size, PFXS, sv);
 
     /* A dot against a constant vector, which is literally what the hardware
      * does -- and the reason a single-lane vavg is zero, since the constant
@@ -478,10 +612,10 @@ void psp_vcolor(uint32_t vd, uint32_t vs, int fmt, int size) {
 
 void psp_vcmov(uint32_t vd, uint32_t vs, int cc_sel, int want, int size) {
     float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    const int n = read_src(vs, size, g_prefix[0], s);
+    const int n = read_src(vs, size, PFXS, s);
     /* The destination is read as the second operand, T prefix and all: a lane
      * that is not moved keeps its old value, so this is a read-modify-write. */
-    read_src(vd, size, g_prefix[1], d);
+    read_src(vd, size, PFXT, d);
 
     const uint32_t cc = psp_cpu.vfpu_cc;
     if (cc_sel < 6) {
@@ -498,13 +632,16 @@ void psp_vcmov(uint32_t vd, uint32_t vs, int cc_sel, int want, int size) {
 }
 
 /* One encoding, two operations, told apart by the operand width: a triple is
- * the cross product and a quad is the quaternion product. Hardware expresses
- * both as dot products against a forced swizzle-and-negate of t; written out
- * here as the products themselves, which is what they are. */
+ * the cross product and a quad is the quaternion product. Both go through the
+ * dot-product unit. The cross product's lanes are two-term dots with no padding
+ * terms: vfpuprobe step 65 (fw 6.60) gives (inf,1,2) x (1,2,3) as
+ * [BF800000 FF800000 7F800000], the plain cross product, where padding with a
+ * zero lane made an inf * 0 NaN of lane 0; and the sqrt-edge row's lane 2 is 0,
+ * not a NaN from s[3] * t[2]. */
 void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, t[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], s);
-    read_src(vt, size, g_prefix[1], t);
+    read_src(vs, size, PFXS, s);
+    read_src(vt, size, PFXT, t);
 
     float d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     if (size == 4) {                                     /* vqmul.q */
@@ -517,24 +654,12 @@ void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
         d[2] = psp_vfpu_dot(s, t2);
         d[3] = psp_vfpu_dot(s, t3);
     } else {                                             /* vcrsp.t */
-        const float t0[4] = { 0.0f,  t[2], -t[1], 0.0f };
-        const float t1[4] = { -t[2], 0.0f,  t[0], 0.0f };
-        d[0] = psp_vfpu_dot(s, t0);
-        d[1] = psp_vfpu_dot(s, t1);
-        /* The third lane comes out of the same forced-swizzle dot as the other
-         * two, which for a triple (t[3] and s[3] zero) is the cross term.
-         *
-         * Infinities are flushed to zero first, and only for this lane. That
-         * looks arbitrary and is what the hardware does: inf * 0 in the dot
-         * would be a NaN, and the PSP answers with the finite part instead.
-         * Nine lines of cpu/vfpu/vector turn on it. */
-        const float ts[4] = { t[1], -t[0], t[3], t[2] };
-        float fs[4], ft[4];
-        for (int i = 0; i < 4; i++) {
-            fs[i] = (s[i]  >  3.4028235e38f || s[i]  < -3.4028235e38f) ? 0.0f : s[i];
-            ft[i] = (ts[i] >  3.4028235e38f || ts[i] < -3.4028235e38f) ? 0.0f : ts[i];
-        }
-        d[2] = psp_vfpu_dot(fs, ft);
+        const float a0[4] = { s[1], s[2], 0.0f, 0.0f }, b0[4] = { t[2], -t[1], 0.0f, 0.0f };
+        const float a1[4] = { s[2], s[0], 0.0f, 0.0f }, b1[4] = { t[0], -t[2], 0.0f, 0.0f };
+        const float a2[4] = { s[0], s[1], 0.0f, 0.0f }, b2[4] = { t[1], -t[0], 0.0f, 0.0f };
+        d[0] = psp_vfpu_dot(a0, b0);
+        d[1] = psp_vfpu_dot(a1, b1);
+        d[2] = psp_vfpu_dot(a2, b2);
     }
 
     write_dst(vd, size, d);
@@ -543,8 +668,8 @@ void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    const int n = read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    const int n = read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     /* The last lane of the source is a forced 1: that is the whole difference
      * from vdot, and it is what makes this the homogeneous form. */
@@ -556,17 +681,19 @@ void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     /* s is forced to yzx and t to zxy, then multiplied lane by lane. There is
      * no subtraction: this is half a cross product, and a full one is two of
-     * these with a vsub between. */
+     * these with a vsub between. Each lane is a vmul, special values and all:
+     * -0 * -inf is 7F800001 and FFC00000 * 7FC00001 is FF800001 (step 64). */
+    static const int SI[4] = { 1, 2, 0, 3 }, TI[4] = { 2, 0, 1, 3 };
     float out[4];
-    out[0] = sv[1] * tv[2];
-    out[1] = sv[2] * tv[0];
-    out[2] = sv[0] * tv[1];
-    out[3] = sv[3] * tv[3];
+    for (int i = 0; i < 4; i++) {
+        const float a = sv[SI[i]], b = tv[TI[i]];
+        out[i] = vout(vin(a) * vin(b), sign_of(a) ^ sign_of(b));
+    }
 
     write_dst(vd, size, out);
     eat_prefixes();
@@ -574,8 +701,8 @@ void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     /* t's first two lanes are forced to yx and s's second is negated, so the
      * dot comes out as s0*t1 - s1*t0. Lanes beyond the pair contribute as they
@@ -591,32 +718,29 @@ void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 
 void psp_vcmp_val(uint32_t vd, uint32_t vs, uint32_t vt, int kind, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    const int n = read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    const int n = read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     float d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     for (int i = 0; i < n; i++) {
         if (kind == 0) {                                  /* vscmp: -1, 0, 1 */
-            const float a = sv[i] - tv[i];
-            if (a != a) {
-                /* A NaN difference means at least one side is NaN or the two
-                 * are opposite infinities. The hardware still orders them, by
-                 * signed magnitude -- the same treatment vmin/vmax give. */
-                const int32_t si = (int32_t)psp_f32_to_bits(sv[i]);
-                const int32_t ti = (int32_t)psp_f32_to_bits(tv[i]);
-                const int32_t sm = si & 0x7FFFFFFF, tm = ti & 0x7FFFFFFF;
-                const int32_t b = (si < 0 ? -sm : sm) - (ti < 0 ? -tm : tm);
-                d[i] = (float)((0 < b) - (b < 0));
-            } else {
-                d[i] = (float)((0.0f < a) - (a < 0.0f));
-            }
+            /* The sign-magnitude order of vmin/vmax, NaNs and denormals
+             * included: vscmp of 007FFFFF and 0 is 0, of -1 and 7FC00000 is
+             * -1 (step 57). Subtracting first, as this used to, compared the
+             * denormal as a number and fell back to an int32 difference that
+             * could overflow. */
+            const int32_t ks = vkey(sv[i]), kt = vkey(tv[i]);
+            d[i] = (float)((ks > kt) - (ks < kt));
         } else {
             /* A NaN on either side is false, not "unordered": both of these
-             * answer 0.0 rather than propagating it. */
-            const int nan = (sv[i] != sv[i]) || (tv[i] != tv[i]);
+             * answer 0.0 rather than propagating it -- unlike vscmp, which
+             * orders NaNs (vfpuprobe steps 58-59 agree). A denormal is a zero,
+             * as it is to vcmp. */
+            const float a = vin(sv[i]), b = vin(tv[i]);
+            const int nan = (a != a) || (b != b);
             if (nan)              d[i] = 0.0f;
-            else if (kind == 1)   d[i] = (sv[i] >= tv[i]) ? 1.0f : 0.0f;
-            else                  d[i] = (sv[i] <  tv[i]) ? 1.0f : 0.0f;
+            else if (kind == 1)   d[i] = (a >= b) ? 1.0f : 0.0f;
+            else                  d[i] = (a <  b) ? 1.0f : 0.0f;
         }
     }
     write_dst(vd, size, d);
@@ -629,7 +753,7 @@ void psp_vcmp_val(uint32_t vd, uint32_t vs, uint32_t vt, int kind, int size) {
  * through untouched. */
 void psp_vwbn(uint32_t vd, uint32_t vs, int exp, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
+    read_src(vs, size, PFXS, sv);
 
     const uint32_t e = (uint32_t)(exp & 0xFF);
     const uint32_t b = psp_f32_to_bits(sv[0]);
@@ -655,8 +779,8 @@ void psp_vwbn(uint32_t vd, uint32_t vs, int exp, int size) {
 
 void psp_vsbn(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     /* vt's first lane is read as an *integer* exponent, biased on the way in. */
     const uint32_t exp = (uint32_t)(uint8_t)(127 + (int32_t)psp_f32_to_bits(tv[0]));
@@ -683,52 +807,54 @@ void psp_vsbn(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  * names a second register. Written out directly here: synthesising a prefix in
  * order to consume it would be a faithful description of the hardware and a
  * worse description of the arithmetic. */
+/* One compare-exchange of the sorts, in the vmin/vmax order (vkey): lanes i < j
+ * receive the smaller and the larger value, or the other way round.
+ *
+ * A tie -- -0 against +0, a denormal against zero -- does not keep both values:
+ * both lanes receive the same one, the lower lane's in vsrt1/vsrt2 and the
+ * higher lane's in vsrt3/vsrt4. vsrt1 of (0, -0, 0, -0) is all 00000000 and
+ * vsrt3 of it all 80000000 (steps 77-80; only the zeros and denormal rows
+ * exercise ties). */
+static void sort_pair(const float s[4], float d[4], int i, int j, int ascending) {
+    const int32_t ki = vkey(s[i]), kj = vkey(s[j]);
+    if (ki == kj) { d[i] = d[j] = ascending ? s[i] : s[j]; return; }
+    const float lo = ki < kj ? s[i] : s[j], hi = ki < kj ? s[j] : s[i];
+    d[i] = ascending ? lo : hi;
+    d[j] = ascending ? hi : lo;
+}
+
 void psp_vfpu9(uint32_t vd, uint32_t vs, int kind, int size) {
     float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    const int n = read_src(vs, size, g_prefix[0], s);
+    const int n = read_src(vs, size, PFXS, s);
 
-    /* The two swizzles the sorts and butterflies use. */
-    const float yxwz[4] = { s[1], s[0], s[3], s[2] };
-    const float wzyx[4] = { s[3], s[2], s[1], s[0] };
-    const float zwxy[4] = { s[2], s[3], s[0], s[1] };
-
-    #define MIN(a,b) ((a) < (b) ? (a) : (b))
-    #define MAX(a,b) ((a) > (b) ? (a) : (b))
+    /* The butterflies and vocp are vadd/vsub lanes, special values and all:
+     * NaN results are +7F800001 whatever the operands' signs (steps 72, 81,
+     * 82). */
+    #define ADD(a, b) vout(vin(a) + vin(b), 0)
+    #define SUB(a, b) vout(vin(a) - vin(b), 0)
     switch (kind) {
-    case 0:                                              /* vsrt1 */
-        d[0] = MIN(s[0], yxwz[0]); d[1] = MAX(s[1], yxwz[1]);
-        d[2] = MIN(s[2], yxwz[2]); d[3] = MAX(s[3], yxwz[3]);
-        break;
-    case 1:                                              /* vsrt2 */
-        d[0] = MIN(s[0], wzyx[0]); d[1] = MIN(s[1], wzyx[1]);
-        d[2] = MAX(s[2], wzyx[2]); d[3] = MAX(s[3], wzyx[3]);
-        break;
-    case 8:                                              /* vsrt3 */
-        d[0] = MAX(s[0], yxwz[0]); d[1] = MIN(s[1], yxwz[1]);
-        d[2] = MAX(s[2], yxwz[2]); d[3] = MIN(s[3], yxwz[3]);
-        break;
-    case 9:                                              /* vsrt4 */
-        d[0] = MAX(s[0], wzyx[0]); d[1] = MAX(s[1], wzyx[1]);
-        d[2] = MIN(s[2], wzyx[2]); d[3] = MIN(s[3], wzyx[3]);
-        break;
+    case 0:  sort_pair(s, d, 0, 1, 1); sort_pair(s, d, 2, 3, 1); break;  /* vsrt1 */
+    case 1:  sort_pair(s, d, 0, 3, 1); sort_pair(s, d, 1, 2, 1); break;  /* vsrt2 */
+    case 8:  sort_pair(s, d, 0, 1, 0); sort_pair(s, d, 2, 3, 0); break;  /* vsrt3 */
+    case 9:  sort_pair(s, d, 0, 3, 0); sort_pair(s, d, 1, 2, 0); break;  /* vsrt4 */
     case 2:                                              /* vbfy1 */
-        d[0] = s[0] + yxwz[0]; d[1] = -s[1] + yxwz[1];
-        d[2] = s[2] + yxwz[2]; d[3] = -s[3] + yxwz[3];
+        d[0] = ADD(s[0], s[1]); d[1] = SUB(s[0], s[1]);
+        d[2] = ADD(s[2], s[3]); d[3] = SUB(s[2], s[3]);
         break;
     case 3:                                              /* vbfy2 */
-        d[0] = s[0] + zwxy[0]; d[1] =  s[1] + zwxy[1];
-        d[2] = -s[2] + zwxy[2]; d[3] = -s[3] + zwxy[3];
+        d[0] = ADD(s[0], s[2]); d[1] = ADD(s[1], s[3]);
+        d[2] = SUB(s[0], s[2]); d[3] = SUB(s[1], s[3]);
         break;
     case 4:                                              /* vocp: 1 - s */
-        for (int i = 0; i < 4; i++) d[i] = 1.0f - s[i];
+        for (int i = 0; i < 4; i++) d[i] = SUB(1.0f, s[i]);
         break;
     case 10:                                             /* vsgn */
+        /* On the bits: an exponent of 0 gives +0 (vsgn of -1e-40 is 0, not
+         * -1), anything else its sign, NaNs and infinities included (step
+         * 71). */
         for (int i = 0; i < n; i++) {
-            /* Through the bits, so that a NaN difference does not compare
-             * equal to zero and both zeroes give exactly +0. */
-            const uint32_t b = psp_f32_to_bits(s[i] - 0.0f);
-            d[i] = (b == 0 || b == 0x80000000u) ? 0.0f
-                 : (b >> 31) == 0               ? 1.0f : -1.0f;
+            const uint32_t b = psp_f32_to_bits(s[i]);
+            d[i] = !(b & 0x7F800000u) ? 0.0f : (b >> 31) ? -1.0f : 1.0f;
         }
         break;
     default:
@@ -736,8 +862,8 @@ void psp_vfpu9(uint32_t vd, uint32_t vs, int kind, int size) {
         eat_prefixes();
         return;
     }
-    #undef MIN
-    #undef MAX
+    #undef ADD
+    #undef SUB
 
     write_dst(vd, size, d);
     eat_prefixes();
@@ -754,12 +880,14 @@ static void read_bits(uint32_t vs, int size, uint32_t out[4]);
  * cast, and silently wrong for every other n. Those entries are gone. */
 void psp_vf2i(uint32_t vd, uint32_t vs, int mode, int scale, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    const int n = read_src(vs, size, g_prefix[0], sv);
+    const int n = read_src(vs, size, PFXS, sv);
     const double mult = (double)(1u << (scale & 0x1F));
 
     uint32_t d[4] = { 0, 0, 0, 0 };
     for (int i = 0; i < n; i++) {
-        const float f = sv[i];
+        /* A denormal is zero here too: vf2iu of 00000001 is 0, not 1 (step
+         * 41). */
+        const float f = vin(sv[i]);
         if (f != f) { d[i] = 0x7FFFFFFFu; continue; }      /* NaN -> INT_MAX */
         const double v = (double)f * mult;
         /* Compared in double: (float)0x7FFFFFFF rounds up to 0x80000000, so a
@@ -785,7 +913,7 @@ void psp_vf2i(uint32_t vd, uint32_t vs, int mode, int scale, int size) {
     int r[4];
     const int dn = psp_vfpu_regs(vd, size, r);
     for (int i = 0; i < dn; i++)
-        if (!((g_prefix[2] >> (8 + i)) & 1))
+        if (!((PFXD >> (8 + i)) & 1))
             psp_cpu.v[r[i]] = psp_bits_to_f32(d[i]);
     eat_prefixes();
 }
@@ -927,7 +1055,7 @@ void psp_vh2f(uint32_t vd, uint32_t vs, int size) {
 
 void psp_vf2h(uint32_t vd, uint32_t vs, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
+    read_src(vs, size, PFXS, sv);
     const int oz = (size <= 2) ? 1 : 2;
     uint32_t d[4] = { 0, 0, 0, 0 };
     for (int i = 0; i < oz; i++)
@@ -938,14 +1066,17 @@ void psp_vf2h(uint32_t vd, uint32_t vs, int size) {
 
 /* ---- arithmetic ---------------------------------------------------------- */
 
+/* `a` and `b` are the lane's operands after the prefixes, `expr` the result;
+ * each op wraps its own special-value rules around the arithmetic (see vin and
+ * vout above). */
 #define BINOP(name, expr)                                                    \
     void psp_##name(uint32_t vd, uint32_t vs, uint32_t vt, int size) {       \
         /* Read every source before writing any destination: vd may alias vs \
          * or vt, and a lane-by-lane read/write would then feed results back  \
          * into later lanes. read_src copies, so this holds for free. */     \
         float sv[4], tv[4], out[4];                                          \
-        const int n = read_src(vs, size, g_prefix[0], sv);                   \
-        read_src(vt, size, g_prefix[1], tv);                                 \
+        const int n = read_src(vs, size, PFXS, sv);                          \
+        read_src(vt, size, PFXT, tv);                                        \
         for (int i = 0; i < n; i++) {                                        \
             float a = sv[i], b = tv[i];                                      \
             out[i] = (expr);                                                 \
@@ -954,18 +1085,20 @@ void psp_vf2h(uint32_t vd, uint32_t vs, int size) {
         eat_prefixes();                                                      \
     }
 
-BINOP(vadd, a + b)
-BINOP(vsub, a - b)
-BINOP(vmul, a * b)
-BINOP(vdiv, a / b)
-BINOP(vmin, a < b ? a : b)
-BINOP(vmax, a > b ? a : b)
+BINOP(vadd, vout(vin(a) + vin(b), 0))
+BINOP(vsub, vout(vin(a) - vin(b), 0))
+BINOP(vmul, vout(vin(a) * vin(b), sign_of(a) ^ sign_of(b)))
+BINOP(vdiv, vout(vin(a) / vin(b), sign_of(a) ^ sign_of(b)))
+/* Ties return t, and the bits come through untouched, denormals and NaN
+ * payloads included (vmax of -0 and +0 is +0, of +0 and -0 is -0). */
+BINOP(vmin, vkey(a) < vkey(b) ? a : b)
+BINOP(vmax, vkey(a) > vkey(b) ? a : b)
 
 /* Dot product: sums all lanes into a single destination lane. */
 void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, tv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     /* Four lanes always: the unused ones are zero and contribute nothing, and
      * going through the one unit is what makes the rounding match. */
@@ -983,75 +1116,456 @@ void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 /* Scale: every lane of vs multiplied by the scalar in vt. */
 void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     float sv[4], tv[4], out[4];
-    const int n = read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, 1, g_prefix[1], tv);
+    const int n = read_src(vs, size, PFXS, sv);
+    read_src(vt, 1, PFXT, tv);
 
     const float k = tv[0];
-    for (int i = 0; i < n; i++) out[i] = sv[i] * k;
+    for (int i = 0; i < n; i++)
+        out[i] = vout(vin(sv[i]) * vin(k), sign_of(sv[i]) ^ sign_of(k));
     write_dst(vd, size, out);
     eat_prefixes();
+}
+
+/* ---- the transcendental unit --------------------------------------------
+ *
+ * vsin, vcos, vasin, vexp2, vlog2, vrcp, vsqrt, vrsq and their negated forms
+ * are the PSP's own fixed-point algorithms, not libm. What vfpuprobe measured
+ * over 26,800 inputs per op (steps 2-12, fw 6.60) and v3's dumps of each core
+ * (steps 193-200, every 3rd, 5th or 7th argument), and what is reproduced:
+ *
+ *   - every result is *truncated* to a 22-bit significand -- the low two
+ *     mantissa bits are clear -- and one below 2^-126 is 0; an operand whose
+ *     exponent is 0 is a signed zero; the NaN result is 7F800001;
+ *   - vnsin is vsin with the sign flipped, vnrcp likewise vrcp, and vrexp2(x)
+ *     is vexp2(-x), NaNs included;
+ *   - vsin/vcos reduce |x| in quarter turns to 25-bit fixed point (2 quadrant
+ *     bits, 23 fraction bits, truncated); an odd quadrant reflects, quadrants
+ *     2 and 3 negate, vsin then takes sign(x) and vcos adds a quarter turn
+ *     first. So vsin(2) is -0, vcos(1) is -0 and vsin(1e-10) is 0. Exponents
+ *     2^33..2^40 shift by e-127-32 rather than e-127: vsin(1e10) = BEFC7DA0;
+ *   - vasin is piecewise quadratic over 128 segments of [0,1], exact at the
+ *     knots; the coefficients below are fitted to the hardware's dense grid.
+ *     |x| > 1 is 7F800001 with x's sign;
+ *   - vexp2 splits |x| into n + f, f on a 23-bit grid; a negative x uses f's
+ *     ones' complement, so vexp2(-1) is 3EFFFFFC, just below 1/2;
+ *   - vlog2 has 22 fraction bits for x >= 1 (truncated to 23 significant
+ *     bits) but only 15 below 1, where vlog2(3F7FFFFF) is -0.
+ *
+ * vrcp, vsqrt, vrsq, vexp2 and vlog2 are bit exact: their cores are the
+ * hardware's own, from tables fitted to the dumps (the shared core, below).
+ * The one gap is vlog2 of x >= 4 (see there).
+ *
+ * vsin, vcos and vasin are not. Their cores do not have that shape at any
+ * segmentation tried, so each is the exact function of its reduced argument,
+ * floored or truncated where the hardware visibly is (vasin: a quadratic per
+ * segment fitted to the dumps). The hardware differs from that, noisily, by
+ * at most one unit of 2^-22 absolute: 78-85% of the dumped results and
+ * 82-97% of the swept ones match bit for bit. */
+#define VINF_BITS 0x7F800000u
+#define VONE_BITS 0x3F800000u
+
+static int bit_length64(uint64_t v) {
+    return v >> 32 ? 64 - (int)psp_clz((uint32_t)(v >> 32)) : 32 - (int)psp_clz((uint32_t)v);
+}
+
+/* q * 2^scale as a float with a `bits`-bit significand, truncated. */
+static uint32_t pack_trunc(uint64_t q, int scale, int bits) {
+    if (q == 0) return 0;
+    const int nb = bit_length64(q);
+    const int e = nb - 1 + scale;
+    if (e > 127)  return VINF_BITS;
+    if (e < -126) return 0;
+    const uint64_t sig = nb > bits ? q >> (nb - bits) : q << (bits - nb);
+    return ((uint32_t)(e + 127) << 23) | ((uint32_t)(sig << (24 - bits)) & 0x007FFFFFu);
+}
+
+static int is_nan_bits(uint32_t b) { return (b & 0x7FFFFFFFu) > 0x7F800000u; }
+
+/* |x| in quarter turns as 25-bit fixed point, 23 fraction bits. */
+static uint32_t quarter_fixed(uint32_t b) {
+    const int e = (int)((b >> 23) & 0xFF);
+    if (e == 0) return 0;
+    const uint64_t m24 = (b & 0x007FFFFFu) | 0x00800000u;
+    int sh = e - 127;
+    uint64_t x;
+    if (sh < 0)        x = -sh < 32 ? m24 >> -sh : 0;
+    else if (sh <= 32) x = m24 << sh;
+    else               x = sh - 32 < 32 ? m24 << (sh - 32) : 0;
+    return (uint32_t)(x & ((1u << 25) - 1));
+}
+
+/* sin(pi/2 * r / 2^23) for r in [0, 2^23], floored at 2^-28. */
+static uint32_t sin_core(uint32_t r) {
+    if (r == 0) return 0;
+    if (r == 1u << 23) return VONE_BITS;
+    const double y = sin(1.5707963267948966 * ((double)r / 8388608.0));
+    return pack_trunc((uint64_t)floor(y * 268435456.0), -28, 22);
+}
+
+static uint32_t vfpu_trig(uint32_t b, int cosine) {
+    const uint32_t sign = b & 0x80000000u;
+    if (((b >> 23) & 0xFF) == 0xFF) return cosine ? VNAN_BITS : (VNAN_BITS | sign);
+    uint32_t x = quarter_fixed(b);
+    if (cosine) x = (x + (1u << 23)) & ((1u << 25) - 1);
+    const uint32_t q = x >> 23;
+    uint32_t r = x & 0x007FFFFFu;
+    if (q & 1) r = (1u << 23) - r;
+    uint32_t res = sin_core(r);
+    if (q >= 2) res ^= 0x80000000u;
+    if (!cosine && sign) res ^= 0x80000000u;
+    return res;
+}
+
+static const double VASIN_SEG[128][3] = {   /* c2, c1, c0 over u in [0,1) */
+    { 7.977272878269432e-10, 0.004973642695892187, -1.3557759486977372e-10 },
+    { 2.239941320235124e-07, 0.004973722510308927, 0.00497364244732326 },
+    { 3.7571225004260335e-07, 0.004974178562346371, 0.009947588132892362 },
+    { 5.176192835815376e-07, 0.004974948036627613, 0.014922141534794372 },
+    { 6.709674563227998e-07, 0.004976009206137086, 0.019897606754358355 },
+    { 8.252383016626318e-07, 0.004977374561553881, 0.024874289265388816 },
+    { 9.910733091762347e-07, 0.004979045952067669, 0.029852491164324348 },
+    { 1.1254144280660903e-06, 0.004981031081993881, 0.0348325264635347 },
+    { 1.2863285155162732e-06, 0.004983326229886745, 0.03981468034571787 },
+    { 1.4250984624333923e-06, 0.004985933948473562, 0.04479929238127237 },
+    { 1.5781390777699025e-06, 0.004988843534752986, 0.04978664992117665 },
+    { 1.723306220718324e-06, 0.004992073042351029, 0.05477707849967347 },
+    { 1.8605998917378182e-06, 0.004995632989733875, 0.059770872633831205 },
+    { 2.0195456110411225e-06, 0.004999483332914589, 0.06476836257121144 },
+    { 2.152410454033625e-06, 0.005003668883021496, 0.06976986926345023 },
+    { 2.3620416503505815e-06, 0.005008109582836151, 0.07477569759999274 },
+    { 2.487033021338233e-06, 0.005012969175974376, 0.07978616479565125 },
+    { 2.683869825502489e-06, 0.0050180502720291245, 0.08480163130782342 },
+    { 2.88070662949524e-06, 0.005023505358012049, 0.0898223769215731 },
+    { 3.042112808962316e-06, 0.005029304416310148, 0.09484876015668563 },
+    { 3.2045031723828204e-06, 0.005035444924952109, 0.0998811010882582 },
+    { 3.3147317828297044e-06, 0.0050419706801265885, 0.10491974319651406 },
+    { 3.5233787952331347e-06, 0.005048750969893759, 0.10996503666643026 },
+    { 3.6936426309421238e-06, 0.005055914414802479, 0.11501730431036568 },
+    { 3.864890650705498e-06, 0.0050634333346772495, 0.12007691019951877 },
+    { 4.062711639103372e-06, 0.005071279803296485, 0.12514421011641305 },
+    { 4.131604520359871e-06, 0.005079585947365472, 0.1302195622271429 },
+    { 4.4465434071494455e-06, 0.005088092495905438, 0.13530329860154822 },
+    { 4.794944550413182e-06, 0.005096885811064755, 0.14039584883595407 },
+    { 4.80281802262516e-06, 0.005106405331008393, 0.14549751796589555 },
+    { 5.037053819655802e-06, 0.005116098190362753, 0.15060871713424748 },
+    { 5.233890623672213e-06, 0.005126218800697525, 0.15572983054184694 },
+    { 5.45041110868186e-06, 0.005136651643412503, 0.16086125745984925 },
+    { 5.61969076003165e-06, 0.005147622588741495, 0.16600335674635278 },
+    { 5.75550815511178e-06, 0.005158970599572981, 0.17115661440372973 },
+    { 5.977933743802303e-06, 0.005170708839369328, 0.1763213472162116 },
+    { 6.208232804943466e-06, 0.005182822545369362, 0.1814980278996861 },
+    { 6.438531865809075e-06, 0.005195403738779617, 0.18668707596259237 },
+    { 6.727881967769912e-06, 0.00520839336855871, 0.19188894240725773 },
+    { 7.058567798807825e-06, 0.005221713315099746, 0.19710407559101562 },
+    { 7.1727331453115245e-06, 0.005235782717772784, 0.20233286648096815 },
+    { 7.298708700010058e-06, 0.005250307797647432, 0.2075758322658186 },
+    { 7.601837377923604e-06, 0.005265146586179311, 0.21283344639959242 },
+    { 7.765211925941722e-06, 0.005280585603940331, 0.21810618645758595 },
+    { 8.07424570882094e-06, 0.0052964352724843055, 0.22339454348611404 },
+    { 8.355722338585754e-06, 0.005312775310717164, 0.22869905257372689 },
+    { 8.554527510736394e-06, 0.005329777704795968, 0.2340201866208463 },
+    { 8.938359278739216e-06, 0.005347132682800598, 0.23935850987247406 },
+    { 9.233614485498817e-06, 0.005365130209947262, 0.24471459023354616 },
+    { 9.365495143994834e-06, 0.005383854433971226, 0.2500889197345613 },
+    { 9.385178825257173e-06, 0.00540328690142038, 0.2554821193648813 },
+    { 1.0066234167610824e-05, 0.00542267508058937, 0.2608948183871646 },
+    { 1.0180399513324144e-05, 0.005443237883388035, 0.26632755884076054 },
+    { 1.0959873258356002e-05, 0.005463822584280167, 0.2717810334681974 },
+    { 1.103860798003238e-05, 0.005485715757828559, 0.27725579082904356 },
+    { 1.1247254992803523e-05, 0.005508156875830469, 0.28275255675901473 },
+    { 1.188500623766345e-05, 0.005530940243826643, 0.28827201145229214 },
+    { 1.2062159362235653e-05, 0.005554834017443284, 0.2938148550327842 },
+    { 1.2542441164231478e-05, 0.005579224065853288, 0.2993817771674435 },
+    { 1.2648733038725623e-05, 0.005604703359928598, 0.3049735626200037 },
+    { 1.3062090327723206e-05, 0.005630782514164446, 0.31059093722618064 },
+    { 1.3664410947863297e-05, 0.005657439384421417, 0.31623479413297295 },
+    { 1.4069894765278028e-05, 0.005685134568819366, 0.3219059051866997 },
+    { 1.4632848024750014e-05, 0.005713607258595096, 0.32760509943937505 },
+    { 1.5077699202185826e-05, 0.005743020828294505, 0.3333333436057543 },
+    { 1.5463499338865538e-05, 0.005773479847469851, 0.33909145566578164 },
+    { 1.5825679058368985e-05, 0.005805047057853454, 0.34488038781749725 },
+    { 1.6349264958176603e-05, 0.005837364462506538, 0.3507012652292836 },
+    { 1.718778974341359e-05, 0.005870498247805997, 0.3565550188162012 },
+    { 1.779798383618809e-05, 0.005904916885344906, 0.36244269501191057 },
+    { 1.8227088070164463e-05, 0.005940732080008645, 0.3683654348547616 },
+    { 1.8778231121718432e-05, 0.005977579929757406, 0.3743243539173416 },
+    { 1.9447476256463945e-05, 0.006015599942674375, 0.38032074418722434 },
+    { 2.0506458261950746e-05, 0.006054553208090647, 0.38635580280124865 },
+    { 2.1014297217514962e-05, 0.006095394630550057, 0.3924308202707119 },
+    { 2.1545756588264266e-05, 0.00613758684557954, 0.39854720705433905 },
+    { 2.2470889567952063e-05, 0.006180918745704967, 0.40470640006080155 },
+    { 2.3218869424598566e-05, 0.006226087379258501, 0.4109098387822527 },
+    { 2.4014090113285307e-05, 0.006272798229174567, 0.4171591570871904 },
+    { 2.4888045523800512e-05, 0.00632113199854064, 0.4234560428512112 },
+    { 2.58249887120634e-05, 0.0063712914292661, 0.42980211112029304 },
+    { 2.660446245668627e-05, 0.0064234408800817, 0.43619923479662875 },
+    { 2.7978383350886454e-05, 0.0064771136017155945, 0.4426493171690914 },
+    { 2.8738173415459135e-05, 0.006533494797776026, 0.44915443904874774 },
+    { 3.007666368316198e-05, 0.0065914991593337, 0.4557166754645832 },
+    { 3.141515395066074e-05, 0.006651915755927383, 0.46233825706968146 },
+    { 3.27536442202453e-05, 0.006714856784533388, 0.46902158908676717 },
+    { 3.389136094920843e-05, 0.006780602491553345, 0.47576920898829245 },
+    { 3.533614309148056e-05, 0.00684897695409524, 0.48258370185661154 },
+    { 3.708405391336332e-05, 0.006920072931500352, 0.48946802393447764 },
+    { 3.880834431888348e-05, 0.006994362093961163, 0.49642517919756957 },
+    { 4.007597333732755e-05, 0.007072427078420394, 0.5034582753914676 },
+    { 4.2343533320866044e-05, 0.007153166582956826, 0.5105709036806421 },
+    { 4.411506455917823e-05, 0.0072385440546912025, 0.5177665690519494 },
+    { 4.656371440414339e-05, 0.007327545291991071, 0.5250492180833142 },
+    { 4.899661730484565e-05, 0.007420713564436271, 0.5324233192162372 },
+    { 5.131141812091875e-05, 0.007519338645187394, 0.539893045144923 },
+    { 5.442143962834955e-05, 0.007622133221542332, 0.547463788459668 },
+    { 5.742910599731177e-05, 0.007731004642135509, 0.5551403315566771 },
+    { 6.012970695018412e-05, 0.007846325912711765, 0.5629287010868027 },
+    { 6.412943081243458e-05, 0.00796733232228488, 0.570835164579937 },
+    { 6.80346730063434e-05, 0.008095539022157285, 0.578866582044753 },
+    { 7.260916033653639e-05, 0.008231519299518106, 0.5870302580950557 },
+    { 7.677422711561225e-05, 0.008376828657214156, 0.5953342987164874 },
+    { 8.198646569008785e-05, 0.008531048324946987, 0.6037879633583647 },
+    { 8.785220245533572e-05, 0.008695637847616988, 0.6124010077447963 },
+    { 9.373368616605557e-05, 0.00887268418744057, 0.621184430378264 },
+    { 0.00010190635027502064, 0.009061155427474833, 0.6301508957387497 },
+    { 0.00010971683466731781, 0.009265472030245789, 0.6393139297133019 },
+    { 0.00011939333196218666, 0.00948575258993178, 0.6486891018470871 },
+    { 0.00013055791549718054, 0.009724431977798797, 0.6582942999307343 },
+    { 0.00014267518916487022, 0.009985504996788658, 0.6681493225481494 },
+    { 0.00015707576976232353, 0.010271147185679484, 0.6782774901857569 },
+    { 0.00017423206561573924, 0.010585467512762696, 0.6887057291341889 },
+    { 0.00019461648505948774, 0.010933846512077117, 0.6994653507159843 },
+    { 0.00021881953850598108, 0.011322547038641696, 0.7105938602158165 },
+    { -0.00023953464378094748, 0.01224811748823502, 0.7221352046488243 },
+    { -0.00020256869195046768, 0.012744994109382393, 0.7341437104808785 },
+    { -0.00015567429171415998, 0.013315631878263713, 0.7466861048965148 },
+    { -9.378880047214144e-05, 0.013979529940799363, 0.7598460831509293 },
+    { -1.1196077423274042e-05, 0.014765528825536986, 0.7737318968748286 },
+    { 0.0001042605184525013, 0.01571560693353178, 0.7884862808005121 },
+    { -0.0002128356996583564, 0.01738162872345937, 0.8043061369343811 },
+    { 5.981476806362325e-05, 0.018892844764071517, 0.8214749528404611 },
+    { 5.299634116445441e-05, 0.021416503209448195, 0.8404276128646887 },
+    { 9.448166602256599e-05, 0.025321799043038003, 0.8618971665454238 },
+    { 0.00022718116594845904, 0.032829956865655305, 0.8873134812088332 },
+    { -2.4313282057061473e-05, 0.07965363166895745, 0.9203707300841631 },
+};
+
+static uint32_t vfpu_asin(uint32_t b) {
+    const uint32_t sign = b & 0x80000000u;
+    const int e = (int)((b >> 23) & 0xFF);
+    if (is_nan_bits(b)) return VNAN_BITS | sign;
+    if (e == 0) return sign;
+    if ((b & 0x7FFFFFFFu) > VONE_BITS) return VNAN_BITS | sign;
+    if (e >= 127) return VONE_BITS | sign;                      /* exactly 1 */
+    const uint32_t m24 = (b & 0x007FFFFFu) | 0x00800000u;
+    const uint32_t x = 127 - e < 32 ? m24 >> (127 - e) : 0;     /* 23-bit fixed point */
+    if (x == 0) return sign;
+    const uint32_t seg = x >> 16 < 127 ? x >> 16 : 127;
+    const double u = (double)(x - (seg << 16)) / 65536.0;
+    const double *c = VASIN_SEG[seg];
+    const double v = (c[0] * u + c[1]) * u + c[2];
+    return pack_trunc((uint64_t)floor(v * 1073741824.0), -30, 22) | sign;
+}
+
+/* ---- the shared core ------------------------------------------------------
+ *
+ * vrcp, vsqrt, vrsq, vexp2 and vlog2 evaluate one kind of piecewise core on a
+ * 23-bit reduced argument X: its top 7 bits pick a segment, the low 16 are u,
+ * and at 24 fraction bits
+ *
+ *     Z = floor(D * u / 2^16) + V(|(u >> 6) - 512|)
+ *
+ * of which the result keeps Z >> 2. V is the segment's quadratic correction,
+ * a function of the distance of u's top ten bits from the segment's middle.
+ * vfpu_cores.h holds, per segment, D, V(0) and the steps V(k+1) - V(k) as
+ * 1- or 2-bit fields; tools/hwprobe/vfpuprobe/gencores.py fits them to
+ * vfpuprobe v3's core dumps (steps 196-200) and the run-1 sweeps (fw 6.60)
+ * and reproduces every one of those results. Arguments the dumps skipped
+ * rest on the fit: holding the sweeps out, it predicted 99.96% of them. */
+#include "vfpu_cores.h"
+
+static uint32_t popcount32(uint32_t v) {
+    v = v - ((v >> 1) & 0x55555555u);
+    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+    return (((v + (v >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24;
+}
+
+/* The sum of the `bits`-bit fields packed in w. */
+static uint32_t field_sum(uint32_t w, int bits) {
+    return bits == 1 ? popcount32(w)
+                     : popcount32(w & 0x55555555u) + 2u * popcount32(w & 0xAAAAAAAAu);
+}
+
+/* floor(v / 2^s), whatever v's sign. */
+static int64_t floor_shr(int64_t v, int s) {
+    return v >= 0 ? v >> s : -((-v + ((int64_t)1 << s) - 1) >> s);
+}
+
+/* V(k) of one segment: V(0) plus sgn times the first k steps. */
+static int64_t core_v(const uint32_t *steps, int bits, int sgn, int32_t v0, uint32_t k) {
+    const uint32_t per = 32u / (uint32_t)bits;
+    uint32_t sum = 0, j = 0;
+    for (; j < k / per; j++) sum += field_sum(steps[j], bits);
+    const uint32_t rem = (k % per) * (uint32_t)bits;
+    if (rem) sum += field_sum(steps[j] & ((1u << rem) - 1u), bits);
+    return (int64_t)v0 + (int64_t)sgn * (int64_t)sum;
+}
+
+typedef struct {
+    const int32_t (*dv)[2];
+    const uint32_t *steps;
+    int words, bits, sgn;
+} vfpu_core;
+
+#define VFPU_CORE(N) { VFPU_CORE_##N##_DV, &VFPU_CORE_##N##_STEPS[0][0], \
+                       (int)(sizeof VFPU_CORE_##N##_STEPS[0] / sizeof(uint32_t)), \
+                       VFPU_CORE_##N##_BITS, VFPU_CORE_##N##_SGN }
+static const vfpu_core CORE_RCP  = VFPU_CORE(RCP);
+static const vfpu_core CORE_EXP2 = VFPU_CORE(EXP2);
+static const vfpu_core CORE_LOG2 = VFPU_CORE(LOG2);
+static const vfpu_core CORE_SQRT = VFPU_CORE(SQRT);
+static const vfpu_core CORE_RSQ  = VFPU_CORE(RSQ);
+
+static int64_t core_seg_v(const vfpu_core *c, uint32_t seg, uint32_t k) {
+    return core_v(c->steps + seg * (uint32_t)c->words, c->bits, c->sgn, c->dv[seg][1], k);
+}
+
+/* Z >> 2 for the 23-bit argument x. */
+static int64_t core_eval(const vfpu_core *c, uint32_t x) {
+    const uint32_t seg = (x >> 16) & 0x7Fu, u = x & 0xFFFFu, g = u >> 6;
+    const int64_t z = floor_shr((int64_t)c->dv[seg][0] * u, 16)
+                    + core_seg_v(c, seg, g >= 512 ? g - 512 : 512 - g);
+    return floor_shr(z, 2);
+}
+
+/* A 22-bit significand y (2^21 <= y <= 2^22) at biased exponent `field`,
+ * flushed to 0 below the normals. */
+static uint32_t pack22(int field, int64_t y) {
+    if (y >= (1 << 22)) { y >>= 1; field++; }
+    if (field <= 0)   return 0;
+    if (field >= 255) return VINF_BITS;
+    return ((uint32_t)field << 23) | ((uint32_t)(y << 2) & 0x007FFFFFu);
+}
+
+/* vexp2: |x| on a 23-bit fraction grid, truncated (v3 dumps x = 0.5 + i*2^-24
+ * in pairs). A negative x takes the ones' complement of that fraction: 2^x is
+ * 2^(-1-n) * core(~f), so vexp2(-1) is 3EFFFFFC and vexp2(-2^-126) 3F7FFFFC
+ * (sweep steps 2-12; the rule reproduces every negative sweep input). */
+static uint32_t vfpu_exp2(uint32_t b) {
+    const uint32_t sign = b & 0x80000000u;
+    const int e = (int)((b >> 23) & 0xFF);
+    if (is_nan_bits(b)) return VNAN_BITS;
+    if (e == 255) return sign ? 0 : VINF_BITS;
+    if (e == 0) return VONE_BITS;
+    if (e >= 127 + 7) return sign ? 0 : VINF_BITS;             /* |x| >= 128 */
+    const uint32_t m24 = (b & 0x007FFFFFu) | 0x00800000u;
+    const int ex = e - 127;
+    const uint32_t f = ex >= 0 ? m24 << ex : (ex > -32 ? m24 >> -ex : 0);
+    const int n = (int)(f >> 23);
+    if (sign) return pack22(127 - 1 - n, core_eval(&CORE_EXP2, ~f & 0x007FFFFFu));
+    return pack22(127 + n, core_eval(&CORE_EXP2, f & 0x007FFFFFu));
+}
+
+/* vlog2: for x >= 1 the exponent plus the core at 22 fraction bits, the sum
+ * truncated to 23 significant bits. Exact for x < 4; above, the hardware's
+ * fraction is often one unit of that 23rd bit lower, by a rule the sweeps
+ * alone do not settle: 1,286 of the 2,510 swept x >= 4 match.
+ *
+ * Below 1 the hardware leaves out the quadratic correction: the magnitude is
+ * 1 - log2(m) from the segment's knot value and D / 256 alone, at 17 bits,
+ * of which 15 are kept, plus the exponent's -1 - e. That reproduces all of
+ * the 1,198,373 x in [0.5, 1) of v3 step 197 and the 4,615 swept x < 1. */
+static uint32_t vfpu_log2(uint32_t b) {
+    const int e = (int)((b >> 23) & 0xFF);
+    if (e == 0) return 0xFF800000u;
+    if (is_nan_bits(b) || (b >> 31)) return VNAN_BITS;
+    if (e == 255) return VINF_BITS;
+    const int ex = e - 127;
+    const uint32_t m = b & 0x007FFFFFu;
+    if (ex >= 0) {
+        const int64_t tot = ((int64_t)ex << 22) + core_eval(&CORE_LOG2, m);
+        return tot > 0 ? pack_trunc((uint64_t)tot, -22, 23) : 0;
+    }
+    const uint32_t seg = m >> 16, u = m & 0xFFFFu;
+    const int64_t knot = core_seg_v(&CORE_LOG2, seg, 512);          /* V at u = 0 */
+    const int64_t d8 = floor_shr(CORE_LOG2.dv[seg][0], 8);
+    const int64_t mag = ((int64_t)1 << 17) - floor_shr(knot, 7)
+                      + floor_shr(-2 * d8 * (int64_t)u, 16);
+    const int64_t tot = ((int64_t)(-ex - 1) << 15) + floor_shr(mag, 2);
+    return tot == 0 ? 0x80000000u : (pack_trunc((uint64_t)tot, -15, 24) | 0x80000000u);
+}
+
+static uint32_t vfpu_rcp(uint32_t b) {
+    const uint32_t sign = b & 0x80000000u;
+    const int e = (int)((b >> 23) & 0xFF);
+    const uint32_t m = b & 0x007FFFFFu;
+    if (is_nan_bits(b)) return VNAN_BITS | sign;
+    if (e == 255) return sign;
+    if (e == 0) return VINF_BITS | sign;
+    if (m == 0) return pack22(254 - e, 1 << 21) | sign;          /* a power of two */
+    return pack22(253 - e, core_eval(&CORE_RCP, m)) | sign;
+}
+
+/* The roots' argument: x's mantissa with its exponent's parity above it, the
+ * last bit dropped; q is floor((e - 127) / 2). */
+static uint32_t root_arg(uint32_t b, int *q) {
+    const int ex = (int)((b >> 23) & 0xFF) - 127;
+    const uint32_t odd = (uint32_t)ex & 1u;
+    *q = (ex - (int)odd) / 2;
+    return ((odd << 23) | (b & 0x007FFFFFu)) >> 1;
+}
+
+static uint32_t vfpu_sqrt(uint32_t b) {
+    const int e = (int)((b >> 23) & 0xFF);
+    if (is_nan_bits(b)) return VNAN_BITS;
+    if (e == 0) return 0;
+    if (b >> 31) return VNAN_BITS;
+    if (e == 255) return VINF_BITS;
+    int q;
+    const uint32_t x = root_arg(b, &q);
+    return pack22(127 + q, core_eval(&CORE_SQRT, x));
+}
+
+static uint32_t vfpu_rsq(uint32_t b) {
+    const uint32_t sign = b & 0x80000000u;
+    const int e = (int)((b >> 23) & 0xFF);
+    if (is_nan_bits(b)) return VNAN_BITS | sign;
+    if (e == 0) return VINF_BITS | sign;
+    if (sign) return VNAN_BITS | 0x80000000u;
+    if (e == 255) return 0;
+    int q;
+    const uint32_t x = root_arg(b, &q);
+    return pack22(126 - q, core_eval(&CORE_RSQ, x));        /* 1/sqrt(4^k) carries up */
 }
 
 /* ---- unary element-wise ops (VFPU4) -------------------------------------- */
 
 void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
     float sv[4], out[4];
-    const int n = read_src(vs, size, g_prefix[0], sv);
+    const int n = read_src(vs, size, PFXS, sv);
 
     for (int i = 0; i < n; i++) {
         const float a = sv[i];
         float r;
         switch (op) {
         case PSP_VU_MOV:  r = a;            break;
-        case PSP_VU_ABS:  r = a < 0 ? -a : a; break;
-        case PSP_VU_NEG:  r = -a;           break;
+        /* On the bits: vabs of -0 is +0 and of FFC00000 is 7FC00000, where
+         * `a < 0 ? -a : a` kept both (step 69). vneg likewise flips only the
+         * sign bit, NaN payloads and denormals included. */
+        case PSP_VU_ABS:  r = psp_bits_to_f32(psp_f32_to_bits(a) & 0x7FFFFFFFu); break;
+        case PSP_VU_NEG:  r = psp_bits_to_f32(psp_f32_to_bits(a) ^ 0x80000000u); break;
         case PSP_VU_ZERO: r = 0.0f;         break;
         case PSP_VU_ONE:  r = 1.0f;         break;
-        case PSP_VU_RCP:  r = 1.0f / a;     break;
-        case PSP_VU_NRCP: r = -1.0f / a;    break;
-
-        /* The square roots classify their argument before computing anything,
-         * and the classes are not what the C library would do. psp_fsqrt is a
-         * general geometry helper, so the instruction's zero, denormal,
-         * negative, infinity and NaN rules live here rather than in it.
-         *
-         * Ordinary values already agree to the last bit; only the edges did
-         * not, and they were 28 lines of cpu/vfpu/vector. */
-        case PSP_VU_SQRT: {
-            const uint32_t b = psp_f32_to_bits(a);
-            if ((b & 0x7FFFFFFFu) <= 0x007FFFFFu)
-                r = 0.0f;                                   /* zero, denormal, either sign */
-            else if (b >> 31)
-                r = psp_bits_to_f32(0x7F800001u);           /* negative -> NaN */
-            else if ((b >> 23) == 255u)
-                r = psp_bits_to_f32(0x7F800000u + ((b & 0x007FFFFFu) != 0u));
-            else
-                r = psp_fsqrt(a);
-            break;
-        }
-        case PSP_VU_RSQ: {
-            const uint32_t b = psp_f32_to_bits(a);
-            if ((b & 0x7FFFFFFFu) <= 0x007FFFFFu)
-                r = psp_bits_to_f32(0x7F800000u | (b & 0x80000000u)); /* +-0 -> +-inf */
-            else if (b >> 31)
-                r = psp_bits_to_f32(0xFF800001u);           /* negative -> negative NaN */
-            else if ((b >> 23) == 255u)
-                r = psp_bits_to_f32((b & 0x007FFFFFu) ? 0x7F800001u : 0u); /* inf -> 0 */
-            else
-                r = 1.0f / psp_fsqrt(a);
-            break;
-        }
+        case PSP_VU_RCP:  r = psp_bits_to_f32(vfpu_rcp(psp_f32_to_bits(a)));               break;
+        case PSP_VU_NRCP: r = psp_bits_to_f32(vfpu_rcp(psp_f32_to_bits(a)) ^ 0x80000000u); break;
+        case PSP_VU_SQRT: r = psp_bits_to_f32(vfpu_sqrt(psp_f32_to_bits(a)));              break;
+        case PSP_VU_RSQ:  r = psp_bits_to_f32(vfpu_rsq(psp_f32_to_bits(a)));               break;
         /* The PSP's trig takes its argument in *quarter turns*: vsin(x) is
-         * sin(x * pi/2), not sin(x). Treating it as radians gives a result
-         * that is smooth, plausible, and wrong -- rotations end up at the
-         * wrong angle rather than visibly broken. */
-        case PSP_VU_SIN:  r = sinf(a * 1.5707963267948966f);  break;
-        case PSP_VU_COS:  r = cosf(a * 1.5707963267948966f);  break;
-        case PSP_VU_NSIN: r = -sinf(a * 1.5707963267948966f); break;
-        case PSP_VU_ASIN: r = asinf(a) * 0.6366197723675814f; break;  /* 2/pi */
-        case PSP_VU_EXP2: r = powf(2.0f, a);   break;
-        case PSP_VU_REXP2:r = 1.0f / powf(2.0f, a); break;
-        case PSP_VU_LOG2: r = logf(a) * 1.4426950408889634f; break;   /* 1/ln2 */
+         * sin(x * pi/2), not sin(x). */
+        case PSP_VU_SIN:  r = psp_bits_to_f32(vfpu_trig(psp_f32_to_bits(a), 0));           break;
+        case PSP_VU_COS:  r = psp_bits_to_f32(vfpu_trig(psp_f32_to_bits(a), 1));           break;
+        case PSP_VU_NSIN: r = psp_bits_to_f32(vfpu_trig(psp_f32_to_bits(a), 0) ^ 0x80000000u); break;
+        case PSP_VU_ASIN: r = psp_bits_to_f32(vfpu_asin(psp_f32_to_bits(a)));              break;
+        case PSP_VU_EXP2: r = psp_bits_to_f32(vfpu_exp2(psp_f32_to_bits(a)));              break;
+        case PSP_VU_REXP2:r = psp_bits_to_f32(vfpu_exp2(psp_f32_to_bits(a) ^ 0x80000000u)); break;
+        case PSP_VU_LOG2: r = psp_bits_to_f32(vfpu_log2(psp_f32_to_bits(a)));              break;
         case PSP_VU_SAT0: r = sat0(a);      break;
         case PSP_VU_SAT1: r = sat1(a);      break;
         default:
@@ -1169,7 +1683,8 @@ void psp_vcst(uint32_t vd, uint32_t which, int size) {
         0.70710678f,            /* sqrt(1/2)          */
         1.12837917f,            /* 2/sqrt(pi)         */
         0.63661977f,            /* 2/pi               */
-        0.31830989f,            /* 1/pi               */
+        0.318309886f,           /* 1/pi, 3EA2F983: the old literal 0.31830989f
+                                 * rounded to 3EA2F984 (vfpuprobe step 50) */
         0.78539816f,            /* pi/4               */
         1.57079633f,            /* pi/2               */
         3.14159265f,            /* pi                 */
@@ -1267,9 +1782,13 @@ void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm, int size) {
     const unsigned cl = imm & 3;
     const unsigned sl = (imm >> 2) & 3;
 
-    float s = sinf(arg * 1.5707963267948966f);
-    const float c = cosf(arg * 1.5707963267948966f);
-    if (imm & 0x10) s = -s;
+    /* The same sine and cosine as vsin and vcos, bit for bit: vfpuprobe steps
+     * 120-127 (fw 6.60) give cos(1 quarter turn) as -0 and sin(1/2) as
+     * 3F3504F0, as vcos and vsin do. The negation is of the sign bit, so a
+     * zero sine negates to -0 and a NaN to FF800001. */
+    const uint32_t ab = psp_f32_to_bits(arg);
+    const float s = psp_bits_to_f32(vfpu_trig(ab, 0) ^ ((imm & 0x10) ? 0x80000000u : 0u));
+    const float c = psp_bits_to_f32(vfpu_trig(ab, 1));
 
     const int n = psp_vfpu_regs(vd, size, d);
     float out[4];
@@ -1290,8 +1809,11 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     matrix_read(vs, size, m);
     psp_vfpu_regs(vt, 1, t);
     const float k = psp_cpu.v[t[0]];
+    /* vscl on every column, so vscl's special values. Only ordinary values
+     * were probed here (step 115). */
     for (int c = 0; c < size; c++)
-        for (int r = 0; r < size; r++) m[c][r] *= k;
+        for (int r = 0; r < size; r++)
+            m[c][r] = vout(vin(m[c][r]) * vin(k), sign_of(m[c][r]) ^ sign_of(k));
     matrix_write(vd, size, m);
     eat_prefixes();
 }
@@ -1319,12 +1841,14 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size, int homogeneous) 
     float in[4], out[4];
     for (int i = 0; i < size; i++) in[i] = psp_cpu.v[t[i]];
 
+    /* Each lane is one pass through the dot-product unit, the implicit 1 of
+     * the homogeneous form included, as vhdp does it. */
     const int n = homogeneous ? size - 1 : size;
     for (int r = 0; r < size; r++) {
-        float sum = 0.0f;
-        for (int c = 0; c < n; c++) sum += m[r][c] * in[c];
-        if (homogeneous) sum += m[r][size - 1];
-        out[r] = sum;
+        float a[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, b[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (int c = 0; c < n; c++) { a[c] = m[r][c]; b[c] = in[c]; }
+        if (homogeneous) { a[n] = m[r][size - 1]; b[n] = 1.0f; }
+        out[r] = psp_vfpu_dot(a, b);
     }
     /* vd may be one of the sources, so write only after the whole result is
      * computed. */
@@ -1353,11 +1877,13 @@ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     matrix_read(vs, size, a);
     matrix_read(vt, size, b);
 
+    /* Every element is a dot product, rounded once: vfpuprobe steps 107 and
+     * 110 (fw 6.60) give 43055555 where a running float sum gave 43055556. */
     for (int c = 0; c < size; c++)
         for (int r = 0; r < size; r++) {
-            float sum = 0.0f;
-            for (int k = 0; k < size; k++) sum += a[r][k] * b[c][k];
-            out[c][r] = sum;
+            float x[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, y[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            for (int k = 0; k < size; k++) { x[k] = a[r][k]; y[k] = b[c][k]; }
+            out[c][r] = psp_vfpu_dot(x, y);
         }
     matrix_write(vd, size, out);
     eat_prefixes();
@@ -1483,13 +2009,15 @@ void psp_vfpu_dump_cmps(FILE *out) {
 
 void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
     float sv[4], tv[4];
-    const int n = read_src(vs, size, g_prefix[0], sv);
-    read_src(vt, size, g_prefix[1], tv);
+    const int n = read_src(vs, size, PFXS, sv);
+    read_src(vt, size, PFXT, tv);
 
     uint32_t cc = 0;
     int all = 1, any = 0;
     for (int i = 0; i < n; i++) {
-        float a = sv[i], b = tv[i];
+        /* A denormal operand is a zero: 00000001 is EQ to 0 and to -0, EZ,
+         * not NZ, and neither LT nor GT zero (steps 90-97 and 101). */
+        const float a = vin(sv[i]), b = vin(tv[i]);
         int r;
         /* The upper eight conditions test the *first* operand's class rather
          * than comparing the two, and they had all been falling into the
@@ -1524,9 +2052,18 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
      * actually compared, plus the any/all pair. A `vcmp.t` leaves bit 3 alone,
      * and a program can rely on that -- cpu/vfpu/vector sets it with a quad
      * compare and then reads it back after a triple one. Overwriting the whole
-     * register cleared it, which cost 25 lines and looked like a vcmov bug. */
+     * register cleared it, which cost 25 lines and looked like a vcmov bug.
+     * Confirmed on firmware 6.60 with the CC read 16 instructions later
+     * (vfpuprobe v3 step 118): TR.q then FL.t gives 08, TR.q then NE.s on
+     * equal values 0E, FL.q then TR.p 33.
+     *
+     * An mfvc of CC as the very next instruction reads the value from
+     * *before* this vcmp; one instruction later it reads the new one, for
+     * every size and both directions (v3 step 117). The old value is kept in
+     * the otherwise unused control slot 3 for psp_mfvc_cc_after_vcmp. */
     const uint32_t affected = (1u << 4) | (1u << 5) | ((1u << n) - 1u);
     const uint32_t before = psp_cpu.vfpu_cc;
+    psp_cpu.vfpu_ctrl[PSP_VFPU_CC] = before;
     psp_cpu.vfpu_cc = (psp_cpu.vfpu_cc & ~affected) | (cc & affected);
 
     /* Recorded after the write, so the operands and the codes they produced

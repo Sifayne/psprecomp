@@ -224,6 +224,16 @@ static void test_vfpu(void) {
     dec(0xD05A0000, 0x08900000, A_VT5551, "vt5551");
     dec(0xD05B0000, 0x08900000, A_VT5650, "vt5650");
 
+    /* The random-number group, VFPU4 rs=1 rt=0..3. These four words are the
+     * ones vfpuprobe executes (step 147, fw 6.60), and each did what the
+     * mnemonic says there: vrnds.s S000 reseeded, the others drew. */
+    dec(0xD0200800, 0x08900000, A_VRNDS,  "vrnds.s");
+    dec(0xD0210004, 0x08900000, A_VRNDI,  "vrndi.s");
+    dec(0xD0220004, 0x08900000, A_VRNDF1, "vrndf1.s");
+    dec(0xD0230004, 0x08900000, A_VRNDF2, "vrndf2.s");
+    a_decode(0xD0200800, 0x08900000, &in);
+    CHECK(in.vs == 8 && in.vsize == 1, "vrnds.s reads S020 (vs=%u size=%u)", in.vs, in.vsize);
+
     /* Something still genuinely unmapped: opcode 0x3F. It must be recognised
      * as VFPU rather than falling through to an integer op, so the emitter
      * refuses it instead of emitting nonsense. */

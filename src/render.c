@@ -522,34 +522,50 @@ static psp_blend_state g_bs;
 /* The texture function: how a texel and the vertex colour become the fragment.
  *
  * The five GE_TEXFUNC codes, the RGB/RGBA flag that says whether the texel's
- * alpha takes part, and the colour-doubling flag. Measured in gpu/texfunc,
- * one test per function: under ADD "One + Zero" is white and "Half + Half"
- * is 0xFE, "Half x2 + Half" saturates to white, and under RGB the fragment
- * alpha is the vertex's. Only MODULATE was implemented before, hardcoded at
- * both call sites, so the other four drew as MODULATE. Codes 5..7 are not
+ * alpha takes part, and the colour-doubling flag. Codes 5..7 are not
  * defined; they are treated as MODULATE rather than refused, because a
- * refusal draws untextured and that has been the harder thing to notice. */
+ * refusal draws untextured and that has been the harder thing to notice.
+ *
+ * The arithmetic is geprobe step 13's (fw 6.60), which it reproduces on all
+ * 40 sprites; t is the texel, c the vertex colour, e the TEXENV colour, d the
+ * doubling bit:
+ *
+ *     MODULATE  (t * (c + 1)) >> (8 - d)
+ *     DECAL     RGBA: (t * ta + c * (255 - ta) + 255) >> (8 - d);  RGB: t << d
+ *     BLEND     (c * (255 - t) + e * t + 255) >> (8 - d)
+ *     REPLACE   t << d
+ *     ADD       (t + c) << d
+ *
+ * each clamped to 255. Doubling happens before the final shift, not to the
+ * rounded result: MODULATE of t 255 and c 64, doubled, is 129, where the
+ * rounded (t * c + 127) / 255 this used, then doubled, gave 128 -- (170,54)
+ * reads 000C6DCC on hardware against 000C6CCC. REPLACE and ADD, and which
+ * alpha each function keeps, were right already (gpu/texfunc: ADD's "One +
+ * Zero" is white, "Half x2 + Half" saturates). The alpha product under RGBA
+ * is taken like MODULATE's colour; step 13 cannot tell it from
+ * ((2t+1)(2c+1)) >> 10 or a truncated t * c / 255, only from the rounded
+ * divide, which it excludes. */
 static uint32_t apply_texfunc(uint32_t tex, uint32_t col) {
     const uint32_t ta = chan(tex, 3), ca = chan(col, 3);
+    const uint32_t d = g_tex.color_double ? 1u : 0u, sh = 8u - d;
     uint32_t out = 0;
     for (int i = 0; i < 3; i++) {
         const uint32_t t = chan(tex, i), c = chan(col, i), e = chan(g_tex.env, i);
         uint32_t o;
         switch (g_tex.func) {
-        case 1:  o = g_tex.tcc_rgba ? (t * ta + c * (255u - ta) + 127u) / 255u : t; break;  /* DECAL   */
-        case 2:  o = (c * (255u - t) + e * t + 127u) / 255u;                          break;  /* BLEND   */
-        case 3:  o = t;                                                                break;  /* REPLACE */
-        case 4:  o = t + c; if (o > 255u) o = 255u;                                    break;  /* ADD     */
-        default: o = (t * c + 127u) / 255u;                                            break;  /* MODULATE */
+        case 1:  o = g_tex.tcc_rgba ? (t * ta + c * (255u - ta) + 255u) >> sh : t << d; break;  /* DECAL */
+        case 2:  o = (c * (255u - t) + e * t + 255u) >> sh;                            break;  /* BLEND   */
+        case 3:  o = t << d;                                                            break;  /* REPLACE */
+        case 4:  o = (t + c) << d;                                                      break;  /* ADD     */
+        default: o = (t * (c + 1u)) >> sh;                                              break;  /* MODULATE */
         }
-        if (g_tex.color_double) { o *= 2u; if (o > 255u) o = 255u; }
-        out |= o << (i * 8);
+        out |= (o > 255u ? 255u : o) << (i * 8);
     }
     uint32_t a;
     switch (g_tex.func) {
-    case 1:  a = ca;                                                  break;  /* DECAL keeps the vertex alpha */
-    case 3:  a = g_tex.tcc_rgba ? ta : ca;                            break;  /* REPLACE */
-    default: a = g_tex.tcc_rgba ? (ta * ca + 127u) / 255u : ca;       break;  /* MODULATE, BLEND, ADD */
+    case 1:  a = ca;                                             break;  /* DECAL keeps the vertex alpha */
+    case 3:  a = g_tex.tcc_rgba ? ta : ca;                       break;  /* REPLACE */
+    default: a = g_tex.tcc_rgba ? (ta * (ca + 1u)) >> 8 : ca;    break;  /* MODULATE, BLEND, ADD */
     }
     return out | (a << 24);
 }
@@ -557,73 +573,116 @@ static uint32_t apply_texfunc(uint32_t tex, uint32_t col) {
 /* The framebuffer's alpha byte is the stencil buffer. An ordinary draw leaves
  * it as it was -- gpu/texfunc fills 44444444, draws, and reads 44ffffff back
  * -- and only a clear that asks for the stencil, or a stencil operation (not
- * modelled), writes it. */
+ * modelled), writes it.
+ *
+ * The pixel mask (PMSK1/PMSK2) is applied last, on the packed word: a set bit
+ * keeps the framebuffer's bit. geprobe step 19 (fw 6.60) draws 0x7FFFFFFF
+ * under mask 0xFF00F0F0 over 0x00402010 and reads 0x00FF2F1F back. A 16-bit
+ * target takes the mask through the same packing as the colour, so each field
+ * keeps the top bits of its mask byte: geprobe 5 scenes 30-32 (fw 6.60) draw
+ * white and black under 0x00F8FCF8, 0x00070307, 0x00808080 and 0xFFFF0000 on
+ * 5650, 5551 and 4444, and PMSK2 0xF0, 0x0F and 0x3C over stencil writes. */
 static void put_pixel(int x, int y, uint32_t rgba, int stencil) {
     if (!g_fb_addr || !g_fb_stride) return;
     if (x < g_sc_x0 || y < g_sc_y0 || x > g_sc_x1 || y > g_sc_y1) return;
     if (g_fb_fmt != 3) {
+        const uint32_t at16 = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
         if (stencil >= 0) rgba = (rgba & 0x00FFFFFFu) | ((uint32_t)stencil << 24);
-        else if (!g_bs.write_alpha && g_fb_fmt != 0) {
-            const uint32_t at16 = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
+        else if (!g_bs.write_alpha && g_fb_fmt != 0)
             rgba = (rgba & 0x00FFFFFFu) | (expand16((uint32_t)psp_read16(at16), g_fb_fmt) & 0xFF000000u);
+        uint32_t px = pack16(rgba, g_fb_fmt);
+        if (g_bs.pixel_mask) {
+            const uint32_t keep = pack16(g_bs.pixel_mask, g_fb_fmt);
+            px = ((uint32_t)psp_read16(at16) & keep) | (px & ~keep);
         }
-        psp_write16(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2, (uint16_t)pack16(rgba, g_fb_fmt));
+        psp_write16(at16, (uint16_t)px);
         g_pixels++;
         return;
     }
     const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4;
     if (stencil >= 0)           rgba = (rgba & 0x00FFFFFFu) | ((uint32_t)stencil << 24);
     else if (!g_bs.write_alpha) rgba = (rgba & 0x00FFFFFFu) | (psp_read32(at) & 0xFF000000u);
+    if (g_bs.pixel_mask) rgba = (psp_read32(at) & g_bs.pixel_mask) | (rgba & ~g_bs.pixel_mask);
     psp_write32(at, rgba);
     g_pixels++;
 }
 
-/* The depth buffer.
+/* The depth buffer: 16 bits a pixel in guest VRAM at ZBP, stride ZBW.
  *
- * Kept host-side rather than in guest VRAM at ZBP. The game only ever writes
- * it through the GE, so nothing reads back a value we did not put there, and
- * an array of floats avoids the 16-bit quantisation that would otherwise make
- * coplanar surfaces fight.
+ * It used to live host-side as floats, on the reasoning that nothing reads it
+ * back and that 16-bit quantisation makes coplanar surfaces fight. Hardware
+ * says otherwise on both counts. geprobe 2 scene 17 (fw 6.60) draws eight
+ * pairs of coplanar quads at z = -5 under each depth function: the hardware
+ * stores 12577 across every one and EQUAL passes everywhere, while the host
+ * floats differed in the last bits between the two quads and EQUAL/NOTEQUAL
+ * came out speckled. And the scene's depth dump shows what the CPU reads at
+ * ZBP, which is now what it reads here too.
  *
- * The *game* clears it, not us. A clear-mode draw with the depth bit set writes
- * its own z across the rectangle it covers, which is what the hardware does and
- * what ge.c now asks for. There is deliberately no host-side "clear to far":
- * "far" is whichever end of the 0..65535 window the game's comparison treats as
- * farthest, and only the game knows which. This one runs GEQUAL, where farthest
- * is 0 -- a buffer cleared to 65535 would fail every one of those tests and draw
- * nothing at all. That is the trap an earlier `#define DEPTH_FAR 1.0e30f` fell
- * into, and lowering it to 65535 did not climb out: for GEQUAL both values
- * reject everything.
+ * The value stored is the interpolated window z floored to an integer:
+ * across both of the scene's triangles the hardware's values are exactly a
+ * floored linear plane. That plane's own gradient is not quite the exact one
+ * (values sit within -4..+3 of it); not modelled yet.
  *
- * The reset value below is therefore the one that rejects nothing under the
- * comparison this game uses, so the frames before its first clear draw rather
- * than vanish. It is a placeholder for a real per-title depth convention, not a
- * claim about hardware; a LEQUAL title needs the other end and will need this
- * revisited. */
-#define DEPTH_RESET 0.0f
-static float g_depth[DEPTH_STRIDE * DEPTH_ROWS];
+ * The game clears depth itself through the GE, a clear-mode draw with the
+ * depth bit set; what is there before its first clear is whatever VRAM held,
+ * zero on a fresh start. For a GEQUAL title that rejects nothing, as the old
+ * host-side DEPTH_RESET of 0 was chosen to. */
+static uint32_t g_zb_addr = PSP_VRAM_BASE, g_zb_stride = 512;
 static struct { int test, func, write; } g_zs = { 0, 1 /* always */, 0 };
 
 static void sw_depth(int test_enable, int func, int write_enable) {
     g_zs.test = test_enable; g_zs.func = func; g_zs.write = write_enable;
 }
 
-/* Called from psp_ge_reset, so a second run in the same process -- the test
- * suite does exactly that -- does not inherit the previous run's depth.
- *
- * Deliberately *not* hung off the backend's init() hook, which looks like the
- * natural home and is never called; neither is shutdown() or present(). Putting
- * the reset there would reproduce the bug this replaces, where the only call to
- * the depth clear sat in an unwired vtable slot. */
+void psp_render_set_depth_buffer(uint32_t addr, uint32_t stride) {
+    g_zb_addr = PSP_VRAM_BASE | (addr & 0x001FFFFEu);
+    g_zb_stride = stride ? stride : 512;
+}
+
+/* Called from psp_ge_reset: the depth-buffer registers go back to their
+ * start-of-run values. The buffer's contents are guest VRAM and are reset
+ * with it. */
 void psp_render_reset_depth(void) {
-    for (int i = 0; i < DEPTH_STRIDE * DEPTH_ROWS; i++) g_depth[i] = DEPTH_RESET;
+    g_zb_addr = PSP_VRAM_BASE;
+    g_zb_stride = 512;
+}
+
+/* Where the GE keeps pixel (x, y)'s depth, as the CPU sees it through the
+ * plain VRAM address. Not the linear (y * ZBW + x) * 2: geprobe 2 scene 17
+ * (fw 6.60, ZBP 0x88000, ZBW 512) dumps ZBP linearly and the image comes back
+ * cut into 16-pixel strips. Matching the strips against the scene's geometry
+ * gives one address permutation that puts every one of them back:
+ *
+ *   - bits 0-4 (a strip of 16 pixels) stay;
+ *   - bits 5-9 rotate up by one, bit 9 landing in bit 5, so strips from the
+ *     left and right halves of a 512-pixel row alternate;
+ *   - bits 6 and 13 are inverted, swapping neighbouring strips and blocks of
+ *     8 rows.
+ *
+ * Those two inversions were constant across everything the scene covers (x
+ * 16..463, y 64..223); whether they depend on address bits the scene held
+ * fixed (bit 19 is set throughout at that ZBP) is a question for a probe
+ * with another ZBP. Only the CPU's view depends on it: the GE reads back
+ * through the same mapping it wrote. */
+static uint32_t depth_addr(int x, int y) {
+    const uint32_t l = (g_zb_addr & 0x001FFFFFu) + ((uint32_t)y * g_zb_stride + (uint32_t)x) * 2u;
+    const uint32_t mid = (l >> 5) & 0x1Fu;                       /* bits 5-9 */
+    const uint32_t rot = ((mid << 1) | (mid >> 4)) & 0x1Fu;
+    const uint32_t p = (l & ~(0x1Fu << 5)) | (rot << 5);
+    return PSP_VRAM_BASE | ((p ^ 0x2040u) & 0x001FFFFFu);
+}
+
+static int depth_value(float z) {
+    if (!(z > 0.0f)) return 0;
+    if (z >= 65535.0f) return 65535;
+    return (int)z;
 }
 
 /* GE comparison codes: 0 never, 1 always, 2 equal, 3 notequal, 4 less,
  * 5 lequal, 6 greater, 7 gequal. */
-static int depth_pass(int x, int y, float z) {
+static int depth_pass(int x, int y, int z) {
     if (!g_zs.test) return 1;
-    const float d = g_depth[y * DEPTH_STRIDE + x];
+    const int d = psp_read16(depth_addr(x, y));
     switch (g_zs.func) {
     case 0: return 0;
     case 2: return z == d;
@@ -679,38 +738,44 @@ static uint32_t clamp255(int v) { return v < 0 ? 0u : (v > 255 ? 255u : (uint32_
 
 /* One blend term: a channel scaled by its factor.
  *
- * gpu/commands/blend draws 64 boxes -- every factor against a fixed zero,
- * the doubling variants over a spread of alphas, every equation -- and reads
- * the pixel back. The arithmetic that reproduces all 192 channel values is
+ * geprobe step 11 (fw 6.60) blends three source colours over a gradient under
+ * twelve factor and equation pairs, and one rule reproduces all of its
+ * 130560 pixels:
  *
- *     term = ((c + 1) * f) >> 8
+ *     term = ((2c + 1) * (2|f| + 1)) >> 10, negated when f < 0
  *
- * and no divide by 255 does: "Zero + Inverse src alpha" wants 28 from 64 x 111
- * (exact 27.86) while "Inverse src alpha + Zero" wants 55 from 128 x 111
- * (exact 55.72), which no single rounding of c*f/255 gives and this does.
- * The doubling factors are twice the plain term, clamped -- 0xFF707070 under
- * double source alpha reads 0xE0, exactly 2x, so the factor is not saturated
- * at 255 as this used to do -- and the inverse-doubling ones take 255 - 2a,
- * clamped at zero, as an ordinary factor: 0x40808080 reads 0x3F, 0x7FFFFFFF
- * reads 0x01, and anything with alpha at 0x80 or above reads black. */
-static uint32_t blend_term(uint32_t c, uint32_t f) { return ((c + 1u) * f) >> 8; }
+ * with c and f in 0..255 units. The ((c + 1) * f) >> 8 this used before came
+ * from gpu/commands/blend's 192 channel values, which this rule also gives
+ * ("Zero + Inverse src alpha" 28 from 64 x 111, "Inverse src alpha + Zero" 55
+ * from 128 x 111); on step 11's own inputs it is wrong on up to a third of the
+ * samples of a row -- FIX 0x80 over FIX 0x80 with s = 64, d = 5 is 34, not 35.
+ *
+ * The doubled factors are neither clamped nor floored at zero. Double alpha
+ * is 2a, up to 510 (0xFF707070 reads 0xE0, as before), and one minus double
+ * alpha is 255 - 2a, signed: step 11's row 5, source 0x80C08040 at alpha
+ * 0x80, reads B = 191 over a destination B of 171 and up, which is
+ * 192 - T(d, -1), where a factor clamped at zero leaves 192. */
+static int blend_term(int c, int f) {
+    const int m = ((2 * c + 1) * (2 * (f < 0 ? -f : f) + 1)) >> 10;
+    return f < 0 ? -m : m;
+}
 
-static uint32_t blend_scaled(int code, int i, uint32_t src, uint32_t dst, int is_src) {
-    const uint32_t c = is_src ? chan(src, i) : chan(dst, i);
-    const uint32_t sa = chan(src, 3), da = chan(dst, 3);
-    uint32_t v;
+static int blend_scaled(int code, int i, uint32_t src, uint32_t dst, int is_src) {
+    const int c = (int)(is_src ? chan(src, i) : chan(dst, i));
+    const int other = (int)(is_src ? chan(dst, i) : chan(src, i));
+    const int sa = (int)chan(src, 3), da = (int)chan(dst, 3);
     switch (code) {
-    case 0:  return blend_term(c, is_src ? chan(dst, i) : chan(src, i));
-    case 1:  return blend_term(c, 255u - (is_src ? chan(dst, i) : chan(src, i)));
+    case 0:  return blend_term(c, other);
+    case 1:  return blend_term(c, 255 - other);
     case 2:  return blend_term(c, sa);
-    case 3:  return blend_term(c, 255u - sa);
+    case 3:  return blend_term(c, 255 - sa);
     case 4:  return blend_term(c, da);
-    case 5:  return blend_term(c, 255u - da);
-    case 6:  v = 2u * blend_term(c, sa); return v > 255u ? 255u : v;
-    case 7:  return blend_term(c, sa >= 128u ? 0u : 255u - 2u * sa);
-    case 8:  v = 2u * blend_term(c, da); return v > 255u ? 255u : v;
-    case 9:  return blend_term(c, da >= 128u ? 0u : 255u - 2u * da);
-    default: return blend_term(c, chan(is_src ? g_bs.fixa : g_bs.fixb, i));
+    case 5:  return blend_term(c, 255 - da);
+    case 6:  return blend_term(c, 2 * sa);
+    case 7:  return blend_term(c, 255 - 2 * sa);
+    case 8:  return blend_term(c, 2 * da);
+    case 9:  return blend_term(c, 255 - 2 * da);
+    default: return blend_term(c, (int)chan(is_src ? g_bs.fixa : g_bs.fixb, i));
     }
 }
 
@@ -718,8 +783,8 @@ static uint32_t blend(uint32_t src, uint32_t dst) {
     uint32_t out = 0;
     for (int i = 0; i < 4; i++) {
         const int s = (int)chan(src, i), d = (int)chan(dst, i);
-        const int ss = (int)blend_scaled(g_bs.src, i, src, dst, 1);
-        const int dd = (int)blend_scaled(g_bs.dst, i, src, dst, 0);
+        const int ss = blend_scaled(g_bs.src, i, src, dst, 1);
+        const int dd = blend_scaled(g_bs.dst, i, src, dst, 0);
         int v;
         switch (g_bs.eq) {
         case 1:  v = ss - dd; break;
@@ -751,29 +816,84 @@ static int stencil_pass(uint32_t cur) {
     }
 }
 
+/* INCR and DECR count in the target's own stencil width: one step of a 4444
+ * target's nibble (0x11 once expanded) and the whole bit of a 5551 target.
+ * geprobe 5 scenes 31 and 32 (fw 6.60) INCR a stencil of 0x5A written
+ * before: 4444 reads 6 where 0x55 + 1 would pack back to 5, and 5551 reads
+ * 1 where 0x00 + 1 would pack back to 0. */
 static uint32_t stencil_op(int op, uint32_t cur) {
+    const uint32_t step = g_fb_fmt == 2 ? 0x11u : (g_fb_fmt == 1 ? 0xFFu : 1u);
     switch (op) {
     case 1:  return 0u;                                  /* ZERO    */
     case 2:  return (uint32_t)g_bs.stencil_ref & 0xFFu;  /* REPLACE */
     case 3:  return ~cur & 0xFFu;                        /* INVERT  */
-    case 4:  return cur < 255u ? cur + 1u : 255u;        /* INCR    */
-    case 5:  return cur > 0u ? cur - 1u : 0u;            /* DECR    */
+    case 4:  return cur <= 255u - step ? cur + step : 255u;   /* INCR */
+    case 5:  return cur >= step ? cur - step : 0u;            /* DECR */
     default: return cur;                                 /* KEEP    */
     }
 }
 
 /* A stencil operation on a pixel whose colour is not written: only the alpha
- * byte changes. A 5650 target has no stencil and the write is dropped. */
+ * byte changes. A 5650 target has no stencil and the write is dropped.
+ * PMSK2 is applied to it as to any other alpha write, a set bit keeping the
+ * old stencil bit: geprobe 5 scenes 29, 31 and 32 (fw 6.60) REPLACE, INCR and
+ * INVERT under PMSK2 0xF0, 0x0F and 0x3C on 8888, 5551 and 4444. */
 static void write_stencil_only(int x, int y, uint32_t value) {
     if (!g_fb_addr || !g_fb_stride || g_fb_fmt == 0) return;
+    const uint32_t keep = 0x00FFFFFFu | g_bs.pixel_mask;
     if (g_fb_fmt != 3) {
         const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
-        const uint32_t px = expand16((uint32_t)psp_read16(at), g_fb_fmt) & 0x00FFFFFFu;
-        psp_write16(at, (uint16_t)pack16(px | (value << 24), g_fb_fmt));
+        const uint32_t old = (uint32_t)psp_read16(at);
+        const uint32_t px = pack16((expand16(old, g_fb_fmt) & 0x00FFFFFFu) | (value << 24), g_fb_fmt);
+        const uint32_t k16 = pack16(keep, g_fb_fmt);
+        psp_write16(at, (uint16_t)((old & k16) | (px & ~k16)));
         return;
     }
     const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4;
-    psp_write32(at, (psp_read32(at) & 0x00FFFFFFu) | (value << 24));
+    const uint32_t old = psp_read32(at);
+    psp_write32(at, (old & keep) | ((value << 24) & ~keep));
+}
+
+/* Colour test (CTE 0x27, CTEST 0xD8, CREF 0xD9, CMSK 0xDA): the masked RGB
+ * word against the masked reference, with only four functions. geprobe
+ * step 19 (fw 6.60) runs NOTEQUAL 0x808080 / 0xF0F0F0 over a ramp and drops
+ * exactly the fragments whose three channels all sit in 0x80..0x8F. */
+static int colour_pass(uint32_t rgba) {
+    if (!g_bs.colour_test) return 1;
+    const uint32_t c = rgba & g_bs.colour_mask & 0x00FFFFFFu;
+    const uint32_t r = g_bs.colour_ref & g_bs.colour_mask & 0x00FFFFFFu;
+    switch (g_bs.colour_func & 3) {
+    case 0:  return 0;
+    case 2:  return c == r;
+    case 3:  return c != r;
+    default: return 1;
+    }
+}
+
+/* Logic op (LOE 0x28, LOP 0xE6), source s against destination d, in the
+ * PSPSDK GU_* order. geprobe step 19 (fw 6.60) combines 0xA55A3C with
+ * 0x402010 and reads CLEAR 000000, AND 000010, XOR E57A2C, OR E57A3C,
+ * NOR 1A85C3, EQUIV 1A85D3, INVERTED BFDFEF (~d), NAND FFFFEF; the other
+ * eight follow the same table and are not measured. */
+static uint32_t logic_op(int op, uint32_t s, uint32_t d) {
+    switch (op & 15) {
+    case 0:  return 0;              /* CLEAR */
+    case 1:  return s & d;          /* AND */
+    case 2:  return s & ~d;         /* AND_REVERSE */
+    case 3:  return s;              /* COPY */
+    case 4:  return ~s & d;         /* AND_INVERTED */
+    case 5:  return d;              /* NOOP */
+    case 6:  return s ^ d;          /* XOR */
+    case 7:  return s | d;          /* OR */
+    case 8:  return ~(s | d);       /* NOR */
+    case 9:  return ~(s ^ d);       /* EQUIV */
+    case 10: return ~d;             /* INVERTED */
+    case 11: return s | ~d;         /* OR_REVERSE */
+    case 12: return ~s;             /* COPY_INVERTED */
+    case 13: return ~s | d;         /* OR_INVERTED */
+    case 14: return ~(s & d);       /* NAND */
+    default: return 0xFFFFFFFFu;    /* SET */
+    }
 }
 
 static int alpha_pass(uint32_t rgba) {
@@ -841,6 +961,11 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
                              x, y, g_fb_addr, g_cur_prim, rgba, g_tex.addr, g_tex.w, g_tex.h, g_tex.fmt, (unsigned long long)g_pixels);
         return;
     }
+    if (!colour_pass(rgba)) {
+        if (watched) fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d COLOUR-TEST-KILLED %08X  ref %06X mask %06X func %d  pixels so far %llu\n",
+                             x, y, g_fb_addr, g_cur_prim, rgba, g_bs.colour_ref, g_bs.colour_mask, g_bs.colour_func, (unsigned long long)g_pixels);
+        return;
+    }
     /* The stencil test runs before the depth test, and each outcome has its
      * operation: fail, pass-but-depth-fails, pass. Only the last writes colour,
      * all three may write the stencil. gpu/commands/blend runs REPLACE with
@@ -854,10 +979,11 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
             return;
         }
     }
-    if (!depth_pass(x, y, z)) {
+    const int zi = depth_value(z);
+    if (!depth_pass(x, y, zi)) {
         g_px_zfail++;
-        if (watched) fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d DEPTH-FAILED %08X  z %.0f against %.0f func %d  tex %08X  pixels so far %llu\n",
-                             x, y, g_fb_addr, g_cur_prim, rgba, (double)z, (double)g_depth[y * DEPTH_STRIDE + x], g_zs.func,
+        if (watched) fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d DEPTH-FAILED %08X  z %d against %d func %d  tex %08X  pixels so far %llu\n",
+                             x, y, g_fb_addr, g_cur_prim, rgba, zi, (int)psp_read16(depth_addr(x, y)), g_zs.func,
                              g_tex.addr, (unsigned long long)g_pixels);
         if (g_bs.stencil_test) write_stencil_only(x, y, stencil_op(g_bs.op_zfail, cur_stencil));
         return;
@@ -865,7 +991,7 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
     /* A disabled depth test writes no depth, as in GL and on the hardware:
      * ZMSK alone does not resurrect the write. Clear mode still writes because
      * the GE layer hands it an enabled test with ALWAYS (src/hle/ge.c). */
-    if (g_zs.test && g_zs.write) g_depth[y * DEPTH_STRIDE + x] = z;
+    if (g_zs.test && g_zs.write) psp_write16(depth_addr(x, y), (uint16_t)zi);
     if (g_bs.stencil_test) stencil = (int)stencil_op(g_bs.op_zpass, cur_stencil);
     if (!g_bs.write_colour) {
         if (stencil >= 0) write_stencil_only(x, y, (uint32_t)stencil);
@@ -873,6 +999,21 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
         return;
     }
     if (g_bs.enable) { rgba = blend(rgba, get_pixel(x, y)); g_px_blend++; }
+    /* Dither: an offset per screen position, then the 16-bit formats keep
+     * the top bits as always (pack16). geprobe step 10 (fw 6.60) dithers
+     * 8888 too: its grey ramp, 7F and 80 at (240,136) and (241,136), reads
+     * 86 and 78 there under the probe's +7/-8 matrix row. Placed after the
+     * blend; the order against blending is not measured. */
+    if (g_bs.dither) {
+        const int d = g_bs.dither_m[y & 3][x & 3];
+        rgba = (rgba & 0xFF000000u) | clamp255((int)chan(rgba, 0) + d)
+             | clamp255((int)chan(rgba, 1) + d) << 8 | clamp255((int)chan(rgba, 2) + d) << 16;
+    }
+    /* The logic op works on RGB only: step 19's alpha byte (the stencil) is
+     * untouched by all eight ops it runs. Its order against the dither is not
+     * measured. */
+    if (g_bs.logic_enable)
+        rgba = (rgba & 0xFF000000u) | (logic_op(g_bs.logic_op, rgba, get_pixel(x, y)) & 0x00FFFFFFu);
     if (watched) {
         g_pw_left--;
         fprintf(stderr, "pixwatch: (%d,%d) fb %08X prim %d arrived %08X wrote %08X  z %.0f  blend %d src %d dst %d eq %d fix %06X/%06X  tex %08X %dx%d fmt %d func %d tcc %d  pixels so far %llu\n",
@@ -902,6 +1043,34 @@ static int edge_is_top_left(int64_t dx, int64_t dy) {
     return (dy == 0 && dx > 0) || dy < 0;
 }
 
+/* v / 2^s, floored (s >= 1). */
+static int64_t floor_shr(int64_t v, int s) {
+    return v >= 0 ? v >> s : -((-v + ((int64_t)1 << s) - 1) >> s);
+}
+
+/* 1/area (area > 0) as the GE's triangle setup has it: the GE's own float,
+ * 16 significant bits, cut toward zero (ge24 in src/hle/ge.c). Returned as
+ * q / 2^sh, q < 2^16 except for a power of two, where it is exact. Depth
+ * gradients go through it (sw_tri); geprobe 5 (fw 6.60) scene 27's four
+ * through-mode triangles pin the width: 15 to 17 bits reproduce all 30300
+ * of their pixels, 14 and 18 do not, and the exact 1/area leaves 653.
+ * Being a hair small is visible on its own: geprobe step 11 spreads 255
+ * over 480 pixels, exactly 544/1024 a pixel, and the hardware steps 543,
+ * while -544/1024 stays -544. A line's gradients take it too, with the
+ * major length for the area (psp_render_walk_line). */
+static void area_rcp(int64_t area, int64_t *q, int *sh) {
+    int L = 0;
+    while (L < 62 && (area >> L) != 0) L++;
+    *sh = 16 + L - 1;
+    *q = (int64_t)(((uint64_t)1 << *sh) / (uint64_t)area);
+}
+
+/* Floored, clamped to a channel: the plane's value in 1/16384ths. */
+static uint32_t plane_chan(int64_t acc) {
+    const int64_t v = acc >> 14;
+    return v < 0 ? 0u : (v > 255 ? 255u : (uint32_t)v);
+}
+
 /* Barycentric fill with integer edge functions, evaluated at pixel centres.
  *
  * Sampling at the pixel *corner* -- which is what this did -- puts the sample
@@ -917,6 +1086,9 @@ static int edge_is_top_left(int64_t dx, int64_t dy) {
  * interpolating at the centre would let the weights go slightly negative on a
  * silhouette pixel, running u and v up to half a texel past the geometry. */
 static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c) {
+    /* Flat shading takes the last vertex as submitted, so before the winding
+     * normalisation below can swap it. */
+    const uint32_t last_rgba = c->rgba;
     /* Positions arrive in 1/16 pixel; the pixel box that can contain a centre
      * inside them is floor(min/16) .. floor((max + 15)/16), and the shifts
      * floor for negatives where a division would not. */
@@ -969,14 +1141,147 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     int64_t row1 = d1x * (py - a->y) - d1y * (px - a->x);
     int64_t row2 = d2x * (py - b->y) - d2y * (px - b->x);
 
-    /* The edge functions are already the barycentric numerators, so colour,
-     * depth and texture coordinates come out of the same three values the
-     * coverage test computes. Filling with a->rgba instead -- which is what
-     * this did -- paints every triangle one flat colour and ignores the
-     * texture entirely, which reads as "the geometry is not arriving" when the
-     * geometry is arriving and being shaded wrong.
+    /* Colour is a plane per channel, and not the barycentric blend that
+     * depth and texture coordinates use below: geprobe (fw 6.60) measured
      *
-     * Colour, depth and fog are affine in screen space. Texture coordinates
+     *     c(px, py) = cA + gx * (px - xA) + gy * (py - yA)
+     *
+     * at the pixel centre, where A is the leftmost vertex (ties: the upper
+     * one); gx and gy are the numerators times area_rcp's short 1/area,
+     * floored to 1/1024 a pixel, as for depth below; the result is floored
+     * and clamped. It reproduces every triangle of geprobe 1 steps 1-11, 18
+     * and 19, alpha included. The rounded barycentric blend this replaces
+     * was one step off on most Gouraud pixels; anchoring at the first or the
+     * topmost vertex fails steps 1-10.
+     *
+     * The short reciprocal is geprobe 6 (fw 6.60) scene 39's, the scene
+     * built to measure gradient precision: of its 78 triangles 75 match on
+     * every pixel with it and 69 with the exact gradient floored,
+     * which the others never beat; scene 17's 3D quads go from 81 pixels off
+     * to none. It costs two skinned triangles of scene 20 (54 -> 101) and
+     * morph and skin triangles of scene 26 (2263 -> 2343), whose corners
+     * psprecomp is less sure of (ge_recip in src/hle/ge.c). Scene 39's other
+     * three fit neither: a through-mode triangle wants a gradient one step
+     * smaller than both give, and a 3D quad's two halves fit no gradient
+     * within eight steps, so the reciprocal is not the whole story
+     * (docs/RENDERER.md).
+     *
+     * The anchor holds in 3D wherever psprecomp's corners are certain:
+     * every 3D triangle of scenes 20, 39 and 40 that fits one or two anchors
+     * fits the leftmost. The 42 of 205 such triangles that fit another are
+     * all lit, morphed, skinned or tessellated (scenes 16, 21, 22, 23, 26),
+     * where a corner's colour or place one step or sixteenth off moves the
+     * best anchor too.
+     *
+     * Which vertices compete depends on the mode. Transformed triangles take
+     * the leftmost of all three: geprobe 2 scene 15's fogged floor has a
+     * corner at (-388, 371) and its colour and fog match on every pixel when
+     * anchored there, where its one on-screen corner leaves 7337 off.
+     * Through-mode triangles take the leftmost among the vertices inside the
+     * scissor, or among all three when none is: geprobe 1 step 18's triangle
+     * with corners at (-100, 200) and (100, 600) matches only when anchored
+     * at its third, (200, 150). "Inside" looks at the pixel coordinate's low
+     * ten bits only, the scissor registers' width: geprobe 5 scene 28's
+     * triangle with a corner saturated to x = -2048 (0 in ten bits) matches
+     * only when anchored there, where its two on-screen corners leave 12007
+     * pixels off, and the -100 above is 924 in ten bits, outside. That is a
+     * fit to these two, not a mechanism anyone has seen. What makes
+     * transformed triangles differ is not known.
+     * (A transformed vertex is one the GE projected: psp_vertex.precise.)
+     *
+     * The fog coefficient is a fifth plane through the same anchor, by the
+     * same rule: scene 15's floor and quads, every pixel.
+     *
+     * Flat shading (SHADE clear) skips the colour planes: the whole triangle
+     * is last_rgba. Measured on a triangle list; a strip's triangle takes its
+     * own third vertex by the same rule, which is not measured.
+     *
+     * A lit triangle's secondary colour (psp_vertex.spec) is three more planes
+     * by the same rule, 5 to 7, added to the colour per pixel and clamped.
+     *
+     * Kept in 1/16384ths of a channel (1/1024 of a step times the 1/16 grid)
+     * so every pixel is exact integer arithmetic. */
+    int64_t col_acc[8] = { 0 }, col_dx[8] = { 0 }, col_dy[8] = { 0 };
+    int64_t z_acc = 0, z_dx = 0, z_dy = 0;
+    const int flat = g_bs.shade_flat;
+    const int sec = !flat && (a->spec_set || b->spec_set || c->spec_set);
+    const int nplanes = sec ? 8 : 5;
+    {
+        const psp_vertex *vs[3] = { a, b, c };
+        int inside[3], any = 0, k0 = -1;
+        for (int k = 0; k < 3; k++) {
+            const int wx = (vs[k]->x >> 4) & 1023, wy = (vs[k]->y >> 4) & 1023;
+            inside[k] = vs[k]->precise ||
+                        (wx >= g_sc_x0 && wx <= g_sc_x1 && wy >= g_sc_y0 && wy <= g_sc_y1);
+            any |= inside[k];
+        }
+        for (int k = 0; k < 3; k++) {
+            if (any && !inside[k]) continue;
+            if (k0 < 0 || vs[k]->x < vs[k0]->x || (vs[k]->x == vs[k0]->x && vs[k]->y < vs[k0]->y))
+                k0 = k;
+        }
+        int64_t rq; int rsh;
+        area_rcp(area, &rq, &rsh);
+        for (int i = flat ? 4 : 0; i < nplanes; i++) {
+            int64_t c0, c1, c2, ck;
+            if (i == 4) {
+                c0 = a->fog; c1 = b->fog; c2 = c->fog; ck = vs[k0]->fog;
+            } else if (i > 4) {
+                c0 = a->spec_set ? chan(a->spec, i - 5) : 0;
+                c1 = b->spec_set ? chan(b->spec, i - 5) : 0;
+                c2 = c->spec_set ? chan(c->spec, i - 5) : 0;
+                ck = vs[k0]->spec_set ? chan(vs[k0]->spec, i - 5) : 0;
+            } else {
+                c0 = chan(a->rgba, i); c1 = chan(b->rgba, i); c2 = chan(c->rgba, i);
+                ck = chan(vs[k0]->rgba, i);
+            }
+            const int64_t nx = (c1 - c0) * (c->y - a->y) - (c2 - c0) * (b->y - a->y);
+            const int64_t ny = (c2 - c0) * (b->x - a->x) - (c1 - c0) * (c->x - a->x);
+            const int64_t gx = floor_shr(nx * rq, rsh - 14), gy = floor_shr(ny * rq, rsh - 14);
+            col_acc[i] = ck * 16384
+                       + gx * (px - vs[k0]->x) + gy * (py - vs[k0]->y);
+            col_dx[i] = gx * SUBPX;
+            col_dy[i] = gy * SUBPX;
+        }
+        /* Depth is a plane too, through the same anchor, in the same
+         * 1/16384 units, with the same gradient: the numerator times
+         * area_rcp's short 1/area, floored to 1/1024 a pixel. The vertex
+         * depths are integers -- through mode's as given, a transformed
+         * vertex's floored from ge_screen_z. geprobe 5 (fw 6.60) scene 27's
+         * through-mode triangles (full range, nearly flat, constant, steep
+         * in y) match on every pixel; the barycentric float blend this
+         * replaces left the constant 12345 at 12344 on 60 of them and was a
+         * step off on 3000 more. geprobe 6 scene 36 draws four 3D shapes
+         * from each corner in both windings: 15 of its 24 triangles match
+         * on every pixel and eight more are within 1 to 56 pixels, one step
+         * each. The leftmost anchor is not settled for depth: the one shape
+         * whose top and leftmost corners differ matches on 5 of 6 when
+         * anchored at the top, against none, but another shape's triangles
+         * split between the two and the top takes scene 17 from 303 pixels
+         * off to 601 (scene 27: 1867 to 1172). Of scenes 27 and 17's 3D
+         * triangles, three match on every interior pixel and three (scene
+         * 27's quad sloping in x, both halves, and the second of scene 17's
+         * interpenetrating pair) still do not (docs/RENDERER.md). */
+        {
+            int64_t zv[3];
+            for (int k = 0; k < 3; k++) {
+                const float z = vs[k]->z;
+                zv[k] = !(z > 0.0f) ? 0 : (z >= 65535.0f ? 65535 : (int64_t)z);
+            }
+            const int64_t nx = (zv[1] - zv[0]) * (c->y - a->y) - (zv[2] - zv[0]) * (b->y - a->y);
+            const int64_t ny = (zv[2] - zv[0]) * (b->x - a->x) - (zv[1] - zv[0]) * (c->x - a->x);
+            const int64_t gx = floor_shr(nx * rq, rsh - 14), gy = floor_shr(ny * rq, rsh - 14);
+            z_acc = zv[k0] * 16384 + gx * (px - vs[k0]->x) + gy * (py - vs[k0]->y);
+            z_dx = gx * SUBPX;
+            z_dy = gy * SUBPX;
+        }
+    }
+
+    /* The edge functions are already the barycentric numerators, so texture
+     * coordinates come out of the same three values the coverage test
+     * computes.
+     *
+     * Texture coordinates
      * are not: transformed vertices retain reciprocal clip W (and a texture
      * projection Q), so the textured branch below performs the homogeneous
      * divide the PSP uses on oblique geometry. Through-mode vertices carry
@@ -1001,26 +1306,24 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
 
     for (int y = miny; y <= maxy; y++) {
         int64_t w0 = row0, w1 = row1, w2 = row2;
+        int64_t acc[8];
+        for (int i = 0; i < nplanes; i++) acc[i] = col_acc[i];
+        int64_t zacc = z_acc;
         for (int x = minx; x <= maxx; x++) {
             if (w0 + bias0 >= 0 && w1 + bias1 >= 0 && w2 + bias2 >= 0) {
                 const float l0 = (float)w0 * inv;
                 const float l1 = (float)w1 * inv;
                 const float l2 = (float)w2 * inv;
 
-                const float z = l0 * a->z + l1 * b->z + l2 * c->z;
+                const int64_t zi = zacc >> 14;
+                const float z = zi < 0 ? 0.0f : (zi > 65535 ? 65535.0f : (float)zi);
 
-                float fgf = l0 * (float)a->fog + l1 * (float)b->fog + l2 * (float)c->fog;
-                if (fgf < 0.0f) fgf = 0.0f; else if (fgf > 255.0f) fgf = 255.0f;
-                const int fg = (int)(fgf + 0.5f);
+                const int fg = (int)plane_chan(acc[4]);
 
-                uint32_t col = 0;
-                for (int i = 0; i < 4; i++) {
-                    float ch = l0 * (float)((a->rgba >> (i * 8)) & 0xFF)
-                             + l1 * (float)((b->rgba >> (i * 8)) & 0xFF)
-                             + l2 * (float)((c->rgba >> (i * 8)) & 0xFF);
-                    if (ch < 0.0f) ch = 0.0f; else if (ch > 255.0f) ch = 255.0f;
-                    col |= (uint32_t)(ch + 0.5f) << (i * 8);
-                }
+                uint32_t col = last_rgba;
+                if (!flat)
+                    col = plane_chan(acc[0]) | plane_chan(acc[1]) << 8 |
+                          plane_chan(acc[2]) << 16 | plane_chan(acc[3]) << 24;
 
                 if (textured) {
                     const float den = l0 * a->tex_q * a->inv_w
@@ -1045,12 +1348,23 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                     col = apply_texfunc(texel, col);
                     g_px_tex++;
                 } else g_px_flat++;
+                /* After the texture function, which is what the mode is for;
+                 * scene 16 is untextured, so that order is not measured. */
+                if (sec)
+                    for (int k = 0; k < 3; k++) {
+                        const uint32_t v = chan(col, k) + plane_chan(acc[5 + k]);
+                        col = (col & ~(0xFFu << (8 * k))) | (v > 255 ? 255u : v) << (8 * k);
+                    }
                 col = apply_fog(col, fg);
                 shade_pixel(x, y, z, col);
             }
             w0 -= d0y * SUBPX; w1 -= d1y * SUBPX; w2 -= d2y * SUBPX;
+            for (int i = 0; i < nplanes; i++) acc[i] += col_dx[i];
+            zacc += z_dx;
         }
         row0 += d0x * SUBPX; row1 += d1x * SUBPX; row2 += d2x * SUBPX;
+        for (int i = 0; i < nplanes; i++) col_acc[i] += col_dy[i];
+        z_acc += z_dy;
     }
 }
 
@@ -1093,9 +1407,26 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
      * standard mapping answers those with (1,0) and (0,1) at the top-left and
      * was one line wrong on every orientation with one flip. */
     const int transposed = (b->x < a->x) != (b->y < a->y);
-    const float du = (b->u - a->u) / (float)(transposed ? (b->y - a->y) : (b->x - a->x));
-    const float dv = (b->v - a->v) / (float)(transposed ? (b->x - a->x) : (b->y - a->y));
-    /* du and dv are texels per sixteenth of a pixel. */
+    /* du and dv are texels per sixteenth of a pixel, truncated toward zero to
+     * 2^-16 of a texel. geprobe step 12 (fw 6.60) maps v 0..16 over 56 rows,
+     * and where a pixel centre lands exactly on v = 1.0 -- (440,11) -- the PSP
+     * reads row 0, the texel below; the exact quotient reads row 1. Any
+     * precision from 2^-8 to 2^-20 per pixel fits that sprite. Truncation
+     * leaves power-of-two steps exact, which the 1:1 and the 2:1 and 4:1
+     * minified sprites of the same scene need. */
+    /* Each ramp starts at the top or left edge, whichever vertex gave it
+     * that: geprobe 5 scene 28 (fw 6.60) maps 2 texels onto 7 pixels with
+     * the corners given bottom-right first, and where a pixel centre lands
+     * on the texel boundary the PSP reads the texel on the far side of it
+     * from that vertex's, which a ramp truncated from the top-left gives and
+     * one from the first vertex does not (it read the near one; 14 pixels).
+     * Given top-left first, as everything before it was, nothing changes.
+     * uo and vo are the vertices the u and v ramps start from. */
+    const psp_vertex *left = a->x <= b->x ? a : b, *top = a->y <= b->y ? a : b;
+    const psp_vertex *uo = transposed ? top : left, *vo = transposed ? left : top;
+    const psp_vertex *ue = uo == a ? b : a, *ve = vo == a ? b : a;
+    const float du = ldexpf(truncf(ldexpf((ue->u - uo->u) / (float)(transposed ? y1 - y0 : x1 - x0), 16)), -16);
+    const float dv = ldexpf(truncf(ldexpf((ve->v - vo->v) / (float)(transposed ? x1 - x0 : y1 - y0), 16)), -16);
     int lod16 = 0;
     if (textured) {
         const float rx = fabsf(du) * 16.0f, ry = fabsf(dv) * 16.0f;
@@ -1106,14 +1437,14 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
         /* Pixel centres, in 1/16 units, against the exact corner: at 1:1 a
          * corner lands exactly on a texel boundary and the rounding decides
          * which side of it to read. */
-        const float ty = (float)(y * SUBPX + SUBPX_HALF - a->y);
-        const float tv_row = transposed ? 0.0f : a->v + dv * ty;
-        const float tu_row = transposed ? a->u + du * ty : 0.0f;
+        const float ty = (float)(y * SUBPX + SUBPX_HALF - y0);
+        const float tv_row = transposed ? 0.0f : vo->v + dv * ty;
+        const float tu_row = transposed ? uo->u + du * ty : 0.0f;
         for (int x = px0; x < px1; x++) {
             if (!textured) { g_px_flat++; shade_pixel(x, y, a->z, apply_fog(b->rgba, b->fog)); continue; }
-            const float tx = (float)(x * SUBPX + SUBPX_HALF - a->x);
-            const float tu = transposed ? tu_row : a->u + du * tx;
-            const float tv = transposed ? a->v + dv * tx : tv_row;
+            const float tx = (float)(x * SUBPX + SUBPX_HALF - x0);
+            const float tu = transposed ? tu_row : uo->u + du * tx;
+            const float tv = transposed ? vo->v + dv * tx : tv_row;
             g_px_tex++;
             shade_pixel(x, y, a->z,
                         apply_fog(apply_texfunc(sample_mip(tu, tv, lod16), b->rgba), b->fog));
@@ -1165,31 +1496,121 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
                           psp_line_pixel_fn emit, void *opaque) {
     const int64_t dx = (int64_t)b->x - a->x, dy = (int64_t)b->y - a->y;
     const int64_t ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
-    const int64_t steps = (ax > ay ? ax : ay) / PSP_SUBPX;
-    if (!steps || x0 > x1 || y0 > y1) return;
-    /* The far endpoint is excluded. At integer boundaries a decreasing
-     * coordinate owns the pixel immediately before it, including at i=0.
-     * Reversing an integer horizontal/vertical interval keeps its coverage. */
-    const int64_t px = ((int64_t)a->x - (dx < 0)) * steps;
-    const int64_t py = ((int64_t)a->y - (dy < 0)) * steps;
-    const int64_t scale = steps * PSP_SUBPX;
-    int64_t first = 0, last = steps - 1;
-    if (!line_clip_axis(px, dx, scale, x0, x1, &first, &last) ||
-        !line_clip_axis(py, dy, scale, y0, y1, &first, &last)) return;
-    for (int64_t i = first; i <= last; i++) {
-        const float t = (float)((double)i / (double)steps), s = 1.0f - t;
+    if ((ax > ay ? ax : ay) < PSP_SUBPX || x0 > x1 || y0 > y1) return;
+    /* One pixel per major-axis column (or row) whose centre lies on the
+     * segment, start included, end excluded; the minor coordinate, colour
+     * and depth are taken where that centre projects onto the line. For
+     * whole-pixel endpoints that is step i's centre, i + 1/2: geprobe step 1
+     * (fw 6.60) draws (140,230)-(230,265) through (150,234), where i alone
+     * gives 233. geprobe 5 scene 27's 3D line, from x 4141/16 to 6101/16,
+     * shows the general case: the hardware starts at the first centre past
+     * 258.81, pixel 259, and each of its 122 columns sits on the row and at
+     * the depth of its centre's projection, where stepping 122 whole steps
+     * from 258.81 put six a row off and every depth up to 18 off.
+     *
+     * The two ends are then adjusted by the pixels' diamonds, below.
+     *
+     * Major index k = 0..n-1: pixel M0 + sm*k along the major axis, its
+     * centre c0 + 16*sm*k; the minor pixel is
+     * floor((m_a*|dM| + dm*sm*(centre - M_a)) / (16*|dM|)). Both are
+     * floor((p + d*k) / s), so one clip serves either. */
+    const int xmajor = ax >= ay;
+    const int64_t Ma = xmajor ? a->x : a->y, ma = xmajor ? a->y : a->x;
+    const int64_t dM = xmajor ? dx : dy, dm = xmajor ? dy : dx, adM = dM < 0 ? -dM : dM;
+    const int64_t sm = dM < 0 ? -1 : 1;
+    /* First and one-past-last major pixels: centres in [Ma, Mb) going up,
+     * (Mb, Ma] going down. */
+    const int64_t Mb = Ma + dM;
+    const int64_t M0 = sm > 0 ? floor_div(Ma - 8 + 15, 16) : floor_div(Ma - 8, 16);
+    const int64_t Mend = sm > 0 ? floor_div(Mb - 8 + 15, 16) : floor_div(Mb - 8, 16);
+    const int64_t n = sm > 0 ? Mend - M0 : M0 - Mend;
+    const int64_t c0 = 16 * M0 + 8;                         /* centre of k = 0 */
+    const int64_t pm = ma * adM + dm * sm * (c0 - Ma), dmk = 16 * dm, smd = 16 * adM;
+    /* The ends go by the pixel's diamond, |x - cx| + |y - cy| < 1/2: the
+     * last pixel is left out when the end lies in its diamond, and the pixel
+     * before the first is drawn when the start lies in its diamond. On the
+     * diamond's edge a point above the centre counts as inside, one below it
+     * as outside. geprobe 6 scene 37 (fw 6.60) ends shallow lines on every
+     * sixteenth of a row: going right to x + 5/8, the PSP leaves out the
+     * last pixel for end rows 2/16 to 13/16 past a whole pixel (its diamond
+     * holds the end, the edge included at 2/16 and not at 14/16); going left
+     * from x + 7/16 it draws one more pixel at the start for 1/16 to 14/16.
+     * Its other lines, whose ends lie on no diamond, match the centre rule
+     * above; so does scene 28's 3D line, which ends in its last pixel's
+     * diamond. */
+    int64_t first = 0, last = n - 1;
+    {
+        const int64_t mb = ma + dm;
+        int64_t k = n - 1;
+        for (int end = 0; end < 2; end++, k = -1) {
+            const int64_t Mp = M0 + sm * k, mp = floor_div(pm + dmk * k, smd);
+            const int64_t pM = end ? Ma : Mb, pmin = end ? ma : mb;
+            const int64_t dMaj = pM - (16 * Mp + 8), dMin = pmin - (16 * mp + 8);
+            const int64_t ddy = xmajor ? dMin : dMaj;
+            const int64_t sum = (dMaj < 0 ? -dMaj : dMaj) + (dMin < 0 ? -dMin : dMin);
+            const int inside = sum < 8 || (sum == 8 && ddy < 0);
+            if (inside) { if (end) first = -1; else last = n - 2; }
+        }
+    }
+    if (last < first) return;
+    if (!line_clip_axis(xmajor ? M0 : pm, xmajor ? sm : dmk, xmajor ? 1 : smd, x0, x1, &first, &last) ||
+        !line_clip_axis(xmajor ? pm : M0, xmajor ? dmk : sm, xmajor ? smd : 1, y0, y1, &first, &last))
+        return;
+    /* Colour and depth at the projected centre, on the triangle's gradient
+     * rule: the difference times area_rcp's short reciprocal of the major
+     * length, floored to 1/16384 a sixteenth, times the distance from the
+     * start, the value floored. Step 1's white-to-blue line reads FDFDFF at
+     * its first pixel: 255 - 2902/1024 * 1/2 = 253.6. geprobe 7 (fw 6.60)
+     * scene 49's 128 steep red-to-green lines match on all 5862 of their
+     * pixels this way; the gradient floored from the exact quotient, as
+     * before, left four a step off (as on 7 pixels of geprobe 6 scene 37).
+     * Depth goes from the integer vertex depths: scene 27's three
+     * through-mode lines match at every step, and its 3D line on every one
+     * of its pixels; taken at the step's start, as it was, each read half a
+     * step short, 149 or 91 off. The distance is kept in sixteenths
+     * (dist16), so the sums are in 1/16384ths. */
+    int64_t cg[4], cv[4], lq;
+    int lsh;
+    area_rcp(adM, &lq, &lsh);
+    for (int c = 0; c < 4; c++) {
+        cv[c] = chan(a->rgba, c);
+        cg[c] = floor_shr(((int64_t)chan(b->rgba, c) - cv[c]) * 16384 * lq, lsh);
+    }
+    const int64_t za = !(a->z > 0.0f) ? 0 : (a->z >= 65535.0f ? 65535 : (int64_t)a->z);
+    const int64_t zb = !(b->z > 0.0f) ? 0 : (b->z >= 65535.0f ? 65535 : (int64_t)b->z);
+    const int64_t zg = floor_shr((zb - za) * 16384 * lq, lsh);
+    /* Fog and texture coordinates at the same point. Unprojected (through
+     * mode), the texture coordinates go by a fixed step, texels a sixteenth,
+     * truncated toward zero to 2^-24 (2^-20 a pixel). geprobe 5 scene 28's
+     * three through-mode textured lines (fw 6.60) read the hardware's texel
+     * on every pixel this way. Taken at the step's start they read the texel
+     * before it wherever a boundary fell inside the step; with an exact step
+     * at the centre they read the one after it at the 9 pixels whose centre
+     * lands exactly on a boundary; a sprite's coarser 2^-16 step truncates
+     * too far and reads the one before (31 pixels). */
+    const int affine = a->inv_w == 1.0f && b->inv_w == 1.0f && a->tex_q == 1.0f && b->tex_q == 1.0f;
+    const float lu = (float)ldexp(trunc(ldexp((double)(b->u - a->u) / (double)adM, 24)), -24);
+    const float lv = (float)ldexp(trunc(ldexp((double)(b->v - a->v) / (double)adM, 24)), -24);
+    for (int64_t k = first; k <= last; k++) {
+        const int64_t dist16 = sm * (c0 - Ma) + 16 * k;    /* < 0 at k = -1 only */
+        const float t = (float)((double)dist16 / (double)adM), s = 1.0f - t;
+        const int64_t Mp = M0 + sm * k, mp = floor_div(pm + dmk * k, smd);
         psp_vertex v = *a;
-        v.x = (int)floor_div(px + dx * i, scale) * PSP_SUBPX + PSP_SUBPX / 2;
-        v.y = (int)floor_div(py + dy * i, scale) * PSP_SUBPX + PSP_SUBPX / 2;
-        v.z = s * a->z + t * b->z;
+        v.x = (int)(xmajor ? Mp : mp) * PSP_SUBPX + PSP_SUBPX / 2;
+        v.y = (int)(xmajor ? mp : Mp) * PSP_SUBPX + PSP_SUBPX / 2;
+        v.z = (float)floor_div(za * 16384 + zg * dist16, 16384);
         v.rgba = 0;
         for (int c = 0; c < 4; c++)
-            v.rgba |= (uint32_t)((chan(a->rgba, c) * (steps - i) +
-                                  chan(b->rgba, c) * i) / steps) << (8 * c);
+            v.rgba |= plane_chan(cv[c] * 16384 + cg[c] * dist16) << (8 * c);
         v.fog = (int)(s * (float)a->fog + t * (float)b->fog + 0.5f);
-        const float den = s * a->tex_q * a->inv_w + t * b->tex_q * b->inv_w;
-        v.u = den ? (s * a->u * a->inv_w + t * b->u * b->inv_w) / den : 0;
-        v.v = den ? (s * a->v * a->inv_w + t * b->v * b->inv_w) / den : 0;
+        if (affine) {
+            v.u = a->u + lu * (float)dist16;
+            v.v = a->v + lv * (float)dist16;
+        } else {
+            const float den = s * a->tex_q * a->inv_w + t * b->tex_q * b->inv_w;
+            v.u = den ? (s * a->u * a->inv_w + t * b->u * b->inv_w) / den : 0;
+            v.v = den ? (s * a->v * a->inv_w + t * b->v * b->inv_w) / den : 0;
+        }
         v.inv_w = v.tex_q = 1.0f;
         emit(&v, opaque);
     }

@@ -105,14 +105,29 @@ float psp_vfpu_dot(const float a[4], const float b[4]);
 
 /* The VFPU control registers, as mfvc/mtvc address them: 0..2 are the three
  * operand prefixes, 3 is the condition-code register, and the rest are the
- * revision and the random-number state. The first four are kept where the rest
- * of this file already keeps them rather than duplicated into an array, so a
- * prefix written through mtvc is the same prefix the next op consumes.
+ * revision and the random-number state. All of them are per-thread state in
+ * psp_cpu (vfpu_ctrl and vfpu_cc), so a prefix written through mtvc is the same
+ * prefix the next op consumes, and a thread switch carries them along.
  *
  * `index` is the instruction's field minus 128; out of range reads as zero and
- * writes are dropped, which is what the hardware does for the reserved slots. */
+ * writes are dropped. */
 uint32_t psp_mfvc(int index);
 void     psp_mtvc(int index, uint32_t value);
+
+/* mfvc of the condition codes as the instruction straight after a vcmp: it
+ * reads CC as it was before that vcmp. The translators call this instead of
+ * psp_mfvc(3) when the word before the mfvc is a vcmp -- statically, so a
+ * vcmp in a delay slot followed by an mfvc at the branch target is not
+ * covered. See psp_vcmp. */
+uint32_t psp_mfvc_cc_after_vcmp(void);
+
+/* The random generator. vrnds seeds rcx0..7 from the bits of vs lane 0;
+ * psp_vrnd draws one value per lane of vd: `kind` 0 is vrndi (the 32-bit
+ * integer), 1 vrndf1 (a float in [1,2)), 2 vrndf2 (a float in [2,4)). The
+ * seeding, the output formats and the generator are fitted to every stream
+ * and state the probe read back -- see vfpu.c. */
+void psp_vrnds(uint32_t vs, int size);
+void psp_vrnd(uint32_t vd, int kind, int size);
 
 /* vcmov -- conditional move driven by the VFPU condition codes.
  *
@@ -287,7 +302,11 @@ void     psp_mtv(uint32_t vd, uint32_t bits);
  *
  * `psp_vfpu_prefix_pending` reports whether any prefix differs from its
  * identity. Nothing in the implementation needs it now; it is kept because it
- * is the cheap way to ask, from outside, whether the next op will be rewritten. */
+ * is the cheap way to ask, from outside, whether the next op will be rewritten.
+ *
+ * `psp_vfpu_reset` puts the current thread's control registers back to their
+ * reset values (psp_cpu_reset_vfpu_ctrl) and clears the trap count; it leaves
+ * the register file alone. */
 void psp_vfpu_set_prefix(int which, uint32_t value);
 int  psp_vfpu_prefix_pending(void);
 void psp_vfpu_reset(void);

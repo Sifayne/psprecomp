@@ -32,6 +32,7 @@ static int failures;
     } while (0)
 
 #define FB     0x04000000u          /* eDRAM */
+#define ZB     0x04088000u          /* depth, past a 512x272x4 colour buffer */
 #define LIST   0x08800000u
 #define VERTS  0x08810000u
 #define INDICES 0x08830000u
@@ -67,6 +68,8 @@ static void begin_list_vtype(uint32_t vtype) {
     cmd(0x10, (VERTS >> 8) & 0xFF0000);            /* BASE */
     cmd(0x9C, FB & 0xFFFFFF);                      /* FBP */
     cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);       /* FBW + address high byte */
+    cmd(0x9E, ZB & 0xFFFFFF);                      /* ZBP */
+    cmd(0x9F, ((ZB >> 8) & 0xFF0000) | 512);       /* ZBW */
     cmd(0x12, vtype);                              /* VTYPE */
     cmd(0x01, VERTS & 0xFFFFFF);                   /* VADDR */
 }
@@ -97,10 +100,15 @@ static uint32_t pixel(int x, int y) {
     return psp_read32(FB + (uint32_t)(y * 480 + x) * 4) & 0x00FFFFFFu;
 }
 
+/* The colour buffer, and the depth buffer as a fresh start leaves it: the
+ * depth lives in VRAM, so a test that wants none left over from the last one
+ * zeroes it the way a new run's memory would be. */
 static void clear_fb(void) {
     for (int y = 0; y < 272; y++)
         for (int x = 0; x < 480; x++)
             psp_write32(FB + (uint32_t)(y * 480 + x) * 4, 0);
+    for (uint32_t a = 0; a < 512u * 272u * 2u; a += 4)
+        psp_write32(ZB + a, 0);
 }
 
 /* A sprite is the PSP's 2D quad: two vertices, opposite corners. */
@@ -189,6 +197,29 @@ static void test_transformed_is_skipped(void) {
 
     CHECK(psp_ge_pixels() == 0, "transformed geometry must not be drawn, got %llu px",
           (unsigned long long)psp_ge_pixels());
+}
+
+/* PRIM and BBOX leave VADDR past the vertices they read. geprobe 5 scene 33
+ * (fw 6.60) draws a marker with a PRIM straight after BBOX and no VADDR, and
+ * the marker is the vertices after the box; libgu's sceGuDrawArrayN sends
+ * one VADDR for several PRIMs. */
+static void test_vertex_pointer_advances(void) {
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    vertex(0, 0, 0, 0xFFFFFFFFu);            /* the "box": BBOX reads these two */
+    vertex(1, 479, 271, 0xFFFFFFFFu);
+    vertex(2, 10, 10, 0xFF0000FFu);          /* first PRIM */
+    vertex(3, 20, 20, 0xFF0000FFu);
+    vertex(4, 30, 10, 0xFF00FF00u);          /* second PRIM, no VADDR between */
+    vertex(5, 40, 20, 0xFF00FF00u);
+    cmd(0x07, 2);                    /* BBOX, 2 vertices */
+    cmd(0x04, (6u << 16) | 2);       /* PRIM sprites */
+    cmd(0x04, (6u << 16) | 2);       /* PRIM sprites */
+    end_list();
+    CHECK(pixel(15, 15) == 0x000000FFu, "PRIM after BBOX reads past the box: 0x%08X", pixel(15, 15));
+    CHECK(pixel(35, 15) == 0x0000FF00u, "second PRIM reads past the first: 0x%08X", pixel(35, 15));
+    CHECK(pixel(100, 100) == 0, "the box itself is not drawn: 0x%08X", pixel(100, 100));
 }
 
 static void test_triangle_strip(void) {
@@ -345,6 +376,34 @@ static void test_texture_minified_samples_centre(void) {
                       k, j, got, want, ramp_texel(3 * k, 3 * j));
             }
         }
+}
+
+/* A lit vertex's secondary (specular) colour is interpolated on its own and
+ * added to the pixel, the sum clamped there and not at the vertex (geprobe 7
+ * scene 16, fw 6.60). Red 255 in both colours at the left corner and 0 at the
+ * others is 255 over the left half of the base and about 160 a third of the
+ * way in; the two summed and clamped at the vertex would give 255 and 80. */
+static void test_secondary_colour(void) {
+    psp_ge_reset();
+    clear_fb();
+    const psp_render_backend *be = psp_render_current();
+    psp_blend_state blend = { .write_colour = 1 };
+    be->set_target(FB, 480, 3);
+    be->set_scissor(0, 0, 479, 271);
+    be->set_texture(&(psp_tex_state){ 0 });
+    be->set_depth(0, 1, 0);
+    be->set_blend(&blend);
+    be->set_fog(0, 0);
+    psp_vertex tri[3] = {
+        { .x =  40 * PSP_SUBPX, .y = 100 * PSP_SUBPX, .rgba = 0xFF0000FFu, .inv_w = 1, .tex_q = 1,
+          .fog = 255, .spec = 0x0000FFu, .spec_set = 1 },
+        { .x = 340 * PSP_SUBPX, .y = 100 * PSP_SUBPX, .rgba = 0xFF000000u, .inv_w = 1, .tex_q = 1, .fog = 255 },
+        { .x =  40 * PSP_SUBPX, .y = 130 * PSP_SUBPX, .rgba = 0xFF000000u, .inv_w = 1, .tex_q = 1, .fog = 255 },
+    };
+    be->draw(PSP_PRIM_TRIANGLES, tri, 3);
+    CHECK((pixel(100, 100) & 0xFF) == 255, "the summed red saturates near the corner: %06X", pixel(100, 100));
+    const uint32_t r = pixel(240, 100) & 0xFF;
+    CHECK(r >= 158 && r <= 163, "two planes from 255 summed, not one from 255, at (240,100): %u", r);
 }
 
 /* World geometry must not use the through-mode affine UV rule.  These three
@@ -798,10 +857,13 @@ static void test_depth_test_still_rejects(void) {
           pixel(150, 100));
 }
 
-/* psp_ge_reset returns depth to its start-of-run contents. Without that, a
- * process that runs the GE twice -- this test binary, the oracle -- carries the
- * first run's depth into the second, and the second silently draws less. */
-static void test_ge_reset_clears_depth(void) {
+/* Depth is 16 bits a pixel in VRAM at ZBP, where the CPU can read it, in the
+ * layout geprobe 2 scene 17 (fw 6.60) dumped for ZBP 0x88000, ZBW 512: the
+ * value for pixel (x, y) sits at the linear offset with address bits 5-9
+ * rotated up by one and bits 6 and 13 inverted. (150, 100): linear offset
+ * 0x88000 + (100 * 512 + 150) * 2 = 0x9912C; bits 5-9 are 0b01001, rotated
+ * 0b10010, so 0x9924C; inverted, 0x9B20C. */
+static void test_depth_in_vram(void) {
     psp_ge_reset();
     clear_fb();
     begin_list();
@@ -810,8 +872,12 @@ static void test_ge_reset_clears_depth(void) {
     vertex_z(1, 200, 150, 1000, 0xFF0000FFu);
     cmd(0x04, (6u << 16) | 2);
     end_list();
+    CHECK(psp_read16(0x0409B20Cu) == 1000, "depth of (150,100) at VRAM 0x9B20C: %u",
+          psp_read16(0x0409B20Cu));
+    CHECK(psp_read16(0x0409912Cu) == 0, "and not at its linear address: %u",
+          psp_read16(0x0409912Cu));
 
-    /* Fresh run: the z=1000 left behind above must not reject this. */
+    /* A fresh start's zeroed VRAM is a fresh depth buffer. */
     psp_ge_reset();
     clear_fb();
     begin_list();
@@ -820,9 +886,94 @@ static void test_ge_reset_clears_depth(void) {
     vertex_z(1, 200, 150, 500, 0xFF00FF00u);
     cmd(0x04, (6u << 16) | 2);
     end_list();
-
     CHECK(pixel(150, 100) == 0x0000FF00u,
-          "depth must not survive psp_ge_reset: 0x%08X", pixel(150, 100));
+          "zeroed VRAM rejects nothing under GEQUAL: 0x%08X", pixel(150, 100));
+}
+
+/* The depth at (x, y), through the VRAM layout test_depth_in_vram describes. */
+static uint16_t depth_at(int x, int y) {
+    const uint32_t l = 0x88000u + (uint32_t)(y * 512 + x) * 2;
+    const uint32_t mid = (l >> 5) & 0x1F, rot = ((mid << 1) | (mid >> 4)) & 0x1F;
+    return psp_read16(0x04000000u + (((l & ~(0x1Fu << 5)) | (rot << 5)) ^ 0x2040u));
+}
+
+/* Depth across a triangle is a plane with a short 1/area (render.c
+ * area_rcp). geprobe 5 (fw 6.60) scene 27's four through-mode triangles,
+ * drawn the same way, and pixels of each that the float blend this replaced
+ * had one off, with what the hardware wrote there. */
+static void test_depth_plane(void) {
+    static const int T[12][3] = {
+        { 10, 10, 0 },      { 230, 10, 65535 },  { 10, 90, 30000 },
+        { 230, 20, 1000 },  { 230, 100, 1003 },  { 20, 100, 1010 },
+        { 10, 110, 12345 }, { 230, 110, 12345 }, { 120, 170, 12345 },
+        { 10, 175, 0 },     { 230, 175, 0 },     { 120, 200, 65535 } };
+    static const int P[][3] = {
+        { 49, 11, 12328 },  { 40, 26, 15272 },   { 128, 42, 47486 },  { 31, 80, 32841 },
+        { 208, 29, 1000 },  { 215, 63, 1001 },   { 208, 83, 1002 },   { 223, 98, 1002 },
+        { 16, 111, 12345 }, { 212, 113, 12345 }, { 209, 119, 12345 }, { 159, 141, 12345 },
+        { 43, 181, 17038 }, { 74, 186, 30145 },  { 140, 189, 38009 }, { 126, 197, 58980 } };
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    depth_state(1);                  /* ALWAYS, writes on */
+    for (int i = 0; i < 12; i++) vertex_z(i, T[i][0], T[i][1], T[i][2], 0xFFFFFFFFu);
+    cmd(0x04, (3u << 16) | 12);      /* PRIM: triangles */
+    end_list();
+    for (unsigned i = 0; i < sizeof P / sizeof P[0]; i++)
+        CHECK(depth_at(P[i][0], P[i][1]) == P[i][2], "depth at (%d,%d): %u, hardware %d",
+              P[i][0], P[i][1], depth_at(P[i][0], P[i][1]), P[i][2]);
+}
+
+/* A 16-bit through-mode vertex far off screen saturates to the 12.4 range
+ * and anchors the colour plane: geprobe 5 scene 28 (fw 6.60), its second
+ * band, with the pixels the PSP wrote. */
+static void test_far_vertex_16bit(void) {
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, -5000, 65, 0xFF0000FFu); vertex(1, 230, 120, 0xFF00FF00u); vertex(2, 230, 65, 0xFFFF0000u);
+    cmd(0x04, (3u << 16) | 3);
+    end_list();
+    CHECK(pixel(0, 112) == 0x07DC18 && pixel(100, 112) == 0x12DC0D && pixel(200, 112) == 0x1EDC02 &&
+          pixel(0, 114) == 0,
+          "far 16-bit vertex: %06X %06X %06X %06X, hardware 07DC18 12DC0D 1EDC02 000000",
+          pixel(0, 112), pixel(100, 112), pixel(200, 112), pixel(0, 114));
+}
+
+static void float_vertex(int i, float x, float y, float z);
+
+static void cmd_float(uint8_t op, float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    cmd(op, bits >> 8);
+}
+
+/* A transformed vertex's depth is computed in the GE's 16-bit-significand
+ * float (ge.c ge_screen_z). geprobe 5 (fw 6.60) scenes 17 and 27 under
+ * sceGumPerspective(60, 480/272, 1, 100) and sceGuDepthRange(65535, 0): eye
+ * z -4.5, -5.5 and -8 give 14049, 11374 and 7612, where a float computation
+ * gives 14048.22, 11373.64 and 7612.5. */
+static void test_transformed_depth(void) {
+    static const float PROJ[16] = { 0.981491089f, 0, 0, 0, 0, 1.73202515f, 0, 0,
+                                    0, 0, -1.02017212f, -1, 0, 0, -2.0201416f, 0 };
+    static const struct { float z; int depth; } Z[] = { { -4.5f, 14049 }, { -5.5f, 11374 }, { -8.0f, 7612 } };
+    for (unsigned k = 0; k < sizeof Z / sizeof Z[0]; k++) {
+        psp_ge_reset(); clear_fb();
+        begin_list_vtype((7u << 2) | (3u << 7));
+        for (int m = 0; m < 2; m++) {                          /* world, view: identity */
+            cmd((uint8_t)(0x3A + 2 * m), 0);
+            for (int i = 0; i < 12; i++) cmd((uint8_t)(0x3B + 2 * m), i % 4 == 0 ? 0x3F8000 : 0);
+        }
+        cmd(0x3E, 0);
+        for (int i = 0; i < 16; i++) cmd_float(0x3F, PROJ[i]);
+        cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+        cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+        cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+        depth_state(1);                                        /* ALWAYS, writes on */
+        float_vertex(0, -1, -1, Z[k].z); float_vertex(1, 1, -1, Z[k].z); float_vertex(2, 0, 1, Z[k].z);
+        cmd(0x04, (3u << 16) | 3);
+        end_list();
+        CHECK(depth_at(240, 140) == Z[k].depth, "eye z %.1f: depth %u, hardware %d",
+              (double)Z[k].z, depth_at(240, 140), Z[k].depth);
+    }
 }
 
 /* The backend interface itself. The software path is the reference every other
@@ -1020,6 +1171,67 @@ static void identity_matrices(void) {
     }
 }
 
+static void put_f32(uint32_t a, float f) { uint32_t b; memcpy(&b, &f, 4); psp_write32(a, b); }
+
+/* Skinned, morphed and patch vertices reach the rasteriser where geprobe 2
+ * scenes 20-22 (fw 6.60) put them. Identity matrices and no viewport, so a
+ * model x of -0.5 lands at screen x 120 and +0.5 at 360. */
+static void test_skin_morph_patch(void) {
+    CHECK(psp_render_select("probe") == 0, "probe selectable for skin/morph test");
+
+    /* Morph: two sets per record, colour then position, 16 bytes each;
+     * weights 0.5 and 0.5 put the point half-way, colour included, and the
+     * colour's 127.5 truncates to 127 (geprobe 2 scene 21, fw 6.60). */
+    psp_ge_reset();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 18));
+    identity_matrices();
+    cmd(0x2C, 0x3F0000); cmd(0x2D, 0x3F0000);        /* MORPHWEIGHT 0.5, 0.5 */
+    psp_write32(VERTS, 0xFF0000FFu);
+    put_f32(VERTS + 4, -0.5f); put_f32(VERTS + 8, 0.0f); put_f32(VERTS + 12, 0.0f);
+    psp_write32(VERTS + 16, 0xFF00FF00u);
+    put_f32(VERTS + 20, 0.5f); put_f32(VERTS + 24, 0.0f); put_f32(VERTS + 28, 0.0f);
+    g_probe_draws = 0;
+    cmd(0x04, (PSP_PRIM_POINTS << 16) | 1);
+    end_list();
+    CHECK(g_probe_draws == 1 && fabsf(g_probe_first.precise_x - 240.0f) < 0.01f,
+          "morphed point at x 240: %u draws, %.3f", g_probe_draws, g_probe_first.precise_x);
+    CHECK(g_probe_first.rgba == 0xFF007F7Fu, "morphed colour 0xFF007F7F: %08X", g_probe_first.rgba);
+
+    /* Skinning: one float weight of 1.0 on bone 0, which moves x by 0.5. */
+    psp_ge_reset();
+    begin_list_vtype((3u << 9) | (7u << 2) | (3u << 7));
+    identity_matrices();
+    cmd(0x2A, 0);
+    for (int i = 0; i < 12; i++)
+        cmd(0x2B, i % 4 == 0 ? 0x3F8000 : i == 9 ? 0x3F0000 : 0);
+    put_f32(VERTS, 1.0f);
+    psp_write32(VERTS + 4, 0xFFFFFFFFu);
+    put_f32(VERTS + 8, 0.0f); put_f32(VERTS + 12, 0.0f); put_f32(VERTS + 16, 0.0f);
+    g_probe_draws = 0;
+    cmd(0x04, (PSP_PRIM_POINTS << 16) | 1);
+    end_list();
+    CHECK(g_probe_draws == 1 && fabsf(g_probe_first.precise_x - 360.0f) < 0.01f,
+          "skinned point at x 360: %u draws, %.3f", g_probe_draws, g_probe_first.precise_x);
+
+    /* A Bezier patch drawn as points with a 1x1 division is its four
+     * corner control points, the far one last. */
+    psp_ge_reset();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    identity_matrices();
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++)
+            float_vertex(j * 4 + i, -0.5f + (float)i / 3.0f, -0.5f + (float)j / 3.0f, 0.0f);
+    cmd(0x36, 1 | (1 << 8));                         /* PATCHDIVISION 1x1 */
+    cmd(0x37, 2);                                    /* PATCHPRIMITIVE points */
+    g_probe_draws = 0;
+    cmd(0x05, 4 | (4 << 8));                         /* BEZIER 4x4 */
+    end_list();
+    CHECK(g_probe_draws == 4 && fabsf(g_probe_first.precise_x - 360.0f) < 0.01f,
+          "Bezier corners: %u draws, last at x %.3f", g_probe_draws, g_probe_first.precise_x);
+
+    CHECK(psp_render_select("software") == 0, "software reselected after skin/morph test");
+}
+
 static void test_indexed_triangle_batch_boundary(void) {
     CHECK(psp_render_select("probe") == 0, "probe selectable for batch test");
 
@@ -1060,9 +1272,27 @@ static void test_precise_vertex_payload(void) {
     identity_matrices();
     float_vertex(0,(40.24f-240.0f)/240.0f,0,0);
     cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
-    CHECK(g_probe_first.precise && fabsf(g_probe_first.precise_x-40.24f)<0.0001f,
+    /* Before the 1/16 grid, in the GE's arithmetic: the eye x cut to 16
+     * significant bits (ge_proj_row in ge.c) puts 40.24 at 40.2429. */
+    CHECK(g_probe_first.precise && fabsf(g_probe_first.precise_x-40.2429f)<0.0001f,
           "GE retains pre-quantization projection %.8f",g_probe_first.precise_x);
-    CHECK(g_probe_first.x==644,"legacy geometry still rounds to 40.25 pixels");
+    /* 40.25: left of the viewport centre a position goes to the sixteenth
+     * nearer the centre (geprobe 2, fw 6.60; see screen_axis_fx16 in ge.c). */
+    CHECK(g_probe_first.x==644,"transformed geometry goes to 40.25 pixels: %d",g_probe_first.x);
+    /* 40.21 also goes up, where rounding would give 40.1875; right of the
+     * centre, 300.05 goes down to 300.0 where rounding would give 300.0625. */
+    psp_ge_reset();
+    begin_list_vtype((7u<<2)|(3u<<7));
+    identity_matrices();
+    float_vertex(0,(40.21f-240.0f)/240.0f,0,0);
+    cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
+    CHECK(g_probe_first.x==644,"40.21 goes toward the centre, to 40.25: %d",g_probe_first.x);
+    psp_ge_reset();
+    begin_list_vtype((7u<<2)|(3u<<7));
+    identity_matrices();
+    float_vertex(0,(300.05f-240.0f)/240.0f,0,0);
+    cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
+    CHECK(g_probe_first.x==4800,"300.05 goes toward the centre, to 300.0: %d",g_probe_first.x);
     psp_ge_reset(); begin_list(); vertex(0,10,20,0xFFFFFFFF);
     cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
     CHECK(!g_probe_first.precise,"through-mode vertices keep the PSP coordinate contract");
@@ -1114,12 +1344,24 @@ static void test_line_interpolation_and_clipping(void) {
     psp_render_walk_line(&a, &b, 10, 0, 19, 9, collect_line, &s);
     CHECK(s.count == 10 && s.first.x == 168 && s.last.x == 312,
           "huge offscreen line clips to ten samples, got %d", s.count);
-    CHECK((s.first.rgba & 255) == 127, "scissor must not reset colour interpolation");
+    /* The colour gradient is floored to 1/1024 a step (geprobe step 1, fw
+     * 6.60), so over two million steps it is zero; a 4000-step line, the
+     * longest the 12.4 grid holds, keeps 65/1024 and reads 127 mid-way. */
+    CHECK((s.first.rgba & 255) == 0, "a sub-1/1024 gradient does not move the colour");
+    a.x = -16 * 2000; b.x = 16 * 2000;
+    s = (line_samples){0};
+    psp_render_walk_line(&a, &b, 10, 0, 19, 9, collect_line, &s);
+    CHECK(s.count == 10 && s.first.x == 168 && (s.first.rgba & 255) == 127,
+          "scissor must not reset colour interpolation: %d samples, %08X",
+          s.count, s.first.rgba);
     a.x = a.y = 0; b.x = b.y = 64; b.inv_w = 0.5f; b.u = 8; b.z = 100;
     s = (line_samples){0};
     psp_render_walk_line(&a, &b, 2, 2, 2, 2, collect_line, &s);
     CHECK(s.count == 1 && s.first.x == 40 && s.first.y == 40, "diagonal scissor sample");
-    CHECK(s.first.z == 50 && s.first.u > 2.666f && s.first.u < 2.667f &&
+    /* Depth and the perspective-divided u at the step's centre, 2.5 of 4
+     * steps, like colour: geprobe 5 scenes 27 and 28 (fw 6.60). u is
+     * (2.5/4 * 8 * 0.5) / (1.5/4 + 2.5/4 * 0.5) = 3.636. */
+    CHECK(s.first.z == 62 && s.first.u > 3.636f && s.first.u < 3.637f &&
           s.first.inv_w == 1 && s.first.tex_q == 1, "line perspective and depth interpolation");
     s = (line_samples){0};
     psp_render_walk_line(&a, &a, 0, 0, 10, 10, collect_line, &s);
@@ -1127,6 +1369,300 @@ static void test_line_interpolation_and_clipping(void) {
     b.x = -64; b.y = -64;
     psp_render_walk_line(&a, &b, 0, 0, 10, 10, collect_line, &s);
     CHECK(!s.count, "negative coordinates floor and descending boundary excludes origin");
+}
+
+/* A line with endpoints between pixel centres: geprobe 5 scene 27's 3D line
+ * (fw 6.60), 258.81 to 381.31 across, its depths 12577 to 10371. The
+ * hardware starts at pixel 259, puts each column on the row of its centre's
+ * projection and writes the depth there. */
+typedef struct { int n, first; int y[4]; float z[4]; } line_picks;
+static void pick_line(const psp_vertex *v, void *data) {
+    line_picks *p = data;
+    static const int want[4] = { 259, 264, 272, 380 };
+    const int x = v->x >> 4;
+    if (!p->n++) p->first = x;
+    for (int i = 0; i < 4; i++)
+        if (x == want[i]) { p->y[i] = v->y >> 4; p->z[i] = v->z; }
+}
+
+static void test_line_between_centres(void) {
+    psp_vertex a = { .x = 4141, .y = 3947, .z = 12577.5f, .rgba = 0xFFFFFFFF, .inv_w = 1, .tex_q = 1 };
+    psp_vertex b = a; b.x = 6101; b.y = 3714; b.z = 10371.0f;
+    line_picks p = {0};
+    psp_render_walk_line(&a, &b, 0, 0, 479, 271, pick_line, &p);
+    CHECK(p.n == 122 && p.first == 259, "pixels %d from %d, hardware 122 from 259", p.n, p.first);
+    CHECK(p.y[1] == 246 && p.y[2] == 245 && p.y[3] == 232,
+          "rows at 264, 272, 380: %d %d %d, hardware 246 245 232", p.y[1], p.y[2], p.y[3]);
+    CHECK(p.z[0] == 12564 && p.z[1] == 12474 && p.z[2] == 12330 && p.z[3] == 10385,
+          "depths %.0f %.0f %.0f %.0f, hardware 12564 12474 12330 10385",
+          (double)p.z[0], (double)p.z[1], (double)p.z[2], (double)p.z[3]);
+}
+
+/* Colour interpolation against geprobe's hardware frames (step 1, fw 6.60):
+ * the Gouraud triangle, the flat one and a line of the geometry scene, with
+ * the pixels the PSP wrote. */
+static void test_hardware_shading(void) {
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, 20, 20, 0xFF0000FF); vertex(1, 200, 30, 0xFF00FF00); vertex(2, 60, 180, 0xFFFF0000);
+    cmd(0x04, (PSP_PRIM_TRIANGLES << 16) | 3); end_list();
+    CHECK(pixel(120, 60) == 0x388144 && pixel(64, 64) == 0x432F8B && pixel(50, 100) == 0x7F0E70,
+          "Gouraud plane: %06X %06X %06X, hardware 388144 432F8B 7F0E70",
+          pixel(120, 60), pixel(64, 64), pixel(50, 100));
+
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, 20, 230, 0xFF0000FF); vertex(1, 120, 230, 0xFF00FF00); vertex(2, 70, 265, 0xFFFF0000);
+    cmd(0x50, 0);                                  /* SHADE: flat */
+    cmd(0x04, (PSP_PRIM_TRIANGLES << 16) | 3); end_list();
+    CHECK(pixel(70, 250) == 0xFF0000 && pixel(40, 240) == 0xFF0000,
+          "flat triangle takes its last vertex: %06X %06X", pixel(70, 250), pixel(40, 240));
+
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, 140, 230, 0xFFFFFFFF); vertex(1, 230, 265, 0xFF0000FF);
+    cmd(0x04, (PSP_PRIM_LINES << 16) | 2); end_list();
+    CHECK(pixel(140, 230) == 0xFDFDFF && pixel(150, 234) == 0xE1E1FF &&
+          pixel(180, 245) == 0x8C8CFF && pixel(229, 264) == 0x0101FF && !pixel(150, 233),
+          "line minor axis and colour at i + 1/2: %06X %06X %06X %06X",
+          pixel(140, 230), pixel(150, 234), pixel(180, 245), pixel(229, 264));
+}
+
+/* Dither on an 8888 target, geprobe step 10 (fw 6.60): a flat 7F sprite
+ * under the probe's extreme matrix, rows {7,-8,7,-8} {-8,7,-8,7} {0,1,2,3}. */
+/* geprobe 2 scene 15 (fw 6.60): the fogged floor, one transformed triangle
+ * with two corners off screen, white to green and fog 255 to 0. Its colour
+ * and fog planes are anchored at the leftmost corner, (-388.125, 371.5),
+ * not at the one on screen; these pixels are the hardware's and each is one
+ * step off in some channel with the on-screen anchor. */
+static void test_hardware_transformed_anchor_fog(void) {
+    psp_ge_reset();
+    clear_fb();
+    const psp_render_backend *be = psp_render_current();
+    psp_blend_state blend = { .write_colour = 1 };
+    be->set_target(FB, 480, 3);
+    be->set_scissor(0, 0, 479, 271);
+    be->set_texture(&(psp_tex_state){ 0 });
+    be->set_depth(0, 1, 0);
+    be->set_blend(&blend);
+    be->set_fog(1, 0xFF8040u);
+    psp_vertex tri[3] = {
+        { .x = -6210, .y = 5944, .rgba = 0xFFFFFFFFu, .inv_w = 1, .tex_q = 1, .fog = 255, .precise = 1 },
+        { .x = 13890, .y = 5944, .rgba = 0xFFFFFFFFu, .inv_w = 1, .tex_q = 1, .fog = 255, .precise = 1 },
+        { .x =  3464, .y = 2317, .rgba = 0xFF00FF00u, .inv_w = 1, .tex_q = 1, .fog = 0,   .precise = 1 },
+    };
+    be->draw(PSP_PRIM_TRIANGLES, tri, 3);
+    be->set_fog(0, 0);
+    CHECK(pixel(127, 178) == 0xDE933C && pixel(252, 203) == 0xCEA141 && pixel(93, 259) == 0xBFC061,
+          "fogged floor: %06X %06X %06X, hardware DE933C CEA141 BFC061",
+          pixel(127, 178), pixel(252, 203), pixel(93, 259));
+}
+
+/* BBOX and BJUMP as geprobe 4 scene 24 (fw 6.60) measured them: a box whose
+ * corners all project beyond one edge of the screen is skipped; one behind
+ * the camera (negative w) projects mirrored onto the screen and is not. */
+static int bbox_marker_drawn(float bx, float bz, float w) {
+    psp_ge_reset();
+    clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    identity_matrices();
+    /* The projection's w row: w = -z * w_per_z + w (identity keeps w = 1). */
+    for (int i = 0; i < 8; i++)
+        float_vertex(i, bx + ((i & 1) ? 0.1f : -0.1f), (i & 2) ? 0.1f : -0.1f, bz + ((i & 4) ? 0.1f : -0.1f));
+    if (w != 1.0f) {
+        /* Replace the projection with one whose w is the constant `w`. */
+        cmd(0x3E, 0);
+        for (int i = 0; i < 16; i++) {
+            float f = (i % 5 == 0 && i != 15) ? 1.0f : (i == 15 ? w : 0.0f);
+            uint32_t bits; memcpy(&bits, &f, 4);
+            cmd(0x3F, bits >> 8);
+        }
+    }
+    cmd(0x07, 8);                                    /* BBOX: 8 corners */
+    const uint32_t bj = g_pc;
+    cmd(0x10, (LIST >> 8) & 0xFF0000);               /* BASE */
+    cmd(0x09, 0);                                    /* BJUMP, patched below */
+    cmd(0x12, VTYPE_2D);
+    cmd(0x01, (VERTS + 20 * 12) & 0xFFFFFF);
+    vertex(20, 10, 10, 0xFF00FF00u);
+    vertex(21, 20, 20, 0xFF00FF00u);
+    cmd(0x04, (6u << 16) | 2);
+    psp_write32(LIST + bj + 4, (0x09u << 24) | ((LIST + g_pc) & 0xFFFFFF));
+    end_list();
+    return pixel(15, 15) == 0x00FF00u;
+}
+
+static void test_bbox_jump(void) {
+    CHECK(bbox_marker_drawn(0.0f, 0.0f, 1.0f), "a box in view is drawn");
+    CHECK(!bbox_marker_drawn(3.0f, 0.0f, 1.0f), "a box right of the screen is skipped");
+    CHECK(!bbox_marker_drawn(-3.0f, 0.0f, 1.0f), "a box left of the screen is skipped");
+    CHECK(bbox_marker_drawn(0.0f, 0.0f, -1.0f), "a box behind the camera (w < 0) is drawn");
+    CHECK(bbox_marker_drawn(0.0f, 50.0f, 1.0f), "depth does not count: a box far out in z is drawn");
+}
+
+static void test_hardware_dither(void) {
+    psp_ge_reset(); clear_fb(); begin_list();
+    vertex(0, 10, 210, 0xFF7F7F7F); vertex(1, 240, 240, 0xFF7F7F7F);
+    cmd(0xE2, 0x8787); cmd(0xE3, 0x7878); cmd(0xE4, 0x3210); cmd(0xE5, 0xCDEF);
+    cmd(0x20, 1);                                  /* dither on */
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    CHECK(pixel(12, 212) == 0x868686 && pixel(13, 212) == 0x777777 &&
+          pixel(12, 213) == 0x777777 && pixel(13, 214) == 0x808080,
+          "dither offsets: %06X %06X %06X %06X, hardware 868686 777777 777777 808080",
+          pixel(12, 212), pixel(13, 212), pixel(12, 213), pixel(13, 214));
+}
+
+/* Blend arithmetic on geprobe step 11's inputs (fw 6.60): a one-pixel sprite
+ * over a destination written straight into the framebuffer. */
+static uint32_t blend_one(uint32_t dst, uint32_t src, uint32_t mode, uint32_t fixa, uint32_t fixb) {
+    psp_ge_reset(); clear_fb();
+    psp_write32(FB + (uint32_t)(20 * 480 + 20) * 4, dst);
+    begin_list();
+    vertex(0, 20, 20, src); vertex(1, 21, 21, src);
+    cmd(0x21, 1); cmd(0xDF, mode); cmd(0xE0, fixa); cmd(0xE1, fixb);
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    return pixel(20, 20);
+}
+
+static void test_hardware_blend(void) {
+    /* FIX 0x80 + FIX 0x80: 64 over 5 is 34 (((c + 1) * f) >> 8 said 35). */
+    uint32_t p = blend_one(0x05, 0xFF000040, 10 | 10 << 4, 0x808080, 0x808080);
+    CHECK((p & 0xFF) == 34, "FIX/FIX 64 over 5: %u, hardware 34", p & 0xFF);
+    /* DOUBLE_SRC_ALPHA / ONE_MINUS_DOUBLE_SRC_ALPHA at alpha 0x80: the
+     * destination factor is -1, so B 0xC0 over B 171 reads 191, over 170 192. */
+    p = blend_one(0x00AB0000, 0x80C08040, 6 | 7 << 4, 0, 0);
+    CHECK((p >> 16) == 191, "negative doubled factor subtracts: B %u, hardware 191", p >> 16);
+    p = blend_one(0x00AA0000, 0x80C08040, 6 | 7 << 4, 0, 0);
+    CHECK((p >> 16) == 192, "negative doubled factor on 170: B %u, hardware 192", p >> 16);
+}
+
+/* MODULATE with colour doubling, geprobe step 13 (fw 6.60): doubling acts
+ * before the final shift, so texel 255 by vertex 64 is (255 * 65) >> 7 = 129,
+ * not twice the rounded 64. */
+static void test_hardware_texfunc(void) {
+    psp_ge_reset(); clear_fb();
+    psp_write32(TEX, 0xFFFFFFFFu);
+    begin_list_vtype(VTYPE_2D_TEX);
+    texture_state(TEX, 1, 0, 0, 3, 0, 0);
+    cmd(0xC9, 0 | 1u << 16);                       /* MODULATE, RGB, doubled */
+    vertex_uv(0, 30, 30, 0, 0, 0xFF404040u);
+    vertex_uv(1, 31, 31, 1, 1, 0xFF404040u);
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    CHECK(pixel(30, 30) == 0x818181, "doubled MODULATE 255 x 64: %06X, hardware 818181",
+          pixel(30, 30));
+}
+
+/* Colour test, logic op and pixel mask, geprobe step 19 (fw 6.60): a
+ * one-pixel sprite over a destination written straight into the framebuffer,
+ * with the state commands passed in; returns the whole word, stencil byte
+ * included. */
+static uint32_t draw_one_with(uint32_t dst, uint32_t src, const uint32_t *state, int n) {
+    psp_ge_reset(); clear_fb();
+    psp_write32(FB + (uint32_t)(20 * 480 + 20) * 4, dst);
+    begin_list();
+    vertex(0, 20, 20, src); vertex(1, 21, 21, src);
+    for (int i = 0; i < n; i++) cmd(state[i] >> 24, state[i] & 0xFFFFFFu);
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    return psp_read32(FB + (uint32_t)(20 * 480 + 20) * 4);
+}
+
+static void test_hardware_colour_logic_mask(void) {
+    /* LOE on, LOP n: source 0xA55A3C over 0x402010; the stencil byte stays. */
+    static const struct { int op; uint32_t want; const char *name; } L[] = {
+        { 0, 0x000000, "CLEAR" }, { 1, 0x000010, "AND" },   { 6, 0xE57A2C, "XOR" },
+        { 7, 0xE57A3C, "OR" },    { 8, 0x1A85C3, "NOR" },   { 9, 0x1A85D3, "EQUIV" },
+        { 10, 0xBFDFEF, "INVERTED" }, { 14, 0xFFFFEF, "NAND" },
+    };
+    for (unsigned i = 0; i < sizeof L / sizeof L[0]; i++) {
+        const uint32_t st[] = { 0x28u << 24 | 1, 0xE6u << 24 | (uint32_t)L[i].op };
+        const uint32_t p = draw_one_with(0x33402010, 0xC3A55A3C, st, 2);
+        CHECK(p == (0x33000000u | L[i].want), "logic op %s: %08X, hardware %08X",
+              L[i].name, p, 0x33000000u | L[i].want);
+    }
+    /* PMSK1 0x00F0F0, PMSK2 0xFF: a set bit keeps the framebuffer's bit. */
+    const uint32_t pm[] = { 0xE8u << 24 | 0x00F0F0, 0xE9u << 24 | 0xFF };
+    uint32_t p = draw_one_with(0x00402010, 0x7FFFFFFF, pm, 2);
+    CHECK(p == 0x00FF2F1F, "pixel mask 0xFF00F0F0: %08X, hardware 00FF2F1F", p);
+    /* CTE on, NOTEQUAL 0x808080 / 0xF0F0F0: 0x8A8F80 is dropped, 0x908080 is
+     * drawn. */
+    const uint32_t ct[] = { 0x27u << 24 | 1, 0xD8u << 24 | 3, 0xD9u << 24 | 0x808080, 0xDAu << 24 | 0xF0F0F0 };
+    p = draw_one_with(0x00402010, 0xFF808F8A, ct, 4);
+    CHECK(p == 0x00402010, "colour test drops 0x8A8F80: %08X", p);
+    p = draw_one_with(0x00402010, 0xFF808090, ct, 4);
+    CHECK((p & 0xFFFFFF) == 0x808090, "colour test passes 0x908080: %08X", p);
+}
+
+/* Float through-mode coordinates saturate to 12.4, geprobe step 18 (fw 6.60):
+ * the triangle with a vertex at x = 5000 reads E0E0E0 at (470,155) and draws
+ * exactly as with that vertex at 2048. */
+static uint32_t g_sat_frame[3][2];
+static void draw_far_triangle(float x1, int k) {
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    float_vertex(0, 300, 150, 0); psp_write32(VERTS + 0 * 16, 0xFFFFFFFF);
+    float_vertex(1, x1, 160, 0);  psp_write32(VERTS + 1 * 16, 0xFF000000);
+    float_vertex(2, 320, 260, 0); psp_write32(VERTS + 2 * 16, 0xFF808080);
+    cmd(0x04, (PSP_PRIM_TRIANGLES << 16) | 3); end_list();
+    g_sat_frame[k][0] = pixel(470, 155);
+    g_sat_frame[k][1] = pixel(400, 200);
+}
+
+static void test_hardware_through_saturation(void) {
+    draw_far_triangle(5000.0f, 0);
+    draw_far_triangle(2048.0f, 1);
+    CHECK(g_sat_frame[0][0] == 0xE0E0E0, "x = 5000 saturates: %06X at (470,155), hardware E0E0E0",
+          g_sat_frame[0][0]);
+    CHECK(g_sat_frame[0][0] == g_sat_frame[1][0] && g_sat_frame[0][1] == g_sat_frame[1][1],
+          "x = 5000 draws as x = 2048: %06X %06X against %06X %06X",
+          g_sat_frame[0][0], g_sat_frame[0][1], g_sat_frame[1][0], g_sat_frame[1][1]);
+    /* Far enough out that an unclamped float would not fit an int. */
+    draw_far_triangle(1.0e12f, 2);
+    CHECK(g_sat_frame[2][0] == g_sat_frame[0][0], "x = 1e12 saturates too: %06X", g_sat_frame[2][0]);
+}
+
+/* The sprite texel step, geprobe step 12 (fw 6.60): v 0..16 over the 56 rows
+ * of (416,8)-(472,64). Row 11's centre lands exactly on v = 1.0 and the PSP
+ * reads the texel below it, row 0. */
+static void test_hardware_sprite_step(void) {
+    psp_ge_reset(); clear_fb();
+    upload_ramp_texture(16, 16);
+    begin_list_vtype(VTYPE_2D_TEXF);
+    texture_state(TEX, 16, 4, 4, 3, 0, 0);
+    cmd(0xC7, 1u);                                 /* TEXWRAP: clamp u, repeat v */
+    vertex_uvf(0, 416, 8, 15.9f, 0.0f, 0xFFFFFFFFu);
+    vertex_uvf(1, 472, 64, 16.1f, 16.0f, 0xFFFFFFFFu);
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    CHECK(pixel(440, 10) == ramp_texel(15, 0) && pixel(440, 11) == ramp_texel(15, 0) &&
+          pixel(440, 12) == ramp_texel(15, 1),
+          "v = 1.0 exactly takes row 0: %06X %06X %06X", pixel(440, 10), pixel(440, 11), pixel(440, 12));
+}
+
+/* Texel boundaries that land exactly on a pixel centre, geprobe 5 scene 28
+ * (fw 6.60). A sprite mapping u and v 4..6 onto 7 pixels with its corners
+ * given bottom-right first reads texel 5 at the centre where u = 5 exactly,
+ * its ramp starting from the top-left corner (from the first vertex it read
+ * texel 4). A through-mode line from x 10 to 470 with u 0..16 reads texel 1
+ * at x 67, where u = 2 exactly: its step, truncated, falls just short. At
+ * x 96 the centre's u is 3.009 and the PSP reads texel 3; the left edge's,
+ * where psprecomp used to take it, is 2.991. */
+static void test_hardware_texel_boundaries(void) {
+    psp_ge_reset(); clear_fb();
+    upload_ramp_texture(16, 16);
+    begin_list_vtype(VTYPE_2D_TEXF);
+    texture_state(TEX, 16, 4, 4, 3, 0, 0);
+    vertex_uvf(0, 65, 187, 4.0f, 4.0f, 0xFFFFFFFFu);
+    vertex_uvf(1, 58, 180, 6.0f, 6.0f, 0xFFFFFFFFu);
+    cmd(0x04, (PSP_PRIM_SPRITES << 16) | 2); end_list();
+    CHECK(pixel(60, 183) == ramp_texel(5, 5) && pixel(61, 183) == ramp_texel(5, 5) &&
+          pixel(62, 183) == ramp_texel(4, 5) && pixel(61, 184) == ramp_texel(5, 4),
+          "reversed sprite at u = 5: %06X %06X %06X %06X", pixel(60, 183), pixel(61, 183),
+          pixel(62, 183), pixel(61, 184));
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype(VTYPE_2D_TEXF);
+    texture_state(TEX, 16, 4, 4, 3, 0, 0);
+    vertex_uvf(0, 10, 226, 0.0f, 8.0f, 0xFFFFFFFFu);
+    vertex_uvf(1, 470, 226, 16.0f, 8.0f, 0xFFFFFFFFu);
+    cmd(0x04, (PSP_PRIM_LINES << 16) | 2); end_list();
+    CHECK(pixel(67, 226) == ramp_texel(1, 8) && pixel(68, 226) == ramp_texel(2, 8) &&
+          pixel(96, 226) == ramp_texel(3, 8),
+          "line at u = 2 and 3.009: %06X %06X %06X", pixel(67, 226), pixel(68, 226), pixel(96, 226));
 }
 
 int main(void) {
@@ -1141,9 +1677,11 @@ int main(void) {
     test_clipping();
     test_transformed_is_skipped();
     test_triangle_strip();
+    test_vertex_pointer_advances();
     test_texture_1to1();
     test_texture_minified_samples_centre();
     test_texture_perspective_interpolation();
+    test_secondary_colour();
     test_sprite_texture_samples_centre();
     test_texture_wrap();
     test_texture_bilinear_midpoint();
@@ -1153,15 +1691,30 @@ int main(void) {
     test_bilinear_equals_nearest_at_1to1();
     test_clear_mode_clears_depth();
     test_depth_test_still_rejects();
-    test_ge_reset_clears_depth();
+    test_depth_in_vram();
+    test_depth_plane();
+    test_transformed_depth();
+    test_line_between_centres();
+    test_far_vertex_16bit();
     test_backend_selection();
     test_backend_registration();
     test_indexed_triangle_batch_boundary();
     test_precise_vertex_payload();
+    test_skin_morph_patch();
     test_points_and_lines();
     test_alpha_only_clear();
     test_transformed_lines();
     test_line_interpolation_and_clipping();
+    test_hardware_shading();
+    test_hardware_transformed_anchor_fog();
+    test_bbox_jump();
+    test_hardware_dither();
+    test_hardware_blend();
+    test_hardware_texfunc();
+    test_hardware_colour_logic_mask();
+    test_hardware_through_saturation();
+    test_hardware_sprite_step();
+    test_hardware_texel_boundaries();
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

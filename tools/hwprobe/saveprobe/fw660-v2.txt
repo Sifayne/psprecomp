@@ -1,0 +1,942 @@
+
+==== saveprobe 2, firmware (sceKernelDevkitVersion) 06060010 ====
+log: ms0:/PSP/GAME/a-test/saveprobe/saveprobe.txt
+
+---- saves (plaintext byte i = (i*7+3) & 0xFF; key A = 00..0F, key B = FF..F0) ----
+[1] save PLAIN: AUTOSAVE 64 bytes, key none, secureVersion 0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110388
+  dir PLAIN: open 80010002
+[2] load PLAIN: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110307
+  read back: dataSize 0, matches the plaintext: n/a
+[3] load PLAIN: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110307
+  read back: dataSize 0, matches the plaintext: n/a
+[4] load PLAIN: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110307
+  read back: dataSize 0, matches the plaintext: n/a
+[5] save A0: AUTOSAVE 64 bytes, key A, secureVersion 0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     80 crc 13839594  first 16: 82 C2 CD 5A 03 FE 8F AD 15 43 34 63 8D DC BB 2C  -> A0__DATA.BIN
+  file PARAM.SFO    size   4912 crc A9E776D4  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> A0__PARAM.SFO
+[6] load A0: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[7] load A0: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[8] load A0: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110308
+  read back: dataSize 0, matches the plaintext: n/a
+[9] save A0AGAIN: AUTOSAVE 64 bytes, key A, secureVersion 0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     80 crc E0A67C99  first 16: 06 00 4F 56 D3 DC 03 99 78 55 A0 FA 6F 43 24 4E  -> A0AGAIN__DATA.BIN
+  file PARAM.SFO    size   4912 crc 095A96E1  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> A0AGAIN__PARAM.SFO
+[10] load A0AGAIN: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[11] load A0AGAIN: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[12] load A0AGAIN: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110308
+  read back: dataSize 0, matches the plaintext: n/a
+[13] save B0: AUTOSAVE 64 bytes, key B, secureVersion 0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     80 crc B100FACC  first 16: AF A0 76 31 0F 0D 05 A0 76 35 C6 F8 1C 1F 5B 10  -> B0__DATA.BIN
+  file PARAM.SFO    size   4912 crc 426F4153  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> B0__PARAM.SFO
+[14] load B0: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[15] load B0: AUTOLOAD with key A
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[16] load B0: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110308
+  read back: dataSize 0, matches the plaintext: n/a
+[17] save A0LEN1: AUTOSAVE 1 bytes, key A, secureVersion 0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     17 crc DFBD752F  first 16: 76 17 52 B0 34 22 AF AA D6 E4 A3 40 E5 67 E0 02  -> A0LEN1__DATA.BIN
+  file PARAM.SFO    size   4912 crc B2509719  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> A0LEN1__PARAM.SFO
+[18] load A0LEN1: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 1, matches the plaintext: yes
+[19] load A0LEN1: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[20] load A0LEN1: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110308
+  read back: dataSize 0, matches the plaintext: n/a
+[21] save A0LEN15: AUTOSAVE 15 bytes, key A, secureVersion 0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     31 crc 44AA1D46  first 16: CA 44 25 B6 7B 92 24 B7 85 AE B0 17 14 2E F4 68  -> A0LEN15__DATA.BIN
+  file PARAM.SFO    size   4912 crc B1B3500E  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> A0LEN15__PARAM.SFO
+[22] load A0LEN15: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 15, matches the plaintext: yes
+[23] load A0LEN15: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[24] load A0LEN15: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110308
+  read back: dataSize 0, matches the plaintext: n/a
+[25] save A0LEN16: AUTOSAVE 16 bytes, key A, secureVersion 0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     32 crc C1C0D4AD  first 16: 1C 95 F1 B0 23 CD E1 6F 6C AE 55 D4 6A 62 98 80  -> A0LEN16__DATA.BIN
+  file PARAM.SFO    size   4912 crc AC896C1E  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> A0LEN16__PARAM.SFO
+[26] load A0LEN16: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 16, matches the plaintext: yes
+[27] load A0LEN16: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[28] load A0LEN16: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110308
+  read back: dataSize 0, matches the plaintext: n/a
+[29] save A0LEN17: AUTOSAVE 17 bytes, key A, secureVersion 0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     33 crc AD887AFA  first 16: 96 C9 6E 71 33 9B 7E 90 17 8D 1B 46 A9 8B F4 F4  -> A0LEN17__DATA.BIN
+  file PARAM.SFO    size   4912 crc EFE2332F  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> A0LEN17__PARAM.SFO
+[30] load A0LEN17: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 17, matches the plaintext: yes
+[31] load A0LEN17: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[32] load A0LEN17: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110308
+  read back: dataSize 0, matches the plaintext: n/a
+[33] save A0LEN1000: AUTOSAVE 1000 bytes, key A, secureVersion 0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size   1016 crc D217A174  first 16: 53 FD CF 2C FC 6C 8C B3 89 17 3F 10 22 2A 09 50  -> A0LEN1000__DATA.BIN
+  file PARAM.SFO    size   4912 crc 7FF04793  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> A0LEN1000__PARAM.SFO
+[34] load A0LEN1000: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 1000, matches the plaintext: yes
+[35] load A0LEN1000: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[36] load A0LEN1000: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110308
+  read back: dataSize 0, matches the plaintext: n/a
+
+---- the data modes ----
+[37] DSEC: make (mode 13)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size    116 crc 299FF830  first 16: 80 94 4D 1D E4 E0 A6 04 0E 3B 98 9A 3E 65 DC 2A  -> DSEC__DATA.BIN
+  file PARAM.SFO    size   4912 crc 052B04EE  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> DSEC__PARAM.SFO
+[38] DSEC: write 100 bytes (mode 17)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size    116 crc 637F14A9  first 16: DC 2B 52 27 62 2C BE 51 9E 28 D2 37 CA 60 82 D4  -> DSEC_s38__DATA.BIN
+  file PARAM.SFO    size   4912 crc 8D4C1041  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> DSEC_s38__PARAM.SFO
+[39] DSEC: read (mode 15)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 100, matches the plaintext: yes
+[40] DPLAIN: make (mode 14)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size    100 crc AA316B09  first 16: 03 0A 11 18 1F 26 2D 34 3B 42 49 50 57 5E 65 6C  -> DPLAIN__DATA.BIN
+  file PARAM.SFO    size   4912 crc CC5113C6  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> DPLAIN__PARAM.SFO
+[41] DPLAIN: write 100 bytes (mode 18)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size    100 crc AA316B09  first 16: 03 0A 11 18 1F 26 2D 34 3B 42 49 50 57 5E 65 6C  -> DPLAIN_s41__DATA.BIN
+  file PARAM.SFO    size   4912 crc CC5113C6  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> DPLAIN_s41__PARAM.SFO
+[42] DPLAIN: read (mode 16)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 100, matches the plaintext: yes
+[43] DPLAINK: make (mode 14)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size    100 crc AA316B09  first 16: 03 0A 11 18 1F 26 2D 34 3B 42 49 50 57 5E 65 6C  -> DPLAINK__DATA.BIN
+  file PARAM.SFO    size   4912 crc 2B5EB554  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> DPLAINK__PARAM.SFO
+[44] DPLAINK: write 100 bytes (mode 18)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size    100 crc AA316B09  first 16: 03 0A 11 18 1F 26 2D 34 3B 42 49 50 57 5E 65 6C  -> DPLAINK_s44__DATA.BIN
+  file PARAM.SFO    size   4912 crc 2B5EB554  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> DPLAINK_s44__PARAM.SFO
+[45] DPLAINK: read (mode 16)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 100, matches the plaintext: yes
+[46] READDATA of a save that does not exist
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110327
+[47] AUTOLOAD of a save that does not exist
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110307
+[48] READDATASECURE of a non-secure save (DPLAIN)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110329
+  read back: dataSize 0, matches the plaintext: n/a
+[49] READDATA of a secure save (DSEC)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 116, matches the plaintext: no
+  first 16 read: DC 2B 52 27 62 2C BE 51 9E 28 D2 37 CA 60 82 D4
+
+---- queries ----
+[50] SIZES for PLAIN (needed space for a save of this shape)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 801103C7
+  msFree: clusterSize 32768, freeClusters >0, freeSpaceKB >0
+  msData: usedClusters 0 usedSpaceKB 0 '' used32KB 0 ''
+  utilityData: usedClusters 3 usedSpaceKB 96 '96 KB' used32KB 96 '96 KB'
+[51] LIST of PRCP00000 with saveName '<>'
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  resultCount 0
+[52] LIST of PRCP00000 with saveName ''
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  resultCount 0
+[53] FILES of A0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  secure 1 normal 0 system 1
+  secure DATA.BIN     mode 21FF size 64
+  system PARAM.SFO    mode 21FF size 4912
+[54] FILES of PLAIN
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110327
+  secure 0 normal 0 system 0
+[55] GETSIZE of A0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  sectorSize 32768 neededKB 0 '' overwriteKB 0 ''
+
+---- secure versions 1..3 ----
+[56] save A1: AUTOSAVE 64 bytes, key A, secureVersion 1
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     80 crc E27A02BE  first 16: B0 22 3C D7 07 DC 80 E6 36 2F 93 96 DE 73 D7 16  -> A1__DATA.BIN
+  file PARAM.SFO    size   4912 crc 0E133868  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> A1__PARAM.SFO
+[57] load A1: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[58] load A1: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[59] load A1: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[60] save A2: AUTOSAVE 64 bytes, key A, secureVersion 2
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     80 crc 6426ED6C  first 16: 3A F3 C4 FC 35 BE 92 59 03 F0 58 23 4E 9D 9D B1  -> A2__DATA.BIN
+  file PARAM.SFO    size   4912 crc A32FE4D1  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> A2__PARAM.SFO
+[61] load A2: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[62] load A2: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[63] load A2: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110308
+  read back: dataSize 0, matches the plaintext: n/a
+[64] save A3: AUTOSAVE 64 bytes, key A, secureVersion 3
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     80 crc DC608A90  first 16: 61 ED 9C AF 30 A0 98 E0 F2 B7 76 37 A7 D7 80 8E  -> A3__DATA.BIN
+  file PARAM.SFO    size   4912 crc 99F23A2E  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> A3__PARAM.SFO
+[65] load A3: AUTOLOAD with same key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[66] load A3: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[67] load A3: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110308
+  read back: dataSize 0, matches the plaintext: n/a
+
+---- v2: cross-version and cross-mode loads (R2, R7) ----
+[68] load A0: AUTOLOAD with key A, secureVersion 1 (saved at 0)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[69] load A0: AUTOLOAD with key B, secureVersion 1 (saved at 0 with key A)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[70] load A1: AUTOLOAD with key A, secureVersion 0 (saved at 1)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[71] load A1: AUTOLOAD with key B, secureVersion 0 (saved at 1 with key A)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[72] load DPLAIN: AUTOLOAD with no key (a MAKEDATA save)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110308
+  read back: dataSize 0, matches the plaintext: n/a
+[73] load DPLAIN: AUTOLOAD with key A (a MAKEDATA save)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110309
+  read back: dataSize 0, matches the plaintext: n/a
+[74] DSEC: READDATASECURE with key B (made with key A)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110326
+  read back: dataSize 0, matches the plaintext: n/a
+
+---- v2: zero key at secureVersion 1 (P1) ----
+[75] save PLAINV1: AUTOSAVE 64 bytes, key none, secureVersion 1
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     80 crc 63C9A791  first 16: 5C CB AF CE AC C2 45 DC 13 A2 81 37 C1 56 4A 34  -> PLAINV1__DATA.BIN
+  file PARAM.SFO    size   4912 crc EC3B1E43  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> PLAINV1__PARAM.SFO
+  sfo: SAVEDATA_PARAMS flags 01, SAVEDATA_FILE_LIST DATA.BIN
+[76] load PLAINV1: AUTOLOAD with no key, secureVersion 1
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+
+---- v2: GetStatus after ShutdownStart, polled back to back (R1) ----
+[77] status: AUTOLOAD of A0 with key A, GetStatus polled back to back after ShutdownStart
+  status 1
+  status 2
+  status 3
+  ShutdownStart = 00000000
+  statuses polled back to back after it: 4 (not 0 within 2 s)
+  status 4 seen: yes; a vblank passed before status 0: n/a
+  timing (varies by run): 4 at +434 us (+0 vblanks), 1162589 polls
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[78] status: FILES of A0, GetStatus polled back to back after ShutdownStart
+  status 1
+  status 2
+  status 3
+  ShutdownStart = 00000000
+  statuses polled back to back after it: 4 (not 0 within 2 s)
+  status 4 seen: yes; a vblank passed before status 0: n/a
+  timing (varies by run): 4 at +433 us (+0 vblanks), 1162580 polls
+  result 00000000
+  secure 1 normal 0 system 1
+
+---- v2: more test vectors (R4, R6) ----
+[79] save KEYPAIR: AUTOSAVE 64 bytes, key A, secureVersion 0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     80 crc C044729F  first 16: F3 DE 21 12 0D A9 44 51 C5 8E B0 41 6E 6B E1 72  -> KEYPAIR__DATA.BIN
+  file PARAM.SFO    size   4912 crc EDC8AB69  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> KEYPAIR__PARAM.SFO
+  sfo: SAVEDATA_PARAMS flags 21, SAVEDATA_FILE_LIST DATA.BIN
+[80] save KEYPAIR again: AUTOSAVE 64 bytes, key B, secureVersion 0 (only the key differs)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     80 crc 14047482  first 16: 22 FB 75 27 C6 6E 83 F2 84 73 01 3A F4 EA 2A F5  -> KEYPAIR_s80__DATA.BIN
+  file PARAM.SFO    size   4912 crc A99F2D69  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> KEYPAIR_s80__PARAM.SFO
+  sfo: SAVEDATA_PARAMS flags 21, SAVEDATA_FILE_LIST DATA.BIN
+[81] load KEYPAIR: AUTOLOAD with key B
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[82] load KEYPAIR: AUTOLOAD with key A (its key before the rewrite)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110306
+  read back: dataSize 0, matches the plaintext: n/a
+[83] save BIG: AUTOSAVE 65537 bytes, key A, secureVersion 0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size  65553 crc AD23AAAC  first 16: D7 10 6B A2 E5 4E E0 74 57 06 A7 BD 5D FD 8B A9  -> BIG__DATA.BIN
+  file PARAM.SFO    size   4912 crc C5FA3920  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> BIG__PARAM.SFO
+  sfo: SAVEDATA_PARAMS flags 21, SAVEDATA_FILE_LIST DATA.BIN
+[84] load BIG: AUTOLOAD with key A, dataBufSize 81920
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 65537, matches the plaintext: yes
+[85] TWO: MAKEDATASECURE DATA.BIN, 100 bytes, key A
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size    116 crc 111ED524  first 16: 2B C3 B1 F1 1F B0 08 49 97 C9 F1 D1 1D 3A 8A D9  -> TWO__DATA.BIN
+  file PARAM.SFO    size   4912 crc 75B67AAE  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> TWO__PARAM.SFO
+  sfo: SAVEDATA_PARAMS flags 21, SAVEDATA_FILE_LIST DATA.BIN
+[86] TWO: WRITEDATASECURE a second file, DATA2.BIN, 64 bytes, key A
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size    116 crc 111ED524  first 16: 2B C3 B1 F1 1F B0 08 49 97 C9 F1 D1 1D 3A 8A D9  -> TWO_s86__DATA.BIN
+  file DATA2.BIN    size     80 crc D46C2673  first 16: DB 75 00 57 7F 4C B6 FF EC 06 74 34 74 7B 2B 7C  -> TWO_s86__DATA2.BIN
+  file PARAM.SFO    size   4912 crc CFCC958E  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> TWO_s86__PARAM.SFO
+  sfo: SAVEDATA_PARAMS flags 21, SAVEDATA_FILE_LIST DATA.BIN DATA2.BIN
+[87] TWO: READDATASECURE DATA.BIN with key A
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 100, matches the plaintext: yes
+[88] TWO: READDATASECURE DATA2.BIN with key A
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[89] FILES of TWO
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  secure 2 normal 0 system 1
+  secure DATA.BIN     mode 21FF size 100
+  secure DATA2.BIN    mode 21FF size 64
+  system PARAM.SFO    mode 21FF size 4912
+[90] save ICON: AUTOSAVE 64 bytes, key A, secureVersion 0, with a 215-byte ICON0 (144x80 PNG)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file ICON0.PNG    size    215 crc 1CF9F1C9  first 16: 89 50 4E 47 0D 0A 1A 0A 00 00 00 0D 49 48 44 52  -> ICON__ICON0.PNG
+  file DATA.BIN     size     80 crc BE3F3FBD  first 16: 6B 74 E9 CA 5B 86 DF 8E EA 4D 07 18 49 A5 9F E8  -> ICON__DATA.BIN
+  file PARAM.SFO    size   4912 crc D164C007  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> ICON__PARAM.SFO
+  sfo: SAVEDATA_PARAMS flags 21, SAVEDATA_FILE_LIST DATA.BIN
+[91] FILES of ICON
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  secure 1 normal 0 system 2
+  secure DATA.BIN     mode 21FF size 64
+  system ICON0.PNG    mode 21FF size 215
+  system PARAM.SFO    mode 21FF size 4912
+
+---- v2: SIZES, GETSIZE and LIST (R8, R9) ----
+[92] SIZES: save SZNEW (none), dataSize 32768, key A; msData A0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  msFree: clusterSize 32768, freeClusters >0, freeSpaceKB >0
+  msData: usedClusters 3 usedSpaceKB 96 '96 KB' used32KB 96 '96 KB'
+  utilityData: usedClusters 4 usedSpaceKB 128 '128 KB' used32KB 128 '128 KB'
+[93] SIZES: save SZNEW (none), dataSize 32769, key A; msData A0
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  msFree: clusterSize 32768, freeClusters >0, freeSpaceKB >0
+  msData: usedClusters 3 usedSpaceKB 96 '96 KB' used32KB 96 '96 KB'
+  utilityData: usedClusters 4 usedSpaceKB 128 '128 KB' used32KB 128 '128 KB'
+[94] SIZES: save A0, dataSize 64, key A; msData NOSUCH (none)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 801103C7
+  msFree: clusterSize 32768, freeClusters >0, freeSpaceKB >0
+  msData: usedClusters 0 usedSpaceKB 0 '' used32KB 0 ''
+  utilityData: usedClusters 3 usedSpaceKB 96 '96 KB' used32KB 96 '96 KB'
+[95] SIZES: save SZNEW (none), dataSize 64, key A, with ICON0; msData ICON
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  msFree: clusterSize 32768, freeClusters >0, freeSpaceKB >0
+  msData: usedClusters 4 usedSpaceKB 128 '128 KB' used32KB 128 '128 KB'
+  utilityData: usedClusters 4 usedSpaceKB 128 '128 KB' used32KB 128 '128 KB'
+[96] SIZES: save BIG, dataSize 65537, key A; msData BIG
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  msFree: clusterSize 32768, freeClusters >0, freeSpaceKB >0
+  msData: usedClusters 5 usedSpaceKB 160 '160 KB' used32KB 160 '160 KB'
+  utilityData: usedClusters 5 usedSpaceKB 160 '160 KB' used32KB 160 '160 KB'
+[97] GETSIZE of SZNEW (none): secure DATA.BIN 32768 bytes, normal OTHER.BIN 100000
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110327
+  sectorSize 32768 freeSectors >0 freeKB >0
+  neededKB 0 '' overwriteKB 0 ''
+[98] GETSIZE of BIG: secure DATA.BIN 32768 bytes, normal OTHER.BIN 100000
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  sectorSize 32768 freeSectors >0 freeKB >0
+  neededKB 0 '' overwriteKB 0 ''
+[99] LIST of PRCP00000 with saveName '*'
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  resultCount 19
+  entry st_mode 11FF name 'A0'
+  entry st_mode 11FF name 'A0AGAIN'
+  entry st_mode 11FF name 'B0'
+  entry st_mode 11FF name 'A0LEN1'
+  entry st_mode 11FF name 'A0LEN15'
+  entry st_mode 11FF name 'A0LEN16'
+  entry st_mode 11FF name 'A0LEN17'
+  entry st_mode 11FF name 'A0LEN1000'
+  entry st_mode 11FF name 'A1'
+  entry st_mode 11FF name 'DPLAIN'
+  entry st_mode 11FF name 'DPLAINK'
+  entry st_mode 11FF name 'A2'
+  entry st_mode 11FF name 'A3'
+  entry st_mode 11FF name 'KEYPAIR'
+  entry st_mode 11FF name 'DSEC'
+  entry st_mode 11FF name 'PLAINV1'
+  entry st_mode 11FF name 'BIG'
+  entry st_mode 11FF name 'TWO'
+  entry st_mode 11FF name 'ICON'
+[100] LIST of PRCP00000 with saveName 'A0*'
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  resultCount 7
+  entry st_mode 11FF name 'A0'
+  entry st_mode 11FF name 'A0AGAIN'
+  entry st_mode 11FF name 'A0LEN1'
+  entry st_mode 11FF name 'A0LEN15'
+  entry st_mode 11FF name 'A0LEN16'
+  entry st_mode 11FF name 'A0LEN17'
+  entry st_mode 11FF name 'A0LEN1000'
+[101] LIST of PRCP00000 with saveName 'A?'
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  resultCount 4
+  entry st_mode 11FF name 'A0'
+  entry st_mode 11FF name 'A1'
+  entry st_mode 11FF name 'A2'
+  entry st_mode 11FF name 'A3'
+[102] LIST of PRCP00000 with saveName 'A0'
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  resultCount 1
+  entry st_mode 11FF name 'A0'
+
+---- v2: sceIoOpen, sceIoGetstat and sceIoDread on ms0 (R3) ----
+[103] io: sceIoOpen of a save directory (DPLAIN), read-only, then a 16-byte read
+  sceIoOpen = 8001000D
+[104] io: sceIoOpen of a save directory with a trailing slash, then a 16-byte read
+  sceIoOpen = 80010016
+[105] io: sceIoGetstat of DPLAIN/DATA.BIN (100 bytes, from WRITEDATA)
+  = 00000000
+  st_mode 21FF st_attr 0020 st_size 100 (high word 0)
+  ctime date, time of day, microsecond 0
+  atime date, time 00:00:00, microsecond 0
+  mtime date, time of day, microsecond 0
+  st_private: untouched untouched untouched untouched untouched untouched
+[106] io: sceIoGetstat of the DPLAIN directory
+  = 00000000
+  st_mode 11FF st_attr 0010 st_size 0 (high word 0)
+  ctime date, time of day, microsecond 0
+  atime date, time 00:00:00, microsecond 0
+  mtime date, time of day, microsecond 0
+  st_private: untouched untouched untouched untouched untouched untouched
+[107] io: sceIoDread of the DPLAIN directory, each entry's d_stat
+  Dread = 1, d_name '.'
+  st_mode 11FF st_attr 0010 st_size 0 (high word 0)
+  ctime date, time of day, microsecond 0
+  atime date, time 00:00:00, microsecond 0
+  mtime date, time of day, microsecond 0
+  st_private: untouched untouched untouched untouched untouched untouched
+  Dread = 1, d_name '..'
+  st_mode 11FF st_attr 0010 st_size 0 (high word 0)
+  ctime date, time of day, microsecond 0
+  atime date, time 00:00:00, microsecond 0
+  mtime date, time of day, microsecond 0
+  st_private: untouched untouched untouched untouched untouched untouched
+  Dread = 1, d_name 'DATA.BIN'
+  st_mode 21FF st_attr 0020 st_size 100 (high word 0)
+  ctime date, time of day, microsecond 0
+  atime date, time 00:00:00, microsecond 0
+  mtime date, time of day, microsecond 0
+  st_private: untouched untouched untouched untouched untouched untouched
+  Dread = 1, d_name 'PARAM.SFO'
+  st_mode 21FF st_attr 0020 st_size 4912 (high word 0)
+  ctime date, time of day, microsecond 0
+  atime date, time 00:00:00, microsecond 0
+  mtime date, time of day, microsecond 0
+  st_private: untouched untouched untouched untouched untouched untouched
+  Dread = 00000000
+
+---- v2: zero-key saves with the older parameter sizes (P1) ----
+[108] save PLAIN1480: AUTOSAVE 64 bytes, param size 1480 (no key field)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     80 crc F238048D  first 16: 93 15 04 1E 27 E8 68 42 22 ED 21 93 36 D2 05 39  -> PLAIN1480__DATA.BIN
+  file PARAM.SFO    size   4912 crc 4C479CCD  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> PLAIN1480__PARAM.SFO
+  sfo: SAVEDATA_PARAMS flags 01, SAVEDATA_FILE_LIST DATA.BIN
+[109] load PLAIN1480: AUTOLOAD, param size 1480
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+[110] save PLAIN1500: AUTOSAVE 64 bytes, param size 1500 (no key field)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  file DATA.BIN     size     80 crc 09F5C839  first 16: 6C F3 03 7B DA 05 35 F8 22 0B 4E 18 0D 8E BF D1  -> PLAIN1500__DATA.BIN
+  file PARAM.SFO    size   4912 crc 1755154F  first 16: 00 50 53 46 01 01 00 00 94 00 00 00 08 01 00 00  -> PLAIN1500__PARAM.SFO
+  sfo: SAVEDATA_PARAMS flags 01, SAVEDATA_FILE_LIST DATA.BIN
+[111] load PLAIN1500: AUTOLOAD, param size 1500
+  status 1
+  status 2
+  status 3
+  status 0
+  result 00000000
+  read back: dataSize 64, matches the plaintext: yes
+
+---- v2: the zero-key save again, then with SDK version 6.60 (P1) ----
+[112] save PLAINEND: AUTOSAVE 64 bytes, key none, secureVersion 0 (PLAIN's request, late in the run)
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110388
+  dir PLAINEND: open 80010002
+[113] load PLAINEND: AUTOLOAD with no key
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110307
+  read back: dataSize 0, matches the plaintext: n/a
+[114] sdk: sceKernelGetCompiledSdkVersion, then sceKernelSetCompiledSdkVersion660(0x06060010)
+  GetCompiledSdkVersion = 00000000
+  SetCompiledSdkVersion660 = 00000000
+  GetCompiledSdkVersion = 06060010
+[115] save PLAIN660: AUTOSAVE 64 bytes, key none, secureVersion 0, after SetCompiledSdkVersion660
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110388
+  dir PLAIN660: open 80010002
+[116] load PLAIN660: AUTOLOAD with no key, after SetCompiledSdkVersion660
+  status 1
+  status 2
+  status 3
+  status 0
+  result 80110307
+  read back: dataSize 0, matches the plaintext: n/a
+
+==== saveprobe done ====

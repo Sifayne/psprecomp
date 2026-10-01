@@ -10,11 +10,18 @@
  * ## Where a deadline is noticed
  *
  * There is no timer and no interrupt. Guest time only moves when the guest
- * moves it, which it does at every firmware call (clock.c), so a firmware call
- * is also the only moment at which a deadline can be observed to have passed.
- * psp_ktimer_tick runs there, and it is the same trade the scheduler already
- * makes for sleeping threads: the instant is not exact, but it arrives, and it
- * arrives in the same place on every run.
+ * moves it, which it does at every firmware call (clock.c), so while a thread
+ * runs, a firmware call is the only moment at which a deadline can be
+ * observed to have passed. psp_ktimer_tick runs there, and it is the same
+ * trade the scheduler already makes for sleeping threads: the instant is not
+ * exact, but it arrives, and it arrives in the same place on every run.
+ *
+ * The other moment is when no thread runs at all. The scheduler then moves
+ * the clock to the next deadline, and when that is a timer's it stops there
+ * and runs the handler (psp_ktimer_next_due, psp_ktimer_fire_idle), as the
+ * interrupt would have: threadprobe step 115 (fw 6.60) has a 2ms alarm fire
+ * inside a 10ms delay, where waiting for the next firmware call ran it at the
+ * delay's end.
  *
  * The handler runs through psp_dispatch, so it is recompiled code in the boot
  * host and interpreted under the test harness, with no special case for either.
@@ -49,7 +56,6 @@ int psp_ktimer_in_handler(void) { return g_firing; }
 /* Both halves of this file are reset and ticked together; the vtimer side is
  * defined below. */
 static void vtimer_reset(void);
-static void vtimer_tick(void);
 
 void psp_ktimer_reset(void) {
     memset(g_alarm, 0, sizeof g_alarm);
@@ -71,7 +77,12 @@ static uint32_t alarm_arm(uint64_t usec, uint32_t handler, uint32_t common) {
     for (int i = 0; i < MAX_ALARMS; i++) if (!g_alarm[i].alive) { a = &g_alarm[i]; break; }
     if (!a) return 0;
     memset(a, 0, sizeof *a);
-    a->schedule = psp_clock_peek() + usec;
+    /* At least a microsecond out. The handler is an interrupt, and it cannot
+     * arrive before the call that armed it has returned: threadprobe step 119
+     * (fw 6.60) reads the hit count straight after SetAlarm(0) as 0, and 1
+     * after a 1ms delay. Due at once, the tick at the end of this very call
+     * fired it. */
+    a->schedule = psp_clock_peek() + (usec ? usec : 1);
     a->handler  = handler;
     a->common   = common;
     a->uid      = psp_threadman_next_uid();
@@ -134,14 +145,20 @@ static void hle_ReferAlarmStatus(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Fire whatever is due. Called from the firmware-call path.
+/* Fire whatever is due, and say how many handlers ran.
  *
  * The handler's return value is a *rescheduling* interval: non-zero re-arms the
  * alarm that many microseconds later, zero retires it. That is what lets a
- * guest write a periodic timer with one call and no thread. */
-void psp_ktimer_tick(void) {
-    if (g_firing) return;
+ * guest write a periodic timer with one call and no thread. Later than the
+ * moment it was *due*, not the moment it ran: threadprobe step 116 (fw 6.60)
+ * has a handler return 1000 twice, and the first gap between its runs comes
+ * out under 1000us -- a late first run does not push the next one back. */
+static int vtimer_tick(void);
+
+static int fire_due(void) {
+    if (g_firing) return 0;
     const uint64_t now = psp_clock_peek();
+    int fired = 0;
 
     for (int i = 0; i < MAX_ALARMS; i++) {
         psp_alarm *a = &g_alarm[i];
@@ -163,21 +180,33 @@ void psp_ktimer_tick(void) {
         psp_cpu = saved;
 
         g_firing = 0;
+        fired++;
 
         a = find_alarm(uid);
         if (!a) continue;                 /* cancelled itself */
-        if (again) a->schedule = psp_clock_peek() + again;
+        if (again) a->schedule += again;
         else       a->alive = 0;
     }
-    vtimer_tick();
+    return fired + vtimer_tick();
 }
+
+/* Called from the firmware-call path. A handler that readied a thread more
+ * urgent than the one it interrupted hands it the CPU on the way out, as the
+ * end of an interrupt does; the reschedule that ran just before this call's
+ * timers could not have known. */
+void psp_ktimer_tick(void) {
+    if (fire_due()) psp_sched_tick();
+}
+
+/* For the scheduler's idle path: nothing is runnable and the clock has just
+ * been moved to psp_ktimer_next_due(). */
+int psp_ktimer_fire_idle(void) { return fire_due(); }
 
 static void alarm_list(int type, uint32_t out, int max, int *count) {
     if (type != PSP_TMID_ALARM) return;
     for (int i = 0; i < MAX_ALARMS; i++) {
         if (!g_alarm[i].alive) continue;
-        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_alarm[i].uid);
-        (*count)++;
+        psp_threadman_list_put(g_alarm[i].uid, out, max, count);
     }
 }
 
@@ -247,10 +276,13 @@ static uint64_t vtimer_now(const psp_vtimer *v) {
     return v->active ? v->value + (psp_clock_peek() - v->since) : v->value;
 }
 
+/* Setting the count re-anchors a running timer. A stopped one keeps base 0:
+ * threadprobe step 124 (fw 6.60) sets the time of a stopped timer and reads
+ * BaseWide 0 and a refer with base=0; this used to move base to "now". */
 static void vtimer_set(psp_vtimer *v, uint64_t to) {
     v->value = to;
     v->since = psp_clock_peek();
-    v->base  = v->since;
+    if (v->active) v->base = v->since;
 }
 
 static void hle_CreateVTimer(void) {
@@ -364,7 +396,12 @@ static void hle_SetVTimerTime(void) {
     const uint32_t in = psp_arg(1);
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
     if (!in) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    /* In and out, like the Wide form's return value: the clock comes back
+     * holding the time it replaced (threadprobe step 124, fw 6.60). */
+    const uint64_t was = vtimer_now(v);
     vtimer_set(v, (uint64_t)psp_read32(in) | ((uint64_t)psp_read32(in + 4) << 32));
+    psp_write32(in, (uint32_t)was);
+    psp_write32(in + 4, (uint32_t)(was >> 32));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -388,11 +425,13 @@ static void hle_SetVTimerHandlerWide(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Only the handler goes: threadprobe step 128 (fw 6.60) cancels a handler set
+ * for 0x7FFFFFFF and the refer still reads that schedule and the common
+ * pointer. This used to clear all three. */
 static void hle_CancelVTimerHandler(void) {
     psp_vtimer *v = find_vtimer(psp_arg(0));
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
-    v->handler = v->common = 0;
-    v->schedule = 0;
+    v->handler = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -427,8 +466,12 @@ static uint32_t vtimer_clock_scratch(void) {
 }
 
 /* Fire any vtimer whose count has reached its schedule. Same contract as an
- * alarm's: the handler's return value re-arms it, zero retires it. */
-static void vtimer_tick(void) {
+ * alarm's: the handler's return value re-arms it, zero retires it -- and
+ * retiring clears the handler but leaves the schedule and the common pointer
+ * where they were: threadprobe steps 126-127 (fw 6.60) read back the last
+ * schedule, handler 0 and the common pointer after a handler returned 0. */
+static int vtimer_tick(void) {
+    int fired = 0;
     for (int i = 0; i < g_vtimer_hi; i++) {
         psp_vtimer *v = &g_vtimer[i];
         if (!v->alive || !v->active || !v->handler || !v->schedule) continue;
@@ -468,20 +511,39 @@ static void vtimer_tick(void) {
         const uint32_t again = psp_cpu.r[PSP_REG_V0];
         psp_cpu = saved;
         g_firing = 0;
+        fired++;
 
         v = find_vtimer(uid);
         if (!v) continue;
         if (again) v->schedule = sched + again;
-        else       v->schedule = 0;
+        else       v->handler = 0;
     }
+    return fired;
+}
+
+/* The earliest guest moment at which an alarm or a running vtimer's handler
+ * is due, or 0 for none. A vtimer's schedule is on its own count, which runs
+ * at the system clock's rate from `since`. */
+uint64_t psp_ktimer_next_due(void) {
+    uint64_t due = 0;
+    for (int i = 0; i < MAX_ALARMS; i++)
+        if (g_alarm[i].alive && (!due || g_alarm[i].schedule < due))
+            due = g_alarm[i].schedule;
+    for (int i = 0; i < g_vtimer_hi; i++) {
+        const psp_vtimer *v = &g_vtimer[i];
+        if (!v->alive || !v->active || !v->handler || !v->schedule) continue;
+        const uint64_t at = v->schedule > v->value ? v->since + (v->schedule - v->value)
+                                                   : v->since;
+        if (!due || at < due) due = at;
+    }
+    return due;
 }
 
 static void vtimer_list(int type, uint32_t out, int max, int *count) {
     if (type != PSP_TMID_VTIMER) return;
     for (int i = 0; i < g_vtimer_hi; i++) {
         if (!g_vtimer[i].alive) continue;
-        if (out && *count < max) psp_write32(out + (uint32_t)*count * 4, g_vtimer[i].uid);
-        (*count)++;
+        psp_threadman_list_put(g_vtimer[i].uid, out, max, count);
     }
 }
 

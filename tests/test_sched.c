@@ -379,6 +379,10 @@ static void test_stop_reason_reports_and_resets(void) {
     CHECK(psp_sched_spawn(UID_TRIVIAL, ENTRY_TRIVIAL, FAKE_SP, 0, 0, 0, 32) == 0,
           "spawn failed");
     psp_sched_stop_all("test-stop");
+    /* Joined before the reset below forgets it: a host thread that had not yet
+     * reached its first wait would otherwise take its slot index into the next
+     * test and run whatever that test puts there. */
+    psp_sched_join_all();
     CHECK(psp_sched_live() == 0, "stop_all left threads alive");
     CHECK(psp_sched_stop_reason() != NULL &&
           strcmp(psp_sched_stop_reason(), "test-stop") == 0,
@@ -389,7 +393,211 @@ static void test_stop_reason_reports_and_resets(void) {
     CHECK(psp_sched_stop_reason() == NULL, "reset did not clear the stop reason");
 }
 
+/* ---- the ready-queue policy ------------------------------------------------
+ *
+ * One FIFO queue per priority and no timeslice, as threadprobe measured on
+ * fw 6.60. Each test records the order its threads ran in as a string. */
+#define ENTRY_Q_A      0x00008000u
+#define ENTRY_Q_B      0x00009000u
+#define ENTRY_Q_C      0x0000A000u
+#define ENTRY_Q_D      0x0000B000u
+#define ENTRY_Q_HI     0x0000C000u
+#define UID_Q_A        0x00041001u
+#define UID_Q_B        0x00041002u
+#define UID_Q_C        0x00041003u
+#define UID_Q_D        0x00041004u
+#define UID_Q_HI       0x00041005u
+
+static char q_order[64];
+static int  q_mode;
+static void q_tag(const char *t) { strncat(q_order, t, sizeof q_order - strlen(q_order) - 1); }
+
+enum { Q_DEADLINE, Q_NOSLICE, Q_ROTATE, Q_HEAD };
+
+static void body_q_a(void) {
+    if (q_mode == Q_DEADLINE) { psp_sched_delay(30000); q_tag("A"); return; }
+    if (q_mode == Q_NOSLICE) {
+        q_tag("A0");
+        psp_clock_advance_to(psp_clock_peek() + 20000);
+        psp_sched_tick();
+        q_tag("A1");
+        return;
+    }
+    if (q_mode == Q_HEAD) {
+        q_tag("A0");
+        psp_sched_spawn(UID_Q_HI, ENTRY_Q_HI, FAKE_SP, 0, 0, 0, 16);
+        q_tag("A1");
+        return;
+    }
+    q_tag("A");
+}
+static void body_q_b(void) {
+    if (q_mode == Q_DEADLINE) psp_sched_delay(20000);
+    q_tag("B");
+}
+static void body_q_c(void) {
+    if (q_mode == Q_DEADLINE) psp_sched_delay(10000);
+    q_tag("C");
+}
+/* Step 77's main: busy past every deadline without giving up the CPU. */
+static void body_q_d(void) {
+    psp_clock_advance_to(psp_clock_peek() + 45000);
+    psp_sched_tick();
+    q_tag("D");
+}
+static void body_q_hi(void) { q_tag("H"); }
+
+static void q_run(int mode) {
+    psp_sched_join_all();      /* the previous test's host threads, as above */
+    psp_sched_reset();
+    psp_sched_set_threading(1);
+    psp_clock_reset();
+    q_order[0] = '\0';
+    q_mode = mode;
+}
+
+/* Timed waits that have all expired run in deadline order, not in the order
+ * the scan happens to find them (threadprobe step 77: delays of 30, 20 and
+ * 10 ms, main busy for 45, run C B A). */
+static void test_expired_delays_run_in_deadline_order(void) {
+    q_run(Q_DEADLINE);
+    psp_sched_spawn(UID_Q_A, ENTRY_Q_A, FAKE_SP, 0, 0, 0, 32);
+    psp_sched_spawn(UID_Q_B, ENTRY_Q_B, FAKE_SP, 0, 0, 0, 32);
+    psp_sched_spawn(UID_Q_C, ENTRY_Q_C, FAKE_SP, 0, 0, 0, 32);
+    psp_sched_spawn(UID_Q_D, ENTRY_Q_D, FAKE_SP, 0, 0, 0, 32);
+    CHECK(psp_sched_drain(5) == 0, "threads still alive");
+    CHECK(strcmp(q_order, "DCBA") == 0, "ran %s, expected DCBA", q_order);
+}
+
+/* No timeslice: a thread that stays runnable keeps the CPU against an equal
+ * however long it runs (threadprobe step 75: `A0 A1 B` across 20 ms). */
+static void test_no_timeslice_between_equals(void) {
+    q_run(Q_NOSLICE);
+    psp_sched_spawn(UID_Q_A, ENTRY_Q_A, FAKE_SP, 0, 0, 0, 32);
+    psp_sched_spawn(UID_Q_B, ENTRY_Q_B, FAKE_SP, 0, 0, 0, 32);
+    CHECK(psp_sched_drain(5) == 0, "threads still alive");
+    CHECK(strcmp(q_order, "A0A1B") == 0, "ran %s, expected A0A1B", q_order);
+}
+
+/* Rotating another priority moves its head to its tail and leaves the caller
+ * running (threadprobe step 66: W1 W2 W3 ready, rotate, run W2 W3 W1). */
+static void test_rotate_other_level(void) {
+    q_run(Q_ROTATE);
+    psp_sched_spawn(UID_Q_A, ENTRY_Q_A, FAKE_SP, 0, 0, 0, 48);
+    psp_sched_spawn(UID_Q_B, ENTRY_Q_B, FAKE_SP, 0, 0, 0, 48);
+    psp_sched_spawn(UID_Q_C, ENTRY_Q_C, FAKE_SP, 0, 0, 0, 48);
+    CHECK(psp_sched_rotate(48) == 1, "nothing to rotate at 48");
+    CHECK(q_order[0] == '\0', "the rotation ran %s before the caller finished", q_order);
+    CHECK(psp_sched_drain(5) == 0, "threads still alive");
+    CHECK(strcmp(q_order, "BCA") == 0, "ran %s, expected BCA", q_order);
+}
+
+/* A thread displaced by a more urgent one goes back to the head of its queue,
+ * ahead of an equal that was waiting (threadprobe steps 59, 71, 72). */
+static void test_displaced_thread_keeps_its_place(void) {
+    q_run(Q_HEAD);
+    psp_sched_spawn(UID_Q_A, ENTRY_Q_A, FAKE_SP, 0, 0, 0, 32);
+    psp_sched_spawn(UID_Q_B, ENTRY_Q_B, FAKE_SP, 0, 0, 0, 32);
+    CHECK(psp_sched_drain(5) == 0, "threads still alive");
+    CHECK(strcmp(q_order, "A0HA1B") == 0, "ran %s, expected A0HA1B", q_order);
+}
+
+/* Suspension is a flag over the wait, not a replacement for it (threadprobe
+ * steps 36, 52-54, fw 6.60): resuming a waiter leaves it waiting, a wake
+ * delivered while suspended completes the wait without running the thread,
+ * and a resume of a ready, more urgent thread says so, for the caller to
+ * switch to it. */
+static int s_wait_rc;
+
+static void body_s_waiter(void) {
+    s_wait_rc = psp_sched_block(psp_sched_current(), PSP_SCHED_BLOCKED, "test-suspend");
+    q_tag("W");
+}
+
+static void body_s_main(void) {
+    CHECK(psp_sched_suspend(UID_Q_A) == 1, "suspend of a waiter failed");
+    CHECK(psp_sched_resume(UID_Q_A) == 0, "resuming a waiter asked for a switch");
+    CHECK(psp_sched_state_of(UID_Q_A) == PSP_SCHED_BLOCKED,
+          "resuming a waiter ended its wait (state %d)", psp_sched_state_of(UID_Q_A));
+    psp_sched_suspend(UID_Q_A);
+    CHECK(psp_sched_wake(UID_Q_A) == 0, "a suspended thread counted as urgent");
+    CHECK(psp_sched_state_of(UID_Q_A) == PSP_SCHED_READY,
+          "a wake while suspended did not end the wait");
+    q_tag("M1");
+    psp_sched_yield();                     /* must come straight back */
+    CHECK(psp_sched_resume(UID_Q_A) == 1, "resuming a ready, more urgent thread "
+                                          "did not ask for a switch");
+    psp_sched_preempt();
+    q_tag("M2");
+}
+
+static void test_suspend_is_a_flag_over_the_wait(void) {
+    q_run(Q_ROTATE);
+    s_wait_rc = -99;
+    psp_sched_spawn(UID_Q_A, ENTRY_Q_C + 0x10, FAKE_SP, 0, 0, 0, 32);
+    psp_sched_spawn(UID_Q_B, ENTRY_Q_C + 0x20, FAKE_SP, 0, 0, 0, 48);
+    CHECK(psp_sched_drain(5) == 0, "threads still alive");
+    CHECK(strcmp(q_order, "M1WM2") == 0, "ran %s, expected M1WM2", q_order);
+    CHECK(s_wait_rc == PSP_SCHED_WOKEN, "the suspended waiter's wait returned %d",
+          s_wait_rc);
+}
+
+/* A finished thread's slot is reused once its host thread is joined, so the
+ * table bounds threads alive at once rather than starts per run (threadprobe
+ * made 115 starts; the 130th of any run used to fail). */
+static void test_dead_slots_are_reused(void) {
+    q_run(Q_ROTATE);
+    int ran = 0;
+    for (int i = 0; i < 1500; i++) {
+        trivial_ran = 0;
+        if (psp_sched_spawn(UID_TRIVIAL + 0x100 + (uint32_t)i, ENTRY_TRIVIAL,
+                            FAKE_SP, 0, 0, 0, 32) != 0) break;
+        psp_sched_drain(5);
+        ran += trivial_ran;
+    }
+    CHECK(ran == 1500, "%d of 1500 sequential starts ran", ran);
+}
+
+/* ReferThreadStatus's counters (threadprobe steps 1, 9-13, fw 6.60): run time
+ * is nonzero during a first turn, a delay is one release, and a thread that
+ * starts a more urgent one has been preempted once. */
+static psp_sched_stats st_first, st_after;
+
+static void body_st_hi(void) { }
+
+static void body_st(void) {
+    psp_sched_stats_of(psp_sched_current(), &st_first);
+    psp_sched_delay(1000);
+    psp_sched_spawn(UID_Q_HI, ENTRY_Q_C + 0x40, FAKE_SP, 0, 0, 0, 16);
+    psp_sched_stats_of(psp_sched_current(), &st_after);
+}
+
+static void test_thread_counters(void) {
+    q_run(Q_ROTATE);
+    psp_sched_spawn(UID_Q_A, ENTRY_Q_C + 0x30, FAKE_SP, 0, 0, 0, 32);
+    psp_sched_stats none;
+    CHECK(psp_sched_stats_of(UID_Q_B, &none) == 0 && none.run_us == 0,
+          "a uid with no slot has counters");
+    CHECK(psp_sched_drain(5) == 0, "threads still alive");
+    CHECK(st_first.run_us > 0 && st_first.releases == 0,
+          "first turn: run %llu, releases %u",
+          (unsigned long long)st_first.run_us, st_first.releases);
+    CHECK(st_after.releases == 1 && st_after.thread_preempts == 1 &&
+          st_after.intr_preempts == 0,
+          "after a delay and a preempting start: releases %u, thread %u, intr %u",
+          st_after.releases, st_after.thread_preempts, st_after.intr_preempts);
+}
+
 int main(void) {
+    psp_register(ENTRY_Q_C + 0x30, body_st);
+    psp_register(ENTRY_Q_C + 0x40, body_st_hi);
+    psp_register(ENTRY_Q_C + 0x10, body_s_waiter);
+    psp_register(ENTRY_Q_C + 0x20, body_s_main);
+    psp_register(ENTRY_Q_A,      body_q_a);
+    psp_register(ENTRY_Q_B,      body_q_b);
+    psp_register(ENTRY_Q_C,      body_q_c);
+    psp_register(ENTRY_Q_D,      body_q_d);
+    psp_register(ENTRY_Q_HI,     body_q_hi);
     psp_register(ENTRY_TRIVIAL,  body_trivial);
     psp_register(ENTRY_WAITER,   body_waiter);
     psp_register(ENTRY_WAKER,    body_waker);
@@ -409,6 +617,13 @@ int main(void) {
     test_thread_identity();
     test_guest_thread_unsatisfiable_wait();
     test_stop_reason_reports_and_resets();
+    test_expired_delays_run_in_deadline_order();
+    test_no_timeslice_between_equals();
+    test_rotate_other_level();
+    test_displaced_thread_keeps_its_place();
+    test_suspend_is_a_flag_over_the_wait();
+    test_dead_slots_are_reused();
+    test_thread_counters();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

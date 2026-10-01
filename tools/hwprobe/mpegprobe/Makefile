@@ -17,7 +17,7 @@ LDFLAGS =
 LIBS = -lpspgu -lpspmpeg
 
 EXTRA_TARGETS = EBOOT.PBP
-PSP_EBOOT_TITLE = MPEG probe
+PSP_EBOOT_TITLE = MPEG probe v$(shell sed -n 's/^.define PROBE_VERSION //p' main.c)
 
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak
