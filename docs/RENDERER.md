@@ -502,15 +502,27 @@ ge_screen_z, clip_to_fx16):
   Patch vertices keep the 14-bit rule: psprecomp's tessellation is not the
   GE's, and the new rule costs scene 22 342 pixels.
 - **Across a triangle** depth is a plane, like colour: anchored at the same
-  vertex, with gradients from the numerator times 1/area, where 1/area is
-  also a 24-bit float, then floored to 1/1024 a pixel. Colour uses the same
-  1/area (geprobe 6 scene 39). Scene 27's four through-mode triangles match
-  on every pixel, and so do 22 of scene 36's 24 3D triangles from one of
-  their corners.
+  vertex, with gradients from the numerator times 1/area, then floored to
+  1/1024 a pixel. Colour uses the same 1/area (geprobe 6 scene 39). Scene
+  27's four through-mode triangles match on every pixel, and so do 22 of
+  scene 36's 24 3D triangles from one of their corners.
+- **1/area comes from a table** with a linear step (area_rcp), not a
+  division. The area's significand is cut to 17 bits. Its leading nine
+  bits, h, pick one of 256 entries holding 2^27/h and the slope 2^24/h²,
+  each cut to an integer. The last eight bits, l, take l times the slope
+  over 32, rounded up, off the first, and the result is cut to 16 bits.
+  geprobe 8 scenes 50 and 51 read it at every 10-bit length, as a
+  triangle's area and as a line's length drawn either way; all three agree
+  on all 512. The reciprocal cut to 16 bits, which this replaces, was a
+  unit out on 50 of them: every one a length whose last bit is set, where
+  the one-bit step lands up to 0.39 of a unit above the exact value or 1.19
+  below it. The table matches all 512, all 44 of scene 46's areas of 18 to
+  20 bits (depth and every colour channel), and every pixel of scenes 37,
+  39, 46, 47, 50 and 51.
 - **Along a line** (psp_render_walk_line) one pixel is drawn per
   major-axis column whose centre lies on the segment. Its row, colour and
   depth are those of the centre's projection onto the line. The gradients
-  are the difference times the same short reciprocal, of the major length,
+  are the difference times the same reciprocal, of the major length,
   floored to 1/16384 of a step per sixteenth of a pixel. For whole-pixel endpoints that is the
   step centre geprobe step 1 measured. Scene 27's 3D line, whose ends fall
   between centres, matches on every pixel only this way. All 5862 pixels of
@@ -606,36 +618,27 @@ fw 6.60):
 - **Splines.** Splines use the same grid. The weights of fill/fill splines
   do not fit yet.
 
-## Still open after geprobe 7
+## Still open after geprobe 8
 
-These are what geprobe 7 (fw 6.60) still shows psprecomp getting wrong,
-with pixels off on run 7 (runs 5 and 6 read the same on the scenes they
-share). Details, confidence and what further probing could settle are in
-`fw660-run7/findings/geprobe.md`.
+These are what geprobe 8 (fw 6.60) still shows psprecomp getting wrong,
+with pixels off on run 8. Run 8 drew every scene it shares with run 7 to
+the byte the same. Details on the geprobe 7 items, and what further probing
+could settle, are in `fw660-run7/findings/geprobe.md`.
 
-- **The gradient reciprocal** (scene 46: 77 colour pixels, 3659 depth;
-  scene 47: 376; scene 37: 7; part of scenes 16 and 26). Gradients take a
-  16-bit reciprocal of the area, or of a line's length, cut toward zero.
-  It fits 35 of scene 46's 44 depth gradients and 129 of its 132 colour
-  gradients, and all of scene 49's lines. Of the nine other depth
-  gradients, seven need a reciprocal one or two units of its last bit
-  above the cut one (five of them at or above the exact value, which no
-  cut gives), and two need one below it, in no order of the area. That looks like a table or iteration
-  with its own error pattern, which these areas do not pin down; geprobe 8
-  scenes 50 and 51 read it at every 10-bit length. Scene 47 misses on the
-  same rows in 3D, so the 3D path takes it too.
-- **Vertex depth** (scene 45: 837 pixels; scene 48's depth: 958). The
+- **Vertex depth** (scene 45: 837 pixels; scene 48's depth: 860). The
   depth arithmetic above is within half a step of the GE's on every point,
   but not equal to it.
 - **The 3D depth anchor** (scene 17's depth: 303; scene 27's: 1867; scene
-  36's: 56). No vertex rule fits; see Depth values.
-- **Patch vertices** (scenes 22, 23 and 26: 612, 1878 and 1190 pixels;
-  scene 38: 28; scene 44: 74). Fill/fill spline weights are unsettled:
-  scene 44 has 10 samples of them, and geprobe 8 scene 52 reads every edge
-  mode at five divisions. psprecomp's tessellated positions are its own,
-  which is why patches keep the older projection rule.
-- **Morph blends** (scene 21: 400) and **skinned corners** (scene 20: 101)
-  are unchanged. The projection change moved neither.
+  36's: 45). No vertex rule fits; see Depth values.
+- **Patch vertices** (scenes 22, 23 and 26: 610, 1876 and 1087 pixels;
+  scene 38: 28; scene 44: 74; scene 52: 600). Fill/fill spline weights are
+  unsettled: scene 44 has 10 samples of them, and geprobe 8 scene 52 reads
+  every edge mode at five divisions. psprecomp's tessellated positions are
+  its own, which is why patches keep the older projection rule.
+- **Lit triangles** (scene 16: 325 pixels), not yet looked at since the
+  gradient reciprocal settled.
+- **Morph blends** (scene 21: 400) and **skinned corners** (scene 20: 54)
+  are unchanged by the projection change.
 - **Point and spot lights** (scene 35: 10 pixels), each one step low, all
   where the GE's power function is used.
 - **Steep line starts** (scene 49: 4 pixels): a start on a diamond's upper

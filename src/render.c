@@ -1048,21 +1048,35 @@ static int64_t floor_shr(int64_t v, int s) {
     return v >= 0 ? v >> s : -((-v + ((int64_t)1 << s) - 1) >> s);
 }
 
-/* 1/area (area > 0) as the GE's triangle setup has it: the GE's own float,
- * 16 significant bits, cut toward zero (ge24 in src/hle/ge.c). Returned as
- * q / 2^sh, q < 2^16 except for a power of two, where it is exact. Depth
- * gradients go through it (sw_tri); geprobe 5 (fw 6.60) scene 27's four
- * through-mode triangles pin the width: 15 to 17 bits reproduce all 30300
- * of their pixels, 14 and 18 do not, and the exact 1/area leaves 653.
- * Being a hair small is visible on its own: geprobe step 11 spreads 255
- * over 480 pixels, exactly 544/1024 a pixel, and the hardware steps 543,
- * while -544/1024 stays -544. A line's gradients take it too, with the
- * major length for the area (psp_render_walk_line). */
+/* 1/area (area > 0) as the GE's triangle setup has it. Returned as q / 2^sh,
+ * q < 2^16 except for a power of two, where it is exact. Colour, fog and
+ * depth gradients go through it (sw_tri); a line's take it too, with the
+ * major length for the area (psp_render_walk_line).
+ *
+ * It is a table with a linear step, not a division. The area's significand
+ * is cut to 17 bits: its leading nine, h, pick one of 256 entries, which
+ * hold 2^27/h and the slope 2^24/h^2, each cut to an integer; the last
+ * eight, l, take l times the slope over 32, rounded up, off the first; and
+ * the result is cut to 16 bits. geprobe 8 (fw 6.60) scenes 50 and 51 read
+ * it at every 10-bit length, as a triangle's area and as a line's length
+ * drawn either way, which agree on all 512. Where the length's last bit is
+ * set the one-bit step leaves it up to 0.39 of a unit above the exact
+ * reciprocal or 1.19 below, so the reciprocal cut to 16 bits that this
+ * replaces was a unit out on 50 of them; this matches all 512, and all 44
+ * of scene 46's areas of 18 to 20 bits, on depth and every colour channel.
+ * Scenes 37, 39, 46, 47, 50 and 51 now match on every pixel. Being a hair
+ * small is visible on its own: geprobe step 11 spreads 255 over 480 pixels,
+ * exactly 544/1024 a pixel, and the hardware steps 543, while -544/1024
+ * stays -544. */
 static void area_rcp(int64_t area, int64_t *q, int *sh) {
     int L = 0;
     while (L < 62 && (area >> L) != 0) L++;
     *sh = 16 + L - 1;
-    *q = (int64_t)(((uint64_t)1 << *sh) / (uint64_t)area);
+    const uint64_t m = L > 17 ? (uint64_t)area >> (L - 17) : (uint64_t)area << (17 - L);
+    const uint64_t h = m >> 8, l = m & 0xFFu;
+    const uint64_t R = ((uint64_t)1 << 27) / h;
+    const uint64_t S = ((uint64_t)1 << 24) / (h * h);
+    *q = (int64_t)((R - ((l * S + 31) >> 5)) >> 3);
 }
 
 /* Floored, clamped to a channel: the plane's value in 1/16384ths. */
@@ -1147,24 +1161,19 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      *     c(px, py) = cA + gx * (px - xA) + gy * (py - yA)
      *
      * at the pixel centre, where A is the leftmost vertex (ties: the upper
-     * one); gx and gy are the numerators times area_rcp's short 1/area,
-     * floored to 1/1024 a pixel, as for depth below; the result is floored
-     * and clamped. It reproduces every triangle of geprobe 1 steps 1-11, 18
+     * one); gx and gy are the numerators times area_rcp's 1/area, floored
+     * to 1/1024 a pixel, as for depth below; the result is floored and
+     * clamped. It reproduces every triangle of geprobe 1 steps 1-11, 18
      * and 19, alpha included. The rounded barycentric blend this replaces
      * was one step off on most Gouraud pixels; anchoring at the first or the
      * topmost vertex fails steps 1-10.
      *
-     * The short reciprocal is geprobe 6 (fw 6.60) scene 39's, the scene
-     * built to measure gradient precision: of its 78 triangles 75 match on
-     * every pixel with it and 69 with the exact gradient floored,
-     * which the others never beat; scene 17's 3D quads go from 81 pixels off
-     * to none. It costs two skinned triangles of scene 20 (54 -> 101) and
-     * morph and skin triangles of scene 26 (2263 -> 2343), whose corners
-     * psprecomp is less sure of (ge_recip in src/hle/ge.c). Scene 39's other
-     * three fit neither: a through-mode triangle wants a gradient one step
-     * smaller than both give, and a 3D quad's two halves fit no gradient
-     * within eight steps, so the reciprocal is not the whole story
-     * (docs/RENDERER.md).
+     * geprobe 6 (fw 6.60) scene 39, built to measure gradient precision,
+     * matches on all 78 of its triangles with area_rcp's table; the exact
+     * gradient floored matches 69 and a 16-bit reciprocal cut toward zero
+     * 75. Scene 17's 3D quads go from 81 pixels off to none. Scene 20's
+     * skinned triangles, which the cut reciprocal took from 54 pixels off to
+     * 101, are back at 54, and scene 26 goes from 1190 to 1087.
      *
      * The anchor holds in 3D wherever psprecomp's corners are certain:
      * every 3D triangle of scenes 20, 39 and 40 that fits one or two anchors
@@ -1245,7 +1254,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
         }
         /* Depth is a plane too, through the same anchor, in the same
          * 1/16384 units, with the same gradient: the numerator times
-         * area_rcp's short 1/area, floored to 1/1024 a pixel. The vertex
+         * area_rcp's 1/area, floored to 1/1024 a pixel. The vertex
          * depths are integers -- through mode's as given, a transformed
          * vertex's floored from ge_screen_z. geprobe 5 (fw 6.60) scene 27's
          * through-mode triangles (full range, nearly flat, constant, steep
@@ -1557,13 +1566,14 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
         !line_clip_axis(xmajor ? pm : M0, xmajor ? dmk : sm, xmajor ? smd : 1, y0, y1, &first, &last))
         return;
     /* Colour and depth at the projected centre, on the triangle's gradient
-     * rule: the difference times area_rcp's short reciprocal of the major
-     * length, floored to 1/16384 a sixteenth, times the distance from the
-     * start, the value floored. Step 1's white-to-blue line reads FDFDFF at
-     * its first pixel: 255 - 2902/1024 * 1/2 = 253.6. geprobe 7 (fw 6.60)
-     * scene 49's 128 steep red-to-green lines match on all 5862 of their
-     * pixels this way; the gradient floored from the exact quotient, as
-     * before, left four a step off (as on 7 pixels of geprobe 6 scene 37).
+     * rule: the difference times area_rcp's reciprocal of the major length,
+     * floored to 1/16384 a sixteenth, times the distance from the start,
+     * the value floored. Step 1's white-to-blue line reads FDFDFF at its
+     * first pixel: 255 - 2902/1024 * 1/2 = 253.6. geprobe 7 (fw 6.60) scene
+     * 49's 128 steep red-to-green lines match on all 5862 of their pixels
+     * this way; the gradient floored from the exact quotient, as before,
+     * left four a step off. geprobe 8 scene 51's 1024 lines, one per 10-bit
+     * length each way, and geprobe 6 scene 37's match on every pixel too.
      * Depth goes from the integer vertex depths: scene 27's three
      * through-mode lines match at every step, and its 3D line on every one
      * of its pixels; taken at the step's start, as it was, each read half a

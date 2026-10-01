@@ -897,7 +897,7 @@ static uint16_t depth_at(int x, int y) {
     return psp_read16(0x04000000u + (((l & ~(0x1Fu << 5)) | (rot << 5)) ^ 0x2040u));
 }
 
-/* Depth across a triangle is a plane with a short 1/area (render.c
+/* Depth across a triangle is a plane with the GE's 1/area (render.c
  * area_rcp). geprobe 5 (fw 6.60) scene 27's four through-mode triangles,
  * drawn the same way, and pixels of each that the float blend this replaced
  * had one off, with what the hardware wrote there. */
@@ -974,6 +974,33 @@ static void test_transformed_depth(void) {
         CHECK(depth_at(240, 140) == Z[k].depth, "eye z %.1f: depth %u, hardware %d",
               (double)Z[k].z, depth_at(240, 140), Z[k].depth);
     }
+}
+
+/* Gradients take 1/area from the GE's reciprocal table (render.c area_rcp),
+ * which is a unit off the reciprocal cut to 16 bits where its linear step
+ * misses. geprobe 8 (fw 6.60) scene 50's triangles 517/16 and 885/16 pixels
+ * wide and 2 high, depth 16384 to 49152, with pixels the PSP wrote where the
+ * cut reciprocal reads a step high and a step low. */
+static void test_gradient_reciprocal(void) {
+    static const struct { float x0, y0; int w16, px[2], z[2]; } T[] = {
+        { 342, 1, 517, { 353, 365 }, { 28045, 40214 } },
+        { 138, 160, 885, { 147, 164 }, { 22012, 32083 } } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    depth_state(1);                                            /* ALWAYS, writes on */
+    for (int i = 0; i < 2; i++) {
+        float_vertex(3 * i, T[i].x0, T[i].y0, 16384);
+        float_vertex(3 * i + 1, T[i].x0 + (float)T[i].w16 / 16.0f, T[i].y0, 49152);
+        float_vertex(3 * i + 2, T[i].x0, T[i].y0 + 2, 16384);
+    }
+    cmd(0x04, (3u << 16) | 6);
+    end_list();
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 2; k++) {
+            const int x = T[i].px[k], y = (int)T[i].y0;
+            CHECK(depth_at(x, y) == T[i].z[k], "width %d/16, depth at (%d,%d): %u, hardware %d",
+                  T[i].w16, x, y, depth_at(x, y), T[i].z[k]);
+        }
 }
 
 /* The backend interface itself. The software path is the reference every other
@@ -1694,6 +1721,7 @@ int main(void) {
     test_depth_in_vram();
     test_depth_plane();
     test_transformed_depth();
+    test_gradient_reciprocal();
     test_line_between_centres();
     test_far_vertex_16bit();
     test_backend_selection();
