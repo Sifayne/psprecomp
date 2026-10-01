@@ -581,7 +581,8 @@ geprobe 7, fw 6.60):
   value of geprobe 6 scene 34 fits, coloured rows included, and 790 of
   scene 35's 800 points fit. The 10 others are one step low, all in the two
   grids that go through the GE's power function (the specular with
-  coefficient 8 and the spot with exponent 4).
+  coefficient 8 and the spot with exponent 4), each where the power lands
+  just below a byte boundary.
 - In single-colour mode the specular is added in, and the total is clamped
   to 255 per vertex.
 - In separate-specular mode the specular is the vertex's secondary colour,

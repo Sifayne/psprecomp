@@ -1958,8 +1958,10 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
  *  - Each light adds lit_mul(spot, lit_mul(attenuation, term)), the term
  *    being its ambient plus its diffuse, and its specular separately; the
  *    factors are bytes too (lit_byte). Geprobe 6 scene 35's attenuated and
- *    spot-lit points fit this on 789 of 800; the 11 others are a step off
- *    where the spot or specular power lands next to a byte boundary.
+ *    spot-lit points fit this on 790 of 800 (run 7). The 10 others are a
+ *    step low, each where ge_pow's spot or specular power lands just below
+ *    a byte boundary (within 0.04 of one): the GE's power comes out a hair
+ *    higher there.
  *  - Single-colour mode (LIGHTMODE 0) adds the specular in and clamps the
  *    total to 255 per vertex: scene 16's bottom right fan, whose rims sum
  *    past 255 in blue, is 630 pixels off with the excess carried to the
