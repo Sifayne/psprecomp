@@ -1252,8 +1252,8 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
          * in y) match on every pixel; the barycentric float blend this
          * replaces left the constant 12345 at 12344 on 60 of them and was a
          * step off on 3000 more. geprobe 6 scene 36 draws four 3D shapes
-         * from each corner in both windings: 16 of its 24 triangles match
-         * on every pixel and seven more are within 1 to 56 pixels, one step
+         * from each corner in both windings: 15 of its 24 triangles match
+         * on every pixel and eight more are within 1 to 56 pixels, one step
          * each. The leftmost anchor is not settled for depth: the one shape
          * whose top and leftmost corners differ matches on 5 of 6 when
          * anchored at the top, against none, but another shape's triangles

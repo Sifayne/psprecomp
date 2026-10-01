@@ -491,7 +491,7 @@ a float blend (`src/render.c` sw_tri, `src/hle/ge.c` ge_screen_z):
   vertex, with gradients from the numerator times 1/area, where 1/area is
   also a 24-bit float, then floored to 1/1024 a pixel. Colour uses the same
   1/area (geprobe 6 scene 39). Scene 27's four through-mode triangles match
-  on every pixel, and so do 16 of scene 36's 24 3D triangles.
+  on every pixel, and so do 15 of scene 36's 24 3D triangles.
 - **Along a line** (psp_render_walk_line) one pixel is drawn per
   major-axis column whose centre lies on the segment, and its row, colour
   and depth are those of the centre's projection onto the line, on gradients
@@ -555,9 +555,11 @@ are in `fw660-run6/findings/geprobe.md`.
   takes floor(256 N.L) (scene 34 rows 0-3). Coloured light or material
   values (rows 4-6) are off by one in a pattern that no gain or rounding we
   tried reproduces.
-- **Point lights** (scene 35, 130 pixels). The spot exponent goes through
-  the GE's own power function (fixed). What remains is ±1 on point-lit
-  vertices, and it follows the squared distance.
+- **Point and spot lights** (scene 35, 130 of its 800 points). The spot
+  exponent goes through the GE's own power function (fixed). What remains
+  is ±1 on all four grids. On the plain point light, points at the same
+  squared distance read the same, so the error is in the distance and
+  attenuation arithmetic, not noise.
 - **Colour gradient precision** (scene 39: 217 pixels; scene 20: 101; scene
   26: 2343). Colour now takes depth's short 1/area, which scene 39 prefers.
   Three of its triangles fit neither that nor the exact 1/area. Two of
