@@ -1475,15 +1475,7 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
      * the depth of its centre's projection, where stepping 122 whole steps
      * from 258.81 put six a row off and every depth up to 18 off.
      *
-     * Open: scene 28's 3D line ends at 5818/16, 363.625, and the PSP leaves
-     * out pixel 363 though its centre is short of the end. Counting whole
-     * pixels of length instead fixes it but leaves out last pixels the PSP
-     * draws on scenes 22 and 23's line-strip patches: pixels it covers and
-     * psprecomp does not go from 13 to 30 and from 31 to 71. Dropping a last
-     * pixel whose diamond holds the end fixes it with less harm (17 and 42).
-     * The patches' vertices are psprecomp's own and may sit a sixteenth off
-     * the PSP's, so neither count is conclusive; geprobe 6 draws lines
-     * ending on every sixteenth.
+     * The two ends are then adjusted by the pixels' diamonds, below.
      *
      * Major index k = 0..n-1: pixel M0 + sm*k along the major axis, its
      * centre c0 + 16*sm*k; the minor pixel is
@@ -1499,10 +1491,35 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
     const int64_t M0 = sm > 0 ? floor_div(Ma - 8 + 15, 16) : floor_div(Ma - 8, 16);
     const int64_t Mend = sm > 0 ? floor_div(Mb - 8 + 15, 16) : floor_div(Mb - 8, 16);
     const int64_t n = sm > 0 ? Mend - M0 : M0 - Mend;
-    if (n <= 0) return;
     const int64_t c0 = 16 * M0 + 8;                         /* centre of k = 0 */
     const int64_t pm = ma * adM + dm * sm * (c0 - Ma), dmk = 16 * dm, smd = 16 * adM;
+    /* The ends go by the pixel's diamond, |x - cx| + |y - cy| < 1/2: the
+     * last pixel is left out when the end lies in its diamond, and the pixel
+     * before the first is drawn when the start lies in its diamond. On the
+     * diamond's edge a point above the centre counts as inside, one below it
+     * as outside. geprobe 6 scene 37 (fw 6.60) ends shallow lines on every
+     * sixteenth of a row: going right to x + 5/8, the PSP leaves out the
+     * last pixel for end rows 2/16 to 13/16 past a whole pixel (its diamond
+     * holds the end, the edge included at 2/16 and not at 14/16); going left
+     * from x + 7/16 it draws one more pixel at the start for 1/16 to 14/16.
+     * Its other lines, whose ends lie on no diamond, match the centre rule
+     * above; so does scene 28's 3D line, which ends in its last pixel's
+     * diamond. */
     int64_t first = 0, last = n - 1;
+    {
+        const int64_t mb = ma + dm;
+        int64_t k = n - 1;
+        for (int end = 0; end < 2; end++, k = -1) {
+            const int64_t Mp = M0 + sm * k, mp = floor_div(pm + dmk * k, smd);
+            const int64_t pM = end ? Ma : Mb, pmin = end ? ma : mb;
+            const int64_t dMaj = pM - (16 * Mp + 8), dMin = pmin - (16 * mp + 8);
+            const int64_t ddy = xmajor ? dMin : dMaj;
+            const int64_t sum = (dMaj < 0 ? -dMaj : dMaj) + (dMin < 0 ? -dMin : dMin);
+            const int inside = sum < 8 || (sum == 8 && ddy < 0);
+            if (inside) { if (end) first = -1; else last = n - 2; }
+        }
+    }
+    if (last < first) return;
     if (!line_clip_axis(xmajor ? M0 : pm, xmajor ? sm : dmk, xmajor ? 1 : smd, x0, x1, &first, &last) ||
         !line_clip_axis(xmajor ? pm : M0, xmajor ? dmk : sm, xmajor ? smd : 1, y0, y1, &first, &last))
         return;
@@ -1536,7 +1553,7 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
     const float lu = (float)ldexp(trunc(ldexp((double)(b->u - a->u) / (double)adM, 24)), -24);
     const float lv = (float)ldexp(trunc(ldexp((double)(b->v - a->v) / (double)adM, 24)), -24);
     for (int64_t k = first; k <= last; k++) {
-        const int64_t dist16 = sm * (c0 - Ma) + 16 * k;            /* > 0 */
+        const int64_t dist16 = sm * (c0 - Ma) + 16 * k;    /* < 0 at k = -1 only */
         const float t = (float)((double)dist16 / (double)adM), s = 1.0f - t;
         const int64_t Mp = M0 + sm * k, mp = floor_div(pm + dmk * k, smd);
         psp_vertex v = *a;
