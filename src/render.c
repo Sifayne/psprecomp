@@ -1244,18 +1244,24 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             col_dy[i] = gy * SUBPX;
         }
         /* Depth is a plane too, through the same anchor, in the same
-         * 1/16384 units; what differs is the gradient: the numerator times
+         * 1/16384 units, with the same gradient: the numerator times
          * area_rcp's short 1/area, floored to 1/1024 a pixel. The vertex
          * depths are integers -- through mode's as given, a transformed
          * vertex's floored from ge_screen_z. geprobe 5 (fw 6.60) scene 27's
          * through-mode triangles (full range, nearly flat, constant, steep
          * in y) match on every pixel; the barycentric float blend this
          * replaces left the constant 12345 at 12344 on 60 of them and was a
-         * step off on 3000 more. Of the 3D triangles of scenes 27 and 17,
-         * three match on every interior pixel; the other three (scene 27's
-         * quad sloping in x, both halves, and the second of scene 17's
-         * interpenetrating pair) match only when anchored at another vertex,
-         * by a rule not yet known (docs/RENDERER.md). */
+         * step off on 3000 more. geprobe 6 scene 36 draws four 3D shapes
+         * from each corner in both windings: 16 of its 24 triangles match
+         * on every pixel and seven more are within 1 to 56 pixels, one step
+         * each. The leftmost anchor is not settled for depth: the one shape
+         * whose top and leftmost corners differ matches on 5 of 6 when
+         * anchored at the top, against none, but another shape's triangles
+         * split between the two and the top takes scene 17 from 303 pixels
+         * off to 601 (scene 27: 1867 to 1172). Of scenes 27 and 17's 3D
+         * triangles, three match on every interior pixel and three (scene
+         * 27's quad sloping in x, both halves, and the second of scene 17's
+         * interpenetrating pair) still do not (docs/RENDERER.md). */
         {
             int64_t zv[3];
             for (int k = 0; k < 3; k++) {

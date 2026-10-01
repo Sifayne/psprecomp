@@ -88,8 +88,8 @@ static int fx16_floor(float f) {
  * 15 and up leave scene 15's). The cost is one skinned corner of scene 20
  * (-1500.014 sixteenths at w = 5), 49 pixels, which an exact 1/w keeps --
  * how the hardware skins may account for that. A power of two is exact
- * either way. Depth keeps the exact divide: scene 17's depth dump fits
- * worse with this one. */
+ * either way. Depth has a reciprocal of its own (ge_screen_z): scene 17's
+ * depth dump fits worse with this one. */
 static float ge_recip(float w) {
     int e;
     const float m = frexpf(1.0f / w, &e);                  /* [0.5, 1) */
@@ -1512,22 +1512,30 @@ static void ndc_to_screen(float nx, float ny, float nz, float *sx, float *sy, fl
                                : (nz * 0.5f + 0.5f) * 65535.0f;
 }
 
-/* Screen depth from clip z and w, in ge24 throughout: the divide, the scale,
- * the centre. geprobe 5 (fw 6.60) scenes 17 and 27 pin six vertex depths
- * through their depth planes (eye z -4, -4.5, -5, -5.5, -6 and -8 under one
- * perspective): 15887, 14049, 12577, 11374, 10371 and 7612, where a float
- * computation gives 15887.0, 14048.22, 12577.20, 11373.64, 10370.67 and
- * 7612.5. Cutting every product, sum and quotient to 16 significant bits
- * toward zero -- clip z and w included (ge_depth_row) -- and the result to an
- * integer by the rasterizer (sw_tri) gives all six (w is the float one cut
- * to ge24, which for a perspective is what the row gives; flooring instead
- * of cutting toward zero fits these positive values too); rounding, a fused
- * multiply-add, a reciprocal in place of the divide, or any other width tried
- * (10 to 24 bits) misses at least one. x and y keep their own measured rule
+/* Screen depth from clip z and w: clip z in ge24 (ge_depth_row), times 1/w
+ * rounded to 17 significant bits, then the scale and the centre, each step
+ * cut to ge24, and the result to an integer by the rasterizer (sw_tri).
+ * Eleven vertex depths under the probes' one perspective pin it: geprobe 5
+ * (fw 6.60) scenes 17 and 27 give eye z -4, -4.5, -5, -5.5, -6 and -8 as
+ * 15887, 14049, 12577, 11374, 10371 and 7612, and geprobe 6 scene 36 gives
+ * -4.9, -5.2, -5.4, -5.6 and -5.7 as 12848, 12068, 11597, 11159 and 10952,
+ * each read off a depth plane that matches on every pixel (a float
+ * computation gives 15887.0, 14048.22, 12577.20, 11373.64, 10370.67,
+ * 7612.5, 12847.39, 12068.00, 11596.52, 11158.71 and 10951.33). The
+ * ge24 divide this replaces fit the first six and gave 12847, 11596 and
+ * 10951 for three of scene 36's, 5354 of its depth pixels off where this
+ * leaves 696. Of 6400 variants searched (16 to 18 bits, truncated or
+ * floored, each step cut or not, w cut or not, a divide or a 14- to 24-bit
+ * reciprocal truncated or rounded, four integer rules) the 40 that give
+ * all eleven all take this 17-bit rounded reciprocal of the float w; they
+ * differ only in steps these values do not reach. Eleven values, so a
+ * fit, not a mechanism seen. x and y keep their own measured rule
  * (screen_axis_fx16). */
 static float ge_screen_z(float cz, float w) {
     if (g_tl.vp_zs == 0.0f) return ((cz / w) * 0.5f + 0.5f) * 65535.0f;
-    const double ndc = ge24((double)cz / ge24(w));
+    int e;
+    const double m = frexp(1.0 / (double)w, &e);
+    const double ndc = ge24((double)cz * ldexp(floor(m * 131072.0 + 0.5), e - 17));
     return (float)ge24(ge24(ndc * g_tl.vp_zs) + g_tl.vp_zc);
 }
 
