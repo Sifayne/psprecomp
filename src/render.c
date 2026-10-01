@@ -1153,12 +1153,31 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      *     c(px, py) = cA + gx * (px - xA) + gy * (py - yA)
      *
      * at the pixel centre, where A is the leftmost vertex (ties: the upper
-     * one); gx and gy are the exact screen gradients floored to 1/1024
-     * (grad1024); the result is floored and clamped. It reproduces every
-     * triangle of geprobe 1 steps 1-11, 18 and 19, alpha included. The
-     * rounded barycentric blend this replaces was one step off on most
-     * Gouraud pixels; anchoring at the first or the topmost vertex fails
-     * steps 1-10.
+     * one); gx and gy are the numerators times area_rcp's short 1/area,
+     * floored to 1/1024 a pixel, as for depth below; the result is floored
+     * and clamped. It reproduces every triangle of geprobe 1 steps 1-11, 18
+     * and 19, alpha included. The rounded barycentric blend this replaces
+     * was one step off on most Gouraud pixels; anchoring at the first or the
+     * topmost vertex fails steps 1-10.
+     *
+     * The short reciprocal is geprobe 6 (fw 6.60) scene 39's, the scene
+     * built to measure gradient precision: of its 78 triangles 75 match on
+     * every pixel with it and 69 with the exact gradient floored (grad1024),
+     * which the others never beat; scene 17's 3D quads go from 81 pixels off
+     * to none. It costs two skinned triangles of scene 20 (54 -> 101) and
+     * morph and skin triangles of scene 26 (2263 -> 2343), whose corners
+     * psprecomp is less sure of (ge_recip in src/hle/ge.c). Scene 39's other
+     * three fit neither: a through-mode triangle wants a gradient one step
+     * smaller than both give, and a 3D quad's two halves fit no gradient
+     * within eight steps, so the reciprocal is not the whole story
+     * (docs/RENDERER.md).
+     *
+     * The anchor holds in 3D wherever psprecomp's corners are certain:
+     * every 3D triangle of scenes 20, 39 and 40 that fits one or two anchors
+     * fits the leftmost. The 42 of 205 such triangles that fit another are
+     * all lit, morphed, skinned or tessellated (scenes 16, 21, 22, 23, 26),
+     * where a corner's colour or place one step or sixteenth off moves the
+     * best anchor too.
      *
      * Which vertices compete depends on the mode. Transformed triangles take
      * the leftmost of all three: geprobe 2 scene 15's fogged floor has a
@@ -1202,6 +1221,8 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             if (k0 < 0 || vs[k]->x < vs[k0]->x || (vs[k]->x == vs[k0]->x && vs[k]->y < vs[k0]->y))
                 k0 = k;
         }
+        int64_t rq; int rsh;
+        area_rcp(area, &rq, &rsh);
         for (int i = flat ? 4 : 0; i < 5; i++) {
             /* A lit channel past 255 is interpolated as it is and clamped per
              * pixel by plane_chan (psp_vertex.hi). */
@@ -1216,7 +1237,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             }
             const int64_t nx = (c1 - c0) * (c->y - a->y) - (c2 - c0) * (b->y - a->y);
             const int64_t ny = (c2 - c0) * (b->x - a->x) - (c1 - c0) * (c->x - a->x);
-            const int64_t gx = grad1024(nx * 16384, area), gy = grad1024(ny * 16384, area);
+            const int64_t gx = floor_shr(nx * rq, rsh - 14), gy = floor_shr(ny * rq, rsh - 14);
             col_acc[i] = ck * 16384
                        + gx * (px - vs[k0]->x) + gy * (py - vs[k0]->y);
             col_dx[i] = gx * SUBPX;
@@ -1236,8 +1257,6 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
          * interpenetrating pair) match only when anchored at another vertex,
          * by a rule not yet known (docs/RENDERER.md). */
         {
-            int64_t rq; int rsh;
-            area_rcp(area, &rq, &rsh);
             int64_t zv[3];
             for (int k = 0; k < 3; k++) {
                 const float z = vs[k]->z;
