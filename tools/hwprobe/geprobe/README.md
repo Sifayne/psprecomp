@@ -49,6 +49,9 @@ blending, depth, clipping, the per-pixel tests).
 | 47 | (v7) scene 46's triangles in 3D at the same screen positions | 8888 |
 | 48 | (v7) 3D depth planes: eight more shapes, each from each corner and in both windings; plus the depth buffer | 8888 |
 | 49 | (v7) steep through-mode lines, red to green, one per sixteenth across | 8888 |
+| 50 | (v8) the triangle setup's reciprocal at every 10-bit width: 512 through-mode right triangles 2 pixels high and 512 to 1023 sixteenths wide, depth 16384 to 49152 (a power-of-two numerator), plus 118 with depth 0 to 65535; plus the depth buffer | 8888 |
+| 51 | (v8) the same for lines: 512 horizontal through-mode lines 512 to 1023 sixteenths long, each drawn left to right and right to left; plus the depth buffer | 8888 |
+| 52 | (v8) spline weights along u as points: every u edge mode, 4 to 6 control columns, divisions 2, 3, 4, 6 and 8, three columns lit (red, green, blue) | 8888 |
 
 After the scenes it records which GE callbacks run, with which arguments and
 when, through libgu (signal and finish) and through a raw `sceGe` list.
@@ -82,6 +85,11 @@ Version 7 adds scenes 43-49 after the callback steps, so every earlier step
 keeps its version 6 number. Each one aims at something geprobe 6 left open
 (`fw660-run6/findings/geprobe.md`).
 
+Version 8 adds scenes 50-52 after those, so steps 1-89 keep their version 7
+numbers. They aim at the two rules geprobe 7 could not settle
+(`fw660-run7/findings/geprobe.md`): the gradient reciprocal, read once per
+10-bit length for triangles and for lines, and the spline weights.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -97,7 +105,7 @@ needs no input; the screen flickers through the scenes, then shows the log
 and returns to the XMB by itself.
 
 It writes, beside the EBOOT, `geprobe.txt` and one `ge_NN_<name>.raw` per
-scene (about 14 MB in all): 480 x 272 pixels, rows packed, in the scene's
+scene (about 25 MB in all): 480 x 272 pixels, rows packed, in the scene's
 framebuffer format, exactly as the GE wrote VRAM. `raw2png.py` turns them into
 PNGs for looking at; comparisons should use the raw files.
 

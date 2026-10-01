@@ -14,8 +14,10 @@
  * functions, filtering, fog, lighting, blending, clipping), so both get a
  * hardware reference from this project's own PSP. Scenes 25 on (version 5)
  * each isolate one rule the earlier scenes left open, scenes 34 on
- * (version 6) what geprobe 5 left open in turn, and scenes 43 on (version
- * 7, after the callback steps) what geprobe 6 left open.
+ * (version 6) what geprobe 5 left open in turn, scenes 43 on (version 7,
+ * after the callback steps) what geprobe 6 left open, and scenes 50 on
+ * (version 8) the two rules geprobe 7 could not settle: the gradient
+ * reciprocal and the spline weights.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -36,7 +38,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 7
+#define PROBE_VERSION 8
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -2049,6 +2051,117 @@ static void scene_steeplines(void) {
     scene_end("steeplines", GU_PSM_8888, 0);
 }
 
+/* ---- version 8 ------------------------------------------------------------
+ *
+ * Scene 46's depth gradients want the triangle setup's 1/area cut to 16 bits
+ * on 35 of 44 areas and something above it, sometimes above the exact value,
+ * on the rest, with no order in which areas do which. Scene 37's line of
+ * length 797/16 wants the same. Scenes 50 and 51 read that reciprocal once
+ * per 10-bit length: the numerator is a power of two, so the depth gradient
+ * is the reciprocal itself, and a depth range of 32768 over 32 to 64 pixels
+ * pins it to a fraction of its last bit. */
+
+#define RS_SLOTS 630                      /* 7 columns x 90 rows */
+static CV g_rs[RS_SLOTS * 3];
+
+/* Scene 50: through-mode right triangles 2 pixels high (32 sixteenths, a
+ * power of two), so the area's significant bits are the width's. Slot i
+ * (7 to a row, 68 pixels apart; rows 3 pixels apart) has its right angle at
+ * a whole pixel. Slots 0-511 are 512 + i sixteenths wide, depth 16384 to
+ * 49152 (a difference of 2^15) left to right; slots 512-629 are 514 + 4 (i -
+ * 512) wide, depth 0 to 65535, so the numerator has 16 significant bits.
+ * Colour black to 0x2080FF (red 255, green 128, blue 32). Depth test ALWAYS,
+ * writes on; the depth buffer is saved. */
+static void scene_rcpsweep(void) {
+    if (step("scene %02d: one triangle reciprocal per 10-bit width, through mode", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    const w32 c0 = 0xFF000000u, c1 = 0xFF2080FFu;
+    int n = 0;
+    for (int i = 0; i < RS_SLOTS; i++) {
+        const float x0 = (float)(2 + 68 * (i % 7)), y0 = (float)(1 + 3 * (i / 7));
+        const int w16 = i < 512 ? 512 + i : 514 + 4 * (i - 512);
+        const float za = i < 512 ? 16384.0f : 0.0f, zb = i < 512 ? 49152.0f : 65535.0f;
+        g_rs[n++] = (CV){ c0, x0, y0, za };
+        g_rs[n++] = (CV){ c1, x0 + w16 / 16.0f, y0, zb };
+        g_rs[n++] = (CV){ c0, x0, y0 + 2.0f, za };
+    }
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV2D, n, NULL, gumem(g_rs, n * sizeof(CV)));
+    scene_end("rcpsweep", GU_PSM_8888, 1);
+}
+
+static CV g_ls[512 * 4];
+
+/* Scene 51: the same for lines. Horizontal through-mode lines 512 + i
+ * sixteenths long, i = 0-511, 7 to a row (68 pixels apart, rows 3 apart):
+ * on the row's first line left to right from a whole pixel, depth 16384 to
+ * 49152, black to 0x2080FF; on its second the same line right to left, so
+ * the differences are negative. Depth test ALWAYS, writes on; the depth
+ * buffer is saved. */
+static void scene_linesweep(void) {
+    if (step("scene %02d: one line reciprocal per 10-bit length, through mode", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    const w32 c0 = 0xFF000000u, c1 = 0xFF2080FFu;
+    int n = 0;
+    for (int i = 0; i < 512; i++) {
+        const float x0 = (float)(2 + 68 * (i % 7)), y = 1.5f + 3 * (i / 7), x1 = x0 + (512 + i) / 16.0f;
+        g_ls[n++] = (CV){ c0, x0, y, 16384.0f };
+        g_ls[n++] = (CV){ c1, x1, y, 49152.0f };
+        g_ls[n++] = (CV){ c1, x1, y + 1.0f, 49152.0f };
+        g_ls[n++] = (CV){ c0, x0, y + 1.0f, 16384.0f };
+    }
+    sceGuDrawArray(GU_LINES, FMT_CV2D, n, NULL, gumem(g_ls, n * sizeof(CV)));
+    scene_end("linesweep", GU_PSM_8888, 1);
+}
+
+/* Scene 44's fill/fill splines read their weights a step off the uniform
+ * B-spline's at most samples, and 10 samples do not settle how; scene 23's
+ * splines mix open and filled ends. Scene 52: splines drawn as points, u the
+ * kind under test and v open/open over 4 rows at one division (v = 0 and 1,
+ * weights exactly 1 and 0), so each point's colour is three u weights: control
+ * column k red, k + 1 green, k + 2 blue, k = 0 and 3. Every u edge mode, 4,
+ * 5 and 6 control columns, divisions 2, 3, 4, 6 and 8: 120 patches, 4 to a
+ * row 119 pixels apart, rows 6 apart, control columns 2.5 x division pixels
+ * apart so the points fall at least 2.5 pixels apart, at z = -6. The clear
+ * is red 255, green 1, blue 255, which no point can be (its red and blue are
+ * two weights of one sample), so the black points show too. */
+static void scene_splineweights(void) {
+    if (step("scene %02d: spline weights along u, three control columns lit", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFFFF01FF);
+    static const int EDGE[4] = { GU_FILL_FILL, GU_OPEN_FILL, GU_FILL_OPEN, GU_OPEN_OPEN };
+    static const int DIV[5] = { 2, 3, 4, 6, 8 };
+    CV g[6 * 4];
+    int cell = 0;
+    sceGuPatchPrim(GU_POINTS);
+    for (int d = 0; d < 5; d++)
+        for (int e = 0; e < 4; e++)
+            for (int cols = 4; cols <= 6; cols++)
+                for (int k = 0; k < cols; k += 3) {
+                    const float X = 4.5f + 119 * (cell % 4), Y = 2.5f + 6 * (cell / 4), s = 2.5f * DIV[d];
+                    for (int j = 0; j < 4; j++)
+                        for (int i = 0; i < cols; i++) {
+                            w32 c = 0xFF000000u;
+                            if (i == k) c |= 0xFFu;
+                            if (i == k + 1) c |= 0xFF00u;
+                            if (i == k + 2) c |= 0xFF0000u;
+                            float x, y;
+                            eye_xy(X + i * s, Y + j, -6.0f, &x, &y);
+                            g[j * cols + i] = (CV){ c, x, y, -6.0f };
+                        }
+                    sceGuPatchDivide(DIV[d], 1);
+                    sceGuDrawSpline(FMT_CV3D, cols, 4, EDGE[e], GU_OPEN_OPEN, NULL,
+                                    gumem(g, cols * 4 * (int)sizeof(CV)));
+                    cell++;
+                }
+    sceGuPatchPrim(GU_TRIANGLE_STRIP);
+    scene_end("splineweights", GU_PSM_8888, 0);
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -2654,6 +2767,11 @@ int main(int argc, char **argv) {
     g_scene = 47; scene_gradsweep3d();
     g_scene = 48; scene_depthanchor2();
     g_scene = 49; scene_steeplines();
+
+    section("scenes, version 8");
+    g_scene = 50; scene_rcpsweep();
+    g_scene = 51; scene_linesweep();
+    g_scene = 52; scene_splineweights();
 
     probe_screen(1);
     probe_done();
