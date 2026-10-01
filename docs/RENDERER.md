@@ -474,34 +474,46 @@ thousand times too fast that cost no time in a Sync):
 
 ## Depth values
 
-The software backend writes the depth geprobe 5 (fw 6.60) measured, not a
-float blend (`src/render.c` sw_tri, `src/hle/ge.c` ge_screen_z):
+The software backend writes the depth geprobe 5 and 6 (fw 6.60) measured, not
+a float blend (`src/render.c` sw_tri, `src/hle/ge.c` ge_screen_z):
 
-- **A transformed vertex's depth** is computed in the GE's own 24-bit float
-  (16 significant bits, cut toward zero) from clip z to the viewport: clip z
-  a product and a sum at a time, the divide by w, the scale, the centre. The
-  rasterizer takes the integer part. Scenes 17 and 27 pin six vertex depths
-  this way; the float computation had four of them off by up to 0.8. x and y
-  keep their own rule (screen_axis_fx16), which was measured separately.
+- **A transformed vertex's depth** is computed from clip z to the viewport in
+  the GE's own 24-bit float (16 significant bits, cut toward zero): clip z a
+  product and a sum at a time, times 1/w, then the scale and the centre. 1/w
+  is the float w's reciprocal rounded to 17 significant bits. The rasterizer
+  takes the integer part. Eleven vertex depths pin this: six from geprobe 5
+  scenes 17 and 27, five from geprobe 6 scene 36. The float computation had
+  four of them off by up to 0.8, and the ge24 divide used before had three of
+  scene 36's one low. It is a fit to eleven values: every variant searched
+  that gives all eleven takes this reciprocal. x and y keep their own rule
+  (screen_axis_fx16), which was measured separately.
 - **Across a triangle** depth is a plane, like colour: anchored at the same
   vertex, with gradients from the numerator times 1/area, where 1/area is
-  also a 24-bit float, then floored to 1/1024 a pixel. Scene 27's four
-  through-mode triangles match on every pixel.
+  also a 24-bit float, then floored to 1/1024 a pixel. Colour uses the same
+  1/area (geprobe 6 scene 39). Scene 27's four through-mode triangles match
+  on every pixel, and so do 16 of scene 36's 24 3D triangles.
 - **Along a line** (psp_render_walk_line) one pixel is drawn per
   major-axis column whose centre lies on the segment, and its row, colour
   and depth are those of the centre's projection onto the line, on gradients
   floored to 1/1024 a pixel. For whole-pixel endpoints that is the step
   centre geprobe step 1 measured; scene 27's 3D line, whose ends fall
   between centres, matches on every pixel only this way.
-- **Open:** three of scene 27's and 17's six 3D triangles match only with
-  the plane anchored at another vertex (the right-hand one of the quad that
-  slopes in x, the nearest of scene 17's second triangle); the rule that
-  picks it is not known. A GPU backend shares the vertex depths and
-  interpolates them itself.
-- **Open:** scene 28's 3D line ends at x 363.625 and the PSP leaves out
-  pixel 363, whose centre is short of that end. The line-strip patches of
-  scenes 22 and 23 draw such last pixels more often than not, so the rule is
-  still the centre's; geprobe 6 draws lines ending on every sixteenth.
+- **Line ends** follow each end pixel's diamond (geprobe 6 scene 37): a
+  pixel's diamond is the points within half a pixel of its centre, counting
+  x and y distance together. Its upper edges and top corner are inside, and
+  its lower edges and side corners are outside. The last pixel is dropped
+  when the line ends
+  inside its diamond. The pixel before the first is drawn when the line
+  starts inside that pixel's diamond. This fixes 26 of scene 37's 33 pixels
+  off; the 7 left are colour. Scene 28's 3D line now matches too.
+- **Open:** the 3D depth anchor. Scene 36 draws four shapes from each corner
+  in both windings. In the shape whose top corner is never its leftmost, 5 of
+  6 triangles match when anchored at the top and none at the leftmost.
+  Another shape's triangles split between the two anchors, and the top
+  anchor takes scene 17 from 303 pixels off to 601. Scene 27's quad that
+  slopes in x and scene 17's second triangle still match only from another
+  corner. A GPU backend shares the vertex depths and interpolates them
+  itself.
 
 ## Texture coordinates on sprites and lines
 
@@ -532,25 +544,35 @@ which texel is read (geprobe step 12 and geprobe 5 scene 28, fw 6.60):
   Modelling the cache is out of scope: the step is `KNOWN_CRASH` from geprobe 6
   on, and step 61 stays a difference.
 
-## Still open after geprobe 5
+## Still open after geprobe 6
 
-What geprobe 5 (fw 6.60) still shows psprecomp getting wrong, with the
-geprobe 6 scene aimed at each. Details and confidence are in
-`fw660-run5/findings/geprobe.md`.
+These are what geprobe 6 (fw 6.60) still shows psprecomp getting wrong, with
+pixels off on run 6. Details, confidence and the geprobe 7 step aimed at each
+are in `fw660-run6/findings/geprobe.md`.
 
-- **Lighting away from the axes** (scene 16, 16930 pixels, 1 or 2 low on the
-  PSP). Scene 25, whose light and normals lie in the x-z plane, is exact.
-  Scene 34 changes one thing per row; scene 35 covers point and spot lights.
-- **Colour gradient precision** (scene 17's colour, 81 pixels; scene 20, 54).
-  A finer 1/area fixes the one and breaks the other. Scene 39.
-- **Morph colour blends** (scene 21, 450 pixels of +1): not a kept fraction,
-  not rounding. Scene 40.
-- **Patch vertices** at divisions that are not powers of 2, and splines
-  (scenes 22, 23 and 26: 3452, 2118 and 2263 pixels). Scene 38 draws them as
-  points.
-- **3D depth anchor** (scene 17's depth buffer, 303; scene 27's, 1867). Scene
-  36.
-- **Line ends** (scene 28, 1 pixel). Scene 37.
+- **Coloured light and material** (scene 16: 16931 pixels; scene 34: 12737).
+  A white directional light is exact, tilted normals included: the PSP
+  takes floor(256 N.L) (scene 34 rows 0-3). Coloured light or material
+  values (rows 4-6) are off by one in a pattern that no gain or rounding we
+  tried reproduces.
+- **Point lights** (scene 35, 130 pixels). The spot exponent goes through
+  the GE's own power function (fixed). What remains is ±1 on point-lit
+  vertices, and it follows the squared distance.
+- **Colour gradient precision** (scene 39: 217 pixels; scene 20: 101; scene
+  26: 2343). Colour now takes depth's short 1/area, which scene 39 prefers.
+  Three of its triangles fit neither that nor the exact 1/area. Two of
+  scene 20's skinned triangles fit only the exact one.
+- **Morph blends** (scene 21, 400 pixels): not a kept fraction and not
+  rounding. Scene 40's colour blends, whose weights sum to one, all match.
+  Scene 21's two off triangles also move their corners, and one of them is
+  weighted 0.25 and 1.0.
+- **Patch vertices** (scenes 22, 23 and 26: 3437, 2105 and 2343 pixels;
+  scene 38: 928). Scene 38 shows linear control colours coming out up to 1.5
+  high past the middle of the patch (0 85 171 255 at division 3). Neither
+  weights cut to a width nor forward differencing reproduces it.
+- **3D depth** (scene 17's depth buffer: 303 pixels; scene 27's: 1867;
+  scene 36's: 696). See the depth anchor above.
+- **Steep line colour** (scene 37, 7 pixels, ±1).
 
 ## Validation
 
