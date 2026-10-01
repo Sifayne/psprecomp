@@ -2816,8 +2816,24 @@ static void draw_prim(uint32_t type, uint32_t count) {
  * control grid is skinned or morphed before it is evaluated. */
 
 /* Where along one direction the grid samples, and with what weights: each
- * sample blends four consecutive control points starting at `first`. */
-typedef struct { int first; float w[4]; float param; } patch_sample;
+ * sample blends four consecutive control points starting at `first`. The
+ * weights are exact (double): the PSP's own rounding is in patch_param and
+ * in the colour (draw_patch), and float weights moved scene 22 by 300
+ * pixels on their own. */
+typedef struct { int first; double w[4]; float param; } patch_sample;
+
+/* Step i of div along a piece, as the GE places it (geprobe 7 scene 44, fw
+ * 6.60): on a 1/256 grid, cut toward the nearer end -- floor(256 i/div)/256
+ * up to the middle and 1 - floor(256 (div - i)/div)/256 past it, so a piece
+ * reads the same from either end. Scene 44 lights one control column and row
+ * of a patch drawn as points, so each point's colour is one weight, 255
+ * times: of its 42 Bezier and open spline samples (168 weights) all fit
+ * this, 28 the exact i/div, and 29 the grid floored throughout. The points
+ * move with it: Bezier 7's fifth column sits a pixel right of i/div's. */
+static double patch_param(int i, int div) {
+    return 2 * i <= div ? floor(256.0 * i / div) / 256.0
+                        : 1.0 - floor(256.0 * (div - i) / div) / 256.0;
+}
 
 /* A Bezier direction: (count - 1) / 3 cubic pieces sharing end points, each
  * cut into `div` steps. Returns the number of samples. */
@@ -2826,14 +2842,14 @@ static int bezier_samples(int count, int div, patch_sample *out, int max) {
     int n = 0;
     for (int pc = 0; pc < pieces; pc++) {
         for (int i = pc ? 1 : 0; i <= div && n < max; i++) {
-            const float t = (float)i / (float)div, s1 = 1.0f - t;
+            const double t = patch_param(i, div), s1 = 1.0 - t;
             patch_sample *o = &out[n++];
             o->first = 3 * pc;
             o->w[0] = s1 * s1 * s1;
-            o->w[1] = 3.0f * t * s1 * s1;
-            o->w[2] = 3.0f * t * t * s1;
+            o->w[1] = 3.0 * t * s1 * s1;
+            o->w[2] = 3.0 * t * t * s1;
             o->w[3] = t * t * t;
-            o->param = (float)pc + t;
+            o->param = (float)pc + (float)t;
         }
     }
     return n;
@@ -2858,16 +2874,24 @@ static int spline_samples(int count, int div, int edge, patch_sample *out, int m
     int n = 0;
     for (int sp = 0; sp < spans; sp++) {
         for (int i = sp ? 1 : 0; i <= div && n < max; i++) {
-            const float t = (float)sp + (float)i / (float)div;
+            /* The same grid as a Bezier's: geprobe 6 scene 38's splines go
+             * from 105 pixels off to 28 with it, and scene 44's from 96 to
+             * 74. Their weights are not settled: scene 44's fill/fill
+             * splines read their two inner weights a step off the uniform
+             * B-spline's at most samples. The one rule found that fits all
+             * 40 of their readings, with t^2 and t^3 cut to 1/256, takes
+             * scene 23 from 1878 pixels off to 2036 and scene 38 from 28 to
+             * 87, so it is not used (docs/RENDERER.md). */
+            const double t = (double)sp + patch_param(i, div);
             const int k = sp + 3;                     /* kn[k] <= t <= kn[k+1] */
-            float N[4] = { 1, 0, 0, 0 }, left[4], right[4];
+            double N[4] = { 1, 0, 0, 0 }, left[4], right[4];
             for (int j = 1; j <= 3; j++) {
                 left[j] = t - kn[k + 1 - j];
                 right[j] = kn[k + j] - t;
-                float saved = 0.0f;
+                double saved = 0.0;
                 for (int r = 0; r < j; r++) {
-                    const float den = right[r + 1] + left[j - r];
-                    const float tmp = den != 0.0f ? N[r] / den : 0.0f;
+                    const double den = right[r + 1] + left[j - r];
+                    const double tmp = den != 0.0 ? N[r] / den : 0.0;
                     N[r] = saved + right[r + 1] * tmp;
                     saved = left[j - r] * tmp;
                 }
@@ -2875,8 +2899,8 @@ static int spline_samples(int count, int div, int edge, patch_sample *out, int m
             }
             patch_sample *o = &out[n++];
             o->first = k - 3;
-            memcpy(o->w, N, sizeof o->w);
-            o->param = t;
+            for (int q = 0; q < 4; q++) o->w[q] = N[q];
+            o->param = (float)t;
         }
     }
     return n;
@@ -2913,33 +2937,33 @@ static void draw_patch(int spline, uint32_t arg) {
 
     for (int j = 0; j < nv; j++)
         for (int i = 0; i < nu; i++) {
-            float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, col[4] = { 0, 0, 0, 0 }, u = 0, v = 0;
+            float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, u = 0, v = 0;
+            double col[4] = { 0, 0, 0, 0 };
             for (int b = 0; b < 4; b++)
                 for (int a = 0; a < 4; a++) {
-                    const float w = sv[j].w[b] * su[i].w[a];
-                    if (w == 0.0f) continue;
+                    const double wd = sv[j].w[b] * su[i].w[a];
+                    const float w = (float)wd;
+                    if (wd == 0.0) continue;
                     const ge_mvert *c = &cp[(sv[j].first + b) * ucount + su[i].first + a];
                     for (int k = 0; k < 3; k++) { pos[k] += w * c->pos[k]; nrm[k] += w * c->nrm[k]; }
-                    for (int k = 0; k < 4; k++) col[k] += w * (float)((c->rgba >> (8 * k)) & 0xFFu);
+                    for (int k = 0; k < 4; k++) col[k] += wd * (double)((c->rgba >> (8 * k)) & 0xFFu);
                     u += w * c->u; v += w * c->v;
                 }
             ge_mvert *o = &grid[j * nu + i];
             memcpy(o->pos, pos, sizeof pos);
             memcpy(o->nrm, nrm, sizeof nrm);
-            /* A generated vertex's colour is the blend rounded up to a whole
-             * step (after cutting the sum to 2^-16, below which it is this
-             * evaluation's float noise, not the PSP's value). geprobe 5 (fw
-             * 6.60) scene 22's first patch, whose colours come to 63.75,
-             * 127.5, 158.008 and 191.25, fits planes through 64, 128, 159 and
-             * 192 on the PSP; rounding gave 191 and 158, and differed from
-             * scenes 22, 23 and 26 on 18760, 10128 and 4188 pixels, this on
-             * 3452, 2118 and 2263. Plain truncation, which a morph's blend
-             * takes (read_mvert), is worse still. What is left is mostly the
-             * 3x7 patch, whose 1/3 and 1/7 steps the PSP evaluates with a
-             * precision of its own. */
+            /* A generated vertex's colour is the blend cut to 1/256 of a step
+             * and rounded up to a whole one. geprobe 5 (fw 6.60) scene 22's
+             * first patch, whose colours come to 63.75, 127.5, 158.008 and
+             * 191.25, fits planes through 64, 128, 159 and 192 on the PSP;
+             * rounding gave 191 and 158. The cut is geprobe 7 scene 44's: a
+             * weight of 13.0008 (Bezier 7, step 1, weight 2) reads 13, not
+             * 14, and with it all 168 of its Bezier weights fit; cut finer,
+             * at 2^-16 as this used to, 166. Plain truncation, which a
+             * morph's blend takes (read_mvert), is worse still. */
             o->rgba = 0;
             for (int k = 0; k < 4; k++) {
-                int c = (int)ceil(floor((double)col[k] * 65536.0) / 65536.0);
+                int c = (int)floor(col[k] + 255.0 / 256.0);
                 if (c < 0) c = 0;
                 if (c > 255) c = 255;
                 o->rgba |= (uint32_t)c << (8 * k);
