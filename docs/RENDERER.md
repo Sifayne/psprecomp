@@ -631,10 +631,19 @@ could settle, are in `fw660-run7/findings/geprobe.md`.
 - **The 3D depth anchor** (scene 17's depth: 303; scene 27's: 1867; scene
   36's: 45). No vertex rule fits; see Depth values.
 - **Patch vertices** (scenes 22, 23 and 26: 610, 1876 and 1087 pixels;
-  scene 38: 28; scene 44: 74; scene 52: 600). Fill/fill spline weights are
-  unsettled: scene 44 has 10 samples of them, and geprobe 8 scene 52 reads
-  every edge mode at five divisions. psprecomp's tessellated positions are
-  its own, which is why patches keep the older projection rule.
+  scene 38: 28; scene 44: 74; scene 52: 600). Spline weights are
+  unsettled. geprobe 8 scene 52 reads 3244 of them, every edge mode at
+  five divisions. Exact Cox-de Boor weights on the 1/256 grid, through the
+  colour rule above, fit 2951. All 112 from open/open 4-column splines (a
+  Bezier piece) fit, but only 670 of 811 fill/fill ones. Those read as if
+  weighted by 256/255: ceil(256 w) fits 763. On a uniform span three of
+  the four weights do so at every step, and the third from the nearer end
+  reads one lower at 1/4 and 1/3. Ruled out: t² and t³ cut to 6 to 16 bits
+  (at best 3058), Cox-de Boor in fixed point (3046), de Boor's algorithm on
+  the colours with each level rounded (3016), and a Bezier conversion of
+  each span whose control values are rounded (no values fit fill/fill).
+  psprecomp's tessellated positions are its own, which is why patches
+  keep the older projection rule.
 - **Lit triangles** (scene 16: 325 pixels), not yet looked at since the
   gradient reciprocal settled.
 - **Morph blends** (scene 21: 400) and **skinned corners** (scene 20: 54)
