@@ -13,8 +13,9 @@
  * at the features it does implement from pspautotests captures (texture
  * functions, filtering, fog, lighting, blending, clipping), so both get a
  * hardware reference from this project's own PSP. Scenes 25 on (version 5)
- * each isolate one rule the earlier scenes left open, and scenes 34 on
- * (version 6) what geprobe 5 left open in turn.
+ * each isolate one rule the earlier scenes left open, scenes 34 on
+ * (version 6) what geprobe 5 left open in turn, and scenes 43 on (version
+ * 7, after the callback steps) what geprobe 6 left open.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -35,7 +36,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 6
+#define PROBE_VERSION 7
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -1762,6 +1763,292 @@ static void scene_indices(void) {
     report_marker("after indexed BBOX, both moved", 126, 160, 176, 200, COL[2]);
 }
 
+/* ---- geprobe 7: what geprobe 6 left open ---------------------------------
+ *
+ * fw660-run6/findings/geprobe.md lists what the version 6 scenes left
+ * unsettled: what a coloured light or material does to a lit channel (the
+ * white light is exact), which weights a patch puts on each control point
+ * (linear control colours come out up to 1.5 high past the middle), the
+ * depth the GE gives a transformed vertex (eleven values pin a model, not a
+ * mechanism), how precise 1/area is in a gradient (scene 39 prefers a short
+ * reciprocal, scene 20 an exact one), which corner a 3D depth plane starts
+ * from, and the colour of steep lines. These scenes run after the callback
+ * steps, so every step before them keeps its version 6 number. */
+
+/* Eye-space x and y that the probes' perspective (60 degrees, 480/272)
+ * puts at screen position (sx, sy), in pixels, at depth z (< 0). */
+static void eye_xy(float sx, float sy, float z, float *x, float *y) {
+    const float t = 0.577350269f * -z;                  /* tan 30 * |z| */
+    *x = (sx - 240.0f) / 240.0f * (480.0f / 272.0f) * t;
+    *y = (136.0f - sy) / 136.0f * t;
+}
+
+/* The centre of pixel (px, py). */
+static void eye_at(int px, int py, float z, float *x, float *y) {
+    eye_xy(px + 0.5f, py + 0.5f, z, x, y);
+}
+
+/* The pixel of point i of a lit row: 64 to a line, 7 pixels apart, four
+ * lines 8 apart from y0. */
+static void lit_px(int i, int y0, int *px, int *py) {
+    *px = 12 + 7 * (i % 64);
+    *py = y0 + 8 * (i / 64);
+}
+
+/* What the step stands for in each channel of a stepped colour: R i, G
+ * 255 - i, B 37 i mod 256, so each channel takes every value once. */
+static w32 step_colour(int i) {
+    return (w32)i | (w32)(255 - i) << 8 | (w32)((i * 37) & 255) << 16;
+}
+
+static CNV g_lp[256];
+
+/* Scene 34's white light is exact, floor(256 N.L) on every normal; a
+ * coloured light or material (its rows 4-6) is off by one in a pattern no
+ * gain tried reproduces. One pixel per lit vertex, normal on the light
+ * (N.L = 1) unless said, no ambient, z = -6, five rows of 256 points
+ * (lit_px), 0 to 255 in every channel (step_colour): row A the light's
+ * diffuse colour stepped, material white, one point per draw; B the
+ * material's diffuse colour stepped through the vertex colour, light white;
+ * C the same under the light 0x80C0FF; D the light stepped, material
+ * 0x80C0FF; E N.L stepped from 1 to 0 (normal (0, 2t, 1 - t^2) / (1 + t^2),
+ * t = i/255), light 0x80C0FF, material white. */
+static void scene_lightgain(void) {
+    if (step("scene %02d: light and material colour gains, one point per value", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_LIGHTING);
+    sceGuLightMode(GU_SINGLE_COLOR);
+    sceGuEnable(GU_LIGHT0);
+    ScePspFVector3 zdir = { 0.0f, 0.0f, 1.0f };
+    lit_white();
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE, &zdir);
+    for (int i = 0; i < 256; i++) {                                     /* A */
+        int px, py; float x, y;
+        lit_px(i, 12, &px, &py);
+        eye_at(px, py, -6.0f, &x, &y);
+        NV p = { 0.0f, 0.0f, 1.0f, x, y, -6.0f };
+        sceGuLightColor(0, GU_DIFFUSE, step_colour(i));
+        sceGuDrawArray(GU_POINTS, FMT_NV3D, 1, NULL, gumem(&p, sizeof p));
+    }
+    sceGuLightColor(0, GU_DIFFUSE, 0xFFFFFF);
+    sceGuColorMaterial(GU_DIFFUSE);
+    for (int row = 0; row < 2; row++) {                                 /* B, C */
+        if (row) sceGuLightColor(0, GU_DIFFUSE, 0x80C0FF);
+        for (int i = 0; i < 256; i++) {
+            int px, py; float x, y;
+            lit_px(i, 60 + 48 * row, &px, &py);
+            eye_at(px, py, -6.0f, &x, &y);
+            g_lp[i] = (CNV){ 0xFF000000u | step_colour(i), 0.0f, 0.0f, 1.0f, x, y, -6.0f };
+        }
+        sceGuDrawArray(GU_POINTS, FMT_CNV3D, 256, NULL, gumem(g_lp, sizeof g_lp));
+    }
+    sceGuColorMaterial(0);
+    sceGuModelColor(0x000000, 0x000000, 0x80C0FF, 0x000000);
+    sceGuAmbientColor(0xFF000000);
+    for (int i = 0; i < 256; i++) {                                     /* D */
+        int px, py; float x, y;
+        lit_px(i, 156, &px, &py);
+        eye_at(px, py, -6.0f, &x, &y);
+        NV p = { 0.0f, 0.0f, 1.0f, x, y, -6.0f };
+        sceGuLightColor(0, GU_DIFFUSE, step_colour(i));
+        sceGuDrawArray(GU_POINTS, FMT_NV3D, 1, NULL, gumem(&p, sizeof p));
+    }
+    lit_white();
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE, &zdir);
+    sceGuLightColor(0, GU_DIFFUSE, 0x80C0FF);
+    for (int i = 0; i < 256; i++) {                                     /* E */
+        int px, py; float x, y;
+        lit_px(i, 204, &px, &py);
+        eye_at(px, py, -6.0f, &x, &y);
+        const float t = i / 255.0f, d = 1.0f + t * t;
+        g_nv[0] = (NV){ 0.0f, 2.0f * t / d, (1.0f - t * t) / d, x, y, -6.0f };
+        sceGuDrawArray(GU_POINTS, FMT_NV3D, 1, NULL, gumem(g_nv, sizeof(NV)));
+    }
+    scene_end("lightgain", GU_PSM_8888, 0);
+}
+
+/* Control points as flat_grid places them, black but for column k, red,
+ * and row k, green: the colour along u is 255 times control column k's
+ * weight, along v row k's. */
+static void onehot_grid(CV *v, float cx, float cy, float s, int k) {
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++)
+            v[j * 4 + i] = (CV){ 0xFF000000u | (i == k ? 0xFFu : 0u) | (j == k ? 0xFF00u : 0u),
+                                 cx + (i - 1.5f) * s, cy + (j - 1.5f) * s, -6.0f };
+}
+
+/* Scene 38's linear control colours (0, 85, 170, 255) come out up to 1.5
+ * high past a patch's middle, which no cut of the weights or forward
+ * differencing reproduces. The weights alone: patches drawn as points
+ * (scene 38's eight kinds, one column each: Bezier at divisions 3, 5, 6, 7
+ * and 12, splines fill/fill at 3 and 5, open/open at 3), one row per k =
+ * 0-3, control column k red and row k green (onehot_grid). */
+static void scene_patchweights(void) {
+    if (step("scene %02d: patch basis weights, one control column and row lit", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    static const struct { int div, spline, edge; } C[8] = {
+        { 3, 0, 0 }, { 5, 0, 0 }, { 6, 0, 0 }, { 7, 0, 0 }, { 12, 0, 0 },
+        { 3, 1, GU_FILL_FILL }, { 5, 1, GU_FILL_FILL }, { 3, 1, GU_OPEN_OPEN } };
+    CV g[16];
+    sceGuPatchPrim(GU_POINTS);
+    for (int k = 0; k < 4; k++)
+        for (int i = 0; i < 8; i++) {
+            onehot_grid(g, -5.075f + i * 1.45f, 2.3f - k * 1.5f, 0.4f, k);
+            sceGuPatchDivide(C[i].div, C[i].div);
+            if (C[i].spline) sceGuDrawSpline(FMT_CV3D, 4, 4, C[i].edge, C[i].edge, NULL, gumem(g, sizeof g));
+            else sceGuDrawBezier(FMT_CV3D, 4, 4, NULL, gumem(g, sizeof g));
+        }
+    sceGuPatchPrim(GU_TRIANGLE_STRIP);
+    scene_end("patchweights", GU_PSM_8888, 0);
+}
+
+#define NZP 3840
+static CV g_zp[NZP];
+
+/* The eye depth of point k of scene_vertexdepth: k < 1920 even steps from
+ * -1.05 to -12, then even steps in 1/z from -12 to -99. */
+static float zp_depth(int k) {
+    if (k < 1920) return -(1.05f + k * (10.95f / 1919.0f));
+    const float r0 = 1.0f / 12.0f, r1 = 1.0f / 99.0f;
+    return -1.0f / (r0 - (k - 1920) * ((r0 - r1) / 1919.0f));
+}
+
+/* Eleven vertex depths pin psprecomp's depth arithmetic as a fit, not a
+ * mechanism. A point writes its vertex's depth as it is, so: 3840 points,
+ * each at its own eye depth (zp_depth), 96 to a row 5 pixels apart, 40 rows
+ * 6 apart, each coloured by its index (red the low byte, green the high,
+ * blue 0x80). Depth test ALWAYS, writes on; the depth buffer is saved. */
+static void scene_vertexdepth(void) {
+    if (step("scene %02d: one point per eye depth, -1.05 to -99", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    for (int k = 0; k < NZP; k++) {
+        const float z = zp_depth(k);
+        float x, y;
+        eye_at(2 + 5 * (k % 96), 8 + 6 * (k / 96), z, &x, &y);
+        g_zp[k] = (CV){ 0xFF800000u | (w32)(k & 0xFF) | (w32)(k >> 8) << 8, x, y, z };
+    }
+    sceGuDrawArray(GU_POINTS, FMT_CV3D, NZP, NULL, gumem(g_zp, sizeof g_zp));
+    scene_end("vertexdepth", GU_PSM_8888, 1);
+}
+
+/* Row r of the gradient sweeps is 3 + 7r/16 pixels high. */
+#define GS_ROWS 22
+static float gs_height(int r) { return 3.0f + 0.4375f * r; }
+
+/* Scene 39 prefers a short 1/area for colour gradients, scene 20's skinned
+ * triangles an exact one. One gradient over many areas: through mode, a
+ * column of right triangles 200 pixels wide (whole corners) and one 200.4375
+ * wide (corners on sixteenths), each row 7/16 of a pixel taller than the one
+ * above (3 to 12.2), red 0 to 250, green 0 to 255, blue 5 to 206, depth 1000
+ * to 51000. Depth test ALWAYS, writes on; the depth buffer is saved. */
+static void scene_gradsweep(void) {
+    if (step("scene %02d: one gradient over 44 areas, through mode", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    const w32 c0 = 0xFF050000u, c1 = 0xFFCEFFFAu;
+    for (int col = 0; col < 2; col++) {
+        const float x0 = col ? 250.3125f : 10.0f, w = col ? 200.4375f : 200.0f;
+        float y = 4.0f;
+        for (int r = 0; r < GS_ROWS; r++) {
+            const float h = gs_height(r);
+            CV v[3] = { { c0, x0, y, 1000.0f }, { c1, x0 + w, y, 51000.0f }, { c0, x0, y + h, 1000.0f } };
+            sceGuDrawArray(GU_TRIANGLES, FMT_CV2D, 3, NULL, gumem(v, sizeof v));
+            y += h + 1.0f;
+        }
+    }
+    scene_end("gradsweep", GU_PSM_8888, 1);
+}
+
+/* The same triangles in 3D at z = -5, placed where the perspective puts
+ * them on the same screen positions (eye_xy), constant depth. */
+static void scene_gradsweep3d(void) {
+    if (step("scene %02d: the same gradients in 3D", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    const w32 c0 = 0xFF050000u, c1 = 0xFFCEFFFAu;
+    for (int col = 0; col < 2; col++) {
+        const float x0 = col ? 250.3125f : 10.0f, w = col ? 200.4375f : 200.0f;
+        float y = 4.0f;
+        for (int r = 0; r < GS_ROWS; r++) {
+            const float h = gs_height(r);
+            CV v[3];
+            float x, yy;
+            eye_xy(x0, y, -5.0f, &x, &yy);         v[0] = (CV){ c0, x, yy, -5.0f };
+            eye_xy(x0 + w, y, -5.0f, &x, &yy);     v[1] = (CV){ c1, x, yy, -5.0f };
+            eye_xy(x0, y + h, -5.0f, &x, &yy);     v[2] = (CV){ c0, x, yy, -5.0f };
+            sceGuDrawArray(GU_TRIANGLES, FMT_CV3D, 3, NULL, gumem(v, sizeof v));
+            y += h + 1.0f;
+        }
+    }
+    scene_end("gradsweep3d", GU_PSM_8888, 0);
+}
+
+/* Eight triangles in the unit square, (u, v down, z) per corner, chosen so
+ * the top, leftmost, rightmost and bottom corners fall on different
+ * vertices in different shapes, with depths far enough apart that a plane
+ * started from another corner writes other values. */
+static const float ANCHOR_SHAPES[8][3][3] = {
+    { { 0.0f, 0.0f, -5.0f }, { 1.0f, 0.2f, -7.4f }, { 0.3f, 1.0f, -5.9f } },
+    { { 0.0f, 0.5f, -5.3f }, { 0.6f, 0.0f, -7.6f }, { 1.0f, 1.0f, -6.1f } },
+    { { 0.0f, 1.0f, -6.8f }, { 0.4f, 0.0f, -5.1f }, { 1.0f, 0.6f, -7.9f } },
+    { { 0.0f, 0.3f, -7.7f }, { 1.0f, 0.0f, -5.2f }, { 0.5f, 1.0f, -6.0f } },
+    { { 0.0f, 0.0f, -6.2f }, { 1.0f, 0.6f, -7.8f }, { 0.2f, 1.0f, -5.0f } },
+    { { 0.3f, 0.0f, -5.1f }, { 0.0f, 0.8f, -7.2f }, { 1.0f, 1.0f, -6.3f } },
+    { { 0.0f, 0.45f, -5.0f }, { 1.0f, 0.0f, -7.9f }, { 0.9f, 1.0f, -5.8f } },
+    { { 0.5f, 0.0f, -6.9f }, { 0.0f, 1.0f, -5.0f }, { 1.0f, 0.7f, -7.6f } },
+};
+
+/* Scene 36's one shape whose top corner is not its leftmost matches when its
+ * depth plane starts from the top, but scene 17 fits worse that way. One
+ * row per ANCHOR_SHAPES shape (0.55 across), six copies each: the corners
+ * given from each of the three, then the same in the other winding, as in
+ * scene 36. Flat colour per triangle; depth test ALWAYS, writes on; the
+ * depth buffer is saved too. */
+static void scene_depthanchor2(void) {
+    if (step("scene %02d: 3D depth planes, eight more shapes from each corner", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    static CV t[8 * 6 * 3];
+    int n = 0;
+    for (int s = 0; s < 8; s++)
+        for (int k = 0; k < 6; k++) {
+            const float X = -4.2f + k * 1.5f, Y = 2.45f - s * 0.68f;
+            const w32 c = 0xFF800000u | (w32)(0x40 + s * 0x18) | (w32)(0x40 + k * 0x20) << 8;
+            for (int j = 0; j < 3; j++) {
+                const int v = k < 3 ? (k + j) % 3 : (k + 3 - j) % 3;
+                t[n++] = (CV){ c, X + ANCHOR_SHAPES[s][v][0] * 0.55f, Y - ANCHOR_SHAPES[s][v][1] * 0.55f,
+                               ANCHOR_SHAPES[s][v][2] };
+            }
+        }
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV3D, n, NULL, gumem(t, n * sizeof(CV)));
+    scene_end("depthanchor2", GU_PSM_8888, 1);
+}
+
+/* Scene 37's steep lines are a step of colour off on 7 pixels. Through-mode
+ * lines, red to green, one per column k (fraction k/16 of a pixel across):
+ * down 46.3 pixels, up the same, down with the start a fraction lower, up
+ * likewise. */
+static void scene_steeplines(void) {
+    if (step("scene %02d: steep line colours", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    g_nl = 0;
+    for (int k = 0; k < 32; k++) {
+        const float f = k / 16.0f, x = 10 + 14 * k;
+        line2d(x, 20, x + f, 66.3125f);
+        line2d(x + f, 130.3125f, x, 84);
+        line2d(x, 150 + f / 2, x + 3 + f, 196);
+        line2d(x + 3 + f, 250, x, 204.5f + f / 2);
+    }
+    sceGuDrawArray(GU_LINES, FMT_CV2D, g_nl, NULL, gumem(g_lines, g_nl * sizeof(CV)));
+    scene_end("steeplines", GU_PSM_8888, 0);
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -2358,6 +2645,15 @@ int main(int argc, char **argv) {
     g_scene = 42; scene_indices();
 
     section_callbacks();
+
+    section("scenes, version 7");
+    g_scene = 43; scene_lightgain();
+    g_scene = 44; scene_patchweights();
+    g_scene = 45; scene_vertexdepth();
+    g_scene = 46; scene_gradsweep();
+    g_scene = 47; scene_gradsweep3d();
+    g_scene = 48; scene_depthanchor2();
+    g_scene = 49; scene_steeplines();
 
     probe_screen(1);
     probe_done();

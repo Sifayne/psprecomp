@@ -42,6 +42,13 @@ blending, depth, clipping, the per-pixel tests).
 | 40 | (v6) morph weights over colour gradients whose two sets differ by 1 (does a blend keep the fraction), with the unmorphed gradients for reference | 8888 |
 | 41 | (v6) bounding boxes at the camera, one list and step each, no dump: across the camera plane at four distances from the axis, behind the camera, between the camera and the near plane, across the near plane | - |
 | 42 | (v6) indexed draws by hand: whether PRIM moves IADDR, VADDR or both (16- and 8-bit indices, and unindexed), and whether an indexed BBOX moves them | 8888 |
+| 43 | (v7) lit colour arithmetic, one point per vertex, every channel stepped 0-255: the light's diffuse colour, the material's, the material under a 0x80C0FF light, the light over a 0x80C0FF material, and N.L from 1 to 0 under a 0x80C0FF light | 8888 |
+| 44 | (v7) patch basis weights as points: one control column lit red and one row green, for each of the four, over scene 38's eight patch kinds | 8888 |
+| 45 | (v7) one point per eye depth, 3840 of them from -1.05 to -99, each coloured by its index; plus the depth buffer | 8888 |
+| 46 | (v7) one colour and depth gradient over 44 areas: through-mode right triangles 200 and 200.4375 pixels wide, 3 to 12.2 high; plus the depth buffer | 8888 |
+| 47 | (v7) scene 46's triangles in 3D at the same screen positions | 8888 |
+| 48 | (v7) 3D depth planes: eight more shapes, each from each corner and in both windings; plus the depth buffer | 8888 |
+| 49 | (v7) steep through-mode lines, red to green, one per sixteenth across | 8888 |
 
 After the scenes it records which GE callbacks run, with which arguments and
 when, through libgu (signal and finish) and through a raw `sceGe` list.
@@ -70,6 +77,10 @@ peeks say meanwhile, and when the handlers run); how long 100 sprites take at
 480x272, 64x64 and 16x16, from the system clock read in the handlers; and
 last, since it may not come back, a PAUSE whose own signal handler calls
 `sceGeContinue`.
+
+Version 7 adds scenes 43-49 after the callback steps, so every earlier step
+keeps its version 6 number. Each one aims at something geprobe 6 left open
+(`fw660-run6/findings/geprobe.md`).
 
 ## Build
 
