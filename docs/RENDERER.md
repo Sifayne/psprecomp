@@ -617,10 +617,12 @@ share). Details, confidence and what further probing could settle are in
   scene 47: 376; scene 37: 7; part of scenes 16 and 26). Gradients take a
   16-bit reciprocal of the area, or of a line's length, cut toward zero.
   It fits 35 of scene 46's 44 depth gradients and 129 of its 132 colour
-  gradients, and all of scene 49's lines. The rest need a reciprocal above
-  the cut one, sometimes above the exact one, at the same lengths where
-  others need the cut. That looks like a table or iteration with its own
-  error pattern, which these areas do not pin down. Scene 47 misses on the
+  gradients, and all of scene 49's lines. Of the nine other depth
+  gradients, seven need a reciprocal one or two units of its last bit
+  above the cut one (five of them at or above the exact value, which no
+  cut gives), and two need one below it, in no order of the area. That looks like a table or iteration
+  with its own error pattern, which these areas do not pin down; geprobe 8
+  scenes 50 and 51 read it at every 10-bit length. Scene 47 misses on the
   same rows in 3D, so the 3D path takes it too.
 - **Vertex depth** (scene 45: 837 pixels; scene 48's depth: 958). The
   depth arithmetic above is within half a step of the GE's on every point,
@@ -628,9 +630,10 @@ share). Details, confidence and what further probing could settle are in
 - **The 3D depth anchor** (scene 17's depth: 303; scene 27's: 1867; scene
   36's: 56). No vertex rule fits; see Depth values.
 - **Patch vertices** (scenes 22, 23 and 26: 612, 1878 and 1190 pixels;
-  scene 38: 28; scene 44: 74). Fill/fill spline weights are unsettled.
-  psprecomp's tessellated positions are its own, which is why patches keep
-  the older projection rule.
+  scene 38: 28; scene 44: 74). Fill/fill spline weights are unsettled:
+  scene 44 has 10 samples of them, and geprobe 8 scene 52 reads every edge
+  mode at five divisions. psprecomp's tessellated positions are its own,
+  which is why patches keep the older projection rule.
 - **Morph blends** (scene 21: 400) and **skinned corners** (scene 20: 101)
   are unchanged. The projection change moved neither.
 - **Point and spot lights** (scene 35: 10 pixels), each one step low, all
