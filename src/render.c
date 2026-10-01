@@ -1043,16 +1043,6 @@ static int edge_is_top_left(int64_t dx, int64_t dy) {
     return (dy == 0 && dx > 0) || dy < 0;
 }
 
-/* A colour gradient, num/den (den > 0), in 1/1024ths of a channel step,
- * floored -- and an exact positive multiple comes out one lower. geprobe step
- * 11 (fw 6.60) spreads 255 over 480 pixels, which is exactly 544/1024 a
- * pixel, and the hardware steps 543; -544/1024 stays -544. That is what a
- * gradient formed through a reciprocal a hair too small gives, and with it
- * the plane below reproduces steps 1-11, 18 and 19 exactly. */
-static int64_t grad1024(int64_t num, int64_t den) {
-    return num > 0 ? (num - 1) / den : -((den - 1 - num) / den);
-}
-
 /* v / 2^s, floored (s >= 1). */
 static int64_t floor_shr(int64_t v, int s) {
     return v >= 0 ? v >> s : -((-v + ((int64_t)1 << s) - 1) >> s);
@@ -1063,7 +1053,11 @@ static int64_t floor_shr(int64_t v, int s) {
  * q / 2^sh, q < 2^16 except for a power of two, where it is exact. Depth
  * gradients go through it (sw_tri); geprobe 5 (fw 6.60) scene 27's four
  * through-mode triangles pin the width: 15 to 17 bits reproduce all 30300
- * of their pixels, 14 and 18 do not, and the exact 1/area leaves 653. */
+ * of their pixels, 14 and 18 do not, and the exact 1/area leaves 653.
+ * Being a hair small is visible on its own: geprobe step 11 spreads 255
+ * over 480 pixels, exactly 544/1024 a pixel, and the hardware steps 543,
+ * while -544/1024 stays -544. A line's gradients take it too, with the
+ * major length for the area (psp_render_walk_line). */
 static void area_rcp(int64_t area, int64_t *q, int *sh) {
     int L = 0;
     while (L < 62 && (area >> L) != 0) L++;
@@ -1162,7 +1156,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      *
      * The short reciprocal is geprobe 6 (fw 6.60) scene 39's, the scene
      * built to measure gradient precision: of its 78 triangles 75 match on
-     * every pixel with it and 69 with the exact gradient floored (grad1024),
+     * every pixel with it and 69 with the exact gradient floored,
      * which the others never beat; scene 17's 3D quads go from 81 pixels off
      * to none. It costs two skinned triangles of scene 20 (54 -> 101) and
      * morph and skin triangles of scene 26 (2263 -> 2343), whose corners
@@ -1563,22 +1557,28 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
         !line_clip_axis(xmajor ? pm : M0, xmajor ? dmk : sm, xmajor ? smd : 1, y0, y1, &first, &last))
         return;
     /* Colour and depth at the projected centre, on the triangle's gradient
-     * rule: the gradient a pixel, floored to 1/1024 (grad1024), times the
-     * distance from the start, the value floored. Step 1's white-to-blue
-     * line reads FDFDFF at its first pixel: 255 - 2902/1024 * 1/2 = 253.6.
+     * rule: the difference times area_rcp's short reciprocal of the major
+     * length, floored to 1/16384 a sixteenth, times the distance from the
+     * start, the value floored. Step 1's white-to-blue line reads FDFDFF at
+     * its first pixel: 255 - 2902/1024 * 1/2 = 253.6. geprobe 7 (fw 6.60)
+     * scene 49's 128 steep red-to-green lines match on all 5862 of their
+     * pixels this way; the gradient floored from the exact quotient, as
+     * before, left four a step off (as on 7 pixels of geprobe 6 scene 37).
      * Depth goes from the integer vertex depths: scene 27's three
      * through-mode lines match at every step, and its 3D line on every one
      * of its pixels; taken at the step's start, as it was, each read half a
      * step short, 149 or 91 off. The distance is kept in sixteenths
      * (dist16), so the sums are in 1/16384ths. */
-    int64_t cg[4], cv[4];
+    int64_t cg[4], cv[4], lq;
+    int lsh;
+    area_rcp(adM, &lq, &lsh);
     for (int c = 0; c < 4; c++) {
         cv[c] = chan(a->rgba, c);
-        cg[c] = grad1024(((int64_t)chan(b->rgba, c) - cv[c]) * 1024 * 16, adM);
+        cg[c] = floor_shr(((int64_t)chan(b->rgba, c) - cv[c]) * 16384 * lq, lsh);
     }
     const int64_t za = !(a->z > 0.0f) ? 0 : (a->z >= 65535.0f ? 65535 : (int64_t)a->z);
     const int64_t zb = !(b->z > 0.0f) ? 0 : (b->z >= 65535.0f ? 65535 : (int64_t)b->z);
-    const int64_t zg = grad1024((zb - za) * 1024 * 16, adM);
+    const int64_t zg = floor_shr((zb - za) * 16384 * lq, lsh);
     /* Fog and texture coordinates at the same point. Unprojected (through
      * mode), the texture coordinates go by a fixed step, texels a sixteenth,
      * truncated toward zero to 2^-24 (2^-20 a pixel). geprobe 5 scene 28's
