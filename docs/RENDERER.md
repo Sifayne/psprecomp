@@ -380,69 +380,97 @@ writes were disabled, fixed in `shade_pixel()`.
 
 The GE works alongside the CPU, and a game can see how far behind it is: in
 when its signal and finish handlers run, and in what `sceGeListSync` and
-`sceGeDrawSync` report when asked without waiting. geprobe 5 (fw 6.60)
+`sceGeDrawSync` report when asked without waiting. geprobe 5 and 6 (fw 6.60)
 measured it:
 
 - A list of a few commands, enqueued with no stall, has run with all its
-  handlers before `sceGeListEnQueue` returns (steps 54-56).
+  handlers before `sceGeListEnQueue` returns (geprobe 5 steps 54-56).
 - 200 full-screen sprites, enqueued the same way, are still being drawn when
   EnQueue returns. `ListSync(peek)` reads 2 (drawing), and only the handler of
   the first SIGNAL, which comes before the sprites, has run (step 58).
-- Words released by `sceGeListUpdateStallAddr` run after that call returns.
-  libgu's `sceGuFinish` releases one small sprite and the FINISH, and the
-  finish handler runs after `sceGuFinish` has returned, in `sceGuSync`
-  (step 50, the same in runs 1, 4 and 5).
+- Words released by `sceGeListUpdateStallAddr` run inside that call when they
+  can. A SIGNAL and a FINISH released from a stall have both called their
+  handlers by its return (geprobe 6 steps 79 and 80). libgu's finish
+  handler runs after `sceGuFinish` has returned, in `sceGuSync` (geprobe 5
+  step 50), because a FINISH waits for the drawing before it to end.
+- A list waiting at its stall peeks 2 from both `ListSync` and `DrawSync`,
+  as EnQueue returns and 10 ms later (steps 79 and 80).
 - A SIGNAL with the PAUSE behaviour stops the list until `sceGeContinue`.
   Twenty milliseconds later only its own handler has run, and the peeks read
   4 (paused) and 2 (drawing). The FINISH that libgu writes after the pause
   calls no handler. The rest of the list runs inside `sceGeContinue` (step 57).
+  A `sceGeContinue` from the PAUSE's own handler lets the list straight
+  through (geprobe 6 step 82). With nothing paused it returns 0 (step 78).
+- Step 81 times 100 sprites between two SIGNALs, then a FINISH, at three
+  sizes, in microseconds after the call before EnQueue:
+
+  | sprites | SIGNAL 1 | SIGNAL 2 | FINISH | EnQueue returns | DrawSync returns |
+  |---|---|---|---|---|---|
+  | 480x272 | 51 | 35609 | 62409 | 68 | 62474 |
+  | 64x64 | 46 | 1130 | 1952 | 57 | 1993 |
+  | 16x16 | 41 | 126 | 138 | 52 | 176 |
+
+  Drawing takes 623.6 and 19.06 µs a sprite at the larger sizes: 209.2 pixels
+  a microsecond. SIGNAL 2 comes 43 sprites' drawing before the FINISH: the
+  command processor runs up to 43 drawing commands ahead of the drawing,
+  and calls a SIGNAL's handler when it reaches it. It takes 0.85 µs a sprite
+  (a VADDR and a PRIM), which is what limits the 16x16 sprites.
 
 psprecomp's model (`src/hle/ge.c`, "When the GE runs"):
 
-- **Time.** Guest time moves only at firmware calls, waits and vblanks, and
-  the GE keeps its own time on that clock. Each command costs a little, plus
-  the pixels it writes and a charge for each vertex. The GE runs about a
-  million pixels a guest microsecond, far faster than the hardware, because
-  the CPU here takes no time between firmware calls; the step 58 list, about
-  13 million pixels, still outlasts EnQueue.
-- **Where it runs.** EnQueue and Continue let the GE run a microsecond of its
-  time before they return, with handlers called as it reaches them. Every
-  firmware call first lets the GE catch up to the present. A SIGNAL or FINISH
-  it reaches while catching up waits, with the GE, until the next firmware
-  call made with interrupts enabled, which is when the interrupt would have
-  been taken. A Sync that waits runs everything, and so does a frame
-  boundary. When no thread can run, the GE finishes what it has.
-- **Peeks.** The peeks report the truth for a list that is running, paused or
-  queued behind one: 2, 4 or 1. A list waiting at its stall still reads done,
-  as before; see the comment at `hle_ListSync`. geprobe 6 asks what a stalled
-  list reads.
-- **Pause.** A PAUSE holds the list at its FINISH until `sceGeContinue`. A
-  `sceGeContinue` from the PAUSE's own signal handler, which runs before the
-  pause takes hold, lets the list through instead. That case is not measured;
-  geprobe 6's last step asks.
+- **Time.** The GE keeps its own time on the guest clock (`clock.h`:
+  virtual microseconds, a tick per firmware call, a frame per vblank), which
+  is also what `sceKernelGetSystemTimeLow` reads. The command processor
+  costs 0.1 µs a command word, 0.6 a PRIM, BEZIER or SPLINE and 0.025 a
+  vertex. Up to 43 drawing commands wait for the drawing, which costs
+  1/209.2 µs a pixel. A FINISH waits for the drawing to end. The split of
+  the 0.85 µs between word, PRIM and vertex is not measured. 16x16 sprites
+  draw a quarter faster on the PSP than this charges.
+- **Where it runs.** Every firmware call first lets the GE catch up to the
+  present; a SIGNAL or FINISH it reaches then waits, with the GE, until the
+  next firmware call made with interrupts enabled. EnQueue,
+  UpdateStallAddr and Continue let the GE run 11 µs ahead, calling handlers
+  as it reaches them. EnQueue itself takes 51 µs: the GE starts 40 µs in.
+  When every thread waits, the GE goes on until the next deadline, and a
+  handler it reaches runs at its moment. A Sync that waits runs everything
+  and takes as long as the GE does: the guest clock follows the GE to each
+  handler and to its end. Under psprecomp step 81 reads 43, 35615 and
+  62449 for the full-screen sprites, with DrawSync returning at 62451.
+- **Peeks.** The truth: 2 running or at a stall, 4 paused, 1 queued behind
+  another list, 0 done.
+- **Pause.** A PAUSE holds the list at its FINISH until `sceGeContinue`, and
+  a `sceGeContinue` from the PAUSE's own handler lets it through.
+- **Frame boundaries** (`psp_ge_drain_all`, at `sceDisplaySetFrameBuf`)
+  still run everything at once and charge no time, since they are no wait.
 - **Backends.** Pixel costs come from the software renderer's counter. Under
   any other backend the GE charges commands and vertices only, so it runs
   faster there.
 
-What this can change for a game, compared with the model it replaces (every
-list ran to its stall inside the call that released it, and a PAUSE was
-passed straight through):
+What this can change for a game, compared with the models before it (every
+list ran to its stall inside the call that released it, then a GE a
+thousand times too fast that cost no time in a Sync):
 
-- Handlers for words released by a stall update, which is every libgu DIRECT
-  list, run at a later firmware call and no longer inside the update. For
-  the usual `sceGuFinish` then `sceGuSync`, the finish handler now runs
-  inside the Sync, before it returns.
+- `sceGuSync` and the other waits now take the GE's time, about what they
+  take on the PSP, so a frame's guest time includes its drawing. A thread
+  sleeping on a deadline that falls inside such a wait wakes when the wait
+  ends, not during it.
+- Handlers for words released by a stall update run inside the update when
+  the GE gets to them in 11 µs, otherwise at a later firmware call. For the
+  usual `sceGuFinish` then `sceGuSync`, the finish handler runs inside the
+  Sync.
 - A guest that spins on a flag set by a GE handler without making any
   firmware call never sees it set. psprecomp cannot interrupt recompiled
   code, which is already true of alarms and vtimers (`src/hle/ktimer.c`).
   With any firmware call in the loop, the GE progresses and the handler runs.
-- Peeks that read done may now read 2 or 4. A heavy list enqueued without a
-  stall can still be drawing when EnQueue returns.
-- A game that pauses a list and never calls `sceGeContinue` now leaves it
+- Peeks that read done may now read 2 or 4, including on a list waiting at
+  its stall, such as a libgu list still being built. A heavy list enqueued
+  without a stall can still be drawing when EnQueue returns.
+- A game that pauses a list and never calls `sceGeContinue` leaves it
   paused, as the PSP does. A Sync that waits on a paused list gives up after
   one yield rather than blocking for ever.
 - PRIM and BBOX move VADDR past the vertices they read (geprobe 5 scene 33,
-  and libgu's `sceGuDrawArrayN`), where before VADDR stayed put.
+  and libgu's `sceGuDrawArrayN`); indexed draws move IADDR instead (geprobe
+  6 scene 42).
 
 ## Depth values
 

@@ -18,6 +18,7 @@
 #define MAIN_SLOT         0        /* the context module_start runs on */
 /* Timer handlers one idle handoff may run before it gives up; see there. */
 #define IDLE_TIMER_CAP    100000
+#define IDLE_GE_CAP       100000
 #define PSP_HOST_STACK_SIZE (16u * 1024u * 1024u)
 
 typedef struct {
@@ -333,27 +334,28 @@ static int handoff_locked(void) {
      * something only a timer handler provides was declared stranded. The cap
      * only stops a periodic handler that never readies anyone from spinning
      * guest time on for ever. */
-    int timer_runs = 0, ge_ran = 0;
+    int timer_runs = 0, ge_runs = 0;
     while (best < 0) {
-        /* The GE, likewise, finishes what it was given while the CPU idles
-         * (src/hle/ge.c, "When the GE runs"); its handlers may ready a
-         * thread. It works at the present moment, so it goes first, and once:
-         * it runs until every list is done, stalled or paused, and running it
-         * again would only walk a list that never ends a second time. */
-        if (!ge_ran) {
-            ge_ran = 1;
+        const uint64_t soonest = soonest_locked();
+        const uint64_t timer = timer_runs < IDLE_TIMER_CAP && !psp_ktimer_in_handler()
+                             ? psp_ktimer_next_due() : 0;
+        /* The GE, likewise, goes on with what it was given while the CPU
+         * idles (src/hle/ge.c, "When the GE runs"), up to whichever comes
+         * first, the next deadline or the next timer; a handler it reaches
+         * by then runs at its moment and may ready a thread. The cap only
+         * stops a list that raises handlers without end. */
+        if (ge_runs < IDLE_GE_CAP) {
+            const uint64_t next = timer && (!soonest || timer < soonest) ? timer : soonest;
             psp_os_unlock(&g_lock);
-            const int ran = psp_ge_idle_run();
+            const int ran = psp_ge_idle_run(next);
             psp_os_lock(&g_lock);
             if (ran) {
+                ge_runs++;
                 expire_locked(psp_clock_peek());
                 best = pick_locked();
                 continue;
             }
         }
-        const uint64_t soonest = soonest_locked();
-        const uint64_t timer = timer_runs < IDLE_TIMER_CAP && !psp_ktimer_in_handler()
-                             ? psp_ktimer_next_due() : 0;
         if (timer && (!soonest || timer <= soonest)) {
             psp_clock_advance_to(timer);
             psp_os_unlock(&g_lock);
