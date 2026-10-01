@@ -474,45 +474,66 @@ thousand times too fast that cost no time in a Sync):
 
 ## Depth values
 
-The software backend writes the depth geprobe 5 and 6 (fw 6.60) measured, not
-a float blend (`src/render.c` sw_tri, `src/hle/ge.c` ge_screen_z):
+The software backend writes the depth geprobes 5 to 7 (fw 6.60) measured, not
+a float blend (`src/render.c` sw_tri, `src/hle/ge.c` ge_proj_row,
+ge_screen_z, clip_to_fx16):
 
-- **A transformed vertex's depth** is computed from clip z to the viewport in
-  the GE's own 24-bit float (16 significant bits, cut toward zero): clip z a
-  product and a sum at a time, times 1/w, then the scale and the centre. 1/w
-  is the float w's reciprocal rounded to 17 significant bits. The rasterizer
-  takes the integer part. Eleven vertex depths pin this: six from geprobe 5
-  scenes 17 and 27, five from geprobe 6 scene 36. The float computation had
-  four of them off by up to 0.8, and the ge24 divide used before had three of
-  scene 36's one low. It is a fit to eleven values: every variant searched
-  that gives all eleven takes this reciprocal. x and y keep their own rule
-  (screen_axis_fx16), which was measured separately.
+- **The projection runs in the GE's own float** (16 significant bits, cut
+  toward zero; ge24). Each eye coordinate is cut to it, each product with a
+  projection entry is cut, and the products and the translation are summed
+  without a cut. That gives clip x, y, z and w.
+- **A transformed vertex's depth** is clip z times 1/w, with w's reciprocal
+  cut to 24 bits and the product to 18. The scale and centre follow, the
+  sum rounded to 16 bits, and the rasterizer takes the integer part.
+  geprobe 7 scene 45 reads back 3720 points, one per eye depth from -1.05
+  to -99. This fits 2883 of them, against 1703 for the rule it replaced.
+  It is the best of 460,800 variants searched, and it keeps the eleven
+  depths that geprobes 5 and 6 pinned. The misses are one step either way,
+  so the GE's arithmetic is within half a step of this but is not it.
+  Scene 48 adds one: eye z -5.3 reads 11829, where this gives 11828.75.
+- **A transformed vertex's x and y** come from the same clip x, y and w.
+  1/w is cut to 24 bits, as for depth, and each quotient to 16. The
+  sixteenth is then taken toward the centre (screen_axis_fx16). geprobe 7
+  scene 48 found six corners a sixteenth further out than the earlier rule
+  put them (a 14-bit reciprocal on float coordinates). Their depth planes
+  were 100 to 500 pixels off and match once each corner moves. Every rule
+  searched that places scene 48's 198 depth-confirmed coordinates and
+  scenes 15 and 18's measured corners cuts the eye coordinates to 16 bits.
+  Patch vertices keep the 14-bit rule: psprecomp's tessellation is not the
+  GE's, and the new rule costs scene 22 342 pixels.
 - **Across a triangle** depth is a plane, like colour: anchored at the same
   vertex, with gradients from the numerator times 1/area, where 1/area is
   also a 24-bit float, then floored to 1/1024 a pixel. Colour uses the same
   1/area (geprobe 6 scene 39). Scene 27's four through-mode triangles match
-  on every pixel, and so do 15 of scene 36's 24 3D triangles.
+  on every pixel, and so do 22 of scene 36's 24 3D triangles from one of
+  their corners.
 - **Along a line** (psp_render_walk_line) one pixel is drawn per
-  major-axis column whose centre lies on the segment, and its row, colour
-  and depth are those of the centre's projection onto the line, on gradients
-  floored to 1/1024 a pixel. For whole-pixel endpoints that is the step
-  centre geprobe step 1 measured; scene 27's 3D line, whose ends fall
-  between centres, matches on every pixel only this way.
+  major-axis column whose centre lies on the segment. Its row, colour and
+  depth are those of the centre's projection onto the line. The gradients
+  are the difference times the same short reciprocal, of the major length,
+  floored to 1/16384 of a step per sixteenth of a pixel. For whole-pixel endpoints that is the
+  step centre geprobe step 1 measured. Scene 27's 3D line, whose ends fall
+  between centres, matches on every pixel only this way. All 5862 pixels of
+  geprobe 7 scene 49's steep lines match.
 - **Line ends** follow each end pixel's diamond (geprobe 6 scene 37): a
   pixel's diamond is the points within half a pixel of its centre, counting
   x and y distance together. Its upper edges and top corner are inside, and
   its lower edges and side corners are outside. The last pixel is dropped
-  when the line ends
-  inside its diamond. The pixel before the first is drawn when the line
-  starts inside that pixel's diamond. This fixes 26 of scene 37's 33 pixels
-  off; the 7 left are colour. Scene 28's 3D line now matches too.
-- **Open:** the 3D depth anchor. Scene 36 draws four shapes from each corner
-  in both windings. In the shape whose top corner is never its leftmost, 5 of
-  6 triangles match when anchored at the top and none at the leftmost.
-  Another shape's triangles split between the two anchors, and the top
-  anchor takes scene 17 from 303 pixels off to 601. Scene 27's quad that
-  slopes in x and scene 17's second triangle still match only from another
-  corner. A GPU backend shares the vertex depths and interpolates them
+  when the line ends inside its diamond. The pixel before the first is
+  drawn when the line starts inside that pixel's diamond. Scene 49 finds an
+  exception at the start of a steep line going up. A start on the upper
+  right edge (5/16 right and 3/16 up) or on the top corner is outside, so
+  the hardware draws no pixel there. That is 4 pixels, and it is not
+  modelled.
+- **Open:** the 3D depth anchor. geprobe 7 scene 48 draws eight more shapes
+  from each corner in both windings. With the corners and vertex depths
+  above, and its one off depth moved, 78 of the 90 3D triangles in scenes
+  17, 36 and 48 match on every pixel from some corner. The leftmost corner
+  matches 57 of them and the top 58. No rule tried picks the matching
+  corner (bottom, right, submission order, depth, the corner opposite the
+  longest or shortest edge, coarser comparisons). Nor does starting the
+  plane at a point that is not a corner, or rounding the step differently.
+  Leftmost stays. A GPU backend shares the vertex depths and interpolates them
   itself.
 
 ## Texture coordinates on sprites and lines
@@ -544,37 +565,77 @@ which texel is read (geprobe step 12 and geprobe 5 scene 28, fw 6.60):
   Modelling the cache is out of scope: the step is `KNOWN_CRASH` from geprobe 6
   on, and step 61 stays a difference.
 
-## Still open after geprobe 6
+## Lighting
 
-These are what geprobe 6 (fw 6.60) still shows psprecomp getting wrong, with
-pixels off on run 6. Details, confidence and the geprobe 7 step aimed at each
-are in `fw660-run6/findings/geprobe.md`.
+The lit colour is computed in bytes (`src/hle/ge.c` light_vertex, lit_mul;
+geprobe 7, fw 6.60):
 
-- **Coloured light and material** (scene 16: 16931 pixels; scene 34: 12737).
-  A white directional light is exact, tilted normals included: the PSP
-  takes floor(256 N.L) (scene 34 rows 0-3). Coloured light or material
-  values (rows 4-6) are off by one in a pattern that no gain or rounding we
-  tried reproduces.
-- **Point and spot lights** (scene 35, 130 of its 800 points). The spot
-  exponent goes through the GE's own power function (fixed). What remains
-  is ±1 on all four grids. On the plain point light, points at the same
-  squared distance read the same, so the error is in the distance and
-  attenuation arithmetic, not noise.
-- **Colour gradient precision** (scene 39: 217 pixels; scene 20: 101; scene
-  26: 2343). Colour now takes depth's short 1/area, which scene 39 prefers.
-  Three of its triangles fit neither that nor the exact 1/area. Two of
-  scene 20's skinned triangles fit only the exact one.
-- **Morph blends** (scene 21, 400 pixels): not a kept fraction and not
-  rounding. Scene 40's colour blends, whose weights sum to one, all match.
-  Scene 21's two off triangles also move their corners, and one of them is
-  weighted 0.25 and 1.0.
-- **Patch vertices** (scenes 22, 23 and 26: 3437, 2105 and 2343 pixels;
-  scene 38: 928). Scene 38 shows linear control colours coming out up to 1.5
-  high past the middle of the patch (0 85 171 255 at division 3). Neither
-  weights cut to a width nor forward differencing reproduces it.
-- **3D depth** (scene 17's depth buffer: 303 pixels; scene 27's: 1867;
-  scene 36's: 696). See the depth anchor above.
-- **Steep line colour** (scene 37, 7 pixels, ±1).
+- A byte x stands for (x + 1/2)/256, so the product of two bytes is
+  floor((2a + 1)(2b + 1) / 1024). Scene 43 steps every byte against 255,
+  192 and 128, as light and as material, and N.L through a coloured light.
+  All 1280 of its points fit.
+- N.L, the specular power, attenuation and the spot factor become bytes
+  first, as floor(256 x) up to 255.
+- Each light adds spot × (attenuation × (ambient + diffuse)), product by
+  product. Its specular is added separately, with the same factors. Every
+  value of geprobe 6 scene 34 fits, coloured rows included, and 790 of
+  scene 35's 800 points fit. The 10 others are one step low, all in the two
+  grids that go through the GE's power function (the specular with
+  coefficient 8 and the spot with exponent 4).
+- In single-colour mode the specular is added in, and the total is clamped
+  to 255 per vertex.
+- In separate-specular mode the specular is the vertex's secondary colour,
+  clamped on its own. The rasterizer interpolates it as three more planes
+  and adds it to each pixel after the texture function (psp_vertex.spec).
+  In scene 16, 46 of 72 triangle channels match exactly this way, against
+  9 with the specular folded into one colour.
+
+## Patches
+
+Bezier and spline patches are tessellated by psprecomp (geprobe 7 scene 44,
+fw 6.60):
+
+- **Steps.** Step i of a division sits on a 1/256 grid, cut toward the
+  nearer end of the piece: floor(256 i/div)/256 up to the middle, and
+  1 - floor(256 (div - i)/div)/256 past it. All 168 Bezier and open-spline
+  weights of scene 44 fit.
+- **Weights.** The weights at those steps are exact.
+- **Colour.** The blend is cut to 1/256, then rounded up to a whole step,
+  so 13.0008 reads 13 and 63.75 reads 64.
+- **Splines.** Splines use the same grid. The weights of fill/fill splines
+  do not fit yet.
+
+## Still open after geprobe 7
+
+These are what geprobe 7 (fw 6.60) still shows psprecomp getting wrong,
+with pixels off on run 7 (runs 5 and 6 read the same on the scenes they
+share). Details, confidence and what further probing could settle are in
+`fw660-run7/findings/geprobe.md`.
+
+- **The gradient reciprocal** (scene 46: 77 colour pixels, 3659 depth;
+  scene 47: 376; scene 37: 7; part of scenes 16 and 26). Gradients take a
+  16-bit reciprocal of the area, or of a line's length, cut toward zero.
+  It fits 35 of scene 46's 44 depth gradients and 129 of its 132 colour
+  gradients, and all of scene 49's lines. The rest need a reciprocal above
+  the cut one, sometimes above the exact one, at the same lengths where
+  others need the cut. That looks like a table or iteration with its own
+  error pattern, which these areas do not pin down. Scene 47 misses on the
+  same rows in 3D, so the 3D path takes it too.
+- **Vertex depth** (scene 45: 837 pixels; scene 48's depth: 958). The
+  depth arithmetic above is within half a step of the GE's on every point,
+  but not equal to it.
+- **The 3D depth anchor** (scene 17's depth: 303; scene 27's: 1867; scene
+  36's: 56). No vertex rule fits; see Depth values.
+- **Patch vertices** (scenes 22, 23 and 26: 612, 1878 and 1190 pixels;
+  scene 38: 28; scene 44: 74). Fill/fill spline weights are unsettled.
+  psprecomp's tessellated positions are its own, which is why patches keep
+  the older projection rule.
+- **Morph blends** (scene 21: 400) and **skinned corners** (scene 20: 101)
+  are unchanged. The projection change moved neither.
+- **Point and spot lights** (scene 35: 10 pixels), each one step low, all
+  where the GE's power function is used.
+- **Steep line starts** (scene 49: 4 pixels): a start on a diamond's upper
+  right edge or top corner, going up.
 
 ## Validation
 
