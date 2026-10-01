@@ -2054,9 +2054,10 @@ static void scene_steeplines(void) {
 /* ---- version 8 ------------------------------------------------------------
  *
  * Scene 46's depth gradients want the triangle setup's 1/area cut to 16 bits
- * on 35 of 44 areas and something above it, sometimes above the exact value,
- * on the rest, with no order in which areas do which. Scene 37's line of
- * length 797/16 wants the same. Scenes 50 and 51 read that reciprocal once
+ * on 35 of 44 areas and another value on the rest: seven a unit or two
+ * above it (five of those at or above the exact value), two below it, with
+ * no order in which areas do which. Scene 37's line of length 797/16 wants
+ * one above it too. Scenes 50 and 51 read that reciprocal once
  * per 10-bit length: the numerator is a power of two, so the depth gradient
  * is the reciprocal itself, and a depth range of 32768 over 32 to 64 pixels
  * pins it to a fraction of its last bit. */
