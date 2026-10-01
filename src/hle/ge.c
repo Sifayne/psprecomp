@@ -1944,8 +1944,11 @@ static void lights_to_eye(void) {
  * that reads a float's exponent and mantissa as e + (m - 1), m in [1, 2), and
  * the matching exp2, 2^n * (1 + f) for the integer and fractional parts of the
  * product. With k = 1 it is x itself; N.H = 0.9 gives 0.8, 0.6, 0.35, 0.2 and
- * 0.1125 for k = 2, 4, 8, 12 and 16, which is what the hardware drew. Only
- * specular and powered diffuse are measured; the spot exponent keeps powf. */
+ * 0.1125 for k = 2, 4, 8, 12 and 16, which is what the hardware drew. The
+ * spot exponent goes through it too (geprobe 6 scene 35, fw 6.60): of 200
+ * points lit by a spot of exponent 4, 174 read ge_pow's value and 122
+ * powf's, and with exponent 1.5, 144 and 88; the misses are a step either
+ * way, the noise described at light_vertex. */
 static float ge_pow(float x, float k) {
     if (!(x > 0.0f)) return 0.0f;
     int e;
@@ -2002,7 +2005,7 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
             if (dlen > 1e-20f) { D[0] /= dlen; D[1] /= dlen; D[2] /= dlen; }
             const float sdot = L[0]*D[0] + L[1]*D[1] + L[2]*D[2];
             if (!(sdot >= g_tl.light[i].cutoff)) att = 0.0f;
-            else att *= powf(sdot, g_tl.light[i].exponent);
+            else att *= ge_pow(sdot, g_tl.light[i].exponent);
         }
         if (att == 0.0f) continue;
 
