@@ -1376,21 +1376,28 @@ static void mul_3x3(const float m[12], const float in[3], float out[3]) {
     out[2] = m[2]*in[0] + m[5]*in[1] + m[8]*in[2];
 }
 
-/* The GE's own float: sign, exponent and 16 significant bits, cut toward
- * zero. The depth path below computes in it (ge_depth_row, ge_screen_z). */
-static double ge24(double v) {
+/* v with its significand cut to `bits` bits, toward zero or (round) to
+ * nearest. */
+static double ge_cut(double v, int bits, int round) {
     if (v == 0.0 || !isfinite(v)) return v;
     int e;
-    const double m = frexp(v, &e);
-    return ldexp(trunc(m * 65536.0), e - 16);
+    const double m = ldexp(frexp(v, &e), bits);
+    return ldexp(round ? floor(m + 0.5) : trunc(m), e - bits);
 }
 
-/* One row of the projection, eye to clip, a product and a sum at a time in
- * ge24: the z and w a transformed vertex's depth comes from. */
-static float ge_depth_row(const float m[16], int row, const float in[3]) {
-    double t = ge24(ge24((double)m[row] * in[0]) + ge24((double)m[4 + row] * in[1]));
-    t = ge24(t + ge24((double)m[8 + row] * in[2]));
-    return (float)ge24(t + m[12 + row]);
+/* The GE's own float: sign, exponent and 16 significant bits, cut toward
+ * zero. The projection below computes in it (ge_proj_row, ge_screen_z). */
+static double ge24(double v) { return ge_cut(v, 16, 0); }
+
+/* One row of the projection, eye to clip, as the GE forms it: each eye
+ * coordinate cut to ge24, each product cut to ge24, the three products and
+ * the translation summed without a cut: geprobe 7 scene 45's fit for the
+ * depth row (ge_screen_z), where summing a step at a time in ge24, as
+ * before, does worse. */
+static float ge_proj_row(const float m[16], int row, const float in[3]) {
+    const double x = ge24(in[0]), y = ge24(in[1]), z = ge24(in[2]);
+    return (float)(ge24((double)m[row] * x) + ge24((double)m[4 + row] * y) +
+                   ge24((double)m[8 + row] * z) + m[12 + row]);
 }
 
 static void mul_4x4(const float m[16], const float in[3], float out[4]) {
@@ -1512,31 +1519,31 @@ static void ndc_to_screen(float nx, float ny, float nz, float *sx, float *sy, fl
                                : (nz * 0.5f + 0.5f) * 65535.0f;
 }
 
-/* Screen depth from clip z and w: clip z in ge24 (ge_depth_row), times 1/w
- * rounded to 17 significant bits, then the scale and the centre, each step
- * cut to ge24, and the result to an integer by the rasterizer (sw_tri).
- * Eleven vertex depths under the probes' one perspective pin it: geprobe 5
- * (fw 6.60) scenes 17 and 27 give eye z -4, -4.5, -5, -5.5, -6 and -8 as
- * 15887, 14049, 12577, 11374, 10371 and 7612, and geprobe 6 scene 36 gives
- * -4.9, -5.2, -5.4, -5.6 and -5.7 as 12848, 12068, 11597, 11159 and 10952,
- * each read off a depth plane that matches on every pixel (a float
- * computation gives 15887.0, 14048.22, 12577.20, 11373.64, 10370.67,
- * 7612.5, 12847.39, 12068.00, 11596.52, 11158.71 and 10951.33). The
- * ge24 divide this replaces fit the first six and gave 12847, 11596 and
- * 10951 for three of scene 36's, 5354 of its depth pixels off where this
- * leaves 696. Of 6400 variants searched (16 to 18 bits, truncated or
- * floored, each step cut or not, w cut or not, a divide or a 14- to 24-bit
- * reciprocal truncated or rounded, four integer rules) the 40 that give
- * all eleven all take this 17-bit rounded reciprocal of the float w; they
- * differ only in steps these values do not reach. Eleven values, so a
- * fit, not a mechanism seen. x and y keep their own measured rule
- * (screen_axis_fx16). */
+/* Screen depth from clip z and w: clip z as ge_proj_row forms it, times 1/w
+ * (w cut to ge24, its reciprocal to 24 bits, both toward zero), the product
+ * cut to 18 bits, then the scale and the centre with the sum rounded to 16
+ * bits, and the result to an integer by the rasterizer (sw_tri), which
+ * floors it. geprobe 7 (fw 6.60) scene 45 draws 3840 points, each at its own
+ * eye depth from -1.05 to -99, and reads their depths back (3720 outside
+ * the dump's unreadable columns): this fits 2883, where the 17-bit rounded
+ * reciprocal of the float w it replaces fit 1703 (2137 of the scene's depth
+ * pixels off -> 837). It keeps the eleven depths geprobes 5 and 6 pinned
+ * that one on: scenes 17 and 27's eye z -4, -4.5, -5, -5.5, -6 and -8 as
+ * 15887, 14049, 12577, 11374, 10371 and 7612, scene 36's -4.9, -5.2,
+ * -5.4, -5.6 and -5.7 as 12848, 12068, 11597, 11159 and 10952. It is the
+ * best of 460,800 variants searched (the eye z cut to 16 or 17 bits, each
+ * later step cut to 16 to 24 bits or not, truncated or rounded, a divide
+ * or a 16- to 24-bit reciprocal, the viewport scale before or after the
+ * divide, the integer floored or rounded); its ties differ only in cutting
+ * the sum at 20 bits or more. The misses are a step either way, low where
+ * the fraction this leaves is small and high where it is large, so the
+ * GE's arithmetic is up to half a step from this somewhere the family does
+ * not reach. geprobe 7 scene 48 reads one more: eye z -5.3 as 11829, where
+ * this gives 11828.75. */
 static float ge_screen_z(float cz, float w) {
     if (g_tl.vp_zs == 0.0f) return ((cz / w) * 0.5f + 0.5f) * 65535.0f;
-    int e;
-    const double m = frexp(1.0 / (double)w, &e);
-    const double ndc = ge24((double)cz * ldexp(floor(m * 131072.0 + 0.5), e - 17));
-    return (float)ge24(ge24(ndc * g_tl.vp_zs) + g_tl.vp_zc);
+    const double ndc = ge_cut((double)cz * ge_cut(1.0 / ge24(w), 24, 0), 18, 0);
+    return (float)ge_cut((double)g_tl.vp_zc + (double)g_tl.vp_zs * ndc, 16, 1);
 }
 
 static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
@@ -2337,7 +2344,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             mul_4x4(g_tl.proj,  eye,   clip);
             /* z as the GE forms it, for depth (ge_screen_z); w stays as it is
              * for x and y, whose rule was measured with it. */
-            clip[2] = ge_depth_row(g_tl.proj, 2, eye);
+            clip[2] = ge_proj_row(g_tl.proj, 2, eye);
             const uint64_t _p2 = ge_prof_now();
 
             psp_vertex *o = &v[decoded];
