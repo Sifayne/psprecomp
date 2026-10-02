@@ -5,6 +5,7 @@
  */
 
 #include "container.h"
+#include "loader.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -211,12 +212,78 @@ static void test_sfo(void) {
     }
 }
 
+static uint32_t get32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* interp --base: a PRX moved to user memory has every relocated word moved
+ * with it. Two segments linked at 0 and 0x100; a jal, a lui/addiu pair into
+ * the second segment, one whose low half goes negative at the new base (so
+ * the high half carries), and a data word. Relocated values are stored
+ * relative to the segment they point into, as a PSP PRX stores them. */
+static void test_rebase(void) {
+    static uint8_t img[0x400];
+    memset(img, 0, sizeof img);
+    put32(img + 0x00, 0x0C000000u | (0x40u >> 2));   /* jal 0x40 (segment 0) */
+    put32(img + 0x04, 0x3C080000u);                  /* lui  t0, 0 */
+    put32(img + 0x08, 0x25080010u);                  /* addiu t0, t0, 0x10 (segment 1) */
+    put32(img + 0x0C, 0x3C090000u);                  /* lui  t1, 0 */
+    put32(img + 0x10, 0x25297F00u);                  /* addiu t1, t1, 0x7F00 (segment 1) */
+    put32(img + 0x120, 0x18);                        /* .word segment 1 + 0x18 */
+    static const uint32_t rel[6][2] = {
+        { 0x00, 4 | (0 << 8) | (0 << 16) },          /* R_MIPS_26 */
+        { 0x04, 5 | (0 << 8) | (1 << 16) },          /* HI16 */
+        { 0x08, 6 | (0 << 8) | (1 << 16) },          /* LO16 */
+        { 0x0C, 5 | (0 << 8) | (1 << 16) },
+        { 0x10, 6 | (0 << 8) | (1 << 16) },
+        { 0x20, 2 | (1 << 8) | (1 << 16) },          /* R_MIPS_32 at segment 1 + 0x20 */
+    };
+    for (int i = 0; i < 6; i++) { put32(img + 0x200 + 8 * i, rel[i][0]); put32(img + 0x204 + 8 * i, rel[i][1]); }
+    put32(img + 0x300 + 4, 0x700000A0u);             /* SHT_PRXRELOC */
+    put32(img + 0x300 + 16, 0x200);
+    put32(img + 0x300 + 20, 6 * 8);
+
+    elf_info e;
+    memset(&e, 0, sizeof e);
+    e.type = ET_PSP_PRX;
+    e.nsegments = 2;
+    e.seg[0].addr = 0;     e.seg[0].offset = 0;     e.seg[0].filesz = e.seg[0].memsz = 0x100;
+    e.seg[1].addr = 0x100; e.seg[1].offset = 0x100; e.seg[1].filesz = e.seg[1].memsz = 0x40;
+    e.shoff = 0x300; e.shentsize = 40; e.shnum = 1;
+
+    elf_info bad = e;
+    int err = 0;
+    bad.type = 2;
+    psp_rebase_image(&bad, 0x08804000u, &err);
+    CHECK(err == -1, "an ET_EXEC is refused, err %d", err);
+    bad = e;
+    psp_rebase_image(&bad, 0x08804010u, &err);
+    CHECK(err == -2, "a base off 256 bytes is refused, err %d", err);
+
+    const uint32_t shift = psp_rebase_image(&e, 0x08804000u, &err);
+    CHECK(err == 0 && shift == 0x08804000u && e.entry == 0x08804000u && e.seg[1].addr == 0x08804100u,
+          "rebase shifts segments and entry: err %d shift %08X seg1 %08X", err, shift, e.seg[1].addr);
+    psp_load_info li;
+    CHECK(psp_relocate_image(img, sizeof img, &e, &li) == 0 && li.nrelocs == 6 && !li.nreloc_skipped,
+          "six relocations applied, %d (%d skipped)", li.nrelocs, li.nreloc_skipped);
+    CHECK(li.lo == 0x08804000u && li.hi == 0x08804140u, "extent %08X-%08X", li.lo, li.hi);
+    CHECK(get32(img + 0x00) == (0x0C000000u | ((0x08804040u >> 2) & 0x03FFFFFFu)),
+          "jal moves with the module: %08X", get32(img + 0x00));
+    CHECK((get32(img + 0x04) & 0xFFFF) == 0x0880 && (get32(img + 0x08) & 0xFFFF) == 0x4110,
+          "lui/addiu reach 0x08804110: %04X %04X", get32(img + 0x04) & 0xFFFF, get32(img + 0x08) & 0xFFFF);
+    CHECK((get32(img + 0x0C) & 0xFFFF) == 0x0881 && (get32(img + 0x10) & 0xFFFF) == 0xC000,
+          "a negative low half carries into the high: %04X %04X",
+          get32(img + 0x0C) & 0xFFFF, get32(img + 0x10) & 0xFFFF);
+    CHECK(get32(img + 0x120) == 0x08804118u, "data word: %08X", get32(img + 0x120));
+}
+
 int main(void) {
     test_sniff();
     test_pbp();
     test_psp_header();
     test_elf();
     test_sfo();
+    test_rebase();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

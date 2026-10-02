@@ -223,6 +223,23 @@ int psp_relocate_image(uint8_t *data, size_t len, const elf_info *e,
     return 0;
 }
 
+uint32_t psp_rebase_image(elf_info *e, uint32_t base, int *err) {
+    *err = 0;
+    if (e->type != ET_PSP_PRX || e->nsegments <= 0) { *err = -1; return 0; }
+    if (base & 0xFFu) { *err = -2; return 0; }
+    uint32_t lo = UINT32_MAX;
+    for (int i = 0; i < e->nsegments && i < 8; i++)
+        if (e->seg[i].addr < lo) lo = e->seg[i].addr;
+    /* Wraps when base < lo, which shifts down; the sums wrap back. */
+    const uint32_t shift = base - lo;
+    for (int i = 0; i < e->nsegments && i < 8; i++) e->seg[i].addr += shift;
+    e->entry += shift;
+    e->text_addr += shift;
+    if (e->stub_addr) e->stub_addr += shift;
+    if (e->modinfo_addr) e->modinfo_addr += shift;
+    return shift;
+}
+
 int psp_find_section(const psp_blob *b, const elf_info *e, const char *name,
                      psp_section *out) {
     if (!e->shoff || !e->shnum || b->size < 52) return -1;

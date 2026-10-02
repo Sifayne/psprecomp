@@ -97,7 +97,7 @@ cases that did so in v3 are not run, so it should run straight through.
 
 ## Compare with psprecomp
 
-    allegrexrecomp interp vfpuprobe.prx --dispatch --budget 4000000000
+    allegrexrecomp interp vfpuprobe.prx --dispatch --budget 4000000000 --base 0x08804000
 
 The same lines go to stderr and to `./ms/PSP/GAME/vfpuprobe/`, next to the
 same `.bin` files, so the hardware copies can be diffed against them.

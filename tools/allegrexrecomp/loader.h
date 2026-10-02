@@ -54,6 +54,20 @@ int psp_relocate_image(uint8_t *data, size_t len, const elf_info *e,
  * psp_mem_init() must already have been called. Returns 0 on success. */
 int psp_load_module(psp_blob *b, const elf_info *e, psp_load_info *out);
 
+/* Move a relocatable module so its lowest segment starts at `base`, as the
+ * PSP's loader places one in user memory (the first module at 0x08804000):
+ * every segment, the entry point and .text shift by the same amount, and
+ * psp_relocate_image then adds the new segment bases to every relocated
+ * word. Call before relocating. Opt-in, for `interp --base`: the recompiled
+ * C is emitted at the linked addresses, so a moved module is no longer
+ * comparable with it address for address.
+ *
+ * Returns the shift applied (base minus the old lowest address), or sets
+ * *err: -1 for a module that is not a relocatable PRX (an ET_EXEC is
+ * linked where it runs and cannot move), -2 for a base not 256-byte
+ * aligned. */
+uint32_t psp_rebase_image(elf_info *e, uint32_t base, int *err);
+
 /* Look a section up by name.
  *
  * Worth preferring over a heuristic scan wherever the module names what it

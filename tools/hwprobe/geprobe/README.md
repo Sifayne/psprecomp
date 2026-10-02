@@ -121,7 +121,7 @@ PNGs for looking at; comparisons should use the raw files.
 
 ## Compare with psprecomp
 
-    allegrexrecomp interp geprobe.prx --dispatch --budget 4000000000 --drain 200
+    allegrexrecomp interp geprobe.prx --dispatch --budget 4000000000 --drain 200 --base 0x08804000
 
 psprecomp's software renderer draws into the same guest VRAM, so its run
 leaves the same files under `./ms/PSP/GAME/geprobe/`.

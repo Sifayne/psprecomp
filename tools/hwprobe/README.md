@@ -45,7 +45,7 @@ github.com/pspdev/pspdev works), `make` in a probe's directory produces its
 The same PRX runs under psprecomp, which writes the same log and files under
 `./ms/PSP/GAME/<name>/`:
 
-    allegrexrecomp interp <name>/<name>.prx --dispatch --budget 4000000000 --drain 200
+    allegrexrecomp interp <name>/<name>.prx --dispatch --budget 4000000000 --drain 200 --base 0x08804000
     tools/hwprobe/compare.py <folder copied from the PSP> ms/PSP/GAME/<name>
 
 `compare.py` diffs the logs step by step and the binary files word by word or

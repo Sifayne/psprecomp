@@ -88,7 +88,7 @@ section.
 
 To run it under psprecomp:
 
-    allegrexrecomp interp threadprobe.prx --dispatch --budget 4000000000 --drain 200
+    allegrexrecomp interp threadprobe.prx --dispatch --budget 4000000000 --drain 200 --base 0x08804000
 
 The log records only what the firmware decided. UIDs appear as valid or not,
 or by the name the probe gave the object. Addresses appear as offsets into a

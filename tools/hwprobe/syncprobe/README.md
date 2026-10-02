@@ -49,7 +49,7 @@ did it.
 
 To run it under psprecomp:
 
-    allegrexrecomp interp syncprobe.prx --dispatch --budget 4000000000 --drain 200
+    allegrexrecomp interp syncprobe.prx --dispatch --budget 4000000000 --drain 200 --base 0x08804000
 
 ## How it works
 

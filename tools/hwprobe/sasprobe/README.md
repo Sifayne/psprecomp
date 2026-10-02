@@ -81,7 +81,7 @@ the step that did it.
 
 The same PRX runs under psprecomp:
 
-    allegrexrecomp interp sasprobe.prx --dispatch --budget 4000000000 --drain 200
+    allegrexrecomp interp sasprobe.prx --dispatch --budget 4000000000 --drain 200 --base 0x08804000
 
 ## Audio files
 

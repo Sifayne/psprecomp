@@ -7,7 +7,7 @@ Both directories hold one probe's output: <name>.txt plus any .bin/.raw
 files. The hardware one is the probe's folder copied off the memory stick;
 the psprecomp one is ./ms/PSP/GAME/<name>/ after
 
-    allegrexrecomp interp <name>.prx --dispatch --budget 4000000000 --drain 200
+    allegrexrecomp interp <name>.prx --dispatch --budget 4000000000 --drain 200 --base 0x08804000
 
 The log is compared step by step (a step starts at a "[n] ..." line), so one
 difference does not shift every line after it. A log holds every run of the
