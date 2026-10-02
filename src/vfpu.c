@@ -1149,12 +1149,14 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  *     with x's sign;
  *   - vexp2 splits |x| into n + f, f on a 23-bit grid; a negative x uses f's
  *     ones' complement, so vexp2(-1) is 3EFFFFFC, just below 1/2;
- *   - vlog2 has 22 fraction bits for x >= 1 (truncated to 23 significant
- *     bits) but only 15 below 1, where vlog2(3F7FFFFF) is -0.
+ *   - vlog2 has 22 fraction bits for x in [1, 4) (truncated to 23
+ *     significant bits), as many as 23 bits leave room for above, from a
+ *     coarser run of the same core, and only 15 below 1, where
+ *     vlog2(3F7FFFFF) is -0.
  *
  * All of them are bit exact: their cores are the hardware's own, from tables
  * fitted to the dumps (the shared core, below). The one gap is vlog2 of
- * x >= 4 (see there). */
+ * x >= 4, where 0.14% of the dumped results are a unit off (see there). */
 #define VINF_BITS 0x7F800000u
 #define VONE_BITS 0x3F800000u
 
@@ -1350,15 +1352,56 @@ static uint32_t vfpu_exp2(uint32_t b) {
     return pack22(127 + n, core_eval(&CORE_EXP2, f & 0x007FFFFFu));
 }
 
-/* vlog2: for x >= 1 the exponent plus the core at 22 fraction bits, the sum
- * truncated to 23 significant bits. Exact for x < 4; above, the hardware's
- * fraction is often one unit of that 23rd bit lower, by a rule the sweeps
- * alone do not settle: 1,286 of the 2,510 swept x >= 4 match.
+/* vlog2: for x in [1, 4) the exponent plus the core at 22 fraction bits, the
+ * sum truncated to 23 significant bits.
+ *
+ * For x >= 4 the result has fewer fraction bits, and the core runs at lower
+ * precision to match, by a rule that depends on the exponent's bit length
+ * alone: with t = bit length - 1 (1 for x in [4, 16) .. 6 above 2^64),
+ *
+ *   - the slope D loses its low t + 1 bits, and the linear term keeps its
+ *     full precision: floor(D' * u / 2^16);
+ *   - the quadratic correction is that of the coefficient C2 = V(0) - V(512)
+ *     with its low t + 1 bits cleared, C2'. The log2 core's correction
+ *     depends on C2 alone (segments with equal C2 have equal V(0) - V(k)),
+ *     so it is read from a segment whose C2 is C2' (VFPU_CORE_LOG2_BYCOEF),
+ *     or, where none is, taken as ceil(C2' * k^2 / 2^18), which it nearly
+ *     always equals. It is rounded up to a multiple of 2^t and subtracted
+ *     from V(0) - (C2 - C2'), rounded down to one;
+ *   - ex * 2^24 plus that, truncated to 23 significant bits.
+ *
+ * Measured on set 10's vfpuprobe 4 (fw660-v4.txt step 203), 230,252
+ * results: the fraction is the same for every exponent of a bit length (for
+ * 4 x 4,113 mantissas), and with the slope cut by t + 1 bits no other
+ * correction can explain two of them differently. This reproduces 229,935
+ * of them and 2,508 of the 2,510 swept x >= 4, where the full-precision core
+ * matched 129,652 and 1,286. The rest are a unit of the 23rd bit off, most
+ * in the three segments whose C2 is odd (9, 56 and 57: 161, 87 and 89) and
+ * where C2' has no segment (44, 88 and 160).
  *
  * Below 1 the hardware leaves out the quadratic correction: the magnitude is
  * 1 - log2(m) from the segment's knot value and D / 256 alone, at 17 bits,
  * of which 15 are kept, plus the exponent's -1 - e. That reproduces all of
  * the 1,198,373 x in [0.5, 1) of v3 step 197 and the 4,615 swept x < 1. */
+
+/* ex + log2(1 + m * 2^-23) at 24 fraction bits, for ex >= 2 (see above). */
+static int64_t log2_wide(int ex, uint32_t m) {
+    const int t = 31 - (int)psp_clz((uint32_t)ex), a = t + 1;
+    const uint32_t seg = m >> 16, u = m & 0xFFFFu, g = u >> 6;
+    const uint32_t k = g >= 512 ? g - 512 : 512 - g;
+    const int64_t d = floor_shr(CORE_LOG2.dv[seg][0], a) << a;
+    const int64_t lin = floor_shr(d * (int64_t)u, 16);
+    const int64_t v0 = core_seg_v(&CORE_LOG2, seg, 0);
+    const int64_t c2 = v0 - core_seg_v(&CORE_LOG2, seg, 512);
+    const int64_t c2t = floor_shr(c2, a) << a;
+    const int s2 = c2t >= 0 && c2t < 256 ? VFPU_CORE_LOG2_BYCOEF[c2t] : -1;
+    const int64_t r = s2 >= 0
+        ? core_seg_v(&CORE_LOG2, (uint32_t)s2, 0) - core_seg_v(&CORE_LOG2, (uint32_t)s2, k)
+        : floor_shr(c2t * (int64_t)k * k + ((int64_t)1 << 18) - 1, 18);
+    const int64_t w = (floor_shr(v0 - (c2 - c2t), t) - floor_shr(r + ((int64_t)1 << t) - 1, t)) << t;
+    return ((int64_t)ex << 24) + lin + w;
+}
+
 static uint32_t vfpu_log2(uint32_t b) {
     const int e = (int)((b >> 23) & 0xFF);
     if (e == 0) return 0xFF800000u;
@@ -1366,6 +1409,7 @@ static uint32_t vfpu_log2(uint32_t b) {
     if (e == 255) return VINF_BITS;
     const int ex = e - 127;
     const uint32_t m = b & 0x007FFFFFu;
+    if (ex >= 2) return pack_trunc((uint64_t)log2_wide(ex, m), -24, 23);
     if (ex >= 0) {
         const int64_t tot = ((int64_t)ex << 22) + core_eval(&CORE_LOG2, m);
         return tot > 0 ? pack_trunc((uint64_t)tot, -22, 23) : 0;

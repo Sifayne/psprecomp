@@ -723,8 +723,9 @@ static void test_units_and_conversions(void) {
 /* ---- the transcendental unit -----------------------------------------------
  *
  * Words from vfpuprobe's dumps (steps 2-12 and 120-127, v3 steps 193-200,
- * fw 6.60). The exact rows are ones the model reproduces; the last one is
- * where it is a unit off the hardware's, and is held to that. */
+ * v4 steps 201-203, fw 6.60). The exact rows are ones the model reproduces;
+ * the last one is where it is a unit off the hardware's, and is held to
+ * that. */
 static void test_transcendentals(void) {
     psp_vfpu_reset();
     static const struct { int op; uint32_t in, out; } exact[] = {
@@ -798,6 +799,16 @@ static void test_transcendentals(void) {
         { PSP_VU_ASIN, 0x3E941144, 0x3E3F41DC },
         { PSP_VU_ASIN, 0x3F604238, 0x3F2DFAD4 },
         { PSP_VU_ASIN, 0x3F6FCDFA, 0x3F45BAEC },
+        /* vlog2 of x >= 4, a coarser run of the core (v4 step 203 and the
+         * sweep), one row per exponent bit length; the full core was a unit
+         * off on each. */
+        { PSP_VU_LOG2, 0x4081C4A1, 0x40014442 },
+        { PSP_VU_LOG2, 0x40B39933, 0x401F45B8 },
+        { PSP_VU_LOG2, 0x41AE3F92, 0x408E3D70 },
+        { PSP_VU_LOG2, 0x43B1EDE0, 0x41079A3E },
+        { PSP_VU_LOG2, 0x47B2824B, 0x4183D6BA },
+        { PSP_VU_LOG2, 0x4FB08A45, 0x4201DAFA },
+        { PSP_VU_LOG2, 0x5FAAC60F, 0x4280D4F4 },
     };
     int r[4];
     psp_vfpu_regs(0x00, 1, r);
@@ -809,7 +820,7 @@ static void test_transcendentals(void) {
               exact[i].op, exact[i].in, got, exact[i].out);
     }
     static const struct { int op; uint32_t in, out; } near[] = {
-        { PSP_VU_LOG2, 0x4081C4A1, 0x40014442 },   /* x >= 4: rule unsettled */
+        { PSP_VU_LOG2, 0x4139AB8A, 0x4062579C },   /* x >= 4, segment 57 (odd C2) */
     };
     for (size_t i = 0; i < sizeof near / sizeof near[0]; i++) {
         psp_cpu.v[r[0]] = psp_bits_to_f32(near[i].in);

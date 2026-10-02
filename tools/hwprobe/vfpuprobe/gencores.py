@@ -59,6 +59,10 @@ segment 56, 3 and 5 in vasin's 98 and 112), so any value in range gives
 every result. Of v3's picks, 601 of sin's and 1,485 of vasin's were
 right.
 
+For vlog2 of x >= 4 the hardware reuses the log2 core at lower precision
+(src/vfpu.c, vfpu_log2). It needs the correction of a reduced coefficient,
+which it looks up through VFPU_CORE_LOG2_BYCOEF, emitted after the tables.
+
 --check reports how many dump and sweep samples the fitted tables
 reproduce. --holdout fits on the dumps alone and checks the sweeps, which
 the fit has not seen.
@@ -453,6 +457,28 @@ def emit(name, tables, f, exps=None):
     f.write('};\n\n')
 
 
+def emit_log2_coef(tables, f):
+    """vlog2 for x >= 4 (set 10, fw660-v4.txt step 203) takes the quadratic
+    correction of the coefficient C2 = V(0) - V(512) with its low bits
+    cleared. The correction is a function of C2 alone: segments with equal
+    C2 have equal V(0) - V(k) for every k. Map each C2 to a segment that
+    has it, -1 where none does."""
+    seg_of = [-1] * 256
+    for s, t in enumerate(tables):
+        c2 = int(t[1][0] - t[1][HALF])
+        assert 0 <= c2 < 256
+        if seg_of[c2] < 0:
+            seg_of[c2] = s
+        else:
+            assert (t[1][0] - t[1] == tables[seg_of[c2]][1][0] - tables[seg_of[c2]][1]).all(), \
+                'segments %d and %d share C2 %d but not V(0) - V(k)' % (seg_of[c2], s, c2)
+    f.write('/* log2: for each C2 = V(0) - V(512), a segment with that C2, or -1. */\n')
+    f.write('static const int8_t VFPU_CORE_LOG2_BYCOEF[256] = {\n')
+    for i in range(0, 256, 16):
+        f.write('    ' + ' '.join('%d,' % v for v in seg_of[i:i + 16]) + '\n')
+    f.write('};\n\n')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('rundir')
@@ -481,6 +507,8 @@ def main():
                     % (' and v4\'s whole segments' if a.v4 else ''))
             for name, (t, E) in fitted.items():
                 emit(name, t, f, E)
+            if 'log2' in fitted:
+                emit_log2_coef(fitted['log2'][0], f)
 
 
 if __name__ == '__main__':
