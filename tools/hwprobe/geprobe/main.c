@@ -18,8 +18,9 @@
  * after the callback steps) what geprobe 6 left open, scenes 50 on
  * (version 8) the two rules geprobe 7 could not settle: the gradient
  * reciprocal and the spline weights, scenes 53 and 54 (version 9) the
- * spline weights again, densely, and scenes 55 to 58 (version 10) the
- * spline weights through depth and texture, and the 3D depth anchor.
+ * spline weights again, densely, scenes 55 to 58 (version 10) the
+ * spline weights through depth and texture, and the 3D depth anchor, and
+ * scenes 59 to 61 (version 11) a vertex's depth, a stage at a time.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -40,7 +41,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 10
+#define PROBE_VERSION 11
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -2477,6 +2478,134 @@ static void scene_anchorsweep(void) {
     dump_depth_full("anchorsweep");
 }
 
+/* ---- version 11 -----------------------------------------------------------
+ *
+ * Every 3D depth plane still off is a corner depth a step off (scene 57: 6
+ * of scene 48's 144 corners), and scene 45's 3840 points fit psprecomp's
+ * depth arithmetic on 2883. These take the arithmetic apart. Scene 59 has
+ * no divide (w = 1), so depth is the viewport's scale and centre on the
+ * eye z alone. Scene 60 makes clip z / clip w the same at every eye depth
+ * from -1 to -100, so every point's depth would be one value in exact
+ * arithmetic and what varies is the reciprocal and the product. Scene 61
+ * repeats scene 60's first batch with the eye depth made by a model matrix
+ * translation, which shows whether the world and view transforms keep
+ * fewer bits. Points are 96 to a row, 5 pixels apart, rows 6 apart, each
+ * coloured by its index (red the low byte, green the high, blue 0x40 + the
+ * batch); depth test ALWAYS, writes on; both depth dumps. */
+
+#define VD_N 1920                         /* points a batch of scene 59 */
+static CV g_vd[3840];
+
+static void vd_load(const ScePspFMatrix4 *m) {
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadMatrix(m);
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumUpdateMatrix();
+}
+
+static w32 vd_colour(int k, int batch) {
+    return 0xFF000000u | (w32)(k & 0xFF) | (w32)(k >> 8) << 8 | (w32)(0x40 + batch) << 16;
+}
+
+/* Scene 59: identity projection (clip = eye, w = 1). Batch 0: viewport z
+ * scale and centre 32768, so depth = 32768 (1 + z); batch 1: the scale and
+ * centre sceGuDepthRange(65535, 0) sets, -32767.5 and 32767.5. 1920 eye
+ * depths each from -0.99 to 0.99 in even float steps. */
+static void scene_depthaffine(void) {
+    if (step("scene %02d: point depths with no divide, two viewport scales", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    static const ScePspFMatrix4 id = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 }, { 0, 0, 0, 1 } };
+    vd_load(&id);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    for (int b = 0; b < 2; b++) {
+        if (b == 0) { sceGuSendCommandf(0x44, 32768.0f); sceGuSendCommandf(0x47, 32768.0f); }
+        else sceGuDepthRange(65535, 0);
+        for (int k = 0; k < VD_N; k++) {
+            const int i = b * VD_N + k, px = 2 + 5 * (i % 96), py = 8 + 6 * (i / 96);
+            const float z = -0.99f + (float)k * (1.98f / (VD_N - 1));
+            g_vd[i] = (CV){ vd_colour(k, b), (px + 0.5f - 240.0f) / 240.0f, (136.0f - (py + 0.5f)) / 136.0f, z };
+        }
+        sceGuDrawArray(GU_POINTS, FMT_CV3D, VD_N, NULL, gumem(&g_vd[b * VD_N], VD_N * (int)sizeof(CV)));
+    }
+    sceGuDepthRange(65535, 0);
+    scene_end("depthaffine", GU_PSM_8888, 1);
+    dump_depth_full("depthaffine");
+}
+
+/* Scenes 60 and 61's projection: clip x and y the eye's, clip z = a z,
+ * clip w = -z, so clip z / clip w = -a at every depth. */
+static void vd_ratio_matrix(ScePspFMatrix4 *m, float a) {
+    *m = (ScePspFMatrix4){ { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, a, -1 }, { 0, 0, 0, 0 } };
+}
+
+/* 1280 eye depths from -1 to -100, even steps in 1/z, as scene 45 spaces
+ * its far points. */
+static float vd_depth(int k) {
+    const float r0 = 1.0f, r1 = 1.0f / 100.0f;
+    return -1.0f / (r0 - (float)k * ((r0 - r1) / 1279.0f));
+}
+
+/* Scene 60: the ratio projection with a = -0.3, 0.45 and -0.82 (one batch
+ * each), the standard depth range, so every point of a batch would read
+ * 32767.5 (1 + a): 22937.25, 47513.875, 5898.15. */
+static void scene_depthratio(void) {
+    if (step("scene %02d: point depths with clip z / w fixed, eye z -1 to -100", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    static const float A[3] = { -0.3f, 0.45f, -0.82f };
+    ScePspFMatrix4 m;
+    for (int b = 0; b < 3; b++) {
+        vd_ratio_matrix(&m, A[b]);
+        vd_load(&m);
+        for (int k = 0; k < 1280; k++) {
+            const int i = b * 1280 + k, px = 2 + 5 * (i % 96), py = 8 + 6 * (i / 96);
+            const float z = vd_depth(k);
+            g_vd[i] = (CV){ vd_colour(k, b), (px + 0.5f - 240.0f) / 240.0f * -z, (136.0f - (py + 0.5f)) / 136.0f * -z, z };
+        }
+        sceGuDrawArray(GU_POINTS, FMT_CV3D, 1280, NULL, gumem(&g_vd[b * 1280], 1280 * (int)sizeof(CV)));
+    }
+    scene_end("depthratio", GU_PSM_8888, 1);
+    dump_depth_full("depthratio");
+}
+
+/* Scene 61: scene 60's first batch (a = -0.3) with each point's model z
+ * its eye z plus 37.125 and the model matrix translating z by -37.125, and
+ * again by 0.4375 and -0.4375: the eye depth is then the GE's own sum. */
+static void scene_depthmodel(void) {
+    if (step("scene %02d: scene 60's first batch with eye z from a model translation", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    ScePspFMatrix4 m;
+    vd_ratio_matrix(&m, -0.3f);
+    vd_load(&m);
+    static const float T[3] = { 37.125f, 0.4375f, -0.4375f };
+    for (int b = 0; b < 3; b++) {
+        ScePspFVector3 tr = { 0.0f, 0.0f, -T[b] };
+        sceGumMatrixMode(GU_MODEL);
+        sceGumLoadIdentity();
+        sceGumTranslate(&tr);
+        sceGumUpdateMatrix();
+        for (int k = 0; k < 1280; k++) {
+            const int i = b * 1280 + k, px = 2 + 5 * (i % 96), py = 8 + 6 * (i / 96);
+            const float z = vd_depth(k);
+            g_vd[i] = (CV){ vd_colour(k, b), (px + 0.5f - 240.0f) / 240.0f * -z, (136.0f - (py + 0.5f)) / 136.0f * -z, z + T[b] };
+        }
+        sceGuDrawArray(GU_POINTS, FMT_CV3D, 1280, NULL, gumem(&g_vd[b * 1280], 1280 * (int)sizeof(CV)));
+    }
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumUpdateMatrix();
+    scene_end("depthmodel", GU_PSM_8888, 1);
+    dump_depth_full("depthmodel");
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -3097,6 +3226,11 @@ int main(int argc, char **argv) {
     g_scene = 56; scene_splineparam();
     g_scene = 57; scene_anchortwin();
     g_scene = 58; scene_anchorsweep();
+
+    section("scenes, version 11");
+    g_scene = 59; scene_depthaffine();
+    g_scene = 60; scene_depthratio();
+    g_scene = 61; scene_depthmodel();
 
     probe_screen(1);
     probe_done();

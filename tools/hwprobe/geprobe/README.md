@@ -58,6 +58,9 @@ blending, depth, clipping, the per-pixel tests).
 | 56 | (v10) the spline parameter the GE uses: the same splines with no texture coordinates over a 512-texel ramp, nearest, repeated, at texture scale 1, 4 and 16 | 8888 |
 | 57 | (v10) scene 48's 144 corners as points, their depths read back and logged, then its 48 triangles in through mode at psprecomp's corners with those depths; plus both depth dumps | 8888 |
 | 58 | (v10) scene 48's shape 1 at every sixteenth of a pixel across and down, 32 copies; plus both depth dumps | 8888 |
+| 59 | (v11) point depths with no divide: identity projection (w = 1), 1920 eye depths from -0.99 to 0.99 at viewport z scale and centre 32768, then 1920 at sceGuDepthRange(65535, 0)'s; plus both depth dumps | 8888 |
+| 60 | (v11) point depths with clip z / clip w fixed: a projection with clip w = -z and clip z = a z, 1280 eye depths from -1 to -100 for each of a = -0.3, 0.45 and -0.82, so each batch would read one depth in exact arithmetic; plus both depth dumps | 8888 |
+| 61 | (v11) scene 60's first batch with the eye depth made by a model matrix translation of -37.125, -0.4375 and 0.4375; plus both depth dumps | 8888 |
 
 After the scenes it records which GE callbacks run, with which arguments and
 when, through libgu (signal and finish) and through a raw `sceGe` list.
@@ -116,6 +119,14 @@ projection), so the two frames say whether the 3D path differs from
 through mode; scene 58 moves one shape by every sixteenth of a pixel. The
 `_depthfull.bin` dumps are the whole 512-pixel stride, which the 480-wide
 `_depth.raw` cannot read all of.
+
+Version 11 adds scenes 59-61, so steps 1-98 keep their version 10 numbers.
+Version 10 settled the depth plane's corner (src/render.c sw_tri); every 3D
+plane still off is a corner's own depth a step off, and scene 45's points
+fit psprecomp's depth arithmetic on 2883 of 3720. These take that
+arithmetic apart: scene 59 without the divide, scene 60 with the ratio
+clip z / clip w fixed so only the reciprocal and the product vary, and
+scene 61 with the eye depth made by a model translation.
 
 ## Build
 
