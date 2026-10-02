@@ -976,6 +976,28 @@ static void test_transformed_depth(void) {
     }
 }
 
+/* A depth plane starts from the end of the long edge on that edge's side
+ * (render.c sw_tri, zk0), not the colour's leftmost corner. geprobe 10
+ * (fw 6.60) scene 57's first triangle in through mode, corners and depths
+ * as the PSP drew it: its middle corner lies left of the long edge, so the
+ * plane starts from the rightmost corner, and these pixels read a step
+ * higher than from the leftmost. */
+static void test_depth_plane_side(void) {
+    static const struct { int x, y, z; } P[] = {
+        { 47, 23, 12297 }, { 72, 37, 10977 }, { 78, 45, 10641 }, { 100, 55, 9489 }, { 103, 59, 9321 } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    depth_state(1);                                            /* ALWAYS, writes on */
+    float_vertex(0, 675 / 16.0f, 330 / 16.0f, 12577);
+    float_vertex(1, 1982 / 16.0f, 985 / 16.0f, 8284);
+    float_vertex(2, 1263 / 16.0f, 963 / 16.0f, 10558);
+    cmd(0x04, (3u << 16) | 3);
+    end_list();
+    for (unsigned i = 0; i < sizeof P / sizeof P[0]; i++)
+        CHECK(depth_at(P[i].x, P[i].y) == (unsigned)P[i].z, "depth at (%d,%d): %u, hardware %d",
+              P[i].x, P[i].y, depth_at(P[i].x, P[i].y), P[i].z);
+}
+
 /* Gradients take 1/area from the GE's reciprocal table (render.c area_rcp),
  * which is a unit off the reciprocal cut to 16 bits where its linear step
  * misses. geprobe 8 (fw 6.60) scene 50's triangles 517/16 and 885/16 pixels
@@ -1722,6 +1744,7 @@ int main(void) {
     test_depth_plane();
     test_transformed_depth();
     test_gradient_reciprocal();
+    test_depth_plane_side();
     test_line_between_centres();
     test_far_vertex_16bit();
     test_backend_selection();

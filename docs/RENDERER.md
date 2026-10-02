@@ -501,11 +501,23 @@ ge_screen_z, clip_to_fx16):
   scenes 15 and 18's measured corners cuts the eye coordinates to 16 bits.
   Patch vertices keep the 14-bit rule: psprecomp's tessellation is not the
   GE's, and the new rule costs scene 22 342 pixels.
-- **Across a triangle** depth is a plane, like colour: anchored at the same
-  vertex, with gradients from the numerator times 1/area, then floored to
-  1/1024 a pixel. Colour uses the same 1/area (geprobe 6 scene 39). Scene
-  27's four through-mode triangles match on every pixel, and so do 22 of
-  scene 36's 24 3D triangles from one of their corners.
+- **Across a triangle** depth is a plane, like colour, with gradients from
+  the numerator times 1/area, floored to 1/1024 a pixel; colour uses the
+  same 1/area (geprobe 6 scene 39). It starts from its own corner, though:
+  the end of the long edge (top to bottom) on that edge's side. When the
+  middle corner lies left of the long edge, the plane starts from the
+  rightmost corner, and when it lies right, from the leftmost; two corners
+  level at the top or bottom count the left one as the end, so a flat-
+  topped or flat-bottomed triangle starts from its leftmost. Colour and fog
+  keep the leftmost corner (geprobe 1 steps 1-11 and scene 39's 78
+  triangles break under the depth rule). geprobe 10 scene 57 settles it: it
+  draws scene 48's 48 3D triangles again in through mode at psprecomp's
+  corners, with the depth the PSP gives each corner as a point, and this
+  rule reproduces every pixel of all 48, where the leftmost corner fits 28
+  and no single corner or feature (top, bottom, depth, angle, the edge
+  opposite) fits more than 31. With those corner depths it fits 47 of
+  scene 48's 3D triangles too (the 48th has a corner a sixteenth off), so
+  the 3D path is the same. Scenes 17, 27 and 36 match on every pixel.
 - **1/area comes from a table** with a linear step (area_rcp), not a
   division. The area's significand is cut to 17 bits. Its leading nine
   bits, h, pick one of 256 entries holding 2^27/h and the slope 2^24/h²,
@@ -537,16 +549,7 @@ ge_screen_z, clip_to_fx16):
   right edge (5/16 right and 3/16 up) or on the top corner is outside, so
   the hardware draws no pixel there. That is 4 pixels, and it is not
   modelled.
-- **Open:** the 3D depth anchor. geprobe 7 scene 48 draws eight more shapes
-  from each corner in both windings. With the corners and vertex depths
-  above, and its one off depth moved, 78 of the 90 3D triangles in scenes
-  17, 36 and 48 match on every pixel from some corner. The leftmost corner
-  matches 57 of them and the top 58. No rule tried picks the matching
-  corner (bottom, right, submission order, depth, the corner opposite the
-  longest or shortest edge, coarser comparisons). Nor does starting the
-  plane at a point that is not a corner, or rounding the step differently.
-  Leftmost stays. A GPU backend shares the vertex depths and interpolates them
-  itself.
+- A GPU backend shares the vertex depths and interpolates them itself.
 
 ## Texture coordinates on sprites and lines
 
@@ -618,18 +621,20 @@ fw 6.60):
 - **Splines.** Splines use the same grid. The weights of fill/fill splines
   do not fit yet.
 
-## Still open after geprobe 8
+## Still open after geprobe 10
 
-These are what geprobe 8 (fw 6.60) still shows psprecomp getting wrong,
-with pixels off on run 8. Run 8 drew every scene it shares with run 7 to
-the byte the same. Details on the geprobe 7 items, and what further probing
-could settle, are in `fw660-run7/findings/geprobe.md`.
+These are what geprobe 10 (fw 6.60) still shows psprecomp getting wrong,
+with pixels off on run 10 (set 11). Run 10 drew every scene it shares with
+runs 7 to 9 to the byte the same. Details on the geprobe 7 items, and what
+further probing could settle, are in `fw660-run7/findings/geprobe.md`.
 
-- **Vertex depth** (scene 45: 837 pixels; scene 48's depth: 860). The
-  depth arithmetic above is within half a step of the GE's on every point,
-  but not equal to it.
-- **The 3D depth anchor** (scene 17's depth: 303; scene 27's: 1867; scene
-  36's: 45). No vertex rule fits; see Depth values.
+- **Vertex depth** (scene 45: 837 pixels). The depth arithmetic above is
+  within half a step of the GE's on every point, but not equal to it. Every
+  other 3D depth plane off is this now: scene 57 reads 6 of scene 48's 144
+  corners a step deeper on the PSP than psprecomp floors them (scene 48's
+  depth: 551, scene 57's: 424), and scene 58's shape is a step deeper
+  across every copy from its corner at eye z -5.3 (7451), the corner that
+  reads 11829 where this gives 11828.75.
 - **Patch vertices** (scenes 22, 23 and 26: 610, 1876 and 1087 pixels;
   scene 38: 28; scene 44: 74; scene 52: 600). Spline weights are
   unsettled. geprobe 8 scene 52 reads 3244 of them, every edge mode at
@@ -662,10 +667,10 @@ could settle, are in `fw660-run7/findings/geprobe.md`.
   in a channel, and all fall in the same four triangles of each fan (the
   two on either side of the vertical, on the left), whatever the light:
   directional, point and single-colour alike, and none in the spot fan. So
-  it is the triangles' shape, not the lighting arithmetic. Anchoring every
-  3D plane at the top, bottom, rightmost, first or last vertex instead
-  makes scene 16 worse (395 to 1079), so it joins the 3D anchor question
-  above.
+  it is the triangles' shape, not the lighting arithmetic. These are colour
+  planes, which keep the leftmost corner; anchoring them at the top,
+  bottom, rightmost, first or last vertex instead, or by the depth plane's
+  rule, makes scene 16 worse (395 to 1079).
 - **Morph blends** (scene 21: 400) and **skinned corners** (scene 20: 54)
   are unchanged by the projection change.
 - **Point and spot lights** (scene 35: 10 pixels), each one step low, all

@@ -1224,10 +1224,35 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                         (wx >= g_sc_x0 && wx <= g_sc_x1 && wy >= g_sc_y0 && wy <= g_sc_y1);
             any |= inside[k];
         }
+        /* The depth plane starts from another corner than the colour's:
+         * the end of the long edge (top to bottom) on the long edge's side.
+         * With the middle corner left of that edge the long edge is the
+         * right side and depth starts from the rightmost corner; with it
+         * right, from the leftmost (see the depth plane below). */
+        int z_from_right, zk0 = -1;
+        {
+            int o[3] = { 0, 1, 2 };                           /* by y, then x */
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 2 - i; j++) {
+                    const psp_vertex *p = vs[o[j]], *q = vs[o[j + 1]];
+                    if (p->y > q->y || (p->y == q->y && p->x > q->x)) { const int s = o[j]; o[j] = o[j + 1]; o[j + 1] = s; }
+                }
+            /* Two corners level at the bottom: the left one is the bottom,
+             * as at the top the left one is the top, so a flat-topped or
+             * flat-bottomed triangle starts from its leftmost corner
+             * (geprobe 5 scene 27's flat-bottomed triangle; scenes 46 and 50's
+             * flat-topped ones). */
+            if (vs[o[1]]->y == vs[o[2]]->y) { const int s = o[1]; o[1] = o[2]; o[2] = s; }
+            const psp_vertex *tv = vs[o[0]], *mv = vs[o[1]], *bv = vs[o[2]];
+            z_from_right = (int64_t)(bv->x - tv->x) * (mv->y - tv->y) - (int64_t)(bv->y - tv->y) * (mv->x - tv->x) >= 0;
+        }
         for (int k = 0; k < 3; k++) {
             if (any && !inside[k]) continue;
             if (k0 < 0 || vs[k]->x < vs[k0]->x || (vs[k]->x == vs[k0]->x && vs[k]->y < vs[k0]->y))
                 k0 = k;
+            if (zk0 < 0 || (z_from_right ? vs[k]->x > vs[zk0]->x : vs[k]->x < vs[zk0]->x) ||
+                (vs[k]->x == vs[zk0]->x && vs[k]->y < vs[zk0]->y))
+                zk0 = k;
         }
         int64_t rq; int rsh;
         area_rcp(area, &rq, &rsh);
@@ -1252,25 +1277,26 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             col_dx[i] = gx * SUBPX;
             col_dy[i] = gy * SUBPX;
         }
-        /* Depth is a plane too, through the same anchor, in the same
-         * 1/16384 units, with the same gradient: the numerator times
-         * area_rcp's 1/area, floored to 1/1024 a pixel. The vertex
-         * depths are integers -- through mode's as given, a transformed
-         * vertex's floored from ge_screen_z. geprobe 5 (fw 6.60) scene 27's
-         * through-mode triangles (full range, nearly flat, constant, steep
-         * in y) match on every pixel; the barycentric float blend this
-         * replaces left the constant 12345 at 12344 on 60 of them and was a
-         * step off on 3000 more. geprobe 6 scene 36 draws four 3D shapes
-         * from each corner in both windings: 15 of its 24 triangles match
-         * on every pixel and eight more are within 1 to 56 pixels, one step
-         * each. The leftmost anchor is not settled for depth: the one shape
-         * whose top and leftmost corners differ matches on 5 of 6 when
-         * anchored at the top, against none, but another shape's triangles
-         * split between the two and the top takes scene 17 from 303 pixels
-         * off to 601 (scene 27: 1867 to 1172). Of scenes 27 and 17's 3D
-         * triangles, three match on every interior pixel and three (scene
-         * 27's quad sloping in x, both halves, and the second of scene 17's
-         * interpenetrating pair) still do not (docs/RENDERER.md). */
+        /* Depth is a plane too, in the same 1/16384 units, with the same
+         * gradient: the numerator times area_rcp's 1/area, floored to 1/1024
+         * a pixel. The vertex depths are integers -- through mode's as
+         * given, a transformed vertex's floored from ge_screen_z -- but the
+         * plane starts from its own corner, zk0 above: the end of the long
+         * edge on that edge's side, the rightmost corner when the middle one
+         * lies left of the long edge and the leftmost when it lies right.
+         * geprobe 10 (fw 6.60) scene 57 shows it. It draws scene 48's 48 3D
+         * triangles again in through mode at psprecomp's corners, with the
+         * depth the PSP gives each corner as a point: this rule reproduces
+         * every pixel of all 48, where the colour's leftmost corner fits 28
+         * and no single corner, nor top, bottom, depth or angle, fits more
+         * than 31. With those corner depths scene 48's 3D planes match too,
+         * 47 of 48 (one corner a sixteenth off), so the 3D path is the same.
+         * The right triangles of scenes 27, 46 and 50, which settled the
+         * plane, have their middle corner right of a vertical long edge, so
+         * there the rule is the leftmost, as before; scenes 17 and 36 go to
+         * no pixel off and scene 27 from 1867 to 1290. What is left is the
+         * corners' own depths (scene 57: 6 of 144 a step deeper on the PSP,
+         * docs/RENDERER.md). */
         {
             int64_t zv[3];
             for (int k = 0; k < 3; k++) {
@@ -1280,7 +1306,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             const int64_t nx = (zv[1] - zv[0]) * (c->y - a->y) - (zv[2] - zv[0]) * (b->y - a->y);
             const int64_t ny = (zv[2] - zv[0]) * (b->x - a->x) - (zv[1] - zv[0]) * (c->x - a->x);
             const int64_t gx = floor_shr(nx * rq, rsh - 14), gy = floor_shr(ny * rq, rsh - 14);
-            z_acc = zv[k0] * 16384 + gx * (px - vs[k0]->x) + gy * (py - vs[k0]->y);
+            z_acc = zv[zk0] * 16384 + gx * (px - vs[zk0]->x) + gy * (py - vs[zk0]->y);
             z_dx = gx * SUBPX;
             z_dy = gy * SUBPX;
         }
