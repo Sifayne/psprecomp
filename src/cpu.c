@@ -51,6 +51,7 @@ void psp_cpu_reset_thread(void) {
     memset(&psp_cpu, 0, sizeof psp_cpu);
     for (int i = 1; i < PSP_NUM_GPR; i++) psp_cpu.r[i] = PSP_GPR_FRESH;
     psp_cpu.r[PSP_REG_K1] = 0;
+    psp_cpu.hi = psp_cpu.lo = PSP_GPR_FRESH;
     psp_cpu_reset_fp();
 }
 
