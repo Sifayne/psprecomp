@@ -24,6 +24,7 @@
  * with its own correctness problem.
  */
 
+#include <limits.h>
 #include <math.h>
 #ifndef _WIN32
 #include <pthread.h>          /* the GE thread census; see ge_note_thread */
@@ -1387,18 +1388,197 @@ static double ge_cut(double v, int bits, int round) {
 }
 
 /* The GE's own float: sign, exponent and 16 significant bits, cut toward
- * zero. The projection below computes in it (ge_proj_row, ge_screen_z). */
+ * zero. The vertex arithmetic below computes in it (ge_sum). */
 static double ge24(double v) { return ge_cut(v, 16, 0); }
 
-/* One row of the projection, eye to clip, as the GE forms it: each eye
- * coordinate cut to ge24, each product cut to ge24, the three products and
- * the translation summed without a cut: geprobe 7 scene 45's fit for the
- * depth row (ge_screen_z), where summing a step at a time in ge24, as
- * before, does worse. */
-static float ge_proj_row(const float m[16], int row, const float in[3]) {
-    const double x = ge24(in[0]), y = ge24(in[1]), z = ge24(in[2]);
-    return (float)(ge24((double)m[row] * x) + ge24((double)m[4 + row] * y) +
-                   ge24((double)m[8 + row] * z) + m[12 + row]);
+/* ---- The GE's vertex arithmetic ----------------------------------------
+ *
+ * geprobe 12 (fw 6.60) reads each stage of a vertex's depth whole: with the
+ * viewport z centre 0 and its scale a power of two, a point's depth is
+ * clip z / w's top 16 bits (scenes 62-66). What it reads, and every point of
+ * scenes 45 and 59-61 besides (41,543 points), fit this to the last bit:
+ *  - A number has 16 significant bits. A vertex coordinate is cut to them
+ *    toward zero on the way in (ge_split); a matrix word holds no more.
+ *  - A product a b keeps its bits down to 2^(ea + eb - 15), toward zero, ea
+ *    and eb the exponents of a and b: when the significands' product reaches
+ *    2 it keeps one bit more than 16 (ge_mul).
+ *  - A sum puts every term on the grid 2^(E - 15), each cut toward zero, E
+ *    the largest term's exponent -- a product's ea + eb, whatever its
+ *    significand -- adds them, and cuts the total to 16 bits (ge_sum). A
+ *    matrix row's three products and its translation are one such sum.
+ *  - The GE multiplies projection by view, that by world, in this same
+ *    arithmetic, and transforms a vertex by the product (ge_wvp). Forming
+ *    eye z first instead cancels scene 61's errors in clip z / w: it fits 939
+ *    of scene 65's 3072 points where this fits all of them.
+ *  - 1/w is a table (ge_rcp16); clip z / w is clip z times it, cut to 16 bits;
+ *    the viewport is zc plus zs times that, a sum, floored (ge_screen_z).
+ * Scene 63 sums two to four terms across alignments of 3 to 18 bits, with a
+ * carry and a cancellation; scene 66 is the probes' own perspective, where
+ * every point a product carries in was a step off until the sum lined it up
+ * by ea + eb. */
+typedef struct {
+    int64_t q;       /* the value is q 2^(e - 15); 0 for zero */
+    int     e;
+    int     bad;     /* an input not finite: sums fall back to v */
+    double  v;       /* the plain product */
+} ge_term;
+
+/* v cut to 16 significant bits toward zero, as a signed significand in
+ * [2^15, 2^16) and an exponent; 0 for zero, -1 for a value not finite. */
+static int ge_split(double v, int64_t *s, int *e) {
+    uint64_t b;
+    memcpy(&b, &v, sizeof b);
+    const int ex = (int)((b >> 52) & 0x7FF);
+    if (ex == 0x7FF) return -1;
+    if (ex == 0) {
+        if (v == 0.0) return 0;
+        int fe;
+        *s = (int64_t)(frexp(fabs(v), &fe) * 65536.0);
+        *e = fe - 1;
+    } else {
+        *s = (int64_t)(0x8000u | ((b >> 37) & 0x7FFFu));
+        *e = ex - 1023;
+    }
+    if (b >> 63) *s = -*s;
+    return 1;
+}
+
+static ge_term ge_mul(double a, double b) {
+    ge_term t = { 0, INT_MIN, 0, a * b };
+    int64_t sa, sb;
+    int ea, eb;
+    const int ka = ge_split(a, &sa, &ea), kb = ge_split(b, &sb, &eb);
+    if (ka < 0 || kb < 0) { t.bad = 1; return t; }
+    if (!ka || !kb) return t;
+    const int64_t p = sa * sb;                     /* under 2^32 */
+    t.q = p < 0 ? -((-p) >> 15) : p >> 15;
+    t.e = ea + eb;
+    return t;
+}
+
+static double ge_sum(const ge_term *t, int n) {
+    int e = INT_MIN, bad = 0;
+    double plain = 0.0;
+    for (int i = 0; i < n; i++) {
+        plain += t[i].v;
+        bad |= t[i].bad;
+        if (t[i].q && t[i].e > e) e = t[i].e;
+    }
+    if (bad) return plain;
+    if (e == INT_MIN) return 0.0;
+    int64_t s = 0;
+    for (int i = 0; i < n; i++) {
+        if (!t[i].q) continue;
+        const int d = e - t[i].e;
+        const int64_t m = t[i].q < 0 ? -t[i].q : t[i].q;
+        const int64_t a = d >= 63 ? 0 : m >> d;
+        s += t[i].q < 0 ? -a : a;
+    }
+    if (!s) return 0.0;
+    int64_t m = s < 0 ? -s : s;
+    int sh = 0;
+    while ((m >> sh) >= 65536) sh++;               /* the total to 16 bits */
+    m >>= sh;
+    return ldexp(s < 0 ? -(double)m : (double)m, e - 15 + sh);
+}
+
+static double ge_dot4(const double row[4], const double in[4]) {
+    ge_term t[4];
+    for (int k = 0; k < 4; k++) t[k] = ge_mul(row[k], in[k]);
+    return ge_sum(t, 4);
+}
+
+static void ge_mat4_mul(const double a[4][4], const double b[4][4], double out[4][4]) {
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            const double col[4] = { b[0][j], b[1][j], b[2][j], b[3][j] };
+            out[i][j] = ge_dot4(a[i], col);
+        }
+}
+
+/* Projection times view times world, row by row, as the GE combines them
+ * (projection and view first: scene 65 cannot tell that from view and world
+ * first). World and view are 4 x 3, their last row 0 0 0 1. */
+static void ge_wvp(double m[4][4]) {
+    double p[4][4], v[4][4], w[4][4], pv[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            p[i][j] = g_tl.proj[4 * j + i];
+            v[i][j] = i < 3 ? g_tl.view[3 * j + i]  : (j == 3);
+            w[i][j] = i < 3 ? g_tl.world[3 * j + i] : (j == 3);
+        }
+    ge_mat4_mul(p, v, pv);
+    ge_mat4_mul(pv, w, m);
+}
+
+/* A model position to clip space through ge_wvp's matrix. */
+static void ge_clip(const double m[4][4], const float model[3], float clip[4]) {
+    const double in[4] = { model[0], model[1], model[2], 1.0 };   /* ge_mul cuts each to 16 bits */
+    for (int i = 0; i < 4; i++) clip[i] = (float)ge_dot4(m[i], in);
+}
+
+/* 1/w as the GE has it. w is cut to 16 bits; the 7 significand bits below
+ * the leading one pick one of 128 straight segments, the 8 after step along
+ * it: twice its start in units of 2^-16, less its drop times the step over
+ * 256, that product rounded up, then floored, for 1/w's significand in
+ * units of 2^-16. Each segment's ends are within a unit of 2^23/h and
+ * 2^23/(h+1), h its index plus 128, so it lies a little above 1/w between
+ * them (a chord, where geprobe 8's gradient reciprocal is a tangent). The
+ * entries are geprobe 12's: scene 62 reads 1/w whole for 9151 w over nine
+ * binades (2^-3 to 2^13), and these reproduce every one; the drops are all
+ * even. Not a rounding of 2^23/h or of the chord at any width tried, and
+ * not consecutive starts' differences either (they differ from the drop by
+ * up to a unit), so they are kept as measured. Every run of 256 w differing
+ * only in the bits a float has past 16 reads one value. */
+static const uint32_t ge_rcp_tab[128][2] = {
+{ 131073, 508 }, { 130056, 500 }, { 129055, 492 }, { 128072, 486 },
+    { 127100, 478 }, { 126144, 470 }, { 125204, 464 }, { 124275, 456 },
+    { 123362, 450 }, { 122462, 444 }, { 121575, 438 }, { 120701, 432 },
+    { 119837, 424 }, { 118987, 418 }, { 118151, 414 }, { 117324, 408 },
+    { 116509, 402 }, { 115705, 396 }, { 114914, 392 }, { 114131, 386 },
+    { 113359, 380 }, { 112600, 376 }, { 111848, 370 }, { 111108, 366 },
+    { 110376, 360 }, { 109655, 356 }, { 108944, 352 }, { 108240, 346 },
+    { 107546, 342 }, { 106862, 338 }, { 106185, 334 }, { 105518, 330 },
+    { 104859, 326 }, { 104207, 322 }, { 103564, 318 }, { 102928, 314 },
+    { 102301, 310 }, { 101681, 306 }, { 101068, 302 }, { 100464, 300 },
+    {  99866, 296 }, {  99274, 292 }, {  98690, 288 }, {  98114, 286 },
+    {  97543, 282 }, {  96978, 278 }, {  96422, 276 }, {  95870, 272 },
+    {  95327, 270 }, {  94787, 266 }, {  94256, 264 }, {  93728, 260 },
+    {  93208, 258 }, {  92692, 254 }, {  92183, 252 }, {  91681, 250 },
+    {  91181, 246 }, {  90689, 244 }, {  90202, 242 }, {  89718, 238 },
+    {  89241, 236 }, {  88770, 234 }, {  88303, 232 }, {  87839, 228 },
+    {  87382, 226 }, {  86929, 224 }, {  86482, 222 }, {  86038, 220 },
+    {  85600, 218 }, {  85165, 216 }, {  84733, 212 }, {  84308, 210 },
+    {  83886, 208 }, {  83469, 206 }, {  83056, 204 }, {  82647, 202 },
+    {  82242, 200 }, {  81840, 198 }, {  81443, 196 }, {  81050, 194 },
+    {  80660, 192 }, {  80276, 192 }, {  79893, 190 }, {  79514, 188 },
+    {  79139, 186 }, {  78767, 184 }, {  78399, 182 }, {  78034, 180 },
+    {  77674, 180 }, {  77316, 178 }, {  76961, 176 }, {  76609, 174 },
+    {  76261, 172 }, {  75915, 170 }, {  75575, 170 }, {  75235, 168 },
+    {  74899, 166 }, {  74565, 164 }, {  74237, 164 }, {  73909, 162 },
+    {  73585, 160 }, {  73265, 160 }, {  72945, 158 }, {  72629, 156 },
+    {  72317, 156 }, {  72006, 154 }, {  71698, 152 }, {  71394, 152 },
+    {  71091, 150 }, {  70790, 148 }, {  70494, 148 }, {  70198, 146 },
+    {  69907, 146 }, {  69616, 144 }, {  69328, 142 }, {  69043, 142 },
+    {  68760, 140 }, {  68480, 140 }, {  68201, 138 }, {  67926, 138 },
+    {  67651, 136 }, {  67379, 134 }, {  67110, 134 }, {  66842, 132 },
+    {  66578, 132 }, {  66314, 130 }, {  66053, 130 }, {  65794, 128 },
+};
+
+static double ge_rcp16(double w) {
+    if (w == 0.0 || !isfinite(w)) return 1.0 / w;
+    int e;
+    const double m = frexp(fabs(w), &e);                     /* [0.5, 1) */
+    const uint32_t sig = (uint32_t)(m * 65536.0) & 0x7FFFu;  /* 15 bits below the leading one */
+    if (sig == 0) return copysign(ldexp(1.0, 1 - e), w);     /* a power of two: exact */
+    const uint32_t t = sig >> 8, l = sig & 0xFFu;
+    const uint32_t q = (128u * ge_rcp_tab[t][0] - ge_rcp_tab[t][1] * l - 1u) >> 8;
+    return copysign(ldexp((double)q, -15 - e), w);           /* (q / 2^16) * 2^(1-e) */
+}
+
+/* clip c over w as the GE forms it: c times 1/w, cut to 16 bits. */
+static double ge_over_w(double c, double w) {
+    return ge_cut(c * ge_rcp16(w), 16, 0);
 }
 
 static void mul_4x4(const float m[16], const float in[3], float out[4]) {
@@ -1520,31 +1700,15 @@ static void ndc_to_screen(float nx, float ny, float nz, float *sx, float *sy, fl
                                : (nz * 0.5f + 0.5f) * 65535.0f;
 }
 
-/* Screen depth from clip z and w: clip z as ge_proj_row forms it, times 1/w
- * (w cut to ge24, its reciprocal to 24 bits, both toward zero), the product
- * cut to 18 bits, then the scale and the centre with the sum rounded to 16
- * bits, and the result to an integer by the rasterizer (sw_tri), which
- * floors it. geprobe 7 (fw 6.60) scene 45 draws 3840 points, each at its own
- * eye depth from -1.05 to -99, and reads their depths back (3720 outside
- * the dump's unreadable columns): this fits 2883, where the 17-bit rounded
- * reciprocal of the float w it replaces fit 1703 (2137 of the scene's depth
- * pixels off -> 837). It keeps the eleven depths geprobes 5 and 6 pinned
- * that one on: scenes 17 and 27's eye z -4, -4.5, -5, -5.5, -6 and -8 as
- * 15887, 14049, 12577, 11374, 10371 and 7612, scene 36's -4.9, -5.2,
- * -5.4, -5.6 and -5.7 as 12848, 12068, 11597, 11159 and 10952. It is the
- * best of 460,800 variants searched (the eye z cut to 16 or 17 bits, each
- * later step cut to 16 to 24 bits or not, truncated or rounded, a divide
- * or a 16- to 24-bit reciprocal, the viewport scale before or after the
- * divide, the integer floored or rounded); its ties differ only in cutting
- * the sum at 20 bits or more. The misses are a step either way, low where
- * the fraction this leaves is small and high where it is large, so the
- * GE's arithmetic is up to half a step from this somewhere the family does
- * not reach. geprobe 7 scene 48 reads one more: eye z -5.3 as 11829, where
- * this gives 11828.75. */
+/* Screen depth from clip z and w, as ge_sum says: zc plus zs times clip z
+ * over w, floored. sceGuDepthRange(65535, 0) sends zs -32768 and zc 32767
+ * (it halves 65535 as an integer). geprobe 11 (fw 6.60) scene 59's 3840
+ * points at w = 1 pinned the sum by itself; geprobe 12 the rest. */
 static float ge_screen_z(float cz, float w) {
     if (g_tl.vp_zs == 0.0f) return ((cz / w) * 0.5f + 0.5f) * 65535.0f;
-    const double ndc = ge_cut((double)cz * ge_cut(1.0 / ge24(w), 24, 0), 18, 0);
-    return (float)ge_cut((double)g_tl.vp_zc + (double)g_tl.vp_zs * ndc, 16, 1);
+    const double nz = ge_over_w(cz, w);
+    const ge_term t[2] = { ge_mul(g_tl.vp_zs, nz), ge_mul(g_tl.vp_zc, 1.0) };
+    return (float)floor(ge_sum(t, 2));
 }
 
 static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
@@ -1553,11 +1717,25 @@ static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
     *sz = ge_screen_z(clip[2], clip[3]);
 }
 
+/* One axis of a vertex the GE read onto the 1/16 grid: the viewport centre
+ * plus scale times clip over w as one of ge_sum's sums, less the screen
+ * offset. With the centre at 2048 the sum's grid is a sixteenth, so this is
+ * screen_axis_fx16's rule -- the product taken to sixteenths toward the
+ * centre -- without its float product. */
+static int ge_screen_axis(double ndc, float scale, float centre, float off) {
+    const ge_term t[2] = { ge_mul(scale, ndc), ge_mul(centre, 1.0) };
+    double v = (ge_sum(t, 2) - (double)off) * PSP_SUBPX;
+    if (!(v > -1073741824.0)) v = -1073741824.0;   /* NaN too */
+    if (v > 1073741824.0) v = 1073741824.0;
+    return (int)floor(v);
+}
+
 /* The same projection onto the rasterizer's grid, as screen_axis_fx16 says.
  *
  * A vertex the GE read from memory (plain, skinned or morphed) comes here
- * with clip x, y and w from ge_proj_row; 1/w is cut to 24 bits, as for
- * depth (ge_screen_z), and each quotient to ge24. geprobe 7 (fw 6.60) scene
+ * with clip x, y and w from ge_clip, and goes through ge_over_w and
+ * ge_screen_axis: geprobe 12's arithmetic. Until then 1/w was cut to 24
+ * bits and each quotient to ge24, the fit below. geprobe 7 (fw 6.60) scene
  * 48 shows why: six of its corners sit a sixteenth further from the centre
  * than ge_recip's rule put them -- each one's triangle has a depth plane
  * 100 to 500 pixels off that matches once the corner moves, and the colour
@@ -1580,9 +1758,14 @@ static void clip_to_fx16(const float clip[4], int *x, int *y) {
         nx = clip[0] * inv;
         ny = clip[1] * inv;
     } else {
-        const double inv = ge_cut(1.0 / (double)clip[3], 24, 0);
-        nx = (float)ge24((double)clip[0] * inv);
-        ny = (float)ge24((double)clip[1] * inv);
+        const double gx = ge_over_w(clip[0], clip[3]), gy = ge_over_w(clip[1], clip[3]);
+        if (g_tl.vp_set) {
+            *x = ge_screen_axis(gx, g_tl.vp_xs, g_tl.vp_xc, g_tl.off_x);
+            *y = ge_screen_axis(gy, g_tl.vp_ys, g_tl.vp_yc, g_tl.off_y);
+            return;
+        }
+        nx = (float)gx;
+        ny = (float)gy;
     }
     if (g_tl.vp_set) {
         *x = screen_axis_fx16(nx, g_tl.vp_xs, g_tl.vp_xc - g_tl.off_x);
@@ -2342,6 +2525,8 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         return;
     }
 
+    double wvp[4][4];
+    ge_wvp(wvp);
     uint32_t done = 0;
     while (done < count) {
         const uint32_t n = primitive_batch_count(type, count - done);
@@ -2373,14 +2558,15 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             mul_4x3(g_tl.world, model, world);
             mul_4x3(g_tl.view,  world, eye);
             mul_4x4(g_tl.proj,  eye,   clip);
-            /* z as the GE forms it, for depth (ge_screen_z), and x, y and w
-             * too for a vertex it read (clip_to_fx16); a tessellated one
-             * keeps the float x, y and w ge_recip's rule was measured with. */
-            clip[2] = ge_proj_row(g_tl.proj, 2, eye);
-            if (!g_mv_src) {
-                clip[0] = ge_proj_row(g_tl.proj, 0, eye);
-                clip[1] = ge_proj_row(g_tl.proj, 1, eye);
-                clip[3] = ge_proj_row(g_tl.proj, 3, eye);
+            /* Clip space as the GE forms it (ge_clip): z for depth
+             * (ge_screen_z), and x, y and w too for a vertex it read
+             * (clip_to_fx16); a tessellated one keeps the float x, y and w
+             * ge_recip's rule was measured with. */
+            {
+                float gc[4];
+                ge_clip(wvp, model, gc);
+                clip[2] = gc[2];
+                if (!g_mv_src) { clip[0] = gc[0]; clip[1] = gc[1]; clip[3] = gc[3]; }
             }
             const uint64_t _p2 = ge_prof_now();
 
@@ -3208,15 +3394,14 @@ static int bbox_hidden(uint32_t count) {
     const int x0 = g_ge.sc_set ? g_ge.sc_x0 : 0,   y0 = g_ge.sc_set ? g_ge.sc_y0 : 0;
     const int x1 = g_ge.sc_set ? g_ge.sc_x1 : 479, y1 = g_ge.sc_set ? g_ge.sc_y1 : 271;
     int left = 1, right = 1, above = 1, below = 1;
+    double wvp[4][4];
+    ge_wvp(wvp);
     for (uint32_t i = 0; i < count; i++) {
-        float m[3], w[3], e[3], c[4];
+        float m[3], c[4];
         if (!read_pos_model(vertex_addr(i, stride), g_ge.vtype, pos_off, m)) return 0;
-        mul_4x3(g_tl.world, m, w);
-        mul_4x3(g_tl.view, w, e);
-        c[0] = ge_proj_row(g_tl.proj, 0, e);
-        c[1] = ge_proj_row(g_tl.proj, 1, e);
+        ge_clip(wvp, m, c);
         c[2] = 0.0f;
-        c[3] = fabsf(ge_proj_row(g_tl.proj, 3, e));
+        c[3] = fabsf(c[3]);
         if (c[3] == 0.0f || !isfinite(c[0] / c[3]) || !isfinite(c[1] / c[3])) return 0;
         int x, y;
         clip_to_fx16(c, &x, &y);

@@ -976,6 +976,67 @@ static void test_transformed_depth(void) {
     }
 }
 
+/* One point at eye (0, 0, z) through world W, identity view and
+ * projection P (column-major, as the GE takes them), viewport z scale zs
+ * and centre zc: the depth it writes at the screen centre. */
+static unsigned point_depth(const float W[12], const float P[16], float z, float zs, float zc) {
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    cmd(0x3A, 0);
+    for (int i = 0; i < 12; i++) cmd_float(0x3B, W[i]);
+    cmd(0x3C, 0);
+    for (int i = 0; i < 12; i++) cmd(0x3D, i % 4 == 0 ? 0x3F8000 : 0);
+    cmd(0x3E, 0);
+    for (int i = 0; i < 16; i++) cmd_float(0x3F, P[i]);
+    cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, zs);
+    cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, zc);
+    cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+    depth_state(1);                                        /* ALWAYS, writes on */
+    float_vertex(0, 0, 0, z);
+    cmd(0x04, (0u << 16) | 1);                             /* one point */
+    end_list();
+    return depth_at(240, 136);
+}
+
+static float bits_float(uint32_t b) { float f; memcpy(&f, &b, 4); return f; }
+
+/* A vertex's depth in the GE's own arithmetic (ge.c ge_sum, ge_rcp16,
+ * ge_wvp): points the PSP drew in geprobe 11 and 12 (fw 6.60). Viewport z
+ * centre 0 and scale 65536 make the depth clip z / w's top 16 bits.
+ *  - Scene 66, the probes' perspective: two eye z where m10 z carries into
+ *    the next exponent, so the sum lines it up by its operands' exponents.
+ *  - Scene 62, clip z a power of two over w = -z: the 1/w table, a step
+ *    above 65536 / w at 1.0859375 (60349.7) and in the binade 2^7.
+ *  - Scene 61, a = -0.3 and a world translation of -37.125: the GE folds
+ *    the translation into the projection's row, and these read 3 above and
+ *    4 below the 22937 an eye z formed first gives.
+ *  - Scene 65 batch 0: world translation 41.32 with w = 1. */
+static void test_vertex_depth_ge(void) {
+    static const float ID[12] = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
+    static const float PERSP[16] = { 0.981491089f, 0, 0, 0, 0, 1.73202515f, 0, 0,
+                                     0, 0, -1.02017212f, -1, 0, 0, -2.0201416f, 0 };
+    static const float RCP1[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, -1, 0, 0, 1, 0 };
+    static const float RCP128[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, -1, 0, 0, 128, 0 };
+    static const float RATIO[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -0.3f, -1, 0, 0, 0, 0 };
+    static const float W61[12] = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -37.125f };
+    static const float P65[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1.020538330078125f, 0, 0, 0, 0, 1 };
+    static const float W65[12] = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 41.322265625f };
+    static const struct { const float *w, *p; uint32_t z; float zs, zc; unsigned hw; } C[] = {
+        { ID,  PERSP,  0xC0FB4351u, 65536.0f, 0.0f,      49996 },
+        { ID,  PERSP,  0xC17F3FCBu, 65536.0f, 0.0f,      58559 },
+        { ID,  RCP1,   0xBF8B0000u, 65536.0f, 0.0f,      60350 },
+        { ID,  RCP1,   0xBF955505u, 65536.0f, 0.0f,      56175 },
+        { ID,  RCP128, 0xC319901Cu, 65536.0f, 0.0f,      54627 },
+        { W61, RATIO,  0x42107D9Eu, -32768.0f, 32767.0f, 22940 },
+        { W61, RATIO,  0x42107CD2u, -32768.0f, 32767.0f, 22933 },
+        { W65, P65,    0xC22348E8u, 65536.0f, 0.0f,      33600 },
+    };
+    for (unsigned k = 0; k < sizeof C / sizeof C[0]; k++) {
+        const unsigned d = point_depth(C[k].w, C[k].p, bits_float(C[k].z), C[k].zs, C[k].zc);
+        CHECK(d == C[k].hw, "case %u (z %08X): depth %u, hardware %u", k, C[k].z, d, C[k].hw);
+    }
+}
+
 /* A spline point's colour is de Boor's algorithm on the control colours
  * with 8-bit parameters and 1/128 cuts (ge.c deboor_fix), not a blend by
  * exact weights. geprobe 9 (fw 6.60) scene 54: a uniform span (fill/fill,
@@ -1364,7 +1425,7 @@ static void test_precise_vertex_payload(void) {
     float_vertex(0,(40.24f-240.0f)/240.0f,0,0);
     cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
     /* Before the 1/16 grid, in the GE's arithmetic: the eye x cut to 16
-     * significant bits (ge_proj_row in ge.c) puts 40.24 at 40.2429. */
+     * significant bits (ge_clip in ge.c) puts 40.24 at 40.2429. */
     CHECK(g_probe_first.precise && fabsf(g_probe_first.precise_x-40.2429f)<0.0001f,
           "GE retains pre-quantization projection %.8f",g_probe_first.precise_x);
     /* 40.25: left of the viewport centre a position goes to the sixteenth
@@ -1785,6 +1846,7 @@ int main(void) {
     test_depth_in_vram();
     test_depth_plane();
     test_transformed_depth();
+    test_vertex_depth_ge();
     test_gradient_reciprocal();
     test_depth_plane_side();
     test_spline_colour();

@@ -474,33 +474,49 @@ thousand times too fast that cost no time in a Sync):
 
 ## Depth values
 
-The software backend writes the depth geprobes 5 to 7 (fw 6.60) measured, not
-a float blend (`src/render.c` sw_tri, `src/hle/ge.c` ge_proj_row,
-ge_screen_z, clip_to_fx16):
+The software backend writes the depth geprobes 5 to 12 (fw 6.60) measured,
+not a float blend (`src/render.c` sw_tri, `src/hle/ge.c` ge_sum, ge_wvp,
+ge_rcp16, ge_screen_z, clip_to_fx16):
 
-- **The projection runs in the GE's own float** (16 significant bits, cut
-  toward zero; ge24). Each eye coordinate is cut to it, each product with a
-  projection entry is cut, and the products and the translation are summed
-  without a cut. That gives clip x, y, z and w.
-- **A transformed vertex's depth** is clip z times 1/w, with w's reciprocal
-  cut to 24 bits and the product to 18. The scale and centre follow, the
-  sum rounded to 16 bits, and the rasterizer takes the integer part.
-  geprobe 7 scene 45 reads back 3720 points, one per eye depth from -1.05
-  to -99. This fits 2883 of them, against 1703 for the rule it replaced.
-  It is the best of 460,800 variants searched, and it keeps the eleven
-  depths that geprobes 5 and 6 pinned. The misses are one step either way,
-  so the GE's arithmetic is within half a step of this but is not it.
-  Scene 48 adds one: eye z -5.3 reads 11829, where this gives 11828.75.
-- **A transformed vertex's x and y** come from the same clip x, y and w.
-  1/w is cut to 24 bits, as for depth, and each quotient to 16. The
-  sixteenth is then taken toward the centre (screen_axis_fx16). geprobe 7
-  scene 48 found six corners a sixteenth further out than the earlier rule
-  put them (a 14-bit reciprocal on float coordinates). Their depth planes
-  were 100 to 500 pixels off and match once each corner moves. Every rule
-  searched that places scene 48's 198 depth-confirmed coordinates and
-  scenes 15 and 18's measured corners cuts the eye coordinates to 16 bits.
-  Patch vertices keep the 14-bit rule: psprecomp's tessellation is not the
-  GE's, and the new rule costs scene 22 342 pixels.
+- **The GE's arithmetic has 16 significant bits.** A vertex coordinate is
+  cut to them toward zero on the way in, and a matrix word holds no more. A
+  product keeps its bits down to 2^(ea + eb - 15), toward zero, with ea and
+  eb its operands' exponents: when the significands' product reaches 2, it
+  keeps 17 bits. A sum puts every term on the grid 2^(E - 15), each cut
+  toward zero, where E is the largest term's exponent; a product counts as
+  ea + eb whatever its significand. The sum adds the terms and cuts the
+  total to 16 bits. A matrix row's three products and its translation are
+  one such sum.
+- **Projection, view and world are one matrix.** The GE multiplies them
+  together in that arithmetic and transforms the vertex by the product.
+  Forming eye z first instead cancels geprobe 11 scene 61's errors in clip
+  z / w. Scene 65 reads clip z whole through world and view z rows with
+  translations of 40 and -20 against an eye z under 1. This fits all 3072
+  of its points; forming eye z first fits 939.
+- **1/w is a table of 128 straight segments**, ge_rcp16. w is cut to 16
+  bits. The 7 significand bits below the leading one pick a segment, and
+  the 8 after step along it. Each segment's ends sit within a unit of
+  2^23/h and 2^23/(h+1), h being its index plus 128. So it is a chord,
+  lying a little above 1/w; geprobe 8's gradient reciprocal is a tangent
+  below it. Scene 62 reads 1/w whole for 9151 w over nine binades, 2^-3 to
+  2^13. Every one fits the 128 measured entries. No rounding of 2^23/h or
+  of the chord gives them, so ge.c keeps them as measured.
+- **A transformed vertex's depth** is clip z times 1/w, cut to 16 bits;
+  then the centre plus the scale times that, as one sum; then the floor.
+  sceGuDepthRange(65535, 0) sends a scale of -32768 and a centre of 32767.
+  It halves 65535 as an integer. With a centre of 0 and a power-of-two
+  scale the depth is clip z / w's top 16 bits, so scenes 62 to 66 read each
+  stage whole. They and scenes 45 and 59-61 match on every point, 41,543 in
+  all. That includes scene 45's 3720 eye depths, where the fit this
+  replaces matched 2883.
+- **A transformed vertex's x and y** come the same way: clip x and y times
+  1/w, then the viewport's sum (ge_screen_axis). The centre, 2048, puts
+  that sum on sixteenths, so it is the rule geprobes 2 and 7 found: the
+  scaled position taken to a sixteenth toward the centre
+  (screen_axis_fx16). It keeps every corner scenes 15, 18, 20, 21 and 48
+  pin. Patch vertices keep a 14-bit reciprocal on float coordinates
+  (ge_recip): psprecomp's tessellation is not the GE's, and the GE's rule
+  cost scene 22 342 pixels when tried.
 - **Across a triangle** depth is a plane, like colour, with gradients from
   the numerator times 1/area, floored to 1/1024 a pixel; colour uses the
   same 1/area (geprobe 6 scene 39). It starts from its own corner, though:
@@ -637,49 +653,16 @@ fw 6.60):
   itself: scene 56 reads it through a texture at 1/8192 and every step is
   on the grid, running on across spans.
 
-## Still open after geprobe 10
+## Still open after geprobe 12
 
-These are what geprobe 10 (fw 6.60) still shows psprecomp getting wrong,
-with pixels off on run 10 (set 11). Run 10 drew every scene it shares with
-runs 7 to 9 to the byte the same. Details on the geprobe 7 items, and what
-further probing could settle, are in `fw660-run7/findings/geprobe.md`.
+These are what geprobe 12 (fw 6.60) still shows psprecomp getting wrong,
+with pixels off on run 12 (set 13). That run matches 90 of 107 steps. Run
+12 drew every scene it shares with run 11 the same, byte for byte. Details
+on the geprobe 7 items, and what further probing could settle, are in
+`fw660-run7/findings/geprobe.md`. Vertex depth, open until geprobe 12, is
+now settled (above). With it every 3D depth plane matches: scenes 45, 48,
+57 and 58.
 
-- **Vertex depth** (scene 45: 837 pixels). The depth arithmetic above is
-  within half a step of the GE's on every point, but not equal to it. Every
-  other 3D depth plane off is this now: scene 57 reads 6 of scene 48's 144
-  corners a step deeper on the PSP than psprecomp floors them (scene 48's
-  depth: 551, scene 57's: 424), and scene 58's shape is a step deeper
-  across every copy from its corner at eye z -5.3 (7451), the corner that
-  reads 11829 where this gives 11828.75.
-
-  geprobe 11 (set 12) took it apart. Two steps are settled, neither in
-  psprecomp yet:
-
-  - *The viewport.* sceGuDepthRange(65535, 0) sends a scale of -32768
-    and a centre of 32767: it halves 65535 as an integer. The depth is
-    floor(zc + p), where p = zs ndc has its bits below the larger term's
-    16th significant bit dropped toward zero before the add. Scene 59's
-    3840 points all fit, at w = 1 with both its scales.
-  - *The matrices are combined.* The GE multiplies projection, view and
-    world into one matrix before it transforms a vertex. In scene 61 the
-    eye depth comes from a world translation of 37.125, and the depths
-    spread from 4 below to 3 above the rest. Any model that forms eye z
-    first cancels that error in clip z / clip w. Folding the translation
-    into the projection's z row instead, with 16-bit products and the
-    viewport's aligned add, fits 1171 to 1207 of those 1280 points.
-    Forming eye z first fits 510.
-
-  The steps in between are not settled. Those are 1/w, clip z times it,
-  and the row sums. The best joint fit cuts each product and the eye z to
-  16 bits and rounds 1/w to 16 bits. It matches 13,921 of 15,240 points
-  over scenes 45 and 59-61; psprecomp now matches 11,450. But it matches
-  scene 45 on 2789 points, below psprecomp's 2883. In scene 60 about a
-  quarter of the points have a clip z / clip w that does not come out
-  below a, though every truncation pushes it down. That ratio is a,
-  exactly, in real numbers. Something rounds up there, and no 16- to
-  24-bit cut or rounding of 1/w or the product reproduces which points.
-  psprecomp's depth arithmetic stays as it is until geprobe 12 reads each
-  of those steps whole (scenes 62-66).
 - **Patch positions** (scene 22: 610 pixels; scene 23: 438; scene 26:
   1087; scenes 52-56: 16 to 96 each, points a pixel apart). The weights
   are the GE's now, but the positions they make go through psprecomp's own
