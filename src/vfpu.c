@@ -1130,8 +1130,9 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  *
  * vsin, vcos, vasin, vexp2, vlog2, vrcp, vsqrt, vrsq and their negated forms
  * are the PSP's own fixed-point algorithms, not libm. What vfpuprobe measured
- * over 26,800 inputs per op (steps 2-12, fw 6.60) and v3's dumps of each core
- * (steps 193-200, every 3rd, 5th or 7th argument), and what is reproduced:
+ * over 26,800 inputs per op (steps 2-12, fw 6.60), v3's dumps of each core
+ * (steps 193-200, every 3rd, 5th or 7th argument) and v4's whole segments of
+ * the vsin/vcos and vasin cores (steps 201-202), and what is reproduced:
  *
  *   - every result is *truncated* to a 22-bit significand -- the low two
  *     mantissa bits are clear -- and one below 2^-126 is 0; an operand whose
@@ -1200,10 +1201,14 @@ static uint32_t quarter_fixed(uint32_t b) {
  * vfpu_cores.h holds, per segment, D, V(0) and the steps V(k+1) - V(k) as
  * 1- or 2-bit fields (signed 4-bit ones for vasin, whose V turns direction
  * from segment to segment); tools/hwprobe/vfpuprobe/gencores.py fits them to
- * vfpuprobe v3's core dumps (steps 193-200) and the run-1 sweeps (fw 6.60)
- * and reproduces every one of those results. Arguments the dumps skipped
- * rest on the fit: holding the sweeps out, it predicted 99.96% of them for
- * the first five, 99.85% for vsin, vcos and vnsin, and all of vasin's.
+ * vfpuprobe v3's core dumps (steps 193-200), the run-1 sweeps and v4's whole
+ * segments (fw660-v4.txt steps 201-202, fw 6.60) and reproduces every one of
+ * those results. For the first five, arguments the dumps skipped rest on the
+ * fit: holding the sweeps out, it predicted 99.96% of them. For vsin/vcos and
+ * vasin, v4 dumped every argument of the segments where v3's every-3rd one
+ * left V's steps open (2,169 of them; 2,086 of the fit's picks there had
+ * been right), and now every one of the 2^23 arguments of either core has
+ * its result fixed by the data: a step still open changes none of them.
  *
  * vsin and vasin are the same core with an exponent E per segment, since
  * their results range over many binades: Z is at 2^(E-23) and the result is

@@ -791,6 +791,13 @@ static void test_transcendentals(void) {
         { PSP_VU_ASIN, 0xBD5E3759, 0xBD0D8956 },
         { PSP_VU_ASIN, 0xB67DC96D, 0xB61DE000 },
         { PSP_VU_ASIN, 0xBF401367, 0xBF0A491C },
+        /* v4 steps 201-202, whole segments: words the v3-only fit missed. */
+        { PSP_VU_COS,  0x3A810000, 0x3F7FFFE8 },
+        { PSP_VU_COS,  0x3E8FD0A8, 0x3F677BBC },
+        { PSP_VU_COS,  0x3F24556E, 0x3F088428 },
+        { PSP_VU_ASIN, 0x3E941144, 0x3E3F41DC },
+        { PSP_VU_ASIN, 0x3F604238, 0x3F2DFAD4 },
+        { PSP_VU_ASIN, 0x3F6FCDFA, 0x3F45BAEC },
     };
     int r[4];
     psp_vfpu_regs(0x00, 1, r);

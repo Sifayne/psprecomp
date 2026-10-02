@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Fit the VFPU's piecewise-quadratic cores to vfpuprobe's hardware dumps.
 
-usage: gencores.py RUNDIR [--out FILE] [--check] [--holdout] [--ops a,b]
+usage: gencores.py RUNDIR [--v4 DIR] [--out FILE] [--check] [--holdout]
+                   [--ops a,b]
 
 RUNDIR is a vfpuprobe v3 result folder with vfpu_core_<op>.bin, the run-1
 sweep files vfpu_<op>.bin and vfpu_inputs.bin (fw660-run4 has all of them).
-Everything in the output comes from those files; nothing is computed from a
-math library except starting points for a search whose answer the data
-decides. src/vfpu_cores.h is this script's output for fw660-run4:
+--v4 DIR adds a vfpuprobe v4 folder's vfpu_core4_vcos.bin and
+vfpu_core4_vasin.bin (set 10, fw660-v4.txt steps 201-202): whole segments
+of the sin and asin cores that v3's every-3rd dump left open. Everything in
+the output comes from those files; nothing is computed from a math library
+except starting points for a search whose answer the data decides.
+src/vfpu_cores.h is this script's output for fw660-run4
+(/mnt/project-files/hwresults/fw660-run4/vfpuprobe) and set 10's v4 run:
 
-    gencores.py /mnt/project-files/hwresults/fw660-run4/vfpuprobe \
+    gencores.py <fw660-run4>/vfpuprobe --v4 <set 10>/vfpuprobe-s10 \
         --check --out src/vfpu_cores.h
 
 What the dumps show for vrcp, vexp2, vlog2 (x in [1,2)), vsqrt and vrsq:
@@ -45,6 +50,14 @@ segment's grid, not the next one's). X = 0, r = 2^23, gives Z = 2^24: 1.0.
 vasin's V does not keep one direction: it rises with the distance except in
 segments 116-120, 122 and 127, where it falls, and its steps reach 4 there.
 They are stored as signed 4-bit fields.
+
+v3 alone left 622 of the sin core's distances open, and 1,547 of vasin's,
+in the 11 and 13 segments v4 dumps whole. With v4, every distance there is
+pinned except where no argument's result depends on it (sin segment 0,
+whose slope is so shallow that 210 distances stay a range wide; 6 in sin
+segment 56, 3 and 5 in vasin's 98 and 112), so any value in range gives
+every result. Of v3's picks, 601 of sin's and 1,485 of vasin's were
+right.
 
 --check reports how many dump and sweep samples the fitted tables
 reproduce. --holdout fits on the dumps alone and checks the sweeps, which
@@ -212,10 +225,26 @@ def trig_arg(xb, cosine):
     return (1 << 23) - r, neg
 
 
-def samples_sin(rundir, sweeps=True):
+# vfpuprobe v4's whole segments (main.c CORES4): every X of each, in order.
+CORE4_SEGS = {'vcos': [0, 11, 17, 34, 35, 36, 56, 81, 82, 83, 84],
+              'vasin': [10, 34, 35, 36, 37, 38, 39, 40, 73, 82, 98, 112, 119]}
+
+
+def core4(v4dir, op):
+    """(X, out) of vfpu_core4_<op>.bin: vcos and vasin of x = X * 2^-23,
+    which for vcos is the shared cosine core at X itself"""
+    out = load(v4dir, 'vfpu_core4_%s.bin' % op).astype(np.int64)
+    X = np.concatenate([(s << UBITS) + np.arange(1 << UBITS, dtype=np.int64)
+                        for s in CORE4_SEGS[op]])
+    assert len(out) == len(X), 'vfpu_core4_%s.bin: %d words, want %d' % (op, len(out), len(X))
+    return X, out
+
+
+def samples_sin(rundir, sweeps=True, v4=None):
     """vsin's dump is r = 3k, then x = 1 + 31k*2^-23 (r = 2^23 - 31k), then
     x = 0.5 + i*2^-24 (r = 2^22 + i/2); vcos's dump repeats the second part
-    and its own strip is r = 2^22 - i/2. Sweeps: vsin, vcos and vnsin."""
+    and its own strip is r = 2^22 - i/2. v4 adds whole segments of the core
+    by vcos. Sweeps: vsin, vcos and vnsin."""
     core = load(rundir, 'vfpu_core_vsin.bin').astype(np.int64)
     cos = load(rundir, 'vfpu_core_vcos.bin').astype(np.int64)
     n0, n1 = 2796203, 270601
@@ -224,6 +253,10 @@ def samples_sin(rundir, sweeps=True):
     r = [3 * k, (1 << 23) - 31 * i1, (1 << 22) + (i2 >> 1), (1 << 22) - (i2 >> 1)]
     X = [(1 << 23) - v for v in r]
     O = [core[:n0], core[n0:n0 + n1], core[n0 + n1:], cos[n1:]]
+    if v4:
+        x4, o4 = core4(v4, 'vcos')
+        X.append(x4); O.append(o4)
+    ndump = len(X)
     if sweeps:
         inp = load(rundir, 'vfpu_inputs.bin').astype(np.int64)
         for name, cosine in (('vfpu_vsin.bin', 0), ('vfpu_vcos.bin', 1), ('vfpu_vnsin.bin', 0)):
@@ -231,7 +264,7 @@ def samples_sin(rundir, sweeps=True):
             ok = normal(inp) & normal(out)
             x, _ = trig_arg(inp[ok], cosine)
             X.append(x); O.append(out[ok] & 0x7FFFFFFF)
-    return core_samples(X, O, 4, (1 << 23) - 1)
+    return core_samples(X, O, ndump, (1 << 23) - 1)
 
 
 def core_samples(X, O, ndump, xmax):
@@ -246,13 +279,18 @@ def core_samples(X, O, ndump, xmax):
     return X, seg_y(X, O, E), E
 
 
-def samples_asin(rundir, sweeps=True):
-    """the dump is x = 3k * 2^-23, then x = 0.5 + i*2^-24 (X = 2^22 + i/2)"""
+def samples_asin(rundir, sweeps=True, v4=None):
+    """the dump is x = 3k * 2^-23, then x = 0.5 + i*2^-24 (X = 2^22 + i/2);
+    v4 adds whole segments"""
     core = load(rundir, 'vfpu_core_vasin.bin').astype(np.int64)
     n0 = 2796203
     i2 = np.arange(len(core) - n0, dtype=np.int64)
     X = [3 * np.arange(n0, dtype=np.int64), (1 << 22) + (i2 >> 1)]
     O = [core[:n0], core[n0:]]
+    if v4:
+        x4, o4 = core4(v4, 'vasin')
+        X.append(x4); O.append(o4)
+    ndump = len(X)
     if sweeps:
         inp = load(rundir, 'vfpu_inputs.bin').astype(np.int64)
         out = load(rundir, 'vfpu_vasin.bin').astype(np.int64)
@@ -261,14 +299,16 @@ def samples_asin(rundir, sweeps=True):
         m24 = (inp[ok] & 0x7FFFFF) | 0x800000
         X.append(np.where(127 - e < 32, m24 >> np.clip(127 - e, 1, 31), 0))
         O.append(out[ok] & 0x7FFFFFFF)
-    X, Y, E = core_samples(X, O, 2, (1 << 23) - 1)
+    X, Y, E = core_samples(X, O, ndump, (1 << 23) - 1)
     keep = X > 0
     return X[keep], Y[keep], E
 
 
-OPS = {'rcp': samples_rcp, 'exp2': samples_exp2, 'log2': samples_log2,
-       'sqrt': lambda d, sweeps=True: samples_root(d, 'vsqrt', sweeps),
-       'rsq': lambda d, sweeps=True: samples_root(d, 'vrsq', sweeps),
+OPS = {'rcp': lambda d, sweeps=True, v4=None: samples_rcp(d, sweeps),
+       'exp2': lambda d, sweeps=True, v4=None: samples_exp2(d, sweeps),
+       'log2': lambda d, sweeps=True, v4=None: samples_log2(d, sweeps),
+       'sqrt': lambda d, sweeps=True, v4=None: samples_root(d, 'vsqrt', sweeps),
+       'rsq': lambda d, sweeps=True, v4=None: samples_root(d, 'vrsq', sweeps),
        'sin': samples_sin, 'asin': samples_asin}
 
 
@@ -416,6 +456,7 @@ def emit(name, tables, f, exps=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('rundir')
+    ap.add_argument('--v4', help='a vfpuprobe v4 folder: its vfpu_core4_*.bin')
     ap.add_argument('--out')
     ap.add_argument('--check', action='store_true')
     ap.add_argument('--holdout', action='store_true')
@@ -424,19 +465,20 @@ def main():
     fitted = {}
     for name in a.ops.split(','):
         get = OPS[name]
-        X, Y, *E = get(a.rundir, sweeps=not a.holdout)
+        X, Y, *E = get(a.rundir, sweeps=not a.holdout, v4=a.v4)
         t = fit(X, Y)
         fitted[name] = (t, E[0] if E else None)
         amb = sum(x[3] for x in t)
         if a.check or a.holdout:
-            Xa, Ya, *_ = get(a.rundir, sweeps=True)
+            Xa, Ya, *_ = get(a.rundir, sweeps=True, v4=a.v4)
             p = predict(t, Xa)
             print('%-5s fitted on %d samples, %d distances open; all samples %d/%d exact'
                   % (name, len(X), amb, int((p == Ya).sum()), len(Ya)))
     if a.out:
         with open(a.out, 'w') as f:
             f.write('/* Generated by tools/hwprobe/vfpuprobe/gencores.py from vfpuprobe v3\n'
-                    ' * core dumps and run-1 sweeps (fw 6.60). Do not edit. */\n\n')
+                    ' * core dumps and run-1 sweeps%s (fw 6.60). Do not edit. */\n\n'
+                    % (' and v4\'s whole segments' if a.v4 else ''))
             for name, (t, E) in fitted.items():
                 emit(name, t, f, E)
 
