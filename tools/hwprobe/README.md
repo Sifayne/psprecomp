@@ -9,7 +9,7 @@ PPSSPP or pspautotests' sources.
 |---|---|---|
 | [mpegprobe](mpegprobe/) | sceMpeg sizes and structures, GE block transfers | values `src/hle/mpeg.c` had no source for (logged on firmware 6.60) |
 | [vfpuprobe](vfpuprobe/) | VFPU and FPU results bit for bit | host libm in `src/vfpu.c`, pspautotests cpu captures |
-| [geprobe](geprobe/) | reference frames for 33 GE scenes, GE callbacks | pspautotests gpu captures; nothing yet for dithering, skinning, patches, bbox |
+| [geprobe](geprobe/) | reference frames for 54 GE scenes, GE callbacks | pspautotests gpu captures and rules psprecomp had guessed: dithering, skinning, patches, bbox, depth and gradient arithmetic |
 | [saveprobe](saveprobe/) | savedata result codes, secure saves under known keys | pspautotests savedata captures; plaintext secure saves |
 | [threadprobe](threadprobe/) | thread manager, callbacks, timers, TLS, RTC | pspautotests threads captures |
 | [syncprobe](syncprobe/) | semaphores, event flags, mutexes, mailboxes, pipes, VPL/FPL | pspautotests kernel-object captures |

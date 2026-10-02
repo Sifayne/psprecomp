@@ -15,9 +15,10 @@
  * hardware reference from this project's own PSP. Scenes 25 on (version 5)
  * each isolate one rule the earlier scenes left open, scenes 34 on
  * (version 6) what geprobe 5 left open in turn, scenes 43 on (version 7,
- * after the callback steps) what geprobe 6 left open, and scenes 50 on
+ * after the callback steps) what geprobe 6 left open, scenes 50 on
  * (version 8) the two rules geprobe 7 could not settle: the gradient
- * reciprocal and the spline weights.
+ * reciprocal and the spline weights, and scenes 53 and 54 (version 9) the
+ * spline weights again, densely.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -38,7 +39,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 8
+#define PROBE_VERSION 9
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -2163,6 +2164,83 @@ static void scene_splineweights(void) {
     scene_end("splineweights", GU_PSM_8888, 0);
 }
 
+/* ---- version 9 ------------------------------------------------------------
+ *
+ * Scene 52's weights fit exact Cox-de Boor values everywhere on a Bezier
+ * piece, but the two inner weights of a B-spline span read a step off at
+ * some samples: both on a uniform span, the second after an open start and
+ * the third before an open end, each pair off in opposite directions. Its
+ * one control colour (255) and 2 to 8 steps cannot tell a weight that is
+ * off from colour arithmetic that is. Scenes 53 and 54 read the same
+ * weights at 40 and 48 steps a span, with control colours 255, 254 and
+ * 129, and with two neighbouring columns lit in one channel, whose sum
+ * shows whether the pair's errors cancel. */
+
+typedef struct { int edge, cols; float s, first; } SW2;
+
+/* The splines under test: a uniform span, two uniform spans, and two spans
+ * with each kind of open end. s is the control columns' spacing in pixels,
+ * first the column the first sample sits on, so every row starts at x = 20
+ * and the samples fall at least 2.5 pixels apart. */
+static const SW2 SW2_SPLINES[5] = {
+    { GU_FILL_FILL, 4, 300.0f, 1.0f }, { GU_FILL_FILL, 5, 200.0f, 1.0f },
+    { GU_OPEN_OPEN, 5, 110.0f, 0.0f }, { GU_OPEN_FILL, 5, 140.0f, 0.0f },
+    { GU_FILL_OPEN, 5, 140.0f, 1.0f } };
+
+/* One patch, a row 6 pixels high at y: v open/open over 4 rows at one
+ * division, as in scene 52, so each point's colour is the u weights alone.
+ * Single (pair = 0): control column k red, k + 1 green, k + 2 blue, each
+ * channel `level`. Pair: columns k and k + 1 red, k + 1 and k + 2 green,
+ * k + 2 and k + 3 blue, at 255. */
+static void sw2_patch(const SW2 *sp, int div, int k, int pair, int level, float y) {
+    CV g[6 * 4];
+    const float x0 = 20.0f - sp->first * sp->s;
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < sp->cols; i++) {
+            w32 c = 0xFF000000u;
+            if (pair) {
+                if (i == k || i == k + 1) c |= 0xFFu;
+                if (i == k + 1 || i == k + 2) c |= 0xFF00u;
+                if (i == k + 2 || i == k + 3) c |= 0xFF0000u;
+            } else {
+                if (i == k) c |= (w32)level;
+                if (i == k + 1) c |= (w32)level << 8;
+                if (i == k + 2) c |= (w32)level << 16;
+            }
+            float x, yy;
+            eye_xy(x0 + i * sp->s, y + j, -6.0f, &x, &yy);
+            g[j * sp->cols + i] = (CV){ c, x, yy, -6.0f };
+        }
+    sceGuPatchDivide(div, 1);
+    sceGuDrawSpline(FMT_CV3D, sp->cols, 4, sp->edge, GU_OPEN_OPEN, NULL,
+                    gumem(g, sp->cols * 4 * (int)sizeof(CV)));
+}
+
+/* Scenes 53 and 54: for each spline, levels 255, 254 and 129 at k = 0 and
+ * 3, then the pairs from k = 0 (and k = 1 with 5 columns), one patch to a
+ * row, 39 rows from y = 2.5. Clear red 255, green 1, blue 255 as in scene
+ * 52: no single point reaches 255, and no pair point lights both red and
+ * blue fully. */
+static void scene_splinedense(int div) {
+    if (step("scene %02d: spline weights at %d steps a span, three levels and pairs", g_scene, div)) return;
+    scene_begin(GU_PSM_8888, 0xFFFF01FF);
+    static const int LEVEL[3] = { 255, 254, 129 };
+    sceGuPatchPrim(GU_POINTS);
+    int row = 0;
+    for (int n = 0; n < 5; n++) {
+        const SW2 *sp = &SW2_SPLINES[n];
+        for (int l = 0; l < 3; l++)
+            for (int k = 0; k < sp->cols; k += 3)
+                sw2_patch(sp, div, k, 0, LEVEL[l], 2.5f + 6 * row++);
+        for (int k = 0; k + 3 < sp->cols; k++)
+            sw2_patch(sp, div, k, 1, 255, 2.5f + 6 * row++);
+    }
+    sceGuPatchPrim(GU_TRIANGLE_STRIP);
+    char name[24];
+    snprintf(name, sizeof name, "splinedense%d", div);
+    scene_end(name, GU_PSM_8888, 0);
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -2773,6 +2851,10 @@ int main(int argc, char **argv) {
     g_scene = 50; scene_rcpsweep();
     g_scene = 51; scene_linesweep();
     g_scene = 52; scene_splineweights();
+
+    section("scenes, version 9");
+    g_scene = 53; scene_splinedense(40);
+    g_scene = 54; scene_splinedense(48);
 
     probe_screen(1);
     probe_done();

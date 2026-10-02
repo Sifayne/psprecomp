@@ -52,6 +52,8 @@ blending, depth, clipping, the per-pixel tests).
 | 50 | (v8) the triangle setup's reciprocal at every 10-bit width: 512 through-mode right triangles 2 pixels high and 512 to 1023 sixteenths wide, depth 16384 to 49152 (a power-of-two numerator), plus 118 with depth 0 to 65535; plus the depth buffer | 8888 |
 | 51 | (v8) the same for lines: 512 horizontal through-mode lines 512 to 1023 sixteenths long, each drawn left to right and right to left; plus the depth buffer | 8888 |
 | 52 | (v8) spline weights along u as points: every u edge mode, 4 to 6 control columns, divisions 2, 3, 4, 6 and 8, three columns lit (red, green, blue) | 8888 |
+| 53 | (v9) spline weights along u as points at 40 steps a span: a uniform span, two uniform spans and two spans with each kind of open end; control colours 255, 254 and 129, and neighbouring columns lit in pairs | 8888 |
+| 54 | (v9) the same at 48 steps a span | 8888 |
 
 After the scenes it records which GE callbacks run, with which arguments and
 when, through libgu (signal and finish) and through a raw `sceGe` list.
@@ -89,6 +91,14 @@ Version 8 adds scenes 50-52 after those, so steps 1-89 keep their version 7
 numbers. They aim at the two rules geprobe 7 could not settle
 (`fw660-run7/findings/geprobe.md`): the gradient reciprocal, read once per
 10-bit length for triangles and for lines, and the spline weights.
+
+Version 9 adds scenes 53 and 54 after those, so steps 1-92 keep their
+version 8 numbers. Version 8 settled the reciprocal (src/render.c
+area_rcp). Scene 52 left the spline weights' inner pair a step off at some
+samples with nothing to tell a weight error from colour arithmetic, so
+these read the same weights at 40 and 48 steps a span, at three control
+colours, and in neighbouring pairs whose sum shows whether the errors
+cancel.
 
 ## Build
 
