@@ -644,8 +644,14 @@ could settle, are in `fw660-run7/findings/geprobe.md`.
   each span whose control values are rounded (no values fit fill/fill).
   psprecomp's tessellated positions are its own, which is why patches
   keep the older projection rule.
-- **Lit triangles** (scene 16: 325 pixels), not yet looked at since the
-  gradient reciprocal settled.
+- **Lit triangles** (scene 16: 325 pixels). Every pixel off is one step
+  in a channel, and all fall in the same four triangles of each fan (the
+  two on either side of the vertical, on the left), whatever the light:
+  directional, point and single-colour alike, and none in the spot fan. So
+  it is the triangles' shape, not the lighting arithmetic. Anchoring every
+  3D plane at the top, bottom, rightmost, first or last vertex instead
+  makes scene 16 worse (395 to 1079), so it joins the 3D anchor question
+  above.
 - **Morph blends** (scene 21: 400) and **skinned corners** (scene 20: 54)
   are unchanged by the projection change.
 - **Point and spot lights** (scene 35: 10 pixels), each one step low, all
