@@ -22,7 +22,10 @@ import os, re, struct, sys
 
 STEP = re.compile(r"^\[(\d+)\] (.*)")
 RUN = re.compile(r"^==== \S+ \d+, firmware")
-HEADER = re.compile(r"^(==== .* firmware|log: |an earlier run stopped in )")
+# The closing "==== <name> done ====" too: it belongs to whichever step is
+# last, so a newer version that appends steps would otherwise show the old
+# last step as different.
+HEADER = re.compile(r"^(==== .* firmware|==== \S+ done ====$|log: |an earlier run stopped in )")
 
 
 def last_run(lines, run):
@@ -51,6 +54,9 @@ def steps(path, run=-1):
             order.append(cur)
         else:
             out[cur].append(line)
+    for lines in out.values():          # the blank line before "done"
+        while lines and not lines[-1]:
+            lines.pop()
     return out, order
 
 

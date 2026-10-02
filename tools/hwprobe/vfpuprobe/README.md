@@ -36,10 +36,15 @@ on pspautotests captures:
 12. Traps: the E cause bit (not run: it switched a 6.60 PSP off), then from
     v3 1/0, 0/0 and max*max in fresh threads that keep their fcr31 of
     00000E00 (O, Z and V enabled), and a ctc1 of a cause bit with its enable.
+    Each of those four stopped a 6.60 PSP in v3; from v4 they are not run.
 13. From v3, each transcendental over its reduced argument range, into
-    `vfpu_core_<op>.bin` (about 91 MB, see below).
+    `vfpu_core_<op>.bin` (about 91 MB, see below). From v4, three more
+    steps (201-203 in the log) into `vfpu_core4_<op>.bin`, about 7 MB:
+    every argument of the 11 cosine-core segments and 13 vasin segments
+    whose fit v3's every-3rd-input dumps left open, and vlog2 of x >= 4.
 
-Version 3 runs 4, then 12, then 13 after the others.
+Version 3 runs 4, then 12, then 13 after the others. Version 4 keeps every
+step of version 3 under the same number and appends to section 13.
 
 ## Build
 
@@ -53,8 +58,8 @@ This produces `EBOOT.PBP`. The CMake build does not include it.
 
 Copy `EBOOT.PBP` to `ms0:/PSP/GAME/vfpuprobe/` and start it from the XMB. It
 needs no input and returns to the XMB by itself. Sections 0-12 take a few
-seconds; section 13 writes about 91 MB, a minute or so at 1.5-2 MB/s and three
-at 0.5 MB/s, so the stick needs 95 MB free.
+seconds; section 13 writes about 98 MB (91 MB before v4), a minute or so at
+1.5-2 MB/s and three or four at 0.5 MB/s, so the stick needs 105 MB free.
 
 It writes, beside the EBOOT:
 
@@ -72,11 +77,23 @@ It writes, beside the EBOOT:
   `b start stride count` (x has the bits start + stride*i). The main segments
   take every 3rd input of the reduced range (every 5th for vsqrt and vrsq,
   which cover [1,4)): all of it would be 352 MB.
+- from v4, `vfpu_core4_<op>.bin` for vcos, vasin and vlog2, in the same
+  segment format (main.c's `CORES4` says why each one is there):
+  - vcos: x = X * 2^-23 for X over cosine-core segments 0, 11, 17, 34-36,
+    56 and 81-84 (65,536 each). vcos of X * 2^-23 is the core vsin and
+    vcos share at X itself.
+  - vasin: x = X * 2^-23 for X over segments 10, 34-40, 73, 82, 98, 112
+    and 119 (65,536 each).
+  - vlog2: every 255th mantissa for x in [2^n, 2^(n+1)), n = 2, 4, 8, 16,
+    32 and 64; every 2040th, the same mantissas as every 8th of those, for
+    n = 3, 7, 15, 31, 63 and 127; and 2048 consecutive mantissas from
+    x = 4, 4 * 1.50378, 2^32 and 2^32 * 1.50378.
 
 The log is written through before every step, so if the PSP switches off,
 its last line names the step that did it. Section 12's cases may do that;
 start the probe again after each one and it skips the case that stopped it
-and carries on. The last run in the log is then the whole result.
+and carries on. The last run in the log is then the whole result. In v4 the
+cases that did so in v3 are not run, so it should run straight through.
 
 ## Compare with psprecomp
 
