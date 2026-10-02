@@ -24,8 +24,9 @@ STEP = re.compile(r"^\[(\d+)\] (.*)")
 RUN = re.compile(r"^==== \S+ \d+, firmware")
 # The closing "==== <name> done ====" too: it belongs to whichever step is
 # last, so a newer version that appends steps would otherwise show the old
-# last step as different.
-HEADER = re.compile(r"^(==== .* firmware|==== \S+ done ====$|log: |an earlier run stopped in )")
+# last step as different. Section headers ("---- <name> ----") likewise land
+# under the step before them, so a section a newer version appends would.
+HEADER = re.compile(r"^(==== .* firmware|==== \S+ done ====$|---- .* ----$|log: |an earlier run stopped in )")
 
 
 def last_run(lines, run):
