@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fit the VFPU's piecewise-quadratic cores to vfpuprobe's hardware dumps.
 
-usage: gencores.py RUNDIR [--v4 DIR] [--out FILE] [--check] [--holdout]
+usage: gencores.py RUNDIR [--v4 DIR] [--v5 DIR] [--out FILE] [--check] [--holdout]
                    [--ops a,b]
 
 RUNDIR is a vfpuprobe v3 result folder with vfpu_core_<op>.bin, the run-1
@@ -61,7 +61,24 @@ right.
 
 For vlog2 of x >= 4 the hardware reuses the log2 core at lower precision
 (src/vfpu.c, vfpu_log2). It needs the correction of a reduced coefficient,
-which it looks up through VFPU_CORE_LOG2_BYCOEF, emitted after the tables.
+which it looks up through VFPU_CORE_LOG2_BYCOEF, emitted after the tables:
+a log2 segment with that coefficient or, for 44, 40 and 32, a sqrt one.
+The correction is one function of the coefficient across the cores whose
+curve bends the same way (log2, sqrt and the cosine core; rcp, exp2, rsq
+and vasin share another), which is why sqrt's serves.
+
+--v5 DIR adds a vfpuprobe v5 folder's vfpu_core5_vlog2.bin (set 11,
+fw660-v5.txt step 204): every x in [1,2) of the 9 log2 segments v3's dump
+left open. 40 distances stay open in segments 55-57, whose slope is so
+near 2 per u that no x in [1,2) shows V's low bit at some distances; two
+of them, V(0) of 56 and V(512) of 57, set C2, and the x >= 4 results
+(the sweep, v4's step 203 and v5's step 205) settle them: 88 in both.
+With all three folders the script output is src/vfpu_cores.h:
+
+    gencores.py <set 11>/vfpuprobe-s11 --v4 <set 11> --v5 <set 11> \
+        --check --out src/vfpu_cores.h
+
+(a v5 folder holds the v3 and v4 dumps too, byte for byte the same).
 
 --check reports how many dump and sweep samples the fitted tables
 reproduce. --holdout fits on the dumps alone and checks the sweeps, which
@@ -142,12 +159,22 @@ def exp2_arg(xb):
     return np.where(xb >> 31 != 0, ~fx, fx) & 0x7FFFFF
 
 
-def samples_log2(rundir, sweeps=True):
+# vfpuprobe v5's whole log2 segments (main.c CORE5_LOG2): every x in [1,2).
+CORE5_LOG2_SEGS = [8, 9, 10, 11, 12, 55, 56, 57, 79]
+
+
+def samples_log2(rundir, sweeps=True, v5=None):
     core = load(rundir, 'vfpu_core_vlog2.bin')
     n0 = 2796203
     x0 = (0x3F800000 + 3 * np.arange(n0, dtype=np.int64)).astype(np.uint32)
     y = f32(core[:n0])
     X = [x0 & 0x7FFFFF]; Y = [np.round(y * 2.0 ** 22).astype(np.int64)]
+    if v5:
+        out = load(v5, 'vfpu_core5_vlog2.bin')
+        x5 = np.concatenate([(s << UBITS) + np.arange(1 << UBITS, dtype=np.int64)
+                             for s in CORE5_LOG2_SEGS])
+        assert len(out) == len(x5), 'vfpu_core5_vlog2.bin: %d words, want %d' % (len(out), len(x5))
+        X.append(x5); Y.append(np.round(f32(out) * 2.0 ** 22).astype(np.int64))
     if sweeps:
         inp = load(rundir, 'vfpu_inputs.bin')
         out = load(rundir, 'vfpu_vlog2.bin')
@@ -308,12 +335,13 @@ def samples_asin(rundir, sweeps=True, v4=None):
     return X[keep], Y[keep], E
 
 
-OPS = {'rcp': lambda d, sweeps=True, v4=None: samples_rcp(d, sweeps),
-       'exp2': lambda d, sweeps=True, v4=None: samples_exp2(d, sweeps),
-       'log2': lambda d, sweeps=True, v4=None: samples_log2(d, sweeps),
-       'sqrt': lambda d, sweeps=True, v4=None: samples_root(d, 'vsqrt', sweeps),
-       'rsq': lambda d, sweeps=True, v4=None: samples_root(d, 'vrsq', sweeps),
-       'sin': samples_sin, 'asin': samples_asin}
+OPS = {'rcp': lambda d, sweeps=True, v4=None, v5=None: samples_rcp(d, sweeps),
+       'exp2': lambda d, sweeps=True, v4=None, v5=None: samples_exp2(d, sweeps),
+       'log2': lambda d, sweeps=True, v4=None, v5=None: samples_log2(d, sweeps, v5),
+       'sqrt': lambda d, sweeps=True, v4=None, v5=None: samples_root(d, 'vsqrt', sweeps),
+       'rsq': lambda d, sweeps=True, v4=None, v5=None: samples_root(d, 'vrsq', sweeps),
+       'sin': lambda d, sweeps=True, v4=None, v5=None: samples_sin(d, sweeps, v4),
+       'asin': lambda d, sweeps=True, v4=None, v5=None: samples_asin(d, sweeps, v4)}
 
 
 # ---- the fit ------------------------------------------------------------------
@@ -457,25 +485,139 @@ def emit(name, tables, f, exps=None):
     f.write('};\n\n')
 
 
-def emit_log2_coef(tables, f):
-    """vlog2 for x >= 4 (set 10, fw660-v4.txt step 203) takes the quadratic
-    correction of the coefficient C2 = V(0) - V(512) with its low bits
-    cleared. The correction is a function of C2 alone: segments with equal
-    C2 have equal V(0) - V(k) for every k. Map each C2 to a segment that
-    has it, -1 where none does."""
-    seg_of = [-1] * 256
-    for s, t in enumerate(tables):
-        c2 = int(t[1][0] - t[1][HALF])
-        assert 0 <= c2 < 256
-        if seg_of[c2] < 0:
-            seg_of[c2] = s
-        else:
-            assert (t[1][0] - t[1] == tables[seg_of[c2]][1][0] - tables[seg_of[c2]][1]).all(), \
-                'segments %d and %d share C2 %d but not V(0) - V(k)' % (seg_of[c2], s, c2)
-    f.write('/* log2: for each C2 = V(0) - V(512), a segment with that C2, or -1. */\n')
-    f.write('static const int8_t VFPU_CORE_LOG2_BYCOEF[256] = {\n')
+# ---- vlog2 of x >= 4 -----------------------------------------------------------
+
+# The x >= 4 dumps: v4's step 203 (main.c CORES4) and v5's step 205
+# (CORE5_LOG2W), as (first input, stride, count).
+CORE4_LOG2 = ([(e, 255, 32897) for e in (0x40800000, 0x41800000, 0x43800000, 0x47800000,
+                                        0x4F800000, 0x5F800000)]
+              + [(e, 2040, 4113) for e in (0x41000000, 0x43000000, 0x47000000, 0x4F000000,
+                                          0x5F000000, 0x7F000000)]
+              + [(e, 1, 2048) for e in (0x40800000, 0x40C07C00, 0x4F800000, 0x4FC07C00)])
+CORE5_LOG2W = [(((127 + ex) << 23) | (s << UBITS), 3, 21846) for ex, s in
+               [(2, 9), (2, 10), (2, 56), (2, 57), (4, 9), (4, 10), (4, 56), (4, 57),
+                (8, 9), (8, 10), (8, 56), (8, 57), (2, 124), (2, 53), (2, 8), (4, 124),
+                (4, 50), (4, 53), (4, 6), (4, 8), (8, 124), (8, 3), (8, 6), (16, 100),
+                (16, 124), (16, 0), (16, 6)]]
+
+
+def samples_log2_wide(rundir, v4=None, v5=None):
+    """(x, vlog2 x) for x >= 4: the run-1 sweep and, given, v4's step 203
+    and v5's step 205"""
+    inp = load(rundir, 'vfpu_inputs.bin').astype(np.int64)
+    out = load(rundir, 'vfpu_vlog2.bin').astype(np.int64)
+    e = ((inp >> 23) & 0xFF) - 127
+    ok = normal(inp) & normal(out) & (inp < 0x80000000) & (e >= 2)
+    xs = [inp[ok]]; os_ = [out[ok]]
+    for d, name, segs in ((v4, 'vfpu_core4_vlog2.bin', CORE4_LOG2),
+                          (v5, 'vfpu_core5_vlog2w.bin', CORE5_LOG2W)):
+        if d:
+            o = load(d, name).astype(np.int64)
+            x = np.concatenate([b + s * np.arange(c, dtype=np.int64) for b, s, c in segs])
+            assert len(o) == len(x), '%s: %d words, want %d' % (name, len(o), len(x))
+            xs.append(x); os_.append(o)
+    return np.concatenate(xs), np.concatenate(os_)
+
+
+def concave_sources(log2, sqrt):
+    """C2 -> (core, segment) of the correction for a coefficient C2 =
+    V(0) - V(512): the log2 core's segment with that C2 if it has one, else
+    the sqrt core's, the one with fewest open distances first"""
+    src = {}
+    for name, tables in (('log2', log2), ('sqrt', sqrt)):
+        for s in sorted(range(len(tables)), key=lambda i: tables[i][3]):
+            V = tables[s][1]
+            src.setdefault(int(V[0] - V[HALF]), (name, s))
+    return src
+
+
+def correction_table(log2, sqrt):
+    """R[C2, k] = V(0) - V(k) from concave_sources; 0 for C2 = 0, -1 where
+    no segment has C2"""
+    R = np.full((256, HALF + 1), -1, dtype=np.int64)
+    R[0] = 0
+    for c2, (name, s) in concave_sources(log2, sqrt).items():
+        if 0 < c2 < 256:
+            V = (log2 if name == 'log2' else sqrt)[s][1]
+            R[c2] = V[0] - V
+    return R
+
+
+def log2_wide(log2, R, xb):
+    """vlog2 of x >= 4 (src/vfpu.c, log2_wide): the log2 core with D's low
+    t + 1 bits cleared, t the bit length of the exponent less one, and the
+    correction of C2 cut the same way, rounded to 2^t; 23 bits kept"""
+    e = ((xb >> 23) & 0xFF).astype(np.int64) - 127
+    m = (xb & 0x7FFFFF).astype(np.int64)
+    t = np.frexp(e.astype(np.float64))[1] - 1
+    a = t + 1
+    seg = m >> UBITS; u = m & ((1 << UBITS) - 1); k = np.abs((u >> GSHIFT) - HALF)
+    D = np.array([x[0] for x in log2], dtype=np.int64)[seg]
+    V = np.stack([x[1] for x in log2])
+    v0 = V[seg, 0]; c2 = v0 - V[seg, HALF]; c2t = (c2 >> a) << a
+    r = R[c2t, k]
+    assert (r >= 0).all(), 'a cut C2 with no correction: %s' % sorted(set(c2t[r < 0].tolist()))
+    tot = ((e << 24) + ((((D >> a) << a) * u) >> 16)
+           + (((v0 - (c2 - c2t)) >> t) << t) - (((r + (1 << t) - 1) >> t) << t))
+    nb = np.frexp(tot.astype(np.float64))[1]
+    sig = tot >> (nb - 23)
+    return ((nb - 25 + 127) << 23) | ((sig << 1) & 0x7FFFFF)
+
+
+def settle_log2_knots(log2, sqrt, X, Y, xw, ow):
+    """Where the [1,2) results leave V(0) or V(512) open -- segments 55-57,
+    whose slope is so near 2 per u that Y never shows V's low bit in the
+    middle or at the knot -- they still decide C2, which x >= 4 reads: take
+    the values in range that reproduce the most x >= 4 results, the fitted
+    ones on a tie. Returns the segments changed."""
+    changed = []
+    seg_w = (xw & 0x7FFFFF) >> UBITS
+    for s in range(len(log2)):
+        sel = (X >> UBITS) == s
+        D, V = log2[s][0], log2[s][1]
+        vl, vh = intervals(X[sel] & ((1 << UBITS) - 1), Y[sel], D)
+        if vl[0] == vh[0] and vl[HALF] == vh[HALF]:
+            continue
+        w = seg_w == s
+        best = None
+        for v0 in range(int(vl[0]), int(vh[0]) + 1):
+            for vk in range(int(vl[HALF]), int(vh[HALF]) + 1):
+                V2 = V.copy(); V2[0] = v0; V2[HALF] = vk
+                trial = list(log2); trial[s] = (D, V2) + tuple(log2[s][2:])
+                miss = int((log2_wide(trial, correction_table(trial, sqrt), xw[w]) != ow[w]).sum())
+                key = (miss, abs(v0 - int(V[0])) + abs(vk - int(V[HALF])))
+                if best is None or key < best[0]:
+                    best = (key, V2)
+        if (best[1] != V).any():
+            log2[s] = (D, best[1]) + tuple(log2[s][2:])
+            changed.append((s, int(V[0] - V[HALF]), int(best[1][0] - best[1][HALF])))
+    return changed
+
+
+def emit_log2_coef(log2, sqrt, f):
+    """vlog2 for x >= 4 takes the quadratic correction of the coefficient
+    C2 = V(0) - V(512) with its low bits cleared. That correction is one
+    function of C2 for the cores whose curve bends down (log2, sqrt and the
+    cosine core: equal C2, equal V(0) - V(k) in all of them), so it comes
+    from the log2 core's segment with that C2 or, where none has it, the
+    sqrt core's. Every C2 x >= 4 can ask for has one but 0, whose
+    correction is 0."""
+    src = concave_sources(log2, sqrt)
+    by = [-1] * 256
+    for c2, (name, s) in src.items():
+        if 0 < c2 < 256:
+            by[c2] = s if name == 'log2' else 128 + s
+    for x in log2:
+        c2 = int(x[1][0] - x[1][HALF])
+        for t in range(1, 7):
+            c2t = (c2 >> (t + 1)) << (t + 1)
+            assert c2t == 0 or by[c2t] >= 0, 'cut C2 %d has no segment' % c2t
+    f.write('/* log2 for x >= 4: for each C2 = V(0) - V(512), the segment whose\n'
+            ' * V(0) - V(k) is its correction: the log2 core\'s, or 128 + the sqrt\n'
+            ' * core\'s; -1 where none is needed. */\n')
+    f.write('static const int16_t VFPU_CORE_LOG2_BYCOEF[256] = {\n')
     for i in range(0, 256, 16):
-        f.write('    ' + ' '.join('%d,' % v for v in seg_of[i:i + 16]) + '\n')
+        f.write('    ' + ' '.join('%d,' % v for v in by[i:i + 16]) + '\n')
     f.write('};\n\n')
 
 
@@ -483,6 +625,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('rundir')
     ap.add_argument('--v4', help='a vfpuprobe v4 folder: its vfpu_core4_*.bin')
+    ap.add_argument('--v5', help='a vfpuprobe v5 folder: its vfpu_core5_vlog2.bin')
     ap.add_argument('--out')
     ap.add_argument('--check', action='store_true')
     ap.add_argument('--holdout', action='store_true')
@@ -491,24 +634,34 @@ def main():
     fitted = {}
     for name in a.ops.split(','):
         get = OPS[name]
-        X, Y, *E = get(a.rundir, sweeps=not a.holdout, v4=a.v4)
+        X, Y, *E = get(a.rundir, sweeps=not a.holdout, v4=a.v4, v5=a.v5)
         t = fit(X, Y)
         fitted[name] = (t, E[0] if E else None)
         amb = sum(x[3] for x in t)
         if a.check or a.holdout:
-            Xa, Ya, *_ = get(a.rundir, sweeps=True, v4=a.v4)
+            Xa, Ya, *_ = get(a.rundir, sweeps=True, v4=a.v4, v5=a.v5)
             p = predict(t, Xa)
             print('%-5s fitted on %d samples, %d distances open; all samples %d/%d exact'
                   % (name, len(X), amb, int((p == Ya).sum()), len(Ya)))
+    if 'log2' in fitted and 'sqrt' in fitted:
+        log2 = fitted['log2'][0]; sqrt = fitted['sqrt'][0]
+        xw, ow = samples_log2_wide(a.rundir, a.v4, a.v5)
+        X, Y = OPS['log2'](a.rundir, sweeps=True, v5=a.v5)
+        for s, old, new in settle_log2_knots(log2, sqrt, X, Y, xw, ow):
+            print('log2  segment %d: C2 %d -> %d, as x >= 4 has it' % (s, old, new))
+        if a.check:
+            p = log2_wide(log2, correction_table(log2, sqrt), xw)
+            print('log2  x >= 4: %d/%d exact' % (int((p == ow).sum()), len(ow)))
     if a.out:
         with open(a.out, 'w') as f:
             f.write('/* Generated by tools/hwprobe/vfpuprobe/gencores.py from vfpuprobe v3\n'
                     ' * core dumps and run-1 sweeps%s (fw 6.60). Do not edit. */\n\n'
-                    % (' and v4\'s whole segments' if a.v4 else ''))
+                    % ((' and v4\'s and v5\'s whole segments' if a.v5 else ' and v4\'s whole segments')
+                       if a.v4 else ''))
             for name, (t, E) in fitted.items():
                 emit(name, t, f, E)
-            if 'log2' in fitted:
-                emit_log2_coef(fitted['log2'][0], f)
+            if 'log2' in fitted and 'sqrt' in fitted:
+                emit_log2_coef(fitted['log2'][0], fitted['sqrt'][0], f)
 
 
 if __name__ == '__main__':

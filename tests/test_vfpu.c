@@ -723,9 +723,7 @@ static void test_units_and_conversions(void) {
 /* ---- the transcendental unit -----------------------------------------------
  *
  * Words from vfpuprobe's dumps (steps 2-12 and 120-127, v3 steps 193-200,
- * v4 steps 201-203, fw 6.60). The exact rows are ones the model reproduces;
- * the last one is where it is a unit off the hardware's, and is held to
- * that. */
+ * v4 steps 201-203, v5 steps 204-205, fw 6.60), each reproduced exactly. */
 static void test_transcendentals(void) {
     psp_vfpu_reset();
     static const struct { int op; uint32_t in, out; } exact[] = {
@@ -809,6 +807,14 @@ static void test_transcendentals(void) {
         { PSP_VU_LOG2, 0x47B2824B, 0x4183D6BA },
         { PSP_VU_LOG2, 0x4FB08A45, 0x4201DAFA },
         { PSP_VU_LOG2, 0x5FAAC60F, 0x4280D4F4 },
+        /* v5 steps 204-205: x >= 4 in the segments v4's rule missed. */
+        { PSP_VU_LOG2, 0x4139AB8A, 0x4062579C },   /* segment 57: C2 88, not 89 */
+        { PSP_VU_LOG2, 0x40B8EE14, 0x4021F934 },   /* segment 56: C2 88, not 87 */
+        { PSP_VU_LOG2, 0x4089B1BD, 0x4006BDA2 },   /* segment 9: V(512) from step 204 */
+        { PSP_VU_LOG2, 0x408A6E9A, 0x40073BF2 },
+        { PSP_VU_LOG2, 0x40B5CFA8, 0x40206728 },   /* C2' 88: segment 56's correction */
+        { PSP_VU_LOG2, 0x40FC64EF, 0x403EB0B2 },   /* C2' 44: the sqrt core's */
+        { PSP_VU_LOG2, 0x4186B1B4, 0x40825A74 },
     };
     int r[4];
     psp_vfpu_regs(0x00, 1, r);
@@ -818,17 +824,6 @@ static void test_transcendentals(void) {
         const uint32_t got = psp_f32_to_bits(psp_cpu.v[r[0]]);
         CHECK(got == exact[i].out, "op %d of %08X: %08X, want %08X",
               exact[i].op, exact[i].in, got, exact[i].out);
-    }
-    static const struct { int op; uint32_t in, out; } near[] = {
-        { PSP_VU_LOG2, 0x4139AB8A, 0x4062579C },   /* x >= 4, segment 57 (odd C2) */
-    };
-    for (size_t i = 0; i < sizeof near / sizeof near[0]; i++) {
-        psp_cpu.v[r[0]] = psp_bits_to_f32(near[i].in);
-        psp_vunary(near[i].op, 0x00, 0x00, 1);
-        const uint32_t got = psp_f32_to_bits(psp_cpu.v[r[0]]);
-        const uint32_t d = got > near[i].out ? got - near[i].out : near[i].out - got;
-        CHECK(d <= 4, "op %d of %08X: %08X, want %08X within 4", near[i].op, near[i].in,
-              got, near[i].out);
     }
 
     /* vrot is the same sine and cosine (steps 120 and 122). */

@@ -1155,8 +1155,8 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
  *     vlog2(3F7FFFFF) is -0.
  *
  * All of them are bit exact: their cores are the hardware's own, from tables
- * fitted to the dumps (the shared core, below). The one gap is vlog2 of
- * x >= 4, where 0.14% of the dumped results are a unit off (see there). */
+ * fitted to the dumps (the shared core, below), and every dumped and swept
+ * result reproduces. */
 #define VINF_BITS 0x7F800000u
 #define VONE_BITS 0x3F800000u
 
@@ -1203,14 +1203,18 @@ static uint32_t quarter_fixed(uint32_t b) {
  * vfpu_cores.h holds, per segment, D, V(0) and the steps V(k+1) - V(k) as
  * 1- or 2-bit fields (signed 4-bit ones for vasin, whose V turns direction
  * from segment to segment); tools/hwprobe/vfpuprobe/gencores.py fits them to
- * vfpuprobe v3's core dumps (steps 193-200), the run-1 sweeps and v4's whole
- * segments (fw660-v4.txt steps 201-202, fw 6.60) and reproduces every one of
- * those results. For the first five, arguments the dumps skipped rest on the
- * fit: holding the sweeps out, it predicted 99.96% of them. For vsin/vcos and
- * vasin, v4 dumped every argument of the segments where v3's every-3rd one
- * left V's steps open (2,169 of them; 2,086 of the fit's picks there had
- * been right), and now every one of the 2^23 arguments of either core has
- * its result fixed by the data: a step still open changes none of them.
+ * vfpuprobe v3's core dumps (steps 193-200), the run-1 sweeps and v4's and
+ * v5's whole segments (fw660-v4.txt steps 201-202, fw660-v5.txt step 204,
+ * fw 6.60) and reproduces every one of those results. For rcp, exp2, sqrt
+ * and rsq, arguments the dumps skipped rest on the fit: holding the sweeps
+ * out, it predicted 99.96% of them. For vsin/vcos and vasin, v4 dumped every
+ * argument of the segments where v3's every-3rd one left V's steps open
+ * (2,169 of them; 2,086 of the fit's picks there had been right), and now
+ * every one of the 2^23 arguments of either core has its result fixed by the
+ * data: a step still open changes none of them. For log2, v5 did the same
+ * for the 9 segments v3 left open (1,004 distances; 40 stay open in 55-57,
+ * where no x in [1, 2) depends on them, and x >= 4 settles the 2 of those
+ * it reads, see vfpu_log2).
  *
  * vsin and vasin are the same core with an exponent E per segment, since
  * their results range over many binades: Z is at 2^(E-23) and the result is
@@ -1362,22 +1366,27 @@ static uint32_t vfpu_exp2(uint32_t b) {
  *   - the slope D loses its low t + 1 bits, and the linear term keeps its
  *     full precision: floor(D' * u / 2^16);
  *   - the quadratic correction is that of the coefficient C2 = V(0) - V(512)
- *     with its low t + 1 bits cleared, C2'. The log2 core's correction
- *     depends on C2 alone (segments with equal C2 have equal V(0) - V(k)),
- *     so it is read from a segment whose C2 is C2' (VFPU_CORE_LOG2_BYCOEF),
- *     or, where none is, taken as ceil(C2' * k^2 / 2^18), which it nearly
- *     always equals. It is rounded up to a multiple of 2^t and subtracted
- *     from V(0) - (C2 - C2'), rounded down to one;
+ *     with its low t + 1 bits cleared, C2'. A core's correction depends on
+ *     C2 alone, the same in every core whose curve bends the same way:
+ *     equal C2, equal V(0) - V(k), in log2's segments and between log2,
+ *     sqrt and the cosine core (rcp, exp2, rsq and vasin, which bend the
+ *     other way, share theirs). So it is read from the log2 segment whose C2
+ *     is C2' or, for 44, 40 and 32, which no log2 segment has, the sqrt
+ *     core's (VFPU_CORE_LOG2_BYCOEF); C2' = 0 has none. It is rounded up to
+ *     a multiple of 2^t and subtracted from V(0) - (C2 - C2'), rounded down
+ *     to one;
  *   - ex * 2^24 plus that, truncated to 23 significant bits.
  *
- * Measured on set 10's vfpuprobe 4 (fw660-v4.txt step 203), 230,252
- * results: the fraction is the same for every exponent of a bit length (for
- * 4 x 4,113 mantissas), and with the slope cut by t + 1 bits no other
- * correction can explain two of them differently. This reproduces 229,935
- * of them and 2,508 of the 2,510 swept x >= 4, where the full-precision core
- * matched 129,652 and 1,286. The rest are a unit of the 23rd bit off, most
- * in the three segments whose C2 is odd (9, 56 and 57: 161, 87 and 89) and
- * where C2' has no segment (44, 88 and 160).
+ * Measured on vfpuprobe 4 and 5 (fw660-v4.txt step 203, fw660-v5.txt steps
+ * 204-205): the fraction is the same for every exponent of a bit length
+ * (for 4 x 4,113 mantissas), and with the slope cut by t + 1 bits no other
+ * correction can explain two of them differently. Every C2 is even. In
+ * segments 55-57 the slope is so near 2 per u that no x in [1, 2) shows
+ * V's low bit in the middle or at the knot, so C2 comes from x >= 4: 88 in
+ * 56 and 57. This reproduces all 822,604 dumped and swept x >= 4 (steps
+ * 203 and 205 and the sweep), where the full-precision core matched about
+ * half. Two segments with the same C2' at one t (50 and 53, 6 and 8, 3 and
+ * 6, 0 and 6, 100 and 124) agree, as the lookup has it.
  *
  * Below 1 the hardware leaves out the quadratic correction: the magnitude is
  * 1 - log2(m) from the segment's knot value and D / 256 alone, at 17 bits,
@@ -1394,10 +1403,10 @@ static int64_t log2_wide(int ex, uint32_t m) {
     const int64_t v0 = core_seg_v(&CORE_LOG2, seg, 0);
     const int64_t c2 = v0 - core_seg_v(&CORE_LOG2, seg, 512);
     const int64_t c2t = floor_shr(c2, a) << a;
-    const int s2 = c2t >= 0 && c2t < 256 ? VFPU_CORE_LOG2_BYCOEF[c2t] : -1;
-    const int64_t r = s2 >= 0
-        ? core_seg_v(&CORE_LOG2, (uint32_t)s2, 0) - core_seg_v(&CORE_LOG2, (uint32_t)s2, k)
-        : floor_shr(c2t * (int64_t)k * k + ((int64_t)1 << 18) - 1, 18);
+    const int src = c2t > 0 && c2t < 256 ? VFPU_CORE_LOG2_BYCOEF[c2t] : -1;
+    const vfpu_core *cc = src >= 128 ? &CORE_SQRT : &CORE_LOG2;
+    const uint32_t s2 = (uint32_t)(src >= 128 ? src - 128 : src);
+    const int64_t r = src >= 0 ? core_seg_v(cc, s2, 0) - core_seg_v(cc, s2, k) : 0;
     const int64_t w = (floor_shr(v0 - (c2 - c2t), t) - floor_shr(r + ((int64_t)1 << t) - 1, t)) << t;
     return ((int64_t)ex << 24) + lin + w;
 }
