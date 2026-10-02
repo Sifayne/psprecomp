@@ -54,6 +54,10 @@ blending, depth, clipping, the per-pixel tests).
 | 52 | (v8) spline weights along u as points: every u edge mode, 4 to 6 control columns, divisions 2, 3, 4, 6 and 8, three columns lit (red, green, blue) | 8888 |
 | 53 | (v9) spline weights along u as points at 40 steps a span: a uniform span, two uniform spans and two spans with each kind of open end; control colours 255, 254 and 129, and neighbouring columns lit in pairs | 8888 |
 | 54 | (v9) the same at 48 steps a span | 8888 |
+| 55 | (v10) spline weights read through depth: one patch per spline and control column, 48 steps a span, orthographic, the column at another eye depth, so each point's depth is that weight to 1/32768 (and its red the same weight as a colour); plus both depth dumps | 8888 |
+| 56 | (v10) the spline parameter the GE uses: the same splines with no texture coordinates over a 512-texel ramp, nearest, repeated, at texture scale 1, 4 and 16 | 8888 |
+| 57 | (v10) scene 48's 144 corners as points, their depths read back and logged, then its 48 triangles in through mode at psprecomp's corners with those depths; plus both depth dumps | 8888 |
+| 58 | (v10) scene 48's shape 1 at every sixteenth of a pixel across and down, 32 copies; plus both depth dumps | 8888 |
 
 After the scenes it records which GE callbacks run, with which arguments and
 when, through libgu (signal and finish) and through a raw `sceGe` list.
@@ -99,6 +103,19 @@ samples with nothing to tell a weight error from colour arithmetic, so
 these read the same weights at 40 and 48 steps a span, at three control
 colours, and in neighbouring pairs whose sum shows whether the errors
 cancel.
+
+Version 10 adds scenes 55-58, so steps 1-94 keep their version 9 numbers.
+Run 10 found each spline weight one value at every colour level and a
+function of the span and t alone; scene 55 reads the weights through depth,
+about 128 times finer than a colour, and scene 56 reads the parameter the
+GE uses through a texture. Scene 48's 3D depth planes are off by a step in
+one direction only; scene 57 draws its corners as points, reads back the
+depth the PSP gives each, and redraws the triangles in through mode at
+psprecomp's corners with those depths (`twin_table.inc`, from psprecomp's
+projection), so the two frames say whether the 3D path differs from
+through mode; scene 58 moves one shape by every sixteenth of a pixel. The
+`_depthfull.bin` dumps are the whole 512-pixel stride, which the 480-wide
+`_depth.raw` cannot read all of.
 
 ## Build
 

@@ -17,8 +17,9 @@
  * (version 6) what geprobe 5 left open in turn, scenes 43 on (version 7,
  * after the callback steps) what geprobe 6 left open, scenes 50 on
  * (version 8) the two rules geprobe 7 could not settle: the gradient
- * reciprocal and the spline weights, and scenes 53 and 54 (version 9) the
- * spline weights again, densely.
+ * reciprocal and the spline weights, scenes 53 and 54 (version 9) the
+ * spline weights again, densely, and scenes 55 to 58 (version 10) the
+ * spline weights through depth and texture, and the 3D depth anchor.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -39,7 +40,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 9
+#define PROBE_VERSION 10
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -2241,6 +2242,241 @@ static void scene_splinedense(int div) {
     scene_end(name, GU_PSM_8888, 0);
 }
 
+/* ---- version 10 -----------------------------------------------------------
+ *
+ * Scenes 53 and 54 found every spline weight one value at all three levels,
+ * a function of the span and t alone (908 read at two divisions agree), but
+ * a colour reads it only to 1/255. Scene 55 reads the same weights through
+ * depth, about 128 times finer, and scene 56 reads the parameter t the GE
+ * itself uses, through a texture. Scenes 48's 3D depth planes are a step off
+ * in one direction only; scene 57 redraws them in through mode at
+ * psprecomp's corners with the depths the PSP gives each corner as a point,
+ * and scene 58 moves one shape by every sixteenth of a pixel. */
+
+/* Through-mode-like placement for 3D draws: x and y in pixels, eye z from 0
+ * (depth 65535) to -1 (depth 0), no perspective. */
+static void ortho_screen(void) {
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadIdentity();
+    sceGumOrtho(0.0f, 480.0f, 272.0f, 0.0f, 0.0f, 1.0f);
+    sceGumMatrixMode(GU_MODEL);
+    sceGumUpdateMatrix();
+}
+
+/* The depth buffer whole, 512 pixels a row through the plain VRAM address,
+ * as `<name>_depthfull.bin`: the 480-wide dump cannot read the pixels whose
+ * addresses fall in columns 480-511 (render.c depth_addr). */
+static void dump_depth_full(const char *name) {
+    const unsigned char *z = (const unsigned char *)VRAM_UNCACHED + (w32)ZBP;
+    const int size = FB_W * SCR_H * 2;
+    memcpy(g_dump, z, size);
+    char file[48];
+    snprintf(file, sizeof file, "ge_%02d_%s_depthfull.bin", g_scene, name);
+    const int wr = probe_write_file(file, g_dump, size);
+    out("  %s: %d bytes, crc %08X\n", file, wr, crc32(g_dump, size));
+}
+
+/* Where the GE keeps pixel (x, y)'s depth, through the plain VRAM address:
+ * the permutation geprobe 2 scene 17 measured (render.c depth_addr). */
+static unsigned depth_at(int x, int y) {
+    const w32 l = (w32)ZBP + (w32)(y * FB_W + x) * 2;
+    const w32 mid = (l >> 5) & 0x1F, rot = ((mid << 1) | (mid >> 4)) & 0x1F;
+    const w32 p = ((l & ~(0x1Fu << 5)) | (rot << 5)) ^ 0x2040u;
+    const unsigned char *b = (const unsigned char *)VRAM_UNCACHED + p;
+    return (unsigned)b[0] | (unsigned)b[1] << 8;
+}
+
+typedef struct { int edge, cols; float s, first; } SD10;
+static const SD10 SD10_SPLINES[6] = {
+    { GU_FILL_FILL, 4, 300.0f, 1.0f }, { GU_OPEN_OPEN, 4, 140.0f, 0.0f },
+    { GU_FILL_FILL, 5, 200.0f, 1.0f }, { GU_OPEN_OPEN, 5, 110.0f, 0.0f },
+    { GU_OPEN_FILL, 5, 140.0f, 0.0f }, { GU_FILL_OPEN, 5, 140.0f, 1.0f } };
+
+/* Scene 55: one patch per spline and control column k, 48 steps a span, as
+ * points in a row 6 pixels high, orthographic. Every control point sits at
+ * eye z -0.25 except column k's, at -0.75, so a point's depth is
+ * 32767.5 (1.5 - w) for column k's weight w; column k is also red 255, so
+ * the colour reads the same weight as scenes 53 and 54 do. The spline
+ * order is a uniform span, a Bezier piece (open/open, 4 columns), two
+ * uniform spans, then 5 columns open/open, open/fill and fill/open: 28 rows
+ * from y = 2.5. Depth test ALWAYS, writes on; both depth dumps. */
+static void scene_splinedepth(void) {
+    if (step("scene %02d: spline weights read through depth, 48 steps a span, one column at a time", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFFFF01FF);
+    ortho_screen();
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    sceGuPatchPrim(GU_POINTS);
+    int row = 0;
+    CV g[6 * 4];
+    for (int n = 0; n < 6; n++) {
+        const SD10 *sp = &SD10_SPLINES[n];
+        for (int k = 0; k < sp->cols; k++, row++) {
+            const float x0 = 20.0f - sp->first * sp->s, y = 2.5f + 6 * row;
+            for (int j = 0; j < 4; j++)
+                for (int i = 0; i < sp->cols; i++)
+                    g[j * sp->cols + i] = (CV){ i == k ? 0xFF0000FFu : 0xFF000000u,
+                                                x0 + i * sp->s, y + j, i == k ? -0.75f : -0.25f };
+            sceGuPatchDivide(48, 1);
+            sceGuDrawSpline(FMT_CV3D, sp->cols, 4, sp->edge, GU_OPEN_OPEN, NULL,
+                            gumem(g, sp->cols * 4 * (int)sizeof(CV)));
+        }
+    }
+    sceGuPatchPrim(GU_TRIANGLE_STRIP);
+    scene_end("splinedepth", GU_PSM_8888, 1);
+    dump_depth_full("splinedepth");
+}
+
+static w32 *g_texramp;           /* 512 x 8, texel x = x in red (low) and green (high) */
+
+/* Scene 56: the same splines with no texture coordinates, so the GE gives
+ * each point its surface parameter as (u, v); a 512-texel ramp, nearest,
+ * repeated, replaces the colour with the texel, red + 256 green = floor of
+ * 512 times u's fraction. Each spline at texture scale 1, 4 and 16, so the
+ * texel pins u to 1/512, 1/2048 and 1/8192 of a turn: 18 rows. */
+static void scene_splineparam(void) {
+    if (step("scene %02d: the spline parameter the GE uses, through a 512-texel ramp", g_scene)) return;
+    if (!g_texramp) {
+        g_texramp = memalign(16, 512 * 8 * 4);
+        if (!g_texramp) { out("  out of memory\n"); return; }
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 512; x++) g_texramp[y * 512 + x] = 0xFF000000u | (w32)(x & 0xFF) | (w32)(x >> 8) << 8;
+        sceKernelDcacheWritebackAll();
+    }
+    scene_begin(GU_PSM_8888, 0xFFFF01FF);
+    ortho_screen();
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, 512, 8, 512, g_texramp);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexWrap(GU_REPEAT, GU_REPEAT);
+    sceGuTexOffset(0.0f, 0.0f);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+    sceGuPatchPrim(GU_POINTS);
+    static const float SCALE[3] = { 1.0f, 4.0f, 16.0f };
+    int row = 0;
+    CV g[6 * 4];
+    for (int n = 0; n < 6; n++) {
+        const SD10 *sp = &SD10_SPLINES[n];
+        for (int l = 0; l < 3; l++, row++) {
+            const float x0 = 20.0f - sp->first * sp->s, y = 2.5f + 6 * row;
+            for (int j = 0; j < 4; j++)
+                for (int i = 0; i < sp->cols; i++)
+                    g[j * sp->cols + i] = (CV){ 0xFF000000u, x0 + i * sp->s, y + j, -0.5f };
+            sceGuTexScale(SCALE[l], 1.0f);
+            sceGuPatchDivide(48, 1);
+            sceGuDrawSpline(FMT_CV3D, sp->cols, 4, sp->edge, GU_OPEN_OPEN, NULL,
+                            gumem(g, sp->cols * 4 * (int)sizeof(CV)));
+        }
+    }
+    sceGuPatchPrim(GU_TRIANGLE_STRIP);
+    sceGuTexScale(1.0f, 1.0f);
+    sceGuDisable(GU_TEXTURE_2D);
+    scene_end("splineparam", GU_PSM_8888, 0);
+}
+
+/* Scene 48's 48 triangles as psprecomp projects them (1/16 pixel, corners
+ * in the order drawn), which the earlier runs confirmed through their depth
+ * planes. */
+static const short TWIN_XY[48][6] = {
+#include "twin_table.inc"
+};
+
+/* Scene 48's corner (s, k, j): the shape, its copy and the corner's place in
+ * the copy's order, as scene_depthanchor2 draws them. */
+static CV anchor_corner(int s, int k, int j, w32 c) {
+    const float X = -4.2f + k * 1.5f, Y = 2.45f - s * 0.68f;
+    const int v = k < 3 ? (k + j) % 3 : (k + 3 - j) % 3;
+    return (CV){ c, X + ANCHOR_SHAPES[s][v][0] * 0.55f, Y - ANCHOR_SHAPES[s][v][1] * 0.55f, ANCHOR_SHAPES[s][v][2] };
+}
+
+/* Scene 57: first each of scene 48's 144 corners as a point (its index in
+ * red and green), read back: the pixel its colour landed on near
+ * psprecomp's corner, and that pixel's depth, logged 8 to a line as
+ * "x,y=depth". Then the 48 triangles again in through mode, at psprecomp's
+ * corners with those depths (psprecomp's floored depth where a point is not
+ * found, marked '?'), colour as scene 48. If these match scene 48 the 3D
+ * planes are the through-mode rule on the corners the GE has; if not, the
+ * 3D path differs. Depth test ALWAYS, writes on; both depth dumps. */
+static void scene_anchortwin(void) {
+    if (step("scene %02d: scene 48's corners as points, then its triangles in through mode at those depths", g_scene)) return;
+    static CV pts[144], tri[144];
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    for (int t = 0; t < 48; t++)
+        for (int j = 0; j < 3; j++) {
+            const int i = t * 3 + j;
+            pts[i] = anchor_corner(t / 6, t % 6, j, 0xFF550000u | (w32)(i & 0xFF) | (w32)(i >> 8) << 8);
+        }
+    sceGuDrawArray(GU_POINTS, FMT_CV3D, 144, NULL, gumem(pts, sizeof pts));
+    sceGuFinish();
+    ge_wait();
+    const w32 *fb = (const w32 *)VRAM_UNCACHED;
+    int found = 0;
+    for (int i = 0; i < 144; i++) {
+        const int t = i / 3, j = i % 3;
+        const int cx = TWIN_XY[t][2 * j] >> 4, cy = TWIN_XY[t][2 * j + 1] >> 4;
+        const w32 want = 0x550000u | (w32)(i & 0xFF) | (w32)(i >> 8) << 8;
+        int hx = -1, hy = -1;
+        for (int dy = -1; dy <= 1 && hx < 0; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+                const int x = cx + dx, y = cy + dy;
+                if (x < 0 || y < 0 || x >= SCR_W || y >= SCR_H) continue;
+                if ((fb[y * FB_W + x] & 0xFFFFFF) == want) { hx = x; hy = y; break; }
+            }
+        const w32 c = 0xFF800000u | (w32)(0x40 + (t / 6) * 0x18) | (w32)(0x40 + (t % 6) * 0x20) << 8;
+        float z = -1.0f;
+        if (hx >= 0) { z = (float)depth_at(hx, hy); found++; }
+        tri[i] = (CV){ c, TWIN_XY[t][2 * j] / 16.0f, TWIN_XY[t][2 * j + 1] / 16.0f, z };
+        if (i % 8 == 0) out("  ");
+        if (hx >= 0) out(" %d,%d=%u", hx, hy, (unsigned)z);
+        else out(" ?");
+        if (i % 8 == 7) out("\n");
+    }
+    out("  %d of 144 corners found\n", found);
+    for (int i = 0; i < 144; i++)
+        if (tri[i].z < 0.0f) tri[i].z = 0.0f;        /* not found: depth 0, logged as '?' */
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV2D, 144, NULL, gumem(tri, sizeof tri));
+    scene_end("anchortwin", GU_PSM_8888, 1);
+    dump_depth_full("anchortwin");
+}
+
+/* Scene 58: scene 48's shape 1 (the one most off), 40 pixels across in its
+ * first order, at screen positions moved by i/16 of a pixel across (top two
+ * rows of 8) and down (bottom two rows), i = 0..15, each copy its own flat
+ * colour, at the shape's eye depths. Depth test ALWAYS, writes on; both
+ * depth dumps. */
+static void scene_anchorsweep(void) {
+    if (step("scene %02d: one 3D shape at every sixteenth of a pixel across and down", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    static CV t[32 * 3];
+    int n = 0;
+    for (int c = 0; c < 32; c++) {
+        const float bx = 20.0f + 55.0f * (c % 8), by = 12.0f + 62.0f * (c / 8);
+        const float dx = c < 16 ? (c % 16) / 16.0f : 0.0f, dy = c < 16 ? 0.0f : (c % 16) / 16.0f;
+        const w32 col = 0xFF000000u | (w32)(0x40 + 4 * c) | (w32)(0xC0 - 4 * c) << 8 | 0x600000u;
+        for (int j = 0; j < 3; j++) {
+            float x, y;
+            const float *v = ANCHOR_SHAPES[1][j];
+            eye_xy(bx + v[0] * 40.0f + dx, by + v[1] * 40.0f + dy, v[2], &x, &y);
+            t[n++] = (CV){ col, x, y, v[2] };
+        }
+    }
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV3D, n, NULL, gumem(t, n * sizeof(CV)));
+    scene_end("anchorsweep", GU_PSM_8888, 1);
+    dump_depth_full("anchorsweep");
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -2855,6 +3091,12 @@ int main(int argc, char **argv) {
     section("scenes, version 9");
     g_scene = 53; scene_splinedense(40);
     g_scene = 54; scene_splinedense(48);
+
+    section("scenes, version 10");
+    g_scene = 55; scene_splinedepth();
+    g_scene = 56; scene_splineparam();
+    g_scene = 57; scene_anchortwin();
+    g_scene = 58; scene_anchorsweep();
 
     probe_screen(1);
     probe_done();
