@@ -2859,12 +2859,63 @@ static void draw_prim(uint32_t type, uint32_t count) {
  * The control points go through read_mvert first, so a skinned or morphed
  * control grid is skinned or morphed before it is evaluated. */
 
-/* Where along one direction the grid samples, and with what weights: each
- * sample blends four consecutive control points starting at `first`. The
- * weights are exact (double): the PSP's own rounding is in patch_param and
- * in the colour (draw_patch), and float weights moved scene 22 by 300
- * pixels on their own. */
-typedef struct { int first; double w[4]; float param; } patch_sample;
+/* Where along one direction the grid samples, and how: each sample blends
+ * four consecutive control points starting at `first`, by de Boor's
+ * algorithm with the six 8-bit parameters `a` (deboor_params). Colours run
+ * that algorithm in fixed point (deboor_fix); positions, normals and texture
+ * coordinates take the weights the same parameters give (deboor_weights),
+ * in double: geprobe 10 scene 55 (fw 6.60) reads 2332 weights through
+ * depth, and every one sits within -2 to 0 depth steps of those, the
+ * readout's own noise on Bezier pieces, where exact Cox-de Boor weights
+ * range from -86 to +63 steps. */
+typedef struct { int first; double w[4]; float param; uint16_t a[6]; } patch_sample;
+
+/* The six lerp parameters of de Boor's algorithm at local step T (1/256)
+ * of the span starting at knot index k, from integer span-local knots, in
+ * the order the levels take them: level 1's three (control 3, 2, 1 of the
+ * span), level 2's two, level 3's one. Each is an 8-bit fraction taken from
+ * the nearer knot: the smaller of t - u_lo and u_hi - t over the knot gap,
+ * cut to 1/256 (geprobe 8-10, fw 6.60: see deboor_eval). */
+static void deboor_params(const int *kn, int k, int T, uint16_t a[6]) {
+    int n = 0;
+    for (int j = 1; j <= 3; j++)
+        for (int idx = 3; idx >= j; idx--) {
+            const int i = k - 3 + idx, ul = kn[i] - kn[k], ur = kn[i + 4 - j] - kn[k];
+            const int den = ur - ul, dl = T - 256 * ul, dr = 256 * ur - T;
+            a[n++] = (uint16_t)(dl <= dr ? dl / den : 256 - dr / den);
+        }
+}
+
+/* de Boor's algorithm on four values with those parameters: integers in
+ * 1/128 of a colour step, each lerp floored back to 1/128. */
+static int64_t deboor_fix(const int64_t in[4], const uint16_t a[6]) {
+    int64_t P[4] = { in[0], in[1], in[2], in[3] };
+    int n = 0;
+    for (int j = 1; j <= 3; j++) {
+        int64_t Q[4] = { P[0], P[1], P[2], P[3] };
+        for (int idx = 3; idx >= j; idx--, n++)
+            Q[idx] = ((256 - (int64_t)a[n]) * P[idx - 1] + (int64_t)a[n] * P[idx]) >> 8;
+        memcpy(P, Q, sizeof P);
+    }
+    return P[3];
+}
+
+/* The same in real arithmetic, on unit vectors: the four weights those
+ * parameters give, for positions, normals and texture coordinates. */
+static void deboor_weights(const uint16_t a[6], double w[4]) {
+    for (int q = 0; q < 4; q++) {
+        double P[4] = { 0, 0, 0, 0 };
+        P[q] = 1.0;
+        int n = 0;
+        for (int j = 1; j <= 3; j++) {
+            double Q[4] = { P[0], P[1], P[2], P[3] };
+            for (int idx = 3; idx >= j; idx--, n++)
+                Q[idx] = (1.0 - a[n] / 256.0) * P[idx - 1] + (a[n] / 256.0) * P[idx];
+            memcpy(P, Q, sizeof P);
+        }
+        w[q] = P[3];
+    }
+}
 
 /* Step i of div along a piece, as the GE places it (geprobe 7 scene 44, fw
  * 6.60): on a 1/256 grid, cut toward the nearer end -- floor(256 i/div)/256
@@ -2886,13 +2937,12 @@ static int bezier_samples(int count, int div, patch_sample *out, int max) {
     int n = 0;
     for (int pc = 0; pc < pieces; pc++) {
         for (int i = pc ? 1 : 0; i <= div && n < max; i++) {
-            const double t = patch_param(i, div), s1 = 1.0 - t;
+            const double t = patch_param(i, div);
             patch_sample *o = &out[n++];
             o->first = 3 * pc;
-            o->w[0] = s1 * s1 * s1;
-            o->w[1] = 3.0 * t * s1 * s1;
-            o->w[2] = 3.0 * t * t * s1;
-            o->w[3] = t * t * t;
+            /* A Bezier piece is de Casteljau's algorithm: every parameter t. */
+            for (int q = 0; q < 6; q++) o->a[q] = (uint16_t)lround(t * 256.0);
+            deboor_weights(o->a, o->w);
             o->param = (float)pc + (float)t;
         }
     }
@@ -2906,45 +2956,29 @@ static int bezier_samples(int count, int div, patch_sample *out, int max) {
  * the uniform knots and stops short of it. Scene 23's OPEN_OPEN patch spans
  * its whole control grid and its FILL_FILL patch the middle third. */
 static int spline_samples(int count, int div, int edge, patch_sample *out, int max) {
-    float kn[64];
+    int kn[64];
     const int spans = count - 3;
     if (spans < 1 || count + 4 > 64) return 0;
     for (int k = 0; k < count + 4; k++) {
-        float t = (float)(k - 3);
-        if ((edge & 1) && t < 0.0f) t = 0.0f;
-        if ((edge & 2) && t > (float)spans) t = (float)spans;
+        int t = k - 3;
+        if ((edge & 1) && t < 0) t = 0;
+        if ((edge & 2) && t > spans) t = spans;
         kn[k] = t;
     }
     int n = 0;
     for (int sp = 0; sp < spans; sp++) {
         for (int i = sp ? 1 : 0; i <= div && n < max; i++) {
-            /* The same grid as a Bezier's: geprobe 6 scene 38's splines go
-             * from 105 pixels off to 28 with it, and scene 44's from 96 to
-             * 74. Their weights are not settled: scene 44's fill/fill
-             * splines read their two inner weights a step off the uniform
-             * B-spline's at most samples. The one rule found that fits all
-             * 40 of their readings, with t^2 and t^3 cut to 1/256, takes
-             * scene 23 from 1878 pixels off to 2036 and scene 38 from 28 to
-             * 87, so it is not used (docs/RENDERER.md). */
-            const double t = (double)sp + patch_param(i, div);
+            /* The same grid as a Bezier's (geprobe 10 scene 56 reads the
+             * parameter itself through a texture: every step on it), and
+             * de Boor's algorithm with 8-bit parameters from it
+             * (deboor_params; deboor_fix says what it reproduces). */
+            const double tl = patch_param(i, div);
             const int k = sp + 3;                     /* kn[k] <= t <= kn[k+1] */
-            double N[4] = { 1, 0, 0, 0 }, left[4], right[4];
-            for (int j = 1; j <= 3; j++) {
-                left[j] = t - kn[k + 1 - j];
-                right[j] = kn[k + j] - t;
-                double saved = 0.0;
-                for (int r = 0; r < j; r++) {
-                    const double den = right[r + 1] + left[j - r];
-                    const double tmp = den != 0.0 ? N[r] / den : 0.0;
-                    N[r] = saved + right[r + 1] * tmp;
-                    saved = left[j - r] * tmp;
-                }
-                N[j] = saved;
-            }
             patch_sample *o = &out[n++];
             o->first = k - 3;
-            for (int q = 0; q < 4; q++) o->w[q] = N[q];
-            o->param = (float)t;
+            deboor_params(kn, k, (int)lround(tl * 256.0), o->a);
+            deboor_weights(o->a, o->w);
+            o->param = (float)(sp + tl);
         }
     }
     return n;
@@ -2982,7 +3016,6 @@ static void draw_patch(int spline, uint32_t arg) {
     for (int j = 0; j < nv; j++)
         for (int i = 0; i < nu; i++) {
             float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, u = 0, v = 0;
-            double col[4] = { 0, 0, 0, 0 };
             for (int b = 0; b < 4; b++)
                 for (int a = 0; a < 4; a++) {
                     const double wd = sv[j].w[b] * su[i].w[a];
@@ -2990,24 +3023,35 @@ static void draw_patch(int spline, uint32_t arg) {
                     if (wd == 0.0) continue;
                     const ge_mvert *c = &cp[(sv[j].first + b) * ucount + su[i].first + a];
                     for (int k = 0; k < 3; k++) { pos[k] += w * c->pos[k]; nrm[k] += w * c->nrm[k]; }
-                    for (int k = 0; k < 4; k++) col[k] += wd * (double)((c->rgba >> (8 * k)) & 0xFFu);
                     u += w * c->u; v += w * c->v;
                 }
             ge_mvert *o = &grid[j * nu + i];
             memcpy(o->pos, pos, sizeof pos);
             memcpy(o->nrm, nrm, sizeof nrm);
-            /* A generated vertex's colour is the blend cut to 1/256 of a step
-             * and rounded up to a whole one. geprobe 5 (fw 6.60) scene 22's
-             * first patch, whose colours come to 63.75, 127.5, 158.008 and
-             * 191.25, fits planes through 64, 128, 159 and 192 on the PSP;
-             * rounding gave 191 and 158. The cut is geprobe 7 scene 44's: a
-             * weight of 13.0008 (Bezier 7, step 1, weight 2) reads 13, not
-             * 14, and with it all 168 of its Bezier weights fit; cut finer,
-             * at 2^-16 as this used to, 166. Plain truncation, which a
-             * morph's blend takes (read_mvert), is worse still. */
+            /* A generated vertex's colour is not a blend by weights: the GE
+             * runs de Boor's algorithm on each channel of the control
+             * colours, with deboor_params' 8-bit parameters, along u for
+             * each of the four control rows and then along v, every lerp
+             * floored to 1/128 of a step and the end rounded up to a whole
+             * one (deboor_fix). geprobe 9 and 10 (fw 6.60) scenes 52-54 read
+             * 19,546 single and paired control columns at three levels over
+             * every edge mode, and this reproduces every one; weights by
+             * Cox-de Boor, through the cut-to-1/256 rule this replaces, fit
+             * 13,452 of scenes 53 and 54's 16,302. The tiny weights near a
+             * span's end that read low are those 1/128 cuts. Bezier pieces
+             * are the same with every parameter t, which is why exact
+             * weights fit them. Which direction goes first is not measured:
+             * every scene so far reads the same either way. */
             o->rgba = 0;
             for (int k = 0; k < 4; k++) {
-                int c = (int)floor(col[k] + 255.0 / 256.0);
+                int64_t Q[4];
+                for (int r = 0; r < 4; r++) {
+                    int64_t in[4];
+                    for (int q = 0; q < 4; q++)
+                        in[q] = (int64_t)((cp[(sv[j].first + r) * ucount + su[i].first + q].rgba >> (8 * k)) & 0xFFu) * 128;
+                    Q[r] = deboor_fix(in, su[i].a);
+                }
+                int c = (int)((deboor_fix(Q, sv[j].a) + 127) >> 7);
                 if (c < 0) c = 0;
                 if (c > 255) c = 255;
                 o->rgba |= (uint32_t)c << (8 * k);

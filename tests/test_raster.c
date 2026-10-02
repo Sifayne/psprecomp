@@ -976,6 +976,48 @@ static void test_transformed_depth(void) {
     }
 }
 
+/* A spline point's colour is de Boor's algorithm on the control colours
+ * with 8-bit parameters and 1/128 cuts (ge.c deboor_fix), not a blend by
+ * exact weights. geprobe 9 (fw 6.60) scene 54: a uniform span (fill/fill,
+ * 4 columns) at 48 steps, column 1 red 255, v open/open over 4 rows at one
+ * division; the PSP's red at each of the 49 points, 17 of which the exact
+ * weights put a step low. Identity matrices, so control x -0.8 .. 0.4 puts
+ * the points between pixels 144 and 240 of the row at y 0.4963 (pixel 68). */
+static void test_spline_colour(void) {
+    static const int HW[49] = { 171, 171, 170, 170, 169, 168, 167, 166, 165, 163, 161, 159, 157, 155, 152, 150, 148,
+                                145, 142, 139, 136, 133, 130, 126, 123, 119, 116, 112, 108, 105, 102, 98, 94, 91, 87,
+                                84, 80, 76, 74, 70, 67, 63, 61, 57, 54, 51, 48, 46, 43 };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    for (int m = 0; m < 3; m++) {                          /* world, view, projection: identity */
+        cmd((uint8_t)(0x3A + 2 * m), 0);
+        const int n = m < 2 ? 12 : 16, rowlen = m < 2 ? 3 : 4;
+        for (int i = 0; i < n; i++) cmd((uint8_t)(0x3B + 2 * m), i % (rowlen + 1) == 0 ? 0x3F8000 : 0);
+    }
+    cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+    cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+    cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++) {
+            const int v = j * 4 + i;
+            float_vertex(v, -0.8f + 0.4f * (float)i, 0.4963f - 0.03f * (float)j, 0.5f);
+            psp_write32(VERTS + (uint32_t)v * 16, i == 1 ? 0xFF0000FFu : 0xFF000000u);
+        }
+    cmd(0x36, 48u | (1u << 8));                            /* PATCHDIVISION */
+    cmd(0x37, 2);                                          /* PATCHPRIMITIVE: points */
+    cmd(0x06, 4u | (4u << 8) | (0u << 16) | (3u << 18));   /* SPLINE 4x4, u fill/fill, v open/open */
+    end_list();
+    int n = 0, bad = 0, first_bad = -1;
+    for (int x = 100; x < 300 && n < 49; x++) {
+        const uint32_t p = pixel(x, 68);
+        if (!p) continue;
+        if ((int)(p & 0xFF) != HW[n] && first_bad < 0) first_bad = n;
+        bad += (int)(p & 0xFF) != HW[n];
+        n++;
+    }
+    CHECK(n == 49 && bad == 0, "spline points: %d found, %d reds off the PSP's (first at %d)", n, bad, first_bad);
+}
+
 /* A depth plane starts from the end of the long edge on that edge's side
  * (render.c sw_tri, zk0), not the colour's leftmost corner. geprobe 10
  * (fw 6.60) scene 57's first triangle in through mode, corners and depths
@@ -1745,6 +1787,7 @@ int main(void) {
     test_transformed_depth();
     test_gradient_reciprocal();
     test_depth_plane_side();
+    test_spline_colour();
     test_line_between_centres();
     test_far_vertex_16bit();
     test_backend_selection();

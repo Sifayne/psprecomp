@@ -615,11 +615,27 @@ fw 6.60):
   nearer end of the piece: floor(256 i/div)/256 up to the middle, and
   1 - floor(256 (div - i)/div)/256 past it. All 168 Bezier and open-spline
   weights of scene 44 fit.
-- **Weights.** The weights at those steps are exact.
-- **Colour.** The blend is cut to 1/256, then rounded up to a whole step,
-  so 13.0008 reads 13 and 63.75 reads 64.
-- **Splines.** Splines use the same grid. The weights of fill/fill splines
-  do not fit yet.
+- **de Boor's algorithm, not weights.** The GE evaluates a point by de
+  Boor's algorithm (de Casteljau's for a Bezier piece) with every lerp
+  parameter an 8-bit fraction taken from the nearer knot: of t - u_lo and
+  u_hi - t, the smaller over the knot gap, cut to 1/256, and the other
+  side one minus that. A Bezier piece's gaps are all 1, so every parameter
+  is t itself.
+- **Colour.** Each channel runs that algorithm on the control colours
+  (along u for each control row, then along v), every lerp floored to
+  1/128 of a step and the end rounded up to a whole one (ge.c deboor_fix).
+  It reproduces every one of geprobe 8 and 9's 19,546 spline colour
+  readings (scenes 52-54: every edge mode, 2 to 48 steps, control levels
+  255, 254 and 129, single and paired columns), where exact Cox-de Boor
+  weights through a cut-to-1/256 blend fit 17,403. The tiny weights near a
+  span's end that read low are the 1/128 cuts, and 13.0008 reading 13
+  (scene 44) is one too. Which direction goes first is not measured.
+- **Positions** take the weights the same 8-bit parameters give: geprobe 10
+  scene 55 reads 2332 weights through depth, every one within -2 to 0
+  depth steps of those (the readout's own noise on Bezier pieces), where
+  exact weights range from -86 to +63. The parameter is the 1/256 grid
+  itself: scene 56 reads it through a texture at 1/8192 and every step is
+  on the grid, running on across spans.
 
 ## Still open after geprobe 10
 
@@ -635,34 +651,12 @@ further probing could settle, are in `fw660-run7/findings/geprobe.md`.
   depth: 551, scene 57's: 424), and scene 58's shape is a step deeper
   across every copy from its corner at eye z -5.3 (7451), the corner that
   reads 11829 where this gives 11828.75.
-- **Patch vertices** (scenes 22, 23 and 26: 610, 1876 and 1087 pixels;
-  scene 38: 28; scene 44: 74; scene 52: 600). Spline weights are
-  unsettled. geprobe 8 scene 52 reads 3244 of them, every edge mode at
-  five divisions. Exact Cox-de Boor weights on the 1/256 grid, through the
-  colour rule above, fit 2951. All 112 from open/open 4-column splines (a
-  Bezier piece) fit, but only 670 of 811 fill/fill ones. Those read as if
-  weighted by 256/255: ceil(256 w) fits 763. On a uniform span three of
-  the four weights do so at every step, and the third from the nearer end
-  reads one lower at 1/4 and 1/3. Ruled out: t² and t³ cut to 6 to 16 bits
-  (at best 3058), Cox-de Boor in fixed point (3046), de Boor's algorithm on
-  the colours with each level rounded (3016), and a Bezier conversion of
-  each span whose control values are rounded (no values fit fill/fill).
-  geprobe 9 scenes 53 and 54 read 16302 more at 40 and 48 steps a span,
-  at control levels 255, 254 and 129 and in neighbouring pairs. Every one
-  of their 3920 weights reads as one value at all three levels, so the GE
-  computes a weight off by up to about 0.55/256 and then colours by it as
-  above; the colour arithmetic is not the cause. Exact weights fit 2984 of
-  the 3920 (any colour cut from 1/32 to 1/65536 does about as well). The
-  weights are not any cubic evaluated exactly, even w0 = (1-t)^3/6 on a
-  uniform span: no four Bernstein control values reproduce its 90 steps.
-  t^3/6 as a chain of rounded products fits 82 of 90, and power-form
-  weights with rounded t^2 and t^3, evaluated from the nearer end or not,
-  3002 of 3920. The tiny weights near a span's end read below exact
-  (t^3/6 at t = 19/256 is under half of it). The points' positions differ
-  from psprecomp's at 10-20% of samples, but patch positions go through
-  psprecomp's own projection, so that does not separate the two.
-  psprecomp's tessellated positions are its own, which is why patches
-  keep the older projection rule.
+- **Patch positions** (scene 22: 610 pixels; scene 23: 438; scene 26:
+  1087; scenes 52-56: 16 to 96 each, points a pixel apart). The weights
+  are the GE's now, but the positions they make go through psprecomp's own
+  arithmetic in double and the older projection rule (ge.c ge_recip): with
+  the GE's projection rule instead, scene 22 goes to 1023 and scene 23 to
+  576. How the GE keeps a tessellated position is not measured.
 - **Lit triangles** (scene 16: 325 pixels). Every pixel off is one step
   in a channel, and all fall in the same four triangles of each fan (the
   two on either side of the vertical, on the left), whatever the light:
