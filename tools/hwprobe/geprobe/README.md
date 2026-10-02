@@ -165,6 +165,8 @@ It writes, beside the EBOOT, `geprobe.txt` and one `ge_NN_<name>.raw` per
 scene (about 25 MB in all): 480 x 272 pixels, rows packed, in the scene's
 framebuffer format, exactly as the GE wrote VRAM. `raw2png.py` turns them into
 PNGs for looking at; comparisons should use the raw files.
+`readout.py <geprobe dir> [scene]` regenerates scenes 62-66's inputs, checks
+them against the log's CRCs, and lists each point's inputs and depth.
 
 ## Compare with psprecomp
 
