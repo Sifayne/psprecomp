@@ -42,9 +42,12 @@ on pspautotests captures:
     steps (201-203 in the log) into `vfpu_core4_<op>.bin`, about 7 MB:
     every argument of the 11 cosine-core segments and 13 vasin segments
     whose fit v3's every-3rd-input dumps left open, and vlog2 of x >= 4.
+    From v5, two more (204-205) into `vfpu_core5_vlog2.bin` and
+    `vfpu_core5_vlog2w.bin`, about 4.7 MB: the vlog2 results v4's rule for
+    x >= 4 still missed.
 
-Version 3 runs 4, then 12, then 13 after the others. Version 4 keeps every
-step of version 3 under the same number and appends to section 13.
+Version 3 runs 4, then 12, then 13 after the others. Versions 4 and 5 keep
+every earlier step under the same number and append to section 13.
 
 ## Build
 
@@ -58,8 +61,9 @@ This produces `EBOOT.PBP`. The CMake build does not include it.
 
 Copy `EBOOT.PBP` to `ms0:/PSP/GAME/vfpuprobe/` and start it from the XMB. It
 needs no input and returns to the XMB by itself. Sections 0-12 take a few
-seconds; section 13 writes about 98 MB (91 MB before v4), a minute or so at
-1.5-2 MB/s and three or four at 0.5 MB/s, so the stick needs 105 MB free.
+seconds; section 13 writes about 103 MB (91 MB in v3, 98 MB in v4), a
+minute or so at 1.5-2 MB/s and three or four at 0.5 MB/s, so the stick
+needs 110 MB free.
 
 It writes, beside the EBOOT:
 
@@ -88,12 +92,24 @@ It writes, beside the EBOOT:
     32 and 64; every 2040th, the same mantissas as every 8th of those, for
     n = 3, 7, 15, 31, 63 and 127; and 2048 consecutive mantissas from
     x = 4, 4 * 1.50378, 2^32 and 2^32 * 1.50378.
+- from v5, two more vlog2 files in the same format (main.c's `CORE5_LOG2`
+  and `CORE5_LOG2W` say why each segment is there):
+  - `vfpu_core5_vlog2.bin`: every x in [1,2) of log2 core segments 8-12,
+    55-57 and 79 (65,536 each), where v3's every-3rd dump left V open,
+    including V(0) or V(512) of segments 9, 10, 56 and 57;
+  - `vfpu_core5_vlog2w.bin`: x >= 4, every 3rd mantissa of a segment
+    (21,846 each), 27 segments at x in [2^n, 2^(n+1)):
+    - n = 2: segments 9, 10, 56, 57, 124, 53 and 8;
+    - n = 4: 9, 10, 56, 57, 124, 50, 53, 6 and 8;
+    - n = 8: 9, 10, 56, 57, 124, 3 and 6;
+    - n = 16: 100, 124, 0 and 6.
 
 The log is written through before every step, so if the PSP switches off,
 its last line names the step that did it. Section 12's cases may do that;
 start the probe again after each one and it skips the case that stopped it
-and carries on. The last run in the log is then the whole result. In v4 the
-cases that did so in v3 are not run, so it should run straight through.
+and carries on. The last run in the log is then the whole result. From v4
+the cases that did so in v3 are not run, so it should run straight through
+(v4 did).
 
 ## Compare with psprecomp
 

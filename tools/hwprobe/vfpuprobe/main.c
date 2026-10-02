@@ -51,6 +51,11 @@
  * segments whose fit version 3's dumps left open, and vlog2 for x >= 4, where
  * the result is often a unit below the core's. Section 12's four trap cases,
  * each of which stopped a 6.60 PSP in version 3, are now "not run".
+ *
+ * Version 5 keeps steps 1-203 and appends two to section 13, about 4.7 MB,
+ * for the vlog2 results the coarse-core rule fitted to version 4 still
+ * misses: every argument in [1,2) of the log2 core segments whose fit is
+ * open, and x >= 4 over the segments where the misses are.
  */
 #include <pspkernel.h>
 #include <pspiofilemgr.h>
@@ -67,7 +72,7 @@ PSP_MODULE_INFO("vfpuprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(4096);
 
-#define PROBE_VERSION 4
+#define PROBE_VERSION 5
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -1602,7 +1607,7 @@ static void section_fpu_trap(void) {
 
 typedef struct { char kind; w32 start, stride, count; const char *what; } coreseg;
 #define CORE_CHUNK 65536
-#define CORE_SEGS  16
+#define CORE_SEGS  32
 
 typedef struct { const char *op; void (*fn)(const w32 *, w32 *, int); coreseg seg[CORE_SEGS]; } coredump;
 
@@ -1694,6 +1699,72 @@ static const coredump CORES4[] = {
         { 'b', 0x4FC07C00, 1, 2048, "x from 2^32 * (1.5 + 0x7C00*2^-23)" } } },
 };
 
+/* Version 5: the vlog2 results the rule fitted to version 4 still misses
+ * (src/vfpu.c, vfpu_log2: 317 of step 203's 230,252), about 4.7 MB.
+ *
+ * For x >= 4 the core runs coarser and takes its quadratic correction from
+ * the segment whose coefficient C2 = V(0) - V(512) is this one's with its
+ * low bits cleared (C2'), or from ceil(C2' * k^2 / 2^18) where no segment
+ * has C2'. Most misses are in segments 9, 10, 56 and 57, whose V(0) or
+ * V(512) v3's every-3rd dump of [1,2) left open (C2 came out 161, 156, 87,
+ * 89; 160, 156, 88 and 88 fit step 203 better), the rest in segments that
+ * take their correction from segment 9 or from the stand-in.
+ *
+ * vfpu_core5_vlog2.bin: every x in [1,2) of the log2 core segments with any
+ * V(k) still open after v3 (8-12, 55-57 and 79), which pins V there.
+ *
+ * vfpu_core5_vlog2w.bin: x >= 4, every 3rd mantissa of a segment (21 or 22
+ * results in each run of 64 u that shares a V(k), enough to pin it at the
+ * coarser grid), at one exponent per bit length,
+ * ex = 2, 4, 8 and 16 (t = 1-4; the fraction depends on t alone):
+ *   - segments 9, 10, 56 and 57 at t = 1-3, where the misses are;
+ *   - segments whose C2' no segment has, for the stand-in: C2' = 44, 40
+ *     and 32 (segment 124, C2 46) at t = 1-3, and 32 at t = 4 (segments
+ *     100 and 124, C2 56 and 46); C2' = 88 (segments 53 and 50, C2 90 and
+ *     94) and 160 (segments 8, 6, 3 and 0, C2 162, 166, 174 and 182), which
+ *     the fitted C2s left without a segment, at the t where they occur.
+ * Two segments with the same C2' at one t tell whether the correction
+ * depends on C2' alone. */
+static const coredump CORE5_LOG2 = { "vlog2", u_vlog2, {
+    { 'b', 0x3F880000, 1, 65536, "x in [1,2), log2 core segment 8" },
+    { 'b', 0x3F890000, 1, 65536, "segment 9" },
+    { 'b', 0x3F8A0000, 1, 65536, "segment 10" },
+    { 'b', 0x3F8B0000, 1, 65536, "segment 11" },
+    { 'b', 0x3F8C0000, 1, 65536, "segment 12" },
+    { 'b', 0x3FB70000, 1, 65536, "segment 55" },
+    { 'b', 0x3FB80000, 1, 65536, "segment 56" },
+    { 'b', 0x3FB90000, 1, 65536, "segment 57" },
+    { 'b', 0x3FCF0000, 1, 65536, "segment 79" } } };
+
+static const coredump CORE5_LOG2W = { "vlog2", u_vlog2, {
+    { 'b', 0x40890000, 3, 21846, "x in [4,8), segment 9, every 3rd mantissa" },
+    { 'b', 0x408A0000, 3, 21846, "x in [4,8), segment 10" },
+    { 'b', 0x40B80000, 3, 21846, "x in [4,8), segment 56" },
+    { 'b', 0x40B90000, 3, 21846, "x in [4,8), segment 57" },
+    { 'b', 0x41890000, 3, 21846, "x in [2^4,2^5), segment 9" },
+    { 'b', 0x418A0000, 3, 21846, "x in [2^4,2^5), segment 10" },
+    { 'b', 0x41B80000, 3, 21846, "x in [2^4,2^5), segment 56" },
+    { 'b', 0x41B90000, 3, 21846, "x in [2^4,2^5), segment 57" },
+    { 'b', 0x43890000, 3, 21846, "x in [2^8,2^9), segment 9" },
+    { 'b', 0x438A0000, 3, 21846, "x in [2^8,2^9), segment 10" },
+    { 'b', 0x43B80000, 3, 21846, "x in [2^8,2^9), segment 56" },
+    { 'b', 0x43B90000, 3, 21846, "x in [2^8,2^9), segment 57" },
+    { 'b', 0x40FC0000, 3, 21846, "x in [4,8), segment 124: C2' 44" },
+    { 'b', 0x40B50000, 3, 21846, "x in [4,8), segment 53: C2' 88" },
+    { 'b', 0x40880000, 3, 21846, "x in [4,8), segment 8: C2' 160" },
+    { 'b', 0x41FC0000, 3, 21846, "x in [2^4,2^5), segment 124: C2' 40" },
+    { 'b', 0x41B20000, 3, 21846, "x in [2^4,2^5), segment 50: C2' 88" },
+    { 'b', 0x41B50000, 3, 21846, "x in [2^4,2^5), segment 53: C2' 88" },
+    { 'b', 0x41860000, 3, 21846, "x in [2^4,2^5), segment 6: C2' 160" },
+    { 'b', 0x41880000, 3, 21846, "x in [2^4,2^5), segment 8: C2' 160" },
+    { 'b', 0x43FC0000, 3, 21846, "x in [2^8,2^9), segment 124: C2' 32" },
+    { 'b', 0x43830000, 3, 21846, "x in [2^8,2^9), segment 3: C2' 160" },
+    { 'b', 0x43860000, 3, 21846, "x in [2^8,2^9), segment 6: C2' 160" },
+    { 'b', 0x47E40000, 3, 21846, "x in [2^16,2^17), segment 100: C2' 32" },
+    { 'b', 0x47FC0000, 3, 21846, "x in [2^16,2^17), segment 124: C2' 32" },
+    { 'b', 0x47800000, 3, 21846, "x in [2^16,2^17), segment 0: C2' 160" },
+    { 'b', 0x47860000, 3, 21846, "x in [2^16,2^17), segment 6: C2' 160" } } };
+
 /* One step: the op over each segment, into probe_dir()/file. */
 static void dump_core(const coredump *c, const char *file, const char *title, w32 *in, w32 *res) {
     const float grid = 1.0f / 8388608.0f;
@@ -1739,6 +1810,8 @@ static void section_cores(void) {
         snprintf(file, sizeof file, "vfpu_core4_%s.bin", CORES4[c].op);
         dump_core(&CORES4[c], file, "core where v3's dump left the fit open", in, res);
     }
+    dump_core(&CORE5_LOG2, "vfpu_core5_vlog2.bin", "core in [1,2) where the log2 fit is still open", in, res);
+    dump_core(&CORE5_LOG2W, "vfpu_core5_vlog2w.bin", "x >= 4 where v4's coarse-core rule misses", in, res);
     free(res);
     free(in);
 }
