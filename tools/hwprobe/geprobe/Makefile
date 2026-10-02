@@ -18,3 +18,6 @@ PSP_EBOOT_TITLE = GE probe v$(shell sed -n 's/^.define PROBE_VERSION //p' main.c
 
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak
+
+# main.c includes the generated streams (patch13.py emit); rebuild when they change.
+main.o: patch13_data.inc

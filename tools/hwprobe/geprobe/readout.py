@@ -7,6 +7,7 @@ scene's log line "N points, eye z crc C" checks the copy.
 
     readout.py <geprobe dir>            check the CRCs, list each scene's points
     readout.py <geprobe dir> <scene>    print slot, batch, z, w and depth per point
+                                        (scenes 67-82: patch13.py's per-point listing)
 
 A point's depth in these scenes is floor(zs * clip z / clip w) with zs a
 power of two (zc 0): the quotient's top 16 bits as the GE has them.
@@ -161,6 +162,10 @@ def read(base, sc, name):
 
 def main():
     base = sys.argv[1]
+    if len(sys.argv) > 2 and int(sys.argv[2]) >= 67:     # geprobe 13's patch scenes
+        import patch13
+        patch13.points(base, int(sys.argv[2]))
+        return
     log = open(f'{base}/geprobe.txt').read()
     want = [int(sys.argv[2])] if len(sys.argv) > 2 else list(SCENES)
     for sc in want:

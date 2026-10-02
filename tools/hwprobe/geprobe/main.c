@@ -20,8 +20,10 @@
  * reciprocal and the spline weights, scenes 53 and 54 (version 9) the
  * spline weights again, densely, scenes 55 to 58 (version 10) the
  * spline weights through depth and texture, and the 3D depth anchor, and
- * scenes 59 to 61 (version 11) a vertex's depth, a stage at a time, and
- * scenes 62 to 66 (version 12) each of those stages read whole.
+ * scenes 59 to 61 (version 11) a vertex's depth, a stage at a time,
+ * scenes 62 to 66 (version 12) each of those stages read whole, and
+ * scenes 67 to 82 (version 13) Bezier and spline patch positions read
+ * through depth, replayed from patch13.py's command streams.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -42,7 +44,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 12
+#define PROBE_VERSION 13
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -2962,6 +2964,251 @@ static void scene_perspread(void) {
     rd_end("perspread");
 }
 
+/* ---- geprobe 13: patch positions read through depth (scenes 67-82) --------
+ *
+ * Every scene step is a command stream that patch13.py writes into
+ * patch13_data.inc: the matrices, viewport z, patch division and primitive,
+ * a record per item, every control vertex blob exactly as the GE is to read
+ * it (float, s16, s8, indexed, morphed, skinned), the cal band's and the
+ * anchors' plain points, and scene 75's colour read-back. p13_run() replays
+ * one; it computes nothing of its own but the read-back, so the streams are
+ * the inputs, and each step logs their counts and CRCs for patch13.py to
+ * check its copy against. Every blob is copied into the display list
+ * (gumem); a list that passes 448 KB is run and a new one started, which
+ * the GE's state outlives. In scenes 76-82 each batch is its own list and
+ * logs its GE time and the list's headroom before it; in 67-75 the step
+ * logs one GE time. */
+#include "patch13_data.inc"
+
+#define P13_LIST_BYTES (512 * 1024)
+#define P13_FLUSH_AT   (448 * 1024)
+
+static w32 crc32_more(w32 crc, const void *p, int n) {
+    const unsigned char *b = p;
+    w32 c = ~crc;
+    for (int i = 0; i < n; i++) {
+        c ^= b[i];
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+static float p13_f(w32 w) { float f; memcpy(&f, &w, 4); return f; }
+
+static void p13_load(int mode, const w32 *w) {
+    ScePspFMatrix4 m;
+    memcpy(&m, w, sizeof m);
+    sceGumMatrixMode(mode);
+    sceGumLoadMatrix(&m);
+}
+
+static w32 g_p13_us;       /* GE time since the last report */
+static int g_p13_flushes;
+
+/* Run the list built so far and start the next; the GE's state carries over. */
+static void p13_flush(void) {
+    const w32 t0 = sceKernelGetSystemTimeLow();
+    sceGuFinish();
+    ge_wait();
+    g_p13_us += sceKernelGetSystemTimeLow() - t0;
+    sceGuStart(GU_DIRECT, g_list);
+}
+
+static void p13_room(void) {
+    if (sceGuCheckList() > P13_FLUSH_AT) { p13_flush(); g_p13_flushes++; }
+}
+
+/* Counts and CRCs of a whole stream, before it runs. */
+static void p13_sums(const w32 *s, int n, int *items, int *samples, w32 *cc, w32 *ic) {
+    *items = *samples = 0;
+    *cc = *ic = 0;
+    for (int i = 0; i < n; i += 1 + (int)(s[i] & 0xFFFFFF)) {
+        const w32 *a = s + i + 1;
+        switch (s[i] >> 24) {
+        case P13_ITEM:   *ic = crc32_more(*ic, a, 16); (*items)++; *samples += (int)a[4]; break;
+        case P13_BEZIER: *cc = crc32_more(*cc, a + 5, (int)(a[3] + a[4])); break;
+        case P13_SPLINE: *cc = crc32_more(*cc, a + 7, (int)(a[5] + a[6])); break;
+        case P13_DRAW:   if (a[4]) *samples += (int)a[2]; break;
+        }
+    }
+}
+
+/* Scene 75 b9: run the list, read each A sample's colour from the 3 x 3
+ * pixels around its exact position, then draw the C cells as plain triangle
+ * strips with those colours. */
+static void p13_b9(const w32 *a) {
+    static CV v[2 * 8];
+    static w32 col[8][64];
+    const w32 t0 = sceKernelGetSystemTimeLow();
+    sceGuFinish();
+    ge_wait();
+    g_p13_us += sceKernelGetSystemTimeLow() - t0;
+    const volatile w32 *fb = (const volatile w32 *)VRAM_UNCACHED;
+    const int nshape = (int)a[0];
+    const w32 *p = a + 1;
+    for (int sh = 0; sh < nshape && sh < 8; sh++) {
+        const int nu = (int)p[0], nv = (int)p[1];
+        const w32 *smp = p + 2;
+        for (int k = 0; k < nu * nv; k++) {
+            const int px = (int)(smp[4 * k] & 0xFFFF), py = (int)(smp[4 * k] >> 16);
+            w32 c = 0;
+            int found = 0;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    const int x = px + dx, y = py + dy;
+                    if (x < 0 || x >= SCR_W || y < 0 || y >= SCR_H) continue;
+                    const w32 q = fb[y * FB_W + x];   /* alpha is the stencil: compare RGB */
+                    if (q & 0xFFFFFFu) { if (!found) c = q; found++; }
+                }
+            if (!found) out("  b9 miss %d %d %d\n", sh, k % nu, k / nu);
+            else if (found > 1) out("  b9 %d pixels lit around %d %d %d\n", found, sh, k % nu, k / nu);
+            col[sh][k] = c;
+        }
+        out("  b9 shape %d (%d x %d) colours:", sh, nu, nv);
+        for (int k = 0; k < nu * nv; k++) out("%s %08X", k && k % 12 == 0 ? "\n   " : "", col[sh][k]);
+        out("\n");
+        p += 2 + 4 * nu * nv;
+    }
+    sceKernelDcacheWritebackAll();
+    sceGuStart(GU_DIRECT, g_list);
+    p = a + 1;
+    for (int sh = 0; sh < nshape && sh < 8; sh++) {
+        const int nu = (int)p[0], nv = (int)p[1];
+        const w32 *smp = p + 2;
+        for (int j = 0; j + 1 < nv; j++) {
+            for (int i = 0; i < nu; i++)
+                for (int h = 0; h < 2; h++) {
+                    const w32 *q = smp + 4 * ((j + h) * nu + i);
+                    const w32 c = col[sh][(j + h) * nu + i];
+                    v[2 * i + h] = (CV){ c ? (c | 0xFF000000u) : 0, p13_f(q[1]), p13_f(q[2]), p13_f(q[3]) };
+                }
+            p13_room();
+            sceGuDrawArray(GU_TRIANGLE_STRIP, FMT_CV3D, 2 * nu, NULL, gumem(v, 2 * nu * (int)sizeof(CV)));
+        }
+        p += 2 + 4 * nu * nv;
+    }
+}
+
+static void p13_run(const struct p13_step *st) {
+    g_scene = st->scene;
+    if (step("scene %02d: %s", st->scene, st->title)) return;
+    const w32 *s = st->s;
+    int items, samples, timing = 0, batch = -1;
+    w32 cc, ic;
+    p13_sums(s, st->n, &items, &samples, &cc, &ic);
+    const w32 sc = crc32(s, st->n * 4);
+    g_p13_us = 0;
+    g_p13_flushes = 0;
+    for (int i = 0; i < st->n; i += 1 + (int)(s[i] & 0xFFFFFF)) {
+        const w32 *a = s + i + 1;
+        switch (s[i] >> 24) {
+        case P13_BEGIN:
+            scene_begin(GU_PSM_8888, 0xFF000000);
+            sceGuViewport(2048, 2048, (int)a[0], (int)a[1]);
+            sceGuEnable(GU_DEPTH_TEST);
+            sceGuDepthFunc(GU_ALWAYS);
+            sceGuDepthMask(GU_FALSE);
+            sceGuPatchPrim(GU_POINTS);
+            sceGuMorphWeight(0, 1.0f);
+            for (int k = 1; k < 8; k++) sceGuMorphWeight(k, 0.0f);
+            timing = (int)a[2];
+            break;
+        case P13_MATS:
+            if (a[0] & 1) p13_load(GU_PROJECTION, a + 1);
+            if (a[0] & 2) p13_load(GU_VIEW, a + 1 + 16 * !!(a[0] & 1));
+            if (a[0] & 4) p13_load(GU_MODEL, a + 1 + 16 * (!!(a[0] & 1) + !!(a[0] & 2)));
+            sceGumMatrixMode(GU_MODEL);
+            sceGumUpdateMatrix();
+            break;
+        case P13_ZVIEW:
+            sceGuSendCommandf(0x44, p13_f(a[0]));
+            sceGuSendCommandf(0x47, p13_f(a[1]));
+            break;
+        case P13_DIVIDE:    sceGuPatchDivide(a[0], a[1]); break;
+        case P13_PATCHPRIM: sceGuPatchPrim((int)a[0]); break;
+        case P13_SHADE:     sceGuShadeModel((int)a[0]); break;
+        case P13_BLEND:
+            if (a[0]) {
+                sceGuEnable(GU_BLEND);
+                sceGuBlendFunc((int)a[1], (int)a[2], (int)a[3], a[4], a[5]);
+            } else {
+                sceGuDisable(GU_BLEND);
+            }
+            break;
+        case P13_MORPH:
+            for (int k = 0; k < 8; k++) sceGuMorphWeight(k, p13_f(a[k]));
+            break;
+        case P13_BONE: {
+            ScePspFMatrix4 m;
+            memcpy(&m, a + 1, sizeof m);
+            sceGuBoneMatrix(a[0], &m);
+            break;
+        }
+        case P13_ITEM: break;
+        case P13_BEZIER: {
+            p13_room();
+            unsigned char *v = gumem(a + 5, (int)(a[3] + a[4]));
+            sceGuDrawBezier((int)a[0], (int)a[1], (int)a[2], a[4] ? v + a[3] : NULL, v);
+            break;
+        }
+        case P13_SPLINE: {
+            p13_room();
+            unsigned char *v = gumem(a + 7, (int)(a[5] + a[6]));
+            sceGuDrawSpline((int)a[0], (int)a[1], (int)a[2], (int)a[3], (int)a[4], a[6] ? v + a[5] : NULL, v);
+            break;
+        }
+        case P13_DRAW:
+            p13_room();
+            sceGuDrawArray((int)a[0], (int)a[1], (int)a[2], NULL, gumem(a + 5, (int)a[3]));
+            break;
+        case P13_BATCH:
+            if (timing) {
+                if (batch >= 0) {
+                    p13_flush();
+                    out("  b%d GE %u us\n", batch, (unsigned)g_p13_us);
+                    g_p13_us = 0;
+                }
+                out("  b%d list headroom %d bytes\n", (int)a[0], P13_LIST_BYTES - sceGuCheckList());
+            }
+            batch = (int)a[0];
+            break;
+        case P13_CALDONE:
+            out("  %d items, %d samples, control crc %08X, item crc %08X, stream crc %08X\n",
+                items, samples, cc, ic, sc);
+            break;
+        case P13_B9: p13_b9(a); break;
+        case P13_END:
+            sceGuPatchPrim(GU_TRIANGLE_STRIP);
+            sceGuPatchDivide(8, 8);
+            sceGuDisable(GU_BLEND);
+            sceGuMorphWeight(0, 1.0f);
+            for (int k = 1; k < 8; k++) sceGuMorphWeight(k, 0.0f);
+            {
+                ScePspFMatrix4 id;
+                memset(&id, 0, sizeof id);
+                id.x.x = id.y.y = id.z.z = id.w.w = 1.0f;
+                sceGuBoneMatrix(0, &id);
+            }
+            sceGumMatrixMode(GU_VIEW);
+            sceGumLoadIdentity();
+            sceGumMatrixMode(GU_MODEL);
+            sceGumLoadIdentity();
+            sceGumUpdateMatrix();
+            sceGuShadeModel(GU_SMOOTH);
+            p13_flush();
+            if (timing) out("  b%d GE %u us\n", batch, (unsigned)g_p13_us);
+            else out("  GE %u us\n", (unsigned)g_p13_us);
+            if (g_p13_flushes) out("  %d list flush(es) at 448 KB\n", g_p13_flushes);
+            scene_end(st->name, GU_PSM_8888, 0);
+            dump_depth_full(st->name);
+            break;
+        default:
+            out("  bad stream word %d: %08X\n", i, s[i]);
+            return;
+        }
+    }
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -3594,6 +3841,11 @@ int main(int argc, char **argv) {
     g_scene = 64; scene_mulread();
     g_scene = 65; scene_matread();
     g_scene = 66; scene_perspread();
+
+    /* Version 13: scenes 67-82, each step a stream from patch13.py, the
+     * risky ones (76-82) last and in the order of what is least known. */
+    section("scenes, version 13");
+    for (int k = 0; k < P13_NSTEPS; k++) p13_run(&P13_STEPS[k]);
 
     probe_screen(1);
     probe_done();

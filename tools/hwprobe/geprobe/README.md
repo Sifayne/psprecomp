@@ -66,6 +66,22 @@ blending, depth, clipping, the per-pixel tests).
 | 64 | (v12) clip z times 1/w read whole: four clip z in [1.5, 2) over scene 62's 1024 w in (2, 4) | 8888 |
 | 65 | (v12) world, view and projection combined, read whole: clip w 1, clip z from world and view z rows with translations of 40 and -20 against an eye z under 1, z scales in all three, an x term, and a projection translation cancelling a world one | 8888 |
 | 66 | (v12) the probes' perspective (60 degrees, 1 to 100) read whole: 2048 eye depths from -1.02 to -96 | 8888 |
+| 67 | (v13) patch control conversion: Bezier strips of 16- and 24-bit constants over 23 binades, carries across the 16-bit grid, exponent edges and rounding ties, 24-bit width twins; generated vertices read whole through depth (as every scene to 82); plus the full depth dump | 8888 |
+| 68 | (v13) random cubics along u at every division 1-48, each read as P, -P through the projection and -P through the viewport; a second pattern at 31 divisions; a base with one control moved | 8888 |
+| 69 | (v13) scene 68's cubics along v (transposed), and one control on zero read through an exponent ladder and anchor-relative (XYR) placement | 8888 |
+| 70 | (v13) one set of cubics at 15 model scales, at clip scales 2^-8 to 2^8, scaled jointly and along one axis, and XYR twins | 8888 |
+| 71 | (v13) mixed magnitudes and signs inside a lerp: one-hot ladders, two binades, sign-split pairs, exponent edges, large middle rows, near-zero windows, operand ties | 8888 |
+| 72 | (v13) 2D Bezier cells: G, its transpose, reversal and negation at eight division pairs, multi-piece cells, a 2D one-hot ladder, contrast strips, signed patterns, rows in four binades | 8888 |
+| 73 | (v13) splines in every edge mode along u and v, 2D splines and transposes, far controls that exceed w, span boundaries under additive blending (double emission) | 8888 |
+| 74 | (v13) where the GE tessellates: world-translation and projection cancellation, viewport z halving and centre, shear and rotation, axis and w routing, a random row in world, view or projection | 8888 |
+| 75 | (v13) perspective strips and cells, w cancellation, near-equal controls, a 16-bit z coefficient, parameter ramps, a rotated world with a view translation, patch primitives and shade models, and patch triangle colour planes against plain triangles built from the colours read back | 8888 |
+| 76 | (v13, own step) extreme magnitudes: constants from 2^-125 to 2^100, random cubics at extreme scales, coarse companions, huge and tiny x, clip scale 2^+-16 | 8888 |
+| 77 | (v13, own step) s16 and s8 controls against float twins, GU_INDEX_16BIT and GU_INDEX_8BIT patches, and every s16/s8 control as an anchor point | 8888 |
+| 78 | (v13, own step) morphed patches (two targets cancelling, weights 1+1 and 0.5+0.5) and skinned ones (one bone translation) | 8888 |
+| 79 | (v13, own step) two 48 x 48 Bezier cells, G and its transpose (2401 vertices each) | 8888 |
+| 80 | (v13, own step) divisions 49 to 128: P, -P and a second pattern | 8888 |
+| 81 | (v13, own step) divisions 129 to 255 at viewport x scale 1024, each strip twice so every sample is on screen once | 8888 |
+| 82 | (v13, last, two steps) two 64 x 64 cells (`patchbig64`), then spline rows of more than 256 samples with each row's end on screen (`patchrows`) | 8888 |
 
 After the scenes it records which GE callbacks run, with which arguments and
 when, through libgu (signal and finish) and through a raw `sceGe` list.
@@ -147,6 +163,33 @@ and batch (blue from 0x40), at viewport scale 256 across and -128 down so
 a slot's ndc x and y are exact. Clip z stays inside -w..w: outside it a
 point is dropped.
 
+Version 13 adds scenes 67-82, so steps 1-106 keep their version 12 numbers.
+Set 13 put a vertex's depth at ge_screen_z exactly; these read patch
+positions through it, a generated vertex drawn as a point whose depth is
+its z's top 16 bits (or a ladder of lower-precision reads, by design), to
+settle how the GE evaluates de Casteljau and de Boor (the lead: each lerp
+cuts both operands to the larger one's 16-bit grid, columns first). The
+scenes are data: `patch13.py` builds every item (generator order, integer
+half-pixel placement, first-fit-decreasing shelves) and writes
+`patch13_data.inc`, one command stream per step, which `main.c`'s
+`p13_run()` replays; each step logs its item and sample counts and the
+CRCs of its control vertices, item records and whole stream. Every step
+opens with a 480-point cal band (rows 10 and 12) in that scene's read
+modes, whose slots 432-479 read what the GE does with clip z beyond w,
+exactly at w, and with negative screen depths. Scenes 76-82 are the risky
+ones (extreme ranges, s16/s8/indexed/morphed/skinned controls, 2401- and
+4225-vertex patches, divisions over 48, rows of more than 256 samples),
+each its own step at the end, logging every batch's GE time and the
+list's headroom.
+
+Regenerate the streams after changing `patch13.py` with
+`python3 patch13.py emit` (needs numpy; it rewrites `patch13_data.inc`
+only when the streams change, and `main.o` depends on it, so `make`
+then rebuilds); `python3 patch13.py check <dir>`
+checks a run's log CRCs and, per batch, that every expected point is on
+its predicted pixel; `python3 patch13.py points <dir> <scene>` lists every
+point's inputs, prediction and reading.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -166,7 +209,8 @@ scene (about 25 MB in all): 480 x 272 pixels, rows packed, in the scene's
 framebuffer format, exactly as the GE wrote VRAM. `raw2png.py` turns them into
 PNGs for looking at; comparisons should use the raw files.
 `readout.py <geprobe dir> [scene]` regenerates scenes 62-66's inputs, checks
-them against the log's CRCs, and lists each point's inputs and depth.
+them against the log's CRCs, and lists each point's inputs and depth;
+for scenes 67-82 it hands over to `patch13.py`.
 
 ## Compare with psprecomp
 
