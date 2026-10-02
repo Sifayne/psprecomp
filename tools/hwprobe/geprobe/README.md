@@ -61,6 +61,11 @@ blending, depth, clipping, the per-pixel tests).
 | 59 | (v11) point depths with no divide: identity projection (w = 1), 1920 eye depths from -0.99 to 0.99 at viewport z scale and centre 32768, then 1920 at sceGuDepthRange(65535, 0)'s; plus both depth dumps | 8888 |
 | 60 | (v11) point depths with clip z / clip w fixed: a projection with clip w = -z and clip z = a z, 1280 eye depths from -1 to -100 for each of a = -0.3, 0.45 and -0.82, so each batch would read one depth in exact arithmetic; plus both depth dumps | 8888 |
 | 61 | (v11) scene 60's first batch with the eye depth made by a model matrix translation of -37.125, -0.4375 and 0.4375; plus both depth dumps | 8888 |
+| 62 | (v12) 1/w read whole: clip z a power of two c, clip w = -z in [c, 2c), viewport z scale 65536 and centre 0, so each point's depth is 1/w's top 16 bits; 6783 w in (1, 2) (every 8-bit significand, random 16- and 24-bit ones, two runs of consecutive ones) and 192 to 1024 in each of eight binades from 2^-3 to 2^13; plus the full depth dump | 8888 |
+| 63 | (v12) a projection row read whole: clip w 1 and clip z = cx x + cy y + a z + b, depth clip z's top 16 bits; z as taken in, z - 1 for z just above 1, a z, z + b across alignments of 3 to 18 bits, a carry, a cancellation, and four terms of different sizes | 8888 |
+| 64 | (v12) clip z times 1/w read whole: four clip z in [1.5, 2) over scene 62's 1024 w in (2, 4) | 8888 |
+| 65 | (v12) world, view and projection combined, read whole: clip w 1, clip z from world and view z rows with translations of 40 and -20 against an eye z under 1, z scales in all three, an x term, and a projection translation cancelling a world one | 8888 |
+| 66 | (v12) the probes' perspective (60 degrees, 1 to 100) read whole: 2048 eye depths from -1.02 to -96 | 8888 |
 
 After the scenes it records which GE callbacks run, with which arguments and
 when, through libgu (signal and finish) and through a raw `sceGe` list.
@@ -127,6 +132,20 @@ fit psprecomp's depth arithmetic on 2883 of 3720. These take that
 arithmetic apart: scene 59 without the divide, scene 60 with the ratio
 clip z / clip w fixed so only the reciprocal and the product vary, and
 scene 61 with the eye depth made by a model translation.
+
+Version 12 adds scenes 62-66, so steps 1-101 keep their version 11 numbers.
+Set 12 showed a point's depth is floor(zc + zs ndc) with zs ndc cut to the
+larger term's 16 significant bits first (scene 59, every point), so with zc
+0 and zs a power of two that puts zs ndc in [32768, 65536) the depth *is*
+ndc's top 16 bits. Scenes 62-66 use that to read each stage whole instead
+of a step either side of a rounding. Every input is an integer bit pattern
+(xorshift32 from a fixed seed per scene; matrix entries 16-bit, so the
+GE's words hold them exactly), and each scene logs a CRC of its points'
+eye z for the analysis to check its copy against. Points sit two pixels
+apart, 240 a row from row 10, coloured by slot (red low byte, green high)
+and batch (blue from 0x40), at viewport scale 256 across and -128 down so
+a slot's ndc x and y are exact. Clip z stays inside -w..w: outside it a
+point is dropped.
 
 ## Build
 

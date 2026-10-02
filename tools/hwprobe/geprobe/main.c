@@ -20,7 +20,8 @@
  * reciprocal and the spline weights, scenes 53 and 54 (version 9) the
  * spline weights again, densely, scenes 55 to 58 (version 10) the
  * spline weights through depth and texture, and the 3D depth anchor, and
- * scenes 59 to 61 (version 11) a vertex's depth, a stage at a time.
+ * scenes 59 to 61 (version 11) a vertex's depth, a stage at a time, and
+ * scenes 62 to 66 (version 12) each of those stages read whole.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -41,7 +42,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 11
+#define PROBE_VERSION 12
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -2510,8 +2511,9 @@ static w32 vd_colour(int k, int batch) {
 
 /* Scene 59: identity projection (clip = eye, w = 1). Batch 0: viewport z
  * scale and centre 32768, so depth = 32768 (1 + z); batch 1: the scale and
- * centre sceGuDepthRange(65535, 0) sets, -32767.5 and 32767.5. 1920 eye
- * depths each from -0.99 to 0.99 in even float steps. */
+ * centre sceGuDepthRange(65535, 0) sets, -32768 and 32767 (it halves
+ * 65535 as an integer). 1920 eye depths each from -0.99 to 0.99 in even
+ * float steps. */
 static void scene_depthaffine(void) {
     if (step("scene %02d: point depths with no divide, two viewport scales", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
@@ -2550,7 +2552,7 @@ static float vd_depth(int k) {
 
 /* Scene 60: the ratio projection with a = -0.3, 0.45 and -0.82 (one batch
  * each), the standard depth range, so every point of a batch would read
- * 32767.5 (1 + a): 22937.25, 47513.875, 5898.15. */
+ * 32767 + 32768 a' with a' the GE's 16-bit a: 22936.75, 47512.5, 5897.5. */
 static void scene_depthratio(void) {
     if (step("scene %02d: point depths with clip z / w fixed, eye z -1 to -100", g_scene)) return;
     scene_begin(GU_PSM_8888, 0xFF000000);
@@ -2604,6 +2606,360 @@ static void scene_depthmodel(void) {
     sceGumUpdateMatrix();
     scene_end("depthmodel", GU_PSM_8888, 1);
     dump_depth_full("depthmodel");
+}
+
+/* ---- Scenes 62 to 66 (version 12): each stage read whole ------------------
+ *
+ * A point's depth is floor(zc + zs * clip z / clip w), the product cut to
+ * the larger term's 16 significant bits first (scene 59). With zc 0 and zs a
+ * power of two that puts the product between 32768 and 65536, the depth is
+ * clip z / clip w's top 16 bits as the GE has them: where scenes 59 to 61
+ * saw a step either side of a rounding, these read a stage's result whole.
+ * Scene 62 reads 1/w, 63 a projection row's sum with w 1, 64 clip z times
+ * 1/w, 65 how the world, view and projection matrices combine, and 66 the
+ * probes' own perspective end to end.
+ *
+ * Every input is built from integer bit patterns (xorshift32 from a fixed
+ * seed per scene), each matrix entry with 16 significant bits so the GE's
+ * 24-bit words hold it exactly, and each scene logs a CRC of its points' eye
+ * z so the analysis can check it made the same ones. Points sit two pixels
+ * apart, 240 to a row from row 10; the viewport scale is 256 across and -128
+ * down so a slot's ndc x and y are exact. Each is coloured by its slot (red
+ * the low byte, green the high) and its batch (blue, from 0x40). */
+
+#define RD_N 30480                          /* 240 slots a row, 127 rows */
+static CV  g_rd[RD_N];
+static w32 g_rdz[RD_N];
+static int g_rdn;
+static w32 g_rng;
+
+static w32 rd_rand(void) {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 17;
+    g_rng ^= g_rng << 5;
+    return g_rng;
+}
+
+static float rd_f(w32 bits) { float f; memcpy(&f, &bits, 4); return f; }
+
+/* (-1)^s 2^e (1 + m / 2^23). */
+static float rd_mk(int s, int e, w32 m) {
+    return rd_f((w32)(s & 1) << 31 | (w32)(e + 127) << 23 | (m & 0x7FFFFFu));
+}
+
+/* The same with 16 significant bits: m15 the 15 below the leading one. */
+static float rd_mk16(int s, int e, w32 m15) { return rd_mk(s, e, (m15 & 0x7FFFu) << 8); }
+
+static float rd_ndcx(int i) { return ((float)(2 * (i % 240)) + 0.5f - 240.0f) / 256.0f; }
+static float rd_ndcy(int i) { return (136.0f - (float)(10 + 2 * (i / 240)) - 0.5f) / 128.0f; }
+
+static void rd_put(int batch, float x, float y, float z) {
+    const int i = g_rdn++;
+    g_rd[i] = (CV){ 0xFF000000u | (w32)(i & 0xFF) | (w32)((i >> 8) & 0xFF) << 8 | (w32)(0x40 + batch) << 16, x, y, z };
+    memcpy(&g_rdz[i], &z, 4);
+}
+
+/* The next slot's point at eye z z, placed for clip w w by a projection
+ * whose x and y rows are the eye's x and y. */
+static void rd_at(int batch, float w, float z) {
+    const int i = g_rdn;
+    rd_put(batch, rd_ndcx(i) * w, rd_ndcy(i) * w, z);
+}
+
+/* World, view and projection, each the identity but for the z row:
+ * world z = rx x + s z + t, eye z = v (world z) + u, clip z = a (eye z) + b,
+ * clip w = wz (eye z) + ww. */
+static void rd_load(float a, float b, float wz, float ww, float v, float u, float rx, float s, float t) {
+    const ScePspFMatrix4 P = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, a, wz }, { 0, 0, b, ww } };
+    const ScePspFMatrix4 V = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, v, 0 }, { 0, 0, u, 1 } };
+    const ScePspFMatrix4 W = { { 1, 0, rx, 0 }, { 0, 1, 0, 0 }, { 0, 0, s, 0 }, { 0, 0, t, 1 } };
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadMatrix(&P);
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadMatrix(&V);
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadMatrix(&W);
+    sceGumUpdateMatrix();
+}
+
+/* A projection row alone: clip z = cx x + cy y + a z + b, clip w = wz z + ww. */
+static void rd_proj(float cx, float cy, float a, float b, float wz, float ww) {
+    const ScePspFMatrix4 P = { { 1, 0, cx, 0 }, { 0, 1, cy, 0 }, { 0, 0, a, wz }, { 0, 0, b, ww } };
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadMatrix(&P);
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadIdentity();
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumUpdateMatrix();
+}
+
+/* Viewport z: scale zs, centre 0. */
+static void rd_zview(float zs) {
+    sceGuSendCommandf(0x44, zs);
+    sceGuSendCommandf(0x47, 0.0f);
+}
+
+static void rd_draw(int from) {
+    const int n = g_rdn - from;
+    if (n > 0) sceGuDrawArray(GU_POINTS, FMT_CV3D, n, NULL, gumem(&g_rd[from], n * (int)sizeof(CV)));
+}
+
+static void rd_begin(void) {
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuViewport(2048, 2048, 512, 256);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    g_rdn = 0;
+}
+
+static void rd_end(const char *name) {
+    out("  %d points, eye z crc %08X\n", g_rdn, crc32(g_rdz, g_rdn * 4));
+    scene_end(name, GU_PSM_8888, 0);
+    dump_depth_full(name);
+}
+
+/* A 24-bit significand, never 0. */
+static w32 rd_m24(void) {
+    w32 m;
+    do m = rd_rand() & 0x7FFFFFu; while (!m);
+    return m;
+}
+
+/* 1024 clip w in (2, 4), which scene 62 reads 1/w of and scene 64 multiplies. */
+static float g_w64[1024];
+static void rd_make_w64(void) {
+    g_rng = 0x64000001u;
+    for (int j = 0; j < 1024; j++) g_w64[j] = rd_mk(0, 1, rd_m24());
+}
+
+/* Scene 62: clip z c = 2^e, clip w = -z in [2^e, 2^(e+1)), so the depth is
+ * 65536 c / w: 1/w's top 16 bits. Batch 0 is w in (1, 2): the 127 w with
+ * 8-bit significands, 4096 with random 16-bit ones, 2048 with random 24-bit
+ * ones, and two runs of 256 consecutive 24-bit ones. Batches 1 to 8 are the
+ * binades from 2^-3 to 2^13, 192 random w each, but 2^1's, scene 64's 1024. */
+static void scene_rcpread(void) {
+    if (step("scene %02d: 1/w read whole: clip z a power of two, depth 1/w's top 16 bits", g_scene)) return;
+    rd_make_w64();
+    rd_begin();
+    rd_zview(65536.0f);
+    g_rng = 0x62000001u;
+    rd_proj(0, 0, 0, 1.0f, -1.0f, 0);
+    int from = g_rdn;
+    for (int j = 1; j < 128; j++) { const float w = rd_mk(0, 0, (w32)j << 16); rd_at(0, w, -w); }
+    for (int j = 0; j < 4096; j++) {
+        w32 m;
+        do m = (rd_rand() & 0x7FFFu) << 8; while (!m);
+        const float w = rd_mk(0, 0, m);
+        rd_at(0, w, -w);
+    }
+    for (int j = 0; j < 2048; j++) { const float w = rd_mk(0, 0, rd_m24()); rd_at(0, w, -w); }
+    for (int j = 0; j < 256; j++) { const float w = rd_mk(0, 0, 0x400000u + (w32)j); rd_at(0, w, -w); }
+    for (int j = 0; j < 256; j++) { const float w = rd_mk(0, 0, 0x155500u + (w32)j); rd_at(0, w, -w); }
+    rd_draw(from);
+    static const int E[8] = { -3, -1, 1, 2, 4, 7, 10, 13 };
+    for (int b = 0; b < 8; b++) {
+        rd_proj(0, 0, 0, rd_mk(0, E[b], 0), -1.0f, 0);
+        from = g_rdn;
+        if (E[b] == 1)
+            for (int j = 0; j < 1024; j++) rd_at(1 + b, g_w64[j], -g_w64[j]);
+        else
+            for (int j = 0; j < 192; j++) { const float w = rd_mk(0, E[b], rd_m24()); rd_at(1 + b, w, -w); }
+        rd_draw(from);
+    }
+    rd_end("rcpread");
+}
+
+/* Scene 63: clip w 1, so the depth is zs times clip z, read whole. Batch 0:
+ * clip z = z, z in [0.5, 1), as the GE takes z in. 1-4: z - 1 for z = 1 + d,
+ * d in [2^e, 2^(e+1)), e -2, -9, -16 and -21: how much of z reaches the
+ * sum. 5-12: a z, a in [1, 1.25), z in [0.5, 0.75), half of them with 16
+ * significant bits. 13-24: z + b, b in [5/8, 3/4), z of either sign in
+ * [2^-g, 2^(1-g)) for g 4, 7, 11, 15, 17 and 19: the smaller term's
+ * alignment. 25: a carry, b in [7/16, 1/2), z in [1/16, 1/8). 26: z = -(b -
+ * k 2^-23), b in [1.5, 2), k in [2^18, 2^19): a cancellation. 27-30: four
+ * terms, cx x + cy y + a z + b, each a different size: the order they are
+ * summed in. Clip z stays below 1, inside the clip volume. */
+static void scene_dotread(void) {
+    if (step("scene %02d: a projection row read whole: clip w 1, depth clip z's top 16 bits", g_scene)) return;
+    rd_begin();
+    g_rng = 0x63000001u;
+    int from, b = 0;
+    w32 r;
+    rd_proj(0, 0, 1.0f, 0, 0, 1.0f);
+    rd_zview(65536.0f);
+    from = g_rdn;
+    for (int j = 0; j < 1024; j++) rd_at(b, 1.0f, rd_mk(0, -1, rd_rand()));
+    rd_draw(from);
+    b++;
+    static const int DE[4] = { -2, -9, -16, -21 };
+    rd_proj(0, 0, 1.0f, -1.0f, 0, 1.0f);
+    for (int q = 0; q < 4; q++, b++) {
+        rd_zview(rd_mk(0, 15 - DE[q], 0));
+        const w32 lo = 1u << (23 + DE[q]);
+        from = g_rdn;
+        for (int j = 0; j < 256; j++) rd_at(b, 1.0f, rd_mk(0, 0, lo | (rd_rand() & (lo - 1))));
+        rd_draw(from);
+    }
+    rd_zview(65536.0f);
+    for (int q = 0; q < 8; q++, b++) {
+        r = rd_rand();
+        rd_proj(0, 0, rd_mk16(0, 0, r & 0x1FFFu), 0, 0, 1.0f);
+        from = g_rdn;
+        for (int j = 0; j < 256; j++) {
+            r = rd_rand();
+            rd_at(b, 1.0f, rd_mk(0, -1, j < 128 ? (r & 0x3FFFu) << 8 : r & 0x3FFFFFu));
+        }
+        rd_draw(from);
+    }
+    static const int G[6] = { 4, 7, 11, 15, 17, 19 };
+    for (int q = 0; q < 12; q++, b++) {
+        r = rd_rand();
+        rd_proj(0, 0, 1.0f, rd_mk16(0, -1, 0x2000u | (r & 0x1FFFu)), 0, 1.0f);
+        from = g_rdn;
+        for (int j = 0; j < 128; j++) rd_at(b, 1.0f, rd_mk(q & 1, -G[q >> 1], rd_rand()));
+        rd_draw(from);
+    }
+    r = rd_rand();
+    rd_proj(0, 0, 1.0f, rd_mk16(0, -2, 0x6000u | (r & 0x1FFFu)), 0, 1.0f);
+    from = g_rdn;
+    for (int j = 0; j < 128; j++) rd_at(b, 1.0f, rd_mk(0, -4, rd_rand()));
+    rd_draw(from);
+    b++;
+    rd_zview(1048576.0f);
+    r = rd_rand();
+    const w32 mb = (0x4000u | (r & 0x3FFFu)) << 8;
+    rd_proj(0, 0, 1.0f, rd_mk(0, 0, mb), 0, 1.0f);
+    from = g_rdn;
+    for (int j = 0; j < 128; j++) rd_at(b, 1.0f, rd_mk(1, 0, mb - ((1u << 18) | (rd_rand() & 0x3FFFFu))));
+    rd_draw(from);
+    b++;
+    rd_zview(65536.0f);
+    static const signed char T4[4][4] = { { -6, -8, 0, -5 }, { -4, -10, -2, -4 }, { -13, -5, 0, -6 }, { -7, -7, 1, -7 } };
+    for (int q = 0; q < 4; q++, b++) {
+        r = rd_rand(); const float cx = rd_mk16((int)(r & 1), T4[q][0], r >> 1);
+        r = rd_rand(); const float cy = rd_mk16((int)(r & 1), T4[q][1], r >> 1);
+        r = rd_rand(); const float a = rd_mk16(0, T4[q][2], r);
+        r = rd_rand(); const float c = rd_mk16(0, -1, 0x1000u + (r & 0x1FFFu));
+        rd_proj(cx, cy, a, c, 0, 1.0f);
+        from = g_rdn;
+        for (int j = 0; j < 512; j++) rd_at(b, 1.0f, rd_mk(0, T4[q][3], rd_rand()));
+        rd_draw(from);
+    }
+    rd_end("dotread");
+}
+
+/* Scene 64: clip z b in [1.5, 2), clip w = -z scene 62's 1024 w in (2, 4):
+ * the depth is 65536 b / w (most of them; the rest, below 1/2, 32768ths),
+ * the product of b and 1/w as the GE forms it. Four b. */
+static void scene_mulread(void) {
+    if (step("scene %02d: clip z times 1/w read whole, for scene 62's w in (2, 4)", g_scene)) return;
+    rd_make_w64();
+    rd_begin();
+    rd_zview(65536.0f);
+    g_rng = 0x64000002u;
+    for (int q = 0; q < 4; q++) {
+        const w32 r = rd_rand();
+        rd_proj(0, 0, 0, rd_mk16(0, 0, 0x4000u | (r & 0x3FFFu)), -1.0f, 0);
+        const int from = g_rdn;
+        for (int j = 0; j < 1024; j++) rd_at(q, g_w64[j], -g_w64[j]);
+        rd_draw(from);
+    }
+    rd_end("mulread");
+}
+
+/* Scene 65: clip w 1, clip z = a (eye z) + b with world and view z rows of
+ * their own, so the depth is clip z read whole however the GE combines
+ * them. 0: a world translation T in [40, 48) and z = -(T - d), d in
+ * [1/2, 3/4): one eye z the size of d, from two terms 60 times larger
+ * (scene 61's batch 0, read whole). 1: a view translation U in -[16, 24) as
+ * well. 2: three z scales, a, view and world. 3: world z = rx x + z. 4:
+ * clip z = a (z + T) - T. 5: batch 0 with T in [1/4, 1/2). Clip z stays
+ * in [1/2, 1) but in batch 3. */
+static void scene_matread(void) {
+    if (step("scene %02d: world, view and projection combined: clip w 1, depth clip z's top 16 bits", g_scene)) return;
+    rd_begin();
+    rd_zview(65536.0f);
+    g_rng = 0x65000001u;
+    int from;
+    w32 r;
+    float a, T, U, v, s, rx;
+    r = rd_rand(); a = rd_mk16(0, 0, r & 0x1FFFu);
+    r = rd_rand(); T = rd_mk16(0, 5, 0x2000u | (r & 0x1FFFu));
+    rd_load(a, 0, 0, 1.0f, 1.0f, 0, 0, 1.0f, T);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) { const float d = rd_mk(0, -1, rd_rand() & 0x3FFFC0u); rd_at(0, 1.0f, -(T - d)); }
+    rd_draw(from);
+    r = rd_rand(); a = rd_mk16(0, 0, r & 0x1FFFu);
+    r = rd_rand(); T = rd_mk16(0, 5, 0x2000u | (r & 0x1FFFu));
+    r = rd_rand(); U = rd_mk16(1, 4, r & 0x3FFFu);
+    rd_load(a, 0, 0, 1.0f, 1.0f, U, 0, 1.0f, T);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) { const float d = rd_mk(0, -1, rd_rand() & 0x3FFFE0u); rd_at(1, 1.0f, -((T + U) - d)); }
+    rd_draw(from);
+    r = rd_rand(); a = rd_mk16(0, 0, r & 0xFFFu);
+    r = rd_rand(); v = rd_mk16(0, -1, r & 0xFFFu);
+    r = rd_rand(); s = rd_mk16(0, 0, r & 0xFFFu);
+    rd_load(a, 0, 0, 1.0f, v, 0, 0, s, 0);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) rd_at(2, 1.0f, rd_mk(0, 0, rd_rand() & 0x1FFFFFu));
+    rd_draw(from);
+    r = rd_rand(); a = rd_mk16(0, 0, r & 0xFFFu);
+    r = rd_rand(); rx = rd_mk16((int)(r & 1), -5, r >> 1);
+    rd_load(a, 0, 0, 1.0f, 1.0f, 0, rx, 1.0f, 0);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) rd_at(3, 1.0f, rd_mk(0, -1, rd_rand() & 0x1FFFFFu));
+    rd_draw(from);
+    r = rd_rand(); a = rd_mk16(0, 0, r & 0x3FFu);
+    r = rd_rand(); T = rd_mk16(0, 3, r & 0xFFFu);
+    rd_load(a, -T, 0, 1.0f, 1.0f, 0, 0, 1.0f, T);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) rd_at(4, 1.0f, rd_mk(0, -1, rd_rand() & 0x1FFFFFu));
+    rd_draw(from);
+    r = rd_rand(); a = rd_mk16(0, 2, r & 0x1FFFu);
+    r = rd_rand(); T = rd_mk16(0, -2, r);
+    rd_load(a, 0, 0, 1.0f, 1.0f, 0, 0, 1.0f, T);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) { const float d = rd_mk16(0, -3, rd_rand() & 0x3FFFu); rd_at(5, 1.0f, -(T - d)); }
+    rd_draw(from);
+    rd_end("matread");
+}
+
+/* Scene 66: the probes' perspective (60 degrees, 1 to 100), read whole.
+ * Batch 0: eye z from -4 to -96, ndc z in [1/2, 1); batch 1: eye z from
+ * -1.016 to -1.266, ndc z in -[1/2, 1), zs -65536. */
+static void scene_perspread(void) {
+    if (step("scene %02d: the probes' perspective read whole: ndc z's top 16 bits", g_scene)) return;
+    rd_begin();
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadIdentity();
+    sceGumPerspective(60.0f, 480.0f / 272.0f, 1.0f, 100.0f);
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadIdentity();
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumUpdateMatrix();
+    g_rng = 0x66000001u;
+    const float kx = 0.981491089f, ky = 1.73205078f;    /* the projection's x and y scales */
+    rd_zview(65536.0f);
+    int from = g_rdn;
+    for (int e = 2; e <= 6; e++)
+        for (int j = 0; j < (e < 6 ? 192 : 256); j++) {
+            const float w = rd_mk(0, e, e < 6 ? rd_rand() : rd_rand() & 0x3FFFFFu);
+            const int i = g_rdn;
+            rd_put(0, rd_ndcx(i) * w / kx, rd_ndcy(i) * w / ky, -w);
+        }
+    rd_draw(from);
+    rd_zview(-65536.0f);
+    from = g_rdn;
+    for (int j = 0; j < 1024; j++) {
+        const float w = rd_mk(0, 0, 0x20000u + (rd_rand() & 0x1FFFFFu));
+        const int i = g_rdn;
+        rd_put(1, rd_ndcx(i) * w / kx, rd_ndcy(i) * w / ky, -w);
+    }
+    rd_draw(from);
+    rd_end("perspread");
 }
 
 /* ---- GE callbacks --------------------------------------------------------
@@ -3231,6 +3587,13 @@ int main(int argc, char **argv) {
     g_scene = 59; scene_depthaffine();
     g_scene = 60; scene_depthratio();
     g_scene = 61; scene_depthmodel();
+
+    section("scenes, version 12");
+    g_scene = 62; scene_rcpread();
+    g_scene = 63; scene_dotread();
+    g_scene = 64; scene_mulread();
+    g_scene = 65; scene_matread();
+    g_scene = 66; scene_perspread();
 
     probe_screen(1);
     probe_done();

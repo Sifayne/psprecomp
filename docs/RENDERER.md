@@ -651,6 +651,35 @@ further probing could settle, are in `fw660-run7/findings/geprobe.md`.
   depth: 551, scene 57's: 424), and scene 58's shape is a step deeper
   across every copy from its corner at eye z -5.3 (7451), the corner that
   reads 11829 where this gives 11828.75.
+
+  geprobe 11 (set 12) took it apart. Two steps are settled, neither in
+  psprecomp yet:
+
+  - *The viewport.* sceGuDepthRange(65535, 0) sends a scale of -32768
+    and a centre of 32767: it halves 65535 as an integer. The depth is
+    floor(zc + p), where p = zs ndc has its bits below the larger term's
+    16th significant bit dropped toward zero before the add. Scene 59's
+    3840 points all fit, at w = 1 with both its scales.
+  - *The matrices are combined.* The GE multiplies projection, view and
+    world into one matrix before it transforms a vertex. In scene 61 the
+    eye depth comes from a world translation of 37.125, and the depths
+    spread from 4 below to 3 above the rest. Any model that forms eye z
+    first cancels that error in clip z / clip w. Folding the translation
+    into the projection's z row instead, with 16-bit products and the
+    viewport's aligned add, fits 1171 to 1207 of those 1280 points.
+    Forming eye z first fits 510.
+
+  The steps in between are not settled. Those are 1/w, clip z times it,
+  and the row sums. The best joint fit cuts each product and the eye z to
+  16 bits and rounds 1/w to 16 bits. It matches 13,921 of 15,240 points
+  over scenes 45 and 59-61; psprecomp now matches 11,450. But it matches
+  scene 45 on 2789 points, below psprecomp's 2883. In scene 60 about a
+  quarter of the points have a clip z / clip w that does not come out
+  below a, though every truncation pushes it down. That ratio is a,
+  exactly, in real numbers. Something rounds up there, and no 16- to
+  24-bit cut or rounding of 1/w or the product reproduces which points.
+  psprecomp's depth arithmetic stays as it is until geprobe 12 reads each
+  of those steps whole (scenes 62-66).
 - **Patch positions** (scene 22: 610 pixels; scene 23: 438; scene 26:
   1087; scenes 52-56: 16 to 96 each, points a pixel apart). The weights
   are the GE's now, but the positions they make go through psprecomp's own
