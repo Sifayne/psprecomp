@@ -642,6 +642,20 @@ could settle, are in `fw660-run7/findings/geprobe.md`.
   (at best 3058), Cox-de Boor in fixed point (3046), de Boor's algorithm on
   the colours with each level rounded (3016), and a Bezier conversion of
   each span whose control values are rounded (no values fit fill/fill).
+  geprobe 9 scenes 53 and 54 read 16302 more at 40 and 48 steps a span,
+  at control levels 255, 254 and 129 and in neighbouring pairs. Every one
+  of their 3920 weights reads as one value at all three levels, so the GE
+  computes a weight off by up to about 0.55/256 and then colours by it as
+  above; the colour arithmetic is not the cause. Exact weights fit 2984 of
+  the 3920 (any colour cut from 1/32 to 1/65536 does about as well). The
+  weights are not any cubic evaluated exactly, even w0 = (1-t)^3/6 on a
+  uniform span: no four Bernstein control values reproduce its 90 steps.
+  t^3/6 as a chain of rounded products fits 82 of 90, and power-form
+  weights with rounded t^2 and t^3, evaluated from the nearer end or not,
+  3002 of 3920. The tiny weights near a span's end read below exact
+  (t^3/6 at t = 19/256 is under half of it). The points' positions differ
+  from psprecomp's at 10-20% of samples, but patch positions go through
+  psprecomp's own projection, so that does not separate the two.
   psprecomp's tessellated positions are its own, which is why patches
   keep the older projection rule.
 - **Lit triangles** (scene 16: 325 pixels). Every pixel off is one step
