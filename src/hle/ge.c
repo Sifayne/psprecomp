@@ -81,23 +81,6 @@ static int fx16_floor(float f) {
     return i - (s < (float)i);
 }
 
-/* 1/w for x and y of a tessellated vertex: the reciprocal's mantissa cut to
- * 14 bits, toward zero, on the float clip position. Every vertex took this
- * until geprobe 7; one the GE reads from memory now takes the GE's own
- * arithmetic (clip_to_fx16). Patch vertices keep this because psprecomp's
- * tessellation is not the GE's: the GE's rule on them takes scene 22 from
- * 612 pixels off to 954 and scene 23 from 1878 to 1925 (scene 26: 1190 to
- * 1032, a gain on one patch and a loss on another). With an exact 1/w and
- * float arithmetic, one corner of scene 15 (w = 1.5, -1809.08 sixteenths
- * from the centre) and one of scene 18 (w = 5, -28945.4) land a sixteenth
- * further out than the hardware draws them; 14 bits was the only width
- * that put both where it does. */
-static float ge_recip(float w) {
-    int e;
-    const float m = frexpf(1.0f / w, &e);                  /* [0.5, 1) */
-    return ldexpf((float)(int)(m * 16384.0f), e - 14);
-}
-
 /* One axis of a transformed vertex onto the 1/16 grid: the viewport centre
  * (less the screen offset) plus ndc * scale, taken to sixteenths toward zero,
  * that is toward the centre -- left of it and above it a position rounds up,
@@ -1387,9 +1370,6 @@ static double ge_cut(double v, int bits, int round) {
     return ldexp(round ? floor(m + 0.5) : trunc(m), e - bits);
 }
 
-/* The GE's own float: sign, exponent and 16 significant bits, cut toward
- * zero. The vertex arithmetic below computes in it (ge_sum). */
-static double ge24(double v) { return ge_cut(v, 16, 0); }
 
 /* ---- The GE's vertex arithmetic ----------------------------------------
  *
@@ -1735,7 +1715,7 @@ static int ge_screen_axis(double ndc, float scale, float centre, float off) {
  * A vertex the GE read from memory (plain, skinned or morphed) comes here
  * with clip x, y and w from ge_clip, and goes through ge_over_w and
  * ge_screen_axis: geprobe 12's arithmetic. Until then 1/w was cut to 24
- * bits and each quotient to ge24, the fit below. geprobe 7 (fw 6.60) scene
+ * bits and each quotient to 16, the fit below. geprobe 7 (fw 6.60) scene
  * 48 shows why: six of its corners sit a sixteenth further from the centre
  * than ge_recip's rule put them -- each one's triangle has a depth plane
  * 100 to 500 pixels off that matches once the corner moves, and the colour
@@ -1749,24 +1729,15 @@ static int ge_screen_axis(double ndc, float scale, float centre, float off) {
  * quotient too. Against run 7: scene 16 497 -> 369 pixels off, scene 36's
  * depth 696 -> 56, scene 39 217 -> 7, scene 48 6 -> 0 and its depth
  * 1898 -> 958; skinned and morphed scenes 20 and 21 stay at 101 and 400.
- * A tessellated vertex keeps ge_recip's rule on the float clip position
- * (ge_recip says why). */
+ * Tessellated vertices come this way too, since geprobe 13 (draw_patch). */
 static void clip_to_fx16(const float clip[4], int *x, int *y) {
-    float nx, ny;
-    if (g_mv_src) {
-        const float inv = ge_recip(clip[3]);
-        nx = clip[0] * inv;
-        ny = clip[1] * inv;
-    } else {
-        const double gx = ge_over_w(clip[0], clip[3]), gy = ge_over_w(clip[1], clip[3]);
-        if (g_tl.vp_set) {
-            *x = ge_screen_axis(gx, g_tl.vp_xs, g_tl.vp_xc, g_tl.off_x);
-            *y = ge_screen_axis(gy, g_tl.vp_ys, g_tl.vp_yc, g_tl.off_y);
-            return;
-        }
-        nx = (float)gx;
-        ny = (float)gy;
+    const double gx = ge_over_w(clip[0], clip[3]), gy = ge_over_w(clip[1], clip[3]);
+    if (g_tl.vp_set) {
+        *x = ge_screen_axis(gx, g_tl.vp_xs, g_tl.vp_xc, g_tl.off_x);
+        *y = ge_screen_axis(gy, g_tl.vp_ys, g_tl.vp_yc, g_tl.off_y);
+        return;
     }
+    const float nx = (float)gx, ny = (float)gy;
     if (g_tl.vp_set) {
         *x = screen_axis_fx16(nx, g_tl.vp_xs, g_tl.vp_xc - g_tl.off_x);
         *y = screen_axis_fx16(ny, g_tl.vp_ys, g_tl.vp_yc - g_tl.off_y);
@@ -2012,7 +1983,12 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
         if (!(p[i].c[3] > 0)) { g_skip_nearplane += (uint64_t)n; return; }
         float x, y, z;
         to_screen(p[i].c, &x, &y, &z);
-        if (!(x >= -ox && x < 4096-ox && y >= -oy && y < 4096-oy) || !isfinite(z)) {
+        if (!(x >= -ox && x < 4096-ox && y >= -oy && y < 4096-oy) || !isfinite(z) ||
+            (n == 1 && !g_tl.depth_clamp && (z < 0.0f || z > 65535.0f))) {
+            /* A point whose depth falls outside 0..65535 is not drawn
+             * (geprobe 13, fw 6.60: every calibration point with clip z in
+             * (-w, 0) at a positive scale, or past 65535, is absent).
+             * Lines are not measured. */
             g_clip_guard += (uint64_t)n; return;
         }
         v[i] = p[i].v;
@@ -2558,16 +2534,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             mul_4x3(g_tl.world, model, world);
             mul_4x3(g_tl.view,  world, eye);
             mul_4x4(g_tl.proj,  eye,   clip);
-            /* Clip space as the GE forms it (ge_clip): z for depth
-             * (ge_screen_z), and x, y and w too for a vertex it read
-             * (clip_to_fx16); a tessellated one keeps the float x, y and w
-             * ge_recip's rule was measured with. */
-            {
-                float gc[4];
-                ge_clip(wvp, model, gc);
-                clip[2] = gc[2];
-                if (!g_mv_src) { clip[0] = gc[0]; clip[1] = gc[1]; clip[3] = gc[3]; }
-            }
+            /* Clip space as the GE forms it (ge_clip), for depth
+             * (ge_screen_z) and position (clip_to_fx16). */
+            ge_clip(wvp, model, clip);
             const uint64_t _p2 = ge_prof_now();
 
             psp_vertex *o = &v[decoded];
@@ -3086,6 +3055,32 @@ static int64_t deboor_fix(const int64_t in[4], const uint16_t a[6]) {
     return P[3];
 }
 
+/* One lerp of a patch position, as the GE runs it (geprobe 13, fw 6.60):
+ * a weight of 0 or 256 hands its operand on as it is; otherwise both
+ * operands go onto the 16-bit grid of the larger, each cut toward zero,
+ * and ((256 - a) P + a Q) / 256 is floored on that grid. */
+static double la_lerp(double p, double q, int a) {
+    if (a == 0) return p;
+    if (a == 256) return q;
+    int ep = INT_MIN, eq = INT_MIN, e;
+    if (p != 0.0) frexp(p, &ep);
+    if (q != 0.0) frexp(q, &eq);
+    e = ep > eq ? ep : eq;
+    if (e == INT_MIN) return 0.0;
+    const double P = trunc(ldexp(p, 16 - e)), Q = trunc(ldexp(q, 16 - e));
+    return ldexp(floor(((256.0 - a) * P + a * Q) / 256.0), e - 16);
+}
+static double deboor_la(const double in[4], const uint16_t a[6]) {
+    double P[4] = { in[0], in[1], in[2], in[3] };
+    int n = 0;
+    for (int j = 1; j <= 3; j++) {
+        double Q[4] = { P[0], P[1], P[2], P[3] };
+        for (int idx = 3; idx >= j; idx--, n++) Q[idx] = la_lerp(P[idx - 1], P[idx], a[n]);
+        memcpy(P, Q, sizeof P);
+    }
+    return P[3];
+}
+
 /* The same in real arithmetic, on unit vectors: the four weights those
  * parameters give, for positions, normals and texture coordinates. */
 static void deboor_weights(const uint16_t a[6], double w[4]) {
@@ -3103,26 +3098,37 @@ static void deboor_weights(const uint16_t a[6], double w[4]) {
     }
 }
 
-/* Step i of div along a piece, as the GE places it (geprobe 7 scene 44, fw
- * 6.60): on a 1/256 grid, cut toward the nearer end -- floor(256 i/div)/256
- * up to the middle and 1 - floor(256 (div - i)/div)/256 past it, so a piece
- * reads the same from either end. Scene 44 lights one control column and row
+/* Step i of div along a piece, as the GE places it: on a 1/256 grid, a
+ * step of 256/div in 8.6 fixed point rounded up, i steps of it floored to
+ * 1/256 up to the middle and 1 less div - i steps past it, so a piece reads
+ * the same from either end. geprobe 13 (fw 6.60) reads the parameter of
+ * 1128 (div, i) pairs whole through depth (scenes 67-82), and this fits
+ * every one; floor(256 i/div), the rule geprobe 7 scene 44 suggested, is
+ * a step off at 68. geprobe 7 scene 44 (fw 6.60) found the grid and the
+ * mirroring. Scene 44 lights one control column and row
  * of a patch drawn as points, so each point's colour is one weight, 255
  * times: of its 42 Bezier and open spline samples (168 weights) all fit
  * this, 28 the exact i/div, and 29 the grid floored throughout. The points
  * move with it: Bezier 7's fifth column sits a pixel right of i/div's. */
 static double patch_param(int i, int div) {
-    return 2 * i <= div ? floor(256.0 * i / div) / 256.0
-                        : 1.0 - floor(256.0 * (div - i) / div) / 256.0;
+    const int q = (16384 + div - 1) / div;          /* 256/div in 8.6, rounded up */
+    return (2 * i <= div ? (i * q) >> 6 : 256 - (((div - i) * q) >> 6)) / 256.0;
 }
 
 /* A Bezier direction: (count - 1) / 3 cubic pieces sharing end points, each
  * cut into `div` steps. Returns the number of samples. */
+/* Set while a patch is drawn as points: each piece or span then emits its
+ * own end samples, so a sample two of them share is drawn twice (geprobe 13
+ * scene 73, fw 6.60: with additive blending those points read doubled).
+ * Scene 73 shares samples along u only; v is taken to do the same.
+ * Triangles and lines share it as one vertex. */
+static int g_patch_dup;
+
 static int bezier_samples(int count, int div, patch_sample *out, int max) {
     const int pieces = (count - 1) / 3;
     int n = 0;
     for (int pc = 0; pc < pieces; pc++) {
-        for (int i = pc ? 1 : 0; i <= div && n < max; i++) {
+        for (int i = pc && !g_patch_dup ? 1 : 0; i <= div && n < max; i++) {
             const double t = patch_param(i, div);
             patch_sample *o = &out[n++];
             o->first = 3 * pc;
@@ -3153,7 +3159,7 @@ static int spline_samples(int count, int div, int edge, patch_sample *out, int m
     }
     int n = 0;
     for (int sp = 0; sp < spans; sp++) {
-        for (int i = sp ? 1 : 0; i <= div && n < max; i++) {
+        for (int i = sp && !g_patch_dup ? 1 : 0; i <= div && n < max; i++) {
             /* The same grid as a Bezier's (geprobe 10 scene 56 reads the
              * parameter itself through a texture: every step on it), and
              * de Boor's algorithm with 8-bit parameters from it
@@ -3170,7 +3176,7 @@ static int spline_samples(int count, int div, int edge, patch_sample *out, int m
     return n;
 }
 
-enum { PATCH_MAX_SAMPLES = 256 };
+enum { PATCH_MAX_SAMPLES = 4096 };   /* geprobe 13 scene 82: rows past 256 draw whole */
 
 static void draw_patch(int spline, uint32_t arg) {
     const int ucount = (int)(arg & 0xFF), vcount = (int)((arg >> 8) & 0xFF);
@@ -3179,9 +3185,15 @@ static void draw_patch(int spline, uint32_t arg) {
     int col_off = -1, pos_off = 0, tex_off = -1, norm_off = -1;
     const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
     if (!stride) return;
-    const int du = g_ge.patch_du > 0 ? g_ge.patch_du : 1, dv = g_ge.patch_dv > 0 ? g_ge.patch_dv : 1;
+    /* The GE takes 7 bits of each division and draws up to 64. geprobe 13
+     * (fw 6.60) scenes 80 and 81: 49 to 64 draw, and 65 (d 193 too) and
+     * 127 (d 255) hang the GE, the list going no further; psprecomp draws
+     * nothing for those and goes on. 0 is not measured and draws as 1. */
+    const int du = g_ge.patch_du ? g_ge.patch_du : 1, dv = g_ge.patch_dv ? g_ge.patch_dv : 1;
+    if (du > 64 || dv > 64) return;
 
     static patch_sample su[PATCH_MAX_SAMPLES], sv[PATCH_MAX_SAMPLES];
+    g_patch_dup = g_ge.patch_prim == 2;
     const int nu = spline ? spline_samples(ucount, du, uedge, su, PATCH_MAX_SAMPLES)
                           : bezier_samples(ucount, du, su, PATCH_MAX_SAMPLES);
     const int nv = spline ? spline_samples(vcount, dv, vedge, sv, PATCH_MAX_SAMPLES)
@@ -3208,16 +3220,36 @@ static void draw_patch(int spline, uint32_t arg) {
                     const float w = (float)wd;
                     if (wd == 0.0) continue;
                     const ge_mvert *c = &cp[(sv[j].first + b) * ucount + su[i].first + a];
-                    for (int k = 0; k < 3; k++) { pos[k] += w * c->pos[k]; nrm[k] += w * c->nrm[k]; }
+                    for (int k = 0; k < 3; k++) nrm[k] += w * c->nrm[k];
                     u += w * c->u; v += w * c->v;
                 }
+            /* A position is de Boor's algorithm too, each coordinate on its
+             * own, every lerp la_lerp's: along v for each of the four
+             * control columns, then along u over the four results, from
+             * controls cut to 16 bits (s16 and s8 controls are exact
+             * fractions). geprobe 13 (fw 6.60) reads 134,198 generated
+             * points whole through depth (scenes 67-82), over every
+             * division to 64, edge mode, sign, binade, format, morph and
+             * skin, and this places every one on its pixel with its depth;
+             * u first misses 8767 of them. The weights above stay for
+             * normals and texture coordinates. */
+            for (int k = 0; k < 3; k++) {
+                double C[4];
+                for (int q = 0; q < 4; q++) {
+                    double in[4];
+                    for (int r = 0; r < 4; r++)
+                        in[r] = ge_cut(cp[(sv[j].first + r) * ucount + su[i].first + q].pos[k], 16, 0);
+                    C[q] = deboor_la(in, sv[j].a);
+                }
+                pos[k] = (float)deboor_la(C, su[i].a);
+            }
             ge_mvert *o = &grid[j * nu + i];
             memcpy(o->pos, pos, sizeof pos);
             memcpy(o->nrm, nrm, sizeof nrm);
             /* A generated vertex's colour is not a blend by weights: the GE
              * runs de Boor's algorithm on each channel of the control
-             * colours, with deboor_params' 8-bit parameters, along u for
-             * each of the four control rows and then along v, every lerp
+             * colours, with deboor_params' 8-bit parameters, along v for
+             * each of the four control columns and then along u, every lerp
              * floored to 1/128 of a step and the end rounded up to a whole
              * one (deboor_fix). geprobe 9 and 10 (fw 6.60) scenes 52-54 read
              * 19,546 single and paired control columns at three levels over
@@ -3226,18 +3258,19 @@ static void draw_patch(int spline, uint32_t arg) {
              * 13,452 of scenes 53 and 54's 16,302. The tiny weights near a
              * span's end that read low are those 1/128 cuts. Bezier pieces
              * are the same with every parameter t, which is why exact
-             * weights fit them. Which direction goes first is not measured:
-             * every scene so far reads the same either way. */
+             * weights fit them. v goes first, as for positions: geprobe 13
+             * scene 72's colour-order cells read 747 pixels a step off u
+             * first and none this way. */
             o->rgba = 0;
             for (int k = 0; k < 4; k++) {
                 int64_t Q[4];
-                for (int r = 0; r < 4; r++) {
+                for (int q = 0; q < 4; q++) {
                     int64_t in[4];
-                    for (int q = 0; q < 4; q++)
-                        in[q] = (int64_t)((cp[(sv[j].first + r) * ucount + su[i].first + q].rgba >> (8 * k)) & 0xFFu) * 128;
-                    Q[r] = deboor_fix(in, su[i].a);
+                    for (int r = 0; r < 4; r++)
+                        in[r] = (int64_t)((cp[(sv[j].first + r) * ucount + su[i].first + q].rgba >> (8 * k)) & 0xFFu) * 128;
+                    Q[q] = deboor_fix(in, sv[j].a);
                 }
-                int c = (int)((deboor_fix(Q, sv[j].a) + 127) >> 7);
+                int c = (int)((deboor_fix(Q, su[i].a) + 127) >> 7);
                 if (c < 0) c = 0;
                 if (c > 255) c = 255;
                 o->rgba |= (uint32_t)c << (8 * k);
@@ -3672,8 +3705,8 @@ static void run_list_body(ge_queue *q) {
             g_tl.morph_w[cmd - GE_MORPHWEIGHT0] = ge_float(arg);
             break;
         case GE_PATCHDIVISION:
-            g_ge.patch_du = (int)(arg & 0xFF);
-            g_ge.patch_dv = (int)((arg >> 8) & 0xFF);
+            g_ge.patch_du = (int)(arg & 0x7F);            /* 7 bits: geprobe 13 */
+            g_ge.patch_dv = (int)((arg >> 8) & 0x7F);
             break;
         case GE_PATCHPRIMITIVE: g_ge.patch_prim = (int)(arg & 3); break;
         case GE_PATCHFACING:    g_ge.patch_face = (int)(arg & 1); break;

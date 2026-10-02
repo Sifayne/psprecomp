@@ -113,7 +113,13 @@ def screen_xy(M, x, y, z, xs=256.0, ys=-128.0):
     return 240 + xs * nx, 136 + ys * ny
 
 # ---------------------------------------------------------------- sampling
-def Tp(i, d): return (256 * i) // d if 2 * i <= d else 256 - (256 * (d - i)) // d
+def Tp_floor(i, d): return (256 * i) // d if 2 * i <= d else 256 - (256 * (d - i)) // d
+def Tp(i, d):
+    """The GE's sample parameter (set 14): a step of 256/d in 8.6 fixed point rounded up,
+    mirrored about the middle. Tp_floor, the rule the spec was written with, is a step off
+    at 68 of the 1128 (d, i) pairs scenes 67-82 read."""
+    q = -(-16384 // d)
+    return (i * q) >> 6 if 2 * i <= d else 256 - (((d - i) * q) >> 6)
 def bez_samples(c, d):
     out = []
     for pc in range((c - 1) // 3):
@@ -205,8 +211,9 @@ def tess(C, su, sv, lerp, order):
 
 LA = make_lerp()
 MODELS = {
-    'LAv':      (LA, 'v', 'trunc'),
-    'LAu':      (LA, 'u', 'trunc'),
+    'LAv':      (make_lerp(copy=True), 'v', 'trunc'),     # the GE's rule (set 14): a = 0/256 copy their operand
+    'LAv_nocopy': (LA, 'v', 'trunc'),
+    'LAu':      (make_lerp(copy=True), 'u', 'trunc'),
     'LAv_opnear': (make_lerp(op='near'), 'v', 'trunc'),
     'LAv_opeven': (make_lerp(op='even'), 'v', 'trunc'),
     'LAv_opfloor': (make_lerp(op='floor'), 'v', 'trunc'),

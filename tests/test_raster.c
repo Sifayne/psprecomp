@@ -1079,6 +1079,57 @@ static void test_spline_colour(void) {
     CHECK(n == 49 && bad == 0, "spline points: %d found, %d reds off the PSP's (first at %d)", n, bad, first_bad);
 }
 
+/* A Bezier patch's points in the GE's own arithmetic (ge.c draw_patch,
+ * la_lerp, patch_param): geprobe 13 (fw 6.60) scene 68 item 60, a 4x4
+ * strip at division 21 (1 down) as points, identity matrices, viewport z
+ * scale 65536 and centre 0 so each depth is the point's z's top 16 bits.
+ * The PSP's 44 points, pixel and depth. Division 21 is the smallest where
+ * the GE's step (256/21 in 8.6, rounded up) leaves floor(256 i/21): t 61,
+ * 122, 134 and 195, not 60, 121, 135 and 196. */
+static void test_patch_points_ge(void) {
+    static const uint32_t C[16][3] = {
+        { 0x3F1A8000u, 0xBDE80000u, 0x3F02BB00u }, { 0x3F2A8000u, 0xBDE80000u, 0x3F0CB800u }, { 0x3F3A8000u, 0xBDE80000u, 0x3F1AA400u }, { 0x3F4A8000u, 0xBDE80000u, 0x3F1D2000u },
+        { 0x3F1A8000u, 0xBDF80000u, 0x3F02BB00u }, { 0x3F2A8000u, 0xBDF80000u, 0x3F0CB800u }, { 0x3F3A8000u, 0xBDF80000u, 0x3F1AA400u }, { 0x3F4A8000u, 0xBDF80000u, 0x3F1D2000u },
+        { 0x3F1A8000u, 0xBE040000u, 0x3F0C5000u }, { 0x3F2A8000u, 0xBE040000u, 0x3F120200u }, { 0x3F3A8000u, 0xBE040000u, 0x3F4E2900u }, { 0x3F4A8000u, 0xBE040000u, 0x3F7DA100u },
+        { 0x3F1A8000u, 0xBE0C0000u, 0x3F0C5000u }, { 0x3F2A8000u, 0xBE0C0000u, 0x3F120200u }, { 0x3F3A8000u, 0xBE0C0000u, 0x3F4E2900u }, { 0x3F4A8000u, 0xBE0C0000u, 0x3F7DA100u } };
+    static const struct { int x, y; unsigned z; } HW[44] = {
+        { 394, 150, 33467 }, { 396, 150, 33831 }, { 399, 150, 34208 }, { 401, 150, 34593 },
+        { 403, 150, 34984 }, { 405, 150, 35412 }, { 408, 150, 35807 }, { 410, 150, 36202 },
+        { 412, 150, 36591 }, { 414, 150, 36976 }, { 417, 150, 37382 }, { 419, 150, 37744 },
+        { 422, 150, 38122 }, { 424, 150, 38453 }, { 426, 150, 38765 }, { 428, 150, 39055 },
+        { 431, 150, 39322 }, { 433, 150, 39581 }, { 435, 150, 39791 }, { 438, 150, 39970 },
+        { 440, 150, 40114 }, { 442, 150, 40224 }, { 394, 153, 35920 }, { 396, 153, 36213 },
+        { 399, 153, 36682 }, { 401, 153, 37313 }, { 403, 153, 38096 }, { 405, 153, 39102 },
+        { 408, 153, 40168 }, { 410, 153, 41352 }, { 412, 153, 42645 }, { 414, 153, 44036 },
+        { 417, 153, 45641 }, { 419, 153, 47202 }, { 422, 153, 48966 }, { 424, 153, 50651 },
+        { 426, 153, 52379 }, { 428, 153, 54138 }, { 431, 153, 55920 }, { 433, 153, 57863 },
+        { 435, 153, 59656 }, { 438, 153, 61438 }, { 440, 153, 63199 }, { 442, 153, 64929 } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    for (int m = 0; m < 3; m++) {
+        cmd((uint8_t)(0x3A + 2 * m), 0);
+        const int n = m < 2 ? 12 : 16, rowlen = m < 2 ? 3 : 4;
+        for (int i = 0; i < n; i++) cmd((uint8_t)(0x3B + 2 * m), i % (rowlen + 1) == 0 ? 0x3F8000 : 0);
+    }
+    cmd_float(0x42, 256.0f); cmd_float(0x43, -128.0f); cmd_float(0x44, 65536.0f);
+    cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 0.0f);
+    cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+    depth_state(1);                                        /* ALWAYS, writes on */
+    for (int k = 0; k < 16; k++) {
+        psp_write32(VERTS + (uint32_t)k * 16, 0xFF41003Du);
+        for (int c = 0; c < 3; c++) psp_write32(VERTS + (uint32_t)k * 16 + 4 + (uint32_t)c * 4, C[k][c]);
+    }
+    cmd(0x36, 21u | (1u << 8));                            /* PATCHDIVISION */
+    cmd(0x37, 2);                                          /* PATCHPRIMITIVE: points */
+    cmd(0x05, 4u | (4u << 8));                             /* BEZIER 4x4 */
+    end_list();
+    int bad = 0, first = -1;
+    for (int k = 0; k < 44; k++)
+        if (depth_at(HW[k].x, HW[k].y) != HW[k].z) { bad++; if (first < 0) first = k; }
+    CHECK(bad == 0, "patch points: %d of 44 depths off the PSP's (first: point %d, %u against %u)", bad, first,
+          first < 0 ? 0 : depth_at(HW[first].x, HW[first].y), first < 0 ? 0 : HW[first].z);
+}
+
 /* A depth plane starts from the end of the long edge on that edge's side
  * (render.c sw_tri, zk0), not the colour's leftmost corner. geprobe 10
  * (fw 6.60) scene 57's first triangle in through mode, corners and depths
@@ -1847,6 +1898,7 @@ int main(void) {
     test_depth_plane();
     test_transformed_depth();
     test_vertex_depth_ge();
+    test_patch_points_ge();
     test_gradient_reciprocal();
     test_depth_plane_side();
     test_spline_colour();

@@ -624,51 +624,71 @@ geprobe 7, fw 6.60):
 
 ## Patches
 
-Bezier and spline patches are tessellated by psprecomp (geprobe 7 scene 44,
-fw 6.60):
+Bezier and spline patches are tessellated as the GE does it (geprobes 7-13,
+fw 6.60; ge.c draw_patch, patch_param, la_lerp, deboor_fix). geprobe 13
+reads 134,198 generated points whole through depth (scenes 67-82), and
+psprecomp places every one on the PSP's pixel with its depth.
 
-- **Steps.** Step i of a division sits on a 1/256 grid, cut toward the
-  nearer end of the piece: floor(256 i/div)/256 up to the middle, and
-  1 - floor(256 (div - i)/div)/256 past it. All 168 Bezier and open-spline
-  weights of scene 44 fit.
-- **de Boor's algorithm, not weights.** The GE evaluates a point by de
-  Boor's algorithm (de Casteljau's for a Bezier piece) with every lerp
-  parameter an 8-bit fraction taken from the nearer knot: of t - u_lo and
-  u_hi - t, the smaller over the knot gap, cut to 1/256, and the other
-  side one minus that. A Bezier piece's gaps are all 1, so every parameter
-  is t itself.
-- **Colour.** Each channel runs that algorithm on the control colours
-  (along u for each control row, then along v), every lerp floored to
-  1/128 of a step and the end rounded up to a whole one (ge.c deboor_fix).
-  It reproduces every one of geprobe 8 and 9's 19,546 spline colour
-  readings (scenes 52-54: every edge mode, 2 to 48 steps, control levels
-  255, 254 and 129, single and paired columns), where exact Cox-de Boor
-  weights through a cut-to-1/256 blend fit 17,403. The tiny weights near a
-  span's end that read low are the 1/128 cuts, and 13.0008 reading 13
-  (scene 44) is one too. Which direction goes first is not measured.
-- **Positions** take the weights the same 8-bit parameters give: geprobe 10
-  scene 55 reads 2332 weights through depth, every one within -2 to 0
-  depth steps of those (the readout's own noise on Bezier pieces), where
-  exact weights range from -86 to +63. The parameter is the 1/256 grid
-  itself: scene 56 reads it through a texture at 1/8192 and every step is
-  on the grid, running on across spans.
+- **Steps.** Step i of a division d is a parameter on a 1/256 grid: a step
+  of 256/d in 8.6 fixed point, rounded up (ceil(16384/d)), times i, cut
+  to 1/256 up to the middle, and mirrored past it (256 less the same
+  from the other end). All 1128 (d, i) pairs geprobe 13 reads fit. The
+  earlier rule, floor(256 i/d) mirrored, is a step off at 68 of them.
+- **Divisions.** The GE takes 7 bits of each PATCHDIVISION field and draws
+  divisions 1 to 64 (scene 82's 64 x 64 patch is exact). 65 to 127 (and
+  so 193 and 255) hang the GE: nothing more of that list runs, and the
+  probe has to break it. psprecomp draws nothing for those and goes on.
+  0 is not measured.
+- **de Boor's algorithm** (de Casteljau's for a Bezier piece), with every
+  lerp parameter an 8-bit fraction taken from the nearer knot: of
+  t - u_lo and u_hi - t, the smaller over the knot gap, cut to 1/256, and
+  the other side one minus that. A Bezier piece's gaps are all 1, so
+  every parameter is t itself. v goes first: each of the four control
+  columns along v, then the four results along u. u first misses 8767 of
+  geprobe 13's points, and scene 72's colour-order cells 747 pixels.
+- **Positions.** Each coordinate on its own, from controls cut to 16
+  bits toward zero (s16 and s8 controls are exact fractions; morph and
+  skin are applied to the controls first). A lerp with weight 0 or 256
+  hands its operand on unchanged. Any other lerp puts both operands onto
+  the 16-bit grid of the larger one, each cut toward zero, then floors
+  ((256 - a) P + a Q) / 256 on that grid (la_lerp). Every rival tried
+  loses points: operands rounded or floored, the result truncated or
+  rounded, a shared exponent across x, y and z, absolute fixed point, or
+  exact arithmetic with one final cut. A generated vertex then takes the
+  ordinary vertex path (Depth values, above).
+- **Colour.** Each channel runs the same algorithm in fixed point on the
+  control colours, v first, every lerp floored to 1/128 of a step and the
+  end rounded up to a whole one (deboor_fix). It reproduces every one of
+  geprobe 8 and 9's 19,546 spline colour readings and geprobe 13's
+  colour-order cells. Inside a patch triangle colour is the ordinary
+  triangle colour plane: scene 75 draws patch triangles and plain
+  triangles with their read-back corner colours, and the two match on
+  every pixel.
+- **Points** emit each piece's or span's own end samples, so a sample two
+  of them share is drawn twice: scene 73's span boundaries read doubled
+  under additive blending. Triangles and lines share it.
+- A point whose depth falls outside 0..65535 is not drawn when depth
+  clamping is off (every geprobe 13 calibration point with clip z in
+  (-w, 0), or over 65535, is absent).
 
-## Still open after geprobe 12
+## Still open after geprobe 13
 
-These are what geprobe 12 (fw 6.60) still shows psprecomp getting wrong,
-with pixels off on run 12 (set 13). That run matches 90 of 107 steps. Run
-12 drew every scene it shares with run 11 the same, byte for byte. Details
-on the geprobe 7 items, and what further probing could settle, are in
-`fw660-run7/findings/geprobe.md`. Vertex depth, open until geprobe 12, is
-now settled (above). With it every 3D depth plane matches: scenes 45, 48,
-57 and 58.
+These are what geprobe 13 (fw 6.60) still shows psprecomp getting wrong,
+with pixels off on run 13 (set 14). Run 13 drew every scene it shares with
+run 12 the same, byte for byte. Its log matches psprecomp's on 95 of 124
+steps; the patch scenes 67-82 that still differ in the log do so only in
+their GE timing lines, and their frames match but for scenes 75 (the
+colour planes below) and 80 and 81 (what follows a division that hangs
+the GE). Details on the geprobe 7 items, and what further probing could
+settle, are in `fw660-run7/findings/geprobe.md`. Vertex depth and patch
+positions are settled (above).
 
-- **Patch positions** (scene 22: 610 pixels; scene 23: 438; scene 26:
-  1087; scenes 52-56: 16 to 96 each, points a pixel apart). The weights
-  are the GE's now, but the positions they make go through psprecomp's own
-  arithmetic in double and the older projection rule (ge.c ge_recip): with
-  the GE's projection rule instead, scene 22 goes to 1023 and scene 23 to
-  576. How the GE keeps a tessellated position is not measured.
+- **Patch triangle colours** (scene 22: 306 pixels; scene 23: 115; scene
+  26: 568; scene 75: 747). Patch positions are settled (Patches, above),
+  and what is left is one step of colour inside patch triangles. The PSP
+  draws those exactly as plain triangles with the same corner colours
+  (scene 75), so this is the triangle colour-plane question below, not
+  tessellation.
 - **Lit triangles** (scene 16: 325 pixels). Every pixel off is one step
   in a channel, and all fall in the same four triangles of each fan (the
   two on either side of the vertical, on the left), whatever the light:
