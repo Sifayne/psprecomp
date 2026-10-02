@@ -9,6 +9,10 @@
  * strong evidence the recompiled code around it is behaving too.
  */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE                 /* statx, for a file's birth time */
+#endif
+
 #include "psprecomp/hle.h"
 #include "psprecomp/sched.h"
 
@@ -21,6 +25,7 @@
 #  include <direct.h>
 #else
 #  include <dirent.h>
+#  include <fcntl.h>
 #  include <sys/stat.h>
 #  include <time.h>
 #  include <unistd.h>
@@ -66,16 +71,18 @@ typedef struct {
     int      dirty;
 } io_file;
 
+/* One entry of a directory listing, as sceIoDopen took it. */
+typedef struct {
+    char name[256];
+    uint64_t born;       /* creation order key: host birth time, in ns */
+    int is_dir;          /* from the listing itself on Windows */
+    uint64_t size;
+} io_dirent;
+
 typedef struct {
     int used;
-#ifdef _WIN32
-    intptr_t handle;
-    struct _finddata_t data;
-    int first;
-    int done;
-#else
-    DIR *dir;
-#endif
+    io_dirent *ent;      /* the whole listing, read and ordered at Dopen */
+    int n, pos;
     char host[1024];     /* the directory's host path, to stat its entries */
     int fat;             /* on the Memory Stick: entries stat the FAT way */
 } io_dir;
@@ -121,6 +128,7 @@ void psp_io_reset(void) {
         g_file[i].sector_mode = 0;
         g_file[i].dirty = 0;
     }
+    for (int i = 0; i < MAX_DIRS; i++) free(g_dir[i].ent);
     memset(g_dir, 0, sizeof g_dir);
     g_cwd[0] = '\0';
     g_bytes_read = 0;
@@ -857,6 +865,66 @@ static void mkdir_parents(const char *host) {
     MKDIR_ONE(tmp);
 }
 
+#ifndef _WIN32
+/* When a host file was made, in ns, for ordering a Memory Stick listing:
+ * its birth time where the filesystem keeps one, its modification time
+ * where it does not. */
+static uint64_t host_born(const char *path) {
+#if defined(__linux__) && defined(STATX_BTIME)
+    struct statx sx;
+    if (statx(AT_FDCWD, path, 0, STATX_BTIME | STATX_MTIME, &sx) == 0) {
+        const struct statx_timestamp *t = (sx.stx_mask & STATX_BTIME) ? &sx.stx_btime : &sx.stx_mtime;
+        return (uint64_t)t->tv_sec * 1000000000u + t->tv_nsec;
+    }
+#endif
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+#if defined(__APPLE__)
+    return (uint64_t)st.st_birthtimespec.tv_sec * 1000000000u + (uint64_t)st.st_birthtimespec.tv_nsec;
+#else
+    return (uint64_t)st.st_mtime * 1000000000u;
+#endif
+}
+#endif
+
+static int g_dir_sort_fat;
+
+/* "." and ".." first, as both the PSP and the hosts list them. Then a
+ * Memory Stick directory goes in the order its files were made, which is
+ * the order of their FAT slots: saveprobe v2 (fw 6.60) lists DATA.BIN before
+ * PARAM.SFO in every save (step 107's sceIoDread too), ICON0.PNG before both
+ * (step 90), and after a WRITEDATASECURE of DATA2.BIN, DATA.BIN DATA2.BIN
+ * PARAM.SFO (step 86), where the host's readdir gave whatever its filesystem
+ * keeps (tmpfs: newest first). A slot freed by a delete and reused is not
+ * modelled. Anywhere else the order is the name's, as an ISO 9660
+ * directory's records are sorted, rather than the host's. */
+static int dirent_order(const void *pa, const void *pb) {
+    const io_dirent *a = pa, *b = pb;
+    const int ra = !strcmp(a->name, ".") ? 0 : !strcmp(a->name, "..") ? 1 : 2;
+    const int rb = !strcmp(b->name, ".") ? 0 : !strcmp(b->name, "..") ? 1 : 2;
+    if (ra != rb) return ra - rb;
+    if (g_dir_sort_fat && a->born != b->born) return a->born < b->born ? -1 : 1;
+    return strcmp(a->name, b->name);
+}
+
+/* Append one entry to d's listing. 0 when out of memory. */
+static int dir_add(io_dir *d, int *cap, const char *name) {
+    if (d->n == *cap) {
+        const int nc = *cap ? 2 * *cap : 32;
+        io_dirent *ne = realloc(d->ent, (size_t)nc * sizeof *ne);
+        if (!ne) return 0;
+        d->ent = ne;
+        *cap = nc;
+    }
+    io_dirent *e = &d->ent[d->n++];
+    memset(e, 0, sizeof *e);
+    snprintf(e->name, sizeof e->name, "%s", name);
+    return 1;
+}
+
+/* sceIoDopen takes the whole listing at once and orders it (dirent_order);
+ * sceIoDread then hands it out an entry at a time. The Windows half has not
+ * been through a Windows build. */
 static void hle_Dopen(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
@@ -864,20 +932,41 @@ static void hle_Dopen(void) {
 
     for (int i = 0; i < MAX_DIRS; i++) {
         if (g_dir[i].used) continue;
+        io_dir *d = &g_dir[i];
+        int cap = 0, ok = 1;
+        d->ent = NULL;
+        d->n = d->pos = 0;
 #ifdef _WIN32
         char pattern[1088];
+        struct _finddata_t fd;
         snprintf(pattern, sizeof pattern, "%s/*", host);
-        g_dir[i].handle = _findfirst(pattern, &g_dir[i].data);
-        if (g_dir[i].handle == -1) { psp_ret(0x80010002); return; }
-        g_dir[i].first = 1;
-        g_dir[i].done = 0;
+        intptr_t h = _findfirst(pattern, &fd);
+        if (h == -1) { psp_ret(0x80010002); return; }
+        do {
+            if (!(ok = dir_add(d, &cap, fd.name))) break;
+            io_dirent *e = &d->ent[d->n - 1];
+            e->born = (uint64_t)fd.time_create * 1000000000u;
+            e->is_dir = (fd.attrib & _A_SUBDIR) != 0;
+            e->size = e->is_dir ? 0 : (uint64_t)fd.size;
+        } while (_findnext(h, &fd) == 0);
+        _findclose(h);
 #else
-        g_dir[i].dir = opendir(host);
-        if (!g_dir[i].dir) { psp_ret(0x80010002); return; }
+        DIR *dd = opendir(host);
+        if (!dd) { psp_ret(0x80010002); return; }
+        for (struct dirent *de; (de = readdir(dd)) != NULL;) {
+            if (!(ok = dir_add(d, &cap, de->d_name))) break;
+            char path[1300];
+            snprintf(path, sizeof path, "%s/%s", host, de->d_name);
+            d->ent[d->n - 1].born = host_born(path);
+        }
+        closedir(dd);
 #endif
-        g_dir[i].used = 1;
-        g_dir[i].fat = is_ms_path(guest);
-        snprintf(g_dir[i].host, sizeof g_dir[i].host, "%s", host);
+        if (!ok) { free(d->ent); d->ent = NULL; psp_ret(0x8001000C); return; }   /* ENOMEM */
+        d->used = 1;
+        d->fat = is_ms_path(guest);
+        g_dir_sort_fat = d->fat;
+        if (d->n > 1) qsort(d->ent, (size_t)d->n, sizeof *d->ent, dirent_order);
+        snprintf(d->host, sizeof d->host, "%s", host);
         psp_ret((uint32_t)(i + 1));
         return;
     }
@@ -894,30 +983,15 @@ static void hle_Dread(void) {
     uint32_t dirent = psp_arg(1);
     if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(0x80020323); return; }
 
-    const char *name = NULL;
-#ifdef _WIN32
-    if (g_dir[id].done) { psp_ret(0); return; }
-    if (g_dir[id].first) {
-        g_dir[id].first = 0;
-        name = g_dir[id].data.name;
-    } else if (_findnext(g_dir[id].handle, &g_dir[id].data) == 0) {
-        name = g_dir[id].data.name;
-    } else {
-        g_dir[id].done = 1;
-        psp_ret(0);
-        return;
-    }
-#else
-    struct dirent *de = readdir(g_dir[id].dir);
-    if (!de) { psp_ret(0); return; }
-    name = de->d_name;
-#endif
+    if (g_dir[id].pos >= g_dir[id].n) { psp_ret(0); return; }
+    const io_dirent *e = &g_dir[id].ent[g_dir[id].pos++];
+    const char *name = e->name;
 
     int is_dir = 0, fat_done = 0;
     uint64_t size = 0;
 #ifdef _WIN32
-    is_dir = (g_dir[id].data.attrib & _A_SUBDIR) != 0;
-    size = is_dir ? 0 : (uint64_t)g_dir[id].data.size;
+    is_dir = e->is_dir;
+    size = e->size;
 #else
     {
         char path[1300];
@@ -962,11 +1036,9 @@ static void hle_Devctl(void) {
 static void hle_Dclose(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
     if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(0x80020323); return; }
-#ifdef _WIN32
-    if (g_dir[id].handle != -1) _findclose(g_dir[id].handle);
-#else
-    if (g_dir[id].dir) closedir(g_dir[id].dir);
-#endif
+    free(g_dir[id].ent);
+    g_dir[id].ent = NULL;
+    g_dir[id].n = g_dir[id].pos = 0;
     g_dir[id].used = 0;
     psp_ret(0);
 }

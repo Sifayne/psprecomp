@@ -827,6 +827,29 @@ static void test_io_dirs(void) {
     CHECK(found, "dread enumerates DATA.BIN");
     CHECK(found_size == 64, "dread reports the entry's size, got %u", found_size);
     CHECK(call(DCLOSE, dd, 0, 0, 0) == 0, "dclose succeeds");
+#ifndef _WIN32
+    /* A Memory Stick directory lists ".", ".." and then its files in the
+     * order they were made, as a FAT directory's slots run (saveprobe v2
+     * steps 86, 90 and 107, fw 6.60), not by name or the host's order. */
+    {
+        static const char *const later[2] = { "ms0:/PSP/SAVEDATA/ZZZ/ZB.BIN", "ms0:/PSP/SAVEDATA/ZZZ/AA.BIN" };
+        for (int k = 0; k < 2; k++) {
+            fd = call(OPEN, guest_name(later[k]), 0x602, 0777, 0);
+            call(WRITE, fd, SRC, 4, 0);
+            call(CLOSE, fd, 0, 0, 0);
+        }
+        static const char *const want[5] = { ".", "..", "DATA.BIN", "ZB.BIN", "AA.BIN" };
+        char got[5][32] = { { 0 } };
+        int n = 0;
+        dd = call(DOPEN, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0, 0, 0);
+        while (call(DREAD, dd, DIR, 0, 0) == 1 && n < 5) psp_str(DIR + 88, got[n++], sizeof got[0]);
+        call(DCLOSE, dd, 0, 0, 0);
+        int ok = n == 5;
+        for (int k = 0; k < n && k < 5; k++) ok &= !strcmp(got[k], want[k]);
+        CHECK(ok, "ms0 lists in creation order: %s %s %s %s %s", got[0], got[1], got[2], got[3], got[4]);
+        for (int k = 0; k < 2; k++) call(REMOVE, guest_name(later[k]), 0, 0, 0);
+    }
+#endif
 
     CHECK(call(REMOVE, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0, 0, 0) == 0,
           "remove deletes");

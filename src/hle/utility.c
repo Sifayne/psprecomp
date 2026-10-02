@@ -594,6 +594,10 @@ static void sd_write_sfo(const char *dir, const char *dirname, uint32_t param) {
     sd_make_parents(guest);
     char host[1024];
     psp_io_host_path(guest, host, sizeof host);
+    /* Made anew each time, not rewritten in place, so it lists after every
+     * file written before it: after a WRITEDATASECURE of DATA2.BIN the save
+     * reads DATA.BIN DATA2.BIN PARAM.SFO (saveprobe v2 step 86, fw 6.60). */
+    remove(host);
     FILE *f = fopen(host, "wb");
     if (!f) sd_io_error = 1;
     else {
@@ -917,23 +921,24 @@ static uint32_t sd_do_list(uint32_t param, const char *game, const char *pattern
     return SD_OK;
 }
 
-/* Write the data file, SFO and sidecars for a save-shaped mode into dir,
+/* Write the sidecars, data file and SFO for a save-shaped mode into dir,
  * whose PARAM.SFO names the save dirname. Empty fileName writes everything
  * but the data file (the suite's empty-filename trials pin exactly that:
- * dir plus PARAM.SFO, result 0). */
+ * dir plus PARAM.SFO, result 0). In that order, which is the order the
+ * save then lists in: ICON0.PNG DATA.BIN PARAM.SFO (saveprobe v2 step 90,
+ * fw 6.60), DATA.BIN PARAM.SFO without an icon (steps 5-41). */
 static void sd_write_save(uint32_t param, const char *dir, const char *dirname, const char *file) {
     char guest[512], leaf[64];
     snprintf(leaf, sizeof leaf, "%s", file);
+    psp_io_mkdir_all(dir);
+    sd_write_sidecars(dir, param);
     if (leaf[0]) {
         snprintf(guest, sizeof guest, "%s/%s", dir, leaf);
         uint32_t buf = psp_read32(param + SD_DATABUF);
         uint32_t sz = psp_read32(param + SD_DATASZ);
         sd_write_file(guest, buf, (buf && sz) ? sz : 0);
-    } else {
-        psp_io_mkdir_all(dir);
     }
     sd_write_sfo(dir, dirname, param);
-    sd_write_sidecars(dir, param);
 }
 
 #include "savedata_io.h"
