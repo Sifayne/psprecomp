@@ -651,9 +651,13 @@ geprobe 7, fw 6.60):
     bits after the leading one and interpolated by the next 8. With the
     light at (a/128, b/128, 1) 2^j over a vertex at the origin and D = +z,
     L.D is the table's output itself; 128 segments fit every point to the
-    last bit where 64 leave kinks. The entries are measured: the value is
-    ceil(2^17/sqrt(knot)) in 217 of the 219 the readings pin down, and no
-    rule gives the slope. 37 entries still allow more than one value.
+    last bit where 64 leave kinks. geprobe 18 (scene 120) reads it at all
+    65,536 16-bit inputs in [1, 4) the same way, so each entry's 256
+    outputs are known and exactly one value and slope give them. Every
+    entry is then a formula: value floor(2^17/sqrt(knot)) + 1, slope
+    2 floor(c/4), c the exact chord to the next knot. (Set 18's readings
+    had left 37 entries open; the rule that filled them was wrong in two.)
+    The 1/w table follows neither rule.
   - L (the light minus the vertex, or a directional light's vector) is
     normalised component by component, each cut to 16 bits.
   - The spot direction and the normal are not. The GE takes the dot
@@ -770,14 +774,14 @@ Python).
 
 Scene 20, the skinned triangle that was 54 pixels off, now matches.
 
-## Still open after geprobe 17
+## Still open after geprobe 18
 
-These are what geprobe 17 (fw 6.60) still shows psprecomp getting wrong,
-with pixels off on run 17 (set 18). Run 17 drew every scene it shares with
-run 16 the same, byte for byte. Details on the geprobe 7 items, and what
+These are what geprobe 18 (fw 6.60) still shows psprecomp getting wrong,
+with pixels off on run 18 (set 19). Run 18 drew every scene it shares with
+run 17 the same, byte for byte. Details on the geprobe 7 items, and what
 further probing could settle, are in `fw660-run7/findings/geprobe.md`.
 Vertex depth, patch positions, colour planes, line colours, skinning and
-lighting's factors are settled (above).
+lighting's factors, its 1/sqrt included, are settled (above).
 
 - **Patch line order** (scene 23: 1 pixel). Two segments of a patch's
   line strips cross at (375,211), and the PSP's colour there is the other
@@ -791,9 +795,6 @@ lighting's factors are settled (above).
 - **What follows a hanging division** (scenes 80 and 81: 12 and 108). A
   patch division of 65 to 127 hangs the GE and the probe breaks the list;
   psprecomp skips the patch and draws the rest.
-- **The rest of the 1/sqrt table.** 37 of its 256 entries still allow two
-  or more values, taken by a rule (ge.c ge_rsq_tab). A dense sweep of those
-  segments through scene 115's cutoff search would pin them.
 - **Lighting's inputs under real matrices.** Every lighting probe so far
   has view and world identity; psprecomp takes the eye-space position and
   normal in float and cuts them to 16 bits on the way in.

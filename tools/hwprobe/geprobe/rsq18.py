@@ -5,8 +5,11 @@ geprobe 17 found the GE's 1/sqrt to be a table like 1/w's: 128 entries for each 
 of the exponent, a value V and a slope S each, indexed by the 16-bit significand's top 7
 bits after the leading one and interpolated by the next 8, l:
     q = (128 V - S l - 1) >> 8,   1/sqrt(s) = q 2^-16 2^-(E - p)/2,   s = sig 2^(E - 15)
-(lights17.py GE_RSQ, ge.c ge_rsq_tab). Its readings pinned 219 entries; 37 still allow
-more than one (V, S). The input is always a 16-bit number (a GE sum, L.L, cut to 16
+(lights17.py GE_RSQ, ge.c ge_rsq_tab). Its readings pinned 219 entries; 37 still allowed
+more than one (V, S). Set 19 (fw 6.60) answered: with all 256 outputs of each entry, one
+(V, S) fits each, two of them not what set 18 chose, and every entry is a formula:
+V = floor(2^17/sqrt(knot)) + 1 and S = 2 floor(c/4), c the exact chord to the next knot
+(rsq18.formula). The input is always a 16-bit number (a GE sum, L.L, cut to 16
 bits), so there are 65536 of them in [1, 4), and the table repeats by 4. This scene
 reads all of them: for each s, a light at (px, py, 1) over a vertex at the origin with
 D = +z, px and py chosen so that the GE's L.L (patch13 ge_sum) is s exactly, so the
@@ -59,9 +62,16 @@ def find_p(s):
             if s_of(px, py) == s: return px, py
     return None
 
+# The table the probe shipped with (set 18's): GE_RSQ but for the two entries set 19 corrected.
+# The search brackets, and so the probe's input CRC, are centred on it; keep it as it was.
+SHIPPED = {(0, 92): (99979, 113), (0, 100): (98209, 107)}
+
 def predicted(s):
-    """The current table's 1/sqrt(s), as the cutoff code the search should find."""
-    return L.code(P13.ge_cut(L.ge_rsqrt16(s)))
+    """Set 18's table's 1/sqrt(s), as the cutoff code the search should find."""
+    m, e = math.frexp(s); sig = int(m * 65536); E = e - 1
+    p, t, l = E & 1, (sig & 0x7FFF) >> 8, sig & 0xFF
+    V, S = SHIPPED.get((p, t), L.GE_RSQ[p][t])
+    return L.code(P13.ge_cut(((128 * V - S * l - 1) >> 8) / 65536 * 2.0 ** (-(E - p) // 2)))
 
 _G = []
 def geometries():
@@ -118,7 +128,7 @@ def compare(dumpdir):
     G = geometries(); R = read(dumpdir)
     flagged = sum(1 for r in R if r[1])
     same = sum(1 for (px, py, pc), r in zip(G, R) if r[0] == pc and not r[1])
-    print(f'120 rsqfull: {N} inputs, {flagged} flagged, {same} as the current table predicts')
+    print(f'120 rsqfull: {N} inputs, {flagged} flagged, {same} as set 18\'s table predicts')
     # each input's q, from its code: x = q/65536 for s in [1, 4)
     fits = {}; nofit = []
     for p in (0, 1):
@@ -128,7 +138,7 @@ def compare(dumpdir):
                 k = (p << 15) | (t << 8) | l
                 code = R[k][0]
                 qs.append(round(L.uncode(code) * 65536))
-            V0, S0 = L.GE_RSQ[p][t]
+            V0, S0 = SHIPPED.get((p, t), L.GE_RSQ[p][t])
             sols = [(V, S) for V in range(V0 - 8, V0 + 9) for S in range(max(0, S0 - 8), S0 + 9)
                     if all(q_of(V, S, l) == qs[l] for l in range(256))]
             fits[(p, t)] = sols
@@ -137,10 +147,19 @@ def compare(dumpdir):
     print('   entries with a (V, S) that fits all 256 inputs:', sum(1 for v in fits.values() if v), 'of 256;',
           'solutions per entry', sorted(Counter(len(v) for v in fits.values()).items()))
     changed = [(k, L.GE_RSQ[k[0]][k[1]], v) for k, v in fits.items() if v and tuple(L.GE_RSQ[k[0]][k[1]]) not in v]
-    print('   entries whose current (V, S) does not fit:', len(changed))
+    print('   entries whose (V, S) in lights17.GE_RSQ does not fit:', len(changed))
     for k, old, v in changed[:40]: print('     ', k, 'now', old, 'fits', v[:4])
     if nofit: print('   no (V, S) fits:', nofit[:20])
+    fv = sum(1 for k, v in fits.items() if v and v[0] == formula(*k))
+    print('   entries the formula gives (V = floor(2^17/sqrt(knot)) + 1, S = 2 floor(chord/4)):', fv, 'of 256')
     return fits
+
+def formula(p, t):
+    """Set 19's table as a rule: every one of its 256 entries is this."""
+    ex = lambda k: 2**17 / math.sqrt(k)
+    knot = (1 + t / 128) * (2 if p else 1)
+    nxt = (1 + (t + 1) / 128) * (2 if p else 1)
+    return math.floor(ex(knot)) + 1, 2 * math.floor((ex(knot) - ex(nxt)) / 4)
 
 def check():
     G = geometries()

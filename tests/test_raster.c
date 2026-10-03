@@ -1206,6 +1206,52 @@ static void test_light_ge(void) {
     }
 }
 
+/* The lighting's 1/sqrt, read exactly the way geprobe 18 read it (fw 6.60,
+ * scene 120): a spot over a vertex at the origin with D = +z and the light at
+ * (px, py, 1), so the spot's L.D is 1/sqrt(L.L) itself, and the PSP's value
+ * is the largest cutoff code that still lights the point. Each case is lit
+ * at that code and dark one code higher. Inputs 23646 and 25779 fall in the
+ * two entries set 18 could not pin and ge.c had wrong by one. */
+static void test_rsqrt_ge(void) {
+    static const struct { uint32_t px, py, code; } C[] = {
+        { 0x00000000u, 0x00000000u, 0x3F8000 },   /* s = 1 */
+        { 0x3F597800u, 0x00000000u, 0x3F431B },   /* input 23646: s = 1.72161865 */
+        { 0x3F631100u, 0x00000000u, 0x3F3F86 },   /* input 25779: s = 1.78671265 */
+        { 0x3F7FFF00u, 0x00000000u, 0x3F3506 },   /* input 32767: s = 1.99996948 */
+        { 0x3FA39200u, 0x00000000u, 0x3F1DC5 },   /* input 43139: s = 2.63299561 */
+        { 0x3FDDB300u, 0x3C000000u, 0x3F0000 },   /* input 65535: s = 3.99993896 */
+    };
+    for (unsigned c = 0; c < sizeof C / sizeof C[0]; c++)
+        for (int up = 0; up < 2; up++) {
+            psp_ge_reset(); clear_fb();
+            begin_list_vtype((3u << 5) | (3u << 7));
+            for (int m = 0; m < 2; m++) {
+                cmd((uint8_t)(0x3A + 2 * m), 0);
+                for (int i = 0; i < 12; i++) cmd((uint8_t)(0x3B + 2 * m), i % 4 == 0 ? 0x3F8000 : 0);
+            }
+            cmd(0x3E, 0);
+            for (int i = 0; i < 16; i++) cmd(0x3F, i == 15 ? 0x3F8000 : 0);
+            cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+            cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+            cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+            cmd(0x17, 1); cmd(0x18, 1); cmd(0x5E, 0);
+            cmd(0x53, 0); cmd(0x54, 0); cmd(0x55, 0); cmd(0x56, 0xFFFFFF); cmd(0x57, 0xFFFFFF); cmd(0x5C, 0);
+            cmd(0x5F, 2u << 8);                                /* spot, diffuse */
+            cmd(0x63, C[c].px >> 8); cmd(0x64, C[c].py >> 8); cmd(0x65, 0x3F8000);
+            cmd(0x6F, 0); cmd(0x70, 0); cmd(0x71, 0x3F8000);   /* D = +z */
+            cmd(0x7B, 0x3F8000); cmd(0x7C, 0); cmd(0x7D, 0);
+            cmd(0x87, 0x3F8000); cmd(0x8B, C[c].code + (uint32_t)up);
+            cmd(0x8F, 0); cmd(0x90, 0xFFFFFF); cmd(0x91, 0);
+            const uint32_t v[6] = { C[c].px, C[c].py, 0x3F800000u, 0, 0, 0 };   /* normal = L, vertex at 0 */
+            for (int i = 0; i < 6; i++) psp_write32(VERTS + 4u * (uint32_t)i, v[i]);
+            cmd(0x04, (0u << 16) | 1);
+            end_list();
+            const int lit = (pixel(240, 136) & 0xFFFF00u) != 0;
+            CHECK(lit == !up, "case %u: cutoff %06X %s, the PSP's %s", c, C[c].code + (unsigned)up,
+                  lit ? "lit" : "dark", up ? "dark" : "lit");
+        }
+}
+
 /* A spline point's colour is de Boor's algorithm on the control colours
  * with 8-bit parameters and 1/128 cuts (ge.c deboor_fix), not a blend by
  * exact weights. geprobe 9 (fw 6.60) scene 54: a uniform span (fill/fill,
@@ -2146,6 +2192,7 @@ int main(void) {
     test_vertex_depth_ge();
     test_skin_ge();
     test_light_ge();
+    test_rsqrt_ge();
     test_patch_points_ge();
     test_colour_plane_anchor();
     test_line_rules();

@@ -2269,11 +2269,13 @@ static float ge_pow(float x, float k) {
  *    bits after the leading one and interpolated by the next 8 (ge_rsqrt16).
  *    The light at (a/128, b/128, 1) 2^j over a vertex at the origin, with
  *    D = +z, reads it directly: its 128-segment chords fit every point to
- *    the last bit where 64 segments leave kinks. The entries are measured,
- *    not computed: the value is ceil(2^17/sqrt(knot)) in 217 of the 219
- *    the readings pin down, but no rule gives the slope. 37 still allow more
- *    than one entry; they take the value ceil(2^17/sqrt(knot)) where they
- *    can, then the slope nearest half the chord.
+ *    the last bit where 64 segments leave kinks. geprobe 18 (scene 120)
+ *    reads it at every one of its 65536 16-bit inputs in [1, 4) the same
+ *    way, so each entry's 256 outputs are known and exactly one value and
+ *    slope give them. Every entry is then a formula: the value
+ *    floor(2^17/sqrt(knot)) + 1, the slope 2 floor(c/4), c the exact chord
+ *    2^17/sqrt(knot) - 2^17/sqrt(next knot) (the last knot's next being 2
+ *    or 4). The table below is that, as measured.
  *  - L, the light minus the vertex (or a directional light's vector), is
  *    normalised component by component: L times 1/sqrt(L.L), each cut to 16
  *    bits.
@@ -2304,8 +2306,8 @@ static const uint32_t ge_rsq_tab[2][128][2] = {
         { 107020, 138 }, { 106743, 136 }, { 106467, 136 }, { 106194, 134 }, { 105923, 134 }, { 105653, 132 }, { 105386, 132 }, { 105121, 130 },
         { 104858, 130 }, { 104597, 128 }, { 104338, 128 }, { 104080, 126 }, { 103825, 126 }, { 103571, 124 }, { 103320, 124 }, { 103070, 124 },
         { 102822, 122 }, { 102576, 122 }, { 102331, 120 }, { 102088, 120 }, { 101847, 118 }, { 101608, 118 }, { 101370, 118 }, { 101134, 116 },
-        { 100900, 116 }, { 100667, 114 }, { 100436, 114 }, { 100206, 112 }, { 99979, 113 }, { 99752, 112 }, { 99527, 110 }, { 99304, 110 },
-        { 99082, 110 }, { 98861, 108 }, { 98642, 108 }, { 98425, 108 }, { 98209, 107 }, { 97994, 106 }, { 97781, 104 }, { 97569, 104 },
+        { 100900, 116 }, { 100667, 114 }, { 100436, 114 }, { 100206, 112 }, { 99978, 112 }, { 99752, 112 }, { 99527, 110 }, { 99304, 110 },
+        { 99082, 110 }, { 98861, 108 }, { 98642, 108 }, { 98425, 108 }, { 98209, 106 }, { 97994, 106 }, { 97781, 104 }, { 97569, 104 },
         { 97358, 104 }, { 97149, 102 }, { 96941, 102 }, { 96735, 102 }, { 96530, 100 }, { 96326, 100 }, { 96123, 100 }, { 95922, 100 },
         { 95722, 98 }, { 95523, 98 }, { 95326, 98 }, { 95129, 96 }, { 94934, 96 }, { 94740, 96 }, { 94547, 94 }, { 94356, 94 },
         { 94165, 94 }, { 93976, 94 }, { 93788, 92 }, { 93601, 92 }, { 93415, 92 }, { 93230, 90 }, { 93047, 90 }, { 92864, 90 },
