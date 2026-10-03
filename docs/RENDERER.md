@@ -524,16 +524,30 @@ ge_rcp16, ge_screen_z, clip_to_fx16):
   middle corner lies left of the long edge, the plane starts from the
   rightmost corner, and when it lies right, from the leftmost; two corners
   level at the top or bottom count the left one as the end, so a flat-
-  topped or flat-bottomed triangle starts from its leftmost. Colour and fog
-  keep the leftmost corner (geprobe 1 steps 1-11 and scene 39's 78
-  triangles break under the depth rule). geprobe 10 scene 57 settles it: it
-  draws scene 48's 48 3D triangles again in through mode at psprecomp's
-  corners, with the depth the PSP gives each corner as a point, and this
-  rule reproduces every pixel of all 48, where the leftmost corner fits 28
-  and no single corner or feature (top, bottom, depth, angle, the edge
-  opposite) fits more than 31. With those corner depths it fits 47 of
+  topped or flat-bottomed triangle starts from its leftmost. geprobe 10 scene 57 settled it
+  for depth: it draws scene 48's 48 3D triangles again in through mode at
+  psprecomp's corners, with the depth the PSP gives each corner as a point,
+  and this rule reproduces every pixel of all 48, where the leftmost corner
+  fits 28 and no single corner or feature (top, bottom, depth, angle, the
+  edge opposite) fits more than 31. With those corner depths it fits 47 of
   scene 48's 3D triangles too (the 48th has a corner a sixteenth off), so
   the 3D path is the same. Scenes 17, 27 and 36 match on every pixel.
+- **Colour, fog and the secondary colour start from the same corner** as
+  depth, with the same gradient arithmetic: each channel the numerator
+  times 1/area floored to 1/1024 a pixel, the value floored and clamped,
+  the secondary colour floored on its own and added after the texture
+  function. All three corners compete, inside the scissor or not, and so
+  for depth too. geprobe 14 (fw 6.60) scenes 83-98 settle it over every
+  orientation, vertex order, tie, sub-pixel offset, scissor case, gradient
+  from 1/4 pixel wide to an anchor 2000 pixels away, strips and fans,
+  alpha, fog and secondary planes, through mode, 3D and perspective. This
+  matches every plane. The leftmost corner, which colour took until then,
+  is 283 to 28,025 pixels off a scene. So is every other corner or tie
+  rule, an anchor among the corners inside the scissor (11,325 pixels, and
+  10,584 of depth), and every other gradient arithmetic (truncated,
+  rounded, exact, finer, wrapped, clamped, a start bias of 1/16384 or
+  more). It took scenes 16, 21 and 26 to no pixel off, and 22 and 23 to
+  their lines.
 - **1/area comes from a table** with a linear step (area_rcp), not a
   division. The area's significand is cut to 17 bits. Its leading nine
   bits, h, pick one of 256 entries holding 2^27/h and the slope 2^24/h²,
@@ -671,34 +685,33 @@ psprecomp places every one on the PSP's pixel with its depth.
   clamping is off (every geprobe 13 calibration point with clip z in
   (-w, 0), or over 65535, is absent).
 
-## Still open after geprobe 13
+## Still open after geprobe 14
 
-These are what geprobe 13 (fw 6.60) still shows psprecomp getting wrong,
-with pixels off on run 13 (set 14). Run 13 drew every scene it shares with
-run 12 the same, byte for byte. Its log matches psprecomp's on 95 of 124
-steps; the patch scenes 67-82 that still differ in the log do so only in
-their GE timing lines, and their frames match but for scenes 75 (the
-colour planes below) and 80 and 81 (what follows a division that hangs
-the GE). Details on the geprobe 7 items, and what further probing could
-settle, are in `fw660-run7/findings/geprobe.md`. Vertex depth and patch
-positions are settled (above).
+These are what geprobe 14 (fw 6.60) still shows psprecomp getting wrong,
+with pixels off on run 14 (set 15). Run 14 drew every scene it shares with
+run 13 the same, byte for byte. Its log matches psprecomp's on 98 of 140
+steps; the patch and colour scenes still listed in the log differ only in
+their GE timing lines, apart from the frames below. Details on the geprobe
+7 items, and what further probing could settle, are in
+`fw660-run7/findings/geprobe.md`. Vertex depth, patch positions and colour
+planes are settled (above).
 
-- **Patch triangle colours** (scene 22: 306 pixels; scene 23: 115; scene
-  26: 568; scene 75: 747). Patch positions are settled (Patches, above),
-  and what is left is one step of colour inside patch triangles. The PSP
-  draws those exactly as plain triangles with the same corner colours
-  (scene 75), so this is the triangle colour-plane question below, not
-  tessellation.
-- **Lit triangles** (scene 16: 325 pixels). Every pixel off is one step
-  in a channel, and all fall in the same four triangles of each fan (the
-  two on either side of the vertical, on the left), whatever the light:
-  directional, point and single-colour alike, and none in the spot fan. So
-  it is the triangles' shape, not the lighting arithmetic. These are colour
-  planes, which keep the leftmost corner; anchoring them at the top,
-  bottom, rightmost, first or last vertex instead, or by the depth plane's
-  rule, makes scene 16 worse (395 to 1079).
-- **Morph blends** (scene 21: 400) and **skinned corners** (scene 20: 54)
-  are unchanged by the projection change.
+- **Line colours** (scene 22: 45 pixels; scene 23: 9; scene 75: 747). All
+  on lines, not triangles: the patch line strips of 22 and 23 a step or
+  two off along diagonals, and scene 75's lines mostly in green (+11 to
+  +128), which looks like which end's or segment's colour a line takes.
+- **Through-mode triangle fans** (scene 88: 8452 pixels). psprecomp draws
+  none; the GE does (render.c sw_draw leaves fans to the GE, but a
+  through-mode batch reaches it unassembled).
+- **Far-off corners' edges** (scene 98: 80 pixels). With corners up to
+  2000 pixels outside the scissor the PSP covers one more pixel a row
+  along one edge, a staircase of 80; the edge arithmetic at that range.
+- **What follows a hanging division** (scenes 80 and 81: 12 and 108). A
+  patch division of 65 to 127 hangs the GE and the probe breaks the list;
+  psprecomp skips the patch and draws the rest.
+- **A skinned corner** (scene 20: 54). All in one triangle, the 3-weight
+  float skin with a rotated bone; moving its 404040 corner up a sixteenth
+  fixes every pixel. Skinning arithmetic, not colour.
 - **Point and spot lights** (scene 35: 10 pixels), each one step low, all
   where the GE's power function is used.
 - **Steep line starts** (scene 49: 4 pixels): a start on a diamond's upper

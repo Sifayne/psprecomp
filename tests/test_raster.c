@@ -1152,6 +1152,37 @@ static void test_depth_plane_side(void) {
               P[i].x, P[i].y, depth_at(P[i].x, P[i].y), P[i].z);
 }
 
+/* A colour plane starts from the depth plane's corner (render.c sw_tri):
+ * the end of the long edge on that edge's side. geprobe 14 (fw 6.60) scene
+ * 83's triangle 33, drawn in through mode, has its middle corner left of
+ * its long edge, so its planes start from the rightmost corner, and these
+ * ten pixels read a step higher in one channel than from the leftmost. */
+static void test_colour_plane_anchor(void) {
+    static const struct { int x, y; uint32_t c; } P[] = {
+        { 86, 190, 0x883347 }, { 92, 190, 0x8F3D38 }, { 90, 191, 0x8F3E43 }, { 93, 191, 0x93433B },
+        { 86, 192, 0x8D3C53 }, { 88, 192, 0x8F3F4E }, { 91, 192, 0x934446 }, { 86, 193, 0x8F4159 },
+        { 89, 193, 0x934651 }, { 84, 194, 0x8F4264 } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    float_vertex(0, 1687 / 16.0f, 3468 / 16.0f, 0);
+    float_vertex(1, 1453 / 16.0f, 2968 / 16.0f, 0);
+    float_vertex(2, 1127 / 16.0f, 3308 / 16.0f, 0);
+    psp_write32(VERTS + 0 * 16, 0xFFE2CDABu);
+    psp_write32(VERTS + 1 * 16, 0xFF812320u);
+    psp_write32(VERTS + 2 * 16, 0xFF9C64CFu);
+    cmd(0x04, (3u << 16) | 3);
+    end_list();
+    int bad = 0;
+    for (unsigned i = 0; i < sizeof P / sizeof P[0]; i++) {
+        const uint32_t got = pixel(P[i].x, P[i].y) & 0xFFFFFFu;
+        if (got != P[i].c) {
+            bad++;
+            CHECK(0, "colour at (%d,%d): %06X, hardware %06X", P[i].x, P[i].y, got, P[i].c);
+        }
+    }
+    CHECK(bad == 0, "%d of 10 colour-plane pixels off the PSP's", bad);
+}
+
 /* Gradients take 1/area from the GE's reciprocal table (render.c area_rcp),
  * which is a unit off the reciprocal cut to 16 bits where its linear step
  * misses. geprobe 8 (fw 6.60) scene 50's triangles 517/16 and 885/16 pixels
@@ -1899,6 +1930,7 @@ int main(void) {
     test_transformed_depth();
     test_vertex_depth_ge();
     test_patch_points_ge();
+    test_colour_plane_anchor();
     test_gradient_reciprocal();
     test_depth_plane_side();
     test_spline_colour();

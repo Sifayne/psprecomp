@@ -1160,53 +1160,43 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      *
      *     c(px, py) = cA + gx * (px - xA) + gy * (py - yA)
      *
-     * at the pixel centre, where A is the leftmost vertex (ties: the upper
-     * one); gx and gy are the numerators times area_rcp's 1/area, floored
-     * to 1/1024 a pixel, as for depth below; the result is floored and
-     * clamped. It reproduces every triangle of geprobe 1 steps 1-11, 18
-     * and 19, alpha included. The rounded barycentric blend this replaces
-     * was one step off on most Gouraud pixels; anchoring at the first or the
-     * topmost vertex fails steps 1-10.
+     * at the pixel centre; gx and gy are the numerators times area_rcp's
+     * 1/area, floored to 1/1024 a pixel, as for depth below; the result is
+     * floored and clamped. It reproduces every triangle of geprobe 1 steps
+     * 1-11, 18 and 19, alpha included, and all 78 of geprobe 6 scene 39's,
+     * built to measure the gradient's precision (the exact gradient floored
+     * matches 69, a 16-bit reciprocal cut toward zero 75).
      *
-     * geprobe 6 (fw 6.60) scene 39, built to measure gradient precision,
-     * matches on all 78 of its triangles with area_rcp's table; the exact
-     * gradient floored matches 69 and a 16-bit reciprocal cut toward zero
-     * 75. Scene 17's 3D quads go from 81 pixels off to none. Scene 20's
-     * skinned triangles, which the cut reciprocal took from 54 pixels off to
-     * 101, are back at 54, and scene 26 goes from 1190 to 1087.
+     * A, the corner the plane starts from, is the depth plane's: the end of
+     * the long edge (top to bottom) on that edge's side -- the rightmost
+     * corner when the middle one lies left of the long edge, the leftmost
+     * when it lies right, ties to the upper, and of two corners level at
+     * the bottom the left one (see zk0 below). All three corners compete,
+     * on screen or off and inside the scissor or not. geprobe 14 (fw 6.60)
+     * scenes 83-98 settle it: one triangle at 48 orientations, 8 shapes in
+     * 6 vertex orders, ties swept through by sixteenths, every sub-pixel
+     * offset, corners outside the scissor, gradients from 1/4 pixel wide to
+     * anchors 2000 pixels away, strips and fans, alpha, fog and the
+     * secondary colour, through mode, 3D and perspective. This matches every
+     * plane of them; the leftmost corner, which colour took until then, is
+     * 283 to 28,025 pixels off a scene, and so is every other corner or
+     * tie rule tried, an anchor among the corners inside the scissor (11,325
+     * in scene 87, and its depth twin 97 10,584), and every other gradient
+     * arithmetic (truncated, rounded, exact, finer, wrapped, clamped, a start
+     * bias of 1/16384 or more). Across geprobe 13's dumps it fixes all 1612
+     * colour pixels left in scenes 16, 21, 22, 23 and 26, every one in a
+     * triangle whose middle corner lies left of its long edge, where the
+     * leftmost corner and this one differ, and changes no other.
      *
-     * The anchor holds in 3D wherever psprecomp's corners are certain:
-     * every 3D triangle of scenes 20, 39 and 40 that fits one or two anchors
-     * fits the leftmost. The 42 of 205 such triangles that fit another are
-     * all lit, morphed, skinned or tessellated (scenes 16, 21, 22, 23, 26),
-     * where a corner's colour or place one step or sixteenth off moves the
-     * best anchor too.
-     *
-     * Which vertices compete depends on the mode. Transformed triangles take
-     * the leftmost of all three: geprobe 2 scene 15's fogged floor has a
-     * corner at (-388, 371) and its colour and fog match on every pixel when
-     * anchored there, where its one on-screen corner leaves 7337 off.
-     * Through-mode triangles take the leftmost among the vertices inside the
-     * scissor, or among all three when none is: geprobe 1 step 18's triangle
-     * with corners at (-100, 200) and (100, 600) matches only when anchored
-     * at its third, (200, 150). "Inside" looks at the pixel coordinate's low
-     * ten bits only, the scissor registers' width: geprobe 5 scene 28's
-     * triangle with a corner saturated to x = -2048 (0 in ten bits) matches
-     * only when anchored there, where its two on-screen corners leave 12007
-     * pixels off, and the -100 above is 924 in ten bits, outside. That is a
-     * fit to these two, not a mechanism anyone has seen. What makes
-     * transformed triangles differ is not known.
-     * (A transformed vertex is one the GE projected: psp_vertex.precise.)
-     *
-     * The fog coefficient is a fifth plane through the same anchor, by the
-     * same rule: scene 15's floor and quads, every pixel.
+     * The fog coefficient is a fifth plane through the same corner, and a
+     * lit triangle's secondary colour (psp_vertex.spec) three more, 5 to 7,
+     * each floored on its own and added to the colour per pixel, then
+     * clamped: of scene 95's 26,998 pixels where that differs from one plane
+     * through the summed corners, every one reads the sum.
      *
      * Flat shading (SHADE clear) skips the colour planes: the whole triangle
      * is last_rgba. Measured on a triangle list; a strip's triangle takes its
      * own third vertex by the same rule, which is not measured.
-     *
-     * A lit triangle's secondary colour (psp_vertex.spec) is three more planes
-     * by the same rule, 5 to 7, added to the colour per pixel and clamped.
      *
      * Kept in 1/16384ths of a channel (1/1024 of a step times the 1/16 grid)
      * so every pixel is exact integer arithmetic. */
@@ -1217,18 +1207,10 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     const int nplanes = sec ? 8 : 5;
     {
         const psp_vertex *vs[3] = { a, b, c };
-        int inside[3], any = 0, k0 = -1;
-        for (int k = 0; k < 3; k++) {
-            const int wx = (vs[k]->x >> 4) & 1023, wy = (vs[k]->y >> 4) & 1023;
-            inside[k] = vs[k]->precise ||
-                        (wx >= g_sc_x0 && wx <= g_sc_x1 && wy >= g_sc_y0 && wy <= g_sc_y1);
-            any |= inside[k];
-        }
-        /* The depth plane starts from another corner than the colour's:
-         * the end of the long edge (top to bottom) on the long edge's side.
-         * With the middle corner left of that edge the long edge is the
-         * right side and depth starts from the rightmost corner; with it
-         * right, from the leftmost (see the depth plane below). */
+        /* Every plane starts from the end of the long edge (top to bottom)
+         * on the long edge's side. With the middle corner left of that edge
+         * the long edge is the right side and the planes start from the
+         * rightmost corner; with it right, from the leftmost. */
         int z_from_right, zk0 = -1;
         {
             int o[3] = { 0, 1, 2 };                           /* by y, then x */
@@ -1246,14 +1228,11 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             const psp_vertex *tv = vs[o[0]], *mv = vs[o[1]], *bv = vs[o[2]];
             z_from_right = (int64_t)(bv->x - tv->x) * (mv->y - tv->y) - (int64_t)(bv->y - tv->y) * (mv->x - tv->x) >= 0;
         }
-        for (int k = 0; k < 3; k++) {
-            if (any && !inside[k]) continue;
-            if (k0 < 0 || vs[k]->x < vs[k0]->x || (vs[k]->x == vs[k0]->x && vs[k]->y < vs[k0]->y))
-                k0 = k;
+        for (int k = 0; k < 3; k++)
             if (zk0 < 0 || (z_from_right ? vs[k]->x > vs[zk0]->x : vs[k]->x < vs[zk0]->x) ||
                 (vs[k]->x == vs[zk0]->x && vs[k]->y < vs[zk0]->y))
                 zk0 = k;
-        }
+        const int k0 = zk0;
         int64_t rq; int rsh;
         area_rcp(area, &rq, &rsh);
         for (int i = flat ? 4 : 0; i < nplanes; i++) {
@@ -1294,9 +1273,11 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
          * The right triangles of scenes 27, 46 and 50, which settled the
          * plane, have their middle corner right of a vertical long edge, so
          * there the rule is the leftmost, as before; scenes 17 and 36 go to
-         * no pixel off and scene 27 from 1867 to 1290. What is left is the
-         * corners' own depths (scene 57: 6 of 144 a step deeper on the PSP,
-         * docs/RENDERER.md). */
+         * no pixel off and scene 27 from 1867 to 1290; with geprobe 12's
+         * vertex depths every 3D depth plane matches. Corners outside the
+         * scissor compete too: geprobe 14 scene 97 draws scene 87's
+         * triangles with corner depths, and an anchor among the corners
+         * inside the scissor is 10,584 depth pixels off where this is none. */
         {
             int64_t zv[3];
             for (int k = 0; k < 3; k++) {
@@ -1383,8 +1364,9 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                     col = apply_texfunc(texel, col);
                     g_px_tex++;
                 } else g_px_flat++;
-                /* After the texture function, which is what the mode is for;
-                 * scene 16 is untextured, so that order is not measured. */
+                /* After the texture function, which is what the mode is for:
+                 * geprobe 14 scene 95's secondary-alone row draws through a
+                 * black REPLACE texture and reads the secondary colour. */
                 if (sec)
                     for (int k = 0; k < 3; k++) {
                         const uint32_t v = chan(col, k) + plane_chan(acc[5 + k]);
@@ -1670,6 +1652,15 @@ static void sw_point_sample(const psp_vertex *v, void *opaque) {
                                        *(const int *)opaque), col);
         g_px_tex++;
     } else g_px_flat++;
+    /* A lit point's secondary colour adds after the texture function, as a
+     * triangle's does: geprobe 14 (fw 6.60) scene 95's corner points read
+     * primary plus secondary, and through a black REPLACE texture the
+     * secondary alone. */
+    if (v->spec_set)
+        for (int k = 0; k < 3; k++) {
+            const uint32_t s = chan(col, k) + chan(v->spec, k);
+            col = (col & ~(0xFFu << (8 * k))) | (s > 255 ? 255u : s) << (8 * k);
+        }
     shade_pixel(x, y, v->z, apply_fog(col, v->fog));
 }
 
