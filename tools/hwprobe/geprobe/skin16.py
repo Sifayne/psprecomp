@@ -28,6 +28,15 @@ and, where they apply,
 Weights: float as given (cut to 16 bits by ge_mul), u8 / 128, u16 / 32768 (unsigned).
 A morph blend follows the rule too: one sum (A, M, C), chained (A2), or float32 (F).
 
+Set 17 (fw 6.60) answered with none of these, but with
+    H    one accumulator (ge_acc): each step puts it and the new term on the grid
+         2^(E-15), E the larger one's own exponent, each cut toward zero, and cuts
+         the sum to 16 bits. Morphing adds mw_s v_s set by set (weights morphed the
+         same way), then the vertex is skinned once; skinning adds, bone by bone, the
+         translation, x, y, z terms (w_i B_i[k] cut) v[k] cut
+which fits every point drawn, 4171 of 4171; and a point is drawn only when |clip x|
+and |clip y| are within w (the 379 others), which H's prediction includes.
+
     skin16.py emit [OUT.inc]        write the streams (default c16_data.inc)
     skin16.py sums DUMPDIR          every scene's SUMS line against these streams
     skin16.py compare DUMPDIR [rule..]   per scene and batch: points found, depth matches per rule
@@ -48,7 +57,7 @@ GU_COLOR_8888, GU_VERTEX_32BITF = 7 << 2, 3 << 7
 def GU_WEIGHTS(n): return ((n - 1) & 7) << 14
 def GU_VERTICES(n): return ((n - 1) & 7) << 18
 GU_ALWAYS = 1
-RULES = ['A', 'A2', 'M', 'C', 'F', 'Am', 'As']
+RULES = ['H', 'A', 'A2', 'M', 'C', 'F', 'Am', 'As']
 ID = P13.ident()
 
 # =========================================================================== numbers
@@ -75,9 +84,27 @@ def wval(fmt, raw, signed=False):
     return raw
 
 # =========================================================================== the arithmetic
+def c16(v): return P13.ge_cut(v)
+def ge_acc(acc, t):
+    """One step of the skinning and morphing accumulator (set 17)."""
+    if t == 0: return acc
+    if acc == 0: return c16(t)
+    E = max(math.frexp(abs(acc))[1], math.frexp(abs(t))[1]) - 1
+    u = math.ldexp(1.0, E - 15)
+    return c16(math.trunc(acc / u) * u + math.trunc(t / u) * u)
+H_ORDER = (3, 0, 1, 2)
+
 def skin_pos(rule, bones, ws, v):
-    """Skinned model position (x, y, z) under rule A, A2, M or F."""
+    """Skinned model position (x, y, z) under rule H, A, A2, M or F."""
     v4 = [v[0], v[1], v[2], 1.0]
+    if rule == 'H':
+        out = []
+        for c in range(3):
+            acc = 0.0
+            for B, w in zip(bones, ws):
+                for k in H_ORDER: acc = ge_acc(acc, c16(c16(c16(w) * c16(B[c][k])) * c16(v4[k])))
+            out.append(acc)
+        return out
     if rule == 'F':
         out = []
         for c in range(3):
@@ -119,6 +146,10 @@ def predict_depth(rule, pt):
         return math.floor(P13.ge_sum([P13.ge_mul(zs, nz), P13.ge_mul(0.0, 1.0)]))
     sr = 'A' if rule in ('C', 'Am', 'As') else rule      # the skinning rule under it
     def blend(vals, mws):
+        if rule == 'H':
+            acc = 0.0
+            for mw, x in zip(mws, vals): acc = ge_acc(acc, c16(f24(mw)) * c16(x))
+            return acc
         if rule == 'F':
             acc = f32(0.0)
             for mw, x in zip(mws, vals): acc = f32(acc + f32(f24(mw) * f32(x)))
@@ -131,7 +162,7 @@ def predict_depth(rule, pt):
     if len(sets) == 1:
         _, v, ws = sets[0]
         pos = skin_pos(sr, pt['bones'], ws, v) if ws else list(v)
-    elif rule == 'Am' and sets[0][2]:   # morph the weights and the position, then skin once
+    elif rule in ('Am', 'H') and sets[0][2]:   # morph the weights and the position, then skin once
         mws = [mw for mw, _, _ in sets]
         v = [blend([s[1][c] for s in sets], mws) for c in range(3)]
         ws = [blend([s[2][i] for s in sets], mws) for i in range(len(sets[0][2]))]
@@ -140,6 +171,10 @@ def predict_depth(rule, pt):
         ps = [skin_pos(sr, pt['bones'], ws, v) if ws else list(v) for _, v, ws in sets]
         mws = [mw for mw, _, _ in sets]
         pos = [blend([p[c] for p in ps], mws) for c in range(3)]
+    if rule == 'H':      # a point outside the clip volume's x and y planes is not drawn
+        v4 = [pos[0], pos[1], pos[2], 1.0]
+        cw = P13.dot4(M[3], v4)
+        if not (abs(P13.dot4(M[0], v4)) <= cw and abs(P13.dot4(M[1], v4)) <= cw): return None
     d = P13.depth(M, pos[0], pos[1], pos[2], zs, 0.0)[0]
     return d if isinstance(d, int) else None
 
@@ -502,12 +537,15 @@ def compare(dumpdir, rules=None):
         for i, pt in enumerate(S.pts):
             b = pt['batch']; st = by.setdefault(b, {'n': 0, 'found': 0, **{r: 0 for r in rules}})
             st['n'] += 1
-            if i not in found: continue
+            if i not in found:
+                if 'H' in rules: st['H'] += predicted(pt, 'H') is None
+                continue
             st['found'] += 1
             for r in rules: st[r] += predicted(pt, r) == found[i][2]
         print(f'{S.num} {S.name}:')
         for b, st in sorted(by.items()):
-            print(f'   b{b}: {st["found"]}/{st["n"]} found; depth matches ' + ' '.join(f'{r}:{st[r]}' for r in rules))
+            print(f'   b{b}: {st["found"]}/{st["n"]} found; depth matches ' + ' '.join(f'{r}:{st[r]}' for r in rules)
+                  + ('  (H counts a point it predicts absent and is)' if 'H' in rules and st['found'] < st['n'] else ''))
 
 def check():
     for S in scenes():

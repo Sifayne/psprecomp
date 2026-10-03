@@ -700,16 +700,61 @@ psprecomp places every one on the PSP's pixel with its depth.
   clamping is off (every geprobe 13 calibration point with clip z in
   (-w, 0), or over 65535, is absent).
 
-## Still open after geprobe 15
+## Skinning and morphing
 
-These are what geprobe 15 (fw 6.60) still shows psprecomp getting wrong,
-with pixels off on run 15 (set 16). Run 15 drew every scene it shares with
-run 14 the same, byte for byte. Its log matches psprecomp's on 100 of 151
-steps; the patch, colour and line scenes still listed in the log differ
-only in their GE timing lines, apart from the frames below. Details on the
-geprobe 7 items, and what further probing could settle, are in
+geprobe 16 (fw 6.60, scenes 110-114) reads skinned and morphed positions
+whole through depth, as geprobe 12 read the vertex path: each point is one
+vertex with an id colour, put on its own pixel by the screen offset, and
+its depth is one skinned coordinate's top 16 bits. Of its 4550 points the
+PSP draws 4171, and psprecomp puts every one on the PSP's depth (ge.c
+ge_acc, ge_skin_axis, read_mvert; skin16.py's rule H is the same in
+Python).
+
+- **One accumulator.** Skinning and morphing both add terms one at a time
+  into a 16-bit number. Each step puts the running total and the new term
+  on the grid 2^(E-15), each cut toward zero, E the larger one's own
+  exponent, and cuts the sum to 16 bits. That is not the vertex path's
+  sum, which lines terms up by a product's ea + eb and adds them all at
+  once: one sum on one grid fits 113 of 160 four-set morph points.
+- **Skinning** adds, bone by bone, each bone's translation, x, y and z
+  terms: the weight times the bone's entry, cut to 16 bits, times the
+  coordinate, cut. Of the 8! orders of two bones' terms only that one
+  (or the first two swapped) fits all 260 points that pose it. Blending
+  the bone matrices first and then one row sum fits 135 of 160 one-bone
+  points; float32, as psprecomp did, fits 15. Up to 8 bones, weights off
+  one, negative or tiny, and bones from 2^-8 to 2^8 all fit.
+- **Weights.** A float weight is cut to 16 bits like any input. 8- and
+  16-bit weights are unsigned fractions of 0x80 and 0x8000: 0xFF and
+  0xFFFF weigh just under two (scene 111's extremes; read as signed they
+  miss).
+- **Morphing** adds each vertex set's coordinate times its morph weight
+  (the command's 24-bit float), set 0 first. A skinned vertex's weights
+  are morphed the same way and the morphed vertex is skinned once:
+  skinning each set and then morphing fits 4 of 160 points.
+- **Then the vertex path.** The skinned position takes world, view and
+  projection as any vertex does (scene 113, under non-trivial world and
+  view z rows). Folding each bone into the combined matrix instead fits 2
+  to 21 points of each batch of 131 to 150.
+- **Points outside x and y.** A point is drawn only when |clip x| and
+  |clip y| are within w, whatever the screen offset: every point drawn is
+  within 0.989 w, every one missing (379, including all of scene 20's
+  replayed corners) at least 1.005 w. Measured with depth clamping off;
+  lines are not measured.
+- Normals are still skinned in float, and colours and texture coordinates
+  still morphed in float: no probe has read them.
+
+Scene 20, the skinned triangle that was 54 pixels off, now matches.
+
+## Still open after geprobe 16
+
+These are what geprobe 16 (fw 6.60) still shows psprecomp getting wrong,
+with pixels off on run 16 (set 17). Run 16 drew every scene it shares with
+run 15 the same, byte for byte. Its log matches psprecomp's on 100 of 155
+steps; the patch, colour, line and skinning scenes still listed in the log
+differ only in their GE timing lines, apart from the frames below. Details
+on the geprobe 7 items, and what further probing could settle, are in
 `fw660-run7/findings/geprobe.md`. Vertex depth, patch positions, colour
-planes and line colours are settled (above).
+planes, line colours and skinning are settled (above).
 
 - **Patch line order** (scene 23: 1 pixel). Two segments of a patch's
   line strips cross at (375,211), and the PSP's colour there is the other
@@ -723,9 +768,6 @@ planes and line colours are settled (above).
 - **What follows a hanging division** (scenes 80 and 81: 12 and 108). A
   patch division of 65 to 127 hangs the GE and the probe breaks the list;
   psprecomp skips the patch and draws the rest.
-- **A skinned corner** (scene 20: 54). All in one triangle, the 3-weight
-  float skin with a rotated bone; moving its 404040 corner up a sixteenth
-  fixes every pixel. Skinning arithmetic, not colour.
 - **Point and spot lights** (scene 35: 10 pixels), each one step low, all
   where the GE's power function is used.
 

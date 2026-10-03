@@ -1037,6 +1037,91 @@ static void test_vertex_depth_ge(void) {
     }
 }
 
+/* Skinning and morphing in the GE's own arithmetic (ge.c ge_acc,
+ * ge_skin_axis): points the PSP drew (or did not) in geprobe 16 (fw 6.60),
+ * scenes 110-114. The projection's z row is 2^k times one model axis, w is
+ * 1 and the viewport z scale +-65536, so a point's depth is that skinned
+ * coordinate's top 16 bits; the screen offset puts the point at about
+ * (240, 136). Vertex words, bone and morph command words exactly as the
+ * probe sent them. The last case's skinned y is 2.1 w: the PSP drops a
+ * point outside the clip volume's x and y planes. */
+static void test_skin_ge(void) {
+    static const struct {
+        uint32_t vtype; int nv; uint32_t v[16];
+        int nb; uint32_t bone[3][12];
+        int nm; uint32_t mw[4];
+        int axis, k; float zs; int ox, oy, hw;
+    } C[] = {
+        /* 110 b1: two bones, float weights (point 160); float skinning gave 41861 */
+        { 0x00479Cu, 6,
+              { 0x3ED65300u, 0x3F14D600u, 0xFF0000FFu, 0xBEF16644u, 0x3EC09DF0u, 0x3F25523Cu },
+          2, { { 0x3F8000, 0x000000, 0x3CD7C3, 0x000000, 0x3F8000, 0x3C81A8, 0x000000, 0x000000, 0x3F18CF, 0x000000, 0x000000, 0x3E80CF },
+                { 0x3F8000, 0x000000, 0xBC8C7B, 0x000000, 0x3F8000, 0x3C9F8F, 0x000000, 0x000000, 0x3F0A63, 0x000000, 0x000000, 0x3E8F6D } },
+          0, { 0 }, 2, 0, 65536.0f, 1694, 1860, 41859 },
+        /* 111 b0: 8-bit weights 0xFF, 0 (point 0); float skinning gave 38950 */
+        { 0x00439Cu, 5,
+              { 0x000000FFu, 0xFF0000FFu, 0xBE86AFA3u, 0xBE822BCDu, 0x3F0695CCu },
+          2, { { 0x3F8000, 0x000000, 0xBCA499, 0x000000, 0x3F8000, 0xBCE16D, 0x000000, 0x000000, 0x3F1654, 0x000000, 0x000000, 0x3E8D24 },
+                { 0x3F8000, 0x000000, 0xBCF8B0, 0x000000, 0x3F8000, 0x3CD005, 0x000000, 0x000000, 0x3F0D4E, 0x000000, 0x000000, 0x3E8778 } },
+          0, { 0 }, 2, -1, 65536.0f, 1682, 1980, 38948 },
+        /* 114 b2: four morph sets (point 321); float skinning gave 49650 */
+        { 0x0C019Cu, 16,
+              { 0xFF0000FFu, 0xBE959D92u, 0xBEDC2439u, 0x3F2DA034u, 0xFF0000FFu, 0x3EACBAABu,
+                0xBEDE3A7Au, 0x3F30E6B0u, 0xFF0000FFu, 0x3EDED44Cu, 0x3EC73CF4u, 0x3F58AE76u,
+                0xFF0000FFu, 0x3E9A9237u, 0x3EC0B409u, 0x3F5A6C27u },
+          0, { { 0 } },
+          4, { 0x3DCDF5, 0x3EF049, 0x3E8DFC, 0x3E1C79 }, 2, 0, 65536.0f, 1878, 1923, 49649 },
+        /* 114 b3: morph sets with two bones each (point 480); float skinning gave 46938 */
+        { 0x04479Cu, 12,
+              { 0x3F2425A2u, 0x3EB7B4BCu, 0xFF0000FFu, 0x3EF975A4u, 0xBEF4A3B2u, 0x3F49BEFBu,
+                0x3EE3C29Cu, 0x3F0E1EB2u, 0xFF0000FFu, 0x3E97B35Fu, 0x3E92B16Cu, 0x3F4826EDu },
+          2, { { 0x3F8000, 0x000000, 0xBCE898, 0x000000, 0x3F8000, 0xBC88BD, 0x000000, 0x000000, 0x3F06A0, 0x000000, 0x000000, 0x3E9322 },
+                { 0x3F8000, 0x000000, 0x3CE3E3, 0x000000, 0x3F8000, 0xBCD4E5, 0x000000, 0x000000, 0x3F0E7C, 0x000000, 0x000000, 0x3E9589 } },
+          2, { 0x3F53C0, 0x3E30FF }, 2, 0, 65536.0f, 1917, 1959, 46967 },
+        /* 110 b8: clip y beyond w, not drawn (point 1269); float skinning gave 40960 */
+        { 0x00879Cu, 7,
+              { 0x3E4CCCCDu, 0x3E99999Au, 0x3F000000u, 0xFF0000FFu, 0x3FB80000u, 0x3F99999Au,
+                0xC0A00000u },
+          3, { { 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000 },
+                { 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x3FC000, 0x3F4CCC, 0x000000 },
+                { 0x000000, 0x3F8000, 0x000000, 0xBF8000, 0x000000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000 } },
+          0, { 0 }, 2, -3, -65536.0f, 1944, 1700, -1 },
+    };
+    for (unsigned c = 0; c < sizeof C / sizeof C[0]; c++) {
+        psp_ge_reset(); clear_fb();
+        begin_list_vtype(C[c].vtype);
+        cmd(0x3A, 0);
+        for (int i = 0; i < 12; i++) cmd(0x3B, i % 4 == 0 ? 0x3F8000 : 0);
+        cmd(0x3C, 0);
+        for (int i = 0; i < 12; i++) cmd(0x3D, i % 4 == 0 ? 0x3F8000 : 0);
+        float P[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+        P[C[c].axis * 4 + 2] = ldexpf(1.0f, C[c].k);
+        cmd(0x3E, 0);
+        for (int i = 0; i < 16; i++) cmd_float(0x3F, P[i]);
+        cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, C[c].zs);
+        cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 0.0f);
+        cmd(0x4C, (uint32_t)C[c].ox << 4); cmd(0x4D, (uint32_t)C[c].oy << 4);
+        for (int b = 0; b < C[c].nb; b++) {
+            cmd(0x2A, (uint32_t)(12 * b));
+            for (int i = 0; i < 12; i++) cmd(0x2B, C[c].bone[b][i]);
+        }
+        for (int m = 0; m < C[c].nm; m++) cmd((uint8_t)(0x2C + m), C[c].mw[m]);
+        depth_state(1);                                    /* ALWAYS, writes on */
+        for (int i = 0; i < C[c].nv; i++) psp_write32(VERTS + 4u * (uint32_t)i, C[c].v[i]);
+        cmd(0x04, (0u << 16) | 1);                         /* one point */
+        end_list();
+        int fx = -1, fy = -1;
+        for (int y = 133; y <= 139; y++)
+            for (int x = 237; x <= 243; x++)
+                if (pixel(x, y)) { fx = x; fy = y; }
+        if (C[c].hw < 0)
+            CHECK(fx < 0, "case %u: drawn at (%d,%d), the PSP drew nothing", c, fx, fy);
+        else
+            CHECK(fx >= 0 && depth_at(fx, fy) == C[c].hw, "case %u: depth %d, hardware %d", c,
+                  fx >= 0 ? depth_at(fx, fy) : -1, C[c].hw);
+    }
+}
+
 /* A spline point's colour is de Boor's algorithm on the control colours
  * with 8-bit parameters and 1/128 cuts (ge.c deboor_fix), not a blend by
  * exact weights. geprobe 9 (fw 6.60) scene 54: a uniform span (fill/fill,
@@ -1975,6 +2060,7 @@ int main(void) {
     test_depth_plane();
     test_transformed_depth();
     test_vertex_depth_ge();
+    test_skin_ge();
     test_patch_points_ge();
     test_colour_plane_anchor();
     test_line_rules();

@@ -1587,65 +1587,130 @@ static void read_weights(uint32_t a, float *w) {
     }
 }
 
-/* One vertex set of a record: its fields, skinned when it carries weights.
- * Skinning is the weighted sum of the vertex through each bone, ahead of the
- * world matrix; the normal goes through the bones' rotation parts. */
+/* ---- Skinning and morphing arithmetic ------------------------------------
+ *
+ * geprobe 16 (fw 6.60) reads skinned and morphed positions whole, the way
+ * geprobe 12 read the vertex path (scenes 110-114, 4171 points drawn), and
+ * every one fits this to the last bit:
+ *  - Both are one accumulator. Each step adds a term to it, putting the two
+ *    on the grid 2^(E - 15), each cut toward zero, E the larger one's own
+ *    exponent (floor log2 |x|, not a product's ea + eb as ge_sum has it), and
+ *    cuts the total to 16 bits (ge_acc). Summing all the terms at once on one
+ *    grid fits 113 of scene 114's 160 four-set points; this fits all 480 of
+ *    its morph-only ones.
+ *  - Morphing adds each vertex set's coordinate times its morph weight (the
+ *    24-bit float the command holds), set 0 first. The weights of a skinned
+ *    vertex are morphed the same way, and the morphed vertex is then skinned
+ *    once: skinning each set and morphing the results fits 4 of 160.
+ *  - Skinning adds, bone by bone, the translation, x, y and z terms of that
+ *    bone's row: (w_i B_i[k]) cut to 16 bits, times the coordinate, cut. Of
+ *    the 8! orders of two bones' terms only this one (and swapping the first
+ *    two) fits all 260 points that pose it; blending the matrices first and
+ *    then one row sum fits 135 of 160 single-bone points.
+ *  - Inputs are cut to 16 bits toward zero, as on the vertex path: a float
+ *    weight too. 8- and 16-bit weights are unsigned, 0x80 and 0x8000 one:
+ *    0xFF and 0xFFFF weigh just under two (scene 111's extremes).
+ * The skinned position then takes the world, view and projection matrices
+ * as an unskinned one would (scene 113). Normals are skinned in float: no
+ * probe has read them. */
+static double ge_c16(double v) { return ge_cut(v, 16, 0); }
+
+static double ge_acc(double acc, double t) {
+    if (t == 0.0 || !isfinite(t) || !isfinite(acc)) return t == 0.0 ? acc : acc + t;
+    if (acc == 0.0) return ge_c16(t);
+    int ea, et;
+    frexp(acc, &ea);
+    frexp(t, &et);
+    const double u = ldexp(1.0, (ea > et ? ea : et) - 1 - 15);
+    return ge_c16(trunc(acc / u) * u + trunc(t / u) * u);
+}
+
+/* One axis of a skinned position (B[c][k] = bone[3k + c]). */
+static float ge_skin_axis(const float *w, const float p[3], int c) {
+    static const int order[4] = { 3, 0, 1, 2 };
+    const double v[4] = { ge_c16(p[0]), ge_c16(p[1]), ge_c16(p[2]), 1.0 };
+    double acc = 0.0;
+    for (int i = 0; i < g_vl.w_n; i++) {
+        const double wi = ge_c16(w[i]);
+        for (int j = 0; j < 4; j++) {
+            const int k = order[j];
+            const double b = ge_c16(wi * ge_c16(g_tl.bone[12 * i + 3 * k + c]));
+            acc = ge_acc(acc, ge_c16(b * v[k]));
+        }
+    }
+    return (float)acc;
+}
+
+/* Skin a vertex in place: its position by the GE's arithmetic, its normal in
+ * float through the bones' rotation parts. */
+static void skin_mvert(ge_mvert *o, const float *w, int want_normal) {
+    float p[3], sn[3] = { 0, 0, 0 };
+    for (int c = 0; c < 3; c++) p[c] = ge_skin_axis(w, o->pos, c);
+    if (want_normal) {
+        for (int i = 0; i < g_vl.w_n; i++) {
+            float t[3];
+            mul_3x3(&g_tl.bone[12 * i], o->nrm, t);
+            for (int k = 0; k < 3; k++) sn[k] += w[i] * t[k];
+        }
+        memcpy(o->nrm, sn, sizeof sn);
+    }
+    memcpy(o->pos, p, sizeof p);
+}
+
+/* One vertex set of a record: its fields and, when it carries them, its
+ * weights (w; left alone otherwise). Nothing is skinned yet. */
 static int read_vertex_set(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
-                           int norm_off, int want_normal, ge_mvert *o) {
+                           int norm_off, int want_normal, ge_mvert *o, float *w) {
     const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)g_vl.set_stride);
-    float p[3], n[3];
-    if (!read_pos_model_at(vp, a, vtype, pos_off, p)) return 0;
-    if (want_normal) read_normal_model_at(vp, a, vtype, norm_off, n);
-    else { n[0] = n[1] = 0.0f; n[2] = 1.0f; }
+    if (!read_pos_model_at(vp, a, vtype, pos_off, o->pos)) return 0;
+    if (want_normal) read_normal_model_at(vp, a, vtype, norm_off, o->nrm);
+    else { o->nrm[0] = o->nrm[1] = 0.0f; o->nrm[2] = 1.0f; }
     o->rgba = current_colour();
     if (col_off >= 0 && VT_COLOR(vtype) == 7) o->rgba = psp_read32(a + (uint32_t)col_off);
     psp_vertex uv;
     read_uv_model_at(vp, a, vtype, tex_off, &uv);
     o->u = uv.u; o->v = uv.v;
-    if (g_vl.w_fmt) {
-        float w[8];
-        read_weights(a, w);
-        float sp[3] = { 0, 0, 0 }, sn[3] = { 0, 0, 0 };
-        for (int i = 0; i < g_vl.w_n; i++) {
-            float t[3];
-            mul_4x3(&g_tl.bone[12 * i], p, t);
-            for (int k = 0; k < 3; k++) sp[k] += w[i] * t[k];
-            if (want_normal) {
-                mul_3x3(&g_tl.bone[12 * i], n, t);
-                for (int k = 0; k < 3; k++) sn[k] += w[i] * t[k];
-            }
-        }
-        memcpy(p, sp, sizeof p);
-        if (want_normal) memcpy(n, sn, sizeof n);
-    }
-    memcpy(o->pos, p, sizeof p);
-    memcpy(o->nrm, n, sizeof n);
+    if (g_vl.w_fmt) read_weights(a, w);
     return 1;
 }
 
 /* A whole record: its vertex sets blended by the morph weights, when there
- * is more than one. Every field is blended, colour included -- scene 21's
- * half-and-half triangle is half-way in colour as well as in place. The
- * blended colour is truncated, not rounded: scene 21's triangles weighted
- * 0.5/0.5 and 0.25/1.0 (127.5 and 63.75 per channel) differ from the
- * hardware on 1170 fewer pixels so (1620 -> 450). What is left is in those
- * two triangles and not pinned down; the whole-weight ones are exact. */
+ * is more than one, then skinned. Every field is blended, colour included --
+ * scene 21's half-and-half triangle is half-way in colour as well as in
+ * place. Position and weights take the accumulator above; the rest is
+ * float. The blended colour is truncated, not rounded: scene 21's triangles
+ * weighted 0.5/0.5 and 0.25/1.0 (127.5 and 63.75 per channel) differ from
+ * the hardware on 1170 fewer pixels so (1620 -> 450). What is left is in
+ * those two triangles and not pinned down; the whole-weight ones are exact. */
 static int read_mvert(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
                       int norm_off, int want_normal, ge_mvert *o) {
-    if (g_vl.morph_n <= 1)
-        return read_vertex_set(a, vtype, col_off, pos_off, tex_off, norm_off, want_normal, o);
-    float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, col[4] = { 0, 0, 0, 0 }, u = 0, v = 0;
+    float w[8] = { 0 };
+    if (g_vl.morph_n <= 1) {
+        if (!read_vertex_set(a, vtype, col_off, pos_off, tex_off, norm_off, want_normal, o, w))
+            return 0;
+        if (g_vl.w_fmt) skin_mvert(o, w, want_normal);
+        return 1;
+    }
+    double pos[3] = { 0, 0, 0 }, mw8[8] = { 0 };
+    float nrm[3] = { 0, 0, 0 }, col[4] = { 0, 0, 0, 0 }, u = 0, v = 0;
     for (int k = 0; k < g_vl.morph_n; k++) {
         ge_mvert s1;
+        float w1[8] = { 0 };
         if (!read_vertex_set(a + (uint32_t)(k * g_vl.set_stride), vtype, col_off, pos_off, tex_off,
-                             norm_off, want_normal, &s1))
+                             norm_off, want_normal, &s1, w1))
             return 0;
-        const float w = g_tl.morph_w[k];
-        for (int i = 0; i < 3; i++) { pos[i] += w * s1.pos[i]; nrm[i] += w * s1.nrm[i]; }
-        for (int i = 0; i < 4; i++) col[i] += w * (float)((s1.rgba >> (8 * i)) & 0xFFu);
-        u += w * s1.u; v += w * s1.v;
+        const float mw = g_tl.morph_w[k];
+        const double m16 = ge_c16(mw);
+        for (int i = 0; i < 3; i++) {
+            pos[i] = ge_acc(pos[i], m16 * ge_c16(s1.pos[i]));
+            nrm[i] += mw * s1.nrm[i];
+        }
+        for (int i = 0; i < g_vl.w_n && g_vl.w_fmt; i++) mw8[i] = ge_acc(mw8[i], m16 * ge_c16(w1[i]));
+        for (int i = 0; i < 4; i++) col[i] += mw * (float)((s1.rgba >> (8 * i)) & 0xFFu);
+        u += mw * s1.u; v += mw * s1.v;
     }
-    memcpy(o->pos, pos, sizeof pos);
+    for (int i = 0; i < 3; i++) o->pos[i] = (float)pos[i];
+    for (int i = 0; i < 8; i++) w[i] = (float)mw8[i];
     memcpy(o->nrm, nrm, sizeof nrm);
     o->rgba = 0;
     for (int i = 0; i < 4; i++) {
@@ -1655,6 +1720,7 @@ static int read_mvert(uint32_t a, uint32_t vtype, int col_off, int pos_off, int 
         o->rgba |= (uint32_t)c << (8 * i);
     }
     o->u = u; o->v = v;
+    if (g_vl.w_fmt) skin_mvert(o, w, want_normal);
     return 1;
 }
 
@@ -1964,6 +2030,14 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
             if (!(p[i].c[3] > 0)) { g_skip_nearplane += (uint64_t)n; return; }
             const float z = p[i].c[2] / p[i].c[3];
             if (!(z >= -1 && z <= 1)) { g_clip_z += (uint64_t)n; return; }
+            /* Nor is a point outside the clip volume's x and y planes,
+             * wherever the screen offset puts it (geprobe 16, fw 6.60: of
+             * scenes 110-114's points every one drawn has |clip x| and
+             * |clip y| at most 0.989 w, every one missing (379) one of
+             * them at least 1.005 w). Lines are not measured. */
+            if (n == 1 && !(fabsf(p[i].c[0]) <= p[i].c[3] && fabsf(p[i].c[1]) <= p[i].c[3])) {
+                g_clip_guard += 1; return;
+            }
         }
     } else {
         const float a = p[0].c[2] + p[0].c[3];
