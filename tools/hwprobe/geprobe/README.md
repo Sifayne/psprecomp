@@ -267,6 +267,22 @@ checks the logged CRC and `compare` fits each entry to its 256 outputs. The
 whole probe now needs an interp budget of 16000000000 instructions under
 psprecomp.
 
+Version 19 adds scenes 121-124 after them, so steps 1-161 keep their version 18
+numbers. Sets 18 and 19 settled lighting's arithmetic with the world and view
+matrices identity; these scenes ask how the GE forms the eye-space vertex,
+normal, light position and spot direction under real ones. Scene 121 runs
+scene 115's cutoff search with W and V loaded per group of eight points
+(`sceGuSetMatrix`), into `ge_121_eyesearch.bin`: worlds and views rotated,
+scaled and translated by up to 2^10, both together, rotations alone (the spot
+direction's transform), and world matrices whose 3x3 cancels. Large
+translations put the vertex and light far from the eye but near each other,
+so L keeps few bits and the rivals (psprecomp's float32, V (W v) or (V W) v in
+the GE's arithmetic, lighting in world space) part by many codes. Scenes
+122-124 read diffuse bytes through cancelling world and view matrices,
+specular bytes under rotated views (is H's (0,0,1) the eye's?) and attenuation
+bytes far out. The inputs are `lights19.py`'s (`l19_data.inc`); `lights19.py
+sums <dir>` checks the logged CRCs and `compare` scores each rule.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -289,7 +305,7 @@ PNGs for looking at; comparisons should use the raw files.
 them against the log's CRCs, and lists each point's inputs and depth;
 for scenes 67-82 it hands over to `patch13.py`, for 83-98 to `colour14.py`,
 for 99-109 to `lines15.py`, for 110-114 to `skin16.py`, for 115-119 to
-`lights17.py`, and for 120 to `rsq18.py`.
+`lights17.py`, for 120 to `rsq18.py`, and for 121-124 to `lights19.py`.
 
 ## Compare with psprecomp
 

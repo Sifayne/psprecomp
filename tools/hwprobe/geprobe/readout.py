@@ -162,6 +162,10 @@ def read(base, sc, name):
 
 def main():
     base = sys.argv[1]
+    if len(sys.argv) > 2 and int(sys.argv[2]) >= 121:    # geprobe 19's lighting under matrices
+        import lights19
+        if lights19.sums(base): lights19.compare(base)
+        return
     if len(sys.argv) > 2 and int(sys.argv[2]) >= 120:    # geprobe 18's 1/sqrt sweep
         import rsq18
         if rsq18.sums(base): rsq18.compare(base)

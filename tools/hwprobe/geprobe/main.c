@@ -30,8 +30,9 @@
  * skinned and morphed positions read whole through depth, from skin16.py's,
  * scenes 115 to 119 (version 17) point and spot lights: L.D searched
  * whole through the spot cutoff, and the lighting factors as bytes, from
- * lights17.py's, and scene 120 (version 18) the lighting's 1/sqrt at every
- * input the same way, from rsq18.py's.
+ * lights17.py's, scene 120 (version 18) the lighting's 1/sqrt at every
+ * input the same way, from rsq18.py's, and scenes 121 to 124 (version 19)
+ * lighting under real world and view matrices, from lights19.py's.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -52,7 +53,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 18
+#define PROBE_VERSION 19
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -3676,6 +3677,103 @@ static void l18_search(void) {
     out("  %d of %d as the table predicts\n", same, L18_N);
 }
 
+/* ---- version 19: lighting under real world and view matrices -------------
+ *
+ * Scenes 115-120 settled lighting's arithmetic with world and view identity.
+ * Scene 121 runs scene 115's cutoff search with W and V loaded per group of
+ * points (lights19.py): large translations put the vertex and the light far
+ * from the eye but near each other, and world matrices whose 3x3 cancels,
+ * so how the GE forms the eye-space vertex, normal, light and spot direction
+ * shows in L.D by many codes. Scenes 122-124 (lights19.py's streams, c14_run)
+ * read diffuse, specular and attenuation bytes the same way. */
+#include "l19_data.inc"      /* geprobe 19: scene 121's table and 122-124's streams, from lights19.py */
+
+static w32 g_l19_lo[L19_NGEO], g_l19_hi[L19_NGEO], g_l19_res[2 * L19_NGEO];
+static signed char g_l19_dx[L19_NGEO], g_l19_dy[L19_NGEO];
+
+static void l19_pass(int pass) {
+    scene_begin(GU_PSM_8888, 0xFF0000FF);
+    l17_mats();
+    l17_lights_on();
+    int last = -1;
+    for (int i = 0; i < L19_NGEO; i++) {
+        const w32 lo = g_l19_lo[i], hi = g_l19_hi[i];
+        if (pass >= 2 && hi - lo <= 1) continue;
+        const w32 c = pass == 0 ? lo : pass == 1 ? hi : lo + (hi - lo) / 2;
+        const w32 *g = L19_GEO[i];
+        p13_room();
+        if ((int)g[0] != last) {
+            ScePspFMatrix4 m;
+            memcpy(&m, L19_MAT[g[0]], sizeof m);
+            sceGuSetMatrix(GU_MODEL, &m);
+            memcpy(&m, L19_MAT[g[0]] + 16, sizeof m);
+            sceGuSetMatrix(GU_VIEW, &m);
+            last = (int)g[0];
+        }
+        int x, y;
+        l17_slot(i, &x, &y);
+        sceGuOffset(2048 - x, 2048 - y);
+        const ScePspFVector3 p = { c14_f(g[7]), c14_f(g[8]), c14_f(g[9]) };
+        const ScePspFVector3 d = { c14_f(g[10]), c14_f(g[11]), c14_f(g[12]) };
+        sceGuLight(0, GU_SPOTLIGHT, GU_DIFFUSE, &p);
+        sceGuLightSpot(0, &d, 1.0f, c14_f(c << 8));
+        const float v[6] = { c14_f(g[4]), c14_f(g[5]), c14_f(g[6]), c14_f(g[1]), c14_f(g[2]), c14_f(g[3]) };
+        sceGuDrawArray(GU_POINTS, GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 1, NULL,
+                       gumem(v, sizeof v));
+    }
+    sceGuFinish();
+    ge_wait();
+}
+
+static void l19_search(void) {
+    g_scene = 121;
+    if (step("scene %02d: spot cutoff search under real world and view matrices", g_scene)) return;
+    out("  %d geometries, %d matrix pairs, input crc %08X\n", L19_NGEO, L19_NMAT,
+        crc32_more(crc32(L19_MAT, sizeof L19_MAT), L19_GEO, sizeof L19_GEO));
+    for (int i = 0; i < L19_NGEO; i++) {
+        g_l19_lo[i] = L17_CUT_LO;
+        g_l19_hi[i] = L17_CUT_HI;
+        g_l19_res[2 * i] = g_l19_res[2 * i + 1] = 0;
+    }
+    int passes = 0, open = L19_NGEO, absent = 0, unlit = 0, toplit = 0, lost = 0;
+    const w32 t0 = sceKernelGetSystemTimeLow();
+    for (int pass = 0; pass < 40 && (pass < 2 || open); pass++) {
+        l19_pass(pass);
+        passes++;
+        open = 0;
+        for (int i = 0; i < L19_NGEO; i++) {
+            w32 *r = &g_l19_res[2 * i];
+            if (pass >= 2 && g_l19_hi[i] - g_l19_lo[i] <= 1) continue;
+            int x, y, v = -1;
+            l17_slot(i, &x, &y);
+            if (pass == 0) {
+                for (int k = 0; k < 9 && v < 0; k++) {
+                    const int dx = k % 3 == 0 ? 0 : k % 3 == 1 ? -1 : 1, dy = k / 3 == 0 ? 0 : k / 3 == 1 ? -1 : 1;
+                    v = l17_read(x + dx, y + dy);
+                    if (v >= 0) { g_l19_dx[i] = (signed char)dx; g_l19_dy[i] = (signed char)dy; }
+                }
+                if (v < 0) { *r |= 1u << 24; absent++; g_l19_hi[i] = g_l19_lo[i]; continue; }
+                if (v == 0) { *r |= 2u << 24; unlit++; g_l19_hi[i] = g_l19_lo[i]; continue; }
+                r[1] = (w32)v;
+            } else {
+                v = l17_read(x + g_l19_dx[i], y + g_l19_dy[i]);
+                if (v < 0) { *r |= 8u << 24; lost++; g_l19_hi[i] = g_l19_lo[i]; continue; }
+                const w32 c = pass == 1 ? g_l19_hi[i] : g_l19_lo[i] + (g_l19_hi[i] - g_l19_lo[i]) / 2;
+                if (pass == 1) {
+                    if (v > 0) { *r |= 4u << 24; toplit++; g_l19_lo[i] = g_l19_hi[i]; }
+                } else if (v > 0) { g_l19_lo[i] = c; r[1] = (w32)v; }
+                else g_l19_hi[i] = c;
+            }
+            if (g_l19_hi[i] - g_l19_lo[i] > 1) open++;
+        }
+    }
+    for (int i = 0; i < L19_NGEO; i++) g_l19_res[2 * i] |= g_l19_lo[i] & 0xFFFFFFu;
+    out("  %d passes, %u us; flagged: %d not drawn, %d unlit at 1/32, %d lit at 16, %d lost\n", passes,
+        (unsigned)(sceKernelGetSystemTimeLow() - t0), absent, unlit, toplit, lost);
+    const int wr = probe_write_file("ge_121_eyesearch.bin", g_l19_res, sizeof g_l19_res);
+    out("  ge_121_eyesearch.bin: %d bytes, crc %08X\n", wr, crc32(g_l19_res, sizeof g_l19_res));
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -4329,6 +4427,10 @@ int main(int argc, char **argv) {
 
     section("scenes, version 18");
     l18_search();
+
+    section("scenes, version 19");
+    l19_search();
+    for (int k = 0; k < C19_NSTEPS; k++) c14_run(&C19_STEPS[k]);
 
     probe_screen(1);
     probe_done();
