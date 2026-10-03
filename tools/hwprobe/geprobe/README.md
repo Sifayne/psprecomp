@@ -252,6 +252,21 @@ light gives. The streams are `lights17.py`'s (`l17_data.inc`), replayed by
 c14_run with new LGT and LMODE ops; `lights17.py sums <dir>` checks the logged
 CRCs and `compare` reads the answers.
 
+Version 18 adds scene 120 after them, so steps 1-160 keep their version 17
+numbers. Set 18 found the lighting's 1/sqrt to be a table like 1/w's (128
+entries for each exponent parity, a value and a slope each), but left 37 of
+its 256 entries with more than one value the readings allow. Its input is
+always a 16-bit number, so there are only 65536 in [1, 4), where the table
+repeats by 4. Scene 120 reads every one, through scene 115's cutoff search:
+a light at (px, py, 1) over a vertex at the origin with D = +z, px and py
+chosen so the GE's L.L is the input exactly, makes the spot's L.D the table's
+output. Three chunks of slots, each searched from a bracket of 32 codes either
+side of the current table's value. Results go to `ge_120_rsqfull.bin` as in
+scene 115. The inputs are `rsq18.py`'s (`l18_data.inc`); `rsq18.py sums <dir>`
+checks the logged CRC and `compare` fits each entry to its 256 outputs. The
+whole probe now needs an interp budget of 16000000000 instructions under
+psprecomp.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -273,12 +288,12 @@ PNGs for looking at; comparisons should use the raw files.
 `readout.py <geprobe dir> [scene]` regenerates scenes 62-66's inputs, checks
 them against the log's CRCs, and lists each point's inputs and depth;
 for scenes 67-82 it hands over to `patch13.py`, for 83-98 to `colour14.py`,
-for 99-109 to `lines15.py`, for 110-114 to `skin16.py`, and for 115-119 to
-`lights17.py`.
+for 99-109 to `lines15.py`, for 110-114 to `skin16.py`, for 115-119 to
+`lights17.py`, and for 120 to `rsq18.py`.
 
 ## Compare with psprecomp
 
-    allegrexrecomp interp geprobe.prx --dispatch --budget 8000000000 --drain 200 --base 0x08804000
+    allegrexrecomp interp geprobe.prx --dispatch --budget 16000000000 --drain 200 --base 0x08804000
 
 psprecomp's software renderer draws into the same guest VRAM, so its run
 leaves the same files under `./ms/PSP/GAME/geprobe/`.

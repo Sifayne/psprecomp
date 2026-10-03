@@ -28,9 +28,10 @@
  * colour14.py's, scenes 99 to 109 (version 15) how it runs along a line,
  * replayed the same way from lines15.py's, scenes 110 to 114 (version 16)
  * skinned and morphed positions read whole through depth, from skin16.py's,
- * and scenes 115 to 119 (version 17) point and spot lights: L.D searched
+ * scenes 115 to 119 (version 17) point and spot lights: L.D searched
  * whole through the spot cutoff, and the lighting factors as bytes, from
- * lights17.py's.
+ * lights17.py's, and scene 120 (version 18) the lighting's 1/sqrt at every
+ * input the same way, from rsq18.py's.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -51,7 +52,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 17
+#define PROBE_VERSION 18
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -3578,6 +3579,103 @@ static void l17_search(void) {
     out("\n");
 }
 
+/* ---- version 18: the lighting's 1/sqrt, every input -----------------------
+ *
+ * Scene 120 reads 1/sqrt at all 65536 16-bit inputs in [1, 4), the table's
+ * whole range: for each, a light at (px, py, 1) over a vertex at the origin
+ * with D = +z, px and py chosen (rsq18.py) so that the GE's L.L is that
+ * input exactly, so the spot's L.D is 1/sqrt(L.L) itself. The cutoff is
+ * searched as in scene 115, but in three chunks of slots, and from a bracket
+ * of L18_BRACKET codes either side of the current table's value: two checks
+ * and six halvings a chunk. Results go to ge_120_rsqfull.bin, two words an
+ * input as in scene 115's file. */
+#include "l18_data.inc"      /* geprobe 18: scene 120's inputs, from rsq18.py */
+
+#define L18_PER ((L18_N + L18_CHUNKS - 1) / L18_CHUNKS)
+static w32 g_l18_lo[L18_PER], g_l18_hi[L18_PER], g_l18_res[2 * L18_N];
+static signed char g_l18_dx[L18_PER], g_l18_dy[L18_PER];
+
+static void l18_pass(int base, int n, int pass) {
+    static const ScePspFVector3 up = { 0.0f, 0.0f, 1.0f };
+    scene_begin(GU_PSM_8888, 0xFF0000FF);
+    l17_mats();
+    l17_lights_on();
+    sceGuLightSpot(0, &up, 1.0f, 1.0f / 32);
+    for (int j = 0; j < n; j++) {
+        const w32 lo = g_l18_lo[j], hi = g_l18_hi[j];
+        if (pass >= 2 && hi - lo <= 1) continue;
+        const w32 c = pass == 0 ? lo : pass == 1 ? hi : lo + (hi - lo) / 2;
+        const w32 *g = L18_GEO[base + j];
+        int x, y;
+        l17_slot(j, &x, &y);
+        p13_room();
+        sceGuOffset(2048 - x, 2048 - y);
+        const ScePspFVector3 p = { c14_f(g[0]), c14_f(g[1]), 1.0f };
+        sceGuLight(0, GU_SPOTLIGHT, GU_DIFFUSE, &p);
+        sceGuSendCommandi(0x8B, (int)c);                     /* light 0's cutoff, the code itself */
+        const float v[6] = { p.x, p.y, p.z, 0.0f, 0.0f, 0.0f };
+        sceGuDrawArray(GU_POINTS, GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 1, NULL,
+                       gumem(v, sizeof v));
+    }
+    sceGuFinish();
+    ge_wait();
+}
+
+static void l18_search(void) {
+    g_scene = 120;
+    if (step("scene %02d: the lighting's 1/sqrt at every input, through the spot cutoff", g_scene)) return;
+    out("  %d inputs, input crc %08X\n", L18_N, crc32(L18_GEO, sizeof L18_GEO));
+    const w32 t0 = sceKernelGetSystemTimeLow();
+    int passes = 0, absent = 0, unlit = 0, toplit = 0, lost = 0;
+    for (int base = 0; base < L18_N; base += L18_PER) {
+        const int n = L18_N - base < L18_PER ? L18_N - base : L18_PER;
+        for (int j = 0; j < n; j++) {
+            g_l18_lo[j] = L18_GEO[base + j][2] - L18_BRACKET;
+            g_l18_hi[j] = L18_GEO[base + j][2] + L18_BRACKET;
+            g_l18_res[2 * (base + j)] = g_l18_res[2 * (base + j) + 1] = 0;
+        }
+        int open = n;
+        for (int pass = 0; pass < 16 && (pass < 2 || open); pass++) {
+            l18_pass(base, n, pass);
+            passes++;
+            open = 0;
+            for (int j = 0; j < n; j++) {
+                w32 *r = &g_l18_res[2 * (base + j)];
+                if (pass >= 2 && g_l18_hi[j] - g_l18_lo[j] <= 1) continue;
+                int x, y, v = -1;
+                l17_slot(j, &x, &y);
+                if (pass == 0) {
+                    for (int k = 0; k < 9 && v < 0; k++) {
+                        const int dx = k % 3 == 0 ? 0 : k % 3 == 1 ? -1 : 1, dy = k / 3 == 0 ? 0 : k / 3 == 1 ? -1 : 1;
+                        v = l17_read(x + dx, y + dy);
+                        if (v >= 0) { g_l18_dx[j] = (signed char)dx; g_l18_dy[j] = (signed char)dy; }
+                    }
+                    if (v < 0) { *r |= 1u << 24; absent++; g_l18_hi[j] = g_l18_lo[j]; continue; }
+                    if (v == 0) { *r |= 2u << 24; unlit++; g_l18_hi[j] = g_l18_lo[j]; continue; }
+                    r[1] = (w32)v;
+                } else {
+                    v = l17_read(x + g_l18_dx[j], y + g_l18_dy[j]);
+                    if (v < 0) { *r |= 8u << 24; lost++; g_l18_hi[j] = g_l18_lo[j]; continue; }
+                    const w32 c = pass == 1 ? g_l18_hi[j] : g_l18_lo[j] + (g_l18_hi[j] - g_l18_lo[j]) / 2;
+                    if (pass == 1) {
+                        if (v > 0) { *r |= 4u << 24; toplit++; g_l18_lo[j] = g_l18_hi[j]; }
+                    } else if (v > 0) { g_l18_lo[j] = c; r[1] = (w32)v; }
+                    else g_l18_hi[j] = c;
+                }
+                if (g_l18_hi[j] - g_l18_lo[j] > 1) open++;
+            }
+        }
+        for (int j = 0; j < n; j++) g_l18_res[2 * (base + j)] |= g_l18_lo[j] & 0xFFFFFFu;
+    }
+    out("  %d passes, %u us; flagged: %d not drawn, %d unlit at the bracket's bottom, %d lit at its top, %d lost\n",
+        passes, (unsigned)(sceKernelGetSystemTimeLow() - t0), absent, unlit, toplit, lost);
+    const int wr = probe_write_file("ge_120_rsqfull.bin", g_l18_res, sizeof g_l18_res);
+    out("  ge_120_rsqfull.bin: %d bytes, crc %08X\n", wr, crc32(g_l18_res, sizeof g_l18_res));
+    int same = 0;
+    for (int i = 0; i < L18_N; i++) same += (g_l18_res[2 * i] & 0xFFFFFFu) == L18_GEO[i][2] && !(g_l18_res[2 * i] >> 24);
+    out("  %d of %d as the table predicts\n", same, L18_N);
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -4228,6 +4326,9 @@ int main(int argc, char **argv) {
     section("scenes, version 17");
     l17_search();
     for (int k = 0; k < C17_NSTEPS; k++) c14_run(&C17_STEPS[k]);
+
+    section("scenes, version 18");
+    l18_search();
 
     probe_screen(1);
     probe_done();
