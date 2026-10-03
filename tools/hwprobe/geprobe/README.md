@@ -340,6 +340,15 @@ triangles past x, y and z, with depth clamping off and on (`clip22.py`,
 `c22c_data.inc`, the CLAMP op). Each module's `sums` checks the logged CRCs and
 `compare` scores its rules.
 
+Set 23 settled all of it: the left edge whatever corner comes first, the extent test
+on the far pixel's centre plus a sixteenth (both ends in), patch triangles in the
+lines' span order, normals, colours and texture coordinates through the skinning and
+morphing accumulator (colours floored with the sign dropped, 16-bit colours widened
+by repeating their top bits), TEXSCALE and TEXOFFSET in the GE's arithmetic and a
+nearest texel cut toward zero to a sixteenth before it is floored, and lines beyond
+one x or y plane at both ends, or points past x, y or z with clamping on, not drawn.
+psprecomp then matches all 189 dumps.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:

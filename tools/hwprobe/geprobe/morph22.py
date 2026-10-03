@@ -38,6 +38,13 @@ The rules:
     morph22.py sums DUMPDIR          the logged CRCs against these streams
     morph22.py compare DUMPDIR       readings matching per rule and batch
     morph22.py check                 design checks: how often the rules part
+
+Set 23 (fw 6.60): colours are H with the sign dropped before the clamp (floor(|acc|), 255
+at most: a sum of -34.004 reads 34), all 13,200 channels, the 16-bit formats widened by
+repeating their top bits; coordinates are H, with the texel coordinate cut toward zero
+to 1/16 texel before it is floored (-61.004 texels reads texel -61), all 15,000
+readings. psprecomp now does both (ge.c read_mvert, uv_to_texels; render.c
+nearest_texel).
 """
 import sys, os, math, struct, zlib, re
 import numpy as np

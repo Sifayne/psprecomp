@@ -27,6 +27,10 @@ The rules (pixels, per cell):
     clip22.py sums DUMPDIR          the logged CRCs against this stream
     clip22.py compare DUMPDIR       per cell: drawn pixels against the rules
     clip22.py check                 design checks
+
+Set 23 (fw 6.60) differs from 'cur' in nine cells: lines beyond x = w at both ends are not
+drawn (clamping off or on), and with clamping on points are culled past x, y and z = w as
+with it off. psprecomp now does so (ge.c emit_point_line) and matches every cell.
 """
 import sys, os, math, struct, zlib, re
 import numpy as np

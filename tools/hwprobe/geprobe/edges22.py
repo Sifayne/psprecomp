@@ -24,6 +24,11 @@ from the level corner given first or last), 'both', 'right'.
     edges22.py sums DUMPDIR          the logged CRCs against these streams
     edges22.py compare DUMPDIR       windows matching each rule, per case
     edges22.py check                 design checks: one edge a window, where rules part
+
+Set 23 (fw 6.60): 'g9' with 'left' fits every window -- the copy when min x <= 16 x + 9
+<= max x (the centre plus a sixteenth, both ends in: a centre one sixteenth short of min x
+copies, one on max x does not), and the left edge whatever corner comes first. It fits
+scenes 125-129's 1100 windows too.
 """
 import sys, os, math, struct, zlib, re
 import numpy as np
@@ -150,6 +155,7 @@ def rule_mask(sc, V, gate='ge', pick='left'):
                 corner = lvl[0] if pick == 'first' else lvl[-1]
                 lifted = [k for k in lifted if corner in edges[k]]
     def gated(cx):
+        if gate == 'g9': return mnx <= cx + 1 <= mxx        # set 23: the centre plus a sixteenth, both ends in
         if gate == 'ge': return mnx <= cx < mxx
         if gate == 'gt': return mnx < cx < mxx
         if gate == 'le': return mnx <= cx <= mxx
@@ -172,7 +178,7 @@ def rule_mask(sc, V, gate='ge', pick='left'):
             m[yy, xx] = ok
     return m
 
-RULES = [('ge', 'left'), ('ge', 'first'), ('ge', 'last'), ('ge', 'right'), ('ge', 'both'),
+RULES = [('g9', 'left'), ('ge', 'left'), ('ge', 'first'), ('ge', 'last'), ('ge', 'right'), ('ge', 'both'),
          ('gt', 'left'), ('le', 'left')]
 
 # =========================================================================== emit, sums, compare

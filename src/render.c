@@ -447,9 +447,22 @@ static uint32_t sample_bilinear(float u, float v) {
     return out;
 }
 
+/* A nearest texel's index: the coordinate cut toward zero to a sixteenth of
+ * a texel, then floored -- so -61.004 texels reads texel -61, -61.0625 texel
+ * -62. geprobe 22 (fw 6.60) scene 140 reads 15,000 coordinates through a
+ * texture that names its own texels, 536 of them negative, and this fits
+ * all; flooring alone misses the 11 within a sixteenth below a whole texel.
+ * Positive coordinates floor as before. */
+static int nearest_texel(float t) {
+    const float s = t * 16.0f;
+    if (!(s > -2147483520.0f && s < 2147483520.0f)) return ifloor(t);
+    const int f = (int)s;                                   /* toward zero */
+    return f >= 0 ? f >> 4 : -((-f + 15) >> 4);             /* floored */
+}
+
 /* The sampler the rasterizer calls: one texel, filtered as the game asked. */
 static uint32_t sample_filtered(float u, float v, int linear) {
-    return linear ? sample_bilinear(u, v) : sample_texel(ifloor(u), ifloor(v));
+    return linear ? sample_bilinear(u, v) : sample_texel(nearest_texel(u), nearest_texel(v));
 }
 
 /* Mipmapping, to gpu/textures/mipmap's numbers.
@@ -1156,17 +1169,18 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * every one of the 241 long edges past that height drawn so, none of the
      * 419 others; the threshold lies between 130,533 and 131,364. Scene 98's
      * window 1, the 80 pixels it was off, is such an edge. The copy happens
-     * only where the far pixel's centre lies within the triangle's x extent,
-     * min x <= centre < max x: geprobe 21 scene 128, 220 windows on edges
-     * leaning 0 to 184 pixels, the small leans' far pixels falling either
-     * side of a corner's x -- which also leaves a vertical edge alone, its far
-     * pixels all beyond the extent (scene 98's window 4, 2981 pixels tall:
-     * 136 pixels off when it was not). A triangle level at its top or bottom
-     * has two edges of full height, and only its left one, the inside to its
-     * right, takes it (scene 129, 220 windows). The probes always gave the
-     * left level corner first, so "first given" would fit as well. Whether
-     * a centre exactly on min x copies is not measured. Coverage only: the
-     * pixel's colour and depth are its own. */
+     * only where the far pixel's centre plus a sixteenth lies within the
+     * triangle's x extent, min x <= 16 x + 9 <= max x: geprobe 21 scene 128,
+     * 220 windows on edges leaning 0 to 184 pixels, the small leans' far
+     * pixels falling either side of a corner's x -- which also leaves a
+     * vertical edge alone, its far pixels all beyond the extent (scene 98's
+     * window 4, 2981 pixels tall: 136 pixels off when it was not) -- and
+     * geprobe 22 scene 134, far pixels -2 to +2 sixteenths from min and max
+     * x: a centre one sixteenth short of min x copies, one on max x does not.
+     * A triangle level at its top or bottom has two edges of full height, and
+     * only its left one, the inside to its right, takes it, whichever corner
+     * comes first (scenes 129 and 134: 364 windows, the level corners in all
+     * six orders). Coverage only: the pixel's colour and depth are its own. */
     int64_t far_lift[3] = { 0, 0, 0 };
     int far_at[3] = { -1, -1, -1 };
     {
@@ -1369,8 +1383,8 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
         for (int x = minx; x <= maxx; x++) {
             int64_t t0 = w0, t1 = w1, t2 = w2;
             if (quirk) {
-                const int64_t xc = (int64_t)SUBPX * x + SUBPX_HALF;
-                if (xc >= xlo && xc < xhi) {
+                const int64_t xc = (int64_t)SUBPX * x + SUBPX_HALF + 1;
+                if (xc >= xlo && xc <= xhi) {
                     if ((x & 3) == far_at[0]) t0 += far_lift[0];
                     if ((x & 3) == far_at[1]) t1 += far_lift[1];
                     if ((x & 3) == far_at[2]) t2 += far_lift[2];

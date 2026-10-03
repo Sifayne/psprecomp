@@ -37,6 +37,9 @@ The rules (normal_of), each followed by the settled lighting:
     norms22.py sums DUMPDIR          the logged CRCs against these streams
     norms22.py compare DUMPDIR [rule..]   bytes matching per rule and batch
     norms22.py check                 design checks: how often the rules part
+
+Set 23 (fw 6.60): H fits all 2400 points (and of a bone's six term orders only x, y, z);
+cur 1315, Ht 1 of the 300 in 'trans'. psprecomp now skins and morphs normals so.
 """
 import sys, os, math, struct, zlib, re
 import numpy as np

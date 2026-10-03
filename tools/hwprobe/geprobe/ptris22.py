@@ -22,6 +22,9 @@ quad's two triangles (s0 s1 s2), (s1 s2 s3) as the strips give them.
     ptris22.py sums DUMPDIR          the logged CRCs against these streams
     ptris22.py compare DUMPDIR       per patch and candidate order: pixels off in 136-137
     ptris22.py check                 design checks: overlaps, where the orders part
+
+Set 23 (fw 6.60): span-uv, as psprecomp already drew them, fits every pixel; grid 1354
+off, span-vu 1381.
 """
 import sys, os, math, struct, zlib, re
 import numpy as np

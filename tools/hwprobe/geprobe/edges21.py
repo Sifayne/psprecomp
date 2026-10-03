@@ -125,7 +125,8 @@ def all_scenes(): return [scene(n) for n, *_ in SCENES]
 
 # =========================================================================== the rules
 def rule_mask(sc, V, gate=True, pick='left'):
-    """psprecomp's sw_tri rule. gate: the far pixel takes the near one's decision only
+    """psprecomp's sw_tri rule (with set 23's ends: min x <= 16 x + 9 <= max x).
+    gate: the far pixel takes the near one's decision only
     when its centre lies within the triangle's x extent, min x <= centre < max x (set 22's
     finding; without it, every full-height edge but a vertical one takes it, clipped to
     the pixel box sw_tri visits, as set 21 left it). pick, when two edges are full height:
@@ -156,7 +157,7 @@ def rule_mask(sc, V, gate=True, pick='left'):
                 px = x
                 if k in lifted:
                     blk = x & ~3; near, far = (blk, blk + 3) if dy > 0 else (blk + 3, blk)
-                    if x == far and (not gate or mnx <= far * 16 + 8 < mxx): px = near
+                    if x == far and (not gate or mnx <= far * 16 + 9 <= mxx): px = near    # set 23's ends
                 e = E((px * 16 + 8, y * 16 + 8), s, t)
                 if not (e > 0 or (e == 0 and tl(dx, dy))): ok = False; break
             m[yy, xx] = ok

@@ -567,19 +567,21 @@ ge_rcp16, ge_screen_z, clip_to_fx16):
   that height are drawn so, and none of the 419 others, short edges past
   it included; the threshold lies between 130,533 and 131,364. Scene 98's
   window 1, 80 pixels off before, is such an edge. The far pixel takes
-  the near one's decision only when its centre lies within the triangle's
-  x extent (min x <= centre < max x): geprobe 21 scene 128 reads 220
-  windows on long edges leaning 0 to 184 pixels, and with leans under a
-  pixel, or of a few pixels near a corner's x, the copy happens exactly
-  where that holds (set 21's rule, the copy wherever the group is, was off
-  in 30 of them; exact coverage in 101). A vertical long edge (scene 98's
-  window 4) never copies for the same reason: its far pixels all lie
-  beyond the extent. A
-  triangle level at its top or bottom has two edges of full height, and
-  only its left one, the inside to its right, takes it (scene 129: 220
-  windows; both was off at 38, the right one at 74). The probes always
-  gave the left level corner first, so "the first corner given" is not
-  told apart; nor is a centre exactly on min x.
+  the near one's decision only when its centre plus a sixteenth lies
+  within the triangle's x extent, min x <= 16 x + 9 <= max x: geprobe 21
+  scene 128 reads 220 windows on long edges leaning 0 to 184 pixels, and
+  with leans under a pixel, or of a few pixels near a corner's x, the copy
+  happens exactly where that holds (set 21's rule, the copy wherever the
+  group is, was off in 30 of them; exact coverage in 101); geprobe 22
+  scene 134 puts far pixels -2 to +2 sixteenths from min and max x, and a
+  centre one sixteenth short of min x copies while one on max x does not
+  (the centre alone, min x <= centre < max x, was off in 8 of its 220).
+  A vertical long edge (scene 98's window 4) never copies for the same
+  reason: its far pixels all lie beyond the extent. A triangle level at
+  its top or bottom has two edges of full height, and only its left one,
+  the inside to its right, takes it, whichever corner is given first
+  (scenes 129 and 134: the level corners in all six orders, 364 windows;
+  the edge from the first corner given was off in 72 of 134's 144).
 - **1/area comes from a table** with a linear step (area_rcp), not a
   division. The area's significand is cut to 17 bits. Its leading nine
   bits, h, pick one of 256 entries holding 2^27/h and the slope 2^24/h²,
@@ -649,6 +651,16 @@ which texel is read (geprobe step 12 and geprobe 5 scene 28, fw 6.60):
   like colour and depth, by a step truncated to 2^-24 a sixteenth: at an
   exact boundary it reads the texel before. A 3D line divides by w at the
   same point.
+- **A nearest texel** is the coordinate cut toward zero to a sixteenth of
+  a texel, then floored: -61.004 texels reads texel -61, -61.0625 texel
+  -62 (geprobe 22 scene 140: 15,000 coordinates read through a texture
+  that names its own texels, 536 of them negative; flooring alone missed
+  the 11 that lie within a sixteenth below a whole texel).
+- **TEXSCALE and TEXOFFSET** apply to a 3D vertex's coordinates in the
+  GE's own arithmetic, u s + o one sum of two products (ge.c
+  uv_to_texels), then the texture's size: scene 140's 600 plain float
+  coordinates read at scales 1, 2^8 and 2^12 fit this on every reading,
+  where a float sum missed 119 at 2^12.
 
 ## Known differences
 
@@ -791,7 +803,11 @@ psprecomp places every one on the PSP's pixel with its depth.
   flat in one grey under additive blending (to count each pixel's
   segments): this order fits every pixel, where the whole grid's strips
   in one go are 204 pixels off and the spans a column at a time 1.
-  Triangles take the same order, which no probe has told apart.
+- **Triangles** go out in the same order. geprobe 22 (fw 6.60) scenes
+  135-137 draw nine patches folded back over themselves, so that a span's
+  triangles lie over other spans' and rows', as flat triangles: the span
+  order fits every pixel, where the whole grid's is 1354 pixels off, the
+  spans a column at a time 1381, and the rows bottom first 10,156.
 - A point whose depth falls outside 0..65535 is not drawn when depth
   clamping is off (every geprobe 13 calibration point with clip z in
   (-w, 0), or over 65535, is absent).
@@ -834,34 +850,48 @@ Python).
 - **Points outside x and y.** A point is drawn only when |clip x| and
   |clip y| are within w, whatever the screen offset: every point drawn is
   within 0.989 w, every one missing (379, including all of scene 20's
-  replayed corners) at least 1.005 w. Measured with depth clamping off;
-  lines are not measured.
-- Normals are still skinned in float, and colours and texture coordinates
-  still morphed in float: no probe has read them.
+  replayed corners) at least 1.005 w. geprobe 22 scene 141 finds the same
+  with depth clamping on, points at 0.95 to 1.05 w on every side drawn to
+  1 w and no further, and with clamping on a point past z = w not drawn
+  either. A line is not drawn when both its ends lie beyond the same x or
+  y plane (with clamping on or off); with one end inside, or across the
+  volume, it is drawn whole, as are triangles out to 150 w (ge.c
+  emit_point_line). Ends beyond different planes are not measured.
+- **Normals** take the same accumulator (geprobe 22 scene 138, 2400
+  points lit through bones and morph sets whose terms cancel on the
+  normal): skinned bone by bone over the x, y and z terms with no
+  translation, and morphed set by set, as positions are. Only x, y, z of
+  a bone's six term orders fits all 2400; float32, as before, fits 1315.
+- **Colours** too (scene 139, 4400 points): each channel, widened to 8
+  bits, times the 16-bit morph weight into the accumulator, then floored
+  with its sign dropped and clamped to 255 (a sum of -34.004 reads 34):
+  all 13,200 channels fit. A 16-bit vertex colour is widened by repeating
+  each field's top bits below it (5 bits to 8 as v << 3 | v >> 2), in 3D
+  as in through mode; psprecomp read only 8888 and gave the others the
+  material colour.
+- **Texture coordinates** too (scene 140, 2500 points at three scales):
+  morphed in units, before TEXSCALE and TEXOFFSET, so the offset is not
+  weighted; all 15,000 readings fit, a float blend of the scaled
+  coordinates 7025.
 
 Scene 20, the skinned triangle that was 54 pixels off, now matches.
 
-## Still open after geprobe 21
+## Still open after geprobe 22
 
-Nothing that geprobe 21 (fw 6.60, set 22) draws: psprecomp matches all
-181 of its frame and depth dumps bit for bit, scenes 1 to 133. The log
+Nothing that geprobe 22 (fw 6.60, set 23) draws: psprecomp matches all
+189 of its frame and depth dumps bit for bit, scenes 1 to 141. The log
 differs in timing only (GE and callback microseconds, and how many stall
 callbacks have run by sceGeListUpdateStallAddr's return), and in the
-cache step: the PSP's sceKernelDcacheWritebackAll changes all 16 words
-written through the uncached alias (cache lines written back over them),
-and psprecomp has no data cache. Measured nowhere yet, so not settled:
+cache step (Known differences). Measured nowhere yet, so not settled:
 
-- whether a level triangle's quirk follows its left edge or its first
-  corner, and whether a far pixel centred exactly on min x copies;
-- the order of a patch's triangles (lines' order is measured);
-- skinned and morphed normals, morphed colours and texture coordinates;
-- 16-bit vertex colours in 3D, which psprecomp reads as the material
-  colour;
-- lines past |clip x| or |clip y| > w (points are culled there), and
-  anything past the clip volume with depth clamping on.
-
-geprobe 22 (scenes 134-141, tools/hwprobe/geprobe README) poses each of
-these.
+- a line whose ends lie beyond different x or y planes without crossing
+  the volume, and triangles wholly beyond one plane;
+- a vertex colour's alpha (a frame's alpha byte is the stencil), so
+  5650's opaque alpha and 5551's 0 or 255 are assumed;
+- 16-bit vertex colours in through mode, taken to widen as in 3D;
+- bilinear filtering of negative texture coordinates (nearest's cut
+  toward zero is measured, not linear's);
+- a patch division of 0.
 
 ## Validation
 

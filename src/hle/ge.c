@@ -1141,6 +1141,38 @@ static uint32_t current_colour(void) {
     return c;
 }
 
+/* A vertex colour in any of its four formats, as 8888: each 16-bit format's
+ * fields widened by repeating their top bits below them (5 bits to 8 as
+ * v << 3 | v >> 2), 5650 opaque and 5551's alpha bit 0 or 255. geprobe 22
+ * (fw 6.60) scene 139 draws 200 points of each 16-bit format and reads every
+ * one of their 1800 channels so; this took 8888 alone and gave the rest the
+ * material colour. The alpha is not read (a frame's alpha byte is the
+ * stencil). */
+static uint32_t widen_colour(uint32_t fmt, uint32_t c) {
+    uint32_t r, g, b, a;
+    switch (fmt) {
+    case 4: r = c & 31; g = (c >> 5) & 63; b = (c >> 11) & 31;
+            return 0xFF000000u | (b << 3 | b >> 2) << 16 | (g << 2 | g >> 4) << 8 | (r << 3 | r >> 2);
+    case 5: r = c & 31; g = (c >> 5) & 31; b = (c >> 10) & 31; a = (c >> 15) & 1;
+            return (a ? 0xFF000000u : 0u) | (b << 3 | b >> 2) << 16 | (g << 3 | g >> 2) << 8 | (r << 3 | r >> 2);
+    case 6: r = c & 15; g = (c >> 4) & 15; b = (c >> 8) & 15; a = (c >> 12) & 15;
+            return (a * 17) << 24 | (b * 17) << 16 | (g * 17) << 8 | r * 17;
+    default: return c;
+    }
+}
+static uint32_t read_colour_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int col_off) {
+    const uint32_t fmt = VT_COLOR(vtype);
+    uint32_t c;
+    if (fmt == 7) {
+        if (vp) memcpy(&c, vp + col_off, 4);
+        else    c = psp_read32(addr + (uint32_t)col_off);
+        return c;
+    }
+    if (vp) { uint16_t h; memcpy(&h, vp + col_off, 2); c = h; }
+    else    c = psp_read16(addr + (uint32_t)col_off);
+    return widen_colour(fmt, c);
+}
+
 static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
                        int tex_off, psp_vertex *out) {
     out->spec = 0; out->spec_set = 0;
@@ -1173,8 +1205,8 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
         break;
     }
     if (tex_off >= 0) note_uv(out->u, out->v);
-    if (col_off >= 0 && VT_COLOR(vtype) == 7)
-        out->rgba = psp_read32(addr + (uint32_t)col_off);
+    if (col_off >= 0 && VT_COLOR(vtype) >= 4)
+        out->rgba = read_colour_at(NULL, addr, vtype, col_off);
 
     switch (VT_POS(vtype)) {
     case 2:   /* 16-bit: whole pixels, onto the 1/16 grid */
@@ -1265,25 +1297,20 @@ static int read_pos_model(uint32_t addr, uint32_t vtype, int pos_off, float p[3]
  * -1.0 and the right edge came out texel 0. Neither TEXSCALE nor TEXOFFSET was
  * decoded before: gpu/filtering/precisionnearest3d scales by 0.5, and its texel
  * boundary landed at a quarter of the sprite instead of the middle. */
-static void read_uv_model(uint32_t addr, uint32_t vtype, int tex_off, psp_vertex *out) {
-    out->u = out->v = 0.0f;
-    if (tex_off < 0) return;
+static int read_uv_raw(uint32_t addr, uint32_t vtype, int tex_off, float *u, float *v) {
+    *u = *v = 0.0f;
+    if (tex_off < 0) return 0;
     const uint32_t a = addr + (uint32_t)tex_off;
-    float u = 0.0f, v = 0.0f;
     switch (VT_TEX(vtype)) {
-    case 1: u = (float)psp_read8(a)       / 128.0f;
-            v = (float)psp_read8(a + 1)   / 128.0f;   break;
-    case 2: u = (float)psp_read16(a)      / 32768.0f;
-            v = (float)psp_read16(a + 2)  / 32768.0f; break;
-    case 3: u = psp_read_f32(a); v = psp_read_f32(a + 4); break;
-    default: return;
+    case 1: *u = (float)psp_read8(a)       / 128.0f;
+            *v = (float)psp_read8(a + 1)   / 128.0f;   return 1;
+    case 2: *u = (float)psp_read16(a)      / 32768.0f;
+            *v = (float)psp_read16(a + 2)  / 32768.0f; return 1;
+    case 3: *u = psp_read_f32(a); *v = psp_read_f32(a + 4); return 1;
+    default: return 0;
     }
-    u = u * g_ge.tex_scale_u + g_ge.tex_offset_u;
-    v = v * g_ge.tex_scale_v + g_ge.tex_offset_v;
-    out->u = u * (float)g_ge.tex_w;
-    out->v = v * (float)g_ge.tex_h;
-    note_uv(out->u, out->v);
 }
+static void uv_to_texels(float u, float v, psp_vertex *out);
 
 /* The same three decoders over one host span for the whole record.
  *
@@ -1319,23 +1346,22 @@ static void read_normal_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtyp
     default: break;
     }
 }
-static void read_uv_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, psp_vertex *out) {
-    if (!vp) { read_uv_model(addr, vtype, tex_off, out); return; }
-    out->u = out->v = 0.0f;
-    if (tex_off < 0) return;
+static int read_uv_raw_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, float *u, float *v) {
+    if (!vp) return read_uv_raw(addr, vtype, tex_off, u, v);
+    *u = *v = 0.0f;
+    if (tex_off < 0) return 0;
     const uint8_t *a = vp + tex_off;
-    float u = 0.0f, v = 0.0f;
     switch (VT_TEX(vtype)) {
-    case 1: u = (float)a[0] / 128.0f;                  v = (float)a[1] / 128.0f;                    break;
-    case 2: u = (float)(uint16_t)rd_s16(a) / 32768.0f; v = (float)(uint16_t)rd_s16(a + 2) / 32768.0f; break;
-    case 3: u = rd_f32(a); v = rd_f32(a + 4); break;
-    default: return;
+    case 1: *u = (float)a[0] / 128.0f;                  *v = (float)a[1] / 128.0f;                    return 1;
+    case 2: *u = (float)(uint16_t)rd_s16(a) / 32768.0f; *v = (float)(uint16_t)rd_s16(a + 2) / 32768.0f; return 1;
+    case 3: *u = rd_f32(a); *v = rd_f32(a + 4); return 1;
+    default: return 0;
     }
-    u = u * g_ge.tex_scale_u + g_ge.tex_offset_u;
-    v = v * g_ge.tex_scale_v + g_ge.tex_offset_v;
-    out->u = u * (float)g_ge.tex_w;
-    out->v = v * (float)g_ge.tex_h;
-    note_uv(out->u, out->v);
+}
+static void read_uv_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, psp_vertex *out) {
+    float u, v;
+    out->u = out->v = 0.0f;
+    if (read_uv_raw_at(vp, addr, vtype, tex_off, &u, &v)) uv_to_texels(u, v, out);
 }
 
 /* World and view are 4 columns of 3 rows; the implied bottom row makes the
@@ -1464,6 +1490,20 @@ static double ge_sum(const ge_term *t, int n) {
     return ldexp(s < 0 ? -(double)m : (double)m, e - 15 + sh);
 }
 
+/* A vertex's texture coordinates, in units, through TEXSCALE and TEXOFFSET to
+ * texels: u s + o as one GE sum of two GE products (ge_mul, ge_sum), then the
+ * texture's size. geprobe 22 (fw 6.60) scene 140 reads 600 plain float
+ * coordinates at scales 1, 2^8 and 2^12 through a texture that names its own
+ * texels, and this fits all 1800 readings; the float sum, as before, missed
+ * 119 at 2^12. */
+static void uv_to_texels(float u, float v, psp_vertex *out) {
+    const ge_term tu[2] = { ge_mul(u, g_ge.tex_scale_u), ge_mul(g_ge.tex_offset_u, 1.0) };
+    const ge_term tv[2] = { ge_mul(v, g_ge.tex_scale_v), ge_mul(g_ge.tex_offset_v, 1.0) };
+    out->u = (float)(ge_sum(tu, 2) * (double)g_ge.tex_w);
+    out->v = (float)(ge_sum(tv, 2) * (double)g_ge.tex_h);
+    note_uv(out->u, out->v);
+}
+
 static double ge_dot4(const double row[4], const double in[4]) {
     ge_term t[4];
     for (int k = 0; k < 4; k++) t[k] = ge_mul(row[k], in[k]);
@@ -1572,7 +1612,7 @@ static void mul_4x4(const float m[16], const float in[3], float out[4]) {
 
 /* One vertex as the transform stage takes it, after skinning and morphing:
  * model-space position and normal, colour, and texture coordinates in texels
- * (read_uv_model's units). Patches are tessellated into these too. */
+ * (uv_to_texels' units). Patches are tessellated into these too. */
 typedef struct { float pos[3], nrm[3]; uint32_t rgba; float u, v; } ge_mvert;
 
 /* A vertex's skinning weights. Normalised like the other narrow fields: an
@@ -1613,8 +1653,22 @@ static void read_weights(uint32_t a, float *w) {
  *    weight too. 8- and 16-bit weights are unsigned, 0x80 and 0x8000 one:
  *    0xFF and 0xFFFF weigh just under two (scene 111's extremes).
  * The skinned position then takes the world, view and projection matrices
- * as an unskinned one would (scene 113). Normals are skinned in float: no
- * probe has read them. */
+ * as an unskinned one would (scene 113).
+ *
+ * geprobe 22 (fw 6.60) reads the rest through the same accumulator:
+ *  - Normals (scene 138, 2400 points lit through bones and morph sets whose
+ *    terms cancel): skinned bone by bone over the x, y and z terms, no
+ *    translation, and morphed set by set, as positions are. Of the six
+ *    orders of a bone's terms only x, y, z fits all 2400; float32, as this
+ *    did, fits 1315; adding the translation, 1 of the 300 that pose it.
+ *  - Colours (scene 139, 4400 points): each channel, widened to 8 bits,
+ *    times the 16-bit morph weight into the accumulator, then floored, the
+ *    sign dropped and clamped to 255 -- a sum of -34.004 reads 34. Every one
+ *    of the 13,200 channels fits.
+ *  - Texture coordinates (scene 140, 2500 points at three scales): morphed
+ *    in units before TEXSCALE and TEXOFFSET (uv_to_texels), so the offset is
+ *    not weighted; all 15,000 readings fit, the float blend of the scaled
+ *    coordinates, as this did, 7,025. */
 static double ge_c16(double v) { return ge_cut(v, 16, 0); }
 
 static double ge_acc(double acc, double t) {
@@ -1643,17 +1697,27 @@ static float ge_skin_axis(const float *w, const float p[3], int c) {
     return (float)acc;
 }
 
-/* Skin a vertex in place: its position by the GE's arithmetic, its normal in
- * float through the bones' rotation parts. */
+/* One axis of a skinned normal: the x, y and z terms of each bone in turn,
+ * as a position's without its translation. */
+static float ge_skin_normal_axis(const float *w, const float n[3], int c) {
+    const double v[3] = { ge_c16(n[0]), ge_c16(n[1]), ge_c16(n[2]) };
+    double acc = 0.0;
+    for (int i = 0; i < g_vl.w_n; i++) {
+        const double wi = ge_c16(w[i]);
+        for (int k = 0; k < 3; k++) {
+            const double b = ge_c16(wi * ge_c16(g_tl.bone[12 * i + 3 * k + c]));
+            acc = ge_acc(acc, ge_c16(b * v[k]));
+        }
+    }
+    return (float)acc;
+}
+
+/* Skin a vertex in place, position and normal, by the GE's arithmetic. */
 static void skin_mvert(ge_mvert *o, const float *w, int want_normal) {
-    float p[3], sn[3] = { 0, 0, 0 };
+    float p[3], sn[3];
     for (int c = 0; c < 3; c++) p[c] = ge_skin_axis(w, o->pos, c);
     if (want_normal) {
-        for (int i = 0; i < g_vl.w_n; i++) {
-            float t[3];
-            mul_3x3(&g_tl.bone[12 * i], o->nrm, t);
-            for (int k = 0; k < 3; k++) sn[k] += w[i] * t[k];
-        }
+        for (int c = 0; c < 3; c++) sn[c] = ge_skin_normal_axis(w, o->nrm, c);
         memcpy(o->nrm, sn, sizeof sn);
     }
     memcpy(o->pos, p, sizeof p);
@@ -1668,60 +1732,59 @@ static int read_vertex_set(uint32_t a, uint32_t vtype, int col_off, int pos_off,
     if (want_normal) read_normal_model_at(vp, a, vtype, norm_off, o->nrm);
     else { o->nrm[0] = o->nrm[1] = 0.0f; o->nrm[2] = 1.0f; }
     o->rgba = current_colour();
-    if (col_off >= 0 && VT_COLOR(vtype) == 7) o->rgba = psp_read32(a + (uint32_t)col_off);
-    psp_vertex uv;
-    read_uv_model_at(vp, a, vtype, tex_off, &uv);
-    o->u = uv.u; o->v = uv.v;
+    if (col_off >= 0 && VT_COLOR(vtype) >= 4) o->rgba = read_colour_at(vp, a, vtype, col_off);
+    read_uv_raw_at(vp, a, vtype, tex_off, &o->u, &o->v);       /* in units: read_mvert scales */
     if (g_vl.w_fmt) read_weights(a, w);
     return 1;
 }
 
+/* A record's texture coordinates, read or morphed in units, to texels. */
+static void mvert_texels(ge_mvert *o, uint32_t vtype, int tex_off) {
+    psp_vertex t;
+    t.u = t.v = 0.0f;
+    if (tex_off >= 0 && VT_TEX(vtype)) uv_to_texels(o->u, o->v, &t);
+    o->u = t.u; o->v = t.v;
+}
+
 /* A whole record: its vertex sets blended by the morph weights, when there
- * is more than one, then skinned. Every field is blended, colour included --
- * scene 21's half-and-half triangle is half-way in colour as well as in
- * place. Position and weights take the accumulator above; the rest is
- * float. The blended colour is truncated, not rounded: scene 21's triangles
- * weighted 0.5/0.5 and 0.25/1.0 (127.5 and 63.75 per channel) differ from
- * the hardware on 1170 fewer pixels so (1620 -> 450). What is left is in
- * those two triangles and not pinned down; the whole-weight ones are exact. */
+ * is more than one, then skinned. Every field is blended, each through the
+ * accumulator above (see there for colour's sign and clamp). */
 static int read_mvert(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
                       int norm_off, int want_normal, ge_mvert *o) {
     float w[8] = { 0 };
     if (g_vl.morph_n <= 1) {
         if (!read_vertex_set(a, vtype, col_off, pos_off, tex_off, norm_off, want_normal, o, w))
             return 0;
+        mvert_texels(o, vtype, tex_off);
         if (g_vl.w_fmt) skin_mvert(o, w, want_normal);
         return 1;
     }
-    double pos[3] = { 0, 0, 0 }, mw8[8] = { 0 };
-    float nrm[3] = { 0, 0, 0 }, col[4] = { 0, 0, 0, 0 }, u = 0, v = 0;
+    double pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, col[4] = { 0, 0, 0, 0 }, uv[2] = { 0, 0 }, mw8[8] = { 0 };
     for (int k = 0; k < g_vl.morph_n; k++) {
         ge_mvert s1;
         float w1[8] = { 0 };
         if (!read_vertex_set(a + (uint32_t)(k * g_vl.set_stride), vtype, col_off, pos_off, tex_off,
                              norm_off, want_normal, &s1, w1))
             return 0;
-        const float mw = g_tl.morph_w[k];
-        const double m16 = ge_c16(mw);
+        const double m16 = ge_c16(g_tl.morph_w[k]);
         for (int i = 0; i < 3; i++) {
             pos[i] = ge_acc(pos[i], m16 * ge_c16(s1.pos[i]));
-            nrm[i] += mw * s1.nrm[i];
+            nrm[i] = ge_acc(nrm[i], m16 * ge_c16(s1.nrm[i]));
         }
         for (int i = 0; i < g_vl.w_n && g_vl.w_fmt; i++) mw8[i] = ge_acc(mw8[i], m16 * ge_c16(w1[i]));
-        for (int i = 0; i < 4; i++) col[i] += mw * (float)((s1.rgba >> (8 * i)) & 0xFFu);
-        u += mw * s1.u; v += mw * s1.v;
+        for (int i = 0; i < 4; i++) col[i] = ge_acc(col[i], m16 * (double)((s1.rgba >> (8 * i)) & 0xFFu));
+        uv[0] = ge_acc(uv[0], m16 * ge_c16(s1.u));
+        uv[1] = ge_acc(uv[1], m16 * ge_c16(s1.v));
     }
-    for (int i = 0; i < 3; i++) o->pos[i] = (float)pos[i];
+    for (int i = 0; i < 3; i++) { o->pos[i] = (float)pos[i]; o->nrm[i] = (float)nrm[i]; }
     for (int i = 0; i < 8; i++) w[i] = (float)mw8[i];
-    memcpy(o->nrm, nrm, sizeof nrm);
     o->rgba = 0;
     for (int i = 0; i < 4; i++) {
-        int c = (int)col[i];
-        if (c < 0) c = 0;
-        if (c > 255) c = 255;
-        o->rgba |= (uint32_t)c << (8 * i);
+        const double c = floor(fabs(col[i]));
+        o->rgba |= (uint32_t)(c > 255.0 ? 255.0 : c) << (8 * i);
     }
-    o->u = u; o->v = v;
+    o->u = (float)uv[0]; o->v = (float)uv[1];
+    mvert_texels(o, vtype, tex_off);
     if (g_vl.w_fmt) skin_mvert(o, w, want_normal);
     return 1;
 }
@@ -2027,19 +2090,33 @@ static int clip_near(const clipvert *in, int n, clipvert *out) {
  * generate the same intersection twice). Points have no intersection to add.
  * This follows the triangle path's existing clip/clamp and guard-band policy. */
 static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) {
+    /* Past the x and y planes, with depth clamping or without: a point
+     * outside either is not drawn, and a line whose two ends lie beyond the
+     * same one is not either; a line with an end inside, or one across the
+     * volume, is drawn whole. geprobe 22 (fw 6.60) scene 141: points at
+     * 0.95 to 1.05 w on every side draw only to 1 w with clamping on too (it
+     * drew all nine), and lines beyond x = w at both ends draw nothing either
+     * way (13 and 7 pixels before); its 74 other lines match as they were.
+     * Ends beyond different planes are not measured. */
+    if (n == 1 && !(fabsf(p[0].c[0]) <= p[0].c[3] && fabsf(p[0].c[1]) <= p[0].c[3])) {
+        g_clip_guard += 1; return;
+    }
+    if (n == 2) {
+        for (int k = 0; k < 2; k++)
+            if ((p[0].c[k] > p[0].c[3] && p[1].c[k] > p[1].c[3]) ||
+                (p[0].c[k] < -p[0].c[3] && p[1].c[k] < -p[1].c[3])) { g_clip_guard += 2; return; }
+    }
+    /* With clamping on a point past the far plane is not drawn either (scene
+     * 141: z 1.0001 w on); the near one is the clip below's. */
+    if (n == 1 && g_tl.depth_clamp && p[0].c[2] > p[0].c[3]) { g_clip_z += 1; return; }
     if (!g_tl.depth_clamp) {
         for (int i = 0; i < n; i++) {
             if (!(p[i].c[3] > 0)) { g_skip_nearplane += (uint64_t)n; return; }
             const float z = p[i].c[2] / p[i].c[3];
             if (!(z >= -1 && z <= 1)) { g_clip_z += (uint64_t)n; return; }
-            /* Nor is a point outside the clip volume's x and y planes,
-             * wherever the screen offset puts it (geprobe 16, fw 6.60: of
-             * scenes 110-114's points every one drawn has |clip x| and
-             * |clip y| at most 0.989 w, every one missing (379) one of
-             * them at least 1.005 w). Lines are not measured. */
-            if (n == 1 && !(fabsf(p[i].c[0]) <= p[i].c[3] && fabsf(p[i].c[1]) <= p[i].c[3])) {
-                g_clip_guard += 1; return;
-            }
+            /* The x and y planes are above: geprobe 16 (fw 6.60) first saw
+             * them, of scenes 110-114's points every one drawn within 0.989
+             * w, every one missing (379) at least 1.005 w. */
         }
     } else {
         const float a = p[0].c[2] + p[0].c[3];
@@ -2673,7 +2750,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 }
             }
             const uint32_t base_colour = current_colour();
-            const int vertex_colour = col_off >= 0 && VT_COLOR(vtype) == 7;
+            const int vertex_colour = col_off >= 0 && VT_COLOR(vtype) >= 4;
             for (; decoded < n; decoded++) {
                 uint32_t a;
                 const uint8_t *vp;
@@ -2691,10 +2768,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 psp_model_vertex *m = &mv[decoded];
                 if (!read_pos_model_at(vp, a, vtype, pos_off, m->pos)) break;
                 m->rgba = base_colour;
-                if (vertex_colour) {
-                    if (vp) memcpy(&m->rgba, vp + col_off, 4);
-                    else    m->rgba = psp_read32(a + (uint32_t)col_off);
-                }
+                if (vertex_colour) m->rgba = read_colour_at(vp, a, vtype, col_off);
                 if (any_light) read_normal_model_at(vp, a, vtype, norm_off, m->nrm);
                 else { m->nrm[0] = m->nrm[1] = 0.0f; m->nrm[2] = 1.0f; }
                 psp_vertex uv;
@@ -2774,10 +2848,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             o->rgba = current_colour();
             o->tex_q = 1.0f;
             if (blended) o->rgba = mv.rgba;
-            else if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7) {
-                if (vp) memcpy(&o->rgba, vp + col_off, 4);
-                else    o->rgba = psp_read32(a + (uint32_t)col_off);
-            }
+            else if (col_off >= 0 && VT_COLOR(g_ge.vtype) >= 4) o->rgba = read_colour_at(vp, a, g_ge.vtype, col_off);
             /* Fog. The coefficient is (end - depth) * range with depth the
              * eye-space distance -- w of the clip position for a standard
              * projection, -z of the eye position here -- clamped to 0..1 and
@@ -3149,7 +3220,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
      * them would otherwise be painted with a stale texture sampled at texel
      * zero. That is exactly what hardware does: gpu/texfunc draws sprites with
      * GU_COLOR_8888 | GU_VERTEX_32BITF, no texcoords, over a solid 4x4
-     * texture, and reads the texture's colour back. read_uv_model already
+     * texture, and reads the texture's colour back. read_uv_model_at already
      * answers (0,0) for a vertex without them. A game that wants flat geometry
      * disables texturing, and this one does. */
     /* The texture address is complete as decoded -- unlike FBP, which is a
