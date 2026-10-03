@@ -162,6 +162,11 @@ def read(base, sc, name):
 
 def main():
     base = sys.argv[1]
+    if len(sys.argv) > 2 and int(sys.argv[2]) >= 83:     # geprobe 14's colour-plane scenes
+        import colour14
+        colour14.sums(base)
+        colour14.compare(base, [int(sys.argv[2])], None)
+        return
     if len(sys.argv) > 2 and int(sys.argv[2]) >= 67:     # geprobe 13's patch scenes
         import patch13
         patch13.points(base, int(sys.argv[2]))

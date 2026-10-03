@@ -190,6 +190,18 @@ checks a run's log CRCs and, per batch, that every expected point is on
 its predicted pixel; `python3 patch13.py points <dir> <scene>` lists every
 point's inputs, prediction and reading.
 
+Version 14 adds scenes 83-98 after them, so steps 1-123 keep their version 13
+numbers. Geprobe 13 left one step of colour off inside some triangles
+(scenes 16, 21, 22, 23 and 26), all of them triangles whose middle corner lies
+left of the long edge. Across all the earlier dumps, starting colour, fog and
+secondary planes from the depth plane's corner instead of the leftmost explains
+every one of those pixels and changes no other. These scenes confirm or refute
+that over every orientation, vertex order, tie, sub-pixel offset, scissor
+case, gradient range, the alpha, fog and secondary planes, and 3D and
+perspective twins. Like 67-82 they are replayed from command streams:
+`colour14.py emit` writes `c14_data.inc`; `colour14.py sums <dir>` checks each
+scene's logged CRCs; `compare`, `decode` and `selfcheck` read the answers.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -210,7 +222,7 @@ framebuffer format, exactly as the GE wrote VRAM. `raw2png.py` turns them into
 PNGs for looking at; comparisons should use the raw files.
 `readout.py <geprobe dir> [scene]` regenerates scenes 62-66's inputs, checks
 them against the log's CRCs, and lists each point's inputs and depth;
-for scenes 67-82 it hands over to `patch13.py`.
+for scenes 67-82 it hands over to `patch13.py`, and for 83-98 to `colour14.py`.
 
 ## Compare with psprecomp
 

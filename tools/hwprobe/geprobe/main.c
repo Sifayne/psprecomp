@@ -21,9 +21,11 @@
  * spline weights again, densely, scenes 55 to 58 (version 10) the
  * spline weights through depth and texture, and the 3D depth anchor, and
  * scenes 59 to 61 (version 11) a vertex's depth, a stage at a time,
- * scenes 62 to 66 (version 12) each of those stages read whole, and
+ * scenes 62 to 66 (version 12) each of those stages read whole,
  * scenes 67 to 82 (version 13) Bezier and spline patch positions read
- * through depth, replayed from patch13.py's command streams.
+ * through depth, replayed from patch13.py's command streams, and scenes 83
+ * to 98 (version 14) how colour runs across a triangle, replayed from
+ * colour14.py's.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -44,7 +46,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 13
+#define PROBE_VERSION 14
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -3209,6 +3211,195 @@ static void p13_run(const struct p13_step *st) {
     }
 }
 
+/* ---- geprobe 14: colour planes, scenes 83-98 ----------------------------
+ *
+ * Every scene is a u32 command stream from colour14.py (c14_data.inc), in
+ * the pattern of patch13.py: the C side draws nothing of its own. Each word
+ * is (op << 24) | nargs, then the args. The second command of every stream
+ * is SUMS, which logs the draw count, vertex count, the CRC of all vertex
+ * bytes and the stream CRC, so readout can confirm the tables before
+ * reading a pixel. Place after p13_run (it uses p13_room/p13_flush, gumem,
+ * scene_begin/scene_end, dump_depth_full, crc32). */
+#include "c14_data.inc"
+
+static w32 g_c14_tex[16 * 16] __attribute__((aligned(16)));   /* all 0xFF000000 */
+static w32 g_c14_vb[8192] __attribute__((aligned(16)));        /* LADDER's vertices */
+
+static float c14_f(w32 w) { float f; memcpy(&f, &w, 4); return f; }
+
+/* Scene 95's lighting. mode 1: light 0 directional along +Z, white diffuse
+ * and specular, no ambient anywhere, vertex colour as diffuse and specular
+ * material, separate specular. mode 2: the same with specular light 0
+ * (primary alone). mode 0: lighting off. */
+static void c14_light(int mode, float coef) {
+    if (!mode) {
+        sceGuDisable(GU_LIGHT0);
+        sceGuDisable(GU_LIGHTING);
+        sceGuColorMaterial(0);
+        sceGuLightMode(GU_SINGLE_COLOR);
+        return;
+    }
+    ScePspFVector3 dir = { 0.0f, 0.0f, 1.0f };
+    sceGuEnable(GU_LIGHTING);
+    sceGuLightMode(GU_SEPARATE_SPECULAR_COLOR);
+    sceGuAmbient(0xFF000000);
+    sceGuModelColor(0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF);
+    sceGuAmbientColor(0xFF000000);
+    sceGuColorMaterial(GU_DIFFUSE | GU_SPECULAR);
+    sceGuSpecular(coef);
+    sceGuEnable(GU_LIGHT0);
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE_AND_SPECULAR, &dir);
+    sceGuLightColor(0, GU_AMBIENT, 0x000000);
+    sceGuLightColor(0, GU_DIFFUSE, 0xFFFFFF);
+    sceGuLightColor(0, GU_SPECULAR, mode == 1 ? 0xFFFFFF : 0x000000);
+}
+
+static void c14_tex(int on) {
+    if (!on) { sceGuDisable(GU_TEXTURE_2D); return; }
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, 16, 16, 16, g_c14_tex);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+    sceGuTexScale(1.0f, 1.0f);
+    sceGuTexOffset(0.0f, 0.0f);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFlush();
+}
+
+static void c14_run(const struct c14_step *st) {
+    g_scene = st->scene;
+    if (step("scene %02d: %s", st->scene, st->title)) return;
+    const w32 *s = st->s;
+    const w32 sc = crc32(s, st->n * 4);
+    int psm = GU_PSM_8888;
+    g_p13_us = 0;
+    g_p13_flushes = 0;
+    for (int i = 0; i < 256; i++) g_c14_tex[i] = 0xFF000000u;
+    sceKernelDcacheWritebackAll();
+    for (int i = 0; i < st->n; i += 1 + (int)(s[i] & 0xFFFFFF)) {
+        const w32 *a = s + i + 1;
+        switch (s[i] >> 24) {
+        case C14_NOP: break;
+        case C14_BEGIN:
+            psm = (int)a[0];
+            scene_begin(psm, a[1]);
+            break;
+        case C14_SUMS: {
+            /* the CRC of every DRAW/LADDER's vertex bytes, in stream order */
+            w32 vc = 0;
+            for (int j = 0; j < st->n; j += 1 + (int)(s[j] & 0xFFFFFF)) {
+                const w32 op = s[j] >> 24;
+                if (op == C14_DRAW || op == C14_LADDER) vc = crc32_more(vc, s + j + 1 + (op == C14_DRAW ? 5 : 6), (int)s[j + 4]);
+            }
+            out("  %u draws, %u vertices, vertex crc %08X, stream crc %08X\n",
+                (unsigned)a[0], (unsigned)a[1], vc, sc);
+            if (vc != a[2]) out("  vertex crc differs from the table's %08X\n", a[2]);
+            break;
+        }
+        case C14_SCISSOR:
+            sceGuScissor((int)a[0], (int)a[1], (int)(a[2] - a[0] + 1), (int)(a[3] - a[1] + 1));
+            break;
+        case C14_SHADE: sceGuShadeModel((int)a[0]); break;
+        case C14_DRAW: {
+            p13_room();
+            const int vb = (int)a[3], ib = (int)a[4];
+            unsigned char *v = gumem(a + 5, vb + ib);
+            sceGuDrawArray((int)a[0], (int)a[1], (int)a[2], ib ? v + vb : NULL, v);
+            break;
+        }
+        case C14_MATS:
+            p13_load(GU_PROJECTION, a + 1);
+            p13_load(GU_VIEW, a + 17);
+            p13_load(GU_MODEL, a + 33);
+            sceGumMatrixMode(GU_MODEL);
+            sceGumUpdateMatrix();
+            break;
+        case C14_VIEWPORT: sceGuViewport((int)a[0], (int)a[1], (int)a[2], (int)a[3]); break;
+        case C14_OFFSET:   sceGuOffset(a[0], a[1]); break;
+        case C14_ALPHA:
+            if (a[0]) { sceGuEnable(GU_ALPHA_TEST); sceGuAlphaFunc((int)a[1], (int)a[2], (int)a[3]); }
+            else sceGuDisable(GU_ALPHA_TEST);
+            break;
+        case C14_STENCIL:
+            if (a[0]) {
+                sceGuEnable(GU_STENCIL_TEST);
+                sceGuStencilFunc(GU_ALWAYS, 0, 0xFF);
+                sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INCR);
+            } else sceGuDisable(GU_STENCIL_TEST);
+            break;
+        case C14_FOG:
+            if (a[0]) { sceGuEnable(GU_FOG); sceGuFog(c14_f(a[1]), c14_f(a[2]), a[3]); }
+            else sceGuDisable(GU_FOG);
+            break;
+        case C14_LADDER: {
+            /* Draw once with the alpha and stencil tests off, then pass r =
+             * first..last with alpha test GEQUAL r and stencil INCR on pass:
+             * the alpha byte (the stencil) counts the passes, i.e. it is the
+             * alpha plane's value. The vertices live outside the list,
+             * because p13_room() may restart it. */
+            const int prim = (int)a[0], vt = (int)a[1], cnt = (int)a[2], vb = (int)a[3];
+            if (vb > (int)sizeof g_c14_vb) { out("  ladder vertices too big: %d\n", vb); break; }
+            memcpy(g_c14_vb, a + 6, vb);
+            sceKernelDcacheWritebackAll();
+            sceGuDisable(GU_ALPHA_TEST);
+            sceGuDisable(GU_STENCIL_TEST);
+            sceGuDrawArray(prim, vt, cnt, NULL, g_c14_vb);
+            sceGuEnable(GU_STENCIL_TEST);
+            sceGuStencilFunc(GU_ALWAYS, 0, 0xFF);
+            sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INCR);
+            sceGuEnable(GU_ALPHA_TEST);
+            for (int r = (int)a[4]; r <= (int)a[5]; r++) {
+                p13_room();
+                sceGuAlphaFunc(GU_GEQUAL, r, 0xFF);
+                sceGuDrawArray(prim, vt, cnt, NULL, g_c14_vb);
+            }
+            sceGuDisable(GU_ALPHA_TEST);
+            sceGuDisable(GU_STENCIL_TEST);
+            break;
+        }
+        case C14_LIGHT: c14_light((int)a[0], c14_f(a[1])); break;
+        case C14_TEX:   c14_tex((int)a[0]); break;
+        case C14_DEPTH:
+            /* Scene 97: depth test with writes on (GU_FALSE is "writes on"),
+             * so the depth planes land in the buffer END dumps. */
+            if (a[0]) {
+                sceGuEnable(GU_DEPTH_TEST);
+                sceGuDepthFunc((int)a[1]);
+                sceGuDepthMask(GU_FALSE);
+            } else sceGuDisable(GU_DEPTH_TEST);
+            break;
+        case C14_END:
+            sceGuScissor(0, 0, SCR_W, SCR_H);
+            sceGuShadeModel(GU_SMOOTH);
+            sceGuDisable(GU_ALPHA_TEST);
+            sceGuDisable(GU_STENCIL_TEST);
+            sceGuDisable(GU_FOG);
+            sceGuDisable(GU_DEPTH_TEST);
+            c14_light(0, 1.0f);
+            c14_tex(0);
+            sceGuOffset(2048 - SCR_W / 2, 2048 - SCR_H / 2);
+            sceGuViewport(2048, 2048, SCR_W, SCR_H);
+            sceGumMatrixMode(GU_VIEW);
+            sceGumLoadIdentity();
+            sceGumMatrixMode(GU_MODEL);
+            sceGumLoadIdentity();
+            sceGumUpdateMatrix();
+            p13_flush();
+            out("  GE %u us\n", (unsigned)g_p13_us);
+            if (g_p13_flushes) out("  %d list flush(es) at 448 KB\n", g_p13_flushes);
+            /* END 1: also the whole depth buffer, as _depthfull.bin (the
+             * 480-wide _depth.raw cannot read every pixel's depth). */
+            scene_end(st->name, psm, 0);
+            if (a[0]) dump_depth_full(st->name);
+            break;
+        default:
+            out("  bad stream word %d: %08X\n", i, s[i]);
+            return;
+        }
+    }
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -3846,6 +4037,9 @@ int main(int argc, char **argv) {
      * risky ones (76-82) last and in the order of what is least known. */
     section("scenes, version 13");
     for (int k = 0; k < P13_NSTEPS; k++) p13_run(&P13_STEPS[k]);
+
+    section("scenes, version 14");
+    for (int k = 0; k < C14_NSTEPS; k++) c14_run(&C14_STEPS[k]);
 
     probe_screen(1);
     probe_done();
