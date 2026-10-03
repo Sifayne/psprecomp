@@ -349,6 +349,19 @@ nearest texel cut toward zero to a sixteenth before it is floored, and lines bey
 one x or y plane at both ends, or points past x, y or z with clamping on, not drawn.
 psprecomp then matches all 189 dumps.
 
+Version 23 adds scenes 142-145 for what set 23 left unmeasured. 142 draws lines
+whose ends lie beyond different x and y planes (through a corner of the volume, or
+past it), triangles wholly beyond one plane or several, ends on a plane exactly or
+past z at both ends with clamping on, and lines whose ends have different w
+(`clip23.py`, `c23c_data.inc`). 143 reads vertex alpha whole through the alpha-test
+ladder (LADDER, now run one at a time): 16-bit colours in through mode and in 3D, and
+morphed alphas (`alpha23.py`, `c23a_data.inc`). 144 samples a 64 x 64 texture whose
+red and green are 255 on odd columns and rows, linear filtered, at coordinates from
+-120 to 120 texels at every 1/64, so each point's red and green are its bilinear
+weights (`bilin23.py`, `c23b_data.inc`, the TEXB op). 145 is risky and last: patch
+divisions of 0, each case its own list (the FLUSH op) with a marker drawn after the
+patch, broken off after a second if it hangs (`pzero23.py`, `c23z_data.inc`).
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -374,7 +387,9 @@ for 99-109 to `lines15.py`, for 110-114 to `skin16.py`, for 115-119 to
 `lights17.py`, for 120 to `rsq18.py`, for 121-124 to `lights19.py`, for
 125-127 to `edges20.py`, for 128-129 to `edges21.py`, for 130-133 to
 `plines21.py`, for 134 to `edges22.py`, for 135-137 to `ptris22.py`, for 138 to
-`norms22.py`, for 139-140 to `morph22.py`, and for 141 to `clip22.py`.
+`norms22.py`, for 139-140 to `morph22.py`, for 141 to `clip22.py`, for 142 to
+`clip23.py`, for 143 to `alpha23.py`, for 144 to `bilin23.py`, and for 145 to
+`pzero23.py`.
 
 ## Compare with psprecomp
 

@@ -163,7 +163,8 @@ def read(base, sc, name):
 def main():
     base = sys.argv[1]
     sc = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-    for lo, hi, mod in ((141, 141, 'clip22'), (139, 140, 'morph22'), (138, 138, 'norms22'),
+    for lo, hi, mod in ((145, 145, 'pzero23'), (144, 144, 'bilin23'), (143, 143, 'alpha23'),
+                        (142, 142, 'clip23'), (141, 141, 'clip22'), (139, 140, 'morph22'), (138, 138, 'norms22'),
                         (135, 137, 'ptris22'), (134, 134, 'edges22')):          # geprobe 22
         if lo <= sc <= hi:
             m = __import__(mod)

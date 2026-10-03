@@ -893,6 +893,9 @@ cache step (Known differences). Measured nowhere yet, so not settled:
   toward zero is measured, not linear's);
 - a patch division of 0.
 
+geprobe 23 (scenes 142-145, tools/hwprobe/geprobe README) poses each of
+these.
+
 ## Validation
 
 The host's expanded scene suite uses `PSPRECOMP_GE_CAPTURE_POLLS=740,915,...`

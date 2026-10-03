@@ -57,7 +57,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 22
+#define PROBE_VERSION 23
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -3242,6 +3242,10 @@ static void p13_run(const struct p13_step *st) {
 #include "c22n_data.inc"     /* geprobe 22: skinned and morphed normals, scene 138, from norms22.py */
 #include "c22m_data.inc"     /* geprobe 22: morphed colours and coordinates, scenes 139-140, from morph22.py */
 #include "c22c_data.inc"     /* geprobe 22: past the clip volume, scene 141, from clip22.py */
+#include "c23c_data.inc"     /* geprobe 23: past the clip volume, more, scene 142, from clip23.py */
+#include "c23a_data.inc"     /* geprobe 23: vertex alpha, scene 143, from alpha23.py */
+#include "c23b_data.inc"     /* geprobe 23: bilinear at negative coordinates, scene 144, from bilin23.py */
+#include "c23z_data.inc"     /* geprobe 23: patch division 0, scene 145 (risky), from pzero23.py */
 
 static w32 g_c14_tex[16 * 16] __attribute__((aligned(16)));   /* all 0xFF000000 */
 static w32 g_c14_vb[8192] __attribute__((aligned(16)));        /* LADDER's vertices */
@@ -3334,6 +3338,36 @@ static void c22_texc(const w32 *a) {
     sceGuTexFlush();
 }
 
+/* geprobe 23's alternating texture: 64 x 64, red 255 on odd s, green 255 on
+ * odd t, blue 0x80, so a bilinear sample's red and green are the weights of
+ * its odd texels. TEXB turns it on (linear both ways, repeating, replacing)
+ * with a scale and offset, or off. */
+static w32 g_c23_tex[64 * 64] __attribute__((aligned(16)));
+static void c23_texb(const w32 *a) {
+    if (!a[0]) {
+        c14_tex(0);
+        sceGuTexScale(1.0f, 1.0f);
+        sceGuTexOffset(0.0f, 0.0f);
+        return;
+    }
+    if (!g_c23_tex[0]) {
+        for (int t = 0; t < 64; t++)
+            for (int s = 0; s < 64; s++)
+                g_c23_tex[t * 64 + s] = 0xFF800000u | (t & 1 ? 0xFF00u : 0u) | (s & 1 ? 0xFFu : 0u);
+        sceKernelDcacheWritebackAll();
+    }
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, 64, 64, 64, g_c23_tex);
+    sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+    sceGuTexWrap(GU_REPEAT, GU_REPEAT);
+    sceGuTexMapMode(GU_TEXTURE_COORDS, 0, 0);
+    sceGuTexScale(c14_f(a[1]), c14_f(a[2]));
+    sceGuTexOffset(c14_f(a[3]), c14_f(a[4]));
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFlush();
+}
+
 static void c14_run(const struct c14_step *st) {
     g_scene = st->scene;
     if (step("scene %02d: %s", st->scene, st->title)) return;
@@ -3408,6 +3442,9 @@ static void c14_run(const struct c14_step *st) {
              * because p13_room() may restart it. */
             const int prim = (int)a[0], vt = (int)a[1], cnt = (int)a[2], vb = (int)a[3];
             if (vb > (int)sizeof g_c14_vb) { out("  ladder vertices too big: %d\n", vb); break; }
+            /* geprobe 23 draws many ladders a scene: the last one's draws read
+             * g_c14_vb, so they run before it is filled again. */
+            p13_flush();
             memcpy(g_c14_vb, a + 6, vb);
             sceKernelDcacheWritebackAll();
             sceGuDisable(GU_ALPHA_TEST);
@@ -3476,6 +3513,12 @@ static void c14_run(const struct c14_step *st) {
             break;
         }
         case C14_TEXC: c22_texc(a); break;               /* geprobe 22: on, su, sv, ou, ov */
+        case C14_TEXB: c23_texb(a); break;               /* geprobe 23: on, su, sv, ou, ov */
+        case C14_FLUSH:                                   /* geprobe 23: run the list so far, its own */
+            p13_flush();
+            out("  part %u: GE %u us\n", (unsigned)a[0], (unsigned)g_p13_us);
+            g_p13_us = 0;
+            break;
         case C14_CLAMP:                                   /* geprobe 22: depth clamping on or off */
             if (a[0]) sceGuEnable(GU_CLIP_PLANES); else sceGuDisable(GU_CLIP_PLANES);
             break;
@@ -4505,6 +4548,13 @@ int main(int argc, char **argv) {
     for (int k = 0; k < C22N_NSTEPS; k++) c14_run(&C22N_STEPS[k]);
     for (int k = 0; k < C22M_NSTEPS; k++) c14_run(&C22M_STEPS[k]);
     for (int k = 0; k < C22C_NSTEPS; k++) c14_run(&C22C_STEPS[k]);
+
+    /* Version 23: scene 145 may hang the GE (a patch division of 0), so last. */
+    section("scenes, version 23");
+    for (int k = 0; k < C23C_NSTEPS; k++) c14_run(&C23C_STEPS[k]);
+    for (int k = 0; k < C23A_NSTEPS; k++) c14_run(&C23A_STEPS[k]);
+    for (int k = 0; k < C23B_NSTEPS; k++) c14_run(&C23B_STEPS[k]);
+    for (int k = 0; k < C23Z_NSTEPS; k++) c14_run(&C23Z_STEPS[k]);
 
     probe_screen(1);
     probe_done();
