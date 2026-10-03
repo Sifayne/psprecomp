@@ -2637,10 +2637,13 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         psp_xform_state xs;
         fill_xform_state(&xs);
         if (g_prof_on > 0) g_prof_m[5] += ge_prof_now() - _x0;
-        psp_model_vertex mv[GE_VERTEX_BATCH];
+        psp_model_vertex mv[GE_VERTEX_BATCH], centre;
         uint32_t mdone = 0;
         while (mdone < count) {
-            const uint32_t n = primitive_batch_count(type, count - mdone);
+            /* A fan's later batches start again from its first vertex (see
+             * draw_prim): one fewer read, then the centre in front. */
+            const uint32_t lead = type == PSP_PRIM_TRIANGLE_FAN && mdone > 0;
+            const uint32_t n = primitive_batch_count(type, count - mdone + lead) - lead;
             uint32_t decoded = 0;
             const uint64_t _m0 = ge_prof_now();
             /* One translation for the batch's vertices and one for its
@@ -2699,15 +2702,23 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             }
             if (g_tl.fog_enable) g_fog_verts += decoded;
             if (g_tl.lighting)   g_lit_verts += decoded;
+            if (lead && decoded) {
+                memmove(mv + 1, mv, decoded * sizeof *mv);
+                mv[0] = centre;
+                decoded++;
+            } else if (type == PSP_PRIM_TRIANGLE_FAN && decoded) centre = mv[0];
             const uint64_t _m1 = ge_prof_now();
             be->draw_model((int)type, mv, (int)decoded, &xs);
             if (g_prof_on > 0) { const uint64_t _m2 = ge_prof_now(); g_prof_m[0] += _m1 - _m0; g_prof_m[1] += _m2 - _m1; }
             g_model_verts += decoded;
-            if ((type == PSP_PRIM_TRIANGLE_STRIP || type == PSP_PRIM_TRIANGLE_FAN) &&
-                decoded == GE_VERTEX_BATCH && mdone + decoded < count)
+            if (type == PSP_PRIM_TRIANGLE_STRIP && decoded == GE_VERTEX_BATCH && mdone + decoded < count)
                 mdone += decoded - 2;
+            else if (type == PSP_PRIM_TRIANGLE_FAN && decoded == GE_VERTEX_BATCH && mdone + decoded - lead < count)
+                mdone += decoded - lead - 1;
+            else if (decoded <= lead)
+                break;
             else
-                mdone += decoded;
+                mdone += decoded - lead;
         }
         return;
     }
@@ -2715,8 +2726,13 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
     double wvp[4][4];
     ge_wvp(wvp);
     uint32_t done = 0;
+    psp_vertex centre_v;
+    float centre_cl[4];
     while (done < count) {
-        const uint32_t n = primitive_batch_count(type, count - done);
+        /* A fan's later batches start again from its first vertex (see
+         * draw_prim): one fewer read, then the centre in front. */
+        const uint32_t lead = type == PSP_PRIM_TRIANGLE_FAN && done > 0;
+        const uint32_t n = primitive_batch_count(type, count - done + lead) - lead;
 
         uint32_t decoded = 0;
         for (; decoded < n; decoded++) {
@@ -2840,6 +2856,16 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         }
         if (!decoded) break;
         g_xformed += decoded;
+        if (lead) {
+            memmove(v + 1, v, decoded * sizeof *v);
+            memmove(cl + 1, cl, decoded * sizeof *cl);
+            v[0] = centre_v;
+            memcpy(cl[0], centre_cl, sizeof centre_cl);
+            decoded++;
+        } else if (type == PSP_PRIM_TRIANGLE_FAN) {
+            centre_v = v[0];
+            memcpy(centre_cl, cl[0], sizeof centre_cl);
+        }
 
         if (texdraw_hit() || wilduv_hit(v, decoded)) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
 
@@ -2923,13 +2949,14 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         }
 
         if (g_prof_on > 0) { g_prof[5] += ge_prof_now() - _pe; g_prof_batches++; }
-        if ((type == PSP_PRIM_TRIANGLE_STRIP || type == PSP_PRIM_TRIANGLE_FAN) &&
-            decoded == GE_VERTEX_BATCH && done + decoded < count)
+        if (type == PSP_PRIM_TRIANGLE_STRIP && decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 2;
+        else if (type == PSP_PRIM_TRIANGLE_FAN && decoded == GE_VERTEX_BATCH && done + decoded - lead < count)
+            done += decoded - lead - 1;
         else if (type == PSP_PRIM_LINE_STRIP && decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 1;
         else
-            done += decoded;
+            done += decoded - lead;
     }
 }
 
@@ -3150,15 +3177,18 @@ static void draw_prim(uint32_t type, uint32_t count) {
         return;
     }
 
-    psp_vertex v[GE_VERTEX_BATCH];
+    psp_vertex v[GE_VERTEX_BATCH], centre;
     const psp_render_backend *be = psp_render_current();
 
     uint32_t done = 0;
     while (done < count) {
-        const uint32_t n = primitive_batch_count(type, count - done);
-
         /* Strips overlap at a batch boundary: two vertices for triangles,
-         * one for lines, or the primitive spanning the boundary is lost. */
+         * one for lines, or the primitive spanning the boundary is lost. A
+         * fan's later batches start again from its first vertex, then the
+         * last batch's last: each triangle is (first, previous, this). */
+        const uint32_t lead = type == PSP_PRIM_TRIANGLE_FAN && done > 0;
+        const uint32_t n = primitive_batch_count(type, count - done + lead) - lead;
+
         uint32_t decoded = 0;
         for (; decoded < n; decoded++) {
             if (!read_vertex(vertex_addr(done + decoded, stride),
@@ -3166,6 +3196,11 @@ static void draw_prim(uint32_t type, uint32_t count) {
                 break;
         }
         if (!decoded) break;
+        if (lead) {
+            memmove(v + 1, v, decoded * sizeof *v);
+            v[0] = centre;
+            decoded++;
+        } else if (type == PSP_PRIM_TRIANGLE_FAN) centre = v[0];
 
         if (texdraw_hit() || wilduv_hit(v, decoded)) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
 
@@ -3200,10 +3235,12 @@ static void draw_prim(uint32_t type, uint32_t count) {
 
         if (type == PSP_PRIM_TRIANGLE_STRIP && decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 2;     /* strip overlap */
+        else if (type == PSP_PRIM_TRIANGLE_FAN && decoded == GE_VERTEX_BATCH && done + decoded - lead < count)
+            done += decoded - lead - 1;
         else if (type == PSP_PRIM_LINE_STRIP && decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 1;
         else
-            done += decoded;
+            done += decoded - lead;
     }
 }
 

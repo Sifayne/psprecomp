@@ -1725,8 +1725,16 @@ static void sw_draw(int prim, const psp_vertex *v, int count) {
     case PSP_PRIM_TRIANGLE_STRIP:
         for (int i = 0; i + 2 < count; i++) sw_tri(&v[i], &v[i + 1], &v[i + 2]);
         break;
+    case PSP_PRIM_TRIANGLE_FAN:
+        /* Through-mode fans reach here whole (ge.c assembles transformed
+         * ones): (first, previous, this), so a flat fan triangle takes its
+         * last vertex's colour. geprobe 14 (fw 6.60) scene 88's fan tiles,
+         * smooth and flat, indexed and with a degenerate first triangle,
+         * match the PSP on every pixel so, and were all blank before. */
+        for (int i = 2; i < count; i++) sw_tri(&v[0], &v[i - 1], &v[i]);
+        break;
     default:
-        break;                       /* fans are assembled by the GE */
+        break;
     }
     g_raster_ns += now_ns() - t0;
 }

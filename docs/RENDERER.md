@@ -107,7 +107,7 @@ backend is wrong the same way, which is at least diagnosable.
 
 | Backend | State | Notes |
 |---|---|---|
-| **software** | Working | The differential reference. Points, lines, line strips, triangles, triangle strips and sprites; GE-assembled fans. `test_raster.c` asserts pixel positions and sampling rules -- perspective UVs, mip/LOD, filtering, wrap, depth and clear mode among them. No GPU, no dependencies, runs in CI. |
+| **software** | Working | The differential reference. Points, lines, line strips, triangles, triangle strips, triangle fans and sprites. `test_raster.c` asserts pixel positions and sampling rules -- perspective UVs, mip/LOD, filtering, wrap, depth and clear mode among them. No GPU, no dependencies, runs in CI. |
 | **null** | Working | Counts primitives, draws nothing. What the bring-up host uses when the question is "did it ask to draw". |
 | **gl33-sdl2** | Working at native resolution | Points, lines, strips, triangles, fans and sprites; render targets and aliases, perspective texturing, PSP mip/LOD/filter rules, depth, scissor, blend, alpha test, RGBA8888 alpha-backed stencil and fog. Remaining gaps are listed below. |
 
@@ -548,6 +548,13 @@ ge_rcp16, ge_screen_z, clip_to_fx16):
   rounded, exact, finer, wrapped, clamped, a start bias of 1/16384 or
   more). It took scenes 16, 21 and 26 to no pixel off, and 22 and 23 to
   their lines.
+- **A triangle fan** is (first, previous, this) for each vertex from the
+  third, in through mode as in 3D: scene 88's fan tiles (smooth and flat,
+  indexed, with a degenerate first triangle) match the PSP on every pixel
+  so. psprecomp drew no through-mode fans until set 20's run (8452 pixels
+  of scene 88), and a 3D fan past its 256-vertex decode batch turned about
+  the batch's first vertex instead of the fan's; both are fixed, and
+  test_triangle_fans holds a 300-vertex fan to its triangles drawn as a list.
 - **1/area comes from a table** with a linear step (area_rcp), not a
   division. The area's significand is cut to 17 bits. Its leading nine
   bits, h, pick one of 256 entries holding 2^27/h and the slope 2^24/h²,
@@ -801,9 +808,6 @@ lighting (its factors, its 1/sqrt and its world-space inputs) are settled
 - **Patch line order** (scene 23: 1 pixel). Two segments of a patch's
   line strips cross at (375,211), and the PSP's colour there is the other
   segment's: the order the GE emits a patch's line segments in.
-- **Through-mode triangle fans** (scene 88: 8452 pixels). psprecomp draws
-  none; the GE does (render.c sw_draw leaves fans to the GE, but a
-  through-mode batch reaches it unassembled).
 - **Far-off corners' edges** (scene 98: 80 pixels). With corners up to
   2000 pixels outside the scissor the PSP covers one more pixel a row
   along one edge, a staircase of 80; the edge arithmetic at that range.

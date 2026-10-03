@@ -12,8 +12,8 @@ One file, in the pattern of patch13.py:
     ('cur' = leftmost corner among those inside the scissor) or any rival
     ('z' = H1, the depth-plane corner; and the alternatives in RULES), under H1's
     arithmetic or a rival's (ARITH, after '+': 'z+trunc'); a rule may end in ':nofan' or
-    ':fan' (through-mode fans dropped as psprecomp's sw_draw does, or drawn; the default
-    drops them only under 'cur');
+    ':fan' (through-mode fans dropped as psprecomp's sw_draw did until geprobe 19's runs,
+    or drawn; the default drops them only under 'cur', psprecomp as it was);
   * `verify` checks the port against psprecomp's own frames (miner's triangle log +
     run), `check` prints the design checks, `predict DIR` writes predicted frames,
     `compare`, `decode` and `selfcheck` read a hardware dump.
@@ -385,10 +385,10 @@ class Mirror:
         m.opt = Opt(r, a)
         if p is not None: pc = p
         m.ladder_exact = ladder_exact
-        # psprecomp's own behaviour where it is not a plane rule: today sw_draw drops
-        # through-mode GU_TRIANGLE_FAN ("fans are assembled by the GE" holds only for
-        # transformed draws), so scene 88's fan tiles are blank in psprecomp.  The
-        # miner's H1 patch (bldc) does not change that: compare it with 'z:nofan'.
+        # psprecomp's own behaviour where it is not a plane rule: sw_draw dropped
+        # through-mode GU_TRIANGLE_FAN until set 20's fix ("fans are assembled by the GE"
+        # held only for transformed draws), leaving scene 88's fan tiles blank; 'z:fan',
+        # fans as (first, previous, this), matches set 20's scene 88 on every pixel.
         m.pc = (m.opt.rule == 'cur') if pc is None else pc
     def reset(m, clear):
         m.F = Frame(clear)

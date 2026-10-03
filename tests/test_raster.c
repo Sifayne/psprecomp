@@ -1332,6 +1332,67 @@ static void test_light_world(void) {
         }
 }
 
+/* A triangle fan is (first, previous, this) for every vertex from the
+ * third, through mode and 3D alike, as geprobe 14 (fw 6.60) scene 88's fan
+ * tiles read on the PSP (smooth, flat, indexed). A 300-vertex fan crosses
+ * the 256-vertex batches the GE code decodes in, so each later batch has to
+ * start again from the fan's first vertex: drawn flat, the fan must come
+ * out pixel for pixel as the same 298 triangles drawn as a list. Through
+ * mode drew no fans at all before, and a 3D fan past 256 vertices turned
+ * about vertex 254 instead of its centre. */
+static void fan_frame(int through, int as_fan, uint32_t *out) {
+    enum { RIM = 299 };
+    float px[RIM + 1], py[RIM + 1];
+    uint32_t col[RIM + 1];
+    for (int i = 0; i <= RIM; i++) {
+        const double th = 2 * 3.14159265358979 * 0.98 * (i - 1) / RIM;
+        const double r = i ? 0.6 : 0.0;
+        px[i] = (float)(r * cos(th));
+        py[i] = (float)(r * sin(th));
+        if (through) { px[i] = 240.0f + 160.0f * px[i]; py[i] = 136.0f - 160.0f * py[i]; }
+        col[i] = 0xFF000000u | (uint32_t)((i * 7) & 0xFF) | (uint32_t)((i * 13) & 0xFF) << 8 | (uint32_t)((i * 29) & 0xFF) << 16;
+    }
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (through ? 1u << 23 : 0));
+    if (!through) {
+        for (int m = 0; m < 3; m++) {
+            cmd((uint8_t)(0x3A + 2 * m), 0);
+            const int n = m < 2 ? 12 : 16, rowlen = m < 2 ? 3 : 4;
+            for (int i = 0; i < n; i++) cmd((uint8_t)(0x3B + 2 * m), i % (rowlen + 1) == 0 ? 0x3F8000 : 0);
+        }
+        cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+        cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+        cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+    }
+    cmd(0x50, 0);                                              /* SHADE: flat */
+    int n = 0;
+    if (as_fan) {
+        for (int i = 0; i <= RIM; i++) { float_vertex(n, px[i], py[i], 0); psp_write32(VERTS + (uint32_t)n++ * 16, col[i]); }
+        cmd(0x04, (5u << 16) | (uint32_t)n);                   /* PRIM: triangle fan */
+    } else {
+        for (int i = 2; i <= RIM; i++) {
+            const int k[3] = { 0, i - 1, i };
+            for (int j = 0; j < 3; j++) { float_vertex(n, px[k[j]], py[k[j]], 0); psp_write32(VERTS + (uint32_t)n++ * 16, col[k[j]]); }
+        }
+        cmd(0x04, (3u << 16) | (uint32_t)n);                   /* PRIM: triangles */
+    }
+    end_list();
+    for (int y = 0; y < 272; y++)
+        for (int x = 0; x < 480; x++) out[y * 480 + x] = pixel(x, y);
+}
+
+static void test_triangle_fans(void) {
+    static uint32_t fan[480 * 272], list[480 * 272];
+    for (int through = 1; through >= 0; through--) {
+        fan_frame(through, 1, fan);
+        fan_frame(through, 0, list);
+        int lit = 0, diff = 0;
+        for (int i = 0; i < 480 * 272; i++) { lit += list[i] != 0; diff += fan[i] != list[i]; }
+        CHECK(lit > 10000 && diff == 0, "%s fan of 300 vertices: %d of the list's %d pixels differ",
+              through ? "through-mode" : "3D", diff, lit);
+    }
+}
+
 /* A spline point's colour is de Boor's algorithm on the control colours
  * with 8-bit parameters and 1/128 cuts (ge.c deboor_fix), not a blend by
  * exact weights. geprobe 9 (fw 6.60) scene 54: a uniform span (fill/fill,
@@ -2274,6 +2335,7 @@ int main(void) {
     test_light_ge();
     test_rsqrt_ge();
     test_light_world();
+    test_triangle_fans();
     test_patch_points_ge();
     test_colour_plane_anchor();
     test_line_rules();
