@@ -1,0 +1,941 @@
+
+==== geprobe 23, firmware (sceKernelDevkitVersion) 06060010 ====
+log: ms0:/PSP/GAME/geprobe/geprobe.txt
+
+---- scenes (the screen shows each one as it is drawn) ----
+[1] scene 01: geom_8888
+  sync 00000000; ge_01_geom_8888.raw: 522240 bytes, psm 3, crc 46416864
+  samples: 00201008 000D36BB 00388144 00201008 00201008 00201008 0040C040 00201008 00201008 00201008 00201008 00201008 00432F8B 00433189 00452F89 00201008 00201008 001C3BA6
+[2] scene 02: geom_5650
+  sync 00000000; ge_02_geom_5650.raw: 261120 bytes, psm 0, crc 3B4241AD
+  samples: 2081 09B7 3C08 2081 2081 2081 4608 2081 2081 2081 2081 2081 4171 4191 4171 2081 2081 19D4
+[3] scene 03: geom_5551
+  sync 00000000; ge_03_geom_5551.raw: 261120 bytes, psm 1, crc 8AE4B0F5
+  samples: 1041 04D7 1E08 1041 1041 1041 2308 1041 1041 1041 1041 1041 20B1 20D1 20B1 1041 1041 0CF4
+[4] scene 04: geom_4444
+  sync 00000000; ge_04_geom_4444.raw: 261120 bytes, psm 2, crc FC2818ED
+  samples: 0210 003B 0384 0210 0210 0210 04C4 0210 0210 0210 0210 0210 0428 0438 0428 0210 0210 013A
+[5] scene 05: dither_off_5650
+  sync 00000000; ge_05_dither_off_5650.raw: 261120 bytes, psm 0, crc 30E5B790
+  samples: 0000 0003 01E0 5800 7BEF A514 0000 8410 0000 0000 FFFF 001E 00E0 00E0 00E0 6800 6800 0000
+[6] scene 06: dither_bayer_5650
+  sync 00000000; ge_06_dither_bayer_5650.raw: 261120 bytes, psm 0, crc E2127D42
+  samples: 0000 0003 01C0 5800 7BCF 9CF3 0000 7BEF 0000 0000 FFDF 001E 00C0 00E0 0100 6000 6800 0000
+[7] scene 07: dither_extreme_5650
+  sync 00000000; ge_07_dither_extreme_5650.raw: 261120 bytes, psm 0, crc FCCC493C
+  samples: 0000 0003 0220 5800 8430 A514 0000 8C51 0000 0000 FFFF 003F 0120 00A0 00A0 7020 7020 0000
+[8] scene 08: dither_bayer_5551
+  sync 00000000; ge_08_dither_bayer_5551.raw: 261120 bytes, psm 1, crc 04491A69
+  samples: 0000 0003 00E0 2C00 3DEF 4E73 0000 3DEF 0000 0000 7FFF 001E 0060 0060 0080 3000 3400 0000
+[9] scene 09: dither_bayer_4444
+  sync 00000000; ge_09_dither_bayer_4444.raw: 261120 bytes, psm 2, crc 78145663
+  samples: 0000 0001 0030 0500 0777 0999 0000 0777 0000 0000 0FFF 000F 0010 0010 0020 0600 0600 0000
+[10] scene 10: dither_extreme_8888
+  sync 00000000; ge_10_dither_extreme_8888.raw: 522240 bytes, psm 3, crc 093645B4
+  samples: 00020202 0000001B 00074407 005E0000 00868686 00A0A0A0 00000000 008A8A8A 00000000 00000000 00FEFEFE 000707FA 00072507 00001600 00001600 00700707 00710707 00000000
+[11] scene 11: blend
+  sync 00000000; ge_11_blend.raw: 522240 bytes, psm 3, crc 84101BBD
+  samples: 00DC6022 00CF6030 00FFC07F 009F405F 00201020 00181028 003F40BF 004EB0DE 000540F9 00EE4010 0009400B 001CCB39 00FFC062 00FFC062 00FFC062 0094406A 0093406A 00B4A0CA
+[12] scene 12: texture filtering
+  sync 00000000; ge_12_filter.raw: 522240 bytes, psm 3, crc 144D847B
+  samples: 00000000 00002266 000066EE 0039A645 00000000 00679B70 00006644 00FF00FF 00000000 006F553A 00836F5F 000033FF 00007777 00007777 00007777 0071BC6F 0061BE71 001D4501
+[13] scene 13: texture functions
+  sync 00000000; ge_13_texfunc.raw: 522240 bytes, psm 3, crc A5F7E4B5
+  samples: 000C0C0C 00644224 00303030 0064642C 003F4057 00474147 0084842A 00434343 00303030 00CCA565 00646464 00293C4D 00242828 00242828 00242828 00646464 00646464 005B2D8D
+[14] scene 14: CLUT
+  sync 00000000; ge_14_clut.raw: 522240 bytes, psm 3, crc 42D0F247
+  samples: 0000FF00 000AD926 0002916E 0046F50A 00000000 00000000 0039C3AD 0031CF63 00000000 008FC639 00FB926D 00000000 00418877 00418877 00418877 004DF40B 004DF40B 001CFB04
+[15] scene 15: fog
+  sync 00000000; ge_15_fog.raw: 522240 bytes, psm 3, crc 27BDE206
+  samples: 00000000 00000000 00000000 00000000 00FCAC84 00FD8345 00D09F40 00C1B552 00BFC163 00000000 00BFBB59 00000000 00000000 00000000 00000000 0087889D 0080839A 00000000
+[16] scene 16: lighting
+  sync 00000000; ge_16_light.raw: 522240 bytes, psm 3, crc 71E9B167
+  samples: 00000000 00000000 00556C84 00343D45 0080ED80 00A57E99 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 006ACA6A 0083F183 00000000
+[17] scene 17: depth
+  sync 00000000; ge_17_depth.raw: 522240 bytes, psm 3, crc 900D2CCD
+  samples: 00000000 00000000 00000000 00000000 0000FF00 00808080 00FFED11 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 000000FF 0000FF00 00000000
+  ge_17_depth_depth.raw: 261120 bytes, crc D6313AFA
+[18] scene 18: clipping
+  sync 00000000; ge_18_clip.raw: 522240 bytes, psm 3, crc 8DCBA245
+  samples: 00101010 00101010 00E3F523 00E97A97 00101010 00FEFEFE 00BDBDBD 00878787 00101010 00498CA8 0064A773 00101010 00DBED33 00DBED33 00DBE937 00EB52BE 00EB4EC2 00101010
+[19] scene 19: alpha/colour/stencil/logic/mask
+  sync 00000000; ge_19_tests.raw: 522240 bytes, psm 3, crc 891C718C
+  samples: 00402010 00402010 00402010 005E5E5E 0100FF00 00402010 00BFDFEF 00402010 00402010 00000000 00000000 00FFFFFF 00402010 00402010 00402010 00696969 006A6A6A 00402010
+[20] scene 20: skinning
+  sync 00000000; ge_20_skin.raw: 522240 bytes, psm 3, crc 2615973B
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00707070
+[21] scene 21: morph
+  sync 00000000; ge_21_morph.raw: 522240 bytes, psm 3, crc 45F469E8
+  samples: 00000000 00000000 00000000 00000000 00000000 00CF2E01 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00752464 00782461 00000000
+[22] scene 22: Bezier patches
+  sync 00000000; ge_22_bezier.raw: 522240 bytes, psm 3, crc 72390A16
+  samples: 00000000 00000000 009FC98B 00000000 00000000 00000000 00004428 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 009C5600 00000000
+[23] scene 23: spline patches
+  sync 00000000; ge_23_spline.raw: 522240 bytes, psm 3, crc 2F9F6B8D
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00A49052 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[24] scene 24: bounding-box jumps: clear
+  wait 00000000
+[25] scene 24: bounding box 0, in view
+  wait 00000000; marker drawn (pixel 00FFFFFF)
+[26] scene 24: bounding box 1, far right
+  wait 00000000; marker not drawn (pixel 00000000)
+[27] scene 24: bounding box 2, behind the camera
+  wait 00000000; marker drawn (pixel 0000FF00)
+[28] scene 24: bounding box 3, straddling the right edge
+  wait 00000000; marker drawn (pixel 00FF0000)
+[29] scene 24: bounding box 4, straddling the near plane
+  wait 00000000; marker drawn (pixel 0000FFFF)
+[30] scene 24: bounding box 5, beyond the far plane
+  wait 00000000; marker drawn (pixel 00FF00FF)
+[31] scene 24: bounding box 6, far above
+  wait 00000000; marker not drawn (pixel 00000000)
+[32] scene 24: bounding box 7, just above the top edge
+  wait 00000000; marker drawn (pixel 00808080)
+[33] scene 24: bounding-box jumps: dump
+  sync 00000000; ge_24_bbox.raw: 522240 bytes, psm 3, crc 8D197D8B
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00808080 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[34] scene 25: specular and diffuse curves
+  sync 00000000; ge_25_specular.raw: 522240 bytes, psm 3, crc 71D4901C
+  samples: 00FFFFFF 00FAFAFA 00C2C2C2 00737373 00000000 00686868 00000000 00E1E1E1 00E1E1E1 00000000 00E1E1E1 00E6E6E6 00EBEBEB 00EBEBEB 00EBEBEB 00454545 00454545 00000000
+[35] scene 26: patch, morph and skin precision
+  sync 00000000; ge_26_precision.raw: 522240 bytes, psm 3, crc 686A3C9C
+  samples: 00000000 0040A7AF 00000000 00A1DD7D 00000000 00000000 00000000 00000000 00000000 001923C1 00000000 0040DDF7 00000000 00000000 00000000 009DB6CC 009DB2D0 00000000
+[36] scene 27: depth interpolation
+  sync 00000000; ge_27_depthplanes.raw: 522240 bytes, psm 3, crc AFF065BE
+  samples: 000000FF 000000FF 00000000 0000FF00 00000000 0000FF00 00FF0000 00000000 00000000 00000000 00FFFFFF 00000000 000000FF 000000FF 000000FF 00000000 00000000 00000000
+  ge_27_depthplanes_depth.raw: 261120 bytes, crc 726289AC
+[37] scene 28: far-off and 16-bit positions, 2-texel sprites, line uv
+  sync 00000000; ge_28_positions.raw: 522240 bytes, psm 3, crc 21AAC787
+  samples: 00CB1917 00747612 00000000 00817604 00000000 00000000 00000000 00000000 00000000 00000000 00000000 009A471C 00000000 00000000 00E80211 0055A402 0051A902 0056A404
+[38] scene 29: other logic ops, stencil band, PMSK2 with stencil ops, clears
+  sync 00000000; ge_29_tests2.raw: 522240 bytes, psm 3, crc 9BBFA30B
+  samples: 00000000 00A44024 00D1806D 00402010 0100FF00 5AFFFFFF 00808080 0B808080 0B808080 00808080 0B808080 00FFFFFF 00E88056 00E78057 00E88056 00402010 00402010 00EF7A7E
+[39] scene 30: masks_5650
+  sync 00000000; ge_30_masks_5650.raw: 261120 bytes, psm 0, crc 75DA4474
+  samples: 0020 2104 001F 5AEB 7C0F 8410 8410 FFFF 8410 8410 FFFF EFFF 001F 001F 001F 2245 2245 8410
+[40] scene 31: masks_5551
+  sync 00000000; ge_31_masks_5551.raw: 261120 bytes, psm 1, crc 9B858112
+  samples: 0000 1084 001F 2D6B 3E0F 4210 4210 FFFF 4210 4210 7FFF 77FF 001F 001F 001F 1125 1125 4210
+[41] scene 32: masks_4444
+  sync 00000000; ge_32_masks_4444.raw: 261120 bytes, psm 2, crc C8E91A55
+  samples: 0000 0222 000F 0555 0787 0888 0888 9FFF 0888 0888 5FFF 0EFF 000F 000F 000F 0242 0242 0888
+[42] scene 33: bounding box 0, behind the camera, far right
+  wait 00000000; marker not drawn (pixel 00000000)
+[43] scene 33: bounding box 1, behind the camera, far above
+  wait 00000000; marker not drawn (pixel 00000000)
+[44] scene 33: bounding box 2, far right, across the camera plane
+  wait 00000000; marker not drawn (pixel 00000000)
+[45] scene 33: bounding box 3, in view, scissor 0-100 away from it
+  wait 00000000; marker not drawn (pixel 00000000)
+[46] scene 33: bounding box 4, in view, scissor 0-245 over part of it
+  wait 00000000; marker drawn (pixel 0000FFFF)
+[47] scene 33: bounding box 5, on screen, outside a half-size viewport's clip volume
+  wait 00000000; marker drawn (pixel 00FF00FF)
+[48] scene 33: bounding box 6, PRIM right after BBOX, no VADDR
+  wait 00000000; marker drawn (pixel 00FFFF00)
+[49] scene 33: bounding box 7, hidden, marker drawn without BJUMP
+  wait 00000000; marker drawn (pixel 00808080)
+[50] scene 34: lighting arithmetic, one flat quad per normal
+  sync 00000000; ge_34_lightmath.raw: 522240 bytes, psm 3, crc C9EBB6C0
+  samples: 00000000 00A3A3A3 00939393 00D5D5D5 005783AE 00000000 007E61BE 00A8A8A8 00000000 00181558 00BABABA 00EBEBEB 00000000 00000000 00000000 00000000 00000000 00000000
+[51] scene 35: point and spot lights, one point per vertex
+  sync 00000000; ge_35_locallights.raw: 522240 bytes, psm 3, crc 92CC0829
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+[52] scene 36: 3D depth planes, each shape from each corner and in both windings
+  sync 00000000; ge_36_depthanchor.raw: 522240 bytes, psm 3, crc A1D3B115
+  samples: 00000000 00000000 00000000 00000000 00000000 0080A0A0 00000000 00000000 00000000 00000000 00000000 00000000 00804040 00804040 00804040 00000000 00000000 0080A040
+  ge_36_depthanchor_depth.raw: 261120 bytes, crc C16F8677
+[53] scene 37: line ends on every sixteenth
+  sync 00000000; ge_37_lineends.raw: 522240 bytes, psm 3, crc BDEC71A3
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0000BF3F
+[54] scene 38: patch vertices as points, divisions 3 to 12
+  sync 00000000; ge_38_patchpoints.raw: 522240 bytes, psm 3, crc 332D5877
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[55] scene 39: colour gradient precision
+  sync 00000000; ge_39_gradients.raw: 522240 bytes, psm 3, crc 5792D082
+  samples: 004C19E5 00000000 00000000 00000000 00000000 006040BE 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[56] scene 40: morph blends of colour gradients
+  sync 00000000; ge_40_morphgrad.raw: 522240 bytes, psm 3, crc 5A3A0208
+  samples: 00000000 0045F40A 0059CC32 006CA558 00000000 009257A5 00A730CD 00B90AF3 00000000 00000000 0052D924 00000000 0047F00E 0047EF0F 0047F00E 00729865 00729765 008C6599
+[57] scene 41: bounding box 0, across the camera plane, x 0.5
+  wait 00000000
+  marker: drawn (pixel 00FFFFFF)
+[58] scene 41: bounding box 1, across the camera plane, x 2
+  wait 00000000
+  marker: not drawn (pixel 00000000)
+[59] scene 41: bounding box 2, across the camera plane, x 5
+  wait 00000000
+  marker: not drawn (pixel 00000000)
+[60] scene 41: bounding box 3, across the camera plane, x 10
+  wait 00000000
+  marker: not drawn (pixel 00000000)
+[61] scene 41: bounding box 4, behind the camera, just off the axis
+  wait 00000000
+  marker: drawn (pixel 0000FFFF)
+[62] scene 41: bounding box 5, between the camera and the near plane
+  wait 00000000
+  marker: drawn (pixel 00FF00FF)
+[63] scene 41: bounding box 6, across the near plane
+  wait 00000000
+  marker: drawn (pixel 00FFFF00)
+[64] scene 41: bounding box 7, behind the camera, wide
+  wait 00000000
+  marker: drawn (pixel 00808080)
+[65] scene 42: indexed draws: do PRIM and BBOX move IADDR
+  sync 00000000; ge_42_indices.raw: 522240 bytes, psm 3, crc 7476904F
+  samples: 00FFFFFF 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  16-bit indices, A (first PRIM): drawn (pixel 00FFFFFF)
+  16-bit indices, B (VADDR moved): not drawn (pixel 00000000)
+  16-bit indices, C (IADDR moved): drawn (pixel 0000FF00)
+  16-bit indices, D (both moved): not drawn (pixel 00000000)
+  8-bit indices, A (first PRIM): drawn (pixel 00FFFFFF)
+  8-bit indices, B (VADDR moved): not drawn (pixel 00000000)
+  8-bit indices, C (IADDR moved): drawn (pixel 0000FF00)
+  8-bit indices, D (both moved): not drawn (pixel 00000000)
+  unindexed, A: drawn (pixel 00FFFFFF)
+  unindexed, B: drawn (pixel 000000FF)
+  after indexed BBOX, IADDR moved: drawn (pixel 00FFFFFF)
+  after indexed BBOX, VADDR moved: not drawn (pixel 00000000)
+  after indexed BBOX, both moved: not drawn (pixel 00000000)
+
+---- GE callbacks ----
+[66] libgu: signal CONTINUE 0x11, SUSPEND 0x22, then finish id 0x33
+  sceGuSync = 00000000
+  3 callback(s)
+    gu signal arg 00000011 phase 1
+    gu signal arg 00000022 phase 1
+    gu finish arg 00000033 phase 3
+[67] sceGe: SetCallback, a raw list with SIGNAL and FINISH, EnQueue, ListSync
+  not run: switched fw 6.60 off in geprobe 4; split into the steps below
+[68] sceGe raw list, split: sceGeSetCallback
+  sceGeSetCallback ok (id >= 0)
+[69] sceGe raw list, split: DrawSync(wait), the list in a static buffer written back from the cache
+  sceGeDrawSync(wait) = 00000000
+  list ready
+[70] sceGe raw list, split: EnQueue (SIGNAL suspend 0x44, SIGNAL continue 0x55, FINISH 0x66)
+  sceGeListEnQueue ok (id >= 0)
+  3 callback(s) before it returned
+[71] sceGe raw list, split: ListSync(wait), ListSync(peek), DrawSync(wait), ListSync(peek)
+  sceGeListSync(wait) = 00000000
+  sceGeListSync(peek) = 00000000
+  sceGeDrawSync(wait) = 00000000
+  sceGeListSync(peek) = 80000100
+[72] sceGe raw list, split: the callbacks, then sceGeUnsetCallback
+  3 callback(s)
+    ge signal arg 005A0044 phase 1
+    ge signal arg 005A0055 phase 1
+    ge finish arg 00A50066 phase 1
+  sceGeUnsetCallback = 00000000
+[73] sceGe PAUSE: SIGNAL pause 0x77 and FINISH 0x78, SIGNAL continue 0x79, FINISH 0x7A; sceGeContinue
+  sceGeListEnQueue ok (id >= 0)
+  after 20 ms: 1 callback(s); sceGeListSync(peek) = 00000004, sceGeDrawSync(peek) = 00000002
+  sceGeContinue = 00000000
+  after 20 ms more: sceGeListSync(peek) = 00000000
+  wait 00000000
+  3 callback(s)
+    ge signal arg 005A0077 phase 1
+    ge signal arg 005A0079 phase 3
+    ge finish arg 00A5007A phase 3
+  sceGeUnsetCallback = 00000000
+[74] sceGe long list without a stall: SIGNAL 0x01, 100 sprites, SIGNAL 0x02, 100 sprites, FINISH 0x03
+  sceGeListEnQueue ok (id >= 0); sceGeListSync(peek) as it returns = 00000002
+  wait 00000000
+  3 callback(s)
+    ge signal arg 005A0001 phase 1
+    ge signal arg 005A0002 phase 3
+    ge finish arg 00A50003 phase 3
+  sceGeUnsetCallback = 00000000
+[75] sceGeSetCallback until it fails, then sceGeUnsetCallback on each
+  15 accepted, then 80000022
+  sceGeUnsetCallback: 0 error(s)
+[76] sceGe raw list as geprobe 4 built it (memalign, uncached writes), log flushed after each call
+  not run: switched fw 6.60 off after EnQueue in geprobe 5: the list shares a dirty cache line with its malloc header, whose write-back replaces it (next step)
+[77] memalign(16, 64) written through the uncached alias, then sceKernelDcacheWritebackAll
+  before the write-back as written; after it 16 of 16 words changed
+[78] sceGeContinue with nothing paused
+  sceGeDrawSync(peek) = 00000000
+  sceGeContinue = 00000000; sceGeDrawSync(peek) after = 00000000
+[79] sceGe stall at the list's start (SIGNAL 0x21, FINISH 0x22), then sceGeListUpdateStallAddr to its end
+  sceGeListEnQueue ok (id >= 0); 0 callback(s) before it returned
+  sceGeListSync(peek) = 00000002, sceGeDrawSync(peek) = 00000002
+  after 10 ms: 0 callback(s); sceGeListSync(peek) = 00000002, sceGeDrawSync(peek) = 00000002
+  sceGeListUpdateStallAddr = 00000000; 1 callback(s) by its return; sceGeListSync(peek) = 00000000
+  wait 00000000
+  2 callback(s)
+    ge signal arg 005A0021 phase 4
+    ge finish arg 00A50022 phase 4
+  sceGeUnsetCallback = 00000000
+[80] sceGe stall just after the SIGNAL 0x21, then sceGeListUpdateStallAddr to the end
+  sceGeListEnQueue ok (id >= 0); 1 callback(s) before it returned
+  sceGeListSync(peek) = 00000002, sceGeDrawSync(peek) = 00000002
+  after 10 ms: 1 callback(s); sceGeListSync(peek) = 00000002, sceGeDrawSync(peek) = 00000002
+  sceGeListUpdateStallAddr = 00000000; 1 callback(s) by its return; sceGeListSync(peek) = 00000000
+  wait 00000000
+  2 callback(s)
+    ge signal arg 005A0021 phase 1
+    ge finish arg 00A50022 phase 4
+  sceGeUnsetCallback = 00000000
+[81] sceGe timing: 100 sprites between SIGNALs, 480x272, 64x64 and 16x16; microseconds to each callback
+  480x272: EnQueue returned after 62 us (1 callback(s) by then), DrawSync = 00000000 after 62518 us; callbacks at 49 35614 62457 us
+  64x64: EnQueue returned after 51 us (1 callback(s) by then), DrawSync = 00000000 after 1991 us; callbacks at 40 1130 1951 us
+  16x16: EnQueue returned after 46 us (1 callback(s) by then), DrawSync = 00000000 after 240 us; callbacks at 36 109 119 us
+  sceGeUnsetCallback = 00000000
+[82] sceGe PAUSE 0x7B with sceGeContinue in its signal handler; FINISH 0x7C, SIGNAL 0x7D, FINISH 0x7E
+  sceGeListEnQueue ok (id >= 0); 3 callback(s) before it returned
+  after 20 ms: 3 callback(s); the handler's sceGeContinue = 00000000; sceGeListSync(peek) = 00000000, sceGeDrawSync(peek) = 00000000
+  wait 00000000
+  3 callback(s)
+    ge signal arg 005A007B phase 1
+    ge signal arg 005A007D phase 1
+    ge finish arg 00A5007E phase 1
+  sceGeUnsetCallback = 00000000
+
+---- scenes, version 7 ----
+[83] scene 43: light and material colour gains, one point per value
+  sync 00000000; ge_43_lightgain.raw: 522240 bytes, psm 3, crc D179FAD2
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[84] scene 44: patch basis weights, one control column and row lit
+  sync 00000000; ge_44_patchweights.raw: 522240 bytes, psm 3, crc EB872283
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00005070 00000000
+[85] scene 45: one point per eye depth, -1.05 to -99
+  sync 00000000; ge_45_vertexdepth.raw: 522240 bytes, psm 3, crc 62CD8EFA
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_45_vertexdepth_depth.raw: 261120 bytes, crc 5EC1E019
+[86] scene 46: one gradient over 44 areas, through mode
+  sync 00000000; ge_46_gradsweep.raw: 522240 bytes, psm 3, crc CE3F4F12
+  samples: 00050000 0037403F 00000000 00B0D9D4 00000000 00373F3E 00000000 00000000 00000000 00000000 00000000 00000000 003B4544 003C4645 003B4544 00000000 00000000 00000000
+  ge_46_gradsweep_depth.raw: 261120 bytes, crc 98581745
+[87] scene 47: the same gradients in 3D
+  sync 00000000; ge_47_gradsweep3d.raw: 522240 bytes, psm 3, crc 1EC389CD
+  samples: 00050000 0037403E 00000000 00B0D9D4 00000000 00373F3E 00000000 00000000 00000000 00000000 00000000 00000000 003B4544 003C4645 003B4544 00000000 00000000 00000000
+[88] scene 48: 3D depth planes, eight more shapes from each corner
+  sync 00000000; ge_48_depthanchor2.raw: 522240 bytes, psm 3, crc 6B8CB934
+  samples: 00000000 00804040 00804040 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00808070 00808070 00000000
+  ge_48_depthanchor2_depth.raw: 261120 bytes, crc E6AC8445
+[89] scene 49: steep line colours
+  sync 00000000; ge_49_steeplines.raw: 522240 bytes, psm 3, crc 4652D24F
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+
+---- scenes, version 8 ----
+[90] scene 50: one triangle reciprocal per 10-bit width, through mode
+  sync 00000000; ge_50_rcpsweep.raw: 522240 bytes, psm 3, crc 356C1D58
+  samples: 00082041 00000000 00000000 00000000 001555A9 00000000 00000000 00000000 00000000 00000000 00134E9C 00000000 00000000 00000000 00000000 00000000 00000000 0005152B
+  ge_50_rcpsweep_depth.raw: 261120 bytes, crc 8E4228A8
+[91] scene 51: one line reciprocal per 10-bit length, through mode
+  sync 00000000; ge_51_linesweep.raw: 522240 bytes, psm 3, crc 5D2B490F
+  samples: 00082041 00000000 00000000 00000000 001555A9 00000000 0009264D 00000000 00000000 000E3B77 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0005152B
+  ge_51_linesweep_depth.raw: 261120 bytes, crc 3DB4FEBD
+[92] scene 52: spline weights along u, three control columns lit
+  sync 00000000; ge_52_splineweights.raw: 522240 bytes, psm 3, crc 4870F4E8
+  samples: 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF
+
+---- scenes, version 9 ----
+[93] scene 53: spline weights at 40 steps a span, three levels and pairs
+  sync 00000000; ge_53_splinedense40.raw: 522240 bytes, psm 3, crc B32A4530
+  samples: 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 0035A922 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00000001 00FF01FF 00FF01FF 00FF01FF
+[94] scene 54: spline weights at 48 steps a span, three levels and pairs
+  sync 00000000; ge_54_splinedense48.raw: 522240 bytes, psm 3, crc A66F4799
+  samples: 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF
+
+---- scenes, version 10 ----
+[95] scene 55: spline weights read through depth, 48 steps a span, one column at a time
+  sync 00000000; ge_55_splinedepth.raw: 522240 bytes, psm 3, crc 30B8D9D5
+  samples: 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF
+  ge_55_splinedepth_depth.raw: 261120 bytes, crc B9F9C454
+  ge_55_splinedepth_depthfull.bin: 278528 bytes, crc 21AC6B66
+[96] scene 56: the spline parameter the GE uses, through a 512-texel ramp
+  sync 00000000; ge_56_splineparam.raw: 522240 bytes, psm 3, crc C5CD9A97
+  samples: 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00FF01FF 00000128 00FF01FF 00000150 00FF01FF
+[97] scene 57: scene 48's corners as points, then its triangles in through mode at those depths
+   42,20=12577 123,61=8284 78,60=10558 171,61=8284 138,60=10558 112,20=12577 198,60=10558 183,20=12577
+   219,61=8284 254,20=12577 258,60=10558 267,61=8284 314,61=8284 324,20=12577 318,60=10558 378,60=10558
+   362,61=8284 395,20=12577 53,69=11829 120,81=8048 99,88=10190 166,81=8048 157,88=10190 120,69=11829
+   214,88=10190 186,69=11829 213,81=8048 253,69=11829 272,88=10190 259,81=8048 306,81=8048 320,69=11829
+   330,88=10190 388,88=10190 352,81=8048 386,69=11829 94,117=9073 56,85=12318 131,113=7718 125,85=12318
+   175,113=7718 146,117=9073 220,113=7718 198,117=9073 194,85=12318 250,117=9073 265,113=7718 264,85=12318
+   333,85=12318 302,117=9073 310,113=7718 354,113=7718 402,85=12318 354,117=9073 111,128=7935 74,117=12068
+   85,141=10371 142,117=12068 144,141=10371 157,128=7935 203,141=10371 203,128=7935 210,117=12068 249,128=7935
+   262,141=10371 278,117=12068 346,117=12068 295,128=7935 321,141=10371 380,141=10371 414,117=12068 340,128=7935
+   80,146=10015 129,154=7825 47,174=12577 175,154=7825 118,174=12577 137,146=10015 188,174=12577 194,146=10015
+   220,154=7825 251,146=10015 259,174=12577 265,154=7825 310,154=7825 308,146=10015 329,174=12577 400,174=12577
+   356,154=7825 365,146=10015 53,179=12318 102,181=8532 103,192=9845 151,181=8532 159,192=9845 122,179=12318
+   215,192=9845 192,179=12318 200,181=8532 261,179=12318 271,192=9845 249,181=8532 298,181=8532 330,179=12318
+   327,192=9845 383,192=9845 347,181=8532 400,179=12318 42,224=12577 131,184=7718 89,224=10751 175,184=7718
+   150,224=10751 112,224=12577 211,224=10751 183,224=12577 220,184=7718 254,224=12577 272,224=10751 265,184=7718
+   310,184=7718 324,224=12577 333,224=10751 394,224=10751 354,184=7718 395,224=12577 106,214=8932 42,270=12577
+   126,219=8048 112,270=12577 173,219=8048 157,214=8932 219,219=8048 208,214=8932 183,270=12577 259,214=8932
+   266,219=8048 254,270=12577 324,270=12577 310,214=8932 312,219=8048 359,219=8048 395,270=12577 362,214=8932
+  144 of 144 corners found
+  sync 00000000; ge_57_anchortwin.raw: 522240 bytes, psm 3, crc 6B8CB934
+  samples: 00000000 00804040 00804040 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00808070 00808070 00000000
+  ge_57_anchortwin_depth.raw: 261120 bytes, crc E9574FF6
+  ge_57_anchortwin_depthfull.bin: 278528 bytes, crc 6B86D217
+[98] scene 58: one 3D shape at every sixteenth of a pixel across and down
+  sync 00000000; ge_58_anchorsweep.raw: 522240 bytes, psm 3, crc D4D4268A
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0060946C 0060946C 00000000
+  ge_58_anchorsweep_depth.raw: 261120 bytes, crc 51A8AD0C
+  ge_58_anchorsweep_depthfull.bin: 278528 bytes, crc 255E2B10
+
+---- scenes, version 11 ----
+[99] scene 59: point depths with no divide, two viewport scales
+  sync 00000000; ge_59_depthaffine.raw: 522240 bytes, psm 3, crc FEF701A5
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_59_depthaffine_depth.raw: 261120 bytes, crc C53DB8DC
+  ge_59_depthaffine_depthfull.bin: 278528 bytes, crc 6FEBF2B7
+[100] scene 60: point depths with clip z / w fixed, eye z -1 to -100
+  sync 00000000; ge_60_depthratio.raw: 522240 bytes, psm 3, crc 3B93E2FE
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_60_depthratio_depth.raw: 261120 bytes, crc A070EFBA
+  ge_60_depthratio_depthfull.bin: 278528 bytes, crc 728292A3
+[101] scene 61: scene 60's first batch with eye z from a model translation
+  sync 00000000; ge_61_depthmodel.raw: 522240 bytes, psm 3, crc 3B93E2FE
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_61_depthmodel_depth.raw: 261120 bytes, crc 0E8EE612
+  ge_61_depthmodel_depthfull.bin: 278528 bytes, crc F8E910AA
+
+---- scenes, version 12 ----
+[102] scene 62: 1/w read whole: clip z a power of two, depth 1/w's top 16 bits
+  9151 points, eye z crc 020217E7
+  sync 00000000; ge_62_rcpread.raw: 522240 bytes, psm 3, crc A44CD79D
+  samples: 00400005 0040097E 004017AC 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00400591 00401970 00000000 00000000 00000000 00000000 00400E9C
+  ge_62_rcpread_depthfull.bin: 278528 bytes, crc B21F7493
+[103] scene 63: a projection row read whole: clip w 1, depth clip z's top 16 bits
+  7936 points, eye z crc 973F94EF
+  sync 00000000; ge_63_dotread.raw: 522240 bytes, psm 3, crc 5163B440
+  samples: 00400005 0046097E 005B17AC 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00420591 005C1970 00000000 00000000 00000000 00000000 004B0E9C
+  ge_63_dotread_depthfull.bin: 278528 bytes, crc 11D8B0F0
+[104] scene 64: clip z times 1/w read whole, for scene 62's w in (2, 4)
+  4096 points, eye z crc BBAB07D9
+  sync 00000000; ge_64_mulread.raw: 522240 bytes, psm 3, crc 4264D110
+  samples: 00400005 0042097E 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00410591 00000000 00000000 00000000 00000000 00000000 00430E9C
+  ge_64_mulread_depthfull.bin: 278528 bytes, crc 7FB71483
+[105] scene 65: world, view and projection combined: clip w 1, depth clip z's top 16 bits
+  3072 points, eye z crc E70688DB
+  sync 00000000; ge_65_matread.raw: 522240 bytes, psm 3, crc DA9D9850
+  samples: 00400005 0044097E 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00420591 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_65_matread_depthfull.bin: 278528 bytes, crc 7DBFF37D
+[106] scene 66: the probes' perspective read whole: ndc z's top 16 bits
+  2048 points, eye z crc 2431630F
+  sync 00000000; ge_66_perspread.raw: 522240 bytes, psm 3, crc E00CFBB9
+  samples: 00400005 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00410591 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_66_perspread_depthfull.bin: 278528 bytes, crc 627573AF
+
+---- scenes, version 13 ----
+[107] scene 67: patch control conversion, constants and 24-bit controls
+  194 items, 13048 samples, control crc DF159462, item crc 779AFA04, stream crc 9673ABF8
+  GE 1084 us
+  sync 00000000; ge_67_patchconv.raw: 522240 bytes, psm 3, crc CF26049D
+  samples: 00400005 00000000 00000000 00000000 00000000 00430070 00000000 00000000 00000000 00000000 004500BE 00000000 00000000 00000000 00000000 00420047 00000000 00000000
+  ge_67_patchconv_depthfull.bin: 278528 bytes, crc EDC7356A
+[108] scene 68: random cubics along u, every division 1-48, and their mirrors
+  270 items, 13324 samples, control crc C9043953, item crc 5E3B42C2, stream crc CB7AED0A
+  GE 1089 us
+  sync 00000000; ge_68_patchlerpu.raw: 522240 bytes, psm 3, crc 33D8B02B
+  samples: 00400005 00000000 00000000 00410047 00000000 00000000 004300CF 00000000 00000000 004200BE 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_68_patchlerpu_depthfull.bin: 278528 bytes, crc 3BF645E1
+[109] scene 69: the same cubics along v, and one control on zero
+  176 items, 6800 samples, control crc A2885BC3, item crc CF7CDD63, stream crc B1DFDD4C
+  GE 2126 us
+  sync 00000000; ge_69_patchlerpv.raw: 522240 bytes, psm 3, crc 29624A95
+  samples: 00400005 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00410030 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00420049
+  ge_69_patchlerpv_depthfull.bin: 278528 bytes, crc FFF7ECB2
+[110] scene 70: one set of cubics at 15 scales, in model and clip space
+  188 items, 12328 samples, control crc 8D4B24B7, item crc C1CDABD2, stream crc 8C653C37
+  GE 1086 us
+  sync 00000000; ge_70_patchscale.raw: 522240 bytes, psm 3, crc 211EE358
+  samples: 00400005 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00410017
+  ge_70_patchscale_depthfull.bin: 278528 bytes, crc 5F6C3022
+[111] scene 71: mixed magnitudes and signs inside a lerp: ladders, sign-split reads, ties
+  344 items, 15256 samples, control crc D4889ED7, item crc 8CD10745, stream crc 58709920
+  GE 70 us
+  sync 00000000; ge_71_patchalign.raw: 522240 bytes, psm 3, crc A2B54D30
+  samples: 00400005 00000000 00000000 00000000 00000000 0041003D 004500EA 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 004600F1 00000000 00000000
+  ge_71_patchalign_depthfull.bin: 278528 bytes, crc 7141CC2B
+[112] scene 72: 2D Bezier patches: transposes, reversals, negations, order contrast, colour order
+  126 items, 13872 samples, control crc 02E8C746, item crc 98F942B4, stream crc DF4E612A
+  GE 2121 us
+  sync 00000000; ge_72_patch2d.raw: 522240 bytes, psm 3, crc 62856826
+  samples: 00400005 00000000 00000000 00000000 00000000 00000000 0046007C 00000000 00000000 00000000 00000000 00000000 00000000 00000000 009659AE 00000000 00000000 00000000
+  ge_72_patch2d_depthfull.bin: 278528 bytes, crc FBC7A8D7
+[113] scene 73: splines in every edge mode, 1D and 2D, exponent reach, span boundaries
+  118 items, 6358 samples, control crc E00EAF46, item crc 749F88AE, stream crc 69FAA6AE
+  GE 1081 us
+  sync 00000000; ge_73_patchspline.raw: 522240 bytes, psm 3, crc 9435E4A6
+  samples: 00400005 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_73_patchspline_depthfull.bin: 278528 bytes, crc BEB1B0EC
+[114] scene 74: where the GE tessellates: cancellation, screen-space halving, axis and w routing, random rows
+  188 items, 11584 samples, control crc C1F85784, item crc 3C9F555A, stream crc 1AC0C62E
+  GE 1082 us
+  sync 00000000; ge_74_patchspace.raw: 522240 bytes, psm 3, crc 4BAA11D7
+  samples: 00400005 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0046009C 00000000 00000000 00000000 00000000 0044006A 004600AA 00000000 00430057
+  ge_74_patchspace_depthfull.bin: 278528 bytes, crc 672C64E1
+[115] scene 75: perspective, w cancellation, near-equal, a 16-bit coefficient, ramps, end-to-end, triangle colour planes
+  149 items, 7457 samples, control crc D2BE2928, item crc F12306F4, stream crc 691D668F
+  b9 shape 0 (5 x 5) colours: 00227131 005BA13D 007EAF3D 00A3A24B 00DD7E7E 003D4270 0055786C 0064835C 00748756 0091A46E 005B4999 00697594
+    006E7482 006C7669 0061AC4E 00806AB7 007A82A6 007C7093 00736074 004D833F 00AC8BD4 006C8793 006B6574 00753968
+    0053155D
+  b9 shape 1 (4 x 6) colours: 00E9CE01 006BB65C 00526E3F 004F2F03 00E9CE01 006BB65C 00526E3F 004F2F03 00E9CE01 006BB65C 00526E3F 004F2F03
+    00E9CE01 006BB65C 00526E3F 004F2F03 00E9CE01 006BB65C 00526E3F 004F2F03 00E9CE01 006BB65C 00526E3F 004F2F03
+  b9 shape 2 (6 x 4) colours: 004F5854 004F5854 004F5854 004F5854 004F5854 004F5854 00AA6367 00AA6367 00AA6367 00AA6367 00AA6367 00AA6367
+    00AA58B0 00AA58B0 00AA58B0 00AA58B0 00AA58B0 00AA58B0 00C079ED 00C079ED 00C079ED 00C079ED 00C079ED 00C079ED
+  GE 1150 us
+  sync 00000000; ge_75_patchvalid.raw: 522240 bytes, psm 3, crc E57D276C
+  samples: 00400005 00546777 006F788B 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00588046
+  ge_75_patchvalid_depthfull.bin: 278528 bytes, crc ECBD85D8
+[116] scene 76: extreme magnitudes (risky, own step)
+  b0 list headroom 523752 bytes
+  116 items, 6960 samples, control crc 50AA36DD, item crc D95E5577, stream crc 984A8580
+  b0 GE 1077 us
+  b1 list headroom 524280 bytes
+  b1 GE 64 us
+  b2 list headroom 524280 bytes
+  b2 GE 54 us
+  b3 list headroom 524280 bytes
+  b3 GE 63 us
+  b4 list headroom 524280 bytes
+  b4 GE 62 us
+  b5 list headroom 524280 bytes
+  b5 GE 1084 us
+  sync 00000000; ge_76_patchrange.raw: 522240 bytes, psm 3, crc E4899008
+  samples: 00400005 00000000 00420026 0043003E 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_76_patchrange_depthfull.bin: 278528 bytes, crc 92D7ED43
+[117] scene 77: 16-bit and 8-bit controls, indexed patches (risky, own step)
+  b0 list headroom 523752 bytes
+  160 items, 10024 samples, control crc 987C5AA6, item crc EE88AD31, stream crc 8C208725
+  b0 GE 1075 us
+  b1 list headroom 524280 bytes
+  b1 GE 1072 us
+  b2 list headroom 524280 bytes
+  b2 GE 65 us
+  b3 list headroom 524280 bytes
+  b3 GE 1067 us
+  b4 list headroom 524280 bytes
+  b4 GE 1070 us
+  b5 list headroom 524280 bytes
+  b5 GE 1062 us
+  b6 list headroom 524280 bytes
+  b6 GE 64 us
+  sync 00000000; ge_77_patchfmt.raw: 522240 bytes, psm 3, crc 9D0C7BF2
+  samples: 00400005 00000000 0041000A 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0041000C 00450097 00000000 00000000
+  ge_77_patchfmt_depthfull.bin: 278528 bytes, crc 547A8B62
+[118] scene 78: morphed and skinned patches (risky, own step)
+  b0 list headroom 523752 bytes
+  64 items, 5064 samples, control crc B419EB77, item crc 0C235973, stream crc 9CABC8D3
+  b0 GE 1078 us
+  b1 list headroom 524280 bytes
+  b1 GE 64 us
+  b2 list headroom 524280 bytes
+  b2 GE 1074 us
+  sync 00000000; ge_78_patchmorph.raw: 522240 bytes, psm 3, crc CFA050D3
+  samples: 00400005 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0042003C 00000000 00000000 00000000
+  ge_78_patchmorph_depthfull.bin: 278528 bytes, crc 45CAE46B
+[119] scene 79: 48 x 48 patches (risky, own step)
+  b0 list headroom 523752 bytes
+  2 items, 4802 samples, control crc 57FB4980, item crc C810A0C1, stream crc E22B2DB7
+  b0 GE 1085 us
+  b1 list headroom 524280 bytes
+  b1 GE 1069 us
+  sync 00000000; ge_79_patchbig48.raw: 522240 bytes, psm 3, crc 16B4A17F
+  samples: 00400005 00000000 00000000 00000000 00000000 00000000 00410002 00000000 00000000 00410001 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_79_patchbig48_depthfull.bin: 278528 bytes, crc A8CA0F59
+[120] scene 80: divisions 49 to 128 (risky, own step)
+  b0 list headroom 523752 bytes
+  60 items, 9276 samples, control crc F515C86D, item crc 51FE3E09, stream crc 1995C6F5
+  b0 GE 1078 us
+  b1 list headroom 524280 bytes
+  GE still busy after 1 s: sceGeDrawSync(peek) = 00000002; sceGeBreak(1) ok
+  b1 GE 1029735 us
+  sync 00000000; ge_80_patchdiv.raw: 522240 bytes, psm 3, crc 4328BD82
+  samples: 00400005 00000000 00000000 00000000 00000000 00410014 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_80_patchdiv_depthfull.bin: 278528 bytes, crc B482C7F1
+[121] scene 81: divisions 129 to 255 (risky, own step)
+  b0 list headroom 523752 bytes
+  42 items, 17464 samples, control crc 90D874C4, item crc D8405876, stream crc E8CA5D2E
+  b0 GE 1079 us
+  b1 list headroom 524280 bytes
+  GE still busy after 1 s: sceGeDrawSync(peek) = 00000002; sceGeBreak(1) ok
+  b1 GE 1029962 us
+  b2 list headroom 524280 bytes
+  GE still busy after 1 s: sceGeDrawSync(peek) = 00000002; sceGeBreak(1) ok
+  b2 GE 1029850 us
+  sync 00000000; ge_81_patchdivmax.raw: 522240 bytes, psm 3, crc 4AD77995
+  samples: 00400005 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_81_patchdivmax_depthfull.bin: 278528 bytes, crc 33D150DF
+[122] scene 82: 64 x 64 patches (riskiest, step 1 of 2)
+  b0 list headroom 523752 bytes
+  2 items, 8450 samples, control crc BCBFE020, item crc 12D9101C, stream crc 1D17D48C
+  b0 GE 1080 us
+  b1 list headroom 524280 bytes
+  b1 GE 1080 us
+  sync 00000000; ge_82_patchbig64.raw: 522240 bytes, psm 3, crc FCA76767
+  samples: 00400005 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_82_patchbig64_depthfull.bin: 278528 bytes, crc C3C0839E
+[123] scene 82: rows of more than 256 samples (riskiest, step 2 of 2)
+  b0 list headroom 523752 bytes
+  6 items, 3096 samples, control crc 4281A733, item crc 2FE4F3D7, stream crc DB2CCA7A
+  b0 GE 1084 us
+  b2 list headroom 524280 bytes
+  b2 GE 1061 us
+  sync 00000000; ge_82_patchrows.raw: 522240 bytes, psm 3, crc B1F5BA44
+  samples: 00400005 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00420006
+  ge_82_patchrows_depthfull.bin: 278528 bytes, crc 00B466DA
+
+---- scenes, version 14 ----
+[124] scene 83: colour planes: one scalene triangle at 48 orientations, through mode
+  1 draws, 144 vertices, vertex crc BF53F45D, stream crc 0D908B33
+  GE 1080 us
+  sync 00000000; ge_83_anchorclock.raw: 522240 bytes, psm 3, crc F4ED02FA
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 009670B0 00000000 006E9281 00000000 00000000 00000000 00000000 00000000 00000000
+[125] scene 84: colour planes: 8 shapes in 6 vertex orders, plain and mirrored colours
+  1 draws, 288 vertices, vertex crc 93CFF077, stream crc C0764B98
+  GE 1084 us
+  sync 00000000; ge_84_anchorperm.raw: 522240 bytes, psm 3, crc 7CE45FF3
+  samples: 00000000 00000000 00000000 008878B3 00000000 006C5142 00B330BA 00000000 00000000 00000000 006D7D5C 00AC66CB 00000000 00000000 00000000 00000000 00000000 00000000
+[126] scene 85: colour planes: level and vertical corner pairs swept through the tie
+  1 draws, 192 vertices, vertex crc 5708B705, stream crc 3BFAC2C5
+  GE 1077 us
+  sync 00000000; ge_85_anchorties.raw: 522240 bytes, psm 3, crc BF40D2C9
+  samples: 0065A4A0 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0035B0B3 00C93186 00000000 00000000 00000000 00000000 00000000 00AF683C
+[127] scene 86: colour planes: two shapes at 128 sub-pixel offsets each
+  1 draws, 768 vertices, vertex crc 29F3B04A, stream crc 9F599374
+  GE 1092 us
+  sync 00000000; ge_86_anchorsub.raw: 522240 bytes, psm 3, crc DC510FA1
+  samples: 00ADC36E 00000000 00000000 00000000 00000000 00000000 00000000 00000000 003F46AA 00000000 008FC8A8 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[128] scene 87: colour planes: corners outside a per-triangle scissor
+  16 draws, 48 vertices, vertex crc 8956AF33, stream crc E14F44CC
+  GE 1074 us
+  sync 00000000; ge_87_anchorscissor.raw: 522240 bytes, psm 3, crc DAF44BC4
+  samples: 00000000 00C54352 00000000 00000000 00000000 00C1886F 00000000 0056B78B 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0058605F 0059605E 00C68EE2
+[129] scene 88: colour planes: list orders, strip, indexed fan; flat shading in 16 draws
+  40 draws, 130 vertices, vertex crc 9C11644B, stream crc F936B83E
+  GE 1080 us
+  sync 00000000; ge_88_primtypes.raw: 522240 bytes, psm 3, crc 28FE2CAD
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00DB94D6 00000000 00DB94D6 00B7858C 00000000 00000000 00000000 00A75AB6 00A656BA 009CAA77
+[130] scene 89: colour planes: wedges down to 1/4 px and 288 tiny triangles
+  1 draws, 936 vertices, vertex crc 97E58F16, stream crc A7E2E171
+  GE 87 us
+  sync 00000000; ge_89_gradsteep.raw: 522240 bytes, psm 3, crc B4290BDC
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[131] scene 90: colour planes: anchors up to 500 px outside a scissor window
+  8 draws, 24 vertices, vertex crc 47E8A63A, stream crc 0BFF4CBE
+  GE 2106 us
+  sync 00000000; ge_90_gradmid.raw: 522240 bytes, psm 3, crc 0E1CBA29
+  samples: 00000401 00000C03 00FEEFFA 00FEF7FC 00000000 00000000 00000000 00000000 00000000 003452AC 00000000 00729D60 00000200 00000200 00000200 00FFFAFD 00FFFAFD 007EB24C
+[132] scene 91: colour planes: alpha read into the stencil by 255 alpha-test passes
+  1 draws, 288 vertices, vertex crc B057DA08, stream crc B45BC59B
+  GE 73397 us
+  sync 00000000; ge_91_alphaladder.raw: 522240 bytes, psm 3, crc 95A4DB7E
+  samples: 00000000 00000000 00000000 B38878B3 00000000 A76C5142 41B330BA 00000000 00000000 00000000 5C6D7D5C 56AC66CB 00000000 00000000 00000000 00000000 00000000 00000000
+[133] scene 92: colour planes: scene 83 through an identity 3D transform
+  1 draws, 144 vertices, vertex crc 4E9F1DE7, stream crc 7A3A0B7A
+  GE 1078 us
+  sync 00000000; ge_92_anchorclock3d.raw: 522240 bytes, psm 3, crc F4ED02FA
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 009670B0 00000000 006E9281 00000000 00000000 00000000 00000000 00000000 00000000
+[134] scene 93: colour planes: scene 83 with clip w 1, 2 and 4 at the corners
+  1 draws, 144 vertices, vertex crc F8B26733, stream crc 32CA352E
+  GE 1079 us
+  sync 00000000; ge_93_perspw.raw: 522240 bytes, psm 3, crc F4ED02FA
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 009670B0 00000000 006E9281 00000000 00000000 00000000 00000000 00000000 00000000
+[135] scene 94: colour planes: the fog coefficient plane, and its corners as points
+  2 draws, 288 vertices, vertex crc 0193DB47, stream crc 8CA11CD8
+  GE 1085 us
+  sync 00000000; ge_94_fogplane.raw: 522240 bytes, psm 3, crc 06047326
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00C0C0C0 00000000 006D6D6D 00000000 00000000 00000000 00000000 00000000 00000000
+[136] scene 95: colour planes: secondary colour, primary, and both, with corner points
+  30 draws, 54 vertices, vertex crc 950CC0EB, stream crc 66093C57
+  GE 1078 us
+  sync 00000000; ge_95_specplane.raw: 522240 bytes, psm 3, crc A8AC9008
+  samples: 00000000 00AF4C73 0069728F 00000000 00323E25 001F581A 00626D38 00000000 00000000 00000000 002C3A60 00000000 00000000 00000000 00000000 00000000 00000000 004DBD54
+[137] scene 96: colour planes: fog plane with eye z = -w (clip w 1, 2, 4), and its corners as points
+  2 draws, 288 vertices, vertex crc 50A3D57E, stream crc 7ED8B1CB
+  GE 1084 us
+  sync 00000000; ge_96_fogw.raw: 522240 bytes, psm 3, crc 95BC7E93
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00A1A1A1 00000000 00A2A2A2 00000000 00000000 00000000 00000000 00000000 00000000
+[138] scene 97: colour planes: scene 87 again with corner depths; plus the full depth dump
+  16 draws, 48 vertices, vertex crc 217EC164, stream crc F8AF5DC0
+  GE 1076 us
+  sync 00000000; ge_97_scissordepth.raw: 522240 bytes, psm 3, crc DAF44BC4
+  samples: 00000000 00C54352 00000000 00000000 00000000 00C1886F 00000000 0056B78B 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0058605F 0059605E 00C68EE2
+  ge_97_scissordepth_depthfull.bin: 278528 bytes, crc 05A25022
+[139] scene 98: colour planes: anchors up to 2000 px outside a scissor window (last: range risk)
+  8 draws, 24 vertices, vertex crc 6B8AC767, stream crc 655170E9
+  GE 2108 us
+  sync 00000000; ge_98_gradfar.raw: 522240 bytes, psm 3, crc 1898E0F5
+  samples: 00000000 00000000 00FFFDFF 00FFFFFF 00000000 00000000 00000000 00000000 00000000 002D4AB2 00000000 00769D5F 00000000 00000000 00000000 00FFFFFF 00FFFFFF 0081B54B
+
+---- scenes, version 15 ----
+[140] scene 99: line colours: 96 directions, random sixteenths
+  1 draws, 192 vertices, vertex crc E113C9C1, stream crc 77984A3C
+  GE 75 us
+  sync 00000000; ge_99_lineoct.raw: 522240 bytes, psm 3, crc 572DA182
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[141] scene 100: line colours: 45-degree lines at 64 offsets, and a sixteenth either side
+  1 draws, 768 vertices, vertex crc 0821D4CC, stream crc 43EE2151
+  GE 76 us
+  sync 00000000; ge_100_linetie.raw: 522240 bytes, psm 3, crc B001CBF3
+  samples: 00638472 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[142] scene 101: line colours: short lines in 8 directions, starts swept around the pixel
+  1 draws, 512 vertices, vertex crc 49B1E9E9, stream crc EBCC7933
+  GE 74 us
+  sync 00000000; ge_101_linestart.raw: 522240 bytes, psm 3, crc AF32EADB
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[143] scene 102: line colours: flat-shaded lines and strips, through mode and 3D
+  10 draws, 152 vertices, vertex crc BD394EE0, stream crc A6846287
+  GE 75 us
+  sync 00000000; ge_102_lineflat.raw: 522240 bytes, psm 3, crc ECC0A593
+  samples: 00000000 00000000 00000000 0074F080 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[144] scene 103: line colours: smooth strips, joints at many angles
+  32 draws, 224 vertices, vertex crc 7AA92C61, stream crc 783808BC
+  GE 72 us
+  sync 00000000; ge_103_linestrip.raw: 522240 bytes, psm 3, crc 69B824B6
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[145] scene 104: line colours: fog along 3D lines, and each end as a point
+  2 draws, 384 vertices, vertex crc 6CA094D7, stream crc E62B7256
+  GE 78 us
+  sync 00000000; ge_104_linefog.raw: 522240 bytes, psm 3, crc AE119DF4
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[146] scene 105: line colours: lit lines, primary and secondary, with end points
+  147 draws, 288 vertices, vertex crc 591AC998, stream crc C8C3C20F
+  GE 78 us
+  sync 00000000; ge_105_linelit.raw: 522240 bytes, psm 3, crc 6DE99E53
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00377104 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[147] scene 106: line colours: alpha along lines read by 255 alpha-test passes
+  1 draws, 192 vertices, vertex crc B7BE46C3, stream crc C1F2DD04
+  GE 9602 us
+  sync 00000000; ge_106_linealpha.raw: 522240 bytes, psm 3, crc 2F6077ED
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[148] scene 107: line colours: scene 99 through an identity 3D transform
+  1 draws, 192 vertices, vertex crc 7A03AB7D, stream crc D4F79AFF
+  GE 77 us
+  sync 00000000; ge_107_line3d.raw: 522240 bytes, psm 3, crc 572DA182
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[149] scene 108: line colours: scene 99 with clip w 1, 2 and 4 at the ends
+  1 draws, 192 vertices, vertex crc D4E080B1, stream crc E997F473
+  GE 77 us
+  sync 00000000; ge_108_lineperspw.raw: 522240 bytes, psm 3, crc 572DA182
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[150] scene 109: line colours: scene 99 with depth ends, and the full depth dump
+  1 draws, 192 vertices, vertex crc C03E8CD6, stream crc D245807D
+  GE 81 us
+  sync 00000000; ge_109_linedepth.raw: 522240 bytes, psm 3, crc 572DA182
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_109_linedepth_depthfull.bin: 278528 bytes, crc 5A3F3412
+
+---- scenes, version 16 ----
+[151] scene 110: skinning: float weights, 1 to 8 bones, x, y and z read whole
+  1629 draws, 1629 vertices, vertex crc 3828BE57, stream crc A9168EAE
+  GE 75 us
+  sync 00000000; ge_110_skinfloat.raw: 522240 bytes, psm 3, crc 6CF6B02E
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_110_skinfloat_depthfull.bin: 278528 bytes, crc 59C59564
+[152] scene 111: skinning: 8-bit and 16-bit weights, extremes included
+  800 draws, 800 vertices, vertex crc 321A73B6, stream crc A94EECDB
+  GE 77 us
+  sync 00000000; ge_111_skinfmt.raw: 522240 bytes, psm 3, crc 670518FC
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_111_skinfmt_depthfull.bin: 278528 bytes, crc B2508FAD
+[153] scene 112: skinning: weights off one, negative and tiny; bones of every size
+  900 draws, 900 vertices, vertex crc 2FEB77E6, stream crc 43D013E9
+  GE 74 us
+  sync 00000000; ge_112_skinodd.raw: 522240 bytes, psm 3, crc 6AC66E7D
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_112_skinodd_depthfull.bin: 278528 bytes, crc 598C3847
+[154] scene 113: skinning: under world and view matrices, blend before or after
+  581 draws, 581 vertices, vertex crc DBEE7769, stream crc B47CD4EE
+  GE 77 us
+  sync 00000000; ge_113_skinworld.raw: 522240 bytes, psm 3, crc DB57BF62
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_113_skinworld_depthfull.bin: 278528 bytes, crc 9BBE3DDD
+[155] scene 114: morphing: 2 to 4 vertex sets, and morphing with skinning
+  640 draws, 640 vertices, vertex crc D6E93CC4, stream crc 480CFF3B
+  GE 76 us
+  sync 00000000; ge_114_skinmorph.raw: 522240 bytes, psm 3, crc 40C30F65
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  ge_114_skinmorph_depthfull.bin: 278528 bytes, crc 5FE418B0
+
+---- scenes, version 17 ----
+[156] scene 115: spot cutoff search, L.D read whole
+  3800 geometries, input crc 6D1DDA81
+  21 passes, 319682 us; flagged: 0 not drawn, 0 unlit at 1/32, 0 lit at 16, 0 lost
+  ge_115_spotcut.bin: 30400 bytes, crc F717139F
+  first codes: 3F8000 3F04EF 3F7C71 3F04F8 3F238B 3F23B6 3F3B74 3F2671
+[157] scene 116: spot factor as a byte: (L.D)^e, 115's geometries
+  5596 draws, 5596 vertices, vertex crc 3D367A59, stream crc 37D3D172
+  GE 137 us
+  1 list flush(es) at 448 KB
+  sync 00000000; ge_116_spotpow.raw: 522240 bytes, psm 3, crc 58F677AA
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+[158] scene 117: N.L: plain diffuse and powered diffuse as bytes
+  5000 draws, 5000 vertices, vertex crc EF0179C6, stream crc B9A5D1C9
+  GE 129 us
+  1 list flush(es) at 448 KB
+  sync 00000000; ge_117_diffpow.raw: 522240 bytes, psm 3, crc 5CD5E6ED
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+[159] scene 118: specular as a byte: (N.H)^c, H = normalise(L + (0,0,1))
+  4726 draws, 4726 vertices, vertex crc 08A43743, stream crc B9CA654A
+  GE 129 us
+  1 list flush(es) at 448 KB
+  sync 00000000; ge_118_specpow.raw: 522240 bytes, psm 3, crc 1474561E
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+[160] scene 119: attenuation as a byte: 1/(k0 + k1 d + k2 d^2)
+  1800 draws, 1800 vertices, vertex crc 800C85B6, stream crc C9EA5C9F
+  GE 70 us
+  sync 00000000; ge_119_atten.raw: 522240 bytes, psm 3, crc 4D9F8712
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+
+---- scenes, version 18 ----
+[161] scene 120: the lighting's 1/sqrt at every input, through the spot cutoff
+  65536 inputs, input crc 98AB056A
+  24 passes, 1933632 us; flagged: 0 not drawn, 0 unlit at the bracket's bottom, 0 lit at its top, 0 lost
+  ge_120_rsqfull.bin: 524288 bytes, crc 84540AB3
+  65345 of 65536 as the table predicts
+
+---- scenes, version 19 ----
+[162] scene 121: spot cutoff search under real world and view matrices
+  2504 geometries, 313 matrix pairs, input crc 0E409B8C
+  21 passes, 233887 us; flagged: 0 not drawn, 0 unlit at 1/32, 0 lit at 16, 0 lost
+  ge_121_eyesearch.bin: 20032 bytes, crc 26A46173
+[163] scene 122: lit under real matrices: diffuse, normals through cancelling matrices
+  2000 draws, 2000 vertices, vertex crc 8F0598D3, stream crc 21D6A4DC
+  GE 74 us
+  sync 00000000; ge_122_eyenorm.raw: 522240 bytes, psm 3, crc 52329499
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+[164] scene 123: lit under real matrices: specular under rotated views
+  1600 draws, 1600 vertices, vertex crc AE0BF061, stream crc ADAD8F4E
+  GE 77 us
+  sync 00000000; ge_123_eyespec.raw: 522240 bytes, psm 3, crc E86F7781
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+[165] scene 124: lit under real matrices: attenuation with the vertex and light far out
+  1200 draws, 1200 vertices, vertex crc 1FE1AD63, stream crc 403756D7
+  GE 72 us
+  sync 00000000; ge_124_eyeatt.raw: 522240 bytes, psm 3, crc 855BFAE9
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+
+---- scenes, version 20 ----
+[166] scene 125: long edges: any direction, 32 to 3900 pixels, one edge a window
+  220 draws, 660 vertices, vertex crc 28A4465C, stream crc DBD40B2D
+  GE 1083 us
+  sync 00000000; ge_125_edgerand.raw: 522240 bytes, psm 3, crc D778598A
+  samples: 00FFFFFF 00FFFFFF 00000000 00FFFFFF 00000000 00FFFFFF 00000000 00000000 00000000 00000000 00FFFFFF 00000000 00FFFFFF 00FFFFFF 00FFFFFF 00000000 00000000 00000000
+[167] scene 126: long edges: 2000 to 3900 pixels, any direction
+  220 draws, 660 vertices, vertex crc BC450FB7, stream crc 329A18D6
+  GE 2113 us
+  sync 00000000; ge_126_edgelong.raw: 522240 bytes, psm 3, crc 1D6FD96D
+  samples: 00000000 00FFFFFF 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00FFFFFF 00FFFFFF 00000000
+[168] scene 127: long edges: scene 98's window 1 at every alignment, order and mirrored
+  220 draws, 660 vertices, vertex crc 4AF76FC3, stream crc 50DA5BE1
+  GE 3159 us
+  sync 00000000; ge_127_edgeninety.raw: 522240 bytes, psm 3, crc 5BE79FED
+  samples: 00FFFFFF 00000000 00000000 00FFFFFF 00000000 00000000 00000000 00000000 00000000 00FFFFFF 00FFFFFF 00000000 00FFFFFF 00FFFFFF 00FFFFFF 00000000 00000000 00FFFFFF
+
+---- scenes, version 21 ----
+[169] scene 128: tall long edges: leans 0 to 184 pixels
+  220 draws, 660 vertices, vertex crc 5DBAED19, stream crc 6AB1DFEA
+  GE 3143 us
+  sync 00000000; ge_128_edgelean.raw: 522240 bytes, psm 3, crc 8D518ADE
+  samples: 00000000 00000000 00000000 00FFFFFF 00000000 00000000 00000000 00000000 00000000 00000000 00FFFFFF 00000000 00000000 00000000 00000000 00FFFFFF 00FFFFFF 00FFFFFF
+[170] scene 129: tall long edges: level tops and bottoms, two full-height edges
+  220 draws, 660 vertices, vertex crc 22E556DC, stream crc F5D09975
+  GE 3142 us
+  sync 00000000; ge_129_edgeflat.raw: 522240 bytes, psm 3, crc 3BA3B3E2
+  samples: 00FFFFFF 00FFFFFF 00000000 00FFFFFF 00000000 00FFFFFF 00000000 00000000 00000000 00FFFFFF 00000000 00000000 00FFFFFF 00FFFFFF 00FFFFFF 00000000 00FFFFFF 00000000
+[171] scene 130: patch lines: nine patches as points
+  9 draws, 205 vertices, vertex crc 0729B4D2, stream crc D14A2064
+  GE 75 us
+  sync 00000000; ge_130_plpoints.raw: 522240 bytes, psm 3, crc C5E44E52
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[172] scene 131: patch lines: the same as lines, smooth
+  9 draws, 205 vertices, vertex crc 0729B4D2, stream crc 910B680E
+  GE 1100 us
+  sync 00000000; ge_131_plsmooth.raw: 522240 bytes, psm 3, crc 48ABEC53
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00A49052 00000000 00000000 004F8999 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[173] scene 132: patch lines: the same as lines, flat
+  9 draws, 205 vertices, vertex crc 0729B4D2, stream crc 53C91256
+  GE 1092 us
+  sync 00000000; ge_132_plflat.raw: 522240 bytes, psm 3, crc 2ECDE16C
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00A28B5A 00000000 00000000 00489CA5 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[174] scene 133: patch lines: the same flat in one grey, added
+  9 draws, 205 vertices, vertex crc 1BBCBB4E, stream crc 96A297FE
+  GE 1086 us
+  sync 00000000; ge_133_pladd.raw: 522240 bytes, psm 3, crc FE40688E
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00202020 00000000 00000000 00202020 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+
+---- scenes, version 22 ----
+[175] scene 134: tall long edges: level corners in every order, far pixels on the extent
+  220 draws, 660 vertices, vertex crc 7BEB5ADD, stream crc FFC76AF1
+  GE 3144 us
+  sync 00000000; ge_134_edgeorder.raw: 522240 bytes, psm 3, crc BDC46CD8
+  samples: 00FFFFFF 00000000 00000000 00FFFFFF 00000000 00FFFFFF 00000000 00000000 00000000 00FFFFFF 00000000 00000000 00000000 00000000 00000000 00FFFFFF 00000000 00000000
+[176] scene 135: patch triangles: nine folded patches as points
+  9 draws, 250 vertices, vertex crc 9A918035, stream crc BD852545
+  GE 1082 us
+  sync 00000000; ge_135_ptpoints.raw: 522240 bytes, psm 3, crc 8E577B47
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[177] scene 136: patch triangles: the same as triangles, flat
+  9 draws, 250 vertices, vertex crc 9A918035, stream crc 108AD6E2
+  GE 1084 us
+  sync 00000000; ge_136_ptflat.raw: 522240 bytes, psm 3, crc 5B1D8CA1
+  samples: 00000000 00998A61 00000000 00000000 00000000 00000000 00A5955A 00000000 00000000 00582EA4 00000000 00000000 00447456 00447456 00447456 00000000 00000000 00438D60
+[178] scene 137: patch triangles: the same flat in one grey, added
+  9 draws, 250 vertices, vertex crc BA185309, stream crc F5BFA673
+  GE 1075 us
+  sync 00000000; ge_137_ptadd.raw: 522240 bytes, psm 3, crc D8D5F847
+  samples: 00000000 00202020 00000000 00000000 00000000 00000000 00101010 00000000 00000000 00101010 00000000 00000000 00202020 00202020 00202020 00000000 00000000 00404040
+[179] scene 138: skinned and morphed normals, read through lighting
+  2400 draws, 2400 vertices, vertex crc 5AA95F62, stream crc B08A783B
+  GE 138 us
+  1 list flush(es) at 448 KB
+  sync 00000000; ge_138_sknorm.raw: 522240 bytes, psm 3, crc A7FF65A8
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+[180] scene 139: morphed colours, and 16-bit vertex colours
+  4400 draws, 4400 vertices, vertex crc AB4E3904, stream crc B63193BE
+  GE 71 us
+  sync 00000000; ge_139_mrcol.raw: 522240 bytes, psm 3, crc 8536F05C
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+[181] scene 140: morphed texture coordinates, read through a coordinate texture
+  7500 draws, 7500 vertices, vertex crc D9C4E4F8, stream crc ED4CCD4E
+  GE 195 us
+  2 list flush(es) at 448 KB
+  sync 00000000; ge_140_mruv.raw: 522240 bytes, psm 3, crc A85A9C47
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+[182] scene 141: points, lines and triangles past x, y and z, clamping off and on
+  120 draws, 354 vertices, vertex crc D123DB7B, stream crc 5529A7F3
+  GE 75 us
+  sync 00000000; ge_141_clipxy.raw: 522240 bytes, psm 3, crc EADF8834
+  samples: 00000000 00000000 00000000 00FFFFFF 00000000 00FFFFFF 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+
+---- scenes, version 23 ----
+[183] scene 142: past the clip volume: ends beyond different planes, z both ways
+  120 draws, 292 vertices, vertex crc 054246D6, stream crc 3C35D8B3
+  GE 74 us
+  sync 00000000; ge_142_clipmore.raw: 522240 bytes, psm 3, crc D8AEE3DF
+  samples: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[184] scene 143: vertex alpha through an alpha-test ladder, 16-bit colours in through mode
+  51 draws, 2760 vertices, vertex crc F0898130, stream crc C91B2427
+  GE 72404 us
+  sync 00000000; ge_143_valpha.raw: 522240 bytes, psm 3, crc 4EB203D5
+  samples: 00F7BD10 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 B293FFC1 00000000 00000000 00000000 00000000 00000000 00000000
+[185] scene 144: bilinear filtering at negative texture coordinates
+  2560 draws, 2560 vertices, vertex crc 94965F9D, stream crc FCEDB2E5
+  GE 70 us
+  sync 00000000; ge_144_bilneg.raw: 522240 bytes, psm 3, crc 1177D975
+  samples: 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF 000000FF
+[186] scene 145: patch division 0 (risky, own step, last)
+  24 draws, 252 vertices, vertex crc 10593FA7, stream crc 39BBF84D
+  part 0: GE 1092 us
+  part 1: GE 1068 us
+  part 2: GE 1065 us
+  part 3: GE 1062 us
+  part 4: GE 47 us
+  part 5: GE 42 us
+  part 6: GE 44 us
+  part 7: GE 1059 us
+  part 8: GE 50 us
+  part 9: GE 42 us
+  part 10: GE 44 us
+  part 11: GE 43 us
+  GE 43 us
+  sync 00000000; ge_145_patchzero.raw: 522240 bytes, psm 3, crc 029D92AE
+  samples: 00000000 005C8886 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00BA6B99 005B7096 005C7098 005C6F96 00000000 00000000 00B9A86C
+
+==== geprobe done ====
