@@ -26,7 +26,12 @@ A rule is 'cur', 'H' (y-major ties, flat from the second vertex) or either follo
                                  psprecomp does since its points add theirs), interpolated
                                  as a plane, or not added on lines
     grad   rcp | exact           colour gradient by area_rcp's reciprocal, or exact
-e.g. 'H,spec=plane'.
+    edge   above | minor         on a pixel diamond's edge, inside means above the centre
+                                 (geprobe 6's shallow lines), or on the minor axis's
+                                 negative side (above for shallow lines, left for steep)
+e.g. 'H,spec=plane'. 'cur' is psprecomp before set 16; 'GE' is what set 16 measured
+(y-major ties, flat from the second vertex, fog and secondary planes, minor-side edges),
+which matches every pixel of scenes 99-109 and which psprecomp draws now.
 
     lines15.py emit [OUT.inc]          write the command streams (default c15_data.inc)
     lines15.py sums DUMPDIR            every scene's SUMS line in geprobe.txt against these streams
@@ -47,8 +52,10 @@ from colour14 import (XS, f32, bf, chan, area_rcp, P16, begin, ID, VP3, cv3d, mo
 GU_LINES, GU_LINE_STRIP = 1, 2
 
 # =========================================================================== rules
-DEFAULTS = dict(tie='x', flat='interp', start='extrap', fog='lerp', spec='consta', grad='rcp')
-PRESETS = {'cur': {}, 'H': dict(tie='y', flat='b')}
+DEFAULTS = dict(tie='x', flat='interp', start='extrap', fog='lerp', spec='consta', grad='rcp', edge='above')
+PRESETS = {'cur': {}, 'H': dict(tie='y', flat='b'),
+           # what set 16 (geprobe 15, fw 6.60) measured, and psprecomp draws since: every scene exact
+           'GE': dict(tie='y', flat='b', fog='plane', spec='plane', edge='minor')}
 def parse_rule(rule):
     parts = rule.split(',')
     o = dict(DEFAULTS); o.update(PRESETS[parts[0]])
@@ -57,7 +64,7 @@ def parse_rule(rule):
         assert k in DEFAULTS, k
         o[k] = v
     return o
-RIVALS = ['cur', 'H', 'H,tie=x', 'H,flat=a', 'H,flat=interp', 'H,start=clamp', 'H,fog=plane',
+RIVALS = ['GE', 'cur', 'H', 'H,tie=x', 'H,flat=a', 'H,flat=interp', 'H,start=clamp', 'H,fog=plane',
           'H,spec=plane', 'H,spec=none', 'H,grad=exact']
 
 def plane_chan(acc):
@@ -87,7 +94,7 @@ def walk(a, b, opt):
         Mp = M0 + sm * k; mp = (pm + dmk * k) // smd
         pM, pmin = (Ma, ma) if end else (Mb, mb)
         dMaj = pM - (16 * Mp + 8); dMin = pmin - (16 * mp + 8)
-        ddy = dMin if xmajor else dMaj
+        ddy = dMin if (xmajor or opt['edge'] == 'minor') else dMaj
         s = abs(dMaj) + abs(dMin)
         if s < 8 or (s == 8 and ddy < 0):
             if end: first = -1

@@ -565,20 +565,35 @@ ge_rcp16, ge_screen_z, clip_to_fx16):
   major-axis column whose centre lies on the segment. Its row, colour and
   depth are those of the centre's projection onto the line. The gradients
   are the difference times the same reciprocal, of the major length,
-  floored to 1/16384 of a step per sixteenth of a pixel. For whole-pixel endpoints that is the
-  step centre geprobe step 1 measured. Scene 27's 3D line, whose ends fall
-  between centres, matches on every pixel only this way. All 5862 pixels of
-  geprobe 7 scene 49's steep lines match.
+  floored to 1/16384 of a step per sixteenth of a pixel. For whole-pixel
+  endpoints that is the step centre geprobe step 1 measured. Scene 27's 3D
+  line, whose ends fall between centres, matches on every pixel only this
+  way. A line as long across as down is **y-major**. Fog and the secondary
+  colour are planes by the same rule, each floored on its own; the
+  secondary colour is added after the texture function, as on a triangle.
+  A **flat-shaded line** is its second vertex's colour throughout, as a
+  flat triangle is its last's. A 3D line is the through-mode line between
+  its projected ends: colour runs straight in screen space whatever w.
+  geprobe 15 (fw 6.60) scenes 99-109 settle it: 96 directions on random
+  sixteenths, 45-degree lines at 64 offsets each way, starts swept around a
+  pixel's diamond, flat lines and strips, strip joints, fog, lit lines,
+  alpha, 3D and clip-w twins, and depth all match on every pixel. The
+  rivals are off: x-major 45-degree lines by 2496 pixels, the first
+  vertex's or interpolated flat colour by 2096, a rounded fog blend by
+  1149, and the first end's secondary colour throughout by 1136. With them
+  scenes 22, 49 and 75 match too.
 - **Line ends** follow each end pixel's diamond (geprobe 6 scene 37): a
   pixel's diamond is the points within half a pixel of its centre, counting
-  x and y distance together. Its upper edges and top corner are inside, and
-  its lower edges and side corners are outside. The last pixel is dropped
-  when the line ends inside its diamond. The pixel before the first is
-  drawn when the line starts inside that pixel's diamond. Scene 49 finds an
-  exception at the start of a steep line going up. A start on the upper
-  right edge (5/16 right and 3/16 up) or on the top corner is outside, so
-  the hardware draws no pixel there. That is 4 pixels, and it is not
-  modelled.
+  x and y distance together. The last pixel is dropped when the line ends
+  inside its diamond. The pixel before the first is drawn when the line
+  starts inside that pixel's diamond, with the colour the plane gives at
+  its centre. On the diamond's edge a point on the minor axis's negative
+  side is inside and one on its positive side outside: above the centre
+  for a shallow line (scene 37), left of it for a steep or 45-degree one.
+  geprobe 15 scenes 99-101 put 27 starts and ends of steep and 45-degree
+  lines on diamond edges and the PSP draws every one this way; taking
+  "above" for steep lines too, as before, put a pixel wrong at each, and
+  that was scene 49's steep starts going up.
 - A GPU backend shares the vertex depths and interpolates them itself.
 
 ## Texture coordinates on sprites and lines
@@ -685,21 +700,20 @@ psprecomp places every one on the PSP's pixel with its depth.
   clamping is off (every geprobe 13 calibration point with clip z in
   (-w, 0), or over 65535, is absent).
 
-## Still open after geprobe 14
+## Still open after geprobe 15
 
-These are what geprobe 14 (fw 6.60) still shows psprecomp getting wrong,
-with pixels off on run 14 (set 15). Run 14 drew every scene it shares with
-run 13 the same, byte for byte. Its log matches psprecomp's on 98 of 140
-steps; the patch and colour scenes still listed in the log differ only in
-their GE timing lines, apart from the frames below. Details on the geprobe
-7 items, and what further probing could settle, are in
-`fw660-run7/findings/geprobe.md`. Vertex depth, patch positions and colour
-planes are settled (above).
+These are what geprobe 15 (fw 6.60) still shows psprecomp getting wrong,
+with pixels off on run 15 (set 16). Run 15 drew every scene it shares with
+run 14 the same, byte for byte. Its log matches psprecomp's on 100 of 151
+steps; the patch, colour and line scenes still listed in the log differ
+only in their GE timing lines, apart from the frames below. Details on the
+geprobe 7 items, and what further probing could settle, are in
+`fw660-run7/findings/geprobe.md`. Vertex depth, patch positions, colour
+planes and line colours are settled (above).
 
-- **Line colours** (scene 22: 45 pixels; scene 23: 9; scene 75: 747). All
-  on lines, not triangles: the patch line strips of 22 and 23 a step or
-  two off along diagonals, and scene 75's lines mostly in green (+11 to
-  +128), which looks like which end's or segment's colour a line takes.
+- **Patch line order** (scene 23: 1 pixel). Two segments of a patch's
+  line strips cross at (375,211), and the PSP's colour there is the other
+  segment's: the order the GE emits a patch's line segments in.
 - **Through-mode triangle fans** (scene 88: 8452 pixels). psprecomp draws
   none; the GE does (render.c sw_draw leaves fans to the GE, but a
   through-mode batch reaches it unassembled).
@@ -714,8 +728,6 @@ planes are settled (above).
   fixes every pixel. Skinning arithmetic, not colour.
 - **Point and spot lights** (scene 35: 10 pixels), each one step low, all
   where the GE's power function is used.
-- **Steep line starts** (scene 49: 4 pixels): a start on a diamond's upper
-  right edge or top corner, going up.
 
 ## Validation
 

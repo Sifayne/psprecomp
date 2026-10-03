@@ -1183,6 +1183,52 @@ static void test_colour_plane_anchor(void) {
     CHECK(bad == 0, "%d of 10 colour-plane pixels off the PSP's", bad);
 }
 
+/* Lines as the PSP draws them (render.c psp_render_walk_line, sw_draw),
+ * from geprobe 15 (fw 6.60). Scene 100's line 41 runs at exactly 45
+ * degrees, so it is y-major, and starts 5/16 left of and 3/16 below a
+ * pixel centre: on that pixel's diamond, on the minor axis's negative side,
+ * so inside. The PSP draws that pixel, (137,17), and stops before (147,27),
+ * with these colours; taken x-major, or "inside" meaning above the centre,
+ * the line shifts a pixel and its colours a step. Scene 102's first line,
+ * flat-shaded, is its second vertex's colour throughout. */
+static void test_line_rules(void) {
+    static const struct { int x, y; uint32_t c; } P[] = {
+        { 137, 17, 0x5FCA4C }, { 138, 18, 0x6EBC58 }, { 139, 19, 0x7EAE64 }, { 140, 20, 0x8DA170 },
+        { 141, 21, 0x9D937C }, { 142, 22, 0xAC8588 }, { 143, 23, 0xBC7794 }, { 144, 24, 0xCB69A0 },
+        { 145, 25, 0xDB5CAC }, { 146, 26, 0xEA4EB8 } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    float_vertex(0, 2195 / 16.0f, 283 / 16.0f, 0);
+    float_vertex(1, 2355 / 16.0f, 443 / 16.0f, 0);
+    psp_write32(VERTS + 0 * 16, 0xFF62C84Fu);
+    psp_write32(VERTS + 1 * 16, 0xFFFD3EC7u);
+    cmd(0x04, (1u << 16) | 2);                             /* one line */
+    end_list();
+    int bad = 0;
+    for (unsigned i = 0; i < sizeof P / sizeof P[0]; i++)
+        bad += (pixel(P[i].x, P[i].y) & 0xFFFFFFu) != P[i].c;
+    CHECK(bad == 0, "45-degree line: %d of 10 pixels off the PSP's (first (137,17) reads %06X)",
+          bad, pixel(137, 17) & 0xFFFFFFu);
+    CHECK((pixel(147, 27) & 0xFFFFFFu) == 0, "45-degree line drew (147,27), which the PSP leaves out");
+
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    cmd(0x50, 0);                                          /* SHADE: flat */
+    float_vertex(0, 141 / 16.0f, 276 / 16.0f, 0);
+    float_vertex(1, 525 / 16.0f, 284 / 16.0f, 0);
+    psp_write32(VERTS + 0 * 16, 0xFF91FF6Au);
+    psp_write32(VERTS + 1 * 16, 0xFF4494D0u);
+    cmd(0x04, (1u << 16) | 2);
+    end_list();
+    int lit = 0, off = 0;
+    for (int y = 16; y <= 19; y++)
+        for (int x = 8; x <= 34; x++) {
+            const uint32_t c = pixel(x, y) & 0xFFFFFFu;
+            if (c) { lit++; off += c != 0x4494D0u; }
+        }
+    CHECK(lit >= 20 && off == 0, "flat line: %d pixels, %d not its second vertex's colour", lit, off);
+}
+
 /* Gradients take 1/area from the GE's reciprocal table (render.c area_rcp),
  * which is a unit off the reciprocal cut to 16 bits where its linear step
  * misses. geprobe 8 (fw 6.60) scene 50's triangles 517/16 and 885/16 pixels
@@ -1931,6 +1977,7 @@ int main(void) {
     test_vertex_depth_ge();
     test_patch_points_ge();
     test_colour_plane_anchor();
+    test_line_rules();
     test_gradient_reciprocal();
     test_depth_plane_side();
     test_spline_colour();

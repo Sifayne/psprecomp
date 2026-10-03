@@ -1531,7 +1531,11 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
      * centre c0 + 16*sm*k; the minor pixel is
      * floor((m_a*|dM| + dm*sm*(centre - M_a)) / (16*|dM|)). Both are
      * floor((p + d*k) / s), so one clip serves either. */
-    const int xmajor = ax >= ay;
+    /* A line as long across as down is y-major: geprobe 15 (fw 6.60) scene
+     * 100's 256 lines at exactly 45 degrees, from 64 start offsets in each
+     * direction, take their colour from y (2496 pixels a step off as
+     * x-major), and so do scene 22's patch diagonals (45 pixels). */
+    const int xmajor = ax > ay;
     const int64_t Ma = xmajor ? a->x : a->y, ma = xmajor ? a->y : a->x;
     const int64_t dM = xmajor ? dx : dy, dm = xmajor ? dy : dx, adM = dM < 0 ? -dM : dM;
     const int64_t sm = dM < 0 ? -1 : 1;
@@ -1546,8 +1550,13 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
     /* The ends go by the pixel's diamond, |x - cx| + |y - cy| < 1/2: the
      * last pixel is left out when the end lies in its diamond, and the pixel
      * before the first is drawn when the start lies in its diamond. On the
-     * diamond's edge a point above the centre counts as inside, one below it
-     * as outside. geprobe 6 scene 37 (fw 6.60) ends shallow lines on every
+     * diamond's edge a point on the minor axis's negative side counts as
+     * inside, one on its positive side as outside: above the centre for a
+     * shallow line, left of it for a steep one. geprobe 15 (fw 6.60) scenes
+     * 99-101 put 27 starts and ends of steep and 45-degree lines on diamond
+     * edges, and the PSP draws every one this way; taking "above" for
+     * steep lines too, as before, was a pixel off at each.
+     * geprobe 6 scene 37 (fw 6.60) ends shallow lines on every
      * sixteenth of a row: going right to x + 5/8, the PSP leaves out the
      * last pixel for end rows 2/16 to 13/16 past a whole pixel (its diamond
      * holds the end, the edge included at 2/16 and not at 14/16); going left
@@ -1563,9 +1572,8 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
             const int64_t Mp = M0 + sm * k, mp = floor_div(pm + dmk * k, smd);
             const int64_t pM = end ? Ma : Mb, pmin = end ? ma : mb;
             const int64_t dMaj = pM - (16 * Mp + 8), dMin = pmin - (16 * mp + 8);
-            const int64_t ddy = xmajor ? dMin : dMaj;
             const int64_t sum = (dMaj < 0 ? -dMaj : dMaj) + (dMin < 0 ? -dMin : dMin);
-            const int inside = sum < 8 || (sum == 8 && ddy < 0);
+            const int inside = sum < 8 || (sum == 8 && dMin < 0);
             if (inside) { if (end) first = -1; else last = n - 2; }
         }
     }
@@ -1594,10 +1602,25 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
         cv[c] = chan(a->rgba, c);
         cg[c] = floor_shr(((int64_t)chan(b->rgba, c) - cv[c]) * 16384 * lq, lsh);
     }
+    /* Fog and the secondary colour are planes by the same rule: geprobe 15
+     * (fw 6.60) scene 104's fogged lines read so on every pixel (a rounded
+     * blend of the end values, as before, left 1149 a step off), and scene
+     * 105's lit lines read the secondary colour interpolated and added, each
+     * channel floored on its own (the first end's secondary throughout left
+     * 1136 off; none at all 1138). */
+    const int64_t fv = a->fog, fgr = floor_shr(((int64_t)b->fog - a->fog) * 16384 * lq, lsh);
+    const int sec = a->spec_set || b->spec_set;
+    int64_t sv[3] = { 0, 0, 0 }, sg[3] = { 0, 0, 0 };
+    if (sec)
+        for (int c = 0; c < 3; c++) {
+            sv[c] = a->spec_set ? chan(a->spec, c) : 0;
+            const int64_t sb = b->spec_set ? chan(b->spec, c) : 0;
+            sg[c] = floor_shr((sb - sv[c]) * 16384 * lq, lsh);
+        }
     const int64_t za = !(a->z > 0.0f) ? 0 : (a->z >= 65535.0f ? 65535 : (int64_t)a->z);
     const int64_t zb = !(b->z > 0.0f) ? 0 : (b->z >= 65535.0f ? 65535 : (int64_t)b->z);
     const int64_t zg = floor_shr((zb - za) * 16384 * lq, lsh);
-    /* Fog and texture coordinates at the same point. Unprojected (through
+    /* Texture coordinates at the same point. Unprojected (through
      * mode), the texture coordinates go by a fixed step, texels a sixteenth,
      * truncated toward zero to 2^-24 (2^-20 a pixel). geprobe 5 scene 28's
      * three through-mode textured lines (fw 6.60) read the hardware's texel
@@ -1620,7 +1643,11 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
         v.rgba = 0;
         for (int c = 0; c < 4; c++)
             v.rgba |= plane_chan(cv[c] * 16384 + cg[c] * dist16) << (8 * c);
-        v.fog = (int)(s * (float)a->fog + t * (float)b->fog + 0.5f);
+        v.fog = (int)plane_chan(fv * 16384 + fgr * dist16);
+        v.spec = 0;
+        v.spec_set = sec;
+        if (sec)
+            for (int c = 0; c < 3; c++) v.spec |= plane_chan(sv[c] * 16384 + sg[c] * dist16) << (8 * c);
         if (affine) {
             v.u = a->u + lu * (float)dist16;
             v.v = a->v + lv * (float)dist16;
@@ -1677,7 +1704,15 @@ static void sw_draw(int prim, const psp_vertex *v, int count) {
     case PSP_PRIM_LINE_STRIP:
         for (int i = 0; i + 1 < count; i += prim == PSP_PRIM_LINES ? 2 : 1) {
             int lod16 = psp_render_line_lod16(&g_tex, &v[i], &v[i + 1]);
-            psp_render_walk_line(&v[i], &v[i + 1], g_sc_x0, g_sc_y0, g_sc_x1, g_sc_y1,
+            /* A flat-shaded line is its second vertex's colour throughout,
+             * as a flat triangle is its last's: geprobe 15 (fw 6.60) scene
+             * 102's lines and strips, in through mode and 3D, and scene 75's
+             * flat patch lines (1494 pixels, half of them off when the
+             * shading was ignored). Fog and the secondary colour are not
+             * measured flat and keep their planes. */
+            psp_vertex fa = v[i];
+            if (g_bs.shade_flat) fa.rgba = v[i + 1].rgba;
+            psp_render_walk_line(&fa, &v[i + 1], g_sc_x0, g_sc_y0, g_sc_x1, g_sc_y1,
                                   sw_point_sample, &lod16);
         }
         break;
