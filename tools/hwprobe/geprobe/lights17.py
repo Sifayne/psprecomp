@@ -36,8 +36,13 @@ can give, so an undrawn point is told from an unlit (black) one. Every input is 
     lights17.py sums DUMPDIR          the logged CRCs against these inputs
     lights17.py compare DUMPDIR [rule..]   115's codes and 116-119's bytes against a rule
     lights17.py check                 design checks: points, boundary nearness
-Rules: 'cur' is psprecomp's float arithmetic (ge.c light_vertex, ge_pow), the reference
-the probe's own run under psprecomp must reproduce.
+Rules: 'cur' is psprecomp's float arithmetic before set 18 (ge.c light_vertex, ge_pow), the
+reference the probe's own run under that psprecomp reproduces; 'ge' is what set 18 (fw 6.60)
+answered, which fits all 20922 readings: 1/sqrt from a 256-entry table like 1/w's (GE_RSQ),
+L normalised component by component, the spot direction and the normal taken as given with
+their 1/sqrt applied to the dot product, H = L + (0,0,1) normalised by components, exponents
+and coefficients cut to 5 significant bits before ge_pow, the distance L.L/sqrt(L.L), and the
+attenuation's reciprocal the 1/w table's -- all in the vertex path's ge_mul/ge_sum.
 """
 import sys, os, math, struct, zlib, re
 import numpy as np
@@ -45,6 +50,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import colour14 as C
+import patch13 as P13
 from colour14 import XS, f32, bf
 
 GU_POINTS = 0
@@ -196,6 +202,97 @@ def cur_code(g):
     """Scene 115 under psprecomp: the largest cutoff code at or below its float L.D."""
     L = Light(GU_SPOTLIGHT, GU_DIFFUSE, g.p, g.d)
     x = cur_parts(L, g.v, g.n)['sx']
+    return code(x) if x > 0 else 0
+
+GE_RSQ = [            # [parity][t] = (value, slope): 1/sqrt, the table ge.c ge_rsq_tab holds
+    [
+        (131073, 254), (130563, 250), (130060, 248), (129563, 244), (129071, 242), (128585, 240), (128104, 236), (127629, 234),
+        (127159, 232), (126694, 228), (126234, 226), (125779, 224), (125329, 222), (124884, 220), (124444, 216), (124008, 214),
+        (123576, 212), (123150, 210), (122727, 208), (122309, 206), (121895, 204), (121485, 202), (121080, 200), (120678, 198),
+        (120280, 196), (119887, 194), (119497, 192), (119111, 190), (118728, 188), (118350, 186), (117975, 184), (117603, 184),
+        (117235, 182), (116870, 180), (116509, 178), (116151, 176), (115796, 174), (115445, 174), (115097, 172), (114752, 170),
+        (114410, 168), (114071, 166), (113735, 166), (113401, 164), (113071, 162), (112744, 162), (112420, 160), (112098, 158),
+        (111779, 158), (111463, 156), (111149, 154), (110838, 154), (110530, 152), (110224, 150), (109921, 150), (109620, 148),
+        (109322, 146), (109026, 146), (108733, 144), (108442, 144), (108153, 142), (107866, 142), (107582, 140), (107300, 138),
+        (107020, 138), (106743, 136), (106467, 136), (106194, 134), (105923, 134), (105653, 132), (105386, 132), (105121, 130),
+        (104858, 130), (104597, 128), (104338, 128), (104080, 126), (103825, 126), (103571, 124), (103320, 124), (103070, 124),
+        (102822, 122), (102576, 122), (102331, 120), (102088, 120), (101847, 118), (101608, 118), (101370, 118), (101134, 116),
+        (100900, 116), (100667, 114), (100436, 114), (100206, 112), (99979, 113), (99752, 112), (99527, 110), (99304, 110),
+        (99082, 110), (98861, 108), (98642, 108), (98425, 108), (98209, 107), (97994, 106), (97781, 104), (97569, 104),
+        (97358, 104), (97149, 102), (96941, 102), (96735, 102), (96530, 100), (96326, 100), (96123, 100), (95922, 100),
+        (95722, 98), (95523, 98), (95326, 98), (95129, 96), (94934, 96), (94740, 96), (94547, 94), (94356, 94),
+        (94165, 94), (93976, 94), (93788, 92), (93601, 92), (93415, 92), (93230, 90), (93047, 90), (92864, 90),
+    ],
+    [
+        (92682, 178), (92322, 176), (91967, 174), (91615, 172), (91267, 170), (90924, 168), (90584, 168), (90248, 166),
+        (89915, 164), (89586, 162), (89261, 160), (88940, 158), (88621, 156), (88307, 154), (87995, 154), (87687, 152),
+        (87382, 150), (87080, 148), (86781, 146), (86486, 146), (86193, 144), (85903, 142), (85616, 140), (85332, 140),
+        (85051, 138), (84773, 136), (84497, 136), (84224, 134), (83954, 132), (83686, 132), (83421, 130), (83158, 130),
+        (82898, 128), (82640, 126), (82384, 126), (82131, 124), (81881, 124), (81632, 122), (81386, 122), (81142, 120),
+        (80900, 118), (80660, 118), (80423, 116), (80187, 116), (79954, 114), (79722, 114), (79493, 112), (79265, 112),
+        (79040, 110), (78816, 110), (78595, 108), (78375, 108), (78157, 108), (77941, 106), (77726, 106), (77513, 104),
+        (77303, 104), (77093, 102), (76886, 102), (76680, 102), (76476, 100), (76273, 100), (76072, 98), (75873, 98),
+        (75675, 98), (75479, 96), (75284, 96), (75091, 94), (74899, 94), (74708, 94), (74520, 92), (74332, 92),
+        (74146, 92), (73961, 90), (73778, 90), (73596, 90), (73416, 88), (73236, 88), (73058, 88), (72882, 86),
+        (72706, 86), (72532, 86), (72359, 84), (72187, 84), (72017, 84), (71848, 84), (71680, 82), (71513, 82),
+        (71347, 82), (71182, 80), (71019, 80), (70857, 80), (70695, 80), (70535, 78), (70376, 78), (70218, 78),
+        (70061, 76), (69906, 76), (69751, 76), (69597, 76), (69444, 74), (69292, 74), (69142, 74), (68992, 74),
+        (68843, 72), (68695, 72), (68548, 72), (68402, 72), (68257, 72), (68113, 70), (67970, 70), (67827, 70),
+        (67686, 70), (67545, 68), (67406, 68), (67267, 68), (67129, 68), (66992, 68), (66855, 66), (66720, 66),
+        (66585, 66), (66451, 66), (66318, 66), (66186, 64), (66055, 64), (65924, 64), (65794, 64), (65665, 64),
+    ],
+]
+
+def ge_rsqrt16(s):
+    if not s > 0 or not math.isfinite(s): return math.inf
+    m, e = math.frexp(s); sig = int(m * 65536); E = e - 1
+    p, t, l = E & 1, (sig & 0x7FFF) >> 8, sig & 0xFF
+    V, S = GE_RSQ[p][t]
+    return ((128 * V - S * l - 1) >> 8) / 65536 * 2.0 ** (-(E - p) // 2)
+def g_mul(a, b): return P13.ge_sum([P13.ge_mul(a, b)])
+def g_dot(a, b): return P13.ge_sum([P13.ge_mul(x, y) for x, y in zip(a, b)])
+def g_unit(v):
+    r = ge_rsqrt16(g_dot(v, v)); return [P13.ge_cut(c * r) if math.isfinite(r) else 0.0 for c in v]
+def g_dot_scaled(a, u):
+    aa = g_dot(a, a); return g_mul(g_dot(a, u), ge_rsqrt16(aa)) if aa > 0 else 0.0
+def g_pow(x, k): return ge_pow(x, P13.ge_cut(k, 5)) if x > 0 else 0.0
+
+def ge_parts(L, v, n):
+    """The factors as set 18 says the GE forms them."""
+    kind = 2 if L.comps == 8 else (1 if L.comps == 6 else 0)
+    att = 1.0
+    if L.type == 0: Lv = list(L.p)
+    else:
+        Lv = [P13.ge_sum([P13.ge_mul(L.p[i], 1.0), P13.ge_mul(v[i], -1.0)]) for i in range(3)]
+        ll = g_dot(Lv, Lv); d = g_mul(ll, ge_rsqrt16(ll))
+        a = P13.ge_sum([P13.ge_mul(L.k[0], 1.0), P13.ge_mul(L.k[1], d), P13.ge_mul(g_mul(L.k[2], d), d)])
+        att = P13.ge_rcp16(a) if a else 1.0
+    Ln = g_unit(Lv)
+    sx = None; spot = 1.0
+    if L.type == 2:
+        sx = g_dot_scaled(list(L.d), Ln)
+        spot = g_pow(sx, L.exp) if sx >= L.cut else None
+    ndl = g_dot_scaled(list(n), Ln)
+    ndh = None
+    if kind == 1 and ndl >= 0:
+        ndh = g_dot_scaled(list(n), g_unit([Ln[0], Ln[1], P13.ge_sum([P13.ge_mul(Ln[2], 1.0), P13.ge_mul(1.0, 1.0)])]))
+    return dict(kind=kind, sx=sx, spot=spot, att=att, ndl=ndl, ndh=ndh)
+
+def ge_byte(L, v, n):
+    P = ge_parts(L, v, n)
+    if P['spot'] is None: return 0
+    dfac = P['ndl'] if P['ndl'] > 0 else 0.0
+    if P['kind'] == 2 and dfac > 0: dfac = g_pow(dfac, L.coef)
+    sfac = g_pow(P['ndh'], L.coef) if P['ndh'] is not None else 0.0
+    vd, vs = lit_byte(dfac), lit_byte(sfac)
+    va = 255 if P['att'] >= 1.0 else lit_byte(P['att'])
+    vsp = 255 if P['spot'] >= 1.0 else lit_byte(P['spot'])
+    ld, ls = L.dif & 0xFF, L.spec & 0xFF
+    t = lit_mul(vd, lit_mul(ld, 255)); ts = lit_mul(vs, lit_mul(ls, 255))
+    return min(255, lit_mul(vsp, lit_mul(va, t)) + lit_mul(vsp, lit_mul(va, ts)))
+
+def ge_code(g):
+    x = ge_parts(Light(GU_SPOTLIGHT, GU_DIFFUSE, g.p, g.d), g.v, g.n)['sx']
     return code(x) if x > 0 else 0
 
 # =========================================================================== the static scenes
@@ -406,7 +503,7 @@ def sums(dumpdir):
     return ok
 
 def compare(dumpdir, rules=None):
-    rules = rules or ['cur']
+    rules = rules or ['ge', 'cur']
     G = geo(); R = read_search(dumpdir)
     print('115 spotcut:')
     for b, name in enumerate(BATCHES):
@@ -414,7 +511,8 @@ def compare(dumpdir, rules=None):
         fl = sum(1 for i in idx if R[i][1])
         line = f'   b{b} {name}: {len(idx)} geometries, {fl} flagged; code matches'
         for rule in rules:
-            if rule == 'cur': line += f' cur:{sum(R[i][0] == cur_code(G[i]) for i in idx)}'
+            fn = {'cur': cur_code, 'ge': ge_code}[rule]
+            line += f' {rule}:{sum(R[i][0] == fn(G[i]) for i in idx)}'
         print(line)
     for S in scenes():
         got = read_scene(dumpdir, S)
@@ -424,7 +522,7 @@ def compare(dumpdir, rules=None):
             st['n'] += 1
             if got[i] < 0: st['absent'] += 1; continue
             for rule in rules:
-                if rule == 'cur': st[rule] += cur_byte(pt['L'], pt['v'], pt['n']) == got[i]
+                st[rule] += {'cur': cur_byte, 'ge': ge_byte}[rule](pt['L'], pt['v'], pt['n']) == got[i]
         print(f'{S.num} {S.name}:')
         for b, st in sorted(by.items()): print(f'   b{b}:', st)
 

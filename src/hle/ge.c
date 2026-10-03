@@ -2257,6 +2257,114 @@ static float ge_pow(float x, float k) {
     return ldexpf(1.0f + (y - n), (int)n);
 }
 
+/* ---- The lighting's vectors (geprobe 17, fw 6.60) ----------------------
+ *
+ * Scene 115 reads L.D whole: the spot cutoff is a threshold on it, so the
+ * probe searches the cutoff a pass at a time on the PSP for 3800 geometries.
+ * 116-119 read the spot, diffuse, specular and attenuation factors as bytes,
+ * 17122 more. All 20922 fit this, in the vertex path's arithmetic (ge_mul,
+ * ge_sum) wherever a product or sum is taken:
+ *  - 1/sqrt is a table like 1/w's: 128 entries for each parity of the
+ *    exponent, a value and a slope each, indexed by the significand's top 7
+ *    bits after the leading one and interpolated by the next 8 (ge_rsqrt16).
+ *    The light at (a/128, b/128, 1) 2^j over a vertex at the origin, with
+ *    D = +z, reads it directly: its 128-segment chords fit every point to
+ *    the last bit where 64 segments leave kinks. The entries are measured,
+ *    not computed: the value is ceil(2^17/sqrt(knot)) in 217 of the 219
+ *    the readings pin down, but no rule gives the slope. 37 still allow more
+ *    than one entry; they take the value ceil(2^17/sqrt(knot)) where they
+ *    can, then the slope nearest half the chord.
+ *  - L, the light minus the vertex (or a directional light's vector), is
+ *    normalised component by component: L times 1/sqrt(L.L), each cut to 16
+ *    bits.
+ *  - The spot direction and the normal are not: the GE takes the dot product
+ *    with them as given and scales it by their 1/sqrt after. Normalising D
+ *    component by component misses 145 of 1200 general geometries (every one
+ *    where 1/sqrt(D.D) is not 1); scaling after misses none. N.L the same
+ *    way fits all 5000 diffuse bytes.
+ *  - H is L + (0, 0, 1) normalised component by component, and N.H is taken
+ *    like N.L.
+ *  - Spot exponents and specular coefficients keep 5 significant bits, cut
+ *    toward zero, before ge_pow: every exponent with no more (quarters,
+ *    halves, whole numbers) already fit, and of 942 with more, all do so
+ *    and 613 at best otherwise.
+ *  - The distance is L.L times its 1/sqrt, the attenuation's sum k0 + k1 d +
+ *    (k2 d) d one GE sum, and its reciprocal the 1/w table's (ge_rcp16).
+ * Scene 35's last ten points, each a step low, come out right. */
+static const uint32_t ge_rsq_tab[2][128][2] = {
+    {  /* even exponent: s in [1, 2) */
+        { 131073, 254 }, { 130563, 250 }, { 130060, 248 }, { 129563, 244 }, { 129071, 242 }, { 128585, 240 }, { 128104, 236 }, { 127629, 234 },
+        { 127159, 232 }, { 126694, 228 }, { 126234, 226 }, { 125779, 224 }, { 125329, 222 }, { 124884, 220 }, { 124444, 216 }, { 124008, 214 },
+        { 123576, 212 }, { 123150, 210 }, { 122727, 208 }, { 122309, 206 }, { 121895, 204 }, { 121485, 202 }, { 121080, 200 }, { 120678, 198 },
+        { 120280, 196 }, { 119887, 194 }, { 119497, 192 }, { 119111, 190 }, { 118728, 188 }, { 118350, 186 }, { 117975, 184 }, { 117603, 184 },
+        { 117235, 182 }, { 116870, 180 }, { 116509, 178 }, { 116151, 176 }, { 115796, 174 }, { 115445, 174 }, { 115097, 172 }, { 114752, 170 },
+        { 114410, 168 }, { 114071, 166 }, { 113735, 166 }, { 113401, 164 }, { 113071, 162 }, { 112744, 162 }, { 112420, 160 }, { 112098, 158 },
+        { 111779, 158 }, { 111463, 156 }, { 111149, 154 }, { 110838, 154 }, { 110530, 152 }, { 110224, 150 }, { 109921, 150 }, { 109620, 148 },
+        { 109322, 146 }, { 109026, 146 }, { 108733, 144 }, { 108442, 144 }, { 108153, 142 }, { 107866, 142 }, { 107582, 140 }, { 107300, 138 },
+        { 107020, 138 }, { 106743, 136 }, { 106467, 136 }, { 106194, 134 }, { 105923, 134 }, { 105653, 132 }, { 105386, 132 }, { 105121, 130 },
+        { 104858, 130 }, { 104597, 128 }, { 104338, 128 }, { 104080, 126 }, { 103825, 126 }, { 103571, 124 }, { 103320, 124 }, { 103070, 124 },
+        { 102822, 122 }, { 102576, 122 }, { 102331, 120 }, { 102088, 120 }, { 101847, 118 }, { 101608, 118 }, { 101370, 118 }, { 101134, 116 },
+        { 100900, 116 }, { 100667, 114 }, { 100436, 114 }, { 100206, 112 }, { 99979, 113 }, { 99752, 112 }, { 99527, 110 }, { 99304, 110 },
+        { 99082, 110 }, { 98861, 108 }, { 98642, 108 }, { 98425, 108 }, { 98209, 107 }, { 97994, 106 }, { 97781, 104 }, { 97569, 104 },
+        { 97358, 104 }, { 97149, 102 }, { 96941, 102 }, { 96735, 102 }, { 96530, 100 }, { 96326, 100 }, { 96123, 100 }, { 95922, 100 },
+        { 95722, 98 }, { 95523, 98 }, { 95326, 98 }, { 95129, 96 }, { 94934, 96 }, { 94740, 96 }, { 94547, 94 }, { 94356, 94 },
+        { 94165, 94 }, { 93976, 94 }, { 93788, 92 }, { 93601, 92 }, { 93415, 92 }, { 93230, 90 }, { 93047, 90 }, { 92864, 90 },
+    },
+    {  /* odd exponent: s in [2, 4) */
+        { 92682, 178 }, { 92322, 176 }, { 91967, 174 }, { 91615, 172 }, { 91267, 170 }, { 90924, 168 }, { 90584, 168 }, { 90248, 166 },
+        { 89915, 164 }, { 89586, 162 }, { 89261, 160 }, { 88940, 158 }, { 88621, 156 }, { 88307, 154 }, { 87995, 154 }, { 87687, 152 },
+        { 87382, 150 }, { 87080, 148 }, { 86781, 146 }, { 86486, 146 }, { 86193, 144 }, { 85903, 142 }, { 85616, 140 }, { 85332, 140 },
+        { 85051, 138 }, { 84773, 136 }, { 84497, 136 }, { 84224, 134 }, { 83954, 132 }, { 83686, 132 }, { 83421, 130 }, { 83158, 130 },
+        { 82898, 128 }, { 82640, 126 }, { 82384, 126 }, { 82131, 124 }, { 81881, 124 }, { 81632, 122 }, { 81386, 122 }, { 81142, 120 },
+        { 80900, 118 }, { 80660, 118 }, { 80423, 116 }, { 80187, 116 }, { 79954, 114 }, { 79722, 114 }, { 79493, 112 }, { 79265, 112 },
+        { 79040, 110 }, { 78816, 110 }, { 78595, 108 }, { 78375, 108 }, { 78157, 108 }, { 77941, 106 }, { 77726, 106 }, { 77513, 104 },
+        { 77303, 104 }, { 77093, 102 }, { 76886, 102 }, { 76680, 102 }, { 76476, 100 }, { 76273, 100 }, { 76072, 98 }, { 75873, 98 },
+        { 75675, 98 }, { 75479, 96 }, { 75284, 96 }, { 75091, 94 }, { 74899, 94 }, { 74708, 94 }, { 74520, 92 }, { 74332, 92 },
+        { 74146, 92 }, { 73961, 90 }, { 73778, 90 }, { 73596, 90 }, { 73416, 88 }, { 73236, 88 }, { 73058, 88 }, { 72882, 86 },
+        { 72706, 86 }, { 72532, 86 }, { 72359, 84 }, { 72187, 84 }, { 72017, 84 }, { 71848, 84 }, { 71680, 82 }, { 71513, 82 },
+        { 71347, 82 }, { 71182, 80 }, { 71019, 80 }, { 70857, 80 }, { 70695, 80 }, { 70535, 78 }, { 70376, 78 }, { 70218, 78 },
+        { 70061, 76 }, { 69906, 76 }, { 69751, 76 }, { 69597, 76 }, { 69444, 74 }, { 69292, 74 }, { 69142, 74 }, { 68992, 74 },
+        { 68843, 72 }, { 68695, 72 }, { 68548, 72 }, { 68402, 72 }, { 68257, 72 }, { 68113, 70 }, { 67970, 70 }, { 67827, 70 },
+        { 67686, 70 }, { 67545, 68 }, { 67406, 68 }, { 67267, 68 }, { 67129, 68 }, { 66992, 68 }, { 66855, 66 }, { 66720, 66 },
+        { 66585, 66 }, { 66451, 66 }, { 66318, 66 }, { 66186, 64 }, { 66055, 64 }, { 65924, 64 }, { 65794, 64 }, { 65665, 64 },
+    },
+};
+
+/* 1/sqrt(s) from the table, s finite and positive: s = sig 2^(e-15). */
+static double ge_rsqrt16(double s) {
+    int64_t sig;
+    int e;
+    if (!(s > 0.0) || ge_split(s, &sig, &e) <= 0) return INFINITY;
+    const int p = e & 1, t = (int)((sig & 0x7FFF) >> 8), l = (int)(sig & 0xFF);
+    const int64_t q = (128 * (int64_t)ge_rsq_tab[p][t][0] - (int64_t)ge_rsq_tab[p][t][1] * l - 1) >> 8;
+    return ldexp((double)q, -16 - (e - p) / 2);
+}
+
+static double gl_mul(double a, double b) { const ge_term t = ge_mul(a, b); return ge_sum(&t, 1); }
+
+static double gl_dot3(const double a[3], const double b[3]) {
+    const ge_term t[3] = { ge_mul(a[0], b[0]), ge_mul(a[1], b[1]), ge_mul(a[2], b[2]) };
+    return ge_sum(t, 3);
+}
+
+/* v normalised component by component. */
+static void gl_unit(const double v[3], double o[3]) {
+    const double r = ge_rsqrt16(gl_dot3(v, v));
+    for (int k = 0; k < 3; k++) o[k] = isfinite(r) ? ge_cut(v[k] * r, 16, 0) : 0.0;
+}
+
+/* a . u, a taken as given and its 1/sqrt applied to the dot product. */
+static double gl_dot_scaled(const double a[3], const double u[3]) {
+    const double aa = gl_dot3(a, a);
+    if (!(aa > 0.0)) return 0.0;
+    return gl_mul(gl_dot3(a, u), ge_rsqrt16(aa));
+}
+
+/* x^k for the lighting: k cut to 5 significant bits, then ge_pow. */
+static float gl_pow(double x, float k) {
+    return x > 0.0 ? ge_pow((float)x, (float)ge_cut(k, 5, 0)) : 0.0f;
+}
+
 static inline int any_light_enabled(void) {
     return g_tl.light[0].enable || g_tl.light[1].enable || g_tl.light[2].enable || g_tl.light[3].enable;
 }
@@ -2299,49 +2407,47 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
         out[k] = lit_colour_byte(g_tl.mat_emissive[k]) + lit_mul(lit_colour_byte(g_tl.global_amb[k]), m_amb[k]);
 
     /* With every light disabled the colour is emissive plus ambient and the
-     * normal never enters: skip normalising it and the loop. Same result. */
-    float n[3] = { wn[0], wn[1], wn[2] };
+     * normal never enters: skip the loop. Same result. */
+    const double n[3] = { wn[0], wn[1], wn[2] };
     if (any_light_enabled()) {
-    const float nlen = sqrtf(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
-    if (nlen > 1e-20f) { n[0] /= nlen; n[1] /= nlen; n[2] /= nlen; }
-
     for (int i = 0; i < 4; i++) {
         if (!g_tl.light[i].enable) continue;
-        float L[3], att = 1.0f, spot = 1.0f;
+        double Lv[3], L[3];
+        float att = 1.0f, spot = 1.0f;
         if (g_tl.light[i].type == 0) {
-            L[0] = g_light_eye[i].pos[0]; L[1] = g_light_eye[i].pos[1]; L[2] = g_light_eye[i].pos[2];
+            for (int k = 0; k < 3; k++) Lv[k] = g_light_eye[i].pos[k];
         } else {
-            L[0] = g_light_eye[i].pos[0] - wp[0];
-            L[1] = g_light_eye[i].pos[1] - wp[1];
-            L[2] = g_light_eye[i].pos[2] - wp[2];
-            const float d = sqrtf(L[0]*L[0] + L[1]*L[1] + L[2]*L[2]);
-            const float a = g_tl.light[i].atten[0] + g_tl.light[i].atten[1] * d
-                          + g_tl.light[i].atten[2] * d * d;
-            att = (a != 0.0f) ? 1.0f / a : 1.0f;
+            for (int k = 0; k < 3; k++) {
+                const ge_term t[2] = { ge_mul(g_light_eye[i].pos[k], 1.0), ge_mul(wp[k], -1.0) };
+                Lv[k] = ge_sum(t, 2);
+            }
+            const double ll = gl_dot3(Lv, Lv);
+            const double d = gl_mul(ll, ge_rsqrt16(ll));
+            const ge_term at[3] = { ge_mul(g_tl.light[i].atten[0], 1.0), ge_mul(g_tl.light[i].atten[1], d),
+                                    ge_mul(gl_mul(g_tl.light[i].atten[2], d), d) };
+            const double a = ge_sum(at, 3);
+            att = a != 0.0 ? (float)ge_rcp16(a) : 1.0f;
         }
-        const float llen = sqrtf(L[0]*L[0] + L[1]*L[1] + L[2]*L[2]);
-        if (llen > 1e-20f) { L[0] /= llen; L[1] /= llen; L[2] /= llen; }
+        gl_unit(Lv, L);
 
         if (g_tl.light[i].type == 2) {
-            float D[3] = { g_light_eye[i].dir[0], g_light_eye[i].dir[1], g_light_eye[i].dir[2] };
-            const float dlen = sqrtf(D[0]*D[0] + D[1]*D[1] + D[2]*D[2]);
-            if (dlen > 1e-20f) { D[0] /= dlen; D[1] /= dlen; D[2] /= dlen; }
-            const float sdot = L[0]*D[0] + L[1]*D[1] + L[2]*D[2];
+            const double D[3] = { g_light_eye[i].dir[0], g_light_eye[i].dir[1], g_light_eye[i].dir[2] };
+            const double sdot = gl_dot_scaled(D, L);
             if (!(sdot >= g_tl.light[i].cutoff)) continue;
-            spot = ge_pow(sdot, g_tl.light[i].exponent);
+            spot = gl_pow(sdot, g_tl.light[i].exponent);
         }
 
-        const float ndl = n[0]*L[0] + n[1]*L[1] + n[2]*L[2];
-        float dfac = ndl > 0.0f ? ndl : 0.0f;
-        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = ge_pow(dfac, g_tl.mat_spec_coef);
+        const double ndl = gl_dot_scaled(n, L);
+        float dfac = ndl > 0.0 ? (float)ndl : 0.0f;
+        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = gl_pow(dfac, g_tl.mat_spec_coef);
 
         float sfac = 0.0f;
-        if (g_tl.light[i].kind == 1 && ndl >= 0.0f) {
-            float H[3] = { L[0], L[1], L[2] + 1.0f };
-            const float hlen = sqrtf(H[0]*H[0] + H[1]*H[1] + H[2]*H[2]);
-            if (hlen > 1e-20f) { H[0] /= hlen; H[1] /= hlen; H[2] /= hlen; }
-            const float ndh = n[0]*H[0] + n[1]*H[1] + n[2]*H[2];
-            sfac = ge_pow(ndh, g_tl.mat_spec_coef);
+        if (g_tl.light[i].kind == 1 && ndl >= 0.0) {
+            const ge_term hz[2] = { ge_mul(L[2], 1.0), ge_mul(1.0, 1.0) };
+            const double Hv[3] = { L[0], L[1], ge_sum(hz, 2) };
+            double H[3];
+            gl_unit(Hv, H);
+            sfac = gl_pow(gl_dot_scaled(n, H), g_tl.mat_spec_coef);
         }
 
         const int vd = lit_byte(dfac), vs = lit_byte(sfac);

@@ -638,11 +638,36 @@ geprobe 7, fw 6.60):
   first, as floor(256 x) up to 255.
 - Each light adds spot × (attenuation × (ambient + diffuse)), product by
   product. Its specular is added separately, with the same factors. Every
-  value of geprobe 6 scene 34 fits, coloured rows included, and 790 of
-  scene 35's 800 points fit. The 10 others are one step low, all in the two
-  grids that go through the GE's power function (the specular with
-  coefficient 8 and the spot with exponent 4), each where the power lands
-  just below a byte boundary.
+  value of geprobe 6 scene 34 fits, coloured rows included, and every one
+  of scene 35's 800 points.
+- The factors themselves are in the vertex path's 16-bit arithmetic
+  (geprobe 17, fw 6.60; ge.c ge_rsqrt16, gl_unit, gl_dot_scaled, gl_pow).
+  Scene 115 reads L.D whole: the spot cutoff is a threshold on it, so the
+  probe searches the cutoff a pass at a time on the PSP, reading back which
+  points are lit, for 3800 geometries. Scenes 116-119 read 17,122 spot,
+  diffuse, specular and attenuation bytes. All of them fit this:
+  - 1/sqrt is a table like 1/w's: 128 entries for each parity of the
+    exponent, a value and a slope each, indexed by the significand's top 7
+    bits after the leading one and interpolated by the next 8. With the
+    light at (a/128, b/128, 1) 2^j over a vertex at the origin and D = +z,
+    L.D is the table's output itself; 128 segments fit every point to the
+    last bit where 64 leave kinks. The entries are measured: the value is
+    ceil(2^17/sqrt(knot)) in 217 of the 219 the readings pin down, and no
+    rule gives the slope. 37 entries still allow more than one value.
+  - L (the light minus the vertex, or a directional light's vector) is
+    normalised component by component, each cut to 16 bits.
+  - The spot direction and the normal are not. The GE takes the dot
+    product with them as given and multiplies it by their 1/sqrt after.
+    Normalising D component by component misses 145 of 1200 general
+    geometries (every one where 1/sqrt(D.D) is not 1); this misses none.
+  - H is L + (0, 0, 1), normalised component by component.
+  - Spot exponents and specular coefficients keep 5 significant bits, cut
+    toward zero, before the power (ge_pow, unchanged): every exponent with
+    no more bits already fit, and of 942 with more, all fit so.
+  - The distance is L.L times its 1/sqrt; the attenuation k0 + k1 d +
+    (k2 d) d is one sum, and its reciprocal the 1/w table's.
+  psprecomp's floats missed 3908 of these 20,922 readings, and 10 of
+  scene 35's points.
 - In single-colour mode the specular is added in, and the total is clamped
   to 255 per vertex.
 - In separate-specular mode the specular is the vertex's secondary colour,
@@ -745,16 +770,14 @@ Python).
 
 Scene 20, the skinned triangle that was 54 pixels off, now matches.
 
-## Still open after geprobe 16
+## Still open after geprobe 17
 
-These are what geprobe 16 (fw 6.60) still shows psprecomp getting wrong,
-with pixels off on run 16 (set 17). Run 16 drew every scene it shares with
-run 15 the same, byte for byte. Its log matches psprecomp's on 100 of 155
-steps; the patch, colour, line and skinning scenes still listed in the log
-differ only in their GE timing lines, apart from the frames below. Details
-on the geprobe 7 items, and what further probing could settle, are in
-`fw660-run7/findings/geprobe.md`. Vertex depth, patch positions, colour
-planes, line colours and skinning are settled (above).
+These are what geprobe 17 (fw 6.60) still shows psprecomp getting wrong,
+with pixels off on run 17 (set 18). Run 17 drew every scene it shares with
+run 16 the same, byte for byte. Details on the geprobe 7 items, and what
+further probing could settle, are in `fw660-run7/findings/geprobe.md`.
+Vertex depth, patch positions, colour planes, line colours, skinning and
+lighting's factors are settled (above).
 
 - **Patch line order** (scene 23: 1 pixel). Two segments of a patch's
   line strips cross at (375,211), and the PSP's colour there is the other
@@ -768,8 +791,12 @@ planes, line colours and skinning are settled (above).
 - **What follows a hanging division** (scenes 80 and 81: 12 and 108). A
   patch division of 65 to 127 hangs the GE and the probe breaks the list;
   psprecomp skips the patch and draws the rest.
-- **Point and spot lights** (scene 35: 10 pixels), each one step low, all
-  where the GE's power function is used.
+- **The rest of the 1/sqrt table.** 37 of its 256 entries still allow two
+  or more values, taken by a rule (ge.c ge_rsq_tab). A dense sweep of those
+  segments through scene 115's cutoff search would pin them.
+- **Lighting's inputs under real matrices.** Every lighting probe so far
+  has view and world identity; psprecomp takes the eye-space position and
+  normal in float and cuts them to 16 bits on the way in.
 
 ## Validation
 
