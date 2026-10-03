@@ -26,9 +26,11 @@
  * through depth, replayed from patch13.py's command streams, scenes 83 to
  * 98 (version 14) how colour runs across a triangle, replayed from
  * colour14.py's, scenes 99 to 109 (version 15) how it runs along a line,
- * replayed the same way from lines15.py's, and scenes 110 to 114 (version
- * 16) skinned and morphed positions read whole through depth, from
- * skin16.py's.
+ * replayed the same way from lines15.py's, scenes 110 to 114 (version 16)
+ * skinned and morphed positions read whole through depth, from skin16.py's,
+ * and scenes 115 to 119 (version 17) point and spot lights: L.D searched
+ * whole through the spot cutoff, and the lighting factors as bytes, from
+ * lights17.py's.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -49,7 +51,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 16
+#define PROBE_VERSION 17
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -3259,6 +3261,24 @@ static void c14_light(int mode, float coef) {
     sceGuLightColor(0, GU_SPECULAR, mode == 1 ? 0xFFFFFF : 0x000000);
 }
 
+/* geprobe 17's lighting: light 0 only, white diffuse, no ambient anywhere,
+ * white diffuse and specular material, one colour; attenuation off and a
+ * specular coefficient of 1 until LGT sets them. */
+static void l17_lights_on(void) {
+    sceGuEnable(GU_LIGHTING);
+    sceGuLightMode(GU_SINGLE_COLOR);
+    sceGuAmbient(0xFF000000);
+    sceGuColorMaterial(0);
+    sceGuModelColor(0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF);
+    sceGuAmbientColor(0xFF000000);
+    sceGuEnable(GU_LIGHT0);
+    sceGuLightColor(0, GU_AMBIENT, 0x000000);
+    sceGuLightColor(0, GU_DIFFUSE, 0xFFFFFF);
+    sceGuLightColor(0, GU_SPECULAR, 0x000000);
+    sceGuLightAtt(0, 1.0f, 0.0f, 0.0f);
+    sceGuSpecular(1.0f);
+}
+
 static void c14_tex(int on) {
     if (!on) { sceGuDisable(GU_TEXTURE_2D); return; }
     sceGuEnable(GU_TEXTURE_2D);
@@ -3387,6 +3407,20 @@ static void c14_run(const struct c14_step *st) {
             sceGuSendCommandf(0x44, c14_f(a[0]));
             sceGuSendCommandf(0x47, c14_f(a[1]));
             break;
+        case C14_LGT: {                                   /* geprobe 17: light 0, whole */
+            const ScePspFVector3 p = { c14_f(a[2]), c14_f(a[3]), c14_f(a[4]) };
+            const ScePspFVector3 d = { c14_f(a[5]), c14_f(a[6]), c14_f(a[7]) };
+            sceGuLight(0, (int)a[0], (int)a[1], &p);
+            sceGuLightSpot(0, &d, c14_f(a[8]), c14_f(a[9]));
+            sceGuLightAtt(0, c14_f(a[10]), c14_f(a[11]), c14_f(a[12]));
+            sceGuSpecular(c14_f(a[13]));
+            sceGuLightColor(0, GU_DIFFUSE, a[14]);
+            sceGuLightColor(0, GU_SPECULAR, a[15]);
+            break;
+        }
+        case C14_LMODE:                                   /* white lighting on, or off */
+            if (a[0]) l17_lights_on(); else c14_light(0, 1.0f);
+            break;
         case C14_END:
             sceGuScissor(0, 0, SCR_W, SCR_H);
             sceGuMorphWeight(0, 1.0f);
@@ -3418,6 +3452,130 @@ static void c14_run(const struct c14_step *st) {
             return;
         }
     }
+}
+
+/* ---- version 17: point and spot lights -----------------------------------
+ *
+ * Scene 35's last ten wrong points are each a step low where a power is
+ * taken (a spot of exponent 4, a specular of coefficient 8), next to a byte
+ * boundary: the GE's power, or what goes into it, comes out a hair higher.
+ * Scene 115 reads what goes into the spot's power whole. The spot cutoff is
+ * a threshold on L.D, so for each geometry (a vertex and its normal, a spot
+ * light's position and direction) the probe searches the cutoff's 24-bit
+ * code, every geometry at once, a pass at a time: draw each point with its
+ * own cutoff, wait for the GE, read back which came out lit, halve each
+ * bracket. What is left is the largest code that still lights the point.
+ * Scenes 116-119 then draw the spot, diffuse, specular and attenuation
+ * factors as bytes from lights17.py's streams (c14_run's LGT and LMODE).
+ *
+ * Every point goes to clip (0, 0, 0, 1) through a zero projection, so the
+ * screen offset alone puts it on its pixel; lighting still sees the vertex
+ * as given. The clear is red, which a white light cannot give: red is a
+ * point not drawn, black one the spot leaves unlit. */
+#include "l17_data.inc"      /* geprobe 17: scene 115's geometries and 116-119's streams, from lights17.py */
+
+static void l17_slot(int i, int *x, int *y) { *x = 1 + 2 * (i % 239); *y = 1 + 2 * (i / 239); }
+
+static void l17_mats(void) {
+    static const ScePspFMatrix4 P = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 1 } };
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadMatrix(&P);
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadIdentity();
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumUpdateMatrix();
+}
+
+static w32 g_l17_lo[L17_NGEO], g_l17_hi[L17_NGEO], g_l17_res[2 * L17_NGEO];
+static signed char g_l17_dx[L17_NGEO], g_l17_dy[L17_NGEO];
+
+/* One pass: every geometry still open drawn once with its cutoff code (pass
+ * 0 the bracket's bottom, pass 1 its top, then the middle); returns when
+ * the GE has finished. */
+static void l17_pass(int pass) {
+    scene_begin(GU_PSM_8888, 0xFF0000FF);
+    l17_mats();
+    l17_lights_on();
+    for (int i = 0; i < L17_NGEO; i++) {
+        const w32 lo = g_l17_lo[i], hi = g_l17_hi[i];
+        if (pass >= 2 && hi - lo <= 1) continue;
+        const w32 c = pass == 0 ? lo : pass == 1 ? hi : lo + (hi - lo) / 2;
+        const w32 *g = L17_GEO[i];
+        int x, y;
+        l17_slot(i, &x, &y);
+        p13_room();
+        sceGuOffset(2048 - x, 2048 - y);
+        const ScePspFVector3 p = { c14_f(g[6]), c14_f(g[7]), c14_f(g[8]) };
+        const ScePspFVector3 d = { c14_f(g[9]), c14_f(g[10]), c14_f(g[11]) };
+        sceGuLight(0, GU_SPOTLIGHT, GU_DIFFUSE, &p);
+        sceGuLightSpot(0, &d, 1.0f, c14_f(c << 8));
+        const float v[6] = { c14_f(g[3]), c14_f(g[4]), c14_f(g[5]), c14_f(g[0]), c14_f(g[1]), c14_f(g[2]) };
+        sceGuDrawArray(GU_POINTS, GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 1, NULL,
+                       gumem(v, sizeof v));
+    }
+    sceGuFinish();
+    ge_wait();
+}
+
+/* Point i's pixel: -1 not drawn (the red clear), 0 unlit, else its grey. */
+static int l17_read(int x, int y) {
+    const w32 c = *(volatile w32 *)(VRAM_UNCACHED + (w32)(y * FB_W + x) * 4) & 0xFFFFFFu;
+    return c == 0x0000FFu ? -1 : (int)((c >> 8) & 0xFF);
+}
+
+static void l17_search(void) {
+    g_scene = 115;
+    if (step("scene %02d: spot cutoff search, L.D read whole", g_scene)) return;
+    out("  %d geometries, input crc %08X\n", L17_NGEO, crc32(L17_GEO, sizeof L17_GEO));
+    for (int i = 0; i < L17_NGEO; i++) {
+        g_l17_lo[i] = L17_CUT_LO;
+        g_l17_hi[i] = L17_CUT_HI;
+        g_l17_res[2 * i] = g_l17_res[2 * i + 1] = 0;
+    }
+    /* Flags (result word's top byte): 1 not drawn at the bracket's bottom,
+     * 2 unlit there, 4 lit at its top, 8 not drawn in a later pass. */
+    int passes = 0, open = L17_NGEO, absent = 0, unlit = 0, toplit = 0, lost = 0;
+    const w32 t0 = sceKernelGetSystemTimeLow();
+    for (int pass = 0; pass < 40 && (pass < 2 || open); pass++) {
+        l17_pass(pass);
+        passes++;
+        open = 0;
+        for (int i = 0; i < L17_NGEO; i++) {
+            w32 *r = &g_l17_res[2 * i];
+            if (pass >= 2 && g_l17_hi[i] - g_l17_lo[i] <= 1) continue;
+            int x, y, v = -1;
+            l17_slot(i, &x, &y);
+            if (pass == 0) {
+                /* find the pixel once: the slot or a neighbour */
+                for (int k = 0; k < 9 && v < 0; k++) {
+                    const int dx = k % 3 == 0 ? 0 : k % 3 == 1 ? -1 : 1, dy = k / 3 == 0 ? 0 : k / 3 == 1 ? -1 : 1;
+                    v = l17_read(x + dx, y + dy);
+                    if (v >= 0) { g_l17_dx[i] = (signed char)dx; g_l17_dy[i] = (signed char)dy; }
+                }
+                if (v < 0) { *r |= 1u << 24; absent++; g_l17_hi[i] = g_l17_lo[i]; continue; }
+                if (v == 0) { *r |= 2u << 24; unlit++; g_l17_hi[i] = g_l17_lo[i]; continue; }
+                r[1] = (w32)v;
+            } else {
+                v = l17_read(x + g_l17_dx[i], y + g_l17_dy[i]);
+                if (v < 0) { *r |= 8u << 24; lost++; g_l17_hi[i] = g_l17_lo[i]; continue; }
+                const w32 c = pass == 1 ? g_l17_hi[i] : g_l17_lo[i] + (g_l17_hi[i] - g_l17_lo[i]) / 2;
+                if (pass == 1) {
+                    if (v > 0) { *r |= 4u << 24; toplit++; g_l17_lo[i] = g_l17_hi[i]; }
+                } else if (v > 0) { g_l17_lo[i] = c; r[1] = (w32)v; }
+                else g_l17_hi[i] = c;
+            }
+            if (g_l17_hi[i] - g_l17_lo[i] > 1) open++;
+        }
+    }
+    for (int i = 0; i < L17_NGEO; i++) g_l17_res[2 * i] |= g_l17_lo[i] & 0xFFFFFFu;
+    out("  %d passes, %u us; flagged: %d not drawn, %d unlit at 1/32, %d lit at 16, %d lost\n", passes,
+        (unsigned)(sceKernelGetSystemTimeLow() - t0), absent, unlit, toplit, lost);
+    const int wr = probe_write_file("ge_115_spotcut.bin", g_l17_res, sizeof g_l17_res);
+    out("  ge_115_spotcut.bin: %d bytes, crc %08X\n", wr, crc32(g_l17_res, sizeof g_l17_res));
+    out("  first codes:");
+    for (int i = 0; i < 8; i++) out(" %06X", (unsigned)(g_l17_res[2 * i] & 0xFFFFFF));
+    out("\n");
 }
 
 /* ---- GE callbacks --------------------------------------------------------
@@ -4066,6 +4224,10 @@ int main(int argc, char **argv) {
 
     section("scenes, version 16");
     for (int k = 0; k < C16_NSTEPS; k++) c14_run(&C16_STEPS[k]);
+
+    section("scenes, version 17");
+    l17_search();
+    for (int k = 0; k < C17_NSTEPS; k++) c14_run(&C17_STEPS[k]);
 
     probe_screen(1);
     probe_done();

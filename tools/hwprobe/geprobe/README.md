@@ -230,6 +230,28 @@ c14_run, which gains BONE, MORPH and ZVIEW ops, from `skin16.py`'s streams
 chained, matrices first, folded into the combined matrix, float32; morph before
 or after skinning; signed narrow weights).
 
+Version 17 adds scenes 115-119 after them, so steps 1-155 keep their version 16
+numbers. Scene 35's last ten wrong points are each a step low where a power is
+taken (a spot of exponent 4, a specular of coefficient 8), next to a byte
+boundary: the GE's power, or the normalised vectors and dot products that go
+into it, comes out a hair higher than psprecomp's floats. Scene 115 reads L.D,
+what the spot cutoff compares, whole: for each of 3800 geometries the probe
+searches the cutoff's 24-bit code on the PSP, a pass at a time, reading back
+which points came out lit, and writes the largest code that still lights each
+one to `ge_115_spotcut.bin` (two words a geometry: the code with flags in the top
+byte, and the grey at the last lit pass). Its batches put the light at
+(a/128, b/128, 1) 2^j over a vertex at the origin with D = +z, so L.D is
+1/|p| itself (the GE's normalisation); keep L = +z and give D every length
+(whether D is normalised); place everything at random; and repeat scene 35's
+vertices and lights. Scenes 116-119 then draw the spot factor, plain and
+powered diffuse, the specular and the attenuation as bytes, at exponents
+chosen to land near byte boundaries, with scene 35's own grids among them.
+Every point goes to clip (0, 0, 0, 1) through a zero projection and the screen
+offset alone places it, two pixels apart; the clear is red, which no white
+light gives. The streams are `lights17.py`'s (`l17_data.inc`), replayed by
+c14_run with new LGT and LMODE ops; `lights17.py sums <dir>` checks the logged
+CRCs and `compare` reads the answers.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -251,7 +273,8 @@ PNGs for looking at; comparisons should use the raw files.
 `readout.py <geprobe dir> [scene]` regenerates scenes 62-66's inputs, checks
 them against the log's CRCs, and lists each point's inputs and depth;
 for scenes 67-82 it hands over to `patch13.py`, for 83-98 to `colour14.py`,
-for 99-109 to `lines15.py`, and for 110-114 to `skin16.py`.
+for 99-109 to `lines15.py`, for 110-114 to `skin16.py`, and for 115-119 to
+`lights17.py`.
 
 ## Compare with psprecomp
 
