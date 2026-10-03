@@ -162,6 +162,10 @@ def read(base, sc, name):
 
 def main():
     base = sys.argv[1]
+    if len(sys.argv) > 2 and int(sys.argv[2]) >= 125:    # geprobe 20's long edges
+        import edges20
+        if edges20.sums(base): edges20.compare(base, True)
+        return
     if len(sys.argv) > 2 and int(sys.argv[2]) >= 121:    # geprobe 19's lighting under matrices
         import lights19
         if lights19.sums(base): lights19.compare(base)

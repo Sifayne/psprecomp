@@ -31,8 +31,10 @@
  * scenes 115 to 119 (version 17) point and spot lights: L.D searched
  * whole through the spot cutoff, and the lighting factors as bytes, from
  * lights17.py's, scene 120 (version 18) the lighting's 1/sqrt at every
- * input the same way, from rsq18.py's, and scenes 121 to 124 (version 19)
- * lighting under real world and view matrices, from lights19.py's.
+ * input the same way, from rsq18.py's, scenes 121 to 124 (version 19)
+ * lighting under real world and view matrices, from lights19.py's, and
+ * scenes 125 to 127 (version 20) where a long edge's pixels fall, from
+ * edges20.py's.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -53,7 +55,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 19
+#define PROBE_VERSION 20
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -3230,6 +3232,7 @@ static void p13_run(const struct p13_step *st) {
 #include "c14_data.inc"
 #include "c15_data.inc"      /* geprobe 15: line colours, scenes 99-109, from lines15.py */
 #include "c16_data.inc"      /* geprobe 16: skinning and morphing, scenes 110-114, from skin16.py */
+#include "c20_data.inc"      /* geprobe 20: long edges, scenes 125-127, from edges20.py */
 
 static w32 g_c14_tex[16 * 16] __attribute__((aligned(16)));   /* all 0xFF000000 */
 static w32 g_c14_vb[8192] __attribute__((aligned(16)));        /* LADDER's vertices */
@@ -4431,6 +4434,9 @@ int main(int argc, char **argv) {
     section("scenes, version 19");
     l19_search();
     for (int k = 0; k < C19_NSTEPS; k++) c14_run(&C19_STEPS[k]);
+
+    section("scenes, version 20");
+    for (int k = 0; k < C20_NSTEPS; k++) c14_run(&C20_STEPS[k]);
 
     probe_screen(1);
     probe_done();

@@ -283,6 +283,21 @@ specular bytes under rotated views (is H's (0,0,1) the eye's?) and attenuation
 bytes far out. The inputs are `lights19.py`'s (`l19_data.inc`); `lights19.py
 sums <dir>` checks the logged CRCs and `compare` scores each rule.
 
+Version 20 adds scenes 125-127 after them, so steps 1-165 keep their version 19
+numbers. Scene 98's window 1 is the last triangle psprecomp covers differently:
+along its long edge, a right boundary from corners 1500-1700 pixels out, the PSP
+adds one pixel a row, always the last of an aligned group of four (x = 3 mod 4),
+in the group the edge crosses, whenever that group's first pixel is inside; the
+same edge as a left boundary (window 0) is exact. Each scene here is 220 windows
+of 20 x 20 pixels, scissored, each window's corner 0-3 pixels into its 24-pixel
+cell so x and y take every alignment mod 4, and each crossed by exactly one edge
+of a flat white triangle: 125 any direction and edges 32-3900 pixels long, 126
+edges 2000-3900 pixels long, 127 scene 98's window 1 triangle itself at every
+alignment, in all six vertex orders, mirrored or not. The streams are
+`edges20.py`'s (`c20_data.inc`), replayed by c14_run; `edges20.py sums <dir>`
+checks the logged CRCs and `compare` lists, per scene, the windows and pixels off
+psprecomp's exact coverage and where they sit mod 4.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -305,7 +320,8 @@ PNGs for looking at; comparisons should use the raw files.
 them against the log's CRCs, and lists each point's inputs and depth;
 for scenes 67-82 it hands over to `patch13.py`, for 83-98 to `colour14.py`,
 for 99-109 to `lines15.py`, for 110-114 to `skin16.py`, for 115-119 to
-`lights17.py`, for 120 to `rsq18.py`, and for 121-124 to `lights19.py`.
+`lights17.py`, for 120 to `rsq18.py`, for 121-124 to `lights19.py`, and for
+125-127 to `edges20.py`.
 
 ## Compare with psprecomp
 

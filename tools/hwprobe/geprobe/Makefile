@@ -20,4 +20,4 @@ PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak
 
 # main.c includes the generated streams (patch13.py emit); rebuild when they change.
-main.o: patch13_data.inc c14_data.inc c15_data.inc c16_data.inc l17_data.inc l18_data.inc l19_data.inc
+main.o: patch13_data.inc c14_data.inc c15_data.inc c16_data.inc l17_data.inc l18_data.inc l19_data.inc c20_data.inc
