@@ -57,7 +57,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 21
+#define PROBE_VERSION 22
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -3237,6 +3237,11 @@ static void p13_run(const struct p13_step *st) {
 #include "c20_data.inc"      /* geprobe 20: long edges, scenes 125-127, from edges20.py */
 #include "c21_data.inc"      /* geprobe 21: tall long edges, scenes 128-129, from edges21.py */
 #include "c21p_data.inc"     /* geprobe 21: patch line order, scenes 130-133, from plines21.py */
+#include "c22e_data.inc"     /* geprobe 22: long edges' order and extent, scene 134, from edges22.py */
+#include "c22t_data.inc"     /* geprobe 22: patch triangle order, scenes 135-137, from ptris22.py */
+#include "c22n_data.inc"     /* geprobe 22: skinned and morphed normals, scene 138, from norms22.py */
+#include "c22m_data.inc"     /* geprobe 22: morphed colours and coordinates, scenes 139-140, from morph22.py */
+#include "c22c_data.inc"     /* geprobe 22: past the clip volume, scene 141, from clip22.py */
 
 static w32 g_c14_tex[16 * 16] __attribute__((aligned(16)));   /* all 0xFF000000 */
 static w32 g_c14_vb[8192] __attribute__((aligned(16)));        /* LADDER's vertices */
@@ -3297,6 +3302,34 @@ static void c14_tex(int on) {
     sceGuTexWrap(GU_CLAMP, GU_CLAMP);
     sceGuTexScale(1.0f, 1.0f);
     sceGuTexOffset(0.0f, 0.0f);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFlush();
+}
+
+/* geprobe 22's coordinate texture: 256 x 256, texel (s, t) red s, green t, blue
+ * 0x80, so a point's colour names the texel its coordinates fell in. TEXC turns it
+ * on with a scale and offset (repeating, nearest, replacing), or off. */
+static w32 g_c22_tex[256 * 256] __attribute__((aligned(16)));
+static void c22_texc(const w32 *a) {
+    if (!a[0]) {
+        c14_tex(0);
+        sceGuTexScale(1.0f, 1.0f);
+        sceGuTexOffset(0.0f, 0.0f);
+        return;
+    }
+    if (!g_c22_tex[0]) {
+        for (int t = 0; t < 256; t++)
+            for (int s = 0; s < 256; s++) g_c22_tex[t * 256 + s] = 0xFF800000u | (w32)t << 8 | (w32)s;
+        sceKernelDcacheWritebackAll();
+    }
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, 256, 256, 256, g_c22_tex);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexWrap(GU_REPEAT, GU_REPEAT);
+    sceGuTexMapMode(GU_TEXTURE_COORDS, 0, 0);
+    sceGuTexScale(c14_f(a[1]), c14_f(a[2]));
+    sceGuTexOffset(c14_f(a[3]), c14_f(a[4]));
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
     sceGuTexFlush();
 }
@@ -3442,6 +3475,10 @@ static void c14_run(const struct c14_step *st) {
             else      sceGuDrawBezier((int)a[1], (int)a[2], (int)a[3], NULL, v);
             break;
         }
+        case C14_TEXC: c22_texc(a); break;               /* geprobe 22: on, su, sv, ou, ov */
+        case C14_CLAMP:                                   /* geprobe 22: depth clamping on or off */
+            if (a[0]) sceGuEnable(GU_CLIP_PLANES); else sceGuDisable(GU_CLIP_PLANES);
+            break;
         case C14_BLEND:                                   /* on, op, src, dst, fixed a, fixed b */
             if (a[0]) { sceGuEnable(GU_BLEND); sceGuBlendFunc((int)a[1], (int)a[2], (int)a[3], a[4], a[5]); }
             else sceGuDisable(GU_BLEND);
@@ -4461,6 +4498,13 @@ int main(int argc, char **argv) {
     section("scenes, version 21");
     for (int k = 0; k < C21_NSTEPS; k++) c14_run(&C21_STEPS[k]);
     for (int k = 0; k < C21P_NSTEPS; k++) c14_run(&C21P_STEPS[k]);
+
+    section("scenes, version 22");
+    for (int k = 0; k < C22E_NSTEPS; k++) c14_run(&C22E_STEPS[k]);
+    for (int k = 0; k < C22T_NSTEPS; k++) c14_run(&C22T_STEPS[k]);
+    for (int k = 0; k < C22N_NSTEPS; k++) c14_run(&C22N_STEPS[k]);
+    for (int k = 0; k < C22M_NSTEPS; k++) c14_run(&C22M_STEPS[k]);
+    for (int k = 0; k < C22C_NSTEPS; k++) c14_run(&C22C_STEPS[k]);
 
     probe_screen(1);
     probe_done();

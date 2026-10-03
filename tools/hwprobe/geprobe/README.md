@@ -324,6 +324,22 @@ lines go out a span at a time, spans a row at a time, and a line under a pixel
 long is drawn by the ordinary diamond rules rather than dropped: scene 23's one
 pixel is such a line. psprecomp then matches all 181 dumps.
 
+Version 22 adds scenes 134-141 after them, for what set 22 left unmeasured. 134 reads
+level triangles given in all six vertex orders (does the left edge take the long-edge
+copy, or the edge from the first corner given?) and far pixels whose centre sits -2 to
++2 sixteenths from the triangle's min or max x (`edges22.py`, `c22e_data.inc`).
+135-137 draw nine patches folded back over themselves as points, flat triangles and
+added flat triangles, to read the order a patch's triangles go out in (`ptris22.py`,
+`c22t_data.inc`). 138 reads skinned and morphed normals through lighting, the bones'
+entries large and cancelling on the normal so the 16-bit cuts move the diffuse byte
+(`norms22.py`, `c22n_data.inc`). 139 reads morphed vertex colours, and plain 5650,
+5551 and 4444 ones; 140 reads morphed texture coordinates through a 256 x 256 texture
+whose texel (s, t) holds s in red and t in green, each point at texture scales 1, 2^8
+and 2^12 (`morph22.py`, `c22m_data.inc`, the TEXC op). 141 draws points, lines and
+triangles past x, y and z, with depth clamping off and on (`clip22.py`,
+`c22c_data.inc`, the CLAMP op). Each module's `sums` checks the logged CRCs and
+`compare` scores its rules.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -347,8 +363,9 @@ them against the log's CRCs, and lists each point's inputs and depth;
 for scenes 67-82 it hands over to `patch13.py`, for 83-98 to `colour14.py`,
 for 99-109 to `lines15.py`, for 110-114 to `skin16.py`, for 115-119 to
 `lights17.py`, for 120 to `rsq18.py`, for 121-124 to `lights19.py`, for
-125-127 to `edges20.py`, for 128-129 to `edges21.py`, and for 130-133 to
-`plines21.py`.
+125-127 to `edges20.py`, for 128-129 to `edges21.py`, for 130-133 to
+`plines21.py`, for 134 to `edges22.py`, for 135-137 to `ptris22.py`, for 138 to
+`norms22.py`, for 139-140 to `morph22.py`, and for 141 to `clip22.py`.
 
 ## Compare with psprecomp
 

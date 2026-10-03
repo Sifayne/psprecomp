@@ -24,6 +24,8 @@
 #define C14_LMODE 21
 #define C14_PATCH 22
 #define C14_BLEND 23
+#define C14_TEXC 24
+#define C14_CLAMP 25
 
 /* scene 83 anchorclock: 1 draws, 144 vertices, vertex crc BF53F45D, 591 words, stream crc 0D908B33 */
 static const w32 C14_S0[591] = {

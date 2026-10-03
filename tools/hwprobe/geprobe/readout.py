@@ -162,6 +162,13 @@ def read(base, sc, name):
 
 def main():
     base = sys.argv[1]
+    sc = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    for lo, hi, mod in ((141, 141, 'clip22'), (139, 140, 'morph22'), (138, 138, 'norms22'),
+                        (135, 137, 'ptris22'), (134, 134, 'edges22')):          # geprobe 22
+        if lo <= sc <= hi:
+            m = __import__(mod)
+            if m.sums(base): m.compare(base)
+            return
     if len(sys.argv) > 2 and int(sys.argv[2]) >= 130:    # geprobe 21's patch line order
         import plines21
         if plines21.sums(base): plines21.compare(base)

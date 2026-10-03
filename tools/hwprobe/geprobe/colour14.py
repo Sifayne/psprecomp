@@ -1066,7 +1066,8 @@ OPS = ['NOP', 'BEGIN', 'END', 'SCISSOR', 'SHADE', 'DRAW', 'MATS', 'VIEWPORT', 'O
        'STENCIL', 'FOG', 'LADDER', 'LIGHT', 'TEX', 'SUMS', 'DEPTH',
        'BONE', 'MORPH', 'ZVIEW',                 # since geprobe 16 (skin16.py)
        'LGT', 'LMODE',                           # since geprobe 17 (lights17.py)
-       'PATCH', 'BLEND']                         # since geprobe 21 (plines21.py)
+       'PATCH', 'BLEND',                         # since geprobe 21 (plines21.py)
+       'TEXC', 'CLAMP']                          # since geprobe 22 (morph22.py, clip22.py)
 OP = {n: i for i, n in enumerate(OPS)}
 
 def vbytes(vtype, verts):

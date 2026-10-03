@@ -854,7 +854,14 @@ and psprecomp has no data cache. Measured nowhere yet, so not settled:
 - whether a level triangle's quirk follows its left edge or its first
   corner, and whether a far pixel centred exactly on min x copies;
 - the order of a patch's triangles (lines' order is measured);
-- skinned normals, morphed colours and texture coordinates, lit lines.
+- skinned and morphed normals, morphed colours and texture coordinates;
+- 16-bit vertex colours in 3D, which psprecomp reads as the material
+  colour;
+- lines past |clip x| or |clip y| > w (points are culled there), and
+  anything past the clip volume with depth clamping on.
+
+geprobe 22 (scenes 134-141, tools/hwprobe/geprobe README) poses each of
+these.
 
 ## Validation
 
