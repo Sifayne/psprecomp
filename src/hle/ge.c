@@ -2204,17 +2204,11 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
  *    as the vertex's secondary colour (psp_vertex.spec), which the
  *    rasterizer interpolates and adds per pixel.
  */
-/* Lighting happens in eye space, and the fixed eye direction above is the
- * evidence: a constant (0,0,1) is only meaningful where the viewer looks down
- * -Z, which is eye space, not world space. gpu/commands/light cannot tell the
- * two apart -- its view matrix is identity -- but the game can, and does: with
- * the lights left in world space the hangar's walls came out at 0x45 from a
- * 0x80 vertex colour, dimmer than the material they started from, because
- * most of the diffuse terms fell on the wrong side of their surfaces.
- *
- * So the light positions are transformed once per draw rather than per vertex:
- * a directional light's position field is a direction and only rotates, a
- * point or spot light's is a point and translates too. */
+/* The lights in eye space, for a backend that lights in eye space itself
+ * (fill_xform_state): the same light as the GE's world-space lighting below
+ * (light_vertex), with the eye's direction (0, 0, 1) where the GE takes the
+ * view's third row. A directional light's position field is a direction and
+ * only rotates, a point or spot light's is a point and translates too. */
 static struct { float pos[3], dir[3]; } g_light_eye[4];
 
 static void lights_to_eye(void) {
@@ -2393,7 +2387,28 @@ static inline int lit_byte(float x) {
 }
 static inline int lit_colour_byte(float c) { return (int)lrintf(c * 255.0f); }
 
-static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, psp_vertex *lit) {
+/* The GE lights in world space (geprobe 19, fw 6.60). Scene 121 runs scene
+ * 115's cutoff search with real world and view matrices (2504 geometries
+ * under 313 pairs, translations up to 2^10, cancelling 3x3s), and 122-124
+ * read diffuse, specular and attenuation bytes the same way (4800). All of
+ * them fit this, in the vertex path's arithmetic (ge_mul, ge_sum):
+ *  - The view matrix does not touch the vertex, normal, light or spot
+ *    direction: with W identity and V rotated and translated by up to 2^10,
+ *    lighting in world space fits all 904 search points and V (W v) 167.
+ *  - L for a point or spot light is -(W3 m + (t - p)), one row sum, t the
+ *    world translation and t - p cut to 16 bits first, m the model-space
+ *    vertex. The world position is never cut on its own: forming W m first
+ *    and subtracting fits 114 of 600 world-matrix points, this all of them,
+ *    translations of 2^10 included. A directional light's L is its position
+ *    field as given.
+ *  - N is W3 n, each row one sum; D is the spot direction as given.
+ *  - The eye's direction is the view matrix's third row, normalised
+ *    component by component; H is L + that. (0, 0, 1) there fits 1 of 1600
+ *    specular bytes under rotated views; this fits them all. For a view that
+ *    is identity it is (0, 0, 1), as sets 18 and 19 had it.
+ *  - The attenuation's quadratic term is k2 (L.L), not (k2 d) d: one of
+ *    3000 attenuation bytes tells them apart, and it reads k2 (L.L). */
+static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba, psp_vertex *lit) {
     const int vc[3] = { (int)(*rgba & 0xFFu), (int)((*rgba >> 8) & 0xFFu), (int)((*rgba >> 16) & 0xFFu) };
     /* MATERIAL_COLOR picks which material components the vertex colour
      * supplies: bit 0 ambient, bit 1 diffuse, bit 2 specular. */
@@ -2410,30 +2425,41 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
 
     /* With every light disabled the colour is emissive plus ambient and the
      * normal never enters: skip the loop. Same result. */
-    const double n[3] = { wn[0], wn[1], wn[2] };
     if (any_light_enabled()) {
+    const float *W = g_tl.world;                 /* row i, column j at W[3j + i]; t at W[9 + i] */
+    double n[3], E[3];
+    for (int i = 0; i < 3; i++) {
+        const ge_term t[3] = { ge_mul(W[i], nm[0]), ge_mul(W[3 + i], nm[1]), ge_mul(W[6 + i], nm[2]) };
+        n[i] = ge_sum(t, 3);
+    }
+    {
+        const double Ev[3] = { g_tl.view[2], g_tl.view[5], g_tl.view[8] };
+        gl_unit(Ev, E);
+    }
     for (int i = 0; i < 4; i++) {
         if (!g_tl.light[i].enable) continue;
         double Lv[3], L[3];
         float att = 1.0f, spot = 1.0f;
         if (g_tl.light[i].type == 0) {
-            for (int k = 0; k < 3; k++) Lv[k] = g_light_eye[i].pos[k];
+            for (int k = 0; k < 3; k++) Lv[k] = g_tl.light[i].pos[k];
         } else {
             for (int k = 0; k < 3; k++) {
-                const ge_term t[2] = { ge_mul(g_light_eye[i].pos[k], 1.0), ge_mul(wp[k], -1.0) };
-                Lv[k] = ge_sum(t, 2);
+                const ge_term tp[2] = { ge_mul(W[9 + k], 1.0), ge_mul(g_tl.light[i].pos[k], -1.0) };
+                const ge_term t[4] = { ge_mul(W[k], model[0]), ge_mul(W[3 + k], model[1]),
+                                       ge_mul(W[6 + k], model[2]), ge_mul(ge_sum(tp, 2), 1.0) };
+                Lv[k] = -ge_sum(t, 4);
             }
             const double ll = gl_dot3(Lv, Lv);
             const double d = gl_mul(ll, ge_rsqrt16(ll));
             const ge_term at[3] = { ge_mul(g_tl.light[i].atten[0], 1.0), ge_mul(g_tl.light[i].atten[1], d),
-                                    ge_mul(gl_mul(g_tl.light[i].atten[2], d), d) };
+                                    ge_mul(g_tl.light[i].atten[2], ll) };
             const double a = ge_sum(at, 3);
             att = a != 0.0 ? (float)ge_rcp16(a) : 1.0f;
         }
         gl_unit(Lv, L);
 
         if (g_tl.light[i].type == 2) {
-            const double D[3] = { g_light_eye[i].dir[0], g_light_eye[i].dir[1], g_light_eye[i].dir[2] };
+            const double D[3] = { g_tl.light[i].dir[0], g_tl.light[i].dir[1], g_tl.light[i].dir[2] };
             const double sdot = gl_dot_scaled(D, L);
             if (!(sdot >= g_tl.light[i].cutoff)) continue;
             spot = gl_pow(sdot, g_tl.light[i].exponent);
@@ -2445,8 +2471,11 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
 
         float sfac = 0.0f;
         if (g_tl.light[i].kind == 1 && ndl >= 0.0) {
-            const ge_term hz[2] = { ge_mul(L[2], 1.0), ge_mul(1.0, 1.0) };
-            const double Hv[3] = { L[0], L[1], ge_sum(hz, 2) };
+            double Hv[3];
+            for (int k = 0; k < 3; k++) {
+                const ge_term h[2] = { ge_mul(L[k], 1.0), ge_mul(E[k], 1.0) };
+                Hv[k] = ge_sum(h, 2);
+            }
             double H[3];
             gl_unit(Hv, H);
             sfac = gl_pow(gl_dot_scaled(n, H), g_tl.mat_spec_coef);
@@ -2750,15 +2779,12 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 g_fog_verts++;
             }
             if (g_tl.lighting) {
-                float ne[3] = { 0.0f, 0.0f, 1.0f };
+                float nm[3] = { 0.0f, 0.0f, 1.0f };
                 if (any_light) {
-                    float nm[3], nw[3];
                     if (blended) memcpy(nm, mv.nrm, sizeof nm);
                     else read_normal_model_at(vp, a, g_ge.vtype, norm_off, nm);
-                    mul_3x3(g_tl.world, nm, nw);
-                    mul_3x3(g_tl.view,  nw, ne);
                 }
-                light_vertex(eye, ne, &o->rgba, o);
+                light_vertex(model, nm, &o->rgba, o);
                 g_lit_verts++;
             }
             const uint64_t _p3 = ge_prof_now();

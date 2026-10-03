@@ -11,6 +11,11 @@ and cuts them to 16 bits on the way in. These scenes tell that from the rivals:
             result cut to 16 bits; the normal V3 (W3 n); the light V p; D V3 D
     comb    (V W) v, the matrices multiplied first as the clip path does (P V) W
     world   lighting in world space: W v, W3 n, the light and D as given
+and what set 20 (fw 6.60) answered, which fits all 7304 readings:
+    ge      lighting in world space: L = -(W3 v + (t - p)), one row sum with t - p cut first
+            (t the world translation); N = W3 n; D and a directional light as given; the
+            eye's direction the view's third row normalised by components, H = L + that;
+            the attenuation's quadratic term k2 (L.L)
 Large translations put the vertex and the light far from the eye but near each other,
 so L = light - vertex keeps few bits and the rivals part by many codes; a world matrix
 whose 3x3 has large entries that cancel does the same for positions and normals.
@@ -44,7 +49,7 @@ from colour14 import XS, f32, bf
 from lights17 import f24, code, Light, GU_SPOTLIGHT, GU_POINTLIGHT, GU_DIRECTIONAL, GU_DIFFUSE, \
     GU_DIFFUSE_AND_SPECULAR, GU_POINTS, VTYPE, CLEAR, slot, P0
 
-RULES = ['cur', 'seq', 'comb', 'world']
+RULES = ['ge', 'cur', 'seq', 'comb', 'world']
 
 # =========================================================================== matrices
 def rot(r):
@@ -104,6 +109,44 @@ def eye_inputs(rule, W, V, v, n, Lt):
     else: raise ValueError(rule)
     return e, ne, lp, ld
 
+def ge_parts_world(W, V, v, n, Lt):
+    """Set 20's rule, as lights17.ge_parts but in world space."""
+    gs, gm = P13.ge_sum, P13.ge_mul
+    kind = 2 if Lt.comps == 8 else (1 if Lt.comps == 6 else 0)
+    att = 1.0
+    if Lt.type == GU_DIRECTIONAL: Lv = list(Lt.p)
+    else:
+        tp = [gs([gm(W[i][3], 1.0), gm(Lt.p[i], -1.0)]) for i in range(3)]
+        Lv = [-gs([gm(W[i][0], v[0]), gm(W[i][1], v[1]), gm(W[i][2], v[2]), gm(tp[i], 1.0)]) for i in range(3)]
+        ll = L17.g_dot(Lv, Lv); d = L17.g_mul(ll, L17.ge_rsqrt16(ll))
+        a = gs([gm(Lt.k[0], 1.0), gm(Lt.k[1], d), gm(Lt.k[2], ll)])
+        att = P13.ge_rcp16(a) if a else 1.0
+    Ln = L17.g_unit(Lv)
+    N = [gs([gm(W[i][j], n[j]) for j in range(3)]) for i in range(3)]
+    sx = None; spot = 1.0
+    if Lt.type == GU_SPOTLIGHT:
+        sx = L17.g_dot_scaled(list(Lt.d), Ln)
+        spot = L17.g_pow(sx, Lt.exp) if sx >= Lt.cut else None
+    ndl = L17.g_dot_scaled(N, Ln)
+    ndh = None
+    if kind == 1 and ndl >= 0:
+        E = L17.g_unit([V[2][0], V[2][1], V[2][2]])
+        ndh = L17.g_dot_scaled(N, L17.g_unit([gs([gm(Ln[i], 1.0), gm(E[i], 1.0)]) for i in range(3)]))
+    return dict(kind=kind, sx=sx, spot=spot, att=att, ndl=ndl, ndh=ndh)
+
+def ge_byte_world(W, V, pt):
+    Lt = pt['L']; P = ge_parts_world(W, V, pt['v'], pt['n'], Lt)
+    if P['spot'] is None: return 0
+    dfac = P['ndl'] if P['ndl'] > 0 else 0.0
+    if P['kind'] == 2 and dfac > 0: dfac = L17.g_pow(dfac, Lt.coef)
+    sfac = L17.g_pow(P['ndh'], Lt.coef) if P['ndh'] is not None else 0.0
+    vd, vs = L17.lit_byte(dfac), L17.lit_byte(sfac)
+    va = 255 if P['att'] >= 1.0 else L17.lit_byte(P['att'])
+    vsp = 255 if P['spot'] >= 1.0 else L17.lit_byte(P['spot'])
+    ld, ls = Lt.dif & 0xFF, Lt.spec & 0xFF
+    t = L17.lit_mul(vd, L17.lit_mul(ld, 255)); ts = L17.lit_mul(vs, L17.lit_mul(ls, 255))
+    return min(255, L17.lit_mul(vsp, L17.lit_mul(va, t)) + L17.lit_mul(vsp, L17.lit_mul(va, ts)))
+
 class EyeLight:
     """A Light with its position and direction replaced by eye-space ones."""
     def __init__(s, Lt, p, d):
@@ -113,11 +156,13 @@ class EyeLight:
 def x_of(rule, W, V, g):
     """Scene 121: L.D under a rule (the lights17 'ge' arithmetic on the eye inputs)."""
     Lt = Light(GU_SPOTLIGHT, GU_DIFFUSE, g['p'], g['d'])
+    if rule == 'ge': return ge_parts_world(W, V, g['v'], g['n'], Lt)['sx']
     e, ne, lp, ld = eye_inputs(rule, W, V, g['v'], g['n'], Lt)
     return L17.ge_parts(EyeLight(Lt, lp, ld), e, ne)['sx']
 def code_of(rule, W, V, g):
     x = x_of(rule, W, V, g); return code(x) if x and x > 0 else 0
 def byte_of(rule, W, V, pt):
+    if rule == 'ge': return ge_byte_world(W, V, pt)
     Lt = pt['L']
     e, ne, lp, ld = eye_inputs(rule, W, V, pt['v'], pt['n'], Lt)
     return L17.ge_byte(EyeLight(Lt, lp, ld), e, ne)
@@ -406,17 +451,18 @@ def check():
         idx = [i for i, g in enumerate(G) if g['batch'] == b]
         xs = {r: [x_of(r, *mats[G[i]['m']], G[i]) for i in idx] for r in RULES}
         lo = min(min(v for v in xs[r] if v is not None) for r in RULES)
-        part = {f'{r}!=cur': sum(code(a or 0) != code(b_ or 0) for a, b_ in zip(xs[r], xs['cur'])) for r in RULES[1:]}
+        part = {f'{r}!=cur': sum(code(a or 0) != code(b_ or 0) for a, b_ in zip(xs[r], xs['cur'])) for r in RULES if r != 'cur'}
         part['seq!=comb'] = sum(code(a or 0) != code(b_ or 0) for a, b_ in zip(xs['seq'], xs['comb']))
         print(f'   b{b} {name}: {len(idx)}, smallest L.D {lo:.3f}', part)
     for S in scenes():
         by = {}
         for pt in S.pts:
-            st = by.setdefault(pt['batch'], {'n': 0, 'cur0': 0, **{f'{r}!=cur': 0 for r in RULES[1:]}, 'seq!=comb': 0})
+            st = by.setdefault(pt['batch'], {'n': 0, 'cur0': 0, **{f'{r}!=cur': 0 for r in RULES if r != 'cur'}, 'seq!=comb': 0})
             st['n'] += 1
             bs = {r: byte_of(r, *S.mats[pt['m']], pt) for r in RULES}
             st['cur0'] += bs['cur'] == 0
-            for r in RULES[1:]: st[f'{r}!=cur'] += bs[r] != bs['cur']
+            for r in RULES:
+                if r != 'cur': st[f'{r}!=cur'] += bs[r] != bs['cur']
             st['seq!=comb'] += bs['seq'] != bs['comb']
         print(f'{S.num} {S.name}: {len(S.pts)} points, {len(S.mats)} matrix pairs, last slot {slot(len(S.pts) - 1)}')
         for b, st in sorted(by.items()): print(f'   b{b}:', st)

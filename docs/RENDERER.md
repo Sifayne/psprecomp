@@ -669,9 +669,23 @@ geprobe 7, fw 6.60):
     toward zero, before the power (ge_pow, unchanged): every exponent with
     no more bits already fit, and of 942 with more, all fit so.
   - The distance is L.L times its 1/sqrt; the attenuation k0 + k1 d +
-    (k2 d) d is one sum, and its reciprocal the 1/w table's.
+    k2 (L.L) is one sum, and its reciprocal the 1/w table's. (One reading
+    of 3000, in geprobe 19, tells k2 (L.L) from (k2 d) d.)
   psprecomp's floats missed 3908 of these 20,922 readings, and 10 of
   scene 35's points.
+- The GE lights in world space (geprobe 19, fw 6.60: scenes 121-124 repeat
+  the search and the bytes under real world and view matrices, 7304
+  readings, translations up to 2^10 and 3x3s that cancel). The view matrix
+  does not touch the vertex, normal, light or spot direction. A point or
+  spot light's L is -(W3 m + (t - p)), one row sum with t - p (the world
+  translation less the light's position) cut first: the world position is
+  never cut on its own, which is why a vertex 1024 out keeps every bit of
+  L. Forming W m first and subtracting fits 114 of 600 world-matrix points.
+  N is W3 n; D and a directional light's vector are used as given. The
+  eye's direction is the view matrix's third row, normalised component by
+  component, and H is L + that: (0, 0, 1) fits 1 of 1600 specular bytes
+  under rotated views. psprecomp formed all of this in eye space in float
+  and missed 3173 of the 7304.
 - In single-colour mode the specular is added in, and the total is clamped
   to 255 per vertex.
 - In separate-specular mode the specular is the vertex's secondary colour,
@@ -774,14 +788,15 @@ Python).
 
 Scene 20, the skinned triangle that was 54 pixels off, now matches.
 
-## Still open after geprobe 18
+## Still open after geprobe 19
 
-These are what geprobe 18 (fw 6.60) still shows psprecomp getting wrong,
-with pixels off on run 18 (set 19). Run 18 drew every scene it shares with
-run 17 the same, byte for byte. Details on the geprobe 7 items, and what
+These are what geprobe 19 (fw 6.60) still shows psprecomp getting wrong,
+with pixels off on run 19 (set 20). Run 19 drew every scene it shares with
+run 18 the same, byte for byte. Details on the geprobe 7 items, and what
 further probing could settle, are in `fw660-run7/findings/geprobe.md`.
 Vertex depth, patch positions, colour planes, line colours, skinning and
-lighting's factors, its 1/sqrt included, are settled (above).
+lighting (its factors, its 1/sqrt and its world-space inputs) are settled
+(above).
 
 - **Patch line order** (scene 23: 1 pixel). Two segments of a patch's
   line strips cross at (375,211), and the PSP's colour there is the other
@@ -795,9 +810,6 @@ lighting's factors, its 1/sqrt included, are settled (above).
 - **What follows a hanging division** (scenes 80 and 81: 12 and 108). A
   patch division of 65 to 127 hangs the GE and the probe breaks the list;
   psprecomp skips the patch and draws the rest.
-- **Lighting's inputs under real matrices.** Every lighting probe so far
-  has view and world identity; psprecomp takes the eye-space position and
-  normal in float and cuts them to 16 bits on the way in.
 
 ## Validation
 

@@ -1252,6 +1252,86 @@ static void test_rsqrt_ge(void) {
         }
 }
 
+/* Lighting under real world and view matrices (ge.c light_vertex): points
+ * the PSP lit in geprobe 19 (fw 6.60), each one the float transforms got
+ * wrong. The GE lights in world space: L = -(W3 m + (t - p)), N = W3 n, the
+ * eye's direction the view's normalised third row. Mode 1 reads L.D through
+ * the spot cutoff as scene 121 does (lit at the PSP's code, dark one
+ * above); mode 0 compares the grey. Matrix and light words as the probe
+ * sent them (a float's top 24 bits), world then view, column by column. */
+static void test_light_world(void) {
+    static const struct {
+        uint32_t w[12], v[12], m[3], n[3];
+        int type, kind;
+        uint32_t p[3], d[3], exp, k[3], coef, dif, spec;
+        int mode;
+        uint32_t want;
+    } C[] = {
+        /* scene 121 batch 2 (both), geometry 1201: L.D read through the cutoff */
+        { { 0xBDDCE5, 0x3F8A09, 0x3F910E, 0x3F83BF, 0xBF4E78, 0x3F5D8E, 0x3F96CB, 0x3F4DAA, 0xBF2701, 0xBE846D, 0x3F412D, 0x3F1A62 },
+          { 0x3E4C4C, 0xBEBD03, 0x3F685E, 0xBF00A1, 0x3F41B8, 0x3ED61F, 0xBF575C, 0xBF0A1E, 0xBD0D68, 0x3E48B8, 0xBF43FD, 0x3F1CDC },
+          { 0xBEDE0000u, 0xBF720C00u, 0xBEC23500u }, { 0x3DA89000u, 0xBEC8CE00u, 0xBEFDFD00u }, 2, 0,
+          { 0xC04074, 0x3F40FD, 0xBEB45E }, { 0xBF11BA, 0x3F4EC7, 0x3E1D12 }, 0x3F8000, { 0x3F8000, 0x000000, 0x000000 }, 0x3F8000, 0xFFFFFF, 0x000000, 1, 0x3F15AE },
+        /* scene 121 batch 4 (cancel), geometry 2104: L.D read through the cutoff */
+        { { 0x3D1D4F, 0x3E087A, 0x3F0D1D, 0xBE814C, 0x3F055D, 0x3F2705, 0xC06D4A, 0xBFB1CC, 0x3F0CC7, 0x40031D, 0x3CA192, 0x405BDE },
+          { 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000 },
+          { 0x3FC85A00u, 0xBF8C5300u, 0xBE19DB00u }, { 0xBFA75200u, 0x3FDC9800u, 0xBE21D500u }, 2, 0,
+          { 0x405042, 0x40325E, 0x408F6C }, { 0xBD89AD, 0x3F6CC9, 0xBEBF88 }, 0x3F8000, { 0x3F8000, 0x000000, 0x000000 }, 0x3F8000, 0xFFFFFF, 0x000000, 1, 0x3F3F3E },
+        /* scene 122 point 57: diffuse, a cancelling world and a rotated view; the float pipeline gave 199 */
+        { { 0xBFF8D0, 0xC0CF62, 0xC112EE, 0xBF9434, 0xC01D52, 0xC02E02, 0x402738, 0x40D374, 0x40FB33, 0x000000, 0x000000, 0x000000 },
+          { 0xBE4BB9, 0xBF45E0, 0xBF1A3B, 0x3ECA4D, 0xBF2036, 0x3F2C26, 0xBF6596, 0xBDD587, 0x3EDC1E, 0x000000, 0x000000, 0x000000 },
+          { 0x00000000u, 0x00000000u, 0x00000000u }, { 0xBDF08500u, 0xBF62ED00u, 0xBEE76B00u }, 0, 0,
+          { 0x3F7C90, 0xBE23E5, 0xBD042F }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, { 0x3F8000, 0x000000, 0x000000 }, 0x3F8000, 0xFFFFFF, 0x000000, 0, 0x0000C6 },
+        /* scene 123 point 72: specular under a rotated, translated view; the float pipeline gave 221 */
+        { { 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000 },
+          { 0xBF3540, 0x3F1981, 0x3EBEFF, 0xBF3344, 0xBF071A, 0xBEF623, 0xBDBB2D, 0xBF1A02, 0x3F4B26, 0xC3C2DA, 0xC46A60, 0xC30557 },
+          { 0xBEDC3C00u, 0xBF3AC200u, 0xBE5F8100u }, { 0x3BE48A00u, 0xBEEB5F00u, 0x3F635600u }, 1, 1,
+          { 0xBECBAA, 0xBF5A5C, 0x3F96D6 }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, { 0x3F8000, 0x000000, 0x000000 }, 0x408000, 0x000000, 0xFFFFFF, 0, 0x0000DC },
+        /* scene 124 point 58: attenuation, k2 alone, far out; the float pipeline gave 189 */
+        { { 0x3E3882, 0x3EAEE9, 0xBF1AE6, 0x3F1829, 0xBFC8D0, 0xBF1632, 0xBF164F, 0xBDDA2B, 0xBF0571, 0xC2E20A, 0xC3297D, 0xC3EADD },
+          { 0xBDCBEC, 0xBF7CEB, 0xBDF249, 0xBF0D95, 0xBD33C1, 0x3F54FC, 0xBF53C1, 0x3E17D4, 0xBF0AC3, 0xC08894, 0x40CECF, 0x40003C },
+          { 0x3EDDF700u, 0xBE058300u, 0xBE9C9000u }, { 0xBE94A600u, 0xBB82F900u, 0xBF93FE00u }, 1, 0,
+          { 0xC2E154, 0xC32918, 0xC3EAC4 }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, { 0x000000, 0x000000, 0x418917 }, 0x3F8000, 0xFFFFFF, 0x000000, 0, 0x0000BA },
+    };
+    for (unsigned c = 0; c < sizeof C / sizeof C[0]; c++)
+        for (int up = 0; up < 1 + C[c].mode; up++) {
+            psp_ge_reset(); clear_fb();
+            begin_list_vtype((3u << 5) | (3u << 7));
+            cmd(0x3A, 0);
+            for (int i = 0; i < 12; i++) cmd(0x3B, C[c].w[i]);
+            cmd(0x3C, 0);
+            for (int i = 0; i < 12; i++) cmd(0x3D, C[c].v[i]);
+            cmd(0x3E, 0);
+            for (int i = 0; i < 16; i++) cmd(0x3F, i == 15 ? 0x3F8000 : 0);
+            cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+            cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+            cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+            cmd(0x17, 1); cmd(0x18, 1); cmd(0x5E, 0);
+            cmd(0x53, 0); cmd(0x54, 0); cmd(0x55, 0); cmd(0x56, 0xFFFFFF); cmd(0x57, 0xFFFFFF); cmd(0x5C, 0);
+            cmd(0x5F, ((uint32_t)C[c].type << 8) | (uint32_t)C[c].kind);
+            for (int i = 0; i < 3; i++) {
+                cmd((uint8_t)(0x63 + i), C[c].p[i]); cmd((uint8_t)(0x6F + i), C[c].d[i]);
+                cmd((uint8_t)(0x7B + i), C[c].k[i]);
+            }
+            cmd(0x87, C[c].exp);
+            cmd(0x8B, C[c].mode ? C[c].want + (uint32_t)up : 0x3C8000);          /* cutoff, or 1/64 */
+            cmd(0x5B, C[c].coef);
+            cmd(0x8F, 0); cmd(0x90, C[c].dif); cmd(0x91, C[c].spec);
+            for (int i = 0; i < 3; i++) {
+                psp_write32(VERTS + 4u * (uint32_t)i, C[c].n[i]);
+                psp_write32(VERTS + 12u + 4u * (uint32_t)i, C[c].m[i]);
+            }
+            cmd(0x04, (0u << 16) | 1);
+            end_list();
+            const int g = (int)((pixel(240, 136) >> 8) & 0xFF);
+            if (C[c].mode)
+                CHECK((g != 0) == !up, "case %u: cutoff %06X %s, the PSP's %s", c, C[c].want + (unsigned)up,
+                      g ? "lit" : "dark", up ? "dark" : "lit");
+            else
+                CHECK(g == (int)C[c].want, "case %u: %d, hardware %u", c, g, C[c].want);
+        }
+}
+
 /* A spline point's colour is de Boor's algorithm on the control colours
  * with 8-bit parameters and 1/128 cuts (ge.c deboor_fix), not a blend by
  * exact weights. geprobe 9 (fw 6.60) scene 54: a uniform span (fill/fill,
@@ -2193,6 +2273,7 @@ int main(void) {
     test_skin_ge();
     test_light_ge();
     test_rsqrt_ge();
+    test_light_world();
     test_patch_points_ge();
     test_colour_plane_anchor();
     test_line_rules();

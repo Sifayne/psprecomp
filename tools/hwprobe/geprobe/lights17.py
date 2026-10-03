@@ -265,7 +265,7 @@ def ge_parts(L, v, n):
     else:
         Lv = [P13.ge_sum([P13.ge_mul(L.p[i], 1.0), P13.ge_mul(v[i], -1.0)]) for i in range(3)]
         ll = g_dot(Lv, Lv); d = g_mul(ll, ge_rsqrt16(ll))
-        a = P13.ge_sum([P13.ge_mul(L.k[0], 1.0), P13.ge_mul(L.k[1], d), P13.ge_mul(g_mul(L.k[2], d), d)])
+        a = P13.ge_sum([P13.ge_mul(L.k[0], 1.0), P13.ge_mul(L.k[1], d), P13.ge_mul(L.k[2], ll)])   # set 20: k2 (L.L)
         att = P13.ge_rcp16(a) if a else 1.0
     Ln = g_unit(Lv)
     sx = None; spot = 1.0
