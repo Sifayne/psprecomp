@@ -1518,6 +1518,23 @@ static ge_term ge_mul(double a, double b) {
     return t;
 }
 
+/* A number split once for ge_mul -- ge_split's significand, exponent and
+ * verdict, and the number -- so that a matrix entry or a coordinate used in
+ * many products is not split again for each. */
+typedef struct { int64_t s; int e, k; double v; } ge_sp;
+static inline ge_sp ge_sp_of(double v) { ge_sp r = { 0, 0, 0, v }; r.k = ge_split(v, &r.s, &r.e); return r; }
+
+/* ge_mul(a->v, b->v), from the split halves. */
+static inline ge_term ge_mul_sp(const ge_sp *a, const ge_sp *b) {
+    ge_term t = { 0, INT_MIN, 0, a->v * b->v };
+    if (a->k < 0 || b->k < 0) { t.bad = 1; return t; }
+    if (!a->k || !b->k) return t;
+    const int64_t p = a->s * b->s;                 /* under 2^32 */
+    t.q = p < 0 ? -((-p) >> 15) : p >> 15;
+    t.e = a->e + b->e;
+    return t;
+}
+
 static double ge_sum(const ge_term *t, int n) {
     int e = INT_MIN, bad = 0;
     double plain = 0.0;
@@ -1591,6 +1608,16 @@ static void ge_wvp(double m[4][4]) {
 static void ge_clip(const double m[4][4], const float model[3], float clip[4]) {
     const double in[4] = { model[0], model[1], model[2], 1.0 };   /* ge_mul cuts each to 16 bits */
     for (int i = 0; i < 4; i++) clip[i] = (float)ge_dot4(m[i], in);
+}
+
+/* ge_clip through the matrix split once (ge_sp_of of each entry). */
+static void ge_clip_sp(const ge_sp m[4][4], const float model[3], float clip[4]) {
+    const ge_sp in[4] = { ge_sp_of(model[0]), ge_sp_of(model[1]), ge_sp_of(model[2]), ge_sp_of(1.0) };
+    for (int i = 0; i < 4; i++) {
+        const ge_term t[4] = { ge_mul_sp(&m[i][0], &in[0]), ge_mul_sp(&m[i][1], &in[1]),
+                               ge_mul_sp(&m[i][2], &in[2]), ge_mul_sp(&m[i][3], &in[3]) };
+        clip[i] = (float)ge_sum(t, 4);
+    }
 }
 
 /* 1/w as the GE has it. w is cut to 16 bits; the 7 significand bits below
@@ -2588,45 +2615,123 @@ static inline int lit_colour_byte(float c) { return (int)lrintf(c * 255.0f); }
  *    is identity it is (0, 0, 1), as sets 18 and 19 had it.
  *  - The attenuation's quadratic term is k2 (L.L), not (k2 d) d: one of
  *    3000 attenuation bytes tells them apart, and it reads k2 (L.L). */
+/* What light_vertex needs that does not change within a draw, worked out once
+ * per draw by light_setup: the colour bytes, the eye's direction, and for a
+ * directional light its L and H, which do not depend on the vertex. Every
+ * value is the one light_vertex used to work out for each vertex, by the same
+ * arithmetic. */
+static struct {
+    int emissive[3], global_amb[3], mat_amb[3], mat_dif[3], mat_spc[3];
+    double E[3];
+    ge_sp W[9];                         /* the world matrix's 3x3, split for ge_mul */
+    float spec_k;                       /* the specular coefficient, cut to 5 bits */
+    struct {
+        int amb[3], dif[3], spec[3];
+        double L[3], H[3];              /* directional only */
+        ge_sp tp[3];                    /* point and spot: t - p, one GE sum, split */
+        double D[3], d_rs;              /* spot: its direction and 1/sqrt(D.D) */
+        int d_ok;                       /* D.D > 0 */
+        float spot_k;                   /* the spot exponent, cut to 5 bits */
+    } light[4];
+} g_ls;
+
+static void light_setup(void) {
+    for (int k = 0; k < 3; k++) {
+        g_ls.emissive[k]   = lit_colour_byte(g_tl.mat_emissive[k]);
+        g_ls.global_amb[k] = lit_colour_byte(g_tl.global_amb[k]);
+        g_ls.mat_amb[k]    = lit_colour_byte(g_tl.mat_ambient[k]);
+        g_ls.mat_dif[k]    = lit_colour_byte(g_tl.mat_diffuse[k]);
+        g_ls.mat_spc[k]    = lit_colour_byte(g_tl.mat_specular[k]);
+    }
+    if (!any_light_enabled()) return;
+    const double Ev[3] = { g_tl.view[2], g_tl.view[5], g_tl.view[8] };
+    gl_unit(Ev, g_ls.E);
+    g_ls.spec_k = (float)ge_cut(g_tl.mat_spec_coef, 5, 0);
+    const float *W = g_tl.world;
+    for (int k = 0; k < 9; k++) g_ls.W[k] = ge_sp_of(W[k]);
+    for (int i = 0; i < 4; i++) {
+        if (!g_tl.light[i].enable) continue;
+        for (int k = 0; k < 3; k++) {
+            g_ls.light[i].amb[k]  = lit_colour_byte(g_tl.light[i].amb[k]);
+            g_ls.light[i].dif[k]  = lit_colour_byte(g_tl.light[i].dif[k]);
+            g_ls.light[i].spec[k] = lit_colour_byte(g_tl.light[i].spec[k]);
+        }
+        if (g_tl.light[i].type == 0) {
+            const double Lv[3] = { g_tl.light[i].pos[0], g_tl.light[i].pos[1], g_tl.light[i].pos[2] };
+            gl_unit(Lv, g_ls.light[i].L);
+            double Hv[3];
+            for (int k = 0; k < 3; k++) {
+                const ge_term h[2] = { ge_mul(g_ls.light[i].L[k], 1.0), ge_mul(g_ls.E[k], 1.0) };
+                Hv[k] = ge_sum(h, 2);
+            }
+            gl_unit(Hv, g_ls.light[i].H);
+        } else {
+            for (int k = 0; k < 3; k++) {
+                const ge_term tp[2] = { ge_mul(W[9 + k], 1.0), ge_mul(g_tl.light[i].pos[k], -1.0) };
+                g_ls.light[i].tp[k] = ge_sp_of(ge_sum(tp, 2));
+            }
+        }
+        if (g_tl.light[i].type == 2) {
+            for (int k = 0; k < 3; k++) g_ls.light[i].D[k] = g_tl.light[i].dir[k];
+            const double dd = gl_dot3(g_ls.light[i].D, g_ls.light[i].D);
+            g_ls.light[i].d_ok = dd > 0.0;
+            g_ls.light[i].d_rs = g_ls.light[i].d_ok ? ge_rsqrt16(dd) : 0.0;
+            g_ls.light[i].spot_k = (float)ge_cut(g_tl.light[i].exponent, 5, 0);
+        }
+    }
+}
+
+/* gl_dot_scaled(a, u) with a's half worked out already: a.a > 0 (ok) and
+ * its 1/sqrt (rs). */
+static double gl_dot_pre(int ok, double rs, const double a[3], const double u[3]) {
+    return ok ? gl_mul(gl_dot3(a, u), rs) : 0.0;
+}
+
+/* gl_pow with k cut already. */
+static float gl_pow_k(double x, float k) { return x > 0.0 ? ge_pow((float)x, k) : 0.0f; }
+
 static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba, psp_vertex *lit) {
     const int vc[3] = { (int)(*rgba & 0xFFu), (int)((*rgba >> 8) & 0xFFu), (int)((*rgba >> 16) & 0xFFu) };
     /* MATERIAL_COLOR picks which material components the vertex colour
      * supplies: bit 0 ambient, bit 1 diffuse, bit 2 specular. */
     int m_amb[3], m_dif[3], m_spc[3];
     for (int k = 0; k < 3; k++) {
-        m_amb[k] = (g_tl.mat_update & 1) ? vc[k] : lit_colour_byte(g_tl.mat_ambient[k]);
-        m_dif[k] = (g_tl.mat_update & 2) ? vc[k] : lit_colour_byte(g_tl.mat_diffuse[k]);
-        m_spc[k] = (g_tl.mat_update & 4) ? vc[k] : lit_colour_byte(g_tl.mat_specular[k]);
+        m_amb[k] = (g_tl.mat_update & 1) ? vc[k] : g_ls.mat_amb[k];
+        m_dif[k] = (g_tl.mat_update & 2) ? vc[k] : g_ls.mat_dif[k];
+        m_spc[k] = (g_tl.mat_update & 4) ? vc[k] : g_ls.mat_spc[k];
     }
 
     int out[3], sec[3] = { 0, 0, 0 };
     for (int k = 0; k < 3; k++)
-        out[k] = lit_colour_byte(g_tl.mat_emissive[k]) + lit_mul(lit_colour_byte(g_tl.global_amb[k]), m_amb[k]);
+        out[k] = g_ls.emissive[k] + lit_mul(g_ls.global_amb[k], m_amb[k]);
 
     /* With every light disabled the colour is emissive plus ambient and the
      * normal never enters: skip the loop. Same result. */
     if (any_light_enabled()) {
-    const float *W = g_tl.world;                 /* row i, column j at W[3j + i]; t at W[9 + i] */
-    double n[3], E[3];
+    const ge_sp *W = g_ls.W;                     /* row i, column j at W[3j + i] */
+    const ge_sp N[3] = { ge_sp_of(nm[0]), ge_sp_of(nm[1]), ge_sp_of(nm[2]) };
+    const ge_sp M[3] = { ge_sp_of(model[0]), ge_sp_of(model[1]), ge_sp_of(model[2]) };
+    const ge_sp one = ge_sp_of(1.0);
+    double n[3];
     for (int i = 0; i < 3; i++) {
-        const ge_term t[3] = { ge_mul(W[i], nm[0]), ge_mul(W[3 + i], nm[1]), ge_mul(W[6 + i], nm[2]) };
+        const ge_term t[3] = { ge_mul_sp(&W[i], &N[0]), ge_mul_sp(&W[3 + i], &N[1]), ge_mul_sp(&W[6 + i], &N[2]) };
         n[i] = ge_sum(t, 3);
     }
-    {
-        const double Ev[3] = { g_tl.view[2], g_tl.view[5], g_tl.view[8] };
-        gl_unit(Ev, E);
-    }
+    /* N's half of every N.L and N.H below (gl_dot_scaled). */
+    const double nn = gl_dot3(n, n);
+    const int n_ok = nn > 0.0;
+    const double n_rs = n_ok ? ge_rsqrt16(nn) : 0.0;
     for (int i = 0; i < 4; i++) {
         if (!g_tl.light[i].enable) continue;
         double Lv[3], L[3];
+        const double *Lp = L;
         float att = 1.0f, spot = 1.0f;
         if (g_tl.light[i].type == 0) {
-            for (int k = 0; k < 3; k++) Lv[k] = g_tl.light[i].pos[k];
+            Lp = g_ls.light[i].L;
         } else {
             for (int k = 0; k < 3; k++) {
-                const ge_term tp[2] = { ge_mul(W[9 + k], 1.0), ge_mul(g_tl.light[i].pos[k], -1.0) };
-                const ge_term t[4] = { ge_mul(W[k], model[0]), ge_mul(W[3 + k], model[1]),
-                                       ge_mul(W[6 + k], model[2]), ge_mul(ge_sum(tp, 2), 1.0) };
+                const ge_term t[4] = { ge_mul_sp(&W[k], &M[0]), ge_mul_sp(&W[3 + k], &M[1]),
+                                       ge_mul_sp(&W[6 + k], &M[2]), ge_mul_sp(&g_ls.light[i].tp[k], &one) };
                 Lv[k] = -ge_sum(t, 4);
             }
             const double ll = gl_dot3(Lv, Lv);
@@ -2635,38 +2740,41 @@ static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba
                                     ge_mul(g_tl.light[i].atten[2], ll) };
             const double a = ge_sum(at, 3);
             att = a != 0.0 ? (float)ge_rcp16(a) : 1.0f;
+            gl_unit(Lv, L);
         }
-        gl_unit(Lv, L);
 
         if (g_tl.light[i].type == 2) {
-            const double D[3] = { g_tl.light[i].dir[0], g_tl.light[i].dir[1], g_tl.light[i].dir[2] };
-            const double sdot = gl_dot_scaled(D, L);
+            const double sdot = gl_dot_pre(g_ls.light[i].d_ok, g_ls.light[i].d_rs, g_ls.light[i].D, Lp);
             if (!(sdot >= g_tl.light[i].cutoff)) continue;
-            spot = gl_pow(sdot, g_tl.light[i].exponent);
+            spot = gl_pow_k(sdot, g_ls.light[i].spot_k);
         }
 
-        const double ndl = gl_dot_scaled(n, L);
+        const double ndl = gl_dot_pre(n_ok, n_rs, n, Lp);
         float dfac = ndl > 0.0 ? (float)ndl : 0.0f;
-        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = gl_pow(dfac, g_tl.mat_spec_coef);
+        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = gl_pow_k(dfac, g_ls.spec_k);
 
         float sfac = 0.0f;
         if (g_tl.light[i].kind == 1 && ndl >= 0.0) {
-            double Hv[3];
-            for (int k = 0; k < 3; k++) {
-                const ge_term h[2] = { ge_mul(L[k], 1.0), ge_mul(E[k], 1.0) };
-                Hv[k] = ge_sum(h, 2);
+            double Hb[3];
+            const double *H = g_ls.light[i].H;
+            if (g_tl.light[i].type != 0) {
+                double Hv[3];
+                for (int k = 0; k < 3; k++) {
+                    const ge_term h[2] = { ge_mul(Lp[k], 1.0), ge_mul(g_ls.E[k], 1.0) };
+                    Hv[k] = ge_sum(h, 2);
+                }
+                gl_unit(Hv, Hb);
+                H = Hb;
             }
-            double H[3];
-            gl_unit(Hv, H);
-            sfac = gl_pow(gl_dot_scaled(n, H), g_tl.mat_spec_coef);
+            sfac = gl_pow_k(gl_dot_pre(n_ok, n_rs, n, H), g_ls.spec_k);
         }
 
         const int vd = lit_byte(dfac), vs = lit_byte(sfac);
         const int va = att >= 1.0f ? 255 : lit_byte(att), vsp = spot >= 1.0f ? 255 : lit_byte(spot);
         for (int k = 0; k < 3; k++) {
-            const int t = lit_mul(lit_colour_byte(g_tl.light[i].amb[k]), m_amb[k])
-                        + lit_mul(vd, lit_mul(lit_colour_byte(g_tl.light[i].dif[k]), m_dif[k]));
-            const int ts = lit_mul(vs, lit_mul(lit_colour_byte(g_tl.light[i].spec[k]), m_spc[k]));
+            const int t = lit_mul(g_ls.light[i].amb[k], m_amb[k])
+                        + lit_mul(vd, lit_mul(g_ls.light[i].dif[k], m_dif[k]));
+            const int ts = lit_mul(vs, lit_mul(g_ls.light[i].spec[k], m_spc[k]));
             out[k] += lit_mul(vsp, lit_mul(va, t));
             sec[k] += lit_mul(vsp, lit_mul(va, ts));
         }
@@ -2805,7 +2913,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                              fabsf(g_tl.proj[11]) < 1e-6f &&
                              fabsf(g_tl.proj[15]) > 1e-6f;
     const uint64_t _x0 = ge_prof_now();
-    if (g_tl.lighting) lights_to_eye();
+    if (g_tl.lighting) { lights_to_eye(); light_setup(); }
     const int any_light = g_tl.lighting && any_light_enabled();
 
     /* The backend's transform, when it offers one. Triangles only (points,
@@ -2903,6 +3011,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
 
     double wvp[4][4];
     ge_wvp(wvp);
+    ge_sp wsp[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) wsp[i][j] = ge_sp_of(wvp[i][j]);
     uint32_t done = 0;
     psp_vertex centre_v;
     float centre_cl[4];
@@ -2936,12 +3047,14 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             }
             const uint64_t _p1 = ge_prof_now();
 
-            mul_4x3(g_tl.world, model, world);
-            mul_4x3(g_tl.view,  world, eye);
-            mul_4x4(g_tl.proj,  eye,   clip);
+            /* The eye position only feeds the fog. */
+            if (g_tl.fog_enable) {
+                mul_4x3(g_tl.world, model, world);
+                mul_4x3(g_tl.view,  world, eye);
+            }
             /* Clip space as the GE forms it (ge_clip), for depth
              * (ge_screen_z) and position (clip_to_fx16). */
-            ge_clip(wvp, model, clip);
+            ge_clip_sp(wsp, model, clip);
             const uint64_t _p2 = ge_prof_now();
 
             psp_vertex *o = &v[decoded];
