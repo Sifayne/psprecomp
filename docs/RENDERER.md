@@ -555,6 +555,21 @@ ge_rcp16, ge_screen_z, clip_to_fx16):
   of scene 88), and a 3D fan past its 256-vertex decode batch turned about
   the batch's first vertex instead of the fan's; both are fixed, and
   test_triangle_fans holds a 300-vertex fan to its triangles drawn as a list.
+- **A tall triangle's long edge** goes in aligned groups of four pixels
+  (render.c sw_tri). When 3 times the triangle's height in sixteenths
+  reaches 2^17 (2731 pixels), the pixel of each group farthest from the
+  inside along its long edge (top corner to bottom corner) takes the
+  nearest's decision: the last of the group (x = 3 mod 4) when the inside
+  is to the edge's left, the first (x = 0 mod 4) when it is to the right,
+  as if its three steps across were dropped. geprobe 20 (fw 6.60, scenes
+  125-127) crosses 660 windows with one edge each, at every direction,
+  length 32 to 3900 pixels and alignment mod 4: all 241 long edges past
+  that height are drawn so, and none of the 419 others, short edges past
+  it included; the threshold lies between 130,533 and 131,364. Scene 98's
+  window 1, 80 pixels off before, is such an edge. A vertical long edge
+  does not (scene 98's window 4); the probes' slanted ones all lean 185
+  pixels or more, so a lean between is unmeasured, as are two edges of full
+  height (a triangle level at its top or bottom), which both take it here.
 - **1/area comes from a table** with a linear step (area_rcp), not a
   division. The area's significand is cut to 17 bits. Its leading nine
   bits, h, pick one of 256 entries holding 2^27/h and the slope 2^24/h²,
@@ -808,9 +823,6 @@ lighting (its factors, its 1/sqrt and its world-space inputs) are settled
 - **Patch line order** (scene 23: 1 pixel). Two segments of a patch's
   line strips cross at (375,211), and the PSP's colour there is the other
   segment's: the order the GE emits a patch's line segments in.
-- **Far-off corners' edges** (scene 98: 80 pixels). With corners up to
-  2000 pixels outside the scissor the PSP covers one more pixel a row
-  along one edge, a staircase of 80; the edge arithmetic at that range.
 - **What follows a hanging division** (scenes 80 and 81: 12 and 108). A
   patch division of 65 to 127 hangs the GE and the probe breaks the list;
   psprecomp skips the patch and draws the rest.

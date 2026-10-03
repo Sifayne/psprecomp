@@ -1145,6 +1145,38 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     const int64_t bias1 = edge_is_top_left(d1x, d1y) ? 0 : -1;
     const int64_t bias2 = edge_is_top_left(d2x, d2y) ? 0 : -1;
 
+    /* A tall triangle's long edge, in aligned groups of four pixels: when 3
+     * times the triangle's height in sixteenths reaches 2^17 (2731 pixels),
+     * the pixel of each group farthest from the inside along that edge takes
+     * the nearest's decision -- the last of the group (x = 3 mod 4) on an
+     * edge with the inside to its left, the first (x = 0 mod 4) with it to
+     * the right -- as if its three steps across had been dropped. geprobe 20
+     * (fw 6.60) scenes 125-127: 660 windows, each crossed by one edge, and
+     * every one of the 241 long edges past that height drawn so, none of the
+     * 419 others; the threshold lies between 130,533 and 131,364. Scene 98's
+     * window 1, the 80 pixels it was off, is such an edge. A vertical long
+     * edge does not (scene 98's window 4, 2981 pixels tall: 136 pixels off
+     * when it did); the probes' slanted ones all lean 185 pixels or more, so
+     * between the two is not measured. A triangle level at its top or bottom
+     * has two edges of full height; both take it here, which no probe has
+     * posed. Coverage only: the pixel's colour and depth are its own. */
+    int64_t far_lift[3] = { 0, 0, 0 };
+    int far_at[3] = { -1, -1, -1 };
+    {
+        const int64_t ylo = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
+        const int64_t yhi = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
+        const int64_t h = yhi - ylo;
+        if (3 * h >= (1 << 17)) {
+            const int64_t dys[3] = { d0y, d1y, d2y }, dxs[3] = { d0x, d1x, d2x };
+            for (int k = 0; k < 3; k++)
+                if ((dys[k] == h || dys[k] == -h) && dxs[k] != 0) {
+                    far_at[k] = dys[k] > 0 ? 3 : 0;
+                    far_lift[k] = 3 * (dys[k] > 0 ? dys[k] : -dys[k]) * SUBPX;
+                }
+        }
+    }
+    const int quirk = far_at[0] >= 0 || far_at[1] >= 0 || far_at[2] >= 0;
+
     /* The three edge functions at the centre of the first pixel, in the same
      * 1/16 units the positions came in. They sum to area, so they are the
      * barycentric numerators. Stepping them by their own derivatives keeps
@@ -1326,7 +1358,13 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
         for (int i = 0; i < nplanes; i++) acc[i] = col_acc[i];
         int64_t zacc = z_acc;
         for (int x = minx; x <= maxx; x++) {
-            if (w0 + bias0 >= 0 && w1 + bias1 >= 0 && w2 + bias2 >= 0) {
+            int64_t t0 = w0, t1 = w1, t2 = w2;
+            if (quirk) {
+                if ((x & 3) == far_at[0]) t0 += far_lift[0];
+                if ((x & 3) == far_at[1]) t1 += far_lift[1];
+                if ((x & 3) == far_at[2]) t2 += far_lift[2];
+            }
+            if (t0 + bias0 >= 0 && t1 + bias1 >= 0 && t2 + bias2 >= 0) {
                 const float l0 = (float)w0 * inv;
                 const float l1 = (float)w1 * inv;
                 const float l2 = (float)w2 * inv;

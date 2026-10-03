@@ -1393,6 +1393,71 @@ static void test_triangle_fans(void) {
     }
 }
 
+/* A tall triangle's long edge in groups of four (render.c sw_tri): geprobe 98
+ * (fw 6.60) scene 98's window 1 triangle, drawn flat white in its scissor.
+ * Its height is 2956 pixels, past the 2731 at which 3 x the height in
+ * sixteenths reaches 2^17, and along its long edge (inside to the left) the
+ * PSP fills the last pixel of each aligned group of four whenever the
+ * group's first is inside: rows 15-21, x 120-135, as the PSP drew them.
+ * The same triangle 2700 pixels tall stays exact. */
+static void long_edge_frame(int scale_down) {
+    static const int V[3][2] = { { -23517, -22210 }, { -21117, 17104 }, { 30083, 25093 } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    cmd(0xD4, 120u | (0u << 10)); cmd(0xD5, 239u | (135u << 10));
+    cmd(0x50, 0);                                              /* SHADE: flat */
+    for (int i = 0; i < 3; i++) {
+        /* scaled about (180, 68): 2700/2956 of the height keeps it under the threshold */
+        const double k = scale_down ? 2700.0 / 2956.0 : 1.0;
+        const double x = 180 + (V[i][0] / 16.0 - 180) * k, y = 68 + (V[i][1] / 16.0 - 68) * k;
+        float_vertex(i, (float)x, (float)y, 0);
+    }
+    cmd(0x04, (3u << 16) | 3);
+    cmd(0xD4, 0); cmd(0xD5, 479u | (271u << 10));           /* the scissor outlives psp_ge_reset */
+    end_list();
+}
+
+static void test_long_edge_groups(void) {
+    static const uint16_t HW[7] = { 0x0009, 0x000B, 0x000F, 0x000F, 0x009F, 0x00BF, 0x00FF };
+    long_edge_frame(0);
+    int bad = 0;
+    for (int r = 0; r < 7; r++) {
+        unsigned m = 0;
+        for (int i = 0; i < 16; i++) m |= (pixel(120 + i, 15 + r) != 0) << i;
+        bad += m != HW[r];
+    }
+    CHECK(bad == 0, "long edge: %d of rows 15-21 off the PSP's (row 15 reads %d%d%d%d)", bad,
+          pixel(120, 15) != 0, pixel(121, 15) != 0, pixel(122, 15) != 0, pixel(123, 15) != 0);
+    /* Under the threshold every pixel is the exact edge's: no x = 3 mod 4
+     * pixel past the edge where its group's first is inside. */
+    long_edge_frame(1);
+    int extra = 0;
+    for (int y = 0; y < 136; y++) {
+        int last = -1;
+        for (int x = 120; x < 240; x++) if (pixel(x, y)) last = x;
+        if (last >= 120 && last < 239 && (last & 3) == 3 && last >= 123 &&
+            pixel(last - 1, y) == 0) extra++;
+    }
+    CHECK(extra == 0, "a 2700-pixel triangle drew %d group-end pixels past its edge", extra);
+
+    /* A vertical long edge is exact however tall: scene 98's window 4,
+     * 3786 pixels high, its long edge at x = 90.6875 -- column 90 drawn,
+     * 91 (x = 3 mod 4, its group's first inside) never, as on the PSP. */
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    cmd(0xD4, 0u | (136u << 10)); cmd(0xD5, 119u | (271u << 10));
+    cmd(0x50, 0);
+    float_vertex(0, 90.6875f, -1785.6875f, 0);
+    float_vertex(1, -1839.8125f, 224.5625f, 0);
+    float_vertex(2, 90.6875f, 2000.0f, 0);
+    cmd(0x04, (3u << 16) | 3);
+    cmd(0xD4, 0); cmd(0xD5, 479u | (271u << 10));
+    end_list();
+    int c90 = 0, c91 = 0;
+    for (int y = 136; y < 272; y++) { c90 += pixel(90, y) != 0; c91 += pixel(91, y) != 0; }
+    CHECK(c90 == 136 && c91 == 0, "vertical long edge: column 90 %d of 136, column 91 %d (PSP 136, 0)", c90, c91);
+}
+
 /* A spline point's colour is de Boor's algorithm on the control colours
  * with 8-bit parameters and 1/128 cuts (ge.c deboor_fix), not a blend by
  * exact weights. geprobe 9 (fw 6.60) scene 54: a uniform span (fill/fill,
@@ -2336,6 +2401,7 @@ int main(void) {
     test_rsqrt_ge();
     test_light_world();
     test_triangle_fans();
+    test_long_edge_groups();
     test_patch_points_ge();
     test_colour_plane_anchor();
     test_line_rules();
