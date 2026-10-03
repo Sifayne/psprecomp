@@ -17,6 +17,9 @@
 #define C14_TEX 14
 #define C14_SUMS 15
 #define C14_DEPTH 16
+#define C14_BONE 17
+#define C14_MORPH 18
+#define C14_ZVIEW 19
 
 /* scene 83 anchorclock: 1 draws, 144 vertices, vertex crc BF53F45D, 591 words, stream crc 0D908B33 */
 static const w32 C14_S0[591] = {

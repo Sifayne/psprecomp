@@ -1063,7 +1063,8 @@ def render(sc, rule='cur', arith=None):
 
 # =========================================================================== stream emission
 OPS = ['NOP', 'BEGIN', 'END', 'SCISSOR', 'SHADE', 'DRAW', 'MATS', 'VIEWPORT', 'OFFSET', 'ALPHA',
-       'STENCIL', 'FOG', 'LADDER', 'LIGHT', 'TEX', 'SUMS', 'DEPTH']
+       'STENCIL', 'FOG', 'LADDER', 'LIGHT', 'TEX', 'SUMS', 'DEPTH',
+       'BONE', 'MORPH', 'ZVIEW']                 # the last three since geprobe 16 (skin16.py)
 OP = {n: i for i, n in enumerate(OPS)}
 
 def vbytes(vtype, verts):

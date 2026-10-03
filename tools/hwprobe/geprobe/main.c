@@ -25,8 +25,10 @@
  * scenes 67 to 82 (version 13) Bezier and spline patch positions read
  * through depth, replayed from patch13.py's command streams, scenes 83 to
  * 98 (version 14) how colour runs across a triangle, replayed from
- * colour14.py's, and scenes 99 to 109 (version 15) how it runs along a
- * line, replayed the same way from lines15.py's.
+ * colour14.py's, scenes 99 to 109 (version 15) how it runs along a line,
+ * replayed the same way from lines15.py's, and scenes 110 to 114 (version
+ * 16) skinned and morphed positions read whole through depth, from
+ * skin16.py's.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -47,7 +49,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 15
+#define PROBE_VERSION 16
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -3223,6 +3225,7 @@ static void p13_run(const struct p13_step *st) {
  * scene_begin/scene_end, dump_depth_full, crc32). */
 #include "c14_data.inc"
 #include "c15_data.inc"      /* geprobe 15: line colours, scenes 99-109, from lines15.py */
+#include "c16_data.inc"      /* geprobe 16: skinning and morphing, scenes 110-114, from skin16.py */
 
 static w32 g_c14_tex[16 * 16] __attribute__((aligned(16)));   /* all 0xFF000000 */
 static w32 g_c14_vb[8192] __attribute__((aligned(16)));        /* LADDER's vertices */
@@ -3371,8 +3374,23 @@ static void c14_run(const struct c14_step *st) {
                 sceGuDepthMask(GU_FALSE);
             } else sceGuDisable(GU_DEPTH_TEST);
             break;
+        case C14_BONE: {                                  /* geprobe 16: bone a[0], 16 words */
+            ScePspFMatrix4 m;
+            memcpy(&m, a + 1, sizeof m);
+            sceGuBoneMatrix(a[0], &m);
+            break;
+        }
+        case C14_MORPH:                                   /* eight morph weights */
+            for (int k = 0; k < 8; k++) sceGuMorphWeight(k, c14_f(a[k]));
+            break;
+        case C14_ZVIEW:                                   /* viewport z scale and centre, raw */
+            sceGuSendCommandf(0x44, c14_f(a[0]));
+            sceGuSendCommandf(0x47, c14_f(a[1]));
+            break;
         case C14_END:
             sceGuScissor(0, 0, SCR_W, SCR_H);
+            sceGuMorphWeight(0, 1.0f);
+            for (int k = 1; k < 8; k++) sceGuMorphWeight(k, 0.0f);
             sceGuShadeModel(GU_SMOOTH);
             sceGuDisable(GU_ALPHA_TEST);
             sceGuDisable(GU_STENCIL_TEST);
@@ -4045,6 +4063,9 @@ int main(int argc, char **argv) {
 
     section("scenes, version 15");
     for (int k = 0; k < C15_NSTEPS; k++) c14_run(&C15_STEPS[k]);
+
+    section("scenes, version 16");
+    for (int k = 0; k < C16_NSTEPS; k++) c14_run(&C16_STEPS[k]);
 
     probe_screen(1);
     probe_done();

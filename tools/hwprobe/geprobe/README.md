@@ -213,6 +213,23 @@ perspective twins, and depth. They replay through colour14's c14_run from
 logged CRCs and `compare`/`selfcheck` read the answers. The whole probe now needs
 an interp budget of 8000000000 instructions under psprecomp.
 
+Version 16 adds scenes 110-114 after them, so steps 1-150 keep their version 15
+numbers. Scene 20's three-weight triangle with a rotated bone puts its 404040
+corner a sixteenth of a pixel from where psprecomp's float skinning does. These
+scenes read skinned and morphed positions whole, the way scenes 62-66 read the
+vertex path: each point is one GU_POINTS vertex with its own id colour, placed on
+its own pixel by a screen offset, and its depth is the top 16 bits of one
+skinned coordinate (projection z row 2^k times that axis, w 1, viewport z scale
++-65536, centre 0). 110 uses float weights with 1 to 8 bones (and scene 20's own
+bones and weights), 111 8- and 16-bit weights with their extremes, 112 weights
+off one, negative and tiny with bones of every size, 113 bones under world and
+view matrices, and 114 morphing, alone and with skinning. They replay through
+c14_run, which gains BONE, MORPH and ZVIEW ops, from `skin16.py`'s streams
+(`c16_data.inc`); `skin16.py sums <dir>` checks the logged CRCs and
+`skin16.py compare <dir>` scores each rule for the blend (one aligned GE sum,
+chained, matrices first, folded into the combined matrix, float32; morph before
+or after skinning; signed narrow weights).
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -234,7 +251,7 @@ PNGs for looking at; comparisons should use the raw files.
 `readout.py <geprobe dir> [scene]` regenerates scenes 62-66's inputs, checks
 them against the log's CRCs, and lists each point's inputs and depth;
 for scenes 67-82 it hands over to `patch13.py`, for 83-98 to `colour14.py`,
-and for 99-109 to `lines15.py`.
+for 99-109 to `lines15.py`, and for 110-114 to `skin16.py`.
 
 ## Compare with psprecomp
 

@@ -162,6 +162,10 @@ def read(base, sc, name):
 
 def main():
     base = sys.argv[1]
+    if len(sys.argv) > 2 and int(sys.argv[2]) >= 110:    # geprobe 16's skinning scenes
+        import skin16
+        if skin16.sums(base): skin16.compare(base)
+        return
     if len(sys.argv) > 2 and int(sys.argv[2]) >= 99:     # geprobe 15's line-colour scenes
         import lines15
         lines15.sums(base)
