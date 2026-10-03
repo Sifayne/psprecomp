@@ -77,7 +77,7 @@ def walk(a, b, opt):
     before the first)."""
     dx, dy = b['x'] - a['x'], b['y'] - a['y']
     ax_, ay_ = abs(dx), abs(dy)
-    if max(ax_, ay_) < 16: return None
+    if max(ax_, ay_) == 0: return None
     xmajor = ax_ > ay_ if opt['tie'] == 'y' else ax_ >= ay_
     Ma, ma = (a['x'], a['y']) if xmajor else (a['y'], a['x'])
     dM, dm = (dx, dy) if xmajor else (dy, dx)

@@ -1458,6 +1458,53 @@ static void test_long_edge_groups(void) {
     CHECK(c90 == 136 && c91 == 0, "vertical long edge: column 90 %d of 136, column 91 %d (PSP 136, 0)", c90, c91);
 }
 
+/* Where the long edge's far pixel takes the near one's decision: only with
+ * its centre inside the triangle's x extent, and of a level triangle's two
+ * full-height edges only the left one. geprobe 21 (fw 6.60) windows, each
+ * row a mask of the 20 pixels from the scissor's left:
+ *   128/19  leans 1 pixel, inside right: x 468 (= 0 mod 4, the triangle's
+ *           first column, centre past min x 468.31) is copied in
+ *   128/36  leans 4 pixels, inside left: x 395's centre is past max x 395.06,
+ *           so it stays out, where the copy drew it
+ *   129/0   level top, the left edge: copied
+ *   129/1   level top, the right edge: exact, where both edges taking it drew
+ *           14 pixels more */
+static void test_long_edge_extent(void) {
+    static const struct { int sc[4]; int v[3][2]; uint32_t hw[20]; } W[4] = {
+        { { 459, 0, 478, 19 }, { { 7493, -19850 }, { 7509, 24230 }, { 30428, -10725 } },
+          { 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00,
+            0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00 } },
+        { { 384, 25, 403, 44 }, { { 6321, -15154 }, { 6257, 31198 }, { -19189, -2221 } },
+          { 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF,
+            0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF } },
+        { { 0, 0, 19, 19 }, { { -5279, -26520 }, { 10417, -26520 }, { 4473, 21368 } },
+          { 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFD00,
+            0xFFD00, 0xFFD00, 0xFFD00, 0xFFD00, 0xFF900, 0xFF900, 0xFF900, 0xFF900, 0xFF900, 0xFF000 } },
+        { { 25, 0, 44, 19 }, { { -24010, -17509 }, { 3974, -17509 }, { -5154, 29739 } },
+          { 0x00FFF, 0x00FFF, 0x007FF, 0x007FF, 0x007FF, 0x007FF, 0x007FF, 0x007FF, 0x003FF, 0x003FF,
+            0x003FF, 0x003FF, 0x003FF, 0x001FF, 0x001FF, 0x001FF, 0x001FF, 0x001FF, 0x000FF, 0x000FF } },
+    };
+    static const char *name[4] = { "128/19", "128/36", "129/0", "129/1" };
+    for (int w = 0; w < 4; w++) {
+        psp_ge_reset(); clear_fb();
+        begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+        cmd(0xD4, (uint32_t)W[w].sc[0] | (uint32_t)W[w].sc[1] << 10);
+        cmd(0xD5, (uint32_t)W[w].sc[2] | (uint32_t)W[w].sc[3] << 10);
+        cmd(0x50, 0);
+        for (int i = 0; i < 3; i++) float_vertex(i, W[w].v[i][0] / 16.0f, W[w].v[i][1] / 16.0f, 0);
+        cmd(0x04, (3u << 16) | 3);
+        cmd(0xD4, 0); cmd(0xD5, 479u | (271u << 10));
+        end_list();
+        int bad = 0, first = -1;
+        for (int r = 0; r < 20; r++) {
+            uint32_t m = 0;
+            for (int i = 0; i < 20; i++) m |= (uint32_t)(pixel(W[w].sc[0] + i, W[w].sc[1] + r) != 0) << i;
+            if (m != W[w].hw[r]) { bad++; if (first < 0) first = r; }
+        }
+        CHECK(bad == 0, "long edge window %s: %d rows off the PSP's (first %d)", name[w], bad, first);
+    }
+}
+
 /* A patch division of 65 to 127 hangs the GE (ge.c draw_patch): geprobe 13
  * (fw 6.60) scenes 80 and 81 draw nothing of the patch and nothing after it
  * in the list, sceGeDrawSync's peek reads 2 until sceGeBreak(1), and lists
@@ -2104,6 +2151,27 @@ static void test_line_interpolation_and_clipping(void) {
     s = (line_samples){0};
     psp_render_walk_line(&a, &a, 0, 0, 10, 10, collect_line, &s);
     CHECK(!s.count, "zero length line is not a point");
+    /* Under a pixel long, the ends' diamonds still decide: three of scene
+     * 23's patch segments, geprobe 21 (fw 6.60) scenes 132-133. 11/16 down
+     * draws its first pixel, (375,211), in its end's flat colour; 8/16 down
+     * starts in the diamond of the pixel before, (374,213); 5/16 across
+     * and down crosses no centre and touches no diamond. */
+    {
+        static const int seg[3][4] = { { 6011, 3375, 6016, 3386 }, { 5993, 3420, 5995, 3428 },
+                                       { 6016, 3386, 6011, 3391 } };
+        static const int want[3][3] = { { 1, 375, 211 }, { 1, 374, 213 }, { 0, 0, 0 } };
+        for (int i = 0; i < 3; i++) {
+            psp_vertex p = a, q = a;
+            p.x = seg[i][0]; p.y = seg[i][1]; q.x = seg[i][2]; q.y = seg[i][3];
+            q.inv_w = 1; q.u = 0; q.z = 0;
+            s = (line_samples){0};
+            psp_render_walk_line(&p, &q, 0, 0, 479, 271, collect_line, &s);
+            CHECK(s.count == want[i][0] && (!s.count || (s.first.x >> 4 == want[i][1] && s.first.y >> 4 == want[i][2])),
+                  "sub-pixel line %d: %d pixels at (%d,%d), PSP %d at (%d,%d)", i, s.count,
+                  s.count ? s.first.x >> 4 : -1, s.count ? s.first.y >> 4 : -1, want[i][0], want[i][1], want[i][2]);
+        }
+        s = (line_samples){0};
+    }
     b.x = -64; b.y = -64;
     psp_render_walk_line(&a, &b, 0, 0, 10, 10, collect_line, &s);
     CHECK(!s.count, "negative coordinates floor and descending boundary excludes origin");
@@ -2439,6 +2507,7 @@ int main(void) {
     test_light_world();
     test_triangle_fans();
     test_long_edge_groups();
+    test_long_edge_extent();
     test_patch_hang();
     test_patch_points_ge();
     test_colour_plane_anchor();

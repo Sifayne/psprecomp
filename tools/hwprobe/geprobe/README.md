@@ -316,6 +316,14 @@ last and which way it ran) and as flat lines in one grey under additive blending
 `plines21.py compare` scores candidate orders (the whole grid's strips in either
 order and direction, or each span's own) per patch.
 
+Set 22 settled all three. The long edge's far pixel copies only when its centre
+lies within the triangle's x extent, which covers every lean and the vertical
+edge; of a level triangle's two full-height edges only the left one takes it
+(`edges21.py compare`: every window of 128 and 129 on psprecomp's rule). A patch's
+lines go out a span at a time, spans a row at a time, and a line under a pixel
+long is drawn by the ordinary diamond rules rather than dropped: scene 23's one
+pixel is such a line. psprecomp then matches all 181 dumps.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:

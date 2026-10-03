@@ -566,10 +566,20 @@ ge_rcp16, ge_screen_z, clip_to_fx16):
   length 32 to 3900 pixels and alignment mod 4: all 241 long edges past
   that height are drawn so, and none of the 419 others, short edges past
   it included; the threshold lies between 130,533 and 131,364. Scene 98's
-  window 1, 80 pixels off before, is such an edge. A vertical long edge
-  does not (scene 98's window 4); the probes' slanted ones all lean 185
-  pixels or more, so a lean between is unmeasured, as are two edges of full
-  height (a triangle level at its top or bottom), which both take it here.
+  window 1, 80 pixels off before, is such an edge. The far pixel takes
+  the near one's decision only when its centre lies within the triangle's
+  x extent (min x <= centre < max x): geprobe 21 scene 128 reads 220
+  windows on long edges leaning 0 to 184 pixels, and with leans under a
+  pixel, or of a few pixels near a corner's x, the copy happens exactly
+  where that holds (set 21's rule, the copy wherever the group is, was off
+  in 30 of them; exact coverage in 101). A vertical long edge (scene 98's
+  window 4) never copies for the same reason: its far pixels all lie
+  beyond the extent. A
+  triangle level at its top or bottom has two edges of full height, and
+  only its left one, the inside to its right, takes it (scene 129: 220
+  windows; both was off at 38, the right one at 74). The probes always
+  gave the left level corner first, so "the first corner given" is not
+  told apart; nor is a centre exactly on min x.
 - **1/area comes from a table** with a linear step (area_rcp), not a
   division. The area's significand is cut to 17 bits. Its leading nine
   bits, h, pick one of 256 entries holding 2^27/h and the slope 2^24/h²,
@@ -616,6 +626,13 @@ ge_rcp16, ge_screen_z, clip_to_fx16):
   lines on diamond edges and the PSP draws every one this way; taking
   "above" for steep lines too, as before, put a pixel wrong at each, and
   that was scene 49's steep starts going up.
+- **A line under a pixel long** goes by the same rules, the ends' diamonds
+  deciding what little it draws; only a line of no length is nothing.
+  Scene 23's folded patch has 12 such segments, 5 to 15 sixteenths long,
+  and the PSP draws a pixel for each of the 8 that cross a centre or start
+  in a diamond (geprobe 21 scene 133, under additive blending), in the
+  segment's own colour (scene 132): (375,211), scene 23's one pixel off,
+  is one of them. psprecomp dropped every line under 16 sixteenths before.
 - A GPU backend shares the vertex depths and interpolates them itself.
 
 ## Texture coordinates on sprites and lines
@@ -764,7 +781,17 @@ psprecomp places every one on the PSP's pixel with its depth.
   every pixel.
 - **Points** emit each piece's or span's own end samples, so a sample two
   of them share is drawn twice: scene 73's span boundaries read doubled
-  under additive blending. Triangles and lines share it.
+  under additive blending.
+- **Lines** go out a span at a time, the spans a row of them at a time,
+  each over its own du x dv samples as the zigzag of its strips (the
+  column's rung, then a diagonal to the next column's top). A rung two
+  spans share is drawn by both. geprobe 21 (fw 6.60) scenes 130-133 draw
+  nine patches, Bezier and spline, every edge mode, divisions 1 to 8, as
+  points (to read each sample's colour), as lines smooth and flat, and
+  flat in one grey under additive blending (to count each pixel's
+  segments): this order fits every pixel, where the whole grid's strips
+  in one go are 204 pixels off and the spans a column at a time 1.
+  Triangles take the same order, which no probe has told apart.
 - A point whose depth falls outside 0..65535 is not drawn when depth
   clamping is off (every geprobe 13 calibration point with clip z in
   (-w, 0), or over 65535, is absent).
@@ -814,19 +841,20 @@ Python).
 
 Scene 20, the skinned triangle that was 54 pixels off, now matches.
 
-## Still open after geprobe 19
+## Still open after geprobe 21
 
-These are what geprobe 19 (fw 6.60) still shows psprecomp getting wrong,
-with pixels off on run 19 (set 20). Run 19 drew every scene it shares with
-run 18 the same, byte for byte. Details on the geprobe 7 items, and what
-further probing could settle, are in `fw660-run7/findings/geprobe.md`.
-Vertex depth, patch positions, colour planes, line colours, skinning and
-lighting (its factors, its 1/sqrt and its world-space inputs) are settled
-(above).
+Nothing that geprobe 21 (fw 6.60, set 22) draws: psprecomp matches all
+181 of its frame and depth dumps bit for bit, scenes 1 to 133. The log
+differs in timing only (GE and callback microseconds, and how many stall
+callbacks have run by sceGeListUpdateStallAddr's return), and in the
+cache step: the PSP's sceKernelDcacheWritebackAll changes all 16 words
+written through the uncached alias (cache lines written back over them),
+and psprecomp has no data cache. Measured nowhere yet, so not settled:
 
-- **Patch line order** (scene 23: 1 pixel). Two segments of a patch's
-  line strips cross at (375,211), and the PSP's colour there is the other
-  segment's: the order the GE emits a patch's line segments in.
+- whether a level triangle's quirk follows its left edge or its first
+  corner, and whether a far pixel centred exactly on min x copies;
+- the order of a patch's triangles (lines' order is measured);
+- skinned normals, morphed colours and texture coordinates, lit lines.
 
 ## Validation
 

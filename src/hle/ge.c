@@ -3539,26 +3539,40 @@ static void draw_patch(int spline, uint32_t arg) {
      * sequence is a zigzag -- each column's rung and a diagonal to the next
      * -- with no line along the rows at all: geprobe 2 scene 22 (fw 6.60)
      * draws its line patch exactly so (627 differing pixels against 1407 for
-     * a plain grid of rows and columns). Points are the grid itself. */
+     * a plain grid of rows and columns). Points are the grid itself.
+     *
+     * Each span goes out on its own, over its own du x dv samples, the spans
+     * a row of them at a time, so a column or row two spans share is drawn
+     * by both: geprobe 21 (fw 6.60) scenes 131-133 draw nine patches as
+     * lines smooth, flat and adding, and this order fits every pixel of
+     * them, the whole grid's 204 off where segments cross or rungs are
+     * drawn twice, spans a column at a time's 1 off. Triangles take the
+     * same order, which no probe has told apart. */
     uint32_t n = 0, type;
     if (g_ge.patch_prim == 2) {
         type = PSP_PRIM_POINTS;
         for (int k = 0; k < nu * nv; k++) list[n++] = grid[k];
     } else {
         type = g_ge.patch_prim == 1 ? PSP_PRIM_LINES : PSP_PRIM_TRIANGLES;
-        for (int j = 0; j + 1 < nv; j++)
-            for (int i = 0; i + 1 < nu; i++) {
-                const ge_mvert *s0 = &grid[j * nu + i], *s1 = &grid[(j + 1) * nu + i];
-                const ge_mvert *s2 = &grid[j * nu + i + 1], *s3 = &grid[(j + 1) * nu + i + 1];
-                if (type == PSP_PRIM_LINES) {
-                    list[n++] = *s0; list[n++] = *s1;
-                    list[n++] = *s1; list[n++] = *s2;
-                    if (i + 2 == nu) { list[n++] = *s2; list[n++] = *s3; }
-                } else {
-                    list[n++] = *s0; list[n++] = *s1; list[n++] = *s2;
-                    list[n++] = *s1; list[n++] = *s2; list[n++] = *s3;
-                }
+        for (int ja = 0; ja + 1 < nv; ja += dv) {
+            const int jb = ja + dv < nv ? ja + dv : nv - 1;
+            for (int ia = 0; ia + 1 < nu; ia += du) {
+                const int ib = ia + du < nu ? ia + du : nu - 1;
+                for (int j = ja; j < jb; j++)
+                    for (int i = ia; i < ib; i++) {
+                        const ge_mvert *s0 = &grid[j * nu + i], *s1 = &grid[(j + 1) * nu + i];
+                        const ge_mvert *s2 = &grid[j * nu + i + 1], *s3 = &grid[(j + 1) * nu + i + 1];
+                        if (type == PSP_PRIM_LINES) {
+                            list[n++] = *s0; list[n++] = *s1;
+                            list[n++] = *s1; list[n++] = *s2;
+                            if (i + 1 == ib) { list[n++] = *s2; list[n++] = *s3; }
+                        } else {
+                            list[n++] = *s0; list[n++] = *s1; list[n++] = *s2;
+                            list[n++] = *s1; list[n++] = *s2; list[n++] = *s3;
+                        }
+                    }
             }
+        }
     }
     g_mv_src = list;
     draw_prim(type, n);

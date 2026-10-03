@@ -22,6 +22,11 @@ any lean and to both full-height edges. These scenes ask:
     edges21.py compare DUMPDIR [-v]  windows off exact coverage and off psprecomp's rule,
                                      per lean and per case
     edges21.py check                 design checks
+
+Set 22 (fw 6.60): the copy happens only where the far pixel's centre lies within the
+triangle's x extent, min x <= centre < max x, which settles every lean and the vertical
+edge alike; with two full-height edges only the left one (inside to its right) takes it.
+rule_mask is that rule, and every window of both scenes matches it.
 """
 import sys, os, math, struct, zlib, re
 import numpy as np
@@ -119,13 +124,15 @@ def scene(num):
 def all_scenes(): return [scene(n) for n, *_ in SCENES]
 
 # =========================================================================== the rules
-def rule_mask(sc, V, lean_min=1, both=True, bbox=True):
-    """psprecomp's sw_tri rule (lean_min = smallest |dx| in sixteenths that takes it;
-    both: two full-height edges both take it; bbox: no pixel outside the triangle's
-    bounding box, floor(min/16) .. floor((max + 15)/16), which sw_tri never visits --
-    a far pixel can lie there when the long edge leans less than a pixel)."""
+def rule_mask(sc, V, gate=True, pick='left'):
+    """psprecomp's sw_tri rule. gate: the far pixel takes the near one's decision only
+    when its centre lies within the triangle's x extent, min x <= centre < max x (set 22's
+    finding; without it, every full-height edge but a vertical one takes it, clipped to
+    the pixel box sw_tri visits, as set 21 left it). pick, when two edges are full height:
+    'left' the triangle's left one (inside to its right, dy < 0 here), 'right', 'both'."""
     a, b, c = V
-    bx0 = min(p[0] for p in V) >> 4; bx1 = (max(p[0] for p in V) + 15) >> 4
+    mnx = min(p[0] for p in V); mxx = max(p[0] for p in V)
+    bx0 = mnx >> 4; bx1 = (mxx + 15) >> 4
     if E(c, a, b) < 0: b, c = c, b
     ys = [a[1], b[1], c[1]]; H = max(ys) - min(ys)
     def tl(dx, dy): return dy < 0 or (dy == 0 and dx > 0)
@@ -134,20 +141,22 @@ def rule_mask(sc, V, lean_min=1, both=True, bbox=True):
     if 3 * H >= 2**17:
         for k, (s, t) in enumerate(edges):
             dx, dy = t[0] - s[0], t[1] - s[1]
-            if abs(dy) == H and abs(dx) >= lean_min: lifted.append(k)
-        if not both and len(lifted) > 1: lifted = lifted[:1]
+            if abs(dy) == H and (gate or dx != 0): lifted.append(k)
+        if len(lifted) > 1 and pick != 'both':
+            want = -H if pick == 'left' else H
+            lifted = [k for k in lifted if edges[k][1][1] - edges[k][0][1] == want]
     m = np.zeros((WIN, WIN), bool)
     for yy in range(WIN):
         for xx in range(WIN):
             x, y = sc[0] + xx, sc[1] + yy
-            ok = not bbox or bx0 <= x <= bx1
+            ok = gate or bx0 <= x <= bx1
             for k, (s, t) in enumerate(edges):
                 if not ok: break
                 dx, dy = t[0] - s[0], t[1] - s[1]
                 px = x
                 if k in lifted:
                     blk = x & ~3; near, far = (blk, blk + 3) if dy > 0 else (blk + 3, blk)
-                    if x == far: px = near
+                    if x == far and (not gate or mnx <= far * 16 + 8 < mxx): px = near
                 e = E((px * 16 + 8, y * 16 + 8), s, t)
                 if not (e > 0 or (e == 0 and tl(dx, dy))): ok = False; break
             m[yy, xx] = ok
@@ -205,18 +214,18 @@ def compare(dumpdir, verbose=False):
             hw = F[sc[1]:sc[3] + 1, sc[0]:sc[2] + 1] != 0
             H, ldx, nfull = lean_of(V)
             key = (round(ldx / 16, 4), nfull) if n == 128 else (nfull, 'top' if k % 48 < 24 else 'bottom', 'edge %d' % (k % 2))
-            st = by.setdefault(key, {'n': 0, 'exact': 0, 'rule': 0, 'nobbox': 0, 'lean0': 0, 'one': 0, 'extra': 0, 'H': []})
+            st = by.setdefault(key, {'n': 0, 'exact': 0, 'rule': 0, 'ungated': 0, 'both': 0, 'right': 0, 'extra': 0, 'H': []})
             st['n'] += 1; st['H'].append(H / 16)
             st['exact'] += (exact_mask(sc, V) == hw).all()
             st['rule'] += (rule_mask(sc, V) == hw).all()
-            st['nobbox'] += (rule_mask(sc, V, bbox=False) == hw).all()
-            st['lean0'] += (rule_mask(sc, V, lean_min=0) == hw).all()
-            st['one'] += (rule_mask(sc, V, both=False) == hw).all()
+            st['ungated'] += (rule_mask(sc, V, gate=False, pick='both') == hw).all()
+            st['both'] += (rule_mask(sc, V, pick='both') == hw).all()
+            st['right'] += (rule_mask(sc, V, pick='right') == hw).all()
             st['extra'] += int((hw & ~exact_mask(sc, V)).sum())
         print(f'{n} {name}:')
         for key, st in sorted(by.items()):
             print(f'   {key}: {st["n"]} windows, matching exact {st["exact"]}, psprecomp\'s rule {st["rule"]} '
-                  f'(unclipped {st["nobbox"]}, vertical too {st["lean0"]}, one full edge only {st["one"]}), '
+                  f'(set 21\'s ungated {st["ungated"]}, both full edges {st["both"]}, the right one {st["right"]}), '
                   f'extra pixels {st["extra"]}, heights {min(st["H"]):.0f}-{max(st["H"]):.0f}')
 
 def check():

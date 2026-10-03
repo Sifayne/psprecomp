@@ -1110,6 +1110,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     int maxx = a->x > b->x ? (a->x > c->x ? a->x : c->x) : (b->x > c->x ? b->x : c->x);
     int miny = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
     int maxy = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
+    const int64_t xlo = minx, xhi = maxx;
     minx >>= 4; miny >>= 4;
     maxx = (maxx + 15) >> 4; maxy = (maxy + 15) >> 4;
 
@@ -1154,12 +1155,18 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * (fw 6.60) scenes 125-127: 660 windows, each crossed by one edge, and
      * every one of the 241 long edges past that height drawn so, none of the
      * 419 others; the threshold lies between 130,533 and 131,364. Scene 98's
-     * window 1, the 80 pixels it was off, is such an edge. A vertical long
-     * edge does not (scene 98's window 4, 2981 pixels tall: 136 pixels off
-     * when it did); the probes' slanted ones all lean 185 pixels or more, so
-     * between the two is not measured. A triangle level at its top or bottom
-     * has two edges of full height; both take it here, which no probe has
-     * posed. Coverage only: the pixel's colour and depth are its own. */
+     * window 1, the 80 pixels it was off, is such an edge. The copy happens
+     * only where the far pixel's centre lies within the triangle's x extent,
+     * min x <= centre < max x: geprobe 21 scene 128, 220 windows on edges
+     * leaning 0 to 184 pixels, the small leans' far pixels falling either
+     * side of a corner's x -- which also leaves a vertical edge alone, its far
+     * pixels all beyond the extent (scene 98's window 4, 2981 pixels tall:
+     * 136 pixels off when it was not). A triangle level at its top or bottom
+     * has two edges of full height, and only its left one, the inside to its
+     * right, takes it (scene 129, 220 windows). The probes always gave the
+     * left level corner first, so "first given" would fit as well. Whether
+     * a centre exactly on min x copies is not measured. Coverage only: the
+     * pixel's colour and depth are its own. */
     int64_t far_lift[3] = { 0, 0, 0 };
     int far_at[3] = { -1, -1, -1 };
     {
@@ -1167,11 +1174,13 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
         const int64_t yhi = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
         const int64_t h = yhi - ylo;
         if (3 * h >= (1 << 17)) {
-            const int64_t dys[3] = { d0y, d1y, d2y }, dxs[3] = { d0x, d1x, d2x };
+            const int64_t dys[3] = { d0y, d1y, d2y };
+            int left = 0;
+            for (int k = 0; k < 3; k++) left |= dys[k] == -h;
             for (int k = 0; k < 3; k++)
-                if ((dys[k] == h || dys[k] == -h) && dxs[k] != 0) {
+                if (dys[k] == -h || (dys[k] == h && !left)) {
                     far_at[k] = dys[k] > 0 ? 3 : 0;
-                    far_lift[k] = 3 * (dys[k] > 0 ? dys[k] : -dys[k]) * SUBPX;
+                    far_lift[k] = 3 * h * SUBPX;
                 }
         }
     }
@@ -1360,9 +1369,12 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
         for (int x = minx; x <= maxx; x++) {
             int64_t t0 = w0, t1 = w1, t2 = w2;
             if (quirk) {
-                if ((x & 3) == far_at[0]) t0 += far_lift[0];
-                if ((x & 3) == far_at[1]) t1 += far_lift[1];
-                if ((x & 3) == far_at[2]) t2 += far_lift[2];
+                const int64_t xc = (int64_t)SUBPX * x + SUBPX_HALF;
+                if (xc >= xlo && xc < xhi) {
+                    if ((x & 3) == far_at[0]) t0 += far_lift[0];
+                    if ((x & 3) == far_at[1]) t1 += far_lift[1];
+                    if ((x & 3) == far_at[2]) t2 += far_lift[2];
+                }
             }
             if (t0 + bias0 >= 0 && t1 + bias1 >= 0 && t2 + bias2 >= 0) {
                 const float l0 = (float)w0 * inv;
@@ -1551,7 +1563,12 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
                           psp_line_pixel_fn emit, void *opaque) {
     const int64_t dx = (int64_t)b->x - a->x, dy = (int64_t)b->y - a->y;
     const int64_t ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
-    if ((ax > ay ? ax : ay) < PSP_SUBPX || x0 > x1 || y0 > y1) return;
+    /* A line under a pixel long goes by the same rules, the ends' diamonds
+     * deciding what little it draws: geprobe 21 (fw 6.60) scene 133 adds up
+     * the 12 such segments of scene 23's folded patch, 5 to 15 sixteenths,
+     * 8 of which draw a pixel, and leaving them out, as this did, was those
+     * 8 pixels short. Only a line of no length at all is nothing. */
+    if ((ax | ay) == 0 || x0 > x1 || y0 > y1) return;
     /* One pixel per major-axis column (or row) whose centre lies on the
      * segment, start included, end excluded; the minor coordinate, colour
      * and depth are taken where that centre projects onto the line. For

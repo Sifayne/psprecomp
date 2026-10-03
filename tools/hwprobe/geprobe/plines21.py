@@ -22,6 +22,12 @@ lines cross. The streams are colour14's format with new PATCH and BLEND ops.
     plines21.py sums DUMPDIR          the logged CRCs against these streams
     plines21.py compare DUMPDIR       per patch and candidate order: pixels off in 131-133
     plines21.py check                 design checks
+
+Set 22 (fw 6.60): 'span-uv', each span's own strips, spans a row at a time, with lines
+under a pixel long walked by the ordinary rules (lines15.walk; psprecomp dropped them),
+fits every pixel but one smooth one on patch 0, where samples (1,11) and (2,10) share a
+pixel in scene 130 and the readout cannot give (1,11)'s colour; psprecomp's own run
+matches that pixel too.
 """
 import sys, os, math, struct, zlib, re
 import numpy as np
