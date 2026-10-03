@@ -23,9 +23,10 @@
  * scenes 59 to 61 (version 11) a vertex's depth, a stage at a time,
  * scenes 62 to 66 (version 12) each of those stages read whole,
  * scenes 67 to 82 (version 13) Bezier and spline patch positions read
- * through depth, replayed from patch13.py's command streams, and scenes 83
- * to 98 (version 14) how colour runs across a triangle, replayed from
- * colour14.py's.
+ * through depth, replayed from patch13.py's command streams, scenes 83 to
+ * 98 (version 14) how colour runs across a triangle, replayed from
+ * colour14.py's, and scenes 99 to 109 (version 15) how it runs along a
+ * line, replayed the same way from lines15.py's.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -46,7 +47,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 14
+#define PROBE_VERSION 15
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -3221,6 +3222,7 @@ static void p13_run(const struct p13_step *st) {
  * reading a pixel. Place after p13_run (it uses p13_room/p13_flush, gumem,
  * scene_begin/scene_end, dump_depth_full, crc32). */
 #include "c14_data.inc"
+#include "c15_data.inc"      /* geprobe 15: line colours, scenes 99-109, from lines15.py */
 
 static w32 g_c14_tex[16 * 16] __attribute__((aligned(16)));   /* all 0xFF000000 */
 static w32 g_c14_vb[8192] __attribute__((aligned(16)));        /* LADDER's vertices */
@@ -4040,6 +4042,9 @@ int main(int argc, char **argv) {
 
     section("scenes, version 14");
     for (int k = 0; k < C14_NSTEPS; k++) c14_run(&C14_STEPS[k]);
+
+    section("scenes, version 15");
+    for (int k = 0; k < C15_NSTEPS; k++) c14_run(&C15_STEPS[k]);
 
     probe_screen(1);
     probe_done();

@@ -202,6 +202,17 @@ perspective twins. Like 67-82 they are replayed from command streams:
 `colour14.py emit` writes `c14_data.inc`; `colour14.py sums <dir>` checks each
 scene's logged CRCs; `compare`, `decode` and `selfcheck` read the answers.
 
+Version 15 adds scenes 99-109 after them, so steps 1-139 keep their version 14
+numbers. Across geprobe 14's dumps every line pixel psprecomp gets wrong has one
+of two causes: a flat-shaded line takes its second vertex's colour (scene 75),
+and a line with |dx| == |dy| is y-major (scene 22). These scenes confirm both
+and measure what no line had drawn: colour in 96 directions, the pixel before
+the first, strips' joint pixels, fog, the secondary colour, alpha, 3D and
+perspective twins, and depth. They replay through colour14's c14_run from
+`lines15.py`'s streams (`c15_data.inc`); `lines15.py sums <dir>` checks the
+logged CRCs and `compare`/`selfcheck` read the answers. The whole probe now needs
+an interp budget of 8000000000 instructions under psprecomp.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -222,11 +233,12 @@ framebuffer format, exactly as the GE wrote VRAM. `raw2png.py` turns them into
 PNGs for looking at; comparisons should use the raw files.
 `readout.py <geprobe dir> [scene]` regenerates scenes 62-66's inputs, checks
 them against the log's CRCs, and lists each point's inputs and depth;
-for scenes 67-82 it hands over to `patch13.py`, and for 83-98 to `colour14.py`.
+for scenes 67-82 it hands over to `patch13.py`, for 83-98 to `colour14.py`,
+and for 99-109 to `lines15.py`.
 
 ## Compare with psprecomp
 
-    allegrexrecomp interp geprobe.prx --dispatch --budget 4000000000 --drain 200 --base 0x08804000
+    allegrexrecomp interp geprobe.prx --dispatch --budget 8000000000 --drain 200 --base 0x08804000
 
 psprecomp's software renderer draws into the same guest VRAM, so its run
 leaves the same files under `./ms/PSP/GAME/geprobe/`.
