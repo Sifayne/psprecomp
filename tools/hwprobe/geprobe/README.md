@@ -298,6 +298,24 @@ alignment, in all six vertex orders, mirrored or not. The streams are
 checks the logged CRCs and `compare` lists, per scene, the windows and pixels off
 psprecomp's exact coverage and where they sit mod 4.
 
+Version 21 adds scenes 128-133 after them, so steps 1-168 keep their version 20
+numbers. Set 21 found that a tall triangle's long edge (3 x its height in
+sixteenths at least 2^17) goes in groups of four, the pixel farthest from the
+inside taking the nearest's decision; scene 98's vertical long edge does not, and
+the probe's slanted ones all leaned 185 pixels or more. 128 reads long edges that
+lean 0, 1/16, 1/8 ... 184 pixels either way, with the inside on either side, and
+a few triangles either side of the height threshold; 129 reads triangles level
+at the top or bottom (two edges of full height) on each of their edges, and
+near-level ones, 1/16 to 4 pixels off, to say which edge counts as long. Both are
+`edges21.py`'s (`c21_data.inc`). Scenes 130-133 draw the same nine patches four
+ways to read the order a patch's lines go out in: as points (each sample's
+colour), as smooth lines, as flat lines (a pixel two segments share names the
+last and which way it ran) and as flat lines in one grey under additive blending
+(how many segments drew each pixel). One is scene 23's own line patch. They are
+`plines21.py`'s (`c21p_data.inc`), with new PATCH and BLEND ops in c14_run;
+`plines21.py compare` scores candidate orders (the whole grid's strips in either
+order and direction, or each span's own) per patch.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -320,8 +338,9 @@ PNGs for looking at; comparisons should use the raw files.
 them against the log's CRCs, and lists each point's inputs and depth;
 for scenes 67-82 it hands over to `patch13.py`, for 83-98 to `colour14.py`,
 for 99-109 to `lines15.py`, for 110-114 to `skin16.py`, for 115-119 to
-`lights17.py`, for 120 to `rsq18.py`, for 121-124 to `lights19.py`, and for
-125-127 to `edges20.py`.
+`lights17.py`, for 120 to `rsq18.py`, for 121-124 to `lights19.py`, for
+125-127 to `edges20.py`, for 128-129 to `edges21.py`, and for 130-133 to
+`plines21.py`.
 
 ## Compare with psprecomp
 

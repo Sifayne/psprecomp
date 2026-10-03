@@ -32,9 +32,11 @@
  * whole through the spot cutoff, and the lighting factors as bytes, from
  * lights17.py's, scene 120 (version 18) the lighting's 1/sqrt at every
  * input the same way, from rsq18.py's, scenes 121 to 124 (version 19)
- * lighting under real world and view matrices, from lights19.py's, and
+ * lighting under real world and view matrices, from lights19.py's,
  * scenes 125 to 127 (version 20) where a long edge's pixels fall, from
- * edges20.py's.
+ * edges20.py's, and scenes 128 to 133 (version 21) tall long edges that
+ * lean little or share the height, from edges21.py's, and the order a
+ * patch's lines go out in, from plines21.py's.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -55,7 +57,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 20
+#define PROBE_VERSION 21
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -3233,6 +3235,8 @@ static void p13_run(const struct p13_step *st) {
 #include "c15_data.inc"      /* geprobe 15: line colours, scenes 99-109, from lines15.py */
 #include "c16_data.inc"      /* geprobe 16: skinning and morphing, scenes 110-114, from skin16.py */
 #include "c20_data.inc"      /* geprobe 20: long edges, scenes 125-127, from edges20.py */
+#include "c21_data.inc"      /* geprobe 21: tall long edges, scenes 128-129, from edges21.py */
+#include "c21p_data.inc"     /* geprobe 21: patch line order, scenes 130-133, from plines21.py */
 
 static w32 g_c14_tex[16 * 16] __attribute__((aligned(16)));   /* all 0xFF000000 */
 static w32 g_c14_vb[8192] __attribute__((aligned(16)));        /* LADDER's vertices */
@@ -3321,6 +3325,7 @@ static void c14_run(const struct c14_step *st) {
             for (int j = 0; j < st->n; j += 1 + (int)(s[j] & 0xFFFFFF)) {
                 const w32 op = s[j] >> 24;
                 if (op == C14_DRAW || op == C14_LADDER) vc = crc32_more(vc, s + j + 1 + (op == C14_DRAW ? 5 : 6), (int)s[j + 4]);
+                if (op == C14_PATCH) vc = crc32_more(vc, s + j + 11, (int)s[j + 10]);   /* geprobe 21 */
             }
             out("  %u draws, %u vertices, vertex crc %08X, stream crc %08X\n",
                 (unsigned)a[0], (unsigned)a[1], vc, sc);
@@ -3425,6 +3430,21 @@ static void c14_run(const struct c14_step *st) {
         }
         case C14_LMODE:                                   /* white lighting on, or off */
             if (a[0]) l17_lights_on(); else c14_light(0, 1.0f);
+            break;
+        case C14_PATCH: {                                 /* geprobe 21: a Bezier or spline patch */
+            /* kind, vtype, ucount, vcount, uedge, vedge, primitive, udiv, vdiv,
+             * bytes, then the control points */
+            p13_room();
+            const w32 *v = (const w32 *)gumem(a + 10, (int)a[9]);
+            sceGuPatchDivide(a[7], a[8]);
+            sceGuPatchPrim((int)a[6]);
+            if (a[0]) sceGuDrawSpline((int)a[1], (int)a[2], (int)a[3], (int)a[4], (int)a[5], NULL, v);
+            else      sceGuDrawBezier((int)a[1], (int)a[2], (int)a[3], NULL, v);
+            break;
+        }
+        case C14_BLEND:                                   /* on, op, src, dst, fixed a, fixed b */
+            if (a[0]) { sceGuEnable(GU_BLEND); sceGuBlendFunc((int)a[1], (int)a[2], (int)a[3], a[4], a[5]); }
+            else sceGuDisable(GU_BLEND);
             break;
         case C14_END:
             sceGuScissor(0, 0, SCR_W, SCR_H);
@@ -4437,6 +4457,10 @@ int main(int argc, char **argv) {
 
     section("scenes, version 20");
     for (int k = 0; k < C20_NSTEPS; k++) c14_run(&C20_STEPS[k]);
+
+    section("scenes, version 21");
+    for (int k = 0; k < C21_NSTEPS; k++) c14_run(&C21_STEPS[k]);
+    for (int k = 0; k < C21P_NSTEPS; k++) c14_run(&C21P_STEPS[k]);
 
     probe_screen(1);
     probe_done();

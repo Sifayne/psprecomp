@@ -162,6 +162,14 @@ def read(base, sc, name):
 
 def main():
     base = sys.argv[1]
+    if len(sys.argv) > 2 and int(sys.argv[2]) >= 130:    # geprobe 21's patch line order
+        import plines21
+        if plines21.sums(base): plines21.compare(base)
+        return
+    if len(sys.argv) > 2 and int(sys.argv[2]) >= 128:    # geprobe 21's tall long edges
+        import edges21
+        if edges21.sums(base): edges21.compare(base)
+        return
     if len(sys.argv) > 2 and int(sys.argv[2]) >= 125:    # geprobe 20's long edges
         import edges20
         if edges20.sums(base): edges20.compare(base, True)
