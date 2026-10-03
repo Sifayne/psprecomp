@@ -74,18 +74,82 @@ static int grain_ok(uint32_t g) { return g >= 64 && g <= SAS_MAX_GRAIN && (g % 3
 
 /* The guest's SasCore, which is not just a handle: hardware keeps the caller's
  * struct up to date and a game -- or a test -- may read fields straight out of
- * it rather than through a getter. setadsr.expected does exactly that, which
- * is why every value it prints used to be zero here.
+ * it rather than through a getter. Here it is a mirror, written from the
+ * state this file plays from; nothing is read back out of it but the voices
+ * a core copies.
  *
- * The layout is pspautotests' sascore.h: a 20-byte header, then 56-byte
- * voices. Only the ADSR block is mirrored, because that is the part the
- * corpus reads and the part a setter is expected to have written by the time
- * it returns. */
-#define SAS_G_HEADER          20u
-#define SAS_G_VOICE           56u
-#define SAS_G_ATTACK_RATE     24u   /* four int rates: attack, decay, sustain, release */
-#define SAS_G_SUSTAIN_LEVEL   40u
-#define SAS_G_ATTACK_TYPE     44u   /* four bytes, same order */
+ * Init writes all 0xE20 bytes, PSPSDK's size for it, and each setter and
+ * core writes the words below. Firmware 6.60's: sasprobe step 4 is Init's
+ * image, and sasprobe 4 steps 18-38 each setter's words and steps 356-359
+ * every word a core changes. Step numbers below are sasprobe 4's.
+ *
+ *   +000  00180990
+ *   +004  0BFF after Init, and 00FF by the layout section, whose setup is
+ *         an Init, a default for every setter and one core. Which of those
+ *         cleared 0x800, 0x200 and 0x100 is not measured; here the core
+ *         does. SetOutputmode sets 0x200, whichever mode it is: 02FF after
+ *         SetOutputmode(1) and still 02FF after SetOutputmode(0) (steps
+ *         35-36)
+ *   +008  0x10000 | output mode << 8 | grain / 32 (steps 35-38)
+ *   +00C  0
+ *   +010  the end flags, as of the last core (FFFFFFFB with voice 2 keyed
+ *         on, step 357)
+ *   +014  32 voices of 0x38 bytes, as the setters leave them
+ *   +714  the same 32 voices as of the last core, which copies them (357)
+ *   +E14  the end flags again, as of the last core (357, 359)
+ *   +E18  0, +E1C 0
+ *
+ * A voice:
+ *
+ *   +00  the sample's address; noise writes EAEAEAEA (step 29)
+ *   +04  VAG: the address plus the size. PCM: loop << 16 | size - 1
+ *        (100 samples looping at 50 read 00320063, step 20). Noise: 400 at
+ *        frequency 17 (step 29)
+ *   +08  pitch << 16 | flags: 0x1 a sample, 0x4 PCM, 0x2 noise, 0x10 paused,
+ *        0x100 a loop (steps 18-21, 29, 33-34)
+ *   +0C  volume, right << 16 | left, 16 bits each (step 22)
+ *   +10  the two sends, the same way
+ *   +14  00180010 + 0x4C * voice, an address in the engine's own memory
+ *   +18  attack, decay, sustain and release rates (steps 23-25)
+ *   +28  sustain level (27)
+ *   +2C  the four curves, a byte each in the same order (26)
+ *   +30  the key << 24 | 0x0707: FF off, FE keyed on, 00 playing, 03 keyed
+ *        off (steps 30-32, 357, 359)
+ *   +34  0
+ *
+ * +000, +004's 0BFF, +008's 0x10000 and the voices' +14 are as Init(256,
+ * 32, 0, 44100) wrote them, the one Init sasprobe dumps, and are written as
+ * measured whatever Init's arguments; whether they depend on the voice count
+ * or anything else is not measured. Nor are the steep and triangular waves'
+ * words, so a wave setter writes nothing, nor a release's key byte between
+ * the core that takes up its key-off and its end, which reads 03 here. */
+#define SAS_S_SIZE     0xE20u
+#define SAS_S_VOICES   0x014u   /* the voices, as the setters leave them */
+#define SAS_S_COPY     0x714u   /* the voices, as of the last core */
+#define SAS_S_TAIL     0xE14u
+#define SAS_S_VOICE    0x38u
+
+#define SV_SRC         0x00u
+#define SV_SRC_END     0x04u
+#define SV_FLAGS       0x08u
+#define SV_VOLUME      0x0Cu
+#define SV_SEND        0x10u
+#define SV_ENGINE      0x14u
+#define SV_RATES       0x18u    /* four: attack, decay, sustain, release */
+#define SV_SL          0x28u
+#define SV_CURVES      0x2Cu    /* four bytes, same order */
+#define SV_KEY         0x30u
+#define SV_LAST        0x34u
+
+/* +08's flags, below the pitch. */
+#define SF_SAMPLE      0x001u
+#define SF_NOISE       0x002u
+#define SF_PCM         0x004u
+#define SF_PAUSED      0x010u
+#define SF_LOOP        0x100u
+
+/* +004's bits that a core clears. */
+#define SH_CORE_CLEARS 0xB00u
 
 /* VAG ADPCM predictor coefficients. Each 16-byte block names a filter in the
  * top nibble of its header; the decoded sample is the shifted nibble plus a
@@ -254,6 +318,12 @@ typedef struct {
 
     /* A wave's phase, as 44100 times its 16-bit phase (see wave_fetch). */
     uint32_t wave_acc;
+
+    /* The struct's +08 flags that say what the last source setter named:
+     * SF_SAMPLE, SF_PCM, SF_NOISE and SF_LOOP. The pause bit and the pitch
+     * come from `paused` and `pitch`. Which of them a later setter of
+     * another kind clears is not measured; here it replaces them all. */
+    uint32_t sflags;
 } sas_voice;
 
 enum { VAG_NXT_UNREAD = 0, VAG_NXT_OK, VAG_NXT_END };
@@ -931,6 +1001,137 @@ static void render(int64_t *mix_l, int64_t *mix_r, int64_t *mix_el, int64_t *mix
     }
 }
 
+/* ---- the caller's struct (see SAS_S_SIZE) -------------------------------- */
+
+/* +004 as the setters and cores have left it. */
+static uint32_t g_s_header_flags;
+
+/* A null or unaligned core: Init refuses both with 80420005 and Core a null
+ * one (sasprobe step 11, sasprobe 4 steps 351 and 355, fw 6.60). The
+ * setters do not check it; here they write nothing to such a struct. */
+static int core_bad(void) {
+    const uint32_t core = psp_arg(0);
+    return !core || (core & 63u);
+}
+
+static uint32_t s_voice(uint32_t vi) { return psp_arg(0) + SAS_S_VOICES + vi * SAS_S_VOICE; }
+
+static uint32_t end_flags(void) {
+    uint32_t f = 0;
+    for (int i = 0; i < SAS_VOICES; i++) if (!g_voice[i].playing) f |= 1u << i;
+    return f;
+}
+
+static void s_header(void) {
+    if (core_bad()) return;
+    psp_write32(psp_arg(0) + 0x004u, g_s_header_flags);
+    psp_write32(psp_arg(0) + 0x008u, 0x10000u | g_output_mode << 8 | g_grain / 32u);
+}
+
+static void s_flags(uint32_t vi) {
+    if (core_bad() || vi >= SAS_VOICES) return;
+    const sas_voice *v = &g_voice[vi];
+    psp_write32(s_voice(vi) + SV_FLAGS, v->pitch << 16 | v->sflags | (v->paused ? SF_PAUSED : 0u));
+}
+
+/* A source setter's words: +00, +04, and what +08's flags say it named. */
+static void s_source(uint32_t vi, uint32_t src, uint32_t src_end, uint32_t sflags) {
+    g_voice[vi].sflags = sflags;
+    if (core_bad()) return;
+    psp_write32(s_voice(vi) + SV_SRC, src);
+    psp_write32(s_voice(vi) + SV_SRC_END, src_end);
+    s_flags(vi);
+}
+
+/* Each volume as 16 bits, so 0x80000000 is kept as 0: SetVolume(0x80000000,
+ * 0x1000, 0x80000000, 0x1000) leaves both words 10000000 (sasprobe 3 step
+ * 290, fw 6.60). */
+static void s_volumes(uint32_t vi) {
+    if (core_bad() || vi >= SAS_VOICES) return;
+    const sas_voice *v = &g_voice[vi];
+    psp_write32(s_voice(vi) + SV_VOLUME, (uint32_t)(uint16_t)v->vol_r << 16 | (uint16_t)v->vol_l);
+    psp_write32(s_voice(vi) + SV_SEND, (uint32_t)(uint16_t)v->vol_er << 16 | (uint16_t)v->vol_el);
+}
+
+static void s_adsr(uint32_t vi) {
+    if (core_bad() || vi >= SAS_VOICES) return;
+    const sas_voice *v = &g_voice[vi];
+    const uint32_t a = s_voice(vi);
+    psp_write32(a + SV_RATES,      (uint32_t)v->attack_rate);
+    psp_write32(a + SV_RATES + 4,  (uint32_t)v->decay_rate);
+    psp_write32(a + SV_RATES + 8,  (uint32_t)v->sustain_rate);
+    psp_write32(a + SV_RATES + 12, (uint32_t)v->release_rate);
+    psp_write32(a + SV_SL,         (uint32_t)v->sustain_level);
+    psp_write8 (a + SV_CURVES,     (uint8_t)v->mode_attack);
+    psp_write8 (a + SV_CURVES + 1, (uint8_t)v->mode_decay);
+    psp_write8 (a + SV_CURVES + 2, (uint8_t)v->mode_sustain);
+    psp_write8 (a + SV_CURVES + 3, (uint8_t)v->mode_release);
+}
+
+/* The key byte: FE from a KeyOn until the core that takes it up, then 00;
+ * 03 from a KeyOff; FF once the voice has ended (sasprobe 4 steps 30-32 and
+ * 356-359, fw 6.60). A KeyOn and a KeyOff with no core between read as the
+ * later of the two, which is not measured. */
+static uint32_t key_byte(const sas_voice *v) {
+    if (v->keyoff_pending) return 0x03;
+    if (v->keyon_pending)  return 0xFE;
+    if (!v->playing)       return 0xFF;
+    return v->on ? 0x00 : 0x03;
+}
+
+static void s_key(uint32_t vi) {
+    if (core_bad() || vi >= SAS_VOICES) return;
+    psp_write32(s_voice(vi) + SV_KEY, key_byte(&g_voice[vi]) << 24 | 0x0707u);
+}
+
+/* Each voice's key byte, the end flags at +010 and +E14, and a copy of the
+ * 32 voices at +714. */
+static void s_snapshot(void) {
+    const uint32_t core = psp_arg(0);
+    for (uint32_t vi = 0; vi < SAS_VOICES; vi++) s_key(vi);
+    psp_write32(core + 0x010u, end_flags());
+    for (uint32_t o = 0; o < SAS_VOICES * SAS_S_VOICE; o += 4)
+        psp_write32(core + SAS_S_COPY + o, psp_read32(core + SAS_S_VOICES + o));
+    psp_write32(core + SAS_S_TAIL, end_flags());
+}
+
+/* What a core leaves: the snapshot, taken after the core has taken up its
+ * key-ons and key-offs, and three of +004's bits cleared (see SAS_S_SIZE).
+ * The first core after the layout setters changes exactly the snapshot's
+ * 38 words that differ, a second core nothing, and a key-off with four
+ * cores after it the key byte in both copies and the two end-flag words
+ * (sasprobe 4 steps 357-359, fw 6.60). */
+static void s_core(void) {
+    if (core_bad()) return;
+    s_snapshot();
+    g_s_header_flags &= ~SH_CORE_CLEARS;
+    psp_write32(psp_arg(0) + 0x004u, g_s_header_flags);
+}
+
+/* Init's image (sasprobe step 4, fw 6.60): every voice as reset_voices left
+ * it, in both copies, and the header for this grain and output mode. A
+ * second Init on a 0xCC-filled struct writes the same 904 words (step 5). */
+static void s_init(void) {
+    const uint32_t core = psp_arg(0);
+    g_s_header_flags = 0xBFFu;
+    psp_write32(core + 0x000u, 0x00180990u);
+    s_header();
+    psp_write32(core + 0x00Cu, 0);
+    for (uint32_t vi = 0; vi < SAS_VOICES; vi++) {
+        const uint32_t a = s_voice(vi);
+        psp_write32(a + SV_SRC, 0);
+        psp_write32(a + SV_SRC_END, 0);
+        s_flags(vi);
+        s_volumes(vi);
+        psp_write32(a + SV_ENGINE, 0x00180010u + vi * 0x4Cu);
+        s_adsr(vi);
+        psp_write32(a + SV_LAST, 0);
+    }
+    s_snapshot();
+    psp_write32(core + SAS_S_TAIL + 4, 0);
+    psp_write32(core + SAS_S_TAIL + 8, 0);
+}
+
 /* ---- the calls ----------------------------------------------------------- */
 
 static sas_voice *voice_arg(void) {
@@ -962,7 +1163,7 @@ static void hle_Init(void) {
      * and playing reads height 0 and ended afterwards, its key is gone
      * (KeyOff is refused), the next core is silent, and a paused voice is
      * unpaused (sasprobe steps 15 and 222, fw 6.60). Every Init rewrites the
-     * whole struct with the defaults (steps 4-5). */
+     * whole struct with the defaults (steps 4-5; s_init). */
     reset_voices();
     /* The effect goes back to off with its lines silent. That every capture
      * after an Init and a RevType starts from silence is measured (steps
@@ -973,13 +1174,19 @@ static void hle_Init(void) {
     g_grain       = grain;
     g_output_mode = mode;
     g_sample_rate = rate;
+    s_init();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Writes +008 alone: SetGrain(512) and (256) change nothing else (sasprobe
+ * 4 steps 37-38, fw 6.60). +004 already had 0x200 up then, so whether a
+ * grain sets that bit as SetOutputmode does is not measured; here it does
+ * not. */
 static void hle_SetGrain(void) {
     const uint32_t grain = psp_arg(1);
     if (!grain_ok(grain)) { psp_ret(SAS_ERROR_GRAIN); return; }
     g_grain = grain;
+    s_header();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -987,11 +1194,14 @@ static void hle_GetGrain(void) { psp_ret(g_grain); }
 
 /* outputmode.expected: 0 and 1 accepted, everything else 80420003, and
  * GetOutputmode answers the mode set. What the mode changes about the mix
- * is not modelled here. */
+ * is not modelled here. In the struct it sets +004's 0x200, whichever mode
+ * it is, and the mode bit in +008 (sasprobe 4 steps 35-36, fw 6.60). */
 static void hle_SetOutputmode(void) {
     const uint32_t mode = psp_arg(1);
     if (mode > 1) { psp_ret(SAS_ERROR_OUTPUT_MODE); return; }
     g_output_mode = mode;
+    g_s_header_flags |= 0x200u;
+    s_header();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1021,6 +1231,9 @@ static void hle_SetVoice(void) {
     v->next.addr = psp_arg(2);
     v->next.size = size;
     v->next.loop = (int32_t)psp_arg(4);
+    /* In the struct, the address, where it ends and the flags: vag+0, vag+50
+     * and 0x001, or 0x101 looping (sasprobe 4 steps 18-19, fw 6.60). */
+    s_source(psp_arg(1), psp_arg(2), psp_arg(2) + size, SF_SAMPLE | (psp_arg(4) ? SF_LOOP : 0u));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1045,6 +1258,12 @@ static void hle_SetVoicePCM(void) {
     v->next.addr = psp_arg(2);
     v->next.size = (uint32_t)size;
     v->next.loop = loop;
+    /* In the struct, the address, loop << 16 | size - 1, and flags 0x105: 100
+     * samples looping at 50 read pcm0+0, 00320063 and 10000105 (sasprobe 4
+     * step 20, fw 6.60). Without a loop it is taken as the same halfwords
+     * and no 0x100, which is not measured. */
+    s_source(psp_arg(1), psp_arg(2), (uint32_t)(uint16_t)loop << 16 | (uint16_t)(size - 1),
+             SF_SAMPLE | SF_PCM | (loop >= 0 ? SF_LOOP : 0u));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1053,6 +1272,7 @@ static void hle_SetPitch(void) {
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     if (psp_arg(2) > 0x4000u) { psp_ret(SAS_ERROR_PITCH); return; }
     v->pitch = psp_arg(2);
+    s_flags(psp_arg(1));   /* 10000001 to 12340001 (sasprobe 4 step 21, fw 6.60) */
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1062,7 +1282,11 @@ static void hle_SetPitch(void) {
  * sample (sasprobe step 200). A voice already playing noise takes the new
  * frequency at once, without a key-on (sasprobe 3 step 279, fw 6.60); what
  * it does to a voice playing a sample is not measured, and that waits for
- * the key-on here. */
+ * the key-on here.
+ *
+ * In the struct, EAEAEAEA, 400 and flags 0x002 at frequency 17 (sasprobe 4
+ * step 29, fw 6.60). The 400 is taken as the clock's half-tick spacing less
+ * one, 2^(14-4) at 17; other frequencies are not measured. */
 static void hle_SetNoise(void) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
@@ -1070,13 +1294,15 @@ static void hle_SetNoise(void) {
     v->next.kind  = SRC_NOISE;
     v->next.param = psp_arg(2);
     if (v->src.kind == SRC_NOISE) v->src.param = psp_arg(2);
+    s_source(psp_arg(1), 0xEAEAEAEAu, (uint32_t)noise_half(psp_arg(2)) - 1u, SF_NOISE);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* __sceSasSetSteepWave / __sceSasSetTrianglarWave(sasCore, voice, duty): the
  * voice plays a wave (see wave_fetch). A duty outside 0..100 is refused,
  * -1 included (sasprobe step 229). Like SetNoise, what the next key-on
- * plays; on a playing voice that is not measured. */
+ * plays; on a playing voice that is not measured. What they write to the
+ * struct is not measured either, and here they write nothing. */
 static void set_wave(int kind) {
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
@@ -1097,10 +1323,10 @@ static void hle_SetVolume(void) {
      * whose negation is itself and still negative (sasprobe step 49).
      *
      * Each is kept as 16 bits, two to a word of the voice's struct (0x111,
-     * 0x222 read back as 02220111), so 0x80000000 is kept as 0 and plays
-     * silence: a constant 1000 or -1000 comes out 0 on that side and in that
-     * send, with the struct word reading 10000000 (sasprobe 3 steps 290-291,
-     * fw 6.60). */
+     * 0x222 read back as 02220111, sasprobe 4 step 22), so 0x80000000 is
+     * kept as 0 and plays silence: a constant 1000 or -1000 comes out 0 on
+     * that side and in that send, with the struct word reading 10000000
+     * (sasprobe 3 steps 290-291, fw 6.60; s_volumes). */
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SAS_ERROR_VOICE); return; }
     for (int i = 2; i <= 5; i++) {
@@ -1112,26 +1338,14 @@ static void hle_SetVolume(void) {
     v->vol_r  = (int16_t)psp_arg(3);
     v->vol_el = (int16_t)psp_arg(4);
     v->vol_er = (int16_t)psp_arg(5);
+    s_volumes(psp_arg(1));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Write the voice's ADSR block back into the caller's struct, so a read
- * straight after a setter sees what hardware would have left there. */
-static void mirror_adsr(const sas_voice *v) {
-    const uint32_t core = psp_arg(0);
-    const uint32_t vi   = psp_arg(1);
-    if (!core || vi >= SAS_VOICES) return;
-    const uint32_t a = core + SAS_G_HEADER + vi * SAS_G_VOICE;
-    psp_write32(a + SAS_G_ATTACK_RATE,      (uint32_t)v->attack_rate);
-    psp_write32(a + SAS_G_ATTACK_RATE + 4,  (uint32_t)v->decay_rate);
-    psp_write32(a + SAS_G_ATTACK_RATE + 8,  (uint32_t)v->sustain_rate);
-    psp_write32(a + SAS_G_ATTACK_RATE + 12, (uint32_t)v->release_rate);
-    psp_write32(a + SAS_G_SUSTAIN_LEVEL,    (uint32_t)v->sustain_level);
-    psp_write8 (a + SAS_G_ATTACK_TYPE,      (uint8_t)v->mode_attack);
-    psp_write8 (a + SAS_G_ATTACK_TYPE + 1,  (uint8_t)v->mode_decay);
-    psp_write8 (a + SAS_G_ATTACK_TYPE + 2,  (uint8_t)v->mode_sustain);
-    psp_write8 (a + SAS_G_ATTACK_TYPE + 3,  (uint8_t)v->mode_release);
-}
+/* The ADSR setters write the voice's ADSR block back into the caller's
+ * struct, so a read straight after a setter sees what hardware would have
+ * left there. */
+static void mirror_adsr(const sas_voice *v) { s_adsr((uint32_t)(v - g_voice)); }
 
 static void hle_SetADSR(void) {
     /* (sasCore, voice, flags, attack, decay, sustain, release) */
@@ -1272,6 +1486,7 @@ static void hle_SetKeyOn(void) {
     v->on = 1;
     v->keyon_pending = 1;
     v->keyoff_pending = 0;
+    s_key(psp_arg(1));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1292,9 +1507,13 @@ static void hle_SetKeyOff(void) {
     if (!v->on || v->paused) { psp_ret(SAS_ERROR_ALREADY_ON); return; }
     v->on = 0;
     v->keyoff_pending = 1;
+    s_key(psp_arg(1));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Each voice in the mask has 0x10 of its struct flags set or cleared: voice
+ * 2's 10000105 reads 10000115 paused and 10000105 again resumed (sasprobe 4
+ * steps 33-34, fw 6.60). */
 static void hle_SetPause(void) {
     /* (sasCore, voiceBitmask, pause) */
     uint32_t mask = psp_arg(1);
@@ -1303,6 +1522,7 @@ static void hle_SetPause(void) {
         if (mask & (1u << i)) {
             g_voice[i].paused = pause;
             if (!pause) g_voice[i].pause_faded = 0;
+            s_flags((uint32_t)i);
         }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1317,9 +1537,7 @@ static void hle_GetEndFlag(void) {
     /* A game polls this to know when a sound has finished, and often will not
      * start the next one until a voice reports ended. Reporting "never ended"
      * is a common way to make audio appear to work and then stop. */
-    uint32_t f = 0;
-    for (int i = 0; i < SAS_VOICES; i++) if (!g_voice[i].playing) f |= 1u << i;
-    psp_ret(f);
+    psp_ret(end_flags());
 }
 
 static void hle_GetEnvelopeHeight(void) {
@@ -1575,17 +1793,13 @@ static void mix_to_guest(uint32_t out_addr, int add, int32_t mix_l, int32_t mix_
 
 /* A null core is refused by __sceSasCore as by Init, with 80420005 (sasprobe
  * 3 step 355, fw 6.60). The unaligned case Init also refuses is assumed the
- * same here, and CoreWithMix is given the same check; neither is measured. */
-static int core_bad(void) {
-    const uint32_t core = psp_arg(0);
-    return !core || (core & 63u);
-}
-
+ * same here (core_bad), and CoreWithMix is given the same check; neither is
+ * measured. A core that renders writes the struct (s_core). */
 static void hle_Core(void) {
     /* (sasCore, sampleBuffer) */
     uint32_t out = psp_arg(1);
     if (core_bad()) { psp_ret(SAS_ERROR_CORE); return; }
-    if (out) mix_to_guest(out, 0, 0, 0);
+    if (out) { mix_to_guest(out, 0, 0, 0); s_core(); }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1602,7 +1816,7 @@ static void hle_CoreWithMix(void) {
     if (core_bad()) { psp_ret(SAS_ERROR_CORE); return; }
     if (g_output_mode != 0) { psp_ret(SAS_ERROR_MIX_MODE); return; }
     if (psp_arg(2) > 0x1000u || psp_arg(3) > 0x1000u) { psp_ret(SAS_ERROR_VOLUME); return; }
-    if (out) mix_to_guest(out, 1, (int32_t)psp_arg(2), (int32_t)psp_arg(3));
+    if (out) { mix_to_guest(out, 1, (int32_t)psp_arg(2), (int32_t)psp_arg(3)); s_core(); }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

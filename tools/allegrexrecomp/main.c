@@ -46,12 +46,16 @@ static int usage(void) {
         "  allegrexrecomp funcs   <file> [--list]\n"
         "  allegrexrecomp emit    <file> <outdir> [prefix] [--replace <addrs>|@<file>]\n"
         "  allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs] [--dispatch] [--drain <s>]\n"
-        "                         [--argv0 <guest path>]\n"
+        "                         [--argv0 <guest path>] [--base <addr>]\n"
         "  allegrexrecomp decrypt <file> [--keys <path>]\n"
         "  allegrexrecomp kirk1   <file> [out] [--keys <path>]\n"
         "\n"
         "Accepts .iso disc images, PBP containers, ~PSP / ~SCE wrappers,\n"
         "ELF/PRX modules, and raw binaries.\n"
+        "\n"
+        "--base loads a relocatable PRX at <addr> (as the PSP's loader would,\n"
+        "0x08804000) instead of where it was linked. For probe runs: the emitted\n"
+        "C uses the linked addresses, so a moved module is not comparable with it.\n"
         "\n"
         "--replace names functions (hex addresses, comma-separated, or @file with\n"
         "one per line and # comments) that the host will implement itself. Their\n"
@@ -967,7 +971,8 @@ static int looks_like_cmd1_meta(const uint8_t *m, size_t avail, uint32_t file_si
  * the console's RAM window. A PRX links at 0, and the recompiled C has those
  * addresses baked in as literals, so the oracle has to use the same address
  * space as the code it is meant to be compared against. psp_mem_map_module()
- * exists for exactly this.
+ * exists for exactly this. --base is the exception, for running a probe the
+ * way the PSP would: it moves the module into user memory (see cmd_interp).
  *
  * Relocations are deliberately not applied. Doing so would move every address
  * away from the ones the emitter used and make traces from the two sides
@@ -1059,7 +1064,7 @@ static void interp_default_argv0(const char *host, char *out, size_t cap) {
 
 static int cmd_interp(const char *path, uint32_t from, int have_from,
                       uint64_t budget, int trace, int trace_regs, int dispatch,
-                      int drain_s, const char *argv0) {
+                      int drain_s, const char *argv0, uint32_t base, int have_base) {
     psp_blob b;
     if (psp_blob_read(path, &b) != 0) { fprintf(stderr, "cannot read %s\n", path); return 1; }
 
@@ -1074,6 +1079,26 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     if (psp_mem_init() != 0) {
         fprintf(stderr, "cannot allocate guest memory\n");
         psp_blob_free(&b); return 1;
+    }
+
+    /* --base: load a PRX where the PSP's loader would rather than where it
+     * was linked, so the module's own buffers sit in user memory as they do
+     * on the console. A probe tells its buffers apart from constants by that
+     * range: sasprobe prints a word pointing into it as "vag+0", where a
+     * module at its link address 0 prints 0003AE40. Not for a differential
+     * run: the emitter writes the linked addresses into the C, and a moved
+     * module no longer lines up with it. --from names a linked address, as
+     * `dis` and `funcs` print them, and moves with the module. */
+    uint32_t shift = 0;
+    if (have_base) {
+        int err = 0;
+        shift = psp_rebase_image(&e, base, &err);
+        if (err == -1) {
+            fprintf(stderr, "--base: %s is not a relocatable PRX; it runs where it was linked\n", path);
+            goto fail;
+        }
+        if (err == -2) { fprintf(stderr, "--base: 0x%08X is not 256-byte aligned\n", base); goto fail; }
+        if (have_from) from += shift;
     }
 
     psp_load_info li;
@@ -1147,7 +1172,8 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     it.trace_regs = trace_regs;
 
     printf("module:   %s\n", path);
-    printf("mapped:   0x%08X + %u bytes (%d segments)\n", lo, hi - lo, e.nsegments);
+    printf("mapped:   0x%08X + %u bytes (%d segments)%s\n", lo, hi - lo, e.nsegments,
+           have_base ? " (--base)" : "");
     printf("relocs:   %d applied%s\n", li.nrelocs,
            li.nreloc_skipped ? " (some skipped -- see loader.c)" : "");
     printf("gp:       0x%08X%s\n", li.gp,
@@ -1429,9 +1455,12 @@ int main(int argc, char **argv) {
          * game, which is supposed to still be going. */
         int drain_s = 10;
         const char *argv0 = NULL;
+        uint32_t base = 0; int have_base = 0;
         for (int i = 3; i < argc; i++) {
             if (!strcmp(argv[i], "--argv0") && i + 1 < argc) {
                 argv0 = argv[++i];
+            } else if (!strcmp(argv[i], "--base") && i + 1 < argc) {
+                base = (uint32_t)strtoul(argv[++i], NULL, 0); have_base = 1;
             } else if (!strcmp(argv[i], "--from") && i + 1 < argc) {
                 from = (uint32_t)strtoul(argv[++i], NULL, 0); have_from = 1;
             } else if (!strcmp(argv[i], "--budget") && i + 1 < argc) {
@@ -1450,7 +1479,7 @@ int main(int argc, char **argv) {
             }
         }
         return cmd_interp(argv[2], from, have_from, budget, trace, regs,
-                          dispatch, drain_s, argv0);
+                          dispatch, drain_s, argv0, base, have_base);
     }
     if (!strcmp(cmd, "decrypt")) return cmd_decrypt(argv[2], keypath);
     if (!strcmp(cmd, "kirk1")) {

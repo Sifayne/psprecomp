@@ -51,6 +51,15 @@ runs can be compared.
 | reverb | RevParam with feedback 128, delay 127 and delay 128 on their own. The dry pulse. A 2-frame pulse through each of the 9 types (64 cores). Echo again with delay 8, and with feedback 0. The hall with a one-frame impulse on an odd frame and on an even one | the RevParam limits, each type's impulse response for fitting the wet signal, the delay and feedback parameters, and how the half-rate engine takes its input |
 | waves | steep and triangular waves at duty 0, 25, 75 and 100 (pitch 441), duty 50 at pitches 1000 and 150, and duty 25 at pitch 150 | the other duties' shapes, and whether the triangle's last-quarter offset depends on the pitch |
 
+### Version 4
+
+Version 4 adds one section at the end, "layout again", so steps 1-355 keep
+their version 3 numbers. The layout section's diff shows at most 24 changed
+words, and run 3's first core (step 31) changed 38. The new steps replay
+the layout setters from a fresh struct and log every word they changed,
+then every word changed by a first core, a second core, and a key-off with
+four cores after it, so psprecomp can mirror the whole struct.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -72,7 +81,7 @@ the step that did it.
 
 The same PRX runs under psprecomp:
 
-    allegrexrecomp interp sasprobe.prx --dispatch --budget 4000000000 --drain 200
+    allegrexrecomp interp sasprobe.prx --dispatch --budget 4000000000 --drain 200 --base 0x08804000
 
 ## Audio files
 

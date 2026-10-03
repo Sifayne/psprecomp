@@ -897,7 +897,7 @@ static uint16_t depth_at(int x, int y) {
     return psp_read16(0x04000000u + (((l & ~(0x1Fu << 5)) | (rot << 5)) ^ 0x2040u));
 }
 
-/* Depth across a triangle is a plane with a short 1/area (render.c
+/* Depth across a triangle is a plane with the GE's 1/area (render.c
  * area_rcp). geprobe 5 (fw 6.60) scene 27's four through-mode triangles,
  * drawn the same way, and pixels of each that the float blend this replaced
  * had one off, with what the hardware wrote there. */
@@ -974,6 +974,1024 @@ static void test_transformed_depth(void) {
         CHECK(depth_at(240, 140) == Z[k].depth, "eye z %.1f: depth %u, hardware %d",
               (double)Z[k].z, depth_at(240, 140), Z[k].depth);
     }
+}
+
+/* One point at eye (0, 0, z) through world W, identity view and
+ * projection P (column-major, as the GE takes them), viewport z scale zs
+ * and centre zc: the depth it writes at the screen centre. */
+static unsigned point_depth(const float W[12], const float P[16], float z, float zs, float zc) {
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    cmd(0x3A, 0);
+    for (int i = 0; i < 12; i++) cmd_float(0x3B, W[i]);
+    cmd(0x3C, 0);
+    for (int i = 0; i < 12; i++) cmd(0x3D, i % 4 == 0 ? 0x3F8000 : 0);
+    cmd(0x3E, 0);
+    for (int i = 0; i < 16; i++) cmd_float(0x3F, P[i]);
+    cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, zs);
+    cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, zc);
+    cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+    depth_state(1);                                        /* ALWAYS, writes on */
+    float_vertex(0, 0, 0, z);
+    cmd(0x04, (0u << 16) | 1);                             /* one point */
+    end_list();
+    return depth_at(240, 136);
+}
+
+static float bits_float(uint32_t b) { float f; memcpy(&f, &b, 4); return f; }
+
+/* A vertex's depth in the GE's own arithmetic (ge.c ge_sum, ge_rcp16,
+ * ge_wvp): points the PSP drew in geprobe 11 and 12 (fw 6.60). Viewport z
+ * centre 0 and scale 65536 make the depth clip z / w's top 16 bits.
+ *  - Scene 66, the probes' perspective: two eye z where m10 z carries into
+ *    the next exponent, so the sum lines it up by its operands' exponents.
+ *  - Scene 62, clip z a power of two over w = -z: the 1/w table, a step
+ *    above 65536 / w at 1.0859375 (60349.7) and in the binade 2^7.
+ *  - Scene 61, a = -0.3 and a world translation of -37.125: the GE folds
+ *    the translation into the projection's row, and these read 3 above and
+ *    4 below the 22937 an eye z formed first gives.
+ *  - Scene 65 batch 0: world translation 41.32 with w = 1. */
+static void test_vertex_depth_ge(void) {
+    static const float ID[12] = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
+    static const float PERSP[16] = { 0.981491089f, 0, 0, 0, 0, 1.73202515f, 0, 0,
+                                     0, 0, -1.02017212f, -1, 0, 0, -2.0201416f, 0 };
+    static const float RCP1[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, -1, 0, 0, 1, 0 };
+    static const float RCP128[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, -1, 0, 0, 128, 0 };
+    static const float RATIO[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -0.3f, -1, 0, 0, 0, 0 };
+    static const float W61[12] = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -37.125f };
+    static const float P65[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1.020538330078125f, 0, 0, 0, 0, 1 };
+    static const float W65[12] = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 41.322265625f };
+    static const struct { const float *w, *p; uint32_t z; float zs, zc; unsigned hw; } C[] = {
+        { ID,  PERSP,  0xC0FB4351u, 65536.0f, 0.0f,      49996 },
+        { ID,  PERSP,  0xC17F3FCBu, 65536.0f, 0.0f,      58559 },
+        { ID,  RCP1,   0xBF8B0000u, 65536.0f, 0.0f,      60350 },
+        { ID,  RCP1,   0xBF955505u, 65536.0f, 0.0f,      56175 },
+        { ID,  RCP128, 0xC319901Cu, 65536.0f, 0.0f,      54627 },
+        { W61, RATIO,  0x42107D9Eu, -32768.0f, 32767.0f, 22940 },
+        { W61, RATIO,  0x42107CD2u, -32768.0f, 32767.0f, 22933 },
+        { W65, P65,    0xC22348E8u, 65536.0f, 0.0f,      33600 },
+    };
+    for (unsigned k = 0; k < sizeof C / sizeof C[0]; k++) {
+        const unsigned d = point_depth(C[k].w, C[k].p, bits_float(C[k].z), C[k].zs, C[k].zc);
+        CHECK(d == C[k].hw, "case %u (z %08X): depth %u, hardware %u", k, C[k].z, d, C[k].hw);
+    }
+}
+
+/* A point at the screen's centre through a zero projection (w row 0 0 0 1),
+ * world and view identity, as geprobe 22's scenes 138-140 place theirs. */
+static void centre_point_state(uint32_t vtype) {
+    begin_list_vtype(vtype);
+    cmd(0x3A, 0);
+    for (int i = 0; i < 12; i++) cmd(0x3B, i % 4 == 0 ? 0x3F8000 : 0);
+    cmd(0x3C, 0);
+    for (int i = 0; i < 12; i++) cmd(0x3D, i % 4 == 0 ? 0x3F8000 : 0);
+    cmd(0x3E, 0);
+    for (int i = 0; i < 16; i++) cmd(0x3F, i == 15 ? 0x3F8000 : 0);
+    cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+    cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+    cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+}
+
+/* Normals, colours and texture coordinates through the skinning and morphing
+ * accumulator (ge.c skin_mvert, read_mvert): points geprobe 22 (fw 6.60)
+ * scenes 138-140 read, each one the float blend put off. Vertex, bone, morph
+ * and light words as the probe sent them. */
+static void test_morph_fields_ge(void) {
+    /* scene 138: the diffuse grey of a white directional light */
+    static const struct {
+        uint32_t vtype; int nv; uint32_t v[24];
+        int nb; uint32_t bone[2][12];
+        int nm; uint32_t mw[4];
+        uint32_t dir[3]; int hw;
+    } N[] = {
+        /* pair, point 302: two bones whose terms cancel; float gave 179 */
+        { 0x0047E0u, 8, { 0x3F000000u, 0x3F000000u, 0x3ED821C9u, 0x3F0517B0u, 0xBF3E1DB7u, 0, 0, 0 },
+          2, { { 0x4265E4, 0xC2839B, 0xBCA65B, 0x42C962, 0xC22688, 0x42DB23, 0x42965B, 0x429761, 0x41AB56, 0, 0, 0 },
+               { 0xC265F2, 0x42839C, 0x3CEEC6, 0xC2C965, 0x422681, 0xC2DB1F, 0xC29658, 0xC2975D, 0xC1AB40, 0, 0, 0 } },
+          0, { 0 }, { 0xBF72BF, 0x3E35AA, 0xBE86DB }, 163 },
+        /* morph, point 1801: four sets whose normals nearly cancel; float gave 134 */
+        { 0x0C01E0u, 24, { 0x3D3F84FDu, 0xBF3DBC2Bu, 0x3E0B825Fu, 0, 0, 0, 0x3E4BFAE7u, 0xBF232E5Eu, 0x3EEB1343u, 0, 0, 0,
+                           0xBF09F251u, 0x3F388B65u, 0xBF2EFF50u, 0, 0, 0, 0x3D9123EFu, 0x3E4E3EDFu, 0x3C7B59AFu, 0, 0, 0 },
+          0, { { 0 } }, 4, { 0x3E9999, 0x3E8000, 0x3E8000, 0x3F8000 }, { 0xBF3379, 0xBF364F, 0x3D1693 }, 142 },
+        /* mskin, point 2103: two morph sets, then one bone; float gave 170 */
+        { 0x0407E0u, 14, { 0x3F800000u, 0x3F51A1C7u, 0x3F03A13Fu, 0x3E829A8Du, 0, 0, 0,
+                           0x3F19999Au, 0x3F51B25Du, 0x3F038995u, 0x3E828EF4u, 0, 0, 0 },
+          1, { { 0xC043A4, 0x41359F, 0x3D957C, 0xC109A9, 0x4220D7, 0xBFBFA5, 0x41D92D, 0xC2EB06, 0x403053, 0, 0, 0 } },
+          2, { 0x3F0000, 0x3F0000 }, { 0xBF014B, 0xBF5CDD, 0xBCC312 }, 175 },
+        /* u8, point 902: an 8-bit weight of 1.5; float gave 162 */
+        { 0x0003E0u, 7, { 0x000000C0u, 0x3F038B66u, 0x3F4275C9u, 0x3ECC2AE4u, 0, 0, 0 },
+          1, { { 0xC08B01, 0x4235D0, 0xC2BB9C, 0x3FEA53, 0xC17AD0, 0x4204DE, 0x400756, 0xC1E5EA, 0x426666, 0, 0, 0 } },
+          0, { 0 }, { 0xBE4D66, 0xBF3617, 0x3F2C75 }, 128 },
+    };
+    for (unsigned c = 0; c < sizeof N / sizeof N[0]; c++) {
+        psp_ge_reset(); clear_fb();
+        centre_point_state(N[c].vtype);
+        for (int b = 0; b < N[c].nb; b++) {
+            cmd(0x2A, (uint32_t)(12 * b));
+            for (int i = 0; i < 12; i++) cmd(0x2B, N[c].bone[b][i]);
+        }
+        for (int m = 0; m < N[c].nm; m++) cmd((uint8_t)(0x2C + m), N[c].mw[m]);
+        cmd(0x17, 1); cmd(0x18, 1); cmd(0x5E, 0);
+        cmd(0x53, 0); cmd(0x54, 0); cmd(0x55, 0); cmd(0x56, 0xFFFFFF); cmd(0x57, 0xFFFFFF); cmd(0x5C, 0);
+        cmd(0x5F, 0);                                          /* directional, diffuse */
+        for (int i = 0; i < 3; i++) { cmd((uint8_t)(0x63 + i), N[c].dir[i]); cmd((uint8_t)(0x7B + i), i ? 0 : 0x3F8000); }
+        cmd(0x8F, 0); cmd(0x90, 0xFFFFFF); cmd(0x91, 0);
+        for (int i = 0; i < N[c].nv; i++) psp_write32(VERTS + 4u * (uint32_t)i, N[c].v[i]);
+        cmd(0x04, 1);
+        end_list();
+        const int g = (int)((pixel(240, 136) >> 8) & 0xFF);
+        CHECK(g == N[c].hw, "normal case %u: grey %d, the PSP's %d", c, g, N[c].hw);
+    }
+
+    /* scene 139: the colour itself */
+    static const struct { uint32_t vtype; int nv; uint32_t v[12]; int nm; uint32_t mw[3]; uint32_t hw; } K[] = {
+        /* neg, point 1600: the red sum is -191.6, which reads 191 (float gave 0) */
+        { 0x08019Cu, 12, { 0xF6693CADu, 0, 0, 0, 0xB412A83Fu, 0, 0, 0, 0xA1365296u, 0, 0, 0 },
+          3, { 0x3FFF9D, 0xBF6666, 0xBD0312 }, 0xBF22FF },
+        /* m5650, point 3473: 5650 colours morphed after widening (this read the material colour) */
+        { 0x040190u, 8, { 0x00006E7Bu, 0, 0, 0, 0x0000E3B3u, 0, 0, 0 }, 2, { 0x3F75E8, 0x3DDF96 }, 0x7FD3E6 },
+        /* plain5551, point 200 */
+        { 0x000194u, 4, { 0x0000BC4Cu, 0, 0, 0 }, 0, { 0 }, 0x7B1063 },
+        /* edge, point 2414: weights a hair from 1/4 and 3/4; float gave E4E2B3 */
+        { 0x04019Cu, 8, { 0xB3C9B3B1u, 0, 0, 0, 0x9FEDF2B4u, 0, 0, 0 }, 2, { 0x3E7FFC, 0x3F4001 }, 0xE3E2B3 },
+    };
+    for (unsigned c = 0; c < sizeof K / sizeof K[0]; c++) {
+        psp_ge_reset(); clear_fb();
+        centre_point_state(K[c].vtype);
+        for (int m = 0; m < K[c].nm; m++) cmd((uint8_t)(0x2C + m), K[c].mw[m]);
+        for (int i = 0; i < K[c].nv; i++) psp_write32(VERTS + 4u * (uint32_t)i, K[c].v[i]);
+        cmd(0x04, 1);
+        end_list();
+        const uint32_t got = pixel(240, 136) & 0xFFFFFF;
+        CHECK(got == K[c].hw, "colour case %u: %06X, the PSP's %06X", c, got, K[c].hw);
+    }
+
+    /* scene 140: the texel of a 256 x 256 texture that names its own texels */
+    static const struct {
+        uint32_t vtype; int nv; uint32_t v[24]; int nm; uint32_t mw[4];
+        uint32_t scale, ou, ov; uint32_t hw;
+    } T[] = {
+        /* cancel, point 1350 at scale 2^8: four float sets; float gave 4D84 */
+        { 0x0C019Fu, 24, { 0x3F3A6560u, 0x3FB9AF1Bu, 0xFFFFFFFFu, 0, 0, 0, 0x3F3B428Fu, 0x3FBC3439u, 0xFFFFFFFFu, 0, 0, 0,
+                           0x3F3B4CCDu, 0x3FBAC1CBu, 0xFFFFFFFFu, 0, 0, 0, 0x3F3965E3u, 0x3FBA5D2Fu, 0xFFFFFFFFu, 0, 0, 0 },
+          4, { 0x3F547A, 0x3F676C, 0x3F23D7, 0xC017A8 }, 0x438000, 0xC08000, 0xC08000, 0x4C88 },
+        /* offset, point 2253: the offset is not weighted (morph weights sum to 0.86) */
+        { 0x04019Fu, 12, { 0x3E8A71DEu, 0x3F48EF35u, 0xFFFFFFFFu, 0, 0, 0, 0x3D676C8Bu, 0x3F48CE70u, 0xFFFFFFFFu, 0, 0, 0 },
+          2, { 0x3F4002, 0x3DE755 }, 0x3F8000, 0xBF9A00, 0xBF9A00, 0x7901 },
+        /* offset, point 2277: u at -61.004 texels reads texel -61 (C3), not -62 */
+        { 0x0C019Fu, 24, { 0x3F39B3D0u, 0x3F46BB99u, 0xFFFFFFFFu, 0, 0, 0, 0x3F4A5E35u, 0x3ED7B4A2u, 0xFFFFFFFFu, 0, 0, 0,
+                           0x3D87C84Bu, 0x3E8816F0u, 0xFFFFFFFFu, 0, 0, 0, 0x3E566CF4u, 0x3EB5C28Fu, 0xFFFFFFFFu, 0, 0, 0 },
+          4, { 0x3D8359, 0x3F42AF, 0x3DE740, 0x3E5782 }, 0x3F8000, 0xBF7000, 0xBF7000, 0x89C3 },
+        /* plainfloat, point 15 at scale 2^12: the scale and offset in GE arithmetic; float gave 1F8F */
+        { 0x00019Fu, 6, { 0x3D088F80u, 0x3E6F07E0u, 0xFFFFFFFFu, 0, 0, 0 }, 0, { 0 }, 0x458000, 0xC30800, 0xC46F00, 0x1C8F },
+        /* u16, point 850 at scale 2^12: four 16-bit sets */
+        { 0x0C019Eu, 20, { 0x25809547u, 0xFFFFFFFFu, 0, 0, 0, 0x29E12456u, 0xFFFFFFFFu, 0, 0, 0,
+                           0xE7C530BDu, 0xFFFFFFFFu, 0, 0, 0, 0x0EFBC357u, 0xFFFFFFFFu, 0, 0, 0 },
+          4, { 0x3E1B9F, 0x3E5AA8, 0x3EC350, 0x3E818B }, 0x458000, 0xC544E0, 0xC555B0, 0xF0B0 },
+    };
+    upload_ramp_texture(256, 256);
+    for (unsigned c = 0; c < sizeof T / sizeof T[0]; c++) {
+        psp_ge_reset(); clear_fb();
+        centre_point_state(T[c].vtype);
+        texture_state(TEX, 256, 8, 8, 3 /* 8888 */, 0, 0 /* nearest */);
+        cmd(0xC7, 0);                                          /* TEXWRAP: repeat both */
+        cmd(0xC9, 3);                                          /* TEXFUNC: replace, RGB */
+        cmd(0x48, T[c].scale); cmd(0x49, T[c].scale); cmd(0x4A, T[c].ou); cmd(0x4B, T[c].ov);
+        for (int m = 0; m < T[c].nm; m++) cmd((uint8_t)(0x2C + m), T[c].mw[m]);
+        for (int i = 0; i < T[c].nv; i++) psp_write32(VERTS + 4u * (uint32_t)i, T[c].v[i]);
+        cmd(0x04, 1);
+        end_list();
+        const uint32_t got = pixel(240, 136) & 0xFFFF;
+        CHECK(got == T[c].hw, "coordinate case %u: texel %04X, the PSP's %04X", c, got, T[c].hw);
+    }
+
+    /* geprobe 23 scene 144: bilinear at negative coordinates, cut toward zero
+     * to a sixteenth before the half texel comes off (render.c
+     * linear_sixteenths). A 64 x 64 texture, red 255 on odd columns, green
+     * on odd rows: the point's red and green are its odd texels' weights.
+     * Point 1601, u -119.984375 and v -2.34375 texels: the PSP's 6F CF, where
+     * flooring after the half texel gave 7F DF. */
+    for (int t = 0; t < 64; t++)
+        for (int u = 0; u < 64; u++)
+            psp_write32(TEX + (uint32_t)(t * 64 + u) * 4, 0xFF800000u | (t & 1 ? 0xFF00u : 0) | (u & 1 ? 0xFFu : 0));
+    psp_ge_reset(); clear_fb();
+    centre_point_state(0x00019Fu);                         /* float uv, 8888, float position */
+    texture_state(TEX, 64, 6, 6, 3 /* 8888 */, 0, 1 /* linear */);
+    cmd(0xC7, 0); cmd(0xC9, 3);
+    cmd(0x48, 0x3F8000); cmd(0x49, 0x3F8000); cmd(0x4A, 0); cmd(0x4B, 0);
+    psp_write32(VERTS, 0xBFEFF800u); psp_write32(VERTS + 4, 0xBD160000u); psp_write32(VERTS + 8, 0xFFFFFFFFu);
+    for (int i = 3; i < 6; i++) psp_write32(VERTS + 4u * (uint32_t)i, 0);
+    cmd(0x04, 1);
+    end_list();
+    CHECK((pixel(240, 136) & 0xFFFF) == 0xCF6F, "bilinear at negative coordinates: %04X, the PSP's CF6F",
+          pixel(240, 136) & 0xFFFF);
+}
+
+/* Past the x and y planes (ge.c emit_point_line): geprobe 22 (fw 6.60)
+ * scene 141. A line beyond x = w at both ends draws nothing, with depth
+ * clamping off or on; with clamping on a point beyond x = w, or past z = w,
+ * draws nothing either; a line with one end in still draws. Clip w 1 and a
+ * viewport of 10 pixels a unit about (240, 136). */
+static void test_clip_xy_lines(void) {
+    for (int clamp = 0; clamp < 2; clamp++) {
+        static const float L[3][6] = { { 1.2f, -0.5f, 0, 1.8f, 0.6f, 0 },      /* both out, one side */
+                                       { 1.02f, -0.6f, 0, 1.02f, 0.7f, 0 },    /* just out, along x */
+                                       { -0.31f, 0.27f, 0, 1.5f, 0.2f, 0 } };  /* one end in */
+        for (int k = 0; k < 4; k++) {
+            psp_ge_reset(); clear_fb();
+            begin_list_vtype((7u << 2) | (3u << 7));
+            cmd(0x3A, 0); for (int i = 0; i < 12; i++) cmd(0x3B, i % 4 == 0 ? 0x3F8000 : 0);
+            cmd(0x3C, 0); for (int i = 0; i < 12; i++) cmd(0x3D, i % 4 == 0 ? 0x3F8000 : 0);
+            cmd(0x3E, 0); for (int i = 0; i < 16; i++) cmd(0x3F, i % 5 == 0 ? 0x3F8000 : 0);
+            cmd_float(0x42, 10.0f); cmd_float(0x43, -10.0f); cmd_float(0x44, -32768.0f);
+            cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+            cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+            cmd(0x1C, (uint32_t)clamp);                        /* depth clamping */
+            if (k < 3) {
+                for (int e = 0; e < 2; e++) float_vertex(e, L[k][3 * e], L[k][3 * e + 1], L[k][3 * e + 2]);
+                cmd(0x04, (1u << 16) | 2);
+            } else {
+                float_vertex(0, 1.02f, 0.1f, 0.0f);            /* past x */
+                float_vertex(1, -0.2f, 0.3f, 1.01f);           /* past z */
+                float_vertex(2, 0.4f, -0.3f, 0.0f);            /* inside */
+                cmd(0x04, 3);
+            }
+            end_list();
+            int drawn = 0;
+            for (int y = 100; y < 172; y++)
+                for (int x = 200; x < 280; x++) drawn += pixel(x, y) != 0;
+            if (k == 2) CHECK(drawn > 10, "clamp %d: a line with one end inside drew %d pixels", clamp, drawn);
+            else CHECK(drawn == (k < 2 ? 0 : 1), "clamp %d case %d: %d pixels drawn, the PSP %d", clamp, k, drawn, k < 2 ? 0 : 1);
+        }
+    }
+
+    /* geprobe 23 scene 142: a triangle with every corner beyond x = w draws
+     * nothing, clamping off or on, nor with clamping on a line or triangle
+     * wholly past z = w; with clamping off a line on z = w draws nothing (its
+     * depth falls just under 0), one on z = -w draws. */
+    static const struct { int prim, clamp, n; float v[3][3]; int drawn; } Z[] = {
+        { 3, 0, 3, { { 1.2f, -0.5f, 0 }, { 1.6f, 0.4f, 0 }, { 1.3f, 0.8f, 0 } }, 0 },
+        { 3, 1, 3, { { 1.2f, -0.5f, 0 }, { 1.6f, 0.4f, 0 }, { 1.3f, 0.8f, 0 } }, 0 },
+        { 3, 0, 3, { { 1.0f, -0.5f, 0 }, { 1.0f, 0.5f, 0 }, { 1.4f, 0.0f, 0 } }, -1 },   /* two on the plane */
+        { 1, 1, 2, { { -0.5f, -0.2f, 1.2f }, { 0.6f, 0.3f, 1.5f } }, 0 },
+        { 3, 1, 3, { { -0.6f, -0.5f, 1.2f }, { 0.5f, -0.6f, 1.3f }, { 0.1f, 0.7f, 1.5f } }, 0 },
+        { 1, 0, 2, { { -0.5f, -0.2f, 1.0f }, { 0.6f, 0.3f, 1.0f } }, 0 },
+        { 1, 0, 2, { { -0.5f, -0.2f, -1.0f }, { 0.6f, 0.3f, -1.0f } }, 11 },
+    };
+    for (unsigned c = 0; c < sizeof Z / sizeof Z[0]; c++) {
+        psp_ge_reset(); clear_fb();
+        begin_list_vtype((7u << 2) | (3u << 7));
+        cmd(0x3A, 0); for (int i = 0; i < 12; i++) cmd(0x3B, i % 4 == 0 ? 0x3F8000 : 0);
+        cmd(0x3C, 0); for (int i = 0; i < 12; i++) cmd(0x3D, i % 4 == 0 ? 0x3F8000 : 0);
+        cmd(0x3E, 0); for (int i = 0; i < 16; i++) cmd(0x3F, i % 5 == 0 ? 0x3F8000 : 0);
+        cmd_float(0x42, 10.0f); cmd_float(0x43, -10.0f); cmd_float(0x44, -32768.0f);   /* sceGuDepthRange(65535, 0) */
+        cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+        cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+        cmd(0x1C, (uint32_t)Z[c].clamp);
+        for (int e = 0; e < Z[c].n; e++) float_vertex(e, Z[c].v[e][0], Z[c].v[e][1], Z[c].v[e][2]);
+        cmd(0x04, ((uint32_t)Z[c].prim << 16) | (uint32_t)Z[c].n);
+        end_list();
+        int drawn = 0;
+        for (int y = 100; y < 172; y++)
+            for (int x = 200; x < 280; x++) drawn += pixel(x, y) != 0;
+        if (Z[c].drawn < 0) CHECK(drawn > 10, "plane case %u: %d pixels, the PSP drew it", c, drawn);
+        else CHECK(drawn == Z[c].drawn, "plane case %u: %d pixels, the PSP %d", c, drawn, Z[c].drawn);
+    }
+}
+
+/* Skinning and morphing in the GE's own arithmetic (ge.c ge_acc,
+ * ge_skin_axis): points the PSP drew (or did not) in geprobe 16 (fw 6.60),
+ * scenes 110-114. The projection's z row is 2^k times one model axis, w is
+ * 1 and the viewport z scale +-65536, so a point's depth is that skinned
+ * coordinate's top 16 bits; the screen offset puts the point at about
+ * (240, 136). Vertex words, bone and morph command words exactly as the
+ * probe sent them. The last case's skinned y is 2.1 w: the PSP drops a
+ * point outside the clip volume's x and y planes. */
+static void test_skin_ge(void) {
+    static const struct {
+        uint32_t vtype; int nv; uint32_t v[16];
+        int nb; uint32_t bone[3][12];
+        int nm; uint32_t mw[4];
+        int axis, k; float zs; int ox, oy, hw;
+    } C[] = {
+        /* 110 b1: two bones, float weights (point 160); float skinning gave 41861 */
+        { 0x00479Cu, 6,
+              { 0x3ED65300u, 0x3F14D600u, 0xFF0000FFu, 0xBEF16644u, 0x3EC09DF0u, 0x3F25523Cu },
+          2, { { 0x3F8000, 0x000000, 0x3CD7C3, 0x000000, 0x3F8000, 0x3C81A8, 0x000000, 0x000000, 0x3F18CF, 0x000000, 0x000000, 0x3E80CF },
+                { 0x3F8000, 0x000000, 0xBC8C7B, 0x000000, 0x3F8000, 0x3C9F8F, 0x000000, 0x000000, 0x3F0A63, 0x000000, 0x000000, 0x3E8F6D } },
+          0, { 0 }, 2, 0, 65536.0f, 1694, 1860, 41859 },
+        /* 111 b0: 8-bit weights 0xFF, 0 (point 0); float skinning gave 38950 */
+        { 0x00439Cu, 5,
+              { 0x000000FFu, 0xFF0000FFu, 0xBE86AFA3u, 0xBE822BCDu, 0x3F0695CCu },
+          2, { { 0x3F8000, 0x000000, 0xBCA499, 0x000000, 0x3F8000, 0xBCE16D, 0x000000, 0x000000, 0x3F1654, 0x000000, 0x000000, 0x3E8D24 },
+                { 0x3F8000, 0x000000, 0xBCF8B0, 0x000000, 0x3F8000, 0x3CD005, 0x000000, 0x000000, 0x3F0D4E, 0x000000, 0x000000, 0x3E8778 } },
+          0, { 0 }, 2, -1, 65536.0f, 1682, 1980, 38948 },
+        /* 114 b2: four morph sets (point 321); float skinning gave 49650 */
+        { 0x0C019Cu, 16,
+              { 0xFF0000FFu, 0xBE959D92u, 0xBEDC2439u, 0x3F2DA034u, 0xFF0000FFu, 0x3EACBAABu,
+                0xBEDE3A7Au, 0x3F30E6B0u, 0xFF0000FFu, 0x3EDED44Cu, 0x3EC73CF4u, 0x3F58AE76u,
+                0xFF0000FFu, 0x3E9A9237u, 0x3EC0B409u, 0x3F5A6C27u },
+          0, { { 0 } },
+          4, { 0x3DCDF5, 0x3EF049, 0x3E8DFC, 0x3E1C79 }, 2, 0, 65536.0f, 1878, 1923, 49649 },
+        /* 114 b3: morph sets with two bones each (point 480); float skinning gave 46938 */
+        { 0x04479Cu, 12,
+              { 0x3F2425A2u, 0x3EB7B4BCu, 0xFF0000FFu, 0x3EF975A4u, 0xBEF4A3B2u, 0x3F49BEFBu,
+                0x3EE3C29Cu, 0x3F0E1EB2u, 0xFF0000FFu, 0x3E97B35Fu, 0x3E92B16Cu, 0x3F4826EDu },
+          2, { { 0x3F8000, 0x000000, 0xBCE898, 0x000000, 0x3F8000, 0xBC88BD, 0x000000, 0x000000, 0x3F06A0, 0x000000, 0x000000, 0x3E9322 },
+                { 0x3F8000, 0x000000, 0x3CE3E3, 0x000000, 0x3F8000, 0xBCD4E5, 0x000000, 0x000000, 0x3F0E7C, 0x000000, 0x000000, 0x3E9589 } },
+          2, { 0x3F53C0, 0x3E30FF }, 2, 0, 65536.0f, 1917, 1959, 46967 },
+        /* 110 b8: clip y beyond w, not drawn (point 1269); float skinning gave 40960 */
+        { 0x00879Cu, 7,
+              { 0x3E4CCCCDu, 0x3E99999Au, 0x3F000000u, 0xFF0000FFu, 0x3FB80000u, 0x3F99999Au,
+                0xC0A00000u },
+          3, { { 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000 },
+                { 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x3FC000, 0x3F4CCC, 0x000000 },
+                { 0x000000, 0x3F8000, 0x000000, 0xBF8000, 0x000000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000 } },
+          0, { 0 }, 2, -3, -65536.0f, 1944, 1700, -1 },
+    };
+    for (unsigned c = 0; c < sizeof C / sizeof C[0]; c++) {
+        psp_ge_reset(); clear_fb();
+        begin_list_vtype(C[c].vtype);
+        cmd(0x3A, 0);
+        for (int i = 0; i < 12; i++) cmd(0x3B, i % 4 == 0 ? 0x3F8000 : 0);
+        cmd(0x3C, 0);
+        for (int i = 0; i < 12; i++) cmd(0x3D, i % 4 == 0 ? 0x3F8000 : 0);
+        float P[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+        P[C[c].axis * 4 + 2] = ldexpf(1.0f, C[c].k);
+        cmd(0x3E, 0);
+        for (int i = 0; i < 16; i++) cmd_float(0x3F, P[i]);
+        cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, C[c].zs);
+        cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 0.0f);
+        cmd(0x4C, (uint32_t)C[c].ox << 4); cmd(0x4D, (uint32_t)C[c].oy << 4);
+        for (int b = 0; b < C[c].nb; b++) {
+            cmd(0x2A, (uint32_t)(12 * b));
+            for (int i = 0; i < 12; i++) cmd(0x2B, C[c].bone[b][i]);
+        }
+        for (int m = 0; m < C[c].nm; m++) cmd((uint8_t)(0x2C + m), C[c].mw[m]);
+        depth_state(1);                                    /* ALWAYS, writes on */
+        for (int i = 0; i < C[c].nv; i++) psp_write32(VERTS + 4u * (uint32_t)i, C[c].v[i]);
+        cmd(0x04, (0u << 16) | 1);                         /* one point */
+        end_list();
+        int fx = -1, fy = -1;
+        for (int y = 133; y <= 139; y++)
+            for (int x = 237; x <= 243; x++)
+                if (pixel(x, y)) { fx = x; fy = y; }
+        if (C[c].hw < 0)
+            CHECK(fx < 0, "case %u: drawn at (%d,%d), the PSP drew nothing", c, fx, fy);
+        else
+            CHECK(fx >= 0 && depth_at(fx, fy) == C[c].hw, "case %u: depth %d, hardware %d", c,
+                  fx >= 0 ? depth_at(fx, fy) : -1, C[c].hw);
+    }
+}
+
+/* Lighting in the GE's own arithmetic (ge.c ge_rsqrt16, gl_unit,
+ * gl_dot_scaled, gl_pow): points the PSP lit in geprobe 17 (fw 6.60), scenes
+ * 116-119, each one the float pipeline put a step off. White light and
+ * material, nothing ambient; a zero projection (w row 0 0 0 1) puts the
+ * point at the screen's centre whatever its position, and its grey is the
+ * byte asked about. Command words as the probe sent them (a float's top 24
+ * bits); vertex words as it wrote them. */
+static void test_light_ge(void) {
+    static const struct {
+        uint32_t v[3], n[3];
+        int type, kind;
+        uint32_t p[3], d[3], exp, cut, k[3], coef, dif, spec;
+        int hw;
+    } C[] = {
+        /* scene 35's spot (exponent 4): scene 116 point 5229; the float pipeline gave 224 */
+        { { 0x40780000u, 0x3F533300u, 0xC0C00000u }, { 0x00000000u, 0x00000000u, 0x3F800000u }, 2, 0,
+          { 0x405CCC, 0x3FACCC, 0xC04000 }, { 0x000000, 0x000000, 0x3F8000 }, 0x408000, 0x3F6666,
+          { 0x3F8000, 0x000000, 0x000000 }, 0x3F8000, 0xFFFFFF, 0x000000, 225 },
+        /* scene 35's specular (coefficient 8): scene 118 point 4531; the float pipeline gave 97 */
+        { { 0xC0840000u, 0xC034CC00u, 0xC0C00000u }, { 0x00000000u, 0x00000000u, 0x3F800000u }, 1, 1,
+          { 0xC02333, 0xC00333, 0xC09000 }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, 0x3C8000,
+          { 0x3F8000, 0x000000, 0x000000 }, 0x410000, 0x000000, 0xFFFFFF, 98 },
+        /* a spot exponent with more than 5 significant bits: scene 116 point 2798; the float pipeline gave 134 */
+        { { 0xBFED6D00u, 0x3FCB0300u, 0xBFCCF800u }, { 0xBF4B2C00u, 0xBEE28A00u, 0x3ED5C900u }, 2, 0,
+          { 0xC00742, 0x3FB890, 0xBFBB8F }, { 0xBF7747, 0x3B55B9, 0xBE847C }, 0x3FB1A9, 0x3C8000,
+          { 0x3F8000, 0x000000, 0x000000 }, 0x3F8000, 0xFFFFFF, 0x000000, 135 },
+        /* powered diffuse, coefficient likewise: scene 117 point 11; the float pipeline gave 100 */
+        { { 0xBFF15E00u, 0x3FE2B100u, 0x3F264D00u }, { 0xBE68B600u, 0x3E8D2A00u, 0xBF6F1900u }, 1, 2,
+          { 0xC05326, 0x3FA369, 0xBF1CF6 }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, 0x3C8000,
+          { 0x3F8000, 0x000000, 0x000000 }, 0x40173B, 0xFFFFFF, 0x000000, 104 },
+        /* plain diffuse, a normal of length 1 in floats: scene 117 point 207; the float pipeline gave 153 */
+        { { 0xBFD11B00u, 0x3FED4000u, 0xBF865000u }, { 0xBEAEBE00u, 0xBF29FD00u, 0x3F2A4E00u }, 1, 0,
+          { 0xC03000, 0x402327, 0x401DF7 }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, 0x3C8000,
+          { 0x3F8000, 0x000000, 0x000000 }, 0x3F8000, 0xFFFFFF, 0x000000, 154 },
+        /* a spot from 1/sqrt(|p|^2) directly: scene 116 point 2; the float pipeline gave 193 */
+        { { 0x00000000u, 0x00000000u, 0x00000000u }, { 0xBCA00000u, 0x3DA80000u, 0x3F000000u }, 2, 0,
+          { 0xBCA000, 0x3DA800, 0x3F0000 }, { 0x000000, 0x000000, 0x3F8000 }, 0x418CC2, 0x3C8000,
+          { 0x3F8000, 0x000000, 0x000000 }, 0x3F8000, 0xFFFFFF, 0x000000, 195 },
+        /* a specular at random: scene 118 point 2; the float pipeline gave 25 */
+        { { 0xBFED6D00u, 0x3FCB0300u, 0xBFCCF800u }, { 0xBF402600u, 0xBD770B00u, 0x3F287300u }, 1, 1,
+          { 0xC00742, 0x3FB890, 0xBFBB8F }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, 0x3C8000,
+          { 0x3F8000, 0x000000, 0x000000 }, 0x41B39B, 0x000000, 0xFFFFFF, 26 },
+        /* attenuation, k1 d alone: scene 119 point 133; the float pipeline gave 82 */
+        { { 0xBF529000u, 0xBEEFC300u, 0xBF376700u }, { 0x3F326B00u, 0xBEA3EA00u, 0xBF244500u }, 1, 0,
+          { 0x3E0A16, 0xBF6876, 0xBFCC86 }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, 0x3C8000,
+          { 0x000000, 0x400FB5, 0x000000 }, 0x3F8000, 0xFFFFFF, 0x000000, 83 },
+        /* attenuation, k2 d^2 alone: scene 119 point 178; the float pipeline gave 133 */
+        { { 0x3EC43400u, 0x3F234D00u, 0xBF10B600u }, { 0xBF75B800u, 0xBE554200u, 0xBE407500u }, 1, 0,
+          { 0xC00640, 0x3DCBF9, 0xBF8689 }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, 0x3C8000,
+          { 0x000000, 0x000000, 0x3E926C }, 0x3F8000, 0xFFFFFF, 0x000000, 134 },
+    };
+    for (unsigned c = 0; c < sizeof C / sizeof C[0]; c++) {
+        psp_ge_reset(); clear_fb();
+        begin_list_vtype((3u << 5) | (3u << 7));               /* float normal, float position */
+        for (int m = 0; m < 2; m++) {                          /* world and view: identity */
+            cmd((uint8_t)(0x3A + 2 * m), 0);
+            for (int i = 0; i < 12; i++) cmd((uint8_t)(0x3B + 2 * m), i % 4 == 0 ? 0x3F8000 : 0);
+        }
+        cmd(0x3E, 0);
+        for (int i = 0; i < 16; i++) cmd(0x3F, i == 15 ? 0x3F8000 : 0);
+        cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+        cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+        cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+        cmd(0x17, 1); cmd(0x18, 1); cmd(0x5E, 0);             /* lighting, light 0, one colour */
+        cmd(0x53, 0); cmd(0x54, 0); cmd(0x55, 0);             /* material: no update, no emissive or ambient */
+        cmd(0x56, 0xFFFFFF); cmd(0x57, 0xFFFFFF); cmd(0x5C, 0);
+        cmd(0x5F, ((uint32_t)C[c].type << 8) | (uint32_t)C[c].kind);
+        for (int i = 0; i < 3; i++) {
+            cmd((uint8_t)(0x63 + i), C[c].p[i]); cmd((uint8_t)(0x6F + i), C[c].d[i]);
+            cmd((uint8_t)(0x7B + i), C[c].k[i]);
+        }
+        cmd(0x87, C[c].exp); cmd(0x8B, C[c].cut); cmd(0x5B, C[c].coef);
+        cmd(0x8F, 0); cmd(0x90, C[c].dif); cmd(0x91, C[c].spec);
+        for (int i = 0; i < 3; i++) {
+            psp_write32(VERTS + 4u * (uint32_t)i, C[c].n[i]);
+            psp_write32(VERTS + 12u + 4u * (uint32_t)i, C[c].v[i]);
+        }
+        cmd(0x04, (0u << 16) | 1);                             /* one point */
+        end_list();
+        const int got = (int)((pixel(240, 136) >> 8) & 0xFF);
+        CHECK(got == C[c].hw, "case %u: %d, hardware %d", c, got, C[c].hw);
+    }
+}
+
+/* The lighting's 1/sqrt, read exactly the way geprobe 18 read it (fw 6.60,
+ * scene 120): a spot over a vertex at the origin with D = +z and the light at
+ * (px, py, 1), so the spot's L.D is 1/sqrt(L.L) itself, and the PSP's value
+ * is the largest cutoff code that still lights the point. Each case is lit
+ * at that code and dark one code higher. Inputs 23646 and 25779 fall in the
+ * two entries set 18 could not pin and ge.c had wrong by one. */
+static void test_rsqrt_ge(void) {
+    static const struct { uint32_t px, py, code; } C[] = {
+        { 0x00000000u, 0x00000000u, 0x3F8000 },   /* s = 1 */
+        { 0x3F597800u, 0x00000000u, 0x3F431B },   /* input 23646: s = 1.72161865 */
+        { 0x3F631100u, 0x00000000u, 0x3F3F86 },   /* input 25779: s = 1.78671265 */
+        { 0x3F7FFF00u, 0x00000000u, 0x3F3506 },   /* input 32767: s = 1.99996948 */
+        { 0x3FA39200u, 0x00000000u, 0x3F1DC5 },   /* input 43139: s = 2.63299561 */
+        { 0x3FDDB300u, 0x3C000000u, 0x3F0000 },   /* input 65535: s = 3.99993896 */
+    };
+    for (unsigned c = 0; c < sizeof C / sizeof C[0]; c++)
+        for (int up = 0; up < 2; up++) {
+            psp_ge_reset(); clear_fb();
+            begin_list_vtype((3u << 5) | (3u << 7));
+            for (int m = 0; m < 2; m++) {
+                cmd((uint8_t)(0x3A + 2 * m), 0);
+                for (int i = 0; i < 12; i++) cmd((uint8_t)(0x3B + 2 * m), i % 4 == 0 ? 0x3F8000 : 0);
+            }
+            cmd(0x3E, 0);
+            for (int i = 0; i < 16; i++) cmd(0x3F, i == 15 ? 0x3F8000 : 0);
+            cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+            cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+            cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+            cmd(0x17, 1); cmd(0x18, 1); cmd(0x5E, 0);
+            cmd(0x53, 0); cmd(0x54, 0); cmd(0x55, 0); cmd(0x56, 0xFFFFFF); cmd(0x57, 0xFFFFFF); cmd(0x5C, 0);
+            cmd(0x5F, 2u << 8);                                /* spot, diffuse */
+            cmd(0x63, C[c].px >> 8); cmd(0x64, C[c].py >> 8); cmd(0x65, 0x3F8000);
+            cmd(0x6F, 0); cmd(0x70, 0); cmd(0x71, 0x3F8000);   /* D = +z */
+            cmd(0x7B, 0x3F8000); cmd(0x7C, 0); cmd(0x7D, 0);
+            cmd(0x87, 0x3F8000); cmd(0x8B, C[c].code + (uint32_t)up);
+            cmd(0x8F, 0); cmd(0x90, 0xFFFFFF); cmd(0x91, 0);
+            const uint32_t v[6] = { C[c].px, C[c].py, 0x3F800000u, 0, 0, 0 };   /* normal = L, vertex at 0 */
+            for (int i = 0; i < 6; i++) psp_write32(VERTS + 4u * (uint32_t)i, v[i]);
+            cmd(0x04, (0u << 16) | 1);
+            end_list();
+            const int lit = (pixel(240, 136) & 0xFFFF00u) != 0;
+            CHECK(lit == !up, "case %u: cutoff %06X %s, the PSP's %s", c, C[c].code + (unsigned)up,
+                  lit ? "lit" : "dark", up ? "dark" : "lit");
+        }
+}
+
+/* Lighting under real world and view matrices (ge.c light_vertex): points
+ * the PSP lit in geprobe 19 (fw 6.60), each one the float transforms got
+ * wrong. The GE lights in world space: L = -(W3 m + (t - p)), N = W3 n, the
+ * eye's direction the view's normalised third row. Mode 1 reads L.D through
+ * the spot cutoff as scene 121 does (lit at the PSP's code, dark one
+ * above); mode 0 compares the grey. Matrix and light words as the probe
+ * sent them (a float's top 24 bits), world then view, column by column. */
+static void test_light_world(void) {
+    static const struct {
+        uint32_t w[12], v[12], m[3], n[3];
+        int type, kind;
+        uint32_t p[3], d[3], exp, k[3], coef, dif, spec;
+        int mode;
+        uint32_t want;
+    } C[] = {
+        /* scene 121 batch 2 (both), geometry 1201: L.D read through the cutoff */
+        { { 0xBDDCE5, 0x3F8A09, 0x3F910E, 0x3F83BF, 0xBF4E78, 0x3F5D8E, 0x3F96CB, 0x3F4DAA, 0xBF2701, 0xBE846D, 0x3F412D, 0x3F1A62 },
+          { 0x3E4C4C, 0xBEBD03, 0x3F685E, 0xBF00A1, 0x3F41B8, 0x3ED61F, 0xBF575C, 0xBF0A1E, 0xBD0D68, 0x3E48B8, 0xBF43FD, 0x3F1CDC },
+          { 0xBEDE0000u, 0xBF720C00u, 0xBEC23500u }, { 0x3DA89000u, 0xBEC8CE00u, 0xBEFDFD00u }, 2, 0,
+          { 0xC04074, 0x3F40FD, 0xBEB45E }, { 0xBF11BA, 0x3F4EC7, 0x3E1D12 }, 0x3F8000, { 0x3F8000, 0x000000, 0x000000 }, 0x3F8000, 0xFFFFFF, 0x000000, 1, 0x3F15AE },
+        /* scene 121 batch 4 (cancel), geometry 2104: L.D read through the cutoff */
+        { { 0x3D1D4F, 0x3E087A, 0x3F0D1D, 0xBE814C, 0x3F055D, 0x3F2705, 0xC06D4A, 0xBFB1CC, 0x3F0CC7, 0x40031D, 0x3CA192, 0x405BDE },
+          { 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000 },
+          { 0x3FC85A00u, 0xBF8C5300u, 0xBE19DB00u }, { 0xBFA75200u, 0x3FDC9800u, 0xBE21D500u }, 2, 0,
+          { 0x405042, 0x40325E, 0x408F6C }, { 0xBD89AD, 0x3F6CC9, 0xBEBF88 }, 0x3F8000, { 0x3F8000, 0x000000, 0x000000 }, 0x3F8000, 0xFFFFFF, 0x000000, 1, 0x3F3F3E },
+        /* scene 122 point 57: diffuse, a cancelling world and a rotated view; the float pipeline gave 199 */
+        { { 0xBFF8D0, 0xC0CF62, 0xC112EE, 0xBF9434, 0xC01D52, 0xC02E02, 0x402738, 0x40D374, 0x40FB33, 0x000000, 0x000000, 0x000000 },
+          { 0xBE4BB9, 0xBF45E0, 0xBF1A3B, 0x3ECA4D, 0xBF2036, 0x3F2C26, 0xBF6596, 0xBDD587, 0x3EDC1E, 0x000000, 0x000000, 0x000000 },
+          { 0x00000000u, 0x00000000u, 0x00000000u }, { 0xBDF08500u, 0xBF62ED00u, 0xBEE76B00u }, 0, 0,
+          { 0x3F7C90, 0xBE23E5, 0xBD042F }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, { 0x3F8000, 0x000000, 0x000000 }, 0x3F8000, 0xFFFFFF, 0x000000, 0, 0x0000C6 },
+        /* scene 123 point 72: specular under a rotated, translated view; the float pipeline gave 221 */
+        { { 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000, 0x3F8000, 0x000000, 0x000000, 0x000000 },
+          { 0xBF3540, 0x3F1981, 0x3EBEFF, 0xBF3344, 0xBF071A, 0xBEF623, 0xBDBB2D, 0xBF1A02, 0x3F4B26, 0xC3C2DA, 0xC46A60, 0xC30557 },
+          { 0xBEDC3C00u, 0xBF3AC200u, 0xBE5F8100u }, { 0x3BE48A00u, 0xBEEB5F00u, 0x3F635600u }, 1, 1,
+          { 0xBECBAA, 0xBF5A5C, 0x3F96D6 }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, { 0x3F8000, 0x000000, 0x000000 }, 0x408000, 0x000000, 0xFFFFFF, 0, 0x0000DC },
+        /* scene 124 point 58: attenuation, k2 alone, far out; the float pipeline gave 189 */
+        { { 0x3E3882, 0x3EAEE9, 0xBF1AE6, 0x3F1829, 0xBFC8D0, 0xBF1632, 0xBF164F, 0xBDDA2B, 0xBF0571, 0xC2E20A, 0xC3297D, 0xC3EADD },
+          { 0xBDCBEC, 0xBF7CEB, 0xBDF249, 0xBF0D95, 0xBD33C1, 0x3F54FC, 0xBF53C1, 0x3E17D4, 0xBF0AC3, 0xC08894, 0x40CECF, 0x40003C },
+          { 0x3EDDF700u, 0xBE058300u, 0xBE9C9000u }, { 0xBE94A600u, 0xBB82F900u, 0xBF93FE00u }, 1, 0,
+          { 0xC2E154, 0xC32918, 0xC3EAC4 }, { 0x000000, 0x000000, 0x3F8000 }, 0x3F8000, { 0x000000, 0x000000, 0x418917 }, 0x3F8000, 0xFFFFFF, 0x000000, 0, 0x0000BA },
+    };
+    for (unsigned c = 0; c < sizeof C / sizeof C[0]; c++)
+        for (int up = 0; up < 1 + C[c].mode; up++) {
+            psp_ge_reset(); clear_fb();
+            begin_list_vtype((3u << 5) | (3u << 7));
+            cmd(0x3A, 0);
+            for (int i = 0; i < 12; i++) cmd(0x3B, C[c].w[i]);
+            cmd(0x3C, 0);
+            for (int i = 0; i < 12; i++) cmd(0x3D, C[c].v[i]);
+            cmd(0x3E, 0);
+            for (int i = 0; i < 16; i++) cmd(0x3F, i == 15 ? 0x3F8000 : 0);
+            cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+            cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+            cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+            cmd(0x17, 1); cmd(0x18, 1); cmd(0x5E, 0);
+            cmd(0x53, 0); cmd(0x54, 0); cmd(0x55, 0); cmd(0x56, 0xFFFFFF); cmd(0x57, 0xFFFFFF); cmd(0x5C, 0);
+            cmd(0x5F, ((uint32_t)C[c].type << 8) | (uint32_t)C[c].kind);
+            for (int i = 0; i < 3; i++) {
+                cmd((uint8_t)(0x63 + i), C[c].p[i]); cmd((uint8_t)(0x6F + i), C[c].d[i]);
+                cmd((uint8_t)(0x7B + i), C[c].k[i]);
+            }
+            cmd(0x87, C[c].exp);
+            cmd(0x8B, C[c].mode ? C[c].want + (uint32_t)up : 0x3C8000);          /* cutoff, or 1/64 */
+            cmd(0x5B, C[c].coef);
+            cmd(0x8F, 0); cmd(0x90, C[c].dif); cmd(0x91, C[c].spec);
+            for (int i = 0; i < 3; i++) {
+                psp_write32(VERTS + 4u * (uint32_t)i, C[c].n[i]);
+                psp_write32(VERTS + 12u + 4u * (uint32_t)i, C[c].m[i]);
+            }
+            cmd(0x04, (0u << 16) | 1);
+            end_list();
+            const int g = (int)((pixel(240, 136) >> 8) & 0xFF);
+            if (C[c].mode)
+                CHECK((g != 0) == !up, "case %u: cutoff %06X %s, the PSP's %s", c, C[c].want + (unsigned)up,
+                      g ? "lit" : "dark", up ? "dark" : "lit");
+            else
+                CHECK(g == (int)C[c].want, "case %u: %d, hardware %u", c, g, C[c].want);
+        }
+}
+
+/* A triangle fan is (first, previous, this) for every vertex from the
+ * third, through mode and 3D alike, as geprobe 14 (fw 6.60) scene 88's fan
+ * tiles read on the PSP (smooth, flat, indexed). A 300-vertex fan crosses
+ * the 256-vertex batches the GE code decodes in, so each later batch has to
+ * start again from the fan's first vertex: drawn flat, the fan must come
+ * out pixel for pixel as the same 298 triangles drawn as a list. Through
+ * mode drew no fans at all before, and a 3D fan past 256 vertices turned
+ * about vertex 254 instead of its centre. */
+static void fan_frame(int through, int as_fan, uint32_t *out) {
+    enum { RIM = 299 };
+    float px[RIM + 1], py[RIM + 1];
+    uint32_t col[RIM + 1];
+    for (int i = 0; i <= RIM; i++) {
+        const double th = 2 * 3.14159265358979 * 0.98 * (i - 1) / RIM;
+        const double r = i ? 0.6 : 0.0;
+        px[i] = (float)(r * cos(th));
+        py[i] = (float)(r * sin(th));
+        if (through) { px[i] = 240.0f + 160.0f * px[i]; py[i] = 136.0f - 160.0f * py[i]; }
+        col[i] = 0xFF000000u | (uint32_t)((i * 7) & 0xFF) | (uint32_t)((i * 13) & 0xFF) << 8 | (uint32_t)((i * 29) & 0xFF) << 16;
+    }
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (through ? 1u << 23 : 0));
+    if (!through) {
+        for (int m = 0; m < 3; m++) {
+            cmd((uint8_t)(0x3A + 2 * m), 0);
+            const int n = m < 2 ? 12 : 16, rowlen = m < 2 ? 3 : 4;
+            for (int i = 0; i < n; i++) cmd((uint8_t)(0x3B + 2 * m), i % (rowlen + 1) == 0 ? 0x3F8000 : 0);
+        }
+        cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+        cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+        cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+    }
+    cmd(0x50, 0);                                              /* SHADE: flat */
+    int n = 0;
+    if (as_fan) {
+        for (int i = 0; i <= RIM; i++) { float_vertex(n, px[i], py[i], 0); psp_write32(VERTS + (uint32_t)n++ * 16, col[i]); }
+        cmd(0x04, (5u << 16) | (uint32_t)n);                   /* PRIM: triangle fan */
+    } else {
+        for (int i = 2; i <= RIM; i++) {
+            const int k[3] = { 0, i - 1, i };
+            for (int j = 0; j < 3; j++) { float_vertex(n, px[k[j]], py[k[j]], 0); psp_write32(VERTS + (uint32_t)n++ * 16, col[k[j]]); }
+        }
+        cmd(0x04, (3u << 16) | (uint32_t)n);                   /* PRIM: triangles */
+    }
+    end_list();
+    for (int y = 0; y < 272; y++)
+        for (int x = 0; x < 480; x++) out[y * 480 + x] = pixel(x, y);
+}
+
+static void test_triangle_fans(void) {
+    static uint32_t fan[480 * 272], list[480 * 272];
+    for (int through = 1; through >= 0; through--) {
+        fan_frame(through, 1, fan);
+        fan_frame(through, 0, list);
+        int lit = 0, diff = 0;
+        for (int i = 0; i < 480 * 272; i++) { lit += list[i] != 0; diff += fan[i] != list[i]; }
+        CHECK(lit > 10000 && diff == 0, "%s fan of 300 vertices: %d of the list's %d pixels differ",
+              through ? "through-mode" : "3D", diff, lit);
+    }
+}
+
+/* A tall triangle's long edge in groups of four (render.c sw_tri): geprobe 98
+ * (fw 6.60) scene 98's window 1 triangle, drawn flat white in its scissor.
+ * Its height is 2956 pixels, past the 2731 at which 3 x the height in
+ * sixteenths reaches 2^17, and along its long edge (inside to the left) the
+ * PSP fills the last pixel of each aligned group of four whenever the
+ * group's first is inside: rows 15-21, x 120-135, as the PSP drew them.
+ * The same triangle 2700 pixels tall stays exact. */
+static void long_edge_frame(int scale_down) {
+    static const int V[3][2] = { { -23517, -22210 }, { -21117, 17104 }, { 30083, 25093 } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    cmd(0xD4, 120u | (0u << 10)); cmd(0xD5, 239u | (135u << 10));
+    cmd(0x50, 0);                                              /* SHADE: flat */
+    for (int i = 0; i < 3; i++) {
+        /* scaled about (180, 68): 2700/2956 of the height keeps it under the threshold */
+        const double k = scale_down ? 2700.0 / 2956.0 : 1.0;
+        const double x = 180 + (V[i][0] / 16.0 - 180) * k, y = 68 + (V[i][1] / 16.0 - 68) * k;
+        float_vertex(i, (float)x, (float)y, 0);
+    }
+    cmd(0x04, (3u << 16) | 3);
+    cmd(0xD4, 0); cmd(0xD5, 479u | (271u << 10));           /* the scissor outlives psp_ge_reset */
+    end_list();
+}
+
+static void test_long_edge_groups(void) {
+    static const uint16_t HW[7] = { 0x0009, 0x000B, 0x000F, 0x000F, 0x009F, 0x00BF, 0x00FF };
+    long_edge_frame(0);
+    int bad = 0;
+    for (int r = 0; r < 7; r++) {
+        unsigned m = 0;
+        for (int i = 0; i < 16; i++) m |= (pixel(120 + i, 15 + r) != 0) << i;
+        bad += m != HW[r];
+    }
+    CHECK(bad == 0, "long edge: %d of rows 15-21 off the PSP's (row 15 reads %d%d%d%d)", bad,
+          pixel(120, 15) != 0, pixel(121, 15) != 0, pixel(122, 15) != 0, pixel(123, 15) != 0);
+    /* Under the threshold every pixel is the exact edge's: no x = 3 mod 4
+     * pixel past the edge where its group's first is inside. */
+    long_edge_frame(1);
+    int extra = 0;
+    for (int y = 0; y < 136; y++) {
+        int last = -1;
+        for (int x = 120; x < 240; x++) if (pixel(x, y)) last = x;
+        if (last >= 120 && last < 239 && (last & 3) == 3 && last >= 123 &&
+            pixel(last - 1, y) == 0) extra++;
+    }
+    CHECK(extra == 0, "a 2700-pixel triangle drew %d group-end pixels past its edge", extra);
+
+    /* A vertical long edge is exact however tall: scene 98's window 4,
+     * 3786 pixels high, its long edge at x = 90.6875 -- column 90 drawn,
+     * 91 (x = 3 mod 4, its group's first inside) never, as on the PSP. */
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    cmd(0xD4, 0u | (136u << 10)); cmd(0xD5, 119u | (271u << 10));
+    cmd(0x50, 0);
+    float_vertex(0, 90.6875f, -1785.6875f, 0);
+    float_vertex(1, -1839.8125f, 224.5625f, 0);
+    float_vertex(2, 90.6875f, 2000.0f, 0);
+    cmd(0x04, (3u << 16) | 3);
+    cmd(0xD4, 0); cmd(0xD5, 479u | (271u << 10));
+    end_list();
+    int c90 = 0, c91 = 0;
+    for (int y = 136; y < 272; y++) { c90 += pixel(90, y) != 0; c91 += pixel(91, y) != 0; }
+    CHECK(c90 == 136 && c91 == 0, "vertical long edge: column 90 %d of 136, column 91 %d (PSP 136, 0)", c90, c91);
+}
+
+/* Where the long edge's far pixel takes the near one's decision: only with
+ * its centre inside the triangle's x extent, and of a level triangle's two
+ * full-height edges only the left one. geprobe 21 (fw 6.60) windows, each
+ * row a mask of the 20 pixels from the scissor's left:
+ *   128/19  leans 1 pixel, inside right: x 468 (= 0 mod 4, the triangle's
+ *           first column, centre past min x 468.31) is copied in
+ *   128/36  leans 4 pixels, inside left: x 395's centre is past max x 395.06,
+ *           so it stays out, where the copy drew it
+ *   129/0   level top, the left edge: copied
+ *   129/1   level top, the right edge: exact, where both edges taking it drew
+ *           14 pixels more
+ * and geprobe 22's:
+ *   134/5   level top, the right corner given first: the left edge still
+ *           copies (the edge from the first corner given would not)
+ *   134/145 inside right, min x a sixteenth past the far pixel's centre:
+ *           x 128 copies (min x <= 16 x + 9; the centre alone would not) */
+static void test_long_edge_extent(void) {
+    static const struct { int sc[4]; int v[3][2]; uint32_t hw[20]; } W[6] = {
+        { { 459, 0, 478, 19 }, { { 7493, -19850 }, { 7509, 24230 }, { 30428, -10725 } },
+          { 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00,
+            0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00, 0xFFE00 } },
+        { { 384, 25, 403, 44 }, { { 6321, -15154 }, { 6257, 31198 }, { -19189, -2221 } },
+          { 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF,
+            0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF, 0x003FF } },
+        { { 0, 0, 19, 19 }, { { -5279, -26520 }, { 10417, -26520 }, { 4473, 21368 } },
+          { 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFF00, 0xFFD00,
+            0xFFD00, 0xFFD00, 0xFFD00, 0xFFD00, 0xFF900, 0xFF900, 0xFF900, 0xFF900, 0xFF900, 0xFF000 } },
+        { { 25, 0, 44, 19 }, { { -24010, -17509 }, { 3974, -17509 }, { -5154, 29739 } },
+          { 0x00FFF, 0x00FFF, 0x007FF, 0x007FF, 0x007FF, 0x007FF, 0x007FF, 0x007FF, 0x003FF, 0x003FF,
+            0x003FF, 0x003FF, 0x003FF, 0x001FF, 0x001FF, 0x001FF, 0x001FF, 0x001FF, 0x000FF, 0x000FF } },
+        { { 121, 1, 140, 20 }, { { 14599, -31043 }, { -4105, -31043 }, { 4831, 13949 } },
+          { 0xFFF80, 0xFFF80, 0xFFF80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFC80, 0xFFC80,
+            0xFFC80, 0xFFC80, 0xFFC80, 0xFF800, 0xFF800, 0xFF800, 0xFF800, 0xFF800, 0xFF800, 0xFF800 } },
+        { { 121, 168, 140, 187 }, { { 2057, 26251 }, { 2101, -23093 }, { 29945, 12978 } },
+          { 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80,
+            0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80, 0xFFE80 } },
+    };
+    static const char *name[6] = { "128/19", "128/36", "129/0", "129/1", "134/5", "134/145" };
+    for (int w = 0; w < 6; w++) {
+        psp_ge_reset(); clear_fb();
+        begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+        cmd(0xD4, (uint32_t)W[w].sc[0] | (uint32_t)W[w].sc[1] << 10);
+        cmd(0xD5, (uint32_t)W[w].sc[2] | (uint32_t)W[w].sc[3] << 10);
+        cmd(0x50, 0);
+        for (int i = 0; i < 3; i++) float_vertex(i, W[w].v[i][0] / 16.0f, W[w].v[i][1] / 16.0f, 0);
+        cmd(0x04, (3u << 16) | 3);
+        cmd(0xD4, 0); cmd(0xD5, 479u | (271u << 10));
+        end_list();
+        int bad = 0, first = -1;
+        for (int r = 0; r < 20; r++) {
+            uint32_t m = 0;
+            for (int i = 0; i < 20; i++) m |= (uint32_t)(pixel(W[w].sc[0] + i, W[w].sc[1] + r) != 0) << i;
+            if (m != W[w].hw[r]) { bad++; if (first < 0) first = r; }
+        }
+        CHECK(bad == 0, "long edge window %s: %d rows off the PSP's (first %d)", name[w], bad, first);
+    }
+}
+
+/* A patch division of 65 to 127 hangs the GE (ge.c draw_patch): geprobe 13
+ * (fw 6.60) scenes 80 and 81 draw nothing of the patch and nothing after it
+ * in the list, sceGeDrawSync's peek reads 2 until sceGeBreak(1), and lists
+ * after the break run as on a fresh queue. Set 21's frames match only so. */
+static void test_patch_hang(void) {
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    for (int m = 0; m < 3; m++) {
+        cmd((uint8_t)(0x3A + 2 * m), 0);
+        const int n = m < 2 ? 12 : 16, rowlen = m < 2 ? 3 : 4;
+        for (int i = 0; i < n; i++) cmd((uint8_t)(0x3B + 2 * m), i % (rowlen + 1) == 0 ? 0x3F8000 : 0);
+    }
+    for (int k = 0; k < 16; k++) float_vertex(k, -0.5f + (k % 4) / 3.0f, -0.5f + (k / 4) / 3.0f, 0.5f);
+    cmd(0x36, 65u | (65u << 8));                           /* PATCHDIVISION 65 x 65 */
+    cmd(0x37, 2);                                          /* points */
+    cmd(0x05, 4u | (4u << 8));                             /* BEZIER 4 x 4: hangs */
+    cmd(0x12, VTYPE_2D);                                   /* then a sprite the GE never reaches */
+    cmd(0x01, (VERTS + 0x1000) & 0xFFFFFF);
+    psp_write32(VERTS + 0x1000, 0xFFFFFFFFu); psp_write16(VERTS + 0x1004, 10); psp_write16(VERTS + 0x1006, 10);
+    psp_write32(VERTS + 0x100C, 0xFFFFFFFFu); psp_write16(VERTS + 0x1010, 30); psp_write16(VERTS + 0x1012, 30);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    const uint32_t busy = call(0xB287BD61, 1, 0, 0, 0);    /* sceGeDrawSync(peek) */
+    const int drawn = pixel(20, 20) != 0;
+    const int brk = (int)call(0xB448EC0D, 1, 0, 0, 0);     /* sceGeBreak(1) */
+    const uint32_t after = call(0xB287BD61, 1, 0, 0, 0);
+    CHECK(busy == 2 && !drawn && brk >= 0 && after == 0,
+          "hung patch: peek %u (PSP 2), sprite after it %s (PSP not), break %d, then peek %u (0)",
+          busy, drawn ? "drawn" : "not drawn", brk, after);
+    /* the queue runs again after the break */
+    clear_fb(); begin_list();
+    vertex(0, 10, 10, 0xFFFFFFFFu); vertex(1, 30, 30, 0xFFFFFFFFu);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    CHECK(pixel(20, 20) != 0, "after sceGeBreak a new list did not draw");
+}
+
+/* A spline point's colour is de Boor's algorithm on the control colours
+ * with 8-bit parameters and 1/128 cuts (ge.c deboor_fix), not a blend by
+ * exact weights. geprobe 9 (fw 6.60) scene 54: a uniform span (fill/fill,
+ * 4 columns) at 48 steps, column 1 red 255, v open/open over 4 rows at one
+ * division; the PSP's red at each of the 49 points, 17 of which the exact
+ * weights put a step low. Identity matrices, so control x -0.8 .. 0.4 puts
+ * the points between pixels 144 and 240 of the row at y 0.4963 (pixel 68). */
+static void test_spline_colour(void) {
+    static const int HW[49] = { 171, 171, 170, 170, 169, 168, 167, 166, 165, 163, 161, 159, 157, 155, 152, 150, 148,
+                                145, 142, 139, 136, 133, 130, 126, 123, 119, 116, 112, 108, 105, 102, 98, 94, 91, 87,
+                                84, 80, 76, 74, 70, 67, 63, 61, 57, 54, 51, 48, 46, 43 };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    for (int m = 0; m < 3; m++) {                          /* world, view, projection: identity */
+        cmd((uint8_t)(0x3A + 2 * m), 0);
+        const int n = m < 2 ? 12 : 16, rowlen = m < 2 ? 3 : 4;
+        for (int i = 0; i < n; i++) cmd((uint8_t)(0x3B + 2 * m), i % (rowlen + 1) == 0 ? 0x3F8000 : 0);
+    }
+    cmd_float(0x42, 240.0f); cmd_float(0x43, -136.0f); cmd_float(0x44, -32768.0f);
+    cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+    cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++) {
+            const int v = j * 4 + i;
+            float_vertex(v, -0.8f + 0.4f * (float)i, 0.4963f - 0.03f * (float)j, 0.5f);
+            psp_write32(VERTS + (uint32_t)v * 16, i == 1 ? 0xFF0000FFu : 0xFF000000u);
+        }
+    cmd(0x36, 48u | (1u << 8));                            /* PATCHDIVISION */
+    cmd(0x37, 2);                                          /* PATCHPRIMITIVE: points */
+    cmd(0x06, 4u | (4u << 8) | (0u << 16) | (3u << 18));   /* SPLINE 4x4, u fill/fill, v open/open */
+    end_list();
+    int n = 0, bad = 0, first_bad = -1;
+    for (int x = 100; x < 300 && n < 49; x++) {
+        const uint32_t p = pixel(x, 68);
+        if (!p) continue;
+        if ((int)(p & 0xFF) != HW[n] && first_bad < 0) first_bad = n;
+        bad += (int)(p & 0xFF) != HW[n];
+        n++;
+    }
+    CHECK(n == 49 && bad == 0, "spline points: %d found, %d reds off the PSP's (first at %d)", n, bad, first_bad);
+}
+
+/* A Bezier patch's points in the GE's own arithmetic (ge.c draw_patch,
+ * la_lerp, patch_param): geprobe 13 (fw 6.60) scene 68 item 60, a 4x4
+ * strip at division 21 (1 down) as points, identity matrices, viewport z
+ * scale 65536 and centre 0 so each depth is the point's z's top 16 bits.
+ * The PSP's 44 points, pixel and depth. Division 21 is the smallest where
+ * the GE's step (256/21 in 8.6, rounded up) leaves floor(256 i/21): t 61,
+ * 122, 134 and 195, not 60, 121, 135 and 196. */
+static void test_patch_points_ge(void) {
+    static const uint32_t C[16][3] = {
+        { 0x3F1A8000u, 0xBDE80000u, 0x3F02BB00u }, { 0x3F2A8000u, 0xBDE80000u, 0x3F0CB800u }, { 0x3F3A8000u, 0xBDE80000u, 0x3F1AA400u }, { 0x3F4A8000u, 0xBDE80000u, 0x3F1D2000u },
+        { 0x3F1A8000u, 0xBDF80000u, 0x3F02BB00u }, { 0x3F2A8000u, 0xBDF80000u, 0x3F0CB800u }, { 0x3F3A8000u, 0xBDF80000u, 0x3F1AA400u }, { 0x3F4A8000u, 0xBDF80000u, 0x3F1D2000u },
+        { 0x3F1A8000u, 0xBE040000u, 0x3F0C5000u }, { 0x3F2A8000u, 0xBE040000u, 0x3F120200u }, { 0x3F3A8000u, 0xBE040000u, 0x3F4E2900u }, { 0x3F4A8000u, 0xBE040000u, 0x3F7DA100u },
+        { 0x3F1A8000u, 0xBE0C0000u, 0x3F0C5000u }, { 0x3F2A8000u, 0xBE0C0000u, 0x3F120200u }, { 0x3F3A8000u, 0xBE0C0000u, 0x3F4E2900u }, { 0x3F4A8000u, 0xBE0C0000u, 0x3F7DA100u } };
+    static const struct { int x, y; unsigned z; } HW[44] = {
+        { 394, 150, 33467 }, { 396, 150, 33831 }, { 399, 150, 34208 }, { 401, 150, 34593 },
+        { 403, 150, 34984 }, { 405, 150, 35412 }, { 408, 150, 35807 }, { 410, 150, 36202 },
+        { 412, 150, 36591 }, { 414, 150, 36976 }, { 417, 150, 37382 }, { 419, 150, 37744 },
+        { 422, 150, 38122 }, { 424, 150, 38453 }, { 426, 150, 38765 }, { 428, 150, 39055 },
+        { 431, 150, 39322 }, { 433, 150, 39581 }, { 435, 150, 39791 }, { 438, 150, 39970 },
+        { 440, 150, 40114 }, { 442, 150, 40224 }, { 394, 153, 35920 }, { 396, 153, 36213 },
+        { 399, 153, 36682 }, { 401, 153, 37313 }, { 403, 153, 38096 }, { 405, 153, 39102 },
+        { 408, 153, 40168 }, { 410, 153, 41352 }, { 412, 153, 42645 }, { 414, 153, 44036 },
+        { 417, 153, 45641 }, { 419, 153, 47202 }, { 422, 153, 48966 }, { 424, 153, 50651 },
+        { 426, 153, 52379 }, { 428, 153, 54138 }, { 431, 153, 55920 }, { 433, 153, 57863 },
+        { 435, 153, 59656 }, { 438, 153, 61438 }, { 440, 153, 63199 }, { 442, 153, 64929 } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    for (int m = 0; m < 3; m++) {
+        cmd((uint8_t)(0x3A + 2 * m), 0);
+        const int n = m < 2 ? 12 : 16, rowlen = m < 2 ? 3 : 4;
+        for (int i = 0; i < n; i++) cmd((uint8_t)(0x3B + 2 * m), i % (rowlen + 1) == 0 ? 0x3F8000 : 0);
+    }
+    cmd_float(0x42, 256.0f); cmd_float(0x43, -128.0f); cmd_float(0x44, 65536.0f);
+    cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 0.0f);
+    cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+    depth_state(1);                                        /* ALWAYS, writes on */
+    for (int k = 0; k < 16; k++) {
+        psp_write32(VERTS + (uint32_t)k * 16, 0xFF41003Du);
+        for (int c = 0; c < 3; c++) psp_write32(VERTS + (uint32_t)k * 16 + 4 + (uint32_t)c * 4, C[k][c]);
+    }
+    cmd(0x36, 21u | (1u << 8));                            /* PATCHDIVISION */
+    cmd(0x37, 2);                                          /* PATCHPRIMITIVE: points */
+    cmd(0x05, 4u | (4u << 8));                             /* BEZIER 4x4 */
+    end_list();
+    int bad = 0, first = -1;
+    for (int k = 0; k < 44; k++)
+        if (depth_at(HW[k].x, HW[k].y) != HW[k].z) { bad++; if (first < 0) first = k; }
+    CHECK(bad == 0, "patch points: %d of 44 depths off the PSP's (first: point %d, %u against %u)", bad, first,
+          first < 0 ? 0 : depth_at(HW[first].x, HW[first].y), first < 0 ? 0 : HW[first].z);
+}
+
+/* A depth plane starts from the end of the long edge on that edge's side
+ * (render.c sw_tri, zk0), not the colour's leftmost corner. geprobe 10
+ * (fw 6.60) scene 57's first triangle in through mode, corners and depths
+ * as the PSP drew it: its middle corner lies left of the long edge, so the
+ * plane starts from the rightmost corner, and these pixels read a step
+ * higher than from the leftmost. */
+static void test_depth_plane_side(void) {
+    static const struct { int x, y, z; } P[] = {
+        { 47, 23, 12297 }, { 72, 37, 10977 }, { 78, 45, 10641 }, { 100, 55, 9489 }, { 103, 59, 9321 } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    depth_state(1);                                            /* ALWAYS, writes on */
+    float_vertex(0, 675 / 16.0f, 330 / 16.0f, 12577);
+    float_vertex(1, 1982 / 16.0f, 985 / 16.0f, 8284);
+    float_vertex(2, 1263 / 16.0f, 963 / 16.0f, 10558);
+    cmd(0x04, (3u << 16) | 3);
+    end_list();
+    for (unsigned i = 0; i < sizeof P / sizeof P[0]; i++)
+        CHECK(depth_at(P[i].x, P[i].y) == (unsigned)P[i].z, "depth at (%d,%d): %u, hardware %d",
+              P[i].x, P[i].y, depth_at(P[i].x, P[i].y), P[i].z);
+}
+
+/* A colour plane starts from the depth plane's corner (render.c sw_tri):
+ * the end of the long edge on that edge's side. geprobe 14 (fw 6.60) scene
+ * 83's triangle 33, drawn in through mode, has its middle corner left of
+ * its long edge, so its planes start from the rightmost corner, and these
+ * ten pixels read a step higher in one channel than from the leftmost. */
+static void test_colour_plane_anchor(void) {
+    static const struct { int x, y; uint32_t c; } P[] = {
+        { 86, 190, 0x883347 }, { 92, 190, 0x8F3D38 }, { 90, 191, 0x8F3E43 }, { 93, 191, 0x93433B },
+        { 86, 192, 0x8D3C53 }, { 88, 192, 0x8F3F4E }, { 91, 192, 0x934446 }, { 86, 193, 0x8F4159 },
+        { 89, 193, 0x934651 }, { 84, 194, 0x8F4264 } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    float_vertex(0, 1687 / 16.0f, 3468 / 16.0f, 0);
+    float_vertex(1, 1453 / 16.0f, 2968 / 16.0f, 0);
+    float_vertex(2, 1127 / 16.0f, 3308 / 16.0f, 0);
+    psp_write32(VERTS + 0 * 16, 0xFFE2CDABu);
+    psp_write32(VERTS + 1 * 16, 0xFF812320u);
+    psp_write32(VERTS + 2 * 16, 0xFF9C64CFu);
+    cmd(0x04, (3u << 16) | 3);
+    end_list();
+    int bad = 0;
+    for (unsigned i = 0; i < sizeof P / sizeof P[0]; i++) {
+        const uint32_t got = pixel(P[i].x, P[i].y) & 0xFFFFFFu;
+        if (got != P[i].c) {
+            bad++;
+            CHECK(0, "colour at (%d,%d): %06X, hardware %06X", P[i].x, P[i].y, got, P[i].c);
+        }
+    }
+    CHECK(bad == 0, "%d of 10 colour-plane pixels off the PSP's", bad);
+}
+
+/* Lines as the PSP draws them (render.c psp_render_walk_line, sw_draw),
+ * from geprobe 15 (fw 6.60). Scene 100's line 41 runs at exactly 45
+ * degrees, so it is y-major, and starts 5/16 left of and 3/16 below a
+ * pixel centre: on that pixel's diamond, on the minor axis's negative side,
+ * so inside. The PSP draws that pixel, (137,17), and stops before (147,27),
+ * with these colours; taken x-major, or "inside" meaning above the centre,
+ * the line shifts a pixel and its colours a step. Scene 102's first line,
+ * flat-shaded, is its second vertex's colour throughout. */
+static void test_line_rules(void) {
+    static const struct { int x, y; uint32_t c; } P[] = {
+        { 137, 17, 0x5FCA4C }, { 138, 18, 0x6EBC58 }, { 139, 19, 0x7EAE64 }, { 140, 20, 0x8DA170 },
+        { 141, 21, 0x9D937C }, { 142, 22, 0xAC8588 }, { 143, 23, 0xBC7794 }, { 144, 24, 0xCB69A0 },
+        { 145, 25, 0xDB5CAC }, { 146, 26, 0xEA4EB8 } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    float_vertex(0, 2195 / 16.0f, 283 / 16.0f, 0);
+    float_vertex(1, 2355 / 16.0f, 443 / 16.0f, 0);
+    psp_write32(VERTS + 0 * 16, 0xFF62C84Fu);
+    psp_write32(VERTS + 1 * 16, 0xFFFD3EC7u);
+    cmd(0x04, (1u << 16) | 2);                             /* one line */
+    end_list();
+    int bad = 0;
+    for (unsigned i = 0; i < sizeof P / sizeof P[0]; i++)
+        bad += (pixel(P[i].x, P[i].y) & 0xFFFFFFu) != P[i].c;
+    CHECK(bad == 0, "45-degree line: %d of 10 pixels off the PSP's (first (137,17) reads %06X)",
+          bad, pixel(137, 17) & 0xFFFFFFu);
+    CHECK((pixel(147, 27) & 0xFFFFFFu) == 0, "45-degree line drew (147,27), which the PSP leaves out");
+
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    cmd(0x50, 0);                                          /* SHADE: flat */
+    float_vertex(0, 141 / 16.0f, 276 / 16.0f, 0);
+    float_vertex(1, 525 / 16.0f, 284 / 16.0f, 0);
+    psp_write32(VERTS + 0 * 16, 0xFF91FF6Au);
+    psp_write32(VERTS + 1 * 16, 0xFF4494D0u);
+    cmd(0x04, (1u << 16) | 2);
+    end_list();
+    int lit = 0, off = 0;
+    for (int y = 16; y <= 19; y++)
+        for (int x = 8; x <= 34; x++) {
+            const uint32_t c = pixel(x, y) & 0xFFFFFFu;
+            if (c) { lit++; off += c != 0x4494D0u; }
+        }
+    CHECK(lit >= 20 && off == 0, "flat line: %d pixels, %d not its second vertex's colour", lit, off);
+}
+
+/* Gradients take 1/area from the GE's reciprocal table (render.c area_rcp),
+ * which is a unit off the reciprocal cut to 16 bits where its linear step
+ * misses. geprobe 8 (fw 6.60) scene 50's triangles 517/16 and 885/16 pixels
+ * wide and 2 high, depth 16384 to 49152, with pixels the PSP wrote where the
+ * cut reciprocal reads a step high and a step low. */
+static void test_gradient_reciprocal(void) {
+    static const struct { float x0, y0; int w16, px[2], z[2]; } T[] = {
+        { 342, 1, 517, { 353, 365 }, { 28045, 40214 } },
+        { 138, 160, 885, { 147, 164 }, { 22012, 32083 } } };
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7) | (1u << 23));
+    depth_state(1);                                            /* ALWAYS, writes on */
+    for (int i = 0; i < 2; i++) {
+        float_vertex(3 * i, T[i].x0, T[i].y0, 16384);
+        float_vertex(3 * i + 1, T[i].x0 + (float)T[i].w16 / 16.0f, T[i].y0, 49152);
+        float_vertex(3 * i + 2, T[i].x0, T[i].y0 + 2, 16384);
+    }
+    cmd(0x04, (3u << 16) | 6);
+    end_list();
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 2; k++) {
+            const int x = T[i].px[k], y = (int)T[i].y0;
+            CHECK(depth_at(x, y) == T[i].z[k], "width %d/16, depth at (%d,%d): %u, hardware %d",
+                  T[i].w16, x, y, depth_at(x, y), T[i].z[k]);
+        }
 }
 
 /* The backend interface itself. The software path is the reference every other
@@ -1273,7 +2291,7 @@ static void test_precise_vertex_payload(void) {
     float_vertex(0,(40.24f-240.0f)/240.0f,0,0);
     cmd(0x04,(PSP_PRIM_POINTS<<16)|1); end_list();
     /* Before the 1/16 grid, in the GE's arithmetic: the eye x cut to 16
-     * significant bits (ge_proj_row in ge.c) puts 40.24 at 40.2429. */
+     * significant bits (ge_clip in ge.c) puts 40.24 at 40.2429. */
     CHECK(g_probe_first.precise && fabsf(g_probe_first.precise_x-40.2429f)<0.0001f,
           "GE retains pre-quantization projection %.8f",g_probe_first.precise_x);
     /* 40.25: left of the viewport centre a position goes to the sixteenth
@@ -1366,6 +2384,27 @@ static void test_line_interpolation_and_clipping(void) {
     s = (line_samples){0};
     psp_render_walk_line(&a, &a, 0, 0, 10, 10, collect_line, &s);
     CHECK(!s.count, "zero length line is not a point");
+    /* Under a pixel long, the ends' diamonds still decide: three of scene
+     * 23's patch segments, geprobe 21 (fw 6.60) scenes 132-133. 11/16 down
+     * draws its first pixel, (375,211), in its end's flat colour; 8/16 down
+     * starts in the diamond of the pixel before, (374,213); 5/16 across
+     * and down crosses no centre and touches no diamond. */
+    {
+        static const int seg[3][4] = { { 6011, 3375, 6016, 3386 }, { 5993, 3420, 5995, 3428 },
+                                       { 6016, 3386, 6011, 3391 } };
+        static const int want[3][3] = { { 1, 375, 211 }, { 1, 374, 213 }, { 0, 0, 0 } };
+        for (int i = 0; i < 3; i++) {
+            psp_vertex p = a, q = a;
+            p.x = seg[i][0]; p.y = seg[i][1]; q.x = seg[i][2]; q.y = seg[i][3];
+            q.inv_w = 1; q.u = 0; q.z = 0;
+            s = (line_samples){0};
+            psp_render_walk_line(&p, &q, 0, 0, 479, 271, collect_line, &s);
+            CHECK(s.count == want[i][0] && (!s.count || (s.first.x >> 4 == want[i][1] && s.first.y >> 4 == want[i][2])),
+                  "sub-pixel line %d: %d pixels at (%d,%d), PSP %d at (%d,%d)", i, s.count,
+                  s.count ? s.first.x >> 4 : -1, s.count ? s.first.y >> 4 : -1, want[i][0], want[i][1], want[i][2]);
+        }
+        s = (line_samples){0};
+    }
     b.x = -64; b.y = -64;
     psp_render_walk_line(&a, &b, 0, 0, 10, 10, collect_line, &s);
     CHECK(!s.count, "negative coordinates floor and descending boundary excludes origin");
@@ -1694,6 +2733,23 @@ int main(void) {
     test_depth_in_vram();
     test_depth_plane();
     test_transformed_depth();
+    test_vertex_depth_ge();
+    test_skin_ge();
+    test_light_ge();
+    test_rsqrt_ge();
+    test_light_world();
+    test_morph_fields_ge();
+    test_clip_xy_lines();
+    test_triangle_fans();
+    test_long_edge_groups();
+    test_long_edge_extent();
+    test_patch_hang();
+    test_patch_points_ge();
+    test_colour_plane_anchor();
+    test_line_rules();
+    test_gradient_reciprocal();
+    test_depth_plane_side();
+    test_spline_colour();
     test_line_between_centres();
     test_far_vertex_16bit();
     test_backend_selection();

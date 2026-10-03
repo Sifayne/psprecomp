@@ -36,7 +36,7 @@ PSP_MODULE_INFO("sasprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(512);
 
-#define PROBE_VERSION 3
+#define PROBE_VERSION 4
 
 typedef unsigned int w32;   /* PSPSDK's u32 is long; this prints with %X */
 
@@ -2627,6 +2627,62 @@ static void sec_badptr(void) {
         ret(__sceSasCore(NULL, g_out));
 }
 
+/* ============================================================================
+ * layout again (version 4): every word, uncapped
+ * ==========================================================================*/
+
+/* diff() shows at most 24 words, and step 31's first core changed 38. */
+static void diff_all(void) {
+    char s1[32], s2[32];
+    const w32 *a = (const w32 *)g_snap, *b = (const w32 *)g_core_mem;
+    int n = 0;
+    sync();
+    for (int i = 0; i < CORE_BYTES / 4; i++) n += a[i] != b[i];
+    out("  struct: %d words changed\n", n);
+    for (int i = 0, shown = 0; i < CORE_BYTES / 4; i++) {
+        if (a[i] == b[i]) continue;
+        if (shown % 3 == 0) out("   ");
+        out(" +%03X %s>%s", i * 4, norm(a[i], s1), norm(b[i], s2));
+        if (++shown % 3 == 0 || shown == n) out("\n");
+    }
+    memcpy(g_snap, g_core_mem, CORE_BYTES);
+}
+
+/* The layout section's setters again, from the same fresh struct and VAG,
+ * with every changed word logged: once for all the setters, then for the
+ * first core (step 31 showed 24 of its 38), a second core, and a key-off
+ * followed by four cores. */
+static void sec_layout4(void) {
+    section("layout again");
+    fresh();
+    vag_clear(VAG);
+    for (int i = 0; i < 5; i++) vag_blk_c(VAG, 0, 4, i == 4 ? 1 : 0, 1);
+    snap();
+    if (!step("layout again: steps 18-30's setters, every word they changed")) {
+        __sceSasSetVoice(core, 0, VAG, 0x50, 0);
+        __sceSasSetVoice(core, 1, VAG, 0x50, 1);
+        __sceSasSetVoicePCM(core, 2, PCM(0), 100, 50);
+        __sceSasSetPitch(core, 0, 0x1234);
+        __sceSasSetVolume(core, 0, 0x111, 0x222, 0x333, 0x444);
+        __sceSasSetADSR(core, 0, 0xF, TA, TD, TS, TR);
+        __sceSasSetADSR(core, 1, 0xF, TA, TD, TS, TR);
+        __sceSasSetADSR(core, 31, 0xF, TA, TD, TS, TR);
+        __sceSasSetADSRmode(core, 0, 0xF, 2, 3, 4, 5);
+        __sceSasSetSL(core, 0, TL);
+        __sceSasSetSimpleADSR(core, 3, 0x8F3A, 0x4ABC);
+        __sceSasSetNoise(core, 4, 17);
+        ret(__sceSasSetKeyOn(core, 2));
+        diff_all();
+    }
+    if (!step("layout again: __sceSasCore once, every word")) { ret(core_raw()); diff_all(); }
+    if (!step("layout again: __sceSasCore a second time, every word")) { ret(core_raw()); diff_all(); }
+    if (!step("layout again: SetKeyOff(2), then __sceSasCore four times, every word")) {
+        ret(__sceSasSetKeyOff(core, 2));
+        for (int i = 0; i < 4; i++) core_raw();
+        diff_all();
+    }
+}
+
 /* ============================================================================ */
 
 int main(int argc, char **argv) {
@@ -2662,6 +2718,7 @@ int main(int argc, char **argv) {
     sec_reverb();
     sec_waves();
     sec_badptr();
+    sec_layout4();
     probe_done();
     return 0;
 }

@@ -24,6 +24,7 @@
  * with its own correctness problem.
  */
 
+#include <limits.h>
 #include <math.h>
 #ifndef _WIN32
 #include <pthread.h>          /* the GE thread census; see ge_note_thread */
@@ -78,23 +79,6 @@ static int fx16_floor(float f) {
     const float s = f * (float)PSP_SUBPX;
     const int i = (int)s;
     return i - (s < (float)i);
-}
-
-/* 1/w for x and y of a tessellated vertex: the reciprocal's mantissa cut to
- * 14 bits, toward zero, on the float clip position. Every vertex took this
- * until geprobe 7; one the GE reads from memory now takes the GE's own
- * arithmetic (clip_to_fx16). Patch vertices keep this because psprecomp's
- * tessellation is not the GE's: the GE's rule on them takes scene 22 from
- * 612 pixels off to 954 and scene 23 from 1878 to 1925 (scene 26: 1190 to
- * 1032, a gain on one patch and a loss on another). With an exact 1/w and
- * float arithmetic, one corner of scene 15 (w = 1.5, -1809.08 sixteenths
- * from the centre) and one of scene 18 (w = 5, -28945.4) land a sixteenth
- * further out than the hardware draws them; 14 bits was the only width
- * that put both where it does. */
-static float ge_recip(float w) {
-    int e;
-    const float m = frexpf(1.0f / w, &e);                  /* [0.5, 1) */
-    return ldexpf((float)(int)(m * 16384.0f), e - 14);
 }
 
 /* One axis of a transformed vertex onto the 1/16 grid: the viewport centre
@@ -337,9 +321,11 @@ typedef struct {
     int      cbid;      /* sceGeSetCallback id given at EnQueue; -1 none */
     int      paused;    /* stopped at a PAUSE until sceGeContinue */
     int      cont_early;/* sceGeContinue arrived before the pause took hold */
+    int      hung;      /* stopped for good at a patch it cannot draw, until sceGeBreak */
 } ge_queue;
 
 static ge_queue g_queue[MAX_QUEUES];
+static int g_ge_hang;   /* draw_patch met a division that hangs the GE (run_list_body) */
 
 /* When the GE runs.
  *
@@ -1155,6 +1141,38 @@ static uint32_t current_colour(void) {
     return c;
 }
 
+/* A vertex colour in any of its four formats, as 8888: each 16-bit format's
+ * fields widened by repeating their top bits below them (5 bits to 8 as
+ * v << 3 | v >> 2), 5650 opaque and 5551's alpha bit 0 or 255. geprobe 22
+ * (fw 6.60) scene 139 draws 200 points of each 16-bit format and reads every
+ * one of their 1800 channels so; this took 8888 alone and gave the rest the
+ * material colour. The alpha is not read (a frame's alpha byte is the
+ * stencil). */
+static uint32_t widen_colour(uint32_t fmt, uint32_t c) {
+    uint32_t r, g, b, a;
+    switch (fmt) {
+    case 4: r = c & 31; g = (c >> 5) & 63; b = (c >> 11) & 31;
+            return 0xFF000000u | (b << 3 | b >> 2) << 16 | (g << 2 | g >> 4) << 8 | (r << 3 | r >> 2);
+    case 5: r = c & 31; g = (c >> 5) & 31; b = (c >> 10) & 31; a = (c >> 15) & 1;
+            return (a ? 0xFF000000u : 0u) | (b << 3 | b >> 2) << 16 | (g << 3 | g >> 2) << 8 | (r << 3 | r >> 2);
+    case 6: r = c & 15; g = (c >> 4) & 15; b = (c >> 8) & 15; a = (c >> 12) & 15;
+            return (a * 17) << 24 | (b * 17) << 16 | (g * 17) << 8 | r * 17;
+    default: return c;
+    }
+}
+static uint32_t read_colour_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int col_off) {
+    const uint32_t fmt = VT_COLOR(vtype);
+    uint32_t c;
+    if (fmt == 7) {
+        if (vp) memcpy(&c, vp + col_off, 4);
+        else    c = psp_read32(addr + (uint32_t)col_off);
+        return c;
+    }
+    if (vp) { uint16_t h; memcpy(&h, vp + col_off, 2); c = h; }
+    else    c = psp_read16(addr + (uint32_t)col_off);
+    return widen_colour(fmt, c);
+}
+
 static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
                        int tex_off, psp_vertex *out) {
     out->spec = 0; out->spec_set = 0;
@@ -1187,8 +1205,8 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
         break;
     }
     if (tex_off >= 0) note_uv(out->u, out->v);
-    if (col_off >= 0 && VT_COLOR(vtype) == 7)
-        out->rgba = psp_read32(addr + (uint32_t)col_off);
+    if (col_off >= 0 && VT_COLOR(vtype) >= 4)
+        out->rgba = read_colour_at(NULL, addr, vtype, col_off);
 
     switch (VT_POS(vtype)) {
     case 2:   /* 16-bit: whole pixels, onto the 1/16 grid */
@@ -1279,25 +1297,20 @@ static int read_pos_model(uint32_t addr, uint32_t vtype, int pos_off, float p[3]
  * -1.0 and the right edge came out texel 0. Neither TEXSCALE nor TEXOFFSET was
  * decoded before: gpu/filtering/precisionnearest3d scales by 0.5, and its texel
  * boundary landed at a quarter of the sprite instead of the middle. */
-static void read_uv_model(uint32_t addr, uint32_t vtype, int tex_off, psp_vertex *out) {
-    out->u = out->v = 0.0f;
-    if (tex_off < 0) return;
+static int read_uv_raw(uint32_t addr, uint32_t vtype, int tex_off, float *u, float *v) {
+    *u = *v = 0.0f;
+    if (tex_off < 0) return 0;
     const uint32_t a = addr + (uint32_t)tex_off;
-    float u = 0.0f, v = 0.0f;
     switch (VT_TEX(vtype)) {
-    case 1: u = (float)psp_read8(a)       / 128.0f;
-            v = (float)psp_read8(a + 1)   / 128.0f;   break;
-    case 2: u = (float)psp_read16(a)      / 32768.0f;
-            v = (float)psp_read16(a + 2)  / 32768.0f; break;
-    case 3: u = psp_read_f32(a); v = psp_read_f32(a + 4); break;
-    default: return;
+    case 1: *u = (float)psp_read8(a)       / 128.0f;
+            *v = (float)psp_read8(a + 1)   / 128.0f;   return 1;
+    case 2: *u = (float)psp_read16(a)      / 32768.0f;
+            *v = (float)psp_read16(a + 2)  / 32768.0f; return 1;
+    case 3: *u = psp_read_f32(a); *v = psp_read_f32(a + 4); return 1;
+    default: return 0;
     }
-    u = u * g_ge.tex_scale_u + g_ge.tex_offset_u;
-    v = v * g_ge.tex_scale_v + g_ge.tex_offset_v;
-    out->u = u * (float)g_ge.tex_w;
-    out->v = v * (float)g_ge.tex_h;
-    note_uv(out->u, out->v);
 }
+static void uv_to_texels(float u, float v, psp_vertex *out);
 
 /* The same three decoders over one host span for the whole record.
  *
@@ -1333,23 +1346,22 @@ static void read_normal_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtyp
     default: break;
     }
 }
-static void read_uv_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, psp_vertex *out) {
-    if (!vp) { read_uv_model(addr, vtype, tex_off, out); return; }
-    out->u = out->v = 0.0f;
-    if (tex_off < 0) return;
+static int read_uv_raw_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, float *u, float *v) {
+    if (!vp) return read_uv_raw(addr, vtype, tex_off, u, v);
+    *u = *v = 0.0f;
+    if (tex_off < 0) return 0;
     const uint8_t *a = vp + tex_off;
-    float u = 0.0f, v = 0.0f;
     switch (VT_TEX(vtype)) {
-    case 1: u = (float)a[0] / 128.0f;                  v = (float)a[1] / 128.0f;                    break;
-    case 2: u = (float)(uint16_t)rd_s16(a) / 32768.0f; v = (float)(uint16_t)rd_s16(a + 2) / 32768.0f; break;
-    case 3: u = rd_f32(a); v = rd_f32(a + 4); break;
-    default: return;
+    case 1: *u = (float)a[0] / 128.0f;                  *v = (float)a[1] / 128.0f;                    return 1;
+    case 2: *u = (float)(uint16_t)rd_s16(a) / 32768.0f; *v = (float)(uint16_t)rd_s16(a + 2) / 32768.0f; return 1;
+    case 3: *u = rd_f32(a); *v = rd_f32(a + 4); return 1;
+    default: return 0;
     }
-    u = u * g_ge.tex_scale_u + g_ge.tex_offset_u;
-    v = v * g_ge.tex_scale_v + g_ge.tex_offset_v;
-    out->u = u * (float)g_ge.tex_w;
-    out->v = v * (float)g_ge.tex_h;
-    note_uv(out->u, out->v);
+}
+static void read_uv_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, psp_vertex *out) {
+    float u, v;
+    out->u = out->v = 0.0f;
+    if (read_uv_raw_at(vp, addr, vtype, tex_off, &u, &v)) uv_to_texels(u, v, out);
 }
 
 /* World and view are 4 columns of 3 rows; the implied bottom row makes the
@@ -1386,19 +1398,209 @@ static double ge_cut(double v, int bits, int round) {
     return ldexp(round ? floor(m + 0.5) : trunc(m), e - bits);
 }
 
-/* The GE's own float: sign, exponent and 16 significant bits, cut toward
- * zero. The projection below computes in it (ge_proj_row, ge_screen_z). */
-static double ge24(double v) { return ge_cut(v, 16, 0); }
 
-/* One row of the projection, eye to clip, as the GE forms it: each eye
- * coordinate cut to ge24, each product cut to ge24, the three products and
- * the translation summed without a cut: geprobe 7 scene 45's fit for the
- * depth row (ge_screen_z), where summing a step at a time in ge24, as
- * before, does worse. */
-static float ge_proj_row(const float m[16], int row, const float in[3]) {
-    const double x = ge24(in[0]), y = ge24(in[1]), z = ge24(in[2]);
-    return (float)(ge24((double)m[row] * x) + ge24((double)m[4 + row] * y) +
-                   ge24((double)m[8 + row] * z) + m[12 + row]);
+/* ---- The GE's vertex arithmetic ----------------------------------------
+ *
+ * geprobe 12 (fw 6.60) reads each stage of a vertex's depth whole: with the
+ * viewport z centre 0 and its scale a power of two, a point's depth is
+ * clip z / w's top 16 bits (scenes 62-66). What it reads, and every point of
+ * scenes 45 and 59-61 besides (41,543 points), fit this to the last bit:
+ *  - A number has 16 significant bits. A vertex coordinate is cut to them
+ *    toward zero on the way in (ge_split); a matrix word holds no more.
+ *  - A product a b keeps its bits down to 2^(ea + eb - 15), toward zero, ea
+ *    and eb the exponents of a and b: when the significands' product reaches
+ *    2 it keeps one bit more than 16 (ge_mul).
+ *  - A sum puts every term on the grid 2^(E - 15), each cut toward zero, E
+ *    the largest term's exponent -- a product's ea + eb, whatever its
+ *    significand -- adds them, and cuts the total to 16 bits (ge_sum). A
+ *    matrix row's three products and its translation are one such sum.
+ *  - The GE multiplies projection by view, that by world, in this same
+ *    arithmetic, and transforms a vertex by the product (ge_wvp). Forming
+ *    eye z first instead cancels scene 61's errors in clip z / w: it fits 939
+ *    of scene 65's 3072 points where this fits all of them.
+ *  - 1/w is a table (ge_rcp16); clip z / w is clip z times it, cut to 16 bits;
+ *    the viewport is zc plus zs times that, a sum, floored (ge_screen_z).
+ * Scene 63 sums two to four terms across alignments of 3 to 18 bits, with a
+ * carry and a cancellation; scene 66 is the probes' own perspective, where
+ * every point a product carries in was a step off until the sum lined it up
+ * by ea + eb. */
+typedef struct {
+    int64_t q;       /* the value is q 2^(e - 15); 0 for zero */
+    int     e;
+    int     bad;     /* an input not finite: sums fall back to v */
+    double  v;       /* the plain product */
+} ge_term;
+
+/* v cut to 16 significant bits toward zero, as a signed significand in
+ * [2^15, 2^16) and an exponent; 0 for zero, -1 for a value not finite. */
+static int ge_split(double v, int64_t *s, int *e) {
+    uint64_t b;
+    memcpy(&b, &v, sizeof b);
+    const int ex = (int)((b >> 52) & 0x7FF);
+    if (ex == 0x7FF) return -1;
+    if (ex == 0) {
+        if (v == 0.0) return 0;
+        int fe;
+        *s = (int64_t)(frexp(fabs(v), &fe) * 65536.0);
+        *e = fe - 1;
+    } else {
+        *s = (int64_t)(0x8000u | ((b >> 37) & 0x7FFFu));
+        *e = ex - 1023;
+    }
+    if (b >> 63) *s = -*s;
+    return 1;
+}
+
+static ge_term ge_mul(double a, double b) {
+    ge_term t = { 0, INT_MIN, 0, a * b };
+    int64_t sa, sb;
+    int ea, eb;
+    const int ka = ge_split(a, &sa, &ea), kb = ge_split(b, &sb, &eb);
+    if (ka < 0 || kb < 0) { t.bad = 1; return t; }
+    if (!ka || !kb) return t;
+    const int64_t p = sa * sb;                     /* under 2^32 */
+    t.q = p < 0 ? -((-p) >> 15) : p >> 15;
+    t.e = ea + eb;
+    return t;
+}
+
+static double ge_sum(const ge_term *t, int n) {
+    int e = INT_MIN, bad = 0;
+    double plain = 0.0;
+    for (int i = 0; i < n; i++) {
+        plain += t[i].v;
+        bad |= t[i].bad;
+        if (t[i].q && t[i].e > e) e = t[i].e;
+    }
+    if (bad) return plain;
+    if (e == INT_MIN) return 0.0;
+    int64_t s = 0;
+    for (int i = 0; i < n; i++) {
+        if (!t[i].q) continue;
+        const int d = e - t[i].e;
+        const int64_t m = t[i].q < 0 ? -t[i].q : t[i].q;
+        const int64_t a = d >= 63 ? 0 : m >> d;
+        s += t[i].q < 0 ? -a : a;
+    }
+    if (!s) return 0.0;
+    int64_t m = s < 0 ? -s : s;
+    int sh = 0;
+    while ((m >> sh) >= 65536) sh++;               /* the total to 16 bits */
+    m >>= sh;
+    return ldexp(s < 0 ? -(double)m : (double)m, e - 15 + sh);
+}
+
+/* A vertex's texture coordinates, in units, through TEXSCALE and TEXOFFSET to
+ * texels: u s + o as one GE sum of two GE products (ge_mul, ge_sum), then the
+ * texture's size. geprobe 22 (fw 6.60) scene 140 reads 600 plain float
+ * coordinates at scales 1, 2^8 and 2^12 through a texture that names its own
+ * texels, and this fits all 1800 readings; the float sum, as before, missed
+ * 119 at 2^12. */
+static void uv_to_texels(float u, float v, psp_vertex *out) {
+    const ge_term tu[2] = { ge_mul(u, g_ge.tex_scale_u), ge_mul(g_ge.tex_offset_u, 1.0) };
+    const ge_term tv[2] = { ge_mul(v, g_ge.tex_scale_v), ge_mul(g_ge.tex_offset_v, 1.0) };
+    out->u = (float)(ge_sum(tu, 2) * (double)g_ge.tex_w);
+    out->v = (float)(ge_sum(tv, 2) * (double)g_ge.tex_h);
+    note_uv(out->u, out->v);
+}
+
+static double ge_dot4(const double row[4], const double in[4]) {
+    ge_term t[4];
+    for (int k = 0; k < 4; k++) t[k] = ge_mul(row[k], in[k]);
+    return ge_sum(t, 4);
+}
+
+static void ge_mat4_mul(const double a[4][4], const double b[4][4], double out[4][4]) {
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            const double col[4] = { b[0][j], b[1][j], b[2][j], b[3][j] };
+            out[i][j] = ge_dot4(a[i], col);
+        }
+}
+
+/* Projection times view times world, row by row, as the GE combines them
+ * (projection and view first: scene 65 cannot tell that from view and world
+ * first). World and view are 4 x 3, their last row 0 0 0 1. */
+static void ge_wvp(double m[4][4]) {
+    double p[4][4], v[4][4], w[4][4], pv[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            p[i][j] = g_tl.proj[4 * j + i];
+            v[i][j] = i < 3 ? g_tl.view[3 * j + i]  : (j == 3);
+            w[i][j] = i < 3 ? g_tl.world[3 * j + i] : (j == 3);
+        }
+    ge_mat4_mul(p, v, pv);
+    ge_mat4_mul(pv, w, m);
+}
+
+/* A model position to clip space through ge_wvp's matrix. */
+static void ge_clip(const double m[4][4], const float model[3], float clip[4]) {
+    const double in[4] = { model[0], model[1], model[2], 1.0 };   /* ge_mul cuts each to 16 bits */
+    for (int i = 0; i < 4; i++) clip[i] = (float)ge_dot4(m[i], in);
+}
+
+/* 1/w as the GE has it. w is cut to 16 bits; the 7 significand bits below
+ * the leading one pick one of 128 straight segments, the 8 after step along
+ * it: twice its start in units of 2^-16, less its drop times the step over
+ * 256, that product rounded up, then floored, for 1/w's significand in
+ * units of 2^-16. Each segment's ends are within a unit of 2^23/h and
+ * 2^23/(h+1), h its index plus 128, so it lies a little above 1/w between
+ * them (a chord, where geprobe 8's gradient reciprocal is a tangent). The
+ * entries are geprobe 12's: scene 62 reads 1/w whole for 9151 w over nine
+ * binades (2^-3 to 2^13), and these reproduce every one; the drops are all
+ * even. Not a rounding of 2^23/h or of the chord at any width tried, and
+ * not consecutive starts' differences either (they differ from the drop by
+ * up to a unit), so they are kept as measured. Every run of 256 w differing
+ * only in the bits a float has past 16 reads one value. */
+static const uint32_t ge_rcp_tab[128][2] = {
+{ 131073, 508 }, { 130056, 500 }, { 129055, 492 }, { 128072, 486 },
+    { 127100, 478 }, { 126144, 470 }, { 125204, 464 }, { 124275, 456 },
+    { 123362, 450 }, { 122462, 444 }, { 121575, 438 }, { 120701, 432 },
+    { 119837, 424 }, { 118987, 418 }, { 118151, 414 }, { 117324, 408 },
+    { 116509, 402 }, { 115705, 396 }, { 114914, 392 }, { 114131, 386 },
+    { 113359, 380 }, { 112600, 376 }, { 111848, 370 }, { 111108, 366 },
+    { 110376, 360 }, { 109655, 356 }, { 108944, 352 }, { 108240, 346 },
+    { 107546, 342 }, { 106862, 338 }, { 106185, 334 }, { 105518, 330 },
+    { 104859, 326 }, { 104207, 322 }, { 103564, 318 }, { 102928, 314 },
+    { 102301, 310 }, { 101681, 306 }, { 101068, 302 }, { 100464, 300 },
+    {  99866, 296 }, {  99274, 292 }, {  98690, 288 }, {  98114, 286 },
+    {  97543, 282 }, {  96978, 278 }, {  96422, 276 }, {  95870, 272 },
+    {  95327, 270 }, {  94787, 266 }, {  94256, 264 }, {  93728, 260 },
+    {  93208, 258 }, {  92692, 254 }, {  92183, 252 }, {  91681, 250 },
+    {  91181, 246 }, {  90689, 244 }, {  90202, 242 }, {  89718, 238 },
+    {  89241, 236 }, {  88770, 234 }, {  88303, 232 }, {  87839, 228 },
+    {  87382, 226 }, {  86929, 224 }, {  86482, 222 }, {  86038, 220 },
+    {  85600, 218 }, {  85165, 216 }, {  84733, 212 }, {  84308, 210 },
+    {  83886, 208 }, {  83469, 206 }, {  83056, 204 }, {  82647, 202 },
+    {  82242, 200 }, {  81840, 198 }, {  81443, 196 }, {  81050, 194 },
+    {  80660, 192 }, {  80276, 192 }, {  79893, 190 }, {  79514, 188 },
+    {  79139, 186 }, {  78767, 184 }, {  78399, 182 }, {  78034, 180 },
+    {  77674, 180 }, {  77316, 178 }, {  76961, 176 }, {  76609, 174 },
+    {  76261, 172 }, {  75915, 170 }, {  75575, 170 }, {  75235, 168 },
+    {  74899, 166 }, {  74565, 164 }, {  74237, 164 }, {  73909, 162 },
+    {  73585, 160 }, {  73265, 160 }, {  72945, 158 }, {  72629, 156 },
+    {  72317, 156 }, {  72006, 154 }, {  71698, 152 }, {  71394, 152 },
+    {  71091, 150 }, {  70790, 148 }, {  70494, 148 }, {  70198, 146 },
+    {  69907, 146 }, {  69616, 144 }, {  69328, 142 }, {  69043, 142 },
+    {  68760, 140 }, {  68480, 140 }, {  68201, 138 }, {  67926, 138 },
+    {  67651, 136 }, {  67379, 134 }, {  67110, 134 }, {  66842, 132 },
+    {  66578, 132 }, {  66314, 130 }, {  66053, 130 }, {  65794, 128 },
+};
+
+static double ge_rcp16(double w) {
+    if (w == 0.0 || !isfinite(w)) return 1.0 / w;
+    int e;
+    const double m = frexp(fabs(w), &e);                     /* [0.5, 1) */
+    const uint32_t sig = (uint32_t)(m * 65536.0) & 0x7FFFu;  /* 15 bits below the leading one */
+    if (sig == 0) return copysign(ldexp(1.0, 1 - e), w);     /* a power of two: exact */
+    const uint32_t t = sig >> 8, l = sig & 0xFFu;
+    const uint32_t q = (128u * ge_rcp_tab[t][0] - ge_rcp_tab[t][1] * l - 1u) >> 8;
+    return copysign(ldexp((double)q, -15 - e), w);           /* (q / 2^16) * 2^(1-e) */
+}
+
+/* clip c over w as the GE forms it: c times 1/w, cut to 16 bits. */
+static double ge_over_w(double c, double w) {
+    return ge_cut(c * ge_rcp16(w), 16, 0);
 }
 
 static void mul_4x4(const float m[16], const float in[3], float out[4]) {
@@ -1410,7 +1612,7 @@ static void mul_4x4(const float m[16], const float in[3], float out[4]) {
 
 /* One vertex as the transform stage takes it, after skinning and morphing:
  * model-space position and normal, colour, and texture coordinates in texels
- * (read_uv_model's units). Patches are tessellated into these too. */
+ * (uv_to_texels' units). Patches are tessellated into these too. */
 typedef struct { float pos[3], nrm[3]; uint32_t rgba; float u, v; } ge_mvert;
 
 /* A vertex's skinning weights. Normalised like the other narrow fields: an
@@ -1427,74 +1629,163 @@ static void read_weights(uint32_t a, float *w) {
     }
 }
 
-/* One vertex set of a record: its fields, skinned when it carries weights.
- * Skinning is the weighted sum of the vertex through each bone, ahead of the
- * world matrix; the normal goes through the bones' rotation parts. */
-static int read_vertex_set(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
-                           int norm_off, int want_normal, ge_mvert *o) {
-    const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)g_vl.set_stride);
-    float p[3], n[3];
-    if (!read_pos_model_at(vp, a, vtype, pos_off, p)) return 0;
-    if (want_normal) read_normal_model_at(vp, a, vtype, norm_off, n);
-    else { n[0] = n[1] = 0.0f; n[2] = 1.0f; }
-    o->rgba = current_colour();
-    if (col_off >= 0 && VT_COLOR(vtype) == 7) o->rgba = psp_read32(a + (uint32_t)col_off);
-    psp_vertex uv;
-    read_uv_model_at(vp, a, vtype, tex_off, &uv);
-    o->u = uv.u; o->v = uv.v;
-    if (g_vl.w_fmt) {
-        float w[8];
-        read_weights(a, w);
-        float sp[3] = { 0, 0, 0 }, sn[3] = { 0, 0, 0 };
-        for (int i = 0; i < g_vl.w_n; i++) {
-            float t[3];
-            mul_4x3(&g_tl.bone[12 * i], p, t);
-            for (int k = 0; k < 3; k++) sp[k] += w[i] * t[k];
-            if (want_normal) {
-                mul_3x3(&g_tl.bone[12 * i], n, t);
-                for (int k = 0; k < 3; k++) sn[k] += w[i] * t[k];
-            }
+/* ---- Skinning and morphing arithmetic ------------------------------------
+ *
+ * geprobe 16 (fw 6.60) reads skinned and morphed positions whole, the way
+ * geprobe 12 read the vertex path (scenes 110-114, 4171 points drawn), and
+ * every one fits this to the last bit:
+ *  - Both are one accumulator. Each step adds a term to it, putting the two
+ *    on the grid 2^(E - 15), each cut toward zero, E the larger one's own
+ *    exponent (floor log2 |x|, not a product's ea + eb as ge_sum has it), and
+ *    cuts the total to 16 bits (ge_acc). Summing all the terms at once on one
+ *    grid fits 113 of scene 114's 160 four-set points; this fits all 480 of
+ *    its morph-only ones.
+ *  - Morphing adds each vertex set's coordinate times its morph weight (the
+ *    24-bit float the command holds), set 0 first. The weights of a skinned
+ *    vertex are morphed the same way, and the morphed vertex is then skinned
+ *    once: skinning each set and morphing the results fits 4 of 160.
+ *  - Skinning adds, bone by bone, the translation, x, y and z terms of that
+ *    bone's row: (w_i B_i[k]) cut to 16 bits, times the coordinate, cut. Of
+ *    the 8! orders of two bones' terms only this one (and swapping the first
+ *    two) fits all 260 points that pose it; blending the matrices first and
+ *    then one row sum fits 135 of 160 single-bone points.
+ *  - Inputs are cut to 16 bits toward zero, as on the vertex path: a float
+ *    weight too. 8- and 16-bit weights are unsigned, 0x80 and 0x8000 one:
+ *    0xFF and 0xFFFF weigh just under two (scene 111's extremes).
+ * The skinned position then takes the world, view and projection matrices
+ * as an unskinned one would (scene 113).
+ *
+ * geprobe 22 (fw 6.60) reads the rest through the same accumulator:
+ *  - Normals (scene 138, 2400 points lit through bones and morph sets whose
+ *    terms cancel): skinned bone by bone over the x, y and z terms, no
+ *    translation, and morphed set by set, as positions are. Of the six
+ *    orders of a bone's terms only x, y, z fits all 2400; float32, as this
+ *    did, fits 1315; adding the translation, 1 of the 300 that pose it.
+ *  - Colours (scene 139, 4400 points): each channel, widened to 8 bits,
+ *    times the 16-bit morph weight into the accumulator, then floored, the
+ *    sign dropped and clamped to 255 -- a sum of -34.004 reads 34. Every one
+ *    of the 13,200 channels fits.
+ *  - Texture coordinates (scene 140, 2500 points at three scales): morphed
+ *    in units before TEXSCALE and TEXOFFSET (uv_to_texels), so the offset is
+ *    not weighted; all 15,000 readings fit, the float blend of the scaled
+ *    coordinates, as this did, 7,025. */
+static double ge_c16(double v) { return ge_cut(v, 16, 0); }
+
+static double ge_acc(double acc, double t) {
+    if (t == 0.0 || !isfinite(t) || !isfinite(acc)) return t == 0.0 ? acc : acc + t;
+    if (acc == 0.0) return ge_c16(t);
+    int ea, et;
+    frexp(acc, &ea);
+    frexp(t, &et);
+    const double u = ldexp(1.0, (ea > et ? ea : et) - 1 - 15);
+    return ge_c16(trunc(acc / u) * u + trunc(t / u) * u);
+}
+
+/* One axis of a skinned position (B[c][k] = bone[3k + c]). */
+static float ge_skin_axis(const float *w, const float p[3], int c) {
+    static const int order[4] = { 3, 0, 1, 2 };
+    const double v[4] = { ge_c16(p[0]), ge_c16(p[1]), ge_c16(p[2]), 1.0 };
+    double acc = 0.0;
+    for (int i = 0; i < g_vl.w_n; i++) {
+        const double wi = ge_c16(w[i]);
+        for (int j = 0; j < 4; j++) {
+            const int k = order[j];
+            const double b = ge_c16(wi * ge_c16(g_tl.bone[12 * i + 3 * k + c]));
+            acc = ge_acc(acc, ge_c16(b * v[k]));
         }
-        memcpy(p, sp, sizeof p);
-        if (want_normal) memcpy(n, sn, sizeof n);
+    }
+    return (float)acc;
+}
+
+/* One axis of a skinned normal: the x, y and z terms of each bone in turn,
+ * as a position's without its translation. */
+static float ge_skin_normal_axis(const float *w, const float n[3], int c) {
+    const double v[3] = { ge_c16(n[0]), ge_c16(n[1]), ge_c16(n[2]) };
+    double acc = 0.0;
+    for (int i = 0; i < g_vl.w_n; i++) {
+        const double wi = ge_c16(w[i]);
+        for (int k = 0; k < 3; k++) {
+            const double b = ge_c16(wi * ge_c16(g_tl.bone[12 * i + 3 * k + c]));
+            acc = ge_acc(acc, ge_c16(b * v[k]));
+        }
+    }
+    return (float)acc;
+}
+
+/* Skin a vertex in place, position and normal, by the GE's arithmetic. */
+static void skin_mvert(ge_mvert *o, const float *w, int want_normal) {
+    float p[3], sn[3];
+    for (int c = 0; c < 3; c++) p[c] = ge_skin_axis(w, o->pos, c);
+    if (want_normal) {
+        for (int c = 0; c < 3; c++) sn[c] = ge_skin_normal_axis(w, o->nrm, c);
+        memcpy(o->nrm, sn, sizeof sn);
     }
     memcpy(o->pos, p, sizeof p);
-    memcpy(o->nrm, n, sizeof n);
+}
+
+/* One vertex set of a record: its fields and, when it carries them, its
+ * weights (w; left alone otherwise). Nothing is skinned yet. */
+static int read_vertex_set(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
+                           int norm_off, int want_normal, ge_mvert *o, float *w) {
+    const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)g_vl.set_stride);
+    if (!read_pos_model_at(vp, a, vtype, pos_off, o->pos)) return 0;
+    if (want_normal) read_normal_model_at(vp, a, vtype, norm_off, o->nrm);
+    else { o->nrm[0] = o->nrm[1] = 0.0f; o->nrm[2] = 1.0f; }
+    o->rgba = current_colour();
+    if (col_off >= 0 && VT_COLOR(vtype) >= 4) o->rgba = read_colour_at(vp, a, vtype, col_off);
+    read_uv_raw_at(vp, a, vtype, tex_off, &o->u, &o->v);       /* in units: read_mvert scales */
+    if (g_vl.w_fmt) read_weights(a, w);
     return 1;
 }
 
+/* A record's texture coordinates, read or morphed in units, to texels. */
+static void mvert_texels(ge_mvert *o, uint32_t vtype, int tex_off) {
+    psp_vertex t;
+    t.u = t.v = 0.0f;
+    if (tex_off >= 0 && VT_TEX(vtype)) uv_to_texels(o->u, o->v, &t);
+    o->u = t.u; o->v = t.v;
+}
+
 /* A whole record: its vertex sets blended by the morph weights, when there
- * is more than one. Every field is blended, colour included -- scene 21's
- * half-and-half triangle is half-way in colour as well as in place. The
- * blended colour is truncated, not rounded: scene 21's triangles weighted
- * 0.5/0.5 and 0.25/1.0 (127.5 and 63.75 per channel) differ from the
- * hardware on 1170 fewer pixels so (1620 -> 450). What is left is in those
- * two triangles and not pinned down; the whole-weight ones are exact. */
+ * is more than one, then skinned. Every field is blended, each through the
+ * accumulator above (see there for colour's sign and clamp). */
 static int read_mvert(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
                       int norm_off, int want_normal, ge_mvert *o) {
-    if (g_vl.morph_n <= 1)
-        return read_vertex_set(a, vtype, col_off, pos_off, tex_off, norm_off, want_normal, o);
-    float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, col[4] = { 0, 0, 0, 0 }, u = 0, v = 0;
+    float w[8] = { 0 };
+    if (g_vl.morph_n <= 1) {
+        if (!read_vertex_set(a, vtype, col_off, pos_off, tex_off, norm_off, want_normal, o, w))
+            return 0;
+        mvert_texels(o, vtype, tex_off);
+        if (g_vl.w_fmt) skin_mvert(o, w, want_normal);
+        return 1;
+    }
+    double pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, col[4] = { 0, 0, 0, 0 }, uv[2] = { 0, 0 }, mw8[8] = { 0 };
     for (int k = 0; k < g_vl.morph_n; k++) {
         ge_mvert s1;
+        float w1[8] = { 0 };
         if (!read_vertex_set(a + (uint32_t)(k * g_vl.set_stride), vtype, col_off, pos_off, tex_off,
-                             norm_off, want_normal, &s1))
+                             norm_off, want_normal, &s1, w1))
             return 0;
-        const float w = g_tl.morph_w[k];
-        for (int i = 0; i < 3; i++) { pos[i] += w * s1.pos[i]; nrm[i] += w * s1.nrm[i]; }
-        for (int i = 0; i < 4; i++) col[i] += w * (float)((s1.rgba >> (8 * i)) & 0xFFu);
-        u += w * s1.u; v += w * s1.v;
+        const double m16 = ge_c16(g_tl.morph_w[k]);
+        for (int i = 0; i < 3; i++) {
+            pos[i] = ge_acc(pos[i], m16 * ge_c16(s1.pos[i]));
+            nrm[i] = ge_acc(nrm[i], m16 * ge_c16(s1.nrm[i]));
+        }
+        for (int i = 0; i < g_vl.w_n && g_vl.w_fmt; i++) mw8[i] = ge_acc(mw8[i], m16 * ge_c16(w1[i]));
+        for (int i = 0; i < 4; i++) col[i] = ge_acc(col[i], m16 * (double)((s1.rgba >> (8 * i)) & 0xFFu));
+        uv[0] = ge_acc(uv[0], m16 * ge_c16(s1.u));
+        uv[1] = ge_acc(uv[1], m16 * ge_c16(s1.v));
     }
-    memcpy(o->pos, pos, sizeof pos);
-    memcpy(o->nrm, nrm, sizeof nrm);
+    for (int i = 0; i < 3; i++) { o->pos[i] = (float)pos[i]; o->nrm[i] = (float)nrm[i]; }
+    for (int i = 0; i < 8; i++) w[i] = (float)mw8[i];
     o->rgba = 0;
     for (int i = 0; i < 4; i++) {
-        int c = (int)col[i];
-        if (c < 0) c = 0;
-        if (c > 255) c = 255;
-        o->rgba |= (uint32_t)c << (8 * i);
+        const double c = floor(fabs(col[i]));
+        o->rgba |= (uint32_t)(c > 255.0 ? 255.0 : c) << (8 * i);
     }
-    o->u = u; o->v = v;
+    o->u = (float)uv[0]; o->v = (float)uv[1];
+    mvert_texels(o, vtype, tex_off);
+    if (g_vl.w_fmt) skin_mvert(o, w, want_normal);
     return 1;
 }
 
@@ -1520,31 +1811,15 @@ static void ndc_to_screen(float nx, float ny, float nz, float *sx, float *sy, fl
                                : (nz * 0.5f + 0.5f) * 65535.0f;
 }
 
-/* Screen depth from clip z and w: clip z as ge_proj_row forms it, times 1/w
- * (w cut to ge24, its reciprocal to 24 bits, both toward zero), the product
- * cut to 18 bits, then the scale and the centre with the sum rounded to 16
- * bits, and the result to an integer by the rasterizer (sw_tri), which
- * floors it. geprobe 7 (fw 6.60) scene 45 draws 3840 points, each at its own
- * eye depth from -1.05 to -99, and reads their depths back (3720 outside
- * the dump's unreadable columns): this fits 2883, where the 17-bit rounded
- * reciprocal of the float w it replaces fit 1703 (2137 of the scene's depth
- * pixels off -> 837). It keeps the eleven depths geprobes 5 and 6 pinned
- * that one on: scenes 17 and 27's eye z -4, -4.5, -5, -5.5, -6 and -8 as
- * 15887, 14049, 12577, 11374, 10371 and 7612, scene 36's -4.9, -5.2,
- * -5.4, -5.6 and -5.7 as 12848, 12068, 11597, 11159 and 10952. It is the
- * best of 460,800 variants searched (the eye z cut to 16 or 17 bits, each
- * later step cut to 16 to 24 bits or not, truncated or rounded, a divide
- * or a 16- to 24-bit reciprocal, the viewport scale before or after the
- * divide, the integer floored or rounded); its ties differ only in cutting
- * the sum at 20 bits or more. The misses are a step either way, low where
- * the fraction this leaves is small and high where it is large, so the
- * GE's arithmetic is up to half a step from this somewhere the family does
- * not reach. geprobe 7 scene 48 reads one more: eye z -5.3 as 11829, where
- * this gives 11828.75. */
+/* Screen depth from clip z and w, as ge_sum says: zc plus zs times clip z
+ * over w, floored. sceGuDepthRange(65535, 0) sends zs -32768 and zc 32767
+ * (it halves 65535 as an integer). geprobe 11 (fw 6.60) scene 59's 3840
+ * points at w = 1 pinned the sum by itself; geprobe 12 the rest. */
 static float ge_screen_z(float cz, float w) {
     if (g_tl.vp_zs == 0.0f) return ((cz / w) * 0.5f + 0.5f) * 65535.0f;
-    const double ndc = ge_cut((double)cz * ge_cut(1.0 / ge24(w), 24, 0), 18, 0);
-    return (float)ge_cut((double)g_tl.vp_zc + (double)g_tl.vp_zs * ndc, 16, 1);
+    const double nz = ge_over_w(cz, w);
+    const ge_term t[2] = { ge_mul(g_tl.vp_zs, nz), ge_mul(g_tl.vp_zc, 1.0) };
+    return (float)floor(ge_sum(t, 2));
 }
 
 static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
@@ -1553,11 +1828,25 @@ static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
     *sz = ge_screen_z(clip[2], clip[3]);
 }
 
+/* One axis of a vertex the GE read onto the 1/16 grid: the viewport centre
+ * plus scale times clip over w as one of ge_sum's sums, less the screen
+ * offset. With the centre at 2048 the sum's grid is a sixteenth, so this is
+ * screen_axis_fx16's rule -- the product taken to sixteenths toward the
+ * centre -- without its float product. */
+static int ge_screen_axis(double ndc, float scale, float centre, float off) {
+    const ge_term t[2] = { ge_mul(scale, ndc), ge_mul(centre, 1.0) };
+    double v = (ge_sum(t, 2) - (double)off) * PSP_SUBPX;
+    if (!(v > -1073741824.0)) v = -1073741824.0;   /* NaN too */
+    if (v > 1073741824.0) v = 1073741824.0;
+    return (int)floor(v);
+}
+
 /* The same projection onto the rasterizer's grid, as screen_axis_fx16 says.
  *
  * A vertex the GE read from memory (plain, skinned or morphed) comes here
- * with clip x, y and w from ge_proj_row; 1/w is cut to 24 bits, as for
- * depth (ge_screen_z), and each quotient to ge24. geprobe 7 (fw 6.60) scene
+ * with clip x, y and w from ge_clip, and goes through ge_over_w and
+ * ge_screen_axis: geprobe 12's arithmetic. Until then 1/w was cut to 24
+ * bits and each quotient to 16, the fit below. geprobe 7 (fw 6.60) scene
  * 48 shows why: six of its corners sit a sixteenth further from the centre
  * than ge_recip's rule put them -- each one's triangle has a depth plane
  * 100 to 500 pixels off that matches once the corner moves, and the colour
@@ -1571,19 +1860,15 @@ static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
  * quotient too. Against run 7: scene 16 497 -> 369 pixels off, scene 36's
  * depth 696 -> 56, scene 39 217 -> 7, scene 48 6 -> 0 and its depth
  * 1898 -> 958; skinned and morphed scenes 20 and 21 stay at 101 and 400.
- * A tessellated vertex keeps ge_recip's rule on the float clip position
- * (ge_recip says why). */
+ * Tessellated vertices come this way too, since geprobe 13 (draw_patch). */
 static void clip_to_fx16(const float clip[4], int *x, int *y) {
-    float nx, ny;
-    if (g_mv_src) {
-        const float inv = ge_recip(clip[3]);
-        nx = clip[0] * inv;
-        ny = clip[1] * inv;
-    } else {
-        const double inv = ge_cut(1.0 / (double)clip[3], 24, 0);
-        nx = (float)ge24((double)clip[0] * inv);
-        ny = (float)ge24((double)clip[1] * inv);
+    const double gx = ge_over_w(clip[0], clip[3]), gy = ge_over_w(clip[1], clip[3]);
+    if (g_tl.vp_set) {
+        *x = ge_screen_axis(gx, g_tl.vp_xs, g_tl.vp_xc, g_tl.off_x);
+        *y = ge_screen_axis(gy, g_tl.vp_ys, g_tl.vp_yc, g_tl.off_y);
+        return;
     }
+    const float nx = (float)gx, ny = (float)gy;
     if (g_tl.vp_set) {
         *x = screen_axis_fx16(nx, g_tl.vp_xs, g_tl.vp_xc - g_tl.off_x);
         *y = screen_axis_fx16(ny, g_tl.vp_ys, g_tl.vp_yc - g_tl.off_y);
@@ -1805,11 +2090,38 @@ static int clip_near(const clipvert *in, int n, clipvert *out) {
  * generate the same intersection twice). Points have no intersection to add.
  * This follows the triangle path's existing clip/clamp and guard-band policy. */
 static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) {
+    /* Past the x and y planes, with depth clamping or without: a point
+     * outside either is not drawn, and a line whose two ends lie beyond the
+     * same one is not either; a line with an end inside, or one across the
+     * volume, is drawn whole. geprobe 22 (fw 6.60) scene 141: points at
+     * 0.95 to 1.05 w on every side draw only to 1 w with clamping on too (it
+     * drew all nine), and lines beyond x = w at both ends draw nothing either
+     * way (13 and 7 pixels before); its 74 other lines match as they were.
+     * Ends beyond different planes are drawn whole even where the line
+     * misses the volume, and an end on a plane is not beyond it (geprobe
+     * 23 scene 142: 20 such lines, as they were). With clamping on, a line
+     * with both ends past the far plane is not drawn either (11 pixels
+     * before); past the near one the clip below drops it. */
+    if (n == 1 && !(fabsf(p[0].c[0]) <= p[0].c[3] && fabsf(p[0].c[1]) <= p[0].c[3])) {
+        g_clip_guard += 1; return;
+    }
+    if (n == 2) {
+        for (int k = 0; k < 2; k++)
+            if ((p[0].c[k] > p[0].c[3] && p[1].c[k] > p[1].c[3]) ||
+                (p[0].c[k] < -p[0].c[3] && p[1].c[k] < -p[1].c[3])) { g_clip_guard += 2; return; }
+        if (g_tl.depth_clamp && p[0].c[2] > p[0].c[3] && p[1].c[2] > p[1].c[3]) { g_clip_z += 2; return; }
+    }
+    /* With clamping on a point past the far plane is not drawn either (scene
+     * 141: z 1.0001 w on); the near one is the clip below's. */
+    if (n == 1 && g_tl.depth_clamp && p[0].c[2] > p[0].c[3]) { g_clip_z += 1; return; }
     if (!g_tl.depth_clamp) {
         for (int i = 0; i < n; i++) {
             if (!(p[i].c[3] > 0)) { g_skip_nearplane += (uint64_t)n; return; }
             const float z = p[i].c[2] / p[i].c[3];
             if (!(z >= -1 && z <= 1)) { g_clip_z += (uint64_t)n; return; }
+            /* The x and y planes are above: geprobe 16 (fw 6.60) first saw
+             * them, of scenes 110-114's points every one drawn within 0.989
+             * w, every one missing (379) at least 1.005 w. */
         }
     } else {
         const float a = p[0].c[2] + p[0].c[3];
@@ -1829,7 +2141,15 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
         if (!(p[i].c[3] > 0)) { g_skip_nearplane += (uint64_t)n; return; }
         float x, y, z;
         to_screen(p[i].c, &x, &y, &z);
-        if (!(x >= -ox && x < 4096-ox && y >= -oy && y < 4096-oy) || !isfinite(z)) {
+        if (!(x >= -ox && x < 4096-ox && y >= -oy && y < 4096-oy) || !isfinite(z) ||
+            (!g_tl.depth_clamp && (z < 0.0f || z > 65535.0f))) {
+            /* A point whose depth falls outside 0..65535 is not drawn
+             * (geprobe 13, fw 6.60: every calibration point with clip z in
+             * (-w, 0) at a positive scale, or past 65535, is absent), and
+             * nor is a line with an end there: geprobe 23 scene 142's line
+             * with both ends on z = w, its depth just under 0 at a depth
+             * range of 65535 to 0, draws nothing (11 pixels before), the
+             * one on z = -w all its pixels. */
             g_clip_guard += (uint64_t)n; return;
         }
         v[i] = p[i].v;
@@ -1841,10 +2161,28 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
     be->draw(n == 1 ? PSP_PRIM_POINTS : PSP_PRIM_LINES, v, n);
 }
 
+/* A triangle whose three corners all lie beyond one plane of the clip volume
+ * -- x or y past w either way, or with depth clamping on z past the far plane
+ * -- is not drawn: geprobe 23 (fw 6.60) scene 142, every side, clamping off
+ * and on (22 to 126 pixels each before). Corners on a plane are not beyond
+ * it, and corners beyond different planes draw whole, as they did (its 14
+ * such triangles). Returns 1 when culled. */
+static int tri_beyond_one_plane(const float *a, const float *b, const float *c) {
+    const float *t[3] = { a, b, c };
+    for (int k = 0; k < 2; k++) {
+        int hi = 0, lo = 0;
+        for (int i = 0; i < 3; i++) { hi += t[i][k] > t[i][3]; lo += t[i][k] < -t[i][3]; }
+        if (hi == 3 || lo == 3) { g_clip_guard += 3; return 1; }
+    }
+    if (g_tl.depth_clamp && a[2] > a[3] && b[2] > b[3] && c[2] > c[3]) { g_clip_z += 3; return 1; }
+    return 0;
+}
+
 static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int flip) {
     int behind = 0;
     for (int i = 0; i < 3; i++) if (tri[i].c[3] <= 0.0f) behind++;
     if (behind == 3) { g_clip_eye += 3; return; }
+    if (tri_beyond_one_plane(tri[0].c, tri[1].c, tri[2].c)) return;
 
     clipvert b[9];
     const clipvert *poly = tri; int n = 3;
@@ -1971,17 +2309,11 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
  *    as the vertex's secondary colour (psp_vertex.spec), which the
  *    rasterizer interpolates and adds per pixel.
  */
-/* Lighting happens in eye space, and the fixed eye direction above is the
- * evidence: a constant (0,0,1) is only meaningful where the viewer looks down
- * -Z, which is eye space, not world space. gpu/commands/light cannot tell the
- * two apart -- its view matrix is identity -- but the game can, and does: with
- * the lights left in world space the hangar's walls came out at 0x45 from a
- * 0x80 vertex colour, dimmer than the material they started from, because
- * most of the diffuse terms fell on the wrong side of their surfaces.
- *
- * So the light positions are transformed once per draw rather than per vertex:
- * a directional light's position field is a direction and only rotates, a
- * point or spot light's is a point and translates too. */
+/* The lights in eye space, for a backend that lights in eye space itself
+ * (fill_xform_state): the same light as the GE's world-space lighting below
+ * (light_vertex), with the eye's direction (0, 0, 1) where the GE takes the
+ * view's third row. A directional light's position field is a direction and
+ * only rotates, a point or spot light's is a point and translates too. */
 static struct { float pos[3], dir[3]; } g_light_eye[4];
 
 static void lights_to_eye(void) {
@@ -2024,6 +2356,116 @@ static float ge_pow(float x, float k) {
     return ldexpf(1.0f + (y - n), (int)n);
 }
 
+/* ---- The lighting's vectors (geprobe 17, fw 6.60) ----------------------
+ *
+ * Scene 115 reads L.D whole: the spot cutoff is a threshold on it, so the
+ * probe searches the cutoff a pass at a time on the PSP for 3800 geometries.
+ * 116-119 read the spot, diffuse, specular and attenuation factors as bytes,
+ * 17122 more. All 20922 fit this, in the vertex path's arithmetic (ge_mul,
+ * ge_sum) wherever a product or sum is taken:
+ *  - 1/sqrt is a table like 1/w's: 128 entries for each parity of the
+ *    exponent, a value and a slope each, indexed by the significand's top 7
+ *    bits after the leading one and interpolated by the next 8 (ge_rsqrt16).
+ *    The light at (a/128, b/128, 1) 2^j over a vertex at the origin, with
+ *    D = +z, reads it directly: its 128-segment chords fit every point to
+ *    the last bit where 64 segments leave kinks. geprobe 18 (scene 120)
+ *    reads it at every one of its 65536 16-bit inputs in [1, 4) the same
+ *    way, so each entry's 256 outputs are known and exactly one value and
+ *    slope give them. Every entry is then a formula: the value
+ *    floor(2^17/sqrt(knot)) + 1, the slope 2 floor(c/4), c the exact chord
+ *    2^17/sqrt(knot) - 2^17/sqrt(next knot) (the last knot's next being 2
+ *    or 4). The table below is that, as measured.
+ *  - L, the light minus the vertex (or a directional light's vector), is
+ *    normalised component by component: L times 1/sqrt(L.L), each cut to 16
+ *    bits.
+ *  - The spot direction and the normal are not: the GE takes the dot product
+ *    with them as given and scales it by their 1/sqrt after. Normalising D
+ *    component by component misses 145 of 1200 general geometries (every one
+ *    where 1/sqrt(D.D) is not 1); scaling after misses none. N.L the same
+ *    way fits all 5000 diffuse bytes.
+ *  - H is L + (0, 0, 1) normalised component by component, and N.H is taken
+ *    like N.L.
+ *  - Spot exponents and specular coefficients keep 5 significant bits, cut
+ *    toward zero, before ge_pow: every exponent with no more (quarters,
+ *    halves, whole numbers) already fit, and of 942 with more, all do so
+ *    and 613 at best otherwise.
+ *  - The distance is L.L times its 1/sqrt, the attenuation's sum k0 + k1 d +
+ *    (k2 d) d one GE sum, and its reciprocal the 1/w table's (ge_rcp16).
+ * Scene 35's last ten points, each a step low, come out right. */
+static const uint32_t ge_rsq_tab[2][128][2] = {
+    {  /* even exponent: s in [1, 2) */
+        { 131073, 254 }, { 130563, 250 }, { 130060, 248 }, { 129563, 244 }, { 129071, 242 }, { 128585, 240 }, { 128104, 236 }, { 127629, 234 },
+        { 127159, 232 }, { 126694, 228 }, { 126234, 226 }, { 125779, 224 }, { 125329, 222 }, { 124884, 220 }, { 124444, 216 }, { 124008, 214 },
+        { 123576, 212 }, { 123150, 210 }, { 122727, 208 }, { 122309, 206 }, { 121895, 204 }, { 121485, 202 }, { 121080, 200 }, { 120678, 198 },
+        { 120280, 196 }, { 119887, 194 }, { 119497, 192 }, { 119111, 190 }, { 118728, 188 }, { 118350, 186 }, { 117975, 184 }, { 117603, 184 },
+        { 117235, 182 }, { 116870, 180 }, { 116509, 178 }, { 116151, 176 }, { 115796, 174 }, { 115445, 174 }, { 115097, 172 }, { 114752, 170 },
+        { 114410, 168 }, { 114071, 166 }, { 113735, 166 }, { 113401, 164 }, { 113071, 162 }, { 112744, 162 }, { 112420, 160 }, { 112098, 158 },
+        { 111779, 158 }, { 111463, 156 }, { 111149, 154 }, { 110838, 154 }, { 110530, 152 }, { 110224, 150 }, { 109921, 150 }, { 109620, 148 },
+        { 109322, 146 }, { 109026, 146 }, { 108733, 144 }, { 108442, 144 }, { 108153, 142 }, { 107866, 142 }, { 107582, 140 }, { 107300, 138 },
+        { 107020, 138 }, { 106743, 136 }, { 106467, 136 }, { 106194, 134 }, { 105923, 134 }, { 105653, 132 }, { 105386, 132 }, { 105121, 130 },
+        { 104858, 130 }, { 104597, 128 }, { 104338, 128 }, { 104080, 126 }, { 103825, 126 }, { 103571, 124 }, { 103320, 124 }, { 103070, 124 },
+        { 102822, 122 }, { 102576, 122 }, { 102331, 120 }, { 102088, 120 }, { 101847, 118 }, { 101608, 118 }, { 101370, 118 }, { 101134, 116 },
+        { 100900, 116 }, { 100667, 114 }, { 100436, 114 }, { 100206, 112 }, { 99978, 112 }, { 99752, 112 }, { 99527, 110 }, { 99304, 110 },
+        { 99082, 110 }, { 98861, 108 }, { 98642, 108 }, { 98425, 108 }, { 98209, 106 }, { 97994, 106 }, { 97781, 104 }, { 97569, 104 },
+        { 97358, 104 }, { 97149, 102 }, { 96941, 102 }, { 96735, 102 }, { 96530, 100 }, { 96326, 100 }, { 96123, 100 }, { 95922, 100 },
+        { 95722, 98 }, { 95523, 98 }, { 95326, 98 }, { 95129, 96 }, { 94934, 96 }, { 94740, 96 }, { 94547, 94 }, { 94356, 94 },
+        { 94165, 94 }, { 93976, 94 }, { 93788, 92 }, { 93601, 92 }, { 93415, 92 }, { 93230, 90 }, { 93047, 90 }, { 92864, 90 },
+    },
+    {  /* odd exponent: s in [2, 4) */
+        { 92682, 178 }, { 92322, 176 }, { 91967, 174 }, { 91615, 172 }, { 91267, 170 }, { 90924, 168 }, { 90584, 168 }, { 90248, 166 },
+        { 89915, 164 }, { 89586, 162 }, { 89261, 160 }, { 88940, 158 }, { 88621, 156 }, { 88307, 154 }, { 87995, 154 }, { 87687, 152 },
+        { 87382, 150 }, { 87080, 148 }, { 86781, 146 }, { 86486, 146 }, { 86193, 144 }, { 85903, 142 }, { 85616, 140 }, { 85332, 140 },
+        { 85051, 138 }, { 84773, 136 }, { 84497, 136 }, { 84224, 134 }, { 83954, 132 }, { 83686, 132 }, { 83421, 130 }, { 83158, 130 },
+        { 82898, 128 }, { 82640, 126 }, { 82384, 126 }, { 82131, 124 }, { 81881, 124 }, { 81632, 122 }, { 81386, 122 }, { 81142, 120 },
+        { 80900, 118 }, { 80660, 118 }, { 80423, 116 }, { 80187, 116 }, { 79954, 114 }, { 79722, 114 }, { 79493, 112 }, { 79265, 112 },
+        { 79040, 110 }, { 78816, 110 }, { 78595, 108 }, { 78375, 108 }, { 78157, 108 }, { 77941, 106 }, { 77726, 106 }, { 77513, 104 },
+        { 77303, 104 }, { 77093, 102 }, { 76886, 102 }, { 76680, 102 }, { 76476, 100 }, { 76273, 100 }, { 76072, 98 }, { 75873, 98 },
+        { 75675, 98 }, { 75479, 96 }, { 75284, 96 }, { 75091, 94 }, { 74899, 94 }, { 74708, 94 }, { 74520, 92 }, { 74332, 92 },
+        { 74146, 92 }, { 73961, 90 }, { 73778, 90 }, { 73596, 90 }, { 73416, 88 }, { 73236, 88 }, { 73058, 88 }, { 72882, 86 },
+        { 72706, 86 }, { 72532, 86 }, { 72359, 84 }, { 72187, 84 }, { 72017, 84 }, { 71848, 84 }, { 71680, 82 }, { 71513, 82 },
+        { 71347, 82 }, { 71182, 80 }, { 71019, 80 }, { 70857, 80 }, { 70695, 80 }, { 70535, 78 }, { 70376, 78 }, { 70218, 78 },
+        { 70061, 76 }, { 69906, 76 }, { 69751, 76 }, { 69597, 76 }, { 69444, 74 }, { 69292, 74 }, { 69142, 74 }, { 68992, 74 },
+        { 68843, 72 }, { 68695, 72 }, { 68548, 72 }, { 68402, 72 }, { 68257, 72 }, { 68113, 70 }, { 67970, 70 }, { 67827, 70 },
+        { 67686, 70 }, { 67545, 68 }, { 67406, 68 }, { 67267, 68 }, { 67129, 68 }, { 66992, 68 }, { 66855, 66 }, { 66720, 66 },
+        { 66585, 66 }, { 66451, 66 }, { 66318, 66 }, { 66186, 64 }, { 66055, 64 }, { 65924, 64 }, { 65794, 64 }, { 65665, 64 },
+    },
+};
+
+/* 1/sqrt(s) from the table, s finite and positive: s = sig 2^(e-15). */
+static double ge_rsqrt16(double s) {
+    int64_t sig;
+    int e;
+    if (!(s > 0.0) || ge_split(s, &sig, &e) <= 0) return INFINITY;
+    const int p = e & 1, t = (int)((sig & 0x7FFF) >> 8), l = (int)(sig & 0xFF);
+    const int64_t q = (128 * (int64_t)ge_rsq_tab[p][t][0] - (int64_t)ge_rsq_tab[p][t][1] * l - 1) >> 8;
+    return ldexp((double)q, -16 - (e - p) / 2);
+}
+
+static double gl_mul(double a, double b) { const ge_term t = ge_mul(a, b); return ge_sum(&t, 1); }
+
+static double gl_dot3(const double a[3], const double b[3]) {
+    const ge_term t[3] = { ge_mul(a[0], b[0]), ge_mul(a[1], b[1]), ge_mul(a[2], b[2]) };
+    return ge_sum(t, 3);
+}
+
+/* v normalised component by component. */
+static void gl_unit(const double v[3], double o[3]) {
+    const double r = ge_rsqrt16(gl_dot3(v, v));
+    for (int k = 0; k < 3; k++) o[k] = isfinite(r) ? ge_cut(v[k] * r, 16, 0) : 0.0;
+}
+
+/* a . u, a taken as given and its 1/sqrt applied to the dot product. */
+static double gl_dot_scaled(const double a[3], const double u[3]) {
+    const double aa = gl_dot3(a, a);
+    if (!(aa > 0.0)) return 0.0;
+    return gl_mul(gl_dot3(a, u), ge_rsqrt16(aa));
+}
+
+/* x^k for the lighting: k cut to 5 significant bits, then ge_pow. */
+static float gl_pow(double x, float k) {
+    return x > 0.0 ? ge_pow((float)x, (float)ge_cut(k, 5, 0)) : 0.0f;
+}
+
 static inline int any_light_enabled(void) {
     return g_tl.light[0].enable || g_tl.light[1].enable || g_tl.light[2].enable || g_tl.light[3].enable;
 }
@@ -2050,7 +2492,28 @@ static inline int lit_byte(float x) {
 }
 static inline int lit_colour_byte(float c) { return (int)lrintf(c * 255.0f); }
 
-static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, psp_vertex *lit) {
+/* The GE lights in world space (geprobe 19, fw 6.60). Scene 121 runs scene
+ * 115's cutoff search with real world and view matrices (2504 geometries
+ * under 313 pairs, translations up to 2^10, cancelling 3x3s), and 122-124
+ * read diffuse, specular and attenuation bytes the same way (4800). All of
+ * them fit this, in the vertex path's arithmetic (ge_mul, ge_sum):
+ *  - The view matrix does not touch the vertex, normal, light or spot
+ *    direction: with W identity and V rotated and translated by up to 2^10,
+ *    lighting in world space fits all 904 search points and V (W v) 167.
+ *  - L for a point or spot light is -(W3 m + (t - p)), one row sum, t the
+ *    world translation and t - p cut to 16 bits first, m the model-space
+ *    vertex. The world position is never cut on its own: forming W m first
+ *    and subtracting fits 114 of 600 world-matrix points, this all of them,
+ *    translations of 2^10 included. A directional light's L is its position
+ *    field as given.
+ *  - N is W3 n, each row one sum; D is the spot direction as given.
+ *  - The eye's direction is the view matrix's third row, normalised
+ *    component by component; H is L + that. (0, 0, 1) there fits 1 of 1600
+ *    specular bytes under rotated views; this fits them all. For a view that
+ *    is identity it is (0, 0, 1), as sets 18 and 19 had it.
+ *  - The attenuation's quadratic term is k2 (L.L), not (k2 d) d: one of
+ *    3000 attenuation bytes tells them apart, and it reads k2 (L.L). */
+static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba, psp_vertex *lit) {
     const int vc[3] = { (int)(*rgba & 0xFFu), (int)((*rgba >> 8) & 0xFFu), (int)((*rgba >> 16) & 0xFFu) };
     /* MATERIAL_COLOR picks which material components the vertex colour
      * supplies: bit 0 ambient, bit 1 diffuse, bit 2 specular. */
@@ -2066,49 +2529,61 @@ static void light_vertex(const float wp[3], const float wn[3], uint32_t *rgba, p
         out[k] = lit_colour_byte(g_tl.mat_emissive[k]) + lit_mul(lit_colour_byte(g_tl.global_amb[k]), m_amb[k]);
 
     /* With every light disabled the colour is emissive plus ambient and the
-     * normal never enters: skip normalising it and the loop. Same result. */
-    float n[3] = { wn[0], wn[1], wn[2] };
+     * normal never enters: skip the loop. Same result. */
     if (any_light_enabled()) {
-    const float nlen = sqrtf(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
-    if (nlen > 1e-20f) { n[0] /= nlen; n[1] /= nlen; n[2] /= nlen; }
-
+    const float *W = g_tl.world;                 /* row i, column j at W[3j + i]; t at W[9 + i] */
+    double n[3], E[3];
+    for (int i = 0; i < 3; i++) {
+        const ge_term t[3] = { ge_mul(W[i], nm[0]), ge_mul(W[3 + i], nm[1]), ge_mul(W[6 + i], nm[2]) };
+        n[i] = ge_sum(t, 3);
+    }
+    {
+        const double Ev[3] = { g_tl.view[2], g_tl.view[5], g_tl.view[8] };
+        gl_unit(Ev, E);
+    }
     for (int i = 0; i < 4; i++) {
         if (!g_tl.light[i].enable) continue;
-        float L[3], att = 1.0f, spot = 1.0f;
+        double Lv[3], L[3];
+        float att = 1.0f, spot = 1.0f;
         if (g_tl.light[i].type == 0) {
-            L[0] = g_light_eye[i].pos[0]; L[1] = g_light_eye[i].pos[1]; L[2] = g_light_eye[i].pos[2];
+            for (int k = 0; k < 3; k++) Lv[k] = g_tl.light[i].pos[k];
         } else {
-            L[0] = g_light_eye[i].pos[0] - wp[0];
-            L[1] = g_light_eye[i].pos[1] - wp[1];
-            L[2] = g_light_eye[i].pos[2] - wp[2];
-            const float d = sqrtf(L[0]*L[0] + L[1]*L[1] + L[2]*L[2]);
-            const float a = g_tl.light[i].atten[0] + g_tl.light[i].atten[1] * d
-                          + g_tl.light[i].atten[2] * d * d;
-            att = (a != 0.0f) ? 1.0f / a : 1.0f;
+            for (int k = 0; k < 3; k++) {
+                const ge_term tp[2] = { ge_mul(W[9 + k], 1.0), ge_mul(g_tl.light[i].pos[k], -1.0) };
+                const ge_term t[4] = { ge_mul(W[k], model[0]), ge_mul(W[3 + k], model[1]),
+                                       ge_mul(W[6 + k], model[2]), ge_mul(ge_sum(tp, 2), 1.0) };
+                Lv[k] = -ge_sum(t, 4);
+            }
+            const double ll = gl_dot3(Lv, Lv);
+            const double d = gl_mul(ll, ge_rsqrt16(ll));
+            const ge_term at[3] = { ge_mul(g_tl.light[i].atten[0], 1.0), ge_mul(g_tl.light[i].atten[1], d),
+                                    ge_mul(g_tl.light[i].atten[2], ll) };
+            const double a = ge_sum(at, 3);
+            att = a != 0.0 ? (float)ge_rcp16(a) : 1.0f;
         }
-        const float llen = sqrtf(L[0]*L[0] + L[1]*L[1] + L[2]*L[2]);
-        if (llen > 1e-20f) { L[0] /= llen; L[1] /= llen; L[2] /= llen; }
+        gl_unit(Lv, L);
 
         if (g_tl.light[i].type == 2) {
-            float D[3] = { g_light_eye[i].dir[0], g_light_eye[i].dir[1], g_light_eye[i].dir[2] };
-            const float dlen = sqrtf(D[0]*D[0] + D[1]*D[1] + D[2]*D[2]);
-            if (dlen > 1e-20f) { D[0] /= dlen; D[1] /= dlen; D[2] /= dlen; }
-            const float sdot = L[0]*D[0] + L[1]*D[1] + L[2]*D[2];
+            const double D[3] = { g_tl.light[i].dir[0], g_tl.light[i].dir[1], g_tl.light[i].dir[2] };
+            const double sdot = gl_dot_scaled(D, L);
             if (!(sdot >= g_tl.light[i].cutoff)) continue;
-            spot = ge_pow(sdot, g_tl.light[i].exponent);
+            spot = gl_pow(sdot, g_tl.light[i].exponent);
         }
 
-        const float ndl = n[0]*L[0] + n[1]*L[1] + n[2]*L[2];
-        float dfac = ndl > 0.0f ? ndl : 0.0f;
-        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = ge_pow(dfac, g_tl.mat_spec_coef);
+        const double ndl = gl_dot_scaled(n, L);
+        float dfac = ndl > 0.0 ? (float)ndl : 0.0f;
+        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = gl_pow(dfac, g_tl.mat_spec_coef);
 
         float sfac = 0.0f;
-        if (g_tl.light[i].kind == 1 && ndl >= 0.0f) {
-            float H[3] = { L[0], L[1], L[2] + 1.0f };
-            const float hlen = sqrtf(H[0]*H[0] + H[1]*H[1] + H[2]*H[2]);
-            if (hlen > 1e-20f) { H[0] /= hlen; H[1] /= hlen; H[2] /= hlen; }
-            const float ndh = n[0]*H[0] + n[1]*H[1] + n[2]*H[2];
-            sfac = ge_pow(ndh, g_tl.mat_spec_coef);
+        if (g_tl.light[i].kind == 1 && ndl >= 0.0) {
+            double Hv[3];
+            for (int k = 0; k < 3; k++) {
+                const ge_term h[2] = { ge_mul(L[k], 1.0), ge_mul(E[k], 1.0) };
+                Hv[k] = ge_sum(h, 2);
+            }
+            double H[3];
+            gl_unit(Hv, H);
+            sfac = gl_pow(gl_dot_scaled(n, H), g_tl.mat_spec_coef);
         }
 
         const int vd = lit_byte(dfac), vs = lit_byte(sfac);
@@ -2204,6 +2679,7 @@ static void fill_xform_state(psp_xform_state *xs) {
 static void emit_tri_indexed(const psp_render_backend *be, const psp_vertex *v,
                              float (*cl)[4], uint32_t i0, uint32_t i1, uint32_t i2, int flip) {
     const uint32_t idx[3] = { i0, i1, i2 };
+    if (tri_beyond_one_plane(cl[i0], cl[i1], cl[i2])) return;
     int fast = 1;
     for (int k = 0; k < 3 && fast; k++) {
         const float *c = cl[idx[k]];
@@ -2267,10 +2743,13 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         psp_xform_state xs;
         fill_xform_state(&xs);
         if (g_prof_on > 0) g_prof_m[5] += ge_prof_now() - _x0;
-        psp_model_vertex mv[GE_VERTEX_BATCH];
+        psp_model_vertex mv[GE_VERTEX_BATCH], centre;
         uint32_t mdone = 0;
         while (mdone < count) {
-            const uint32_t n = primitive_batch_count(type, count - mdone);
+            /* A fan's later batches start again from its first vertex (see
+             * draw_prim): one fewer read, then the centre in front. */
+            const uint32_t lead = type == PSP_PRIM_TRIANGLE_FAN && mdone > 0;
+            const uint32_t n = primitive_batch_count(type, count - mdone + lead) - lead;
             uint32_t decoded = 0;
             const uint64_t _m0 = ge_prof_now();
             /* One translation for the batch's vertices and one for its
@@ -2298,7 +2777,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 }
             }
             const uint32_t base_colour = current_colour();
-            const int vertex_colour = col_off >= 0 && VT_COLOR(vtype) == 7;
+            const int vertex_colour = col_off >= 0 && VT_COLOR(vtype) >= 4;
             for (; decoded < n; decoded++) {
                 uint32_t a;
                 const uint8_t *vp;
@@ -2316,10 +2795,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 psp_model_vertex *m = &mv[decoded];
                 if (!read_pos_model_at(vp, a, vtype, pos_off, m->pos)) break;
                 m->rgba = base_colour;
-                if (vertex_colour) {
-                    if (vp) memcpy(&m->rgba, vp + col_off, 4);
-                    else    m->rgba = psp_read32(a + (uint32_t)col_off);
-                }
+                if (vertex_colour) m->rgba = read_colour_at(vp, a, vtype, col_off);
                 if (any_light) read_normal_model_at(vp, a, vtype, norm_off, m->nrm);
                 else { m->nrm[0] = m->nrm[1] = 0.0f; m->nrm[2] = 1.0f; }
                 psp_vertex uv;
@@ -2329,22 +2805,37 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             }
             if (g_tl.fog_enable) g_fog_verts += decoded;
             if (g_tl.lighting)   g_lit_verts += decoded;
+            if (lead && decoded) {
+                memmove(mv + 1, mv, decoded * sizeof *mv);
+                mv[0] = centre;
+                decoded++;
+            } else if (type == PSP_PRIM_TRIANGLE_FAN && decoded) centre = mv[0];
             const uint64_t _m1 = ge_prof_now();
             be->draw_model((int)type, mv, (int)decoded, &xs);
             if (g_prof_on > 0) { const uint64_t _m2 = ge_prof_now(); g_prof_m[0] += _m1 - _m0; g_prof_m[1] += _m2 - _m1; }
             g_model_verts += decoded;
-            if ((type == PSP_PRIM_TRIANGLE_STRIP || type == PSP_PRIM_TRIANGLE_FAN) &&
-                decoded == GE_VERTEX_BATCH && mdone + decoded < count)
+            if (type == PSP_PRIM_TRIANGLE_STRIP && decoded == GE_VERTEX_BATCH && mdone + decoded < count)
                 mdone += decoded - 2;
+            else if (type == PSP_PRIM_TRIANGLE_FAN && decoded == GE_VERTEX_BATCH && mdone + decoded - lead < count)
+                mdone += decoded - lead - 1;
+            else if (decoded <= lead)
+                break;
             else
-                mdone += decoded;
+                mdone += decoded - lead;
         }
         return;
     }
 
+    double wvp[4][4];
+    ge_wvp(wvp);
     uint32_t done = 0;
+    psp_vertex centre_v;
+    float centre_cl[4];
     while (done < count) {
-        const uint32_t n = primitive_batch_count(type, count - done);
+        /* A fan's later batches start again from its first vertex (see
+         * draw_prim): one fewer read, then the centre in front. */
+        const uint32_t lead = type == PSP_PRIM_TRIANGLE_FAN && done > 0;
+        const uint32_t n = primitive_batch_count(type, count - done + lead) - lead;
 
         uint32_t decoded = 0;
         for (; decoded < n; decoded++) {
@@ -2373,15 +2864,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             mul_4x3(g_tl.world, model, world);
             mul_4x3(g_tl.view,  world, eye);
             mul_4x4(g_tl.proj,  eye,   clip);
-            /* z as the GE forms it, for depth (ge_screen_z), and x, y and w
-             * too for a vertex it read (clip_to_fx16); a tessellated one
-             * keeps the float x, y and w ge_recip's rule was measured with. */
-            clip[2] = ge_proj_row(g_tl.proj, 2, eye);
-            if (!g_mv_src) {
-                clip[0] = ge_proj_row(g_tl.proj, 0, eye);
-                clip[1] = ge_proj_row(g_tl.proj, 1, eye);
-                clip[3] = ge_proj_row(g_tl.proj, 3, eye);
-            }
+            /* Clip space as the GE forms it (ge_clip), for depth
+             * (ge_screen_z) and position (clip_to_fx16). */
+            ge_clip(wvp, model, clip);
             const uint64_t _p2 = ge_prof_now();
 
             psp_vertex *o = &v[decoded];
@@ -2390,10 +2875,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             o->rgba = current_colour();
             o->tex_q = 1.0f;
             if (blended) o->rgba = mv.rgba;
-            else if (col_off >= 0 && VT_COLOR(g_ge.vtype) == 7) {
-                if (vp) memcpy(&o->rgba, vp + col_off, 4);
-                else    o->rgba = psp_read32(a + (uint32_t)col_off);
-            }
+            else if (col_off >= 0 && VT_COLOR(g_ge.vtype) >= 4) o->rgba = read_colour_at(vp, a, g_ge.vtype, col_off);
             /* Fog. The coefficient is (end - depth) * range with depth the
              * eye-space distance -- w of the clip position for a standard
              * projection, -z of the eye position here -- clamped to 0..1 and
@@ -2413,15 +2895,12 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 g_fog_verts++;
             }
             if (g_tl.lighting) {
-                float ne[3] = { 0.0f, 0.0f, 1.0f };
+                float nm[3] = { 0.0f, 0.0f, 1.0f };
                 if (any_light) {
-                    float nm[3], nw[3];
                     if (blended) memcpy(nm, mv.nrm, sizeof nm);
                     else read_normal_model_at(vp, a, g_ge.vtype, norm_off, nm);
-                    mul_3x3(g_tl.world, nm, nw);
-                    mul_3x3(g_tl.view,  nw, ne);
                 }
-                light_vertex(eye, ne, &o->rgba, o);
+                light_vertex(model, nm, &o->rgba, o);
                 g_lit_verts++;
             }
             const uint64_t _p3 = ge_prof_now();
@@ -2477,6 +2956,16 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         }
         if (!decoded) break;
         g_xformed += decoded;
+        if (lead) {
+            memmove(v + 1, v, decoded * sizeof *v);
+            memmove(cl + 1, cl, decoded * sizeof *cl);
+            v[0] = centre_v;
+            memcpy(cl[0], centre_cl, sizeof centre_cl);
+            decoded++;
+        } else if (type == PSP_PRIM_TRIANGLE_FAN) {
+            centre_v = v[0];
+            memcpy(centre_cl, cl[0], sizeof centre_cl);
+        }
 
         if (texdraw_hit() || wilduv_hit(v, decoded)) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
 
@@ -2560,13 +3049,14 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
         }
 
         if (g_prof_on > 0) { g_prof[5] += ge_prof_now() - _pe; g_prof_batches++; }
-        if ((type == PSP_PRIM_TRIANGLE_STRIP || type == PSP_PRIM_TRIANGLE_FAN) &&
-            decoded == GE_VERTEX_BATCH && done + decoded < count)
+        if (type == PSP_PRIM_TRIANGLE_STRIP && decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 2;
+        else if (type == PSP_PRIM_TRIANGLE_FAN && decoded == GE_VERTEX_BATCH && done + decoded - lead < count)
+            done += decoded - lead - 1;
         else if (type == PSP_PRIM_LINE_STRIP && decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 1;
         else
-            done += decoded;
+            done += decoded - lead;
     }
 }
 
@@ -2757,7 +3247,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
      * them would otherwise be painted with a stale texture sampled at texel
      * zero. That is exactly what hardware does: gpu/texfunc draws sprites with
      * GU_COLOR_8888 | GU_VERTEX_32BITF, no texcoords, over a solid 4x4
-     * texture, and reads the texture's colour back. read_uv_model already
+     * texture, and reads the texture's colour back. read_uv_model_at already
      * answers (0,0) for a vertex without them. A game that wants flat geometry
      * disables texturing, and this one does. */
     /* The texture address is complete as decoded -- unlike FBP, which is a
@@ -2787,15 +3277,18 @@ static void draw_prim(uint32_t type, uint32_t count) {
         return;
     }
 
-    psp_vertex v[GE_VERTEX_BATCH];
+    psp_vertex v[GE_VERTEX_BATCH], centre;
     const psp_render_backend *be = psp_render_current();
 
     uint32_t done = 0;
     while (done < count) {
-        const uint32_t n = primitive_batch_count(type, count - done);
-
         /* Strips overlap at a batch boundary: two vertices for triangles,
-         * one for lines, or the primitive spanning the boundary is lost. */
+         * one for lines, or the primitive spanning the boundary is lost. A
+         * fan's later batches start again from its first vertex, then the
+         * last batch's last: each triangle is (first, previous, this). */
+        const uint32_t lead = type == PSP_PRIM_TRIANGLE_FAN && done > 0;
+        const uint32_t n = primitive_batch_count(type, count - done + lead) - lead;
+
         uint32_t decoded = 0;
         for (; decoded < n; decoded++) {
             if (!read_vertex(vertex_addr(done + decoded, stride),
@@ -2803,6 +3296,11 @@ static void draw_prim(uint32_t type, uint32_t count) {
                 break;
         }
         if (!decoded) break;
+        if (lead) {
+            memmove(v + 1, v, decoded * sizeof *v);
+            v[0] = centre;
+            decoded++;
+        } else if (type == PSP_PRIM_TRIANGLE_FAN) centre = v[0];
 
         if (texdraw_hit() || wilduv_hit(v, decoded)) texdraw_dump(PRIM_NAME[type & 7], v, decoded);
 
@@ -2837,10 +3335,12 @@ static void draw_prim(uint32_t type, uint32_t count) {
 
         if (type == PSP_PRIM_TRIANGLE_STRIP && decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 2;     /* strip overlap */
+        else if (type == PSP_PRIM_TRIANGLE_FAN && decoded == GE_VERTEX_BATCH && done + decoded - lead < count)
+            done += decoded - lead - 1;
         else if (type == PSP_PRIM_LINE_STRIP && decoded == GE_VERTEX_BATCH && done + decoded < count)
             done += decoded - 1;
         else
-            done += decoded;
+            done += decoded - lead;
     }
 }
 
@@ -2859,40 +3359,127 @@ static void draw_prim(uint32_t type, uint32_t count) {
  * The control points go through read_mvert first, so a skinned or morphed
  * control grid is skinned or morphed before it is evaluated. */
 
-/* Where along one direction the grid samples, and with what weights: each
- * sample blends four consecutive control points starting at `first`. The
- * weights are exact (double): the PSP's own rounding is in patch_param and
- * in the colour (draw_patch), and float weights moved scene 22 by 300
- * pixels on their own. */
-typedef struct { int first; double w[4]; float param; } patch_sample;
+/* Where along one direction the grid samples, and how: each sample blends
+ * four consecutive control points starting at `first`, by de Boor's
+ * algorithm with the six 8-bit parameters `a` (deboor_params). Colours run
+ * that algorithm in fixed point (deboor_fix); positions, normals and texture
+ * coordinates take the weights the same parameters give (deboor_weights),
+ * in double: geprobe 10 scene 55 (fw 6.60) reads 2332 weights through
+ * depth, and every one sits within -2 to 0 depth steps of those, the
+ * readout's own noise on Bezier pieces, where exact Cox-de Boor weights
+ * range from -86 to +63 steps. */
+typedef struct { int first; double w[4]; float param; uint16_t a[6]; } patch_sample;
 
-/* Step i of div along a piece, as the GE places it (geprobe 7 scene 44, fw
- * 6.60): on a 1/256 grid, cut toward the nearer end -- floor(256 i/div)/256
- * up to the middle and 1 - floor(256 (div - i)/div)/256 past it, so a piece
- * reads the same from either end. Scene 44 lights one control column and row
+/* The six lerp parameters of de Boor's algorithm at local step T (1/256)
+ * of the span starting at knot index k, from integer span-local knots, in
+ * the order the levels take them: level 1's three (control 3, 2, 1 of the
+ * span), level 2's two, level 3's one. Each is an 8-bit fraction taken from
+ * the nearer knot: the smaller of t - u_lo and u_hi - t over the knot gap,
+ * cut to 1/256 (geprobe 8-10, fw 6.60: see deboor_eval). */
+static void deboor_params(const int *kn, int k, int T, uint16_t a[6]) {
+    int n = 0;
+    for (int j = 1; j <= 3; j++)
+        for (int idx = 3; idx >= j; idx--) {
+            const int i = k - 3 + idx, ul = kn[i] - kn[k], ur = kn[i + 4 - j] - kn[k];
+            const int den = ur - ul, dl = T - 256 * ul, dr = 256 * ur - T;
+            a[n++] = (uint16_t)(dl <= dr ? dl / den : 256 - dr / den);
+        }
+}
+
+/* de Boor's algorithm on four values with those parameters: integers in
+ * 1/128 of a colour step, each lerp floored back to 1/128. */
+static int64_t deboor_fix(const int64_t in[4], const uint16_t a[6]) {
+    int64_t P[4] = { in[0], in[1], in[2], in[3] };
+    int n = 0;
+    for (int j = 1; j <= 3; j++) {
+        int64_t Q[4] = { P[0], P[1], P[2], P[3] };
+        for (int idx = 3; idx >= j; idx--, n++)
+            Q[idx] = ((256 - (int64_t)a[n]) * P[idx - 1] + (int64_t)a[n] * P[idx]) >> 8;
+        memcpy(P, Q, sizeof P);
+    }
+    return P[3];
+}
+
+/* One lerp of a patch position, as the GE runs it (geprobe 13, fw 6.60):
+ * a weight of 0 or 256 hands its operand on as it is; otherwise both
+ * operands go onto the 16-bit grid of the larger, each cut toward zero,
+ * and ((256 - a) P + a Q) / 256 is floored on that grid. */
+static double la_lerp(double p, double q, int a) {
+    if (a == 0) return p;
+    if (a == 256) return q;
+    int ep = INT_MIN, eq = INT_MIN, e;
+    if (p != 0.0) frexp(p, &ep);
+    if (q != 0.0) frexp(q, &eq);
+    e = ep > eq ? ep : eq;
+    if (e == INT_MIN) return 0.0;
+    const double P = trunc(ldexp(p, 16 - e)), Q = trunc(ldexp(q, 16 - e));
+    return ldexp(floor(((256.0 - a) * P + a * Q) / 256.0), e - 16);
+}
+static double deboor_la(const double in[4], const uint16_t a[6]) {
+    double P[4] = { in[0], in[1], in[2], in[3] };
+    int n = 0;
+    for (int j = 1; j <= 3; j++) {
+        double Q[4] = { P[0], P[1], P[2], P[3] };
+        for (int idx = 3; idx >= j; idx--, n++) Q[idx] = la_lerp(P[idx - 1], P[idx], a[n]);
+        memcpy(P, Q, sizeof P);
+    }
+    return P[3];
+}
+
+/* The same in real arithmetic, on unit vectors: the four weights those
+ * parameters give, for positions, normals and texture coordinates. */
+static void deboor_weights(const uint16_t a[6], double w[4]) {
+    for (int q = 0; q < 4; q++) {
+        double P[4] = { 0, 0, 0, 0 };
+        P[q] = 1.0;
+        int n = 0;
+        for (int j = 1; j <= 3; j++) {
+            double Q[4] = { P[0], P[1], P[2], P[3] };
+            for (int idx = 3; idx >= j; idx--, n++)
+                Q[idx] = (1.0 - a[n] / 256.0) * P[idx - 1] + (a[n] / 256.0) * P[idx];
+            memcpy(P, Q, sizeof P);
+        }
+        w[q] = P[3];
+    }
+}
+
+/* Step i of div along a piece, as the GE places it: on a 1/256 grid, a
+ * step of 256/div in 8.6 fixed point rounded up, i steps of it floored to
+ * 1/256 up to the middle and 1 less div - i steps past it, so a piece reads
+ * the same from either end. geprobe 13 (fw 6.60) reads the parameter of
+ * 1128 (div, i) pairs whole through depth (scenes 67-82), and this fits
+ * every one; floor(256 i/div), the rule geprobe 7 scene 44 suggested, is
+ * a step off at 68. geprobe 7 scene 44 (fw 6.60) found the grid and the
+ * mirroring. Scene 44 lights one control column and row
  * of a patch drawn as points, so each point's colour is one weight, 255
  * times: of its 42 Bezier and open spline samples (168 weights) all fit
  * this, 28 the exact i/div, and 29 the grid floored throughout. The points
  * move with it: Bezier 7's fifth column sits a pixel right of i/div's. */
 static double patch_param(int i, int div) {
-    return 2 * i <= div ? floor(256.0 * i / div) / 256.0
-                        : 1.0 - floor(256.0 * (div - i) / div) / 256.0;
+    const int q = (16384 + div - 1) / div;          /* 256/div in 8.6, rounded up */
+    return (2 * i <= div ? (i * q) >> 6 : 256 - (((div - i) * q) >> 6)) / 256.0;
 }
 
 /* A Bezier direction: (count - 1) / 3 cubic pieces sharing end points, each
  * cut into `div` steps. Returns the number of samples. */
+/* Set while a patch is drawn as points: each piece or span then emits its
+ * own end samples, so a sample two of them share is drawn twice (geprobe 13
+ * scene 73, fw 6.60: with additive blending those points read doubled).
+ * Scene 73 shares samples along u only; v is taken to do the same.
+ * Triangles and lines share it as one vertex. */
+static int g_patch_dup;
+
 static int bezier_samples(int count, int div, patch_sample *out, int max) {
     const int pieces = (count - 1) / 3;
     int n = 0;
     for (int pc = 0; pc < pieces; pc++) {
-        for (int i = pc ? 1 : 0; i <= div && n < max; i++) {
-            const double t = patch_param(i, div), s1 = 1.0 - t;
+        for (int i = pc && !g_patch_dup ? 1 : 0; i <= div && n < max; i++) {
+            const double t = patch_param(i, div);
             patch_sample *o = &out[n++];
             o->first = 3 * pc;
-            o->w[0] = s1 * s1 * s1;
-            o->w[1] = 3.0 * t * s1 * s1;
-            o->w[2] = 3.0 * t * t * s1;
-            o->w[3] = t * t * t;
+            /* A Bezier piece is de Casteljau's algorithm: every parameter t. */
+            for (int q = 0; q < 6; q++) o->a[q] = (uint16_t)lround(t * 256.0);
+            deboor_weights(o->a, o->w);
             o->param = (float)pc + (float)t;
         }
     }
@@ -2906,51 +3493,35 @@ static int bezier_samples(int count, int div, patch_sample *out, int max) {
  * the uniform knots and stops short of it. Scene 23's OPEN_OPEN patch spans
  * its whole control grid and its FILL_FILL patch the middle third. */
 static int spline_samples(int count, int div, int edge, patch_sample *out, int max) {
-    float kn[64];
+    int kn[64];
     const int spans = count - 3;
     if (spans < 1 || count + 4 > 64) return 0;
     for (int k = 0; k < count + 4; k++) {
-        float t = (float)(k - 3);
-        if ((edge & 1) && t < 0.0f) t = 0.0f;
-        if ((edge & 2) && t > (float)spans) t = (float)spans;
+        int t = k - 3;
+        if ((edge & 1) && t < 0) t = 0;
+        if ((edge & 2) && t > spans) t = spans;
         kn[k] = t;
     }
     int n = 0;
     for (int sp = 0; sp < spans; sp++) {
-        for (int i = sp ? 1 : 0; i <= div && n < max; i++) {
-            /* The same grid as a Bezier's: geprobe 6 scene 38's splines go
-             * from 105 pixels off to 28 with it, and scene 44's from 96 to
-             * 74. Their weights are not settled: scene 44's fill/fill
-             * splines read their two inner weights a step off the uniform
-             * B-spline's at most samples. The one rule found that fits all
-             * 40 of their readings, with t^2 and t^3 cut to 1/256, takes
-             * scene 23 from 1878 pixels off to 2036 and scene 38 from 28 to
-             * 87, so it is not used (docs/RENDERER.md). */
-            const double t = (double)sp + patch_param(i, div);
+        for (int i = sp && !g_patch_dup ? 1 : 0; i <= div && n < max; i++) {
+            /* The same grid as a Bezier's (geprobe 10 scene 56 reads the
+             * parameter itself through a texture: every step on it), and
+             * de Boor's algorithm with 8-bit parameters from it
+             * (deboor_params; deboor_fix says what it reproduces). */
+            const double tl = patch_param(i, div);
             const int k = sp + 3;                     /* kn[k] <= t <= kn[k+1] */
-            double N[4] = { 1, 0, 0, 0 }, left[4], right[4];
-            for (int j = 1; j <= 3; j++) {
-                left[j] = t - kn[k + 1 - j];
-                right[j] = kn[k + j] - t;
-                double saved = 0.0;
-                for (int r = 0; r < j; r++) {
-                    const double den = right[r + 1] + left[j - r];
-                    const double tmp = den != 0.0 ? N[r] / den : 0.0;
-                    N[r] = saved + right[r + 1] * tmp;
-                    saved = left[j - r] * tmp;
-                }
-                N[j] = saved;
-            }
             patch_sample *o = &out[n++];
             o->first = k - 3;
-            for (int q = 0; q < 4; q++) o->w[q] = N[q];
-            o->param = (float)t;
+            deboor_params(kn, k, (int)lround(tl * 256.0), o->a);
+            deboor_weights(o->a, o->w);
+            o->param = (float)(sp + tl);
         }
     }
     return n;
 }
 
-enum { PATCH_MAX_SAMPLES = 256 };
+enum { PATCH_MAX_SAMPLES = 4096 };   /* geprobe 13 scene 82: rows past 256 draw whole */
 
 static void draw_patch(int spline, uint32_t arg) {
     const int ucount = (int)(arg & 0xFF), vcount = (int)((arg >> 8) & 0xFF);
@@ -2959,9 +3530,19 @@ static void draw_patch(int spline, uint32_t arg) {
     int col_off = -1, pos_off = 0, tex_off = -1, norm_off = -1;
     const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
     if (!stride) return;
-    const int du = g_ge.patch_du > 0 ? g_ge.patch_du : 1, dv = g_ge.patch_dv > 0 ? g_ge.patch_dv : 1;
+    /* The GE takes 7 bits of each division and draws up to 64. geprobe 13
+     * (fw 6.60) scenes 80 and 81: 49 to 64 draw, and 65 (d 193 too) to 127
+     * (d 255) hang the GE: nothing of the patch, nothing more of the list,
+     * and the queue stays busy (sceGeDrawSync peeks 2) until sceGeBreak.
+     * The run_list walk stops here and the queue is marked hung; set 21's
+     * scenes 80 and 81 match the PSP so, where going on drew 120 pixels the
+     * PSP never did. 0 draws as 1 (geprobe 23 scene 145: twelve patches at
+     * 0 in u, v or both, none hangs and every pixel is 1's). */
+    const int du = g_ge.patch_du ? g_ge.patch_du : 1, dv = g_ge.patch_dv ? g_ge.patch_dv : 1;
+    if (du > 64 || dv > 64) { g_ge_hang = 1; return; }
 
     static patch_sample su[PATCH_MAX_SAMPLES], sv[PATCH_MAX_SAMPLES];
+    g_patch_dup = g_ge.patch_prim == 2;
     const int nu = spline ? spline_samples(ucount, du, uedge, su, PATCH_MAX_SAMPLES)
                           : bezier_samples(ucount, du, su, PATCH_MAX_SAMPLES);
     const int nv = spline ? spline_samples(vcount, dv, vedge, sv, PATCH_MAX_SAMPLES)
@@ -2982,32 +3563,63 @@ static void draw_patch(int spline, uint32_t arg) {
     for (int j = 0; j < nv; j++)
         for (int i = 0; i < nu; i++) {
             float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, u = 0, v = 0;
-            double col[4] = { 0, 0, 0, 0 };
             for (int b = 0; b < 4; b++)
                 for (int a = 0; a < 4; a++) {
                     const double wd = sv[j].w[b] * su[i].w[a];
                     const float w = (float)wd;
                     if (wd == 0.0) continue;
                     const ge_mvert *c = &cp[(sv[j].first + b) * ucount + su[i].first + a];
-                    for (int k = 0; k < 3; k++) { pos[k] += w * c->pos[k]; nrm[k] += w * c->nrm[k]; }
-                    for (int k = 0; k < 4; k++) col[k] += wd * (double)((c->rgba >> (8 * k)) & 0xFFu);
+                    for (int k = 0; k < 3; k++) nrm[k] += w * c->nrm[k];
                     u += w * c->u; v += w * c->v;
                 }
+            /* A position is de Boor's algorithm too, each coordinate on its
+             * own, every lerp la_lerp's: along v for each of the four
+             * control columns, then along u over the four results, from
+             * controls cut to 16 bits (s16 and s8 controls are exact
+             * fractions). geprobe 13 (fw 6.60) reads 134,198 generated
+             * points whole through depth (scenes 67-82), over every
+             * division to 64, edge mode, sign, binade, format, morph and
+             * skin, and this places every one on its pixel with its depth;
+             * u first misses 8767 of them. The weights above stay for
+             * normals and texture coordinates. */
+            for (int k = 0; k < 3; k++) {
+                double C[4];
+                for (int q = 0; q < 4; q++) {
+                    double in[4];
+                    for (int r = 0; r < 4; r++)
+                        in[r] = ge_cut(cp[(sv[j].first + r) * ucount + su[i].first + q].pos[k], 16, 0);
+                    C[q] = deboor_la(in, sv[j].a);
+                }
+                pos[k] = (float)deboor_la(C, su[i].a);
+            }
             ge_mvert *o = &grid[j * nu + i];
             memcpy(o->pos, pos, sizeof pos);
             memcpy(o->nrm, nrm, sizeof nrm);
-            /* A generated vertex's colour is the blend cut to 1/256 of a step
-             * and rounded up to a whole one. geprobe 5 (fw 6.60) scene 22's
-             * first patch, whose colours come to 63.75, 127.5, 158.008 and
-             * 191.25, fits planes through 64, 128, 159 and 192 on the PSP;
-             * rounding gave 191 and 158. The cut is geprobe 7 scene 44's: a
-             * weight of 13.0008 (Bezier 7, step 1, weight 2) reads 13, not
-             * 14, and with it all 168 of its Bezier weights fit; cut finer,
-             * at 2^-16 as this used to, 166. Plain truncation, which a
-             * morph's blend takes (read_mvert), is worse still. */
+            /* A generated vertex's colour is not a blend by weights: the GE
+             * runs de Boor's algorithm on each channel of the control
+             * colours, with deboor_params' 8-bit parameters, along v for
+             * each of the four control columns and then along u, every lerp
+             * floored to 1/128 of a step and the end rounded up to a whole
+             * one (deboor_fix). geprobe 9 and 10 (fw 6.60) scenes 52-54 read
+             * 19,546 single and paired control columns at three levels over
+             * every edge mode, and this reproduces every one; weights by
+             * Cox-de Boor, through the cut-to-1/256 rule this replaces, fit
+             * 13,452 of scenes 53 and 54's 16,302. The tiny weights near a
+             * span's end that read low are those 1/128 cuts. Bezier pieces
+             * are the same with every parameter t, which is why exact
+             * weights fit them. v goes first, as for positions: geprobe 13
+             * scene 72's colour-order cells read 747 pixels a step off u
+             * first and none this way. */
             o->rgba = 0;
             for (int k = 0; k < 4; k++) {
-                int c = (int)floor(col[k] + 255.0 / 256.0);
+                int64_t Q[4];
+                for (int q = 0; q < 4; q++) {
+                    int64_t in[4];
+                    for (int r = 0; r < 4; r++)
+                        in[r] = (int64_t)((cp[(sv[j].first + r) * ucount + su[i].first + q].rgba >> (8 * k)) & 0xFFu) * 128;
+                    Q[q] = deboor_fix(in, sv[j].a);
+                }
+                int c = (int)((deboor_fix(Q, su[i].a) + 127) >> 7);
                 if (c < 0) c = 0;
                 if (c > 255) c = 255;
                 o->rgba |= (uint32_t)c << (8 * k);
@@ -3026,26 +3638,40 @@ static void draw_patch(int spline, uint32_t arg) {
      * sequence is a zigzag -- each column's rung and a diagonal to the next
      * -- with no line along the rows at all: geprobe 2 scene 22 (fw 6.60)
      * draws its line patch exactly so (627 differing pixels against 1407 for
-     * a plain grid of rows and columns). Points are the grid itself. */
+     * a plain grid of rows and columns). Points are the grid itself.
+     *
+     * Each span goes out on its own, over its own du x dv samples, the spans
+     * a row of them at a time, so a column or row two spans share is drawn
+     * by both: geprobe 21 (fw 6.60) scenes 131-133 draw nine patches as
+     * lines smooth, flat and adding, and this order fits every pixel of
+     * them, the whole grid's 204 off where segments cross or rungs are
+     * drawn twice, spans a column at a time's 1 off. Triangles take the
+     * same order, which no probe has told apart. */
     uint32_t n = 0, type;
     if (g_ge.patch_prim == 2) {
         type = PSP_PRIM_POINTS;
         for (int k = 0; k < nu * nv; k++) list[n++] = grid[k];
     } else {
         type = g_ge.patch_prim == 1 ? PSP_PRIM_LINES : PSP_PRIM_TRIANGLES;
-        for (int j = 0; j + 1 < nv; j++)
-            for (int i = 0; i + 1 < nu; i++) {
-                const ge_mvert *s0 = &grid[j * nu + i], *s1 = &grid[(j + 1) * nu + i];
-                const ge_mvert *s2 = &grid[j * nu + i + 1], *s3 = &grid[(j + 1) * nu + i + 1];
-                if (type == PSP_PRIM_LINES) {
-                    list[n++] = *s0; list[n++] = *s1;
-                    list[n++] = *s1; list[n++] = *s2;
-                    if (i + 2 == nu) { list[n++] = *s2; list[n++] = *s3; }
-                } else {
-                    list[n++] = *s0; list[n++] = *s1; list[n++] = *s2;
-                    list[n++] = *s1; list[n++] = *s2; list[n++] = *s3;
-                }
+        for (int ja = 0; ja + 1 < nv; ja += dv) {
+            const int jb = ja + dv < nv ? ja + dv : nv - 1;
+            for (int ia = 0; ia + 1 < nu; ia += du) {
+                const int ib = ia + du < nu ? ia + du : nu - 1;
+                for (int j = ja; j < jb; j++)
+                    for (int i = ia; i < ib; i++) {
+                        const ge_mvert *s0 = &grid[j * nu + i], *s1 = &grid[(j + 1) * nu + i];
+                        const ge_mvert *s2 = &grid[j * nu + i + 1], *s3 = &grid[(j + 1) * nu + i + 1];
+                        if (type == PSP_PRIM_LINES) {
+                            list[n++] = *s0; list[n++] = *s1;
+                            list[n++] = *s1; list[n++] = *s2;
+                            if (i + 1 == ib) { list[n++] = *s2; list[n++] = *s3; }
+                        } else {
+                            list[n++] = *s0; list[n++] = *s1; list[n++] = *s2;
+                            list[n++] = *s1; list[n++] = *s2; list[n++] = *s3;
+                        }
+                    }
             }
+        }
     }
     g_mv_src = list;
     draw_prim(type, n);
@@ -3164,15 +3790,14 @@ static int bbox_hidden(uint32_t count) {
     const int x0 = g_ge.sc_set ? g_ge.sc_x0 : 0,   y0 = g_ge.sc_set ? g_ge.sc_y0 : 0;
     const int x1 = g_ge.sc_set ? g_ge.sc_x1 : 479, y1 = g_ge.sc_set ? g_ge.sc_y1 : 271;
     int left = 1, right = 1, above = 1, below = 1;
+    double wvp[4][4];
+    ge_wvp(wvp);
     for (uint32_t i = 0; i < count; i++) {
-        float m[3], w[3], e[3], c[4];
+        float m[3], c[4];
         if (!read_pos_model(vertex_addr(i, stride), g_ge.vtype, pos_off, m)) return 0;
-        mul_4x3(g_tl.world, m, w);
-        mul_4x3(g_tl.view, w, e);
-        c[0] = ge_proj_row(g_tl.proj, 0, e);
-        c[1] = ge_proj_row(g_tl.proj, 1, e);
+        ge_clip(wvp, m, c);
         c[2] = 0.0f;
-        c[3] = fabsf(ge_proj_row(g_tl.proj, 3, e));
+        c[3] = fabsf(c[3]);
         if (c[3] == 0.0f || !isfinite(c[0] / c[3]) || !isfinite(c[1] / c[3])) return 0;
         int x, y;
         clip_to_fx16(c, &x, &y);
@@ -3214,7 +3839,7 @@ static void ge_back_push(uint64_t pixels) {
 }
 
 static void run_list(ge_queue *q) {
-    if (g_ge_walking || q->paused) return;
+    if (g_ge_walking || q->paused || q->hung) return;
     g_ge_walking = 1;
     const uint64_t _r0 = ge_prof_now();
     run_list_body(q);
@@ -3292,6 +3917,7 @@ static void run_list_body(ge_queue *q) {
             g_ge.prims[3]++;
             const uint64_t px0 = psp_render_pixels();
             draw_patch(cmd == GE_SPLINE, arg);
+            if (g_ge_hang) { g_ge_hang = 0; q->hung = 1; return; }
             g_ge_t += GE_PRIM_UNITS + GE_VERTEX_UNITS * (arg & 0xFF) * ((arg >> 8) & 0xFF);
             ge_back_push(psp_render_pixels() - px0);
             break;
@@ -3443,8 +4069,8 @@ static void run_list_body(ge_queue *q) {
             g_tl.morph_w[cmd - GE_MORPHWEIGHT0] = ge_float(arg);
             break;
         case GE_PATCHDIVISION:
-            g_ge.patch_du = (int)(arg & 0xFF);
-            g_ge.patch_dv = (int)((arg >> 8) & 0xFF);
+            g_ge.patch_du = (int)(arg & 0x7F);            /* 7 bits: geprobe 13 */
+            g_ge.patch_dv = (int)((arg >> 8) & 0x7F);
             break;
         case GE_PATCHPRIMITIVE: g_ge.patch_prim = (int)(arg & 3); break;
         case GE_PATCHFACING:    g_ge.patch_face = (int)(arg & 1); break;
@@ -4071,7 +4697,7 @@ static void drain_all(void) {
 static int ge_has_work(void) {
     if (g_ge_pend.valid) return 1;
     const ge_queue *q = oldest_pending();
-    return q && !q->paused && !(q->stall && q->list == q->stall);
+    return q && !q->paused && !q->hung && !(q->stall && q->list == q->stall);
 }
 
 /* Words were released (EnQueue, a stall update, Continue). An idle GE starts
@@ -4736,13 +5362,29 @@ static void hle_DrawSync(void) {
     psp_sched_yield();
     ge_wait_drain(1, 0);
     retire_done();
-    /* DONE even if a stalled list remains: Break is still a stub that reports
-     * success without clearing anything, so reporting busy afterwards would
-     * contradict our own Break. Revisit with real BREAK state. */
+    /* DONE even if a stalled or hung list remains. A list hung at a patch
+     * division (draw_patch) would block this wait for ever on the PSP; here
+     * it returns, so the host cannot freeze, and the list stays pending for
+     * sceGeDrawSync's peek and sceGeBreak. Not measured. */
     psp_ret(GE_SYNC_DONE);
 }
 
-static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* sceGeBreak: mode 1 drops every list, mode 0 the one at the head. Only
+ * mode 1 on a hung queue is measured: geprobe 13's scenes 80 and 81 (fw
+ * 6.60) break a list hung at a patch division of 65-127 with sceGeBreak(1),
+ * which returns 0 or more, after which new lists run as on a fresh queue.
+ * Return values and the rest are not measured. */
+static void hle_Break(void) {
+    if (psp_arg(0) == 1) {
+        for (int i = 0; i < MAX_QUEUES; i++)
+            if (g_queue[i].used && !g_queue[i].done) { g_queue[i].done = 1; g_queue[i].hung = 0; g_queue[i].paused = 0; }
+    } else {
+        ge_queue *q = oldest_pending();
+        if (q) { q->done = 1; q->hung = 0; q->paused = 0; }
+    }
+    if (!ge_has_work()) g_ge_backlog = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 /* sceGeContinue: a paused list goes on, run inside the call as EnQueue runs a
  * new one -- geprobe 5 step 57 (fw 6.60): the SIGNAL and FINISH after the

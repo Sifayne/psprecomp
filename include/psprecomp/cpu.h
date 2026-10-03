@@ -102,7 +102,9 @@ void psp_cpu_reset_vfpu_ctrl(void);
  * fp = sp, k0 = top-256 and a1 = 0; with 16 bytes sp = top-336, fp = sp,
  * k0 = top-256 and a1 = top-272, where the arguments were copied (vfpuprobe
  * v3 step 162, fw 6.60). $ra differs between two threads there; the probe
- * did not print what it holds. */
+ * did not print what it holds. hi and lo are nonzero at entry in all three
+ * runs of threadprobe (v3 step 22), which logs only that; they take the
+ * general registers' fill, which is a guess at the value. */
 void psp_cpu_reset_thread(void);
 #define PSP_GPR_FRESH 0xDEADBEEFu
 

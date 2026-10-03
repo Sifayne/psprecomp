@@ -15,9 +15,28 @@
  * hardware reference from this project's own PSP. Scenes 25 on (version 5)
  * each isolate one rule the earlier scenes left open, scenes 34 on
  * (version 6) what geprobe 5 left open in turn, scenes 43 on (version 7,
- * after the callback steps) what geprobe 6 left open, and scenes 50 on
+ * after the callback steps) what geprobe 6 left open, scenes 50 on
  * (version 8) the two rules geprobe 7 could not settle: the gradient
- * reciprocal and the spline weights.
+ * reciprocal and the spline weights, scenes 53 and 54 (version 9) the
+ * spline weights again, densely, scenes 55 to 58 (version 10) the
+ * spline weights through depth and texture, and the 3D depth anchor, and
+ * scenes 59 to 61 (version 11) a vertex's depth, a stage at a time,
+ * scenes 62 to 66 (version 12) each of those stages read whole,
+ * scenes 67 to 82 (version 13) Bezier and spline patch positions read
+ * through depth, replayed from patch13.py's command streams, scenes 83 to
+ * 98 (version 14) how colour runs across a triangle, replayed from
+ * colour14.py's, scenes 99 to 109 (version 15) how it runs along a line,
+ * replayed the same way from lines15.py's, scenes 110 to 114 (version 16)
+ * skinned and morphed positions read whole through depth, from skin16.py's,
+ * scenes 115 to 119 (version 17) point and spot lights: L.D searched
+ * whole through the spot cutoff, and the lighting factors as bytes, from
+ * lights17.py's, scene 120 (version 18) the lighting's 1/sqrt at every
+ * input the same way, from rsq18.py's, scenes 121 to 124 (version 19)
+ * lighting under real world and view matrices, from lights19.py's,
+ * scenes 125 to 127 (version 20) where a long edge's pixels fall, from
+ * edges20.py's, and scenes 128 to 133 (version 21) tall long edges that
+ * lean little or share the height, from edges21.py's, and the order a
+ * patch's lines go out in, from plines21.py's.
  *
  * Every raw file is 480 x 272 pixels, rows packed (no stride padding), in the
  * scene's framebuffer format: 4 bytes per pixel for 8888, 2 for the 16-bit
@@ -38,7 +57,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 8
+#define PROBE_VERSION 23
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -2163,6 +2182,1701 @@ static void scene_splineweights(void) {
     scene_end("splineweights", GU_PSM_8888, 0);
 }
 
+/* ---- version 9 ------------------------------------------------------------
+ *
+ * Scene 52's weights fit exact Cox-de Boor values everywhere on a Bezier
+ * piece, but the two inner weights of a B-spline span read a step off at
+ * some samples: both on a uniform span, the second after an open start and
+ * the third before an open end, each pair off in opposite directions. Its
+ * one control colour (255) and 2 to 8 steps cannot tell a weight that is
+ * off from colour arithmetic that is. Scenes 53 and 54 read the same
+ * weights at 40 and 48 steps a span, with control colours 255, 254 and
+ * 129, and with two neighbouring columns lit in one channel, whose sum
+ * shows whether the pair's errors cancel. */
+
+typedef struct { int edge, cols; float s, first; } SW2;
+
+/* The splines under test: a uniform span, two uniform spans, and two spans
+ * with each kind of open end. s is the control columns' spacing in pixels,
+ * first the column the first sample sits on, so every row starts at x = 20
+ * and the samples fall at least 2.5 pixels apart. */
+static const SW2 SW2_SPLINES[5] = {
+    { GU_FILL_FILL, 4, 300.0f, 1.0f }, { GU_FILL_FILL, 5, 200.0f, 1.0f },
+    { GU_OPEN_OPEN, 5, 110.0f, 0.0f }, { GU_OPEN_FILL, 5, 140.0f, 0.0f },
+    { GU_FILL_OPEN, 5, 140.0f, 1.0f } };
+
+/* One patch, a row 6 pixels high at y: v open/open over 4 rows at one
+ * division, as in scene 52, so each point's colour is the u weights alone.
+ * Single (pair = 0): control column k red, k + 1 green, k + 2 blue, each
+ * channel `level`. Pair: columns k and k + 1 red, k + 1 and k + 2 green,
+ * k + 2 and k + 3 blue, at 255. */
+static void sw2_patch(const SW2 *sp, int div, int k, int pair, int level, float y) {
+    CV g[6 * 4];
+    const float x0 = 20.0f - sp->first * sp->s;
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < sp->cols; i++) {
+            w32 c = 0xFF000000u;
+            if (pair) {
+                if (i == k || i == k + 1) c |= 0xFFu;
+                if (i == k + 1 || i == k + 2) c |= 0xFF00u;
+                if (i == k + 2 || i == k + 3) c |= 0xFF0000u;
+            } else {
+                if (i == k) c |= (w32)level;
+                if (i == k + 1) c |= (w32)level << 8;
+                if (i == k + 2) c |= (w32)level << 16;
+            }
+            float x, yy;
+            eye_xy(x0 + i * sp->s, y + j, -6.0f, &x, &yy);
+            g[j * sp->cols + i] = (CV){ c, x, yy, -6.0f };
+        }
+    sceGuPatchDivide(div, 1);
+    sceGuDrawSpline(FMT_CV3D, sp->cols, 4, sp->edge, GU_OPEN_OPEN, NULL,
+                    gumem(g, sp->cols * 4 * (int)sizeof(CV)));
+}
+
+/* Scenes 53 and 54: for each spline, levels 255, 254 and 129 at k = 0 and
+ * 3, then the pairs from k = 0 (and k = 1 with 5 columns), one patch to a
+ * row, 39 rows from y = 2.5. Clear red 255, green 1, blue 255 as in scene
+ * 52: no single point reaches 255, and no pair point lights both red and
+ * blue fully. */
+static void scene_splinedense(int div) {
+    if (step("scene %02d: spline weights at %d steps a span, three levels and pairs", g_scene, div)) return;
+    scene_begin(GU_PSM_8888, 0xFFFF01FF);
+    static const int LEVEL[3] = { 255, 254, 129 };
+    sceGuPatchPrim(GU_POINTS);
+    int row = 0;
+    for (int n = 0; n < 5; n++) {
+        const SW2 *sp = &SW2_SPLINES[n];
+        for (int l = 0; l < 3; l++)
+            for (int k = 0; k < sp->cols; k += 3)
+                sw2_patch(sp, div, k, 0, LEVEL[l], 2.5f + 6 * row++);
+        for (int k = 0; k + 3 < sp->cols; k++)
+            sw2_patch(sp, div, k, 1, 255, 2.5f + 6 * row++);
+    }
+    sceGuPatchPrim(GU_TRIANGLE_STRIP);
+    char name[24];
+    snprintf(name, sizeof name, "splinedense%d", div);
+    scene_end(name, GU_PSM_8888, 0);
+}
+
+/* ---- version 10 -----------------------------------------------------------
+ *
+ * Scenes 53 and 54 found every spline weight one value at all three levels,
+ * a function of the span and t alone (908 read at two divisions agree), but
+ * a colour reads it only to 1/255. Scene 55 reads the same weights through
+ * depth, about 128 times finer, and scene 56 reads the parameter t the GE
+ * itself uses, through a texture. Scenes 48's 3D depth planes are a step off
+ * in one direction only; scene 57 redraws them in through mode at
+ * psprecomp's corners with the depths the PSP gives each corner as a point,
+ * and scene 58 moves one shape by every sixteenth of a pixel. */
+
+/* Through-mode-like placement for 3D draws: x and y in pixels, eye z from 0
+ * (depth 65535) to -1 (depth 0), no perspective. */
+static void ortho_screen(void) {
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadIdentity();
+    sceGumOrtho(0.0f, 480.0f, 272.0f, 0.0f, 0.0f, 1.0f);
+    sceGumMatrixMode(GU_MODEL);
+    sceGumUpdateMatrix();
+}
+
+/* The depth buffer whole, 512 pixels a row through the plain VRAM address,
+ * as `<name>_depthfull.bin`: the 480-wide dump cannot read the pixels whose
+ * addresses fall in columns 480-511 (render.c depth_addr). */
+static void dump_depth_full(const char *name) {
+    const unsigned char *z = (const unsigned char *)VRAM_UNCACHED + (w32)ZBP;
+    const int size = FB_W * SCR_H * 2;
+    memcpy(g_dump, z, size);
+    char file[48];
+    snprintf(file, sizeof file, "ge_%02d_%s_depthfull.bin", g_scene, name);
+    const int wr = probe_write_file(file, g_dump, size);
+    out("  %s: %d bytes, crc %08X\n", file, wr, crc32(g_dump, size));
+}
+
+/* Where the GE keeps pixel (x, y)'s depth, through the plain VRAM address:
+ * the permutation geprobe 2 scene 17 measured (render.c depth_addr). */
+static unsigned depth_at(int x, int y) {
+    const w32 l = (w32)ZBP + (w32)(y * FB_W + x) * 2;
+    const w32 mid = (l >> 5) & 0x1F, rot = ((mid << 1) | (mid >> 4)) & 0x1F;
+    const w32 p = ((l & ~(0x1Fu << 5)) | (rot << 5)) ^ 0x2040u;
+    const unsigned char *b = (const unsigned char *)VRAM_UNCACHED + p;
+    return (unsigned)b[0] | (unsigned)b[1] << 8;
+}
+
+typedef struct { int edge, cols; float s, first; } SD10;
+static const SD10 SD10_SPLINES[6] = {
+    { GU_FILL_FILL, 4, 300.0f, 1.0f }, { GU_OPEN_OPEN, 4, 140.0f, 0.0f },
+    { GU_FILL_FILL, 5, 200.0f, 1.0f }, { GU_OPEN_OPEN, 5, 110.0f, 0.0f },
+    { GU_OPEN_FILL, 5, 140.0f, 0.0f }, { GU_FILL_OPEN, 5, 140.0f, 1.0f } };
+
+/* Scene 55: one patch per spline and control column k, 48 steps a span, as
+ * points in a row 6 pixels high, orthographic. Every control point sits at
+ * eye z -0.25 except column k's, at -0.75, so a point's depth is
+ * 32767.5 (1.5 - w) for column k's weight w; column k is also red 255, so
+ * the colour reads the same weight as scenes 53 and 54 do. The spline
+ * order is a uniform span, a Bezier piece (open/open, 4 columns), two
+ * uniform spans, then 5 columns open/open, open/fill and fill/open: 28 rows
+ * from y = 2.5. Depth test ALWAYS, writes on; both depth dumps. */
+static void scene_splinedepth(void) {
+    if (step("scene %02d: spline weights read through depth, 48 steps a span, one column at a time", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFFFF01FF);
+    ortho_screen();
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    sceGuPatchPrim(GU_POINTS);
+    int row = 0;
+    CV g[6 * 4];
+    for (int n = 0; n < 6; n++) {
+        const SD10 *sp = &SD10_SPLINES[n];
+        for (int k = 0; k < sp->cols; k++, row++) {
+            const float x0 = 20.0f - sp->first * sp->s, y = 2.5f + 6 * row;
+            for (int j = 0; j < 4; j++)
+                for (int i = 0; i < sp->cols; i++)
+                    g[j * sp->cols + i] = (CV){ i == k ? 0xFF0000FFu : 0xFF000000u,
+                                                x0 + i * sp->s, y + j, i == k ? -0.75f : -0.25f };
+            sceGuPatchDivide(48, 1);
+            sceGuDrawSpline(FMT_CV3D, sp->cols, 4, sp->edge, GU_OPEN_OPEN, NULL,
+                            gumem(g, sp->cols * 4 * (int)sizeof(CV)));
+        }
+    }
+    sceGuPatchPrim(GU_TRIANGLE_STRIP);
+    scene_end("splinedepth", GU_PSM_8888, 1);
+    dump_depth_full("splinedepth");
+}
+
+static w32 *g_texramp;           /* 512 x 8, texel x = x in red (low) and green (high) */
+
+/* Scene 56: the same splines with no texture coordinates, so the GE gives
+ * each point its surface parameter as (u, v); a 512-texel ramp, nearest,
+ * repeated, replaces the colour with the texel, red + 256 green = floor of
+ * 512 times u's fraction. Each spline at texture scale 1, 4 and 16, so the
+ * texel pins u to 1/512, 1/2048 and 1/8192 of a turn: 18 rows. */
+static void scene_splineparam(void) {
+    if (step("scene %02d: the spline parameter the GE uses, through a 512-texel ramp", g_scene)) return;
+    if (!g_texramp) {
+        g_texramp = memalign(16, 512 * 8 * 4);
+        if (!g_texramp) { out("  out of memory\n"); return; }
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 512; x++) g_texramp[y * 512 + x] = 0xFF000000u | (w32)(x & 0xFF) | (w32)(x >> 8) << 8;
+        sceKernelDcacheWritebackAll();
+    }
+    scene_begin(GU_PSM_8888, 0xFFFF01FF);
+    ortho_screen();
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, 512, 8, 512, g_texramp);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexWrap(GU_REPEAT, GU_REPEAT);
+    sceGuTexOffset(0.0f, 0.0f);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+    sceGuPatchPrim(GU_POINTS);
+    static const float SCALE[3] = { 1.0f, 4.0f, 16.0f };
+    int row = 0;
+    CV g[6 * 4];
+    for (int n = 0; n < 6; n++) {
+        const SD10 *sp = &SD10_SPLINES[n];
+        for (int l = 0; l < 3; l++, row++) {
+            const float x0 = 20.0f - sp->first * sp->s, y = 2.5f + 6 * row;
+            for (int j = 0; j < 4; j++)
+                for (int i = 0; i < sp->cols; i++)
+                    g[j * sp->cols + i] = (CV){ 0xFF000000u, x0 + i * sp->s, y + j, -0.5f };
+            sceGuTexScale(SCALE[l], 1.0f);
+            sceGuPatchDivide(48, 1);
+            sceGuDrawSpline(FMT_CV3D, sp->cols, 4, sp->edge, GU_OPEN_OPEN, NULL,
+                            gumem(g, sp->cols * 4 * (int)sizeof(CV)));
+        }
+    }
+    sceGuPatchPrim(GU_TRIANGLE_STRIP);
+    sceGuTexScale(1.0f, 1.0f);
+    sceGuDisable(GU_TEXTURE_2D);
+    scene_end("splineparam", GU_PSM_8888, 0);
+}
+
+/* Scene 48's 48 triangles as psprecomp projects them (1/16 pixel, corners
+ * in the order drawn), which the earlier runs confirmed through their depth
+ * planes. */
+static const short TWIN_XY[48][6] = {
+#include "twin_table.inc"
+};
+
+/* Scene 48's corner (s, k, j): the shape, its copy and the corner's place in
+ * the copy's order, as scene_depthanchor2 draws them. */
+static CV anchor_corner(int s, int k, int j, w32 c) {
+    const float X = -4.2f + k * 1.5f, Y = 2.45f - s * 0.68f;
+    const int v = k < 3 ? (k + j) % 3 : (k + 3 - j) % 3;
+    return (CV){ c, X + ANCHOR_SHAPES[s][v][0] * 0.55f, Y - ANCHOR_SHAPES[s][v][1] * 0.55f, ANCHOR_SHAPES[s][v][2] };
+}
+
+/* Scene 57: first each of scene 48's 144 corners as a point (its index in
+ * red and green), read back: the pixel its colour landed on near
+ * psprecomp's corner, and that pixel's depth, logged 8 to a line as
+ * "x,y=depth". Then the 48 triangles again in through mode, at psprecomp's
+ * corners with those depths (psprecomp's floored depth where a point is not
+ * found, marked '?'), colour as scene 48. If these match scene 48 the 3D
+ * planes are the through-mode rule on the corners the GE has; if not, the
+ * 3D path differs. Depth test ALWAYS, writes on; both depth dumps. */
+static void scene_anchortwin(void) {
+    if (step("scene %02d: scene 48's corners as points, then its triangles in through mode at those depths", g_scene)) return;
+    static CV pts[144], tri[144];
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    for (int t = 0; t < 48; t++)
+        for (int j = 0; j < 3; j++) {
+            const int i = t * 3 + j;
+            pts[i] = anchor_corner(t / 6, t % 6, j, 0xFF550000u | (w32)(i & 0xFF) | (w32)(i >> 8) << 8);
+        }
+    sceGuDrawArray(GU_POINTS, FMT_CV3D, 144, NULL, gumem(pts, sizeof pts));
+    sceGuFinish();
+    ge_wait();
+    const w32 *fb = (const w32 *)VRAM_UNCACHED;
+    int found = 0;
+    for (int i = 0; i < 144; i++) {
+        const int t = i / 3, j = i % 3;
+        const int cx = TWIN_XY[t][2 * j] >> 4, cy = TWIN_XY[t][2 * j + 1] >> 4;
+        const w32 want = 0x550000u | (w32)(i & 0xFF) | (w32)(i >> 8) << 8;
+        int hx = -1, hy = -1;
+        for (int dy = -1; dy <= 1 && hx < 0; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+                const int x = cx + dx, y = cy + dy;
+                if (x < 0 || y < 0 || x >= SCR_W || y >= SCR_H) continue;
+                if ((fb[y * FB_W + x] & 0xFFFFFF) == want) { hx = x; hy = y; break; }
+            }
+        const w32 c = 0xFF800000u | (w32)(0x40 + (t / 6) * 0x18) | (w32)(0x40 + (t % 6) * 0x20) << 8;
+        float z = -1.0f;
+        if (hx >= 0) { z = (float)depth_at(hx, hy); found++; }
+        tri[i] = (CV){ c, TWIN_XY[t][2 * j] / 16.0f, TWIN_XY[t][2 * j + 1] / 16.0f, z };
+        if (i % 8 == 0) out("  ");
+        if (hx >= 0) out(" %d,%d=%u", hx, hy, (unsigned)z);
+        else out(" ?");
+        if (i % 8 == 7) out("\n");
+    }
+    out("  %d of 144 corners found\n", found);
+    for (int i = 0; i < 144; i++)
+        if (tri[i].z < 0.0f) tri[i].z = 0.0f;        /* not found: depth 0, logged as '?' */
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV2D, 144, NULL, gumem(tri, sizeof tri));
+    scene_end("anchortwin", GU_PSM_8888, 1);
+    dump_depth_full("anchortwin");
+}
+
+/* Scene 58: scene 48's shape 1 (the one most off), 40 pixels across in its
+ * first order, at screen positions moved by i/16 of a pixel across (top two
+ * rows of 8) and down (bottom two rows), i = 0..15, each copy its own flat
+ * colour, at the shape's eye depths. Depth test ALWAYS, writes on; both
+ * depth dumps. */
+static void scene_anchorsweep(void) {
+    if (step("scene %02d: one 3D shape at every sixteenth of a pixel across and down", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    static CV t[32 * 3];
+    int n = 0;
+    for (int c = 0; c < 32; c++) {
+        const float bx = 20.0f + 55.0f * (c % 8), by = 12.0f + 62.0f * (c / 8);
+        const float dx = c < 16 ? (c % 16) / 16.0f : 0.0f, dy = c < 16 ? 0.0f : (c % 16) / 16.0f;
+        const w32 col = 0xFF000000u | (w32)(0x40 + 4 * c) | (w32)(0xC0 - 4 * c) << 8 | 0x600000u;
+        for (int j = 0; j < 3; j++) {
+            float x, y;
+            const float *v = ANCHOR_SHAPES[1][j];
+            eye_xy(bx + v[0] * 40.0f + dx, by + v[1] * 40.0f + dy, v[2], &x, &y);
+            t[n++] = (CV){ col, x, y, v[2] };
+        }
+    }
+    sceGuDrawArray(GU_TRIANGLES, FMT_CV3D, n, NULL, gumem(t, n * sizeof(CV)));
+    scene_end("anchorsweep", GU_PSM_8888, 1);
+    dump_depth_full("anchorsweep");
+}
+
+/* ---- version 11 -----------------------------------------------------------
+ *
+ * Every 3D depth plane still off is a corner depth a step off (scene 57: 6
+ * of scene 48's 144 corners), and scene 45's 3840 points fit psprecomp's
+ * depth arithmetic on 2883. These take the arithmetic apart. Scene 59 has
+ * no divide (w = 1), so depth is the viewport's scale and centre on the
+ * eye z alone. Scene 60 makes clip z / clip w the same at every eye depth
+ * from -1 to -100, so every point's depth would be one value in exact
+ * arithmetic and what varies is the reciprocal and the product. Scene 61
+ * repeats scene 60's first batch with the eye depth made by a model matrix
+ * translation, which shows whether the world and view transforms keep
+ * fewer bits. Points are 96 to a row, 5 pixels apart, rows 6 apart, each
+ * coloured by its index (red the low byte, green the high, blue 0x40 + the
+ * batch); depth test ALWAYS, writes on; both depth dumps. */
+
+#define VD_N 1920                         /* points a batch of scene 59 */
+static CV g_vd[3840];
+
+static void vd_load(const ScePspFMatrix4 *m) {
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadMatrix(m);
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumUpdateMatrix();
+}
+
+static w32 vd_colour(int k, int batch) {
+    return 0xFF000000u | (w32)(k & 0xFF) | (w32)(k >> 8) << 8 | (w32)(0x40 + batch) << 16;
+}
+
+/* Scene 59: identity projection (clip = eye, w = 1). Batch 0: viewport z
+ * scale and centre 32768, so depth = 32768 (1 + z); batch 1: the scale and
+ * centre sceGuDepthRange(65535, 0) sets, -32768 and 32767 (it halves
+ * 65535 as an integer). 1920 eye depths each from -0.99 to 0.99 in even
+ * float steps. */
+static void scene_depthaffine(void) {
+    if (step("scene %02d: point depths with no divide, two viewport scales", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    static const ScePspFMatrix4 id = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 }, { 0, 0, 0, 1 } };
+    vd_load(&id);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    for (int b = 0; b < 2; b++) {
+        if (b == 0) { sceGuSendCommandf(0x44, 32768.0f); sceGuSendCommandf(0x47, 32768.0f); }
+        else sceGuDepthRange(65535, 0);
+        for (int k = 0; k < VD_N; k++) {
+            const int i = b * VD_N + k, px = 2 + 5 * (i % 96), py = 8 + 6 * (i / 96);
+            const float z = -0.99f + (float)k * (1.98f / (VD_N - 1));
+            g_vd[i] = (CV){ vd_colour(k, b), (px + 0.5f - 240.0f) / 240.0f, (136.0f - (py + 0.5f)) / 136.0f, z };
+        }
+        sceGuDrawArray(GU_POINTS, FMT_CV3D, VD_N, NULL, gumem(&g_vd[b * VD_N], VD_N * (int)sizeof(CV)));
+    }
+    sceGuDepthRange(65535, 0);
+    scene_end("depthaffine", GU_PSM_8888, 1);
+    dump_depth_full("depthaffine");
+}
+
+/* Scenes 60 and 61's projection: clip x and y the eye's, clip z = a z,
+ * clip w = -z, so clip z / clip w = -a at every depth. */
+static void vd_ratio_matrix(ScePspFMatrix4 *m, float a) {
+    *m = (ScePspFMatrix4){ { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, a, -1 }, { 0, 0, 0, 0 } };
+}
+
+/* 1280 eye depths from -1 to -100, even steps in 1/z, as scene 45 spaces
+ * its far points. */
+static float vd_depth(int k) {
+    const float r0 = 1.0f, r1 = 1.0f / 100.0f;
+    return -1.0f / (r0 - (float)k * ((r0 - r1) / 1279.0f));
+}
+
+/* Scene 60: the ratio projection with a = -0.3, 0.45 and -0.82 (one batch
+ * each), the standard depth range, so every point of a batch would read
+ * 32767 + 32768 a' with a' the GE's 16-bit a: 22936.75, 47512.5, 5897.5. */
+static void scene_depthratio(void) {
+    if (step("scene %02d: point depths with clip z / w fixed, eye z -1 to -100", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    static const float A[3] = { -0.3f, 0.45f, -0.82f };
+    ScePspFMatrix4 m;
+    for (int b = 0; b < 3; b++) {
+        vd_ratio_matrix(&m, A[b]);
+        vd_load(&m);
+        for (int k = 0; k < 1280; k++) {
+            const int i = b * 1280 + k, px = 2 + 5 * (i % 96), py = 8 + 6 * (i / 96);
+            const float z = vd_depth(k);
+            g_vd[i] = (CV){ vd_colour(k, b), (px + 0.5f - 240.0f) / 240.0f * -z, (136.0f - (py + 0.5f)) / 136.0f * -z, z };
+        }
+        sceGuDrawArray(GU_POINTS, FMT_CV3D, 1280, NULL, gumem(&g_vd[b * 1280], 1280 * (int)sizeof(CV)));
+    }
+    scene_end("depthratio", GU_PSM_8888, 1);
+    dump_depth_full("depthratio");
+}
+
+/* Scene 61: scene 60's first batch (a = -0.3) with each point's model z
+ * its eye z plus 37.125 and the model matrix translating z by -37.125, and
+ * again by 0.4375 and -0.4375: the eye depth is then the GE's own sum. */
+static void scene_depthmodel(void) {
+    if (step("scene %02d: scene 60's first batch with eye z from a model translation", g_scene)) return;
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    ScePspFMatrix4 m;
+    vd_ratio_matrix(&m, -0.3f);
+    vd_load(&m);
+    static const float T[3] = { 37.125f, 0.4375f, -0.4375f };
+    for (int b = 0; b < 3; b++) {
+        ScePspFVector3 tr = { 0.0f, 0.0f, -T[b] };
+        sceGumMatrixMode(GU_MODEL);
+        sceGumLoadIdentity();
+        sceGumTranslate(&tr);
+        sceGumUpdateMatrix();
+        for (int k = 0; k < 1280; k++) {
+            const int i = b * 1280 + k, px = 2 + 5 * (i % 96), py = 8 + 6 * (i / 96);
+            const float z = vd_depth(k);
+            g_vd[i] = (CV){ vd_colour(k, b), (px + 0.5f - 240.0f) / 240.0f * -z, (136.0f - (py + 0.5f)) / 136.0f * -z, z + T[b] };
+        }
+        sceGuDrawArray(GU_POINTS, FMT_CV3D, 1280, NULL, gumem(&g_vd[b * 1280], 1280 * (int)sizeof(CV)));
+    }
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumUpdateMatrix();
+    scene_end("depthmodel", GU_PSM_8888, 1);
+    dump_depth_full("depthmodel");
+}
+
+/* ---- Scenes 62 to 66 (version 12): each stage read whole ------------------
+ *
+ * A point's depth is floor(zc + zs * clip z / clip w), the product cut to
+ * the larger term's 16 significant bits first (scene 59). With zc 0 and zs a
+ * power of two that puts the product between 32768 and 65536, the depth is
+ * clip z / clip w's top 16 bits as the GE has them: where scenes 59 to 61
+ * saw a step either side of a rounding, these read a stage's result whole.
+ * Scene 62 reads 1/w, 63 a projection row's sum with w 1, 64 clip z times
+ * 1/w, 65 how the world, view and projection matrices combine, and 66 the
+ * probes' own perspective end to end.
+ *
+ * Every input is built from integer bit patterns (xorshift32 from a fixed
+ * seed per scene), each matrix entry with 16 significant bits so the GE's
+ * 24-bit words hold it exactly, and each scene logs a CRC of its points' eye
+ * z so the analysis can check it made the same ones. Points sit two pixels
+ * apart, 240 to a row from row 10; the viewport scale is 256 across and -128
+ * down so a slot's ndc x and y are exact. Each is coloured by its slot (red
+ * the low byte, green the high) and its batch (blue, from 0x40). */
+
+#define RD_N 30480                          /* 240 slots a row, 127 rows */
+static CV  g_rd[RD_N];
+static w32 g_rdz[RD_N];
+static int g_rdn;
+static w32 g_rng;
+
+static w32 rd_rand(void) {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 17;
+    g_rng ^= g_rng << 5;
+    return g_rng;
+}
+
+static float rd_f(w32 bits) { float f; memcpy(&f, &bits, 4); return f; }
+
+/* (-1)^s 2^e (1 + m / 2^23). */
+static float rd_mk(int s, int e, w32 m) {
+    return rd_f((w32)(s & 1) << 31 | (w32)(e + 127) << 23 | (m & 0x7FFFFFu));
+}
+
+/* The same with 16 significant bits: m15 the 15 below the leading one. */
+static float rd_mk16(int s, int e, w32 m15) { return rd_mk(s, e, (m15 & 0x7FFFu) << 8); }
+
+static float rd_ndcx(int i) { return ((float)(2 * (i % 240)) + 0.5f - 240.0f) / 256.0f; }
+static float rd_ndcy(int i) { return (136.0f - (float)(10 + 2 * (i / 240)) - 0.5f) / 128.0f; }
+
+static void rd_put(int batch, float x, float y, float z) {
+    const int i = g_rdn++;
+    g_rd[i] = (CV){ 0xFF000000u | (w32)(i & 0xFF) | (w32)((i >> 8) & 0xFF) << 8 | (w32)(0x40 + batch) << 16, x, y, z };
+    memcpy(&g_rdz[i], &z, 4);
+}
+
+/* The next slot's point at eye z z, placed for clip w w by a projection
+ * whose x and y rows are the eye's x and y. */
+static void rd_at(int batch, float w, float z) {
+    const int i = g_rdn;
+    rd_put(batch, rd_ndcx(i) * w, rd_ndcy(i) * w, z);
+}
+
+/* World, view and projection, each the identity but for the z row:
+ * world z = rx x + s z + t, eye z = v (world z) + u, clip z = a (eye z) + b,
+ * clip w = wz (eye z) + ww. */
+static void rd_load(float a, float b, float wz, float ww, float v, float u, float rx, float s, float t) {
+    const ScePspFMatrix4 P = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, a, wz }, { 0, 0, b, ww } };
+    const ScePspFMatrix4 V = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, v, 0 }, { 0, 0, u, 1 } };
+    const ScePspFMatrix4 W = { { 1, 0, rx, 0 }, { 0, 1, 0, 0 }, { 0, 0, s, 0 }, { 0, 0, t, 1 } };
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadMatrix(&P);
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadMatrix(&V);
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadMatrix(&W);
+    sceGumUpdateMatrix();
+}
+
+/* A projection row alone: clip z = cx x + cy y + a z + b, clip w = wz z + ww. */
+static void rd_proj(float cx, float cy, float a, float b, float wz, float ww) {
+    const ScePspFMatrix4 P = { { 1, 0, cx, 0 }, { 0, 1, cy, 0 }, { 0, 0, a, wz }, { 0, 0, b, ww } };
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadMatrix(&P);
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadIdentity();
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumUpdateMatrix();
+}
+
+/* Viewport z: scale zs, centre 0. */
+static void rd_zview(float zs) {
+    sceGuSendCommandf(0x44, zs);
+    sceGuSendCommandf(0x47, 0.0f);
+}
+
+static void rd_draw(int from) {
+    const int n = g_rdn - from;
+    if (n > 0) sceGuDrawArray(GU_POINTS, FMT_CV3D, n, NULL, gumem(&g_rd[from], n * (int)sizeof(CV)));
+}
+
+static void rd_begin(void) {
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuViewport(2048, 2048, 512, 256);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthFunc(GU_ALWAYS);
+    sceGuDepthMask(GU_FALSE);
+    g_rdn = 0;
+}
+
+static void rd_end(const char *name) {
+    out("  %d points, eye z crc %08X\n", g_rdn, crc32(g_rdz, g_rdn * 4));
+    scene_end(name, GU_PSM_8888, 0);
+    dump_depth_full(name);
+}
+
+/* A 24-bit significand, never 0. */
+static w32 rd_m24(void) {
+    w32 m;
+    do m = rd_rand() & 0x7FFFFFu; while (!m);
+    return m;
+}
+
+/* 1024 clip w in (2, 4), which scene 62 reads 1/w of and scene 64 multiplies. */
+static float g_w64[1024];
+static void rd_make_w64(void) {
+    g_rng = 0x64000001u;
+    for (int j = 0; j < 1024; j++) g_w64[j] = rd_mk(0, 1, rd_m24());
+}
+
+/* Scene 62: clip z c = 2^e, clip w = -z in [2^e, 2^(e+1)), so the depth is
+ * 65536 c / w: 1/w's top 16 bits. Batch 0 is w in (1, 2): the 127 w with
+ * 8-bit significands, 4096 with random 16-bit ones, 2048 with random 24-bit
+ * ones, and two runs of 256 consecutive 24-bit ones. Batches 1 to 8 are the
+ * binades from 2^-3 to 2^13, 192 random w each, but 2^1's, scene 64's 1024. */
+static void scene_rcpread(void) {
+    if (step("scene %02d: 1/w read whole: clip z a power of two, depth 1/w's top 16 bits", g_scene)) return;
+    rd_make_w64();
+    rd_begin();
+    rd_zview(65536.0f);
+    g_rng = 0x62000001u;
+    rd_proj(0, 0, 0, 1.0f, -1.0f, 0);
+    int from = g_rdn;
+    for (int j = 1; j < 128; j++) { const float w = rd_mk(0, 0, (w32)j << 16); rd_at(0, w, -w); }
+    for (int j = 0; j < 4096; j++) {
+        w32 m;
+        do m = (rd_rand() & 0x7FFFu) << 8; while (!m);
+        const float w = rd_mk(0, 0, m);
+        rd_at(0, w, -w);
+    }
+    for (int j = 0; j < 2048; j++) { const float w = rd_mk(0, 0, rd_m24()); rd_at(0, w, -w); }
+    for (int j = 0; j < 256; j++) { const float w = rd_mk(0, 0, 0x400000u + (w32)j); rd_at(0, w, -w); }
+    for (int j = 0; j < 256; j++) { const float w = rd_mk(0, 0, 0x155500u + (w32)j); rd_at(0, w, -w); }
+    rd_draw(from);
+    static const int E[8] = { -3, -1, 1, 2, 4, 7, 10, 13 };
+    for (int b = 0; b < 8; b++) {
+        rd_proj(0, 0, 0, rd_mk(0, E[b], 0), -1.0f, 0);
+        from = g_rdn;
+        if (E[b] == 1)
+            for (int j = 0; j < 1024; j++) rd_at(1 + b, g_w64[j], -g_w64[j]);
+        else
+            for (int j = 0; j < 192; j++) { const float w = rd_mk(0, E[b], rd_m24()); rd_at(1 + b, w, -w); }
+        rd_draw(from);
+    }
+    rd_end("rcpread");
+}
+
+/* Scene 63: clip w 1, so the depth is zs times clip z, read whole. Batch 0:
+ * clip z = z, z in [0.5, 1), as the GE takes z in. 1-4: z - 1 for z = 1 + d,
+ * d in [2^e, 2^(e+1)), e -2, -9, -16 and -21: how much of z reaches the
+ * sum. 5-12: a z, a in [1, 1.25), z in [0.5, 0.75), half of them with 16
+ * significant bits. 13-24: z + b, b in [5/8, 3/4), z of either sign in
+ * [2^-g, 2^(1-g)) for g 4, 7, 11, 15, 17 and 19: the smaller term's
+ * alignment. 25: a carry, b in [7/16, 1/2), z in [1/16, 1/8). 26: z = -(b -
+ * k 2^-23), b in [1.5, 2), k in [2^18, 2^19): a cancellation. 27-30: four
+ * terms, cx x + cy y + a z + b, each a different size: the order they are
+ * summed in. Clip z stays below 1, inside the clip volume. */
+static void scene_dotread(void) {
+    if (step("scene %02d: a projection row read whole: clip w 1, depth clip z's top 16 bits", g_scene)) return;
+    rd_begin();
+    g_rng = 0x63000001u;
+    int from, b = 0;
+    w32 r;
+    rd_proj(0, 0, 1.0f, 0, 0, 1.0f);
+    rd_zview(65536.0f);
+    from = g_rdn;
+    for (int j = 0; j < 1024; j++) rd_at(b, 1.0f, rd_mk(0, -1, rd_rand()));
+    rd_draw(from);
+    b++;
+    static const int DE[4] = { -2, -9, -16, -21 };
+    rd_proj(0, 0, 1.0f, -1.0f, 0, 1.0f);
+    for (int q = 0; q < 4; q++, b++) {
+        rd_zview(rd_mk(0, 15 - DE[q], 0));
+        const w32 lo = 1u << (23 + DE[q]);
+        from = g_rdn;
+        for (int j = 0; j < 256; j++) rd_at(b, 1.0f, rd_mk(0, 0, lo | (rd_rand() & (lo - 1))));
+        rd_draw(from);
+    }
+    rd_zview(65536.0f);
+    for (int q = 0; q < 8; q++, b++) {
+        r = rd_rand();
+        rd_proj(0, 0, rd_mk16(0, 0, r & 0x1FFFu), 0, 0, 1.0f);
+        from = g_rdn;
+        for (int j = 0; j < 256; j++) {
+            r = rd_rand();
+            rd_at(b, 1.0f, rd_mk(0, -1, j < 128 ? (r & 0x3FFFu) << 8 : r & 0x3FFFFFu));
+        }
+        rd_draw(from);
+    }
+    static const int G[6] = { 4, 7, 11, 15, 17, 19 };
+    for (int q = 0; q < 12; q++, b++) {
+        r = rd_rand();
+        rd_proj(0, 0, 1.0f, rd_mk16(0, -1, 0x2000u | (r & 0x1FFFu)), 0, 1.0f);
+        from = g_rdn;
+        for (int j = 0; j < 128; j++) rd_at(b, 1.0f, rd_mk(q & 1, -G[q >> 1], rd_rand()));
+        rd_draw(from);
+    }
+    r = rd_rand();
+    rd_proj(0, 0, 1.0f, rd_mk16(0, -2, 0x6000u | (r & 0x1FFFu)), 0, 1.0f);
+    from = g_rdn;
+    for (int j = 0; j < 128; j++) rd_at(b, 1.0f, rd_mk(0, -4, rd_rand()));
+    rd_draw(from);
+    b++;
+    rd_zview(1048576.0f);
+    r = rd_rand();
+    const w32 mb = (0x4000u | (r & 0x3FFFu)) << 8;
+    rd_proj(0, 0, 1.0f, rd_mk(0, 0, mb), 0, 1.0f);
+    from = g_rdn;
+    for (int j = 0; j < 128; j++) rd_at(b, 1.0f, rd_mk(1, 0, mb - ((1u << 18) | (rd_rand() & 0x3FFFFu))));
+    rd_draw(from);
+    b++;
+    rd_zview(65536.0f);
+    static const signed char T4[4][4] = { { -6, -8, 0, -5 }, { -4, -10, -2, -4 }, { -13, -5, 0, -6 }, { -7, -7, 1, -7 } };
+    for (int q = 0; q < 4; q++, b++) {
+        r = rd_rand(); const float cx = rd_mk16((int)(r & 1), T4[q][0], r >> 1);
+        r = rd_rand(); const float cy = rd_mk16((int)(r & 1), T4[q][1], r >> 1);
+        r = rd_rand(); const float a = rd_mk16(0, T4[q][2], r);
+        r = rd_rand(); const float c = rd_mk16(0, -1, 0x1000u + (r & 0x1FFFu));
+        rd_proj(cx, cy, a, c, 0, 1.0f);
+        from = g_rdn;
+        for (int j = 0; j < 512; j++) rd_at(b, 1.0f, rd_mk(0, T4[q][3], rd_rand()));
+        rd_draw(from);
+    }
+    rd_end("dotread");
+}
+
+/* Scene 64: clip z b in [1.5, 2), clip w = -z scene 62's 1024 w in (2, 4):
+ * the depth is 65536 b / w (most of them; the rest, below 1/2, 32768ths),
+ * the product of b and 1/w as the GE forms it. Four b. */
+static void scene_mulread(void) {
+    if (step("scene %02d: clip z times 1/w read whole, for scene 62's w in (2, 4)", g_scene)) return;
+    rd_make_w64();
+    rd_begin();
+    rd_zview(65536.0f);
+    g_rng = 0x64000002u;
+    for (int q = 0; q < 4; q++) {
+        const w32 r = rd_rand();
+        rd_proj(0, 0, 0, rd_mk16(0, 0, 0x4000u | (r & 0x3FFFu)), -1.0f, 0);
+        const int from = g_rdn;
+        for (int j = 0; j < 1024; j++) rd_at(q, g_w64[j], -g_w64[j]);
+        rd_draw(from);
+    }
+    rd_end("mulread");
+}
+
+/* Scene 65: clip w 1, clip z = a (eye z) + b with world and view z rows of
+ * their own, so the depth is clip z read whole however the GE combines
+ * them. 0: a world translation T in [40, 48) and z = -(T - d), d in
+ * [1/2, 3/4): one eye z the size of d, from two terms 60 times larger
+ * (scene 61's batch 0, read whole). 1: a view translation U in -[16, 24) as
+ * well. 2: three z scales, a, view and world. 3: world z = rx x + z. 4:
+ * clip z = a (z + T) - T. 5: batch 0 with T in [1/4, 1/2). Clip z stays
+ * in [1/2, 1) but in batch 3. */
+static void scene_matread(void) {
+    if (step("scene %02d: world, view and projection combined: clip w 1, depth clip z's top 16 bits", g_scene)) return;
+    rd_begin();
+    rd_zview(65536.0f);
+    g_rng = 0x65000001u;
+    int from;
+    w32 r;
+    float a, T, U, v, s, rx;
+    r = rd_rand(); a = rd_mk16(0, 0, r & 0x1FFFu);
+    r = rd_rand(); T = rd_mk16(0, 5, 0x2000u | (r & 0x1FFFu));
+    rd_load(a, 0, 0, 1.0f, 1.0f, 0, 0, 1.0f, T);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) { const float d = rd_mk(0, -1, rd_rand() & 0x3FFFC0u); rd_at(0, 1.0f, -(T - d)); }
+    rd_draw(from);
+    r = rd_rand(); a = rd_mk16(0, 0, r & 0x1FFFu);
+    r = rd_rand(); T = rd_mk16(0, 5, 0x2000u | (r & 0x1FFFu));
+    r = rd_rand(); U = rd_mk16(1, 4, r & 0x3FFFu);
+    rd_load(a, 0, 0, 1.0f, 1.0f, U, 0, 1.0f, T);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) { const float d = rd_mk(0, -1, rd_rand() & 0x3FFFE0u); rd_at(1, 1.0f, -((T + U) - d)); }
+    rd_draw(from);
+    r = rd_rand(); a = rd_mk16(0, 0, r & 0xFFFu);
+    r = rd_rand(); v = rd_mk16(0, -1, r & 0xFFFu);
+    r = rd_rand(); s = rd_mk16(0, 0, r & 0xFFFu);
+    rd_load(a, 0, 0, 1.0f, v, 0, 0, s, 0);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) rd_at(2, 1.0f, rd_mk(0, 0, rd_rand() & 0x1FFFFFu));
+    rd_draw(from);
+    r = rd_rand(); a = rd_mk16(0, 0, r & 0xFFFu);
+    r = rd_rand(); rx = rd_mk16((int)(r & 1), -5, r >> 1);
+    rd_load(a, 0, 0, 1.0f, 1.0f, 0, rx, 1.0f, 0);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) rd_at(3, 1.0f, rd_mk(0, -1, rd_rand() & 0x1FFFFFu));
+    rd_draw(from);
+    r = rd_rand(); a = rd_mk16(0, 0, r & 0x3FFu);
+    r = rd_rand(); T = rd_mk16(0, 3, r & 0xFFFu);
+    rd_load(a, -T, 0, 1.0f, 1.0f, 0, 0, 1.0f, T);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) rd_at(4, 1.0f, rd_mk(0, -1, rd_rand() & 0x1FFFFFu));
+    rd_draw(from);
+    r = rd_rand(); a = rd_mk16(0, 2, r & 0x1FFFu);
+    r = rd_rand(); T = rd_mk16(0, -2, r);
+    rd_load(a, 0, 0, 1.0f, 1.0f, 0, 0, 1.0f, T);
+    from = g_rdn;
+    for (int j = 0; j < 512; j++) { const float d = rd_mk16(0, -3, rd_rand() & 0x3FFFu); rd_at(5, 1.0f, -(T - d)); }
+    rd_draw(from);
+    rd_end("matread");
+}
+
+/* Scene 66: the probes' perspective (60 degrees, 1 to 100), read whole.
+ * Batch 0: eye z from -4 to -96, ndc z in [1/2, 1); batch 1: eye z from
+ * -1.016 to -1.266, ndc z in -[1/2, 1), zs -65536. */
+static void scene_perspread(void) {
+    if (step("scene %02d: the probes' perspective read whole: ndc z's top 16 bits", g_scene)) return;
+    rd_begin();
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadIdentity();
+    sceGumPerspective(60.0f, 480.0f / 272.0f, 1.0f, 100.0f);
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadIdentity();
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumUpdateMatrix();
+    g_rng = 0x66000001u;
+    const float kx = 0.981491089f, ky = 1.73205078f;    /* the projection's x and y scales */
+    rd_zview(65536.0f);
+    int from = g_rdn;
+    for (int e = 2; e <= 6; e++)
+        for (int j = 0; j < (e < 6 ? 192 : 256); j++) {
+            const float w = rd_mk(0, e, e < 6 ? rd_rand() : rd_rand() & 0x3FFFFFu);
+            const int i = g_rdn;
+            rd_put(0, rd_ndcx(i) * w / kx, rd_ndcy(i) * w / ky, -w);
+        }
+    rd_draw(from);
+    rd_zview(-65536.0f);
+    from = g_rdn;
+    for (int j = 0; j < 1024; j++) {
+        const float w = rd_mk(0, 0, 0x20000u + (rd_rand() & 0x1FFFFFu));
+        const int i = g_rdn;
+        rd_put(1, rd_ndcx(i) * w / kx, rd_ndcy(i) * w / ky, -w);
+    }
+    rd_draw(from);
+    rd_end("perspread");
+}
+
+/* ---- geprobe 13: patch positions read through depth (scenes 67-82) --------
+ *
+ * Every scene step is a command stream that patch13.py writes into
+ * patch13_data.inc: the matrices, viewport z, patch division and primitive,
+ * a record per item, every control vertex blob exactly as the GE is to read
+ * it (float, s16, s8, indexed, morphed, skinned), the cal band's and the
+ * anchors' plain points, and scene 75's colour read-back. p13_run() replays
+ * one; it computes nothing of its own but the read-back, so the streams are
+ * the inputs, and each step logs their counts and CRCs for patch13.py to
+ * check its copy against. Every blob is copied into the display list
+ * (gumem); a list that passes 448 KB is run and a new one started, which
+ * the GE's state outlives. In scenes 76-82 each batch is its own list and
+ * logs its GE time and the list's headroom before it; in 67-75 the step
+ * logs one GE time. */
+#include "patch13_data.inc"
+
+#define P13_LIST_BYTES (512 * 1024)
+#define P13_FLUSH_AT   (448 * 1024)
+
+static w32 crc32_more(w32 crc, const void *p, int n) {
+    const unsigned char *b = p;
+    w32 c = ~crc;
+    for (int i = 0; i < n; i++) {
+        c ^= b[i];
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+static float p13_f(w32 w) { float f; memcpy(&f, &w, 4); return f; }
+
+static void p13_load(int mode, const w32 *w) {
+    ScePspFMatrix4 m;
+    memcpy(&m, w, sizeof m);
+    sceGumMatrixMode(mode);
+    sceGumLoadMatrix(&m);
+}
+
+static w32 g_p13_us;       /* GE time since the last report */
+static int g_p13_flushes;
+
+/* Run the list built so far and start the next; the GE's state carries over. */
+static void p13_flush(void) {
+    const w32 t0 = sceKernelGetSystemTimeLow();
+    sceGuFinish();
+    ge_wait();
+    g_p13_us += sceKernelGetSystemTimeLow() - t0;
+    sceGuStart(GU_DIRECT, g_list);
+}
+
+static void p13_room(void) {
+    if (sceGuCheckList() > P13_FLUSH_AT) { p13_flush(); g_p13_flushes++; }
+}
+
+/* Counts and CRCs of a whole stream, before it runs. */
+static void p13_sums(const w32 *s, int n, int *items, int *samples, w32 *cc, w32 *ic) {
+    *items = *samples = 0;
+    *cc = *ic = 0;
+    for (int i = 0; i < n; i += 1 + (int)(s[i] & 0xFFFFFF)) {
+        const w32 *a = s + i + 1;
+        switch (s[i] >> 24) {
+        case P13_ITEM:   *ic = crc32_more(*ic, a, 16); (*items)++; *samples += (int)a[4]; break;
+        case P13_BEZIER: *cc = crc32_more(*cc, a + 5, (int)(a[3] + a[4])); break;
+        case P13_SPLINE: *cc = crc32_more(*cc, a + 7, (int)(a[5] + a[6])); break;
+        case P13_DRAW:   if (a[4]) *samples += (int)a[2]; break;
+        }
+    }
+}
+
+/* Scene 75 b9: run the list, read each A sample's colour from the 3 x 3
+ * pixels around its exact position, then draw the C cells as plain triangle
+ * strips with those colours. */
+static void p13_b9(const w32 *a) {
+    static CV v[2 * 8];
+    static w32 col[8][64];
+    const w32 t0 = sceKernelGetSystemTimeLow();
+    sceGuFinish();
+    ge_wait();
+    g_p13_us += sceKernelGetSystemTimeLow() - t0;
+    const volatile w32 *fb = (const volatile w32 *)VRAM_UNCACHED;
+    const int nshape = (int)a[0];
+    const w32 *p = a + 1;
+    for (int sh = 0; sh < nshape && sh < 8; sh++) {
+        const int nu = (int)p[0], nv = (int)p[1];
+        const w32 *smp = p + 2;
+        for (int k = 0; k < nu * nv; k++) {
+            const int px = (int)(smp[4 * k] & 0xFFFF), py = (int)(smp[4 * k] >> 16);
+            w32 c = 0;
+            int found = 0;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    const int x = px + dx, y = py + dy;
+                    if (x < 0 || x >= SCR_W || y < 0 || y >= SCR_H) continue;
+                    const w32 q = fb[y * FB_W + x];   /* alpha is the stencil: compare RGB */
+                    if (q & 0xFFFFFFu) { if (!found) c = q; found++; }
+                }
+            if (!found) out("  b9 miss %d %d %d\n", sh, k % nu, k / nu);
+            else if (found > 1) out("  b9 %d pixels lit around %d %d %d\n", found, sh, k % nu, k / nu);
+            col[sh][k] = c;
+        }
+        out("  b9 shape %d (%d x %d) colours:", sh, nu, nv);
+        for (int k = 0; k < nu * nv; k++) out("%s %08X", k && k % 12 == 0 ? "\n   " : "", col[sh][k]);
+        out("\n");
+        p += 2 + 4 * nu * nv;
+    }
+    sceKernelDcacheWritebackAll();
+    sceGuStart(GU_DIRECT, g_list);
+    p = a + 1;
+    for (int sh = 0; sh < nshape && sh < 8; sh++) {
+        const int nu = (int)p[0], nv = (int)p[1];
+        const w32 *smp = p + 2;
+        for (int j = 0; j + 1 < nv; j++) {
+            for (int i = 0; i < nu; i++)
+                for (int h = 0; h < 2; h++) {
+                    const w32 *q = smp + 4 * ((j + h) * nu + i);
+                    const w32 c = col[sh][(j + h) * nu + i];
+                    v[2 * i + h] = (CV){ c ? (c | 0xFF000000u) : 0, p13_f(q[1]), p13_f(q[2]), p13_f(q[3]) };
+                }
+            p13_room();
+            sceGuDrawArray(GU_TRIANGLE_STRIP, FMT_CV3D, 2 * nu, NULL, gumem(v, 2 * nu * (int)sizeof(CV)));
+        }
+        p += 2 + 4 * nu * nv;
+    }
+}
+
+static void p13_run(const struct p13_step *st) {
+    g_scene = st->scene;
+    if (step("scene %02d: %s", st->scene, st->title)) return;
+    const w32 *s = st->s;
+    int items, samples, timing = 0, batch = -1;
+    w32 cc, ic;
+    p13_sums(s, st->n, &items, &samples, &cc, &ic);
+    const w32 sc = crc32(s, st->n * 4);
+    g_p13_us = 0;
+    g_p13_flushes = 0;
+    for (int i = 0; i < st->n; i += 1 + (int)(s[i] & 0xFFFFFF)) {
+        const w32 *a = s + i + 1;
+        switch (s[i] >> 24) {
+        case P13_BEGIN:
+            scene_begin(GU_PSM_8888, 0xFF000000);
+            sceGuViewport(2048, 2048, (int)a[0], (int)a[1]);
+            sceGuEnable(GU_DEPTH_TEST);
+            sceGuDepthFunc(GU_ALWAYS);
+            sceGuDepthMask(GU_FALSE);
+            sceGuPatchPrim(GU_POINTS);
+            sceGuMorphWeight(0, 1.0f);
+            for (int k = 1; k < 8; k++) sceGuMorphWeight(k, 0.0f);
+            timing = (int)a[2];
+            break;
+        case P13_MATS:
+            if (a[0] & 1) p13_load(GU_PROJECTION, a + 1);
+            if (a[0] & 2) p13_load(GU_VIEW, a + 1 + 16 * !!(a[0] & 1));
+            if (a[0] & 4) p13_load(GU_MODEL, a + 1 + 16 * (!!(a[0] & 1) + !!(a[0] & 2)));
+            sceGumMatrixMode(GU_MODEL);
+            sceGumUpdateMatrix();
+            break;
+        case P13_ZVIEW:
+            sceGuSendCommandf(0x44, p13_f(a[0]));
+            sceGuSendCommandf(0x47, p13_f(a[1]));
+            break;
+        case P13_DIVIDE:    sceGuPatchDivide(a[0], a[1]); break;
+        case P13_PATCHPRIM: sceGuPatchPrim((int)a[0]); break;
+        case P13_SHADE:     sceGuShadeModel((int)a[0]); break;
+        case P13_BLEND:
+            if (a[0]) {
+                sceGuEnable(GU_BLEND);
+                sceGuBlendFunc((int)a[1], (int)a[2], (int)a[3], a[4], a[5]);
+            } else {
+                sceGuDisable(GU_BLEND);
+            }
+            break;
+        case P13_MORPH:
+            for (int k = 0; k < 8; k++) sceGuMorphWeight(k, p13_f(a[k]));
+            break;
+        case P13_BONE: {
+            ScePspFMatrix4 m;
+            memcpy(&m, a + 1, sizeof m);
+            sceGuBoneMatrix(a[0], &m);
+            break;
+        }
+        case P13_ITEM: break;
+        case P13_BEZIER: {
+            p13_room();
+            unsigned char *v = gumem(a + 5, (int)(a[3] + a[4]));
+            sceGuDrawBezier((int)a[0], (int)a[1], (int)a[2], a[4] ? v + a[3] : NULL, v);
+            break;
+        }
+        case P13_SPLINE: {
+            p13_room();
+            unsigned char *v = gumem(a + 7, (int)(a[5] + a[6]));
+            sceGuDrawSpline((int)a[0], (int)a[1], (int)a[2], (int)a[3], (int)a[4], a[6] ? v + a[5] : NULL, v);
+            break;
+        }
+        case P13_DRAW:
+            p13_room();
+            sceGuDrawArray((int)a[0], (int)a[1], (int)a[2], NULL, gumem(a + 5, (int)a[3]));
+            break;
+        case P13_BATCH:
+            if (timing) {
+                if (batch >= 0) {
+                    p13_flush();
+                    out("  b%d GE %u us\n", batch, (unsigned)g_p13_us);
+                    g_p13_us = 0;
+                }
+                out("  b%d list headroom %d bytes\n", (int)a[0], P13_LIST_BYTES - sceGuCheckList());
+            }
+            batch = (int)a[0];
+            break;
+        case P13_CALDONE:
+            out("  %d items, %d samples, control crc %08X, item crc %08X, stream crc %08X\n",
+                items, samples, cc, ic, sc);
+            break;
+        case P13_B9: p13_b9(a); break;
+        case P13_END:
+            sceGuPatchPrim(GU_TRIANGLE_STRIP);
+            sceGuPatchDivide(8, 8);
+            sceGuDisable(GU_BLEND);
+            sceGuMorphWeight(0, 1.0f);
+            for (int k = 1; k < 8; k++) sceGuMorphWeight(k, 0.0f);
+            {
+                ScePspFMatrix4 id;
+                memset(&id, 0, sizeof id);
+                id.x.x = id.y.y = id.z.z = id.w.w = 1.0f;
+                sceGuBoneMatrix(0, &id);
+            }
+            sceGumMatrixMode(GU_VIEW);
+            sceGumLoadIdentity();
+            sceGumMatrixMode(GU_MODEL);
+            sceGumLoadIdentity();
+            sceGumUpdateMatrix();
+            sceGuShadeModel(GU_SMOOTH);
+            p13_flush();
+            if (timing) out("  b%d GE %u us\n", batch, (unsigned)g_p13_us);
+            else out("  GE %u us\n", (unsigned)g_p13_us);
+            if (g_p13_flushes) out("  %d list flush(es) at 448 KB\n", g_p13_flushes);
+            scene_end(st->name, GU_PSM_8888, 0);
+            dump_depth_full(st->name);
+            break;
+        default:
+            out("  bad stream word %d: %08X\n", i, s[i]);
+            return;
+        }
+    }
+}
+
+/* ---- geprobe 14: colour planes, scenes 83-98 ----------------------------
+ *
+ * Every scene is a u32 command stream from colour14.py (c14_data.inc), in
+ * the pattern of patch13.py: the C side draws nothing of its own. Each word
+ * is (op << 24) | nargs, then the args. The second command of every stream
+ * is SUMS, which logs the draw count, vertex count, the CRC of all vertex
+ * bytes and the stream CRC, so readout can confirm the tables before
+ * reading a pixel. Place after p13_run (it uses p13_room/p13_flush, gumem,
+ * scene_begin/scene_end, dump_depth_full, crc32). */
+#include "c14_data.inc"
+#include "c15_data.inc"      /* geprobe 15: line colours, scenes 99-109, from lines15.py */
+#include "c16_data.inc"      /* geprobe 16: skinning and morphing, scenes 110-114, from skin16.py */
+#include "c20_data.inc"      /* geprobe 20: long edges, scenes 125-127, from edges20.py */
+#include "c21_data.inc"      /* geprobe 21: tall long edges, scenes 128-129, from edges21.py */
+#include "c21p_data.inc"     /* geprobe 21: patch line order, scenes 130-133, from plines21.py */
+#include "c22e_data.inc"     /* geprobe 22: long edges' order and extent, scene 134, from edges22.py */
+#include "c22t_data.inc"     /* geprobe 22: patch triangle order, scenes 135-137, from ptris22.py */
+#include "c22n_data.inc"     /* geprobe 22: skinned and morphed normals, scene 138, from norms22.py */
+#include "c22m_data.inc"     /* geprobe 22: morphed colours and coordinates, scenes 139-140, from morph22.py */
+#include "c22c_data.inc"     /* geprobe 22: past the clip volume, scene 141, from clip22.py */
+#include "c23c_data.inc"     /* geprobe 23: past the clip volume, more, scene 142, from clip23.py */
+#include "c23a_data.inc"     /* geprobe 23: vertex alpha, scene 143, from alpha23.py */
+#include "c23b_data.inc"     /* geprobe 23: bilinear at negative coordinates, scene 144, from bilin23.py */
+#include "c23z_data.inc"     /* geprobe 23: patch division 0, scene 145 (risky), from pzero23.py */
+
+static w32 g_c14_tex[16 * 16] __attribute__((aligned(16)));   /* all 0xFF000000 */
+static w32 g_c14_vb[8192] __attribute__((aligned(16)));        /* LADDER's vertices */
+
+static float c14_f(w32 w) { float f; memcpy(&f, &w, 4); return f; }
+
+/* Scene 95's lighting. mode 1: light 0 directional along +Z, white diffuse
+ * and specular, no ambient anywhere, vertex colour as diffuse and specular
+ * material, separate specular. mode 2: the same with specular light 0
+ * (primary alone). mode 0: lighting off. */
+static void c14_light(int mode, float coef) {
+    if (!mode) {
+        sceGuDisable(GU_LIGHT0);
+        sceGuDisable(GU_LIGHTING);
+        sceGuColorMaterial(0);
+        sceGuLightMode(GU_SINGLE_COLOR);
+        return;
+    }
+    ScePspFVector3 dir = { 0.0f, 0.0f, 1.0f };
+    sceGuEnable(GU_LIGHTING);
+    sceGuLightMode(GU_SEPARATE_SPECULAR_COLOR);
+    sceGuAmbient(0xFF000000);
+    sceGuModelColor(0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF);
+    sceGuAmbientColor(0xFF000000);
+    sceGuColorMaterial(GU_DIFFUSE | GU_SPECULAR);
+    sceGuSpecular(coef);
+    sceGuEnable(GU_LIGHT0);
+    sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE_AND_SPECULAR, &dir);
+    sceGuLightColor(0, GU_AMBIENT, 0x000000);
+    sceGuLightColor(0, GU_DIFFUSE, 0xFFFFFF);
+    sceGuLightColor(0, GU_SPECULAR, mode == 1 ? 0xFFFFFF : 0x000000);
+}
+
+/* geprobe 17's lighting: light 0 only, white diffuse, no ambient anywhere,
+ * white diffuse and specular material, one colour; attenuation off and a
+ * specular coefficient of 1 until LGT sets them. */
+static void l17_lights_on(void) {
+    sceGuEnable(GU_LIGHTING);
+    sceGuLightMode(GU_SINGLE_COLOR);
+    sceGuAmbient(0xFF000000);
+    sceGuColorMaterial(0);
+    sceGuModelColor(0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF);
+    sceGuAmbientColor(0xFF000000);
+    sceGuEnable(GU_LIGHT0);
+    sceGuLightColor(0, GU_AMBIENT, 0x000000);
+    sceGuLightColor(0, GU_DIFFUSE, 0xFFFFFF);
+    sceGuLightColor(0, GU_SPECULAR, 0x000000);
+    sceGuLightAtt(0, 1.0f, 0.0f, 0.0f);
+    sceGuSpecular(1.0f);
+}
+
+static void c14_tex(int on) {
+    if (!on) { sceGuDisable(GU_TEXTURE_2D); return; }
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, 16, 16, 16, g_c14_tex);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+    sceGuTexScale(1.0f, 1.0f);
+    sceGuTexOffset(0.0f, 0.0f);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFlush();
+}
+
+/* geprobe 22's coordinate texture: 256 x 256, texel (s, t) red s, green t, blue
+ * 0x80, so a point's colour names the texel its coordinates fell in. TEXC turns it
+ * on with a scale and offset (repeating, nearest, replacing), or off. */
+static w32 g_c22_tex[256 * 256] __attribute__((aligned(16)));
+static void c22_texc(const w32 *a) {
+    if (!a[0]) {
+        c14_tex(0);
+        sceGuTexScale(1.0f, 1.0f);
+        sceGuTexOffset(0.0f, 0.0f);
+        return;
+    }
+    if (!g_c22_tex[0]) {
+        for (int t = 0; t < 256; t++)
+            for (int s = 0; s < 256; s++) g_c22_tex[t * 256 + s] = 0xFF800000u | (w32)t << 8 | (w32)s;
+        sceKernelDcacheWritebackAll();
+    }
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, 256, 256, 256, g_c22_tex);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexWrap(GU_REPEAT, GU_REPEAT);
+    sceGuTexMapMode(GU_TEXTURE_COORDS, 0, 0);
+    sceGuTexScale(c14_f(a[1]), c14_f(a[2]));
+    sceGuTexOffset(c14_f(a[3]), c14_f(a[4]));
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFlush();
+}
+
+/* geprobe 23's alternating texture: 64 x 64, red 255 on odd s, green 255 on
+ * odd t, blue 0x80, so a bilinear sample's red and green are the weights of
+ * its odd texels. TEXB turns it on (linear both ways, repeating, replacing)
+ * with a scale and offset, or off. */
+static w32 g_c23_tex[64 * 64] __attribute__((aligned(16)));
+static void c23_texb(const w32 *a) {
+    if (!a[0]) {
+        c14_tex(0);
+        sceGuTexScale(1.0f, 1.0f);
+        sceGuTexOffset(0.0f, 0.0f);
+        return;
+    }
+    if (!g_c23_tex[0]) {
+        for (int t = 0; t < 64; t++)
+            for (int s = 0; s < 64; s++)
+                g_c23_tex[t * 64 + s] = 0xFF800000u | (t & 1 ? 0xFF00u : 0u) | (s & 1 ? 0xFFu : 0u);
+        sceKernelDcacheWritebackAll();
+    }
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, 64, 64, 64, g_c23_tex);
+    sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+    sceGuTexWrap(GU_REPEAT, GU_REPEAT);
+    sceGuTexMapMode(GU_TEXTURE_COORDS, 0, 0);
+    sceGuTexScale(c14_f(a[1]), c14_f(a[2]));
+    sceGuTexOffset(c14_f(a[3]), c14_f(a[4]));
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFlush();
+}
+
+static void c14_run(const struct c14_step *st) {
+    g_scene = st->scene;
+    if (step("scene %02d: %s", st->scene, st->title)) return;
+    const w32 *s = st->s;
+    const w32 sc = crc32(s, st->n * 4);
+    int psm = GU_PSM_8888;
+    g_p13_us = 0;
+    g_p13_flushes = 0;
+    for (int i = 0; i < 256; i++) g_c14_tex[i] = 0xFF000000u;
+    sceKernelDcacheWritebackAll();
+    for (int i = 0; i < st->n; i += 1 + (int)(s[i] & 0xFFFFFF)) {
+        const w32 *a = s + i + 1;
+        switch (s[i] >> 24) {
+        case C14_NOP: break;
+        case C14_BEGIN:
+            psm = (int)a[0];
+            scene_begin(psm, a[1]);
+            break;
+        case C14_SUMS: {
+            /* the CRC of every DRAW/LADDER's vertex bytes, in stream order */
+            w32 vc = 0;
+            for (int j = 0; j < st->n; j += 1 + (int)(s[j] & 0xFFFFFF)) {
+                const w32 op = s[j] >> 24;
+                if (op == C14_DRAW || op == C14_LADDER) vc = crc32_more(vc, s + j + 1 + (op == C14_DRAW ? 5 : 6), (int)s[j + 4]);
+                if (op == C14_PATCH) vc = crc32_more(vc, s + j + 11, (int)s[j + 10]);   /* geprobe 21 */
+            }
+            out("  %u draws, %u vertices, vertex crc %08X, stream crc %08X\n",
+                (unsigned)a[0], (unsigned)a[1], vc, sc);
+            if (vc != a[2]) out("  vertex crc differs from the table's %08X\n", a[2]);
+            break;
+        }
+        case C14_SCISSOR:
+            sceGuScissor((int)a[0], (int)a[1], (int)(a[2] - a[0] + 1), (int)(a[3] - a[1] + 1));
+            break;
+        case C14_SHADE: sceGuShadeModel((int)a[0]); break;
+        case C14_DRAW: {
+            p13_room();
+            const int vb = (int)a[3], ib = (int)a[4];
+            unsigned char *v = gumem(a + 5, vb + ib);
+            sceGuDrawArray((int)a[0], (int)a[1], (int)a[2], ib ? v + vb : NULL, v);
+            break;
+        }
+        case C14_MATS:
+            p13_load(GU_PROJECTION, a + 1);
+            p13_load(GU_VIEW, a + 17);
+            p13_load(GU_MODEL, a + 33);
+            sceGumMatrixMode(GU_MODEL);
+            sceGumUpdateMatrix();
+            break;
+        case C14_VIEWPORT: sceGuViewport((int)a[0], (int)a[1], (int)a[2], (int)a[3]); break;
+        case C14_OFFSET:   sceGuOffset(a[0], a[1]); break;
+        case C14_ALPHA:
+            if (a[0]) { sceGuEnable(GU_ALPHA_TEST); sceGuAlphaFunc((int)a[1], (int)a[2], (int)a[3]); }
+            else sceGuDisable(GU_ALPHA_TEST);
+            break;
+        case C14_STENCIL:
+            if (a[0]) {
+                sceGuEnable(GU_STENCIL_TEST);
+                sceGuStencilFunc(GU_ALWAYS, 0, 0xFF);
+                sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INCR);
+            } else sceGuDisable(GU_STENCIL_TEST);
+            break;
+        case C14_FOG:
+            if (a[0]) { sceGuEnable(GU_FOG); sceGuFog(c14_f(a[1]), c14_f(a[2]), a[3]); }
+            else sceGuDisable(GU_FOG);
+            break;
+        case C14_LADDER: {
+            /* Draw once with the alpha and stencil tests off, then pass r =
+             * first..last with alpha test GEQUAL r and stencil INCR on pass:
+             * the alpha byte (the stencil) counts the passes, i.e. it is the
+             * alpha plane's value. The vertices live outside the list,
+             * because p13_room() may restart it. */
+            const int prim = (int)a[0], vt = (int)a[1], cnt = (int)a[2], vb = (int)a[3];
+            if (vb > (int)sizeof g_c14_vb) { out("  ladder vertices too big: %d\n", vb); break; }
+            /* geprobe 23 draws many ladders a scene: the last one's draws read
+             * g_c14_vb, so they run before it is filled again. */
+            p13_flush();
+            memcpy(g_c14_vb, a + 6, vb);
+            sceKernelDcacheWritebackAll();
+            sceGuDisable(GU_ALPHA_TEST);
+            sceGuDisable(GU_STENCIL_TEST);
+            sceGuDrawArray(prim, vt, cnt, NULL, g_c14_vb);
+            sceGuEnable(GU_STENCIL_TEST);
+            sceGuStencilFunc(GU_ALWAYS, 0, 0xFF);
+            sceGuStencilOp(GU_KEEP, GU_KEEP, GU_INCR);
+            sceGuEnable(GU_ALPHA_TEST);
+            for (int r = (int)a[4]; r <= (int)a[5]; r++) {
+                p13_room();
+                sceGuAlphaFunc(GU_GEQUAL, r, 0xFF);
+                sceGuDrawArray(prim, vt, cnt, NULL, g_c14_vb);
+            }
+            sceGuDisable(GU_ALPHA_TEST);
+            sceGuDisable(GU_STENCIL_TEST);
+            break;
+        }
+        case C14_LIGHT: c14_light((int)a[0], c14_f(a[1])); break;
+        case C14_TEX:   c14_tex((int)a[0]); break;
+        case C14_DEPTH:
+            /* Scene 97: depth test with writes on (GU_FALSE is "writes on"),
+             * so the depth planes land in the buffer END dumps. */
+            if (a[0]) {
+                sceGuEnable(GU_DEPTH_TEST);
+                sceGuDepthFunc((int)a[1]);
+                sceGuDepthMask(GU_FALSE);
+            } else sceGuDisable(GU_DEPTH_TEST);
+            break;
+        case C14_BONE: {                                  /* geprobe 16: bone a[0], 16 words */
+            ScePspFMatrix4 m;
+            memcpy(&m, a + 1, sizeof m);
+            sceGuBoneMatrix(a[0], &m);
+            break;
+        }
+        case C14_MORPH:                                   /* eight morph weights */
+            for (int k = 0; k < 8; k++) sceGuMorphWeight(k, c14_f(a[k]));
+            break;
+        case C14_ZVIEW:                                   /* viewport z scale and centre, raw */
+            sceGuSendCommandf(0x44, c14_f(a[0]));
+            sceGuSendCommandf(0x47, c14_f(a[1]));
+            break;
+        case C14_LGT: {                                   /* geprobe 17: light 0, whole */
+            const ScePspFVector3 p = { c14_f(a[2]), c14_f(a[3]), c14_f(a[4]) };
+            const ScePspFVector3 d = { c14_f(a[5]), c14_f(a[6]), c14_f(a[7]) };
+            sceGuLight(0, (int)a[0], (int)a[1], &p);
+            sceGuLightSpot(0, &d, c14_f(a[8]), c14_f(a[9]));
+            sceGuLightAtt(0, c14_f(a[10]), c14_f(a[11]), c14_f(a[12]));
+            sceGuSpecular(c14_f(a[13]));
+            sceGuLightColor(0, GU_DIFFUSE, a[14]);
+            sceGuLightColor(0, GU_SPECULAR, a[15]);
+            break;
+        }
+        case C14_LMODE:                                   /* white lighting on, or off */
+            if (a[0]) l17_lights_on(); else c14_light(0, 1.0f);
+            break;
+        case C14_PATCH: {                                 /* geprobe 21: a Bezier or spline patch */
+            /* kind, vtype, ucount, vcount, uedge, vedge, primitive, udiv, vdiv,
+             * bytes, then the control points */
+            p13_room();
+            const w32 *v = (const w32 *)gumem(a + 10, (int)a[9]);
+            sceGuPatchDivide(a[7], a[8]);
+            sceGuPatchPrim((int)a[6]);
+            if (a[0]) sceGuDrawSpline((int)a[1], (int)a[2], (int)a[3], (int)a[4], (int)a[5], NULL, v);
+            else      sceGuDrawBezier((int)a[1], (int)a[2], (int)a[3], NULL, v);
+            break;
+        }
+        case C14_TEXC: c22_texc(a); break;               /* geprobe 22: on, su, sv, ou, ov */
+        case C14_TEXB: c23_texb(a); break;               /* geprobe 23: on, su, sv, ou, ov */
+        case C14_FLUSH:                                   /* geprobe 23: run the list so far, its own */
+            p13_flush();
+            out("  part %u: GE %u us\n", (unsigned)a[0], (unsigned)g_p13_us);
+            g_p13_us = 0;
+            break;
+        case C14_CLAMP:                                   /* geprobe 22: depth clamping on or off */
+            if (a[0]) sceGuEnable(GU_CLIP_PLANES); else sceGuDisable(GU_CLIP_PLANES);
+            break;
+        case C14_BLEND:                                   /* on, op, src, dst, fixed a, fixed b */
+            if (a[0]) { sceGuEnable(GU_BLEND); sceGuBlendFunc((int)a[1], (int)a[2], (int)a[3], a[4], a[5]); }
+            else sceGuDisable(GU_BLEND);
+            break;
+        case C14_END:
+            sceGuScissor(0, 0, SCR_W, SCR_H);
+            sceGuMorphWeight(0, 1.0f);
+            for (int k = 1; k < 8; k++) sceGuMorphWeight(k, 0.0f);
+            sceGuShadeModel(GU_SMOOTH);
+            sceGuDisable(GU_ALPHA_TEST);
+            sceGuDisable(GU_STENCIL_TEST);
+            sceGuDisable(GU_FOG);
+            sceGuDisable(GU_DEPTH_TEST);
+            c14_light(0, 1.0f);
+            c14_tex(0);
+            sceGuOffset(2048 - SCR_W / 2, 2048 - SCR_H / 2);
+            sceGuViewport(2048, 2048, SCR_W, SCR_H);
+            sceGumMatrixMode(GU_VIEW);
+            sceGumLoadIdentity();
+            sceGumMatrixMode(GU_MODEL);
+            sceGumLoadIdentity();
+            sceGumUpdateMatrix();
+            p13_flush();
+            out("  GE %u us\n", (unsigned)g_p13_us);
+            if (g_p13_flushes) out("  %d list flush(es) at 448 KB\n", g_p13_flushes);
+            /* END 1: also the whole depth buffer, as _depthfull.bin (the
+             * 480-wide _depth.raw cannot read every pixel's depth). */
+            scene_end(st->name, psm, 0);
+            if (a[0]) dump_depth_full(st->name);
+            break;
+        default:
+            out("  bad stream word %d: %08X\n", i, s[i]);
+            return;
+        }
+    }
+}
+
+/* ---- version 17: point and spot lights -----------------------------------
+ *
+ * Scene 35's last ten wrong points are each a step low where a power is
+ * taken (a spot of exponent 4, a specular of coefficient 8), next to a byte
+ * boundary: the GE's power, or what goes into it, comes out a hair higher.
+ * Scene 115 reads what goes into the spot's power whole. The spot cutoff is
+ * a threshold on L.D, so for each geometry (a vertex and its normal, a spot
+ * light's position and direction) the probe searches the cutoff's 24-bit
+ * code, every geometry at once, a pass at a time: draw each point with its
+ * own cutoff, wait for the GE, read back which came out lit, halve each
+ * bracket. What is left is the largest code that still lights the point.
+ * Scenes 116-119 then draw the spot, diffuse, specular and attenuation
+ * factors as bytes from lights17.py's streams (c14_run's LGT and LMODE).
+ *
+ * Every point goes to clip (0, 0, 0, 1) through a zero projection, so the
+ * screen offset alone puts it on its pixel; lighting still sees the vertex
+ * as given. The clear is red, which a white light cannot give: red is a
+ * point not drawn, black one the spot leaves unlit. */
+#include "l17_data.inc"      /* geprobe 17: scene 115's geometries and 116-119's streams, from lights17.py */
+
+static void l17_slot(int i, int *x, int *y) { *x = 1 + 2 * (i % 239); *y = 1 + 2 * (i / 239); }
+
+static void l17_mats(void) {
+    static const ScePspFMatrix4 P = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 1 } };
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadMatrix(&P);
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadIdentity();
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+    sceGumUpdateMatrix();
+}
+
+static w32 g_l17_lo[L17_NGEO], g_l17_hi[L17_NGEO], g_l17_res[2 * L17_NGEO];
+static signed char g_l17_dx[L17_NGEO], g_l17_dy[L17_NGEO];
+
+/* One pass: every geometry still open drawn once with its cutoff code (pass
+ * 0 the bracket's bottom, pass 1 its top, then the middle); returns when
+ * the GE has finished. */
+static void l17_pass(int pass) {
+    scene_begin(GU_PSM_8888, 0xFF0000FF);
+    l17_mats();
+    l17_lights_on();
+    for (int i = 0; i < L17_NGEO; i++) {
+        const w32 lo = g_l17_lo[i], hi = g_l17_hi[i];
+        if (pass >= 2 && hi - lo <= 1) continue;
+        const w32 c = pass == 0 ? lo : pass == 1 ? hi : lo + (hi - lo) / 2;
+        const w32 *g = L17_GEO[i];
+        int x, y;
+        l17_slot(i, &x, &y);
+        p13_room();
+        sceGuOffset(2048 - x, 2048 - y);
+        const ScePspFVector3 p = { c14_f(g[6]), c14_f(g[7]), c14_f(g[8]) };
+        const ScePspFVector3 d = { c14_f(g[9]), c14_f(g[10]), c14_f(g[11]) };
+        sceGuLight(0, GU_SPOTLIGHT, GU_DIFFUSE, &p);
+        sceGuLightSpot(0, &d, 1.0f, c14_f(c << 8));
+        const float v[6] = { c14_f(g[3]), c14_f(g[4]), c14_f(g[5]), c14_f(g[0]), c14_f(g[1]), c14_f(g[2]) };
+        sceGuDrawArray(GU_POINTS, GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 1, NULL,
+                       gumem(v, sizeof v));
+    }
+    sceGuFinish();
+    ge_wait();
+}
+
+/* Point i's pixel: -1 not drawn (the red clear), 0 unlit, else its grey. */
+static int l17_read(int x, int y) {
+    const w32 c = *(volatile w32 *)(VRAM_UNCACHED + (w32)(y * FB_W + x) * 4) & 0xFFFFFFu;
+    return c == 0x0000FFu ? -1 : (int)((c >> 8) & 0xFF);
+}
+
+static void l17_search(void) {
+    g_scene = 115;
+    if (step("scene %02d: spot cutoff search, L.D read whole", g_scene)) return;
+    out("  %d geometries, input crc %08X\n", L17_NGEO, crc32(L17_GEO, sizeof L17_GEO));
+    for (int i = 0; i < L17_NGEO; i++) {
+        g_l17_lo[i] = L17_CUT_LO;
+        g_l17_hi[i] = L17_CUT_HI;
+        g_l17_res[2 * i] = g_l17_res[2 * i + 1] = 0;
+    }
+    /* Flags (result word's top byte): 1 not drawn at the bracket's bottom,
+     * 2 unlit there, 4 lit at its top, 8 not drawn in a later pass. */
+    int passes = 0, open = L17_NGEO, absent = 0, unlit = 0, toplit = 0, lost = 0;
+    const w32 t0 = sceKernelGetSystemTimeLow();
+    for (int pass = 0; pass < 40 && (pass < 2 || open); pass++) {
+        l17_pass(pass);
+        passes++;
+        open = 0;
+        for (int i = 0; i < L17_NGEO; i++) {
+            w32 *r = &g_l17_res[2 * i];
+            if (pass >= 2 && g_l17_hi[i] - g_l17_lo[i] <= 1) continue;
+            int x, y, v = -1;
+            l17_slot(i, &x, &y);
+            if (pass == 0) {
+                /* find the pixel once: the slot or a neighbour */
+                for (int k = 0; k < 9 && v < 0; k++) {
+                    const int dx = k % 3 == 0 ? 0 : k % 3 == 1 ? -1 : 1, dy = k / 3 == 0 ? 0 : k / 3 == 1 ? -1 : 1;
+                    v = l17_read(x + dx, y + dy);
+                    if (v >= 0) { g_l17_dx[i] = (signed char)dx; g_l17_dy[i] = (signed char)dy; }
+                }
+                if (v < 0) { *r |= 1u << 24; absent++; g_l17_hi[i] = g_l17_lo[i]; continue; }
+                if (v == 0) { *r |= 2u << 24; unlit++; g_l17_hi[i] = g_l17_lo[i]; continue; }
+                r[1] = (w32)v;
+            } else {
+                v = l17_read(x + g_l17_dx[i], y + g_l17_dy[i]);
+                if (v < 0) { *r |= 8u << 24; lost++; g_l17_hi[i] = g_l17_lo[i]; continue; }
+                const w32 c = pass == 1 ? g_l17_hi[i] : g_l17_lo[i] + (g_l17_hi[i] - g_l17_lo[i]) / 2;
+                if (pass == 1) {
+                    if (v > 0) { *r |= 4u << 24; toplit++; g_l17_lo[i] = g_l17_hi[i]; }
+                } else if (v > 0) { g_l17_lo[i] = c; r[1] = (w32)v; }
+                else g_l17_hi[i] = c;
+            }
+            if (g_l17_hi[i] - g_l17_lo[i] > 1) open++;
+        }
+    }
+    for (int i = 0; i < L17_NGEO; i++) g_l17_res[2 * i] |= g_l17_lo[i] & 0xFFFFFFu;
+    out("  %d passes, %u us; flagged: %d not drawn, %d unlit at 1/32, %d lit at 16, %d lost\n", passes,
+        (unsigned)(sceKernelGetSystemTimeLow() - t0), absent, unlit, toplit, lost);
+    const int wr = probe_write_file("ge_115_spotcut.bin", g_l17_res, sizeof g_l17_res);
+    out("  ge_115_spotcut.bin: %d bytes, crc %08X\n", wr, crc32(g_l17_res, sizeof g_l17_res));
+    out("  first codes:");
+    for (int i = 0; i < 8; i++) out(" %06X", (unsigned)(g_l17_res[2 * i] & 0xFFFFFF));
+    out("\n");
+}
+
+/* ---- version 18: the lighting's 1/sqrt, every input -----------------------
+ *
+ * Scene 120 reads 1/sqrt at all 65536 16-bit inputs in [1, 4), the table's
+ * whole range: for each, a light at (px, py, 1) over a vertex at the origin
+ * with D = +z, px and py chosen (rsq18.py) so that the GE's L.L is that
+ * input exactly, so the spot's L.D is 1/sqrt(L.L) itself. The cutoff is
+ * searched as in scene 115, but in three chunks of slots, and from a bracket
+ * of L18_BRACKET codes either side of the current table's value: two checks
+ * and six halvings a chunk. Results go to ge_120_rsqfull.bin, two words an
+ * input as in scene 115's file. */
+#include "l18_data.inc"      /* geprobe 18: scene 120's inputs, from rsq18.py */
+
+#define L18_PER ((L18_N + L18_CHUNKS - 1) / L18_CHUNKS)
+static w32 g_l18_lo[L18_PER], g_l18_hi[L18_PER], g_l18_res[2 * L18_N];
+static signed char g_l18_dx[L18_PER], g_l18_dy[L18_PER];
+
+static void l18_pass(int base, int n, int pass) {
+    static const ScePspFVector3 up = { 0.0f, 0.0f, 1.0f };
+    scene_begin(GU_PSM_8888, 0xFF0000FF);
+    l17_mats();
+    l17_lights_on();
+    sceGuLightSpot(0, &up, 1.0f, 1.0f / 32);
+    for (int j = 0; j < n; j++) {
+        const w32 lo = g_l18_lo[j], hi = g_l18_hi[j];
+        if (pass >= 2 && hi - lo <= 1) continue;
+        const w32 c = pass == 0 ? lo : pass == 1 ? hi : lo + (hi - lo) / 2;
+        const w32 *g = L18_GEO[base + j];
+        int x, y;
+        l17_slot(j, &x, &y);
+        p13_room();
+        sceGuOffset(2048 - x, 2048 - y);
+        const ScePspFVector3 p = { c14_f(g[0]), c14_f(g[1]), 1.0f };
+        sceGuLight(0, GU_SPOTLIGHT, GU_DIFFUSE, &p);
+        sceGuSendCommandi(0x8B, (int)c);                     /* light 0's cutoff, the code itself */
+        const float v[6] = { p.x, p.y, p.z, 0.0f, 0.0f, 0.0f };
+        sceGuDrawArray(GU_POINTS, GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 1, NULL,
+                       gumem(v, sizeof v));
+    }
+    sceGuFinish();
+    ge_wait();
+}
+
+static void l18_search(void) {
+    g_scene = 120;
+    if (step("scene %02d: the lighting's 1/sqrt at every input, through the spot cutoff", g_scene)) return;
+    out("  %d inputs, input crc %08X\n", L18_N, crc32(L18_GEO, sizeof L18_GEO));
+    const w32 t0 = sceKernelGetSystemTimeLow();
+    int passes = 0, absent = 0, unlit = 0, toplit = 0, lost = 0;
+    for (int base = 0; base < L18_N; base += L18_PER) {
+        const int n = L18_N - base < L18_PER ? L18_N - base : L18_PER;
+        for (int j = 0; j < n; j++) {
+            g_l18_lo[j] = L18_GEO[base + j][2] - L18_BRACKET;
+            g_l18_hi[j] = L18_GEO[base + j][2] + L18_BRACKET;
+            g_l18_res[2 * (base + j)] = g_l18_res[2 * (base + j) + 1] = 0;
+        }
+        int open = n;
+        for (int pass = 0; pass < 16 && (pass < 2 || open); pass++) {
+            l18_pass(base, n, pass);
+            passes++;
+            open = 0;
+            for (int j = 0; j < n; j++) {
+                w32 *r = &g_l18_res[2 * (base + j)];
+                if (pass >= 2 && g_l18_hi[j] - g_l18_lo[j] <= 1) continue;
+                int x, y, v = -1;
+                l17_slot(j, &x, &y);
+                if (pass == 0) {
+                    for (int k = 0; k < 9 && v < 0; k++) {
+                        const int dx = k % 3 == 0 ? 0 : k % 3 == 1 ? -1 : 1, dy = k / 3 == 0 ? 0 : k / 3 == 1 ? -1 : 1;
+                        v = l17_read(x + dx, y + dy);
+                        if (v >= 0) { g_l18_dx[j] = (signed char)dx; g_l18_dy[j] = (signed char)dy; }
+                    }
+                    if (v < 0) { *r |= 1u << 24; absent++; g_l18_hi[j] = g_l18_lo[j]; continue; }
+                    if (v == 0) { *r |= 2u << 24; unlit++; g_l18_hi[j] = g_l18_lo[j]; continue; }
+                    r[1] = (w32)v;
+                } else {
+                    v = l17_read(x + g_l18_dx[j], y + g_l18_dy[j]);
+                    if (v < 0) { *r |= 8u << 24; lost++; g_l18_hi[j] = g_l18_lo[j]; continue; }
+                    const w32 c = pass == 1 ? g_l18_hi[j] : g_l18_lo[j] + (g_l18_hi[j] - g_l18_lo[j]) / 2;
+                    if (pass == 1) {
+                        if (v > 0) { *r |= 4u << 24; toplit++; g_l18_lo[j] = g_l18_hi[j]; }
+                    } else if (v > 0) { g_l18_lo[j] = c; r[1] = (w32)v; }
+                    else g_l18_hi[j] = c;
+                }
+                if (g_l18_hi[j] - g_l18_lo[j] > 1) open++;
+            }
+        }
+        for (int j = 0; j < n; j++) g_l18_res[2 * (base + j)] |= g_l18_lo[j] & 0xFFFFFFu;
+    }
+    out("  %d passes, %u us; flagged: %d not drawn, %d unlit at the bracket's bottom, %d lit at its top, %d lost\n",
+        passes, (unsigned)(sceKernelGetSystemTimeLow() - t0), absent, unlit, toplit, lost);
+    const int wr = probe_write_file("ge_120_rsqfull.bin", g_l18_res, sizeof g_l18_res);
+    out("  ge_120_rsqfull.bin: %d bytes, crc %08X\n", wr, crc32(g_l18_res, sizeof g_l18_res));
+    int same = 0;
+    for (int i = 0; i < L18_N; i++) same += (g_l18_res[2 * i] & 0xFFFFFFu) == L18_GEO[i][2] && !(g_l18_res[2 * i] >> 24);
+    out("  %d of %d as the table predicts\n", same, L18_N);
+}
+
+/* ---- version 19: lighting under real world and view matrices -------------
+ *
+ * Scenes 115-120 settled lighting's arithmetic with world and view identity.
+ * Scene 121 runs scene 115's cutoff search with W and V loaded per group of
+ * points (lights19.py): large translations put the vertex and the light far
+ * from the eye but near each other, and world matrices whose 3x3 cancels,
+ * so how the GE forms the eye-space vertex, normal, light and spot direction
+ * shows in L.D by many codes. Scenes 122-124 (lights19.py's streams, c14_run)
+ * read diffuse, specular and attenuation bytes the same way. */
+#include "l19_data.inc"      /* geprobe 19: scene 121's table and 122-124's streams, from lights19.py */
+
+static w32 g_l19_lo[L19_NGEO], g_l19_hi[L19_NGEO], g_l19_res[2 * L19_NGEO];
+static signed char g_l19_dx[L19_NGEO], g_l19_dy[L19_NGEO];
+
+static void l19_pass(int pass) {
+    scene_begin(GU_PSM_8888, 0xFF0000FF);
+    l17_mats();
+    l17_lights_on();
+    int last = -1;
+    for (int i = 0; i < L19_NGEO; i++) {
+        const w32 lo = g_l19_lo[i], hi = g_l19_hi[i];
+        if (pass >= 2 && hi - lo <= 1) continue;
+        const w32 c = pass == 0 ? lo : pass == 1 ? hi : lo + (hi - lo) / 2;
+        const w32 *g = L19_GEO[i];
+        p13_room();
+        if ((int)g[0] != last) {
+            ScePspFMatrix4 m;
+            memcpy(&m, L19_MAT[g[0]], sizeof m);
+            sceGuSetMatrix(GU_MODEL, &m);
+            memcpy(&m, L19_MAT[g[0]] + 16, sizeof m);
+            sceGuSetMatrix(GU_VIEW, &m);
+            last = (int)g[0];
+        }
+        int x, y;
+        l17_slot(i, &x, &y);
+        sceGuOffset(2048 - x, 2048 - y);
+        const ScePspFVector3 p = { c14_f(g[7]), c14_f(g[8]), c14_f(g[9]) };
+        const ScePspFVector3 d = { c14_f(g[10]), c14_f(g[11]), c14_f(g[12]) };
+        sceGuLight(0, GU_SPOTLIGHT, GU_DIFFUSE, &p);
+        sceGuLightSpot(0, &d, 1.0f, c14_f(c << 8));
+        const float v[6] = { c14_f(g[4]), c14_f(g[5]), c14_f(g[6]), c14_f(g[1]), c14_f(g[2]), c14_f(g[3]) };
+        sceGuDrawArray(GU_POINTS, GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D, 1, NULL,
+                       gumem(v, sizeof v));
+    }
+    sceGuFinish();
+    ge_wait();
+}
+
+static void l19_search(void) {
+    g_scene = 121;
+    if (step("scene %02d: spot cutoff search under real world and view matrices", g_scene)) return;
+    out("  %d geometries, %d matrix pairs, input crc %08X\n", L19_NGEO, L19_NMAT,
+        crc32_more(crc32(L19_MAT, sizeof L19_MAT), L19_GEO, sizeof L19_GEO));
+    for (int i = 0; i < L19_NGEO; i++) {
+        g_l19_lo[i] = L17_CUT_LO;
+        g_l19_hi[i] = L17_CUT_HI;
+        g_l19_res[2 * i] = g_l19_res[2 * i + 1] = 0;
+    }
+    int passes = 0, open = L19_NGEO, absent = 0, unlit = 0, toplit = 0, lost = 0;
+    const w32 t0 = sceKernelGetSystemTimeLow();
+    for (int pass = 0; pass < 40 && (pass < 2 || open); pass++) {
+        l19_pass(pass);
+        passes++;
+        open = 0;
+        for (int i = 0; i < L19_NGEO; i++) {
+            w32 *r = &g_l19_res[2 * i];
+            if (pass >= 2 && g_l19_hi[i] - g_l19_lo[i] <= 1) continue;
+            int x, y, v = -1;
+            l17_slot(i, &x, &y);
+            if (pass == 0) {
+                for (int k = 0; k < 9 && v < 0; k++) {
+                    const int dx = k % 3 == 0 ? 0 : k % 3 == 1 ? -1 : 1, dy = k / 3 == 0 ? 0 : k / 3 == 1 ? -1 : 1;
+                    v = l17_read(x + dx, y + dy);
+                    if (v >= 0) { g_l19_dx[i] = (signed char)dx; g_l19_dy[i] = (signed char)dy; }
+                }
+                if (v < 0) { *r |= 1u << 24; absent++; g_l19_hi[i] = g_l19_lo[i]; continue; }
+                if (v == 0) { *r |= 2u << 24; unlit++; g_l19_hi[i] = g_l19_lo[i]; continue; }
+                r[1] = (w32)v;
+            } else {
+                v = l17_read(x + g_l19_dx[i], y + g_l19_dy[i]);
+                if (v < 0) { *r |= 8u << 24; lost++; g_l19_hi[i] = g_l19_lo[i]; continue; }
+                const w32 c = pass == 1 ? g_l19_hi[i] : g_l19_lo[i] + (g_l19_hi[i] - g_l19_lo[i]) / 2;
+                if (pass == 1) {
+                    if (v > 0) { *r |= 4u << 24; toplit++; g_l19_lo[i] = g_l19_hi[i]; }
+                } else if (v > 0) { g_l19_lo[i] = c; r[1] = (w32)v; }
+                else g_l19_hi[i] = c;
+            }
+            if (g_l19_hi[i] - g_l19_lo[i] > 1) open++;
+        }
+    }
+    for (int i = 0; i < L19_NGEO; i++) g_l19_res[2 * i] |= g_l19_lo[i] & 0xFFFFFFu;
+    out("  %d passes, %u us; flagged: %d not drawn, %d unlit at 1/32, %d lit at 16, %d lost\n", passes,
+        (unsigned)(sceKernelGetSystemTimeLow() - t0), absent, unlit, toplit, lost);
+    const int wr = probe_write_file("ge_121_eyesearch.bin", g_l19_res, sizeof g_l19_res);
+    out("  ge_121_eyesearch.bin: %d bytes, crc %08X\n", wr, crc32(g_l19_res, sizeof g_l19_res));
+}
+
 /* ---- GE callbacks --------------------------------------------------------
  *
  * Handlers only record; they run in interrupt context. `g_phase` says where
@@ -2773,6 +4487,74 @@ int main(int argc, char **argv) {
     g_scene = 50; scene_rcpsweep();
     g_scene = 51; scene_linesweep();
     g_scene = 52; scene_splineweights();
+
+    section("scenes, version 9");
+    g_scene = 53; scene_splinedense(40);
+    g_scene = 54; scene_splinedense(48);
+
+    section("scenes, version 10");
+    g_scene = 55; scene_splinedepth();
+    g_scene = 56; scene_splineparam();
+    g_scene = 57; scene_anchortwin();
+    g_scene = 58; scene_anchorsweep();
+
+    section("scenes, version 11");
+    g_scene = 59; scene_depthaffine();
+    g_scene = 60; scene_depthratio();
+    g_scene = 61; scene_depthmodel();
+
+    section("scenes, version 12");
+    g_scene = 62; scene_rcpread();
+    g_scene = 63; scene_dotread();
+    g_scene = 64; scene_mulread();
+    g_scene = 65; scene_matread();
+    g_scene = 66; scene_perspread();
+
+    /* Version 13: scenes 67-82, each step a stream from patch13.py, the
+     * risky ones (76-82) last and in the order of what is least known. */
+    section("scenes, version 13");
+    for (int k = 0; k < P13_NSTEPS; k++) p13_run(&P13_STEPS[k]);
+
+    section("scenes, version 14");
+    for (int k = 0; k < C14_NSTEPS; k++) c14_run(&C14_STEPS[k]);
+
+    section("scenes, version 15");
+    for (int k = 0; k < C15_NSTEPS; k++) c14_run(&C15_STEPS[k]);
+
+    section("scenes, version 16");
+    for (int k = 0; k < C16_NSTEPS; k++) c14_run(&C16_STEPS[k]);
+
+    section("scenes, version 17");
+    l17_search();
+    for (int k = 0; k < C17_NSTEPS; k++) c14_run(&C17_STEPS[k]);
+
+    section("scenes, version 18");
+    l18_search();
+
+    section("scenes, version 19");
+    l19_search();
+    for (int k = 0; k < C19_NSTEPS; k++) c14_run(&C19_STEPS[k]);
+
+    section("scenes, version 20");
+    for (int k = 0; k < C20_NSTEPS; k++) c14_run(&C20_STEPS[k]);
+
+    section("scenes, version 21");
+    for (int k = 0; k < C21_NSTEPS; k++) c14_run(&C21_STEPS[k]);
+    for (int k = 0; k < C21P_NSTEPS; k++) c14_run(&C21P_STEPS[k]);
+
+    section("scenes, version 22");
+    for (int k = 0; k < C22E_NSTEPS; k++) c14_run(&C22E_STEPS[k]);
+    for (int k = 0; k < C22T_NSTEPS; k++) c14_run(&C22T_STEPS[k]);
+    for (int k = 0; k < C22N_NSTEPS; k++) c14_run(&C22N_STEPS[k]);
+    for (int k = 0; k < C22M_NSTEPS; k++) c14_run(&C22M_STEPS[k]);
+    for (int k = 0; k < C22C_NSTEPS; k++) c14_run(&C22C_STEPS[k]);
+
+    /* Version 23: scene 145 may hang the GE (a patch division of 0), so last. */
+    section("scenes, version 23");
+    for (int k = 0; k < C23C_NSTEPS; k++) c14_run(&C23C_STEPS[k]);
+    for (int k = 0; k < C23A_NSTEPS; k++) c14_run(&C23A_STEPS[k]);
+    for (int k = 0; k < C23B_NSTEPS; k++) c14_run(&C23B_STEPS[k]);
+    for (int k = 0; k < C23Z_NSTEPS; k++) c14_run(&C23Z_STEPS[k]);
 
     probe_screen(1);
     probe_done();

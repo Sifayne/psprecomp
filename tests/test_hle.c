@@ -827,6 +827,29 @@ static void test_io_dirs(void) {
     CHECK(found, "dread enumerates DATA.BIN");
     CHECK(found_size == 64, "dread reports the entry's size, got %u", found_size);
     CHECK(call(DCLOSE, dd, 0, 0, 0) == 0, "dclose succeeds");
+#ifndef _WIN32
+    /* A Memory Stick directory lists ".", ".." and then its files in the
+     * order they were made, as a FAT directory's slots run (saveprobe v2
+     * steps 86, 90 and 107, fw 6.60), not by name or the host's order. */
+    {
+        static const char *const later[2] = { "ms0:/PSP/SAVEDATA/ZZZ/ZB.BIN", "ms0:/PSP/SAVEDATA/ZZZ/AA.BIN" };
+        for (int k = 0; k < 2; k++) {
+            fd = call(OPEN, guest_name(later[k]), 0x602, 0777, 0);
+            call(WRITE, fd, SRC, 4, 0);
+            call(CLOSE, fd, 0, 0, 0);
+        }
+        static const char *const want[5] = { ".", "..", "DATA.BIN", "ZB.BIN", "AA.BIN" };
+        char got[5][32] = { { 0 } };
+        int n = 0;
+        dd = call(DOPEN, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0, 0, 0);
+        while (call(DREAD, dd, DIR, 0, 0) == 1 && n < 5) psp_str(DIR + 88, got[n++], sizeof got[0]);
+        call(DCLOSE, dd, 0, 0, 0);
+        int ok = n == 5;
+        for (int k = 0; k < n && k < 5; k++) ok &= !strcmp(got[k], want[k]);
+        CHECK(ok, "ms0 lists in creation order: %s %s %s %s %s", got[0], got[1], got[2], got[3], got[4]);
+        for (int k = 0; k < 2; k++) call(REMOVE, guest_name(later[k]), 0, 0, 0);
+    }
+#endif
 
     CHECK(call(REMOVE, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0, 0, 0) == 0,
           "remove deletes");
@@ -1364,6 +1387,62 @@ static void sas_rev_pulse(const char *name, int type, uint32_t delay, uint32_t f
     }
 }
 
+/* The caller's SasCore as firmware 6.60 leaves it: Init's image (sasprobe
+ * step 4), a setter's words (sasprobe 4 steps 20, 30 and 35, and sasprobe 3
+ * step 290) and a core's (sasprobe 4 step 357). */
+static void test_sas_struct(void) {
+    const uint32_t C = SAS_CORE, PCM = SAS_DATA;
+    psp_sas_reset();
+    for (uint32_t o = 0; o < 0xE40u; o += 4) psp_write32(C + o, 0xCCCCCCCCu);
+    CHECK(call5(psp_nid("__sceSasInit"), C, 256, 32, 0, 44100) == 0, "SAS init");
+    static const uint32_t init[][2] = {
+        { 0x000, 0x00180990u }, { 0x004, 0x00000BFFu }, { 0x008, 0x00010008u },
+        { 0x00C, 0 },           { 0x010, 0xFFFFFFFFu },
+        /* voice 0 */
+        { 0x014, 0 },           { 0x01C, 0x10000000u }, { 0x020, 0x10001000u },
+        { 0x024, 0x10001000u }, { 0x028, 0x00180010u }, { 0x038, 0 },
+        { 0x040, 0x01010100u }, { 0x044, 0xFF000707u }, { 0x048, 0 },
+        /* voice 31, and its copy */
+        { 0x6F0, 0x00180944u }, { 0xDF0, 0x00180944u }, { 0xE0C, 0xFF000707u },
+        { 0xE10, 0 },           { 0xE14, 0xFFFFFFFFu }, { 0xE1C, 0 },
+        { 0xE20, 0xCCCCCCCCu },   /* past the 0xE20 bytes Init writes */
+    };
+    for (size_t i = 0; i < sizeof init / sizeof init[0]; i++)
+        CHECK(psp_read32(C + init[i][0]) == init[i][1], "Init: +%03X = %08X, want %08X",
+              init[i][0], psp_read32(C + init[i][0]), init[i][1]);
+
+    call5(psp_nid("__sceSasSetVoicePCM"), C, 2, PCM, 100, 50);
+    CHECK(psp_read32(C + 0x084) == PCM && psp_read32(C + 0x088) == 0x00320063u &&
+          psp_read32(C + 0x08C) == 0x10000105u,
+          "SetVoicePCM(2, pcm, 100, 50): %08X %08X %08X, want pcm 00320063 10000105",
+          psp_read32(C + 0x084), psp_read32(C + 0x088), psp_read32(C + 0x08C));
+    call7(psp_nid("__sceSasSetVolume"), C, 0, 0x80000000u, 0x1000, 0x80000000u, 0x1000, 0);
+    CHECK(psp_read32(C + 0x020) == 0x10000000u && psp_read32(C + 0x024) == 0x10000000u,
+          "SetVolume(0x80000000, 0x1000, ...): %08X %08X, want 10000000 twice",
+          psp_read32(C + 0x020), psp_read32(C + 0x024));
+    call(psp_nid("__sceSasSetKeyOn"), C, 2, 0, 0);
+    CHECK(psp_read32(C + 0x0B4) == 0xFE000707u, "KeyOn: key word %08X, want FE000707",
+          psp_read32(C + 0x0B4));
+    CHECK(psp_read32(C + 0x784) == 0, "the copy waits for a core");
+
+    sas_core();
+    CHECK(psp_read32(C + 0x0B4) == 0x00000707u && psp_read32(C + 0x7B4) == 0x00000707u,
+          "core: key words %08X %08X, want 00000707 in both copies",
+          psp_read32(C + 0x0B4), psp_read32(C + 0x7B4));
+    CHECK(psp_read32(C + 0x784) == PCM && psp_read32(C + 0x78C) == 0x10000105u,
+          "core: voice 2 copied to +784");
+    CHECK(psp_read32(C + 0x010) == 0xFFFFFFFBu && psp_read32(C + 0xE14) == 0xFFFFFFFBu,
+          "core: end flags %08X %08X, want FFFFFFFB", psp_read32(C + 0x010),
+          psp_read32(C + 0xE14));
+    CHECK(psp_read32(C + 0x004) == 0x000000FFu, "core: +004 %08X, want 000000FF",
+          psp_read32(C + 0x004));
+
+    call(psp_nid("__sceSasSetOutputmode"), C, 1, 0, 0);
+    CHECK(psp_read32(C + 0x004) == 0x000002FFu && psp_read32(C + 0x008) == 0x00010108u,
+          "SetOutputmode(1): %08X %08X, want 000002FF 00010108",
+          psp_read32(C + 0x004), psp_read32(C + 0x008));
+}
+
 static void test_sas_reverb(void) {
     /* Echo: the pulse back at 16d + 7 + D1 steps, then again 16d + 4 later
      * at feedback / -128 of it; nothing on the odd frames. */
@@ -1672,6 +1751,7 @@ int main(void) {
     test_sas_hardware_rules();
     test_sas_round3_rules();
     test_sas_reverb();
+    test_sas_struct();
     test_stdio_async();
     test_display();
     test_time_calls();

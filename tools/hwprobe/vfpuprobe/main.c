@@ -45,6 +45,17 @@
  * FPU exception traps (last but one, each case skippable); and, last of all,
  * dumps of each transcendental's core over its reduced argument range
  * (section 13, about 91 MB).
+ *
+ * Version 4 keeps every step of version 3 where it was and appends three to
+ * section 13, about 7 MB: every argument of the vsin/vcos and vasin core
+ * segments whose fit version 3's dumps left open, and vlog2 for x >= 4, where
+ * the result is often a unit below the core's. Section 12's four trap cases,
+ * each of which stopped a 6.60 PSP in version 3, are now "not run".
+ *
+ * Version 5 keeps steps 1-203 and appends two to section 13, about 4.7 MB,
+ * for the vlog2 results the coarse-core rule fitted to version 4 still
+ * misses: every argument in [1,2) of the log2 core segments whose fit is
+ * open, and x >= 4 over the segments where the misses are.
  */
 #include <pspkernel.h>
 #include <pspiofilemgr.h>
@@ -61,7 +72,7 @@ PSP_MODULE_INFO("vfpuprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(4096);
 
-#define PROBE_VERSION 3
+#define PROBE_VERSION 5
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -1503,7 +1514,9 @@ static void section_fpu(void) {
  * divide-by-zero and invalid enables are set. Each case runs in its own
  * thread, which does nothing else, and reports how far it got; the main thread
  * waits for it with a timeout. A case that takes the PSP down is skipped when
- * the probe is started again. */
+ * the probe is started again. On firmware 6.60 all four did (vfpuprobe 3,
+ * four runs that each ended in the next case), so from version 4 they are
+ * known crashes: "not run" unless built with -DRUN_KNOWN_CRASHES. */
 
 /* Stage 1: entered and read fcr31; 2: about to run the operation; 3: done. */
 static volatile w32 g_trap_stage, g_trap_entry, g_trap_after, g_trap_res;
@@ -1539,7 +1552,7 @@ static int trap_thread(SceSize args, void *argp) {
 
 /* fcr 0xFFFFFFFF leaves the thread's own fcr31 alone. */
 static void trap_case(const char *title, int op, w32 a, w32 b, w32 fcr) {
-    if (step("%s", title)) return;
+    if (step("%s", title) || KNOWN_CRASH("stopped the PSP on firmware 6.60 (vfpuprobe 3)")) return;
     g_trap_op = op; g_trap_a = a; g_trap_b = b; g_trap_fcr = fcr;
     g_trap_stage = 0; g_trap_entry = g_trap_after = g_trap_res = 0x5A5A5A5Au;
     SceUID th = sceKernelCreateThread("trap", trap_thread, 0x10, 0x4000, PSP_THREAD_ATTR_USER, NULL);
@@ -1594,8 +1607,11 @@ static void section_fpu_trap(void) {
 
 typedef struct { char kind; w32 start, stride, count; const char *what; } coreseg;
 #define CORE_CHUNK 65536
+#define CORE_SEGS  32
 
-static const struct { const char *op; void (*fn)(const w32 *, w32 *, int); coreseg seg[3]; } CORES[] = {
+typedef struct { const char *op; void (*fn)(const w32 *, w32 *, int); coreseg seg[CORE_SEGS]; } coredump;
+
+static const coredump CORES[] = {
     { "vsin", u_vsin, {
         { 'k', 0, 3, 2796203, "x = k*2^-23 in [0,1): the core, one quadrant" },
         { 'b', 0x3F800000, 31, 270601, "x in [1,2): the reflected quadrant" },
@@ -1620,41 +1636,182 @@ static const struct { const char *op; void (*fn)(const w32 *, w32 *, int); cores
         { 'b', 0x3F800000, 5, 3355444, "x in [1,4): the mantissa and the exponent's parity" } } },
 };
 
+/* Version 4: where version 3's dumps did not settle the fit (fw660-v3.txt,
+ * steps 193-197), into vfpu_core4_<op>.bin, about 7 MB.
+ *
+ * vsin, vcos and vasin turned out to be the shared core with an exponent per
+ * segment (src/vfpu.c), but every 3rd argument leaves some of V's steps open
+ * where the stride aliases with the slope: in 11 of the cosine core's 128
+ * segments and 13 of vasin's. Here those segments are dumped whole. vcos of
+ * x = X * 2^-23 is the cosine core at X itself (one quarter turn on, then
+ * reflected), so segment s is X = s*2^16 .. s*2^16 + 65535.
+ *
+ * vlog2 of x >= 4 is ex + log2(m) truncated to 23 bits in about half of the
+ * 2,510 swept inputs and one unit below that in the rest, by a rule the
+ * sweep cannot pin. The input is (ex, m): every 255th mantissa for one
+ * exponent of each bit length 2..7 (ex = 2, 4, 8, 16, 32, 64), every 2040th,
+ * a subset of those, at the top of each length (3, 7, 15, 31, 63, 127), to
+ * tell whether ex matters beyond its length, and 2048 consecutive mantissas
+ * from the start and the middle of a segment for ex = 2 and 32. */
+static const coredump CORES4[] = {
+    { "vcos", u_vcos, {
+        { 'k', 0x000000, 1, 65536, "cosine core segment 0" },
+        { 'k', 0x0B0000, 1, 65536, "cosine core segment 11" },
+        { 'k', 0x110000, 1, 65536, "cosine core segment 17" },
+        { 'k', 0x220000, 1, 65536, "cosine core segment 34" },
+        { 'k', 0x230000, 1, 65536, "cosine core segment 35" },
+        { 'k', 0x240000, 1, 65536, "cosine core segment 36" },
+        { 'k', 0x380000, 1, 65536, "cosine core segment 56" },
+        { 'k', 0x510000, 1, 65536, "cosine core segment 81" },
+        { 'k', 0x520000, 1, 65536, "cosine core segment 82" },
+        { 'k', 0x530000, 1, 65536, "cosine core segment 83" },
+        { 'k', 0x540000, 1, 65536, "cosine core segment 84" } } },
+    { "vasin", u_vasin, {
+        { 'k', 0x0A0000, 1, 65536, "segment 10" },
+        { 'k', 0x220000, 1, 65536, "segment 34" },
+        { 'k', 0x230000, 1, 65536, "segment 35" },
+        { 'k', 0x240000, 1, 65536, "segment 36" },
+        { 'k', 0x250000, 1, 65536, "segment 37" },
+        { 'k', 0x260000, 1, 65536, "segment 38" },
+        { 'k', 0x270000, 1, 65536, "segment 39" },
+        { 'k', 0x280000, 1, 65536, "segment 40" },
+        { 'k', 0x490000, 1, 65536, "segment 73" },
+        { 'k', 0x520000, 1, 65536, "segment 82" },
+        { 'k', 0x620000, 1, 65536, "segment 98" },
+        { 'k', 0x700000, 1, 65536, "segment 112" },
+        { 'k', 0x770000, 1, 65536, "segment 119" } } },
+    { "vlog2", u_vlog2, {
+        { 'b', 0x40800000, 255, 32897, "x in [4,8): every 255th mantissa" },
+        { 'b', 0x41800000, 255, 32897, "x in [2^4,2^5)" },
+        { 'b', 0x43800000, 255, 32897, "x in [2^8,2^9)" },
+        { 'b', 0x47800000, 255, 32897, "x in [2^16,2^17)" },
+        { 'b', 0x4F800000, 255, 32897, "x in [2^32,2^33)" },
+        { 'b', 0x5F800000, 255, 32897, "x in [2^64,2^65)" },
+        { 'b', 0x41000000, 2040, 4113, "x in [2^3,2^4): every 2040th mantissa" },
+        { 'b', 0x43000000, 2040, 4113, "x in [2^7,2^8)" },
+        { 'b', 0x47000000, 2040, 4113, "x in [2^15,2^16)" },
+        { 'b', 0x4F000000, 2040, 4113, "x in [2^31,2^32)" },
+        { 'b', 0x5F000000, 2040, 4113, "x in [2^63,2^64)" },
+        { 'b', 0x7F000000, 2040, 4113, "x in [2^127,2^128)" },
+        { 'b', 0x40800000, 1, 2048, "x from 4, consecutive mantissas" },
+        { 'b', 0x40C07C00, 1, 2048, "x from 4 * (1.5 + 0x7C00*2^-23), segment 64's middle" },
+        { 'b', 0x4F800000, 1, 2048, "x from 2^32, consecutive mantissas" },
+        { 'b', 0x4FC07C00, 1, 2048, "x from 2^32 * (1.5 + 0x7C00*2^-23)" } } },
+};
+
+/* Version 5: the vlog2 results the rule fitted to version 4 still misses
+ * (src/vfpu.c, vfpu_log2: 317 of step 203's 230,252), about 4.7 MB.
+ *
+ * For x >= 4 the core runs coarser and takes its quadratic correction from
+ * the segment whose coefficient C2 = V(0) - V(512) is this one's with its
+ * low bits cleared (C2'), or from ceil(C2' * k^2 / 2^18) where no segment
+ * has C2'. Most misses are in segments 9, 10, 56 and 57, whose V(0) or
+ * V(512) v3's every-3rd dump of [1,2) left open (C2 came out 161, 156, 87,
+ * 89; 160, 156, 88 and 88 fit step 203 better), the rest in segments that
+ * take their correction from segment 9 or from the stand-in.
+ *
+ * vfpu_core5_vlog2.bin: every x in [1,2) of the log2 core segments with any
+ * V(k) still open after v3 (8-12, 55-57 and 79), which pins V there.
+ *
+ * vfpu_core5_vlog2w.bin: x >= 4, every 3rd mantissa of a segment (21 or 22
+ * results in each run of 64 u that shares a V(k), enough to pin it at the
+ * coarser grid), at one exponent per bit length,
+ * ex = 2, 4, 8 and 16 (t = 1-4; the fraction depends on t alone):
+ *   - segments 9, 10, 56 and 57 at t = 1-3, where the misses are;
+ *   - segments whose C2' no segment has, for the stand-in: C2' = 44, 40
+ *     and 32 (segment 124, C2 46) at t = 1-3, and 32 at t = 4 (segments
+ *     100 and 124, C2 56 and 46); C2' = 88 (segments 53 and 50, C2 90 and
+ *     94) and 160 (segments 8, 6, 3 and 0, C2 162, 166, 174 and 182), which
+ *     the fitted C2s left without a segment, at the t where they occur.
+ * Two segments with the same C2' at one t tell whether the correction
+ * depends on C2' alone. */
+static const coredump CORE5_LOG2 = { "vlog2", u_vlog2, {
+    { 'b', 0x3F880000, 1, 65536, "x in [1,2), log2 core segment 8" },
+    { 'b', 0x3F890000, 1, 65536, "segment 9" },
+    { 'b', 0x3F8A0000, 1, 65536, "segment 10" },
+    { 'b', 0x3F8B0000, 1, 65536, "segment 11" },
+    { 'b', 0x3F8C0000, 1, 65536, "segment 12" },
+    { 'b', 0x3FB70000, 1, 65536, "segment 55" },
+    { 'b', 0x3FB80000, 1, 65536, "segment 56" },
+    { 'b', 0x3FB90000, 1, 65536, "segment 57" },
+    { 'b', 0x3FCF0000, 1, 65536, "segment 79" } } };
+
+static const coredump CORE5_LOG2W = { "vlog2", u_vlog2, {
+    { 'b', 0x40890000, 3, 21846, "x in [4,8), segment 9, every 3rd mantissa" },
+    { 'b', 0x408A0000, 3, 21846, "x in [4,8), segment 10" },
+    { 'b', 0x40B80000, 3, 21846, "x in [4,8), segment 56" },
+    { 'b', 0x40B90000, 3, 21846, "x in [4,8), segment 57" },
+    { 'b', 0x41890000, 3, 21846, "x in [2^4,2^5), segment 9" },
+    { 'b', 0x418A0000, 3, 21846, "x in [2^4,2^5), segment 10" },
+    { 'b', 0x41B80000, 3, 21846, "x in [2^4,2^5), segment 56" },
+    { 'b', 0x41B90000, 3, 21846, "x in [2^4,2^5), segment 57" },
+    { 'b', 0x43890000, 3, 21846, "x in [2^8,2^9), segment 9" },
+    { 'b', 0x438A0000, 3, 21846, "x in [2^8,2^9), segment 10" },
+    { 'b', 0x43B80000, 3, 21846, "x in [2^8,2^9), segment 56" },
+    { 'b', 0x43B90000, 3, 21846, "x in [2^8,2^9), segment 57" },
+    { 'b', 0x40FC0000, 3, 21846, "x in [4,8), segment 124: C2' 44" },
+    { 'b', 0x40B50000, 3, 21846, "x in [4,8), segment 53: C2' 88" },
+    { 'b', 0x40880000, 3, 21846, "x in [4,8), segment 8: C2' 160" },
+    { 'b', 0x41FC0000, 3, 21846, "x in [2^4,2^5), segment 124: C2' 40" },
+    { 'b', 0x41B20000, 3, 21846, "x in [2^4,2^5), segment 50: C2' 88" },
+    { 'b', 0x41B50000, 3, 21846, "x in [2^4,2^5), segment 53: C2' 88" },
+    { 'b', 0x41860000, 3, 21846, "x in [2^4,2^5), segment 6: C2' 160" },
+    { 'b', 0x41880000, 3, 21846, "x in [2^4,2^5), segment 8: C2' 160" },
+    { 'b', 0x43FC0000, 3, 21846, "x in [2^8,2^9), segment 124: C2' 32" },
+    { 'b', 0x43830000, 3, 21846, "x in [2^8,2^9), segment 3: C2' 160" },
+    { 'b', 0x43860000, 3, 21846, "x in [2^8,2^9), segment 6: C2' 160" },
+    { 'b', 0x47E40000, 3, 21846, "x in [2^16,2^17), segment 100: C2' 32" },
+    { 'b', 0x47FC0000, 3, 21846, "x in [2^16,2^17), segment 124: C2' 32" },
+    { 'b', 0x47800000, 3, 21846, "x in [2^16,2^17), segment 0: C2' 160" },
+    { 'b', 0x47860000, 3, 21846, "x in [2^16,2^17), segment 6: C2' 160" } } };
+
+/* One step: the op over each segment, into probe_dir()/file. */
+static void dump_core(const coredump *c, const char *file, const char *title, w32 *in, w32 *res) {
+    const float grid = 1.0f / 8388608.0f;
+    char path[300];
+    if (step("%s.s %s -> %s", c->op, title, file)) return;
+    snprintf(path, sizeof path, "%s%s", probe_dir(), file);
+    SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (fd < 0) { out("  open"); ret(fd); return; }
+    int total = 0, failed = 0;
+    for (int s = 0; s < CORE_SEGS && c->seg[s].kind && !failed; s++) {
+        const coreseg *g = &c->seg[s];
+        w32 sum = 0, rx = 0;
+        for (w32 i0 = 0; i0 < g->count && !failed; i0 += CORE_CHUNK) {
+            const int n = g->count - i0 < CORE_CHUNK ? (int)(g->count - i0) : CORE_CHUNK;
+            for (int j = 0; j < n; j++) {
+                const w32 v = g->start + g->stride * (i0 + (w32)j);
+                in[j] = g->kind == 'k' ? fb((float)(int)v * grid) : v;
+            }
+            c->fn(in, res, n);
+            for (int j = 0; j < n; j++) { sum += res[j]; rx = ((rx << 1) | (rx >> 31)) ^ res[j]; }
+            const int wr = sceIoWrite(fd, res, n * 4);
+            if (wr != n * 4) { out("  write at word %d", total / 4); ret(wr); failed = 1; }
+            else total += wr;
+        }
+        out("  %c start %08X stride %u count %u, %s: sum %08X rotxor %08X\n",
+            g->kind, g->start, g->stride, g->count, g->what, sum, rx);
+    }
+    sceIoClose(fd);
+    out("  %s: %d bytes\n", file, total);
+}
+
 static void section_cores(void) {
     section("13. transcendental cores over their reduced ranges (runs last)");
     w32 *in  = memalign(64, CORE_CHUNK * 4);
     w32 *res = memalign(64, CORE_CHUNK * 4);
     if (!in || !res) { say("out of memory\n"); return; }
-    const float grid = 1.0f / 8388608.0f;
+    char file[40];
     for (int c = 0; c < (int)(sizeof CORES / sizeof CORES[0]); c++) {
-        char name[40], path[300];
-        snprintf(name, sizeof name, "vfpu_core_%s.bin", CORES[c].op);
-        step("%s.s core -> %s", CORES[c].op, name);
-        snprintf(path, sizeof path, "%s%s", probe_dir(), name);
-        SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-        if (fd < 0) { out("  open"); ret(fd); continue; }
-        int total = 0, failed = 0;
-        for (int s = 0; s < 3 && CORES[c].seg[s].kind && !failed; s++) {
-            const coreseg *g = &CORES[c].seg[s];
-            w32 sum = 0, rx = 0;
-            for (w32 i0 = 0; i0 < g->count && !failed; i0 += CORE_CHUNK) {
-                const int n = g->count - i0 < CORE_CHUNK ? (int)(g->count - i0) : CORE_CHUNK;
-                for (int j = 0; j < n; j++) {
-                    const w32 v = g->start + g->stride * (i0 + (w32)j);
-                    in[j] = g->kind == 'k' ? fb((float)(int)v * grid) : v;
-                }
-                CORES[c].fn(in, res, n);
-                for (int j = 0; j < n; j++) { sum += res[j]; rx = ((rx << 1) | (rx >> 31)) ^ res[j]; }
-                const int wr = sceIoWrite(fd, res, n * 4);
-                if (wr != n * 4) { out("  write at word %d", total / 4); ret(wr); failed = 1; }
-                else total += wr;
-            }
-            out("  %c start %08X stride %u count %u, %s: sum %08X rotxor %08X\n",
-                g->kind, g->start, g->stride, g->count, g->what, sum, rx);
-        }
-        sceIoClose(fd);
-        out("  %s: %d bytes\n", name, total);
+        snprintf(file, sizeof file, "vfpu_core_%s.bin", CORES[c].op);
+        dump_core(&CORES[c], file, "core", in, res);
     }
+    for (int c = 0; c < (int)(sizeof CORES4 / sizeof CORES4[0]); c++) {
+        snprintf(file, sizeof file, "vfpu_core4_%s.bin", CORES4[c].op);
+        dump_core(&CORES4[c], file, "core where v3's dump left the fit open", in, res);
+    }
+    dump_core(&CORE5_LOG2, "vfpu_core5_vlog2.bin", "core in [1,2) where the log2 fit is still open", in, res);
+    dump_core(&CORE5_LOG2W, "vfpu_core5_vlog2w.bin", "x >= 4 where v4's coarse-core rule misses", in, res);
     free(res);
     free(in);
 }

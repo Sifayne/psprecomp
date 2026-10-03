@@ -83,4 +83,4 @@ it stopped in. The steps that could do that are written to be skipped.
 
 ## Compare with psprecomp
 
-    allegrexrecomp interp saveprobe.prx --dispatch --budget 4000000000 --drain 200
+    allegrexrecomp interp saveprobe.prx --dispatch --budget 4000000000 --drain 200 --base 0x08804000

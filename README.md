@@ -284,7 +284,7 @@ allegrexrecomp funcs   <file> [--list]           function discovery report
 allegrexrecomp emit    <file> <outdir> [prefix] [--replace <addrs>|@<file>]
                                                  generate C
 allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs]
-                       [--dispatch] [--drain <s>]
+                       [--dispatch] [--drain <s>] [--argv0 <path>] [--base <addr>]
                                                  run a module under the interpreter oracle
 allegrexrecomp decrypt <file> [--keys <path>]    identify a ~PSP module and probe it
 allegrexrecomp kirk1   <file> [out] [--keys <path>]
