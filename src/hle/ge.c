@@ -1401,10 +1401,52 @@ static void mul_3x3(const float m[12], const float in[3], float out[3]) {
     out[2] = m[2]*in[0] + m[5]*in[1] + m[8]*in[2];
 }
 
+/* ---- Exact arithmetic without libm -----------------------------------------
+ *
+ * The vertex path below cuts, splits and scales every value it touches, and
+ * frexp, ldexp, trunc and floor are library calls on x86-64 without SSE4.1:
+ * they were most of a lit vertex's cost. These give the same doubles bit for
+ * bit wherever they take the fast path (a normal finite input, a power of two
+ * a double can hold) and fall back to the library call everywhere else. */
+static inline uint64_t ge_bits(double v) { uint64_t b; memcpy(&b, &v, sizeof b); return b; }
+static inline double ge_from_bits(uint64_t b) { double v; memcpy(&v, &b, sizeof v); return v; }
+
+/* 2^n, exactly. */
+static inline double ge_pow2(int n) {
+    return n >= -1022 && n <= 1023 ? ge_from_bits((uint64_t)(n + 1023) << 52) : ldexp(1.0, n);
+}
+
+/* ldexp(x, n): x times an exact 2^n rounds once, as ldexp does. */
+static inline double ge_ldexp(double x, int n) {
+    return n >= -1022 && n <= 1023 ? x * ge_pow2(n) : ldexp(x, n);
+}
+
+/* frexp's exponent of a normal, non-zero x (x = m 2^e, m in [0.5, 1));
+ * INT_MIN for anything else, whose callers keep frexp. */
+static inline int ge_frexp_e(double x) {
+    const int ex = (int)((ge_bits(x) >> 52) & 0x7FF);
+    return ex && ex != 0x7FF ? ex - 1022 : INT_MIN;
+}
+
+/* trunc and floor of a finite x below 2^52, through an integer; the sign of a
+ * zero result is the one the library gives. */
+static inline double ge_trunc(double x) {
+    if (!(fabs(x) < 4503599627370496.0)) return trunc(x);
+    const double r = (double)(int64_t)x;
+    return r == 0.0 ? copysign(0.0, x) : r;
+}
+static inline double ge_floor(double x) {
+    if (!(fabs(x) < 4503599627370496.0) || x == 0.0) return floor(x);
+    const int64_t i = (int64_t)x;
+    return (double)(i - ((double)i > x));
+}
+
 /* v with its significand cut to `bits` bits, toward zero or (round) to
- * nearest. */
+ * nearest. Toward zero on a normal v is clearing the low bits. */
 static double ge_cut(double v, int bits, int round) {
     if (v == 0.0 || !isfinite(v)) return v;
+    if (!round && bits >= 1 && bits <= 53 && ((ge_bits(v) >> 52) & 0x7FF))
+        return ge_from_bits(ge_bits(v) & ~((UINT64_C(1) << (53 - bits)) - 1));
     int e;
     const double m = ldexp(frexp(v, &e), bits);
     return ldexp(round ? floor(m + 0.5) : trunc(m), e - bits);
@@ -1496,10 +1538,10 @@ static double ge_sum(const ge_term *t, int n) {
     }
     if (!s) return 0.0;
     int64_t m = s < 0 ? -s : s;
-    int sh = 0;
-    while ((m >> sh) >= 65536) sh++;               /* the total to 16 bits */
+    const int len = 64 - __builtin_clzll((uint64_t)m);
+    const int sh = len > 16 ? len - 16 : 0;        /* the total to 16 bits */
     m >>= sh;
-    return ldexp(s < 0 ? -(double)m : (double)m, e - 15 + sh);
+    return ge_ldexp(s < 0 ? -(double)m : (double)m, e - 15 + sh);
 }
 
 /* A vertex's texture coordinates, in units, through TEXSCALE and TEXOFFSET to
@@ -1601,13 +1643,17 @@ static const uint32_t ge_rcp_tab[128][2] = {
 
 static double ge_rcp16(double w) {
     if (w == 0.0 || !isfinite(w)) return 1.0 / w;
-    int e;
-    const double m = frexp(fabs(w), &e);                     /* [0.5, 1) */
-    const uint32_t sig = (uint32_t)(m * 65536.0) & 0x7FFFu;  /* 15 bits below the leading one */
-    if (sig == 0) return copysign(ldexp(1.0, 1 - e), w);     /* a power of two: exact */
+    int e = ge_frexp_e(w);
+    uint32_t sig;
+    if (e != INT_MIN) sig = (uint32_t)(ge_bits(w) >> 37) & 0x7FFFu;    /* 15 bits below the leading one */
+    else {
+        const double m = frexp(fabs(w), &e);                 /* [0.5, 1) */
+        sig = (uint32_t)(m * 65536.0) & 0x7FFFu;
+    }
+    if (sig == 0) return copysign(ge_ldexp(1.0, 1 - e), w);  /* a power of two: exact */
     const uint32_t t = sig >> 8, l = sig & 0xFFu;
     const uint32_t q = (128u * ge_rcp_tab[t][0] - ge_rcp_tab[t][1] * l - 1u) >> 8;
-    return copysign(ldexp((double)q, -15 - e), w);           /* (q / 2^16) * 2^(1-e) */
+    return copysign(ge_ldexp((double)q, -15 - e), w);        /* (q / 2^16) * 2^(1-e) */
 }
 
 /* clip c over w as the GE forms it: c times 1/w, cut to 16 bits. */
@@ -1686,11 +1732,11 @@ static double ge_c16(double v) { return ge_cut(v, 16, 0); }
 static double ge_acc(double acc, double t) {
     if (t == 0.0 || !isfinite(t) || !isfinite(acc)) return t == 0.0 ? acc : acc + t;
     if (acc == 0.0) return ge_c16(t);
-    int ea, et;
-    frexp(acc, &ea);
-    frexp(t, &et);
-    const double u = ldexp(1.0, (ea > et ? ea : et) - 1 - 15);
-    return ge_c16(trunc(acc / u) * u + trunc(t / u) * u);
+    int ea = ge_frexp_e(acc), et = ge_frexp_e(t);
+    if (ea == INT_MIN) frexp(acc, &ea);
+    if (et == INT_MIN) frexp(t, &et);
+    const double u = ge_pow2((ea > et ? ea : et) - 1 - 15);
+    return ge_c16(ge_trunc(acc / u) * u + ge_trunc(t / u) * u);
 }
 
 /* One axis of a skinned position (B[c][k] = bone[3k + c]). */
@@ -1831,7 +1877,7 @@ static float ge_screen_z(float cz, float w) {
     if (g_tl.vp_zs == 0.0f) return ((cz / w) * 0.5f + 0.5f) * 65535.0f;
     const double nz = ge_over_w(cz, w);
     const ge_term t[2] = { ge_mul(g_tl.vp_zs, nz), ge_mul(g_tl.vp_zc, 1.0) };
-    return (float)floor(ge_sum(t, 2));
+    return (float)ge_floor(ge_sum(t, 2));
 }
 
 static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
@@ -1850,7 +1896,7 @@ static int ge_screen_axis(double ndc, float scale, float centre, float off) {
     double v = (ge_sum(t, 2) - (double)off) * PSP_SUBPX;
     if (!(v > -1073741824.0)) v = -1073741824.0;   /* NaN too */
     if (v > 1073741824.0) v = 1073741824.0;
-    return (int)floor(v);
+    return (int)ge_floor(v);
 }
 
 /* The same projection onto the rasterizer's grid, as screen_axis_fx16 says.
@@ -2361,11 +2407,28 @@ static void lights_to_eye(void) {
 static float ge_pow(float x, float k) {
     if (!(x > 0.0f)) return 0.0f;
     int e;
-    const float m = frexpf(x, &e);                          /* [0.5, 1) */
+    float m;                                                /* [0.5, 1) */
+    uint32_t b;
+    memcpy(&b, &x, sizeof b);
+    if (((b >> 23) & 0xFF) && ((b >> 23) & 0xFF) != 0xFF) { /* normal: frexpf by hand */
+        e = (int)((b >> 23) & 0xFF) - 126;
+        b = (b & 0x807FFFFFu) | (126u << 23);
+        memcpy(&m, &b, sizeof m);
+    } else m = frexpf(x, &e);
     const float y = k * ((float)(e - 1) + (2.0f * m - 1.0f));
     if (!(y > -126.0f)) return 0.0f;
-    const float n = floorf(y);
-    return ldexpf(1.0f + (y - n), (int)n);
+    if (!(y < 127.0f)) {                                    /* the library's overflow */
+        const float n = floorf(y);
+        return ldexpf(1.0f + (y - n), (int)n);
+    }
+    /* floorf and ldexpf: y is in (-126, 127), so n is an int and 2^n a
+     * normal float, and the product rounds once as ldexpf's does. */
+    const int ni = (int)y - ((float)(int)y > y);
+    const float n = (float)ni;
+    const uint32_t pb = (uint32_t)(ni + 127) << 23;
+    float p;
+    memcpy(&p, &pb, sizeof p);
+    return (1.0f + (y - n)) * p;
 }
 
 /* ---- The lighting's vectors (geprobe 17, fw 6.60) ----------------------
@@ -2450,7 +2513,7 @@ static double ge_rsqrt16(double s) {
     if (!(s > 0.0) || ge_split(s, &sig, &e) <= 0) return INFINITY;
     const int p = e & 1, t = (int)((sig & 0x7FFF) >> 8), l = (int)(sig & 0xFF);
     const int64_t q = (128 * (int64_t)ge_rsq_tab[p][t][0] - (int64_t)ge_rsq_tab[p][t][1] * l - 1) >> 8;
-    return ldexp((double)q, -16 - (e - p) / 2);
+    return ge_ldexp((double)q, -16 - (e - p) / 2);
 }
 
 static double gl_mul(double a, double b) { const ge_term t = ge_mul(a, b); return ge_sum(&t, 1); }
