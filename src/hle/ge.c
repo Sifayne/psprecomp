@@ -321,9 +321,11 @@ typedef struct {
     int      cbid;      /* sceGeSetCallback id given at EnQueue; -1 none */
     int      paused;    /* stopped at a PAUSE until sceGeContinue */
     int      cont_early;/* sceGeContinue arrived before the pause took hold */
+    int      hung;      /* stopped for good at a patch it cannot draw, until sceGeBreak */
 } ge_queue;
 
 static ge_queue g_queue[MAX_QUEUES];
+static int g_ge_hang;   /* draw_patch met a division that hangs the GE (run_list_body) */
 
 /* When the GE runs.
  *
@@ -3431,11 +3433,14 @@ static void draw_patch(int spline, uint32_t arg) {
     const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
     if (!stride) return;
     /* The GE takes 7 bits of each division and draws up to 64. geprobe 13
-     * (fw 6.60) scenes 80 and 81: 49 to 64 draw, and 65 (d 193 too) and
-     * 127 (d 255) hang the GE, the list going no further; psprecomp draws
-     * nothing for those and goes on. 0 is not measured and draws as 1. */
+     * (fw 6.60) scenes 80 and 81: 49 to 64 draw, and 65 (d 193 too) to 127
+     * (d 255) hang the GE: nothing of the patch, nothing more of the list,
+     * and the queue stays busy (sceGeDrawSync peeks 2) until sceGeBreak.
+     * The run_list walk stops here and the queue is marked hung; set 21's
+     * scenes 80 and 81 match the PSP so, where going on drew 120 pixels the
+     * PSP never did. 0 is not measured and draws as 1. */
     const int du = g_ge.patch_du ? g_ge.patch_du : 1, dv = g_ge.patch_dv ? g_ge.patch_dv : 1;
-    if (du > 64 || dv > 64) return;
+    if (du > 64 || dv > 64) { g_ge_hang = 1; return; }
 
     static patch_sample su[PATCH_MAX_SAMPLES], sv[PATCH_MAX_SAMPLES];
     g_patch_dup = g_ge.patch_prim == 2;
@@ -3721,7 +3726,7 @@ static void ge_back_push(uint64_t pixels) {
 }
 
 static void run_list(ge_queue *q) {
-    if (g_ge_walking || q->paused) return;
+    if (g_ge_walking || q->paused || q->hung) return;
     g_ge_walking = 1;
     const uint64_t _r0 = ge_prof_now();
     run_list_body(q);
@@ -3799,6 +3804,7 @@ static void run_list_body(ge_queue *q) {
             g_ge.prims[3]++;
             const uint64_t px0 = psp_render_pixels();
             draw_patch(cmd == GE_SPLINE, arg);
+            if (g_ge_hang) { g_ge_hang = 0; q->hung = 1; return; }
             g_ge_t += GE_PRIM_UNITS + GE_VERTEX_UNITS * (arg & 0xFF) * ((arg >> 8) & 0xFF);
             ge_back_push(psp_render_pixels() - px0);
             break;
@@ -4578,7 +4584,7 @@ static void drain_all(void) {
 static int ge_has_work(void) {
     if (g_ge_pend.valid) return 1;
     const ge_queue *q = oldest_pending();
-    return q && !q->paused && !(q->stall && q->list == q->stall);
+    return q && !q->paused && !q->hung && !(q->stall && q->list == q->stall);
 }
 
 /* Words were released (EnQueue, a stall update, Continue). An idle GE starts
@@ -5243,13 +5249,29 @@ static void hle_DrawSync(void) {
     psp_sched_yield();
     ge_wait_drain(1, 0);
     retire_done();
-    /* DONE even if a stalled list remains: Break is still a stub that reports
-     * success without clearing anything, so reporting busy afterwards would
-     * contradict our own Break. Revisit with real BREAK state. */
+    /* DONE even if a stalled or hung list remains. A list hung at a patch
+     * division (draw_patch) would block this wait for ever on the PSP; here
+     * it returns, so the host cannot freeze, and the list stays pending for
+     * sceGeDrawSync's peek and sceGeBreak. Not measured. */
     psp_ret(GE_SYNC_DONE);
 }
 
-static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* sceGeBreak: mode 1 drops every list, mode 0 the one at the head. Only
+ * mode 1 on a hung queue is measured: geprobe 13's scenes 80 and 81 (fw
+ * 6.60) break a list hung at a patch division of 65-127 with sceGeBreak(1),
+ * which returns 0 or more, after which new lists run as on a fresh queue.
+ * Return values and the rest are not measured. */
+static void hle_Break(void) {
+    if (psp_arg(0) == 1) {
+        for (int i = 0; i < MAX_QUEUES; i++)
+            if (g_queue[i].used && !g_queue[i].done) { g_queue[i].done = 1; g_queue[i].hung = 0; g_queue[i].paused = 0; }
+    } else {
+        ge_queue *q = oldest_pending();
+        if (q) { q->done = 1; q->hung = 0; q->paused = 0; }
+    }
+    if (!ge_has_work()) g_ge_backlog = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 /* sceGeContinue: a paused list goes on, run inside the call as EnQueue runs a
  * new one -- geprobe 5 step 57 (fw 6.60): the SIGNAL and FINISH after the

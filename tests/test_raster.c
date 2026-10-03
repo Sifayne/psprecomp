@@ -1458,6 +1458,43 @@ static void test_long_edge_groups(void) {
     CHECK(c90 == 136 && c91 == 0, "vertical long edge: column 90 %d of 136, column 91 %d (PSP 136, 0)", c90, c91);
 }
 
+/* A patch division of 65 to 127 hangs the GE (ge.c draw_patch): geprobe 13
+ * (fw 6.60) scenes 80 and 81 draw nothing of the patch and nothing after it
+ * in the list, sceGeDrawSync's peek reads 2 until sceGeBreak(1), and lists
+ * after the break run as on a fresh queue. Set 21's frames match only so. */
+static void test_patch_hang(void) {
+    psp_ge_reset(); clear_fb();
+    begin_list_vtype((7u << 2) | (3u << 7));
+    for (int m = 0; m < 3; m++) {
+        cmd((uint8_t)(0x3A + 2 * m), 0);
+        const int n = m < 2 ? 12 : 16, rowlen = m < 2 ? 3 : 4;
+        for (int i = 0; i < n; i++) cmd((uint8_t)(0x3B + 2 * m), i % (rowlen + 1) == 0 ? 0x3F8000 : 0);
+    }
+    for (int k = 0; k < 16; k++) float_vertex(k, -0.5f + (k % 4) / 3.0f, -0.5f + (k / 4) / 3.0f, 0.5f);
+    cmd(0x36, 65u | (65u << 8));                           /* PATCHDIVISION 65 x 65 */
+    cmd(0x37, 2);                                          /* points */
+    cmd(0x05, 4u | (4u << 8));                             /* BEZIER 4 x 4: hangs */
+    cmd(0x12, VTYPE_2D);                                   /* then a sprite the GE never reaches */
+    cmd(0x01, (VERTS + 0x1000) & 0xFFFFFF);
+    psp_write32(VERTS + 0x1000, 0xFFFFFFFFu); psp_write16(VERTS + 0x1004, 10); psp_write16(VERTS + 0x1006, 10);
+    psp_write32(VERTS + 0x100C, 0xFFFFFFFFu); psp_write16(VERTS + 0x1010, 30); psp_write16(VERTS + 0x1012, 30);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    const uint32_t busy = call(0xB287BD61, 1, 0, 0, 0);    /* sceGeDrawSync(peek) */
+    const int drawn = pixel(20, 20) != 0;
+    const int brk = (int)call(0xB448EC0D, 1, 0, 0, 0);     /* sceGeBreak(1) */
+    const uint32_t after = call(0xB287BD61, 1, 0, 0, 0);
+    CHECK(busy == 2 && !drawn && brk >= 0 && after == 0,
+          "hung patch: peek %u (PSP 2), sprite after it %s (PSP not), break %d, then peek %u (0)",
+          busy, drawn ? "drawn" : "not drawn", brk, after);
+    /* the queue runs again after the break */
+    clear_fb(); begin_list();
+    vertex(0, 10, 10, 0xFFFFFFFFu); vertex(1, 30, 30, 0xFFFFFFFFu);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    CHECK(pixel(20, 20) != 0, "after sceGeBreak a new list did not draw");
+}
+
 /* A spline point's colour is de Boor's algorithm on the control colours
  * with 8-bit parameters and 1/128 cuts (ge.c deboor_fix), not a blend by
  * exact weights. geprobe 9 (fw 6.60) scene 54: a uniform span (fill/fill,
@@ -2402,6 +2439,7 @@ int main(void) {
     test_light_world();
     test_triangle_fans();
     test_long_edge_groups();
+    test_patch_hang();
     test_patch_points_ge();
     test_colour_plane_anchor();
     test_line_rules();

@@ -730,9 +730,13 @@ psprecomp places every one on the PSP's pixel with its depth.
   earlier rule, floor(256 i/d) mirrored, is a step off at 68 of them.
 - **Divisions.** The GE takes 7 bits of each PATCHDIVISION field and draws
   divisions 1 to 64 (scene 82's 64 x 64 patch is exact). 65 to 127 (and
-  so 193 and 255) hang the GE: nothing more of that list runs, and the
-  probe has to break it. psprecomp draws nothing for those and goes on.
-  0 is not measured.
+  so 193 and 255) hang the GE: nothing of the patch and nothing more of
+  that list, the queue busy (sceGeDrawSync's peek reads 2) until
+  sceGeBreak(1) clears it, after which new lists run. psprecomp hangs the
+  same way (ge.c draw_patch, hle_Break); going on past the patch instead
+  drew 12 and 108 pixels in scenes 80 and 81 that the PSP never does. A
+  sceGeDrawSync that waits on a hung list would wait for ever on the PSP;
+  psprecomp returns. 0 is not measured.
 - **de Boor's algorithm** (de Casteljau's for a Bezier piece), with every
   lerp parameter an 8-bit fraction taken from the nearer knot: of
   t - u_lo and u_hi - t, the smaller over the knot gap, cut to 1/256, and
@@ -823,9 +827,6 @@ lighting (its factors, its 1/sqrt and its world-space inputs) are settled
 - **Patch line order** (scene 23: 1 pixel). Two segments of a patch's
   line strips cross at (375,211), and the PSP's colour there is the other
   segment's: the order the GE emits a patch's line segments in.
-- **What follows a hanging division** (scenes 80 and 81: 12 and 108). A
-  patch division of 65 to 127 hangs the GE and the probe breaks the list;
-  psprecomp skips the patch and draws the rest.
 
 ## Validation
 
