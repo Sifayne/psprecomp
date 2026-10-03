@@ -23,6 +23,9 @@ draws up to 100 points with one weight set.
     alpha23.py sums DUMPDIR          the logged CRCs against this stream
     alpha23.py compare DUMPDIR       channels matching psprecomp's rules, per batch
     alpha23.py check                 design checks
+
+Set 24 (fw 6.60): the frame is psprecomp's, every channel of every point: the alphas were
+as assumed.
 """
 import sys, os, math, struct, zlib, re
 import numpy as np

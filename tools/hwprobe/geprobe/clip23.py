@@ -24,6 +24,12 @@ psprecomp's own frame, which draws by the first):
     clip23.py sums DUMPDIR          the logged CRCs against this stream
     clip23.py compare DUMPDIR [PCDIR]   per cell: pixels drawn, and against psprecomp's frame
     clip23.py check                 design checks
+
+Set 24 (fw 6.60): outcode, with the far plane under clamping -- a line or triangle with
+every corner beyond one plane (x or y past w either way, z past w with clamping on) is
+not drawn; corners beyond different planes draw whole; a corner on a plane is not beyond
+it. And with clamping off a line on z = w is not drawn: its depth is -1 at the probe's
+depth range, which points already fail. psprecomp now matches every cell.
 """
 import sys, os, math, struct, zlib, re
 import numpy as np

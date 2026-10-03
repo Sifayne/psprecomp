@@ -362,6 +362,13 @@ weights (`bilin23.py`, `c23b_data.inc`, the TEXB op). 145 is risky and last: pat
 divisions of 0, each case its own list (the FLUSH op) with a marker drawn after the
 patch, broken off after a second if it hangs (`pzero23.py`, `c23z_data.inc`).
 
+Set 24 settled all of it: a line or triangle with every corner beyond one plane (x or
+y past w, or with clamping on z past the far one) is not drawn, corners beyond
+different planes draw whole, and with clamping off a line takes the point's depth
+range test; vertex alphas and through-mode 16-bit colours are as assumed; a bilinear
+coordinate is cut toward zero to a sixteenth before the half texel comes off; and a
+patch division of 0 draws as 1, without hanging. psprecomp then matches all 193 dumps.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:

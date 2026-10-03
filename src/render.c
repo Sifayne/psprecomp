@@ -402,6 +402,19 @@ size_t psp_render_decode_level(const psp_tex_state *t, int level,
     return (size_t)w * (size_t)h;
 }
 
+/* A bilinear coordinate in sixteenths of a texel, the half texel taken off:
+ * the coordinate cut toward zero to a sixteenth first, as nearest's is
+ * (nearest_texel), then less 8. geprobe 23 (fw 6.60) scene 144 reads the
+ * weights at -120 to 120 texels at every 1/64 through a texture alternating
+ * 0 and 255, and this fits all 5120 readings; flooring after the half texel,
+ * as before, fits only 576 of the 2304 negative ones. The epsilon, away
+ * from zero, is for our own arithmetic (below). */
+static int linear_sixteenths(float t) {
+    const float s = t * 16.0f;
+    if (!(s > -2147483520.0f && s < 2147483520.0f)) return ifloor((t - 0.5f) * 16.0f);
+    return (int)(s >= 0.0f ? s + 1.0e-3f : s - 1.0e-3f) - 8;
+}
+
 static uint32_t sample_bilinear(float u, float v) {
     /* The coordinate is quantised to sixteenths, floored, and split into the
      * texel and the weight. Floored, not rounded: gpu/filtering's linear tests
@@ -416,8 +429,8 @@ static uint32_t sample_bilinear(float u, float v) {
      * stopped agreeing with nearest at the one scale where they must agree.
      * A thousandth of a texel is four orders of magnitude below the sixteenth
      * being measured and cannot move a weight hardware would place elsewhere. */
-    const int fu = ifloor((u - 0.5f) * 16.0f + 1.0e-3f);
-    const int fv = ifloor((v - 0.5f) * 16.0f + 1.0e-3f);
+    const int fu = linear_sixteenths(u);
+    const int fv = linear_sixteenths(v);
     const int   u0 = fu >> 4, v0 = fv >> 4;
     const float au = (float)(fu & 15) / 16.0f;
     const float av = (float)(fv & 15) / 16.0f;

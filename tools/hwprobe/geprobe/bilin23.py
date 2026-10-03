@@ -22,6 +22,9 @@ The rules (texel_rgb):
     bilin23.py sums DUMPDIR          the logged CRCs against this stream
     bilin23.py compare DUMPDIR       readings matching each rule, by sign and fraction
     bilin23.py check                 design checks: where the rules part
+
+Set 24 (fw 6.60): 'cut' fits all 5120 readings, 'cutafter' 5064, 'cur' 3392. psprecomp now
+cuts so (render.c linear_sixteenths).
 """
 import sys, os, math, struct, zlib, re
 import numpy as np

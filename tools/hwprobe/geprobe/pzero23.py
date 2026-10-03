@@ -15,6 +15,9 @@ each in its own cell, drawn as triangles, lines or points; the controls at divis
     pzero23.py sums DUMPDIR          the logged CRCs against this stream
     pzero23.py compare DUMPDIR [PCDIR]   per case: GE time, marker, pixels, against psprecomp
     pzero23.py check                 the cases
+
+Set 24 (fw 6.60): no case hangs, every marker is drawn, and the frame is psprecomp's
+(division 0 drawn as 1).
 """
 import sys, os, math, struct, zlib, re
 import numpy as np

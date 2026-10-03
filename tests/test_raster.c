@@ -1164,6 +1164,27 @@ static void test_morph_fields_ge(void) {
         const uint32_t got = pixel(240, 136) & 0xFFFF;
         CHECK(got == T[c].hw, "coordinate case %u: texel %04X, the PSP's %04X", c, got, T[c].hw);
     }
+
+    /* geprobe 23 scene 144: bilinear at negative coordinates, cut toward zero
+     * to a sixteenth before the half texel comes off (render.c
+     * linear_sixteenths). A 64 x 64 texture, red 255 on odd columns, green
+     * on odd rows: the point's red and green are its odd texels' weights.
+     * Point 1601, u -119.984375 and v -2.34375 texels: the PSP's 6F CF, where
+     * flooring after the half texel gave 7F DF. */
+    for (int t = 0; t < 64; t++)
+        for (int u = 0; u < 64; u++)
+            psp_write32(TEX + (uint32_t)(t * 64 + u) * 4, 0xFF800000u | (t & 1 ? 0xFF00u : 0) | (u & 1 ? 0xFFu : 0));
+    psp_ge_reset(); clear_fb();
+    centre_point_state(0x00019Fu);                         /* float uv, 8888, float position */
+    texture_state(TEX, 64, 6, 6, 3 /* 8888 */, 0, 1 /* linear */);
+    cmd(0xC7, 0); cmd(0xC9, 3);
+    cmd(0x48, 0x3F8000); cmd(0x49, 0x3F8000); cmd(0x4A, 0); cmd(0x4B, 0);
+    psp_write32(VERTS, 0xBFEFF800u); psp_write32(VERTS + 4, 0xBD160000u); psp_write32(VERTS + 8, 0xFFFFFFFFu);
+    for (int i = 3; i < 6; i++) psp_write32(VERTS + 4u * (uint32_t)i, 0);
+    cmd(0x04, 1);
+    end_list();
+    CHECK((pixel(240, 136) & 0xFFFF) == 0xCF6F, "bilinear at negative coordinates: %04X, the PSP's CF6F",
+          pixel(240, 136) & 0xFFFF);
 }
 
 /* Past the x and y planes (ge.c emit_point_line): geprobe 22 (fw 6.60)
@@ -1202,6 +1223,39 @@ static void test_clip_xy_lines(void) {
             if (k == 2) CHECK(drawn > 10, "clamp %d: a line with one end inside drew %d pixels", clamp, drawn);
             else CHECK(drawn == (k < 2 ? 0 : 1), "clamp %d case %d: %d pixels drawn, the PSP %d", clamp, k, drawn, k < 2 ? 0 : 1);
         }
+    }
+
+    /* geprobe 23 scene 142: a triangle with every corner beyond x = w draws
+     * nothing, clamping off or on, nor with clamping on a line or triangle
+     * wholly past z = w; with clamping off a line on z = w draws nothing (its
+     * depth falls just under 0), one on z = -w draws. */
+    static const struct { int prim, clamp, n; float v[3][3]; int drawn; } Z[] = {
+        { 3, 0, 3, { { 1.2f, -0.5f, 0 }, { 1.6f, 0.4f, 0 }, { 1.3f, 0.8f, 0 } }, 0 },
+        { 3, 1, 3, { { 1.2f, -0.5f, 0 }, { 1.6f, 0.4f, 0 }, { 1.3f, 0.8f, 0 } }, 0 },
+        { 3, 0, 3, { { 1.0f, -0.5f, 0 }, { 1.0f, 0.5f, 0 }, { 1.4f, 0.0f, 0 } }, -1 },   /* two on the plane */
+        { 1, 1, 2, { { -0.5f, -0.2f, 1.2f }, { 0.6f, 0.3f, 1.5f } }, 0 },
+        { 3, 1, 3, { { -0.6f, -0.5f, 1.2f }, { 0.5f, -0.6f, 1.3f }, { 0.1f, 0.7f, 1.5f } }, 0 },
+        { 1, 0, 2, { { -0.5f, -0.2f, 1.0f }, { 0.6f, 0.3f, 1.0f } }, 0 },
+        { 1, 0, 2, { { -0.5f, -0.2f, -1.0f }, { 0.6f, 0.3f, -1.0f } }, 11 },
+    };
+    for (unsigned c = 0; c < sizeof Z / sizeof Z[0]; c++) {
+        psp_ge_reset(); clear_fb();
+        begin_list_vtype((7u << 2) | (3u << 7));
+        cmd(0x3A, 0); for (int i = 0; i < 12; i++) cmd(0x3B, i % 4 == 0 ? 0x3F8000 : 0);
+        cmd(0x3C, 0); for (int i = 0; i < 12; i++) cmd(0x3D, i % 4 == 0 ? 0x3F8000 : 0);
+        cmd(0x3E, 0); for (int i = 0; i < 16; i++) cmd(0x3F, i % 5 == 0 ? 0x3F8000 : 0);
+        cmd_float(0x42, 10.0f); cmd_float(0x43, -10.0f); cmd_float(0x44, -32768.0f);   /* sceGuDepthRange(65535, 0) */
+        cmd_float(0x45, 2048.0f); cmd_float(0x46, 2048.0f); cmd_float(0x47, 32767.0f);
+        cmd(0x4C, 1808u << 4); cmd(0x4D, 1912u << 4);
+        cmd(0x1C, (uint32_t)Z[c].clamp);
+        for (int e = 0; e < Z[c].n; e++) float_vertex(e, Z[c].v[e][0], Z[c].v[e][1], Z[c].v[e][2]);
+        cmd(0x04, ((uint32_t)Z[c].prim << 16) | (uint32_t)Z[c].n);
+        end_list();
+        int drawn = 0;
+        for (int y = 100; y < 172; y++)
+            for (int x = 200; x < 280; x++) drawn += pixel(x, y) != 0;
+        if (Z[c].drawn < 0) CHECK(drawn > 10, "plane case %u: %d pixels, the PSP drew it", c, drawn);
+        else CHECK(drawn == Z[c].drawn, "plane case %u: %d pixels, the PSP %d", c, drawn, Z[c].drawn);
     }
 }
 

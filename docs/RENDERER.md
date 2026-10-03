@@ -656,6 +656,13 @@ which texel is read (geprobe step 12 and geprobe 5 scene 28, fw 6.60):
   -62 (geprobe 22 scene 140: 15,000 coordinates read through a texture
   that names its own texels, 536 of them negative; flooring alone missed
   the 11 that lie within a sixteenth below a whole texel).
+- **A bilinear sample** takes the coordinate in sixteenths the same way,
+  cut toward zero, and then the half texel off: trunc(16 t) - 8, the texel
+  its top bits and the weight its last four (render.c linear_sixteenths).
+  geprobe 23 scene 144 reads the weights at -120 to 120 texels at every
+  1/64 through a texture alternating 0 and 255, and this fits all 5120
+  readings; flooring after the half texel, as before, fit 576 of the 2304
+  negative ones.
 - **TEXSCALE and TEXOFFSET** apply to a 3D vertex's coordinates in the
   GE's own arithmetic, u s + o one sum of two products (ge.c
   uv_to_texels), then the texture's size: scene 140's 600 plain float
@@ -765,7 +772,10 @@ psprecomp places every one on the PSP's pixel with its depth.
   same way (ge.c draw_patch, hle_Break); going on past the patch instead
   drew 12 and 108 pixels in scenes 80 and 81 that the PSP never does. A
   sceGeDrawSync that waits on a hung list would wait for ever on the PSP;
-  psprecomp returns. 0 is not measured.
+  psprecomp returns. 0 draws as 1: geprobe 23 scene 145 draws Bezier and
+  spline patches at 0 in u, in v and in both, as triangles, lines and
+  points, each its own list with a marker after it, and none hangs and
+  every pixel is what 1 draws.
 - **de Boor's algorithm** (de Casteljau's for a Bezier piece), with every
   lerp parameter an 8-bit fraction taken from the nearer knot: of
   t - u_lo and u_hi - t, the smaller over the knot gap, cut to 1/256, and
@@ -855,8 +865,14 @@ Python).
   1 w and no further, and with clamping on a point past z = w not drawn
   either. A line is not drawn when both its ends lie beyond the same x or
   y plane (with clamping on or off); with one end inside, or across the
-  volume, it is drawn whole, as are triangles out to 150 w (ge.c
-  emit_point_line). Ends beyond different planes are not measured.
+  volume, it is drawn whole (ge.c emit_point_line). geprobe 23 scene 142
+  finishes it: a line or triangle with every corner beyond one plane --
+  x or y past w either way, and with clamping on z past the far plane --
+  is not drawn (ge.c tri_beyond_one_plane), and one with corners beyond
+  different planes is drawn whole even where it misses the volume; a
+  corner on a plane is not beyond it. With clamping off a line takes the
+  point's depth test too: on z = w, at a depth range of 65535 to 0, its
+  depth is -1 and it draws nothing.
 - **Normals** take the same accumulator (geprobe 22 scene 138, 2400
   points lit through bones and morph sets whose terms cancel on the
   normal): skinned bone by bone over the x, y and z terms with no
@@ -868,7 +884,10 @@ Python).
   all 13,200 channels fit. A 16-bit vertex colour is widened by repeating
   each field's top bits below it (5 bits to 8 as v << 3 | v >> 2), in 3D
   as in through mode; psprecomp read only 8888 and gave the others the
-  material colour.
+  material colour. The alpha too, read through the alpha-test ladder
+  (geprobe 23 scene 143, 2760 points through mode and 3D, plain and
+  morphed): 5650 opaque, 5551's bit 0 or 255, 4444's nibble repeated,
+  and a morphed alpha as the other channels, on every point.
 - **Texture coordinates** too (scene 140, 2500 points at three scales):
   morphed in units, before TEXSCALE and TEXOFFSET, so the offset is not
   weighted; all 15,000 readings fit, a float blend of the scaled
@@ -876,25 +895,14 @@ Python).
 
 Scene 20, the skinned triangle that was 54 pixels off, now matches.
 
-## Still open after geprobe 22
+## Still open after geprobe 23
 
-Nothing that geprobe 22 (fw 6.60, set 23) draws: psprecomp matches all
-189 of its frame and depth dumps bit for bit, scenes 1 to 141. The log
+Nothing that geprobe 23 (fw 6.60, set 24) draws: psprecomp matches all
+193 of its frame and depth dumps bit for bit, scenes 1 to 145. The log
 differs in timing only (GE and callback microseconds, and how many stall
 callbacks have run by sceGeListUpdateStallAddr's return), and in the
-cache step (Known differences). Measured nowhere yet, so not settled:
-
-- a line whose ends lie beyond different x or y planes without crossing
-  the volume, and triangles wholly beyond one plane;
-- a vertex colour's alpha (a frame's alpha byte is the stencil), so
-  5650's opaque alpha and 5551's 0 or 255 are assumed;
-- 16-bit vertex colours in through mode, taken to widen as in 3D;
-- bilinear filtering of negative texture coordinates (nearest's cut
-  toward zero is measured, not linear's);
-- a patch division of 0.
-
-geprobe 23 (scenes 142-145, tools/hwprobe/geprobe README) poses each of
-these.
+cache step (Known differences). Every item the earlier lists named has
+been measured.
 
 ## Validation
 

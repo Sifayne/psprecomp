@@ -2097,7 +2097,11 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
      * 0.95 to 1.05 w on every side draw only to 1 w with clamping on too (it
      * drew all nine), and lines beyond x = w at both ends draw nothing either
      * way (13 and 7 pixels before); its 74 other lines match as they were.
-     * Ends beyond different planes are not measured. */
+     * Ends beyond different planes are drawn whole even where the line
+     * misses the volume, and an end on a plane is not beyond it (geprobe
+     * 23 scene 142: 20 such lines, as they were). With clamping on, a line
+     * with both ends past the far plane is not drawn either (11 pixels
+     * before); past the near one the clip below drops it. */
     if (n == 1 && !(fabsf(p[0].c[0]) <= p[0].c[3] && fabsf(p[0].c[1]) <= p[0].c[3])) {
         g_clip_guard += 1; return;
     }
@@ -2105,6 +2109,7 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
         for (int k = 0; k < 2; k++)
             if ((p[0].c[k] > p[0].c[3] && p[1].c[k] > p[1].c[3]) ||
                 (p[0].c[k] < -p[0].c[3] && p[1].c[k] < -p[1].c[3])) { g_clip_guard += 2; return; }
+        if (g_tl.depth_clamp && p[0].c[2] > p[0].c[3] && p[1].c[2] > p[1].c[3]) { g_clip_z += 2; return; }
     }
     /* With clamping on a point past the far plane is not drawn either (scene
      * 141: z 1.0001 w on); the near one is the clip below's. */
@@ -2137,11 +2142,14 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
         float x, y, z;
         to_screen(p[i].c, &x, &y, &z);
         if (!(x >= -ox && x < 4096-ox && y >= -oy && y < 4096-oy) || !isfinite(z) ||
-            (n == 1 && !g_tl.depth_clamp && (z < 0.0f || z > 65535.0f))) {
+            (!g_tl.depth_clamp && (z < 0.0f || z > 65535.0f))) {
             /* A point whose depth falls outside 0..65535 is not drawn
              * (geprobe 13, fw 6.60: every calibration point with clip z in
-             * (-w, 0) at a positive scale, or past 65535, is absent).
-             * Lines are not measured. */
+             * (-w, 0) at a positive scale, or past 65535, is absent), and
+             * nor is a line with an end there: geprobe 23 scene 142's line
+             * with both ends on z = w, its depth just under 0 at a depth
+             * range of 65535 to 0, draws nothing (11 pixels before), the
+             * one on z = -w all its pixels. */
             g_clip_guard += (uint64_t)n; return;
         }
         v[i] = p[i].v;
@@ -2153,10 +2161,28 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
     be->draw(n == 1 ? PSP_PRIM_POINTS : PSP_PRIM_LINES, v, n);
 }
 
+/* A triangle whose three corners all lie beyond one plane of the clip volume
+ * -- x or y past w either way, or with depth clamping on z past the far plane
+ * -- is not drawn: geprobe 23 (fw 6.60) scene 142, every side, clamping off
+ * and on (22 to 126 pixels each before). Corners on a plane are not beyond
+ * it, and corners beyond different planes draw whole, as they did (its 14
+ * such triangles). Returns 1 when culled. */
+static int tri_beyond_one_plane(const float *a, const float *b, const float *c) {
+    const float *t[3] = { a, b, c };
+    for (int k = 0; k < 2; k++) {
+        int hi = 0, lo = 0;
+        for (int i = 0; i < 3; i++) { hi += t[i][k] > t[i][3]; lo += t[i][k] < -t[i][3]; }
+        if (hi == 3 || lo == 3) { g_clip_guard += 3; return 1; }
+    }
+    if (g_tl.depth_clamp && a[2] > a[3] && b[2] > b[3] && c[2] > c[3]) { g_clip_z += 3; return 1; }
+    return 0;
+}
+
 static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int flip) {
     int behind = 0;
     for (int i = 0; i < 3; i++) if (tri[i].c[3] <= 0.0f) behind++;
     if (behind == 3) { g_clip_eye += 3; return; }
+    if (tri_beyond_one_plane(tri[0].c, tri[1].c, tri[2].c)) return;
 
     clipvert b[9];
     const clipvert *poly = tri; int n = 3;
@@ -2653,6 +2679,7 @@ static void fill_xform_state(psp_xform_state *xs) {
 static void emit_tri_indexed(const psp_render_backend *be, const psp_vertex *v,
                              float (*cl)[4], uint32_t i0, uint32_t i1, uint32_t i2, int flip) {
     const uint32_t idx[3] = { i0, i1, i2 };
+    if (tri_beyond_one_plane(cl[i0], cl[i1], cl[i2])) return;
     int fast = 1;
     for (int k = 0; k < 3 && fast; k++) {
         const float *c = cl[idx[k]];
@@ -3509,7 +3536,8 @@ static void draw_patch(int spline, uint32_t arg) {
      * and the queue stays busy (sceGeDrawSync peeks 2) until sceGeBreak.
      * The run_list walk stops here and the queue is marked hung; set 21's
      * scenes 80 and 81 match the PSP so, where going on drew 120 pixels the
-     * PSP never did. 0 is not measured and draws as 1. */
+     * PSP never did. 0 draws as 1 (geprobe 23 scene 145: twelve patches at
+     * 0 in u, v or both, none hangs and every pixel is 1's). */
     const int du = g_ge.patch_du ? g_ge.patch_du : 1, dv = g_ge.patch_dv ? g_ge.patch_dv : 1;
     if (du > 64 || dv > 64) { g_ge_hang = 1; return; }
 
