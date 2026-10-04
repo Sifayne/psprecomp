@@ -1750,13 +1750,6 @@ static double ge_over_w(double c, double w) {
     return ge_cut(c * ge_rcp16(w), 16, 0);
 }
 
-static void mul_4x4(const float m[16], const float in[3], float out[4]) {
-    out[0] = m[0]*in[0] + m[4]*in[1] + m[8] *in[2] + m[12];
-    out[1] = m[1]*in[0] + m[5]*in[1] + m[9] *in[2] + m[13];
-    out[2] = m[2]*in[0] + m[6]*in[1] + m[10]*in[2] + m[14];
-    out[3] = m[3]*in[0] + m[7]*in[1] + m[11]*in[2] + m[15];
-}
-
 /* One vertex as the transform stage takes it, after skinning and morphing:
  * model-space position and normal, colour, and texture coordinates in texels
  * (uv_to_texels' units). Patches are tessellated into these too. */
@@ -2668,18 +2661,6 @@ static void gl_unit(const double v[3], double o[3]) {
     for (int k = 0; k < 3; k++) o[k] = isfinite(r) ? ge_cut(v[k] * r, 16, 0) : 0.0;
 }
 
-/* a . u, a taken as given and its 1/sqrt applied to the dot product. */
-static double gl_dot_scaled(const double a[3], const double u[3]) {
-    const double aa = gl_dot3(a, a);
-    if (!(aa > 0.0)) return 0.0;
-    return gl_mul(gl_dot3(a, u), ge_rsqrt16(aa));
-}
-
-/* x^k for the lighting: k cut to 5 significant bits, then ge_pow. */
-static float gl_pow(double x, float k) {
-    return x > 0.0 ? ge_pow((float)x, (float)ge_cut(k, 5, 0)) : 0.0f;
-}
-
 static inline int any_light_enabled(void) {
     return g_tl.light[0].enable || g_tl.light[1].enable || g_tl.light[2].enable || g_tl.light[3].enable;
 }
@@ -2805,13 +2786,13 @@ static inline double gl_dot3_sp(const ge_sp a[3], const ge_sp b[3]) {
     return ge_sum(t, 3);
 }
 
-/* gl_dot_scaled(a, u) with a's half worked out already: a.a > 0 (ok) and
- * its 1/sqrt (rs). */
+/* a . u, a taken as given and its 1/sqrt applied to the dot product, with
+ * a's half worked out already: whether a.a > 0 (ok), and its 1/sqrt (rs). */
 static double gl_dot_pre(int ok, double rs, const ge_sp a[3], const ge_sp u[3]) {
     return ok ? gl_mul(gl_dot3_sp(a, u), rs) : 0.0;
 }
 
-/* gl_pow with k cut already. */
+/* x^k for the lighting, k already cut to 5 significant bits (ge_cut(k, 5, 0)). */
 static float gl_pow_k(double x, float k) { return x > 0.0 ? ge_pow((float)x, k) : 0.0f; }
 
 static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba, psp_vertex *lit) {
@@ -2841,7 +2822,7 @@ static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba
         const ge_term t[3] = { ge_mul_sp(&W[i], &N[0]), ge_mul_sp(&W[3 + i], &N[1]), ge_mul_sp(&W[6 + i], &N[2]) };
         n[i] = ge_sum(t, 3);
     }
-    /* N's half of every N.L and N.H below (gl_dot_scaled). */
+    /* N's half of every N.L and N.H below (gl_dot_pre). */
     const ge_sp Ns[3] = { ge_sp_of(n[0]), ge_sp_of(n[1]), ge_sp_of(n[2]) };
     const double nn = gl_dot3_sp(Ns, Ns);
     const int n_ok = nn > 0.0;
