@@ -33,6 +33,7 @@
 #endif
 #include "psprecomp/hle.h"
 #include "psprecomp/clock.h"
+#include "psprecomp/interrupt.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/render.h"
 #include "psprecomp/sched.h"
@@ -302,6 +303,11 @@ static int fx16_sat(float f) {
 /* SIGNAL behaviour emitted by sceGuSignal(GU_SIGNAL_PAUSE); PSPSDK's pspgu.h
  * defines GU_SIGNAL_PAUSE as 3. */
 #define GE_SIGNAL_HANDLER_PAUSE 0x03
+/* PSPSDK pspge.h's PSP_GE_SIGNAL_SYNC: a SIGNAL 08 / END / FINISH / END
+ * sequence is a sync point inside the list, not its end. The 3rd
+ * Birthday's list writer (003FC590) emits it and goes on writing the HUD
+ * after it. Not measured on a PSP. */
+#define GE_SIGNAL_SYNC 0x08
 
 /* Primitive types, from the PRIM argument's type field. */
 static const char *const PRIM_NAME[8] = {
@@ -315,13 +321,26 @@ typedef struct {
     uint32_t stall;     /* stop before this address; 0 means "no stall" */
     uint32_t base;      /* GE_BASE: high bits for addresses */
     uint32_t origin;
-    int      signal;    /* pending PAUSE through its FINISH/END pair */
+    int      signal;    /* pending PAUSE or SYNC through its FINISH/END pair */
     int      used;
+    /* What the guest sees, which follows the GE's time (see "Drawing now,
+     * reporting on the clock"). */
     int      done;
-    int      cbid;      /* sceGeSetCallback id given at EnQueue; -1 none */
     int      paused;    /* stopped at a PAUSE until sceGeContinue */
+    int      psig;      /* between a PAUSE's SIGNAL and its FINISH */
+    /* Where the walk itself is, which may be ahead. */
+    int      xdone;     /* walked to its end */
+    int      xpaused;   /* the walk stopped at a PAUSE's FINISH */
+    uint64_t t_x;       /* the GE's time where the walk last stopped */
+    int      cbid;      /* sceGeSetCallback id given at EnQueue; -1 none */
     int      cont_early;/* sceGeContinue arrived before the pause took hold */
     int      hung;      /* stopped for good at a patch it cannot draw, until sceGeBreak */
+    int      replay;    /* a capture's list (psp_ge_replay_list): no guest to Continue it */
+    /* CALL's return addresses live with the list, not the walk: a walk that
+     * stops at the stall or at the end of its time slice inside a CALL has
+     * to find them when it resumes. */
+    uint32_t stack[GE_STACK];
+    int      sp;
 } ge_queue;
 
 static ge_queue g_queue[MAX_QUEUES];
@@ -370,14 +389,14 @@ static int g_ge_hang;   /* draw_patch met a division that hangs the GE (run_list
  * deadline when every thread waits. sceKernelGetSystemTimeLow reads it, and
  * so do the stamps of step 81. The GE keeps its own time on that clock,
  * g_ge_t for the front end and g_ge_back for the back end, in
- * GE_UNITS_PER_US units a microsecond. It starts a command only while g_ge_t
- * is behind the moment it may reach: the present at a firmware call
- * (psp_ge_tick), GE_KICK_WINDOW_US past it inside EnQueue, UpdateStallAddr
- * and Continue, the next deadline when every thread waits
- * (psp_ge_idle_run), and no limit in a Sync that waits or at a frame
- * boundary. The kick window is the 11-17 microseconds by which step 81's
- * EnQueue returns after its first SIGNAL's handler; the GE starts on a list
- * GE_ENQUEUE_US into the EnQueue call, which returns at the window's end.
+ * GE_UNITS_PER_US units a microsecond. The guest sees the GE get only as far
+ * as the moment it may reach: the present at a firmware call (psp_ge_tick),
+ * GE_KICK_WINDOW_US past it inside EnQueue, UpdateStallAddr and Continue,
+ * the next deadline when every thread waits (psp_ge_idle_run), and no limit
+ * in a Sync that waits or at a frame boundary. The kick window is the 11-17
+ * microseconds by which step 81's EnQueue returns after its first SIGNAL's
+ * handler; the GE starts on a list GE_ENQUEUE_US into the EnQueue call, which
+ * returns at the window's end.
  *
  * When a handler runs, the guest clock is moved up to the GE's time for it,
  * where the caller is waiting on the GE anyway: in a Sync that waits, while
@@ -397,23 +416,50 @@ static uint64_t g_ge_t;        /* the front end's time, in units */
 static uint64_t g_ge_back;     /* when the back end has drawn all it was given */
 static uint64_t g_ge_fifo[GE_FIFO_PRIMS];   /* when each of the last drawing commands is drawn */
 static unsigned g_ge_fifo_i;
-static uint64_t g_ge_limit;    /* a walk starts no command at or past this; 0: no limit */
-static int      g_ge_backlog;  /* released words may be waiting for the GE */
-static int      g_ge_follow;   /* the guest clock follows the GE to each handler */
 
-/* A handler the GE has asked for between firmware calls, waiting to run.
+/* Drawing now, reporting on the clock.
  *
- * Inside EnQueue, UpdateStallAddr and Continue, and in a Sync that waits,
- * handlers run as the GE reaches them. When the GE catches up at a firmware
- * call, a SIGNAL or FINISH it reaches is held here instead, and the GE waits
- * on it; the handler runs at the next firmware call made with interrupts
- * enabled, which is when the interrupt would have been taken. geprobe 5 step
- * 50 (fw 6.60) is the measurement: libgu's sceGuFinish releases a sprite and
- * the FINISH, then suspends and resumes interrupts, and the finish handler
- * runs after it has returned. `at` is the GE's time when it reached it; one
- * reached while every thread waits is held until the clock gets there. */
-static struct { int valid, cbid, finish; uint32_t id; uint64_t at; } g_ge_pend;
-static int g_ge_defer;         /* hold handlers in g_ge_pend (a catch-up) */
+ * The clock above moves only at firmware calls: guest code between them
+ * costs no time. A GE that drew no faster than that clock fell behind the
+ * game, where on a PSP the CPU's own work gives the GE time to keep up. The
+ * game went on to rewrite vertices and matrices the GE had not read yet, and
+ * parts of Last Raven's scenes flickered from frame to frame. So the walk
+ * (ge_execute) runs a list as soon as its words are released, as far as its
+ * stall, its end or a PAUSE, and works out the GE's times as it goes. What
+ * the guest can see of it -- a handler running, a list done or paused -- is
+ * not applied there. It goes into g_ev, stamped with the GE's time, and the
+ * timeline (ge_advance) applies it when the guest clock gets there, by the
+ * rules above.
+ *
+ * What the guest cannot see first is the order. A handler runs after the
+ * words behind its SIGNAL or FINISH have been drawn, and a list queued behind
+ * another can be drawn before the first one's finish handler runs. A handler
+ * that rewrites words the GE has already passed is too late here. On a PSP
+ * it may be in time.
+ *
+ * A held handler. Inside EnQueue, UpdateStallAddr and Continue, and in a
+ * Sync that waits, handlers run as the timeline reaches them. When it
+ * catches up at a firmware call, a SIGNAL or FINISH it reaches is held at
+ * the head of g_ev instead (g_ev_held), and the timeline waits on it. The
+ * handler runs at the next firmware call made with interrupts enabled, which
+ * is when the interrupt would have been taken. geprobe 5 step 50 (fw 6.60)
+ * is the measurement: libgu's sceGuFinish releases a sprite and the FINISH,
+ * then suspends and resumes interrupts, and the finish handler runs after it
+ * has returned. One reached while every thread waits is held until the
+ * clock gets to its time. */
+enum { GE_EV_HANDLER, GE_EV_DONE, GE_EV_PAUSE, GE_EV_PSIG };
+typedef struct {
+    int       kind, finish, cbid;
+    ge_queue *q;
+    uint32_t  qid;             /* q's id, in case its slot has been reused */
+    uint32_t  code, pc;        /* a handler's command and the address after its END */
+    uint64_t  start, at;       /* the GE's time at the command's start and end */
+} ge_event;
+#define GE_EVENTS 256
+static ge_event g_ev[GE_EVENTS];
+static unsigned g_ev_head, g_ev_n;
+static int      g_ev_held;     /* the head is a handler held for a firmware call */
+static int      g_ge_xfull;    /* the walk stopped for want of room in g_ev */
 
 static uint64_t ge_now(void) { return psp_clock_peek() * GE_UNITS_PER_US; }
 
@@ -559,6 +605,11 @@ static struct {
     int   bb_seen;
 } g_tl;
 
+/* Each bone matrix entry cut to 16 bits, as skinning takes it (bones_cut).
+ * Valid until a bone is written: GE_BONEMATRIXDATA, a reset, a state load. */
+static double g_bone16[8 * 12];
+static int    g_bone16_ok;
+
 /* A GE float argument: 24 bits of mantissa-truncated float, in the low bits. */
 static float ge_float(uint32_t arg) {
     union { uint32_t u; float f; } c;
@@ -677,13 +728,11 @@ static void ge_note_thread(void) {
 
 void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
-    g_ge_t = g_ge_limit = g_ge_back = 0;
+    g_ge_t = g_ge_back = 0;
     memset(g_ge_fifo, 0, sizeof g_ge_fifo);
     g_ge_fifo_i = 0;
-    g_ge_backlog = 0;
-    g_ge_follow = 0;
-    memset(&g_ge_pend, 0, sizeof g_ge_pend);
-    g_ge_defer = 0;
+    g_ev_head = g_ev_n = 0;
+    g_ev_held = g_ge_xfull = 0;
     memset(g_ge_cb, 0, sizeof g_ge_cb);
     memset(&g_ge, 0, sizeof g_ge);
     g_ge.fbfmt = 3;
@@ -701,6 +750,7 @@ void psp_ge_reset(void) {
     g_col_n = 0; g_col_last_valid = 0;
     g_clear_draws = g_clear_z_draws = 0;
     memset(&g_tl, 0, sizeof g_tl);
+    g_bone16_ok = 0;
     memset(&g_light_eye_from, 0, sizeof g_light_eye_from);
     g_next_id = 0x00080000u;
 }
@@ -1389,10 +1439,52 @@ static void mul_3x3(const float m[12], const float in[3], float out[3]) {
     out[2] = m[2]*in[0] + m[5]*in[1] + m[8]*in[2];
 }
 
+/* ---- Exact arithmetic without libm -----------------------------------------
+ *
+ * The vertex path below cuts, splits and scales every value it touches, and
+ * frexp, ldexp, trunc and floor are library calls on x86-64 without SSE4.1:
+ * they were most of a lit vertex's cost. These give the same doubles bit for
+ * bit wherever they take the fast path (a normal finite input, a power of two
+ * a double can hold) and fall back to the library call everywhere else. */
+static inline uint64_t ge_bits(double v) { uint64_t b; memcpy(&b, &v, sizeof b); return b; }
+static inline double ge_from_bits(uint64_t b) { double v; memcpy(&v, &b, sizeof v); return v; }
+
+/* 2^n, exactly. */
+static inline double ge_pow2(int n) {
+    return n >= -1022 && n <= 1023 ? ge_from_bits((uint64_t)(n + 1023) << 52) : ldexp(1.0, n);
+}
+
+/* ldexp(x, n): x times an exact 2^n rounds once, as ldexp does. */
+static inline double ge_ldexp(double x, int n) {
+    return n >= -1022 && n <= 1023 ? x * ge_pow2(n) : ldexp(x, n);
+}
+
+/* frexp's exponent of a normal, non-zero x (x = m 2^e, m in [0.5, 1));
+ * INT_MIN for anything else, whose callers keep frexp. */
+static inline int ge_frexp_e(double x) {
+    const int ex = (int)((ge_bits(x) >> 52) & 0x7FF);
+    return ex && ex != 0x7FF ? ex - 1022 : INT_MIN;
+}
+
+/* trunc and floor of a finite x below 2^52, through an integer; the sign of a
+ * zero result is the one the library gives. */
+static inline double ge_trunc(double x) {
+    if (!(fabs(x) < 4503599627370496.0)) return trunc(x);
+    const double r = (double)(int64_t)x;
+    return r == 0.0 ? copysign(0.0, x) : r;
+}
+static inline double ge_floor(double x) {
+    if (!(fabs(x) < 4503599627370496.0) || x == 0.0) return floor(x);
+    const int64_t i = (int64_t)x;
+    return (double)(i - ((double)i > x));
+}
+
 /* v with its significand cut to `bits` bits, toward zero or (round) to
- * nearest. */
+ * nearest. Toward zero on a normal v is clearing the low bits. */
 static double ge_cut(double v, int bits, int round) {
     if (v == 0.0 || !isfinite(v)) return v;
+    if (!round && bits >= 1 && bits <= 53 && ((ge_bits(v) >> 52) & 0x7FF))
+        return ge_from_bits(ge_bits(v) & ~((UINT64_C(1) << (53 - bits)) - 1));
     int e;
     const double m = ldexp(frexp(v, &e), bits);
     return ldexp(round ? floor(m + 0.5) : trunc(m), e - bits);
@@ -1433,7 +1525,7 @@ typedef struct {
 
 /* v cut to 16 significant bits toward zero, as a signed significand in
  * [2^15, 2^16) and an exponent; 0 for zero, -1 for a value not finite. */
-static int ge_split(double v, int64_t *s, int *e) {
+static inline int ge_split(double v, int64_t *s, int *e) {
     uint64_t b;
     memcpy(&b, &v, sizeof b);
     const int ex = (int)((b >> 52) & 0x7FF);
@@ -1451,7 +1543,7 @@ static int ge_split(double v, int64_t *s, int *e) {
     return 1;
 }
 
-static ge_term ge_mul(double a, double b) {
+static inline ge_term ge_mul(double a, double b) {
     ge_term t = { 0, INT_MIN, 0, a * b };
     int64_t sa, sb;
     int ea, eb;
@@ -1464,30 +1556,67 @@ static ge_term ge_mul(double a, double b) {
     return t;
 }
 
-static double ge_sum(const ge_term *t, int n) {
+/* A number split once for ge_mul -- ge_split's significand, exponent and
+ * verdict, and the number -- so that a matrix entry or a coordinate used in
+ * many products is not split again for each. */
+typedef struct { int64_t s; int e, bad; double v; } ge_sp;
+/* A zero splits to a zero significand, whose products are zero terms, as
+ * ge_mul makes them; a number not finite sets bad, as ge_split's -1 does. */
+static inline ge_sp ge_sp_of(double v) {
+    ge_sp r = { 0, 0, 0, v };
+    const int k = ge_split(v, &r.s, &r.e);
+    if (k <= 0) { r.s = 0; r.e = 0; r.bad = k < 0; }
+    return r;
+}
+
+/* ge_mul(a->v, b->v), from the split halves. A term whose q is zero is no
+ * term to ge_sum, whatever its e. The shift is toward zero, as ge_mul's. */
+static inline ge_term ge_mul_sp(const ge_sp *a, const ge_sp *b) {
+    const int64_t p = a->s * b->s;                 /* under 2^32 */
+    ge_term t;
+    t.q = (p + ((p >> 63) & 0x7FFF)) >> 15;
+    t.e = a->e + b->e;
+    t.bad = a->bad | b->bad;
+    t.v = a->v * b->v;
+    return t;
+}
+
+/* ge_sp_of for the value last asked of this memo, kept: the viewport and
+ * texture constants every vertex of a draw multiplies by. Keyed on the bits,
+ * so a changed constant is split afresh. */
+typedef struct { uint64_t key; int ok; ge_sp sp; } ge_sp_memo;
+static inline const ge_sp *ge_sp_memo_of(ge_sp_memo *m, double x) {
+    if (!m->ok || m->key != ge_bits(x)) { m->sp = ge_sp_of(x); m->key = ge_bits(x); m->ok = 1; }
+    return &m->sp;
+}
+static const ge_sp GE_SP_ONE = { 32768, 0, 0, 1.0 };      /* ge_sp_of(1.0) */
+
+static inline double ge_sum(const ge_term *t, int n) {
     int e = INT_MIN, bad = 0;
-    double plain = 0.0;
     for (int i = 0; i < n; i++) {
-        plain += t[i].v;
         bad |= t[i].bad;
         if (t[i].q && t[i].e > e) e = t[i].e;
     }
-    if (bad) return plain;
+    if (bad) {                                     /* the plain products' sum, in order */
+        double plain = 0.0;
+        for (int i = 0; i < n; i++) plain += t[i].v;
+        return plain;
+    }
     if (e == INT_MIN) return 0.0;
     int64_t s = 0;
     for (int i = 0; i < n; i++) {
         if (!t[i].q) continue;
         const int d = e - t[i].e;
         const int64_t m = t[i].q < 0 ? -t[i].q : t[i].q;
-        const int64_t a = d >= 63 ? 0 : m >> d;
+        const int64_t a = m >> (d < 63 ? d : 63);     /* m is under 2^34: 63 leaves 0 */
         s += t[i].q < 0 ? -a : a;
     }
     if (!s) return 0.0;
     int64_t m = s < 0 ? -s : s;
-    int sh = 0;
-    while ((m >> sh) >= 65536) sh++;               /* the total to 16 bits */
+    const int len = 64 - __builtin_clzll((uint64_t)m);
+    const int sh = len > 16 ? len - 16 : 0;        /* the total to 16 bits */
     m >>= sh;
-    return ldexp(s < 0 ? -(double)m : (double)m, e - 15 + sh);
+    return ge_ldexp(s < 0 ? -(double)m : (double)m, e - 15 + sh);
 }
 
 /* A vertex's texture coordinates, in units, through TEXSCALE and TEXOFFSET to
@@ -1497,8 +1626,12 @@ static double ge_sum(const ge_term *t, int n) {
  * texels, and this fits all 1800 readings; the float sum, as before, missed
  * 119 at 2^12. */
 static void uv_to_texels(float u, float v, psp_vertex *out) {
-    const ge_term tu[2] = { ge_mul(u, g_ge.tex_scale_u), ge_mul(g_ge.tex_offset_u, 1.0) };
-    const ge_term tv[2] = { ge_mul(v, g_ge.tex_scale_v), ge_mul(g_ge.tex_offset_v, 1.0) };
+    static ge_sp_memo su, ou, sv, ov;
+    const ge_sp us = ge_sp_of(u), vs = ge_sp_of(v);
+    const ge_term tu[2] = { ge_mul_sp(&us, ge_sp_memo_of(&su, g_ge.tex_scale_u)),
+                            ge_mul_sp(ge_sp_memo_of(&ou, g_ge.tex_offset_u), &GE_SP_ONE) };
+    const ge_term tv[2] = { ge_mul_sp(&vs, ge_sp_memo_of(&sv, g_ge.tex_scale_v)),
+                            ge_mul_sp(ge_sp_memo_of(&ov, g_ge.tex_offset_v), &GE_SP_ONE) };
     out->u = (float)(ge_sum(tu, 2) * (double)g_ge.tex_w);
     out->v = (float)(ge_sum(tv, 2) * (double)g_ge.tex_h);
     note_uv(out->u, out->v);
@@ -1537,6 +1670,16 @@ static void ge_wvp(double m[4][4]) {
 static void ge_clip(const double m[4][4], const float model[3], float clip[4]) {
     const double in[4] = { model[0], model[1], model[2], 1.0 };   /* ge_mul cuts each to 16 bits */
     for (int i = 0; i < 4; i++) clip[i] = (float)ge_dot4(m[i], in);
+}
+
+/* ge_clip through the matrix split once (ge_sp_of of each entry). */
+static void ge_clip_sp(const ge_sp m[4][4], const float model[3], float clip[4]) {
+    const ge_sp in[4] = { ge_sp_of(model[0]), ge_sp_of(model[1]), ge_sp_of(model[2]), ge_sp_of(1.0) };
+    for (int i = 0; i < 4; i++) {
+        const ge_term t[4] = { ge_mul_sp(&m[i][0], &in[0]), ge_mul_sp(&m[i][1], &in[1]),
+                               ge_mul_sp(&m[i][2], &in[2]), ge_mul_sp(&m[i][3], &in[3]) };
+        clip[i] = (float)ge_sum(t, 4);
+    }
 }
 
 /* 1/w as the GE has it. w is cut to 16 bits; the 7 significand bits below
@@ -1589,25 +1732,22 @@ static const uint32_t ge_rcp_tab[128][2] = {
 
 static double ge_rcp16(double w) {
     if (w == 0.0 || !isfinite(w)) return 1.0 / w;
-    int e;
-    const double m = frexp(fabs(w), &e);                     /* [0.5, 1) */
-    const uint32_t sig = (uint32_t)(m * 65536.0) & 0x7FFFu;  /* 15 bits below the leading one */
-    if (sig == 0) return copysign(ldexp(1.0, 1 - e), w);     /* a power of two: exact */
+    int e = ge_frexp_e(w);
+    uint32_t sig;
+    if (e != INT_MIN) sig = (uint32_t)(ge_bits(w) >> 37) & 0x7FFFu;    /* 15 bits below the leading one */
+    else {
+        const double m = frexp(fabs(w), &e);                 /* [0.5, 1) */
+        sig = (uint32_t)(m * 65536.0) & 0x7FFFu;
+    }
+    if (sig == 0) return copysign(ge_ldexp(1.0, 1 - e), w);  /* a power of two: exact */
     const uint32_t t = sig >> 8, l = sig & 0xFFu;
     const uint32_t q = (128u * ge_rcp_tab[t][0] - ge_rcp_tab[t][1] * l - 1u) >> 8;
-    return copysign(ldexp((double)q, -15 - e), w);           /* (q / 2^16) * 2^(1-e) */
+    return copysign(ge_ldexp((double)q, -15 - e), w);        /* (q / 2^16) * 2^(1-e) */
 }
 
 /* clip c over w as the GE forms it: c times 1/w, cut to 16 bits. */
 static double ge_over_w(double c, double w) {
     return ge_cut(c * ge_rcp16(w), 16, 0);
-}
-
-static void mul_4x4(const float m[16], const float in[3], float out[4]) {
-    out[0] = m[0]*in[0] + m[4]*in[1] + m[8] *in[2] + m[12];
-    out[1] = m[1]*in[0] + m[5]*in[1] + m[9] *in[2] + m[13];
-    out[2] = m[2]*in[0] + m[6]*in[1] + m[10]*in[2] + m[14];
-    out[3] = m[3]*in[0] + m[7]*in[1] + m[11]*in[2] + m[15];
 }
 
 /* One vertex as the transform stage takes it, after skinning and morphing:
@@ -1674,23 +1814,32 @@ static double ge_c16(double v) { return ge_cut(v, 16, 0); }
 static double ge_acc(double acc, double t) {
     if (t == 0.0 || !isfinite(t) || !isfinite(acc)) return t == 0.0 ? acc : acc + t;
     if (acc == 0.0) return ge_c16(t);
-    int ea, et;
-    frexp(acc, &ea);
-    frexp(t, &et);
-    const double u = ldexp(1.0, (ea > et ? ea : et) - 1 - 15);
-    return ge_c16(trunc(acc / u) * u + trunc(t / u) * u);
+    int ea = ge_frexp_e(acc), et = ge_frexp_e(t);
+    if (ea == INT_MIN) frexp(acc, &ea);
+    if (et == INT_MIN) frexp(t, &et);
+    const int n = (ea > et ? ea : et) - 1 - 15;
+    const double u = ge_pow2(n);
+    if (n > -1022 && n < 1022) {                   /* 1/u exact too: the same quotients */
+        const double iu = ge_pow2(-n);
+        return ge_c16(ge_trunc(acc * iu) * u + ge_trunc(t * iu) * u);
+    }
+    return ge_c16(ge_trunc(acc / u) * u + ge_trunc(t / u) * u);
 }
 
-/* One axis of a skinned position (B[c][k] = bone[3k + c]). */
-static float ge_skin_axis(const float *w, const float p[3], int c) {
+static void bones_cut(void) {
+    for (int i = 0; i < 8 * 12; i++) g_bone16[i] = ge_c16(g_tl.bone[i]);
+    g_bone16_ok = 1;
+}
+
+/* One axis of a skinned position (B[c][k] = bone[3k + c]), from the weights
+ * and the position already cut (v[3] = 1). */
+static float ge_skin_axis(const double *wi, const double v[4], int c) {
     static const int order[4] = { 3, 0, 1, 2 };
-    const double v[4] = { ge_c16(p[0]), ge_c16(p[1]), ge_c16(p[2]), 1.0 };
     double acc = 0.0;
     for (int i = 0; i < g_vl.w_n; i++) {
-        const double wi = ge_c16(w[i]);
         for (int j = 0; j < 4; j++) {
             const int k = order[j];
-            const double b = ge_c16(wi * ge_c16(g_tl.bone[12 * i + 3 * k + c]));
+            const double b = ge_c16(wi[i] * g_bone16[12 * i + 3 * k + c]);
             acc = ge_acc(acc, ge_c16(b * v[k]));
         }
     }
@@ -1699,13 +1848,11 @@ static float ge_skin_axis(const float *w, const float p[3], int c) {
 
 /* One axis of a skinned normal: the x, y and z terms of each bone in turn,
  * as a position's without its translation. */
-static float ge_skin_normal_axis(const float *w, const float n[3], int c) {
-    const double v[3] = { ge_c16(n[0]), ge_c16(n[1]), ge_c16(n[2]) };
+static float ge_skin_normal_axis(const double *wi, const double v[3], int c) {
     double acc = 0.0;
     for (int i = 0; i < g_vl.w_n; i++) {
-        const double wi = ge_c16(w[i]);
         for (int k = 0; k < 3; k++) {
-            const double b = ge_c16(wi * ge_c16(g_tl.bone[12 * i + 3 * k + c]));
+            const double b = ge_c16(wi[i] * g_bone16[12 * i + 3 * k + c]);
             acc = ge_acc(acc, ge_c16(b * v[k]));
         }
     }
@@ -1714,10 +1861,15 @@ static float ge_skin_normal_axis(const float *w, const float n[3], int c) {
 
 /* Skin a vertex in place, position and normal, by the GE's arithmetic. */
 static void skin_mvert(ge_mvert *o, const float *w, int want_normal) {
+    if (!g_bone16_ok) bones_cut();
+    double wi[8];
+    for (int i = 0; i < g_vl.w_n; i++) wi[i] = ge_c16(w[i]);
+    const double v[4] = { ge_c16(o->pos[0]), ge_c16(o->pos[1]), ge_c16(o->pos[2]), 1.0 };
     float p[3], sn[3];
-    for (int c = 0; c < 3; c++) p[c] = ge_skin_axis(w, o->pos, c);
+    for (int c = 0; c < 3; c++) p[c] = ge_skin_axis(wi, v, c);
     if (want_normal) {
-        for (int c = 0; c < 3; c++) sn[c] = ge_skin_normal_axis(w, o->nrm, c);
+        const double nv[3] = { ge_c16(o->nrm[0]), ge_c16(o->nrm[1]), ge_c16(o->nrm[2]) };
+        for (int c = 0; c < 3; c++) sn[c] = ge_skin_normal_axis(wi, nv, c);
         memcpy(o->nrm, sn, sizeof sn);
     }
     memcpy(o->pos, p, sizeof p);
@@ -1819,7 +1971,7 @@ static float ge_screen_z(float cz, float w) {
     if (g_tl.vp_zs == 0.0f) return ((cz / w) * 0.5f + 0.5f) * 65535.0f;
     const double nz = ge_over_w(cz, w);
     const ge_term t[2] = { ge_mul(g_tl.vp_zs, nz), ge_mul(g_tl.vp_zc, 1.0) };
-    return (float)floor(ge_sum(t, 2));
+    return (float)ge_floor(ge_sum(t, 2));
 }
 
 static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
@@ -1838,7 +1990,7 @@ static int ge_screen_axis(double ndc, float scale, float centre, float off) {
     double v = (ge_sum(t, 2) - (double)off) * PSP_SUBPX;
     if (!(v > -1073741824.0)) v = -1073741824.0;   /* NaN too */
     if (v > 1073741824.0) v = 1073741824.0;
-    return (int)floor(v);
+    return (int)ge_floor(v);
 }
 
 /* The same projection onto the rasterizer's grid, as screen_axis_fx16 says.
@@ -1875,6 +2027,44 @@ static void clip_to_fx16(const float clip[4], int *x, int *y) {
     } else {
         *x = screen_axis_fx16(nx, 240.0f, 240.0f);
         *y = screen_axis_fx16(ny, -136.0f, 136.0f);
+    }
+}
+
+/* ge_screen_axis with the scale and centre split through memos, one pair
+ * per axis. */
+static int ge_screen_axis_m(double ndc, float scale, float centre, float off, ge_sp_memo m[2]) {
+    const ge_sp n = ge_sp_of(ndc);
+    const ge_term t[2] = { ge_mul_sp(ge_sp_memo_of(&m[0], scale), &n),
+                           ge_mul_sp(ge_sp_memo_of(&m[1], centre), &GE_SP_ONE) };
+    double v = (ge_sum(t, 2) - (double)off) * PSP_SUBPX;
+    if (!(v > -1073741824.0)) v = -1073741824.0;   /* NaN too */
+    if (v > 1073741824.0) v = 1073741824.0;
+    return (int)ge_floor(v);
+}
+
+/* to_screen and clip_to_fx16 for one vertex at once: their three ge_over_w
+ * take 1/w from the same table entry, so it is looked up once. clip[3] must
+ * be past the near limit, as for those two. */
+static void clip_to_screen(const float clip[4], float *sx, float *sy, float *sz, int *x, int *y) {
+    const float inv = 1.0f / clip[3];
+    float unused;
+    ndc_to_screen(clip[0] * inv, clip[1] * inv, clip[2] * inv, sx, sy, &unused);
+    static ge_sp_memo mz[2], mx[2], my[2];
+    const double r = ge_rcp16(clip[3]);
+    if (g_tl.vp_zs == 0.0f) *sz = ((clip[2] / clip[3]) * 0.5f + 0.5f) * 65535.0f;
+    else {
+        const ge_sp nz = ge_sp_of(ge_cut(clip[2] * r, 16, 0));
+        const ge_term t[2] = { ge_mul_sp(ge_sp_memo_of(&mz[0], g_tl.vp_zs), &nz),
+                               ge_mul_sp(ge_sp_memo_of(&mz[1], g_tl.vp_zc), &GE_SP_ONE) };
+        *sz = (float)ge_floor(ge_sum(t, 2));
+    }
+    const double gx = ge_cut(clip[0] * r, 16, 0), gy = ge_cut(clip[1] * r, 16, 0);
+    if (g_tl.vp_set) {
+        *x = ge_screen_axis_m(gx, g_tl.vp_xs, g_tl.vp_xc, g_tl.off_x, mx);
+        *y = ge_screen_axis_m(gy, g_tl.vp_ys, g_tl.vp_yc, g_tl.off_y, my);
+    } else {
+        *x = screen_axis_fx16((float)gx, 240.0f, 240.0f);
+        *y = screen_axis_fx16((float)gy, -136.0f, 136.0f);
     }
 }
 
@@ -2349,11 +2539,28 @@ static void lights_to_eye(void) {
 static float ge_pow(float x, float k) {
     if (!(x > 0.0f)) return 0.0f;
     int e;
-    const float m = frexpf(x, &e);                          /* [0.5, 1) */
+    float m;                                                /* [0.5, 1) */
+    uint32_t b;
+    memcpy(&b, &x, sizeof b);
+    if (((b >> 23) & 0xFF) && ((b >> 23) & 0xFF) != 0xFF) { /* normal: frexpf by hand */
+        e = (int)((b >> 23) & 0xFF) - 126;
+        b = (b & 0x807FFFFFu) | (126u << 23);
+        memcpy(&m, &b, sizeof m);
+    } else m = frexpf(x, &e);
     const float y = k * ((float)(e - 1) + (2.0f * m - 1.0f));
     if (!(y > -126.0f)) return 0.0f;
-    const float n = floorf(y);
-    return ldexpf(1.0f + (y - n), (int)n);
+    if (!(y < 127.0f)) {                                    /* the library's overflow */
+        const float n = floorf(y);
+        return ldexpf(1.0f + (y - n), (int)n);
+    }
+    /* floorf and ldexpf: y is in (-126, 127), so n is an int and 2^n a
+     * normal float, and the product rounds once as ldexpf's does. */
+    const int ni = (int)y - ((float)(int)y > y);
+    const float n = (float)ni;
+    const uint32_t pb = (uint32_t)(ni + 127) << 23;
+    float p;
+    memcpy(&p, &pb, sizeof p);
+    return (1.0f + (y - n)) * p;
 }
 
 /* ---- The lighting's vectors (geprobe 17, fw 6.60) ----------------------
@@ -2438,7 +2645,7 @@ static double ge_rsqrt16(double s) {
     if (!(s > 0.0) || ge_split(s, &sig, &e) <= 0) return INFINITY;
     const int p = e & 1, t = (int)((sig & 0x7FFF) >> 8), l = (int)(sig & 0xFF);
     const int64_t q = (128 * (int64_t)ge_rsq_tab[p][t][0] - (int64_t)ge_rsq_tab[p][t][1] * l - 1) >> 8;
-    return ldexp((double)q, -16 - (e - p) / 2);
+    return ge_ldexp((double)q, -16 - (e - p) / 2);
 }
 
 static double gl_mul(double a, double b) { const ge_term t = ge_mul(a, b); return ge_sum(&t, 1); }
@@ -2452,18 +2659,6 @@ static double gl_dot3(const double a[3], const double b[3]) {
 static void gl_unit(const double v[3], double o[3]) {
     const double r = ge_rsqrt16(gl_dot3(v, v));
     for (int k = 0; k < 3; k++) o[k] = isfinite(r) ? ge_cut(v[k] * r, 16, 0) : 0.0;
-}
-
-/* a . u, a taken as given and its 1/sqrt applied to the dot product. */
-static double gl_dot_scaled(const double a[3], const double u[3]) {
-    const double aa = gl_dot3(a, a);
-    if (!(aa > 0.0)) return 0.0;
-    return gl_mul(gl_dot3(a, u), ge_rsqrt16(aa));
-}
-
-/* x^k for the lighting: k cut to 5 significant bits, then ge_pow. */
-static float gl_pow(double x, float k) {
-    return x > 0.0 ? ge_pow((float)x, (float)ge_cut(k, 5, 0)) : 0.0f;
 }
 
 static inline int any_light_enabled(void) {
@@ -2513,45 +2708,137 @@ static inline int lit_colour_byte(float c) { return (int)lrintf(c * 255.0f); }
  *    is identity it is (0, 0, 1), as sets 18 and 19 had it.
  *  - The attenuation's quadratic term is k2 (L.L), not (k2 d) d: one of
  *    3000 attenuation bytes tells them apart, and it reads k2 (L.L). */
+/* What light_vertex needs that does not change within a draw, worked out once
+ * per draw by light_setup: the colour bytes, the eye's direction, and for a
+ * directional light its L and H, which do not depend on the vertex. Every
+ * value is the one light_vertex used to work out for each vertex, by the same
+ * arithmetic. */
+static struct {
+    int emissive[3], global_amb[3], mat_amb[3], mat_dif[3], mat_spc[3];
+    double E[3];
+    ge_sp W[9];                         /* the world matrix's 3x3, split for ge_mul */
+    float spec_k;                       /* the specular coefficient, cut to 5 bits */
+    struct {
+        int amb[3], dif[3], spec[3];
+        ge_sp L[3], H[3];               /* directional only, split */
+        ge_sp tp[3];                    /* point and spot: t - p, one GE sum, split */
+        ge_sp D[3];                     /* spot: its direction, split */
+        double d_rs;                    /* and 1/sqrt(D.D) */
+        int d_ok;                       /* D.D > 0 */
+        float spot_k;                   /* the spot exponent, cut to 5 bits */
+    } light[4];
+} g_ls;
+
+static void light_setup(void) {
+    for (int k = 0; k < 3; k++) {
+        g_ls.emissive[k]   = lit_colour_byte(g_tl.mat_emissive[k]);
+        g_ls.global_amb[k] = lit_colour_byte(g_tl.global_amb[k]);
+        g_ls.mat_amb[k]    = lit_colour_byte(g_tl.mat_ambient[k]);
+        g_ls.mat_dif[k]    = lit_colour_byte(g_tl.mat_diffuse[k]);
+        g_ls.mat_spc[k]    = lit_colour_byte(g_tl.mat_specular[k]);
+    }
+    if (!any_light_enabled()) return;
+    const double Ev[3] = { g_tl.view[2], g_tl.view[5], g_tl.view[8] };
+    gl_unit(Ev, g_ls.E);
+    g_ls.spec_k = (float)ge_cut(g_tl.mat_spec_coef, 5, 0);
+    const float *W = g_tl.world;
+    for (int k = 0; k < 9; k++) g_ls.W[k] = ge_sp_of(W[k]);
+    for (int i = 0; i < 4; i++) {
+        if (!g_tl.light[i].enable) continue;
+        for (int k = 0; k < 3; k++) {
+            g_ls.light[i].amb[k]  = lit_colour_byte(g_tl.light[i].amb[k]);
+            g_ls.light[i].dif[k]  = lit_colour_byte(g_tl.light[i].dif[k]);
+            g_ls.light[i].spec[k] = lit_colour_byte(g_tl.light[i].spec[k]);
+        }
+        if (g_tl.light[i].type == 0) {
+            const double Lv[3] = { g_tl.light[i].pos[0], g_tl.light[i].pos[1], g_tl.light[i].pos[2] };
+            double L[3], Hv[3], H[3];
+            gl_unit(Lv, L);
+            for (int k = 0; k < 3; k++) {
+                const ge_term h[2] = { ge_mul(L[k], 1.0), ge_mul(g_ls.E[k], 1.0) };
+                Hv[k] = ge_sum(h, 2);
+            }
+            gl_unit(Hv, H);
+            for (int k = 0; k < 3; k++) {
+                g_ls.light[i].L[k] = ge_sp_of(L[k]);
+                g_ls.light[i].H[k] = ge_sp_of(H[k]);
+            }
+        } else {
+            for (int k = 0; k < 3; k++) {
+                const ge_term tp[2] = { ge_mul(W[9 + k], 1.0), ge_mul(g_tl.light[i].pos[k], -1.0) };
+                g_ls.light[i].tp[k] = ge_sp_of(ge_sum(tp, 2));
+            }
+        }
+        if (g_tl.light[i].type == 2) {
+            const double D[3] = { g_tl.light[i].dir[0], g_tl.light[i].dir[1], g_tl.light[i].dir[2] };
+            for (int k = 0; k < 3; k++) g_ls.light[i].D[k] = ge_sp_of(D[k]);
+            const double dd = gl_dot3(D, D);
+            g_ls.light[i].d_ok = dd > 0.0;
+            g_ls.light[i].d_rs = g_ls.light[i].d_ok ? ge_rsqrt16(dd) : 0.0;
+            g_ls.light[i].spot_k = (float)ge_cut(g_tl.light[i].exponent, 5, 0);
+        }
+    }
+}
+
+/* gl_dot3 of split vectors. */
+static inline double gl_dot3_sp(const ge_sp a[3], const ge_sp b[3]) {
+    const ge_term t[3] = { ge_mul_sp(&a[0], &b[0]), ge_mul_sp(&a[1], &b[1]), ge_mul_sp(&a[2], &b[2]) };
+    return ge_sum(t, 3);
+}
+
+/* a . u, a taken as given and its 1/sqrt applied to the dot product, with
+ * a's half worked out already: whether a.a > 0 (ok), and its 1/sqrt (rs). */
+static double gl_dot_pre(int ok, double rs, const ge_sp a[3], const ge_sp u[3]) {
+    return ok ? gl_mul(gl_dot3_sp(a, u), rs) : 0.0;
+}
+
+/* x^k for the lighting, k already cut to 5 significant bits (ge_cut(k, 5, 0)). */
+static float gl_pow_k(double x, float k) { return x > 0.0 ? ge_pow((float)x, k) : 0.0f; }
+
 static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba, psp_vertex *lit) {
     const int vc[3] = { (int)(*rgba & 0xFFu), (int)((*rgba >> 8) & 0xFFu), (int)((*rgba >> 16) & 0xFFu) };
     /* MATERIAL_COLOR picks which material components the vertex colour
      * supplies: bit 0 ambient, bit 1 diffuse, bit 2 specular. */
     int m_amb[3], m_dif[3], m_spc[3];
     for (int k = 0; k < 3; k++) {
-        m_amb[k] = (g_tl.mat_update & 1) ? vc[k] : lit_colour_byte(g_tl.mat_ambient[k]);
-        m_dif[k] = (g_tl.mat_update & 2) ? vc[k] : lit_colour_byte(g_tl.mat_diffuse[k]);
-        m_spc[k] = (g_tl.mat_update & 4) ? vc[k] : lit_colour_byte(g_tl.mat_specular[k]);
+        m_amb[k] = (g_tl.mat_update & 1) ? vc[k] : g_ls.mat_amb[k];
+        m_dif[k] = (g_tl.mat_update & 2) ? vc[k] : g_ls.mat_dif[k];
+        m_spc[k] = (g_tl.mat_update & 4) ? vc[k] : g_ls.mat_spc[k];
     }
 
     int out[3], sec[3] = { 0, 0, 0 };
     for (int k = 0; k < 3; k++)
-        out[k] = lit_colour_byte(g_tl.mat_emissive[k]) + lit_mul(lit_colour_byte(g_tl.global_amb[k]), m_amb[k]);
+        out[k] = g_ls.emissive[k] + lit_mul(g_ls.global_amb[k], m_amb[k]);
 
     /* With every light disabled the colour is emissive plus ambient and the
      * normal never enters: skip the loop. Same result. */
     if (any_light_enabled()) {
-    const float *W = g_tl.world;                 /* row i, column j at W[3j + i]; t at W[9 + i] */
-    double n[3], E[3];
+    const ge_sp *W = g_ls.W;                     /* row i, column j at W[3j + i] */
+    const ge_sp N[3] = { ge_sp_of(nm[0]), ge_sp_of(nm[1]), ge_sp_of(nm[2]) };
+    const ge_sp M[3] = { ge_sp_of(model[0]), ge_sp_of(model[1]), ge_sp_of(model[2]) };
+    const ge_sp one = ge_sp_of(1.0);
+    double n[3];
     for (int i = 0; i < 3; i++) {
-        const ge_term t[3] = { ge_mul(W[i], nm[0]), ge_mul(W[3 + i], nm[1]), ge_mul(W[6 + i], nm[2]) };
+        const ge_term t[3] = { ge_mul_sp(&W[i], &N[0]), ge_mul_sp(&W[3 + i], &N[1]), ge_mul_sp(&W[6 + i], &N[2]) };
         n[i] = ge_sum(t, 3);
     }
-    {
-        const double Ev[3] = { g_tl.view[2], g_tl.view[5], g_tl.view[8] };
-        gl_unit(Ev, E);
-    }
+    /* N's half of every N.L and N.H below (gl_dot_pre). */
+    const ge_sp Ns[3] = { ge_sp_of(n[0]), ge_sp_of(n[1]), ge_sp_of(n[2]) };
+    const double nn = gl_dot3_sp(Ns, Ns);
+    const int n_ok = nn > 0.0;
+    const double n_rs = n_ok ? ge_rsqrt16(nn) : 0.0;
     for (int i = 0; i < 4; i++) {
         if (!g_tl.light[i].enable) continue;
         double Lv[3], L[3];
+        ge_sp Ls[3];
+        const ge_sp *Lp = Ls;
         float att = 1.0f, spot = 1.0f;
         if (g_tl.light[i].type == 0) {
-            for (int k = 0; k < 3; k++) Lv[k] = g_tl.light[i].pos[k];
+            Lp = g_ls.light[i].L;
         } else {
             for (int k = 0; k < 3; k++) {
-                const ge_term tp[2] = { ge_mul(W[9 + k], 1.0), ge_mul(g_tl.light[i].pos[k], -1.0) };
-                const ge_term t[4] = { ge_mul(W[k], model[0]), ge_mul(W[3 + k], model[1]),
-                                       ge_mul(W[6 + k], model[2]), ge_mul(ge_sum(tp, 2), 1.0) };
+                const ge_term t[4] = { ge_mul_sp(&W[k], &M[0]), ge_mul_sp(&W[3 + k], &M[1]),
+                                       ge_mul_sp(&W[6 + k], &M[2]), ge_mul_sp(&g_ls.light[i].tp[k], &one) };
                 Lv[k] = -ge_sum(t, 4);
             }
             const double ll = gl_dot3(Lv, Lv);
@@ -2560,38 +2847,43 @@ static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba
                                     ge_mul(g_tl.light[i].atten[2], ll) };
             const double a = ge_sum(at, 3);
             att = a != 0.0 ? (float)ge_rcp16(a) : 1.0f;
+            gl_unit(Lv, L);
+            for (int k = 0; k < 3; k++) Ls[k] = ge_sp_of(L[k]);
         }
-        gl_unit(Lv, L);
 
         if (g_tl.light[i].type == 2) {
-            const double D[3] = { g_tl.light[i].dir[0], g_tl.light[i].dir[1], g_tl.light[i].dir[2] };
-            const double sdot = gl_dot_scaled(D, L);
+            const double sdot = gl_dot_pre(g_ls.light[i].d_ok, g_ls.light[i].d_rs, g_ls.light[i].D, Lp);
             if (!(sdot >= g_tl.light[i].cutoff)) continue;
-            spot = gl_pow(sdot, g_tl.light[i].exponent);
+            spot = gl_pow_k(sdot, g_ls.light[i].spot_k);
         }
 
-        const double ndl = gl_dot_scaled(n, L);
+        const double ndl = gl_dot_pre(n_ok, n_rs, Ns, Lp);
         float dfac = ndl > 0.0 ? (float)ndl : 0.0f;
-        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = gl_pow(dfac, g_tl.mat_spec_coef);
+        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = gl_pow_k(dfac, g_ls.spec_k);
 
         float sfac = 0.0f;
         if (g_tl.light[i].kind == 1 && ndl >= 0.0) {
-            double Hv[3];
-            for (int k = 0; k < 3; k++) {
-                const ge_term h[2] = { ge_mul(L[k], 1.0), ge_mul(E[k], 1.0) };
-                Hv[k] = ge_sum(h, 2);
+            ge_sp Hs[3];
+            const ge_sp *H = g_ls.light[i].H;
+            if (g_tl.light[i].type != 0) {
+                double Hv[3], Hb[3];
+                for (int k = 0; k < 3; k++) {
+                    const ge_term h[2] = { ge_mul(L[k], 1.0), ge_mul(g_ls.E[k], 1.0) };
+                    Hv[k] = ge_sum(h, 2);
+                }
+                gl_unit(Hv, Hb);
+                for (int k = 0; k < 3; k++) Hs[k] = ge_sp_of(Hb[k]);
+                H = Hs;
             }
-            double H[3];
-            gl_unit(Hv, H);
-            sfac = gl_pow(gl_dot_scaled(n, H), g_tl.mat_spec_coef);
+            sfac = gl_pow_k(gl_dot_pre(n_ok, n_rs, Ns, H), g_ls.spec_k);
         }
 
         const int vd = lit_byte(dfac), vs = lit_byte(sfac);
         const int va = att >= 1.0f ? 255 : lit_byte(att), vsp = spot >= 1.0f ? 255 : lit_byte(spot);
         for (int k = 0; k < 3; k++) {
-            const int t = lit_mul(lit_colour_byte(g_tl.light[i].amb[k]), m_amb[k])
-                        + lit_mul(vd, lit_mul(lit_colour_byte(g_tl.light[i].dif[k]), m_dif[k]));
-            const int ts = lit_mul(vs, lit_mul(lit_colour_byte(g_tl.light[i].spec[k]), m_spc[k]));
+            const int t = lit_mul(g_ls.light[i].amb[k], m_amb[k])
+                        + lit_mul(vd, lit_mul(g_ls.light[i].dif[k], m_dif[k]));
+            const int ts = lit_mul(vs, lit_mul(g_ls.light[i].spec[k], m_spc[k]));
             out[k] += lit_mul(vsp, lit_mul(va, t));
             sec[k] += lit_mul(vsp, lit_mul(va, ts));
         }
@@ -2730,7 +3022,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                              fabsf(g_tl.proj[11]) < 1e-6f &&
                              fabsf(g_tl.proj[15]) > 1e-6f;
     const uint64_t _x0 = ge_prof_now();
-    if (g_tl.lighting) lights_to_eye();
+    if (g_tl.lighting) { lights_to_eye(); light_setup(); }
     const int any_light = g_tl.lighting && any_light_enabled();
 
     /* The backend's transform, when it offers one. Triangles only (points,
@@ -2828,6 +3120,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
 
     double wvp[4][4];
     ge_wvp(wvp);
+    ge_sp wsp[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) wsp[i][j] = ge_sp_of(wvp[i][j]);
     uint32_t done = 0;
     psp_vertex centre_v;
     float centre_cl[4];
@@ -2861,12 +3156,14 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             }
             const uint64_t _p1 = ge_prof_now();
 
-            mul_4x3(g_tl.world, model, world);
-            mul_4x3(g_tl.view,  world, eye);
-            mul_4x4(g_tl.proj,  eye,   clip);
+            /* The eye position only feeds the fog. */
+            if (g_tl.fog_enable) {
+                mul_4x3(g_tl.world, model, world);
+                mul_4x3(g_tl.view,  world, eye);
+            }
             /* Clip space as the GE forms it (ge_clip), for depth
              * (ge_screen_z) and position (clip_to_fx16). */
-            ge_clip(wvp, model, clip);
+            ge_clip_sp(wsp, model, clip);
             const uint64_t _p2 = ge_prof_now();
 
             psp_vertex *o = &v[decoded];
@@ -2932,11 +3229,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             const uint64_t _p4 = ge_prof_now();
             memcpy(cl[decoded], clip, sizeof clip);
             float sx, sy, sz;
-            if (clip[3] > 1e-6f) to_screen(clip, &sx, &sy, &sz);
-            else                 sx = sy = sz = 0.0f;
             /* Onto the 1/16 grid, as screen_axis_fx16 explains. */
-            if (clip[3] > 1e-6f) clip_to_fx16(clip, &o->x, &o->y);
-            else                 o->x = o->y = 0;
+            if (clip[3] > 1e-6f) clip_to_screen(clip, &sx, &sy, &sz, &o->x, &o->y);
+            else { sx = sy = sz = 0.0f; o->x = o->y = 0; }
             o->precise_x = sx; o->precise_y = sy; o->precise = 1;
             o->z = sz;
             o->inv_w = clip[3] > 1e-6f ? 1.0f / clip[3] : 1.0f;
@@ -3686,12 +3981,16 @@ static void draw_patch(int spline, uint32_t arg) {
  * malformed or partially-written list hangs the host with no diagnostic. */
 static void run_list_body(ge_queue *q);
 
-/* Set while a list is being walked. A GE callback is guest code and may call
- * back into sceGe; a walk it would start is left to the one already running,
- * which reads the stall afresh on every word, or to the next Sync. */
+/* Set while a list is being walked. No guest code runs inside a walk, since
+ * handlers run from the timeline, but a walk is never started inside one. */
 static int g_ge_walking;
-/* Set while a handler runs outside a walk (one held for a firmware call): a
- * firmware call it makes does not start the GE again inside it. */
+/* Set while the timeline applies events, calling handlers as it reaches
+ * them. A handler is guest code and may call back into sceGe. A list it
+ * enqueues or releases is walked at once. The timeline it would start is left
+ * to the one already running, which goes on to that list's events. */
+static int g_tl_in;
+/* Set while a handler runs outside the timeline (one held for a firmware
+ * call): a firmware call it makes does not start the timeline again inside it. */
 static int g_ge_in_cb;
 
 /* A SIGNAL or FINISH interrupt handler, called the way the firmware calls it:
@@ -3700,25 +3999,28 @@ static int g_ge_in_cb;
  * and 0x0E020055 then FINISH 0x0F000066 under signal_arg 0x5A, finish_arg
  * 0xA5 reach the handlers as (0x44, 0x5A), (0x55, 0x5A), (0x66, 0xA5).
  * On hardware they run in interrupt context; here on the thread driving the
- * list, with dispatch off so a handler cannot block or be switched away. */
-static void ge_callback(int cbid, int finish, uint32_t id) {
+ * list, as an interrupt (src/hle/interrupt.c), with dispatch off so a
+ * handler cannot block or be switched away.
+ *
+ * From the game's callback probe (tests/provenance/ge, recorded under an
+ * emulator, not a PSP): the handler runs with its module's gp and the
+ * incoming VFPU controls, and a module built against SDK 0x02000011 or
+ * later finds in a2 the address after the END that follows the command
+ * (`pc`). A host that registers no module keeps the interrupted thread's
+ * gp, as this did before. */
+static void ge_callback(int cbid, int finish, uint32_t id, uint32_t pc) {
     if (cbid < 0 || cbid >= GE_MAX_CALLBACKS || !g_ge_cb[cbid].used) return;
     const uint32_t fn  = finish ? g_ge_cb[cbid].finish_func : g_ge_cb[cbid].signal_func;
     const uint32_t arg = finish ? g_ge_cb[cbid].finish_arg  : g_ge_cb[cbid].signal_arg;
     if (!fn) return;
-    const psp_cpu_state save = psp_cpu;
+    /* Guest code is about to read what the GE drew. */
+    psp_render_current()->finish();
+    const uint32_t a2 = psp_sysmem_compiled_sdk() >= 0x02000011u ? pc : 0;
     const int was = psp_sched_set_dispatch(0);
-    psp_cpu.r[PSP_REG_A0] = id & 0xFFFFu;
-    psp_cpu.r[PSP_REG_A1] = arg;
-    psp_cpu.r[PSP_REG_RA] = 0;
-    psp_dispatch(fn);
+    psp_interrupt_call_now(fn, psp_interrupt_handler_gp(fn), id & 0xFFFFu, arg, a2);
     psp_sched_set_dispatch(was);
-    psp_cpu = save;
 }
 
-/* The GE reaching a SIGNAL or FINISH: the handler runs now, or, during a
- * catch-up, is held in g_ge_pend. Returns nonzero when the walk has to stop
- * and wait for it. A list with no handler for it does not wait. */
 /* The guest clock moved up to GE time `at`, for a handler that runs there
  * (see "When the GE runs"). Never back. */
 static void ge_clock_to(uint64_t at) {
@@ -3726,17 +4028,55 @@ static void ge_clock_to(uint64_t at) {
     if (us > psp_clock_peek()) psp_clock_advance_to(us);
 }
 
-static int ge_raise(int cbid, int finish, uint32_t id) {
-    if (cbid < 0 || cbid >= GE_MAX_CALLBACKS || !g_ge_cb[cbid].used ||
-        !(finish ? g_ge_cb[cbid].finish_func : g_ge_cb[cbid].signal_func)) return 0;
-    if (!g_ge_defer) {
-        if (g_ge_follow) ge_clock_to(g_ge_t);
-        ge_callback(cbid, finish, id);
-        return 0;
-    }
-    g_ge_pend.valid = 1; g_ge_pend.cbid = cbid; g_ge_pend.finish = finish; g_ge_pend.id = id;
-    g_ge_pend.at = g_ge_t;
-    return 1;
+/* ---- the events (see "Drawing now, reporting on the clock") ---- */
+
+static ge_event *ev_at(unsigned i) { return &g_ev[(g_ev_head + i) % GE_EVENTS]; }
+
+/* The walk has run a command the guest will see, `start` being the GE's
+ * time when the command started. The walk stops before a command while fewer
+ * than two slots are free, so there is room. */
+static void ev_push(int kind, ge_queue *q, int finish, uint32_t code, uint32_t pc, uint64_t start) {
+    ge_event *e = ev_at(g_ev_n++);
+    e->kind = kind; e->finish = finish; e->cbid = q->cbid;
+    e->q = q; e->qid = q->id;
+    e->code = code; e->pc = pc;
+    e->start = start; e->at = g_ge_t;
+}
+
+static void ev_pop(void) {
+    g_ev_head = (g_ev_head + 1) % GE_EVENTS;
+    g_ev_n--;
+    g_ev_held = 0;
+}
+
+static void ev_remove(unsigned i) {
+    if (i == 0) { ev_pop(); return; }
+    for (; i + 1 < g_ev_n; i++) *ev_at(i) = *ev_at(i + 1);
+    g_ev_n--;
+}
+
+/* Whether an event's list is still in its slot: a list retired by DrawSync
+ * may have given the slot to a new one. */
+static int ev_live(const ge_event *e) { return e->q->used && e->q->id == e->qid; }
+
+/* A SIGNAL or FINISH that has a handler to call. Asked when the timeline
+ * reaches it, as the GE asks when it does. */
+static int ev_has_handler(const ge_event *e) {
+    return e->cbid >= 0 && e->cbid < GE_MAX_CALLBACKS && g_ge_cb[e->cbid].used &&
+           (e->finish ? g_ge_cb[e->cbid].finish_func : g_ge_cb[e->cbid].signal_func);
+}
+
+/* The walk reaching a SIGNAL or FINISH whose list names a callback. */
+static void ge_x_raise(ge_queue *q, int finish, uint32_t code, uint32_t pc, uint64_t start) {
+    if (q->cbid < 0 || q->cbid >= GE_MAX_CALLBACKS) return;
+    ev_push(GE_EV_HANDLER, q, finish, code, pc, start);
+}
+
+/* The walk reaching a list's end. A capture's replay has no guest to tell. */
+static void ge_x_done(ge_queue *q, uint64_t start) {
+    q->xdone = 1;
+    if (q->replay) q->done = 1;
+    else ev_push(GE_EV_DONE, q, 0, 0, 0, start);
 }
 
 /* Run a held handler. `force` runs it whatever the interrupt state (a wait on
@@ -3744,14 +4084,24 @@ static int ge_raise(int cbid, int finish, uint32_t id) {
  * the GE reached it; otherwise only with interrupts enabled and once the
  * clock has got there. Returns nonzero if one is still held. */
 static int ge_deliver(int force) {
-    if (!g_ge_pend.valid) return 0;
-    if (!force && (!psp_intr_enabled() || g_ge_pend.at > ge_now())) return 1;
-    g_ge_pend.valid = 0;
-    if (force) ge_clock_to(g_ge_pend.at);
+    if (!g_ev_held) return 0;
+    const ge_event e = *ev_at(0);
+    if (!force && (!psp_intr_enabled() || e.at > ge_now())) return 1;
+    ev_pop();
+    if (force) ge_clock_to(e.at);
     g_ge_in_cb = 1;
-    ge_callback(g_ge_pend.cbid, g_ge_pend.finish, g_ge_pend.id);
+    ge_callback(e.cbid, e.finish, e.code, e.pc);
     g_ge_in_cb = 0;
     return 0;
+}
+
+/* For the interrupt layer (src/hle/interrupt.c): a handler held for an
+ * interrupt-enabled moment, and delivering it at a completed firmware call. */
+int psp_ge_callbacks_pending(void) { return g_ev_held; }
+
+void psp_ge_run_pending_callbacks(void) {
+    if (g_tl_in || g_ge_in_cb || psp_interrupt_in_handler()) return;
+    ge_deliver(0);
 }
 
 /* BBOX (0x07): the next `count` vertices at VADDR, of the current vertex
@@ -3839,17 +4189,16 @@ static void ge_back_push(uint64_t pixels) {
 }
 
 static void run_list(ge_queue *q) {
-    if (g_ge_walking || q->paused || q->hung) return;
+    if (g_ge_walking || q->xpaused || q->hung) return;
     g_ge_walking = 1;
     const uint64_t _r0 = ge_prof_now();
     run_list_body(q);
+    q->t_x = g_ge_t;
     if (g_prof_on > 0) { g_prof_m[3] += ge_prof_now() - _r0; g_prof_lists++; }
     g_ge_walking = 0;
 }
 static void run_list_body(ge_queue *q) {
     ge_note_thread();
-    uint32_t stack[GE_STACK];
-    int sp = 0;
     uint64_t budget = 1u << 22;
 
     /* NB: lists are counted at enqueue (submitted), not here: a
@@ -3866,7 +4215,9 @@ static void run_list_body(ge_queue *q) {
     uint32_t lp_addr = 0, lp_end = 0;
     while (budget--) {
         if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
-        if (g_ge_limit && g_ge_t >= g_ge_limit) break; /* out of time for now */
+        /* A command adds at most two events; the walk goes on once the
+         * timeline has made room (ge_advance). */
+        if (!q->replay && g_ev_n + 2 > GE_EVENTS) { g_ge_xfull = 1; break; }
 
         uint32_t word;
         if (q->list != lp_addr || q->list + 4 > lp_end || !lp) {
@@ -3880,13 +4231,10 @@ static void run_list_body(ge_queue *q) {
         uint32_t cmd  = word >> 24;
         uint32_t arg  = word & 0x00FFFFFF;
         /* A FINISH waits for the drawing before it (see "When the GE
-         * runs"); if that ends past the time the GE may reach, it is left
-         * for later, unread. */
-        if (cmd == GE_FINISH && g_ge_back > g_ge_t) {
-            g_ge_t = g_ge_back;
-            if (g_ge_limit && g_ge_t >= g_ge_limit) break;
-        }
+         * runs"). */
+        if (cmd == GE_FINISH && g_ge_back > g_ge_t) g_ge_t = g_ge_back;
         const uint64_t _c0 = ge_prof_now();
+        const uint64_t t0 = g_ge_t;
         q->list += 4;
         g_ge.commands++;
         g_ge_t += GE_COMMAND_UNITS;
@@ -3927,11 +4275,11 @@ static void run_list_body(ge_queue *q) {
             q->list = (q->base | (arg & 0xFFFFFC));
             break;
         case GE_CALL:
-            if (sp < GE_STACK) stack[sp++] = q->list;
+            if (q->sp < GE_STACK) q->stack[q->sp++] = q->list;
             q->list = (q->base | (arg & 0xFFFFFC));
             break;
         case GE_RET:
-            if (sp > 0) q->list = stack[--sp];
+            if (q->sp > 0) q->list = q->stack[--q->sp];
             break;
         case GE_BBOX:
             g_ge.bbox_hidden = bbox_hidden(arg & 0xFFFF);
@@ -3946,6 +4294,13 @@ static void run_list_body(ge_queue *q) {
             break;
 
         case GE_FINISH:
+            if (q->signal == GE_SIGNAL_SYNC) {
+                /* A sync point's FINISH flushes what came before it and the
+                 * list goes on: no finish handler, no capture snapshot, and
+                 * the list is not done. The END after it clears the mark. */
+                psp_render_current()->finish();
+                break;
+            }
             if (q->signal == GE_SIGNAL_HANDLER_PAUSE) {
                 /* sceGuSignal(GU_SIGNAL_PAUSE) writes SIGNAL, END, FINISH,
                  * END. geprobe 5 step 57 (fw 6.60): the signal handler runs
@@ -3959,11 +4314,14 @@ static void run_list_body(ge_queue *q) {
                  * lets it through; not measured. */
                 psp_render_current()->finish();
                 if (q->cont_early) { q->cont_early = 0; break; }
-                q->paused = 1;
+                /* A capture's replay has no guest to call sceGeContinue, so
+                 * it goes on through to the list's real FINISH. */
+                if (q->replay) break;
+                q->xpaused = 1;
+                ev_push(GE_EV_PAUSE, q, 0, 0, 0, t0);
                 return;
             }
             g_ge.finishes++;
-            q->done = 1;
             cap_snapshot_memory();
             /* The end of a list is what finish() means, and until now nothing
              * called it -- the interface has documented it as "a good point to
@@ -3974,7 +4332,8 @@ static void run_list_body(ge_queue *q) {
             psp_render_current()->finish();
             /* The list is done before its handler runs, so a handler that
              * asks after it is told so. Not measured. */
-            ge_raise(q->cbid, 1, arg);
+            ge_x_done(q, t0);
+            ge_x_raise(q, 1, arg, q->list + 4, t0);
             return;
 
         case GE_END: {
@@ -3984,20 +4343,20 @@ static void run_list_body(ge_queue *q) {
             uint32_t signal = psp_read32(q->list - 8);
             if ((signal >> 24) != GE_SIGNAL) {
                 if ((signal >> 24) == GE_FINISH &&
-                    q->signal == GE_SIGNAL_HANDLER_PAUSE) {
+                    (q->signal == GE_SIGNAL_HANDLER_PAUSE || q->signal == GE_SIGNAL_SYNC)) {
                     q->signal = 0;
                     break;
                 }
                 /* Preserve the old bare-END fallback. Normal completed lists
                  * stop at FINISH above and never reach their trailing END. */
-                q->done = 1;
                 cap_snapshot_memory();
                 psp_render_current()->finish();
+                ge_x_done(q, t0);
                 return;
             }
 
             uint32_t behaviour = (signal >> 16) & 0xFF;
-            if (behaviour == GE_SIGNAL_HANDLER_PAUSE) {
+            if (behaviour == GE_SIGNAL_HANDLER_PAUSE || behaviour == GE_SIGNAL_SYNC) {
                 q->signal = (int)behaviour;
             }
             break;
@@ -4012,11 +4371,14 @@ static void run_list_body(ge_queue *q) {
              * sceGeContinue from that handler finds it (cont_early);
              * without the mark the handler's call did nothing and the list
              * paused anyway. Which of the two the PSP does is not measured
-             * (geprobe 6 asks). */
-            if (((arg >> 16) & 0xFF) == GE_SIGNAL_HANDLER_PAUSE) q->signal = GE_SIGNAL_HANDLER_PAUSE;
-            if (((arg >> 16) & 0xFF) >= 1 && ((arg >> 16) & 0xFF) <= 3 &&
-                ge_raise(q->cbid, 0, arg))
-                return;
+             * (geprobe 6 asks). The guest's Continue looks for the mark once
+             * the timeline has reached it (psig). */
+            if (((arg >> 16) & 0xFF) == GE_SIGNAL_HANDLER_PAUSE) {
+                q->signal = GE_SIGNAL_HANDLER_PAUSE;
+                if (!q->replay) ev_push(GE_EV_PSIG, q, 0, 0, 0, t0);
+            }
+            if (((arg >> 16) & 0xFF) >= 1 && ((arg >> 16) & 0xFF) <= 3)
+                ge_x_raise(q, 0, arg, q->list + 4, t0);
             break;
 
         case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -4061,7 +4423,7 @@ static void run_list_body(ge_queue *q) {
             break;
         case GE_BONEMATRIXNUMBER: g_tl.bone_n = (int)(arg & 0x7F); break;
         case GE_BONEMATRIXDATA:
-            if (g_tl.bone_n < 8 * 12) g_tl.bone[g_tl.bone_n++] = ge_float(arg);
+            if (g_tl.bone_n < 8 * 12) { g_tl.bone[g_tl.bone_n++] = ge_float(arg); g_bone16_ok = 0; }
             break;
         case GE_MORPHWEIGHT0:     case GE_MORPHWEIGHT0 + 1: case GE_MORPHWEIGHT0 + 2:
         case GE_MORPHWEIGHT0 + 3: case GE_MORPHWEIGHT0 + 4: case GE_MORPHWEIGHT0 + 5:
@@ -4513,10 +4875,9 @@ static ge_queue *find_queue(uint32_t id) {
 
 
 static ge_queue *oldest_pending(void);
-static int  ge_has_work(void);
+static int  ge_busy(void);
 static void ge_release(int was_busy);
-static void ge_run_until(uint64_t limit);
-static void ge_after_wait(void);
+static void ge_execute(void);
 static void ge_kick(void);
 
 static void enqueue(int head) {
@@ -4608,10 +4969,11 @@ static void enqueue(int head) {
      * window). */
     const uint64_t start = psp_clock_peek() + GE_ENQUEUE_US;
     psp_clock_advance_to(start);
-    if (q == oldest_pending()) {
-        ge_release(0);
-        ge_kick();
-    }
+    const int first = q == oldest_pending();
+    if (first) ge_release(0);
+    /* Drawn now, if the lists ahead of it have been; seen on the clock. */
+    ge_execute();
+    if (first) ge_kick();
     psp_clock_advance_to(start + GE_KICK_WINDOW_US);
     psp_ret(q->id);
 }
@@ -4622,7 +4984,7 @@ static void hle_ListEnQueueHead(void) { enqueue(1); }
 static void hle_ListUpdateStallAddr(void) {
     ge_queue *q = find_queue(psp_arg(0));
     if (!q) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
-    const int busy = ge_has_work();
+    const int busy = ge_busy();
     q->stall = psp_arg(1) & 0x0FFFFFFCu;
     /* The words run inside the call, for the kick window, as EnQueue's do:
      * geprobe 6 steps 79 and 80 (fw 6.60) release a SIGNAL and a FINISH
@@ -4632,6 +4994,7 @@ static void hle_ListUpdateStallAddr(void) {
      * it. */
     if (!q->done) {
         ge_release(busy);
+        ge_execute();
         if (q == oldest_pending()) ge_kick();
     }
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -4662,102 +5025,124 @@ static int list_status(ge_queue *q) {
     return 2;
 }
 
-/* Drain one list as far as its stall allows. run_list stops at the stall
- * (still pending) or at FINISH/END (done). */
-static void drain_one(ge_queue *q) {
-    if (!q || !q->used || q->done) return;
-    run_list(q);
+/* The walk's own queue: lists it has not run to their end, oldest first. */
+static ge_queue *oldest_xpending(void) {
+    ge_queue *best = NULL;
+    for (int i = 0; i < MAX_QUEUES; i++)
+        if (g_queue[i].used && !g_queue[i].xdone &&
+            (!best || g_queue[i].id < best->id)) best = &g_queue[i];
+    return best;
 }
 
-/* Drain every pending list up to and including the target, in id order --
- * the order hardware executes them. */
-static void drain_through(uint32_t id) {
-    if (!g_ge_walking) ge_deliver(1);
+/* Walk the lists, in id order -- the order hardware runs them -- as far as
+ * their words are released: until one stalls, pauses or hangs, the queue is
+ * empty, or g_ev is full. Nothing here waits on the clock. */
+static void ge_execute(void) {
+    if (g_ge_walking) return;
+    g_ge_xfull = 0;
     for (;;) {
-        ge_queue *q = oldest_pending();
-        if (!q || q->id > id) break;
-        drain_one(q);
-        if (!q->done) break;      /* stalled: later lists stay queued */
-        if (q->id == id) break;
-    }
-}
-
-static void drain_all(void) {
-    if (!g_ge_walking) ge_deliver(1);
-    for (;;) {
-        ge_queue *q = oldest_pending();
+        ge_queue *q = oldest_xpending();
         if (!q) break;
-        drain_one(q);
-        if (!q->done) break;      /* stalled head blocks the rest */
+        run_list(q);
+        if (!q->xdone) break;     /* stalled, paused or hung: later lists wait */
     }
 }
 
-/* Whether the GE has words it could run now: the list at the head of the
- * queue is neither paused nor waiting at its stall. */
-static int ge_has_work(void) {
-    if (g_ge_pend.valid) return 1;
-    const ge_queue *q = oldest_pending();
-    return q && !q->paused && !q->hung && !(q->stall && q->list == q->stall);
+/* Whether the GE is still busy, as the guest's clock sees it: there are
+ * events the timeline has not reached, or the walk has words it could run. */
+static int ge_busy(void) {
+    if (g_ev_n) return 1;
+    const ge_queue *q = oldest_xpending();
+    return q && !q->xpaused && !q->hung && !(q->stall && q->list == q->stall);
 }
 
 /* Words were released (EnQueue, a stall update, Continue). An idle GE starts
  * on them now; a busy one gets to them after what it has. `was_busy` is
- * ge_has_work() from before the release. */
+ * ge_busy() from before the release. */
 static void ge_release(int was_busy) {
     const uint64_t now = ge_now();
     if (!was_busy && g_ge_t < now) g_ge_t = now;
-    g_ge_backlog = 1;
 }
 
-/* Run the queue, in order, until the GE's time reaches `limit`, a list
- * stalls or pauses, or the queue is empty. */
-static void ge_run_until(uint64_t limit) {
-    if (g_ge_walking || g_ge_in_cb) return;
-    if (ge_deliver(!g_ge_defer)) return;   /* still waiting on a handler */
-    g_ge_limit = limit ? limit : 1;
+static uint64_t g_tl_done_at;  /* the GE's time at the last list the timeline saw end */
+
+/* The timeline: what the walk did, applied in order as far as GE time
+ * `limit` -- the guest sees each command that started before it -- and for
+ * lists up to id `through`. A handler runs as it is reached (the clock moved
+ * up to it when `follow`), or is held when `defer`, with interrupts off, or
+ * inside another handler, and the timeline then waits on it. */
+static void ge_advance(uint64_t limit, int defer, int follow, uint32_t through) {
+    if (g_tl_in) return;
+    if (ge_deliver(!defer)) return;   /* still waiting on a handler */
+    g_tl_in = 1;
     for (;;) {
-        ge_queue *q = oldest_pending();
-        if (!q) break;
-        drain_one(q);
-        if (!q->done || g_ge_t >= limit || g_ge_pend.valid) break;
+        if (g_ge_xfull && g_ev_n + 2 <= GE_EVENTS) ge_execute();
+        if (!g_ev_n) break;
+        const ge_event e = *ev_at(0);
+        if (e.qid > through || e.start >= limit) break;
+        if (e.kind == GE_EV_HANDLER && ev_has_handler(&e) &&
+            (defer || !psp_intr_enabled() || psp_interrupt_in_handler())) {
+            /* With the CPU's interrupts suspended, or inside another
+             * interrupt's handler, the GE's interrupt waits: the handler is
+             * held and runs at the first completed firmware call after the
+             * resume (the game's callback probe, scenario 4, recorded under
+             * an emulator; not measured on a PSP). */
+            g_ev_held = 1;
+            break;
+        }
+        ev_pop();
+        switch (e.kind) {
+        case GE_EV_DONE:
+            if (ev_live(&e)) e.q->done = 1;
+            g_tl_done_at = e.at;
+            break;
+        case GE_EV_PAUSE:
+            if (ev_live(&e)) { e.q->paused = 1; e.q->psig = 0; }
+            break;
+        case GE_EV_PSIG:
+            if (ev_live(&e)) e.q->psig = 1;
+            break;
+        case GE_EV_HANDLER:
+            if (!ev_has_handler(&e)) break;
+            if (follow) ge_clock_to(e.at);
+            ge_callback(e.cbid, e.finish, e.code, e.pc);
+            break;
+        }
     }
-    g_ge_limit = 0;
-    if (!ge_has_work()) g_ge_backlog = 0;
-}
-
-/* After a Sync has waited for the GE, its front end is idle at the present
- * moment, waiting for words; the back end may still be drawing what came
- * before a stall. */
-static void ge_after_wait(void) {
-    g_ge_t = ge_now();
-    if (!ge_has_work()) g_ge_backlog = 0;
+    g_tl_in = 0;
 }
 
 /* Inside EnQueue, UpdateStallAddr and Continue: the GE runs for the kick
  * window, handlers and all, the clock following it to each handler. */
 static void ge_kick(void) {
-    g_ge_follow = 1;
-    ge_run_until(ge_now() + GE_KICK_WINDOW_US * GE_UNITS_PER_US);
-    g_ge_follow = 0;
+    if (g_ge_in_cb) return;
+    ge_advance(ge_now() + GE_KICK_WINDOW_US * GE_UNITS_PER_US, 0, 1, UINT32_MAX);
 }
 
-/* A Sync that waits: the caller is blocked until the GE is through (or
- * stalled), so the clock follows it to each handler and to where it stops.
- * `all` waits for every list, otherwise for the lists up to `id`. */
-static void ge_wait_drain(int all, uint32_t id) {
-    g_ge_follow = 1;
-    if (all) drain_all(); else drain_through(id);
-    g_ge_follow = 0;
-    ge_clock_to(g_ge_t);
-    ge_after_wait();
+/* A Sync that waits: the caller is blocked until the GE is through with the
+ * lists up to id `through` (or stalled), so the clock follows it to each
+ * handler and to where it stops. Its front end is then idle at the present
+ * moment, waiting for words; the back end may still be drawing what came
+ * before a stall. Lists behind `through` that the walk has already run keep
+ * their times. */
+static void ge_wait(uint32_t through) {
+    if (g_tl_in) return;
+    ge_execute();
+    g_tl_done_at = 0;
+    ge_advance(UINT64_MAX, 0, 1, through);
+    uint64_t stop = g_tl_done_at;
+    const ge_queue *q = oldest_pending();
+    if (g_ev_held) stop = ev_at(0)->at;
+    else if (q && q->id <= through) stop = q->t_x;
+    ge_clock_to(stop);
+    if (g_ge_t <= stop) g_ge_t = ge_now();
 }
 
-/* At every firmware call (hle.c): the GE catches up to the present. */
+/* At every firmware call (hle.c): the guest catches up with the GE, to the
+ * present. */
 void psp_ge_tick(void) {
-    if (!g_ge_backlog || g_ge_walking || g_ge_in_cb) return;
-    g_ge_defer = 1;
-    ge_run_until(ge_now());
-    g_ge_defer = 0;
+    if (!g_ev_n || g_tl_in || g_ge_in_cb) return;
+    ge_advance(ge_now(), 1, 0, UINT32_MAX);
 }
 
 /* From the scheduler when no thread can run, up to `until_us`, the next
@@ -4766,15 +5151,10 @@ void psp_ge_tick(void) {
  * thread waiting for something a GE handler provides is not left stranded.
  * Returns whether a handler ran; the scheduler then looks again. */
 int psp_ge_idle_run(uint64_t until_us) {
-    if (!g_ge_backlog || g_ge_walking || g_ge_in_cb) return 0;
-    if (!ge_has_work()) { g_ge_backlog = 0; return 0; }
+    if (!g_ev_n || g_tl_in || g_ge_in_cb) return 0;
     const uint64_t until = until_us ? until_us * GE_UNITS_PER_US : UINT64_MAX;
-    if (!g_ge_pend.valid) {
-        g_ge_defer = 1;
-        ge_run_until(until);
-        g_ge_defer = 0;
-    }
-    if (g_ge_pend.valid && g_ge_pend.at <= until) { ge_deliver(1); return 1; }
+    if (!g_ev_held) ge_advance(until, 1, 0, UINT32_MAX);
+    if (g_ev_held && ev_at(0)->at <= until) { ge_deliver(1); return 1; }
     return 0;
 }
 
@@ -4860,10 +5240,14 @@ void psp_ge_sync_backend(void) {
     const psp_render_backend *be = psp_render_current();
     be->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
     be->set_scissor(g_ge.sc_x0, g_ge.sc_y0, g_ge.sc_x1, g_ge.sc_y1);
+    /* The depth buffer lives in VRAM where ZBP puts it; a replay that left
+     * it at the reset address wrote its depth over the frame being drawn. */
+    psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
 }
 
 void psp_ge_state_load(const void *buf) {
     memcpy(&g_tl, buf, sizeof g_tl);
+    g_bone16_ok = 0;
     memcpy(&g_ge, (const uint8_t *)buf + sizeof g_tl, sizeof g_ge);
     /* The counters travel with the registers because they share a struct;
      * a replay should report what *it* drew, not what the capture did. */
@@ -5276,12 +5660,13 @@ static void view_log_frame_mark(void) {
 }
 
 void psp_ge_drain_all(void) {
-    drain_all();
-    if (!g_ge_walking) {
+    if (!g_tl_in) {
+        ge_execute();
+        ge_advance(UINT64_MAX, 0, 0, UINT32_MAX);
         /* Not a wait: what the GE did here cost no time, as before the GE
          * was timed. */
-        ge_after_wait();
         const uint64_t now = ge_now();
+        g_ge_t = now;
         if (g_ge_back > now) g_ge_back = now;
         for (int i = 0; i < GE_FIFO_PRIMS; i++) if (g_ge_fifo[i] > now) g_ge_fifo[i] = now;
     }
@@ -5300,6 +5685,7 @@ void psp_ge_replay_list(uint32_t list, uint32_t stall, uint32_t base) {
     if (!q) return;
     memset(q, 0, sizeof *q);
     q->used = 1; q->id = 0x10000u + (uint32_t)(q - g_queue); q->cbid = -1;
+    q->replay = 1;
     q->list = list & 0x0FFFFFFCu;
     q->stall = stall & 0x0FFFFFFCu;
     q->base = base;
@@ -5319,7 +5705,7 @@ void psp_ge_current_target(uint32_t *addr, uint32_t *stride, int *fmt) {
 static void hle_ListSync(void) {
     ge_queue *q = find_queue(psp_arg(0));
     if (!q) { psp_ret(0x80000100); return; }
-    if (psp_arg(1) == GE_SYNC_WAIT && !g_ge_walking) ge_deliver(1);
+    if (psp_arg(1) == GE_SYNC_WAIT && !g_tl_in) ge_deliver(1);
     if (q->done) { psp_ret(GE_SYNC_DONE); return; }
     /* NOWAIT tells the truth: 4 while paused, 1 queued behind another list,
      * 2 otherwise -- running, or waiting at its stall: geprobe 5 steps 57
@@ -5336,7 +5722,7 @@ static void hle_ListSync(void) {
      * complete, taking as long as the GE does. A lone thread yields to
      * itself and carries on, so the game is unaffected. */
     psp_sched_yield();
-    ge_wait_drain(0, q->id);
+    ge_wait(q->id);
     psp_ret(q->done ? GE_SYNC_DONE : list_status(q));
 }
 
@@ -5357,10 +5743,10 @@ static void hle_DrawSync(void) {
         psp_ret(oldest_pending() ? 2u : GE_SYNC_DONE);
         return;
     }
-    if (!g_ge_walking) ge_deliver(1);     /* a wait sees the handlers it owes run */
+    if (!g_tl_in) ge_deliver(1);          /* a wait sees the handlers it owes run */
     if (!oldest_pending()) { retire_done(); psp_ret(GE_SYNC_DONE); return; }
     psp_sched_yield();
-    ge_wait_drain(1, 0);
+    ge_wait(UINT32_MAX);
     retire_done();
     /* DONE even if a stalled or hung list remains. A list hung at a patch
      * division (draw_patch) would block this wait for ever on the PSP; here
@@ -5374,15 +5760,25 @@ static void hle_DrawSync(void) {
  * 6.60) break a list hung at a patch division of 65-127 with sceGeBreak(1),
  * which returns 0 or more, after which new lists run as on a fresh queue.
  * Return values and the rest are not measured. */
+static void break_queue(ge_queue *q) {
+    q->done = q->xdone = 1;
+    q->hung = q->paused = q->xpaused = q->psig = 0;
+    /* What the walk did past the point the guest has seen never happens,
+     * but a handler the timeline has already reached and holds still runs. */
+    for (unsigned i = g_ev_held ? 1u : 0u; i < g_ev_n;)
+        if (ev_at(i)->q == q && ev_at(i)->qid == q->id) ev_remove(i); else i++;
+}
+
 static void hle_Break(void) {
     if (psp_arg(0) == 1) {
         for (int i = 0; i < MAX_QUEUES; i++)
-            if (g_queue[i].used && !g_queue[i].done) { g_queue[i].done = 1; g_queue[i].hung = 0; g_queue[i].paused = 0; }
+            if (g_queue[i].used && !g_queue[i].done) break_queue(&g_queue[i]);
     } else {
         ge_queue *q = oldest_pending();
-        if (q) { q->done = 1; q->hung = 0; q->paused = 0; }
+        if (q) break_queue(q);
     }
-    if (!ge_has_work()) g_ge_backlog = 0;
+    /* The lists behind a broken one go on. */
+    ge_execute();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -5396,11 +5792,25 @@ static void hle_Break(void) {
 static void hle_Continue(void) {
     ge_queue *q = oldest_pending();
     if (q && q->paused) {
-        q->paused = 0;
+        q->paused = q->xpaused = 0;
         ge_release(0);
+        ge_execute();
         ge_kick();
-    } else if (q && q->signal == GE_SIGNAL_HANDLER_PAUSE) {
-        q->cont_early = 1;
+    } else if (q && q->psig) {
+        q->psig = 0;
+        if (q->xpaused) {
+            /* The walk has stopped at the FINISH already, the guest not yet:
+             * the pause it has yet to see never takes hold. */
+            for (unsigned i = 0; i < g_ev_n; i++)
+                if (ev_at(i)->kind == GE_EV_PAUSE && ev_at(i)->q == q && ev_at(i)->qid == q->id) {
+                    ev_remove(i);
+                    break;
+                }
+            q->xpaused = 0;
+            ge_execute();
+        } else {
+            q->cont_early = 1;
+        }
     }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -5411,6 +5821,9 @@ static void hle_Continue(void) {
  * 6.60) registers 15 beside libgu's own and the 16th is refused with it. */
 static void hle_SetCallback(void) {
     const uint32_t p = psp_arg(0);
+    /* Four words the call reads; an unreadable table is refused rather than
+     * read as zeros (PSPSDK's ILLEGAL_ADDR; not measured). */
+    if (!psp_mem_ptr(p, 16)) { psp_ret(0x800200D3u); return; }
     for (int i = 0; i < GE_MAX_CALLBACKS; i++) {
         if (g_ge_cb[i].used) continue;
         g_ge_cb[i].used        = 1;
@@ -5426,7 +5839,15 @@ static void hle_SetCallback(void) {
 
 static void hle_UnsetCallback(void) {
     const uint32_t id = psp_arg(0);
-    if (id < GE_MAX_CALLBACKS) g_ge_cb[id].used = 0;
+    if (id < GE_MAX_CALLBACKS) {
+        g_ge_cb[id].used = 0;
+        /* Lists queued under it call nothing now, rather than whatever a later
+         * SetCallback puts in the same slot. */
+        for (int i = 0; i < MAX_QUEUES; i++)
+            if (g_queue[i].used && g_queue[i].cbid == (int)id) g_queue[i].cbid = -1;
+        for (unsigned i = 0; i < g_ev_n; i++)
+            if (ev_at(i)->cbid == (int)id) ev_at(i)->cbid = -1;
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

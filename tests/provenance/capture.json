@@ -1,0 +1,25 @@
+{
+  "suite": "vrnd",
+  "command": [
+    "/usr/bin/PPSSPPHeadless",
+    "--root",
+    "/home/sif/Projects/third-birthday-recomp/reports/74-rng",
+    "--timeout=30",
+    "-l",
+    "/home/sif/Projects/third-birthday-recomp/reports/74-rng/probe.elf"
+  ],
+  "executable_sha256": "c065cf204335e9eb26a85592947e9f8fb4ddc718bc4eaad2ce06240a01d82f8d",
+  "probe_sha256": "2779bb0e410b0d612786662777b07312e46a916f49dbb328b6eb6276693e620c",
+  "observations_sha256": "56adbc35c69ba30d7663f1acdeb3ea676ebb840a46409a3206b0f3335ddfdb4c",
+  "fixture_sha256": "d2e27338b6acac0b3526a445268b2a2142e3aaef2918ffa48b75820032cbd741",
+  "sources": {
+    "probe.c": "be62d64248aa28580f00d0470e87a4ef8ef78de3b1bf654e44bed7497fe8d907",
+    "rng.S": "15c25aeccb3e244c628bf7c65088fab825f2e76e86930e628b249b985897e57b",
+    "imports.S": "bfd3f02e04c554f71a6ac9442d793d1344c5d8f8699b41e70166815c384e1a56",
+    "probe.ld": "f46ef37392ea8cf736ed7217401708ec9f18bc2c4294a21e249b5911d503fea6"
+  },
+  "clang": "clang version 22.1.8",
+  "linker": "LLD 22.1.8 (compatible with GNU linkers)",
+  "observations": 54809,
+  "evidence": "external executable output; not physical PSP"
+}

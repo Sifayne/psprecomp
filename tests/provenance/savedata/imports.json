@@ -1,0 +1,12 @@
+{
+  "name": "IndependentSaveProbe",
+  "imports": {
+    "IoFileMgrForUser": ["sceIoWrite", "sceIoRemove"],
+    "LoadExecForUser": ["sceKernelExitGame"],
+    "ThreadManForUser": ["sceKernelDelayThread"],
+    "sceUtility": [
+      "sceUtilitySavedataInitStart", "sceUtilitySavedataGetStatus",
+      "sceUtilitySavedataUpdate", "sceUtilitySavedataShutdownStart"
+    ]
+  }
+}

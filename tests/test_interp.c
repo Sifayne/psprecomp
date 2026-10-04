@@ -21,6 +21,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/vfpu.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -74,6 +75,29 @@ static void test_alu(void) {
     CHECK(R(V0) == 5, "addiu v0: got %u", R(V0));
     CHECK(R(V1) == 7, "addiu v1: got %u", R(V1));
     CHECK(R(A0) == 12, "addu a0: got %u", R(A0));
+}
+
+static void test_vfpu_random_pipeline(void) {
+    /* Pipeline instructions in a delay slot must not trap or consume the
+     * destination prefix. The following random triple has one lane masked;
+     * which lane is open (hardware has not been probed for vector vrnd), so
+     * the check is that exactly one lane kept its zero. */
+    const uint32_t barriers[] = {0xFFFF0000,0xFFFF0320,0xFFFF040D};
+    for (int i=0;i<3;i++) {
+        const uint32_t code[] = {0xDE000100,0x10000001,barriers[i],
+                                0xD0238000,0x03E00008,0};
+        psp_vfpu_reset();
+        psp_interp it=run(code,6,100);
+        CHECK(it.status==I_OK_RETURN,"VFPU barrier/random interpreter path");
+        int r[4]; psp_vfpu_regs(0,3,r);
+        int kept=0, drawn=0;
+        for (int l=0;l<3;l++) {
+            if (psp_cpu.v[r[l]]==0) kept++;
+            else if (psp_cpu.v[r[l]]>=2 && psp_cpu.v[r[l]]<4) drawn++;
+        }
+        CHECK(kept==1 && drawn==2,
+              "VFPU barrier preserves prefix through branch delay slot");
+    }
 }
 
 static void test_zero_is_hardwired(void) {
@@ -583,6 +607,7 @@ int main(void) {
     }
 
     test_alu();
+    test_vfpu_random_pipeline();
     test_zero_is_hardwired();
     test_shift_masks_amount();
     test_load_store();

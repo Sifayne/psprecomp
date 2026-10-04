@@ -4,6 +4,8 @@
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/dispatch.h"
+#include "psprecomp/interrupt.h"
+#include "psprecomp/os.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +16,12 @@
 static psp_hle_entry g_entry[HLE_MAX];
 static psp_hle_fn    g_fn[HLE_MAX];
 static int           g_count;
+static void (*g_host_work)(uint32_t nid, uint64_t elapsed_ns);
+static _Thread_local unsigned g_call_depth;
+
+void psp_hle_set_host_work(void (*fn)(uint32_t nid, uint64_t elapsed_ns)) {
+    g_host_work = fn;
+}
 
 void psp_hle_register(uint32_t nid, const char *lib, const char *name, psp_hle_fn fn) {
     /* Re-registering replaces, so a game repo can override one function
@@ -201,6 +209,7 @@ void psp_hle_dump_calls(FILE *out, int top) {
 }
 
 void psp_hle_call(uint32_t nid) {
+    g_call_depth++;
     /* Every firmware call costs a tick of guest time.
      *
      * The clock advanced three ways and every one of them could stop. A vblank
@@ -228,6 +237,10 @@ void psp_hle_call(uint32_t nid) {
      * runs"). Before the call and not after, so that a call which blocks
      * until a GE handler has run finds it already run. */
     psp_ge_tick();
+    /* And the display: Vblank boundaries are accounted under the
+     * registrations that existed at entry, before this call can enable,
+     * replace or release a handler (src/hle/interrupt.c). */
+    psp_display_tick();
 
     for (int i = 0; i < g_count; i++) {
         if (g_entry[i].nid == nid) {
@@ -248,7 +261,10 @@ void psp_hle_call(uint32_t nid) {
                     psp_trace_dump();
                 }
             }
+            const uint64_t work_begin = g_host_work && g_call_depth == 1 ? psp_os_mono_ns() : 0;
             g_fn[i]();
+            if (work_begin && g_host_work)
+                g_host_work(nid, psp_os_mono_ns() - work_begin);
             if (logging())
                 fprintf(stderr, "hle: [%05X] %-36s  = 0x%08X\n",
                         psp_sched_current(), "", psp_cpu.r[PSP_REG_V0]);
@@ -256,11 +272,16 @@ void psp_hle_call(uint32_t nid) {
             /* After the handler, not before: the call has to finish before the
              * thread can be switched away from, or its result is written into
              * whoever runs next. */
+            psp_display_tick();
+            psp_interrupt_run_pending();
             psp_sched_tick();
             /* After the handler and after the reschedule: a timer handler is
              * guest code, and running it before the call it interrupted has
              * finished would write its result into the caller's $v0. */
             psp_ktimer_tick();
+            psp_display_tick();
+            psp_interrupt_run_pending();
+            g_call_depth--;
             return;
         }
     }
@@ -282,6 +303,8 @@ void psp_hle_call(uint32_t nid) {
     if (!g_quiet)
         fprintf(stderr, "psprecomp: unimplemented firmware call 0x%08X\n", nid);
     psp_ret(0);
+    psp_interrupt_run_pending();
+    g_call_depth--;
 }
 
 const char *psp_str(uint32_t addr, char *dst, size_t cap) {

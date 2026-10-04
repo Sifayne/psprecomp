@@ -32,6 +32,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/interrupt.h"
 
 #include <string.h>
 
@@ -156,7 +157,9 @@ static void hle_ReferAlarmStatus(void) {
 static int vtimer_tick(void);
 
 static int fire_due(void) {
-    if (g_firing) return 0;
+    /* Not inside another interrupt's handler, and not while the CPU has
+     * interrupts suspended: the timer's interrupt waits for the resume. */
+    if (g_firing || psp_interrupt_in_handler() || !psp_interrupt_enabled()) return 0;
     const uint64_t now = psp_clock_peek();
     int fired = 0;
 

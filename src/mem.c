@@ -403,6 +403,19 @@ void psp_mem_module_region(uint32_t *base, uint32_t *size) {
     if (size) *size = g_module_size;
 }
 
+uint32_t psp_mem_mapped_span(uint32_t addr) {
+    const uint32_t a = addr & PSP_ADDR_MASK;
+    if (g_module_size && a >= g_module_base && a - g_module_base < g_module_size)
+        return g_module_size - (a - g_module_base);
+    if (psp_mem.ram && a >= PSP_RAM_BASE && a - PSP_RAM_BASE < PSP_RAM_SIZE)
+        return PSP_RAM_SIZE - (a - PSP_RAM_BASE);
+    if (psp_mem.vram && a >= PSP_VRAM_BASE && a - PSP_VRAM_BASE < PSP_VRAM_SIZE)
+        return PSP_VRAM_SIZE - (a - PSP_VRAM_BASE);
+    if (psp_mem.scratch && a >= PSP_SCRATCH_BASE && a - PSP_SCRATCH_BASE < PSP_SCRATCH_SIZE)
+        return PSP_SCRATCH_SIZE - (a - PSP_SCRATCH_BASE);
+    return 0;
+}
+
 void *psp_mem_ptr(uint32_t addr, uint32_t size) {
     /* Collapse the three cache-behaviour mirrors onto one backing store. */
     const uint32_t a = addr & PSP_ADDR_MASK;

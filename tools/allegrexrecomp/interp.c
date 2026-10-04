@@ -196,6 +196,7 @@ static void st32(uint32_t a, uint32_t v) { psp_write32(a, v); trace_mem('W', a, 
 
 static psp_interp_status exec_simple(const a_insn *in) {
     switch (in->op) {
+    case A_VNOP: case A_VSYNC: case A_VFLUSH:
     case A_NOP:
         return I_RUNNING;
 

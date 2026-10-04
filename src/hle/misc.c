@@ -13,6 +13,7 @@
 #include "psprecomp/sched.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/os.h"
+#include "psprecomp/interrupt.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -41,27 +42,6 @@ static void hle_PowerRegisterCallback(void) {
     const uint32_t cb = psp_arg(1);
     psp_ret(psp_threadman_notify_callback(cb, 0));
 }
-
-/* ---- Kernel_Library ------------------------------------------------------
- * Interrupt masking. With no interrupts to mask, the pair only has to be
- * *consistent*: suspend returns a cookie that resume accepts. Games use them
- * to bracket short critical sections, and libc's lightweight mutexes are built
- * on them -- which is why a game stalls in its own startup without these. */
-
-static uint32_t g_intr_enabled = 1;
-
-static void hle_CpuSuspendIntr(void) {
-    uint32_t prev = g_intr_enabled;
-    g_intr_enabled = 0;
-    psp_ret(prev);                    /* the cookie resume expects */
-}
-
-static void hle_CpuResumeIntr(void) {
-    g_intr_enabled = psp_arg(0);
-    psp_ret(SCE_KERNEL_ERROR_OK);
-}
-
-int psp_intr_enabled(void) { return g_intr_enabled != 0; }
 
 /* ---- UtilsForUser -------------------------------------------------------- */
 
@@ -196,29 +176,71 @@ static void hle_Stderr(void) { psp_ret(2); }
  * to sit below the user heap so that psp_sysmem_alloc can never hand the same
  * bytes out twice. User memory begins at 0x08800000 (uofw's
  * include/common/memory.h, SCE_USERSPACE_ADDR_KU0), so the 4MB immediately
- * under it is free for this. */
-#define PSP_VOLATILE_BASE 0x08400000u
-#define PSP_VOLATILE_SIZE 0x00400000u
+ * under it is free for this.
+ *
+ * Under contention Lock blocks and TryLock refuses, an unlock wakes the first
+ * waiter, and a non-zero type is refused: tests/provenance/kernel records
+ * that, together with the address and size, under an emulator (not a PSP).
+ * FIFO selection among several waiters is a host policy; the probe measures
+ * one waiter. */
+#define VOLATILE_ADDRESS 0x08400000u
+#define VOLATILE_BYTES   0x00400000u
+#define VOLATILE_BAD_TYPE 0x80000107u
+#define VOLATILE_BUSY     0x802b0200u
+static struct {
+    int acquired;
+    unsigned count;
+    uint32_t waiting[128]; /* host thread-table capacity */
+} volatile_memory;
 
-static int g_volatile_held;
-
-static void volatile_grant(void) {
-    const uint32_t ptr_out = psp_arg(1), size_out = psp_arg(2);
-    if (ptr_out)  psp_write32(ptr_out,  PSP_VOLATILE_BASE);
-    if (size_out) psp_write32(size_out, PSP_VOLATILE_SIZE);
-    g_volatile_held = 1;
-    psp_ret(SCE_KERNEL_ERROR_OK);
+static void volatile_acquire(int nonblocking) {
+    if (psp_arg(0)) { psp_ret(VOLATILE_BAD_TYPE); return; }
+    const uint32_t address_out=psp_arg(1), bytes_out=psp_arg(2);
+    /* Invalid mapped outputs are a host validation policy. The SDK permits
+     * null outputs; the probe exercises all four null/non-null combinations. */
+    if ((address_out && !psp_mem_ptr(address_out,4)) ||
+        (bytes_out && !psp_mem_ptr(bytes_out,4))) {
+        psp_ret(0x800200d3u); return; /* SDK ILLEGAL_ADDR */
+    }
+    while (volatile_memory.acquired) {
+        if (nonblocking) { psp_ret(VOLATILE_BUSY); return; }
+        if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
+        if (volatile_memory.count==128) { psp_ret(SCE_KERNEL_ERROR_NOTIMPLEMENTED); return; }
+        uint32_t self=psp_sched_current();
+        volatile_memory.waiting[volatile_memory.count++]=self;
+        int result=psp_sched_block(self,PSP_SCHED_BLOCKED,"volatile memory");
+        /* Remove a cancelled/stranded wait without leaving a stale UID. */
+        for (unsigned i=0;i<volatile_memory.count;i++) {
+            if (volatile_memory.waiting[i]!=self) continue;
+            memmove(&volatile_memory.waiting[i],&volatile_memory.waiting[i+1],
+                    (--volatile_memory.count-i)*sizeof(uint32_t));
+            break;
+        }
+        if (result!=0) {
+            psp_sched_stop_all("volatile memory wait has no runnable releaser");
+            psp_ret(SCE_KERNEL_ERROR_NOTIMPLEMENTED); return;
+        }
+    }
+    volatile_memory.acquired=1;
+    if (address_out) psp_write32(address_out,VOLATILE_ADDRESS);
+    if (bytes_out) psp_write32(bytes_out,VOLATILE_BYTES);
+    psp_ret(0);
 }
-
-/* Lock blocks until the block is free; nothing else here ever takes it, so it
- * is always free and the two differ only in what they would do under
- * contention. TryLock is the one games actually call. */
-static void hle_VolatileMemLock(void)    { volatile_grant(); }
-static void hle_VolatileMemTryLock(void) { volatile_grant(); }
-
+static void hle_VolatileMemLock(void) { volatile_acquire(0); }
+static void hle_VolatileMemTryLock(void) { volatile_acquire(1); }
 static void hle_VolatileMemUnlock(void) {
-    g_volatile_held = 0;
-    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (psp_arg(0)) { psp_ret(VOLATILE_BAD_TYPE); return; }
+    if (!volatile_memory.acquired) { psp_ret(SCE_KERNEL_ERROR_SEMA_OVF); return; }
+    volatile_memory.acquired=0;
+    int urgent=0;
+    if (volatile_memory.count) {
+        const uint32_t next=volatile_memory.waiting[0];
+        memmove(volatile_memory.waiting,volatile_memory.waiting+1,
+                --volatile_memory.count*sizeof(uint32_t));
+        urgent=psp_sched_wake(next);
+    }
+    psp_ret(0);
+    if (urgent) psp_sched_preempt();
 }
 /* Power management around suspend. Nothing suspends here. */
 static void hle_ok(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
@@ -311,8 +333,10 @@ static uint32_t         g_ctrl_frame;
  * is "one thing the guest did", and unlike g_ctrl_frame it does not move when
  * a game changes how many samples it asks for per poll. */
 static uint32_t         g_ctrl_polls;
+static uint32_t         g_ctrl_last_buttons, g_ctrl_pressed_buttons;
 
 uint32_t psp_ctrl_polls(void)   { return g_ctrl_polls; }
+uint32_t psp_ctrl_pressed_buttons(void) { return g_ctrl_pressed_buttons; }
 
 /* The stick as the guest last saw it: the merged lane, after the script took
  * or returned it. For native code that wants the magnitude the game's own
@@ -546,6 +570,43 @@ static void ctrl_wait_sample(void) {
     g_sample_due = psp_clock_next_frame();
 }
 
+/* How many samples a buffer call hands back. Observed from an external
+ * executable (tests/provenance/ctrl, not a physical PSP), and consistent with
+ * the hardware-recorded ctrl/sampling and ctrl/vblank expectations:
+ *
+ *   - Read returns the samples taken since the previous Read -- one per
+ *     vblank -- newest last, at most 63 of them, and at most the room the
+ *     caller gave. With none unread it waits for the next one. A title that
+ *     reads every other vblank gets two per call; one that reads every vblank
+ *     gets one. Room 0 behaves as room 1.
+ *   - Peek returns `count` samples of history without consuming anything;
+ *     room 0 returns 0 and writes nothing.
+ *   - Room above 64 is rejected by both with SCE_ERROR_INVALID_SIZE, and
+ *     nothing is written.
+ *
+ * Handing back as many samples as the room allowed (the old behaviour) made
+ * The 3rd Birthday, which reads with room for ten every other vblank, count
+ * ten samples per poll into its per-sample menu repeat, and a short tap
+ * skipped entries. One sample per call halved the real rate instead.
+ *
+ * This provider has one merged snapshot per call, not a sample history, so
+ * every entry carries the current state. The unread count comes from the
+ * guest clock's vblank grid; scenarios replay in virtual time, where it is
+ * deterministic. In live play a late frame can deliver more than two, as
+ * the hardware would. */
+enum { CTRL_HISTORY = 64, CTRL_UNREAD_MAX = 63 };
+static uint64_t g_read_frame = UINT64_MAX;  /* vblank of the last Read's newest sample */
+
+static uint32_t ctrl_unread_samples(uint32_t room) {
+    const uint64_t frame = psp_clock_peek() / PSP_CLOCK_FRAME_US;
+    uint64_t unread = g_read_frame == UINT64_MAX || frame <= g_read_frame
+                    ? 1 : frame - g_read_frame;
+    g_read_frame = frame;
+    if (unread > CTRL_UNREAD_MAX) unread = CTRL_UNREAD_MAX;
+    if (!room) room = 1;
+    return unread < room ? (uint32_t)unread : room;
+}
+
 /* ---- PSPRECOMP_RAMSNAP -- whole-RAM snapshots at chosen polls -------------
  *
  * PSPRECOMP_RAMSNAP=<prefix> with PSPRECOMP_RAMSNAP_POLLS=<n>[,<n>...] writes
@@ -631,8 +692,9 @@ static void ramsnap_step(uint32_t poll) {
     }
 }
 
-/* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16. */
-static void ctrl_fill(void) {
+/* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16.
+ * Delivers `samples` entries of the merged state and returns that count. */
+static void ctrl_fill(uint32_t samples) {
     const uint64_t us = psp_clock_peek();
     g_ctrl_polls++;
     if (g_watch_from && g_ctrl_polls == g_watch_from) psp_mem_watch_arm(1);
@@ -651,6 +713,8 @@ static void ctrl_fill(void) {
     const uint8_t  hax  = scripted ? 128 : atomic_load(&g_host_ax);
     const uint8_t  hay  = scripted ? 128 : atomic_load(&g_host_ay);
     const uint32_t buttons = g_hold_buttons | g_script_buttons | host;
+    g_ctrl_pressed_buttons = buttons & ~g_ctrl_last_buttons;
+    g_ctrl_last_buttons = buttons;
     const uint8_t  ax = g_script_analog ? g_script_ax : hax;
     const uint8_t  ay = g_script_analog ? g_script_ay : hay;
     g_ctrl_last_ax = ax;
@@ -678,21 +742,32 @@ static void ctrl_fill(void) {
                            g_ctrl_last_rx, g_ctrl_last_ry,
                            g_ctrl_last_mdx, g_ctrl_last_mdy);
 
-    uint32_t buf = psp_arg(0), count = psp_arg(1);
-    if (!count) count = 1;
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t at = buf + i * 16;
+    /* Room past the delivered samples is left untouched. */
+    const uint32_t buf = psp_arg(0);
+    for (uint32_t i = 0; i < samples; i++) {
+        const uint32_t at = buf + i * 16;
         psp_write32(at, g_ctrl_frame++);
         psp_write32(at + 4, buttons);
         psp_write8(at + 8, ax);
         psp_write8(at + 9, ay);
         for (int k = 10; k < 16; k++) psp_write8(at + (uint32_t)k, 0);
     }
-    psp_ret(count);
+    psp_ret(samples);
 }
 
-static void hle_ReadBufferPositive(void) { ctrl_wait_sample(); ctrl_fill(); }
-static void hle_PeekBufferPositive(void) { ctrl_fill(); }
+static void hle_ReadBufferPositive(void) {
+    const uint32_t room = psp_arg(1);
+    if (room > CTRL_HISTORY) { psp_ret(SCE_ERROR_INVALID_SIZE); return; }
+    ctrl_wait_sample();
+    ctrl_fill(ctrl_unread_samples(room));
+}
+
+static void hle_PeekBufferPositive(void) {
+    const uint32_t room = psp_arg(1);
+    if (room > CTRL_HISTORY) { psp_ret(SCE_ERROR_INVALID_SIZE); return; }
+    if (!room) { psp_ret(0); return; }
+    ctrl_fill(room);
+}
 
 /* ---- sceRtc ----------------------------------------------------------------
  *
@@ -956,9 +1031,12 @@ static void hle_RtcFormatRFC3339(void) {
 /* ---- sceAudio ------------------------------------------------------------ */
 
 #define AUDIO_CHANNELS 8
+#define AUDIO_OUTPUT2_CHANNEL AUDIO_CHANNELS
+#define AUDIO_OUTPUTS (AUDIO_CHANNELS + 1)
 
 typedef struct { int reserved; uint32_t samples; uint32_t format; uint64_t play_until_ns; } audio_ch;
-static audio_ch g_audio[AUDIO_CHANNELS];
+static audio_ch g_audio[AUDIO_OUTPUTS];
+static uint64_t g_output2_until_ns;
 static uint64_t g_audio_blocks;
 
 uint64_t psp_audio_blocks(void) { return g_audio_blocks; }
@@ -975,17 +1053,21 @@ uint64_t psp_audio_blocks(void) { return g_audio_blocks; }
  * with psp_sched_delay, the non-blocking ones never wait. */
 static int64_t (*g_audio_out)(int ch, uint32_t samples, uint32_t fmt,
                               uint32_t buf, uint32_t lvol, uint32_t rvol);
+static uint32_t (*g_audio_pending)(int ch);
 
 void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples, uint32_t fmt,
                                         uint32_t buf, uint32_t lvol, uint32_t rvol)) {
     g_audio_out = fn;
+    g_audio_pending = NULL;
 }
+
+void psp_audio_set_pending(uint32_t (*fn)(int ch)) { g_audio_pending = fn; }
 
 /* PSPRECOMP_AUDIO_DUMP=<prefix> appends every output buffer, raw signed
  * 16-bit as the game wrote it, to <prefix>.chN.raw -- one file per channel,
  * with a line on stderr naming its shape. A headless run has no speaker, and
  * "is there sound" is otherwise a question only a windowed run can answer. */
-static FILE *g_audio_dump[AUDIO_CHANNELS];
+static FILE *g_audio_dump[AUDIO_OUTPUTS];
 static const char *audio_dump_prefix(void) {
     static const char *p; static int looked;
     if (!looked) { looked = 1; p = getenv("PSPRECOMP_AUDIO_DUMP"); if (p && !*p) p = NULL; }
@@ -1043,7 +1125,7 @@ static void hle_ChRelease(void) {
  * popping comes down to. Only meaningful when the run is paced against the
  * wall clock -- a window, or PSPRECOMP_REALTIME -- and reported then. */
 typedef struct { uint64_t first_ns, last_ns, max_gap_ns; uint32_t late, outputs; } audio_gap;
-static audio_gap g_audio_gap[AUDIO_CHANNELS];
+static audio_gap g_audio_gap[AUDIO_OUTPUTS];
 static void audio_note_gap(uint32_t ch, uint32_t samples) {
     audio_gap *g = &g_audio_gap[ch];
     const uint64_t now = psp_os_mono_ns();
@@ -1057,7 +1139,7 @@ static void audio_note_gap(uint32_t ch, uint32_t samples) {
     g->outputs++;
 }
 void psp_audio_dump_gaps(FILE *out) {
-    for (uint32_t ch = 0; ch < AUDIO_CHANNELS; ch++) {
+    for (uint32_t ch = 0; ch < AUDIO_OUTPUTS; ch++) {
         const audio_gap *g = &g_audio_gap[ch];
         if (g->outputs < 2) continue;
         fprintf(out, "    audio ch %u: %u outputs over %.1f s, longest wait %.0f ms, %u arrived later than 1.5 buffers\n",
@@ -1153,8 +1235,100 @@ static void hle_ChangeChannelConfig(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Output2 contract: PSPSDK 654ac51 src/audio/pspaudio.h and sceAudio.S.
+ * This implementation uses a host queue query, or a single timed transfer
+ * without a device. The latter is our scheduling policy, not a claim about
+ * firmware FIFO depth or undocumented reservation/status quirks.
+ * Error categories below are SDK constants. Exact errors for unspecified
+ * edge cases still require independent hardware observations. */
+enum {
+    O2_BUSY = 0x80260002u, O2_SIZE = 0x80260006u,
+    O2_NOT_RESERVED = 0x80260008u, O2_VOLUME = 0x8026000Bu,
+    O2_ADDRESS = 0x800200D3u /* PSPSDK src/user/pspkerror.h */
+};
+
+static uint32_t output2_remaining(void) {
+    if (g_audio_out)
+        return g_audio_pending ? g_audio_pending(AUDIO_OUTPUT2_CHANNEL) : 0;
+    const uint64_t now = psp_clock_peek() * 1000ull;
+    if (now >= g_output2_until_ns) return 0;
+    return (uint32_t)(((g_output2_until_ns - now) * PSP_AUDIO_RATE
+                      + 999999999ull) / 1000000000ull);
+}
+
+static int output2_length_ok(uint32_t samples) {
+    return samples >= 17 && samples <= 4111;
+}
+
+static void hle_Output2Reserve(void) {
+    audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
+    const uint32_t samples = psp_arg(0);
+    if (!output2_length_ok(samples)) { psp_ret(O2_SIZE); return; }
+    if (channel->reserved) { psp_ret(O2_BUSY); return; }
+    *channel = (audio_ch){.reserved = 1, .samples = samples};
+    g_output2_until_ns = 0;
+    psp_ret(0);
+}
+
+static void hle_Output2ChangeLength(void) {
+    audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
+    if (!channel->reserved) { psp_ret(O2_NOT_RESERVED); return; }
+    if (!output2_length_ok(psp_arg(0))) { psp_ret(O2_SIZE); return; }
+    channel->samples = psp_arg(0);
+    psp_ret(0);
+}
+
+static void hle_Output2Rest(void) {
+    if (!g_audio[AUDIO_OUTPUT2_CHANNEL].reserved) {
+        psp_ret(O2_NOT_RESERVED); return;
+    }
+    psp_ret(output2_remaining());
+}
+
+static void hle_Output2Release(void) {
+    audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
+    if (!channel->reserved) { psp_ret(O2_NOT_RESERVED); return; }
+    if (output2_remaining()) { psp_ret(O2_BUSY); return; }
+    *channel = (audio_ch){0};
+    g_output2_until_ns = 0;
+    psp_ret(0);
+}
+
+static void hle_Output2Blocking(void) {
+    audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
+    const uint32_t volume = psp_arg(0), pcm = psp_arg(1);
+    if (!channel->reserved) { psp_ret(O2_NOT_RESERVED); return; }
+    if (volume > 0x8000) { psp_ret(O2_VOLUME); return; }
+    if (!pcm || !psp_mem_ptr(pcm, channel->samples * 4)) {
+        psp_ret(O2_ADDRESS); return;
+    }
+    /* No device: finish the previous transfer before accepting the next one.
+     * If scheduling is disabled (unit probes), report busy without losing it. */
+    if (!g_audio_out && output2_remaining()) {
+        const uint64_t now = psp_clock_peek() * 1000ull;
+        if (g_output2_until_ns > now)
+            psp_sched_delay((g_output2_until_ns - now + 999) / 1000);
+        if (output2_remaining()) { psp_ret(O2_BUSY); return; }
+    }
+    const uint32_t samples = channel->samples;
+    g_audio_blocks++;
+    audio_note_gap(AUDIO_OUTPUT2_CHANNEL, samples);
+    audio_dump(AUDIO_OUTPUT2_CHANNEL, samples, 0, pcm);
+    int64_t wait_us;
+    if (g_audio_out) {
+        wait_us = g_audio_out(AUDIO_OUTPUT2_CHANNEL, samples, 0, pcm, volume, volume);
+    } else {
+        wait_us = ((uint64_t)samples * 1000000ull + PSP_AUDIO_RATE - 1) / PSP_AUDIO_RATE;
+        g_output2_until_ns = psp_clock_peek() * 1000ull
+                          + (uint64_t)samples * 1000000000ull / PSP_AUDIO_RATE;
+    }
+    if (wait_us > 0) psp_sched_delay((uint64_t)wait_us);
+    psp_ret(0);
+}
+
 void psp_misc_reset(void) {
-    g_intr_enabled = 1;
+    memset(&volatile_memory,0,sizeof volatile_memory);
+    psp_interrupt_reset();
     g_exit_requested = 0;
     g_hold_buttons   = 0;
     g_script_buttons = 0;
@@ -1165,8 +1339,11 @@ void psp_misc_reset(void) {
     atomic_store(&g_host_ay, 128);
     g_ctrl_frame = 0;
     g_ctrl_polls = 0;
+    g_read_frame = UINT64_MAX;
+    g_ctrl_last_buttons = g_ctrl_pressed_buttons = 0;
     memset(&g_press, 0, sizeof g_press);
     memset(g_audio, 0, sizeof g_audio);
+    g_output2_until_ns = 0;
     memset(g_audio_gap, 0, sizeof g_audio_gap);
     g_audio_blocks = 0;
     psp_ctrl_replay_reset();
@@ -1188,8 +1365,7 @@ void psp_misc_init(void) {
 void psp_misc_register(void) {
     psp_hle_register(0x04B7766E, "scePower", "scePowerRegisterCallback", hle_PowerRegisterCallback);
 
-    psp_hle_register(0x092968F4, "Kernel_Library", "sceKernelCpuSuspendIntr", hle_CpuSuspendIntr);
-    psp_hle_register(0x5F10D406, "Kernel_Library", "sceKernelCpuResumeIntr",  hle_CpuResumeIntr);
+    psp_interrupt_register();
 
     psp_hle_register(0x79D1C3FA, "UtilsForUser", "sceKernelDcacheWritebackAll",           hle_CacheOp);
     psp_hle_register(0xB435DEC5, "UtilsForUser", "sceKernelDcacheWritebackInvalidateAll", hle_CacheOp);
@@ -1271,4 +1447,9 @@ void psp_misc_register(void) {
     psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
     psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ChangeChannelConfig);
     psp_hle_register(0xB7E1D8E7, "sceAudio", "sceAudioChangeChannelVolume",  hle_ok);
+    psp_hle_register(0x01562BA3, "sceAudio", "sceAudioOutput2Reserve", hle_Output2Reserve);
+    psp_hle_register(0x2D53F36E, "sceAudio", "sceAudioOutput2OutputBlocking", hle_Output2Blocking);
+    psp_hle_register(0x63F2889C, "sceAudio", "sceAudioOutput2ChangeLength", hle_Output2ChangeLength);
+    psp_hle_register(0x647CEF33, "sceAudio", "sceAudioOutput2GetRestSample", hle_Output2Rest);
+    psp_hle_register(0x43196845, "sceAudio", "sceAudioOutput2Release", hle_Output2Release);
 }

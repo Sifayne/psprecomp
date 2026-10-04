@@ -1,0 +1,37 @@
+{
+  "name": "IndependentKernelProbe",
+  "imports": {
+    "IoFileMgrForUser": [
+      "sceIoWrite"
+    ],
+    "LoadExecForUser": [
+      "sceKernelExitGame"
+    ],
+    "sceSuspendForUser": [
+      "sceKernelVolatileMemLock",
+      "sceKernelVolatileMemTryLock",
+      "sceKernelVolatileMemUnlock"
+    ],
+    "ThreadManForUser": [
+      "sceKernelCreateThread",
+      "sceKernelStartThread",
+      "sceKernelDeleteThread",
+      "sceKernelWaitThreadEnd",
+      "sceKernelWaitThreadEndCB",
+      "sceKernelGetThreadId",
+      "sceKernelChangeThreadPriority",
+      "sceKernelDelayThread",
+      "sceKernelTerminateDeleteThread"
+    ],
+    "SysMemUserForUser": [
+      "sceKernelSetCompiledSdkVersion",
+      "sceKernelGetCompiledSdkVersion",
+      "probeOpaque91de"
+    ]
+  },
+  "opaque_imports": {
+    "SysMemUserForUser": {
+      "probeOpaque91de": "0x91de343c"
+    }
+  }
+}

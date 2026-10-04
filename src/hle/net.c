@@ -18,8 +18,8 @@
  *   stands in. Out-parameters are left untouched on these paths: the test
  *   seeds guards.
  * - The WLAN switch reads off (0 -- there is no switch), and
- *   sceNetEtherNtostr is pure formatting, so it is implemented: it writes a
- *   zero MAC, which is what this radio has.
+ *   sceNetEtherNtostr is pure formatting, so it is implemented: it formats
+ *   whatever six bytes the caller passes.
  *
  * Library, NID and name for every entry below are PSPSDK's import stubs
  * (src/net/sceNet.S, sceNetAdhoc.S, sceNetAdhocctl.S, src/wlan/sceWlanDrv.S;
@@ -34,6 +34,7 @@
 #include "psprecomp/mem.h"
 
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 /* The net stack is a memory pool, not a radio: succeed vacuously. Terminate is
@@ -46,15 +47,16 @@ static void hle_NetTerm(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
  * untouched. */
 static void hle_NetNotImpl(void) { psp_ret(SCE_KERNEL_ERROR_NOTIMPLEMENTED); }
 
-/* Pure formatting over whatever MAC the caller points at; ours is zeros.
- * Invalid pointers are skipped silently: a void function has no error to
- * report, and faulting the caller is worse. */
+/* Pure formatting of the caller's six bytes. Invalid pointers are skipped
+ * silently: a void function has no error to report, and faulting the caller
+ * is worse. */
 static void hle_EtherNtostr(void) {
-    static const char zero[] = "00:00:00:00:00:00";
-    void *dst = psp_mem_ptr(psp_arg(1), (uint32_t)sizeof zero);
-    if (!dst) return;
-    memcpy(dst, zero, sizeof zero);
-    psp_mem_mark_write(psp_arg(1), (uint32_t)sizeof zero);
+    const uint8_t *mac = psp_mem_ptr(psp_arg(0), 6);
+    char text[18];
+    if (!mac || !psp_mem_ptr(psp_arg(1), (uint32_t)sizeof text)) return;
+    snprintf(text, sizeof text, "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    psp_mem_write_block(psp_arg(1), text, sizeof text);
 }
 
 /* There is no switch. Off is the honest reading, and it is what sends a

@@ -39,6 +39,14 @@ static void test_core_integer(void) {
     /* The function prologue/epilogue every MIPS compiler emits. If these four
      * are wrong nothing else matters. */
     a_insn i;
+    dec(0xD0200000,0,A_VRNDS,"vrnds.s");
+    dec(0xD0218080,0,A_VRNDI,"vrndi.q");
+    dec(0xD0220080,0,A_VRNDF1,"vrndf1.p");
+    i=dec(0xD0238000,0,A_VRNDF2,"vrndf2.t");
+    CHECK(i.vsize==3 && i.vd==0,"vrndf2.t operands");
+    dec(0xFFFF0000,0,A_VNOP,"vnop");
+    dec(0xFFFF0320,0,A_VSYNC,"vsync");
+    dec(0xFFFF040D,0,A_VFLUSH,"vflush");
 
     i = dec(0x27BDFFE0, 0x08900000, A_ADDIU, "addiu $sp,$sp,-32");
     CHECK(i.rt == 29 && i.rs == 29, "addiu registers");
@@ -300,7 +308,7 @@ static void test_formatting(void) {
 
     /* An unrecognised word must format as data, never as a plausible-looking
      * instruction — that is what makes a bad disassembly obvious on sight. */
-    a_decode(0xFFFFFFFF, 0x08900000, &in);
+    a_decode(0xFC000000, 0x08900000, &in);
     a_format(&in, buf, sizeof buf);
     CHECK(strstr(buf, ".word"), "unknown word formatting: \"%s\"", buf);
 }

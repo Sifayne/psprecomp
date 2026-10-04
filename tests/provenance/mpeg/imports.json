@@ -1,0 +1,38 @@
+{
+  "name": "IndependentMpegProbe",
+  "imports": {
+    "IoFileMgrForUser": [
+      "sceIoWrite"
+    ],
+    "LoadExecForUser": [
+      "sceKernelExitGame"
+    ],
+    "sceUtility": [
+      "sceUtilityLoadAvModule"
+    ],
+    "SysMemUserForUser": [
+      "sceKernelSetCompiledSdkVersion"
+    ],
+    "sceMpeg": [
+      "sceMpegInit",
+      "sceMpegFinish",
+      "sceMpegQueryMemSize",
+      "sceMpegRingbufferQueryMemSize",
+      "sceMpegRingbufferConstruct",
+      "sceMpegRingbufferDestruct",
+      "sceMpegRingbufferAvailableSize",
+      "sceMpegCreate",
+      "sceMpegDelete",
+      "sceMpegQueryAtracEsSize",
+      "sceMpegInitAu",
+      "sceMpegMallocAvcEsBuf",
+      "sceMpegFreeAvcEsBuf",
+      "sceMpegQueryStreamSize",
+      "sceMpegQueryStreamOffset",
+      "sceMpegRegistStream",
+      "sceMpegUnRegistStream",
+      "sceMpegGetAvcAu",
+      "sceMpegRingbufferPut"
+    ]
+  }
+}

@@ -48,6 +48,13 @@ int psp_hle_is_named(int index);
 /* Call a firmware function by NID. An unregistered NID reports itself by name
  * where possible and by number otherwise, rather than failing silently. */
 void psp_hle_call(uint32_t nid);
+/* Optional host scheduling policy, configured before guest execution. Called
+ * after an outermost registered handler has completed and written its result,
+ * before returning to guest code. elapsed_ns measures the handler's host wall
+ * duration (possibly including suspension), not emulated CPU cycles. Nested
+ * calls are excluded so a host cannot yield halfway through an outer handler.
+ * NULL disables both the callback and timing. No default firmware policy. */
+void psp_hle_set_host_work(void (*fn)(uint32_t nid, uint64_t elapsed_ns));
 
 /* Silence the per-call "unimplemented firmware call" message. Intended for
  * batch callers making millions of calls; see the note in hle.c. */
@@ -76,6 +83,10 @@ void psp_mpeg_reset(void);
  * environment default. Returns -1 if decoding is requested but unavailable. */
 int psp_mpeg_set_decoding(int enabled);
 int psp_mpeg_decoding_available(void);
+/* Whether a late movie picture may be dropped to hold the sound (1), or every
+ * picture is handed over (0); -1 restores the PSPRECOMP_MPEG_NODROP default.
+ * See the catch-up comment in mpeg.c for what each choice costs. */
+int psp_mpeg_set_drop(int enabled);
 
 void psp_hle_dump_recent(FILE *out);
 
@@ -300,10 +311,12 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 void psp_sysmem_init(void);
 void psp_sysmem_register(void);
 void psp_sysmem_reset(void);
+uint32_t psp_sysmem_compiled_sdk(void);
 
 void psp_display_init(void);
 void psp_display_register(void);
 void psp_display_reset(void);
+void psp_display_tick(void);
 int      psp_display_capture(const char *path);
 uint64_t psp_display_vblanks(void);
 uint32_t psp_display_framebuffer(void);
@@ -337,6 +350,8 @@ void psp_ge_drain_all(void);
  * src/hle/ge.c. */
 void psp_ge_tick(void);
 int  psp_ge_idle_run(uint64_t until_us);
+int psp_ge_callbacks_pending(void);
+void psp_ge_run_pending_callbacks(void);
 
 /* The GE's register state, for capture and replay. Commands are differential,
  * so a frame only means anything against the state it started from -- a replay
@@ -372,11 +387,13 @@ void psp_io_set_root(const char *root);
 
 /* Back the raw UMD block device with a disc image.
  *
- * `disc0:` is the ISO9660 filesystem and maps to a directory; `umd0:` and
- * `umd1:` are the block device underneath it, and a game opens those by bare
- * name to read sectors -- which is how a PSP title reaches its own data when it
- * does not want the filesystem. With no image set those opens fail, and a game
- * that retries on failure never gets past its first read. */
+ * `disc0:` is the ISO9660 filesystem, served from the image when one is set
+ * and from a directory otherwise; `umd0:` and `umd1:` are the block device
+ * underneath it, and a game opens those by bare name to read sectors -- which
+ * is how a PSP title reaches its own data when it does not want the
+ * filesystem (tests/provenance/disc, run as a game booted from its image).
+ * With no image set those opens fail, and a game that retries on failure
+ * never gets past its first read. */
 void psp_io_set_umd_image(const char *path);
 uint64_t psp_io_bytes_read(void);
 /* Map a guest path to its host path (same rewriting opens use). For layers
@@ -436,6 +453,9 @@ uint64_t psp_audio_blocks(void);
  * counts SceCtrlData entries written, which is the guest-visible timestamp
  * and counts what it always counted. */
 uint32_t psp_ctrl_polls(void);
+/* Buttons newly pressed in the last merged poll, including recorded carrier
+ * bits. This is a snapshot, not a queue: menu/paused polls do not accumulate. */
+uint32_t psp_ctrl_pressed_buttons(void);
 /* The stick as the guest last read it (merged lane, 0..255 centred on 128),
  * for native replacements that want the magnitude the game's own control code
  * discards. Same value a recording holds, so a replay reproduces it. */
@@ -503,7 +523,7 @@ int  psp_ctrl_replay_drain(void);
  * cadence this game keeps; it never asks for a vblank. */
 void psp_display_set_present(void (*fn)(uint32_t addr, uint32_t stride,
                                         uint32_t fmt));
-/* Each output buffer: the channel, its reserved shape (sample count per call
+/* Each output buffer: the channel (0..7 normal, 8 for Output2), its reserved shape (sample count per call
  * and PSP_AUDIO_FORMAT_STEREO 0 / MONO 0x10), where the PCM lives in guest
  * memory, and the left and right volumes on the 0..0x8000 scale the call was
  * given. Returns the playback backlog in microseconds, which the blocking
@@ -511,6 +531,10 @@ void psp_display_set_present(void (*fn)(uint32_t addr, uint32_t stride,
 void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples,
                                         uint32_t fmt, uint32_t buf,
                                         uint32_t lvol, uint32_t rvol));
+/* Optional unplayed-frame query for the current sink. Install after set_output;
+ * changing/unregistering the sink clears this query. Without it a sink is
+ * treated as consuming buffers immediately for status reporting. */
+void psp_audio_set_pending(uint32_t (*fn)(int ch));
 /* The host-clock gaps between each channel's outputs; see audio_note_gap. */
 void psp_audio_dump_gaps(FILE *out);
 /* A movie's audio clock against its picture; see mpeg.c. */
@@ -547,6 +571,7 @@ void psp_threadman_cb_end(void);
 /* Raise a callback from outside threadman -- scePowerRegisterCallback fires one
  * as it registers. Returns what sceKernelNotifyCallback would. */
 uint32_t psp_threadman_notify_callback(uint32_t cbid, uint32_t arg);
+int psp_threadman_callback_exists(uint32_t cbid);
 
 /* Shared with the other kernel object types: one uid space, and one way of
  * writing a name into a SceKernel*Info block. */

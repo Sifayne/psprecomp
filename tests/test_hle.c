@@ -723,12 +723,18 @@ static void test_net(void) {
     /* The two value-returning calls. Ntostr is void: only the string is
      * checked, not $v0. An invalid pointer is skipped, not faulted. */
     const uint32_t MAC = 0x08830100u, BUF = 0x08830200u;
+    const uint8_t address[] = {0x02, 0x34, 0x56, 0x78, 0x9a, 0xbc};
+    psp_mem_write_block(MAC, address, sizeof address);
+    psp_write32(BUF-4, 0x87654321);
+    psp_write32(BUF+18, 0x12345678);
     call(psp_nid("sceNetEtherNtostr"), MAC, BUF, 0, 0);
     char got[32];
-    CHECK(strcmp(psp_str(BUF, got, sizeof got), "00:00:00:00:00:00") == 0,
-          "ntostr formats the zero MAC, got \"%s\"", got);
+    CHECK(strcmp(psp_str(BUF, got, sizeof got), "02:34:56:78:9a:bc") == 0,
+          "ntostr formats the caller's MAC, got \"%s\"", got);
+    CHECK(psp_read32(BUF-4)==0x87654321 && psp_read32(BUF+18)==0x12345678,
+          "ntostr respects the buffer's bounds");
     call(psp_nid("sceNetEtherNtostr"), 0xDEADBEEFu, BUF, 0, 0);
-    CHECK(strcmp(psp_str(BUF, got, sizeof got), "00:00:00:00:00:00") == 0,
+    CHECK(strcmp(psp_str(BUF, got, sizeof got), "02:34:56:78:9a:bc") == 0,
           "ntostr with a bad source leaves the buffer");
     CHECK(call(psp_nid("sceWlanGetSwitchState"), 0, 0, 0, 0) == 0,
           "the WLAN switch reads off");
@@ -918,6 +924,24 @@ static void test_ge_display_list(void) {
           "eDRAM is 2 MB");
 }
 
+static void test_ge_alias_stall(void) {
+    psp_ge_reset();
+    const uint32_t list = 0x0882C000, stall = list + 12;
+    psp_write32(list, 0x10080000);       /* BASE 0x08000000 */
+    psp_write32(list + 4, 0x0882C00C);   /* JUMP to cached stall */
+    psp_write32(list + 8, 0);            /* skipped */
+    psp_write32(stall, 0x0F000000);     /* not released yet */
+    psp_write32(stall + 4, 0x0C000000);
+    uint32_t id = call(psp_nid("sceGeListEnQueue"), list | 0x40000000,
+                       list | 0x40000000, 0, 0);
+    call(psp_nid("sceGeListUpdateStallAddr"), id, stall | 0x40000000, 0, 0);
+    CHECK(psp_ge_command_count() == 2, "uncached stall stops a cached GE jump before FINISH");
+    /* A list held at its stall reads DRAWING (geprobe 6 steps 79 and 80). */
+    CHECK(call(psp_nid("sceGeListSync"), id, 1, 0, 0) == 2, "alias-equivalent stall reads DRAWING");
+    call(psp_nid("sceGeListUpdateStallAddr"), id, 0, 0, 0);
+    CHECK(psp_ge_command_count() == 3, "releasing alias stall consumes FINISH exactly once");
+}
+
 /* GU_SIGNAL_PAUSE is followed by a FINISH/END pair, and the list stops there
  * until sceGeContinue: geprobe 5 step 57 (fw 6.60) reads ListSync(peek) 4
  * and DrawSync(peek) 2 while it waits, and the rest of the list runs inside
@@ -1038,12 +1062,55 @@ static void test_ge_long_list(void) {
 #undef W_
     const uint32_t qid = call(psp_nid("sceGeListEnQueue"), LIST, 0, cbid, 0);
     CHECK(g_gecb_n == 1 && g_gecb[0][1] == 0x01, "only SIGNAL 0x01 inside EnQueue: %d handler(s)", g_gecb_n);
+    /* Drawn already, all of it: only what the guest sees waits for the GE's
+     * time (src/hle/ge.c, "Drawing now, reporting on the clock"). BASE, FBP,
+     * FBW, VTYPE, two SIGNAL/END pairs, 40 VADDR/PRIM pairs and the FINISH. */
+    CHECK(psp_ge_command_count() == 89, "the whole list walked inside EnQueue: %llu command(s)",
+          (unsigned long long)psp_ge_command_count());
     const uint32_t peek = call(psp_nid("sceGeListSync"), qid, 1, 0, 0);
     CHECK(peek == 2, "ListSync(peek) as EnQueue returns: 0x%08X, hardware 2", peek);
     CHECK(call(psp_nid("sceGeDrawSync"), 1, 0, 0, 0) == 2, "DrawSync(peek) while it runs: 2");
     CHECK(call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0) == 0, "DrawSync(wait) reads 0");
     CHECK(g_gecb_n == 3 && g_gecb[1][1] == 0x02 && g_gecb[2][0] == 2 && g_gecb[2][1] == 0x03,
           "SIGNAL 0x02 and FINISH 0x03 by the end of the wait: %d handler(s)", g_gecb_n);
+    call(psp_nid("sceGeUnsetCallback"), cbid, 0, 0, 0);
+}
+
+/* sceGeContinue from a PAUSE's own signal handler lets the list through the
+ * pause. The walk has stopped at the pause's FINISH before the handler runs,
+ * so the pause it took is taken back before the guest sees it. Not measured
+ * on a PSP. */
+static uint32_t g_gecb_continue;
+static void gecb_signal_continue(void) {
+    gecb_note(1);
+    g_gecb_continue = call(psp_nid("sceGeContinue"), 0, 0, 0, 0);
+}
+
+static void test_ge_pause_continue_early(void) {
+    psp_ge_reset();
+    g_gecb_n = 0;
+    g_gecb_continue = 0xFFFFFFFFu;
+    psp_register(0x08A00200u, gecb_signal_continue);
+    psp_register(0x08A00100u, gecb_finish);
+    const uint32_t CB = 0x08836000u, LIST = 0x0882C000u;
+    psp_write32(CB + 0, 0x08A00200u); psp_write32(CB + 4, 0x5A);
+    psp_write32(CB + 8, 0x08A00100u); psp_write32(CB + 12, 0xA5);
+    const uint32_t cbid = call(psp_nid("sceGeSetCallback"), CB, 0, 0, 0);
+    psp_write32(LIST + 0x00, (0x0Eu << 24) | (0x03u << 16) | 1u); /* SIGNAL PAUSE */
+    psp_write32(LIST + 0x04, (0x0Cu << 24));                      /* END */
+    psp_write32(LIST + 0x08, (0x0Fu << 24));                      /* pause FINISH */
+    psp_write32(LIST + 0x0C, (0x0Cu << 24));                      /* pause END */
+    psp_write32(LIST + 0x10, (0x00u << 24));                      /* NOP */
+    psp_write32(LIST + 0x14, (0x0Fu << 24) | 0x66u);              /* final FINISH */
+    psp_write32(LIST + 0x18, (0x0Cu << 24));                      /* final END */
+    const uint32_t qid = call(psp_nid("sceGeListEnQueue"), LIST, 0, cbid, 0);
+    CHECK(g_gecb_continue == 0, "sceGeContinue from the handler reads 0x%08X", g_gecb_continue);
+    CHECK(psp_ge_command_count() == 6, "walked through the pause: %llu command(s), want 6",
+          (unsigned long long)psp_ge_command_count());
+    CHECK(call(psp_nid("sceGeListSync"), qid, 1, 0, 0) == 0, "done as EnQueue returns, never paused");
+    CHECK(g_gecb_n == 2 && g_gecb[0][0] == 1 && g_gecb[1][0] == 2 && g_gecb[1][1] == 0x66,
+          "the signal handler, then FINISH 0x66's: %d handler(s)", g_gecb_n);
+    call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0);
     call(psp_nid("sceGeUnsetCallback"), cbid, 0, 0, 0);
 }
 
@@ -1722,6 +1789,161 @@ static void test_waits_with_threads(void) {
     psp_threadman_reset();
 }
 
+/* PSPSDK 654ac51, src/audio/pspaudio.h and sceAudio.S supply the public
+ * contract and NIDs. These tests assert that contract plus our host queue
+ * behavior; undocumented firmware quirks are not used as an oracle. */
+static unsigned output2_sink_calls, output2_pending_frames;
+static uint32_t output2_pending(int ch) {
+    CHECK(ch == 8, "query independent Output2 channel");
+    return output2_pending_frames;
+}
+static int64_t output2_sink(int ch, uint32_t samples, uint32_t fmt,
+                           uint32_t buf, uint32_t left, uint32_t right) {
+    CHECK(ch == 8 && samples == 512 && fmt == 0, "Output2 stereo PCM shape");
+    CHECK(buf == 0x08820000 && left == 0x8000 && right == left, "PCM pointer and volume");
+    output2_sink_calls++;
+    output2_pending_frames += samples;
+    return 0;
+}
+
+static void test_audio_output2(void) {
+    const uint32_t reserve = 0x01562BA3, output = 0x2D53F36E;
+    const uint32_t rest = 0x647CEF33, release = 0x43196845, length = 0x63F2889C;
+    psp_sched_set_threading(0);
+    psp_audio_set_output(NULL);
+    psp_clock_reset();
+    CHECK((int32_t)call(output, 0x8000, 0x08820000, 0, 0) < 0, "output requires reservation");
+    const uint32_t invalid[] = {0,16,4112,0x80000200};
+    for (unsigned i=0; i<sizeof invalid/sizeof invalid[0]; i++)
+        CHECK((int32_t)call(reserve, invalid[i], 0, 0, 0) < 0, "SDK reserve range is 17..4111");
+    const uint32_t valid[] = {17,4111,512};
+    for (unsigned i=0; i<sizeof valid/sizeof valid[0]; i++) {
+        CHECK(call(reserve, valid[i], 0, 0, 0) == 0, "SDK sample count accepted");
+        CHECK(call(release, 0, 0, 0, 0) == 0, "unused channel releases");
+    }
+    CHECK(call(reserve, 512, 0, 0, 0) == 0, "reserve for PCM tests");
+    CHECK((int32_t)call(reserve, 512, 0, 0, 0) < 0, "duplicate reservation rejected");
+    CHECK(call(psp_nid("sceAudioChReserve"), 0, 64, 0x10, 0) == 0, "normal channel remains independent");
+    CHECK((int32_t)call(output, 0x8001, 0x08820000, 0, 0) < 0, "SDK volume maximum enforced");
+    CHECK((int32_t)call(output, 0x8000, 0xFFFFFFFF, 0, 0) < 0, "invalid PCM cannot be read");
+    CHECK(call(rest, 0, 0, 0, 0) == 0, "rejected writes queue nothing");
+    psp_audio_set_output(output2_sink);
+    psp_audio_set_pending(output2_pending);
+    output2_sink_calls = output2_pending_frames = 0;
+    for (int i=0; i<12; i++)
+        CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 0, "sink accepts each buffer exactly once");
+    CHECK(output2_sink_calls == 12, "all buffers delivered");
+    psp_clock_advance_to(1000000);
+    CHECK(call(rest, 0, 0, 0, 0) == 6144, "guest time does not consume a device queue");
+    CHECK(call(length, 256, 0, 0, 0) == 0, "change future transfer size");
+    CHECK(call(rest, 0, 0, 0, 0) == 6144, "queued sample count retains its original size");
+    output2_pending_frames -= 1024;
+    CHECK(call(rest, 0, 0, 0, 0) == 5120, "query follows device consumption");
+    CHECK((int32_t)call(release, 0, 0, 0, 0) < 0, "do not discard pending PCM on release");
+    output2_pending_frames = 0;
+    CHECK(call(release, 0, 0, 0, 0) == 0, "release after device drains");
+    psp_audio_set_output(NULL);
+    CHECK(call(reserve, 512, 0, 0, 0) == 0, "reserve without device");
+    CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 0, "headless transfer starts");
+    const uint64_t start = psp_clock_peek();
+    psp_clock_advance_to(start + 6000);
+    uint32_t remaining = call(rest, 0, 0, 0, 0);
+    CHECK(remaining > 200 && remaining < 300, "headless count decreases at 44100 frames per second");
+    CHECK(call(length, 17, 0, 0, 0) == 0, "length change does not resize current transfer");
+    CHECK(call(rest, 0, 0, 0, 0) == remaining, "remaining frames independent of future length");
+    psp_clock_advance_to(start + 12000);
+    CHECK(call(rest, 0, 0, 0, 0) == 0, "headless PCM fully consumed");
+    CHECK(call(release, 0, 0, 0, 0) == 0, "release headless channel");
+    CHECK(call(psp_nid("sceAudioOutputBlocking"), 0, 0x8000, 0x08820000, 0) == 64,
+          "ordinary channel retained its sample count");
+    call(psp_nid("sceAudioChRelease"), 0, 0, 0, 0);
+    psp_sched_set_threading(1);
+}
+
+/* Callback observations from tests/provenance/umd/observed.txt, records
+ * 3..10 and 13..18. The oracle is our executable probe output. Physical UMD
+ * timing and deactivation transitions are outside this mounted-image test. */
+static unsigned umd_hits;
+static uint32_t umd_seen[3];
+static void umd_callback(void) {
+    umd_hits++;
+    for (unsigned i = 0; i < 3; i++) umd_seen[i] = psp_arg(i);
+    psp_ret(0);
+}
+
+static void test_umd_activation_callback(void) {
+    psp_threadman_reset();
+    psp_umd_reset();
+    umd_hits = 0;
+    memset(umd_seen, 0, sizeof umd_seen);
+    psp_register(0x08802000, umd_callback);
+    uint32_t cb = call(0xE81CAF8F, guest_name("UMD probe"),
+                       0x08802000, 0x13579bdf, 0);
+    CHECK((int32_t)cb >= 0, "SDK callback creation");
+    CHECK(call(0xAEE7404D, cb, 0, 0, 0) == 0, "register UMD callback");
+    CHECK(call(0x349D6D6C, 0, 0, 0, 0) == 0 && !umd_hits,
+          "registration alone produces no callback");
+    CHECK(call(0xC6183D47, 1, guest_name("disc0:"), 0, 0) == 0 && !umd_hits,
+          "activation queues callback");
+    CHECK(call(0x56202973, 0x20, 1000, 0, 0) == 0 && !umd_hits,
+          "ordinary ready wait does not consume callback");
+    CHECK(call(0x349D6D6C, 0, 0, 0, 0) == 1 && umd_hits == 1,
+          "callback check consumes queued notification");
+    CHECK(umd_seen[0] == 1 && umd_seen[1] == 0x22 && umd_seen[2] == 0x13579bdf,
+          "observed count, activation event and callback common value");
+    call(0xC6183D47, 1, 0, 0, 0);
+    call(0xC6183D47, 1, 0, 0, 0);
+    CHECK(call(0x4A9E5E29, 0x20, 1000, 0, 0) == 0 && umd_hits == 2,
+          "callback-aware ready wait consumes pending notifications");
+    CHECK(umd_seen[0] == 2 && umd_seen[1] == 0x22,
+          "two activations coalesce with observed count");
+    CHECK(call(0xC6183D47, 0, 0, 0, 0) == 0x80010016,
+          "observed invalid-unit result");
+    CHECK(call(0x349D6D6C, 0, 0, 0, 0) == 0 && umd_hits == 2,
+          "failed activation does not notify");
+    call(0xC6183D47, 2, 0, 0, 0);
+    CHECK(call(0x349D6D6C, 0, 0, 0, 0) == 1 && umd_hits == 3,
+          "observed unit-2 notification");
+    call(0xBD2BDE07, cb, 0, 0, 0);
+    call(0xC6183D47, 1, 0, 0, 0);
+    CHECK(call(0x349D6D6C, 0, 0, 0, 0) == 0 && umd_hits == 3,
+          "unregistration prevents later notifications");
+    call(0xEDBA5844, cb, 0, 0, 0);
+    psp_umd_reset();
+}
+
+/* Original host-interface test: a completed outer call may offer a scheduling
+ * opportunity, but nested calls must not expose partially executed handlers. */
+static unsigned host_work_calls, host_inner_done;
+static uint32_t host_work_nid, host_work_result;
+static void host_inner(void) { host_inner_done++; psp_ret(17); }
+static void host_outer(void) {
+    psp_hle_call(0xff001001u);
+    CHECK(host_work_calls == 0, "no host callback inside outer handler");
+    CHECK(psp_cpu.r[PSP_REG_V0] == 17, "nested handler result preserved");
+    psp_ret(29);
+}
+static void host_work(uint32_t nid, uint64_t elapsed_ns) {
+    (void)elapsed_ns;
+    host_work_calls++;
+    host_work_nid = nid;
+    host_work_result = psp_cpu.r[PSP_REG_V0];
+    CHECK(host_inner_done == 1, "inner call completed before host callback");
+    psp_sched_yield();
+}
+static void test_host_work_boundary(void) {
+    psp_hle_register_unnamed(0xff001001u, "host-test", host_inner);
+    psp_hle_register_unnamed(0xff001002u, "host-test", host_outer);
+    host_work_calls = host_inner_done = 0;
+    psp_hle_set_host_work(host_work);
+    CHECK(call(0xff001002u, 0, 0, 0, 0) == 29, "host yield preserves outer result");
+    CHECK(host_work_calls == 1 && host_work_nid == 0xff001002u && host_work_result == 29,
+          "one callback observes the completed outer call");
+    psp_hle_set_host_work(NULL);
+    call(0xff001001u, 0, 0, 0, 0);
+    CHECK(host_work_calls == 1, "unregistering disables callback");
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -1733,6 +1955,8 @@ int main(void) {
     test_sha1_vectors();
     test_nids_match_names();
     test_sysmem();
+    test_audio_output2();
+    test_umd_activation_callback();
     test_semaphores();
     test_create_attributes();
     test_event_flags();
@@ -1743,7 +1967,9 @@ int main(void) {
     test_io_dirs();
     test_net();
     test_ge_display_list();
+    test_ge_alias_stall();
     test_ge_signal_pause();
+    test_ge_pause_continue_early();
     test_ge_callbacks();
     test_ge_long_list();
     test_ge_infinite_list();
@@ -1757,6 +1983,7 @@ int main(void) {
     test_time_calls();
     test_pool_free_pointers();
     test_waits_with_threads();
+    test_host_work_boundary();
 
     psp_mem_free();
 

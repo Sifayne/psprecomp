@@ -283,11 +283,9 @@ int psp_find_section(const psp_blob *b, const elf_info *e, const char *name,
  * Read after relocation, not before: gp_value is one of the five relocated
  * words in this header, so the image already holds the final address. */
 static uint32_t module_gp(const psp_blob *b, const elf_info *e) {
-    psp_section mi;
-    if (psp_find_section(b, e, ".rodata.sceModuleInfo", &mi) != 0) return 0;
     /* flags(4) + name(28) puts gp_value at 0x20. */
-    if (mi.size < 0x24 || (size_t)mi.offset + 0x24 > b->size) return 0;
-    return rd32(b->data + mi.offset + 0x20);
+    if (e->modinfo_size < 0x24 || (size_t)e->modinfo_offset + 0x24 > b->size) return 0;
+    return rd32(b->data + e->modinfo_offset + 0x20);
 }
 
 int psp_load_module(psp_blob *b, const elf_info *e, psp_load_info *out) {

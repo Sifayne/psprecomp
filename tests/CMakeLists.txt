@@ -32,6 +32,57 @@ add_executable(test_hle test_hle.c)
 target_link_libraries(test_hle PRIVATE psprecomp allegrex_core)
 add_test(NAME hle COMMAND test_hle)
 
+add_executable(test_directory_sdk test_directory_sdk.c)
+target_link_libraries(test_directory_sdk PRIVATE psprecomp allegrex_core)
+add_test(NAME directory_sdk COMMAND test_directory_sdk)
+
+add_executable(test_interrupt test_interrupt.c)
+target_link_libraries(test_interrupt PRIVATE psprecomp)
+add_test(NAME interrupt COMMAND test_interrupt
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/intr/observed.txt)
+set_tests_properties(interrupt PROPERTIES TIMEOUT 10)
+
+add_executable(test_ge_callback test_ge_callback.c)
+target_link_libraries(test_ge_callback PRIVATE psprecomp allegrex_core)
+add_test(NAME ge_callback COMMAND test_ge_callback
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/ge/observed.txt)
+set_tests_properties(ge_callback PROPERTIES TIMEOUT 10)
+
+add_executable(test_ge_sync test_ge_sync.c)
+target_link_libraries(test_ge_sync PRIVATE psprecomp)
+add_test(NAME ge_sync COMMAND test_ge_sync)
+add_test(NAME ge_sync_capture COMMAND test_ge_sync sync-capture.gcap)
+
+add_executable(test_texture_upload test_texture_upload.c)
+target_link_libraries(test_texture_upload PRIVATE psprecomp)
+add_test(NAME texture_upload COMMAND test_texture_upload)
+
+add_executable(test_thread_lifecycle test_thread_lifecycle.c)
+target_link_libraries(test_thread_lifecycle PRIVATE psprecomp allegrex_core)
+add_test(NAME thread_lifecycle COMMAND test_thread_lifecycle)
+set_tests_properties(thread_lifecycle PROPERTIES TIMEOUT 10)
+
+add_executable(test_kernel_observed test_kernel_observed.c)
+target_link_libraries(test_kernel_observed PRIVATE psprecomp allegrex_core)
+add_test(NAME kernel_observed COMMAND test_kernel_observed
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/kernel/observed.txt)
+set_tests_properties(kernel_observed PROPERTIES TIMEOUT 10)
+
+# sceMpeg follows mpegprobe (fw 6.60) where it measured: the handle is the
+# buffer, the ring's word after the struct is the caller's gp, InitAu leaves
+# the timestamps and sets size 0, and the stream-size query checks the size
+# word, not the magic. provenance/mpeg/observed.txt, recorded under an
+# emulator, differs in exactly those 176 checks, so its checker is built for
+# reference but not run.
+add_executable(test_ctrl_observed test_ctrl_observed.c)
+target_link_libraries(test_ctrl_observed PRIVATE psprecomp allegrex_core)
+add_test(NAME ctrl_observed COMMAND test_ctrl_observed
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/ctrl/observed.txt)
+set_tests_properties(ctrl_observed PROPERTIES TIMEOUT 10)
+
+add_executable(test_mpeg_observed test_mpeg_observed.c)
+target_link_libraries(test_mpeg_observed PRIVATE psprecomp allegrex_core)
+
 add_executable(test_vfpu test_vfpu.c)
 target_link_libraries(test_vfpu PRIVATE psprecomp)
 add_test(NAME vfpu COMMAND test_vfpu)
@@ -91,3 +142,38 @@ else()
     target_compile_options(test_savedata PRIVATE -UNDEBUG)
 endif()
 add_test(NAME savedata COMMAND test_savedata)
+
+# The random unit follows the hardware fit in src/vfpu.c (vfpuprobe, fw 6.60).
+# provenance/vrnd-observed.txt was recorded under an emulator and disagrees
+# with it on the carry and on vector lane order, so the checker is built for
+# reference but not run.
+# Savedata's result codes follow saveprobe (fw 6.60) in src/hle/utility.c.
+# provenance/savedata/observed.txt was recorded under an emulator and
+# disagrees with the hardware in 19 of its checks, so the checker is built
+# for reference but not run.
+add_executable(test_savedata_observed test_savedata_observed.c)
+target_link_libraries(test_savedata_observed PRIVATE psprecomp)
+
+add_executable(test_mpeg_au test_mpeg_au.c)
+target_link_libraries(test_mpeg_au PRIVATE psprecomp)
+add_test(NAME mpeg_au COMMAND test_mpeg_au)
+set_tests_properties(mpeg_au PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_vrnd_observed test_vrnd_observed.c)
+target_link_libraries(test_vrnd_observed PRIVATE psprecomp)
+
+add_executable(test_vertex_observed test_vertex_observed.c)
+target_link_libraries(test_vertex_observed PRIVATE psprecomp)
+add_test(NAME vertex_observed COMMAND test_vertex_observed
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/vertices/observed.txt)
+
+add_executable(test_pixels_observed test_pixels_observed.c)
+target_link_libraries(test_pixels_observed PRIVATE psprecomp)
+add_test(NAME pixels_observed COMMAND test_pixels_observed
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/pixels/observed.txt)
+
+add_executable(test_disc_observed test_disc_observed.c)
+target_link_libraries(test_disc_observed PRIVATE psprecomp allegrex_core)
+add_test(NAME disc_observed COMMAND test_disc_observed
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/observed.txt
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/probe.iso)

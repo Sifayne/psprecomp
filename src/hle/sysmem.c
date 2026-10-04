@@ -43,6 +43,8 @@ static uint32_t  g_next_uid;
 static uint32_t  g_heap_lo, g_heap_hi;
 static uint32_t  g_sdk_version;   /* see hle_SetCompiledSdkVersion */
 
+uint32_t psp_sysmem_compiled_sdk(void) { return g_sdk_version; }
+
 /* Default user heap. Modules load at 0x08800000 and are a few megabytes, so
  * starting above them keeps the allocator from handing out memory the module
  * itself occupies. A host that knows its real layout should narrow this. */
@@ -402,6 +404,10 @@ void psp_sysmem_register(void) {
     psp_hle_register(0xB6D61D02, "SysMemUserForUser", "sceKernelFreePartitionMemory",  hle_FreePartitionMemory);
     psp_hle_register(0x9D9A5BA1, "SysMemUserForUser", "sceKernelGetBlockHeadAddr",     hle_GetBlockHeadAddr);
     psp_hle_register(0x7591C7DB, "SysMemUserForUser", "sceKernelSetCompiledSdkVersion",hle_SetCompiledSdkVersion);
+    /* ULUS10567 (The 3rd Birthday) imports this ID and supplies 0x06030010.
+     * Its GE probe observes that it updates the SDK getter and the callback
+     * ABI. Unnamed for the same reason as the two below. */
+    psp_hle_register_unnamed(0x1B4217BC, "SysMemUserForUser", hle_SetCompiledSdkVersion);
     /* A firmware-specific variant of the call above: same effect, different
      * NID per SDK generation, and a module imports exactly the one matching
      * what it was built against. This module's ~PSP header reports devkit

@@ -26,6 +26,7 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/dispatch.h"
+#include "psprecomp/interrupt.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/mem.h"
@@ -610,6 +611,11 @@ static void release_stack(psp_thread *t);
  * UNKNOWN_THID, and the call does not return. It was unimplemented, so it
  * returned 0 and the thread ran on past its own exit. */
 static void hle_ExitDeleteThread(void) {
+    /* A handler runs on no thread, so it has no thread to end. */
+    if (psp_interrupt_in_handler() || psp_ktimer_in_handler()) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+        return;
+    }
     uint32_t status = psp_arg(0);
     if ((int32_t)status < 0) status = SCE_KERNEL_ERROR_ILLEGAL_PARTITION;  /* as ExitThread */
     const uint32_t me = psp_sched_current();
@@ -886,7 +892,7 @@ static void hle_GetThreadId(void) {
     /* A handler runs on no thread, so there is no id to give back, and the
      * kernel says where it was asked: ILLEGAL_CONTEXT (threadprobe step 115,
      * fw 6.60, from an alarm handler). This answered 0. */
-    if (psp_ktimer_in_handler()) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT); return; }
+    if (psp_ktimer_in_handler() || psp_interrupt_in_handler()) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT); return; }
     psp_ret(psp_sched_current());
 }
 
@@ -2404,6 +2410,8 @@ uint32_t psp_threadman_notify_callback(uint32_t cbid, uint32_t arg) {
     }
     return SCE_KERNEL_ERROR_OK;
 }
+
+int psp_threadman_callback_exists(uint32_t cbid) { return find_cb(cbid) != NULL; }
 
 static void hle_NotifyCallback(void) {
     psp_ret(psp_threadman_notify_callback(psp_arg(0), psp_arg(1)));

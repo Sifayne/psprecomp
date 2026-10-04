@@ -11,6 +11,7 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/dispatch.h"
+#include "psprecomp/clock.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,10 +103,13 @@ static void test_directives(void) {
 
     uint8_t ax = 0, ay = 0;
     CHECK(poll_pad(NULL, NULL) == BTN_CROSS, "@1 down cross");
+    CHECK(psp_ctrl_pressed_buttons()==BTN_CROSS, "merged press snapshot");
     CHECK(poll_pad(NULL, NULL) == 0, "@2 up cross");
+    CHECK(!psp_ctrl_pressed_buttons(), "release is not a press");
     CHECK(poll_pad(NULL, NULL) == (BTN_START | BTN_SQUARE), "@3 a button list");
     CHECK(poll_pad(NULL, NULL) == (BTN_START | BTN_SQUARE | 0x000400u),
           "@4 a raw 0x bit");
+    CHECK(psp_ctrl_pressed_buttons()==0x000400u, "carrier press excludes held buttons");
     CHECK(poll_pad(&ax, &ay) == 0 && ax == 200 && ay == 60,
           "@5 state assigns buttons and stick: got %u,%u", ax, ay);
     CHECK(poll_pad(&ax, &ay) == 0 && ax == 128 && ay == 128, "@6 analog center");
@@ -115,6 +119,7 @@ static void test_directives(void) {
     poll_pad(NULL, NULL);                      /* poll 10: wait, not an edge */
     CHECK(poll_pad(NULL, NULL) == BTN_UP,
           "poll 11: @12 is not due yet -- a stamp is a floor, not a queue");
+    CHECK(!psp_ctrl_pressed_buttons(), "held buttons do not repeat a press");
     CHECK(poll_pad(NULL, NULL) == (BTN_UP | BTN_DOWN), "@12 after a wait");
 
     unload();
@@ -330,6 +335,144 @@ static void test_look_is_recorded(void) {
     psp_misc_init();
 }
 
+/* A title can supply room for ten samples and read the latched look more
+ * than once. Neither operation changes its poll identity or spends mouse
+ * motion. Native gameplay owns that consumption, separately from transport. */
+static void test_look_snapshot_and_clear(void) {
+    unload();
+    psp_ctrl_set(0x03fc0c00u, 170, 90);
+    psp_ctrl_set_look(201, 61);
+    psp_ctrl_add_mouse(17, -9);
+    psp_cpu.r[PSP_REG_A0] = BUF;
+    psp_cpu.r[PSP_REG_A1] = 10;
+    psp_hle_call(CTRL_PEEK);
+    CHECK(psp_ctrl_polls() == 1 && psp_cpu.r[PSP_REG_V0]==10,
+          "ten samples of room are one poll");
+    CHECK(psp_ctrl_pressed_buttons()==0x03fc0c00u, "snapshot retains the press edge");
+    CHECK(psp_read32(BUF + 4) == 0x03fc0c00u, "physical carrier bits survive");
+    psp_ctrl_set_look(30, 40); /* Live changes cannot alter a recorded snapshot. */
+    psp_ctrl_add_mouse(100, 100);
+    for (int i = 0; i < 3; i++) {
+        uint8_t rx, ry; int dx, dy;
+        psp_ctrl_last_look(&rx, &ry, &dx, &dy);
+        CHECK(rx == 201 && ry == 61 && dx == 17 && dy == -9,
+              "look snapshot remains identical on reread %d", i);
+    }
+    psp_ctrl_clear_mouse(); /* Focus/modal reset drops only unpolled motion. */
+    poll_pad(NULL, NULL);
+    uint8_t rx, ry; int dx, dy;
+    psp_ctrl_last_look(&rx, &ry, &dx, &dy);
+    CHECK(rx == 30 && ry == 40 && dx == 0 && dy == 0,
+          "next poll sees new stick and no cleared mouse backlog");
+    unload();
+}
+
+#define CTRL_READ 0x1F803938u
+
+/* One buffer call with the guest buffer filled with a sentinel first. */
+static uint32_t buffer_call(uint32_t nid, uint32_t room, uint32_t buttons) {
+    for (int i=0;i<65*16;i++) psp_write8(BUF+i,0xa5);
+    psp_ctrl_set(buttons,170,90);
+    psp_cpu.r[PSP_REG_A0]=BUF;
+    psp_cpu.r[PSP_REG_A1]=room;
+    psp_hle_call(nid);
+    return psp_cpu.r[PSP_REG_V0];
+}
+static int untouched_from(uint32_t byte) {
+    for (uint32_t i=byte;i<65*16;i++) if (psp_read8(BUF+i)!=0xa5) return 0;
+    return 1;
+}
+/* What sceDisplayWaitVblankStart does to the guest clock. */
+static void wait_vblanks(unsigned n) {
+    while (n--) psp_clock_advance_to(psp_clock_next_frame());
+}
+
+static void test_buffer_capacity(void) {
+    /* Peek hands back `room` samples of history; nothing is consumed. */
+    const uint32_t rooms[]={1,10,64};
+    for (unsigned n=0;n<3;n++) {
+        unload();
+        const uint32_t v0=buffer_call(CTRL_PEEK,rooms[n],BTN_DOWN);
+        CHECK(v0==rooms[n] && psp_ctrl_samples()==rooms[n] && psp_ctrl_polls()==1,
+              "peek room %u returns %u samples, got %u",rooms[n],rooms[n],v0);
+        for (uint32_t i=0;i<rooms[n];i++)
+            CHECK(psp_read32(BUF+i*16+4)==BTN_DOWN && psp_read8(BUF+i*16+8)==170 &&
+                  psp_read8(BUF+i*16+9)==90, "peek entry %u holds the merged state",i);
+        CHECK(untouched_from(rooms[n]*16), "peek room %u writes nothing past it",rooms[n]);
+    }
+
+    /* Room 0: Peek returns 0 and writes nothing; room above 64 is rejected
+     * by both calls before anything is written or polled. */
+    unload();
+    CHECK(buffer_call(CTRL_PEEK,0,BTN_DOWN)==0 && untouched_from(0) && !psp_ctrl_polls(),
+          "peek room 0 returns 0 and writes nothing");
+    CHECK(buffer_call(CTRL_PEEK,65,BTN_DOWN)==0x80000104u && untouched_from(0) &&
+          !psp_ctrl_polls(), "peek room 65 is SCE_ERROR_INVALID_SIZE");
+    CHECK(buffer_call(CTRL_READ,65,BTN_DOWN)==0x80000104u && untouched_from(0) &&
+          !psp_ctrl_polls(), "read room 65 is SCE_ERROR_INVALID_SIZE");
+    unload();
+}
+
+/* Read hands back the samples taken since the previous Read: one per vblank,
+ * at most 63, at most the room given (room 0 acts as 1). With none unread it
+ * waits for the next vblank. Observed in provenance/ctrl. */
+static void test_read_counts_vblanks(void) {
+    unload();
+    CHECK(buffer_call(CTRL_READ,10,BTN_DOWN)==1, "first read returns the current sample");
+    const uint64_t before=psp_clock_peek()/PSP_CLOCK_FRAME_US;
+    CHECK(buffer_call(CTRL_READ,10,BTN_DOWN)==1, "read with nothing unread returns one");
+    CHECK(psp_clock_peek()/PSP_CLOCK_FRAME_US==before+1, "and waits for the next vblank");
+    for (unsigned i=0;i<8;i++) {
+        wait_vblanks(2);
+        CHECK(buffer_call(CTRL_READ,10,BTN_DOWN)==2,
+              "read every other vblank returns two samples (call %u)",i);
+        CHECK(untouched_from(2*16), "room past the two samples is untouched");
+    }
+    wait_vblanks(1);
+    CHECK(buffer_call(CTRL_READ,10,BTN_DOWN)==1, "read every vblank returns one");
+    wait_vblanks(3);
+    CHECK(buffer_call(CTRL_READ,2,BTN_DOWN)==2, "room limits the samples returned");
+    wait_vblanks(1);
+    CHECK(buffer_call(CTRL_READ,0,BTN_DOWN)==1, "room 0 acts as room 1");
+    wait_vblanks(70);
+    CHECK(buffer_call(CTRL_READ,64,BTN_DOWN)==63, "at most 63 unread samples");
+    const uint32_t first=psp_read32(BUF), last=psp_read32(BUF+62*16);
+    CHECK(last-first==62, "timestamps count the samples in delivery order");
+    unload();
+}
+
+static void test_complete_input_round_trip(void) {
+    uint32_t buttons[5] = {0x00400400u, 0x00800800u, 0x03000000u, 0x03fc0c00u, 0};
+    uint8_t axes[5][4] = {{160,128,128,192}, {128,64,255,0}, {0,255,64,128},
+                         {192,192,128,128}, {128,128,128,128}};
+    int mouse[5][2] = {{7,-3}, {-12,9}, {0,0}, {100,-50}, {0,0}};
+    unload();
+    setenv("PSPRECOMP_REPLAY_REC", "t-complete-rec.pad", 1);
+    psp_misc_init();
+    for (int i = 0; i < 5; i++) {
+        psp_ctrl_set(buttons[i], axes[i][0], axes[i][1]);
+        psp_ctrl_set_look(axes[i][2], axes[i][3]);
+        psp_ctrl_add_mouse(mouse[i][0], mouse[i][1]);
+        poll_pad(NULL, NULL);
+        CHECK(psp_ctrl_pressed_buttons()==(buttons[i] & ~(i ? buttons[i-1] : 0)),
+              "live merged button edges at poll %d", i+1);
+    }
+    psp_ctrl_replay_finish(NULL);
+    unsetenv("PSPRECOMP_REPLAY_REC");
+    load("t-complete-rec.pad");
+    for (int i = 0; i < 5; i++) {
+        uint8_t ax, ay, rx, ry; int dx, dy;
+        uint32_t b = poll_pad(&ax, &ay);
+        CHECK(psp_ctrl_pressed_buttons()==(buttons[i] & ~(i ? buttons[i-1] : 0)),
+              "replayed button edges at poll %d", i+1);
+        psp_ctrl_last_look(&rx, &ry, &dx, &dy);
+        CHECK(b == buttons[i] && ax == axes[i][0] && ay == axes[i][1] &&
+              rx == axes[i][2] && ry == axes[i][3] && dx == mouse[i][0] && dy == mouse[i][1],
+              "complete physical input record/replay at poll %d", i + 1);
+    }
+    unload();
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -345,11 +488,16 @@ int main(void) {
     test_round_trip();
     test_look_channel();
     test_look_is_recorded();
+    test_look_snapshot_and_clear();
+    test_buffer_capacity();
+    test_read_counts_vblanks();
+    test_complete_input_round_trip();
 
     remove("t-directives.pad"); remove("t-bad.pad"); remove("t-tap.pad");
     remove("t-catchup.pad"); remove("t-lanes.pad"); remove("t-host.pad");
     remove("t-rt-src.pad"); remove("t-rt-rec.pad");
     remove("t-look.pad"); remove("t-look-rec.pad");
+    remove("t-complete-rec.pad");
     psp_mem_free();
 
     if (failures) {

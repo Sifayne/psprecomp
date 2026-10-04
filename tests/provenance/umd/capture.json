@@ -1,0 +1,24 @@
+{
+  "suite": "umd",
+  "command": [
+    "/usr/bin/PPSSPPHeadless",
+    "--root",
+    "/home/sif/Projects/third-birthday-recomp/reports/72-umd",
+    "--timeout=30",
+    "-l",
+    "/home/sif/Projects/third-birthday-recomp/reports/72-umd/probe.elf"
+  ],
+  "executable_sha256": "c065cf204335e9eb26a85592947e9f8fb4ddc718bc4eaad2ce06240a01d82f8d",
+  "probe_sha256": "d70777ce8171a4477fa0a59ce3e8d4e73d444d842136d72f1779e166723a8548",
+  "observations_sha256": "bb2e36920e96bf9e94dd83cc3e7c43310875ada06527ecde691196931ecf5e0c",
+  "fixture_sha256": "bb2e36920e96bf9e94dd83cc3e7c43310875ada06527ecde691196931ecf5e0c",
+  "sources": {
+    "probe.c": "86156820745659a63b5edf85162d2ae8c20179c5a800ccdb3a66765b900a0682",
+    "imports.S": "32e15e6799fb1058adbe77c985931c4b7efd3881538ec085d35182420f3e7bb7",
+    "probe.ld": "f46ef37392ea8cf736ed7217401708ec9f18bc2c4294a21e249b5911d503fea6"
+  },
+  "clang": "clang version 22.1.8",
+  "linker": "LLD 22.1.8 (compatible with GNU linkers)",
+  "observations": 31,
+  "evidence": "external executable output; not physical PSP"
+}

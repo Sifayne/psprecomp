@@ -184,9 +184,16 @@ static uint32_t expand16(uint32_t p, int fmt) {
     return (a << 24) | (b << 16) | (g << 8) | r;
 }
 
-static uint32_t clut_entry(uint32_t raw) {
+typedef struct { uint32_t tex_bytes, clut_bytes; size_t padded; } decode_bounds;
+
+static uint32_t clut_entry(uint32_t raw, decode_bounds *bounds) {
     const uint32_t idx =
         (uint32_t)((((int)raw >> g_clut.shift) & g_clut.mask) | g_clut.start);
+    const uint32_t bytes = g_clut.fmt == 3 ? 4u : 2u;
+    if (bounds && ((uint64_t)idx + 1) * bytes > bounds->clut_bytes) {
+        bounds->padded++;
+        return 0;
+    }
     if (g_clut.fmt == 3) return psp_read32(g_clut.addr + idx * 4u);
     return expand16((uint32_t)psp_read16(g_clut.addr + idx * 2u),
                     g_clut.fmt == 0 ? GE_TFMT_5650 :
@@ -220,22 +227,31 @@ static int wrap_axis(int t, int size, int clamp) {
 
 /* One texel. Stride is in texels, as the GE reports it, so the byte pitch a
  * swizzle block is measured against has to be derived per format. */
-static uint32_t sample_texel(int u, int v) {
+static uint32_t sample_texel_bounded(int u, int v, decode_bounds *bounds) {
     u = wrap_axis(u, g_tex.w, g_tex.wrap_s);
     v = wrap_axis(v, g_tex.h, g_tex.wrap_t);
 
     const int hb = tex_halfbytes(g_tex.fmt);
     const uint32_t row_bytes = ((uint32_t)g_tex.stride * (uint32_t)hb) / 2u;
+    if (bounds) {
+        const uint32_t bx = ((uint32_t)u * (uint32_t)hb) / 2u;
+        const uint32_t off = swizzled_byte(bx, (uint32_t)v, row_bytes);
+        const uint32_t bytes = hb > 2 ? (uint32_t)hb / 2u : 1u;
+        if ((uint64_t)off + bytes > bounds->tex_bytes) {
+            bounds->padded++;
+            return 0;
+        }
+    }
 
     if (g_tex.fmt == GE_TFMT_CLUT4) {
         const uint32_t bx = (uint32_t)u / 2u;
         const uint32_t off = swizzled_byte(bx, (uint32_t)v, row_bytes);
         const uint32_t byte = psp_read8(g_tex.addr + off);
-        return clut_entry((u & 1) ? (byte >> 4) : (byte & 0xF));
+        return clut_entry((u & 1) ? (byte >> 4) : (byte & 0xF), bounds);
     }
     if (g_tex.fmt == GE_TFMT_CLUT8) {
         const uint32_t off = swizzled_byte((uint32_t)u, (uint32_t)v, row_bytes);
-        return clut_entry(psp_read8(g_tex.addr + off));
+        return clut_entry(psp_read8(g_tex.addr + off), bounds);
     }
     /* Wide indices: the whole 16- or 32-bit texel is the raw index, and the
      * palette mode's shift and mask pick the bits that count. gpu/clut/shifts
@@ -245,11 +261,11 @@ static uint32_t sample_texel(int u, int v) {
      * the reason they exist. */
     if (g_tex.fmt == GE_TFMT_CLUT16) {
         const uint32_t off = swizzled_byte((uint32_t)u * 2u, (uint32_t)v, row_bytes);
-        return clut_entry(psp_read16(g_tex.addr + off));
+        return clut_entry(psp_read16(g_tex.addr + off), bounds);
     }
     if (g_tex.fmt == GE_TFMT_CLUT32) {
         const uint32_t off = swizzled_byte((uint32_t)u * 4u, (uint32_t)v, row_bytes);
-        return clut_entry(psp_read32(g_tex.addr + off));
+        return clut_entry(psp_read32(g_tex.addr + off), bounds);
     }
     if (g_tex.fmt == GE_TFMT_8888) {
         const uint32_t off = swizzled_byte((uint32_t)u * 4u, (uint32_t)v, row_bytes);
@@ -257,6 +273,10 @@ static uint32_t sample_texel(int u, int v) {
     }
     const uint32_t off = swizzled_byte((uint32_t)u * 2u, (uint32_t)v, row_bytes);
     return expand16((uint32_t)psp_read16(g_tex.addr + off), g_tex.fmt);
+}
+
+static uint32_t sample_texel(int u, int v) {
+    return sample_texel_bounded(u, v, NULL);
 }
 
 static void dump_texture(void) {
@@ -354,9 +374,10 @@ uint64_t psp_render_filter_split(void) { return g_filter_split; }
  * Returns the number of texels written, or 0 if the level is empty or the
  * buffer is too small. g_tex is saved and restored: this can be called between
  * draws without disturbing what the rasterizer is in the middle of. */
-size_t psp_render_decode_level(const psp_tex_state *t, int level,
+static size_t decode_level(const psp_tex_state *t, int level,
                                const psp_clut_state *clut,
-                               uint32_t *out, size_t cap, int *out_w, int *out_h) {
+                               uint32_t *out, size_t cap, int *out_w, int *out_h,
+                               decode_bounds *bounds) {
     if (!t || !out || level < 0 || level > 7) return 0;
     const psp_tex_state saved = g_tex;
     /* The palette travels with the call rather than being read from wherever
@@ -382,6 +403,10 @@ size_t psp_render_decode_level(const psp_tex_state *t, int level,
     /* Clamp both axes: the sampler wraps, and a decode that wrapped would fold
      * the texture onto itself rather than reporting its own grid. */
     g_tex.wrap_s = g_tex.wrap_t = 1;
+    if (bounds) {
+        bounds->tex_bytes = psp_mem_mapped_span(g_tex.addr);
+        bounds->clut_bytes = psp_mem_mapped_span(g_clut.addr);
+    }
     const int w = g_tex.w, h = g_tex.h;
     if (w <= 0 || h <= 0 || (size_t)w * (size_t)h > cap) {
         g_tex = saved;
@@ -392,7 +417,7 @@ size_t psp_render_decode_level(const psp_tex_state *t, int level,
     }
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++)
-            out[(size_t)y * (size_t)w + (size_t)x] = sample_texel(x, y);
+            out[(size_t)y * (size_t)w + (size_t)x] = sample_texel_bounded(x, y, bounds);
     if (out_w) *out_w = w;
     if (out_h) *out_h = h;
     g_tex = saved;
@@ -400,6 +425,22 @@ size_t psp_render_decode_level(const psp_tex_state *t, int level,
     g_clut.shift = saved_clut.shift; g_clut.mask = saved_clut.mask;
     g_clut.start = saved_clut.start;
     return (size_t)w * (size_t)h;
+}
+
+size_t psp_render_decode_level(const psp_tex_state *t, int level,
+                               const psp_clut_state *clut,
+                               uint32_t *out, size_t cap, int *out_w, int *out_h) {
+    return decode_level(t, level, clut, out, cap, out_w, out_h, NULL);
+}
+
+size_t psp_render_decode_level_padded(const psp_tex_state *t, int level,
+                                      const psp_clut_state *clut,
+                                      uint32_t *out, size_t cap,
+                                      int *out_w, int *out_h, size_t *padded) {
+    decode_bounds bounds = {0};
+    const size_t count = decode_level(t, level, clut, out, cap, out_w, out_h, &bounds);
+    if (padded) *padded = bounds.padded;
+    return count;
 }
 
 /* A bilinear coordinate in sixteenths of a texel, the half texel taken off:
@@ -1419,16 +1460,16 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                           plane_chan(acc[2]) << 16 | plane_chan(acc[3]) << 24;
 
                 if (textured) {
-                    const float den = l0 * a->tex_q * a->inv_w
-                                    + l1 * b->tex_q * b->inv_w
-                                    + l2 * c->tex_q * c->inv_w;
-                    const float rden = den != 0.0f ? 1.0f / den : 0.0f;
-                    const float u = (l0 * a->u * a->inv_w
-                                   + l1 * b->u * b->inv_w
-                                   + l2 * c->u * c->inv_w) * rden;
-                    const float v = (l0 * a->v * a->inv_w
-                                   + l1 * b->v * b->inv_w
-                                   + l2 * c->v * c->inv_w) * rden;
+                    /* Keep exact edge weights until the homogeneous divide.
+                     * Normalizing each one to float first can put an exact
+                     * integer UV just below its texel boundary. Half-pixel
+                     * aligned UI quads expose this as ragged nearest edges. */
+                    const double q0 = (double)w0 * a->inv_w;
+                    const double q1 = (double)w1 * b->inv_w;
+                    const double q2 = (double)w2 * c->inv_w;
+                    const double den = q0 * a->tex_q + q1 * b->tex_q + q2 * c->tex_q;
+                    const float u = den != 0.0 ? (float)((q0 * a->u + q1 * b->u + q2 * c->u) / den) : 0.0f;
+                    const float v = den != 0.0 ? (float)((q0 * a->v + q1 * b->v + q2 * c->v) / den) : 0.0f;
                     const uint32_t texel = sample_mip(u, v, lod16);
                     /* The watched pixel's two inputs, separately: which of the
                      * texel and the shaded vertex colour is the dark one is
