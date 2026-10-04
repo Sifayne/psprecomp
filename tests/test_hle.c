@@ -1611,6 +1611,42 @@ static void test_kernel_memory(void) {
           psp_read32(b + 8) == 0, "Memcpy copies exactly size bytes");
 }
 
+/* sceAtracReinit lays the six ID slots out again (uofw libatrac3plus.c):
+ * the first numAT3plusId for ATRAC3+, the next numAT3Id for ATRAC3; busy
+ * while an ID is held. */
+static void test_atrac_reinit(void) {
+    enum { GETID = 0x780F88D1u, RELEASE = 0x61EB33F5u, REINIT = 0x132F1ECAu,
+           AT3P = 0x1000u, AT3 = 0x1001u, NO_ID = 0x80630003u };
+    CHECK(call(GETID, AT3P, 0, 0, 0) == 0 && call(GETID, AT3P, 0, 0, 0) == 1 &&
+          call(GETID, AT3P, 0, 0, 0) == NO_ID, "default layout: ATRAC3+ gets 0 and 1");
+    CHECK(call(GETID, AT3, 0, 0, 0) == 2 && call(GETID, AT3, 0, 0, 0) == 3 &&
+          call(GETID, AT3, 0, 0, 0) == NO_ID, "default layout: ATRAC3 gets 2 and 3");
+    CHECK(call(REINIT, 4, 1, 0, 0) == 0x80000021u, "Reinit is busy while IDs are held");
+    for (uint32_t id = 0; id < 4; id++) call(RELEASE, id, 0, 0, 0);
+
+    CHECK(call(REINIT, 4, 1, 0, 0) == 0, "Reinit(4, 1) with nothing held");
+    CHECK(call(GETID, AT3P, 0, 0, 0) == 0 && call(GETID, AT3P, 0, 0, 0) == NO_ID,
+          "one ATRAC3+ slot, first");
+    uint32_t ids[5];
+    for (int i = 0; i < 5; i++) ids[i] = call(GETID, AT3, 0, 0, 0);
+    CHECK(ids[0] == 1 && ids[1] == 2 && ids[2] == 3 && ids[3] == 4 && ids[4] == NO_ID,
+          "then four ATRAC3 slots");
+    for (uint32_t id = 0; id < 5; id++) call(RELEASE, id, 0, 0, 0);
+
+    CHECK(call(REINIT, 5, 2, 0, 0) == 0x80000022u, "seven IDs do not fit in six slots");
+    CHECK(call(GETID, AT3P, 0, 0, 0) == 0 && call(GETID, AT3P, 0, 0, 0) == 1,
+          "the slots that fit are laid out: ATRAC3+ 0 and 1");
+    for (int i = 0; i < 5; i++) ids[i] = call(GETID, AT3, 0, 0, 0);
+    CHECK(ids[0] == 2 && ids[3] == 5 && ids[4] == NO_ID, "and ATRAC3 2 to 5");
+    for (uint32_t id = 0; id < 6; id++) call(RELEASE, id, 0, 0, 0);
+
+    CHECK(call(REINIT, 0, 0, 0, 0) == 0 && call(GETID, AT3P, 0, 0, 0) == NO_ID &&
+          call(GETID, AT3, 0, 0, 0) == NO_ID, "Reinit(0, 0) leaves no IDs");
+    CHECK(call(REINIT, 2, 2, 0, 0) == 0 && call(GETID, AT3, 0, 0, 0) == 2,
+          "Reinit(2, 2) is the default layout again");
+    call(RELEASE, 2, 0, 0, 0);
+}
+
 static void test_time_calls(void) {
     const uint32_t B = 0x08805000u;   /* scratch in user RAM */
 
@@ -1998,6 +2034,7 @@ int main(void) {
     test_stdio_async();
     test_display();
     test_kernel_memory();
+    test_atrac_reinit();
     test_time_calls();
     test_pool_free_pointers();
     test_waits_with_threads();
