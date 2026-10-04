@@ -1594,6 +1594,23 @@ static void put_date(uint32_t at, int y, int mo, int d, int h, int mi, int s, ui
 
 /* The SysClock conversions and the sceRtc calendar, against what a 6.60 PSP
  * answered (threadprobe steps 132-140). */
+/* sceKernelMemset/Memcpy answer dst and mark what they write; the fill value
+ * is an s8, so only its low byte counts. */
+static void test_kernel_memory(void) {
+    enum { MEMSET = 0xA089ECA4u, MEMCPY = 0x1839852Au };
+    const uint32_t a = 0x08A00000u, b = 0x08A01000u;
+    const uint64_t before = psp_mem_range_generation(a, 16);
+    CHECK(call(MEMSET, a, 0xFFFFFFA5u, 16, 0) == a, "Memset answers dst");
+    int filled = 1;
+    for (uint32_t i = 0; i < 16; i++) filled &= psp_read8(a + i) == 0xA5;
+    CHECK(filled && psp_read8(a + 16) == 0, "Memset fills the low byte, exactly size bytes");
+    CHECK(psp_mem_range_generation(a, 16) > before, "Memset marks what it wrote");
+    psp_write32(a, 0x11223344u);
+    CHECK(call(MEMCPY, b, a, 8, 0) == b, "Memcpy answers dst");
+    CHECK(psp_read32(b) == 0x11223344u && psp_read32(b + 4) == 0xA5A5A5A5u &&
+          psp_read32(b + 8) == 0, "Memcpy copies exactly size bytes");
+}
+
 static void test_time_calls(void) {
     const uint32_t B = 0x08805000u;   /* scratch in user RAM */
 
@@ -1980,6 +1997,7 @@ int main(void) {
     test_sas_struct();
     test_stdio_async();
     test_display();
+    test_kernel_memory();
     test_time_calls();
     test_pool_free_pointers();
     test_waits_with_threads();

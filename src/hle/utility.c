@@ -1613,7 +1613,20 @@ static void hle_SavedataShutdownStart(void) {
     g_savedata_shutdown_releases=st.releases;
     psp_ret(0);
 }
+
+/* sceUtilityLoadModule / sceUtilityUnloadModule(PSP_MODULE_xxx): "0 on
+ * success, < 0 on error" (PSPSDK src/utility/psputility_modules.h; BSD). The
+ * libraries they would load -- AV codecs, mpeg, atrac, network -- are part of
+ * the runtime already, so there is nothing to load and both succeed, as the
+ * unregistered calls did. Which errors the firmware gives for a module
+ * loaded twice or never loaded is not measured: Last Raven loads seven and
+ * unloads two, and The 3rd Birthday loads four, and each would see them. */
+static void hle_UtilityLoadModule(void)   { psp_ret(0); }
+static void hle_UtilityUnloadModule(void) { psp_ret(0); }
+
 void psp_utility_register(void) {
+    psp_hle_register(0x2A2B3DE0,"sceUtility","sceUtilityLoadModule",hle_UtilityLoadModule);
+    psp_hle_register(0xE49BFE92,"sceUtility","sceUtilityUnloadModule",hle_UtilityUnloadModule);
     psp_hle_register(0x50C4CD57,"sceUtility","sceUtilitySavedataInitStart",hle_SavedataInitStart);
     psp_hle_register(0x8874DBE0,"sceUtility","sceUtilitySavedataGetStatus",hle_SavedataGetStatus);
     psp_hle_register(0xD4B95FFB,"sceUtility","sceUtilitySavedataUpdate",hle_SavedataUpdate);

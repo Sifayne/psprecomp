@@ -1343,9 +1343,8 @@ static void hle_GetAtracAu(void) {
  * frameWidth is the stride in pixels, not the picture width -- 512 for a
  * 480-wide movie. initAddr is the "first call" flag the player clears itself.
  *
- * Written as 8888 because that is the format this game's display is in; a mode
- * selector exists on hardware (sceMpegAvcDecodeMode) and would belong here if a
- * game ever set something else. */
+ * Written as 8888 because that is the format this game's display is in. The
+ * mode selector, sceMpegAvcDecodeMode, says so when a game asks for another. */
 static void write_picture(mpeg_ctx *c, uint32_t dst, uint32_t stride) {
     if (!c->pic || !dst) return;
     const int w = c->pic_w, h = c->pic_h;
@@ -1501,6 +1500,33 @@ static void hle_AvcDecodeStop(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* sceMpegAvcDecodeMode(SceMpeg *, SceMpegAvcMode *): the mode is { iUnk0 =
+ * -1, iPixelFormat } and formats 0-3 are 5650, 5551, 4444 and 8888 (PSPSDK
+ * src/mpeg/pspmpeg.h; BSD). Pictures are written as 8888, so a game asking
+ * for another format is told about once rather than given it. What the
+ * firmware answers for a bad mode is not measured. */
+static void hle_AvcDecodeMode(void) {
+    const uint32_t mode = psp_arg(1);
+    if (mode && psp_mem_ptr(mode, 8)) {
+        const uint32_t format = psp_read32(mode + 4);
+        static int said;
+        if (format != 3 && !said++)
+            fprintf(stderr, "psprecomp: sceMpegAvcDecodeMode asks for pixel format %u; "
+                            "pictures are written as 8888 (3)\n", format);
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* sceMpegFlushAllStream(SceMpeg *) answers 0 on success (pspmpeg.h), and
+ * sceMpegAvcDecodeFlush has no declaration in PSPSDK or uofw, only its NID,
+ * which is SHA-1 of the name. What either discards is not measured. The 3rd
+ * Birthday calls FlushAllStream on a context it has just created, before it
+ * registers a stream, and DecodeFlush as it tears a movie down, so neither
+ * has anything here to discard; both succeed, as the unregistered calls
+ * did. */
+static void hle_FlushAllStream(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_AvcDecodeFlush(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
 void psp_mpeg_register(void) {
     psp_hle_register(0x682A619B, "sceMpeg", "sceMpegInit",            hle_MpegInit);
     psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",          hle_MpegFinish);
@@ -1535,4 +1561,7 @@ void psp_mpeg_register(void) {
     psp_hle_register(0x0E3C2E9D, "sceMpeg", "sceMpegAvcDecode",       hle_AvcDecode);
     psp_hle_register(0x800C44DF, "sceMpeg", "sceMpegAtracDecode",     hle_AtracDecode);
     psp_hle_register(0x740FCCD1, "sceMpeg", "sceMpegAvcDecodeStop",   hle_AvcDecodeStop);
+    psp_hle_register(0xA11C7026, "sceMpeg", "sceMpegAvcDecodeMode",   hle_AvcDecodeMode);
+    psp_hle_register(0x4571CC64, "sceMpeg", "sceMpegAvcDecodeFlush",  hle_AvcDecodeFlush);
+    psp_hle_register(0x707B7629, "sceMpeg", "sceMpegFlushAllStream",  hle_FlushAllStream);
 }
