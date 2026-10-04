@@ -611,6 +611,69 @@ static void test_memory(void) {
     CHECK(psp_mem_range_generation(0x00100100u, 1) != 0,
           "module image writes carry generations too");
 
+    /* Ranges that no single backing covers. A texture or CLUT read near a
+     * region's end used to report generation 0 -- "never written" -- so a
+     * cache keyed on it never refreshed. */
+    {
+        const uint32_t ram_tail = PSP_RAM_BASE + PSP_RAM_SIZE - 0x10u;
+        const uint64_t serial = psp_mem_write_serial();
+        const unsigned writes = observed_writes;
+        psp_mem_set_write_observer(observe_write);
+        psp_mem_mark_write(ram_tail, 0x20u);
+        psp_mem_set_write_observer(NULL);
+        CHECK(observed_writes == writes + 1 && observed_addr == ram_tail && observed_size == 0x20u,
+              "a write across RAM's end reaches the observer whole");
+        observed_writes = writes;
+        const uint64_t g = psp_mem_range_generation(ram_tail, 0x20u);
+        CHECK(g > serial && g == psp_mem_range_generation(ram_tail, 0x10u),
+              "a range across RAM's end carries its RAM part's generation");
+
+        psp_mem_mark_write(0x00100FF0u, 0x20u);
+        CHECK(psp_mem_range_generation(0x00100FF0u, 0x20u) ==
+                  psp_mem_range_generation(0x00100FF0u, 0x10u) &&
+              psp_mem_range_generation(0x00100FF0u, 0x10u) > g,
+              "a range across the module's end carries the module part's generation");
+
+        const uint64_t before_gap = psp_mem_write_serial();
+        psp_mem_mark_write(0x01000000u, 16);
+        CHECK(psp_mem_write_serial() == before_gap,
+              "marking an unmapped range takes no generation");
+    }
+
+    /* A module linked at 0 covers the start of the scratchpad, as both games'
+     * do: its part of a range is written to the module's backing, so a range
+     * running from the module into the scratchpad must read the module's
+     * table for that part, not the scratchpad's. */
+    CHECK(psp_mem_map_module(0x00000000u, 0x00012000u) == 0,
+          "module maps over the scratchpad's first half");
+    {
+        const uint64_t mapped = psp_mem_write_serial();
+        CHECK(psp_mem_range_generation(0x00011F00u, 0x200u) <= mapped,
+              "a range from the module into the scratchpad starts clean");
+        psp_write8(0x00011F80u, 0x01u);
+        const uint64_t module_write = psp_mem_range_generation(0x00011F80u, 1);
+        CHECK(module_write > mapped &&
+              psp_mem_range_generation(0x00011F00u, 0x200u) == module_write,
+              "a range from the module into the scratchpad sees the module write");
+        psp_write8(0x00012010u, 0x02u);
+        CHECK(psp_mem_range_generation(0x00011F00u, 0x200u) > module_write,
+              "and the scratchpad write beyond it");
+    }
+
+    /* A module mapped inside RAM: a RAM range running into it. */
+    CHECK(psp_mem_map_module(0x08900000u, 0x1000u) == 0,
+          "module maps inside RAM");
+    {
+        const uint64_t mapped = psp_mem_write_serial();
+        psp_write8(0x08900010u, 0x03u);
+        CHECK(psp_mem_range_generation(0x088FFF00u, 0x200u) > mapped,
+              "a RAM range running into a module inside RAM sees the module write");
+        psp_mem_mark_write(0x088FFF00u, 0x200u);
+        const uint64_t both = psp_mem_range_generation(0x088FFF00u, 0x100u);
+        CHECK(both > mapped && psp_mem_range_generation(0x08900000u, 0x100u) == both,
+              "one mark across RAM and the module stamps both with one generation");
+    }
+
     psp_write32(0x08800000u, 0x12345678u);
     CHECK_EQ(psp_read32(0x08800000u), 0x12345678u, "round-trip a word");
     CHECK_EQ(psp_read8 (0x08800000u), 0x78u, "little-endian byte 0");
