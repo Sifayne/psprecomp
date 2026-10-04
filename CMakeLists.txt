@@ -123,6 +123,19 @@ if(NOT MSVC)
     endif()
 endif()
 
+# --- optional: the SDL2 host layer --------------------------------------------
+#
+# Code a game's host needs and the runtime does not: so far the savedata
+# dialog (src/host/save_dialog.c), drawn with SDL2_ttf and stb_image
+# (third_party/stb, MIT). Off by default and required when asked for -- the
+# runtime itself never touches SDL. A host that builds its own sources can
+# compile src/host/*.c directly instead; they need SDL2, SDL2_ttf, include/
+# and third_party/, nothing else from here.
+option(PSPRECOMP_HOST "Build the SDL2 host layer (psprecomp_host)" OFF)
+if(PSPRECOMP_HOST)
+    add_subdirectory(src/host)
+endif()
+
 # --- the recompiler -----------------------------------------------------------
 
 add_subdirectory(tools/allegrexrecomp)
