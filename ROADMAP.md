@@ -1,6 +1,6 @@
 # Roadmap
 
-Phased plan, last checked against the code on 2026-09-27. Phases 1, 2a and 4
+Phased plan, last checked against the code on 2026-10-04. Phases 1, 2a and 4
 are done, phase 3 lacks only a hints file, and phase 5 lacks only the PPSSPP
 cross-check. Phase 2b is still open but off the critical path, because
 `pspdecrypt` supplies plaintext modules today. What is left is breadth: see
@@ -180,7 +180,7 @@ about being self-contained, which is a goal but not a gate.
 ## Phase 4 — the HLE library ✅
 
 Games do not touch hardware directly; they call the firmware. That surface is a
-library, which means it is implemented, not emulated. 340 functions across 25
+library, which means it is implemented, not emulated. 407 functions across 29
 libraries are registered; `test_hle` checks every named NID against SHA-1 of
 its name.
 
@@ -200,12 +200,14 @@ its name.
 - [x] **`sceAudio` / `sceSas`** — PCM out to a host hook, and the hardware
       voice mixer with its ADSR curves and argument checks.
 - [x] **`sceAtrac3plus` and `sceMpeg`** — the streaming contracts, with
-      optional libavcodec and openh264 behind them for the actual decoding.
+      optional libavcodec and openh264 behind them for the actual decoding;
+      `sceAtracReinit`'s six-slot ID layout as uofw has it.
 - [x] **`sceUtility` savedata** — `ms0:/PSP/SAVEDATA` on a host directory, an
       interactive session a host can present, and a savedata host bridge
       (`include/psprecomp/savedata.h`).
-- [x] **`sceUmd`, `scePower`, `sceRtc`, `sceDmac`, ModuleMgr, LoadExec** — the
-      small libraries a game's startup needs.
+- [x] **`sceUmd`, `scePower`, `sceRtc`, `sceDmac`, ModuleMgr, LoadExec,
+      `sceImpose`, `sceOpenPSID`** and `Kernel_Library`'s memset and memcpy —
+      the small libraries a game's startup needs.
 - [x] **`sceNet` / adhoc** — refused the way hardware refuses with no radio.
 - [x] **Module import resolution** — the emitter turns each import stub into
       a traced call through the NID table, and the interpreter binds
@@ -226,7 +228,11 @@ its name.
       clock that advances at every firmware call (`src/hle/clock.c`).
 - [ ] **PPSSPP cross-check** — trace comparison against the external oracle at
       the syscall and frame level. See [`docs/ORACLE.md`](docs/ORACLE.md).
-      Nothing in this repo produces or compares such traces yet.
+      Nothing here compares a game run against PPSSPP yet. What does compare:
+      `tools/oracle/oracle_diff.c` runs each function of a game both
+      recompiled and interpreted and diffs the results, and
+      `tools/hwprobe/compare.py` diffs a probe's PSP log against the same probe
+      under `allegrexrecomp interp`.
 - [x] **First pixels** — a recompiled module reaching a rendered frame.
       Armored Core: Last Raven Portable renders its garage, missions and
       combat.
@@ -249,25 +255,47 @@ its name.
       decoder names; a sub-encoding the runtime does not recognise traps by
       name.
 - [ ] Save states, an SDL2 + Dear ImGui frontend, controller remapping.
-      The SDL2 window, audio and GL backend exist, but in the game repo's host
-      rather than behind a CMake option here. RAM snapshots
-      (`PSPRECOMP_RAMSNAP`) are an instrument, not save states.
+      The host layer has started: `PSPRECOMP_HOST` builds `src/host/` as
+      `psprecomp_host`, so far the savedata dialog both games shared. The SDL2
+      window, audio and GL backend still live in each game's host (see *Open
+      work*). RAM snapshots (`PSPRECOMP_RAMSNAP`) are an instrument, not save
+      states.
 
 ## Open work
 
 Gaps found in the code while checking this file, none of them on a phase above:
 
-- [ ] **GE features** — skinned (weighted) vertices are dropped, Bezier and
-      spline patches are counted but not drawn, bounding-box conditional jumps
-      are never taken (`src/hle/ge.c`). The GL
-      backend's own gaps are listed in [`docs/RENDERER.md`](docs/RENDERER.md).
+- [ ] **The GE's queue calls** — DeQueue and GetCmd/GetMtx/GetStack are
+      unregistered, and a full list pool answers NO_MEMORY rather than the
+      hardware's 0x80000022 (`src/hle/ge.c`). What the GE draws is done:
+      skinning, morphing, patches, bounding boxes and the rest match the PSP
+      bit for bit through geprobe 23. The GL backend's own gaps are listed in
+      [`docs/RENDERER.md`](docs/RENDERER.md).
 - [ ] **Preemption** — a thread yields only at firmware calls, so one that
-      spins without calling the kernel hangs (reported, not silent).
+      spins without calling the kernel hangs (reported, not silent). The 3rd
+      Birthday's host adds a 1 ms yield after GE calls to keep its sound
+      threads fed.
 - [ ] **Static-constructor discovery** — `src/ctors.c` picks the single
       longest null-terminated table; its own notes say candidates should be
       scored on locality before it is trusted on another title.
-- [ ] **MPEG decode** — the opt-in path produces frames and samples but does
-      not yet get a game further, and assumes a single context.
-- [ ] **Secure savedata** — secure modes store plaintext.
+- [ ] **MPEG decode** — the opt-in path plays The 3rd Birthday's movies, in
+      up to four contexts. `sceMpegDelete` only frees the slot, and
+      `sceMpegCreate` clears a reused one without freeing its decoder or
+      picture, so each movie leaks them.
+- [ ] **Secure savedata** — secure modes store plaintext. saveprobe already
+      holds the hardware's secure saves under known keys.
 - [ ] **Windows** — the Windows half of `src/os.c` has not been through a
       Windows build in this fork.
+- [ ] **The rest of the host** — both games still carry their own copies of
+      `present.c` (SDL2 window, audio, input), `render_gl.c` (the GL backend)
+      and `boot.c`, and they have drifted apart. `boot.c` is where both
+      register `sceKernelStopUnloadSelfModuleWithStatus` (0x8F2DF740, whose
+      name does not hash to its NID; uofw `start-stopModule.c`), because its
+      exit path needs the host.
+- [ ] **Hardware probe set 25** — what the games rely on and no PSP has
+      answered: vector `vrnd` lane order and D prefix (`src/vfpu.c`), a GE
+      signal handler rewriting the list words behind its SIGNAL now that lists
+      are drawn as they are released (`src/hle/ge.c`), and `sceIoMkdir` with a
+      missing parent and `sceIoChstat` (`src/hle/iofilemgr.c`). Then the vrnd,
+      savedata and mpeg provenance checkers, built but unregistered, can be
+      checked against hardware logs instead of an emulator's.

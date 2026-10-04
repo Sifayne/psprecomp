@@ -17,7 +17,12 @@ git log --format='%H %(trailers:key=Last-Raven-Patch,valueonly)' | grep 0021
 ```
 
 Subsequent commits develop the runtime directly: rendering, input/replay,
-audio/video, scheduling and interactive savedata support. The game's
+audio/video, scheduling and interactive savedata support.
+
+Host code that both games carried moves here once it no longer depends on
+either: `src/host/` (built as `psprecomp_host` with `-DPSPRECOMP_HOST=ON`)
+holds the SDL2 savedata dialog, and `tools/oracle/oracle_diff.c` the
+differential oracle. A game compiles them rather than keeping its own copy. The game's
 `tools/psprecomp` submodule pins the exact runtime revision it uses; building
 the game does not use a separate standalone clone or apply a patch series.
 
