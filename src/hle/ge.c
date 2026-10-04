@@ -5170,6 +5170,9 @@ void psp_ge_sync_backend(void) {
     const psp_render_backend *be = psp_render_current();
     be->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
     be->set_scissor(g_ge.sc_x0, g_ge.sc_y0, g_ge.sc_x1, g_ge.sc_y1);
+    /* The depth buffer lives in VRAM where ZBP puts it; a replay that left
+     * it at the reset address wrote its depth over the frame being drawn. */
+    psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
 }
 
 void psp_ge_state_load(const void *buf) {
