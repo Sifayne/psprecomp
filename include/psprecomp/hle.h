@@ -130,6 +130,18 @@ static inline uint32_t psp_arg(int n) {
 
 static inline void psp_ret(uint32_t v) { psp_cpu.r[PSP_REG_V0] = v; }
 
+/* Call the guest function at addr with up to eight arguments, in $a0-$a3 and
+ * then $t0-$t3 as firmware passes them, and $ra = 0; answer its $v0. The
+ * whole register file -- VFPU prefixes included -- is put back afterwards, so
+ * the guest thread that made the firmware call, between two of whose
+ * instructions this runs, cannot tell. The prefixes are not reset for the
+ * call; nothing has measured what firmware hands a callback.
+ *
+ * From a firmware call made on a guest thread the callee may block (a ring
+ * buffer callback that reads its file does): the scheduler keeps each
+ * thread's registers. From an interrupt or timer handler it must not. */
+uint32_t psp_call_guest(uint32_t addr, const uint32_t *args, int nargs);
+
 /* Read a NUL-terminated string out of guest memory into a host buffer.
  * Always terminates; returns `dst`. */
 const char *psp_str(uint32_t addr, char *dst, size_t cap);

@@ -14,7 +14,6 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/cpu.h"
-#include "psprecomp/dispatch.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/os.h"
 #include "psprecomp/clock.h"
@@ -914,18 +913,6 @@ static int avc_pump(mpeg_ctx *c) {
 static int avc_pump(mpeg_ctx *c) { (void)c; return 0; }
 #endif
 
-static uint32_t call_guest(uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2) {
-    const psp_cpu_state save = psp_cpu;
-    psp_cpu.r[PSP_REG_A0] = a0;
-    psp_cpu.r[PSP_REG_A1] = a1;
-    psp_cpu.r[PSP_REG_A2] = a2;
-    psp_cpu.r[PSP_REG_RA] = 0;
-    psp_dispatch(fn);
-    const uint32_t v0 = psp_cpu.r[PSP_REG_V0];
-    psp_cpu = save;
-    return v0;
-}
-
 /* sceMpegRingbufferPut(rb, numPackets, available)
  *
  * The count was being bumped without ever asking the game for the bytes, so the
@@ -954,8 +941,8 @@ static void hle_RingbufferPut(void) {
     if (count>packets-cursor) count=packets-cursor;
     uint32_t target=psp_read32(ring+RB_DATA)+cursor*stride;
     uint32_t callback=psp_read32(ring+RB_CALLBACK);
-    int32_t copied=callback?(int32_t)call_guest(callback,target,count,
-                                              psp_read32(ring+RB_CALLBACK_ARG)):0;
+    const uint32_t args[3]={target,count,psp_read32(ring+RB_CALLBACK_ARG)};
+    int32_t copied=callback?(int32_t)psp_call_guest(callback,args,3):0;
     mpeg_trace(20,ring,count,(uint32_t)copied,context->aes_len-context->aes_pos);
     if (copied<0) { psp_ret((uint32_t)copied); return; }
     if ((uint32_t)copied>count) { psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }

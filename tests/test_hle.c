@@ -1594,6 +1594,42 @@ static void put_date(uint32_t at, int y, int mo, int d, int h, int mi, int s, ui
 
 /* The SysClock conversions and the sceRtc calendar, against what a 6.60 PSP
  * answered (threadprobe steps 132-140). */
+/* psp_call_guest: arguments in $a0-$a3 then $t0-$t3, $ra = 0, $v0 back, and
+ * the caller's whole register file -- prefixes too -- put back. */
+static uint32_t g_callee_regs[9];
+static uint32_t g_callee_pfxs;
+static void guest_callee(void) {
+    for (int i = 0; i < 4; i++) g_callee_regs[i] = psp_cpu.r[PSP_REG_A0 + i];
+    for (int i = 0; i < 4; i++) g_callee_regs[4 + i] = psp_cpu.r[PSP_REG_T0 + i];
+    g_callee_regs[8] = psp_cpu.r[PSP_REG_RA];
+    g_callee_pfxs = psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS];
+    psp_cpu.r[PSP_REG_S0] = 0xBAD0BAD0u;
+    psp_cpu.r[PSP_REG_SP] -= 64;
+    psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS] = 0x000000FFu;
+    psp_cpu.r[PSP_REG_V0] = 0x600Du;
+}
+static void test_call_guest(void) {
+    const uint32_t fn = 0x08A10000u;
+    psp_register(fn, guest_callee);
+    const psp_cpu_state before = psp_cpu;
+    psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS] = 0x000E4E4u;
+    psp_cpu.r[PSP_REG_S0] = 0x50505050u;
+    psp_cpu.r[PSP_REG_RA] = 0x08800123u;
+    psp_cpu.r[PSP_REG_T3] = 0x7777u;
+    const uint32_t args[6] = { 1, 2, 3, 4, 5, 6 };
+    CHECK(psp_call_guest(fn, args, 6) == 0x600Du, "psp_call_guest answers the callee's v0");
+    CHECK(g_callee_regs[0] == 1 && g_callee_regs[3] == 4 && g_callee_regs[4] == 5 &&
+          g_callee_regs[5] == 6, "arguments 0-3 in a0-a3, 4-5 in t0-t1");
+    CHECK(g_callee_regs[7] == 0x7777u, "registers past nargs are left as they were");
+    CHECK(g_callee_regs[8] == 0, "the callee returns to 0");
+    CHECK(g_callee_pfxs == 0x000E4E4u, "the caller's prefixes are not reset for the call");
+    CHECK(psp_cpu.r[PSP_REG_S0] == 0x50505050u && psp_cpu.r[PSP_REG_RA] == 0x08800123u &&
+          psp_cpu.r[PSP_REG_SP] == before.r[PSP_REG_SP] &&
+          psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS] == 0x000E4E4u,
+          "the caller's registers and prefixes are put back");
+    psp_cpu = before;
+}
+
 /* sceKernelMemset/Memcpy answer dst and mark what they write; the fill value
  * is an s8, so only its low byte counts. */
 static void test_kernel_memory(void) {
@@ -2033,6 +2069,7 @@ int main(void) {
     test_sas_struct();
     test_stdio_async();
     test_display();
+    test_call_guest();
     test_kernel_memory();
     test_atrac_reinit();
     test_time_calls();

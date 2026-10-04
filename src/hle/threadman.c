@@ -2475,14 +2475,8 @@ int psp_threadman_run_callbacks(void) {
          * That thread must not be able to tell, so its registers are put back;
          * same reasoning as the alarm handler in ktimer.c. */
         const uint32_t uid = c->uid;
-        const psp_cpu_state saved = psp_cpu;
-        psp_cpu.r[PSP_REG_A0] = count;
-        psp_cpu.r[PSP_REG_A1] = arg;
-        psp_cpu.r[PSP_REG_A2] = common;
-        psp_cpu.r[PSP_REG_RA] = 0;
-        psp_dispatch(func);
-        const uint32_t handler_result = psp_cpu.r[PSP_REG_V0];
-        psp_cpu = saved;
+        const uint32_t args[3] = { count, arg, common };
+        const uint32_t handler_result = psp_call_guest(func, args, 3);
         ran = 1;
 
         /* A handler that returns non-zero is saying it is finished, and the
