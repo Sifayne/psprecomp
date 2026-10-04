@@ -1062,12 +1062,55 @@ static void test_ge_long_list(void) {
 #undef W_
     const uint32_t qid = call(psp_nid("sceGeListEnQueue"), LIST, 0, cbid, 0);
     CHECK(g_gecb_n == 1 && g_gecb[0][1] == 0x01, "only SIGNAL 0x01 inside EnQueue: %d handler(s)", g_gecb_n);
+    /* Drawn already, all of it: only what the guest sees waits for the GE's
+     * time (src/hle/ge.c, "Drawing now, reporting on the clock"). BASE, FBP,
+     * FBW, VTYPE, two SIGNAL/END pairs, 40 VADDR/PRIM pairs and the FINISH. */
+    CHECK(psp_ge_command_count() == 89, "the whole list walked inside EnQueue: %llu command(s)",
+          (unsigned long long)psp_ge_command_count());
     const uint32_t peek = call(psp_nid("sceGeListSync"), qid, 1, 0, 0);
     CHECK(peek == 2, "ListSync(peek) as EnQueue returns: 0x%08X, hardware 2", peek);
     CHECK(call(psp_nid("sceGeDrawSync"), 1, 0, 0, 0) == 2, "DrawSync(peek) while it runs: 2");
     CHECK(call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0) == 0, "DrawSync(wait) reads 0");
     CHECK(g_gecb_n == 3 && g_gecb[1][1] == 0x02 && g_gecb[2][0] == 2 && g_gecb[2][1] == 0x03,
           "SIGNAL 0x02 and FINISH 0x03 by the end of the wait: %d handler(s)", g_gecb_n);
+    call(psp_nid("sceGeUnsetCallback"), cbid, 0, 0, 0);
+}
+
+/* sceGeContinue from a PAUSE's own signal handler lets the list through the
+ * pause. The walk has stopped at the pause's FINISH before the handler runs,
+ * so the pause it took is taken back before the guest sees it. Not measured
+ * on a PSP. */
+static uint32_t g_gecb_continue;
+static void gecb_signal_continue(void) {
+    gecb_note(1);
+    g_gecb_continue = call(psp_nid("sceGeContinue"), 0, 0, 0, 0);
+}
+
+static void test_ge_pause_continue_early(void) {
+    psp_ge_reset();
+    g_gecb_n = 0;
+    g_gecb_continue = 0xFFFFFFFFu;
+    psp_register(0x08A00200u, gecb_signal_continue);
+    psp_register(0x08A00100u, gecb_finish);
+    const uint32_t CB = 0x08836000u, LIST = 0x0882C000u;
+    psp_write32(CB + 0, 0x08A00200u); psp_write32(CB + 4, 0x5A);
+    psp_write32(CB + 8, 0x08A00100u); psp_write32(CB + 12, 0xA5);
+    const uint32_t cbid = call(psp_nid("sceGeSetCallback"), CB, 0, 0, 0);
+    psp_write32(LIST + 0x00, (0x0Eu << 24) | (0x03u << 16) | 1u); /* SIGNAL PAUSE */
+    psp_write32(LIST + 0x04, (0x0Cu << 24));                      /* END */
+    psp_write32(LIST + 0x08, (0x0Fu << 24));                      /* pause FINISH */
+    psp_write32(LIST + 0x0C, (0x0Cu << 24));                      /* pause END */
+    psp_write32(LIST + 0x10, (0x00u << 24));                      /* NOP */
+    psp_write32(LIST + 0x14, (0x0Fu << 24) | 0x66u);              /* final FINISH */
+    psp_write32(LIST + 0x18, (0x0Cu << 24));                      /* final END */
+    const uint32_t qid = call(psp_nid("sceGeListEnQueue"), LIST, 0, cbid, 0);
+    CHECK(g_gecb_continue == 0, "sceGeContinue from the handler reads 0x%08X", g_gecb_continue);
+    CHECK(psp_ge_command_count() == 6, "walked through the pause: %llu command(s), want 6",
+          (unsigned long long)psp_ge_command_count());
+    CHECK(call(psp_nid("sceGeListSync"), qid, 1, 0, 0) == 0, "done as EnQueue returns, never paused");
+    CHECK(g_gecb_n == 2 && g_gecb[0][0] == 1 && g_gecb[1][0] == 2 && g_gecb[1][1] == 0x66,
+          "the signal handler, then FINISH 0x66's: %d handler(s)", g_gecb_n);
+    call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0);
     call(psp_nid("sceGeUnsetCallback"), cbid, 0, 0, 0);
 }
 
@@ -1926,6 +1969,7 @@ int main(void) {
     test_ge_display_list();
     test_ge_alias_stall();
     test_ge_signal_pause();
+    test_ge_pause_continue_early();
     test_ge_callbacks();
     test_ge_long_list();
     test_ge_infinite_list();
