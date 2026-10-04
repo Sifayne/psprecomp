@@ -1963,6 +1963,30 @@ static void clip_to_fx16(const float clip[4], int *x, int *y) {
     }
 }
 
+/* to_screen and clip_to_fx16 for one vertex at once: their three ge_over_w
+ * take 1/w from the same table entry, so it is looked up once. clip[3] must
+ * be past the near limit, as for those two. */
+static void clip_to_screen(const float clip[4], float *sx, float *sy, float *sz, int *x, int *y) {
+    const float inv = 1.0f / clip[3];
+    float unused;
+    ndc_to_screen(clip[0] * inv, clip[1] * inv, clip[2] * inv, sx, sy, &unused);
+    const double r = ge_rcp16(clip[3]);
+    if (g_tl.vp_zs == 0.0f) *sz = ((clip[2] / clip[3]) * 0.5f + 0.5f) * 65535.0f;
+    else {
+        const double nz = ge_cut(clip[2] * r, 16, 0);
+        const ge_term t[2] = { ge_mul(g_tl.vp_zs, nz), ge_mul(g_tl.vp_zc, 1.0) };
+        *sz = (float)ge_floor(ge_sum(t, 2));
+    }
+    const double gx = ge_cut(clip[0] * r, 16, 0), gy = ge_cut(clip[1] * r, 16, 0);
+    if (g_tl.vp_set) {
+        *x = ge_screen_axis(gx, g_tl.vp_xs, g_tl.vp_xc, g_tl.off_x);
+        *y = ge_screen_axis(gy, g_tl.vp_ys, g_tl.vp_yc, g_tl.off_y);
+    } else {
+        *x = screen_axis_fx16((float)gx, 240.0f, 240.0f);
+        *y = screen_axis_fx16((float)gy, -136.0f, 136.0f);
+    }
+}
+
 /* Transformed geometry, one primitive at a time.
  *
  * Triangles go through emit_tri below -- the near-plane clip, the guard band
@@ -2627,9 +2651,10 @@ static struct {
     float spec_k;                       /* the specular coefficient, cut to 5 bits */
     struct {
         int amb[3], dif[3], spec[3];
-        double L[3], H[3];              /* directional only */
+        ge_sp L[3], H[3];               /* directional only, split */
         ge_sp tp[3];                    /* point and spot: t - p, one GE sum, split */
-        double D[3], d_rs;              /* spot: its direction and 1/sqrt(D.D) */
+        ge_sp D[3];                     /* spot: its direction, split */
+        double d_rs;                    /* and 1/sqrt(D.D) */
         int d_ok;                       /* D.D > 0 */
         float spot_k;                   /* the spot exponent, cut to 5 bits */
     } light[4];
@@ -2658,13 +2683,17 @@ static void light_setup(void) {
         }
         if (g_tl.light[i].type == 0) {
             const double Lv[3] = { g_tl.light[i].pos[0], g_tl.light[i].pos[1], g_tl.light[i].pos[2] };
-            gl_unit(Lv, g_ls.light[i].L);
-            double Hv[3];
+            double L[3], Hv[3], H[3];
+            gl_unit(Lv, L);
             for (int k = 0; k < 3; k++) {
-                const ge_term h[2] = { ge_mul(g_ls.light[i].L[k], 1.0), ge_mul(g_ls.E[k], 1.0) };
+                const ge_term h[2] = { ge_mul(L[k], 1.0), ge_mul(g_ls.E[k], 1.0) };
                 Hv[k] = ge_sum(h, 2);
             }
-            gl_unit(Hv, g_ls.light[i].H);
+            gl_unit(Hv, H);
+            for (int k = 0; k < 3; k++) {
+                g_ls.light[i].L[k] = ge_sp_of(L[k]);
+                g_ls.light[i].H[k] = ge_sp_of(H[k]);
+            }
         } else {
             for (int k = 0; k < 3; k++) {
                 const ge_term tp[2] = { ge_mul(W[9 + k], 1.0), ge_mul(g_tl.light[i].pos[k], -1.0) };
@@ -2672,8 +2701,9 @@ static void light_setup(void) {
             }
         }
         if (g_tl.light[i].type == 2) {
-            for (int k = 0; k < 3; k++) g_ls.light[i].D[k] = g_tl.light[i].dir[k];
-            const double dd = gl_dot3(g_ls.light[i].D, g_ls.light[i].D);
+            const double D[3] = { g_tl.light[i].dir[0], g_tl.light[i].dir[1], g_tl.light[i].dir[2] };
+            for (int k = 0; k < 3; k++) g_ls.light[i].D[k] = ge_sp_of(D[k]);
+            const double dd = gl_dot3(D, D);
             g_ls.light[i].d_ok = dd > 0.0;
             g_ls.light[i].d_rs = g_ls.light[i].d_ok ? ge_rsqrt16(dd) : 0.0;
             g_ls.light[i].spot_k = (float)ge_cut(g_tl.light[i].exponent, 5, 0);
@@ -2681,10 +2711,16 @@ static void light_setup(void) {
     }
 }
 
+/* gl_dot3 of split vectors. */
+static double gl_dot3_sp(const ge_sp a[3], const ge_sp b[3]) {
+    const ge_term t[3] = { ge_mul_sp(&a[0], &b[0]), ge_mul_sp(&a[1], &b[1]), ge_mul_sp(&a[2], &b[2]) };
+    return ge_sum(t, 3);
+}
+
 /* gl_dot_scaled(a, u) with a's half worked out already: a.a > 0 (ok) and
  * its 1/sqrt (rs). */
-static double gl_dot_pre(int ok, double rs, const double a[3], const double u[3]) {
-    return ok ? gl_mul(gl_dot3(a, u), rs) : 0.0;
+static double gl_dot_pre(int ok, double rs, const ge_sp a[3], const ge_sp u[3]) {
+    return ok ? gl_mul(gl_dot3_sp(a, u), rs) : 0.0;
 }
 
 /* gl_pow with k cut already. */
@@ -2718,13 +2754,15 @@ static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba
         n[i] = ge_sum(t, 3);
     }
     /* N's half of every N.L and N.H below (gl_dot_scaled). */
-    const double nn = gl_dot3(n, n);
+    const ge_sp Ns[3] = { ge_sp_of(n[0]), ge_sp_of(n[1]), ge_sp_of(n[2]) };
+    const double nn = gl_dot3_sp(Ns, Ns);
     const int n_ok = nn > 0.0;
     const double n_rs = n_ok ? ge_rsqrt16(nn) : 0.0;
     for (int i = 0; i < 4; i++) {
         if (!g_tl.light[i].enable) continue;
         double Lv[3], L[3];
-        const double *Lp = L;
+        ge_sp Ls[3];
+        const ge_sp *Lp = Ls;
         float att = 1.0f, spot = 1.0f;
         if (g_tl.light[i].type == 0) {
             Lp = g_ls.light[i].L;
@@ -2741,6 +2779,7 @@ static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba
             const double a = ge_sum(at, 3);
             att = a != 0.0 ? (float)ge_rcp16(a) : 1.0f;
             gl_unit(Lv, L);
+            for (int k = 0; k < 3; k++) Ls[k] = ge_sp_of(L[k]);
         }
 
         if (g_tl.light[i].type == 2) {
@@ -2749,24 +2788,25 @@ static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba
             spot = gl_pow_k(sdot, g_ls.light[i].spot_k);
         }
 
-        const double ndl = gl_dot_pre(n_ok, n_rs, n, Lp);
+        const double ndl = gl_dot_pre(n_ok, n_rs, Ns, Lp);
         float dfac = ndl > 0.0 ? (float)ndl : 0.0f;
         if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = gl_pow_k(dfac, g_ls.spec_k);
 
         float sfac = 0.0f;
         if (g_tl.light[i].kind == 1 && ndl >= 0.0) {
-            double Hb[3];
-            const double *H = g_ls.light[i].H;
+            ge_sp Hs[3];
+            const ge_sp *H = g_ls.light[i].H;
             if (g_tl.light[i].type != 0) {
-                double Hv[3];
+                double Hv[3], Hb[3];
                 for (int k = 0; k < 3; k++) {
-                    const ge_term h[2] = { ge_mul(Lp[k], 1.0), ge_mul(g_ls.E[k], 1.0) };
+                    const ge_term h[2] = { ge_mul(L[k], 1.0), ge_mul(g_ls.E[k], 1.0) };
                     Hv[k] = ge_sum(h, 2);
                 }
                 gl_unit(Hv, Hb);
-                H = Hb;
+                for (int k = 0; k < 3; k++) Hs[k] = ge_sp_of(Hb[k]);
+                H = Hs;
             }
-            sfac = gl_pow_k(gl_dot_pre(n_ok, n_rs, n, H), g_ls.spec_k);
+            sfac = gl_pow_k(gl_dot_pre(n_ok, n_rs, Ns, H), g_ls.spec_k);
         }
 
         const int vd = lit_byte(dfac), vs = lit_byte(sfac);
@@ -3120,11 +3160,9 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             const uint64_t _p4 = ge_prof_now();
             memcpy(cl[decoded], clip, sizeof clip);
             float sx, sy, sz;
-            if (clip[3] > 1e-6f) to_screen(clip, &sx, &sy, &sz);
-            else                 sx = sy = sz = 0.0f;
             /* Onto the 1/16 grid, as screen_axis_fx16 explains. */
-            if (clip[3] > 1e-6f) clip_to_fx16(clip, &o->x, &o->y);
-            else                 o->x = o->y = 0;
+            if (clip[3] > 1e-6f) clip_to_screen(clip, &sx, &sy, &sz, &o->x, &o->y);
+            else { sx = sy = sz = 0.0f; o->x = o->y = 0; }
             o->precise_x = sx; o->precise_y = sy; o->precise = 1;
             o->z = sz;
             o->inv_w = clip[3] > 1e-6f ? 1.0f / clip[3] : 1.0f;
