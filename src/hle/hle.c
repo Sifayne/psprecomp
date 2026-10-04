@@ -65,6 +65,17 @@ const char *psp_hle_name(uint32_t nid) {
 
 int psp_hle_count(void) { return g_count; }
 
+uint32_t psp_call_guest(uint32_t addr, const uint32_t *args, int nargs) {
+    const psp_cpu_state saved = psp_cpu;
+    for (int i = 0; i < nargs && i < 8; i++)
+        psp_cpu.r[i < 4 ? PSP_REG_A0 + i : PSP_REG_T0 + (i - 4)] = args[i];
+    psp_cpu.r[PSP_REG_RA] = 0;
+    psp_dispatch(addr);
+    const uint32_t v0 = psp_cpu.r[PSP_REG_V0];
+    psp_cpu = saved;
+    return v0;
+}
+
 const psp_hle_entry *psp_hle_entries(int *count) {
     if (count) *count = g_count;
     return g_entry;

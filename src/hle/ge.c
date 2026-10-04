@@ -490,7 +490,7 @@ static uint32_t g_next_id;
  * Guessing between them is the same mistake as reading one stop reason for
  * another, so they are counted apart. */
 static uint64_t g_skip_noaddr;     /* no vertex address in the stream */
-static uint64_t g_skip_layout;     /* weighted, or no position -- vertex_layout declined */
+static uint64_t g_skip_layout;     /* no position -- vertex_layout declined */
 static uint64_t g_skip_nearplane;  /* lines and points behind the eye (triangles go to the clipper) */
 static uint64_t g_clip_eye, g_clip_z, g_clip_guard, g_clip_split;
 static uint64_t g_draw_mip;
@@ -960,7 +960,7 @@ void psp_ge_dump_stats(FILE *out) {
         fprintf(out, "    %llu vertices dropped: no vertex address set\n",
                 (unsigned long long)g_skip_noaddr);
     if (g_skip_layout)
-        fprintf(out, "    %llu vertices dropped: layout not decoded (weighted, or no position)\n",
+        fprintf(out, "    %llu vertices dropped: layout has no position\n",
                 (unsigned long long)g_skip_layout);
 }
 
@@ -4475,12 +4475,9 @@ static void run_list_body(ge_queue *q) {
             break;
         /* ---- texture state -------------------------------------------------
          *
-         * Recorded, not yet sampled. What the sampler has to support is a
-         * question about this game rather than about the hardware, and the
-         * cheapest way to answer it is to watch which formats and sizes it
-         * actually sets -- the PSP offers eleven pixel formats, four palette
-         * formats and a swizzle, and building all of that before knowing which
-         * are used is how a rasterizer ends up mostly untested code. */
+         * Recorded here and handed to the backend, which samples it: the
+         * software one in render.c, against geprobe's texel readings
+         * (docs/RENDERER.md). */
         /* Texture and palette addresses arrive in two registers, and the
          * second one carries the high *nibble* -- bits 24..27 -- in its own
          * bits 16..19, not in its low byte. Both addresses are 16-byte
@@ -4959,9 +4956,9 @@ static void enqueue(int head) {
      * DrawSync, even 10 ms later. Tiny lists that pspgu's helpers poll
      * have finished by then because the kick window ran them.
      *
-     * Not yet modelled: head-vs-tail ordering, BREAK, DeQueue,
-     * GetCmd/GetMtx/GetStack (unimplemented, read 0), and the queue-full
-     * code (hardware 0x80000022). */
+     * Not yet modelled: DeQueue and GetCmd/GetMtx/GetStack (unregistered,
+     * so they answer 0), and the queue-full code (hardware 0x80000022; a
+     * full pool here answers NO_MEMORY). EnQueueHead and sceGeBreak are. */
     g_ge.lists++;
     /* The call itself takes time: step 81's first SIGNAL, the list's first
      * word, calls its handler 41-51 microseconds after the call is made,

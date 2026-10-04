@@ -1594,6 +1594,95 @@ static void put_date(uint32_t at, int y, int mo, int d, int h, int mi, int s, ui
 
 /* The SysClock conversions and the sceRtc calendar, against what a 6.60 PSP
  * answered (threadprobe steps 132-140). */
+/* psp_call_guest: arguments in $a0-$a3 then $t0-$t3, $ra = 0, $v0 back, and
+ * the caller's whole register file -- prefixes too -- put back. */
+static uint32_t g_callee_regs[9];
+static uint32_t g_callee_pfxs;
+static void guest_callee(void) {
+    for (int i = 0; i < 4; i++) g_callee_regs[i] = psp_cpu.r[PSP_REG_A0 + i];
+    for (int i = 0; i < 4; i++) g_callee_regs[4 + i] = psp_cpu.r[PSP_REG_T0 + i];
+    g_callee_regs[8] = psp_cpu.r[PSP_REG_RA];
+    g_callee_pfxs = psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS];
+    psp_cpu.r[PSP_REG_S0] = 0xBAD0BAD0u;
+    psp_cpu.r[PSP_REG_SP] -= 64;
+    psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS] = 0x000000FFu;
+    psp_cpu.r[PSP_REG_V0] = 0x600Du;
+}
+static void test_call_guest(void) {
+    const uint32_t fn = 0x08A10000u;
+    psp_register(fn, guest_callee);
+    const psp_cpu_state before = psp_cpu;
+    psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS] = 0x000E4E4u;
+    psp_cpu.r[PSP_REG_S0] = 0x50505050u;
+    psp_cpu.r[PSP_REG_RA] = 0x08800123u;
+    psp_cpu.r[PSP_REG_T3] = 0x7777u;
+    const uint32_t args[6] = { 1, 2, 3, 4, 5, 6 };
+    CHECK(psp_call_guest(fn, args, 6) == 0x600Du, "psp_call_guest answers the callee's v0");
+    CHECK(g_callee_regs[0] == 1 && g_callee_regs[3] == 4 && g_callee_regs[4] == 5 &&
+          g_callee_regs[5] == 6, "arguments 0-3 in a0-a3, 4-5 in t0-t1");
+    CHECK(g_callee_regs[7] == 0x7777u, "registers past nargs are left as they were");
+    CHECK(g_callee_regs[8] == 0, "the callee returns to 0");
+    CHECK(g_callee_pfxs == 0x000E4E4u, "the caller's prefixes are not reset for the call");
+    CHECK(psp_cpu.r[PSP_REG_S0] == 0x50505050u && psp_cpu.r[PSP_REG_RA] == 0x08800123u &&
+          psp_cpu.r[PSP_REG_SP] == before.r[PSP_REG_SP] &&
+          psp_cpu.vfpu_ctrl[PSP_VFPU_PFXS] == 0x000E4E4u,
+          "the caller's registers and prefixes are put back");
+    psp_cpu = before;
+}
+
+/* sceKernelMemset/Memcpy answer dst and mark what they write; the fill value
+ * is an s8, so only its low byte counts. */
+static void test_kernel_memory(void) {
+    enum { MEMSET = 0xA089ECA4u, MEMCPY = 0x1839852Au };
+    const uint32_t a = 0x08A00000u, b = 0x08A01000u;
+    const uint64_t before = psp_mem_range_generation(a, 16);
+    CHECK(call(MEMSET, a, 0xFFFFFFA5u, 16, 0) == a, "Memset answers dst");
+    int filled = 1;
+    for (uint32_t i = 0; i < 16; i++) filled &= psp_read8(a + i) == 0xA5;
+    CHECK(filled && psp_read8(a + 16) == 0, "Memset fills the low byte, exactly size bytes");
+    CHECK(psp_mem_range_generation(a, 16) > before, "Memset marks what it wrote");
+    psp_write32(a, 0x11223344u);
+    CHECK(call(MEMCPY, b, a, 8, 0) == b, "Memcpy answers dst");
+    CHECK(psp_read32(b) == 0x11223344u && psp_read32(b + 4) == 0xA5A5A5A5u &&
+          psp_read32(b + 8) == 0, "Memcpy copies exactly size bytes");
+}
+
+/* sceAtracReinit lays the six ID slots out again (uofw libatrac3plus.c):
+ * the first numAT3plusId for ATRAC3+, the next numAT3Id for ATRAC3; busy
+ * while an ID is held. */
+static void test_atrac_reinit(void) {
+    enum { GETID = 0x780F88D1u, RELEASE = 0x61EB33F5u, REINIT = 0x132F1ECAu,
+           AT3P = 0x1000u, AT3 = 0x1001u, NO_ID = 0x80630003u };
+    CHECK(call(GETID, AT3P, 0, 0, 0) == 0 && call(GETID, AT3P, 0, 0, 0) == 1 &&
+          call(GETID, AT3P, 0, 0, 0) == NO_ID, "default layout: ATRAC3+ gets 0 and 1");
+    CHECK(call(GETID, AT3, 0, 0, 0) == 2 && call(GETID, AT3, 0, 0, 0) == 3 &&
+          call(GETID, AT3, 0, 0, 0) == NO_ID, "default layout: ATRAC3 gets 2 and 3");
+    CHECK(call(REINIT, 4, 1, 0, 0) == 0x80000021u, "Reinit is busy while IDs are held");
+    for (uint32_t id = 0; id < 4; id++) call(RELEASE, id, 0, 0, 0);
+
+    CHECK(call(REINIT, 4, 1, 0, 0) == 0, "Reinit(4, 1) with nothing held");
+    CHECK(call(GETID, AT3P, 0, 0, 0) == 0 && call(GETID, AT3P, 0, 0, 0) == NO_ID,
+          "one ATRAC3+ slot, first");
+    uint32_t ids[5];
+    for (int i = 0; i < 5; i++) ids[i] = call(GETID, AT3, 0, 0, 0);
+    CHECK(ids[0] == 1 && ids[1] == 2 && ids[2] == 3 && ids[3] == 4 && ids[4] == NO_ID,
+          "then four ATRAC3 slots");
+    for (uint32_t id = 0; id < 5; id++) call(RELEASE, id, 0, 0, 0);
+
+    CHECK(call(REINIT, 5, 2, 0, 0) == 0x80000022u, "seven IDs do not fit in six slots");
+    CHECK(call(GETID, AT3P, 0, 0, 0) == 0 && call(GETID, AT3P, 0, 0, 0) == 1,
+          "the slots that fit are laid out: ATRAC3+ 0 and 1");
+    for (int i = 0; i < 5; i++) ids[i] = call(GETID, AT3, 0, 0, 0);
+    CHECK(ids[0] == 2 && ids[3] == 5 && ids[4] == NO_ID, "and ATRAC3 2 to 5");
+    for (uint32_t id = 0; id < 6; id++) call(RELEASE, id, 0, 0, 0);
+
+    CHECK(call(REINIT, 0, 0, 0, 0) == 0 && call(GETID, AT3P, 0, 0, 0) == NO_ID &&
+          call(GETID, AT3, 0, 0, 0) == NO_ID, "Reinit(0, 0) leaves no IDs");
+    CHECK(call(REINIT, 2, 2, 0, 0) == 0 && call(GETID, AT3, 0, 0, 0) == 2,
+          "Reinit(2, 2) is the default layout again");
+    call(RELEASE, 2, 0, 0, 0);
+}
+
 static void test_time_calls(void) {
     const uint32_t B = 0x08805000u;   /* scratch in user RAM */
 
@@ -1980,6 +2069,9 @@ int main(void) {
     test_sas_struct();
     test_stdio_async();
     test_display();
+    test_call_guest();
+    test_kernel_memory();
+    test_atrac_reinit();
     test_time_calls();
     test_pool_free_pointers();
     test_waits_with_threads();

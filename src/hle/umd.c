@@ -117,7 +117,15 @@ static void hle_UnRegisterCallback(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* sceUmdGetErrorStat(void): "the error code associated with a failed event"
+ * (PSPSDK src/umd/pspumd.h; BSD). uofw's mediaman (src/kd/mediaman/
+ * mediaman.c; MIT) keeps one error status, which sceUmdActivate sets to its
+ * mount's result; that the user call reads it back is assumed, not measured.
+ * Activation here always mounts, so it is 0. */
+static void hle_GetErrorStat(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
 void psp_umd_register(void) {
+    psp_hle_register(0x20628E6F, "sceUmdUser", "sceUmdGetErrorStat",          hle_GetErrorStat);
     psp_hle_register(0x46EBB729, "sceUmdUser", "sceUmdCheckMedium",           hle_CheckMedium);
     psp_hle_register(0xC6183D47, "sceUmdUser", "sceUmdActivate",              hle_Activate);
     psp_hle_register(0xE83742BA, "sceUmdUser", "sceUmdDeactivate",            hle_Deactivate);

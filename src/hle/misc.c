@@ -1,7 +1,8 @@
 /* psprecomp — the smaller firmware libraries.
  *
  * Kernel_Library, UtilsForUser, StdioForUser, sceSuspendForUser,
- * LoadExecForUser, ModuleMgrForUser, sceCtrl, sceRtc, sceAudio and scePower.
+ * LoadExecForUser, ModuleMgrForUser, sceCtrl, sceRtc, sceAudio, scePower,
+ * sceImpose and sceOpenPSID.
  * Individually small,
  * but collectively they are what a game's C runtime needs before main() gets
  * anywhere -- newlib's reentrancy setup alone wants interrupt masking, a
@@ -66,24 +67,68 @@ static void hle_CacheOp(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 #define SCE_ERROR_INVALID_POINTER 0x80000103u
 #define SCE_ERROR_INVALID_SIZE    0x80000104u
 
-static void dmac_copy(void) {
-    const uint32_t dst = psp_arg(0), src = psp_arg(1), size = psp_arg(2);
-    if (!size)       { psp_ret(SCE_ERROR_INVALID_SIZE); return; }
-    if (!dst || !src){ psp_ret(SCE_ERROR_INVALID_POINTER); return; }
+/* Guest-to-guest copy and fill, marking what they write. A range the flat map
+ * cannot hand over whole goes byte by byte, so what is mapped is written and
+ * the bad-access counter records the rest. */
+static void guest_copy(uint32_t dst, uint32_t src, uint32_t size) {
     void *d = psp_mem_ptr(dst, size);
     const void *sp = psp_mem_ptr(src, size);
     if (d && sp) {
         memmove(d, sp, size);
         psp_mem_mark_write(dst, size);
     } else {
-        /* A range the flat map cannot hand over whole: byte by byte, so what is
-         * mapped is copied and the bad-access counter records the rest. */
         for (uint32_t i = 0; i < size; i++) psp_write8(dst + i, psp_read8(src + i));
     }
+}
+static void guest_set(uint32_t dst, uint8_t val, uint32_t size) {
+    void *d = psp_mem_ptr(dst, size);
+    if (d) {
+        memset(d, val, size);
+        psp_mem_mark_write(dst, size);
+    } else {
+        for (uint32_t i = 0; i < size; i++) psp_write8(dst + i, val);
+    }
+}
+
+static void dmac_copy(void) {
+    const uint32_t dst = psp_arg(0), src = psp_arg(1), size = psp_arg(2);
+    if (!size)       { psp_ret(SCE_ERROR_INVALID_SIZE); return; }
+    if (!dst || !src){ psp_ret(SCE_ERROR_INVALID_POINTER); return; }
+    guest_copy(dst, src, size);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 static void hle_DmacMemcpy(void)    { dmac_copy(); }
 static void hle_DmacTryMemcpy(void) { dmac_copy(); }
+
+/* ---- Kernel_Library: memory ------------------------------------------------
+ *
+ * sceKernelMemcpy(dst, src, size) and sceKernelMemset(dst, s8 val, size),
+ * each answering dst (uofw include/usersystemlib_kernel.h; MIT). They are the
+ * user-mode libc's, with no argument checks documented. What an overlapping
+ * memcpy does is not measured; this copies as memmove does. The 3rd Birthday
+ * calls Memset; unregistered it answered 0 and filled nothing. */
+static void hle_KernelMemcpy(void) {
+    const uint32_t dst = psp_arg(0);
+    guest_copy(dst, psp_arg(1), psp_arg(2));
+    psp_ret(dst);
+}
+static void hle_KernelMemset(void) {
+    const uint32_t dst = psp_arg(0);
+    guest_set(dst, (uint8_t)psp_arg(1), psp_arg(2));
+    psp_ret(dst);
+}
+
+/* ---- sceImpose, sceOpenPSID -------------------------------------------------
+ *
+ * Both games import one call from each and test neither result beyond < 0.
+ * sceImposeSetLanguageMode(lang, button) is "< 0 on error" (PSPSDK
+ * src/impose/pspimpose.h); nothing here reads the mode back, so it is
+ * accepted and not kept. sceOpenPSIDGetOpenPSID(PspOpenPSID *) fills a
+ * 16-byte console id (PSPSDK src/openpsid/pspopenpsid.h); there is no
+ * console, and any value invented here could end up tied to a save, so the
+ * buffer is left as the game passed it -- what the unregistered call did. */
+static void hle_ImposeSetLanguageMode(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_OpenPSIDGetOpenPSID(void)   { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 /* ---- the wall clock --------------------------------------------------------
  *
@@ -287,6 +332,15 @@ static void hle_RegisterExitCallback(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_GetModuleId(void)          { psp_ret(PSP_MAIN_MODULE_ID); }
 static void hle_GetModuleIdByAddress(void) { psp_ret(PSP_MAIN_MODULE_ID); }
 static void hle_ModuleOk(void)             { psp_ret(SCE_KERNEL_ERROR_OK); }
+
+/* 0xF9275D98 is sceKernelLoadModuleBufferUsbWlan: PSPSDK's import stub
+ * (src/user/ModuleMgrForUser.S; BSD) names it, and SHA-1 of the name is the
+ * NID. It was registered unnamed, after eighteen ModuleMgr names guessed
+ * against SHA-1 missed it. WTF's microgame calls it three times on its
+ * heap-setup path, where the unregistered 0 failed heap establishment; a load
+ * answers the loaded module's id, and the one module's id is what it went on
+ * answering. Nothing is loaded. */
+static void hle_LoadModuleBufferUsbWlan(void) { psp_ret(PSP_MAIN_MODULE_ID); }
 
 /* ---- sceCtrl ------------------------------------------------------------- */
 
@@ -880,6 +934,12 @@ static void hle_RtcGetCurrentTick(void) {
 /* Ticks per second, and the unit above is what makes it this number. */
 static void hle_RtcGetTickResolution(void) { psp_ret(1000000u); }
 
+/* sceRtcGetAccumulativeTime(void). uofw's version (src/kd/rtc/rtc.c; MIT)
+ * answers SCE_ERROR_OK with its system-time read commented out and the
+ * function marked unfinished, so 0 is all a source gives; what firmware 6.60
+ * answers is not measured. The 3rd Birthday calls it once. */
+static void hle_RtcGetAccumulativeTime(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
 /* (date, tz minutes): the date now, tz minutes east of UTC (step 134). */
 static void hle_RtcGetCurrentClock(void) {
     const uint32_t out = psp_arg(0);
@@ -1374,6 +1434,10 @@ void psp_misc_register(void) {
     psp_hle_register(0xBFA98062, "UtilsForUser", "sceKernelDcacheInvalidateRange",        hle_CacheOp);
     psp_hle_register(0x617F3FE6, "sceDmac", "sceDmacMemcpy",    hle_DmacMemcpy);
     psp_hle_register(0xD97F94D8, "sceDmac", "sceDmacTryMemcpy", hle_DmacTryMemcpy);
+    psp_hle_register(0x1839852A, "Kernel_Library", "sceKernelMemcpy", hle_KernelMemcpy);
+    psp_hle_register(0xA089ECA4, "Kernel_Library", "sceKernelMemset", hle_KernelMemset);
+    psp_hle_register(0x36AA6E91, "sceImpose", "sceImposeSetLanguageMode", hle_ImposeSetLanguageMode);
+    psp_hle_register(0xC69BEBCE, "sceOpenPSID", "sceOpenPSIDGetOpenPSID", hle_OpenPSIDGetOpenPSID);
     psp_hle_register(0x27CC57F0, "UtilsForUser", "sceKernelLibcTime",         hle_LibcTime);
     psp_hle_register(0x91E4F6A7, "UtilsForUser", "sceKernelLibcClock",        hle_LibcClock);
     psp_hle_register(0x71EC4271, "UtilsForUser", "sceKernelLibcGettimeofday", hle_LibcGettimeofday);
@@ -1396,12 +1460,7 @@ void psp_misc_register(void) {
     psp_hle_register(0x05572A5F, "LoadExecForUser", "sceKernelExitGame",             hle_ExitGame);
     psp_hle_register(0x4AC57943, "LoadExecForUser", "sceKernelRegisterExitCallback", hle_RegisterExitCallback);
 
-    /* Observed but unidentified. The game calls this three times on its
-     * heap-setup path, and an unimplemented call returns 0 -- which for a
-     * module query means "no module" and makes heap establishment fail.
-     * Eighteen plausible ModuleMgr names were tried against SHA-1 with no
-     * match, so the name is genuinely unknown and is not invented here. */
-    psp_hle_register_unnamed(0xF9275D98, "ModuleMgrForUser", hle_GetModuleId);
+    psp_hle_register(0xF9275D98, "ModuleMgrForUser", "sceKernelLoadModuleBufferUsbWlan", hle_LoadModuleBufferUsbWlan);
     psp_hle_register(0xF0A26395, "ModuleMgrForUser", "sceKernelGetModuleId",          hle_GetModuleId);
     psp_hle_register(0xD8B73127, "ModuleMgrForUser", "sceKernelGetModuleIdByAddress", hle_GetModuleIdByAddress);
     psp_hle_register(0x50F0C1EC, "ModuleMgrForUser", "sceKernelStartModule",          hle_ModuleOk);
@@ -1417,6 +1476,7 @@ void psp_misc_register(void) {
 
     psp_hle_register(0x3F7AD767, "sceRtc", "sceRtcGetCurrentTick",         hle_RtcGetCurrentTick);
     psp_hle_register(0xC41C2853, "sceRtc", "sceRtcGetTickResolution",      hle_RtcGetTickResolution);
+    psp_hle_register(0x011F03C1, "sceRtc", "sceRtcGetAccumulativeTime",    hle_RtcGetAccumulativeTime);
     psp_hle_register(0x4CFA57B0, "sceRtc", "sceRtcGetCurrentClock",        hle_RtcGetCurrentClock);
     psp_hle_register(0x42307A17, "sceRtc", "sceRtcIsLeapYear",             hle_RtcIsLeapYear);
     psp_hle_register(0x05EF322C, "sceRtc", "sceRtcGetDaysInMonth",         hle_RtcGetDaysInMonth);

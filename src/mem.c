@@ -36,6 +36,25 @@ static uint64_t g_vram_write[(PSP_VRAM_SIZE + WRITE_GRANULE - 1) / WRITE_GRANULE
 static uint64_t g_scratch_write[(PSP_SCRATCH_SIZE + WRITE_GRANULE - 1) / WRITE_GRANULE];
 static uint64_t g_write_serial;
 
+/* Whether the module image overlaps each fixed region, set when it is mapped.
+ * The module is checked first everywhere, so its part of such a region is
+ * stored -- and written -- in the module's backing, not the region's. Both
+ * games link theirs at 0, over the scratchpad. */
+static int g_module_in_ram, g_module_in_vram, g_module_in_scratch;
+
+static int module_overlaps(uint32_t base, uint32_t size) {
+    return g_module_size && g_module_write &&
+           g_module_base < (uint64_t)base + size &&
+           (uint64_t)g_module_base + g_module_size > base;
+}
+static int range_hits_module(uint32_t a, uint64_t end) {
+    return a < (uint64_t)g_module_base + g_module_size && end > g_module_base;
+}
+
+/* The one table that covers the whole range, or NULL when no single table
+ * does: the range crosses a region's end, runs into the module, or is not
+ * mapped. Every store from guest code lands in the first case, so this stays
+ * a handful of compares and the rest goes to walk_range. */
 static uint64_t *write_table(uint32_t addr, uint32_t size, uint32_t *off) {
     const uint32_t a = addr & PSP_ADDR_MASK;
     const uint64_t end = (uint64_t)a + size;
@@ -45,19 +64,101 @@ static uint64_t *write_table(uint32_t addr, uint32_t size, uint32_t *off) {
         return g_module_write;
     }
     if (a >= PSP_RAM_BASE && end <= (uint64_t)PSP_RAM_BASE + PSP_RAM_SIZE) {
+        if (g_module_in_ram && range_hits_module(a, end)) return NULL;
         if (off) *off = a - PSP_RAM_BASE;
         return g_ram_write;
     }
     if (a >= PSP_VRAM_BASE && end <= (uint64_t)PSP_VRAM_BASE + PSP_VRAM_SIZE) {
+        if (g_module_in_vram && range_hits_module(a, end)) return NULL;
         if (off) *off = a - PSP_VRAM_BASE;
         return g_vram_write;
     }
     if (a >= PSP_SCRATCH_BASE &&
         end <= (uint64_t)PSP_SCRATCH_BASE + PSP_SCRATCH_SIZE) {
+        if (g_module_in_scratch && range_hits_module(a, end)) return NULL;
         if (off) *off = a - PSP_SCRATCH_BASE;
         return g_scratch_write;
     }
     return NULL;
+}
+
+/* The backing piece that starts at a: its table and offset, and in *stop the
+ * address where that backing ends -- the region's end, or the module's start
+ * when the module begins inside it. An unmapped a returns NULL with *stop at
+ * the next mapped address above it. Same priority as psp_mem_ptr: module
+ * first. */
+static uint64_t *backing_piece(uint32_t a, uint32_t *off, uint64_t *stop) {
+    static const struct { uint32_t base, size; uint64_t *table; } regions[] = {
+        { PSP_SCRATCH_BASE, PSP_SCRATCH_SIZE, g_scratch_write },
+        { PSP_VRAM_BASE,    PSP_VRAM_SIZE,    g_vram_write    },
+        { PSP_RAM_BASE,     PSP_RAM_SIZE,     g_ram_write     },
+    };
+    const int module = g_module_size && g_module_write;
+    const uint64_t module_end = (uint64_t)g_module_base + g_module_size;
+    if (module && a >= g_module_base && a < module_end) {
+        *off = a - g_module_base;
+        *stop = module_end;
+        return g_module_write;
+    }
+    uint64_t next = UINT64_MAX;
+    for (size_t i = 0; i < sizeof regions / sizeof regions[0]; i++) {
+        const uint64_t region_end = (uint64_t)regions[i].base + regions[i].size;
+        if (a >= regions[i].base && a < region_end) {
+            *off = a - regions[i].base;
+            *stop = region_end;
+            if (module && g_module_base > a && g_module_base < *stop) *stop = g_module_base;
+            return regions[i].table;
+        }
+        if (regions[i].base > a && regions[i].base < next) next = regions[i].base;
+    }
+    if (module && g_module_base > a && g_module_base < next) next = g_module_base;
+    *stop = next;
+    return NULL;
+}
+
+static uint64_t next_stamp(void) {
+    uint64_t stamp = ++g_write_serial;
+    /* Zero is the pristine-memory generation. In practice wrapping a 64-bit
+     * write count is unreachable; retaining the invariant still costs one
+     * branch and keeps the API honest. */
+    if (!stamp) stamp = ++g_write_serial;
+    return stamp;
+}
+
+#if defined(_MSC_VER)
+#  define MEM_NOINLINE __declspec(noinline)
+#else
+#  define MEM_NOINLINE __attribute__((noinline))
+#endif
+
+/* The slow path, for a range write_table cannot answer with one table: split
+ * it where its backing changes and visit each mapped piece, skipping the
+ * unmapped gaps. With mark set every piece gets one new generation, taken
+ * only once a mapped piece is found, and the result is that generation (0 if
+ * nothing was mapped); otherwise the result is the newest generation over the
+ * pieces. Kept out of line so the fast path stays small. */
+static MEM_NOINLINE uint64_t walk_range(uint32_t addr, uint32_t size, int mark) {
+    uint64_t at = addr & PSP_ADDR_MASK;
+    const uint64_t end = at + size;
+    uint64_t result = 0;
+    while (at < end) {
+        uint32_t off = 0;
+        uint64_t stop = 0;
+        uint64_t *table = backing_piece((uint32_t)at, &off, &stop);
+        if (stop > end) stop = end;
+        if (table) {
+            if (mark && !result) result = next_stamp();
+            const uint32_t first = off >> WRITE_GRANULE_SHIFT;
+            const uint32_t last = (uint32_t)(((uint64_t)off + (stop - at) - 1u) >>
+                                             WRITE_GRANULE_SHIFT);
+            for (uint32_t i = first; i <= last; i++) {
+                if (mark) table[i] = result;
+                else if (table[i] > result) result = table[i];
+            }
+        }
+        at = stop;
+    }
+    return result;
 }
 
 uint64_t psp_mem_write_serial(void) { return g_write_serial; }
@@ -66,7 +167,7 @@ uint64_t psp_mem_range_generation(uint32_t addr, uint32_t size) {
     if (!size) return 0;
     uint32_t off = 0;
     uint64_t *table = write_table(addr, size, &off);
-    if (!table) return 0;
+    if (!table) return walk_range(addr, size, 0);
     const uint32_t first = off >> WRITE_GRANULE_SHIFT;
     const uint32_t last = (uint32_t)(((uint64_t)off + size - 1u) >>
                                      WRITE_GRANULE_SHIFT);
@@ -101,16 +202,15 @@ void psp_mem_mark_write(uint32_t addr, uint32_t size) {
     if (!size) return;
     uint32_t off = 0;
     uint64_t *table = write_table(addr, size, &off);
-    if (!table) return;
-    uint64_t stamp = ++g_write_serial;
-    /* Zero is the pristine-memory generation. In practice wrapping a 64-bit
-     * write count is unreachable; retaining the invariant still costs one
-     * branch and keeps the API honest. */
-    if (!stamp) stamp = ++g_write_serial;
-    const uint32_t first = off >> WRITE_GRANULE_SHIFT;
-    const uint32_t last = (uint32_t)(((uint64_t)off + size - 1u) >>
-                                     WRITE_GRANULE_SHIFT);
-    for (uint32_t i = first; i <= last; i++) table[i] = stamp;
+    if (table) {
+        const uint64_t stamp = next_stamp();
+        const uint32_t first = off >> WRITE_GRANULE_SHIFT;
+        const uint32_t last = (uint32_t)(((uint64_t)off + size - 1u) >>
+                                         WRITE_GRANULE_SHIFT);
+        for (uint32_t i = first; i <= last; i++) table[i] = stamp;
+    } else if (!walk_range(addr, size, 1)) {
+        return;   /* nothing of it is mapped */
+    }
     if (g_write_observer) {
         const uint32_t a = addr & PSP_ADDR_MASK;
         if (a < g_write_watch_hi && a + size > g_write_watch_lo) g_write_observer(a, size);
@@ -372,6 +472,7 @@ void psp_mem_free(void) {
     g_module = NULL;
     g_module_write = NULL;
     g_module_base = g_module_size = 0;
+    g_module_in_ram = g_module_in_vram = g_module_in_scratch = 0;
 }
 
 int psp_mem_map_module(uint32_t base, uint32_t size) {
@@ -386,10 +487,14 @@ int psp_mem_map_module(uint32_t base, uint32_t size) {
         g_module = NULL;
         g_module_write = NULL;
         g_module_size = 0;
+        g_module_in_ram = g_module_in_vram = g_module_in_scratch = 0;
         return -1;
     }
     g_module_base = base;
     g_module_size = size;
+    g_module_in_ram     = module_overlaps(PSP_RAM_BASE, PSP_RAM_SIZE);
+    g_module_in_vram    = module_overlaps(PSP_VRAM_BASE, PSP_VRAM_SIZE);
+    g_module_in_scratch = module_overlaps(PSP_SCRATCH_BASE, PSP_SCRATCH_SIZE);
     if (++g_write_serial == 0) g_write_serial++;
     return 0;
 }

@@ -177,3 +177,13 @@ target_link_libraries(test_disc_observed PRIVATE psprecomp allegrex_core)
 add_test(NAME disc_observed COMMAND test_disc_observed
          ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/observed.txt
          ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/probe.iso)
+
+# The SDL2 host layer, when it is built. The dummy video driver keeps it off
+# the screen; with no system font the controller half skips.
+if(PSPRECOMP_HOST)
+    add_executable(test_save_dialog test_save_dialog.c)
+    target_link_libraries(test_save_dialog PRIVATE psprecomp_host)
+    add_test(NAME save_dialog COMMAND test_save_dialog)
+    set_tests_properties(save_dialog PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy")
+endif()

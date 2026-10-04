@@ -29,7 +29,6 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/clock.h"
-#include "psprecomp/dispatch.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/interrupt.h"
@@ -175,12 +174,7 @@ static int fire_due(void) {
          * restored around it because it runs *between* two instructions of
          * whatever thread happened to make the firmware call, and that thread
          * must not be able to tell. */
-        const psp_cpu_state saved = psp_cpu;
-        psp_cpu.r[PSP_REG_A0] = common;
-        psp_cpu.r[PSP_REG_RA] = 0;
-        psp_dispatch(handler);
-        const uint32_t again = psp_cpu.r[PSP_REG_V0];
-        psp_cpu = saved;
+        const uint32_t again = psp_call_guest(handler, &common, 1);
 
         g_firing = 0;
         fired++;
@@ -504,15 +498,8 @@ static int vtimer_tick(void) {
         }
 
         g_firing = 1;
-        const psp_cpu_state saved = psp_cpu;
-        psp_cpu.r[PSP_REG_A0] = uid;
-        psp_cpu.r[PSP_REG_A1] = clocks;
-        psp_cpu.r[PSP_REG_A2] = clocks + 8;
-        psp_cpu.r[PSP_REG_A3] = common;
-        psp_cpu.r[PSP_REG_RA] = 0;
-        psp_dispatch(handler);
-        const uint32_t again = psp_cpu.r[PSP_REG_V0];
-        psp_cpu = saved;
+        const uint32_t args[4] = { uid, clocks, clocks + 8, common };
+        const uint32_t again = psp_call_guest(handler, args, 4);
         g_firing = 0;
         fired++;
 

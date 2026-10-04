@@ -110,10 +110,12 @@
 
 /* Hardware hands out IDs 0 and 1 for ATRAC3+ and 2 and 3 for ATRAC3 at its
  * default split, and refuses a third of either -- audio/atrac/ids.expected,
- * "Initial ids: ATRAC3+: 0 1, ATRAC3: 2 3". sceAtracReinit can change the
- * split; the game does not import it and it is not registered. */
-#define ATRAC_IDS       4
-#define ATRAC_PER_CODEC 2
+ * "Initial ids: ATRAC3+: 0 1, ATRAC3: 2 3". That split is the module start's
+ * sceAtracReinit(2, 2) over six slots (uofw src/kd/libatrac3plus/
+ * libatrac3plus.c, sceAtracStartEntry), and a game's own sceAtracReinit lays
+ * the six out again: g_slot_codec says which codec each slot serves, 0 for
+ * none. */
+#define ATRAC_IDS       6
 
 typedef struct {
     int      used;
@@ -163,6 +165,7 @@ typedef struct {
 } atrac_ctx;
 
 static atrac_ctx g_id[ATRAC_IDS];
+static uint32_t  g_slot_codec[ATRAC_IDS];
 
 /* ---- the decoder ---------------------------------------------------------- */
 
@@ -260,9 +263,25 @@ static int dec_frame(atrac_ctx *c, const uint8_t *in, int16_t *out, uint32_t cap
     return psp_at3_decode((psp_at3_dec *)c->dec, in, c->block_align, out, cap);
 }
 
+/* sceAtracReinit's layout (uofw libatrac3plus.c): the first n_at3plus slots
+ * serve ATRAC3+, the next n_at3 ATRAC3, the rest nothing. */
+static void lay_out_slots(int n_at3, int n_at3plus) {
+    for (int i = 0; i < ATRAC_IDS; i++)
+        g_slot_codec[i] = i >= n_at3plus + n_at3 ? 0
+                        : i < n_at3plus ? PSP_ATRAC_AT3PLUS : PSP_ATRAC_AT3;
+}
+
 void psp_atrac_init(void) {
     for (int i = 0; i < ATRAC_IDS; i++) { dec_close(&g_id[i]); free(g_id[i].frame); }
     memset(g_id, 0, sizeof g_id);
+    lay_out_slots(2, 2);
+}
+
+/* The lowest free slot serving codec, or -1: sceAtracGetAtracID's scan. */
+static int free_slot(uint32_t codec) {
+    for (int i = 0; i < ATRAC_IDS; i++)
+        if (g_slot_codec[i] == codec && !g_id[i].used) return i;
+    return -1;
 }
 
 /* Said once. A title screen restarts its music every time it comes back. */
@@ -545,10 +564,10 @@ static uint32_t set_data(atrac_ctx *c, uint32_t buf, uint32_t read, uint32_t siz
 
 /* ---- the calls ------------------------------------------------------------- */
 
-/* Hands out the lowest free ID of the requested codec from its own pair --
- * 0 and 1 for ATRAC3+, 2 and 3 for ATRAC3, as ids.expected has it. A codec
- * that is neither is refused by name; that code is the header's, not
- * measured. */
+/* Hands out the lowest free ID among the slots serving the requested codec --
+ * 0 and 1 for ATRAC3+, 2 and 3 for ATRAC3 at the default layout, as
+ * ids.expected has it. A codec that is neither is refused by name; that code
+ * is the header's, not measured. */
 static void hle_GetAtracID(void) {
     ATRAC_LOG("GetAtracID");
     const uint32_t codec = psp_arg(0);
@@ -556,18 +575,33 @@ static void hle_GetAtracID(void) {
         psp_ret(PSP_ATRAC_ERROR_BAD_CODECTYPE);
         return;
     }
-    const int first = codec == PSP_ATRAC_AT3PLUS ? 0 : ATRAC_PER_CODEC;
-    for (int i = first; i < first + ATRAC_PER_CODEC; i++) {
-        if (g_id[i].used) continue;
-        dec_close(&g_id[i]);
-        free(g_id[i].frame);
-        memset(&g_id[i], 0, sizeof g_id[i]);
-        g_id[i].used  = 1;
-        g_id[i].codec = codec;
-        psp_ret((uint32_t)i);
-        return;
-    }
-    psp_ret(PSP_ATRAC_ERROR_NO_ATRACID);
+    const int i = free_slot(codec);
+    if (i < 0) { psp_ret(PSP_ATRAC_ERROR_NO_ATRACID); return; }
+    dec_close(&g_id[i]);
+    free(g_id[i].frame);
+    memset(&g_id[i], 0, sizeof g_id[i]);
+    g_id[i].used  = 1;
+    g_id[i].codec = codec;
+    psp_ret((uint32_t)i);
+}
+
+/* (numAT3Id, numAT3plusId). uofw's sceAtracReinit (libatrac3plus.c): busy
+ * while any ID is held, otherwise every slot is cleared and laid out again --
+ * the first numAT3plusId for ATRAC3+, the next numAT3Id for ATRAC3 -- and
+ * (0, 0) leaves none. uofw stops with SCE_ERROR_OUT_OF_MEMORY when the IDs'
+ * codec memory passes its 0x19000-byte EDRAM block; the per-codec sizes come
+ * from sceAudiocodecCheckNeedMem and are not measured, so the only limit
+ * here is the six slots: past them the slots that fit are laid out and the
+ * call answers OUT_OF_MEMORY, as uofw's loop would. The 3rd Birthday calls
+ * it once from a thread's start, before it holds any ID. */
+static void hle_Reinit(void) {
+    ATRAC_LOG("Reinit");
+    const int n_at3 = (int)psp_arg(0), n_at3plus = (int)psp_arg(1);
+    for (int i = 0; i < ATRAC_IDS; i++)
+        if (g_id[i].used) { psp_ret(0x80000021u); return; }   /* SCE_ERROR_BUSY */
+    const int fits = n_at3 + n_at3plus <= ATRAC_IDS;
+    lay_out_slots(n_at3, n_at3plus);
+    psp_ret(fits ? SCE_KERNEL_ERROR_OK : 0x80000022u);        /* SCE_ERROR_OUT_OF_MEMORY */
 }
 
 static void hle_ReleaseAtracID(void) {
@@ -877,9 +911,7 @@ static void set_and_get_id(uint32_t buf, uint32_t read, uint32_t size) {
         psp_ret(err ? err : PSP_ATRAC_ERROR_UNKNOWN_FORMAT);
         return;
     }
-    int id = -1;
-    const int first = codec == PSP_ATRAC_AT3PLUS ? 0 : ATRAC_PER_CODEC;
-    for (int i = first; i < first + ATRAC_PER_CODEC; i++) if (!g_id[i].used) { id = i; break; }
+    const int id = free_slot(codec);
     if (id < 0) { psp_ret(PSP_ATRAC_ERROR_NO_ATRACID); return; }
     atrac_ctx *c = &g_id[id];
     dec_close(c); free(c->frame);
@@ -1007,8 +1039,8 @@ static void hle_IsSecondBufferNeeded(void) {
 
 /* NIDs and names are PSPSDK's import stubs (src/atrac3/sceAtrac3plus.S; BSD),
  * and uofw's libatrac3plus exports (src/kd/libatrac3plus/exports.exp; MIT) for
- * the three PSPSDK lacks: GetOutputChannel, IsSecondBufferNeeded and
- * GetBufferInfoForResetting. tests/test_hle.c re-derives every NID from its
+ * the four PSPSDK lacks: GetOutputChannel, IsSecondBufferNeeded,
+ * GetBufferInfoForResetting and Reinit. tests/test_hle.c re-derives every NID from its
  * name, so a wrong pairing here fails the build's tests. */
 void psp_atrac_register(void) {
     psp_hle_register(0x7A20E7AF, "sceAtrac3plus", "sceAtracSetDataAndGetID",          hle_SetDataAndGetID);
@@ -1037,4 +1069,5 @@ void psp_atrac_register(void) {
     psp_hle_register(0x868120B5, "sceAtrac3plus", "sceAtracSetLoopNum",               hle_SetLoopNum);
     psp_hle_register(0xFAA4F89B, "sceAtrac3plus", "sceAtracGetLoopStatus",            hle_GetLoopStatus);
     psp_hle_register(0xE88F759B, "sceAtrac3plus", "sceAtracGetInternalErrorInfo",     hle_GetInternalErrorInfo);
+    psp_hle_register(0x132F1ECA, "sceAtrac3plus", "sceAtracReinit",                   hle_Reinit);
 }

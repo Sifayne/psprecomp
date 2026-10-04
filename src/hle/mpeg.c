@@ -14,7 +14,6 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/cpu.h"
-#include "psprecomp/dispatch.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/os.h"
 #include "psprecomp/clock.h"
@@ -914,18 +913,6 @@ static int avc_pump(mpeg_ctx *c) {
 static int avc_pump(mpeg_ctx *c) { (void)c; return 0; }
 #endif
 
-static uint32_t call_guest(uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2) {
-    const psp_cpu_state save = psp_cpu;
-    psp_cpu.r[PSP_REG_A0] = a0;
-    psp_cpu.r[PSP_REG_A1] = a1;
-    psp_cpu.r[PSP_REG_A2] = a2;
-    psp_cpu.r[PSP_REG_RA] = 0;
-    psp_dispatch(fn);
-    const uint32_t v0 = psp_cpu.r[PSP_REG_V0];
-    psp_cpu = save;
-    return v0;
-}
-
 /* sceMpegRingbufferPut(rb, numPackets, available)
  *
  * The count was being bumped without ever asking the game for the bytes, so the
@@ -954,8 +941,8 @@ static void hle_RingbufferPut(void) {
     if (count>packets-cursor) count=packets-cursor;
     uint32_t target=psp_read32(ring+RB_DATA)+cursor*stride;
     uint32_t callback=psp_read32(ring+RB_CALLBACK);
-    int32_t copied=callback?(int32_t)call_guest(callback,target,count,
-                                              psp_read32(ring+RB_CALLBACK_ARG)):0;
+    const uint32_t args[3]={target,count,psp_read32(ring+RB_CALLBACK_ARG)};
+    int32_t copied=callback?(int32_t)psp_call_guest(callback,args,3):0;
     mpeg_trace(20,ring,count,(uint32_t)copied,context->aes_len-context->aes_pos);
     if (copied<0) { psp_ret((uint32_t)copied); return; }
     if ((uint32_t)copied>count) { psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }
@@ -1343,9 +1330,8 @@ static void hle_GetAtracAu(void) {
  * frameWidth is the stride in pixels, not the picture width -- 512 for a
  * 480-wide movie. initAddr is the "first call" flag the player clears itself.
  *
- * Written as 8888 because that is the format this game's display is in; a mode
- * selector exists on hardware (sceMpegAvcDecodeMode) and would belong here if a
- * game ever set something else. */
+ * Written as 8888 because that is the format this game's display is in. The
+ * mode selector, sceMpegAvcDecodeMode, says so when a game asks for another. */
 static void write_picture(mpeg_ctx *c, uint32_t dst, uint32_t stride) {
     if (!c->pic || !dst) return;
     const int w = c->pic_w, h = c->pic_h;
@@ -1501,6 +1487,33 @@ static void hle_AvcDecodeStop(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* sceMpegAvcDecodeMode(SceMpeg *, SceMpegAvcMode *): the mode is { iUnk0 =
+ * -1, iPixelFormat } and formats 0-3 are 5650, 5551, 4444 and 8888 (PSPSDK
+ * src/mpeg/pspmpeg.h; BSD). Pictures are written as 8888, so a game asking
+ * for another format is told about once rather than given it. What the
+ * firmware answers for a bad mode is not measured. */
+static void hle_AvcDecodeMode(void) {
+    const uint32_t mode = psp_arg(1);
+    if (mode && psp_mem_ptr(mode, 8)) {
+        const uint32_t format = psp_read32(mode + 4);
+        static int said;
+        if (format != 3 && !said++)
+            fprintf(stderr, "psprecomp: sceMpegAvcDecodeMode asks for pixel format %u; "
+                            "pictures are written as 8888 (3)\n", format);
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* sceMpegFlushAllStream(SceMpeg *) answers 0 on success (pspmpeg.h), and
+ * sceMpegAvcDecodeFlush has no declaration in PSPSDK or uofw, only its NID,
+ * which is SHA-1 of the name. What either discards is not measured. The 3rd
+ * Birthday calls FlushAllStream on a context it has just created, before it
+ * registers a stream, and DecodeFlush as it tears a movie down, so neither
+ * has anything here to discard; both succeed, as the unregistered calls
+ * did. */
+static void hle_FlushAllStream(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_AvcDecodeFlush(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
 void psp_mpeg_register(void) {
     psp_hle_register(0x682A619B, "sceMpeg", "sceMpegInit",            hle_MpegInit);
     psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",          hle_MpegFinish);
@@ -1535,4 +1548,7 @@ void psp_mpeg_register(void) {
     psp_hle_register(0x0E3C2E9D, "sceMpeg", "sceMpegAvcDecode",       hle_AvcDecode);
     psp_hle_register(0x800C44DF, "sceMpeg", "sceMpegAtracDecode",     hle_AtracDecode);
     psp_hle_register(0x740FCCD1, "sceMpeg", "sceMpegAvcDecodeStop",   hle_AvcDecodeStop);
+    psp_hle_register(0xA11C7026, "sceMpeg", "sceMpegAvcDecodeMode",   hle_AvcDecodeMode);
+    psp_hle_register(0x4571CC64, "sceMpeg", "sceMpegAvcDecodeFlush",  hle_AvcDecodeFlush);
+    psp_hle_register(0x707B7629, "sceMpeg", "sceMpegFlushAllStream",  hle_FlushAllStream);
 }

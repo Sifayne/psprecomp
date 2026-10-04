@@ -81,7 +81,10 @@ uint32_t psp_mem_mapped_span(uint32_t addr);
  * The global serial changes after every tracked write. A range generation is
  * the newest write touching any 256-byte granule in that range; it may change
  * for a nearby write in the same granule, which causes a harmless conservative
- * cache miss rather than stale data. Unmapped ranges return zero. */
+ * cache miss rather than stale data. A range that crosses a region's end or
+ * runs into the module image is split by backing, as psp_mem_ptr maps it, and
+ * its unmapped parts are skipped; a wholly unmapped range returns zero and
+ * marking one does nothing. */
 uint64_t psp_mem_write_serial(void);
 uint64_t psp_mem_range_generation(uint32_t addr, uint32_t size);
 void     psp_mem_mark_write(uint32_t addr, uint32_t size);

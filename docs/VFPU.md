@@ -1,9 +1,11 @@
 # The VFPU
 
 The PSP's vector unit is the reason people give for why the PSP has never had a
-static recompiler. It is genuinely awkward. It is also, importantly,
-**localized** — and this document exists partly to make that claim measurable
-rather than rhetorical.
+static recompiler. It is genuinely awkward. It is also **localized**: a VFPU
+instruction reads and writes VFPU registers and a handful of control
+registers, and nothing about it needs anything but a function call per
+instruction in the emitted C. This file says how that is done and where its
+numbers come from.
 
 ## What it is
 
@@ -20,69 +22,84 @@ Three things make it hard to decode:
    quad operation writes one lane instead of four.
 2. **Prefix instructions.** `vpfxs` / `vpfxt` / `vpfxd` do not compute anything;
    they set a register that *modifies the operands of the next instruction* —
-   swizzling lanes, negating, forcing constants, masking writes. An instruction's
-   meaning depends on what came before it, which is exactly what a
-   one-instruction-at-a-time decoder is bad at.
+   swizzling lanes, negating, forcing constants, masking or saturating writes.
 3. **A sprawling opcode space.** The VFPU occupies most of opcodes `0x18`,
    `0x19`, `0x1B`–`0x1E`, `0x32`–`0x3F`, with sub-opcodes in several different
    bit positions depending on the family.
 
-## What we decode today
+## Decoding and emitting
 
-Named and decoded:
+The decoder (`tools/allegrexrecomp/decode.c`) names 93 VFPU mnemonics:
+loads and stores including the unaligned `lvl.q`/`lvr.q`/`svl.q`/`svr.q`,
+the COP2 moves and branches, arithmetic, the dot-product family, compares and
+`vcmov`, the transcendentals, conversions and colour packing, `vcst`,
+`viim`/`vfim`, the matrix ops (`vmmul`, `vtfm2`-`4`, `vmscl`, `vrot`,
+`vmmov`, `vmidt`, ...), `vsbn`/`vwbn`, the random generator and the three
+prefix instructions.
 
-- **Load/store** — `lv.s` (`0x32`), `lv.q` (`0x36`), `sv.s` (`0x3A`),
-  `sv.q` (`0x3E`)
-- **COP2 moves and branches** — `mfv`, `mtv`, `mfvc`, `mtvc`, `bvf`, `bvt`,
-  `bvfl`, `bvtl`
-- **VFPU0** (`0x18`) — `vadd`, `vsub`, `vdiv`
-- **VFPU1** (`0x19`) — `vmul`, `vdot`, `vscl`, `vhdp`, `vcrs`, `vdet`
-- **VFPU3** (`0x1B`) — `vcmp`, `vmin`, `vmax`, `vscmp`, `vsge`, `vslt`
-- **Vector width**, for all four widths, unit-tested
-
-Everything else in the VFPU encoding space decodes to `A_VFPU_UNKNOWN`.
-
-## Why "unknown" is a distinct result
-
-`A_VFPU_UNKNOWN` is deliberately *not* `A_INVALID`. The difference matters:
+An encoding inside the VFPU space that none of those match decodes to
+`A_VFPU_UNKNOWN` ("`vfpu?`"), which is deliberately *not* `A_INVALID`:
 
 - `A_INVALID` means "this is not an instruction" — probably data misread as
   code, and the analyzer should stop following this path.
-- `A_VFPU_UNKNOWN` means "this **is** a VFPU instruction and we know it, but we
-  cannot yet say which one." The emitter must refuse to emit rather than
-  guessing, and the analyzer should keep going.
+- `A_VFPU_UNKNOWN` means "this **is** a VFPU instruction, but not one we can
+  name." The analyzer keeps going, and the emitter writes a run-time trap
+  (`psp_unimplemented`, naming the address) instead of guessing.
 
-Conflating them would mean a game's VFPU-heavy maths library looks like data,
-function discovery stops at its first vector instruction, and the resulting
-coverage number looks *better* than reality because the code was never counted.
+The emitter (`tools/allegrexrecomp/emit.c`) lowers each named instruction to
+one call into the runtime (`include/psprecomp/vfpu.h`, `src/vfpu.c`):
+`psp_vmmul(vd, vs, vt, size)` and the like. A sub-encoding the runtime does
+not recognise inside a family it does traps by name through
+`psp_vfpu_unimplemented`.
 
-## Measuring before committing
+## Prefixes
 
-`allegrexrecomp cover <module>` reports three numbers over a module's `.text`:
-decoded, VFPU-recognised-but-unnamed, and unknown. That third number is decoder
-bugs or data; the second is the honest size of the VFPU problem *for that
-specific title*.
+The prefix state is thread context, so it lives in `psp_cpu.vfpu_ctrl`
+beside the condition codes and the random generator's registers. A prefix
+instruction emits `psp_vfpu_set_prefix(n, value)`; the next VFPU instruction
+reads all three prefixes and puts them back to the identity (`0xE4`, `0xE4`,
+`0`), whether or not it used them, as the hardware does. "No prefix" and
+"the identity prefix" are therefore the same state, and the emitted C needs
+no knowledge of prefixes at all. Saturation substitutes the bound (so
+`vsat0` of -0.0 is +0.0, as pspautotests' hardware capture shows).
 
-This is the point of the whole approach. "The PSP is hard because of the VFPU"
-is an assumption. A 2D microgame that never builds a projection matrix may use
-almost none of it, while a 3D engine will use a great deal. Running `cover`
-across a corpus turns the question into a sorted list of which titles are cheap
-targets — which is phase 6, and which is why `cover` exists in phase 1 rather
-than being deferred until the emitter needs it.
+## Arithmetic: measured, not approximated
 
-## Plan
+Where the PSP's arithmetic differs from IEEE single precision or libm, the
+runtime reproduces the PSP's, from `tools/hwprobe/vfpuprobe` runs on
+firmware 6.60 (`fw660*.txt` beside the probe):
 
-VFPU completion is deliberately **demand-driven**, not front-loaded. Rather
-than implementing 300 vector instructions speculatively, the order is:
+- **The dot-product unit.** Every reduction (`vdot`, `vhdp`, `vfad`, `vavg`,
+  `vdet`, `vcrsp`, `vmmul` and the transforms) goes through one circuit:
+  products to 24+2 bits with round-to-odd, alignment by truncation, an exact
+  integer sum and a single rounding at the end (`psp_vfpu_dot`).
+- **The transcendentals.** `vsin`, `vcos`, `vasin`, `vexp2`, `vlog2`, `vrcp`,
+  `vsqrt`, `vrsq` and their negated forms are the PSP's own fixed-point
+  algorithms: a 23-bit reduced argument, a piecewise core per segment and a
+  result truncated to 22 significand bits. The cores' constants
+  (`src/vfpu_cores.h`) are fitted by `tools/hwprobe/vfpuprobe/gencores.py` to
+  the probe's dumps. Every argument of the vsin/vcos and vasin cores is fixed
+  by the data; for the others, arguments the dumps skipped rest on the fit,
+  which predicted 99.96% of the held-out sweeps.
+- **The random generator.** `vrnds`, `vrndi`, `vrndf1` and `vrndf2` run a
+  state fitted to 1,624 logged transitions, which it reproduces exactly
+  (see `vrnd_next`).
+- **Conversions, packing and constants.** `vf2i` rounding, `vi2f` scaling,
+  the half-float and colour conversions and all 32 `vcst` constants, against
+  the probe's logs.
 
-1. Decrypt a corpus (phase 2).
-2. Run `cover` across it; rank titles by VFPU density.
-3. Implement the families that the chosen title actually uses.
-4. Validate each against [pspautotests](https://github.com/hrydgard/pspautotests),
-   which has hardware-verified VFPU coverage including the prefix behaviour.
+## What is still open
 
-The prefix instructions are the part that will need real design work, because
-they break the one-instruction-one-statement model the rest of the emitter
-uses. The likely shape is emitting prefix state as explicit local variables
-that the following instruction's generated C reads — which keeps the output
-readable and keeps the weirdness visible rather than hidden in a helper.
+- **Vector `vrnd`.** The order in which a `.p`/`.t`/`.q` `vrnd` fills its
+  lanes, and what a destination prefix that masks a lane does to the state,
+  have not been measured; the runtime fills lanes forward. The 3rd
+  Birthday's New Game reaches `vrndf2.t`. It is on the next probe set's list
+  (ROADMAP.md, *Open work*).
+
+## Measuring a title
+
+`allegrexrecomp cover <module>` reports, over a module's `.text`, how much
+decodes, how much is VFPU, and how much is unknown. The third number is
+decoder bugs or data. Validated across six real modules the VFPU came to
+0.14-0.20% of what decodes, which is why VFPU completion followed the games
+rather than preceding them.
