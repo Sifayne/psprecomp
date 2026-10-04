@@ -1493,7 +1493,7 @@ typedef struct {
 
 /* v cut to 16 significant bits toward zero, as a signed significand in
  * [2^15, 2^16) and an exponent; 0 for zero, -1 for a value not finite. */
-static int ge_split(double v, int64_t *s, int *e) {
+static inline int ge_split(double v, int64_t *s, int *e) {
     uint64_t b;
     memcpy(&b, &v, sizeof b);
     const int ex = (int)((b >> 52) & 0x7FF);
@@ -1511,7 +1511,7 @@ static int ge_split(double v, int64_t *s, int *e) {
     return 1;
 }
 
-static ge_term ge_mul(double a, double b) {
+static inline ge_term ge_mul(double a, double b) {
     ge_term t = { 0, INT_MIN, 0, a * b };
     int64_t sa, sb;
     int ea, eb;
@@ -1527,36 +1527,56 @@ static ge_term ge_mul(double a, double b) {
 /* A number split once for ge_mul -- ge_split's significand, exponent and
  * verdict, and the number -- so that a matrix entry or a coordinate used in
  * many products is not split again for each. */
-typedef struct { int64_t s; int e, k; double v; } ge_sp;
-static inline ge_sp ge_sp_of(double v) { ge_sp r = { 0, 0, 0, v }; r.k = ge_split(v, &r.s, &r.e); return r; }
+typedef struct { int64_t s; int e, bad; double v; } ge_sp;
+/* A zero splits to a zero significand, whose products are zero terms, as
+ * ge_mul makes them; a number not finite sets bad, as ge_split's -1 does. */
+static inline ge_sp ge_sp_of(double v) {
+    ge_sp r = { 0, 0, 0, v };
+    const int k = ge_split(v, &r.s, &r.e);
+    if (k <= 0) { r.s = 0; r.e = 0; r.bad = k < 0; }
+    return r;
+}
 
-/* ge_mul(a->v, b->v), from the split halves. */
+/* ge_mul(a->v, b->v), from the split halves. A term whose q is zero is no
+ * term to ge_sum, whatever its e. The shift is toward zero, as ge_mul's. */
 static inline ge_term ge_mul_sp(const ge_sp *a, const ge_sp *b) {
-    ge_term t = { 0, INT_MIN, 0, a->v * b->v };
-    if (a->k < 0 || b->k < 0) { t.bad = 1; return t; }
-    if (!a->k || !b->k) return t;
     const int64_t p = a->s * b->s;                 /* under 2^32 */
-    t.q = p < 0 ? -((-p) >> 15) : p >> 15;
+    ge_term t;
+    t.q = (p + ((p >> 63) & 0x7FFF)) >> 15;
     t.e = a->e + b->e;
+    t.bad = a->bad | b->bad;
+    t.v = a->v * b->v;
     return t;
 }
 
-static double ge_sum(const ge_term *t, int n) {
+/* ge_sp_of for the value last asked of this memo, kept: the viewport and
+ * texture constants every vertex of a draw multiplies by. Keyed on the bits,
+ * so a changed constant is split afresh. */
+typedef struct { uint64_t key; int ok; ge_sp sp; } ge_sp_memo;
+static inline const ge_sp *ge_sp_memo_of(ge_sp_memo *m, double x) {
+    if (!m->ok || m->key != ge_bits(x)) { m->sp = ge_sp_of(x); m->key = ge_bits(x); m->ok = 1; }
+    return &m->sp;
+}
+static const ge_sp GE_SP_ONE = { 32768, 0, 0, 1.0 };      /* ge_sp_of(1.0) */
+
+static inline double ge_sum(const ge_term *t, int n) {
     int e = INT_MIN, bad = 0;
-    double plain = 0.0;
     for (int i = 0; i < n; i++) {
-        plain += t[i].v;
         bad |= t[i].bad;
         if (t[i].q && t[i].e > e) e = t[i].e;
     }
-    if (bad) return plain;
+    if (bad) {                                     /* the plain products' sum, in order */
+        double plain = 0.0;
+        for (int i = 0; i < n; i++) plain += t[i].v;
+        return plain;
+    }
     if (e == INT_MIN) return 0.0;
     int64_t s = 0;
     for (int i = 0; i < n; i++) {
         if (!t[i].q) continue;
         const int d = e - t[i].e;
         const int64_t m = t[i].q < 0 ? -t[i].q : t[i].q;
-        const int64_t a = d >= 63 ? 0 : m >> d;
+        const int64_t a = m >> (d < 63 ? d : 63);     /* m is under 2^34: 63 leaves 0 */
         s += t[i].q < 0 ? -a : a;
     }
     if (!s) return 0.0;
@@ -1574,8 +1594,12 @@ static double ge_sum(const ge_term *t, int n) {
  * texels, and this fits all 1800 readings; the float sum, as before, missed
  * 119 at 2^12. */
 static void uv_to_texels(float u, float v, psp_vertex *out) {
-    const ge_term tu[2] = { ge_mul(u, g_ge.tex_scale_u), ge_mul(g_ge.tex_offset_u, 1.0) };
-    const ge_term tv[2] = { ge_mul(v, g_ge.tex_scale_v), ge_mul(g_ge.tex_offset_v, 1.0) };
+    static ge_sp_memo su, ou, sv, ov;
+    const ge_sp us = ge_sp_of(u), vs = ge_sp_of(v);
+    const ge_term tu[2] = { ge_mul_sp(&us, ge_sp_memo_of(&su, g_ge.tex_scale_u)),
+                            ge_mul_sp(ge_sp_memo_of(&ou, g_ge.tex_offset_u), &GE_SP_ONE) };
+    const ge_term tv[2] = { ge_mul_sp(&vs, ge_sp_memo_of(&sv, g_ge.tex_scale_v)),
+                            ge_mul_sp(ge_sp_memo_of(&ov, g_ge.tex_offset_v), &GE_SP_ONE) };
     out->u = (float)(ge_sum(tu, 2) * (double)g_ge.tex_w);
     out->v = (float)(ge_sum(tv, 2) * (double)g_ge.tex_h);
     note_uv(out->u, out->v);
@@ -1981,6 +2005,18 @@ static void clip_to_fx16(const float clip[4], int *x, int *y) {
     }
 }
 
+/* ge_screen_axis with the scale and centre split through memos, one pair
+ * per axis. */
+static int ge_screen_axis_m(double ndc, float scale, float centre, float off, ge_sp_memo m[2]) {
+    const ge_sp n = ge_sp_of(ndc);
+    const ge_term t[2] = { ge_mul_sp(ge_sp_memo_of(&m[0], scale), &n),
+                           ge_mul_sp(ge_sp_memo_of(&m[1], centre), &GE_SP_ONE) };
+    double v = (ge_sum(t, 2) - (double)off) * PSP_SUBPX;
+    if (!(v > -1073741824.0)) v = -1073741824.0;   /* NaN too */
+    if (v > 1073741824.0) v = 1073741824.0;
+    return (int)ge_floor(v);
+}
+
 /* to_screen and clip_to_fx16 for one vertex at once: their three ge_over_w
  * take 1/w from the same table entry, so it is looked up once. clip[3] must
  * be past the near limit, as for those two. */
@@ -1988,17 +2024,19 @@ static void clip_to_screen(const float clip[4], float *sx, float *sy, float *sz,
     const float inv = 1.0f / clip[3];
     float unused;
     ndc_to_screen(clip[0] * inv, clip[1] * inv, clip[2] * inv, sx, sy, &unused);
+    static ge_sp_memo mz[2], mx[2], my[2];
     const double r = ge_rcp16(clip[3]);
     if (g_tl.vp_zs == 0.0f) *sz = ((clip[2] / clip[3]) * 0.5f + 0.5f) * 65535.0f;
     else {
-        const double nz = ge_cut(clip[2] * r, 16, 0);
-        const ge_term t[2] = { ge_mul(g_tl.vp_zs, nz), ge_mul(g_tl.vp_zc, 1.0) };
+        const ge_sp nz = ge_sp_of(ge_cut(clip[2] * r, 16, 0));
+        const ge_term t[2] = { ge_mul_sp(ge_sp_memo_of(&mz[0], g_tl.vp_zs), &nz),
+                               ge_mul_sp(ge_sp_memo_of(&mz[1], g_tl.vp_zc), &GE_SP_ONE) };
         *sz = (float)ge_floor(ge_sum(t, 2));
     }
     const double gx = ge_cut(clip[0] * r, 16, 0), gy = ge_cut(clip[1] * r, 16, 0);
     if (g_tl.vp_set) {
-        *x = ge_screen_axis(gx, g_tl.vp_xs, g_tl.vp_xc, g_tl.off_x);
-        *y = ge_screen_axis(gy, g_tl.vp_ys, g_tl.vp_yc, g_tl.off_y);
+        *x = ge_screen_axis_m(gx, g_tl.vp_xs, g_tl.vp_xc, g_tl.off_x, mx);
+        *y = ge_screen_axis_m(gy, g_tl.vp_ys, g_tl.vp_yc, g_tl.off_y, my);
     } else {
         *x = screen_axis_fx16((float)gx, 240.0f, 240.0f);
         *y = screen_axis_fx16((float)gy, -136.0f, 136.0f);
@@ -2730,7 +2768,7 @@ static void light_setup(void) {
 }
 
 /* gl_dot3 of split vectors. */
-static double gl_dot3_sp(const ge_sp a[3], const ge_sp b[3]) {
+static inline double gl_dot3_sp(const ge_sp a[3], const ge_sp b[3]) {
     const ge_term t[3] = { ge_mul_sp(&a[0], &b[0]), ge_mul_sp(&a[1], &b[1]), ge_mul_sp(&a[2], &b[2]) };
     return ge_sum(t, 3);
 }
