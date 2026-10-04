@@ -571,6 +571,11 @@ static struct {
     int   bb_seen;
 } g_tl;
 
+/* Each bone matrix entry cut to 16 bits, as skinning takes it (bones_cut).
+ * Valid until a bone is written: GE_BONEMATRIXDATA, a reset, a state load. */
+static double g_bone16[8 * 12];
+static int    g_bone16_ok;
+
 /* A GE float argument: 24 bits of mantissa-truncated float, in the low bits. */
 static float ge_float(uint32_t arg) {
     union { uint32_t u; float f; } c;
@@ -713,6 +718,7 @@ void psp_ge_reset(void) {
     g_col_n = 0; g_col_last_valid = 0;
     g_clear_draws = g_clear_z_draws = 0;
     memset(&g_tl, 0, sizeof g_tl);
+    g_bone16_ok = 0;
     memset(&g_light_eye_from, 0, sizeof g_light_eye_from);
     g_next_id = 0x00080000u;
 }
@@ -1762,20 +1768,29 @@ static double ge_acc(double acc, double t) {
     int ea = ge_frexp_e(acc), et = ge_frexp_e(t);
     if (ea == INT_MIN) frexp(acc, &ea);
     if (et == INT_MIN) frexp(t, &et);
-    const double u = ge_pow2((ea > et ? ea : et) - 1 - 15);
+    const int n = (ea > et ? ea : et) - 1 - 15;
+    const double u = ge_pow2(n);
+    if (n > -1022 && n < 1022) {                   /* 1/u exact too: the same quotients */
+        const double iu = ge_pow2(-n);
+        return ge_c16(ge_trunc(acc * iu) * u + ge_trunc(t * iu) * u);
+    }
     return ge_c16(ge_trunc(acc / u) * u + ge_trunc(t / u) * u);
 }
 
-/* One axis of a skinned position (B[c][k] = bone[3k + c]). */
-static float ge_skin_axis(const float *w, const float p[3], int c) {
+static void bones_cut(void) {
+    for (int i = 0; i < 8 * 12; i++) g_bone16[i] = ge_c16(g_tl.bone[i]);
+    g_bone16_ok = 1;
+}
+
+/* One axis of a skinned position (B[c][k] = bone[3k + c]), from the weights
+ * and the position already cut (v[3] = 1). */
+static float ge_skin_axis(const double *wi, const double v[4], int c) {
     static const int order[4] = { 3, 0, 1, 2 };
-    const double v[4] = { ge_c16(p[0]), ge_c16(p[1]), ge_c16(p[2]), 1.0 };
     double acc = 0.0;
     for (int i = 0; i < g_vl.w_n; i++) {
-        const double wi = ge_c16(w[i]);
         for (int j = 0; j < 4; j++) {
             const int k = order[j];
-            const double b = ge_c16(wi * ge_c16(g_tl.bone[12 * i + 3 * k + c]));
+            const double b = ge_c16(wi[i] * g_bone16[12 * i + 3 * k + c]);
             acc = ge_acc(acc, ge_c16(b * v[k]));
         }
     }
@@ -1784,13 +1799,11 @@ static float ge_skin_axis(const float *w, const float p[3], int c) {
 
 /* One axis of a skinned normal: the x, y and z terms of each bone in turn,
  * as a position's without its translation. */
-static float ge_skin_normal_axis(const float *w, const float n[3], int c) {
-    const double v[3] = { ge_c16(n[0]), ge_c16(n[1]), ge_c16(n[2]) };
+static float ge_skin_normal_axis(const double *wi, const double v[3], int c) {
     double acc = 0.0;
     for (int i = 0; i < g_vl.w_n; i++) {
-        const double wi = ge_c16(w[i]);
         for (int k = 0; k < 3; k++) {
-            const double b = ge_c16(wi * ge_c16(g_tl.bone[12 * i + 3 * k + c]));
+            const double b = ge_c16(wi[i] * g_bone16[12 * i + 3 * k + c]);
             acc = ge_acc(acc, ge_c16(b * v[k]));
         }
     }
@@ -1799,10 +1812,15 @@ static float ge_skin_normal_axis(const float *w, const float n[3], int c) {
 
 /* Skin a vertex in place, position and normal, by the GE's arithmetic. */
 static void skin_mvert(ge_mvert *o, const float *w, int want_normal) {
+    if (!g_bone16_ok) bones_cut();
+    double wi[8];
+    for (int i = 0; i < g_vl.w_n; i++) wi[i] = ge_c16(w[i]);
+    const double v[4] = { ge_c16(o->pos[0]), ge_c16(o->pos[1]), ge_c16(o->pos[2]), 1.0 };
     float p[3], sn[3];
-    for (int c = 0; c < 3; c++) p[c] = ge_skin_axis(w, o->pos, c);
+    for (int c = 0; c < 3; c++) p[c] = ge_skin_axis(wi, v, c);
     if (want_normal) {
-        for (int c = 0; c < 3; c++) sn[c] = ge_skin_normal_axis(w, o->nrm, c);
+        const double nv[3] = { ge_c16(o->nrm[0]), ge_c16(o->nrm[1]), ge_c16(o->nrm[2]) };
+        for (int c = 0; c < 3; c++) sn[c] = ge_skin_normal_axis(wi, nv, c);
         memcpy(o->nrm, sn, sizeof sn);
     }
     memcpy(o->pos, p, sizeof p);
@@ -4315,7 +4333,7 @@ static void run_list_body(ge_queue *q) {
             break;
         case GE_BONEMATRIXNUMBER: g_tl.bone_n = (int)(arg & 0x7F); break;
         case GE_BONEMATRIXDATA:
-            if (g_tl.bone_n < 8 * 12) g_tl.bone[g_tl.bone_n++] = ge_float(arg);
+            if (g_tl.bone_n < 8 * 12) { g_tl.bone[g_tl.bone_n++] = ge_float(arg); g_bone16_ok = 0; }
             break;
         case GE_MORPHWEIGHT0:     case GE_MORPHWEIGHT0 + 1: case GE_MORPHWEIGHT0 + 2:
         case GE_MORPHWEIGHT0 + 3: case GE_MORPHWEIGHT0 + 4: case GE_MORPHWEIGHT0 + 5:
@@ -5118,6 +5136,7 @@ void psp_ge_sync_backend(void) {
 
 void psp_ge_state_load(const void *buf) {
     memcpy(&g_tl, buf, sizeof g_tl);
+    g_bone16_ok = 0;
     memcpy(&g_ge, (const uint8_t *)buf + sizeof g_tl, sizeof g_ge);
     /* The counters travel with the registers because they share a struct;
      * a replay should report what *it* drew, not what the capture did. */
