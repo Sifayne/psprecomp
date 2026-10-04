@@ -259,7 +259,10 @@ its name.
       `psprecomp_host`, so far the savedata dialog both games shared. The SDL2
       window, audio and GL backend still live in each game's host (see *Open
       work*). RAM snapshots (`PSPRECOMP_RAMSNAP`) are an instrument, not save
-      states.
+      states. The plan is [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md): one
+      player in this repository, every game a title pack compiled on the
+      player's machine, and the three features staged from a shared safe
+      point and host pause.
 
 ## Open work
 
