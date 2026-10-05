@@ -139,7 +139,7 @@ def copy_inputs(dest):
     for folder in ("src", "include", "player", "third_party/stb", "third_party/ffmpeg"):
         copy_tree(TOOLKIT / folder, toolkit / folder)
     copy_tree(TOOLKIT / "tools/allegrexrecomp", toolkit / "tools/allegrexrecomp", {".c", ".h"})
-    for name in ("LICENSE", "tests/test_present.c", "tests/test_savedata.c"):
+    for name in ("LICENSE", "tests/test_present.c", "tests/test_savedata.c", "tests/test_launcher.c"):
         (toolkit / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(TOOLKIT / name, toolkit / name)
     for name in PACK.files():
