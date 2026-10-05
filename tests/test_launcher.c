@@ -10,8 +10,8 @@
 #undef main
 #include <assert.h>
 
-enum { RESOLUTION, WINDOW_SIZE, WINDOW_MODE, DISPLAY, CAP, INPUT, GAMEPAD, KEYS, RENDER, MOVIE, WINDOW,
-       OPTION_COUNT };
+enum { RESOLUTION, WINDOW_SIZE, WINDOW_MODE, DISPLAY, CAP, INPUT, GAMEPAD, LAG, KEYS, RENDER, MOVIE,
+       WINDOW, OPTION_COUNT };
 #define CHOICE(k,pg,d_,ch_,...) {.key=k,.env="PSPRECOMP_TEST_" k,.label=k,.page=pg,.help="",\
     .type=PSP_OPTION_CHOICE,.dflt=d_,.choices=ch_,.labels=ch_, __VA_ARGS__}
 static const psp_option_def options[OPTION_COUNT] = {
@@ -26,6 +26,9 @@ static const psp_option_def options[OPTION_COUNT] = {
            .stops="30|60|120|unlimited"},
     [INPUT]=CHOICE("INPUT","Gameplay","classic","classic|modern"),
     [GAMEPAD]=CHOICE("GAMEPAD","Controller","auto","auto|classic|modern"),
+    [LAG]={.key="LAG",.env="PSPRECOMP_TEST_LAG",.label="Lag",.page="Controller",.help="",
+           .type=PSP_OPTION_NUMBER,.dflt="game",.min=0,.max=0.99,.step=0.05,.special="game",
+           .special_label="Off",.zero_label="Off"},
     [KEYS]=CHOICE("KEYS","Keyboard & Mouse","classic","classic|wasd"),
     [RENDER]=CHOICE("RENDER","Advanced","auto","auto|software|gl|null"),
     [MOVIE]=CHOICE("MPEG_DECODE","Advanced","0","0|1"),
@@ -91,6 +94,8 @@ int main(void) {
     step(&a,CAP,-1,"60");
     assert(!psp_settings_set(editing(&a),CAP,"75",PSP_SOURCE_PRESET,error));
     step(&a,CAP,1,"120");
+    /* Its special word and 0 both read Off: one stop. */
+    step(&a,LAG,1,"0.05"); step(&a,LAG,-1,"game"); step(&a,LAG,-1,"0.99");
     /* Null is for files and the command line. */
     step(&a,RENDER,-1,"gl"); step(&a,RENDER,1,"auto");
 
@@ -114,6 +119,7 @@ int main(void) {
     a.games[2]=(game_entry){"second","Second","boot","module",NULL};
     qsort(a.games,3,sizeof a.games[0],title_order);
     assert(!strcmp(a.games[0].slug,"second") && !strcmp(a.games[1].slug,"first") && !strcmp(a.games[2].slug,"zeta"));
+    assert(tab_count(&a)==3);
     a.game_count=0;
     assert(!strcmp(game_title(&a),"Launcher test"));
 

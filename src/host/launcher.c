@@ -178,12 +178,18 @@ static void close_modal(launcher *a) {
     SDL_StopTextInput(); a->modal=MODAL_NONE; a->focus=a->selected_row;
 }
 
-/* Titles. Each --game names one profile the scripts found built. The tabs
+/* Titles: each --game, or each game in the importer's library. The tabs
  * switch which boot host, module and disc a launch uses, and the chosen slug
  * is saved beside the presets so the next start opens on the same game.
- * Without --game this is the single-title launcher it always was. */
+ * Without a title, or in a single-title pack, there are no tabs. */
 static const char *game_title(const launcher *a) {
     return a->game_count?a->games[a->game].title:psp_launcher_info.name;
+}
+/* A pack with one title shows no tabs: the heading already names it. */
+static int tab_count(const launcher *a) {
+    const char *const *titles=psp_launcher_info.titles; int n=0;
+    while (titles && titles[n]) n++;
+    return n==1?0:a->game_count;
 }
 static void select_game(launcher *a,int at,int quiet) {
     if (at<0 || at>=a->game_count) return;
@@ -212,14 +218,16 @@ static void draw(launcher *a) {
     label(a,a->heading,26,48,a->importer?770:930,heading,TEXT);
     if (a->importer) button(a,ADD_GAME,822,44,138,40,"Add Game",1);
     button(a,ABOUT,972,44,120,40,"About",0);
-    if (!a->game_count) label(a,a->body,28,94,1000,a->boot && a->module?
+    int tabs=tab_count(a);
+    if (!tabs) label(a,a->body,28,94,1000,a->boot && a->module?
         "Choose a setup. Make it yours. Launch when you're ready.":
+        a->game_count && a->importer?"Choose Prepare game to get your game ready for play.":
         a->importer?"Choose Add Game to select your PSP ISO and prepare it for play.":
         "No game installed. You can set up and save your presets.",MUTED);
     /* One tab per built title, where the tagline goes otherwise. */
-    int tab_w=a->game_count?(936-8*(a->game_count-1))/a->game_count:0;
+    int tab_w=tabs?(936-8*(tabs-1))/tabs:0;
     if (tab_w>300) tab_w=300;
-    for (int k=0;k<a->game_count;k++) {
+    for (int k=0;k<tabs;k++) {
         SDL_Rect r={28+k*(tab_w+8),90,tab_w,40}; box(a,r,ROW);
         outline(a,r,a->focus==GAME_BASE+k?ACCENT:BORDER);
         if (k==a->game) box(a,(SDL_Rect){r.x,r.y+37,r.w,3},ACCENT);
@@ -418,10 +426,13 @@ static void adjust(launcher *a,int id,int direction) {
         int pick=0; for (int i=0;i<6;i++) if (!strcmp(sizes[i],s->value[id])) pick=i;
         snprintf(value,sizeof value,"%s",sizes[(pick+direction+6)%6]);
     } else {
+        /* A special word shown the same as 0 (both "Off", say) is one stop
+         * with it, not two. */
+        int as_zero=d->special && d->special_label && d->zero_label && !strcmp(d->special_label,d->zero_label);
         double n=s->number[id];
-        if (n<0) n=direction>0?d->min:d->max;
+        if (n<0) n=direction>0?(as_zero?d->min+d->step:d->min):d->max;
         else n=round((n+direction*d->step)/d->step)*d->step;
-        if (n<d->min && d->special) snprintf(value,sizeof value,"%s",d->special);
+        if (d->special && (n<d->min || (as_zero && n<=d->min))) snprintf(value,sizeof value,"%s",d->special);
         else snprintf(value,sizeof value,"%.9g",fmin(d->max,fmax(d->min,n)));
     }
     if (!psp_settings_set(s,id,value,PSP_SOURCE_PRESET,a->status)) changed(a);
@@ -586,7 +597,7 @@ static void activate(launcher *a,int id) {
         if (a->book.selected!=id-PRESET_BASE) { a->book.selected=id-PRESET_BASE; changed(a); }
         a->focus=id; return;
     }
-    if (id>=GAME_BASE && id<GAME_BASE+a->game_count) { select_game(a,id-GAME_BASE,0); a->focus=id; return; }
+    if (id>=GAME_BASE && id<GAME_BASE+tab_count(a)) { select_game(a,id-GAME_BASE,0); a->focus=id; return; }
     if (is_option(id)) {
         a->selected_row=a->focus=id;
         if (overridden(id) || (unavailable(a,id) && !editing(a)->number[id])) return;
@@ -622,7 +633,7 @@ static void focus_next(launcher *a,int direction) {
     if (a->modal) { a->focus=a->focus==MODAL_OK?MODAL_CANCEL:MODAL_OK; return; }
     /* Include every option, including offscreen rows, so navigation can
      * scroll them into view. Small +/- mouse targets are not tab stops. */
-    for (int i=0;i<a->game_count;i++) ids[n++]=GAME_BASE+i;
+    for (int i=0;i<tab_count(a);i++) ids[n++]=GAME_BASE+i;
     if (a->importer) ids[n++]=ADD_GAME;
     for (int i=0;i<a->book.count;i++) ids[n++]=PRESET_BASE+i;
     ids[n++]=NEW; ids[n++]=DUPLICATE; ids[n++]=RENAME; ids[n++]=DELETE;
@@ -670,7 +681,7 @@ static void key(launcher *a,SDL_Keycode k,SDL_Keymod mod) {
     if (k==SDLK_LEFT || k==SDLK_RIGHT) {
         int d=k==SDLK_LEFT?-1:1;
         if (is_option(a->focus)) adjust(a,a->focus,d);
-        else if (a->game_count && a->focus>=GAME_BASE && a->focus<GAME_BASE+a->game_count) {
+        else if (tab_count(a) && a->focus>=GAME_BASE && a->focus<GAME_BASE+tab_count(a)) {
             /* A focused tab cycles the titles, so a controller can pick one. */
             select_game(a,(a->game+d+a->game_count)%a->game_count,0); a->focus=GAME_BASE+a->game;
         } else focus_next(a,d);
