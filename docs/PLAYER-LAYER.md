@@ -272,6 +272,20 @@ shipped with a release includes every pack it was built with.
 5. **Stage 3: The 3rd Birthday becomes a pack.** Its features move onto
    hooks, and its launcher pages (Graphics, Gameplay, Controller, Keyboard &
    Mouse, Advanced) become pages of its schema.
+   *Settings and presentation done 5 Oct*.
+   - Its settings are a schema on the shared mechanism. Its CMake makes the
+     schema part of `psprecomp_settings`'s link interface.
+   - Its `present.c` is gone. The audio backend, input tables and hooks,
+     and scene extent it needs are in `host/t3b_present.c`, given through
+     `psp_title_info`.
+   - An input harness drove the old and new layers through 16
+     configurations and got identical pad words, 896 lines.
+   - Its deterministic scenarios gave identical artifacts. The real-time
+     windowed ones vary run to run.
+   - Still open: `render_gl.c` (step 4: each game's adaptive-aspect HUD
+     heuristics and The 3rd Birthday's bloom detection need per-title
+     hooks), and a launcher both packs can use. The 3rd Birthday's
+     launcher has no library or import flow; Last Raven's does.
 
 The launcher stays a separate pre-launch process, and its INI file and
 `--config`/`--preset` arguments remain the contract with each game.
