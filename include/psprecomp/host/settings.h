@@ -25,6 +25,9 @@ enum {
 };
 /* A non-zero choice of this option needs the OpenGL renderer. */
 #define PSP_OPTION_NEEDS_GL 0x1u
+/* The launcher does not show this option; files, the environment and the
+ * command line still set it. */
+#define PSP_OPTION_HIDDEN   0x2u
 
 typedef struct {
     const char *key, *env, *label, *page, *help;
@@ -39,10 +42,14 @@ typedef struct {
      * none of them the canonical value is shown as stored. */
     const char *special_label, *zero_label, *format;
     double scale;
+    /* Optional: what the launcher's arrows step through, separated by '|',
+     * in place of step -- ascending numbers, then the special word if it is
+     * one. From a value between two stops an arrow goes to the adjacent one. */
+    const char *stops;
     /* Older spellings accepted on input and stored as the new one:
      * "old=new|old=new". */
     const char *aliases;
-    unsigned flags;                 /* PSP_OPTION_NEEDS_GL */
+    unsigned flags;                 /* PSP_OPTION_* */
 } psp_option_def;
 
 typedef struct {

@@ -212,4 +212,17 @@ if(PSPRECOMP_HOST)
     add_test(NAME present_controller COMMAND test_present controller)
     set_tests_properties(present present_keyboard present_controller PROPERTIES
         TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
+
+    # The player's launcher, on a schema of its own; it includes launcher.c.
+    # Without a font the drawn half skips.
+    add_executable(test_launcher test_launcher.c)
+    target_link_libraries(test_launcher PRIVATE psprecomp_host)
+    if(MSVC)
+        target_compile_options(test_launcher PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_launcher PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME launcher COMMAND test_launcher)
+    set_tests_properties(launcher PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy")
 endif()

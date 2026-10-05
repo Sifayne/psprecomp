@@ -35,8 +35,13 @@ data. Its manifest is documented at the top of [`pack.py`](pack.py):
 - the checks the builder runs;
 - the sources the matching archive must carry.
 
-Last Raven's `pack.json` is the first. It carries the launcher, `boot.c`
-and the GL backend in its CMake file until those move into the shared host.
+The launcher is the toolkit's (`src/host/launcher.c`). Its pages come from
+the pack's settings schema, and the rest of what it shows from the pack's
+`psp_launcher_info` (`include/psprecomp/host/launcher.h`). A pack's CMake
+file builds it from `PLAYER_LAUNCHER` with those two.
+
+Last Raven's `pack.json` is the first. Its CMake file also carries `boot.c`
+and the GL backend until those move into the shared host.
 
 ## Files
 

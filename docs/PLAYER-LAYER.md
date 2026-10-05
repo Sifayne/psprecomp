@@ -282,10 +282,23 @@ shipped with a release includes every pack it was built with.
      configurations and got identical pad words, 896 lines.
    - Its deterministic scenarios gave identical artifacts. The real-time
      windowed ones vary run to run.
+   - The packaged launcher is psprecomp's, from Last Raven's, which had
+     the library and import flow (The 3rd Birthday's does not).
+     *Done 5 Oct* (`src/host/launcher.c`, `tests/test_launcher.c`).
+     - Its pages are the schema's page names, in the order they first
+       appear. Its rows are their options, except those marked
+       `PSP_OPTION_HIDDEN`.
+     - An option's `stops` replace Last Raven's FPS-cap list.
+     - Each pack's `psp_launcher_info` names the app and carries its About
+       text, its title order and what New and Reset start from.
+     - Last Raven's launcher tests pass on it, and their 14 screenshots
+       are byte-identical.
+     - The 3rd Birthday keeps its own richer launcher for development.
+   - Decided 5 Oct: The 3rd Birthday is packaged before `render_gl.c` is
+     merged. Its pack carries its own `render_gl.c` until then.
    - Still open: `render_gl.c` (step 4: each game's adaptive-aspect HUD
      heuristics and The 3rd Birthday's bloom detection need per-title
-     hooks), and a launcher both packs can use. The 3rd Birthday's
-     launcher has no library or import flow; Last Raven's does.
+     hooks).
 
 The launcher stays a separate pre-launch process, and its INI file and
 `--config`/`--preset` arguments remain the contract with each game.

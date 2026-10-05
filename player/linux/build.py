@@ -189,6 +189,8 @@ def main():
     ui = BUILD / "ui-checks"
     ui.mkdir()
     run([obj / "savedata-tests"])
+    run([obj / "player-launcher-tests"], env={**os.environ, "SDL_VIDEODRIVER": "dummy",
+        "PSPRECOMP_UI_FONT": str(font / "ttf/DejaVuSans.ttf")})
     for command in PACK.checks:
         check(command, ui, font / "ttf/DejaVuSans.ttf", obj)
     print("Staging only app binaries, dependencies, font and notices...", flush=True)
