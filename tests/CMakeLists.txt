@@ -215,14 +215,15 @@ if(PSPRECOMP_HOST)
 
     # The player's launcher, on a schema of its own; it includes launcher.c.
     # Without a font the drawn half skips.
-    add_executable(test_launcher test_launcher.c)
-    target_link_libraries(test_launcher PRIVATE psprecomp_host)
+    # Named apart from the games' own launcher tests, which build alongside.
+    add_executable(test_player_launcher test_launcher.c)
+    target_link_libraries(test_player_launcher PRIVATE psprecomp_host)
     if(MSVC)
-        target_compile_options(test_launcher PRIVATE /UNDEBUG)
+        target_compile_options(test_player_launcher PRIVATE /UNDEBUG)
     else()
-        target_compile_options(test_launcher PRIVATE -UNDEBUG)
+        target_compile_options(test_player_launcher PRIVATE -UNDEBUG)
     endif()
-    add_test(NAME launcher COMMAND test_launcher)
+    add_test(NAME launcher COMMAND test_player_launcher)
     set_tests_properties(launcher PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy")
 endif()
