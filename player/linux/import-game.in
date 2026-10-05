@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+app_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+exec "$app_root/usr/python/bin/python3.12" -I -B \
+    "$app_root/usr/share/@APP_ID@/import_game.py" --app-root "$app_root" --app-id @APP_ID@ "$@"

@@ -1,0 +1,8 @@
+{
+  "version": "9.0.1",
+  "url": "https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz",
+  "sha256": "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635",
+  "release_signing_key": "FCF986EA15E6E293A5644F10B4322F04D67658D8",
+  "avcodec_major": 63,
+  "avutil_major": 61
+}

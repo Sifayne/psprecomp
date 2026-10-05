@@ -1,0 +1,58 @@
+#!/bin/bash
+# The player's entry point, generated from player/linux/AppRun.in for the
+# pack @APP_ID@ ("@APP_NAME@").
+set -euo pipefail
+app_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export PSPRECOMP_UI_FONT="${PSPRECOMP_UI_FONT:-$app_root/usr/share/@APP_ID@/DejaVuSans.ttf}"
+# SDL2 otherwise filters Steam Input's virtual pad. Both the launcher and the
+# game consume ordinary SDL controller events, not the Steam Input API.
+# Export before launching either process, preserving an explicit user override.
+export SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD="${SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD-1}"
+# Relative XDG values are invalid; never put user data in the mounted AppImage.
+xdg_base() {
+    if [[ "$1" = /* ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+}
+config_root="$(xdg_base "${XDG_CONFIG_HOME:-}" "$HOME/.config")/@APP_ID@"
+data_root="$(xdg_base "${XDG_DATA_HOME:-}" "$HOME/.local/share")/@APP_ID@"
+state_root="$(xdg_base "${XDG_STATE_HOME:-}" "$HOME/.local/state")/@APP_ID@"
+config="$config_root/settings.ini"
+if [[ "${1:-}" = --print-paths ]]; then
+    printf 'Application: %s\nSettings: %s\nGames: %s/games\nSaves: %s/saves\nLogs: %s/logs\n' \
+        "$app_root" "$config" "$data_root" "$data_root" "$state_root"
+    exit 0
+fi
+if [[ "${1:-}" = --help ]]; then
+    printf '%s\n' '@APP_NAME@: import your own PSP ISO and play.' \
+        '  --print-paths       Show persistent storage locations' \
+        '  --check-startup     Open and render the launcher, report success, exit' \
+        '  --print-settings    Inspect saved settings without opening a window' \
+        '  --list-presets      List saved presets without opening a window' \
+        '  --import ISO        Prepare a game from the command line' \
+        '  --list-games        Inspect the installed game library'
+    exec "$app_root/usr/bin/launcher" --help
+fi
+export LR_APP_ROOT="$app_root" LR_DATA_ROOT="$data_root" LR_STATE_ROOT="$state_root"
+mkdir -p -- "$config_root" "$data_root/games" "$data_root/saves" "$state_root/logs"
+# Preserve the pack's earlier settings file, if it names one, on first launch.
+legacy_name='@LEGACY_SETTINGS@'
+legacy="$(xdg_base "${XDG_DATA_HOME:-}" "$HOME/.local/share")/$legacy_name"
+if [[ -n "$legacy_name" && ! -e "$config" && -f "$legacy" ]]; then
+    cp -n -- "$legacy" "$config"
+fi
+case "${1:-}" in
+    --import) shift; exec "$app_root/usr/bin/import-game" import "$@" ;;
+    --list-games) exec "$app_root/usr/bin/import-game" list ;;
+    --print-settings|--list-presets|--create-defaults)
+        exec "$app_root/usr/bin/settings-tool" --config "$config" "$@" ;;
+esac
+# A corrupt or half-written library record must not stop the launcher, which
+# reports "Cannot read game library" itself and leaves the files untouched.
+"$app_root/usr/bin/import-game" refresh || \
+    printf 'launcher: the game library could not be refreshed; starting anyway\n' >&2
+log="$(mktemp "$state_root/logs/launcher-XXXXXXXX.log")"
+printf '@APP_NAME@\nApplication: %s\nSettings: %s\n' "$app_root" "$config" > "$log"
+# Each ELF has a relative RUNPATH. Do not override system drivers or prevent
+# users from substituting compatible libraries through LD_LIBRARY_PATH.
+exec "$app_root/usr/bin/launcher" --config "$config" \
+    --font "$app_root/usr/share/@APP_ID@/DejaVuSans.ttf" \
+    --library "$data_root/library.bin" --importer "$app_root/usr/bin/import-game" "$@" 2>> "$log"

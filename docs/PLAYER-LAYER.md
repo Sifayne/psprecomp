@@ -131,7 +131,7 @@ aspect camera, gait, and its own launcher pages.
 | # | Stage | Needs | Gate |
 |---|---|---|---|
 | 1 | Pack interface; the host and settings core into psprecomp; the Armored Core titles built on it | — | Replay rows, render checks and host fixtures unchanged for all three titles |
-| 2 | The player in psprecomp: importer, compiler, packaging; Armored Core packs taken by path | 1 | Real ISO imports of all three titles match `deck-test-6`'s control logs; existing installs migrate intact |
+| 2 | The player in psprecomp: importer, compiler, packaging; Armored Core packs taken by path | 1 | The player's package and one built by the old pipeline from the same sources prepare all three real ISOs into games that replay identically; an existing install updates intact |
 | 3 | The 3rd Birthday as a pack: its features on host hooks, `render_gl.c` reconciled | 1, 2 | TB's own tests and replays unchanged; a packaged TB import plays |
 | 4 | Save-state census and resume entries (spike) | — | Park census per title; emitted-code cost measured; resume unit test passes |
 | 5 | Safe point and host pause | 1 | A pause is invisible to the guest; paced summary shows guest time excludes it |
@@ -152,8 +152,8 @@ decided again before the overlay is built around them.
 **The player** is one application: launcher, ISO importer, on-device
 compiler, runtime and the shared host. It prepares each supported game on
 the player's own machine from their own disc. It is Last Raven's AppImage
-generalised, and its recipe moves into psprecomp, under a directory to be
-named when stage 2 starts:
+generalised, and its recipe moved into psprecomp's `player/` on 5 Oct
+(`player/README.md`):
 
 - `import_game.py`, `compile_game.py`, `emit-split.py`;
 - `game_fingerprints.py`;
@@ -250,10 +250,23 @@ shipped with a release includes every pack it was built with.
    audio hook waits for The 3rd Birthday's mixer in stage 3, the first
    consumer that needs it.
 3. **Stage 2: the importer, compiler and packaging recipe move into
-   psprecomp.** Last Raven's three titles become packs. The packaged result
-   has to match the `deck-test-6` evidence: control logs of 2,713 records
-   for Last Raven, 11,991 for AC3P and 41,665 for Silent Line, all with zero
-   bad accesses.
+   psprecomp.** Last Raven's three titles become packs. *Done 5 Oct*
+   (`player/`). Last Raven is one pack: `pack.json`, plus a CMake file for
+   the launcher, `boot.c` and the GL backend, which have not moved yet.
+   - The gate was first written against the `deck-test-6` control logs.
+     A month of runtime changes separates that build from today's, so the
+     gate became an A/B. Last Raven's own pipeline and the player built
+     packages from the same sources, and each prepared the three real ISOs
+     into an isolated library.
+   - The garage and both probe replays gave identical summaries: 928 and
+     3,003 lists; 10,980,171, 14,251,977 and 14,242,139 commands; 0 bad
+     accesses.
+   - Both AppDirs hold the same files, apart from the new `app.json`, and
+     pass the same builder checks.
+   - An install made by the old package opened in the new one with its
+     settings and records untouched. Every title asked for preparation once,
+     because its fingerprint changed, and re-preparing one kept its old build
+     and the save beside it.
 4. **Stage 3: `render_gl.c`.** It moves after The 3rd Birthday's roughly 470
    lines of drift are reconciled.
 5. **Stage 3: The 3rd Birthday becomes a pack.** Its features move onto

@@ -1,0 +1,18 @@
+This software uses libraries from the FFmpeg project (https://ffmpeg.org/),
+licensed under the GNU Lesser General Public License version 2.1 or later.
+FFmpeg remains copyright its respective contributors; Last Raven's MIT
+license does not replace FFmpeg's license.
+
+This build contains libavcodec and libavutil, with ATRAC3 and ATRAC3+ decoding.
+The FFmpeg source is unmodified. GPL, nonfree and version-3-only components,
+external-library autodetection, and unrelated codecs are disabled.
+
+The distribution's source/ directory contains the exact upstream source
+archive, the build recipe and build information. Copying the library binaries
+alone is not the complete distribution; keep the notices and license, and
+provide equivalent access to the corresponding source alongside downloads.
+
+You may replace the shared libraries with modified, interface-compatible
+versions. The application must permit their use and must not prohibit
+modification for your own use or reverse engineering to debug modifications.
+See COPYING.LGPLv2.1 for the full terms.

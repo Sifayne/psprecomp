@@ -259,7 +259,9 @@ its name.
       `psprecomp_host`, with the savedata dialog and the presentation layer
       (SDL2 window, input, audio); player settings are `psprecomp_settings`.
       Last Raven's titles use them; The 3rd Birthday's copies and both
-      games' GL backends remain (see *Open work*). RAM snapshots (`PSPRECOMP_RAMSNAP`) are an instrument, not save
+      games' GL backends remain (see *Open work*). `player/` builds the
+      AppImage for a title pack (`player/README.md`); Last Raven is the
+      first. RAM snapshots (`PSPRECOMP_RAMSNAP`) are an instrument, not save
       states. The plan is [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md): one
       player in this repository, every game a title pack compiled on the
       player's machine, and the three features staged from a shared safe
