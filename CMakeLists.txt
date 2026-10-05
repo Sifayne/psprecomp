@@ -123,6 +123,21 @@ if(NOT MSVC)
     endif()
 endif()
 
+# --- player settings ----------------------------------------------------------
+#
+# The settings mechanism every title's launcher, game and tools share
+# (src/host/settings.c). Plain C with no SDL, so it is always built; a title
+# supplies the options as a schema. See include/psprecomp/host/settings.h.
+add_library(psprecomp_settings STATIC src/host/settings.c)
+target_include_directories(psprecomp_settings PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(psprecomp_settings PUBLIC Threads::Threads)
+if(NOT MSVC)
+    find_library(PSPRECOMP_SETTINGS_LIBM m)
+    if(PSPRECOMP_SETTINGS_LIBM)
+        target_link_libraries(psprecomp_settings PUBLIC ${PSPRECOMP_SETTINGS_LIBM})
+    endif()
+endif()
+
 # --- optional: the SDL2 host layer --------------------------------------------
 #
 # Code a game's host needs and the runtime does not: so far the savedata

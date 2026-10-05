@@ -10,7 +10,7 @@ add_library(psprecomp_host STATIC save_dialog.c)
 # (The 3rd Birthday's boot saw SIGSTKSZ change). Its include directories are
 # public: save_dialog.h includes <SDL2/SDL.h>.
 target_link_libraries(psprecomp_host
-    PUBLIC  psprecomp
+    PUBLIC  psprecomp psprecomp_settings
     PRIVATE PkgConfig::PSPRECOMP_SDL2)
 target_include_directories(psprecomp_host PUBLIC ${PSPRECOMP_SDL2_INCLUDE_DIRS})
 message(STATUS "psprecomp_host: SDL2 host layer (save dialog)")

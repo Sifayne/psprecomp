@@ -6,6 +6,16 @@ add_executable(test_decode test_decode.c)
 target_link_libraries(test_decode PRIVATE allegrex_core)
 add_test(NAME decode COMMAND test_decode)
 
+add_executable(test_settings test_settings.c)
+target_link_libraries(test_settings PRIVATE psprecomp_settings)
+# Its checks are asserts; Release must not compile them out.
+if(MSVC)
+    target_compile_options(test_settings PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test_settings PRIVATE -UNDEBUG)
+endif()
+add_test(NAME settings COMMAND test_settings)
+
 add_executable(test_runtime test_runtime.c)
 target_link_libraries(test_runtime PRIVATE psprecomp)
 add_test(NAME runtime COMMAND test_runtime)
