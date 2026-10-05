@@ -196,4 +196,20 @@ if(PSPRECOMP_HOST)
     add_test(NAME save_dialog COMMAND test_save_dialog)
     set_tests_properties(save_dialog PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy")
+
+    # Includes present.c for its internals, so it links the host layer only
+    # for the save dialog. The quit shortcuts alone, then the real SDL loop
+    # closed by the keyboard and by a virtual controller.
+    add_executable(test_present test_present.c)
+    target_link_libraries(test_present PRIVATE psprecomp_host)
+    if(MSVC)
+        target_compile_options(test_present PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_present PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME present COMMAND test_present)
+    add_test(NAME present_keyboard COMMAND test_present keyboard)
+    add_test(NAME present_controller COMMAND test_present controller)
+    set_tests_properties(present present_keyboard present_controller PROPERTIES
+        TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
 endif()
