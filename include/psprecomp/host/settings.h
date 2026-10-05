@@ -94,7 +94,13 @@ typedef struct {
  * another, so a program that reads settings without a title fails to link
  * rather than running with nobody's options -- and the reference pulls the
  * title's table out of a static archive. Error buffers passed to this API
- * must hold PSP_SETTINGS_ERROR bytes. */
+ * must hold PSP_SETTINGS_ERROR bytes.
+ *
+ * The pull only works when the title's object comes after the mechanism on
+ * the link line, or in the same archive. A title building with CMake makes its
+ * schema part of the mechanism's interface, so it always follows:
+ *     target_link_libraries(psprecomp_settings INTERFACE <its schema library>)
+ * The 3rd Birthday's dev/CMakeLists.txt does this. */
 extern const psp_settings_schema psp_title_settings;
 void psp_settings_schema_use(const psp_settings_schema *schema);
 const psp_settings_schema *psp_settings_active_schema(void);

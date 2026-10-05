@@ -156,7 +156,7 @@ static _Atomic uint8_t  g_pad_ax = 128, g_pad_ay = 128;
  * the stick took are moved: square to c, triangle to v. Everything else is
  * the classic layout. Which button does what in the game is the game's
  * key-assign, not this table's. */
-typedef struct { SDL_Keycode key; uint32_t bit; } key_bind;
+typedef psp_key_bind key_bind;      /* key: an SDL_Keycode */
 typedef struct { uint8_t sdl; uint32_t psp; } controller_bind;
 
 static const key_bind KEYS_CLASSIC[] = {
@@ -182,6 +182,21 @@ static const key_bind KEYS_WASD[] = {
  * 1/2/3. */
 static const uint32_t MOUSE_WASD[4] = { 0, 0x008000, 0x000040, 0x000040 };
 static uint32_t g_mouse_down;               /* physical buttons, SDL thread */
+
+/* The title's Modern controls are on: its resolved settings say input and it
+ * has PSP_TITLE_MODERN_CONTROLS. Its classic_keys/classic_mouse apply when
+ * they are off. */
+static int g_keys_modern;
+
+/* The WASD layout and the mouse buttons: the title's, or the host's. */
+static const key_bind *wasd_keys(size_t *n) {
+    if (psp_title_info.keys_wasd) { *n = psp_title_info.keys_wasd_count; return psp_title_info.keys_wasd; }
+    *n = sizeof KEYS_WASD / sizeof *KEYS_WASD;
+    return KEYS_WASD;
+}
+static const uint32_t *mouse_wasd(void) {
+    return psp_title_info.mouse_wasd ? psp_title_info.mouse_wasd : MOUSE_WASD;
+}
 
 static int g_keys_wasd;                     /* PSPRECOMP_KEYS=wasd */
 static int g_gamepad_modern;                /* semantic buttons in modern/dual */
@@ -231,7 +246,8 @@ static void set_mouse_button(uint8_t button, int down) {
      * the other while it is still held. */
     uint32_t buttons = 0;
     for (int b = 1; b < 4; b++)
-        if (g_mouse_down & SDL_BUTTON(b)) buttons |= MOUSE_WASD[b];
+        if (g_mouse_down & SDL_BUTTON(b)) buttons |= mouse_wasd()[b];
+    if (!g_keys_modern && psp_title_info.classic_mouse) buttons = psp_title_info.classic_mouse(buttons);
     atomic_store(&g_mouse_buttons, buttons);
 }
 
@@ -252,8 +268,14 @@ static void rebuild_key_stick(void) {
     const int a = g_key_down[SDL_SCANCODE_A] != 0;
     const int d = g_key_down[SDL_SCANCODE_D] != 0;
     const int x = d - a, y = s - w;
-    atomic_store(&g_key_ax, (uint8_t)(128 + 127 * x));
-    atomic_store(&g_key_ay, (uint8_t)(128 + 127 * y));
+    if (psp_title_info.key_axis) {
+        const int walk = g_key_down[SDL_SCANCODE_LALT] != 0;
+        atomic_store(&g_key_ax, psp_title_info.key_axis(x, y, walk));
+        atomic_store(&g_key_ay, psp_title_info.key_axis(y, x, walk));
+    } else {
+        atomic_store(&g_key_ax, (uint8_t)(128 + 127 * x));
+        atomic_store(&g_key_ay, (uint8_t)(128 + 127 * y));
+    }
     /* Opposite keys explicitly own a centred axis.  Without these flags,
      * W+S handed Y back to a drifting controller instead of cancelling it. */
     atomic_store(&g_key_x_owned, a || d);
@@ -261,14 +283,15 @@ static void rebuild_key_stick(void) {
 }
 
 static void rebuild_key_buttons(void) {
-    const key_bind *keys = g_keys_wasd ? KEYS_WASD : KEYS_CLASSIC;
-    const size_t n = g_keys_wasd ? sizeof KEYS_WASD / sizeof *KEYS_WASD
-                                 : sizeof KEYS_CLASSIC / sizeof *KEYS_CLASSIC;
+    size_t n = sizeof KEYS_CLASSIC / sizeof *KEYS_CLASSIC;
+    const key_bind *keys = g_keys_wasd ? wasd_keys(&n) : KEYS_CLASSIC;
     uint32_t buttons = 0;
     for (size_t i = 0; i < n; i++) {
         const SDL_Scancode sc = SDL_GetScancodeFromKey(keys[i].key);
         if (sc != SDL_SCANCODE_UNKNOWN && g_key_down[sc]) buttons |= keys[i].bit;
     }
+    if (g_keys_wasd && !g_keys_modern && psp_title_info.classic_keys)
+        buttons = psp_title_info.classic_keys(buttons);
     atomic_store(&g_key_buttons, buttons);
 }
 
@@ -290,6 +313,10 @@ static void clear_keys(void) {
 
 static void set_button(uint8_t b, int down) {
     quit_chord_button(b, down, SDL_GetTicks64());
+    if (psp_title_info.pad_button) {
+        const uint32_t carrier = psp_title_info.pad_button(b);
+        if (carrier) { set_bit(&g_controller_buttons, carrier, down); return; }
+    }
     static const controller_bind CLASSIC[] = {
         { SDL_CONTROLLER_BUTTON_DPAD_RIGHT,          0x000020 },
         { SDL_CONTROLLER_BUTTON_DPAD_LEFT,           0x000080 },
@@ -381,10 +408,19 @@ static void set_axis(uint8_t axis, int16_t value) {
  * with PSPRECOMP_MOUSE=1; and even then focus loss and Escape release it,
  * because a window that traps the pointer and cannot be left is the one
  * thing worse than no mouse-look at all. A click takes it back. */
+static void publish_pad(void);
 static void mouse_grab(int on) {
     if (!g_mouse_want || on == g_mouse_grabbed) return;
     SDL_SetRelativeMouseMode(on ? SDL_TRUE : SDL_FALSE);
     g_mouse_grabbed = on;
+    if (!on) {
+        psp_ctrl_clear_mouse();
+        /* A button-up outside capture is intentionally ignored. Clear the
+         * old held set now so Escape cannot leave fire/aim stuck on. */
+        g_mouse_down = 0;
+        atomic_store(&g_mouse_buttons, 0);
+        publish_pad();
+    }
     fprintf(stderr, on ? "present: mouse captured -- Escape releases it\n"
                        : "present: mouse released -- click the window to capture it\n");
 }
@@ -568,6 +604,13 @@ static void audio_callback(void *ud, Uint8 *stream, int len) {
     }
 }
 
+static void mix_prepare(uint32_t lead_frames, uint32_t preroll_frames) {
+    g_audio_target_frames = lead_frames;
+    g_audio_preroll_frames = preroll_frames;
+}
+/* The mixer locks the device through g_audio_dev, which is this file's. */
+static void mix_opened(uint32_t device) { (void)device; }
+
 /* The audio hook. Runs on the guest audio thread, inside the output call:
  * the buffer is complete -- the game filled it before calling -- so read it
  * out, scale it, and push it. Returns the backlog in microseconds for the
@@ -623,6 +666,37 @@ static int64_t present_audio(int ch, uint32_t samples, uint32_t fmt,
     const int64_t us = over * 1000000 / 44100;
     return us > 100000 ? 100000 : us;          /* never claim more than 100ms */
 }
+
+/* What the mixer saw, per channel: frames pushed, dropped for a full ring,
+ * and the times the ring ran dry -- each of those a gap the listener heard. */
+static void mix_report(FILE *out) {
+    if (!g_audio_dev) return;
+    SDL_LockAudioDevice(g_audio_dev);
+    for (int ch = 0; ch < MIX_CHANNELS; ch++) {
+        const mix_ring *m = &g_mix[ch];
+        if (m->pushed)
+            fprintf(out, "present: audio ch %d  %.1f s pushed over %.1f s  %u dropped  "
+                         "%u underruns (%.2f s of silence)  longest wait between pushes %llu ms, "
+                         "%u waits longer than the pre-roll\n",
+                    ch, m->pushed / 44100.0,
+                    (m->last_ms - m->first_ms) / 1000.0, m->dropped,
+                    m->underruns, m->silence / 44100.0,
+                    (unsigned long long)m->max_gap_ms, m->long_gaps);
+    }
+    SDL_UnlockAudioDevice(g_audio_dev);
+}
+
+static const psp_audio_backend host_mixer = {
+    .prepare = mix_prepare, .callback = audio_callback, .opened = mix_opened,
+    .output = present_audio, .report = mix_report,
+};
+
+/* The title's audio output, or the host's mixer. */
+static const psp_audio_backend *audio(void) {
+    return psp_title_info.audio ? psp_title_info.audio : &host_mixer;
+}
+
+void present_audio_report(FILE *out) { audio()->report(out); }
 
 /* ---- the GL handoff -------------------------------------------------------
  *
@@ -732,15 +806,44 @@ int present_adaptive_aspect(void) {
     return 0;
 }
 
-int present_aspect_wide_width(void) {
-    if (!present_adaptive_aspect()) return SCREEN_W;
-    int w = 0, h = 0;
-    present_gl_drawable_size(&w, &h);
-    if (w <= 0 || h <= 0) return SCREEN_W;
-    long long ww = ((long long)SCREEN_H * w + h / 2) / h;
+/* The GL renderer latches the drawable once per present and sizes its
+ * targets from that snapshot. The camera hooks read the same snapshot, so a
+ * window drag cannot give one frame's projection and its placement different
+ * sizes. Until the renderer's first latch the live drawable is used. (The
+ * 3rd Birthday's present.c had this before it moved here.) */
+static _Atomic uint64_t g_scene_latch;
+void present_aspect_latch_scene_size(int w, int h) {
+    if (w > 0 && h > 0)
+        atomic_store(&g_scene_latch, ((uint64_t)(uint32_t)w << 32) | (uint32_t)h);
+}
+
+/* The drawable's shape at 272 rows, never narrower than 480. */
+static void wide_scene(int draw_w, int draw_h, int *scene_w, int *scene_h) {
+    long long ww = ((long long)SCREEN_H * draw_w + draw_h / 2) / draw_h;
     if (ww < SCREEN_W) ww = SCREEN_W;
     if (ww > 8192) ww = 8192;       /* a texture limit, and past any monitor */
-    return (int)ww;
+    *scene_w = (int)ww; *scene_h = SCREEN_H;
+}
+
+void present_aspect_scene_size(int *scene_w, int *scene_h) {
+    *scene_w = SCREEN_W; *scene_h = SCREEN_H;
+    if (!present_adaptive_aspect()) return;
+    const uint64_t latched = atomic_load(&g_scene_latch);
+    if (latched) {
+        *scene_w = (int)(latched >> 32);
+        *scene_h = (int)(latched & UINT32_MAX);
+        return;
+    }
+    int w = 0, h = 0;
+    present_gl_drawable_size(&w, &h);
+    if (psp_title_info.scene_extent) psp_title_info.scene_extent(w, h, scene_w, scene_h);
+    else if (w > 0 && h > 0) wide_scene(w, h, scene_w, scene_h);
+}
+
+int present_aspect_wide_width(void) {
+    int w, h;
+    present_aspect_scene_size(&w, &h);
+    return w;
 }
 
 void *present_gl_proc(const char *name) { return SDL_GL_GetProcAddress(name); }
@@ -750,24 +853,7 @@ void *present_gl_proc(const char *name) { return SDL_GL_GetProcAddress(name); }
 /* Window close and both shortcuts share the scheduler's normal shutdown. */
 static void close_game_window(void) {
     save_dialog_shutdown();
-    /* What the mixer saw, per channel: frames pushed, dropped
-     * for a full ring, and the times the ring ran dry -- each
-     * of those a gap the listener heard. */
-    if (g_audio_dev) {
-        SDL_LockAudioDevice(g_audio_dev);
-        for (int ch = 0; ch < MIX_CHANNELS; ch++) {
-            const mix_ring *m = &g_mix[ch];
-            if (m->pushed)
-                fprintf(stderr, "present: audio ch %d  %.1f s pushed over %.1f s  %u dropped  "
-                                "%u underruns (%.2f s of silence)  longest wait between pushes %llu ms, "
-                                "%u waits longer than the pre-roll\n",
-                        ch, m->pushed / 44100.0,
-                        (m->last_ms - m->first_ms) / 1000.0, m->dropped,
-                        m->underruns, m->silence / 44100.0,
-                        (unsigned long long)m->max_gap_ms, m->long_gaps);
-        }
-        SDL_UnlockAudioDevice(g_audio_dev);
-    }
+    present_audio_report(stderr);
     /* Stop the run the way the host already stops one, rather than
      * _exit(0): that killed the process mid-drain and took the
      * whole end-of-run report with it. This is not a guest thread,
@@ -887,17 +973,24 @@ static void *sdl_thread(void *arg) {
     want.format   = AUDIO_S16SYS;
     want.channels = 2;
     want.samples  = 1024;
-    want.callback = audio_callback;
+    want.callback = audio()->callback;
     SDL_AudioSpec have;
-    g_audio_target_frames  = settings_ms_frames("AUDIO_LEAD_MS",    g_audio_target_frames);
-    g_audio_preroll_frames = settings_ms_frames("AUDIO_PREROLL_MS", g_audio_preroll_frames);
+    /* Lead 0 is two of the channel's own buffers; the pre-roll is 93 ms. */
+    audio()->prepare(settings_ms_frames("AUDIO_LEAD_MS", 0),
+                     settings_ms_frames("AUDIO_PREROLL_MS", 4096));
     g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (g_audio_dev) SDL_PauseAudioDevice(g_audio_dev, 0);
+    if (g_audio_dev) {
+        audio()->opened(g_audio_dev);
+        SDL_PauseAudioDevice(g_audio_dev, 0);
+    }
     else fprintf(stderr, "present: no audio device: %s\n", SDL_GetError());
 
     g_keys_wasd = setting("KEYS", 0) != 0;
     g_gamepad_modern = gamepad_modern();
-    if (g_keys_wasd && psp_title_info.keys_wasd_help)
+    g_keys_modern = settings->input && psp_title_can(PSP_TITLE_MODERN_CONTROLS);
+    if (g_keys_wasd && !g_keys_modern && psp_title_info.keys_wasd_classic_help)
+        fprintf(stderr, "present: %s\n", psp_title_info.keys_wasd_classic_help);
+    else if (g_keys_wasd && psp_title_info.keys_wasd_help)
         fprintf(stderr, "present: %s\n", psp_title_info.keys_wasd_help);
     else if (g_keys_wasd)
         fprintf(stderr, "present: keys wasd stick | space/z cross, x circle, "
@@ -916,7 +1009,7 @@ static void *sdl_thread(void *arg) {
      * After the GL handoff above on purpose -- that block owns the context
      * juggling and does not need company. */
     {
-        g_mouse_want = setting("MOUSE", 0) != 0;
+        g_mouse_want = settings->mouse;
         if (g_mouse_want) mouse_grab(1);
     }
 
@@ -1111,7 +1204,7 @@ static void *sdl_thread(void *arg) {
             case SDL_MOUSEBUTTONUP:
                 /* The click that captures the pointer is not also a shot. */
                 if (!g_mouse_grabbed) { if (e.type == SDL_MOUSEBUTTONDOWN) mouse_grab(1); break; }
-                if (g_keys_wasd && e.button.button < 4 && MOUSE_WASD[e.button.button]) {
+                if (g_keys_wasd && e.button.button < 4 && mouse_wasd()[e.button.button]) {
                     set_mouse_button(e.button.button, e.type == SDL_MOUSEBUTTONDOWN);
                     publish_pad();
                 }
@@ -1155,7 +1248,8 @@ int present_start(void) {
      * guest-thread conversion this hook does -- 130k pixels into RGBA, every
      * frame -- would be work whose result nothing reads. */
     if (!g_gl_want) psp_display_set_present(present_frame);
-    psp_audio_set_output(present_audio);
+    psp_audio_set_output(audio()->output);
+    if (audio()->pending) psp_audio_set_pending(audio()->pending);
 
     /* Queue depth target: two buffers -- deep enough that jitter never
      * underruns, shallow enough that the backlog tracks real playback. */
@@ -1163,12 +1257,14 @@ int present_start(void) {
     if (pthread_cond_init(&g_frame_cv, NULL) != 0) {
         psp_display_set_present(NULL);
         psp_audio_set_output(NULL);
+        psp_audio_set_pending(NULL);
         return -1;
     }
     if (pthread_create(&g_thread, NULL, sdl_thread, NULL) != 0) {
         fprintf(stderr, "present: cannot start the SDL thread\n");
         psp_display_set_present(NULL);
         psp_audio_set_output(NULL);
+        psp_audio_set_pending(NULL);
         pthread_cond_destroy(&g_frame_cv);
         return -1;
     }
@@ -1186,11 +1282,13 @@ int present_start(void) {
     if (!ready) {
         psp_display_set_present(NULL);
         psp_audio_set_output(NULL);
+        psp_audio_set_pending(NULL);
         pthread_join(g_thread, NULL);
         pthread_cond_destroy(&g_frame_cv);
         return -1;
     }
 
+    if (audio()->started) audio()->started(g_audio_dev != 0, g_gl_want);
     psp_clock_realtime(1);
     return 0;
 }
