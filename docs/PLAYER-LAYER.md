@@ -87,7 +87,8 @@ aspect camera, gait, and its own launcher pages.
 
 1. **One player, many title packs, in psprecomp.** Everything
    game-specific is a pack:
-   - a manifest (data) that both the launcher and the game read;
+   - a manifest (data) that the importer and the compile step read;
+   - a settings schema (C) compiled into both the launcher and the game;
    - C sources compiled on the device with the generated code;
    - one registration call at boot.
 
@@ -161,19 +162,23 @@ named when stage 2 starts:
 **A title pack** is everything about one game, and it ships as source and
 data only, never game bytes.
 
-*The manifest*, data read by both the launcher and the compile step:
+*The manifest*, data read by the importer and the compile step:
 
 - slug and title;
 - accepted disc IDs and executable SHA-256s, today's `games.json` rows;
 - module path, replace list and code-generation steps that run after the
   emit, such as Last Raven's `fps-loop.py`;
 - source files and header directories;
-- **settings options**: key, type, default, range or choices, labels, page,
-  help and apply policy (live, next launch, restart);
-- starter presets;
 - **named input actions** with their carrier bits and default bindings;
 - the frame-boundary calls for the safe point (§2);
 - capabilities such as movie decoding.
+
+*The settings schema*, `psp_title_settings`
+(`include/psprecomp/host/settings.h`): a C file with no dependency on
+generated code. It holds the option table (key, type, default, range or
+choices, labels, page, help, display format), the starter presets, and hooks
+for the title's derived values and notes. An apply policy (live, next
+launch, restart) joins it in stage 7.
 
 *C sources*, compiled on the device alongside the generated code: the
 replacements, and any host features of the title's own.
@@ -196,11 +201,17 @@ games to rebuild. A pack's fingerprint covers its manifest, its sources and
 their transitive headers, as a title's replacements are covered today.
 
 **One definition of each option.** The launcher has to show a title's
-settings before that title has ever been compiled, so options come from the
-manifest. The compile step generates the game's C option table from the
-same manifest, so the launcher and the game validate against one definition.
-The launcher's pages are generated from the manifest from stage 2 on. That
-is what makes it a generic launcher before stage 10 rebuilds it on ImGui.
+settings before that title has ever been compiled, and the game has to
+validate the same values. The player build compiles each pack's settings
+schema into the launcher, and the device compiles it into the game, so both
+read one table. The launcher's pages are generated from the schema from
+stage 2 on. That is what makes it a generic launcher before stage 10
+rebuilds it on ImGui.
+
+This plan first put the options in the manifest and generated the C table
+from it. Writing the schema in C needs no generator, and the hooks that
+derive values from options were C anyway. Stage 1's settings core is built
+that way (5 Oct).
 
 **Hooks, added when a pack needs one.** Title behaviour that today is a fork
 of `present.c` or `render_gl.c` becomes a hook in the shared host:
@@ -223,8 +234,11 @@ shipped with a release includes every pack it was built with.
 **Moving the host (stages 1–3), in the order that unblocks the rest:**
 
 1. **Stage 1: the registration call and the settings core.** Last Raven's
-   `settings.c` core moves into the toolkit, its options move into
-   manifests, and the three Armored Core titles are built on it.
+   `settings.c` core moves into the toolkit, its options become the title's
+   schema, and the three Armored Core titles are built on it. *The settings
+   core was done 5 Oct* (`src/host/settings.c`, `tests/test_settings.c`).
+   Last Raven's printouts, preferences file, launcher screenshots and garage
+   replay are byte-identical across the move.
 2. **Stage 1: `present.c`'s shared core.** That is the SDL thread, GL
    handoff, frame conversion, controller ownership, look channel and dialog
    integration. Audio becomes a hook, and the title becomes a runtime value.
@@ -237,7 +251,7 @@ shipped with a release includes every pack it was built with.
    lines of drift are reconciled.
 5. **Stage 3: The 3rd Birthday becomes a pack.** Its features move onto
    hooks, and its launcher pages (Graphics, Gameplay, Controller, Keyboard &
-   Mouse, Advanced) become manifest pages.
+   Mouse, Advanced) become pages of its schema.
 
 The launcher stays a separate pre-launch process, and its INI file and
 `--config`/`--preset` arguments remain the contract with each game.
