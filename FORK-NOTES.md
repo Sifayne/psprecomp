@@ -21,7 +21,9 @@ audio/video, scheduling and interactive savedata support.
 
 Host code that both games carried moves here once it no longer depends on
 either: `src/host/` (built as `psprecomp_host` with `-DPSPRECOMP_HOST=ON`)
-holds the SDL2 savedata dialog, and `tools/oracle/oracle_diff.c` the
+holds the SDL2 savedata dialog and presentation layer, `src/host/settings.c`
+(always built, as `psprecomp_settings`) the player settings mechanism, and
+`tools/oracle/oracle_diff.c` the
 differential oracle. A game compiles them rather than keeping its own copy. The game's
 `tools/psprecomp` submodule pins the exact runtime revision it uses; building
 the game does not use a separate standalone clone or apply a patch series.

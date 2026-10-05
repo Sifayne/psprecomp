@@ -242,6 +242,13 @@ shipped with a release includes every pack it was built with.
 2. **Stage 1: `present.c`'s shared core.** That is the SDL thread, GL
    handoff, frame conversion, controller ownership, look channel and dialog
    integration. Audio becomes a hook, and the title becomes a runtime value.
+   *Moved 5 Oct* (`src/host/present.c`, `tests/test_present.c`), whole and
+   with Last Raven's behaviour. The title is `psp_title_info`: a name,
+   capability bits replacing the weak flags, and optional control notes.
+   The carriers are `PSP_PAD_*`. Garage and both sibling probes replay to
+   identical summaries, and the windowed startup lines are unchanged. The
+   audio hook waits for The 3rd Birthday's mixer in stage 3, the first
+   consumer that needs it.
 3. **Stage 2: the importer, compiler and packaging recipe move into
    psprecomp.** Last Raven's three titles become packs. The packaged result
    has to match the `deck-test-6` evidence: control logs of 2,713 records
