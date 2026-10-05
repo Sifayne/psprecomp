@@ -296,6 +296,19 @@ shipped with a release includes every pack it was built with.
      - The 3rd Birthday keeps its own richer launcher for development.
    - Decided 5 Oct: The 3rd Birthday is packaged before `render_gl.c` is
      merged. Its pack carries its own `render_gl.c` until then.
+   - *The 3rd Birthday is a pack, 5 Oct* (its `pack.json` and
+     `packaging/linux/pack.cmake`).
+     - Its replacements compile on the player's machine.
+       `aspect_camera.c` needs no generated header, so it is a host
+       object, and `compile_game.py` is unchanged.
+     - Its AppImage passed every builder check.
+     - Its importer took the retail ISO and compiled the game in 2 m 17 s.
+     - The packaged game replayed the `gameplay` scenario to a GE capture
+       and PCM byte-identical to the development build's, with 0 bad
+       accesses, and ran it through GL at 1080p.
+     - Last Raven's package, rebuilt on the shared launcher, passes the
+       same checks. Its builder screenshots match stage 2's, apart from
+       one save time.
    - Still open: `render_gl.c` (step 4: each game's adaptive-aspect HUD
      heuristics and The 3rd Birthday's bloom detection need per-title
      hooks).
