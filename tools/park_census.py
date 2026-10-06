@@ -64,6 +64,8 @@ def main():
             if not ROW.match(line):
                 continue
             f_ = line.rstrip("\n").split("\t")
+            if len(f_) < 11:        # cut short, or interleaved with other output
+                continue
             _, uid, name, state, kind, call, what, site, nest, frames, verdict = f_[:11]
             if verdict == "refused-host-frames":
                 refusals[(name, call, frames)] += 1

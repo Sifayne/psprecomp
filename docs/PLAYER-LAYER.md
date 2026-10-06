@@ -680,9 +680,11 @@ thread, right after its controller read.
 |---|---|---|---|---|---|
 | The 3rd Birthday | gameplay (boot to the street), modern-buttons (street, pause), modern-hub (a save loaded into the hub), movie-audio | 98 | 38 | 60 | 0 |
 | Last Raven | pause-look (intro, menus, garage, a mission, pause), mission-effects (fire and boost, Higher FPS on and off) | 37 | 12 | 2 | 23 |
+| AC3 Portable | pause-peek (menus, the first sortie, pause) | 13 | 3 | 1 | 9 |
+| Silent Line | mission (menus into a mission) | 7 | 1 | 0 | 6 |
 
-AC3 Portable and Silent Line run slower headless: their first pass covered
-the menus only. Its 11 censuses parked the same way as Last Raven's.
+The Armored Core replays need movie decoding (`09-replay.sh --decode`):
+without it the runtime refuses the movie, and the game waits at it for good.
 
 The threads were parked in eight firmware calls in all:
 
@@ -702,12 +704,14 @@ is only "return". The scope stays as decided, quick save and load anywhere.
 
 Two things refuse a save at the safe point:
 
-- **Last Raven's mission loop.** `0x00102018` is replaced (`fps_native_loop`
-  and its Higher FPS loop). From the sortie on (poll 1500 of pause-look;
-  play starts near 2050) the safe point sits under it, with Higher FPS on
-  or off. Menus and the garage
-  are clear. Stage 8 needs the registered resume this section already plans
-  for it, at its frame start, `0x0010209C`.
+- **The Armored Core mission loops.** Each title's mission loop is replaced
+  by `fps_native_loop` and its Higher FPS loop: `0x00102018` in Last
+  Raven, `0x000E0F10` in AC3 Portable, `0x000914B0` in Silent Line. From
+  the sortie on, the safe point sits under it, with Higher FPS on or off.
+  In Last Raven that is from poll 1500 of pause-look, with play starting
+  near 2050. Menus and the garage are clear. Stage 8 needs the registered
+  resume this section already plans for it, one per title, at the loop's
+  frame start (Last Raven's is `0x0010209C`).
 - **A movie playing** (a movie context holding stream data): most of The 3rd
   Birthday's opening. As planned, a quick save waits for the next safe point
   and says why. The savedata dialog was never open at a census; a finished
