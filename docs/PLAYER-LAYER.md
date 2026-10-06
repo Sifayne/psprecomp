@@ -658,17 +658,94 @@ unregistered one at save time.
 ### The census (stage 4)
 
 `PSPRECOMP_PARK_CENSUS=<polls>` prints, at the safe point, where every guest
-thread is parked:
+thread is parked (`src/hle/census.c`):
 
 - handler, wait type and object;
 - callback nesting;
 - live replacements;
 - whether a movie or dialog is active.
 
-Run it over the existing scenarios: Last Raven's title, garage, mission and
-pause; AC3P and Silent Line in a sortie; The 3rd Birthday's equivalents.
-The table goes into this file. It decides how many waits need splitting,
-and whether the safe point has to move.
+The safe point is the one stage 5 will formalize: a firmware call from the
+GE-owning thread's own guest code has completed. The scheduler records each
+park as it happens (block, delay, yield, preemption). Every host frame that
+calls back into guest code marks itself per thread: the runtime's guest
+calls and interrupt handlers, and every call the emitted code makes into a
+function the host replaced (`PSP_REPLACED`, emitted always).
+`tools/park_census.py` reduces the logs.
+
+*Results, 6 Oct.* Every census found the safe point on the game's main
+thread, right after its controller read.
+
+| Title | Replays | Censuses | Resumable, given split waits | Movie playing | Under host frames |
+|---|---|---|---|---|---|
+| The 3rd Birthday | gameplay (boot to the street), modern-buttons (street, pause), modern-hub (a save loaded into the hub), movie-audio | 98 | 38 | 60 | 0 |
+| Last Raven | pause-look (intro, menus, garage, a mission, pause), mission-effects (fire and boost, Higher FPS on and off) | 37 | 12 | 2 | 23 |
+
+AC3 Portable and Silent Line run slower headless: their first pass covered
+the menus only. Its 11 censuses parked the same way as Last Raven's.
+
+The threads were parked in eight firmware calls in all:
+
+| Call | Kind | Where |
+|---|---|---|
+| `sceKernelWaitSemaCB` | a queue wait | The 3rd Birthday's three stream handlers |
+| `sceKernelSleepThreadCB` | a wakeup count | The 3rd Birthday's file reader |
+| `sceKernelWaitThreadEnd` | waits for a thread | Armored Core's `user_main`, for the game thread |
+| `sceKernelDelayThread`, `sceKernelDelayThreadCB` | a timed delay | both games' sound and movie threads |
+| `sceAudioOutputPannedBlocking`, `sceAudioOutput2OutputBlocking` | a timed delay (the runtime's audio pacing) | both games' mixers |
+| `sceMpegRingbufferAvailableSize` | a delay inside the call | during movies only, which are refused anyway |
+
+None was a nested call, and no thread was inside a callback when the census
+ran. So the split is small: three real waits, whose parked state is a
+queue position or a count, and two kinds of timed delay, whose finish half
+is only "return". The scope stays as decided, quick save and load anywhere.
+
+Two things refuse a save at the safe point:
+
+- **Last Raven's mission loop.** `0x00102018` is replaced (`fps_native_loop`
+  and its Higher FPS loop). From the sortie on (poll 1500 of pause-look;
+  play starts near 2050) the safe point sits under it, with Higher FPS on
+  or off. Menus and the garage
+  are clear. Stage 8 needs the registered resume this section already plans
+  for it, at its frame start, `0x0010209C`.
+- **A movie playing** (a movie context holding stream data): most of The 3rd
+  Birthday's opening. As planned, a quick save waits for the next safe point
+  and says why. The savedata dialog was never open at a census; a finished
+  one (status 4) is only a status word.
+
+### Resume entries: what they cost (stage 4)
+
+`allegrexrecomp emit --resume` gives every call's return site a case in its
+function's entry switch, without a dispatch thunk of its own. It also gives
+each function holding one a `psp_resume_<addr>(site)`, and the module a
+sorted table that `psp_resume_chain` climbs. `tests/test_resume.c` checks it
+end to end on a three-deep chain interrupted inside a firmware call:
+scrambled, restored and resumed natively, the chain ends in the
+uninterrupted run's registers and memory, and so does the interpreter from
+the same snapshot.
+
+Emitted, all four titles:
+
+| Title | Return sites | Switch cases | Dispatch thunks | Generated C |
+|---|---|---|---|---|
+| The 3rd Birthday | 61,261 | 62,311 → 121,732 | 51,913, unchanged | 107.5 → 115.0 MB |
+| Last Raven | 50,323 | 52,333 → 102,817 | 43,324, unchanged | 78.4 → 84.8 MB |
+| AC3 Portable | 35,042 | 40,996 → 76,061 | 34,264, unchanged | 61.2 → 65.6 MB |
+| Silent Line | 39,895 | 42,862 → 83,030 | 35,476, unchanged | 65.4 → 70.5 MB |
+
+Built at `-O2` the way the games' own scripts split it, and replayed
+headless. Instructions are counted with `perf_event_open`; the machine was
+busy, so wall time is not used.
+
+| Title | Compile CPU | Code | Resume table | Replay instructions |
+|---|---|---|---|---|
+| The 3rd Birthday | 466 → 496 s (+6.5%) | 29.6 → 31.5 MB (+6.1%) | 0.98 MB | +0.010% (gameplay, 239.3 billion; three runs each) |
+| Last Raven | 314 → 330 s (+5.3%) | 20.2 → 21.9 MB (+8.0%) | 0.81 MB | +0.002% (mission-effects, 2,832 billion; two runs each) |
+
+Every replay ended identically with and without resume entries. The
+measured cost is mostly in the build. In play it is within the noise of the
+replays themselves. So resume entries can be the default when stage 8 needs
+them.
 
 ### What a state holds
 
