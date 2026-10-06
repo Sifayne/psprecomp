@@ -129,6 +129,9 @@ void psp_census_check(void) {
     const int dialog = psp_utility_census();
     fprintf(out, "census: movie contexts %d (%d holding stream data), savedata dialog status %d (%s)\n",
             movies, fed, dialog, dialog >= 1 && dialog <= 3 ? "open" : dialog == 4 ? "finished" : "none");
+    /* Flushed: a long run's stderr goes to a file, block-buffered, and one
+     * that is stopped from outside would otherwise lose its censuses. */
+    fflush(out);
 }
 
 /* What resuming this thread would take, in the plan's terms (§5, "What can
