@@ -124,8 +124,11 @@ void psp_census_check(void) {
     psp_sched_census(out, self);
     int fed = 0;
     const int movies = psp_mpeg_census(&fed);
-    fprintf(out, "census: movie contexts %d (%d holding stream data), savedata dialog status %d\n",
-            movies, fed, psp_utility_census());
+    /* 1..3 are a dialog in progress; 4, finished, is only a status word
+     * the game has not shut down yet, which a state carries as data. */
+    const int dialog = psp_utility_census();
+    fprintf(out, "census: movie contexts %d (%d holding stream data), savedata dialog status %d (%s)\n",
+            movies, fed, dialog, dialog >= 1 && dialog <= 3 ? "open" : dialog == 4 ? "finished" : "none");
 }
 
 /* What resuming this thread would take, in the plan's terms (§5, "What can
