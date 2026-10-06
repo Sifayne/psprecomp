@@ -309,9 +309,31 @@ shipped with a release includes every pack it was built with.
      - Last Raven's package, rebuilt on the shared launcher, passes the
        same checks. Its builder screenshots match stage 2's, apart from
        one save time.
-   - Still open: `render_gl.c` (step 4: each game's adaptive-aspect HUD
-     heuristics and The 3rd Birthday's bloom detection need per-title
-     hooks).
+   - *`render_gl.c` merged, 6 Oct* (`src/host/render_gl.c`; step 4).
+     - The 3rd Birthday's backend, a superset of Last Raven's, is the base.
+     - What was that game's own is title data:
+       - `PSP_TITLE_ASPECT_BY_SOURCE`: screen-space draws placed by what
+         they read;
+       - `psp_title.bloom`: the glow composite the smooth filter
+         recognises;
+       - the scene extent, through `present_aspect_extent`.
+     - Armored Core keeps its rule: a full-width screen-space draw fills
+       the wide scene.
+     - Checked by replaying 17 game captures through both backends across
+       seven to nine resolution, aspect, window-shape and bloom settings:
+       131 cases.
+       - The 3rd Birthday: all 54 cases identical, images and reports. Its six GL
+         fixtures report identically.
+       - Last Raven: classification, native aspect and tall windows
+         unchanged. Three general fixes now apply, each reproduced by
+         reverting it alone:
+         - nearest sampling's texel-boundary tolerance;
+         - a whole-pixel HUD origin at window resolution with the wide
+           aspect;
+         - the exact scene scale at PSP resolution with the wide aspect,
+           which was up to 0.3 px too wide.
+       - Its render, resolution, preview and savedata checks keep their
+         counts.
 
 The launcher stays a separate pre-launch process, and its INI file and
 `--config`/`--preset` arguments remain the contract with each game.

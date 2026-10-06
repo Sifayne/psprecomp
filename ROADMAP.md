@@ -292,12 +292,11 @@ Gaps found in the code while checking this file, none of them on a phase above:
       holds the hardware's secure saves under known keys.
 - [ ] **Windows** — the Windows half of `src/os.c` has not been through a
       Windows build in this fork.
-- [ ] **The rest of the host** — `present.c` and the settings mechanism are
-      here (`src/host/`), and Last Raven's titles use them. The 3rd Birthday
-      still carries its own copies, which differ in audio handoff, input
-      carriers and aspect; both games carry `render_gl.c` (the GL backend) and
-      `boot.c`, which have drifted apart. The order is stages 1–3 of
-      [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md). `boot.c` is where both
+- [ ] **The rest of the host** — `present.c`, the settings mechanism, the
+      launcher and the GL backend (`render_gl.c`) are here (`src/host/`), and
+      both games use them, stating what is theirs in `psp_title_info`. Each
+      still carries its own `boot.c`, and they have drifted apart. The order
+      was stages 1–3 of [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md). `boot.c` is where both
       register `sceKernelStopUnloadSelfModuleWithStatus` (0x8F2DF740, whose
       name does not hash to its NID; uofw `start-stopModule.c`), because its
       exit path needs the host.
