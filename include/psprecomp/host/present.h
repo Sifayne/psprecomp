@@ -67,6 +67,8 @@ int   present_adaptive_aspect(void);
  * cannot give one frame's projection and its placement different sizes. */
 void  present_aspect_scene_size(int *w, int *h);
 void  present_aspect_latch_scene_size(int w, int h);
+/* The scene for a given drawable, latched or not: what the renderer latches. */
+void  present_aspect_extent(int draw_w, int draw_h, int *w, int *h);
 /* The scene's width alone. */
 int   present_aspect_wide_width(void);
 void  present_gl_swap(void);
@@ -83,6 +85,7 @@ static inline void  present_request_window_size(int w, int h) { (void)w; (void)h
 static inline int   present_aspect_wide_width(void) { return 480; }
 static inline void  present_aspect_scene_size(int *w, int *h) { *w = 480; *h = 272; }
 static inline void  present_aspect_latch_scene_size(int w, int h) { (void)w; (void)h; }
+static inline void  present_aspect_extent(int dw, int dh, int *w, int *h) { (void)dw; (void)dh; *w = 480; *h = 272; }
 static inline void  present_gl_swap(void) { }
 static inline void  present_note_frame(void) { }
 static inline void *present_gl_proc(const char *name) { (void)name; return 0; }

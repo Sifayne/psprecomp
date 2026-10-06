@@ -825,6 +825,12 @@ static void wide_scene(int draw_w, int draw_h, int *scene_w, int *scene_h) {
     *scene_w = (int)ww; *scene_h = SCREEN_H;
 }
 
+void present_aspect_extent(int draw_w, int draw_h, int *scene_w, int *scene_h) {
+    *scene_w = SCREEN_W; *scene_h = SCREEN_H;
+    if (psp_title_info.scene_extent) psp_title_info.scene_extent(draw_w, draw_h, scene_w, scene_h);
+    else if (draw_w > 0 && draw_h > 0) wide_scene(draw_w, draw_h, scene_w, scene_h);
+}
+
 void present_aspect_scene_size(int *scene_w, int *scene_h) {
     *scene_w = SCREEN_W; *scene_h = SCREEN_H;
     if (!present_adaptive_aspect()) return;
@@ -836,8 +842,7 @@ void present_aspect_scene_size(int *scene_w, int *scene_h) {
     }
     int w = 0, h = 0;
     present_gl_drawable_size(&w, &h);
-    if (psp_title_info.scene_extent) psp_title_info.scene_extent(w, h, scene_w, scene_h);
-    else if (w > 0 && h > 0) wide_scene(w, h, scene_w, scene_h);
+    present_aspect_extent(w, h, scene_w, scene_h);
 }
 
 int present_aspect_wide_width(void) {

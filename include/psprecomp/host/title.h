@@ -22,7 +22,27 @@ enum {
     PSP_TITLE_ADAPTIVE_ASPECT = 1u << 1,
     /* The title places off-screen HUD draws in the wide bands. */
     PSP_TITLE_HUD_BANDS       = 1u << 2,
+    /* At a wide aspect the GL backend places the title's screen-space draws
+     * by what they read: one that reads a render target composites the
+     * scene and fills it, at any width, and other textured 2D -- movies and
+     * menus too, full width or not -- keeps its proportions in the centred
+     * area. Without it every full-width screen-space draw fills the scene
+     * (Armored Core's movies in strips, bars and fades). The 3rd Birthday's. */
+    PSP_TITLE_ASPECT_BY_SOURCE = 1u << 3,
 };
+
+/* The GL backend's smooth bloom filter (setting BLOOM_FILTER): the title's
+ * final glow composite, which it draws from a small scratch target as a
+ * full-screen sprite. The backend recognises the draw by this description,
+ * not by an address, and samples it with a soft cubic instead of the PSP's
+ * bilinear steps; nothing else changes. */
+typedef struct {
+    uint16_t w, h;          /* the scratch target, in pixels; its stride is w */
+    uint8_t target_fmt;     /* the pixel format it is drawn in (GE 0..3) */
+    uint8_t tex_fmt;        /* the texture format the composite reads it as */
+    uint8_t tex_func;       /* the composite's texture function */
+    uint8_t blend_src, blend_dst;   /* and its blend factors (equation add) */
+} psp_bloom_composite;
 
 /* key is an SDL_Keycode; bit a PSP button or a carrier. */
 typedef struct { int32_t key; uint32_t bit; } psp_key_bind;
@@ -60,6 +80,10 @@ typedef struct {
 
     /* The title's own audio output; NULL uses the host's mixer. */
     const struct psp_audio_backend *audio;
+
+    /* The glow composite the smooth bloom filter recognises; NULL: the
+     * title has none, and the filter does nothing. */
+    const psp_bloom_composite *bloom;
 } psp_title;
 
 extern const psp_title psp_title_info;
