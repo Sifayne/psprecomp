@@ -8,6 +8,7 @@
 #include "psprecomp/hle.h"          /* psp_ktimer_in_handler */
 
 #include "psprecomp/os.h"
+#include "census.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -71,6 +72,7 @@ typedef struct {
     uint64_t        run_us, run_since;
     uint32_t        releases, thread_preempts, intr_preempts;
     psp_cpu_state   ctx;           /* valid whenever this slot is not running */
+    psp_park        park;          /* how it last parked: the census (census.h) */
     psp_os_thread   host;
     int             started;
     int             joined;        /* host thread reaped by psp_sched_join_all */
@@ -147,6 +149,7 @@ void psp_sched_init(void) {
      * before anything can be waiting on it. */
     psp_os_cond_use_monotonic(&g_turn);
     psp_sched_reset();
+    psp_census_init();
 }
 
 void psp_sched_set_threading(int on) { g_threading = on; }
@@ -455,6 +458,7 @@ static int switch_away(int me, psp_sched_state why, const char *what,
     if (psp_interrupt_in_handler()) return -1;
     psp_os_lock(&g_lock);
     g_slot[me].ctx        = psp_cpu;
+    psp_census_note_park(&g_slot[me].park, PSP_PARK_BLOCK, what, deadline_us);
     /* With a deadline the wait *is* a sleep as far as the handoff is concerned:
      * SLEEPING plus wake_at is the state it already knows how to expire, and
      * teaching it a second one would be two mechanisms for one thing. What the
@@ -729,6 +733,7 @@ static void yield_as(int displaced) {
     const int me = g_running;
     if (me < 0) { psp_os_unlock(&g_lock); return; }
     g_slot[me].ctx = psp_cpu;
+    psp_census_note_park(&g_slot[me].park, displaced ? PSP_PARK_PREEMPT : PSP_PARK_YIELD, NULL, 0);
     /* Displaced goes to the head of its queue, a yield to the tail; see
      * sched_slot.rq_time for the measurements. */
     if (displaced) ready_head_locked(me);
@@ -784,6 +789,8 @@ int psp_sched_delay(uint64_t usec) {
     const int me = g_self;
 
     g_slot[me].ctx      = psp_cpu;
+    psp_census_note_park(&g_slot[me].park, PSP_PARK_DELAY, NULL,
+                         psp_clock_peek() + (usec ? usec : 1));
     g_slot[me].state    = PSP_SCHED_SLEEPING;
     g_slot[me].woken    = 0;
     g_slot[me].park_seq = ++g_rq_seq;
@@ -1055,6 +1062,36 @@ int psp_sched_drain(int timeout_s) {
  * gives up; a wait that cannot be satisfied needs exactly the same list, and
  * printing it there is the difference between "deadlock" and knowing which
  * semaphore nobody is going to signal. */
+/* The census's thread lines: copied under the lock, printed without it,
+ * since the names come from the thread manager. */
+void psp_sched_census(FILE *out, uint32_t self) {
+    static const char *const ST[] = { "ready", "running", "blocked", "sleeping", "dead" };
+    static struct { uint32_t uid, entry; int priority, suspended; psp_sched_state state; psp_park park; }
+        copy[MAX_SCHED_THREADS];
+    int n = 0;
+    psp_os_lock(&g_lock);
+    for (int i = 0; i < g_slot_hi; i++) {
+        const sched_slot *t = &g_slot[i];
+        if (!t->used || t->state == PSP_SCHED_DEAD) continue;
+        copy[n].uid = t->uid; copy[n].entry = t->entry; copy[n].priority = t->priority;
+        copy[n].suspended = t->suspended; copy[n].state = t->state; copy[n].park = t->park;
+        n++;
+    }
+    psp_os_unlock(&g_lock);
+    for (int i = 0; i < n; i++) {
+        const int me = copy[i].uid == self;
+        const char *name = psp_threadman_thread_name(copy[i].uid);
+        fprintf(out, "census:   0x%08X %-24s prio %3d %-8s ", copy[i].uid, name,
+                copy[i].priority, me ? "SAFE" : ST[copy[i].state]);
+        if (me) fprintf(out, "at the safe point");
+        else if (!copy[i].park.kind) fprintf(out, "not started: entry 0x%08X", copy[i].entry);
+        else psp_census_print_park(out, &copy[i].park);
+        if (copy[i].suspended) fprintf(out, " (suspended)");
+        fprintf(out, "\n");
+        if (!me) psp_census_row(out, copy[i].uid, name, ST[copy[i].state], &copy[i].park, copy[i].entry);
+    }
+}
+
 void psp_sched_dump_threads(FILE *out) {
     psp_os_lock(&g_lock);
     dump_locked(out, 0);

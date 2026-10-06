@@ -2,6 +2,7 @@
  * Secure modes still store plaintext; encryption is a separate capability.
  * Interactive requests never write or delete before explicit confirmation. */
 #include "psprecomp/hle.h"
+#include "census.h"
 #include "psprecomp/cpu.h"
 #include "psprecomp/os.h"
 #include "psprecomp/sched.h"
@@ -1203,6 +1204,9 @@ int psp_savedata_set_script(const char *path) {
     }
     return 0;
 }
+/* For the park census (census.h). */
+int psp_utility_census(void) { return g_savedata_state; }
+
 void psp_utility_init(void) {
     g_savedata_state=PSP_UTILITY_DIALOG_NONE;
     g_savedata_param=0; g_savedata_done=0; g_savedata_interactive=0;

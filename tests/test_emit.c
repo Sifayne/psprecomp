@@ -408,9 +408,13 @@ static void test_replace_leaves_the_symbol_to_the_host(void) {
           "replace: the public symbol is left undefined for the host");
     expect_contains(src, "psp_body_08804000",
                     "replace: the translated body itself is untouched");
-    expect_contains(src, "psp_register(0x08804000u, psp_func_08804000);",
-                    "replace: registration still points at the public symbol, "
-                    "so indirect calls reach the replacement");
+    expect_contains(src, "psp_register(0x08804000u, psp_replaced_08804000);",
+                    "replace: registration points at the replacement's marker, "
+                    "so indirect calls count its host frame");
+    expect_contains(src, "void psp_replaced_08804000(void) "
+                         "{ PSP_REPLACED(0x08804000u, psp_func_08804000()); }",
+                    "replace: the marker calls the public symbol, so indirect "
+                    "calls still reach the replacement");
     free(src);
 
     char *hdr = slurp("./t_rep_funcs.h", NULL);

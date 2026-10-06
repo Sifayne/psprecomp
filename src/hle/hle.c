@@ -6,6 +6,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/interrupt.h"
 #include "psprecomp/os.h"
+#include "census.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,7 +71,9 @@ uint32_t psp_call_guest(uint32_t addr, const uint32_t *args, int nargs) {
     for (int i = 0; i < nargs && i < 8; i++)
         psp_cpu.r[i < 4 ? PSP_REG_A0 + i : PSP_REG_T0 + (i - 4)] = args[i];
     psp_cpu.r[PSP_REG_RA] = 0;
+    psp_nest_enter(PSP_NEST_CALL_GUEST, addr);
     psp_dispatch(addr);
+    psp_nest_leave();
     const uint32_t v0 = psp_cpu.r[PSP_REG_V0];
     psp_cpu = saved;
     return v0;
@@ -221,6 +224,8 @@ void psp_hle_dump_calls(FILE *out, int top) {
 
 void psp_hle_call(uint32_t nid) {
     g_call_depth++;
+    /* Where the guest resumes after this call: its $ra, set by the jal. */
+    psp_census_call_enter(nid, psp_cpu.r[PSP_REG_RA]);
     /* Every firmware call costs a tick of guest time.
      *
      * The clock advanced three ways and every one of them could stop. A vblank
@@ -292,6 +297,10 @@ void psp_hle_call(uint32_t nid) {
             psp_ktimer_tick();
             psp_display_tick();
             psp_interrupt_run_pending();
+            /* The safe point the park census (census.h) is taken at: a call
+             * from the thread's own guest code, finished. */
+            if (psp_census_next && g_call_depth == 1) psp_census_check();
+            psp_census_call_leave();
             g_call_depth--;
             return;
         }
@@ -315,6 +324,7 @@ void psp_hle_call(uint32_t nid) {
         fprintf(stderr, "psprecomp: unimplemented firmware call 0x%08X\n", nid);
     psp_ret(0);
     psp_interrupt_run_pending();
+    psp_census_call_leave();
     g_call_depth--;
 }
 

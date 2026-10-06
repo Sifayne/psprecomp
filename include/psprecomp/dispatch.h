@@ -23,6 +23,42 @@ extern "C" {
 
 typedef void (*psp_fn_t)(void);
 
+/* Host frames between guest frames.
+ *
+ * A save state resumes a thread natively from the return addresses on its
+ * guest stack (docs/PLAYER-LAYER.md §5), which only covers a thread whose C
+ * stack holds guest frames alone. Every host frame that calls back into guest
+ * code marks itself, so a thread parked under one is known: the runtime's
+ * guest calls and interrupt handlers, and every call the emitted code makes
+ * into a function the host replaced (PSP_REPLACED). Per host thread. */
+enum { PSP_NEST_CALL_GUEST = 1, PSP_NEST_INTERRUPT, PSP_NEST_REPLACED };
+void     psp_nest_enter(int kind, uint32_t addr);
+void     psp_nest_leave(void);
+unsigned psp_nest_depth(void);
+#define PSP_REPLACED(addr, call) \
+    do { psp_nest_enter(PSP_NEST_REPLACED, (addr)); call; psp_nest_leave(); } while (0)
+
+/* Resuming a guest call chain natively (docs/PLAYER-LAYER.md §5).
+ *
+ * A module emitted with --resume makes each call's return site an entry of
+ * the function holding it, and registers a table of them. A thread whose
+ * register file and memory have been restored continues at the return site
+ * of its innermost call: entering that function there runs it to its
+ * `jr $ra`, whose epilogue has reloaded $ra from the guest stack with its
+ * caller's return site, which is entered next, and so on until $ra is 0 --
+ * the thread's entry point returning, as thread_main sets it up. The guest
+ * stack is the whole state; no host frame needs to survive. */
+typedef void (*psp_resume_fn)(uint32_t site);
+typedef struct { uint32_t site; psp_resume_fn fn; } psp_resume_site;
+/* `sites` sorted by site, and kept by the caller (the emitted table). */
+void          psp_resume_register(const psp_resume_site *sites, int count);
+psp_resume_fn psp_resume_lookup(uint32_t site);
+int           psp_resume_count(void);
+/* Continue the current thread at `site` until $ra reaches `stop` (0 for a
+ * whole thread). Returns 0, or -1 with the address that is no return site in
+ * *missing: nothing has run past the frames already resumed. */
+int           psp_resume_chain(uint32_t site, uint32_t stop, uint32_t *missing);
+
 /* Register one recompiled function. The generated code calls this for every
  * function it defines, from a single init routine. */
 void psp_register(uint32_t addr, psp_fn_t fn);

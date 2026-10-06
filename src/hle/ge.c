@@ -37,6 +37,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/render.h"
 #include "psprecomp/sched.h"
+#include "census.h"
 
 #include <stdio.h>
 #include <errno.h>
@@ -712,7 +713,13 @@ static struct { unsigned long id; uint64_t lists; } g_ge_threads[GE_MAX_THREADS]
 static int g_ge_nthreads;
 static uint64_t g_ge_thread_overflow;
 
+/* The guest thread that last ran a list: the one whose host thread owns the
+ * GL context, and so the one a save is taken on (census.h). */
+static uint32_t g_ge_owner;
+uint32_t psp_ge_owner(void) { return g_ge_owner; }
+
 static void ge_note_thread(void) {
+    g_ge_owner = psp_sched_current();
 #ifndef _WIN32
     const unsigned long id = (unsigned long)pthread_self();
 #else

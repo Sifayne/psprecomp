@@ -13,6 +13,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "census.h"
 #include "psprecomp/cpu.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/os.h"
@@ -496,6 +497,19 @@ static void hle_RingbufferAvailableSize(void) {
  * infinite spin the choice of INVALID_VALUE above exists to avoid. Refuse the
  * override instead of quietly doing the harmful thing. */
 static int g_decode_override = -1;
+
+/* For the park census (census.h): contexts in use, and how many hold stream
+ * data a decoder would have to be rebuilt from. */
+int psp_mpeg_census(int *fed) {
+    int used = 0, with_data = 0;
+    for (int i = 0; i < MAX_MPEG; i++) {
+        if (!g_mpeg[i].used) continue;
+        used++;
+        if (g_mpeg[i].es_len || g_mpeg[i].aes_len) with_data++;
+    }
+    if (fed) *fed = with_data;
+    return used;
+}
 
 int psp_mpeg_decoding_available(void) {
 #if PSPRECOMP_HAVE_OPENH264

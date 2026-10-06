@@ -37,6 +37,13 @@ typedef struct {
     uint32_t *entries;     /* interior labels that got a dispatch thunk */
     int nentries, centries;
     const emit_opts *o;    /* for the replace set; see is_replaced() */
+    /* --resume: every call's return site, module-wide, since the function
+     * that makes a call is not always the one that owns the address after
+     * it. And the table built from them, {site, owning function}. */
+    uint8_t *is_resume_site;
+    uint8_t *resume_only;  /* per word, within the current function: no thunk */
+    uint32_t (*resume)[2];
+    int nresume, cresume;
 } ectx;
 
 /* Is this function one the host will define itself? See emit_opts.replace.
@@ -60,6 +67,19 @@ static void entry_push(ectx *c, uint32_t a) {
         c->centries = n;
     }
     c->entries[c->nentries++] = a;
+}
+
+static void resume_push(ectx *c, uint32_t site, uint32_t owner) {
+    if (c->nresume == c->cresume) {
+        int n = c->cresume ? c->cresume * 2 : 4096;
+        uint32_t (*p)[2] = realloc(c->resume, (size_t)n * sizeof *p);
+        if (!p) return;
+        c->resume = p;
+        c->cresume = n;
+    }
+    c->resume[c->nresume][0] = site;
+    c->resume[c->nresume][1] = owner;
+    c->nresume++;
 }
 
 /* ---- helpers ------------------------------------------------------------- */
@@ -110,6 +130,17 @@ static void comment(ectx *c, const a_insn *in) {
     fprintf(c->out, "    /* %08X  %s */\n", in->addr, text);
 }
 
+/* The C call to a discovered function. One the host replaced goes through
+ * PSP_REPLACED, so the runtime knows a host frame is live while it runs: a
+ * thread parked under it cannot be resumed from its guest stack alone
+ * (<psprecomp/dispatch.h>, "Host frames between guest frames"). */
+static void call_expr(const ectx *c, uint32_t target, char *buf, size_t n) {
+    if (is_replaced(c->o, target))
+        snprintf(buf, n, "PSP_REPLACED(0x%08Xu, psp_func_%08X())", target, target);
+    else
+        snprintf(buf, n, "psp_func_%08X()", target);
+}
+
 /* Emit a call to whatever lives at a static target. */
 static void emit_static_call(ectx *c, uint32_t target) {
     if (is_import(c->an, target)) {
@@ -121,8 +152,10 @@ static void emit_static_call(ectx *c, uint32_t target) {
          * at the call site catches it wherever the imbalance actually occurs --
          * including across split bodies, where no single body owns both halves
          * of a frame and a per-body check is blind. */
-        fprintf(c->out, "    { uint32_t _spc = r_sp; psp_func_%08X();"
-                        " PSP_SP_CALL(0x%08Xu, _spc, r_sp); }\n", target, target);
+        char call[96];
+        call_expr(c, target, call, sizeof call);
+        fprintf(c->out, "    { uint32_t _spc = r_sp; %s;"
+                        " PSP_SP_CALL(0x%08Xu, _spc, r_sp); }\n", call, target);
     } else {
         /* Discovery did not reach it. Going through the dispatch table means
          * the failure is named at run time instead of failing to link. */
@@ -765,6 +798,23 @@ static void emit_function(ectx *c, const a_func *fn) {
             c->is_label[widx(an, a + 4)] = 1;
     }
 
+    /* Return sites become entries too (--resume), after every other label is
+     * known: one that is only a return site gets a case in the switch below
+     * and a row in the resume table, but no thunk and no dispatch entry --
+     * nothing jumps there, a restored thread only resumes there. */
+    int resumes = 0;
+    if (c->is_resume_site) {
+        for (uint32_t a = fn->start; a < fn->end; a += 4) {
+            if (!owned_by(an, a, owner)) continue;
+            const uint32_t i = widx(an, a);
+            if (!c->is_resume_site[i] || c->is_slot[i]) continue;
+            if (!c->is_label[i]) c->resume_only[i] = 1;
+            c->is_label[i] = 1;
+            resume_push(c, a, fn->addr);
+            resumes++;
+        }
+    }
+
     fprintf(f, "\n/* ---------------------------------------------------------------\n");
     fprintf(f, " * psp_func_%08X  --  %u instructions, %u bytes\n",
             fn->addr, fn->insns, fn->end - fn->addr);
@@ -953,7 +1003,11 @@ static void emit_function(ectx *c, const a_func *fn) {
                 else {
                     fprintf(f, "      if (_c) { ");
                     if (is_import(an, in.target))      fprintf(f, "psp_import_%08X();", in.target);
-                    else if (is_function(an, in.target)) fprintf(f, "psp_func_%08X();", in.target);
+                    else if (is_function(an, in.target)) {
+                        char call[96];
+                        call_expr(c, in.target, call, sizeof call);
+                        fprintf(f, "%s;", call);
+                    }
                     else                                fprintf(f, "psp_dispatch(0x%08Xu);", in.target);
                     fprintf(f, " return; } }\n");
                 }
@@ -1060,8 +1114,10 @@ static void emit_function(ectx *c, const a_func *fn) {
     if (!last_terminal) {
         uint32_t next = fn->end;
         if (is_function(an, next)) {
+            char call[96];
+            call_expr(c, next, call, sizeof call);
             fprintf(f, "    /* falls through into the next function */\n");
-            fprintf(f, "    psp_func_%08X();\n", next);
+            fprintf(f, "    %s;\n", call);
         } else if (a_in_range(an, next)) {
             /* The same defect one step further out: the address after this
              * function is real code, but it is a *label* inside another
@@ -1102,13 +1158,21 @@ static void emit_function(ectx *c, const a_func *fn) {
          * Check for psp_at_ thunks on a candidate before relying on one. */
         fprintf(f, "void psp_func_%08X__orig(void) { psp_body_%08X(0x%08Xu); }\n",
                 fn->addr, fn->addr, fn->addr);
+        /* What the dispatch table calls for it, so an indirect call into the
+         * replacement is counted as a host frame too. */
+        fprintf(f, "void psp_replaced_%08X(void) { PSP_REPLACED(0x%08Xu, psp_func_%08X()); }\n",
+                fn->addr, fn->addr, fn->addr);
     } else {
         fprintf(f, "void psp_func_%08X(void) { psp_body_%08X(0x%08Xu); }\n",
                 fn->addr, fn->addr, fn->addr);
     }
+    if (resumes)
+        fprintf(f, "void psp_resume_%08X(uint32_t _site) { psp_body_%08X(_site); }\n",
+                fn->addr, fn->addr);
     for (uint32_t a = fn->start; a < fn->end; a += 4) {
         if (!owned_by(an, a, owner) || !c->is_label[widx(an, a)]) continue;
         if (c->is_slot[widx(an, a)] || a == fn->addr) continue;
+        if (c->resume_only && c->resume_only[widx(an, a)]) continue;
         fprintf(f, "void psp_at_%08X(void) { psp_body_%08X(0x%08Xu); }\n",
                 a, fn->addr, a);
         entry_push(c, a);
@@ -1117,7 +1181,35 @@ static void emit_function(ectx *c, const a_func *fn) {
 
 /* ---- files --------------------------------------------------------------- */
 
-static void emit_header(FILE *f, const a_analysis *an, const emit_opts *o) {
+/* --resume: the address after every call's delay slot, wherever it lies. A
+ * word that is itself a delay slot cannot be one (the call's own slot is
+ * never a branch), and is left out rather than trusted. */
+static uint8_t *find_resume_sites(const a_analysis *an) {
+    uint8_t *site = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
+    if (!site) return NULL;
+    for (int i = 0; i < an->nfuncs; i++) {
+        const a_func *fn = &an->funcs[i];
+        for (uint32_t a = fn->start; a < fn->end; a += 4) {
+            if (!owned_by(an, a, fn->addr)) continue;
+            a_insn in;
+            a_decode(fetch(an, a), a, &in);
+            if (!in.is_call || !a_in_range(an, a + 8)) continue;
+            a_insn slot;
+            a_decode(fetch(an, a + 4), a + 4, &slot);
+            if (slot.has_delay_slot) continue;
+            site[widx(an, a + 8)] = 1;
+        }
+    }
+    return site;
+}
+
+static int site_order(const void *x, const void *y) {
+    const uint32_t a = ((const uint32_t *)x)[0], b = ((const uint32_t *)y)[0];
+    return a < b ? -1 : a > b;
+}
+
+static void emit_header(FILE *f, const a_analysis *an, const emit_opts *o,
+                        const uint8_t *resume_site) {
     fprintf(f,
         "/* Generated by allegrexrecomp -- do not edit.\n"
         " *\n"
@@ -1187,6 +1279,22 @@ static void emit_header(FILE *f, const a_analysis *an, const emit_opts *o) {
         fprintf(f, "\n/* Originals of the functions the host replaces. */\n");
         for (int i = 0; i < o->nreplace; i++)
             fprintf(f, "void psp_func_%08X__orig(void);\n", o->replace[i]);
+        for (int i = 0; i < o->nreplace; i++)
+            fprintf(f, "void psp_replaced_%08X(void);\n", o->replace[i]);
+    }
+
+    /* --resume: the functions that own a return site, which the resume
+     * table names. */
+    if (resume_site) {
+        fprintf(f, "\n/* Resume entries: continue a restored thread at a return site. */\n");
+        for (int i = 0; i < an->nfuncs; i++) {
+            const a_func *fn = &an->funcs[i];
+            for (uint32_t a = fn->start; a < fn->end; a += 4)
+                if (owned_by(an, a, fn->addr) && resume_site[widx(an, a)]) {
+                    fprintf(f, "void psp_resume_%08X(uint32_t site);\n", fn->addr);
+                    break;
+                }
+        }
     }
 
     fprintf(f, "\n");
@@ -1245,11 +1353,14 @@ static void emit_imports(FILE *f, const a_analysis *an, const emit_opts *o) {
 int a_emit(const a_analysis *an, const emit_opts *o) {
     char path[1024];
 
+    uint8_t *resume_site = o->resume ? find_resume_sites(an) : NULL;
+    if (o->resume && !resume_site) return -1;
+
     /* Header */
     snprintf(path, sizeof path, "%s/%s_funcs.h", o->outdir, o->prefix);
     FILE *h = fopen(path, "w");
-    if (!h) { fprintf(stderr, "cannot write %s\n", path); return -1; }
-    emit_header(h, an, o);
+    if (!h) { fprintf(stderr, "cannot write %s\n", path); free(resume_site); return -1; }
+    emit_header(h, an, o, resume_site);
     fclose(h);
 
     /* Imports */
@@ -1282,6 +1393,10 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     c.is_fallthrough_target = NULL;
     c.entries = NULL;
     c.nentries = c.centries = 0;
+    c.is_resume_site = resume_site;
+    c.resume_only = resume_site ? (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1) : NULL;
+    c.resume = NULL;
+    c.nresume = c.cresume = 0;
     if (!c.is_label || !c.is_slot) {
         free(c.is_fallthrough_target);
     free(c.is_label); free(c.is_slot); free(c.is_fallthrough_target); fclose(f);
@@ -1316,23 +1431,42 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
         " * Populate the dispatch table. Indirect calls -- function pointers,\n"
         " * vtables, callbacks, switch tables — resolve through this.\n"
         " * ------------------------------------------------------------- */\n"
-        "void psp_recomp_register(void) {\n");
+        );
+    /* The resume table, sorted by site for psp_resume_lookup's search. Part
+     * of the registration code, which a split build compiles on its own. */
+    if (c.is_resume_site) {
+        qsort(c.resume, (size_t)c.nresume, sizeof *c.resume, site_order);
+        fprintf(f, "static const psp_resume_site psp_resume_sites[%d] = {\n",
+                c.nresume ? c.nresume : 1);
+        for (int i = 0; i < c.nresume; i++)
+            fprintf(f, "    {0x%08Xu, psp_resume_%08X},\n", c.resume[i][0], c.resume[i][1]);
+        if (!c.nresume) fprintf(f, "    {0, 0},\n");
+        fprintf(f, "};\n");
+    }
+    fprintf(f, "void psp_recomp_register(void) {\n");
     for (int i = 0; i < an->nfuncs; i++)
-        fprintf(f, "    psp_register(0x%08Xu, psp_func_%08X);\n",
-                an->funcs[i].addr, an->funcs[i].addr);
+        fprintf(f, "    psp_register(0x%08Xu, psp_%s_%08X);\n", an->funcs[i].addr,
+                is_replaced(o, an->funcs[i].addr) ? "replaced" : "func", an->funcs[i].addr);
     /* Interior labels last, so a real function entry always wins a collision. */
     for (int i = 0; i < c.nentries; i++)
         fprintf(f, "    psp_register_label(0x%08Xu, psp_at_%08X);\n",
                 c.entries[i], c.entries[i]);
+    if (c.is_resume_site) fprintf(f, "    psp_resume_register(psp_resume_sites, %d);\n", c.nresume);
     fprintf(f, "}\n");
 
     free(c.is_label);
     free(c.is_slot);
     free(c.entries);
+    free(c.is_fallthrough_target);
+    free(c.resume_only);
+    free(c.resume);
+    free(resume_site);
     fclose(f);
 
-    printf("wrote %s/%s_funcs.c   (%d functions, %d interior entries)\n",
-           o->outdir, o->prefix, an->nfuncs, c.nentries);
+    printf("wrote %s/%s_funcs.c   (%d functions, %d interior entries", o->outdir, o->prefix,
+           an->nfuncs, c.nentries);
+    if (o->resume) printf(", %d resume sites", c.nresume);
+    printf(")\n");
     printf("wrote %s/%s_funcs.h\n", o->outdir, o->prefix);
     printf("wrote %s/%s_imports.c (%d imports)\n", o->outdir, o->prefix, an->nimports);
     return 0;

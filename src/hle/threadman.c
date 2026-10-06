@@ -25,6 +25,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "census.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/interrupt.h"
 #include "psprecomp/clock.h"
@@ -1193,6 +1194,12 @@ static void hle_ResumeDispatchThread(void) {
 /* The next uid, shared so that every kernel object type draws from one space --
  * which is what makes a handle of the wrong type resolve to nothing. */
 uint32_t psp_threadman_next_uid(void) { return g_next_uid++; }
+
+/* For the park census (census.h). */
+const char *psp_threadman_thread_name(uint32_t uid) {
+    const psp_thread *t = find_thread(uid);
+    return t ? t->name : "";
+}
 
 uint32_t psp_threadman_current_priority(void) {
     const psp_thread *c = current_thread();

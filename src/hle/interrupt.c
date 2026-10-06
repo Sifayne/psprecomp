@@ -147,7 +147,9 @@ static void deliver(uint32_t entry, uint32_t gp, uint32_t a0, uint32_t a1, uint3
     psp_cpu.r[PSP_REG_RA] = 0;
     if (psp_cpu.r[PSP_REG_SP] >= 16)
         psp_cpu.r[PSP_REG_SP] = (psp_cpu.r[PSP_REG_SP] - 16) & ~15u;
+    psp_nest_enter(PSP_NEST_INTERRUPT, entry);
     psp_dispatch(entry);
+    psp_nest_leave();
     psp_cpu = saved;
     for (unsigned i = 0; i < 16; i++) psp_mtvc(i, controls[i]);
     cpu_enabled = saved_enabled;

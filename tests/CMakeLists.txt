@@ -118,6 +118,24 @@ add_executable(test_interp test_interp.c)
 target_link_libraries(test_interp PRIVATE allegrex_core)
 add_test(NAME interp COMMAND test_interp)
 
+# Resuming a guest call chain natively (docs/PLAYER-LAYER.md §5). A
+# synthetic program is emitted with --resume at build time and compiled into
+# the test, which interrupts it in a firmware call, resumes it, and checks it
+# against the uninterrupted run and the interpreter.
+set(RESUME_GEN ${CMAKE_CURRENT_BINARY_DIR}/resume)
+add_executable(gen_resume gen_resume.c)
+target_link_libraries(gen_resume PRIVATE allegrex_core)
+add_custom_command(
+    OUTPUT ${RESUME_GEN}/t_resume_funcs.c ${RESUME_GEN}/t_resume_imports.c ${RESUME_GEN}/t_resume_funcs.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${RESUME_GEN}
+    COMMAND gen_resume ${RESUME_GEN}
+    DEPENDS gen_resume
+    COMMENT "Emitting the resume test's program")
+add_executable(test_resume test_resume.c ${RESUME_GEN}/t_resume_funcs.c ${RESUME_GEN}/t_resume_imports.c)
+target_include_directories(test_resume PRIVATE ${RESUME_GEN})
+target_link_libraries(test_resume PRIVATE allegrex_core)
+add_test(NAME resume COMMAND test_resume ${RESUME_GEN})
+
 add_executable(test_ctrl_replay test_ctrl_replay.c)
 target_link_libraries(test_ctrl_replay PRIVATE psprecomp)
 add_test(NAME ctrl_replay COMMAND test_ctrl_replay)
