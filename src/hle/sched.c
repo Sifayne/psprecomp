@@ -1066,20 +1066,26 @@ int psp_sched_drain(int timeout_s) {
  * since the names come from the thread manager. */
 void psp_sched_census(FILE *out, uint32_t self) {
     static const char *const ST[] = { "ready", "running", "blocked", "sleeping", "dead" };
-    static struct { uint32_t uid, entry; int priority, suspended; psp_sched_state state; psp_park park; }
+    static struct { uint32_t uid, entry; int slot, priority, suspended; psp_sched_state state; psp_park park; }
         copy[MAX_SCHED_THREADS];
     int n = 0;
     psp_os_lock(&g_lock);
     for (int i = 0; i < g_slot_hi; i++) {
         const sched_slot *t = &g_slot[i];
         if (!t->used || t->state == PSP_SCHED_DEAD) continue;
-        copy[n].uid = t->uid; copy[n].entry = t->entry; copy[n].priority = t->priority;
+        copy[n].uid = t->uid; copy[n].entry = t->entry; copy[n].slot = i; copy[n].priority = t->priority;
         copy[n].suspended = t->suspended; copy[n].state = t->state; copy[n].park = t->park;
         n++;
     }
     psp_os_unlock(&g_lock);
     for (int i = 0; i < n; i++) {
         const int me = copy[i].uid == self;
+        /* The host's own context, which ran module_start and now waits for
+         * the threads to end: not a guest thread, and re-created on a load. */
+        if (copy[i].slot == MAIN_SLOT && !me) {
+            fprintf(out, "census:   (host main context: ran module_start, waits for the threads)\n");
+            continue;
+        }
         const char *name = psp_threadman_thread_name(copy[i].uid);
         fprintf(out, "census:   0x%08X %-24s prio %3d %-8s ", copy[i].uid, name,
                 copy[i].priority, me ? "SAFE" : ST[copy[i].state]);
