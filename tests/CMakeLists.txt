@@ -228,8 +228,25 @@ if(PSPRECOMP_HOST)
     add_test(NAME present COMMAND test_present)
     add_test(NAME present_keyboard COMMAND test_present keyboard)
     add_test(NAME present_controller COMMAND test_present controller)
-    set_tests_properties(present present_keyboard present_controller PROPERTIES
+    add_test(NAME present_modern COMMAND test_present modern)
+    add_test(NAME present_rebind COMMAND test_present rebind)
+    add_test(NAME present_last_pad COMMAND test_present last)
+    set_tests_properties(present present_keyboard present_controller present_modern
+                         present_rebind present_last_pad PROPERTIES
         TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
+
+    # The bindings: the table test against the input code before stage 6
+    # (input_before.h), spelling, rebinding, host actions and the owner. It
+    # includes input.c.
+    add_executable(test_input test_input.c)
+    target_link_libraries(test_input PRIVATE psprecomp_host)
+    if(MSVC)
+        target_compile_options(test_input PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_input PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME input COMMAND test_input)
+    set_tests_properties(input PROPERTIES TIMEOUT 60 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
 
     # The player's launcher, on a schema of its own; it includes launcher.c.
     # Without a font the drawn half skips.

@@ -37,7 +37,7 @@ target_link_libraries(allegrexrecomp PRIVATE runtime)
 
 # The shared host, compiled into the pack's programs by path.
 set(PLAYER_SETTINGS "${TOOLKIT}/src/host/settings.c")
-set(PLAYER_HOST "${TOOLKIT}/src/host/present.c" "${TOOLKIT}/src/host/save_dialog.c"
+set(PLAYER_HOST "${TOOLKIT}/src/host/present.c" "${TOOLKIT}/src/host/input.c" "${TOOLKIT}/src/host/save_dialog.c"
     "${TOOLKIT}/src/host/render_gl.c" "${PLAYER_SETTINGS}")
 set(PLAYER_LAUNCHER "${TOOLKIT}/src/host/launcher.c")
 

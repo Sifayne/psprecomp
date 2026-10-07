@@ -170,6 +170,30 @@ int main(void) {
     for (int i = 0; i < 2; i++) for (int k = 0; k < T_COUNT; k++)
         assert(!strcmp(p.presets[i].settings.value[k], loaded.presets[i].settings.value[k]));
 
+    /* Bindings ride in the preset as written, whatever the host makes of them,
+     * and an empty one survives as an unbinding. Only their shape is checked. */
+    psp_settings *b = &p.presets[0].settings;
+    assert(!psp_settings_bind(b, "key.cross", "Z, Space", error));
+    assert(!psp_settings_bind(b, "pad.fire", "righttrigger", error));
+    assert(!psp_settings_bind(b, "mouse.square", "", error));
+    assert(!psp_settings_bind(b, "key.cross", "F", error) && b->bind_count == 3);   /* replaced */
+    assert(psp_settings_bind(b, "joystick.cross", "a", error));
+    assert(psp_settings_bind(b, "key.", "a", error));
+    assert(psp_settings_bind(b, "key.cross", "Z\t", error));
+    assert(psp_settings_bind(b, "key.cross", "Z ", error));
+    assert(!psp_settings_bind(b, "pad.fire", NULL, error) && b->bind_count == 2);
+    assert(!psp_settings_bind(b, "pad.fire", "righttrigger", error));
+    assert(!psp_presets_save(&p, path, error)); assert(!psp_presets_load(&loaded, path, error));
+    assert(contains(path, "bind.key.cross=F\nbind.mouse.square=\nbind.pad.fire=righttrigger\n"));
+    assert(loaded.presets[0].settings.bind_count == 3 && !loaded.presets[1].settings.bind_count);
+    assert(!strcmp(psp_settings_binding(&loaded.presets[0].settings, "key.cross"), "F"));
+    assert(!strcmp(psp_settings_binding(&loaded.presets[0].settings, "mouse.square"), ""));
+    assert(!psp_settings_binding(&loaded.presets[0].settings, "pad.cross"));
+    assert(!psp_settings_load(&s, path, p.presets[0].name, error) && s.bind_count == 3);
+    pf = fopen(out, "w"); assert(pf); psp_settings_print(&s, pf); fclose(pf);
+    assert(contains(out, "bind.key.cross           = F            [preset]\n"));
+    b->bind_count = 0;
+
     /* Precedence: environment over preset, never saved back. */
     setenv("PSPRECOMP_DISPLAY", "primary", 1);
     assert(!psp_settings_load(&s, path, "Modern", error));
@@ -197,6 +221,8 @@ int main(void) {
         "version=1\nselected=A\n[preset A]\n[preset A]\n",
         "version=1\nselected=A\n[preset A]\nCAPTURE=oops\n",
         "version=1\nselected=A\n[preset A]\nDEADZONE=NaN\n",
+        "version=1\nselected=A\n[preset A]\nbind.key.cross=Z\nbind.key.cross=X\n",
+        "version=1\nselected=A\n[preset A]\nbind.keyboard.cross=Z\n",
     };
     for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
         putfile(path, invalid[i]); psp_presets prior = loaded;

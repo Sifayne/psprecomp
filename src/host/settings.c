@@ -148,6 +148,47 @@ int psp_settings_assign(psp_settings *s, const char *assignments,
     *s = next; return 0;
 }
 
+int psp_settings_bind(psp_settings *s, const char *key, const char *value, char *error) {
+    char where[PSP_BIND_KEY + 8];
+    snprintf(where, sizeof where, "bind.%.*s", PSP_BIND_KEY, key ? key : "");
+    const char *dot = key ? strchr(key, '.') : NULL;
+    const size_t device = dot ? (size_t)(dot - key) : 0;
+    if (!dot || strlen(key) >= PSP_BIND_KEY || !dot[1] ||
+        !((device == 3 && !strncmp(key, "key", 3)) || (device == 3 && !strncmp(key, "pad", 3)) ||
+          (device == 5 && !strncmp(key, "mouse", 5))))
+        return fail(error, where, "expected bind.key.<target>, bind.pad.<target> or bind.mouse.<target>");
+    for (const char *c = dot + 1; *c; c++)
+        if (!islower((unsigned char)*c) && !isdigit((unsigned char)*c) && *c != '_')
+            return fail(error, where, "a target is lower-case letters, digits and _");
+    int at = 0;
+    while (at < s->bind_count && strcmp(s->bind[at].key, key)) at++;
+    if (!value) {
+        if (at < s->bind_count) {
+            memmove(&s->bind[at], &s->bind[at + 1], (size_t)(s->bind_count - at - 1) * sizeof *s->bind);
+            s->bind_count--;
+        }
+        return 0;
+    }
+    const size_t n = strlen(value);
+    if (n >= PSP_BIND_VALUE) return fail(error, where, "value too long");
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)value[i] < 0x20 || (unsigned char)value[i] > 0x7e)
+            return fail(error, where, "printable ASCII only");
+    if (n && (value[0] == ' ' || value[n - 1] == ' ')) return fail(error, where, "no leading or trailing spaces");
+    if (at == s->bind_count) {
+        if (s->bind_count >= PSP_BINDS_MAX) return fail(error, where, "at most 48 bindings per preset");
+        s->bind_count++;
+    }
+    snprintf(s->bind[at].key, sizeof s->bind[at].key, "%s", key);
+    snprintf(s->bind[at].value, sizeof s->bind[at].value, "%s", value);
+    return 0;
+}
+
+const char *psp_settings_binding(const psp_settings *s, const char *key) {
+    for (int i = 0; i < s->bind_count; i++) if (!strcmp(s->bind[i].key, key)) return s->bind[i].value;
+    return NULL;
+}
+
 void psp_settings_defaults(psp_settings *s) {
     const psp_settings_schema *sc = need_schema();
     memset(s, 0, sizeof *s); char error[PSP_SETTINGS_ERROR];
@@ -206,6 +247,8 @@ void psp_settings_print(const psp_settings *s, FILE *out) {
                 s->source[i] == PSP_SOURCE_COMMAND_LINE ? "command line" : "default",
                 s->source[i] == PSP_SOURCE_ENV ? sc->options[i].env : "");
     }
+    for (int i = 0; i < s->bind_count; i++)
+        fprintf(out, "bind.%-19s = %-12s [preset]\n", s->bind[i].key, s->bind[i].value);
     fprintf(out, "effective: renderer=%s gamepad=%s window=%d realtime=%d",
             s->render == 2 ? "gl" : s->render == 3 ? "null" : "software",
             s->gamepad ? "modern" : "classic", s->window, s->realtime);
@@ -273,7 +316,9 @@ int psp_presets_load(psp_presets *p, const char *path, char *error) {
     const psp_settings_schema *sc = need_schema();
     FILE *f = fopen(path, "r");
     if (!f) return fail(error, path, strerror(errno));
-    psp_presets next = {0};
+    /* On the heap: a book of presets is a third of a megabyte. */
+    psp_presets *next = calloc(1, sizeof *next);
+    if (!next) { fclose(f); return fail(error, path, "out of memory"); }
     char line[512], selected[PSP_SETTINGS_NAME] = "", why[PSP_SETTINGS_ERROR] = "";
     int at = -1, version = 0, lineno = 0, bad = 0;
     unsigned char seen[PSP_PRESETS_MAX][PSP_SETTINGS_MAX] = {{0}};
@@ -286,8 +331,8 @@ int psp_presets_load(psp_presets *p, const char *path, char *error) {
             size_t n = strlen(v);
             if (strncmp(v, "[preset ", 8) || n < 10 || v[n-1] != ']') { strcpy(why, "expected [preset Name]"); bad = 1; break; }
             v[n-1] = 0; psp_settings s; psp_settings_defaults(&s);
-            if (psp_presets_add(&next, v + 8, &s, why)) { bad = 1; break; }
-            at = next.count - 1; continue;
+            if (psp_presets_add(next, v + 8, &s, why)) { bad = 1; break; }
+            at = next->count - 1; continue;
         }
         char *eq = strchr(v, '=');
         if (!eq) { strcpy(why, "expected key=value"); bad = 1; break; }
@@ -295,22 +340,34 @@ int psp_presets_load(psp_presets *p, const char *path, char *error) {
         if (at < 0) {
             if (!strcmp(key, "version") && !version && !strcmp(v, "1")) version = 1;
             else if (!strcmp(key, "selected") && !*selected && psp_presets_name_valid(v)) strcpy(selected, v);
-            else if (!strcmp(key, "game") && !*next.game && psp_presets_name_valid(v)) strcpy(next.game, v);
+            else if (!strcmp(key, "game") && !*next->game && psp_presets_name_valid(v)) strcpy(next->game, v);
             else { strcpy(why, "expected version=1, selected=Name and at most one game=Slug, before preset sections"); bad = 1; break; }
         } else {
             if (listed(sc->retired_keys, key)) continue;
+            if (!strncmp(key, "bind.", 5)) {
+                if (psp_settings_binding(&next->presets[at].settings, key + 5)) {
+                    snprintf(why, sizeof why, "duplicate binding '%s'", key); bad = 1; break;
+                }
+                if (psp_settings_bind(&next->presets[at].settings, key + 5, v, why)) { bad = 1; break; }
+                continue;
+            }
             int id = psp_settings_find(key);
             if (id < 0) { snprintf(why, sizeof why, "unknown option '%s'", key); bad = 1; break; }
             if (seen[at][id]++) { snprintf(why, sizeof why, "duplicate option '%s'", key); bad = 1; break; }
-            if (psp_settings_set(&next.presets[at].settings, id, v, PSP_SOURCE_PRESET, why)) { bad = 1; break; }
+            if (psp_settings_set(&next->presets[at].settings, id, v, PSP_SOURCE_PRESET, why)) { bad = 1; break; }
         }
     }
     if (ferror(f)) { snprintf(why, sizeof why, "read failed: %s", strerror(errno)); bad = 1; }
     fclose(f);
-    if (bad) { snprintf(error, PSP_SETTINGS_ERROR, "%s:%d: %.300s", path, lineno, why); return -1; }
-    if (!version || !next.count || (next.selected = psp_presets_find(&next, selected)) < 0)
+    if (bad) {
+        snprintf(error, PSP_SETTINGS_ERROR, "%s:%d: %.300s", path, lineno, why);
+        free(next); return -1;
+    }
+    if (!version || !next->count || (next->selected = psp_presets_find(next, selected)) < 0) {
+        free(next);
         return fail(error, path, "requires version=1, at least one preset and an existing selected preset");
-    *p = next; return 0;
+    }
+    *p = *next; free(next); return 0;
 }
 
 int psp_presets_save(const psp_presets *p, const char *path, char *error) {
@@ -340,6 +397,8 @@ int psp_presets_save(const psp_presets *p, const char *path, char *error) {
         fprintf(f, "\n[preset %s]\n", p->presets[i].name);
         for (int k = 0; k < sc->count; k++)
             fprintf(f, "%s=%s\n", sc->options[k].key, p->presets[i].settings.value[k]);
+        for (int k = 0; k < p->presets[i].settings.bind_count; k++)
+            fprintf(f, "bind.%s=%s\n", p->presets[i].settings.bind[k].key, p->presets[i].settings.bind[k].value);
     }
     int bad = ferror(f), saved_errno = errno;
     if (fflush(f) || fsync(fd)) { bad = 1; saved_errno = errno; }
@@ -353,11 +412,13 @@ int psp_settings_load(psp_settings *s, const char *path, const char *preset, cha
     psp_settings next; psp_settings_defaults(&next);
     if (preset && !path) return fail(error, "--preset", "requires --config");
     if (path) {
-        psp_presets p;
-        if (psp_presets_load(&p, path, error)) return -1;
-        int at = preset ? psp_presets_find(&p, preset) : p.selected;
-        if (at < 0) return fail(error, preset, "preset does not exist");
-        next = p.presets[at].settings;
+        psp_presets *p = malloc(sizeof *p);
+        if (!p) return fail(error, path, "out of memory");
+        if (psp_presets_load(p, path, error)) { free(p); return -1; }
+        int at = preset ? psp_presets_find(p, preset) : p->selected;
+        if (at < 0) { free(p); return fail(error, preset, "preset does not exist"); }
+        next = p->presets[at].settings;
+        free(p);
     }
     if (psp_settings_env(&next, error) || psp_settings_resolve(&next, error)) return -1;
     *s = next; return 0;

@@ -18,6 +18,8 @@ enum psp_settings_source {
     PSP_SOURCE_DEFAULT, PSP_SOURCE_PRESET, PSP_SOURCE_ENV, PSP_SOURCE_COMMAND_LINE
 };
 enum {
+    PSP_BINDS_MAX = 48,             /* bind.* keys in one preset */
+    PSP_BIND_KEY = 32, PSP_BIND_VALUE = 80,
     PSP_SETTINGS_MAX = 40,          /* options in one schema */
     PSP_SETTINGS_TITLE_DERIVED = 8, /* derived values a title resolves itself */
     PSP_PRESETS_MAX = 32,
@@ -52,6 +54,15 @@ typedef struct {
     unsigned flags;                 /* PSP_OPTION_* */
 } psp_option_def;
 
+/* One bind.* key of a preset: which of one device's controls press one
+ * target -- bind.key.cross=Z, Space; bind.pad.fire=righttrigger. The key is
+ * stored without its "bind." prefix, and the value as written; an empty one
+ * unbinds the target on that device. The host reads them when it starts
+ * (src/host/input.c, docs/PLAYER-LAYER.md §3); a key it does not know is
+ * reported and skipped there, so one title's actions ride along harmlessly in
+ * another's preset. */
+typedef struct { char key[PSP_BIND_KEY], value[PSP_BIND_VALUE]; } psp_binding;
+
 typedef struct {
     char value[PSP_SETTINGS_MAX][PSP_SETTINGS_VALUE];
     double number[PSP_SETTINGS_MAX];          /* Numeric value or choice index. */
@@ -63,6 +74,9 @@ typedef struct {
     int render, gamepad, window, realtime;
     int input, mouse;
     int title[PSP_SETTINGS_TITLE_DERIVED];    /* Indexed by the title's own enum. */
+    /* Bindings that differ from the title's defaults, from the preset. */
+    int bind_count;
+    psp_binding bind[PSP_BINDS_MAX];
 } psp_settings;
 
 typedef struct { char name[PSP_SETTINGS_NAME]; psp_settings settings; } psp_preset;
@@ -121,6 +135,11 @@ int psp_settings_set(psp_settings *s, int id, const char *value,
 int psp_settings_assign(psp_settings *s, const char *assignments,
                         enum psp_settings_source source, char *error);
 int psp_settings_env(psp_settings *s, char *error);
+/* Set bind.<key>, where key is "<key|pad|mouse>.<target>"; a NULL value
+ * removes it, restoring the default. Only the shape is checked here. */
+int psp_settings_bind(psp_settings *s, const char *key, const char *value, char *error);
+/* The value of bind.<key>, or NULL when the title's default applies. */
+const char *psp_settings_binding(const psp_settings *s, const char *key);
 int psp_settings_resolve(psp_settings *s, char *error);
 void psp_settings_print(const psp_settings *s, FILE *out);
 void psp_option_label(const psp_settings *s, int id, char *out, size_t size);

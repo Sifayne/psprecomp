@@ -3,7 +3,7 @@
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PSPRECOMP_SDL2 REQUIRED IMPORTED_TARGET sdl2 SDL2_ttf)
 
-add_library(psprecomp_host STATIC present.c save_dialog.c render_gl.c)
+add_library(psprecomp_host STATIC present.c input.c save_dialog.c render_gl.c)
 
 # SDL is linked privately because its compile flags define _GNU_SOURCE, which
 # changes what the C library declares for whatever else is compiled with them
@@ -16,4 +16,4 @@ target_include_directories(psprecomp_host PUBLIC ${PSPRECOMP_SDL2_INCLUDE_DIRS})
 # present.h declares the windowed calls only under HAVE_SDL2, and stubs them
 # for a host built without SDL; anything linking this layer has SDL.
 target_compile_definitions(psprecomp_host PUBLIC HAVE_SDL2)
-message(STATUS "psprecomp_host: SDL2 host layer (presentation, save dialog, GL backend)")
+message(STATUS "psprecomp_host: SDL2 host layer (presentation, input, save dialog, GL backend)")

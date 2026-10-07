@@ -16,9 +16,15 @@ config_root="$(xdg_base "${XDG_CONFIG_HOME:-}" "$HOME/.config")/@APP_ID@"
 data_root="$(xdg_base "${XDG_DATA_HOME:-}" "$HOME/.local/share")/@APP_ID@"
 state_root="$(xdg_base "${XDG_STATE_HOME:-}" "$HOME/.local/state")/@APP_ID@"
 config="$config_root/settings.ini"
+# Controller mappings beyond SDL's own, one gamecontrollerdb.txt line per
+# pad, for the launcher and the game alike: SDL reads the file when it
+# starts, before any pad is opened. An explicit setting is kept.
+if [[ -z "${SDL_GAMECONTROLLERCONFIG_FILE:-}" && -f "$config_root/gamecontrollerdb.txt" ]]; then
+    export SDL_GAMECONTROLLERCONFIG_FILE="$config_root/gamecontrollerdb.txt"
+fi
 if [[ "${1:-}" = --print-paths ]]; then
-    printf 'Application: %s\nSettings: %s\nGames: %s/games\nSaves: %s/saves\nLogs: %s/logs\n' \
-        "$app_root" "$config" "$data_root" "$data_root" "$state_root"
+    printf 'Application: %s\nSettings: %s\nController mappings: %s\nGames: %s/games\nSaves: %s/saves\nLogs: %s/logs\n' \
+        "$app_root" "$config" "$config_root/gamecontrollerdb.txt" "$data_root" "$data_root" "$state_root"
     exit 0
 fi
 if [[ "${1:-}" = --help ]]; then

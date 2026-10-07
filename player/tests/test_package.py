@@ -159,6 +159,22 @@ class PackageTests(unittest.TestCase):
         self.env["SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD"] = "0"
         self.assertEqual(self.run_app("--check-startup").stdout, "0")
 
+    def test_controller_mappings_from_the_config_directory(self):
+        # A gamecontrollerdb.txt beside the settings reaches SDL in the
+        # launcher and its child; without one, SDL is told nothing; an
+        # explicit setting is kept.
+        launcher = self.app / "usr/bin/launcher"
+        launcher.write_text('#!/bin/sh\nexec /bin/sh -c \'printf "%s" "$SDL_GAMECONTROLLERCONFIG_FILE"\'\n')
+        launcher.chmod(0o755)
+        self.assertEqual(self.run_app("--check-startup").stdout, "")
+        mappings = self.config.parent / "gamecontrollerdb.txt"
+        mappings.parent.mkdir(parents=True, exist_ok=True)
+        mappings.write_text("# no mappings\n")
+        self.assertEqual(self.run_app("--check-startup").stdout, str(mappings))
+        self.assertIn(str(mappings), self.run_app("--print-paths").stdout)
+        self.env["SDL_GAMECONTROLLERCONFIG_FILE"] = "/elsewhere/db.txt"
+        self.assertEqual(self.run_app("--check-startup").stdout, "/elsewhere/db.txt")
+
 
 if __name__ == "__main__":
     if APP is None or not (APP / "AppRun").is_file():

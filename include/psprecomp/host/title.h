@@ -11,6 +11,8 @@
  *
  * Everything after the name and capabilities is optional; a zero field keeps
  * the shared host's own behaviour. */
+#include "psprecomp/host/settings.h"
+
 #include <stdint.h>
 
 enum {
@@ -44,8 +46,59 @@ typedef struct {
     uint8_t blend_src, blend_dst;   /* and its blend factors (equation add) */
 } psp_bloom_composite;
 
-/* key is an SDL_Keycode; bit a PSP button or a carrier. */
+/* key is an SDL_Keycode, button an SDL_GameControllerButton; bit a PSP
+ * button or a carrier. */
 typedef struct { int32_t key; uint32_t bit; } psp_key_bind;
+typedef struct { int32_t button; uint32_t bit; } psp_pad_bind;
+
+/* A title action: a carrier bit (psprecomp/host/pad.h) that the title's
+ * replacements decode, with the name the bindings know it by (bind.pad.fire)
+ * and the label the overlay will show. While the title's Modern controls are
+ * off for a device, the device's carrier becomes the PSP buttons in classic
+ * before the game sees it -- or stays, with PSP_ACTION_KEEP. */
+#define PSP_ACTION_KEEP 0xFFFFFFFFu
+typedef struct {
+    const char *name, *label;
+    uint32_t carrier, classic;
+} psp_title_action;
+
+/* What a title adds to the host's input (src/host/input.c), for its resolved
+ * settings. Everything is optional. */
+typedef struct {
+    /* Its actions; a carrier no action names is not bound by default. */
+    const psp_title_action *actions;
+    unsigned action_count;
+    /* The WASD keyboard layout, replacing the host's, and what SDL mouse
+     * buttons 1-3 press in it ([4]). */
+    const psp_key_bind *keys_wasd;
+    unsigned keys_wasd_count;
+    const uint32_t *mouse_wasd;
+    /* Controller buttons that press these in either controller layout,
+     * replacing what the layout gives them. */
+    const psp_pad_bind *pad;
+    unsigned pad_count;
+    /* How far the keyboard's stick reaches while walk (Left Alt) is held:
+     * along one axis, and on each axis of a diagonal. 0: a full push. */
+    uint8_t walk, walk_diagonal;
+} psp_title_input;
+
+/* What the host does with these, for a title's own tests: a device's buttons
+ * while the title's Modern controls are off for it, and the keyboard stick's
+ * byte for one axis (along and across are -1, 0 or 1). */
+static inline uint32_t psp_title_classic(const psp_title_input *in, uint32_t buttons) {
+    uint32_t out = buttons;
+    for (unsigned i = 0; i < in->action_count; i++) {
+        const psp_title_action *a = &in->actions[i];
+        if (a->classic == PSP_ACTION_KEEP) continue;
+        out &= ~a->carrier;
+        if (buttons & a->carrier) out |= a->classic;
+    }
+    return out;
+}
+static inline uint8_t psp_title_key_axis(const psp_title_input *in, int along, int across, int walk) {
+    const int reach = !walk || !in->walk ? 127 : along && across ? in->walk_diagonal : in->walk;
+    return (uint8_t)(128 + reach * along);
+}
 
 struct psp_audio_backend;           /* psprecomp/host/present.h */
 
@@ -57,22 +110,11 @@ typedef struct {
      * controls are off), and the modern controller layout. */
     const char *keys_wasd_help, *gamepad_modern_help, *keys_wasd_classic_help;
 
-    /* Input, until stage 6 of docs/PLAYER-LAYER.md makes bindings data. The
-     * title's Modern controls are on when its resolved settings say input
-     * and it has PSP_TITLE_MODERN_CONTROLS. */
-    const psp_key_bind *keys_wasd;  /* the WASD layout, replacing the host's */
-    unsigned keys_wasd_count;
-    const uint32_t *mouse_wasd;     /* [4]: what SDL mouse buttons 1-3 press */
-    /* What the WASD keys and the mouse buttons press while Modern controls
-     * are off, from what the tables above say. */
-    uint32_t (*classic_keys)(uint32_t buttons);
-    uint32_t (*classic_mouse)(uint32_t buttons);
-    /* The stick byte for one axis of WASD: along and across are -1, 0 or 1,
-     * walk is Left Alt. The host's is a full push. */
-    uint8_t (*key_axis)(int along, int across, int walk);
-    /* A carrier for a controller button the layout leaves unmapped, or 0
-     * (an SDL_GameControllerButton). */
-    uint32_t (*pad_button)(int button);
+    /* The title's input, for its resolved settings. Its Modern controls are
+     * on for the keyboard and mouse when the settings say input, and for the
+     * controller when they say gamepad -- each only with
+     * PSP_TITLE_MODERN_CONTROLS. */
+    void (*input)(const psp_settings *s, psp_title_input *out);
 
     /* The adaptive aspect's scene for a drawable: the host's widens to the
      * drawable's shape at 272 rows. */
