@@ -95,10 +95,11 @@ static void hold(uint32_t ms, const char *why) {
             psp_clock_peek() / 1e6);
     psp_clock_hold();
     g_held = 1;
+    unsigned redraws = 0;
     while (!psp_sched_stopping()) {
         const uint64_t now = psp_os_mono_ns();
         if (ms ? now - start >= (uint64_t)ms * 1000000u : !g_request) break;
-        if (g_redraw) g_redraw();
+        if (g_redraw) { g_redraw(); redraws++; }
         uint64_t next = now + 16666667u;
         if (ms && next > start + (uint64_t)ms * 1000000u) next = start + (uint64_t)ms * 1000000u;
         psp_os_sleep_until_ns(next);
@@ -106,8 +107,8 @@ static void hold(uint32_t ms, const char *why) {
     g_held = 0;
     psp_clock_release();
     g_holds++;
-    fprintf(stderr, "pause: released after %.3f s, guest time %.3f s\n",
-            (psp_os_mono_ns() - start) / 1e9, psp_clock_peek() / 1e6);
+    fprintf(stderr, "pause: released after %.3f s, guest time %.3f s, %u redraws\n",
+            (psp_os_mono_ns() - start) / 1e9, psp_clock_peek() / 1e6, redraws);
 }
 
 void psp_safepoint(uint32_t nid) {
