@@ -285,6 +285,11 @@ void psp_hle_call(uint32_t nid) {
                 fprintf(stderr, "hle: [%05X] %-36s  = 0x%08X\n",
                         psp_sched_current(), "", psp_cpu.r[PSP_REG_V0]);
             if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name, 1);
+            /* The safe point (psprecomp/safepoint.h): this call is finished --
+             * v0 written -- and nothing after it has run yet. Only a call from
+             * the thread's own guest code, never one nested in a callback or
+             * a handler. */
+            if (psp_safepoint_armed && g_call_depth == 1) psp_safepoint(nid);
             /* After the handler, not before: the call has to finish before the
              * thread can be switched away from, or its result is written into
              * whoever runs next. */
@@ -297,9 +302,6 @@ void psp_hle_call(uint32_t nid) {
             psp_ktimer_tick();
             psp_display_tick();
             psp_interrupt_run_pending();
-            /* The safe point the park census (census.h) is taken at: a call
-             * from the thread's own guest code, finished. */
-            if (psp_census_next && g_call_depth == 1) psp_census_check();
             psp_census_call_leave();
             g_call_depth--;
             return;

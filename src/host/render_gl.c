@@ -41,6 +41,7 @@
 #include "psprecomp/mem.h"
 #include "psprecomp/hle.h"
 #include "psprecomp/os.h"
+#include "psprecomp/safepoint.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -1981,6 +1982,7 @@ static int claim(void) {
 
 /* ---- the interface ---------------------------------------------------------- */
 static int gl_dialog_redraw(void);
+static void gl_pause_redraw(void);
 
 static int gl_init(int w, int h) {
     /* No GL here on purpose: this runs on boot.c's thread, not the GE's. */
@@ -1992,11 +1994,13 @@ static int gl_init(int w, int h) {
     g.adaptive_aspect = present_adaptive_aspect();
     g.smooth_bloom = psp_title_info.bloom && setting_number("BLOOM_FILTER") != 0;
     psp_savedata_set_redraw(gl_dialog_redraw);
+    psp_pause_set_redraw(gl_pause_redraw);
     return 0;
 }
 
 static void gl_shutdown(void) {
     psp_savedata_set_redraw(NULL);
+    psp_pause_set_redraw(NULL);
     if (g_rb.async) readback_complete(-1);
     psp_mem_set_vram_access_observer(NULL, 0, 0);
     psp_mem_set_write_observer(NULL);
@@ -3720,6 +3724,10 @@ static int gl_dialog_redraw(void) {
     g.mu.disturbed=1;
     return dialog_failed ? -1 : 0;
 }
+/* The same while the guest is held (psprecomp/safepoint.h): the safe point
+ * is on the thread that last ran a display list, which owns the context, and
+ * calls this about once a display refresh. */
+static void gl_pause_redraw(void) { (void)gl_dialog_redraw(); }
 
 static void gl_present(void) {
     if (claim() != 0) return;

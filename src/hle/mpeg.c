@@ -1241,7 +1241,7 @@ static void hle_GetAvcAu(void) {
     if (mpeg_logging() && c->frames <= 3)
         fprintf(stderr, "mpeg: GetAvcAu -> frame %d, pts %u\n", c->frames, c->pts);
     {
-        const uint64_t now = psp_os_mono_ns();
+        const uint64_t now = psp_clock_run_ns();   /* less host pauses */
         if (!c->v_fetched) { c->v_first_ns = now; c->v_first_pts = c->pts; }
         c->v_last_ns = now; c->v_last_pts = c->pts; c->v_fetched++;
     }
@@ -1318,7 +1318,7 @@ static void hle_GetAtracAu(void) {
     }
     c->aes_pos += total;
     {
-        const uint64_t now = psp_os_mono_ns();
+        const uint64_t now = psp_clock_run_ns();   /* less host pauses */
         if (!c->a_fetched) { c->a_first_ns = now; c->a_first_pts = c->atrac_pts; }
         c->a_last_ns = now; c->a_last_pts = c->atrac_pts; c->a_fetched++;
     }

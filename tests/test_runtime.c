@@ -8,6 +8,7 @@
 
 #include "psprecomp/recomp_rt.h"
 #include "psprecomp/clock.h"
+#include "psprecomp/os.h"
 
 #include <stdio.h>
 
@@ -51,6 +52,30 @@ static void test_clock_mode_report(void) {
           "real-time clock reports its wall-time mapping");
     CHECK(guest == 0, "fresh real-time guest clock starts at zero");
     CHECK(wall < 1000000u, "fresh real-time wall clock has a sane origin");
+    psp_clock_realtime(0);
+}
+
+/* A host pause (psprecomp/safepoint.h): guest time stands still while held
+ * and does not catch up on release, and the run clock leaves the hold out.
+ * Nothing ticks the clock during the hold, as no guest thread runs then. */
+static void test_clock_hold(void) {
+    psp_clock_realtime(1);
+    psp_clock_reset();
+    psp_os_sleep_until_ns(psp_os_mono_ns() + 5000000u);
+    psp_clock_tick();
+    const uint64_t guest0 = psp_clock_peek(), run0 = psp_clock_run_ns(), held0 = psp_clock_held_us();
+    psp_clock_hold();
+    psp_os_sleep_until_ns(psp_os_mono_ns() + 50000000u);
+    CHECK(psp_clock_run_ns() - run0 < 1000000u, "the run clock stands still while held");
+    CHECK(psp_clock_held_us() - held0 >= 50000u, "the current hold counts as held");
+    psp_clock_release();
+    CHECK(psp_clock_held_us() - held0 >= 50000u, "a finished hold stays counted");
+    psp_clock_tick();
+    CHECK(psp_clock_peek() - guest0 < 20000u, "guest time does not catch up on release");
+    CHECK(psp_clock_run_ns() - run0 < 20000000u, "the run clock resumes where it stopped");
+    uint64_t guest = 0, wall = 0;
+    psp_clock_realtime_stats(&guest, &wall);
+    CHECK(wall - guest >= 50000u, "wall time still includes the hold");
     psp_clock_realtime(0);
 }
 
@@ -760,6 +785,7 @@ static void test_unaligned(void) {
 int main(void) {
     test_zero_register();
     test_clock_mode_report();
+    test_clock_hold();
     test_division();
     test_multiply();
     test_shifts();

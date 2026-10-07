@@ -1188,7 +1188,9 @@ typedef struct { uint64_t first_ns, last_ns, max_gap_ns; uint32_t late, outputs;
 static audio_gap g_audio_gap[AUDIO_OUTPUTS];
 static void audio_note_gap(uint32_t ch, uint32_t samples) {
     audio_gap *g = &g_audio_gap[ch];
-    const uint64_t now = psp_os_mono_ns();
+    /* Less host pauses: a held guest outputs nothing, and the speaker is
+     * silenced rather than starved meanwhile. */
+    const uint64_t now = psp_clock_run_ns();
     if (g->first_ns) {
         const uint64_t gap = now - g->last_ns;
         const uint64_t buf = (uint64_t)samples * 1000000000ull / PSP_AUDIO_RATE;

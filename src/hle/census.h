@@ -40,8 +40,13 @@ void psp_census_call_leave(void);
 /* sched.c, as the calling host thread parks. */
 void psp_census_note_park(psp_park *out, int kind, const char *what, uint64_t deadline);
 
-/* The safe point: hle.c calls this after a firmware call from the thread's
- * own guest code (depth 1) completes, while a census is pending. */
+/* The safe point (psprecomp/safepoint.h): hle.c asks for it after a
+ * firmware call from the thread's own guest code (depth 1) returns, while
+ * anything is armed -- a pause request, a scripted hold, a pending census.
+ * It runs the census there. */
+extern _Atomic int psp_safepoint_armed;
+void psp_safepoint(uint32_t nid);
+void psp_safepoint_rearm(void);
 extern uint32_t psp_census_next;
 void psp_census_check(void);
 

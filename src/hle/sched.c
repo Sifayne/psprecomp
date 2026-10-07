@@ -9,6 +9,7 @@
 
 #include "psprecomp/os.h"
 #include "census.h"
+#include "psprecomp/safepoint.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -150,6 +151,7 @@ void psp_sched_init(void) {
     psp_os_cond_use_monotonic(&g_turn);
     psp_sched_reset();
     psp_census_init();
+    psp_safepoint_init();
 }
 
 void psp_sched_set_threading(int on) { g_threading = on; }

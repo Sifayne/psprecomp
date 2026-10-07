@@ -22,6 +22,7 @@
 #include "psprecomp/clock.h"
 #include "psprecomp/hle.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/safepoint.h"
 #include "psprecomp/sched.h"
 
 #include <SDL2/SDL.h>
@@ -634,7 +635,8 @@ static int64_t present_audio(int ch, uint32_t samples, uint32_t fmt,
     if (lvol > 0x8000) lvol = 0x8000;
     if (rvol > 0x8000) rvol = 0x8000;
 
-    const uint64_t now = SDL_GetTicks64();
+    /* Run time, so a host pause between two pushes is not a gap. */
+    const uint64_t now = psp_clock_run_ns() / 1000000u;
     SDL_LockAudioDevice(g_audio_dev);
     if (!m->first_ms) m->first_ms = now;
     else {
@@ -694,6 +696,14 @@ static const psp_audio_backend host_mixer = {
 /* The title's audio output, or the host's mixer. */
 static const psp_audio_backend *audio(void) {
     return psp_title_info.audio ? psp_title_info.audio : &host_mixer;
+}
+
+/* While the guest is held the device plays silence and the mixer is not
+ * asked: its rings keep what was queued, and resume where the pause cut
+ * them, without counting the pause as an underrun. */
+static void audio_device_callback(void *ud, Uint8 *stream, int len) {
+    if (psp_paused()) { memset(stream, 0, (size_t)len); return; }
+    audio()->callback(ud, stream, len);
 }
 
 void present_audio_report(FILE *out) { audio()->report(out); }
@@ -978,7 +988,7 @@ static void *sdl_thread(void *arg) {
     want.format   = AUDIO_S16SYS;
     want.channels = 2;
     want.samples  = 1024;
-    want.callback = audio()->callback;
+    want.callback = audio_device_callback;
     SDL_AudioSpec have;
     /* Lead 0 is two of the channel's own buffers; the pre-roll is 93 ms. */
     audio()->prepare(settings_ms_frames("AUDIO_LEAD_MS", 0),
@@ -1089,26 +1099,33 @@ static void *sdl_thread(void *arg) {
         if (fresh && !g_gl_want) present_note_frame();
         /* The frame rate in the title, once a second: rendered frames over
          * wall time, whichever backend rendered them. Set from this thread,
-         * which owns the window. */
+         * which owns the window. While the guest is held the title says so,
+         * and the count starts again when it is let go. */
         {
             static uint32_t title_t0; static uint64_t title_frames; static char last[128];
-            static int was_quitting; static double shown_fps;
+            static int was_quitting, was_paused; static double shown_fps;
             const uint32_t now = SDL_GetTicks();
             /* The quit chord shows in the title the moment it is held, so a
              * player sees the countdown rather than an unexplained close. */
             const int quitting = g_quit_chord.timing;
-            if (!title_t0) { title_t0 = now; title_frames = atomic_load(&g_frames_rendered); }
-            else if ((now - title_t0 >= 1000 || quitting != was_quitting) && win) {
+            const int paused = psp_paused();
+            if (!title_t0 || paused != was_paused) { title_t0 = now; title_frames = atomic_load(&g_frames_rendered); }
+            if ((now - title_t0 >= 1000 || quitting != was_quitting || paused != was_paused) && win) {
                 if (now - title_t0 >= 1000) {
                     const uint64_t frames = atomic_load(&g_frames_rendered);
                     shown_fps = (double)(frames - title_frames) * 1000.0 / (double)(now - title_t0);
                     title_t0 = now; title_frames = frames;
                 }
                 char title[128];
-                snprintf(title, sizeof title, "%s -- recompiled  |  %.0f fps%s", title_name(), shown_fps,
-                         quitting ? "  |  QUITTING: keep holding Select + Start, release to cancel" : "");
+                if (paused)
+                    snprintf(title, sizeof title, "%s -- recompiled  |  paused%s", title_name(),
+                             quitting ? "  |  QUITTING: keep holding Select + Start, release to cancel" : "");
+                else
+                    snprintf(title, sizeof title, "%s -- recompiled  |  %.0f fps%s", title_name(), shown_fps,
+                             quitting ? "  |  QUITTING: keep holding Select + Start, release to cancel" : "");
                 if (strcmp(title, last) != 0) { SDL_SetWindowTitle(win, title); snprintf(last, sizeof last, "%s", title); }
                 was_quitting = quitting;
+                was_paused = paused;
             }
         }
 
