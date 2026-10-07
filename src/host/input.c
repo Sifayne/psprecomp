@@ -925,8 +925,23 @@ static void print_controls(const psp_settings *s) {
                         "close window to stop\n");
     if (g_gamepad_modern && g_title->gamepad_modern_help)
         fprintf(stderr, "present: %s\n", g_title->gamepad_modern_help);
-    for (int i = 0; i < s->bind_count; i++)
-        fprintf(stderr, "present: bind.%s=%s\n", s->bind[i].key, s->bind[i].value);
+    /* The preset's bindings, as the table holds them. */
+    for (int i = 0; i < s->bind_count; i++) {
+        const char *key = s->bind[i].key, *dot = strchr(key, '.');
+        binding t = { 0 };
+        int device = -1;
+        for (int d = 0; d < DEVICES; d++)
+            if ((size_t)(dot - key) == strlen(DEVICE_NAME[d]) && !strncmp(key, DEVICE_NAME[d], (size_t)(dot - key))) device = d;
+        if (device < 0 || parse_target(dot + 1, &t)) continue;
+        t.device = (uint8_t)device;
+        char list[256] = "", one[64];
+        for (int k = 0; k < g_nbinds; k++) {
+            if (!same_target(&g_binds[k], &t)) continue;
+            format_source(&g_binds[k], one, sizeof one);
+            if (strlen(list) + strlen(one) + 3 < sizeof list) { if (*list) strcat(list, ", "); strcat(list, one); }
+        }
+        fprintf(stderr, "present: bind.%s = %s\n", key, *list ? list : "(nothing)");
+    }
 }
 
 void input_start(const psp_settings *s) {
