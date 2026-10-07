@@ -362,24 +362,42 @@ three hold:
 At that moment the calling thread has finished its call (v0 is written) and
 holds the scheduler token. Every other guest thread is parked inside a
 firmware call, because handoff happens only in firmware calls
-(`src/hle/sched.h:3-30`). Which calls count as frame boundaries is measured
-per title, not assumed; Last Raven presents through `sceDisplaySetFrameBuf`
-from `00259820`, and the controller read is another candidate.
+(`src/hle/sched.h:3-30`).
+
+The frame-boundary calls are the controller reads by default
+(`sceCtrlReadBufferPositive`, `sceCtrlPeekBufferPositive` and their Negative
+forms). Stage 4's census found every safe point there on all four titles: the
+game's main thread, right after its once-a-frame read. A title whose frame
+does not read the controller names its own calls with
+`psp_safepoint_set_calls` (`psprecomp/safepoint.h`). The hook costs one
+atomic load per firmware call. It does anything only while something is
+armed: a pause request, a scripted hold or a pending census.
 
 **Pause.** On a pause request the hook enters a host loop. Because that loop
 keeps the token, no guest thread runs. While it loops:
 
-- **Clock.** The real-time clock stops. On resume it is re-anchored
-  (`origin = now - us*1000`, `src/clock.c`), so neither vblank nor the timers
-  catch up. Game hosts with clocks of their own subscribe to a resume
-  listener; Last Raven's higher-frame-rate deadlines in `host/fps.h` are the
-  first.
-- **Audio.** The mixer outputs silence without consuming its rings. A
-  movie's audio/picture lead is preserved because both are measured in guest
-  time.
-- **Redraw.** In GL, the loop recomposes the last presented frame plus the
-  overlay and swaps at display rate. This generalises the dialog's existing
-  `gl_dialog_redraw`. In software the SDL thread already repaints.
+- **Clock.** `psp_clock_hold` stops guest time. `psp_clock_release` moves
+  the real-time origin forward by the time held (`src/hle/clock.c`), so
+  neither vblank nor the timers catch up.
+  - Host clocks get the same treatment from `psp_clock_run_ns`: wall time
+    less every hold, frozen while held. It replaces the resume listener the
+    plan first had in mind.
+  - It drives the runtime's audio-gap and movie-fetch statistics, the host
+    mixer's push gaps, The 3rd Birthday's audio pacing deadlines and Last
+    Raven's Higher FPS deadlines (`host/fps.h`).
+  - `PSPRECOMP_DRAIN`'s time limit moves out by the time held.
+- **Audio.** The SDL device callback outputs silence while the guest is
+  held, and asks neither mixer for samples, so the rings keep what was queued
+  and nothing counts as an underrun. A movie's audio/picture lead is
+  preserved because both are measured in guest time.
+- **Redraw.** In GL the hold calls `gl_pause_redraw` about once a display
+  refresh. It is the dialog's `gl_dialog_redraw`: it recomposes the last
+  presented frame (and, at stage 7, the overlay) and swaps. In software the
+  SDL thread already repaints. The window title says "paused".
+- **Requests.** `psp_pause_request(1)` from any thread holds the guest at
+  the next safe point, and `psp_pause_request(0)` lets it go. Nothing binds
+  a key to it yet: stage 7's menu (View+Start) will be the first caller.
+  `PSPRECOMP_PAUSE_AT=<poll>:<ms>[,...]` scripts holds for the gates.
 
 **Gates.**
 
@@ -391,6 +409,48 @@ keeps the token, no guest thread runs. While it loops:
 - Clock drift is no worse than before.
 - Audio gap counts are unchanged.
 - A pause in the middle of the intro movie keeps the lead flat.
+
+*Results, 6 Oct.* All gates pass. The holds were scripted with
+`PSPRECOMP_PAUSE_AT`. The harnesses are third-birthday-recomp
+`build/pause/` and the Last Raven worktree's `build/pause-gates.sh` and
+`build/pause-paced.sh`.
+
+Unpaced, the rows are identical:
+
+| Title | Replay | Holds (poll: length) | Identical |
+|---|---|---|---|
+| The 3rd Birthday | gameplay | 600: 1.5 s, 1200: 2 s, 2000: 1 s | GE capture at poll 2300 (40.6 MB), PCM (15.3 MB), the log apart from paths and host thread IDs |
+| Last Raven | mission-effects, movies decoded | 600: 1.5 s, 1950: 3 s (in the mission), 2100: 1 s | GE capture at poll 2200 (41.8 MB), PCM on all three channels, the summary apart from a host thread ID |
+
+Paced, each run held 10 s and was compared with the same replay unpaused.
+Late outputs are those that arrived more than 1.5 buffers after the
+previous one.
+
+| Run | Held at | Guest / wall | Drift, unpaused → paused | Late outputs, unpaused → paused |
+|---|---|---|---|---|
+| TB movie-audio, software | poll 1000, mid-movie | 83.979 / 93.979 s | +0.017 → +0.046 ms | 177 → 178; no underruns |
+| TB movie-audio, GL | poll 1000, mid-movie | 80.168 / 90.169 s | +0.033 → +0.019 ms | 1 → 1; no underruns |
+| LR mission-effects, Higher FPS | poll 1950, in the mission | 104.971 / 114.971 s | +0.015, +0.023 → +0.016, +0.021 ms | ch 1/2/3: 474/44/1400 and 473/51/1380 → 499/55/1408 and 474/48/1394 |
+| LR pause-look | poll 200, intro movie | 190.085 / 200.085 s | +0.019 → +0.020 ms | 1172/40/2076 → 1166/40/2089 |
+
+- **Guest time.** Every paced run reports exactly 10.000 s paused, with
+  guest time 10 s below wall. Drift is measured against wall less pauses,
+  and it stays within a few hundredths of a millisecond.
+- **Audio.** Late counts move within the spread of repeated unpaused runs.
+  The first paused mission's 499 on channel 1 was not repeated (474).
+- **Movie lead.** TB's lead, sampled every 250 pictures, varies by about
+  50 ms between unpaused runs (GL: −13 and −20 where the paused run had 33
+  and 26), and the samples after the hold fall in that range. Last Raven
+  prints no lead for its intro, whose movie context is gone by the end of
+  the run.
+- **GL redraw.** The 10 s GL hold made 599 redraws (60 Hz). In a 2 s hold
+  with `PSPRECOMP_GL_SHOT`, the redraw captures were byte-identical to the
+  last frame presented before the hold: the title screen.
+- **Higher FPS.** The frame that spans the hold advanced 74 ms of run time
+  and two ticks, with nothing dropped. Every run, paused or not, drops one
+  tick near poll 2197 at the mission's end.
+- **Census.** Moving the census onto this hook left The 3rd Birthday's 26
+  gameplay censuses unchanged.
 
 ## 3. Input ownership and remapping
 
@@ -665,8 +725,8 @@ thread is parked (`src/hle/census.c`):
 - live replacements;
 - whether a movie or dialog is active.
 
-The safe point is the one stage 5 will formalize: a firmware call from the
-GE-owning thread's own guest code has completed. The scheduler records each
+The safe point is the one stage 5 formalized (§2): a frame-boundary call
+from the GE-owning thread's own guest code has completed. The scheduler records each
 park as it happens (block, delay, yield, preemption). Every host frame that
 calls back into guest code marks itself per thread: the runtime's guest
 calls and interrupt handlers, and every call the emitted code makes into a
