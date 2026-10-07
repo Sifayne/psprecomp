@@ -1020,7 +1020,11 @@ int psp_sched_drain(int timeout_s) {
     const uint64_t span_ns = timeout_s > 0
         ? (uint64_t)timeout_s * 1000000000ull
         : 365ull * 24 * 3600 * 1000000000ull;
-    const uint64_t deadline_ns = psp_os_mono_ns() + span_ns;
+    uint64_t deadline_ns = psp_os_mono_ns() + span_ns;
+    /* Time the guest spends held by a host pause (psprecomp/safepoint.h) is
+     * not run time: the limit moves out by it, so a hold does not cut a
+     * timed run short. */
+    uint64_t held_us = psp_clock_held_us();
 
     /* The main context steps aside so the guest threads can run. It becomes
      * runnable again only when they are all finished -- or when none of them
@@ -1031,7 +1035,13 @@ int psp_sched_drain(int timeout_s) {
         g_slot[MAIN_SLOT].ctx   = psp_cpu;
         g_slot[MAIN_SLOT].state = PSP_SCHED_BLOCKED;
         if (handoff_locked() < 0) { stalled = 1; break; }
-        const int rc = await_turn_deadline_locked(MAIN_SLOT, deadline_ns);
+        int rc;
+        while ((rc = await_turn_deadline_locked(MAIN_SLOT, deadline_ns)) == -1) {
+            const uint64_t held = psp_clock_held_us();
+            if (held == held_us) break;
+            deadline_ns += (held - held_us) * 1000u;
+            held_us = held;
+        }
         if (rc == -2) { stalled = 1; break; }
         if (rc != 0)  { timed_out = 1; break; }
     }
