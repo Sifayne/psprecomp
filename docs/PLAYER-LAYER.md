@@ -533,6 +533,81 @@ ignores title-action keys it did not register.
 - Unchanged replay rows, as a guard: replays bypass the host, so a change
   there means the layer leaked.
 
+*Built, 6 Oct (stage 6: 3a and 3b; 3c waits for the overlay).*
+`src/host/input.c` holds the input that `present.c` had, and present's SDL
+loop hands it every event.
+
+- **The owner.** `input_take` and `input_return` take the controls for the
+  dialog, and later the overlay, as planned. The save dialog uses them with
+  its behaviour unchanged. Ctrl+Shift+Q and the View+Start chord still quit
+  whoever owns the controls; the chord retires with stage 7.
+- **The table.** A binding joins one source to one target on one device:
+  `key`, `pad` or `mouse`. Sources are keys (by keycode, following the
+  layout, or `scancode:` for a position), controller buttons, axis halves
+  (`+leftx`, `-righty`, `lefttrigger`), whole sticks (`leftxy`, `rightxy`),
+  mouse buttons, the wheel and the mouse's motion. Targets are the PSP
+  buttons (`cross`, `l`, `start`...), `stick_up`... `stick_right`, `walk`,
+  `stick` and `look`, the title's actions, and the host actions `menu`,
+  `quick_save`, `quick_load`, `slot_next`, `slot_prev`, `screenshot`,
+  `release_mouse`, `fullscreen` and `quit`. Host actions press once, on
+  the way down. Of those, releasing the mouse, fullscreen and quit work
+  now; the rest report that they are not available yet.
+- **Storage.** `bind.<device>.<target>=<source>, <source>` replaces that
+  target's sources on that device, and an empty value unbinds it, for
+  example `bind.key.cross=Z, Space`, `bind.pad.fire=righttrigger`,
+  `bind.mouse.square=`. SDL's own names spell the sources. `settings.c`
+  keeps up to 48 per preset and checks their shape only. The host checks the
+  rest when it starts, and reports and skips anything it cannot use, so a
+  mistyped key never stops the game, and one title's actions ride along
+  harmlessly in another's preset.
+- **Title registration.** It is C, like the options: `psp_title.input`
+  fills a `psp_title_input` from the resolved settings. That holds:
+  - the title's actions: a name, a label, a carrier, and the PSP buttons it
+    becomes while the title's Modern controls are off for a device (or kept);
+  - its WASD keys, mouse buttons and controller buttons;
+  - its walk reach.
+
+  It replaces the `classic_keys`, `classic_mouse`, `key_axis` and
+  `pad_button` hooks. Through it, The 3rd Birthday's Shooter Type fallback
+  and its free camera's recenter are data. Its `host/controls_tests.c`
+  holds that data to the old functions over every set of carriers. The
+  modern layout binds only the carriers a title names, and the three
+  Armored Core titles name all ten.
+- **Controllers.** `ACTIVE_PAD=last` (Last used, in both titles'
+  Controller options) opens every controller and gives the lane to the one
+  pressed last. A stick or trigger only counts from halfway, so drift never
+  takes the lane. The packaged player sets SDL's
+  `SDL_GAMECONTROLLERCONFIG_FILE` to `gamecontrollerdb.txt` beside
+  `settings.ini` when that file exists. SDL then reads it before any pad
+  opens, in the launcher as in the game, and the game process need not know
+  where the config directory is.
+
+*Results, 6 Oct.*
+
+- **Table test.** `tests/test_input.c` runs every control alone and the
+  combinations that interact through `tests/input_before.h` (the input code
+  as it was) and through the defaults. It covers every layout and both
+  Modern states, for a plain title, Armored Core's and The 3rd Birthday's
+  (free camera on and off): 26 modes and 34,580 pads, none different.
+- **Virtual pads.** `test_present` drives, through SDL's real event loop:
+  - every button of both controller layouts and the modern triggers'
+    hysteresis;
+  - a rebinding from a preset;
+  - hot-plug;
+  - the switch to the last-used pad, its drift guard, and unplugging the
+    active pad.
+- **Replay rows.** All unchanged:
+  - The 3rd Birthday's gameplay replay: GE capture and PCM identical to
+    stage 5's.
+  - Last Raven's mission-effects: GE capture, all three PCM channels and
+    the summary identical. The settings it prints have one new line,
+    `ACTIVE_PAD`.
+  - AC3 Portable's pause-peek: the same 186 events over 7,800 polls, 7,801
+    lists and 64,068,809 commands as stage 4's run.
+- **Other tests.** All pass: psprecomp's 49 tests; The 3rd Birthday's core
+  (57); Last Raven's host, render, resolution, settings, preview, savedata,
+  higher-FPS and launcher tests.
+
 ## 4. The Dear ImGui overlay
 
 **Dependency.** Pin Dear ImGui v1.92.9b, released 31 Jul 2026, under
