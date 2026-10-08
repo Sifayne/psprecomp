@@ -14,6 +14,7 @@ typedef struct {
     void (*start)(SDL_Window *win, SDL_Renderer *ren);
     void (*stop)(void);
     void (*toggle)(void);                   /* the menu action */
+    void (*open_page)(const char *page);    /* opens it on a page, by its name */
     int  (*is_open)(void);
     void (*event)(const SDL_Event *e);      /* every event while it is open */
     void (*frame)(void);                    /* once a loop while it is open */

@@ -697,6 +697,26 @@ static void *sdl_thread(void *arg) {
                 done = 1;
             }
         }
+        /* PSPRECOMP_MENU_AT=<seconds>[:<page>] opens the menu once, that many
+         * seconds after the window opened, on a page by its name: the menu
+         * in a check, or a capture, where no player can open it. */
+        if (g_overlay) {
+            static int menu_done, menu_at = -1;
+            static char menu_page[64];
+            static uint32_t menu_t0;
+            if (menu_at < 0) {
+                const char *spec = getenv("PSPRECOMP_MENU_AT");
+                menu_at = spec ? atoi(spec) : 0;
+                const char *colon = spec ? strchr(spec, ':') : NULL;
+                snprintf(menu_page, sizeof menu_page, "%s", colon ? colon + 1 : "");
+                if (menu_at <= 0) menu_done = 1;
+                menu_t0 = SDL_GetTicks();
+            }
+            if (!menu_done && SDL_GetTicks() - menu_t0 >= (uint32_t)menu_at * 1000u) {
+                g_overlay->open_page(menu_page);
+                menu_done = 1;
+            }
+        }
         const uint64_t requested = atomic_exchange(&g_requested_size, 0);
         if (requested && win)
             SDL_SetWindowSize(win, (int)(requested >> 32), (int)(requested & UINT32_MAX));

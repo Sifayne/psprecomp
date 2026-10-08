@@ -140,6 +140,15 @@ static void close_menu(void) {
 }
 
 static void toggle(void) { if (o.open) close_menu(); else open_menu(); }
+
+static void open_page(const char *page) {
+    open_menu();
+    if (!page || !*page) return;
+    if (!strcmp(page, "Bindings")) o.page = PAGE_BINDINGS;
+    else if (!strcmp(page, "Performance")) o.page = page_performance();
+    else if (!strcmp(page, "Quit")) o.page = page_quit();
+    for (int p = 0; p < o.page_count; p++) if (!strcmp(o.pages[p], page)) o.page = PAGE_SCHEMA + p;
+}
 static int is_open(void) { return o.open; }
 
 /* ---- events ------------------------------------------------------------------------ */
@@ -424,7 +433,7 @@ static void stop(void) {
 static void draw(SDL_Renderer *ren) { if (o.open) psp_ui_draw(ren); }
 
 static const present_overlay OVERLAY = {
-    .start = start, .stop = stop, .toggle = toggle, .is_open = is_open, .event = event,
+    .start = start, .stop = stop, .toggle = toggle, .open_page = open_page, .is_open = is_open, .event = event,
     .frame = frame, .draw = draw, .gl_lock = psp_ui_gl_lock, .gl_unlock = psp_ui_gl_unlock,
 };
 
