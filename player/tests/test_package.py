@@ -139,7 +139,8 @@ class PackageTests(unittest.TestCase):
         self.assertFalse(list(self.app.rglob("installed.json")))
         for name in ("ffmpeg/COPYING.LGPLv2.1", "SDL/LICENSE.txt", "SDL_ttf/LICENSE.txt",
                      "FreeType/FTL.TXT", "OpenH264/LICENSE", "DejaVu/LICENSE", "Adwaita/COPYING",
-                     "Python/LICENSE", "pspdecrypt/LICENSE.TXT", "OpenSSL/LICENSE.txt", "Zig/LICENSE", "stb/LICENSE"):
+                     "Python/LICENSE", "pspdecrypt/LICENSE.TXT", "OpenSSL/LICENSE.txt", "Zig/LICENSE", "stb/LICENSE",
+                     "imgui/LICENSE.txt"):
             self.assertTrue((self.app / "licenses" / name).is_file(), name)
 
     def test_empty_library_and_missing_iso(self):

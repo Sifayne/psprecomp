@@ -34,8 +34,6 @@ void input_chord_event(const SDL_Event *e);
 int input_event(const SDL_Event *e);
 /* Once a loop: ownership coming back, wheel presses ending. */
 void input_tick(void);
-/* The quit chord has been held long enough. */
-int input_quit_due(void);
 
 /* Take the controls from the game: the mouse is released, everything held is
  * let go and the game sees a neutral pad. */
@@ -45,10 +43,27 @@ void input_take(int owner);
 void input_return(int owner);
 int input_owner(void);
 
+/* The menu's bindings page. Devices are 0 keyboard, 1 controller, 2 mouse. */
+enum { INPUT_KEYBOARD, INPUT_CONTROLLER, INPUT_MOUSE, INPUT_DEVICES };
+int  input_rows(void);
+const char *input_row_label(int row);
+/* A row's sources on a device, as the menu shows them: "Z, Space",
+ * "D-pad up, LB", or "". */
+void input_row_sources(int row, int device, char *out, size_t size);
+/* Bind one source to a row on a device in s's bind.* keys, taking it from
+ * whatever else it pressed there; NULL unbinds the row on that device. The
+ * table changes with input_rebuild. */
+int  input_assign(psp_settings *s, int row, int device, const char *source);
+/* The control an event presses on a device, spelled as a source: 1, or 0
+ * when the event is not one. */
+int  input_spell(const SDL_Event *e, int device, char *out, size_t size);
+/* What the host can apply at once: the keyboard layout, the active pad and
+ * the bindings. */
+void input_rebuild(const psp_settings *s);
+void input_release_mouse(void);
+
 /* The active controller, or NULL. */
 SDL_GameController *input_pad(void);
 SDL_JoystickID input_pad_id(void);
-/* The quit chord is being held: the window title says so. */
-int input_quitting(void);
 
 #endif

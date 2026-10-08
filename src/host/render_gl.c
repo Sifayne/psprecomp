@@ -62,6 +62,7 @@ int render_gl_resolution_mode(void) {
 #ifdef HAVE_SDL2
 
 #include "psprecomp/host/save_dialog.h"
+#include "overlay.h"
 #include "psprecomp/savedata.h"
 #include <SDL_opengl.h>
 #include <pthread.h>
@@ -3654,6 +3655,141 @@ static void gl_dialog_overlay(int x, int y, int width, int height) {
     /* Both draw paths reapply their PSP state; model draws normally cache it. */
     g.mu.disturbed=1;
 }
+/* The in-game menu (src/host/overlay.c), over everything: a frame the SDL
+ * thread laid out with Dear ImGui (src/host/ui.h), drawn here because the
+ * context is this thread's. Its textures -- the font atlas -- arrive as
+ * create, update and destroy requests, taken in order before the frame that
+ * uses them. One shader and a scissor per command, on this file's own GL
+ * loader. Nothing of it reaches a render target or guest memory. */
+enum { UI_TEXTURES_MAX = 32 };
+static GLuint ui_program, ui_vao, ui_vbo, ui_ibo;
+static GLint ui_display;
+static int ui_failed;
+static struct { uint32_t id; GLuint tex; } ui_textures[UI_TEXTURES_MAX];
+
+static GLuint ui_texture(uint32_t id) {
+    for (int i = 0; i < UI_TEXTURES_MAX; i++) if (ui_textures[i].id == id) return ui_textures[i].tex;
+    return 0;
+}
+
+static void ui_take(const psp_ui_texture_op *ops, int count) {
+    for (int k = 0; k < count; k++) {
+        const psp_ui_texture_op *op = &ops[k];
+        if (op->op == PSP_UI_TEXTURE_CREATE) {
+            int slot = -1;
+            for (int i = 0; i < UI_TEXTURES_MAX && slot < 0; i++) if (!ui_textures[i].id) slot = i;
+            if (slot < 0 || !op->pixels) { fprintf(stderr, "gl: menu texture %u not created\n", op->texture); continue; }
+            GLuint tex = 0;
+            p_glGenTextures(1, &tex);
+            p_glBindTexture(GL_TEXTURE_2D, tex);
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, op->w, op->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, op->pixels);
+            ui_textures[slot].id = op->texture;
+            ui_textures[slot].tex = tex;
+        } else if (op->op == PSP_UI_TEXTURE_UPDATE) {
+            const GLuint tex = ui_texture(op->texture);
+            if (!tex || !op->pixels) continue;
+            p_glBindTexture(GL_TEXTURE_2D, tex);
+            p_glTexSubImage2D(GL_TEXTURE_2D, 0, op->x, op->y, op->w, op->h, GL_RGBA, GL_UNSIGNED_BYTE, op->pixels);
+        } else {
+            for (int i = 0; i < UI_TEXTURES_MAX; i++)
+                if (ui_textures[i].id == op->texture) {
+                    p_glDeleteTextures(1, &ui_textures[i].tex);
+                    ui_textures[i].id = 0; ui_textures[i].tex = 0;
+                }
+        }
+    }
+}
+
+static int ui_setup(void) {
+    if (ui_program) return 0;
+    if (ui_failed) return -1;
+    GLuint vs = compile(GL_VERTEX_SHADER,
+        "#version 330 core\n"
+        "layout(location=0) in vec2 pos; layout(location=1) in vec2 uv; layout(location=2) in vec4 col;"
+        "uniform vec2 display; out vec2 v_uv; out vec4 v_col;"
+        "void main(){v_uv=uv;v_col=col;"
+        "gl_Position=vec4(pos.x/display.x*2.-1.,1.-pos.y/display.y*2.,0,1);}", "menu vertex");
+    GLuint fs = compile(GL_FRAGMENT_SHADER,
+        "#version 330 core\n"
+        "in vec2 v_uv; in vec4 v_col; uniform sampler2D tex; out vec4 color;"
+        "void main(){color=v_col*texture(tex,v_uv);}", "menu fragment");
+    if (!vs || !fs) { ui_failed = 1; return -1; }
+    ui_program = p_glCreateProgram();
+    p_glAttachShader(ui_program, vs); p_glAttachShader(ui_program, fs);
+    p_glLinkProgram(ui_program); p_glDeleteShader(vs); p_glDeleteShader(fs);
+    GLint ok = 0; p_glGetProgramiv(ui_program, GL_LINK_STATUS, &ok);
+    if (!ok) { ui_failed = 1; ui_program = 0; return -1; }
+    ui_display = p_glGetUniformLocation(ui_program, "display");
+    GLint old_vao, old_buffer;
+    p_glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+    p_glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
+    p_glGenVertexArrays(1, &ui_vao); p_glGenBuffers(1, &ui_vbo); p_glGenBuffers(1, &ui_ibo);
+    p_glBindVertexArray(ui_vao);
+    p_glBindBuffer(GL_ARRAY_BUFFER, ui_vbo);
+    p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ui_ibo);
+    p_glEnableVertexAttribArray(0); p_glEnableVertexAttribArray(1); p_glEnableVertexAttribArray(2);
+    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(psp_ui_vertex), (void *)0);
+    p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(psp_ui_vertex), (void *)8);
+    p_glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(psp_ui_vertex), (void *)16);
+    p_glBindVertexArray((GLuint)old_vao);
+    p_glBindBuffer(GL_ARRAY_BUFFER, (GLuint)old_buffer);
+    return 0;
+}
+
+static void gl_ui_overlay(int draw_w, int draw_h) {
+    const psp_ui_texture_op *ops = NULL;
+    int count = 0;
+    const psp_ui_frame *f = present_ui_lock(&ops, &count);
+    if ((!f && !count) || ui_setup()) { present_ui_unlock(); return; }
+    GLint old_program, old_texture, old_vao, old_buffer, viewport[4];
+    p_glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
+    p_glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture);
+    p_glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+    p_glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
+    p_glGetIntegerv(GL_VIEWPORT, viewport);
+    ui_take(ops, count);
+    if (f && f->command_count && f->width > 0 && f->height > 0) {
+        /* Laid out for the drawable as the SDL thread last saw it; a resize
+         * since stretches it for a frame. */
+        const float sx = (float)draw_w / (float)f->width, sy = (float)draw_h / (float)f->height;
+        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        p_glViewport(0, 0, draw_w, draw_h);
+        p_glDisable(GL_DEPTH_TEST); p_glDisable(GL_STENCIL_TEST); p_glDisable(GL_CULL_FACE);
+        p_glEnable(GL_BLEND); p_glBlendEquation(GL_FUNC_ADD);
+        p_glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        p_glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        p_glEnable(GL_SCISSOR_TEST);
+        p_glUseProgram(ui_program);
+        p_glUniform2f(ui_display, (float)f->width / f->scale_x, (float)f->height / f->scale_y);
+        p_glBindVertexArray(ui_vao);
+        p_glBindBuffer(GL_ARRAY_BUFFER, ui_vbo);
+        p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)f->vertex_count * sizeof(psp_ui_vertex), f->vertices, GL_STREAM_DRAW);
+        p_glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)f->index_count * sizeof(uint16_t), f->indices, GL_STREAM_DRAW);
+        for (uint32_t i = 0; i < f->command_count; i++) {
+            const psp_ui_command *c = &f->commands[i];
+            const int x0 = (int)(c->clip[0] * sx), y0 = (int)(c->clip[1] * sy);
+            const int x1 = (int)(c->clip[2] * sx), y1 = (int)(c->clip[3] * sy);
+            if (x1 <= x0 || y1 <= y0 || !c->count) continue;
+            p_glScissor(x0, draw_h - y1, x1 - x0, y1 - y0);
+            p_glBindTexture(GL_TEXTURE_2D, ui_texture(c->texture));
+            p_glDrawElementsBaseVertex(GL_TRIANGLES, (GLsizei)c->count, GL_UNSIGNED_SHORT,
+                                       (void *)(uintptr_t)(c->first_index * sizeof(uint16_t)), (GLint)c->first_vertex);
+        }
+        p_glDisable(GL_SCISSOR_TEST);
+    }
+    present_ui_unlock();
+    p_glUseProgram((GLuint)old_program); p_glBindVertexArray((GLuint)old_vao);
+    p_glBindBuffer(GL_ARRAY_BUFFER, (GLuint)old_buffer);
+    p_glBindTexture(GL_TEXTURE_2D, (GLuint)old_texture);
+    p_glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    /* Both draw paths reapply their PSP state; model draws normally cache it. */
+    g.mu.disturbed = 1;
+}
+
 static void gl_compose(int dialog_redraw) {
     /* The current target, scaled into the window's physical GL drawable. SDL
      * window sizes are logical pixels on a high-DPI desktop; blitting to the
@@ -3698,6 +3834,7 @@ static void gl_compose(int dialog_redraw) {
                         out_x, out_y, out_x + out_w, out_y + out_h,
                         GL_COLOR_BUFFER_BIT, GL_LINEAR);
     gl_dialog_overlay(out_x,out_y,out_w,out_h);
+    gl_ui_overlay(draw_w,draw_h);
     gl_shot(draw_w,draw_h,dialog_redraw);
 }
 /* Called from the guest's SavedataUpdate while the dialog is open, so the

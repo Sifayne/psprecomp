@@ -5,8 +5,8 @@
  *
  *   test_present                  the quit shortcuts alone
  *   test_present keyboard         the real SDL loop, closed by Ctrl+Shift+Q
- *   test_present controller       ... by a virtual controller's quit chord, after
- *                                 every button of the PSP layout, hot-plug included
+ *   test_present controller       every button of the PSP layout on a virtual
+ *                                 controller, View + Menu held, hot-plug
  *   test_present modern           every button and trigger of the modern layout
  *   test_present rebind           a preset's bind.pad.* keys, through the loop
  *   test_present last             ACTIVE_PAD=last: the pad pressed last has the lane */
@@ -64,8 +64,6 @@ void fixture_stop_all(const char *reason) {
     atomic_fetch_add(&stop_calls, 1);
 }
 
-static void reset_chord(void) { clear_controller(); assert(!quit_chord_due(100000)); }
-
 static SDL_Event button_event(int button, int is_down) {
     SDL_Event e; memset(&e, 0, sizeof e);
     e.type = is_down ? SDL_CONTROLLERBUTTONDOWN : SDL_CONTROLLERBUTTONUP;
@@ -74,41 +72,41 @@ static SDL_Event button_event(int button, int is_down) {
 }
 
 static void shortcuts(void) {
-    reset_chord();
-    quit_chord_button(SDL_CONTROLLER_BUTTON_BACK, 1, 0);
-    assert(!quit_chord_due(5000));
-    quit_chord_button(SDL_CONTROLLER_BUTTON_START, 1, 5000);
-    assert(!quit_chord_due(6999)); assert(quit_chord_due(7000));
-    /* Repeated down events do not restart the hold. */
-    quit_chord_button(SDL_CONTROLLER_BUTTON_START, 1, 6000);
-    assert(quit_chord_due(7000));
-    /* Releasing either half cancels; time from earlier taps never accumulates. */
-    quit_chord_button(SDL_CONTROLLER_BUTTON_BACK, 0, 7001);
-    assert(!quit_chord_due(10000));
-    quit_chord_button(SDL_CONTROLLER_BUTTON_BACK, 1, 10000);
-    assert(!quit_chord_due(11999)); assert(quit_chord_due(12000));
-    quit_chord_button(SDL_CONTROLLER_BUTTON_START, 0, 12001);
-    assert(!quit_chord_due(20000));
-    reset_chord();  /* Focus loss or controller disconnection uses this reset. */
-    quit_chord_button(SDL_CONTROLLER_BUTTON_START, 1, 0);
-    quit_chord_button(SDL_CONTROLLER_BUTTON_A, 1, 1);
-    assert(!quit_chord_due(5000));
-    quit_chord_button(SDL_CONTROLLER_BUTTON_BACK, 1, 6000);
-    assert(!quit_chord_due(7999)); assert(quit_chord_due(8000));
-    reset_chord();
-    assert(!quit_chord_due(20000));
-    /* Physical shortcut works with both mappings; game/replay pad words do
-     * not touch its state. Start and Select individually retain their bits. */
+    /* The menu chord: the press that completes View + Menu, once a pair;
+     * either half alone is the game's. */
+    clear_controller();
+    assert(!chord_button(SDL_CONTROLLER_BUTTON_BACK, 1));
+    assert(chord_button(SDL_CONTROLLER_BUTTON_START, 1));
+    assert(!chord_button(SDL_CONTROLLER_BUTTON_START, 1));     /* a repeat is not another */
+    assert(!chord_button(SDL_CONTROLLER_BUTTON_BACK, 0));
+    assert(chord_button(SDL_CONTROLLER_BUTTON_BACK, 1));       /* completed again */
+    assert(!chord_button(SDL_CONTROLLER_BUTTON_A, 1));
+    clear_controller();      /* focus loss or a disconnection forgets the pair */
+    assert(!chord_button(SDL_CONTROLLER_BUTTON_START, 1));
+    assert(chord_button(SDL_CONTROLLER_BUTTON_BACK, 1));
+    clear_controller();
+    /* With both mappings, through the input layer: Start and Select keep
+     * their bits, the pair is the menu, and the game's pad words never
+     * touch it. */
     g_controller_id = 1;
     for (int modern=0;modern<2;modern++) {
         g_gamepad_modern=modern; build_defaults(); clear_controller();
-        SDL_Event e = button_event(SDL_CONTROLLER_BUTTON_START, 1); input_event(&e);
-        assert(atomic_load(&published)==0x8 && !g_quit_chord.timing);
-        e = button_event(SDL_CONTROLLER_BUTTON_BACK, 1); input_event(&e);
-        assert(atomic_load(&published)==0x9 && g_quit_chord.timing);
-        clear_controller(); assert(!g_quit_chord.timing);
-        fixture_ctrl_set(0x9,128,128); assert(!g_quit_chord.timing);
+        SDL_Event e = button_event(SDL_CONTROLLER_BUTTON_START, 1);
+        assert(input_event(&e)==INPUT_ACTION_NONE && atomic_load(&published)==0x8);
+        e = button_event(SDL_CONTROLLER_BUTTON_BACK, 1);
+        assert(input_event(&e)==INPUT_ACTION_MENU && atomic_load(&published)==0x9);
+        assert(input_event(&e)==INPUT_ACTION_NONE);
+        clear_controller(); assert(!g_chord.buttons);
+        fixture_ctrl_set(0x9,128,128); assert(!g_chord.buttons);
     }
+    /* Escape is the menu's key: a keycode, which SDL places on the keyboard
+     * once video is up, as it is in a game. */
+    assert(SDL_InitSubSystem(SDL_INIT_VIDEO)==0);
+    find_keys();
+    SDL_Event key; memset(&key,0,sizeof key); key.type=SDL_KEYDOWN; key.key.state=SDL_PRESSED;
+    key.key.keysym.sym=SDLK_ESCAPE; key.key.keysym.scancode=SDL_SCANCODE_ESCAPE;
+    assert(input_event(&key)==INPUT_ACTION_MENU);
+    key.type=SDL_KEYUP; key.key.state=SDL_RELEASED; assert(input_event(&key)==INPUT_ACTION_NONE);
     g_controller_id = -1;
     SDL_Event event; memset(&event,0,sizeof event); event.type=SDL_KEYDOWN; event.key.keysym.sym=SDLK_q;
     assert(!input_quit_event(&event));
@@ -119,7 +117,7 @@ static void shortcuts(void) {
     event.type=SDL_KEYUP; assert(!input_quit_event(&event)); event.type=SDL_KEYDOWN;
     event.key.keysym.sym=SDLK_ESCAPE; assert(!input_quit_event(&event));
     close_game_window(); assert(atomic_load(&g_quit) && atomic_load(&stop_calls)==1);
-    puts("presentation: two-second hold, release/reset, mappings, replay isolation and graceful quit passed");
+    puts("presentation: the menu chord, Escape, mappings, replay isolation and graceful quit passed");
 }
 
 static void virtual_button(SDL_Joystick *joystick,int button,int down) {
@@ -162,6 +160,14 @@ static void every_button(SDL_Joystick *joy,const psp_pad_bind *map,size_t n) {
     }
 }
 
+/* Ctrl+Shift+Q, through SDL's queue as a key press would come. */
+static void quit_by_keyboard(void) {
+    SDL_Event e; memset(&e,0,sizeof e); e.type=SDL_KEYDOWN; e.key.state=SDL_PRESSED;
+    e.key.keysym.sym=SDLK_q; e.key.keysym.scancode=SDL_SCANCODE_Q;
+    e.key.keysym.mod=KMOD_LCTRL|KMOD_LSHIFT;
+    assert(SDL_PushEvent(&e)==1);
+}
+
 static void event_loop(const char *mode) {
     if (!strcmp(mode,"modern")) setenv("PSPRECOMP_GAMEPAD","modern",1);
     if (!strcmp(mode,"last")) setenv("PSPRECOMP_ACTIVE_PAD","last",1);
@@ -181,12 +187,8 @@ static void event_loop(const char *mode) {
     SDL_SetHintWithPriority(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT,"0x0000/0x0000",
                             SDL_HINT_OVERRIDE);
     assert(present_start()==0);
-    if (!strcmp(mode,"keyboard")) {
-        SDL_Event e; memset(&e,0,sizeof e); e.type=SDL_KEYDOWN; e.key.state=SDL_PRESSED;
-        e.key.keysym.sym=SDLK_q; e.key.keysym.scancode=SDL_SCANCODE_Q;
-        e.key.keysym.mod=KMOD_LCTRL|KMOD_LSHIFT;
-        assert(SDL_PushEvent(&e)==1);
-    } else if (!strcmp(mode,"controller")) {
+    if (!strcmp(mode,"keyboard")) quit_by_keyboard();
+    else if (!strcmp(mode,"controller")) {
         /* The package builder has no physical controllers. An SDL virtual
          * gamepad goes through real discovery, mapping and button events. */
         int index; SDL_Joystick *joy=attach(&index);
@@ -198,23 +200,21 @@ static void event_loop(const char *mode) {
         SDL_Delay(100); assert(atomic_load(&published)==0);
         virtual_axis(joy,SDL_CONTROLLER_AXIS_TRIGGERRIGHT,-32768);
         virtual_button(joy,SDL_CONTROLLER_BUTTON_LEFTSTICK,0);
+        /* View + Menu is the menu's (this program has none) and no longer
+         * quits however long it is held; both still reach the game. */
         virtual_button(joy,SDL_CONTROLLER_BUTTON_BACK,1);
         virtual_button(joy,SDL_CONTROLLER_BUTTON_START,1);
         assert(published_becomes(9));
-        SDL_Delay(100); virtual_button(joy,SDL_CONTROLLER_BUTTON_START,0);
-        SDL_Delay(100); assert(!atomic_load(&stop_calls));
-        virtual_button(joy,SDL_CONTROLLER_BUTTON_START,1);
-        SDL_Delay(100); assert(!atomic_load(&stop_calls));
-        /* Device removal cancels an in-progress chord, and clears the pad. */
+        SDL_Delay(2100); assert(!atomic_load(&stop_calls));
+        /* Device removal clears the pad. */
         SDL_JoystickClose(joy); assert(!SDL_JoystickDetachVirtual(index));
         assert(published_becomes(0));
-        SDL_Delay(2100); assert(!atomic_load(&stop_calls));
         /* A pad plugged in again takes the lane. */
         joy=attach(&index);
         virtual_button(joy,SDL_CONTROLLER_BUTTON_START,1);
         virtual_button(joy,SDL_CONTROLLER_BUTTON_BACK,1);
         assert(published_becomes(9));
-        SDL_Delay(1500); assert(!atomic_load(&stop_calls));
+        quit_by_keyboard();
     } else if (!strcmp(mode,"modern")) {
         int index; SDL_Joystick *joy=attach(&index);
         assert(published_becomes(0));
@@ -230,8 +230,7 @@ static void event_loop(const char *mode) {
         assert(published_becomes(PSP_PAD_RT));
         virtual_axis(joy,SDL_CONTROLLER_AXIS_TRIGGERRIGHT,-32768);
         assert(published_becomes(0));
-        virtual_button(joy,SDL_CONTROLLER_BUTTON_BACK,1);
-        virtual_button(joy,SDL_CONTROLLER_BUTTON_START,1);
+        quit_by_keyboard();
     } else if (!strcmp(mode,"rebind")) {
         int index; SDL_Joystick *joy=attach(&index);
         assert(published_becomes(0));
@@ -271,8 +270,7 @@ static void event_loop(const char *mode) {
         deadline=SDL_GetTicks64()+1000;
         while (input_pad_id()!=SDL_JoystickInstanceID(first) && SDL_GetTicks64()<deadline) SDL_Delay(2);
         assert(input_pad_id()==SDL_JoystickInstanceID(first));
-        virtual_button(first,SDL_CONTROLLER_BUTTON_BACK,1);
-        virtual_button(first,SDL_CONTROLLER_BUTTON_START,1);
+        quit_by_keyboard();
     }
     Uint64 deadline=SDL_GetTicks64()+3000;
     while (!atomic_load(&stop_calls) && SDL_GetTicks64()<deadline) SDL_Delay(5);

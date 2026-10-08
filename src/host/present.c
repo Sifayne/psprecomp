@@ -15,6 +15,7 @@
 
 #include "psprecomp/host/present.h"
 #include "input.h"
+#include "overlay.h"
 #include "psprecomp/host/save_dialog.h"
 #include "psprecomp/host/settings.h"
 #include "psprecomp/host/title.h"
@@ -325,9 +326,22 @@ static const psp_audio_backend *audio(void) {
 /* While the guest is held the device plays silence and the mixer is not
  * asked: its rings keep what was queued, and resume where the pause cut
  * them, without counting the pause as an underrun. */
+/* The menu's master volume, 0..65536 for silence..unity, scaled on the way
+ * out so the guest and the mixers never see it. */
+static _Atomic int g_volume = 65536;
+
 static void audio_device_callback(void *ud, Uint8 *stream, int len) {
     if (psp_paused()) { memset(stream, 0, (size_t)len); return; }
     audio()->callback(ud, stream, len);
+    const int volume = atomic_load(&g_volume);
+    if (volume >= 65536) return;
+    int16_t *pcm = (int16_t *)stream;
+    for (int i = 0; i < len / 2; i++) pcm[i] = (int16_t)(((int32_t)pcm[i] * volume) >> 16);
+}
+
+void present_set_volume(double fraction, int mute) {
+    const double v = mute ? 0 : fraction < 0 ? 0 : fraction > 1 ? 1 : fraction;
+    atomic_store(&g_volume, (int)(v * 65536 + 0.5));
 }
 
 void present_audio_report(FILE *out) { audio()->report(out); }
@@ -489,8 +503,32 @@ void *present_gl_proc(const char *name) { return SDL_GL_GetProcAddress(name); }
 
 /* ---- the SDL thread -------------------------------------------------------- */
 
+/* The in-game menu, when the program asked for one (present_use_overlay). */
+static const present_overlay *g_overlay;
+static SDL_Window *g_window;
+static int g_quit_requested;
+static double g_shown_fps;
+
+void present_set_overlay(const present_overlay *overlay) { g_overlay = overlay; }
+
+const psp_ui_frame *present_ui_lock(const psp_ui_texture_op **ops, int *op_count) {
+    if (!g_overlay) { *ops = NULL; *op_count = 0; return NULL; }
+    return g_overlay->gl_lock(ops, op_count);
+}
+void present_ui_unlock(void) { if (g_overlay) g_overlay->gl_unlock(); }
+
+double present_fps(void) { return g_shown_fps; }
+void present_quit(void) { g_quit_requested = 1; }
+const char *present_renderer_name(void) { return g_gl_want ? "OpenGL" : "Software"; }
+void present_set_fullscreen(int on) {
+    if (!g_window) return;
+    const int full = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0;
+    if (full != (on != 0)) SDL_SetWindowFullscreen(g_window, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+}
+
 /* Window close and both shortcuts share the scheduler's normal shutdown. */
 static void close_game_window(void) {
+    if (g_overlay) g_overlay->stop();
     save_dialog_shutdown();
     present_audio_report(stderr);
     /* Stop the run the way the host already stops one, rather than
@@ -628,6 +666,9 @@ static void *sdl_thread(void *arg) {
      * the GL handoff above on purpose -- that block owns the context
      * juggling and does not need company. */
     input_start(settings);
+    present_set_volume(setting("VOLUME", 100) / 100.0, 0);
+    g_window = win;
+    if (g_overlay && win) g_overlay->start(win, g_gl_want ? NULL : ren);
 
     if (save_dialog_init() != 0)
         fprintf(stderr, "present: in-game save dialog unavailable (%s); interactive save/load requests will be cancelled\n",
@@ -701,28 +742,23 @@ static void *sdl_thread(void *arg) {
          * and the count starts again when it is let go. */
         {
             static uint32_t title_t0; static uint64_t title_frames; static char last[128];
-            static int was_quitting, was_paused; static double shown_fps;
+            static int was_paused;
             const uint32_t now = SDL_GetTicks();
-            /* The quit chord shows in the title the moment it is held, so a
-             * player sees the countdown rather than an unexplained close. */
-            const int quitting = input_quitting();
             const int paused = psp_paused();
             if (!title_t0 || paused != was_paused) { title_t0 = now; title_frames = atomic_load(&g_frames_rendered); }
-            if ((now - title_t0 >= 1000 || quitting != was_quitting || paused != was_paused) && win) {
+            if ((now - title_t0 >= 1000 || paused != was_paused) && win) {
                 if (now - title_t0 >= 1000) {
                     const uint64_t frames = atomic_load(&g_frames_rendered);
-                    shown_fps = (double)(frames - title_frames) * 1000.0 / (double)(now - title_t0);
+                    if (!paused)
+                        g_shown_fps = (double)(frames - title_frames) * 1000.0 / (double)(now - title_t0);
                     title_t0 = now; title_frames = frames;
                 }
                 char title[128];
                 if (paused)
-                    snprintf(title, sizeof title, "%s -- recompiled  |  paused%s", title_name(),
-                             quitting ? "  |  QUITTING: keep holding Select + Start, release to cancel" : "");
+                    snprintf(title, sizeof title, "%s -- recompiled  |  paused", title_name());
                 else
-                    snprintf(title, sizeof title, "%s -- recompiled  |  %.0f fps%s", title_name(), shown_fps,
-                             quitting ? "  |  QUITTING: keep holding Select + Start, release to cancel" : "");
+                    snprintf(title, sizeof title, "%s -- recompiled  |  %.0f fps", title_name(), g_shown_fps);
                 if (strcmp(title, last) != 0) { SDL_SetWindowTitle(win, title); snprintf(last, sizeof last, "%s", title); }
-                was_quitting = quitting;
                 was_paused = paused;
             }
         }
@@ -734,9 +770,13 @@ static void *sdl_thread(void *arg) {
         if (save_dialog_active() && !was_dialog) input_take(INPUT_DIALOG);
         else if (!save_dialog_active()) input_return(INPUT_DIALOG);
         input_tick();
+        /* The menu lays out its frame here, every loop while it is open:
+         * drawn below under software, by the GL thread under GL. */
+        if (g_overlay && g_overlay->is_open()) g_overlay->frame();
         if (tex) {
             SDL_RenderCopy(ren, tex, NULL, NULL);
             save_dialog_draw_software(ren);
+            if (g_overlay) g_overlay->draw(ren);
             SDL_RenderPresent(ren);
         }
 
@@ -751,7 +791,16 @@ static void *sdl_thread(void *arg) {
                 close_game_window();
                 return NULL;
             }
+            /* An open menu sees every event first; the input layer still
+             * sees devices come and go and focus, and keeps the rest from
+             * the game while the menu owns the controls. */
+            if (g_overlay && g_overlay->is_open()) g_overlay->event(&e);
             const int action = input_event(&e);
+            if (action == INPUT_ACTION_MENU) {
+                if (g_overlay) g_overlay->toggle();
+                else input_release_mouse();     /* what Escape did before the menu */
+                continue;
+            }
             if (action == INPUT_ACTION_QUIT) {
                 fprintf(stderr, "present: quit binding\n");
                 close_game_window();
@@ -761,8 +810,8 @@ static void *sdl_thread(void *arg) {
                 const int full = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) != 0;
                 SDL_SetWindowFullscreen(win, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
             } else if (action != INPUT_ACTION_NONE && action != INPUT_ACTION_FULLSCREEN) {
-                /* The menu, quick save and load and screenshots come with
-                 * the overlay and save states (docs/PLAYER-LAYER.md). */
+                /* Quick save and load and screenshots come with save states
+                 * (docs/PLAYER-LAYER.md). */
                 static unsigned said;
                 if (!(said & 1u << action)) {
                     said |= 1u << action;
@@ -770,8 +819,8 @@ static void *sdl_thread(void *arg) {
                 }
             }
         }
-        if (input_quit_due()) {
-            fprintf(stderr, "present: controller quit shortcut (held 2 seconds)\n");
+        if (g_quit_requested) {
+            fprintf(stderr, "present: quit from the menu\n");
             close_game_window();
             return NULL;
         }

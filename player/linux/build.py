@@ -220,6 +220,7 @@ def main():
     notices = [(PACK.license, f"{PACK.id}/LICENSE"),
         (TOOLKIT / "LICENSE", "psprecomp/LICENSE"),
         (TOOLKIT / "third_party/stb/LICENSE", "stb/LICENSE"),
+        (TOOLKIT / "third_party/imgui/LICENSE.txt", "imgui/LICENSE.txt"),
         (sdl / "LICENSE.txt", "SDL/LICENSE.txt"), (ttf / "LICENSE.txt", "SDL_ttf/LICENSE.txt"),
         (ttf / "external/freetype/docs/FTL.TXT", "FreeType/FTL.TXT"),
         (h264 / "LICENSE", "OpenH264/LICENSE"), (font / "LICENSE", "DejaVu/LICENSE"),

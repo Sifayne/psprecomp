@@ -136,7 +136,7 @@ def copy_inputs(dest):
     toolkit = dest / "psprecomp"
     if not (TOOLKIT / "src/cpu.c").is_file():
         raise ValueError(f"{TOOLKIT} is not a psprecomp checkout")
-    for folder in ("src", "include", "player", "third_party/stb", "third_party/ffmpeg"):
+    for folder in ("src", "include", "player", "third_party/stb", "third_party/imgui", "third_party/ffmpeg"):
         copy_tree(TOOLKIT / folder, toolkit / folder)
     copy_tree(TOOLKIT / "tools/allegrexrecomp", toolkit / "tools/allegrexrecomp", {".c", ".h"})
     for name in ("LICENSE", "tests/test_present.c", "tests/test_savedata.c", "tests/test_launcher.c"):

@@ -235,6 +235,24 @@ if(PSPRECOMP_HOST)
                          present_rebind present_last_pad PROPERTIES
         TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
 
+    # The in-game menu: the toolkit, then the real loop with held input and
+    # with press-to-bind and saving. Linked as C: Dear ImGui needs nothing of
+    # the C++ runtime (third_party/imgui/README.md).
+    add_executable(test_overlay test_overlay.c)
+    target_link_libraries(test_overlay PRIVATE psprecomp_host)
+    set_target_properties(test_overlay PROPERTIES LINKER_LANGUAGE C)
+    if(MSVC)
+        target_compile_options(test_overlay PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_overlay PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME overlay_ui COMMAND test_overlay ui)
+    add_test(NAME overlay_held COMMAND test_overlay held)
+    add_test(NAME overlay_bind COMMAND test_overlay bind)
+    add_test(NAME overlay_pad COMMAND test_overlay pad)
+    set_tests_properties(overlay_ui overlay_held overlay_bind overlay_pad PROPERTIES
+        TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
+
     # The bindings: the table test against the input code before stage 6
     # (input_before.h), spelling, rebinding, host actions and the owner. It
     # includes input.c.

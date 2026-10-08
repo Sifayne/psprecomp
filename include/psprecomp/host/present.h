@@ -27,12 +27,17 @@ int present_start(void);
 void present_note_frame(void);
 /* What audio output saw, per channel; the window's close prints it. */
 void present_audio_report(FILE *out);
+/* The in-game menu (src/host/overlay.c, docs/PLAYER-LAYER.md §4), for a
+ * program that wants one: call before present_start. One that only presents
+ * -- a render check, a test -- leaves it out, and Dear ImGui with it. */
+void present_use_overlay(void);
 #else
 /* No SDL2 when this was built, so present.c was never compiled and there is
  * nothing to link against. The declaration becomes a stub rather than the call
  * site becoming conditional: a host without SDL2 has to build, and asking for a
  * window on one should say why it did not get one instead of failing to link. */
 static inline void present_audio_report(FILE *out) { (void)out; }
+static inline void present_use_overlay(void) { }
 static inline int present_start(void) {
     fprintf(stderr, "present: built without SDL2 -- no window. Install the "
                     "SDL2 development package and rebuild the host\n");

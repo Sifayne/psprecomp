@@ -331,7 +331,7 @@ static void build_defaults(void) {
         add(DEV_KEY, SRC_SCANCODE, SDL_SCANCODE_D, TGT_STICK_DIR, DIR_RIGHT);
         add(DEV_KEY, SRC_SCANCODE, SDL_SCANCODE_LALT, TGT_WALK, 0);
     }
-    add(DEV_KEY, SRC_KEY, SDLK_ESCAPE, TGT_ACTION, INPUT_ACTION_RELEASE_MOUSE);
+    add(DEV_KEY, SRC_KEY, SDLK_ESCAPE, TGT_ACTION, INPUT_ACTION_MENU);
     add(DEV_KEY, SRC_KEY, SDLK_q, TGT_ACTION, INPUT_ACTION_QUIT);
     g_binds[g_nbinds - 1].mods = KMOD_CTRL | KMOD_SHIFT;
 
@@ -531,34 +531,26 @@ static void mouse_grab(int on) {
                        : "present: mouse released -- click the window to capture it\n");
 }
 
-/* ---- the quit chord --------------------------------------------------------------- */
+/* ---- the menu chord ---------------------------------------------------------------- */
 
-/* Host-only quit chord: physical View/Back + Menu/Start on the active pad,
- * held continuously. Kept apart from the bindings, the guest and replays. */
-static struct { unsigned buttons; uint64_t since; int timing; } g_quit_chord;
-enum { QUIT_HOLD_MS = 2000 };
+/* Physical View/Back + Menu/Start on the active pad, pressed together, opens
+ * the menu (docs/PLAYER-LAYER.md, decided 4 Oct): the press that completes the
+ * pair. It was a two-second hold that quit; Quit is in the menu now. Kept
+ * apart from the bindings, the guest and replays. Both buttons still reach
+ * the game until the menu takes the controls. */
+static struct { unsigned buttons; int fired; } g_chord;
 
-static void quit_chord_button(uint8_t button, int is_down, uint64_t now) {
+static int chord_button(uint8_t button, int is_down) {
     const unsigned bit = button == SDL_CONTROLLER_BUTTON_BACK ? 1u :
                          button == SDL_CONTROLLER_BUTTON_START ? 2u : 0u;
-    if (!bit) return;
-    if (is_down) g_quit_chord.buttons |= bit;
-    else g_quit_chord.buttons &= ~bit;
-    if (g_quit_chord.buttons == 3) {
-        if (!g_quit_chord.timing) {
-            g_quit_chord.since = now; g_quit_chord.timing = 1;
-            /* The window title says so at once; this is for the log. */
-            fprintf(stderr, "present: quit chord held -- keep holding Select + Start for %d s to close, release to cancel\n",
-                    QUIT_HOLD_MS / 1000);
-        }
-    } else g_quit_chord.timing = 0;
+    if (!bit) return 0;
+    if (is_down) g_chord.buttons |= bit;
+    else g_chord.buttons &= ~bit;
+    if (g_chord.buttons != 3) { g_chord.fired = 0; return 0; }
+    if (g_chord.fired) return 0;
+    g_chord.fired = 1;
+    return 1;
 }
-
-static int quit_chord_due(uint64_t now) {
-    return g_quit_chord.timing && now - g_quit_chord.since >= QUIT_HOLD_MS;
-}
-
-int input_quitting(void) { return g_quit_chord.timing; }
 
 /* ---- controllers -------------------------------------------------------------------- */
 
@@ -578,7 +570,7 @@ SDL_GameController *input_pad(void) { return g_controller; }
 SDL_JoystickID input_pad_id(void) { return g_controller_id; }
 
 static void clear_controller(void) {
-    memset(&g_quit_chord, 0, sizeof g_quit_chord);
+    memset(&g_chord, 0, sizeof g_chord);
     memset(g_pad_down, 0, sizeof g_pad_down);
     memset(g_pad_axis, 0, sizeof g_pad_axis);
     for (int i = 0; i < g_nbinds; i++)
@@ -591,8 +583,10 @@ static void sample_controller(void) {
     if (!g_controller) return;
     for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX; b++) {
         g_pad_down[b] = SDL_GameControllerGetButton(g_controller, (SDL_GameControllerButton)b) != 0;
-        quit_chord_button((uint8_t)b, g_pad_down[b], SDL_GetTicks64());
+        chord_button((uint8_t)b, g_pad_down[b]);
     }
+    /* A pair already held when the pad is sampled is not a press. */
+    g_chord.fired = g_chord.buttons == 3;
     for (int a = 0; a < SDL_CONTROLLER_AXIS_MAX; a++)
         g_pad_axis[a] = SDL_GameControllerGetAxis(g_controller, (SDL_GameControllerAxis)a);
 }
@@ -721,14 +715,15 @@ static void returning(void) {
     if (!calm)
         fprintf(stderr, "present: input still held a second after the %s closed; resuming game input\n",
                 g_owner == INPUT_DIALOG ? "save dialog" : "menu");
-    g_owner = INPUT_GAME;
     g_returning = 0;
     g_return_at = 0;
     let_go();
     sample_controller();
-    publish();
     if (g_owner_mouse_was_grabbed) mouse_grab(1);
     g_owner_mouse_was_grabbed = 0;
+    /* The game's again only now, with everything in place. */
+    g_owner = INPUT_GAME;
+    publish();
 }
 
 /* ---- events -------------------------------------------------------------------------- */
@@ -751,7 +746,7 @@ int input_quit_event(const SDL_Event *e) {
 
 void input_chord_event(const SDL_Event *e) {
     if ((e->type == SDL_CONTROLLERBUTTONDOWN || e->type == SDL_CONTROLLERBUTTONUP) && e->cbutton.which == g_controller_id)
-        quit_chord_button(e->cbutton.button, e->cbutton.state, SDL_GetTicks64());
+        chord_button(e->cbutton.button, e->cbutton.state);
 }
 
 /* Host actions press on the way down, once. One bound to a key with
@@ -809,12 +804,13 @@ int input_event(const SDL_Event *e) {
     }
     if (!input_types(e->type)) return INPUT_ACTION_NONE;
     if (g_owner != INPUT_GAME) { input_chord_event(e); return INPUT_ACTION_NONE; }
+    int menu = 0;
 
     switch (e->type) {
     case SDL_CONTROLLERBUTTONDOWN:
     case SDL_CONTROLLERBUTTONUP:
         if (e->cbutton.which != g_controller_id && !pressed_elsewhere(e)) return INPUT_ACTION_NONE;
-        quit_chord_button(e->cbutton.button, e->cbutton.state, SDL_GetTicks64());
+        menu = chord_button(e->cbutton.button, e->cbutton.state);
         if (e->cbutton.button < SDL_CONTROLLER_BUTTON_MAX) g_pad_down[e->cbutton.button] = e->cbutton.state != 0;
         break;
     case SDL_CONTROLLERAXISMOTION:
@@ -862,10 +858,8 @@ int input_event(const SDL_Event *e) {
     }
     const int action = carry_out(actions());
     publish();
-    return action;
+    return menu ? INPUT_ACTION_MENU : action;
 }
-
-int input_quit_due(void) { return quit_chord_due(SDL_GetTicks64()); }
 
 void input_tick(void) {
     returning();
@@ -878,6 +872,174 @@ void input_tick(void) {
         }
     if (ended) publish();
 }
+
+/* ---- the menu's bindings page ------------------------------------------------------------ */
+
+/* What the page lists, in order: the PSP's buttons, the stick and walk, the
+ * title's actions, and the host actions that do something today. */
+static const struct { const char *name, *label; } HOST_ROWS[] = {
+    { "up", "Up" }, { "down", "Down" }, { "left", "Left" }, { "right", "Right" },
+    { "cross", "Cross" }, { "circle", "Circle" }, { "square", "Square" }, { "triangle", "Triangle" },
+    { "l", "L" }, { "r", "R" }, { "start", "Start" }, { "select", "Select" },
+    { "stick_up", "Stick up" }, { "stick_down", "Stick down" }, { "stick_left", "Stick left" },
+    { "stick_right", "Stick right" }, { "walk", "Walk" },
+};
+static const struct { const char *name, *label; } HOST_ACTION_ROWS[] = {
+    { "menu", "Menu" }, { "fullscreen", "Fullscreen" }, { "release_mouse", "Release the mouse" }, { "quit", "Quit" },
+};
+enum { HOST_ROW_COUNT = sizeof HOST_ROWS / sizeof *HOST_ROWS,
+       HOST_ACTION_ROW_COUNT = sizeof HOST_ACTION_ROWS / sizeof *HOST_ACTION_ROWS };
+
+int input_rows(void) { return HOST_ROW_COUNT + (int)g_tin.action_count + HOST_ACTION_ROW_COUNT; }
+
+static const char *row_name(int row) {
+    if (row < HOST_ROW_COUNT) return HOST_ROWS[row].name;
+    row -= HOST_ROW_COUNT;
+    if (row < (int)g_tin.action_count) return g_tin.actions[row].name;
+    return HOST_ACTION_ROWS[row - (int)g_tin.action_count].name;
+}
+
+const char *input_row_label(int row) {
+    if (row < HOST_ROW_COUNT) return HOST_ROWS[row].label;
+    row -= HOST_ROW_COUNT;
+    if (row < (int)g_tin.action_count) return g_tin.actions[row].label;
+    return HOST_ACTION_ROWS[row - (int)g_tin.action_count].label;
+}
+
+/* The key on the keyboard a source is, for telling two spellings apart. */
+static int32_t physical(const binding *b) { return b->src == SRC_KEY ? b->scancode : b->code; }
+static int same_source(const binding *a, const binding *b) {
+    const int key_a = a->src == SRC_KEY || a->src == SRC_SCANCODE, key_b = b->src == SRC_KEY || b->src == SRC_SCANCODE;
+    if (key_a || key_b) return key_a && key_b && physical(a) == physical(b) && a->mods == b->mods;
+    return a->src == b->src && a->code == b->code;
+}
+
+/* A source as the menu shows it: SDL's names are for the settings file. */
+static void describe_source(const binding *b, char *out, size_t size) {
+    static const struct { const char *sdl, *shown; } PAD[] = {
+        { "a", "A" }, { "b", "B" }, { "x", "X" }, { "y", "Y" }, { "back", "View" }, { "guide", "Guide" },
+        { "start", "Menu" }, { "leftstick", "L3" }, { "rightstick", "R3" }, { "leftshoulder", "LB" },
+        { "rightshoulder", "RB" }, { "dpup", "D-pad up" }, { "dpdown", "D-pad down" },
+        { "dpleft", "D-pad left" }, { "dpright", "D-pad right" }, { "misc1", "Share" },
+        { "paddle1", "P1" }, { "paddle2", "P2" }, { "paddle3", "P3" }, { "paddle4", "P4" },
+        { "touchpad", "Touchpad" }, { "lefttrigger", "LT" }, { "righttrigger", "RT" },
+        { "+leftx", "Left stick right" }, { "-leftx", "Left stick left" },
+        { "+lefty", "Left stick down" }, { "-lefty", "Left stick up" },
+        { "+rightx", "Right stick right" }, { "-rightx", "Right stick left" },
+        { "+righty", "Right stick down" }, { "-righty", "Right stick up" },
+        { "leftxy", "Left stick" }, { "rightxy", "Right stick" },
+    };
+    static const char *const MOUSE_SHOWN[] = { "", "Left button", "Middle button", "Right button",
+                                               "Back button", "Forward button" };
+    static const char *const WHEEL_SHOWN[] = { "Wheel up", "Wheel down", "Wheel left", "Wheel right" };
+    char spelled[64];
+    format_source(b, spelled, sizeof spelled);
+    if (b->src == SRC_SCANCODE) {
+        snprintf(out, size, "%s", spelled);
+        char *at = strstr(out, "scancode:");
+        if (at) memmove(at, at + 9, strlen(at + 9) + 1);
+        return;
+    }
+    if (b->src == SRC_MOUSE_BUTTON) { snprintf(out, size, "%s", MOUSE_SHOWN[b->code]); return; }
+    if (b->src == SRC_WHEEL) { snprintf(out, size, "%s", WHEEL_SHOWN[b->code]); return; }
+    if (b->src == SRC_MOTION) { snprintf(out, size, "Motion"); return; }
+    if (b->device == DEV_PAD)
+        for (size_t i = 0; i < sizeof PAD / sizeof *PAD; i++)
+            if (!strcmp(PAD[i].sdl, spelled)) { snprintf(out, size, "%s", PAD[i].shown); return; }
+    snprintf(out, size, "%s", spelled);
+}
+
+/* A target's sources on a device, joined as a bind.* value spells them;
+ * skip one equal to `without`. */
+static void sources_of(const binding *t, int device, const binding *without, char *out, size_t size) {
+    *out = 0;
+    for (int i = 0; i < g_nbinds; i++) {
+        const binding *b = &g_binds[i];
+        if (b->device != device || b->tgt != t->tgt || b->value != t->value) continue;
+        if (without && same_source(b, without)) continue;
+        char one[64];
+        format_source(b, one, sizeof one);
+        if (strlen(out) + strlen(one) + 3 < size) { if (*out) strcat(out, ", "); strcat(out, one); }
+    }
+}
+
+void input_row_sources(int row, int device, char *out, size_t size) {
+    binding t = { 0 };
+    *out = 0;
+    if (row < 0 || row >= input_rows() || parse_target(row_name(row), &t)) return;
+    for (int i = 0; i < g_nbinds; i++) {
+        const binding *b = &g_binds[i];
+        if (b->device != device || b->tgt != t.tgt || b->value != t.value) continue;
+        char one[64];
+        describe_source(b, one, sizeof one);
+        if (strlen(out) + strlen(one) + 3 < size) { if (*out) strcat(out, ", "); strcat(out, one); }
+    }
+}
+
+int input_assign(psp_settings *s, int row, int device, const char *source) {
+    char key[PSP_BIND_KEY], error[PSP_SETTINGS_ERROR];
+    binding t = { 0 }, src = { 0 };
+    if (row < 0 || row >= input_rows() || device < 0 || device >= DEVICES || parse_target(row_name(row), &t)) return -1;
+    snprintf(key, sizeof key, "%s.%s", DEVICE_NAME[device], row_name(row));
+    if (!source) return psp_settings_bind(s, key, "", error);
+    char why[160];
+    src.tgt = t.tgt; src.value = t.value;
+    if (parse_source(device, source, &src, why, sizeof why) || mismatch(&src)) return -1;
+    if (src.src == SRC_KEY) src.scancode = SDL_GetScancodeFromKey(src.code);
+    if (psp_settings_bind(s, key, source, error)) return -1;
+    /* A control does one thing: it leaves whatever else it pressed here. */
+    for (int r = 0; r < input_rows(); r++) {
+        binding other = { 0 };
+        if (r == row || parse_target(row_name(r), &other)) continue;
+        int has = 0;
+        for (int i = 0; i < g_nbinds; i++)
+            has |= g_binds[i].device == device && g_binds[i].tgt == other.tgt && g_binds[i].value == other.value &&
+                   same_source(&g_binds[i], &src);
+        if (!has) continue;
+        char rest[PSP_BIND_VALUE];
+        sources_of(&other, device, &src, rest, sizeof rest);
+        snprintf(key, sizeof key, "%s.%s", DEVICE_NAME[device], row_name(r));
+        if (psp_settings_bind(s, key, rest, error)) return -1;
+    }
+    return 0;
+}
+
+int input_spell(const SDL_Event *e, int device, char *out, size_t size) {
+    switch (e->type) {
+    case SDL_KEYDOWN:
+        if (device != DEV_KEY || e->key.repeat) return 0;
+        snprintf(out, size, "%s", e->key.keysym.sym == SDLK_COMMA ? "Comma" : SDL_GetKeyName(e->key.keysym.sym));
+        return *out != 0;
+    case SDL_CONTROLLERBUTTONDOWN:
+        if (device != DEV_PAD) return 0;
+        snprintf(out, size, "%s", SDL_GameControllerGetStringForButton((SDL_GameControllerButton)e->cbutton.button));
+        return 1;
+    case SDL_CONTROLLERAXISMOTION: {
+        if (device != DEV_PAD || abs(e->caxis.value) < 16384) return 0;
+        const SDL_GameControllerAxis a = (SDL_GameControllerAxis)e->caxis.axis;
+        const int trigger = a == SDL_CONTROLLER_AXIS_TRIGGERLEFT || a == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
+        if (trigger && e->caxis.value < 0) return 0;
+        snprintf(out, size, "%s%s", trigger ? "" : e->caxis.value > 0 ? "+" : "-", SDL_GameControllerGetStringForAxis(a));
+        return 1;
+    }
+    case SDL_MOUSEBUTTONDOWN:
+        if (device != DEV_MOUSE || e->button.button < 1 || e->button.button > 5) return 0;
+        snprintf(out, size, "%s", MOUSE_NAMES[e->button.button]);
+        return 1;
+    case SDL_MOUSEWHEEL: {
+        if (device != DEV_MOUSE) return 0;
+        int y = e->wheel.y, x = e->wheel.x;
+        if (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { y = -y; x = -x; }
+        const int which = y > 0 ? 0 : y < 0 ? 1 : x < 0 ? 2 : x > 0 ? 3 : -1;
+        if (which < 0) return 0;
+        snprintf(out, size, "%s", WHEEL_NAMES[which]);
+        return 1;
+    }
+    default: return 0;
+    }
+}
+
+void input_release_mouse(void) { mouse_grab(0); }
 
 /* ---- starting -------------------------------------------------------------------------- */
 
@@ -894,6 +1056,20 @@ static int gamepad_modern(const psp_settings *s) {
     fprintf(stderr, "present: this title has no native replacements for the modern "
                     "controller layout -- using the classic PSP buttons instead\n");
     return 0;
+}
+
+/* The keyboard layout, the active pad and the bindings, from settings the
+ * menu changed: what the host can apply while the game runs. The title's
+ * input and its Modern controls stay as they started. */
+void input_rebuild(const psp_settings *s) {
+    g_keys_wasd = option_value(s, "KEYS", 0) != 0;
+    const int was_last = g_pad_last;
+    g_pad_last = option_value(s, "ACTIVE_PAD", 0) != 0;
+    build_defaults();
+    for (int i = 0; i < s->bind_count; i++) apply_binding(s->bind[i].key, s->bind[i].value);
+    find_keys();
+    if (g_pad_last && !was_last) open_controllers();
+    publish();
 }
 
 /* The layouts, the title's input and the preset's bindings, as a table. */
@@ -952,6 +1128,6 @@ void input_start(const psp_settings *s) {
      * launched for it is playable at once; Escape lets go, a click retakes. */
     g_mouse_want = s->mouse;
     if (g_mouse_want) mouse_grab(1);
-    fprintf(stderr, "present: quit with Ctrl+Shift+Q or hold View + Menu (Select + Start) for 2 seconds\n");
+    fprintf(stderr, "present: Escape or View + Menu (Select + Start) opens the menu; Ctrl+Shift+Q quits\n");
     open_controllers();
 }

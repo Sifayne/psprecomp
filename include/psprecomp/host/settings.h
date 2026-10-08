@@ -30,6 +30,11 @@ enum {
 /* The launcher does not show this option; files, the environment and the
  * command line still set it. */
 #define PSP_OPTION_HIDDEN   0x2u
+/* The in-game menu applies a change to this option at once; without it, a
+ * change applies the next time the game starts. The host applies its own
+ * (the keyboard layout, the active controller, the window mode, the volume);
+ * a title that marks one of its own reads it again when it changes. */
+#define PSP_OPTION_LIVE     0x4u
 
 typedef struct {
     const char *key, *env, *label, *page, *help;
@@ -159,4 +164,11 @@ int psp_presets_save(const psp_presets *p, const char *path, char *error);
 /* No implicit preferences file: NULL path means defaults + env only. */
 int psp_settings_load(psp_settings *s, const char *path, const char *preset,
                       char *error);
+/* The preferences file and the preset the last psp_settings_load read, or
+ * NULL for a run started without one. */
+const char *psp_settings_origin(const char **preset);
+/* Write s back into that preset: every option the preset set or s changed,
+ * and the bindings. A value that came from the environment is not written;
+ * the preset keeps its own. */
+int psp_settings_save_origin(const psp_settings *s, char *error);
 #endif

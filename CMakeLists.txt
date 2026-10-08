@@ -140,6 +140,28 @@ if(NOT MSVC)
     endif()
 endif()
 
+# --- Dear ImGui, for the player's in-game menu ----------------------------------
+#
+# The core (third_party/imgui), without SDL: the host layer's menu draws with
+# it (src/host/ui.cpp). Built here, with the runtime, so that a game whose
+# own scripts compile the host files by path links this archive instead of
+# compiling ImGui every time. C++ without exceptions, RTTI or thread-safe
+# statics needs nothing of the C++ runtime, so a C link takes it as it is
+# (third_party/imgui/README.md). Needs a C++ compiler; without one there is
+# no archive, and no menu.
+include(CheckLanguage)
+check_language(CXX)
+if(CMAKE_CXX_COMPILER)
+    enable_language(CXX)
+    add_library(psprecomp_imgui STATIC
+        third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
+        third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp)
+    target_include_directories(psprecomp_imgui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
+    set(PSPRECOMP_CXX_FLAGS -fno-exceptions -fno-rtti -fno-threadsafe-statics)
+    target_compile_options(psprecomp_imgui PRIVATE ${PSPRECOMP_CXX_FLAGS})
+    set_target_properties(psprecomp_imgui PROPERTIES CXX_STANDARD 11 POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # --- optional: the SDL2 host layer --------------------------------------------
 #
 # Code a game's host needs and the runtime does not: so far the savedata

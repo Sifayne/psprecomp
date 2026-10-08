@@ -13,7 +13,7 @@
 # (include/psprecomp/host/launcher.h). Last Raven's
 # packaging/linux/CMakeLists.txt until stage 2 of docs/PLAYER-LAYER.md split it.
 cmake_minimum_required(VERSION 3.16)
-project(psprecomp_player C)
+project(psprecomp_player C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_BUILD_TYPE Release)
 foreach(var TOOLKIT PACK PACK_CMAKE PACK_SLUGS DEPS FFMPEG)
@@ -37,8 +37,21 @@ target_link_libraries(allegrexrecomp PRIVATE runtime)
 
 # The shared host, compiled into the pack's programs by path.
 set(PLAYER_SETTINGS "${TOOLKIT}/src/host/settings.c")
+# The in-game menu is Dear ImGui (third_party/imgui) behind ui.cpp, compiled
+# once for every target that takes the host. C++ without exceptions, RTTI or
+# thread-safe statics needs nothing of the C++ runtime, so the game's
+# on-device C link (compile_game.py) takes the host archive as it is.
+set(PLAYER_IMGUI "${TOOLKIT}/third_party/imgui")
+add_library(player_ui OBJECT "${TOOLKIT}/src/host/overlay.c" "${TOOLKIT}/src/host/ui.cpp"
+    "${PLAYER_IMGUI}/imgui.cpp" "${PLAYER_IMGUI}/imgui_draw.cpp" "${PLAYER_IMGUI}/imgui_tables.cpp"
+    "${PLAYER_IMGUI}/imgui_widgets.cpp" "${PLAYER_IMGUI}/backends/imgui_impl_sdl2.cpp"
+    "${PLAYER_IMGUI}/backends/imgui_impl_sdlrenderer2.cpp")
+target_include_directories(player_ui PRIVATE "${PLAYER_IMGUI}")
+target_compile_definitions(player_ui PRIVATE HAVE_SDL2)
+target_compile_options(player_ui PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti;-fno-threadsafe-statics>")
+target_link_libraries(player_ui PRIVATE runtime PkgConfig::SDL)
 set(PLAYER_HOST "${TOOLKIT}/src/host/present.c" "${TOOLKIT}/src/host/input.c" "${TOOLKIT}/src/host/save_dialog.c"
-    "${TOOLKIT}/src/host/render_gl.c" "${PLAYER_SETTINGS}")
+    "${TOOLKIT}/src/host/render_gl.c" $<TARGET_OBJECTS:player_ui> "${PLAYER_SETTINGS}")
 set(PLAYER_LAUNCHER "${TOOLKIT}/src/host/launcher.c")
 
 # Its own checks. Assertions are the fixtures' checks; Release must not

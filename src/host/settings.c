@@ -17,7 +17,7 @@ static const psp_settings_schema *schema;
 static int opt_render = -1, opt_window = -1, opt_window_mode = -1, opt_realtime = -1;
 
 static int fail(char *error, const char *key, const char *message) {
-    snprintf(error, PSP_SETTINGS_ERROR, "%s: %s", key, message);
+    snprintf(error, PSP_SETTINGS_ERROR, "%.255s: %s", key, message);
     return -1;
 }
 
@@ -408,9 +408,12 @@ int psp_presets_save(const psp_presets *p, const char *path, char *error) {
     free(tmp); return bad ? -1 : 0;
 }
 
+static char origin_path[4096], origin_preset[PSP_SETTINGS_NAME];
+
 int psp_settings_load(psp_settings *s, const char *path, const char *preset, char *error) {
     psp_settings next; psp_settings_defaults(&next);
     if (preset && !path) return fail(error, "--preset", "requires --config");
+    char loaded[PSP_SETTINGS_NAME] = "";
     if (path) {
         psp_presets *p = malloc(sizeof *p);
         if (!p) return fail(error, path, "out of memory");
@@ -418,8 +421,40 @@ int psp_settings_load(psp_settings *s, const char *path, const char *preset, cha
         int at = preset ? psp_presets_find(p, preset) : p->selected;
         if (at < 0) { free(p); return fail(error, preset, "preset does not exist"); }
         next = p->presets[at].settings;
+        snprintf(loaded, sizeof loaded, "%s", p->presets[at].name);
         free(p);
     }
     if (psp_settings_env(&next, error) || psp_settings_resolve(&next, error)) return -1;
+    if (path && strlen(path) >= sizeof origin_path) return fail(error, path, "path too long");
+    snprintf(origin_path, sizeof origin_path, "%s", path ? path : "");
+    snprintf(origin_preset, sizeof origin_preset, "%s", loaded);
     *s = next; return 0;
+}
+
+const char *psp_settings_origin(const char **preset) {
+    if (preset) *preset = origin_preset;
+    return *origin_path ? origin_path : NULL;
+}
+
+int psp_settings_save_origin(const psp_settings *s, char *error) {
+    const psp_settings_schema *sc = need_schema();
+    if (!*origin_path) return fail(error, "settings", "the game was started without a preferences file");
+    psp_presets *p = malloc(sizeof *p);
+    if (!p) return fail(error, origin_path, "out of memory");
+    int rc = psp_presets_load(p, origin_path, error);
+    const int at = rc ? -1 : psp_presets_find(p, origin_preset);
+    if (!rc && at < 0) rc = fail(error, origin_preset, "preset no longer exists");
+    if (!rc) {
+        psp_settings *target = &p->presets[at].settings;
+        for (int k = 0; k < sc->count && !rc; k++)
+            if (s->source[k] != PSP_SOURCE_ENV && strcmp(target->value[k], s->value[k]))
+                rc = psp_settings_set(target, k, s->value[k], PSP_SOURCE_PRESET, error);
+        if (!rc) {
+            target->bind_count = s->bind_count;
+            memcpy(target->bind, s->bind, sizeof s->bind);
+            rc = psp_settings_resolve(target, error) || psp_presets_save(p, origin_path, error) ? -1 : 0;
+        }
+    }
+    free(p);
+    return rc;
 }
