@@ -767,6 +767,13 @@ static void poll_child(launcher *a) {
     int status; pid_t done=waitpid(a->child,&status,WNOHANG);
     if (done<=0) return;
     close(a->child_error_fd); a->child=0;
+    /* The game's menu may have written the preset it started with: the file
+     * is the truth now, unless something here is still unsaved. */
+    if (!a->dirty) {
+        psp_presets *fresh=malloc(sizeof *fresh); char why[PSP_SETTINGS_ERROR];
+        if (fresh && !psp_presets_load(fresh,a->path,why)) { a->book=*fresh; refresh(a); }
+        free(fresh);
+    }
     if (WIFEXITED(status) && WEXITSTATUS(status)==0) { a->running=0; return; }
     SDL_ShowWindow(a->window); SDL_RaiseWindow(a->window);
     snprintf(a->status,sizeof a->status,"Game stopped (%s %d). See terminal output.",
