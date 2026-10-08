@@ -704,6 +704,111 @@ Ctrl+Shift+Q stays.
 - Controller-only operation works on the Deck.
 - The packaged build links and runs.
 
+*Built, 7 Oct (stage 7).* Sif chose:
+- Escape opens the menu; View+Menu does on a controller.
+- The pages are listed down the side.
+- The menu takes the launcher's colours.
+
+What was built:
+- **The code.**
+  - Dear ImGui v1.92.9b is in `third_party/imgui`: the core, the SDL2 backend
+    and the SDL_Renderer2 backend, with its version and checksum in
+    `README.md`.
+  - `src/host/ui.cpp` is the host's one C++ file. It puts a C API over
+    ImGui (`src/host/ui.h`).
+  - `src/host/overlay.c` is the menu, in C.
+- **No C++ runtime.** ImGui and `ui.cpp` compile with
+  `-fno-exceptions -fno-rtti -fno-threadsafe-statics`. Their only
+  references outside themselves are then libc, libm and SDL. So every C link
+  takes them as they are, the player's on-device `zig cc` included, and the
+  C++ runtime risk the plan foresaw did not arise.
+- **Building it.**
+  - ImGui's core is `psprecomp_imgui`, built with the runtime. The games'
+    `06-boot.sh` link it and compile only `ui.cpp`, the two backends and
+    `overlay.c`.
+  - The player's CMake builds all of these once, as an object library.
+  - A program has the menu only if it calls `present_use_overlay`. Render
+    checks and tests that only present leave it out, and ImGui with it.
+- **Drawing.** As planned: the SDL thread runs ImGui.
+  - Under software, the SDL_Renderer backend draws over the game before
+    presenting.
+  - Under GL, the frame is copied into a snapshot, and ImGui's texture
+    requests are answered at once and queued in order.
+  - `render_gl.c` takes both in compose, after the dialog. It creates
+    textures before the frame that uses them, then draws with one shader of
+    its own and a scissor per command.
+  - The 1.92 dynamic font atlas crossed threads through that queue without
+    trouble, so the fixed-atlas fallback was not needed.
+  - With the menu shut, compose makes no GL call for it.
+- **Opening and closing.**
+  - Opening asks for the pause (§2) and takes the controls (§3).
+  - Escape, Menu, View+Menu or Resume close it. The game gets the controls
+    back once they are let go, or after a second.
+  - View+Menu held for two seconds no longer quits: Quit is a menu page.
+    Ctrl+Shift+Q stays.
+- **The pages.**
+  - Resume.
+  - Bindings: every target by device, with friendly names for the
+    controls. Choosing a cell waits for a press (Escape cancels, Delete
+    unbinds). A control bound to one target leaves whatever else it pressed
+    on that device.
+  - One page per page of the title's schema.
+  - Performance: fps, frame time, renderer, window, time played and paused.
+  - Quit.
+- **Apply policy.** It is one flag, `PSP_OPTION_LIVE`, rather than three
+  values.
+  - The host applies its own live options at once: bindings, keyboard
+    layout, active controller, window mode and volume.
+  - Every other option is marked "applies the next time the game starts".
+- **Saving.** On closing, the menu writes its changes into the preset the
+  game was started with (`psp_settings_save_origin`). It never writes what
+  the environment set. The launcher re-reads the file when the game exits,
+  so a later Save there does not undo the menu's.
+- **Audio.** Both titles gain `VOLUME` on an Audio page. Mute is in the
+  menu and is not saved.
+- **Checks.** `PSPRECOMP_MENU_AT=<seconds>[:<page>]` opens the menu for
+  checks and captures.
+
+What is not built yet:
+- The save-state pages come with stage 9.
+- The titles' own tuning (deadzones, sensitivity, curves, camera smoothing)
+  is not live; it applies next launch. Making it live is 3c's generation
+  counter, read by each title's replacements.
+- There is no user multiplier on the UI scale. The scale follows the
+  window's height (720 rows is 1.0).
+
+*Results, 7 Oct.*
+- **Render checks, menu shut.**
+  - Last Raven's `12-render-tests.sh`: 430 checks in software and 430 in
+    GL, no failures.
+  - The 3rd Birthday's GL scenarios (bloom, sampling, blend, texture,
+    resolution, aspect) pass.
+  - Its gameplay replay's GE capture and PCM are identical to stage 5's.
+- **`tests/test_overlay.c`.** Its modes cover:
+  - the toolkit drawing in software (pixels read back) and snapshotting
+    for GL, its font texture created first, then clearing;
+  - opening while moving and firing, which takes the controls whole, asks
+    for the pause and lets the mouse go;
+  - nothing reaching the game while the menu is open, and focus loss
+    leaving it open;
+  - closing with fire held, after which the game has nothing until fire
+    is let go, and capture returns;
+  - press-to-bind, a live volume, and both saved to the preset;
+  - the controller alone opening the menu, walking it, choosing and
+    resuming.
+- **A real GL run.** With `PSPRECOMP_MENU_AT=12:Bindings`, The 3rd
+  Birthday's capture shows the menu over the paused game, drawn by the
+  redraw at the safe point.
+- **Controller only.** Driven through a virtual pad, the same ImGui
+  gamepad navigation the Deck uses. The Deck itself is untested.
+- **The packaged build.** The 3rd Birthday's AppImage built and passed
+  its own checks. Importing the real ISO then compiled the game on the
+  device with `zig cc`, linking the ImGui objects in its host archive as
+  plain C. That game's gameplay replay matches the development build's: GE
+  capture (40.6 MB) and PCM (15.3 MB) byte-identical. Run windowed in GL
+  with the menu opened on Audio, the packaged game drew it over the paused
+  picture.
+
 ## 5. Save states
 
 ### Why the obvious approach does not work here
