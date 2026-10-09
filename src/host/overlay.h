@@ -17,8 +17,10 @@ typedef struct {
     void (*open_page)(const char *page);    /* opens it on a page, by its name */
     int  (*is_open)(void);
     void (*event)(const SDL_Event *e);      /* every event while it is open */
-    void (*frame)(void);                    /* once a loop while it is open */
+    void (*frame)(void);                    /* once a loop */
     void (*draw)(SDL_Renderer *ren);        /* software, before presenting */
+    void (*action)(int action);             /* quick save and load, the slot keys */
+    void (*before_quit)(void);              /* the state written on quitting, if wanted */
     /* GL thread, through present_ui_lock below. */
     const psp_ui_frame *(*gl_lock)(const psp_ui_texture_op **ops, int *count);
     void (*gl_unlock)(void);

@@ -94,6 +94,7 @@ class PackageTests(unittest.TestCase):
         paths = self.run_app("--print-paths").stdout
         self.assertIn(str(self.root / "config override" / ID / "settings.ini"), paths)
         self.assertIn(str(self.root / "data override" / ID / "games"), paths)
+        self.assertIn(str(self.root / "data override" / ID / "states"), paths)
         self.run_app("--check-startup")
         self.assertFalse(self.config.exists())
         self.env["XDG_CONFIG_HOME"] = "relative-is-invalid"

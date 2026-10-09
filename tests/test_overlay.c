@@ -273,6 +273,7 @@ static void held(void) {
 /* Controller only: the pad opens the menu, walks its pages with the D-pad,
  * chooses with A, and resumes from Resume. */
 static int on_bindings(void) { return o.open && o.page == PAGE_BINDINGS; }
+static int on_save(void) { return o.open && o.page == PAGE_SAVE; }
 static int have_pad(void) { return input_pad() != NULL; }
 static void press(SDL_Joystick *joy, int button) {
     virtual_button(joy, button, 1);
@@ -296,12 +297,16 @@ static void pad(void) {
     virtual_button(joy, SDL_CONTROLLER_BUTTON_BACK, 0);
     virtual_button(joy, SDL_CONTROLLER_BUTTON_START, 0);
     SDL_Delay(150);
-    /* Focus starts on Resume; down once is Bindings. */
+    /* Focus starts on Resume; down once is Save state, three times Bindings. */
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(waits_for(on_save));
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
     press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
     press(joy, SDL_CONTROLLER_BUTTON_A);
     assert(waits_for(on_bindings));
     /* Back up the list to Resume, and choose it. */
-    press(joy, SDL_CONTROLLER_BUTTON_DPAD_UP);
+    for (int i = 0; i < 3; i++) press(joy, SDL_CONTROLLER_BUTTON_DPAD_UP);
     press(joy, SDL_CONTROLLER_BUTTON_A);
     assert(waits_for(menu_shut));
     assert(waits_for(game_owns));

@@ -26,6 +26,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+extern char **environ;
+
 enum { UI_W=1120, UI_H=800, VISIBLE_ROWS=6, MAX_GAMES=8, MAX_FILES=1024, MAX_PAGES=8, MAX_STOPS=16 };
 enum { NEW=100, DUPLICATE, RENAME, DELETE, RESET, SAVE, PLAY, CANCEL,
        MODAL_OK, MODAL_CANCEL, ABOUT, ADD_GAME, PRESET_BASE=200, PAGE_BASE=300, GAME_BASE=700,
@@ -494,6 +496,16 @@ static int game_save_root(launcher *a,char *out,size_t cap) {
     int n=snprintf(out,cap,"%s/saves/%s",root,a->games[a->game].slug);
     return n>0 && (size_t)n<cap?0:-1;
 }
+/* Save states, beside the saves and not among them: a state loads only into
+ * the build that wrote it, so it has no business in a folder synced between
+ * computers. The game makes it on its first save (psp_state_dir). */
+static int game_state_root(launcher *a,char *out,size_t cap) {
+    char root[4096]; out[0]=0;
+    if (!a->game_count) return 0;
+    if (data_root(root,sizeof root)) return -1;
+    int n=snprintf(out,cap,"%s/states/%s",root,a->games[a->game].slug);
+    return n>0 && (size_t)n<cap?0:-1;
+}
 static int make_directories(const char *path) {
     char work[4096]; size_t len=strlen(path);
     if (!len || len>=sizeof work) { errno=ENAMETOOLONG; return -1; }
@@ -546,11 +558,27 @@ static void launch_game(launcher *a) {
         strcpy(a->status,"Cannot launch: a game path is too long."); return;
     }
     if (*save_root) fprintf(stderr,"launcher: saves %s\n",save_root);
+    /* The game's environment, with its state folder: built before the fork,
+     * since only async-signal-safe calls may follow it. */
+    static char state_var[4200];
+    char state_root[4096];
+    size_t nenv=0;
+    while (environ[nenv]) nenv++;
+    char **env=malloc((nenv+2)*sizeof *env);
+    if (!env) { strcpy(a->status,"Cannot launch: out of memory."); return; }
+    size_t k=0;
+    for (size_t i=0;i<nenv;i++) if (strncmp(environ[i],"PSPRECOMP_STATE_DIR=",20)) env[k++]=environ[i];
+    if (!game_state_root(a,state_root,sizeof state_root) && *state_root) {
+        snprintf(state_var,sizeof state_var,"PSPRECOMP_STATE_DIR=%s",state_root);
+        env[k++]=state_var;
+        fprintf(stderr,"launcher: states %s\n",state_root);
+    }
+    env[k]=NULL;
     int pipes[2];
-    if (pipe(pipes)) { snprintf(a->status,sizeof a->status,"Cannot launch: %s",strerror(errno)); return; }
+    if (pipe(pipes)) { free(env); snprintf(a->status,sizeof a->status,"Cannot launch: %s",strerror(errno)); return; }
     fflush(NULL);
     pid_t child=fork();
-    if (child<0) { close(pipes[0]); close(pipes[1]); snprintf(a->status,sizeof a->status,"Cannot launch: %s",strerror(errno)); return; }
+    if (child<0) { free(env); close(pipes[0]); close(pipes[1]); snprintf(a->status,sizeof a->status,"Cannot launch: %s",strerror(errno)); return; }
     if (!child) {
         close(pipes[0]); dup2(pipes[1],STDERR_FILENO); close(pipes[1]);
         const char *args[12]; int n=0;
@@ -564,7 +592,7 @@ static void launch_game(launcher *a) {
                           chdir_failed[]="Could not enter the save folder. Check its permissions.\n";
         const char *message=exec_failed; size_t sent=0,total=sizeof exec_failed-1;
         if (*save_root && chdir(save_root)) { message=chdir_failed; total=sizeof chdir_failed-1; }
-        else execv(boot,(char *const *)args);
+        else execve(boot,(char *const *)args,env);
         while (sent<total) {
             ssize_t n=write(STDERR_FILENO,message+sent,total-sent);
             if (n>0) sent+=(size_t)n;
@@ -573,6 +601,7 @@ static void launch_game(launcher *a) {
         }
         _exit(127);
     }
+    free(env);
     close(pipes[1]); fcntl(pipes[0],F_SETFL,O_NONBLOCK);
     a->child=child; a->child_error_fd=pipes[0]; a->child_error_len=0; a->child_error[0]=0;
     SDL_HideWindow(a->window);

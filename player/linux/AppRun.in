@@ -23,8 +23,8 @@ if [[ -z "${SDL_GAMECONTROLLERCONFIG_FILE:-}" && -f "$config_root/gamecontroller
     export SDL_GAMECONTROLLERCONFIG_FILE="$config_root/gamecontrollerdb.txt"
 fi
 if [[ "${1:-}" = --print-paths ]]; then
-    printf 'Application: %s\nSettings: %s\nController mappings: %s\nGames: %s/games\nSaves: %s/saves\nLogs: %s/logs\n' \
-        "$app_root" "$config" "$config_root/gamecontrollerdb.txt" "$data_root" "$data_root" "$state_root"
+    printf 'Application: %s\nSettings: %s\nController mappings: %s\nGames: %s/games\nSaves: %s/saves\nSave states: %s/states\nLogs: %s/logs\n' \
+        "$app_root" "$config" "$config_root/gamecontrollerdb.txt" "$data_root" "$data_root" "$data_root" "$state_root"
     exit 0
 fi
 if [[ "${1:-}" = --help ]]; then

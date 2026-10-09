@@ -90,6 +90,9 @@ static int g_front = -1;                // what the GL thread draws; -1: nothing
 static ImVector<psp_ui_texture_op> g_pending, g_taken;
 static uint32_t g_next_texture = 1;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+/* The menu's own pictures: an SDL texture under software, a texture of the GL
+ * thread's, made through the same queue as ImGui's, under GL. */
+static struct { uint32_t gl; SDL_Texture *tex; int w, h; } g_img[PSP_UI_IMAGES];
 
 static void free_ops(ImVector<psp_ui_texture_op> &ops) {
     for (psp_ui_texture_op &op : ops) free((void *)op.pixels);
@@ -243,6 +246,8 @@ extern "C" int psp_ui_start(SDL_Window *win, SDL_Renderer *ren) {
 extern "C" void psp_ui_stop(void) {
     if (!u.started) return;
     psp_ui_clear();
+    for (auto &im : g_img) if (im.tex) SDL_DestroyTexture(im.tex);
+    memset(g_img, 0, sizeof g_img);
     if (u.ren) ImGui_ImplSDLRenderer2_Shutdown();
     else {
         // Answer the outstanding requests ourselves: the GL thread frees its
@@ -452,5 +457,106 @@ extern "C" void psp_ui_prompt(const char *title, const char *text) {
                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav);
     psp_ui_heading(title);
     psp_ui_text(text);
+    ImGui::End();
+}
+
+extern "C" int psp_ui_confirm(const char *title, const char *text, const char *yes, const char *no) {
+    // A modal popup: it has the keys and the pad, and the page behind it
+    // cannot be chosen until it is answered.
+    if (!ImGui::IsPopupOpen("##confirm")) ImGui::OpenPopup("##confirm");
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(520 * u.scale, 0), ImGuiCond_Always);
+    int answer = -1;
+    if (ImGui::BeginPopupModal("##confirm", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                               ImGuiWindowFlags_NoSavedSettings)) {
+        psp_ui_heading(title);
+        psp_ui_text(text);
+        ImGui::Spacing();
+        if (ImGui::Button(yes)) answer = 1;
+        // The answer the player asked for has the cursor, shown, so Enter or
+        // A takes it at once and the arrows move to the other.
+        if (ImGui::IsWindowAppearing()) { ImGui::SetItemDefaultFocus(); ImGui::SetNavCursorVisible(true); }
+        ImGui::SameLine();
+        if (ImGui::Button(no)) answer = 0;
+        if (answer >= 0) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    return answer;
+}
+
+extern "C" void psp_ui_confirm_close(void) {
+    if (!ImGui::IsPopupOpen("##confirm")) return;
+    if (ImGui::BeginPopupModal("##confirm", NULL, ImGuiWindowFlags_NoDecoration)) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+
+extern "C" void psp_ui_image_set(int slot, const unsigned char *rgba, int w, int h) {
+    if (slot < 0 || slot >= PSP_UI_IMAGES || !u.started) return;
+    auto &im = g_img[slot];
+    if (u.ren) {
+        if (im.tex && (!rgba || im.w != w || im.h != h)) { SDL_DestroyTexture(im.tex); im.tex = NULL; }
+        if (rgba && !im.tex) im.tex = SDL_CreateTexture(u.ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w, h);
+        if (rgba && im.tex) SDL_UpdateTexture(im.tex, NULL, rgba, w * 4);
+    } else {
+        psp_ui_texture_op op;
+        memset(&op, 0, sizeof op);
+        if (im.gl && (!rgba || im.w != w || im.h != h)) {
+            op.op = PSP_UI_TEXTURE_DESTROY;
+            op.texture = im.gl;
+            pthread_mutex_lock(&g_lock); g_pending.push_back(op); pthread_mutex_unlock(&g_lock);
+            im.gl = 0;
+        }
+        if (rgba) {
+            unsigned char *copy = (unsigned char *)malloc((size_t)w * h * 4);
+            if (!copy) return;
+            memcpy(copy, rgba, (size_t)w * h * 4);
+            op.op = im.gl ? PSP_UI_TEXTURE_UPDATE : PSP_UI_TEXTURE_CREATE;
+            if (!im.gl) im.gl = g_next_texture++;
+            op.texture = im.gl;
+            op.x = op.y = 0; op.w = w; op.h = h;
+            op.pixels = copy;
+            pthread_mutex_lock(&g_lock); g_pending.push_back(op); pthread_mutex_unlock(&g_lock);
+        }
+    }
+    im.w = rgba ? w : 0;
+    im.h = rgba ? h : 0;
+}
+
+extern "C" int psp_ui_picture_row(const char *id, int image, const char *title, const char *detail, int highlight) {
+    const float h = 76 * u.scale, w = h * 240.0f / 136.0f, pad = 10 * u.scale;
+    ImGui::PushID(id);
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    const int chosen = ImGui::Selectable("##row", highlight != 0, 0, ImVec2(0, h));
+    take_focus();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImVec2 a(at.x, at.y), b(at.x + w, at.y + h);
+    const int have = image >= 0 && image < PSP_UI_IMAGES && g_img[image].w;
+    if (have) {
+        const ImTextureID tex = u.ren ? (ImTextureID)(intptr_t)g_img[image].tex : (ImTextureID)g_img[image].gl;
+        dl->AddImage(ImTextureRef(tex), a, b);
+    } else {
+        dl->AddRectFilled(a, b, ImGui::GetColorU32(BG));
+        dl->AddRect(a, b, ImGui::GetColorU32(BORDER));
+    }
+    const float line = ImGui::GetTextLineHeightWithSpacing();
+    dl->AddText(ImVec2(b.x + pad, at.y + h * 0.5f - line), ImGui::GetColorU32(highlight ? ACCENT : TEXT), title);
+    if (detail) dl->AddText(ImVec2(b.x + pad, at.y + h * 0.5f), ImGui::GetColorU32(MUTED), detail);
+    ImGui::PopID();
+    return chosen;
+}
+
+extern "C" void psp_ui_toast(const char *text) {
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + 24 * u.scale, vp->Pos.y + vp->Size.y - 24 * u.scale), ImGuiCond_Always,
+                            ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.9f);
+    ImGui::Begin("##toast", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::TextUnformatted(text);
     ImGui::End();
 }

@@ -1999,6 +1999,15 @@ static int gl_init(int w, int h) {
     return 0;
 }
 
+/* Before a save state: every target drawn into, back in guest memory. A
+ * frame the guest presented is there already; a target only sampled later,
+ * or not at all, may not be. */
+static void gl_to_memory(void) {
+    if (!g.ready) return;
+    flush();
+    for (int i = 0; i < g.n_rts; i++) readback_rt(i);
+}
+
 static void gl_shutdown(void) {
     psp_savedata_set_redraw(NULL);
     psp_pause_set_redraw(NULL);
@@ -4121,6 +4130,7 @@ static const psp_render_backend gl_backend = {
     .name = "gl",
     .init = gl_init,
     .shutdown = gl_shutdown,
+    .to_memory = gl_to_memory,
     .set_target = gl_target,
     .set_scissor = gl_scissor,
     .set_texture = gl_texture,

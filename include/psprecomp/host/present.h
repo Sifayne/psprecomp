@@ -122,6 +122,9 @@ typedef struct psp_audio_backend {
     void (*started)(int device, int gl);
     /* The window is closing: report what the channels saw. */
     void (*report)(FILE *out);
+    /* Optional: a save state is loading into the running game, on a guest
+     * thread: what is queued belongs to the game being replaced. */
+    void (*flush)(void);
 } psp_audio_backend;
 
 #endif

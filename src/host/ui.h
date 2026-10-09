@@ -74,6 +74,21 @@ int  psp_ui_table_button(const char *id, const char *text, int highlight);
 void psp_ui_table_end(void);
 /* A box over everything else, for a question that waits on the player. */
 void psp_ui_prompt(const char *title, const char *text);
+/* The same with an answer: 1 for `yes`, 0 for `no`, -1 while it waits. */
+int  psp_ui_confirm(const char *title, const char *text, const char *yes, const char *no);
+/* The question withdrawn without an answer, when its asker no longer waits. */
+void psp_ui_confirm_close(void);
+
+/* Pictures the menu shows -- a save state's thumbnail -- by slot,
+ * 0..PSP_UI_IMAGES-1: RGBA pixels, w x h, given again whenever they change;
+ * NULL forgets one. */
+enum { PSP_UI_IMAGES = 16 };
+void psp_ui_image_set(int slot, const unsigned char *rgba, int w, int h);
+/* A row that can be chosen: a picture (-1 for a blank one), a title and a
+ * line under it. Returns 1 when chosen. */
+int  psp_ui_picture_row(const char *id, int image, const char *title, const char *detail, int highlight);
+/* A line at the foot of the screen, menu or not: what a key just did. */
+void psp_ui_toast(const char *text);
 
 /* ---- the GL snapshot ---------------------------------------------------------- */
 

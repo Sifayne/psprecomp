@@ -24,6 +24,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/safepoint.h"
+#include "psprecomp/state.h"
 #include "psprecomp/sched.h"
 
 #include <SDL2/SDL.h>
@@ -313,15 +314,28 @@ static void mix_report(FILE *out) {
     SDL_UnlockAudioDevice(g_audio_dev);
 }
 
+static void mix_flush(void) {
+    if (g_audio_dev) SDL_LockAudioDevice(g_audio_dev);
+    for (int ch = 0; ch < MIX_CHANNELS; ch++) {
+        g_mix[ch].head = g_mix[ch].tail = g_mix[ch].count = 0;
+        g_mix[ch].playing = 0;
+    }
+    if (g_audio_dev) SDL_UnlockAudioDevice(g_audio_dev);
+}
+
 static const psp_audio_backend host_mixer = {
     .prepare = mix_prepare, .callback = audio_callback, .opened = mix_opened,
-    .output = present_audio, .report = mix_report,
+    .output = present_audio, .report = mix_report, .flush = mix_flush,
 };
 
 /* The title's audio output, or the host's mixer. */
 static const psp_audio_backend *audio(void) {
     return psp_title_info.audio ? psp_title_info.audio : &host_mixer;
 }
+
+/* A save state loading into the running game (psprecomp/state.h) leaves
+ * nothing of the old game's sound queued. */
+static void audio_drop(void) { if (audio()->flush) audio()->flush(); }
 
 /* While the guest is held the device plays silence and the mixer is not
  * asked: its rings keep what was queued, and resume where the pause cut
@@ -528,6 +542,7 @@ void present_set_fullscreen(int on) {
 
 /* Window close and both shortcuts share the scheduler's normal shutdown. */
 static void close_game_window(void) {
+    if (g_overlay) g_overlay->before_quit();
     if (g_overlay) g_overlay->stop();
     save_dialog_shutdown();
     present_audio_report(stderr);
@@ -717,6 +732,58 @@ static void *sdl_thread(void *arg) {
                 menu_done = 1;
             }
         }
+        /* PSPRECOMP_KEYS_AT=<seconds>:<key>[,<seconds>:<key>...] presses a
+         * key (by SDL's name: F5, Return, Down; Ctrl+, Shift+ and Alt+ before
+         * it hold those) that many seconds after the window opened, for checks
+         * of what the keys do where nobody can press them. */
+        {
+            static int keys_read;
+            static struct { uint32_t ms; SDL_Keycode key; Uint16 mod; } keys_at[16];
+            static int keys_n, keys_next;
+            static uint32_t keys_t0;
+            if (!keys_read) {
+                keys_read = 1;
+                keys_t0 = SDL_GetTicks();
+                const char *spec = getenv("PSPRECOMP_KEYS_AT");
+                while (spec && *spec && keys_n < 16) {
+                    char *end;
+                    const double at = strtod(spec, &end);
+                    if (end == spec || *end != ':') break;
+                    const char *name = end + 1;
+                    const size_t len = strcspn(name, ",");
+                    char key[32];
+                    snprintf(key, sizeof key, "%.*s", (int)(len < sizeof key ? len : sizeof key - 1), name);
+                    keys_at[keys_n].ms = (uint32_t)(at * 1000.0);
+                    keys_at[keys_n].mod = 0;
+                    const char *bare = key;
+                    for (;;) {
+                        if (!strncmp(bare, "Ctrl+", 5)) { keys_at[keys_n].mod |= KMOD_LCTRL; bare += 5; }
+                        else if (!strncmp(bare, "Shift+", 6)) { keys_at[keys_n].mod |= KMOD_LSHIFT; bare += 6; }
+                        else if (!strncmp(bare, "Alt+", 4)) { keys_at[keys_n].mod |= KMOD_LALT; bare += 4; }
+                        else break;
+                    }
+                    keys_at[keys_n].key = SDL_GetKeyFromName(bare);
+                    keys_n++;
+                    spec = name[len] ? name + len + 1 : name + len;
+                }
+            }
+            if (keys_next < keys_n && SDL_GetTicks() - keys_t0 >= keys_at[keys_next].ms) {
+                SDL_Event e;
+                memset(&e, 0, sizeof e);
+                e.type = SDL_KEYDOWN;
+                e.key.state = SDL_PRESSED;
+                e.key.keysym.sym = keys_at[keys_next].key;
+                e.key.keysym.scancode = SDL_GetScancodeFromKey(keys_at[keys_next].key);
+                e.key.keysym.mod = keys_at[keys_next].mod;
+                e.key.windowID = win ? SDL_GetWindowID(win) : 0;
+                SDL_PushEvent(&e);
+                e.type = SDL_KEYUP;
+                e.key.state = SDL_RELEASED;
+                SDL_PushEvent(&e);
+                fprintf(stderr, "present: key %s pressed for a check\n", SDL_GetKeyName(keys_at[keys_next].key));
+                keys_next++;
+            }
+        }
         const uint64_t requested = atomic_exchange(&g_requested_size, 0);
         if (requested && win)
             SDL_SetWindowSize(win, (int)(requested >> 32), (int)(requested & UINT32_MAX));
@@ -790,9 +857,10 @@ static void *sdl_thread(void *arg) {
         if (save_dialog_active() && !was_dialog) input_take(INPUT_DIALOG);
         else if (!save_dialog_active()) input_return(INPUT_DIALOG);
         input_tick();
-        /* The menu lays out its frame here, every loop while it is open:
-         * drawn below under software, by the GL thread under GL. */
-        if (g_overlay && g_overlay->is_open()) g_overlay->frame();
+        /* The menu lays out its frame here, every loop -- closed, only a
+         * line saying what a key just did, for a moment: drawn below under
+         * software, by the GL thread under GL. */
+        if (g_overlay) g_overlay->frame();
         if (tex) {
             SDL_RenderCopy(ren, tex, NULL, NULL);
             save_dialog_draw_software(ren);
@@ -826,12 +894,16 @@ static void *sdl_thread(void *arg) {
                 close_game_window();
                 return NULL;
             }
+            const int states = action == INPUT_ACTION_QUICK_SAVE || action == INPUT_ACTION_QUICK_LOAD ||
+                               action == INPUT_ACTION_SLOT_NEXT || action == INPUT_ACTION_SLOT_PREV;
             if (action == INPUT_ACTION_FULLSCREEN && win) {
                 const int full = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) != 0;
                 SDL_SetWindowFullscreen(win, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+            } else if (states && g_overlay) {
+                g_overlay->action(action);
             } else if (action != INPUT_ACTION_NONE && action != INPUT_ACTION_FULLSCREEN) {
-                /* Quick save and load and screenshots come with save states
-                 * (docs/PLAYER-LAYER.md). */
+                /* Screenshots are still to come, and save states need the
+                 * menu (docs/PLAYER-LAYER.md). */
                 static unsigned said;
                 if (!(said & 1u << action)) {
                     said |= 1u << action;
@@ -854,6 +926,8 @@ int present_start(void) {
     if (!g_gl_want) psp_display_set_present(present_frame);
     psp_audio_set_output(audio()->output);
     if (audio()->pending) psp_audio_set_pending(audio()->pending);
+    static const psp_state_part part = { .name = "audio", .drop = audio_drop };
+    psp_state_register(&part);
 
     /* Queue depth target: two buffers -- deep enough that jitter never
      * underruns, shallow enough that the backlog tracks real playback. */
