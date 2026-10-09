@@ -19,7 +19,8 @@
  *                   (vfpu.c:771), vi2f scaling.
  *   constants       all 32 vcst entries.
  *   random          vrnds / vrndi / vrndf1 / vrndf2 sequences, and the
- *                   generator's state words.
+ *                   generator's state words; the vector forms' lane order
+ *                   and destination prefixes (vfpu.c:447).
  *   arithmetic      vadd..vdiv, min/max, dot products and sums on inputs that
  *                   expose rounding, NaN, -0, infinities and denormals;
  *                   vcrsp's infinity rule (vfpu.c:529); square-root edges
@@ -56,6 +57,12 @@
  * for the vlog2 results the coarse-core rule fitted to version 4 still
  * misses: every argument in [1,2) of the log2 core segments whose fit is
  * open, and x >= 4 over the segments where the misses are.
+ *
+ * Version 6 keeps steps 1-205 and adds section 14 after section 13, seven
+ * steps that write only to the log: the vector forms of vrndi, vrndf1 and
+ * vrndf2 -- which lane receives the first value drawn, and what a
+ * destination prefix that masks or saturates lanes does to the lanes and to
+ * the generator's state.
  */
 #include <pspkernel.h>
 #include <pspiofilemgr.h>
@@ -72,7 +79,7 @@ PSP_MODULE_INFO("vfpuprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(4096);
 
-#define PROBE_VERSION 5
+#define PROBE_VERSION 6
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -1816,6 +1823,267 @@ static void section_cores(void) {
     free(in);
 }
 
+/* ---- 14, version 6: the vector forms of vrndi, vrndf1 and vrndf2 -----------
+ *
+ * Section 4's draws were all .s. A .p, .t or .q draw fills two to four lanes,
+ * and two things about it were never measured: which lane receives the first
+ * value drawn (src/vfpu.c's psp_vrnd fills lane 0 first; the last lane first
+ * is the other candidate), and what a destination prefix does -- whether a
+ * masked lane still advances the generator, whether saturation applies to
+ * vrndf1/vrndf2 and to vrndi's integer, and whether lane i's controls act on
+ * lane i or on the i-th value drawn. The 3rd Birthday's New Game runs
+ * vrndf2.t C000 (0x003BF12C).
+ *
+ * Every case seeds with vrnds, runs one draw into a matrix pre-filled with
+ * 5A5A5A5A, stores the whole matrix and reads rcx0-7. Before the cases the
+ * same seed and six .s draws of the same op, with rcx0-7 after each, give the
+ * reference: s1..s6 are those draws in order, rcx sK the state after K of
+ * them (s0 just after the seed). A case's line gives its lanes in lane order,
+ * then each lane as the draw it equals (sK), -- for the sentinel or ?? for
+ * neither (a saturated value), then which sK its rcx equals; when none does,
+ * "rcx ??" and the words follow. So for .q with no prefix:
+ *
+ *   lane 0 first:      [...] = s1 s2 s3 s4, rcx s4
+ *   last lane first:   [...] = s4 s3 s2 s1, rcx s4
+ *
+ * and with lane 0 masked, a masked lane that still draws keeps rcx s4 and the
+ * other lanes' sK; one that does not draw leaves rcx s3. A word of the matrix
+ * outside the lanes that changed gets a line of its own. It runs after 13, so
+ * steps 1-205 keep their numbers, and writes only to the log. */
+
+static w32 VM[16] __attribute__((aligned(16)));
+
+/* Matrix m (a digit) from VM, then pre and insn, then the matrix back to VM:
+ * word 4c+r is S<m><c><r>. */
+#define VRNDM(id, m, pre, insn) static void id(void) {                         \
+        __asm__ volatile(LOADM(m, "%0") pre insn "\n\t" STOREM(m, "%0")         \
+                         :: "r"(VM) : "memory"); }
+
+static w32 (*const RND_FN[3])(void) = { rnd_i, rnd_f1, rnd_f2 };
+static const char *const RND_NAME[3] = { "vrndi", "vrndf1", "vrndf2" };
+
+/* pfxd, sixteen instructions after whatever came before. */
+static w32 pfxd_read(void) {
+    w32 v;
+    __asm__ volatile(NOPS16 "mfvc %0, $130\n" : "=r"(v));
+    return v;
+}
+/* No prefix pending, whether or not the draw consumed its own. */
+static void pfx_clear(void) {
+    __asm__ volatile("mtvc %0, $128\n\tmtvc %0, $129\n\tmtvc $zero, $130\n" :: "r"(0xE4u));
+}
+
+#define VREF 6
+
+/* Seed, then VREF .s draws of op: draws[k-1] is draw k, st[k] rcx0-7 after k
+ * of them, st[0] after the seed. */
+static void vrnd_ref(int op, w32 seed, w32 draws[VREF], w32 st[VREF + 1][8]) {
+    char lead[48], name[12];
+    rnd_seed(seed);
+    rcx_read(st[0]);
+    snprintf(lead, sizeof lead, "  seed %08X         ", seed);
+    log_rcx(lead, st[0]);
+    snprintf(name, sizeof name, "%s.s", RND_NAME[op]);
+    for (int k = 1; k <= VREF; k++) {
+        draws[k - 1] = RND_FN[op]();
+        rcx_read(st[k]);
+        snprintf(lead, sizeof lead, "   s%d %-9s %08X", k, name, draws[k - 1]);
+        log_rcx(lead, st[k]);
+    }
+}
+
+/* One case: seed, fn, then the n lanes at words lane[] of matrix m against
+ * the reference. pfx adds the pfxd the draw left behind. */
+static void vrnd_vec(const char *insn, const char *m, void (*fn)(void), w32 seed, int n,
+                     const unsigned char *lane, const w32 draws[VREF], w32 st[VREF + 1][8], int pfx) {
+    static const char *const TAG[VREF] = { "s1", "s2", "s3", "s4", "s5", "s6" };
+    w32 rcx[8];
+    for (int i = 0; i < 16; i++) VM[i] = SENT;
+    rnd_seed(seed);
+    fn();
+    rcx_read(rcx);
+    const w32 pd = pfxd_read();
+    pfx_clear();
+    out("   %s%-14s [", pfx ? "  " : "", insn);
+    for (int i = 0; i < n; i++) out(i ? " %08X" : "%08X", VM[lane[i]]);
+    out("] =");
+    for (int i = 0; i < n; i++) {
+        const char *t = VM[lane[i]] == SENT ? "--" : "??";
+        for (int k = 0; k < VREF; k++)
+            if (VM[lane[i]] == draws[k]) { t = TAG[k]; break; }
+        out(" %s", t);
+    }
+    int k = VREF;
+    while (k >= 0 && memcmp(rcx, st[k], sizeof rcx)) k--;
+    if (k >= 0) out(", rcx s%d", k); else out(", rcx ??");
+    if (pfx) out(", pfxd after %08X", pd);
+    out("\n");
+    if (k < 0) log_rcx("       ", rcx);
+    for (int w = 0; w < 16; w++) {
+        int inside = 0;
+        for (int i = 0; i < n; i++) inside |= lane[i] == w;
+        if (!inside && VM[w] != SENT)
+            out("       outside the lanes: S%s%d%d %08X\n", m, w >> 2, w & 3, VM[w]);
+    }
+}
+
+static const unsigned char LANES_C100[4] = { 0, 1, 2, 3 };
+
+/* Lane order: each op at each size into C100, no prefix. */
+#define VORDER_LIST(X)                          \
+    X(vo_i_p,  0, 2, "vrndi.p C100")            \
+    X(vo_i_t,  0, 3, "vrndi.t C100")            \
+    X(vo_i_q,  0, 4, "vrndi.q C100")            \
+    X(vo_f1_p, 1, 2, "vrndf1.p C100")           \
+    X(vo_f1_t, 1, 3, "vrndf1.t C100")           \
+    X(vo_f1_q, 1, 4, "vrndf1.q C100")           \
+    X(vo_f2_p, 2, 2, "vrndf2.p C100")           \
+    X(vo_f2_t, 2, 3, "vrndf2.t C100")           \
+    X(vo_f2_q, 2, 4, "vrndf2.q C100")
+
+#define X_DEF(id, op, n, insn) VRNDM(id, "1", "", insn)
+VORDER_LIST(X_DEF)
+#undef X_DEF
+static const struct { int op, n; const char *insn; void (*fn)(void); } VORDER[] = {
+#define X_TAB(id, op, n, insn) { op, n, insn, id },
+    VORDER_LIST(X_TAB)
+#undef X_TAB
+};
+
+/* The same question in other registers, so "lane" is the instruction's lane
+ * whatever the register: C<m><c><r> runs down column c from row r,
+ * R<m><c><r> along row r from column c; the last numbers are the words of the
+ * matrix dump that hold lanes 0..n-1. vrndf2.t C000 is The 3rd Birthday's. */
+#define VREG_LIST(X)                                                           \
+    X(vg_f2_c000t, 2, "0", "vrndf2.t C000", 3, 0, 1, 2, 0)                     \
+    X(vg_f2_r000t, 2, "0", "vrndf2.t R000", 3, 0, 4, 8, 0)                     \
+    X(vg_i_r100q,  0, "1", "vrndi.q R100",  4, 0, 4, 8, 12)                    \
+    X(vg_i_r101t,  0, "1", "vrndi.t R101",  3, 1, 5, 9, 0)                     \
+    X(vg_i_c101t,  0, "1", "vrndi.t C101",  3, 1, 2, 3, 0)                     \
+    X(vg_i_c102p,  0, "1", "vrndi.p C102",  2, 2, 3, 0, 0)                     \
+    X(vg_i_r123p,  0, "1", "vrndi.p R123",  2, 11, 15, 0, 0)                   \
+    X(vg_i_c730q,  0, "7", "vrndi.q C730",  4, 12, 13, 14, 15)                 \
+    X(vg_f1_r302q, 1, "3", "vrndf1.q R302", 4, 2, 6, 10, 14)
+
+#define X_DEF(id, op, m, insn, n, l0, l1, l2, l3) VRNDM(id, m, "", insn)
+VREG_LIST(X_DEF)
+#undef X_DEF
+static const struct { int op; const char *m, *insn; int n; unsigned char lane[4]; void (*fn)(void); } VREG[] = {
+#define X_TAB(id, op, m, insn, n, l0, l1, l2, l3) { op, m, insn, n, { l0, l1, l2, l3 }, id },
+    VREG_LIST(X_TAB)
+#undef X_TAB
+};
+
+/* The destination prefix: each op at each size (.s too) into C100 after
+ * vpfxd 0xDE000000 | imm (section 9: saturation 2 bits per lane at 0..7,
+ * 1 = [0,1], 3 = [-1,1]; write mask at 8..11). The masks are one lane, two,
+ * all but one and all four; the saturations one lane or all, each kind; the
+ * last masks lane 1 and saturates lane 0. Lane i's control separates "lane
+ * i" from "the i-th draw" whichever order the lanes fill in, and for .p and
+ * .t some controls name lanes the vector does not have. */
+#define VPFXD_OPS(Y)                                                           \
+    Y(i_s,  0, 1, "vrndi.s S100")  Y(i_p,  0, 2, "vrndi.p C100")               \
+    Y(i_t,  0, 3, "vrndi.t C100")  Y(i_q,  0, 4, "vrndi.q C100")               \
+    Y(f1_s, 1, 1, "vrndf1.s S100") Y(f1_p, 1, 2, "vrndf1.p C100")              \
+    Y(f1_t, 1, 3, "vrndf1.t C100") Y(f1_q, 1, 4, "vrndf1.q C100")              \
+    Y(f2_s, 2, 1, "vrndf2.s S100") Y(f2_p, 2, 2, "vrndf2.p C100")              \
+    Y(f2_t, 2, 3, "vrndf2.t C100") Y(f2_q, 2, 4, "vrndf2.q C100")
+#define VPFXD_IMMS(X, tag, op, n, insn)                                        \
+    X(tag, op, n, insn, 100) X(tag, op, n, insn, 200) X(tag, op, n, insn, 500) \
+    X(tag, op, n, insn, E00) X(tag, op, n, insn, D00) X(tag, op, n, insn, B00) \
+    X(tag, op, n, insn, 700) X(tag, op, n, insn, F00) X(tag, op, n, insn, 001) \
+    X(tag, op, n, insn, 004) X(tag, op, n, insn, 003) X(tag, op, n, insn, 0C0) \
+    X(tag, op, n, insn, 055) X(tag, op, n, insn, 0FF) X(tag, op, n, insn, 201)
+#define NPFXD 15
+
+#define VD_DEF(tag, op, n, insn, imm) VRNDM(vd_##tag##_##imm, "1", ".word 0xDE000" #imm "\n\t", insn)
+#define VD_DEFS(tag, op, n, insn) VPFXD_IMMS(VD_DEF, tag, op, n, insn)
+VPFXD_OPS(VD_DEFS)
+#undef VD_DEFS
+#undef VD_DEF
+/* Op-major, then size (.s .p .t .q), then prefix. */
+static const struct { int op, n; w32 pfxd; const char *insn; void (*fn)(void); } VPFXD[] = {
+#define VD_TAB(tag, op, n, insn, imm) { op, n, 0x##imm, insn, vd_##tag##_##imm },
+#define VD_TABS(tag, op, n, insn) VPFXD_IMMS(VD_TAB, tag, op, n, insn)
+    VPFXD_OPS(VD_TABS)
+#undef VD_TABS
+#undef VD_TAB
+};
+_Static_assert(sizeof VPFXD / sizeof VPFXD[0] == 3 * 4 * NPFXD, "VPFXD is op x size x prefix");
+
+/* "mask 0 2", "[0,1] on 1", ... */
+static void pfxd_what(char *b, int cap, w32 p) {
+    int len = 0;
+    if ((p >> 8) & 0xF) {
+        len += snprintf(b + len, cap - len, "mask");
+        for (int i = 0; i < 4; i++) if ((p >> (8 + i)) & 1) len += snprintf(b + len, cap - len, " %d", i);
+    }
+    for (int s = 1; s < 4; s++) {
+        int any = 0;
+        for (int i = 0; i < 4; i++) {
+            if (((p >> (2 * i)) & 3) != (w32)s) continue;
+            if (!any) len += snprintf(b + len, cap - len, "%s%s on", len ? ", " : "",
+                                      s == 1 ? "[0,1]" : s == 3 ? "[-1,1]" : "saturation 2");
+            len += snprintf(b + len, cap - len, " %d", i);
+            any = 1;
+        }
+    }
+}
+
+static void vrnd_order(int op) {
+    static const w32 seeds[] = { 0x00000000, 0x12345678, 0xFFFFFFFF, 0x3F800000 };
+    w32 draws[VREF], st[VREF + 1][8];
+    step("%s.p, .t and .q C100 against %s.s draws from the same seed", RND_NAME[op], RND_NAME[op]);
+    for (int s = 0; s < (int)(sizeof seeds / sizeof seeds[0]); s++) {
+        vrnd_ref(op, seeds[s], draws, st);
+        for (int c = 0; c < (int)(sizeof VORDER / sizeof VORDER[0]); c++)
+            if (VORDER[c].op == op)
+                vrnd_vec(VORDER[c].insn, "1", VORDER[c].fn, seeds[s], VORDER[c].n,
+                         LANES_C100, draws, st, 0);
+    }
+}
+
+static void vrnd_regs(void) {
+    const w32 seed = 0x12345678;
+    w32 draws[3][VREF], st[3][VREF + 1][8];
+    step("vector vrnd into rows, offset pairs and triples, M0, M3 and M7, from seed %08X", seed);
+    for (int op = 0; op < 3; op++) vrnd_ref(op, seed, draws[op], st[op]);
+    for (int c = 0; c < (int)(sizeof VREG / sizeof VREG[0]); c++) {
+        const int op = VREG[c].op;
+        vrnd_vec(VREG[c].insn, VREG[c].m, VREG[c].fn, seed, VREG[c].n, VREG[c].lane,
+                 draws[op], st[op], 0);
+    }
+}
+
+/* Two seeds, so each saturation meets vrndi values above 1, below -1 and in
+ * between: from 12345678 the first draws are +huge, -tiny, -tiny, +huge; from
+ * 3F800000 +tiny, +141, -huge, -huge. */
+static void vrnd_pfxd(int op) {
+    static const w32 seeds[] = { 0x12345678, 0x3F800000 };
+    w32 draws[VREF], st[VREF + 1][8];
+    char what[80];
+    step("%s.s, .p, .t and .q C100 after vpfxd: %d masks and saturations", RND_NAME[op], NPFXD);
+    for (int s = 0; s < (int)(sizeof seeds / sizeof seeds[0]); s++) {
+        vrnd_ref(op, seeds[s], draws, st);
+        for (int p = 0; p < NPFXD; p++) {
+            pfxd_what(what, sizeof what, VPFXD[op * 4 * NPFXD + p].pfxd);
+            out("   pfxd %03X (%s):\n", VPFXD[op * 4 * NPFXD + p].pfxd, what);
+            for (int z = 0; z < 4; z++) {
+                const int c = (op * 4 + z) * NPFXD + p;
+                vrnd_vec(VPFXD[c].insn, "1", VPFXD[c].fn, seeds[s], VPFXD[c].n,
+                         LANES_C100, draws, st, 1);
+            }
+        }
+    }
+}
+
+static void section_vrnd_vector(void) {
+    section("14. vector vrndi / vrndf1 / vrndf2: lane order and the destination prefix (runs after 13)");
+    for (int op = 0; op < 3; op++) vrnd_order(op);
+    vrnd_regs();
+    for (int op = 0; op < 3; op++) vrnd_pfxd(op);
+}
+
 /* ---- main ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
@@ -1841,6 +2109,7 @@ int main(int argc, char **argv) {
     section_random();
     section_fpu_trap();
     section_cores();
+    section_vrnd_vector();
     probe_done();
     return 0;
 }

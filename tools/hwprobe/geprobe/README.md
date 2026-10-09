@@ -369,6 +369,31 @@ range test; vertex alphas and through-mode 16-bit colours are as assumed; a bili
 coordinate is cut toward zero to a sixteenth before the half texel comes off; and a
 patch division of 0 draws as 1, without hanging. psprecomp then matches all 193 dumps.
 
+Version 24 adds scenes 146-154 for the one guest-visible assumption of psprecomp's eager
+draw (`src/hle/ge.c`, "Drawing now, reporting on the clock"): it draws a list as soon as
+its words are released and calls the SIGNAL and FINISH handlers afterwards, so a handler
+that rewrites words behind its SIGNAL is too late there; on a PSP it may be in time. Each
+scene is one raw list: a white marker A, the trigger, red 16 x 16 markers 0, 4, 8, 16,
+32, 64, 128 and 256 words past it (NOPs between; the trigger ends a 64-byte line), 100
+filler sprites below them (about 20 ms of GE work), a far marker, FINISH. A handler
+rewrites each marker's VADDR word, nearest first, to a green copy of the same sprite,
+writing each word's cache line back (`sceKernelDcacheWritebackRange`) as a game must, and
+counts the words memory holds at once. Read back, G is a rewrite the GE saw, R a word it
+had read before the rewrite, - a marker never drawn. The log gives each marker's letter,
+every handler call with its argument and phase, the pixels A, +0 and far as each handler
+began (and after its wait), and sceGeListSync's peeks. 146 is SIGNAL suspend (behaviour 1)
+and 147 continue (2); 148 suspend with the write-back left out; 149 PAUSE (3), whose
+handler rewrites row 1 and the thread row 2 while the list waits for `sceGeContinue` (does
+a stopped GE read ahead?); 150 The 3rd Birthday's interior SIGNAL 08, END, FINISH 0, END
+with drawing after it, a signal handler for id 0 rewriting row 1 and a finish handler for
+id 0 row 2 (which handlers run at the pair, and does the GE go on past it); 151 the same
+queued with its stall just after the pair, then moved to the end. Last, since their
+handlers spin in interrupt context, 152-154 are 146, 147 and 150 with handlers that wait
+1 ms before they write: a GE that waits for its handler still shows +0 green, one that
+runs on only the far marker. Under psprecomp today every marker is R in 146-148 and
+152-153 (eager draw), both rows are G in 149, and in 150, 151 and 154 no handler runs at
+the pair and everything after it is drawn, R.
+
 ## Build
 
 Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
@@ -396,11 +421,11 @@ for 99-109 to `lines15.py`, for 110-114 to `skin16.py`, for 115-119 to
 `plines21.py`, for 134 to `edges22.py`, for 135-137 to `ptris22.py`, for 138 to
 `norms22.py`, for 139-140 to `morph22.py`, for 141 to `clip22.py`, for 142 to
 `clip23.py`, for 143 to `alpha23.py`, for 144 to `bilin23.py`, and for 145 to
-`pzero23.py`.
+`pzero23.py`. Scenes 146-154 log their own answer, a letter per marker.
 
 ## Compare with psprecomp
 
-    allegrexrecomp interp geprobe.prx --dispatch --budget 16000000000 --drain 200 --base 0x08804000
+    allegrexrecomp interp geprobe.prx --dispatch --budget 24000000000 --drain 200 --base 0x08804000
 
 psprecomp's software renderer draws into the same guest VRAM, so its run
 leaves the same files under `./ms/PSP/GAME/geprobe/`.
