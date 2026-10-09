@@ -550,8 +550,8 @@ loop hands it every event.
   `stick` and `look`, the title's actions, and the host actions `menu`,
   `quick_save`, `quick_load`, `slot_next`, `slot_prev`, `screenshot`,
   `release_mouse`, `fullscreen` and `quit`. Host actions press once, on
-  the way down. Of those, releasing the mouse, fullscreen and quit work
-  now; the rest report that they are not available yet.
+  the way down. All but the screenshot work (quick save and load with
+  stage 9); the screenshot reports that it is not available yet.
 - **Storage.** `bind.<device>.<target>=<source>, <source>` replaces that
   target's sources on that device, and an empty value unbinds it, for
   example `bind.key.cross=Z, Space`, `bind.pad.fire=righttrigger`,
@@ -666,8 +666,8 @@ rebuilt when the scale changes.
 **What it shows.**
 
 - **Resume.**
-- **Save state and Load state:** slots with thumbnails and times, from
-  stage 9.
+- **Save state and Load state:** slots with thumbnails and times (stage 9,
+  in §5).
 - **Controls:** the bindings, a press-to-bind capture and the tuning values.
 - **Graphics:** options that apply live are editable; the rest show
   "applies on restart".
@@ -770,7 +770,6 @@ What was built:
   checks and captures.
 
 What is not built yet:
-- The save-state pages come with stage 9.
 - The titles' own tuning (deadzones, sensitivity, curves, camera smoothing)
   is not live; it applies next launch. Making it live is 3c's generation
   counter, read by each title's replacements.
@@ -1002,7 +1001,8 @@ As built in stage 8 (`include/psprecomp/state.h`, `src/hle/state.c`):
   it, which is what lets most of it be plain bytes;
 - guest time and poll count.
 
-The thumbnail is left for stage 9's slots.
+Stage 9 added a thumbnail as the first chunk and the wall-clock time of the
+save to the header, so a slot list reads only the start of each file.
 
 **Guest memory:** RAM, VRAM, the scratchpad and the module image. Each is
 written as a 4 KB page map plus the pages that are not all zero.
@@ -1127,13 +1127,14 @@ loads and registers the module as usual. It then loads the state in place of
 steps 3 to 5 (the entry stack, the constructors, `module_start`) and
 drains.
 
-**Saving, until stage 9's menu:** `PSPRECOMP_SAVE_STATE=<poll>:<file>[,...]`
-saves at the first safe point, at or after each poll, that nothing refuses.
+**Saving for the gates:** `PSPRECOMP_SAVE_STATE=<poll>:<file>[,...]` saves at
+the first safe point, at or after each poll, that nothing refuses. The menu
+and its keys save the same way (stage 9, below).
 
-A save from a GL window also needs the readback the plan names. VRAM is in
-the state, and a render target that is never presented or sampled lives only
-on the GPU. That is stage 9's, along with the menu that will save from a
-window. Every stage 8 save is headless.
+A save from a GL window needs the readback the plan names. VRAM is in the
+state, and a render target that is never presented or sampled lives only on
+the GPU. Stage 9 added it as the backend's `to_memory`, run before every
+save; every stage 8 save was headless.
 
 **The gate is deterministic, and it is the whole argument.** Run a replay
 headless (unpaced, synthetic clock) and save at poll N. Then either:
@@ -1200,30 +1201,121 @@ Loading exposed one bug. The GE's backend was first told the restored
 registers from the boot thread, so the GL backend claimed its context there
 and then refused the GE thread. The push now waits for the first list walk.
 
-**Quick load in-process (stage 9).**
+**Quick load in-process (stage 9), as built.** A load into the running game
+is taken by the thread at the safe point (`psp_state_load_here`):
 
-1. Every guest host thread unwinds to the base of its `thread_main` by
-   `longjmp`. The `unwind` buffer the thread record carried was never used,
-   because `sceKernelExitThread` exits the host thread. Stage 8 removed it,
-   since a `jmp_buf` must not be in a kept table. Stage 9 adds its own, per
-   host thread.
-2. The loader, which is the GE-owner thread at its safe point, restores
-   state.
-3. Each slot resumes on a host thread: the existing ones are reused, missing
-   ones are spawned, and surplus ones exit.
+1. The file is read and checked against this build before anything is
+   touched, so a bad file is refused with the game unharmed.
+2. Every other guest thread is ended. Each is parked, waiting for a turn it
+   will never get: its slot is marked dead, its wait returns, its host thread
+   exits, and it is joined. The main context goes on waiting in its drain.
+3. Each part lets go of what the running game holds (`drop`: ATRAC decoders,
+   pool lists, open movies, queued host audio, the PCM dumps, a title's own
+   files). Memory, the kept variables and the parts are restored under the
+   scheduler's lock.
+4. The loading thread takes over the state's saving thread, and every other
+   live slot gets a new host thread. The loading thread then `longjmp`s to
+   the base of its host thread, kept per host thread (`t_base`; the record's
+   old `unwind` buffer was never used), and continues as the saving thread
+   did after its safe point.
 
-Because the loader is the GE-owner thread and comes back as the same guest
-slot, the GL context never changes thread. That rule is what the GL backend
-relies on.
+The loader is the GE-owner thread and comes back as the saving thread, which
+was the GE owner, so the GL context never changes thread.
+
+`PSPRECOMP_LOAD_STATE=<poll>:<file>[:<times>]` loads in place for the
+gates. A poll past the state's own makes a loop.
+
+**The player's side.** The menu gains Save state and Load state pages: ten
+slots in a list, each with its thumbnail, when it was saved and how long the
+game had been played. The Load state list also shows "When you quit" and
+"Before the last load" when they exist. A state from another build shows as
+such and cannot be chosen. The keys are host actions, bindable like the
+rest:
+- F5 saves to the current slot;
+- F9 loads it;
+- F6 and F7 choose the slot;
+- what a key did shows at the foot of the screen for a moment.
+
+Sif's choices (8 Oct):
+- these keys;
+- ten slots in a list;
+- states kept out of the synced save folder, in
+  `<data root>/states/<game>/` (the launcher passes it as
+  `PSPRECOMP_STATE_DIR`);
+- two settings, on the title's "Save states" page, shown in the launcher and
+  under the Load state list.
+
+The two settings:
+- **Loading a state:**
+  - *Ask first* (the default) confirms every load, from the menu or F9.
+  - *Load at once* does not ask.
+  - *Keep an undo* first saves the game as "Before the last load".
+- **When the game starts:**
+  - *Start fresh* (the default).
+  - *Continue where I quit* writes "When you quit" as the window closes, at
+    the next safe point (within a frame, or at once while the menu holds
+    the game), and `boot` loads it at launch.
+
+Saving over a used slot from the menu asks first. F5 does not.
+
+The game is held while a state is written or read. In The 3rd Birthday's
+replays, a save took about 60 ms and a load in place 10 to 60 ms. A save
+asked for during a movie keeps trying for a second of play and then says why
+it could not save. A save asked for while the menu holds the game is written
+there and then.
 
 **What players should know.** A state does not roll back memory-stick saves.
-States are tied to one build.
+States are tied to one build: an update of the game shows its old states as
+from another build.
 
-**Gates.** The stage 8 rows again, but loaded in-process, 100 times in a
-loop with no growth in threads or memory, and in both renderers. In
-resolution mode a restored render target is rebuilt from the 1x VRAM copy,
-so the first frame after a load may be softer on persistent targets. That
-is expected and should be noted, not fixed.
+**Gates.** The stage 8 rows again, loaded in place, many times in a loop,
+with no growth in host threads or resident memory, in both renderers.
+
+*Results, 9 Oct.* Each run saves at one poll, then a second run loads that
+state in place at a later poll, over and over, and plays to the end. The
+loaded run's capture, RAM and module image near the end, and PCM after the
+last load all matched the run that saved, every time. Host threads stayed
+the same and resident memory flat from the second load on:
+
+| Title, replay | Saved at | Loaded at, times | Host threads | Resident memory, load 2 → last |
+|---|---|---|---|---|
+| The 3rd Birthday, gameplay | 2250 | 2350 ×100 | 7 | 212,668 → 212,676 kB |
+| modern-hub | 1700 | 1800 ×50 | 7 | 159,684 → 158,180 kB |
+| manual-aim | 2200 | 2300 ×50 | 7 | 210,496 → 210,516 kB |
+| free-look | 2300 | 2400 ×50 | 7 | 211,020 → 211,036 kB |
+| lighting-hub-probe | 1500 | 1600 ×50 | 7 | 159,560 → 159,576 kB |
+| Last Raven, mission-effects | 1950 | 2050 ×100 | 6 | 156,028 → 157,420 kB |
+| the same, Higher FPS | 1950 | 2050 ×30 | 6 | 157,680 → 158,988 kB |
+| Last Raven, pause-look (play, pause, mouse in the pause menu) | 2120 | 2200 ×30 | 6 | 158,660 → 159,900 kB |
+| AC3 Portable, pause-peek | 7300 | 7400 ×30 | 6 | 156,888 → 157,344 kB |
+| Silent Line, mission (stopped at 5300) | 5000 | 5100 ×30 | 6 | 155,660 → 155,664 kB |
+
+The first load adds about 38 MB, which stays: the file is read whole, and
+the allocator keeps the room. The Armored Core titles settle a megabyte
+higher over the next few loads and stay there from about the sixth. The
+heap's in-use size, logged with each load, stays at 912 kB throughout.
+Every Armored Core point resumes its mission loop through the title's
+override, from inside it.
+
+In a GL window at 1080p and real time, The 3rd Birthday loaded 30 times in
+place with 23 host threads throughout and resident memory flat after the
+tenth load, and drew the street after the last.
+
+The keys were checked in a GL window with `PSPRECOMP_KEYS_AT`, which
+presses keys at given seconds for checks:
+- F5 saved;
+- F6 and F7 chose slots;
+- F9 asked, and Return loaded, after one fix: the question became a modal
+  popup with its cursor shown, since Return had chosen the menu's Resume
+  behind it;
+- with *keep an undo*, the undo save came first;
+- with *continue where I quit*, Ctrl+Shift+Q wrote the quit state and the
+  next launch began from it.
+
+One leak showed in the first loop and was fixed in both games' `boot.c`.
+Each guest thread's 64 kB signal stack was never freed, and a load starts
+every thread again. A thread-specific key now frees each one when its
+thread ends.
 
 ## Testing, all stages
 
