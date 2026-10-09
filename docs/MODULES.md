@@ -161,6 +161,11 @@ state, and a state refuses to load into a game whose modules differ.
   counts are the same all run.
 - A state is its build's own, so its modules cannot differ.
 - A save is refused only while a module's start or stop is running.
+- Not yet gated on a game. WipEout Pulse, the one game with modules so far,
+  now reaches its title screen, but plays a movie behind it from then on.
+  Saves are refused while a movie context exists (`src/hle/mpeg.c`), so the
+  gate (`build/verify10/wostate.sh`) waits for movie states or another
+  game with modules.
 
 **M6. Evidence and gates.**
 - **A hardware probe** that loads small PRXs from the Memory Stick. It
@@ -172,6 +177,9 @@ state, and a state refuses to load into a game whose modules differ.
   - how much free memory a load takes;
   - what an unresolved import does.
 - **WipEout** loads its three modules, and its font calls reach libfont.
+  It loads and starts all three through the app; by its title screen,
+  nothing has called libfont yet.
+- **The hardware probe** is `tools/hwprobe/modprobe`, in probe set 25 (9 Oct).
 - **The 3rd Birthday and the Armored Core titles**, which load no modules,
   replay byte-identical to stage 11.
 
