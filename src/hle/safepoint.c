@@ -6,6 +6,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/os.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,11 +66,13 @@ void psp_pause_set_redraw(void (*redraw)(void)) { g_redraw = redraw; }
  * computation and the store is caught by the second look: it stored its arm
  * before this re-reads the request, or this re-reads it after. */
 void psp_safepoint_rearm(void) {
-    psp_safepoint_armed = g_request || psp_census_next || g_script_at < g_nscript;
+    psp_safepoint_armed = g_request || psp_census_next || g_script_at < g_nscript ||
+                          psp_state_scripted_pending();
     if (g_request) psp_safepoint_armed = 1;
 }
 
 void psp_safepoint_init(void) {
+    psp_state_init();
     const char *spec = getenv("PSPRECOMP_PAUSE_AT");
     g_nscript = g_script_at = 0;
     while (spec && *spec && g_nscript < 32) {
@@ -111,13 +114,18 @@ static void hold(uint32_t ms, const char *why) {
             (psp_os_mono_ns() - start) / 1e9, psp_clock_peek() / 1e6, redraws);
 }
 
+static uint32_t g_at;     /* the call the safe point is in, while it is */
+uint32_t psp_safepoint_nid(void) { return g_at; }
+
 void psp_safepoint(uint32_t nid) {
     if (!boundary(nid)) return;
     /* On the thread that owns the GL context -- the last to run a display
      * list -- or on any before the GE has run. */
     const uint32_t owner = psp_ge_owner();
     if (owner && owner != psp_sched_current()) return;
+    g_at = nid;
     if (psp_census_next) psp_census_check();
+    if (psp_state_scripted_pending()) psp_state_scripted();
     const uint32_t polls = psp_ctrl_polls();
     while (g_script_at < g_nscript && polls >= g_script[g_script_at].poll) {
         char why[48];
@@ -126,5 +134,6 @@ void psp_safepoint(uint32_t nid) {
         g_script_at++;
     }
     if (g_request) hold(0, "held");
+    g_at = 0;
     psp_safepoint_rearm();
 }

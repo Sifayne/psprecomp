@@ -32,8 +32,8 @@
 #include "psprecomp/sched.h"
 #include "psprecomp/mem.h"
 #include "waitq.h"
+#include "psprecomp/state.h"
 
-#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,8 +120,6 @@ typedef struct {
     psp_sched_stats final_stats;
     int      has_final_stats;
     int      used;
-    jmp_buf  unwind;       /* where sceKernelExitThread returns to */
-    int      unwind_set;
 } psp_thread;
 
 typedef struct {
@@ -190,6 +188,16 @@ static uint32_t     g_next_uid;
  * and a second copy maintained here would be a second thing to keep in step.
  * Returns NULL on the main context, which is not a guest thread. */
 static psp_thread *current_thread(void);
+
+/* A wait's first park is its own, unless a save state restored the thread
+ * inside it (psp_hle_register_resume): then the wait goes on from what that
+ * park answered, one of the PSP_SCHED_* results. */
+enum { WAIT_BEGINS = 1 };
+static void thread_end_wait(uint32_t thid, uint32_t timeout, uint64_t deadline, int restored);
+static void sleep_end(int rc);
+static void sema_wait_end(uint32_t id, uint32_t tmo_ptr, uint64_t deadline, uint32_t me, int rc);
+static void delay_cb_until(uint64_t until, int restored);
+static void sleep_cb(int restored);
 static psp_callback *find_cb(uint32_t id);
 static int          g_warned_block;
 /* psp_thread.end_status for the main context, which has no record. */
@@ -710,6 +718,14 @@ static void hle_DeleteThread(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* How a delay ends: here, and on a thread a save state restored inside one. */
+static void delay_end(int rc) {
+    psp_thread *me = current_thread();
+    if (me) me->wait_kind = WAIT_NONE;
+    psp_ret(rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
+                                     : SCE_KERNEL_ERROR_OK);
+}
+
 /* Sleep for the given guest microseconds. The thread is not runnable for that
  * long, which is what lets anything less urgent run -- a yield would leave it
  * READY and the handoff would pick it straight back.
@@ -724,12 +740,11 @@ static void delay_for(uint64_t us) {
     if (us == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
     psp_thread *me = current_thread();
     if (me) me->wait_kind = WAIT_DELAY;
-    const int rc = psp_sched_delay(us);
-    me = current_thread();
-    if (me) me->wait_kind = WAIT_NONE;
-    psp_ret(rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
-                                     : SCE_KERNEL_ERROR_OK);
+    delay_end(psp_sched_delay(us));
 }
+
+/* A thread restored from a save state inside a delay (psp_hle_register_resume). */
+static void delay_resume(void) { delay_end(psp_sched_resume_delay(NULL)); }
 
 static void hle_DelayThread(void) { delay_for(psp_arg(0)); }
 
@@ -847,17 +862,26 @@ static void hle_WaitThreadEnd(void) {
      * there: a caller waiting on a thread that sleeps forever has a timeout
      * precisely so that it can give up, and without one the whole run stops.
      * threads/threads/threadend is that test, and it went silent. */
-    const uint64_t deadline = psp_wait_deadline(timeout);
+    thread_end_wait(thid, timeout, psp_wait_deadline(timeout), WAIT_BEGINS);
+}
 
+/* The wait, from its first park -- or from a park a save state restored, when
+ * `restored` is what that park answered (thread_end_resume). */
+static void thread_end_wait(uint32_t thid, uint32_t timeout, uint64_t deadline, int restored) {
+    psp_thread *t = find_thread(thid);
     /* Park until it ends. This is what drives a freshly started thread: nothing
      * runs it until the thread holding the token gives it up, and a caller
      * waiting for its result is the usual moment that happens. */
-    while (t->state != TH_DORMANT) {
+    while (restored != WAIT_BEGINS || t->state != TH_DORMANT) {
         const uint32_t me = psp_sched_current();
-        t->enders[t->nenders++ % MAX_SEMA_WAITERS] = me;
-        wait_mark(WAITTYPE_THREADEND, thid);
-        const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
-                                             "sceKernelWaitThreadEnd", deadline);
+        int rc = restored;
+        if (restored == WAIT_BEGINS) {
+            t->enders[t->nenders++ % MAX_SEMA_WAITERS] = me;
+            wait_mark(WAITTYPE_THREADEND, thid);
+            rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
+                                       "sceKernelWaitThreadEnd", deadline);
+        }
+        restored = WAIT_BEGINS;
         wait_mark(0, 0);
         if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
             if ((t = find_thread(thid)) != NULL) drop_ender(t, me);
@@ -887,6 +911,12 @@ static void hle_WaitThreadEnd(void) {
 
     psp_wait_writeback(timeout, deadline);
     psp_ret(t->exit_status);
+}
+
+static void thread_end_resume(void) {
+    uint64_t deadline = 0;
+    const int rc = psp_sched_resume_block(&deadline);
+    thread_end_wait(psp_arg(0), psp_arg(1), deadline, rc);
 }
 
 static void hle_GetThreadId(void) {
@@ -1076,25 +1106,27 @@ static void hle_SleepThread(void) {
     if (t->wakeup_count > 0) { t->wakeup_count--; psp_ret(SCE_KERNEL_ERROR_OK); return; }
 
     t->wait_kind = WAIT_SLEEP;
-    const int rc = psp_sched_block(t->uid, PSP_SCHED_SLEEPING, "sceKernelSleepThread");
+    sleep_end(psp_sched_block(t->uid, PSP_SCHED_SLEEPING, "sceKernelSleepThread"));
+}
+
+static void sleep_end(int rc) {
+    psp_thread *t = current_thread();
+    if (t) t->wait_kind = WAIT_NONE;
     if (rc == PSP_SCHED_RELEASED) {             /* threadprobe step 70 */
-        t = current_thread();
-        if (t) t->wait_kind = WAIT_NONE;
         psp_ret(SCE_KERNEL_ERROR_RELEASE_WAIT);
         return;
     }
     if (rc != PSP_SCHED_WOKEN) {
-        t->wait_kind = WAIT_NONE;
         wait_deadlock("sceKernelSleepThread");
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
     /* Woken by name. The wakeup went straight to this sleep and was never
      * banked, so there is nothing to take off the count. */
-    t = current_thread();
-    if (t) t->wait_kind = WAIT_NONE;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
+
+static void sleep_resume(void) { sleep_end(psp_sched_resume_block(NULL)); }
 
 /* Wake a thread in sceKernelSleepThread, or bank the wakeup for its next one.
  *
@@ -1679,8 +1711,13 @@ static void hle_WaitSema(void) {
     }
 
     wait_mark(WAITTYPE_SEMA, id);
-    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, s->waitdesc,
-                                         deadline);
+    sema_wait_end(id, tmo_ptr, deadline, me,
+                  psp_sched_block_until(me, PSP_SCHED_BLOCKED, s->waitdesc, deadline));
+}
+
+/* How a semaphore wait ends: here, and on a thread a save state restored
+ * inside one (sema_wait_resume). */
+static void sema_wait_end(uint32_t id, uint32_t tmo_ptr, uint64_t deadline, uint32_t me, int rc) {
     wait_mark(0, 0);
     if (rc == PSP_SCHED_WOKEN) {
         const int why = psp_sched_wake_reason();
@@ -1695,7 +1732,7 @@ static void hle_WaitSema(void) {
     /* Gone while we were parked, which is what sceKernelDeleteSema releasing
      * its waiters looks like from in here -- and a different answer from asking
      * about a semaphore that was already gone before the call. */
-    s = find_sema(id);
+    psp_sema *s = find_sema(id);
     if (!s) { psp_wait_writeback(tmo_ptr, deadline);
               psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
 
@@ -1725,6 +1762,12 @@ static void hle_WaitSema(void) {
      * one elapsed -- a fabricated timeout is something a game acts on. */
     wait_deadlock("sceKernelWaitSema");
     psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void sema_wait_resume(void) {
+    uint64_t deadline = 0;
+    const int rc = psp_sched_resume_block(&deadline);
+    sema_wait_end(psp_arg(0), psp_arg(2), deadline, psp_sched_current(), rc);
 }
 
 /* sceKernelCancelSema(uid, newCount, numWaitThreads) -- syncprobe steps 44-45
@@ -2562,16 +2605,26 @@ static void hle_WaitThreadEndCB(void) { psp_threadman_cb_begin(); hle_WaitThread
  * runs it 100ms later, after everything else the test prints. */
 static void delay_cb_for(uint64_t us) {
     if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
-    const uint64_t until = psp_clock_peek() + us;
-    for (;;) {
-        psp_threadman_run_callbacks();
-        psp_thread *t = current_thread();
-        const uint64_t now = psp_clock_peek();
-        if (!t || now >= until) break;
+    delay_cb_until(psp_clock_peek() + us, WAIT_BEGINS);
+}
 
-        t->wait_kind = WAIT_DELAY;
-        t->cb_wait   = 1;
-        const int rc = psp_sched_delay(until - now);
+/* The delay, from its first park -- or from one a save state restored, when
+ * `restored` is what that park answered (delay_cb_resume). */
+static void delay_cb_until(uint64_t until, int restored) {
+    for (;;) {
+        psp_thread *t;
+        int rc = restored;
+        if (restored == WAIT_BEGINS) {
+            psp_threadman_run_callbacks();
+            t = current_thread();
+            const uint64_t now = psp_clock_peek();
+            if (!t || now >= until) break;
+
+            t->wait_kind = WAIT_DELAY;
+            t->cb_wait   = 1;
+            rc = psp_sched_delay(until - now);
+        }
+        restored = WAIT_BEGINS;
         t = current_thread();
         if (t) { t->wait_kind = WAIT_NONE; t->cb_wait = 0; }
         if (rc == PSP_SCHED_RELEASED) {
@@ -2587,6 +2640,12 @@ static void delay_cb_for(uint64_t us) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static void delay_cb_resume(void) {
+    uint64_t until = 0;
+    const int rc = psp_sched_resume_delay(&until);
+    delay_cb_until(until, rc);
+}
+
 static void hle_DelayThreadCB(void) { delay_cb_for(psp_arg(0)); }
 
 static void hle_DelaySysClockThreadCB(void) {
@@ -2595,6 +2654,8 @@ static void hle_DelaySysClockThreadCB(void) {
 }
 
 static void hle_WaitSemaCB(void) { psp_threadman_cb_begin(); hle_WaitSema(); psp_threadman_cb_end(); }
+static void sema_wait_cb_resume(void) { sema_wait_resume(); psp_threadman_cb_end(); }
+static void thread_end_cb_resume(void) { thread_end_resume(); psp_threadman_cb_end(); }
 
 /* A sleep that a notify can interrupt, and that goes back to sleep afterwards.
  * The other CB waits above deliver on the way in and are done; this one is the
@@ -2602,16 +2663,26 @@ static void hle_WaitSemaCB(void) { psp_threadman_cb_begin(); hle_WaitSema(); psp
  * reachable only by a callback. */
 static void hle_SleepThreadCB(void) {
     if (!psp_sched_can_wait()) { psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return; }
-    for (;;) {
-        psp_threadman_run_callbacks();
-        psp_thread *t = current_thread();
-        if (!t) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
-        if (t->wakeup_count > 0) { t->wakeup_count--; psp_ret(SCE_KERNEL_ERROR_OK); return; }
+    sleep_cb(WAIT_BEGINS);
+}
 
-        t->wait_kind = WAIT_SLEEP;
-        t->cb_wait   = 1;
-        const int rc = psp_sched_block(t->uid, PSP_SCHED_SLEEPING,
-                                       "sceKernelSleepThreadCB");
+/* The sleep, from its first park -- or from one a save state restored, when
+ * `restored` is what that park answered (sleep_cb_resume). */
+static void sleep_cb(int restored) {
+    for (;;) {
+        psp_thread *t;
+        int rc = restored;
+        if (restored == WAIT_BEGINS) {
+            psp_threadman_run_callbacks();
+            t = current_thread();
+            if (!t) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+            if (t->wakeup_count > 0) { t->wakeup_count--; psp_ret(SCE_KERNEL_ERROR_OK); return; }
+
+            t->wait_kind = WAIT_SLEEP;
+            t->cb_wait   = 1;
+            rc = psp_sched_block(t->uid, PSP_SCHED_SLEEPING, "sceKernelSleepThreadCB");
+        }
+        restored = WAIT_BEGINS;
         t = current_thread();
         if (t) { t->wait_kind = WAIT_NONE; t->cb_wait = 0; }
         if (rc == PSP_SCHED_RELEASED) {
@@ -2632,9 +2703,25 @@ static void hle_SleepThreadCB(void) {
     }
 }
 
+static void sleep_cb_resume(void) { sleep_cb(psp_sched_resume_block(NULL)); }
+
 void psp_threadman_register(void) {
+    /* What a save state keeps of the thread manager (psprecomp/state.h). */
+    PSP_STATE_KEEP(g_thread);
+    PSP_STATE_KEEP(g_sema);
+    PSP_STATE_KEEP(g_flag);
+    PSP_STATE_KEEP(g_cb);
+    PSP_STATE_KEEP(g_cb_hi);
+    PSP_STATE_KEEP(g_sema_hi);
+    PSP_STATE_KEEP(g_flag_hi);
+    PSP_STATE_KEEP(g_thread_hi);
+    PSP_STATE_KEEP(g_next_uid);
+    PSP_STATE_KEEP(g_main_end_status);
+    psp_waitq_keep();
+
     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every
      * pair below. */
+
     psp_hle_register(0x349D6D6C, "ThreadManForUser", "sceKernelCheckCallback",           hle_CheckCallback);
     psp_hle_register(0xC11BA8C4, "ThreadManForUser", "sceKernelNotifyCallback",          hle_NotifyCallback);
     psp_hle_register(0x3B183E26, "ThreadManForUser", "sceKernelGetThreadExitStatus",     hle_GetThreadExitStatus);
@@ -2707,4 +2794,17 @@ void psp_threadman_register(void) {
     psp_hle_register(0xBC6FEBC5, "ThreadManForUser", "sceKernelReferSemaStatus",         hle_ReferSemaStatus);
     psp_hle_register(0xA66B0120, "ThreadManForUser", "sceKernelReferEventFlagStatus",    hle_ReferEventFlagStatus);
     psp_hle_register(0x730ED8BC, "ThreadManForUser", "sceKernelReferCallbackStatus",     hle_ReferCallbackStatus);
+
+    /* The waits a thread can be parked in when a state is saved, finished
+     * on a thread the state restored (psprecomp/state.h). */
+    psp_hle_register_resume(0xCEADEB47, delay_resume);              /* DelayThread */
+    psp_hle_register_resume(0xBD123D9E, delay_resume);              /* DelaySysClockThread */
+    psp_hle_register_resume(0x68DA9E36, delay_cb_resume);           /* DelayThreadCB */
+    psp_hle_register_resume(0x1181E963, delay_cb_resume);           /* DelaySysClockThreadCB */
+    psp_hle_register_resume(0x9ACE131E, sleep_resume);              /* SleepThread */
+    psp_hle_register_resume(0x82826F70, sleep_cb_resume);           /* SleepThreadCB */
+    psp_hle_register_resume(0x278C0DF5, thread_end_resume);         /* WaitThreadEnd */
+    psp_hle_register_resume(0x840E8133, thread_end_cb_resume);      /* WaitThreadEndCB */
+    psp_hle_register_resume(0x4E3A1105, sema_wait_resume);          /* WaitSema */
+    psp_hle_register_resume(0x6D212BAC, sema_wait_cb_resume);       /* WaitSemaCB */
 }

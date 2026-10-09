@@ -19,6 +19,7 @@
 #include "psprecomp/os.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1055,11 +1056,19 @@ static void hle_QueryStreamSize(void) {
  * recycling nothing. The values lie outside the caller's storage, so their
  * base is not observable; 0x10000 is a host choice. The game hands the
  * handle back to GetAvcAu and friends and never looks inside it. */
+static uint32_t g_next_stream = 0x00010000u;
+
 static void hle_RegistStream(void) {
-    static uint32_t next = 0x00010000u;
     if (!ctx_of(psp_arg(0))) { psp_ret(0); return; }
-    psp_ret(next);
-    next += MPEG_STREAM_HANDLE_STEP;
+    psp_ret(g_next_stream);
+    g_next_stream += MPEG_STREAM_HANDLE_STEP;
+}
+
+/* A save state (psprecomp/state.h) is not taken while a movie is open: its
+ * decoders and demuxed streams are host objects with no way back. The
+ * handle counter, which outlives the movies, is kept. */
+static const char *mpeg_refuse(void) {
+    return psp_mpeg_census(NULL) ? "a movie is playing" : NULL;
 }
 
 static void hle_UnRegistStream(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
@@ -1529,6 +1538,9 @@ static void hle_FlushAllStream(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_AvcDecodeFlush(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 void psp_mpeg_register(void) {
+    static const psp_state_part part = { "mpeg", mpeg_refuse, NULL, NULL };
+    PSP_STATE_KEEP(g_next_stream);
+    psp_state_register(&part);
     psp_hle_register(0x682A619B, "sceMpeg", "sceMpegInit",            hle_MpegInit);
     psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",          hle_MpegFinish);
     psp_hle_register(0xC132E22F, "sceMpeg", "sceMpegQueryMemSize",    hle_QueryMemSize);

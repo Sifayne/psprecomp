@@ -157,3 +157,9 @@ void psp_census_row(FILE *out, uint32_t uid, const char *name, const char *state
     if (!p->nest) fprintf(out, "\t-");
     fprintf(out, "\t%s\n", verdict(p));
 }
+
+int psp_census_self_nest(uint8_t *kind, uint32_t *addr, int max) {
+    const int n = (int)t_nnest;
+    for (int i = 0; i < n && i < max && i < NEST_MAX; i++) { kind[i] = t_nest[i].kind; addr[i] = t_nest[i].addr; }
+    return n;
+}

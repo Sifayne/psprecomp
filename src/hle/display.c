@@ -16,6 +16,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/render.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -427,6 +428,16 @@ static void hle_GetFramePerSec(void) {
 }
 
 void psp_display_register(void) {
+    PSP_STATE_KEEP(g_fb_addr);          /* a save state's (psprecomp/state.h) */
+    PSP_STATE_KEEP(g_fb_width);
+    PSP_STATE_KEEP(g_fb_format);
+    PSP_STATE_KEEP(g_mode);
+    PSP_STATE_KEEP(g_mode_w);
+    PSP_STATE_KEEP(g_mode_h);
+    PSP_STATE_KEEP(g_vblank_count);
+    PSP_STATE_KEEP(g_last_vblank_us);
+    PSP_STATE_KEEP(g_irq_vblank_us);
+    PSP_STATE_KEEP(g_vcount);
     psp_hle_register(0x0E20F177, "sceDisplay", "sceDisplaySetMode",           hle_SetMode);
     psp_hle_register(0x289D82FE, "sceDisplay", "sceDisplaySetFrameBuf",       hle_SetFrameBuf);
     psp_hle_register(0xEEDA2E54, "sceDisplay", "sceDisplayGetFrameBuf",       hle_GetFrameBuf);

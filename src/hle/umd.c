@@ -21,6 +21,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 
@@ -125,6 +126,8 @@ static void hle_UnRegisterCallback(void) {
 static void hle_GetErrorStat(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 void psp_umd_register(void) {
+    PSP_STATE_KEEP(g_callback_id);      /* a save state's (psprecomp/state.h) */
+    PSP_STATE_KEEP(g_drive_state);
     psp_hle_register(0x20628E6F, "sceUmdUser", "sceUmdGetErrorStat",          hle_GetErrorStat);
     psp_hle_register(0x46EBB729, "sceUmdUser", "sceUmdCheckMedium",           hle_CheckMedium);
     psp_hle_register(0xC6183D47, "sceUmdUser", "sceUmdActivate",              hle_Activate);

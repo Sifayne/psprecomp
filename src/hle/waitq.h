@@ -171,6 +171,9 @@ int  psp_waitq_count(const psp_waitq *q);
 int  psp_waitq_leave(uint32_t uid);
 /* Forget every parked thread, with the objects: psp_threadman_reset. */
 void psp_waitq_reset(void);
+/* Names the parked-thread table to the save state (psprecomp/state.h);
+ * threadman.c calls it, with its own objects. */
+void psp_waitq_keep(void);
 
 /* Wake everyone and empty the queue, for delete and cancel -- where no waiter
  * is being *satisfied* and each has to discover for itself that its object is

@@ -424,11 +424,31 @@ void psp_resume_register(const psp_resume_site *sites, int count) {
 
 int psp_resume_count(void) { return g_nresume; }
 
+static struct { uint32_t addr; psp_resume_fn original, fn; } g_override[8];
+static int g_noverride;
+
+void psp_resume_override(uint32_t addr, psp_resume_fn original, psp_resume_fn fn) {
+    if (g_noverride >= (int)(sizeof g_override / sizeof *g_override)) return;
+    g_override[g_noverride].addr = addr;
+    g_override[g_noverride].original = original;
+    g_override[g_noverride].fn = fn;
+    g_noverride++;
+}
+
+int psp_resume_overridden(uint32_t addr) {
+    for (int i = 0; i < g_noverride; i++) if (g_override[i].addr == addr) return 1;
+    return 0;
+}
+
 psp_resume_fn psp_resume_lookup(uint32_t site) {
     int lo = 0, hi = g_nresume - 1;
     while (lo <= hi) {
         const int mid = lo + (hi - lo) / 2;
-        if (g_resume[mid].site == site) return g_resume[mid].fn;
+        if (g_resume[mid].site == site) {
+            for (int i = 0; i < g_noverride; i++)
+                if (g_override[i].original == g_resume[mid].fn) return g_override[i].fn;
+            return g_resume[mid].fn;
+        }
         if (g_resume[mid].site < site) lo = mid + 1; else hi = mid - 1;
     }
     return NULL;

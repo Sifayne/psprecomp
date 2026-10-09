@@ -48,6 +48,11 @@ int psp_hle_is_named(int index);
 /* Call a firmware function by NID. An unregistered NID reports itself by name
  * where possible and by number otherwise, rather than failing silently. */
 void psp_hle_call(uint32_t nid);
+/* How a call a thread can be parked in finishes on a thread restored from a
+ * save state (psprecomp/state.h): the handler's code after its wait, from
+ * what the wait left in the thread's record. A call without one refuses a
+ * save while a thread waits in it. */
+void psp_hle_register_resume(uint32_t nid, void (*finish)(void));
 /* Optional host scheduling policy, configured before guest execution. Called
  * after an outermost registered handler has completed and written its result,
  * before returning to guest code. elapsed_ns measures the handler's host wall
@@ -508,6 +513,8 @@ uint32_t psp_pad_bit(const char *s, size_t n);
  * see the header comment in ctrl_replay.c for why that is the whole design. */
 void psp_ctrl_replay_init(void);
 void psp_ctrl_replay_reset(void);
+/* Registers the scenario's place with a save state (psprecomp/state.h). */
+void psp_ctrl_replay_keep(void);
 /* Advance the scenario to (polls, us), applying at most one visible edge. */
 void psp_ctrl_replay_step(uint32_t polls, uint64_t us);
 /* Record the composed pad state, look channel included; writes a line only

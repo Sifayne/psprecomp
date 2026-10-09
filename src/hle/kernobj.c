@@ -13,6 +13,7 @@
 #include "psprecomp/mem.h"
 #include "psprecomp/sched.h"
 #include "waitq.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -509,6 +510,7 @@ static void vpl_list(int type, uint32_t out, int max, int *count) {
 static void hle_AllocateVplCB(void) { psp_threadman_cb_begin(); hle_AllocateVpl(); psp_threadman_cb_end(); }
 
 void psp_kernobj_register(void) {
+    PSP_STATE_KEEP(g_vpl);              /* a save state's (psprecomp/state.h) */
     psp_threadman_add_lister(vpl_list);
     psp_hle_register(0x56C039B5, "ThreadManForUser", "sceKernelCreateVpl",      hle_CreateVpl);
     psp_hle_register(0x89B3D48C, "ThreadManForUser", "sceKernelDeleteVpl",      hle_DeleteVpl);
@@ -1049,6 +1051,7 @@ static void hle_SendMsgPipeCB(void)    { psp_threadman_cb_begin(); hle_SendMsgPi
 static void hle_ReceiveMsgPipeCB(void) { psp_threadman_cb_begin(); hle_ReceiveMsgPipe(); psp_threadman_cb_end(); }
 
 void psp_kernobj_register_mpp(void) {
+    PSP_STATE_KEEP(g_pipe);
     psp_threadman_add_lister(mpp_list);
     psp_hle_register(0x7C0DC2A0, "ThreadManForUser", "sceKernelCreateMsgPipe",     hle_CreateMsgPipe);
     psp_hle_register(0xF0B7DA1C, "ThreadManForUser", "sceKernelDeleteMsgPipe",     hle_DeleteMsgPipe);
@@ -1393,6 +1396,7 @@ static void mbx_list(int type, uint32_t out, int max, int *count) {
 static void hle_ReceiveMbxCB(void) { psp_threadman_cb_begin(); hle_ReceiveMbx(); psp_threadman_cb_end(); }
 
 void psp_kernobj_register_mbx(void) {
+    PSP_STATE_KEEP(g_mbx);
     psp_threadman_add_lister(mbx_list);
     psp_hle_register(0x8125221D, "ThreadManForUser", "sceKernelCreateMbx",        hle_CreateMbx);
     psp_hle_register(0x86255ADA, "ThreadManForUser", "sceKernelDeleteMbx",        hle_DeleteMbx);
@@ -1706,7 +1710,42 @@ static void fpl_list(int type, uint32_t out, int max, int *count) {
 
 static void hle_AllocateFplCB(void) { psp_threadman_cb_begin(); hle_AllocateFpl(); psp_threadman_cb_end(); }
 
+/* A save state keeps the pools as they are, and each free list beside them:
+ * a saved pointer to one says the pool had a list, and the load gives it a
+ * new one with the same entries. */
+static int fpl_save(psp_state_writer *w) {
+    size_t n = 0;
+    for (int i = 0; i < MAX_FPLS; i++) if (g_fpl[i].freelist) n += g_fpl[i].nblocks;
+    uint32_t *all = malloc(n ? n * sizeof *all : 1), *at = all;
+    if (!all) return -1;
+    for (int i = 0; i < MAX_FPLS; i++)
+        if (g_fpl[i].freelist) { memcpy(at, g_fpl[i].freelist, g_fpl[i].nblocks * sizeof *at); at += g_fpl[i].nblocks; }
+    const int rc = psp_state_put(w, "fpllist", all, n * sizeof *all);
+    free(all);
+    return rc;
+}
+
+static int fpl_load(psp_state_reader *r, char *why, size_t size) {
+    size_t n;
+    const uint8_t *at = psp_state_get(r, "fpllist", &n), *end = at + (at ? n : 0);
+    for (int i = 0; i < MAX_FPLS; i++) {
+        if (!g_fpl[i].freelist) continue;
+        const size_t bytes = g_fpl[i].nblocks * sizeof(uint32_t);
+        g_fpl[i].freelist = malloc(bytes ? bytes : 1);
+        if (!at || (size_t)(end - at) < bytes || !g_fpl[i].freelist) {
+            snprintf(why, size, "a fixed pool's free list is missing");
+            return -1;
+        }
+        memcpy(g_fpl[i].freelist, at, bytes);
+        at += bytes;
+    }
+    return 0;
+}
+
 void psp_kernobj_register_fpl(void) {
+    static const psp_state_part part = { "fpl", NULL, fpl_save, fpl_load };
+    PSP_STATE_KEEP(g_fpl);
+    psp_state_register(&part);
     psp_threadman_add_lister(fpl_list);
     psp_hle_register(0xC07BB470, "ThreadManForUser", "sceKernelCreateFpl",      hle_CreateFpl);
     psp_hle_register(0xED1410E0, "ThreadManForUser", "sceKernelDeleteFpl",      hle_DeleteFpl);
@@ -2049,7 +2088,40 @@ static void tls_list(int type, uint32_t out, int max, int *count) {
     }
 }
 
+/* The same for each pool's block owners. */
+static int tls_save(psp_state_writer *w) {
+    size_t n = 0;
+    for (int i = 0; i < MAX_TLSPLS; i++) if (g_tls[i].owner) n += g_tls[i].nblocks;
+    uint32_t *all = malloc(n ? n * sizeof *all : 1), *at = all;
+    if (!all) return -1;
+    for (int i = 0; i < MAX_TLSPLS; i++)
+        if (g_tls[i].owner) { memcpy(at, g_tls[i].owner, g_tls[i].nblocks * sizeof *at); at += g_tls[i].nblocks; }
+    const int rc = psp_state_put(w, "tlsowner", all, n * sizeof *all);
+    free(all);
+    return rc;
+}
+
+static int tls_load(psp_state_reader *r, char *why, size_t size) {
+    size_t n;
+    const uint8_t *at = psp_state_get(r, "tlsowner", &n), *end = at + (at ? n : 0);
+    for (int i = 0; i < MAX_TLSPLS; i++) {
+        if (!g_tls[i].owner) continue;
+        const size_t bytes = g_tls[i].nblocks * sizeof(uint32_t);
+        g_tls[i].owner = malloc(bytes ? bytes : 1);
+        if (!at || (size_t)(end - at) < bytes || !g_tls[i].owner) {
+            snprintf(why, size, "a thread-local pool's owners are missing");
+            return -1;
+        }
+        memcpy(g_tls[i].owner, at, bytes);
+        at += bytes;
+    }
+    return 0;
+}
+
 void psp_kernobj_register_tls(void) {
+    static const psp_state_part part = { "tlspl", NULL, tls_save, tls_load };
+    PSP_STATE_KEEP(g_tls);
+    psp_state_register(&part);
     psp_threadman_add_lister(tls_list);
     psp_hle_register(0x8DAFF657, "ThreadManForUser", "sceKernelCreateTlspl",      hle_CreateTlspl);
     psp_hle_register(0x32BF938E, "ThreadManForUser", "sceKernelDeleteTlspl",      hle_DeleteTlspl);

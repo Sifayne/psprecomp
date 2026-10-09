@@ -58,6 +58,14 @@ int           psp_resume_count(void);
  * whole thread). Returns 0, or -1 with the address that is no return site in
  * *missing: nothing has run past the frames already resumed. */
 int           psp_resume_chain(uint32_t site, uint32_t stop, uint32_t *missing);
+/* A function the host replaced, live on a thread's stack, resumes through
+ * the title: the return sites the emitted table gives to `original` (the
+ * function's own psp_resume_<addr>) go to `fn` instead. `addr` is the
+ * function, as the census reports it (PSP_REPLACED). The replacement's own
+ * state is the title's to save (psp_state_keep). */
+void          psp_resume_override(uint32_t addr, psp_resume_fn original, psp_resume_fn fn);
+/* Whether a replaced function at `addr` resumes: a title registered it. */
+int           psp_resume_overridden(uint32_t addr);
 
 /* Register one recompiled function. The generated code calls this for every
  * function it defines, from a single init routine. */

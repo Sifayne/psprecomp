@@ -9,7 +9,10 @@
  * between guest frames -- a callback, an interrupt handler, a host
  * replacement of a guest function. sched.c stores one record per thread when
  * it parks; PSPRECOMP_PARK_CENSUS=<poll>[,<poll>...] prints them all at the
- * safe point once those polls are reached. */
+ * safe point once those polls are reached.
+ *
+ * Save states (psprecomp/state.h) are built on the same records, so what the
+ * runtime's modules tell each other about saving and resuming is here too. */
 #ifndef PSPRECOMP_HLE_CENSUS_H
 #define PSPRECOMP_HLE_CENSUS_H
 
@@ -49,6 +52,38 @@ void psp_safepoint(uint32_t nid);
 void psp_safepoint_rearm(void);
 extern uint32_t psp_census_next;
 void psp_census_check(void);
+/* sched.c, for state.c: why a save is impossible, the slots made ready to be
+ * written, and the threads restarted last of all when a state loads. */
+const char *psp_sched_state_refuse(void);
+int  psp_sched_state_prepare(void);
+int  psp_sched_state_load(char *why, size_t size);
+/* sched.c, for the calls that finish a wait begun before a load
+ * (psp_hle_register_resume): the restored thread's first wait, answered as
+ * psp_sched_block_until or psp_sched_delay would have answered it, with the
+ * deadline it was given; and the saving thread's token. */
+int  psp_sched_resume_block(uint64_t *deadline);
+int  psp_sched_resume_delay(uint64_t *deadline);
+void psp_sched_resume_token(void);
+/* What a save state keeps of the modules with no registration of their own
+ * (psp_state_keep): clock.c's, by sched.c. */
+void psp_clock_keep(void);
+/* sched.c: where in its call a thread is, for a call that can park at more
+ * than one place; kept with the thread, so it survives a save state. */
+void     psp_sched_set_step(uint8_t step);
+uint8_t  psp_sched_step(void);
+/* census.c: the host frames between this thread's guest frames, innermost
+ * last; returns how many. */
+int  psp_census_self_nest(uint8_t *kind, uint32_t *addr, int max);
+/* hle.c: whether a thread parked in this call can finish it after a load,
+ * and finishing it -- then everything a call ends with -- on a restored
+ * thread. `safepoint`: the thread that saved, inside psp_safepoint. */
+int  psp_hle_resumable(uint32_t nid);
+void psp_hle_resume(uint32_t nid, uint32_t site, int safepoint);
+/* safepoint.c: the call the safe point is in, while it is; else 0. */
+uint32_t psp_safepoint_nid(void);
+/* state.c: PSPRECOMP_SAVE_STATE's saves, taken at the safe point. */
+int  psp_state_scripted_pending(void);
+void psp_state_scripted(void);
 
 /* sched.c: one line per live thread, from the records above. */
 void psp_sched_census(FILE *out, uint32_t self);

@@ -50,6 +50,7 @@ add_library(psprecomp STATIC
     src/hle/sched.c
     src/hle/census.c
     src/hle/safepoint.c
+    src/hle/state.c
     src/hle/clock.c
     src/hle/mpeg.c
     src/hle/display.c

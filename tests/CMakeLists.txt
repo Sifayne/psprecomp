@@ -152,6 +152,10 @@ add_executable(test_watch_arm test_watch_arm.c)
 target_link_libraries(test_watch_arm PRIVATE psprecomp)
 add_test(NAME watch_arm COMMAND test_watch_arm)
 
+add_executable(test_state test_state.c)
+target_link_libraries(test_state PRIVATE psprecomp)
+add_test(NAME state COMMAND test_state ${CMAKE_CURRENT_BINARY_DIR})
+
 add_executable(test_ge_capture test_ge_capture.c)
 target_link_libraries(test_ge_capture PRIVATE psprecomp)
 add_test(NAME ge_capture_polls COMMAND test_ge_capture polls capture-polls)

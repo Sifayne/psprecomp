@@ -16,6 +16,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/sched.h"
 #include "io_observed.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +72,10 @@ typedef struct {
     int      sector_mode;
     /* Written since it was opened, so closing it flushes (see io_park). */
     int      dirty;
+    /* How to open it again in another process, for a save state: the disc
+     * image, or this host path read-only. A writable file is not saved. */
+    int      image, writable;
+    char     host[1024];
 } io_file;
 
 /* One entry of a directory listing, as sceIoDopen took it. */
@@ -225,6 +230,7 @@ static void hle_open_body(void) {
             for (int i = 0; i < MAX_FILES; i++) {
                 if (g_file[i].used) continue;
                 g_file[i].f = e.f; g_file[i].used = 1; g_file[i].dirty = 0;
+                g_file[i].image = 1; g_file[i].writable = 0; g_file[i].host[0] = '\0';
                 g_file[i].base = e.base; g_file[i].len = e.len; g_file[i].pos = 0;
                 g_file[i].has_result = g_file[i].close_pending = g_file[i].running = 0;
                 g_file[i].sector_mode = e.is_device;
@@ -257,6 +263,7 @@ static void hle_open_body(void) {
             g_file[i].f = f;
             g_file[i].used = 1;
             g_file[i].dirty = 0;
+            g_file[i].image = 1; g_file[i].writable = 0; g_file[i].host[0] = '\0';
             g_file[i].base = 0;
             g_file[i].pos  = 0;
             g_file[i].len  = (fseeko(f, 0, SEEK_END) == 0 && ftello(f) > 0)
@@ -344,6 +351,9 @@ static void hle_open_body(void) {
         g_file[i].f = f;
         g_file[i].used = 1;
         g_file[i].dirty = 0;
+        g_file[i].image = 0;
+        g_file[i].writable = strcmp(mode, "rb") != 0;
+        snprintf(g_file[i].host, sizeof g_file[i].host, "%s", host);
         g_file[i].base = 0;
         g_file[i].pos  = 0;
         g_file[i].has_result = g_file[i].close_pending = g_file[i].running = 0;
@@ -1398,6 +1408,7 @@ static void hle_OpenAsync(void) {
     for (int i = 0; i < MAX_FILES; i++) {
         if (g_file[i].used) continue;
         g_file[i].f = NULL; g_file[i].used = 1;
+        g_file[i].image = g_file[i].writable = 0; g_file[i].host[0] = '\0';
         g_file[i].base = g_file[i].len = g_file[i].pos = 0;
         g_file[i].sector_mode = 0;
         g_file[i].close_pending = 1;
@@ -1510,7 +1521,103 @@ static void hle_GetAsyncStat(void) {
     else async_wait(fd_arg(), psp_arg(2));
 }
 
+/* ---- save states (psprecomp/state.h) ----------------------------------------
+ *
+ * A descriptor is saved as how to open it again and where it was: the disc
+ * image, or a host path read-only. Paths under the root are saved relative to
+ * it, so a state outlives the data directory moving. A writable file or an
+ * open directory refuses the save; a game holds neither across frames. */
+typedef struct {
+    int32_t  used, open, image, sector_mode, has_result, close_pending, running, rooted;
+    uint64_t base, len, pos;
+    int64_t  result;
+    char     path[1024];
+} saved_file;
+
+static const char *io_refuse(void) {
+    for (int i = 0; i < MAX_FILES; i++)
+        if (g_file[i].used && g_file[i].f && g_file[i].writable) return "a file is open for writing";
+    for (int i = 0; i < MAX_DIRS; i++)
+        if (g_dir[i].used) return "a directory is open";
+    return NULL;
+}
+
+/* A host path under the root, as the part after it; else as it is. */
+static int unroot(const char *host, char *out, size_t cap) {
+    const size_t n = strlen(g_root);
+    if (n && !strncmp(host, g_root, n) && (host[n] == '/' || host[n] == '\\' || !host[n])) {
+        snprintf(out, cap, "%s", host + n);
+        return 1;
+    }
+    snprintf(out, cap, "%s", host);
+    return 0;
+}
+
+static int io_save(psp_state_writer *w) {
+    static saved_file out[MAX_FILES];
+    memset(out, 0, sizeof out);
+    for (int i = 0; i < MAX_FILES; i++) {
+        const io_file *f = &g_file[i];
+        if (!f->used) continue;
+        saved_file *s = &out[i];
+        s->used = 1;
+        s->open = f->f != NULL;
+        s->image = f->image;
+        s->sector_mode = f->sector_mode;
+        s->has_result = f->has_result;
+        s->close_pending = f->close_pending;
+        s->running = f->running;
+        s->base = f->base; s->len = f->len; s->pos = f->pos;
+        s->result = f->result;
+        s->rooted = unroot(f->host, s->path, sizeof s->path);
+    }
+    char cwd[sizeof g_cwd + 1];
+    cwd[0] = (char)unroot(g_cwd, cwd + 1, sizeof cwd - 1);
+    return psp_state_put(w, "iofiles", out, sizeof out) || psp_state_put(w, "iocwd", cwd, sizeof cwd) ? -1 : 0;
+}
+
+static int io_load(psp_state_reader *r, char *why, size_t size) {
+    size_t n, m;
+    const saved_file *in = psp_state_get(r, "iofiles", &n);
+    const char *cwd = psp_state_get(r, "iocwd", &m);
+    if (!in || n != MAX_FILES * sizeof *in || !cwd || m != sizeof g_cwd + 1) {
+        snprintf(why, size, "the open files are missing");
+        return -1;
+    }
+    psp_io_reset();
+    if (cwd[0]) snprintf(g_cwd, sizeof g_cwd, "%s%s", g_root, cwd + 1);
+    else snprintf(g_cwd, sizeof g_cwd, "%s", cwd + 1);
+    for (int i = 0; i < MAX_FILES; i++) {
+        saved_file s;
+        memcpy(&s, &in[i], sizeof s);
+        if (!s.used) continue;
+        io_file *f = &g_file[i];
+        memset(f, 0, sizeof *f);
+        f->used = 1;
+        f->image = s.image;
+        s.path[sizeof s.path - 1] = '\0';
+        if (s.rooted) snprintf(f->host, sizeof f->host, "%s%.511s", g_root, s.path);
+        else snprintf(f->host, sizeof f->host, "%s", s.path);
+        if (s.open) {
+            f->f = fopen(s.image ? g_umd_image : f->host, "rb");
+            if (!f->f) {
+                snprintf(why, size, "%.200s cannot be opened again", s.image ? g_umd_image : f->host);
+                return -1;
+            }
+        }
+        f->sector_mode = s.sector_mode;
+        f->has_result = s.has_result;
+        f->close_pending = s.close_pending;
+        f->running = s.running;
+        f->base = s.base; f->len = s.len; f->pos = s.pos;
+        f->result = s.result;
+    }
+    return 0;
+}
+
 void psp_io_register(void) {
+    static const psp_state_part part = { "io", io_refuse, io_save, io_load };
+    psp_state_register(&part);
     psp_hle_register(0x109F50BC, "IoFileMgrForUser", "sceIoOpen",   hle_Open);
     psp_hle_register(0x810C4BC3, "IoFileMgrForUser", "sceIoClose",  hle_Close);
     psp_hle_register(0x6A638D83, "IoFileMgrForUser", "sceIoRead",   hle_Read);

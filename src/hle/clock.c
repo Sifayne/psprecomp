@@ -1,6 +1,8 @@
 /* psprecomp — the guest clock. See include/psprecomp/clock.h. */
 
 #include "psprecomp/clock.h"
+#include "psprecomp/state.h"
+#include "census.h"
 #include "psprecomp/os.h"
 
 #include <stdatomic.h>
@@ -114,8 +116,14 @@ static void wall_sync(uint64_t us) {
     psp_os_sleep_until_ns(target);
 }
 
+/* Anchored so that the guest's present is the wall's: at start-up that maps
+ * guest 0 to now, and after a save state loads, the saved guest time. The
+ * arithmetic is modular, so a guest that has run longer than the host has
+ * been up still maps exactly. */
+static void anchor(void) { g_origin_ns = g_start_ns = wall_ns() - g_us * 1000u; }
+
 void psp_clock_realtime(int enable) {
-    if (enable && !g_realtime) g_origin_ns = g_start_ns = wall_ns();
+    if (enable && !g_realtime) anchor();
     g_realtime = enable;
 }
 
@@ -165,10 +173,22 @@ void psp_clock_reset(void) {
     /* Re-anchor if the mode is already on: reset means a new run, and the
      * origin is what makes "microseconds since the module started" mean the
      * same thing on both sides of the mapping. */
-    if (g_realtime) g_origin_ns = g_start_ns = wall_ns();
+    if (g_realtime) anchor();
 }
 
 uint64_t psp_clock_peek(void) { return g_us; }
+
+static int clock_load(psp_state_reader *r, char *why, size_t size) {
+    (void)r; (void)why; (void)size;
+    if (g_realtime) anchor();
+    return 0;
+}
+
+void psp_clock_keep(void) {
+    static const psp_state_part part = { "clock", NULL, NULL, clock_load };
+    PSP_STATE_KEEP(g_us);
+    psp_state_register(&part);
+}
 
 uint64_t psp_clock_read(void) {
     if (g_realtime) {

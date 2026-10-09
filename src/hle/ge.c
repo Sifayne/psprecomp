@@ -38,6 +38,7 @@
 #include "psprecomp/render.h"
 #include "psprecomp/sched.h"
 #include "census.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <errno.h>
@@ -4204,8 +4205,15 @@ static void run_list(ge_queue *q) {
     if (g_prof_on > 0) { g_prof_m[3] += ge_prof_now() - _r0; g_prof_lists++; }
     g_ge_walking = 0;
 }
+/* Set by a save state's load: the backend has not been told the registers.
+ * Told from the first list's walk rather than from the load, because the GL
+ * backend belongs to the thread that first calls it, and that has to be the
+ * GE's, not the boot's. */
+static int g_backend_stale;
+
 static void run_list_body(ge_queue *q) {
     ge_note_thread();
+    if (g_backend_stale) { g_backend_stale = 0; psp_ge_sync_backend(); }
     uint64_t budget = 1u << 22;
 
     /* NB: lists are counted at enqueue (submitted), not here: a
@@ -5260,6 +5268,43 @@ void psp_ge_state_load(const void *buf) {
     g_ge.vertices = g_ge.lists = g_ge.finishes = g_ge.commands = 0;
 }
 
+/* What a save state keeps of the GE (psprecomp/state.h): the lists, the
+ * timeline and its events, the callbacks and every register. A state is
+ * saved between firmware calls, so no walk is in progress. */
+static int ge_load(psp_state_reader *r, char *why, size_t size) {
+    (void)r; (void)why; (void)size;
+    /* The events' lists are kept with them: their pointers move as one. */
+    for (unsigned i = 0; i < GE_EVENTS; i++)
+        if (g_ev[i].q) g_ev[i].q = (ge_queue *)((char *)g_ev[i].q + psp_state_delta());
+    /* Caches of the registers, rebuilt from them as needed. */
+    g_bone16_ok = 0;
+    memset(&g_light_eye_from, 0, sizeof g_light_eye_from);
+    g_backend_stale = 1;
+    return 0;
+}
+
+static void ge_keep(void) {
+    static const psp_state_part part = { "ge", NULL, NULL, ge_load };
+    PSP_STATE_KEEP(g_queue);
+    PSP_STATE_KEEP(g_ge_hang);
+    PSP_STATE_KEEP(g_ge_t);
+    PSP_STATE_KEEP(g_ge_back);
+    PSP_STATE_KEEP(g_ge_fifo);
+    PSP_STATE_KEEP(g_ge_fifo_i);
+    PSP_STATE_KEEP(g_ev);
+    PSP_STATE_KEEP(g_ev_head);
+    PSP_STATE_KEEP(g_ev_n);
+    PSP_STATE_KEEP(g_ev_held);
+    PSP_STATE_KEEP(g_ge_xfull);
+    PSP_STATE_KEEP(g_ge_cb);
+    PSP_STATE_KEEP(g_next_id);
+    PSP_STATE_KEEP(g_tl);
+    PSP_STATE_KEEP(g_ge);
+    PSP_STATE_KEEP(g_imm);
+    PSP_STATE_KEEP(g_ge_owner);
+    psp_state_register(&part);
+}
+
 static void cap_init(void) {
     static int looked;
     if (looked) return;
@@ -5860,6 +5905,7 @@ static void hle_EdramGetAddr(void) { psp_ret(PSP_VRAM_BASE); }
 static void hle_EdramGetSize(void) { psp_ret(PSP_VRAM_SIZE); }
 
 void psp_ge_register(void) {
+    ge_keep();
     psp_hle_register(0xAB49E76A, "sceGe_user", "sceGeListEnQueue",         hle_ListEnQueue);
     psp_hle_register(0x1C0D95A6, "sceGe_user", "sceGeListEnQueueHead",     hle_ListEnQueueHead);
     psp_hle_register(0xE0D68148, "sceGe_user", "sceGeListUpdateStallAddr", hle_ListUpdateStallAddr);
