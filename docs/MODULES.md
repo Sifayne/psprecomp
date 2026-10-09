@@ -3,7 +3,8 @@
 The plan for games that load modules (PRX files) of their own at run time,
 through `sceKernelLoadModule`. Written 9 Oct 2026 against psprecomp e73adc1.
 Sif chose the approach the same day: the importer recompiles each module on
-the disc, as it does the executable. M1 is built (d7af565); the rest is not.
+the disc, as it does the executable. M1 and M2's emitter half are built;
+the rest is not.
 
 ## Where things stand
 
@@ -92,6 +93,15 @@ emission. Generated symbols are named by guest address (`psp_func_<addr>`),
 so modules at distinct bases cannot collide. The one program-wide name,
 `psp_recomp_register`, becomes a registration function per module, called
 when the module loads. Tests use synthetic PRXs in both relocation formats.
+
+*Emitter built.* `emit --base <addr> --module <n>`:
+- WipEout's libfont at 0x00400000 gives 150 functions that compile, needing
+  only runtime symbols.
+- `test_emit` checks the name, and `test_reloc` checks the move.
+
+What remains of M2 belongs with M3: the runtime calls a module's
+registration function when the module loads. `psp_resume_register` keeps
+one table, which a second module would replace.
 
 **M3. The runtime's module table.**
 - `sceKernelLoadModule` and `sceKernelLoadModuleByID` (an open file).
