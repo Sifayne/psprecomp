@@ -466,6 +466,8 @@ static int state_load(psp_state_reader *r, char *why, size_t size) {
             m->im.export_nid[e] = x[at];
             m->im.export_addr[e] = x[at + 1];
         }
+        fprintf(stderr, "psprecomp: restored module %.28s at 0x%08X..0x%08X as 0x%X\n",
+                m->im.name, m->im.lo, m->im.hi, m->id);
     }
     return 0;
 }
