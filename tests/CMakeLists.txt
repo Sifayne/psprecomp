@@ -210,6 +210,11 @@ add_test(NAME disc_observed COMMAND test_disc_observed
          ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/observed.txt
          ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/probe.iso)
 
+add_executable(test_disc_lbn test_disc_lbn.c)
+target_link_libraries(test_disc_lbn PRIVATE psprecomp allegrex_core)
+add_test(NAME disc_lbn COMMAND test_disc_lbn
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/probe.iso)
+
 # The SDL2 host layer, when it is built. The dummy video driver keeps it off
 # the screen; with no system font the controller half skips.
 if(PSPRECOMP_HOST)

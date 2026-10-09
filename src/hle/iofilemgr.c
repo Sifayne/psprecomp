@@ -851,6 +851,41 @@ static int iso_lookup_in(FILE *f, uint32_t lba, uint32_t bytes,
     return rc;
 }
 
+/* One number of an extent name: hexadecimal after `0x`, else decimal. Moves
+ * *s past it; 0 if there are no digits. */
+static int lbn_number(const char **s, uint32_t *out) {
+    const char *p = *s;
+    const int hex = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
+    if (hex) p += 2;
+    uint64_t v = 0;
+    const char *digits = p;
+    for (;; p++) {
+        int d;
+        if (*p >= '0' && *p <= '9') d = *p - '0';
+        else if (hex && *p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
+        else if (hex && *p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
+        else break;
+        v = v * (hex ? 16 : 10) + (uint64_t)d;
+        if (v > 0xFFFFFFFFu) return 0;
+    }
+    if (p == digits) return 0;
+    *s = p; *out = (uint32_t)v;
+    return 1;
+}
+
+/* `sce_lbn<sector>_size<bytes>`: the bytes starting at that sector of the
+ * disc, as a file. UCUS98712 (WipEout Pulse) opens its archives this way:
+ * `disc0:/sce_lbn0xf100_size0x12c6f640` is Data.wad's extent exactly, sector
+ * 61696 and 315,029,056 bytes. That form is the one observed; decimal is
+ * accepted too, and nothing past the size. */
+static int lbn_name(const char *p, uint32_t *lbn, uint32_t *bytes) {
+    if (strncmp(p, "sce_lbn", 7) != 0) return 0;
+    p += 7;
+    if (!lbn_number(&p, lbn) || strncmp(p, "_size", 5) != 0) return 0;
+    p += 5;
+    return lbn_number(&p, bytes) && *p == '\0';
+}
+
 /* Resolve a guest path inside the disc image. Returns 0 and fills `e` with
  * the byte range of what the path names, the image left open in e->f, or -1
  * if there is no image or no such path. */
@@ -889,6 +924,14 @@ static int iso_lookup(const char *guest, iso_entry *e)
         }
         e->base = (uint64_t)root_lba * ISO_SECTOR;   /* disc0:/ is the root */
         e->len = root_len; e->is_dir = e->is_root = 1;
+        return 0;
+    }
+
+    /* A file named by its extent rather than its path. */
+    uint32_t lbn = 0, bytes = 0;
+    if (lbn_name(p, &lbn, &bytes)) {
+        e->base = (uint64_t)lbn * ISO_SECTOR;
+        e->len = bytes;
         return 0;
     }
 
