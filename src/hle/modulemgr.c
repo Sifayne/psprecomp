@@ -437,6 +437,9 @@ static int state_save(psp_state_writer *w) {
         }
         n++;
     }
+    /* Nothing at all for a game that has loaded none: its states stay as
+     * they were before modules could be loaded. */
+    if (!n) return 0;
     return psp_state_put(w, "modules", entries, (size_t)n * sizeof *entries) ||
            psp_state_put(w, "modexps", exports, (size_t)nx * sizeof *exports) ? -1 : 0;
 }
