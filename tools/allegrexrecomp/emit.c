@@ -699,13 +699,12 @@ static void emit_slot_alias(ectx *c, uint32_t a, const a_insn *slot, int falls_t
 
     if (falls_through) {
         /* Jumping past the standalone copy needs a label to jump to, and the
-         * main pass prints one only for an address it actually emits -- which
-         * it does not when that address is itself a delay slot, since a slot is
-         * emitted with its branch. That happens when a *branch* sits in a delay
-         * slot, which real code never does; it appears where data is being
-         * decoded as instructions. Dispatching instead of jumping keeps such a
-         * region compiling, and it can only ever be reached by executing the
-         * data, which reports a dispatch miss rather than failing silently. */
+         * main pass prints one only for an address it actually emits, not for
+         * one it skips as a delay slot. The delay-slot pass labels the word
+         * past every labelled slot, and a slot's own slot is not a slot (pass
+         * 1), so this is a goto; dispatching is the guard should that word
+         * ever go unlabelled. Either way the region compiles, and reaching it
+         * means executing data, which reports rather than failing silently. */
         const uint32_t ai = widx(an, after);
         if (owned_by(an, after, owner) && c->is_label[ai] && !c->is_slot[ai])
             fprintf(c->out, "    goto L_%08X;\n", after);
@@ -728,7 +727,14 @@ static void emit_function(ectx *c, const a_func *fn) {
 
     /* Pass 1: which owned addresses are branch targets, and which are consumed
      * as delay slots. A delay slot is emitted inline with its branch, so the
-     * main pass must skip it. */
+     * main pass must skip it.
+     *
+     * Only a transfer the main pass emits as one consumes a slot. A transfer
+     * that is itself a slot -- a branch in a delay slot, which real code never
+     * has but data decoded as code does -- is emitted inline with its own
+     * branch, so the word after it is an ordinary instruction. Marking that
+     * word as a slot too left it emitted by nobody, and a branch to it named a
+     * label nothing declared: WipEout Pulse's `L_0029148C`. */
     for (uint32_t a = fn->start; a < fn->end; a += 4) {
         if (!owned_by(an, a, owner)) continue;
         a_insn in;
@@ -738,7 +744,7 @@ static void emit_function(ectx *c, const a_func *fn) {
         if (in.is_jump && !in.is_indirect && in.has_target &&
             owned_by(an, in.target, owner) && !is_function(an, in.target))
             c->is_label[widx(an, in.target)] = 1;
-        if (in.has_delay_slot && owned_by(an, a + 4, owner))
+        if (in.has_delay_slot && !c->is_slot[widx(an, a)] && owned_by(an, a + 4, owner))
             c->is_slot[widx(an, a + 4)] = 1;
     }
 

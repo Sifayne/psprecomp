@@ -311,6 +311,79 @@ static void test_vfpu_branch_condition(void) {
     a_analysis_free(&an);
 }
 
+/* ---- a branch in a delay slot does not hide the word after it ---------------
+ *
+ * Regression test for WipEout Pulse's compile error, `use of undeclared label
+ * 'L_0029148C'`.
+ *
+ * Real code never puts a branch in a delay slot, but data decoded as code
+ * does. The first pass marked the slot of *every* transfer as consumed,
+ * including a transfer that was itself a slot -- which the main pass never
+ * emits as a branch, so nothing consumes its slot. The word after it was then
+ * skipped as a slot that no branch emitted, and when another branch targeted
+ * it the `goto` named a label no one printed.
+ *
+ * Only the slots the main pass really consumes count: a slot's own slot is an
+ * ordinary instruction. */
+
+#define SS_BASE 0x08850000u
+
+static const uint32_t SS_CODE[] = {
+    0x50850003,  /* +00  beql  $a0, $a1, +10   targets the word after +0C   */
+    0x00000000,  /* +04  nop                                                */
+    0x1CC00002,  /* +08  bgtz  $a2, +14                                     */
+    0x14E00001,  /* +0C  bne   $a3, $zero, +14 a branch in a delay slot     */
+    0x24420001,  /* +10  addiu $v0, $v0, 1     not a slot: +0C's own slot    */
+    0x03E00008,  /* +14  jr    $ra                                          */
+    0x00000000,  /* +18  nop                                                */
+};
+
+static void test_branch_in_slot_keeps_next_label(void) {
+    uint8_t code[sizeof SS_CODE];
+    for (size_t i = 0; i < sizeof SS_CODE / sizeof SS_CODE[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(SS_CODE[i]);
+        code[i * 4 + 1] = (uint8_t)(SS_CODE[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(SS_CODE[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(SS_CODE[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = SS_BASE;
+    an.size = (uint32_t)sizeof code;
+
+    const uint32_t seed = SS_BASE;
+    CHECK(a_discover(&an, &seed, 1, 1) == 0, "slot branch: discovery runs");
+
+    emit_opts o = {0};
+    o.outdir = ".";
+    o.prefix = "t_ss";
+    o.module = "synthetic";
+    CHECK(a_emit(&an, &o) == 0, "slot branch: emission succeeds");
+
+    char *src = slurp("./t_ss_funcs.c", NULL);
+    CHECK(src != NULL, "slot branch: generated .c is readable");
+    if (!src) { a_analysis_free(&an); return; }
+
+    CHECK(strstr(src, "goto L_08850010;") != NULL,
+          "slot branch: the beql jumps to the word after the slot branch");
+    CHECK(strstr(src, "L_08850010:") != NULL,
+          "slot branch: the word after a branch in a delay slot is emitted\n"
+          "  under its label -- otherwise the `goto` does not compile");
+
+    /* Every goto in the file names a label the file declares. */
+    for (const char *p = src; (p = strstr(p, "goto L_")) != NULL; p += 7) {
+        char label[16];
+        memcpy(label, p + 5, 10);
+        label[10] = ':';
+        label[11] = 0;
+        CHECK(strstr(src, label) != NULL, "slot branch: `goto %.10s` has a label", p + 5);
+    }
+    free(src);
+    a_analysis_free(&an);
+}
+
 /* ---- CC latency and FPU traps -----------------------------------------------
  *
  * An mfvc of CC as the word straight after a vcmp reads CC from before that
@@ -572,6 +645,7 @@ int main(void) {
     test_return_delay_slot_not_owned();
     test_indirect_call_is_not_terminal();
     test_vfpu_branch_condition();
+    test_branch_in_slot_keeps_next_label();
     test_cc_latency_and_fpu_trap();
     test_replace_leaves_the_symbol_to_the_host();
     test_replace_absent_changes_nothing();
