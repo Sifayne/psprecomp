@@ -87,10 +87,11 @@ and discovery currently misses their pointer seeds.
   forms.
 
 **M2. Several modules in one game.** `allegrexrecomp emit` takes a base and a
-module index. It relocates the image to that base before discovery and
-emission, gives the module's symbols their own prefix, and emits a
-registration function for the module rather than the program. Tests use
-synthetic PRXs in both relocation formats.
+module index, and relocates the image to that base before discovery and
+emission. Generated symbols are named by guest address (`psp_func_<addr>`),
+so modules at distinct bases cannot collide. The one program-wide name,
+`psp_recomp_register`, becomes a registration function per module, called
+when the module loads. Tests use synthetic PRXs in both relocation formats.
 
 **M3. The runtime's module table.**
 - `sceKernelLoadModule` and `sceKernelLoadModuleByID` (an open file).
