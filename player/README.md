@@ -6,13 +6,14 @@ One application, psprecomp, for every game. It has:
 - an on-device compiler built from the bundled Zig;
 - this runtime and the shared host.
 
-It holds no game of its own. A player adds a **pack**, the source of what
-makes one game or one family of games run, and the app builds it on their
-machine. Then it prepares each game from their own disc. No game code or
-assets are ever in the package.
+It holds no game of its own. It prepares each game from the player's own
+disc, as the plain recompiled game, or with a **pack**: the source of what
+makes one game or one family of games play well, which the player adds and
+the app builds on their machine. No game code or assets are ever in the
+package.
 
 The design and its stages are in
-[`docs/PLAYER-LAYER.md`](../docs/PLAYER-LAYER.md), §1 and §6. This directory
+[`docs/PLAYER-LAYER.md`](../docs/PLAYER-LAYER.md), §1, §6 and §7. This directory
 was Last Raven's packaging until stage 2 moved it here.
 
 ## Building the app and the packs' files
@@ -55,6 +56,12 @@ data. Its manifest, version 2, is documented at the top of
 - optionally, a CMake file for its checks, which
   [`linux/CMakeLists.txt`](linux/CMakeLists.txt) includes;
 - the other files its pack file carries.
+
+**The boot host** is the toolkit's (`src/host/boot.c`), in `libplayer.a`
+for every game. What is a pack's own reaches it through its titles'
+`psp_title_info` (`include/psprecomp/host/title.h`): state keeps, a settings
+policy and a start hook. A game with no pack links `src/host/title_plain.c`
+instead, named as its disc names it, with the player's settings alone.
 
 **The launcher** is the toolkit's (`src/host/launcher.c`):
 - Its pages are the player's settings, then the selected game's pack's.

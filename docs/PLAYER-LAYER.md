@@ -356,9 +356,9 @@ without a copy remaining. *Built in stage 10* as adding a pack brings in
 its own app's data, and the launcher its settings (§6).
 
 **A disc without a pack is rejected,** as an unknown executable is today.
-Each title's correctness rests on its own measurements. *Stage 11 changes
-this* (decided 9 Oct): a disc no pack knows will play as the plain
-recompiled game, with nothing a pack adds.
+Each title's correctness rests on its own measurements. *Stage 11 changed
+this* (decided 9 Oct): a disc no pack knows plays as the plain recompiled
+game, with nothing a pack adds (§7).
 
 ## 2. The safe point and host pause
 
@@ -1514,6 +1514,101 @@ thread ends.
 - **The in-game menu in a GL window** shows the merged pages: The 3rd
   Birthday's Controller page opens with the player's Active controller,
   and Advanced comes last.
+
+## 7. Games without a pack (stage 11)
+
+A disc no added pack knows plays as **the plain recompiled game**: what the
+recompiler makes of its executable, with nothing a pack adds. That means no
+replacements, no controls of its own and no settings beyond the player's.
+Decided with Sif, 9 Oct: "it just works like a normal psp game".
+
+### The boot host moves into psprecomp
+
+The two packs' `host/boot.c` differed in 57 lines. `src/host/boot.c` is the
+one boot host now, linked into every game from `libplayer.a`.
+
+**Title hooks.** What was a title's own reaches the boot host through
+`psp_title_info` (`psprecomp/host/title.h`):
+- `settings`: a policy over the loaded settings, before they are printed or
+  used. The 3rd Birthday turns the decoder on by default, and plays Classic
+  in a host without its replacements.
+- `start`: what a title sets up before the module loads, or a refusal. The
+  3rd Birthday refuses Higher FPS and sets movie sync.
+- `keep`: the replacements' state keeps.
+
+Armored Core's three titles set `keep` beside their replacements. The 3rd
+Birthday's title, with all three hooks, is its new `host/title.c`. Every
+game prints the audio report at the end, as The 3rd Birthday's did.
+
+**Fidelity fixes.** The 3rd Birthday's boot carried three fixes from its
+bring-up, now every game's:
+- the GP register set before the entry;
+- the module's interrupt context registered;
+- the entry stack released once `module_start` returns, as hardware frees
+  the starting thread's stack.
+
+On The 3rd Birthday nothing changed. Its `gameplay` scenario gave the same
+GE capture, PCM and rendered frame. On Last Raven the mission-effects replay
+gave:
+- the same three PCM channels, the same rendered frame from the GE capture,
+  all 87 events and 0 bad accesses;
+- a GE capture whose bytes differ.
+
+With the stack release alone undone, the capture was byte-identical too. So
+the released 256 KiB only moves later allocations, and with them the
+addresses the capture records. Both titles' save-state gates pass on the
+shared boot, through the `keep` hook:
+- Last Raven at poll 1950 of the mission;
+- The 3rd Birthday at the `gameplay` scenario's state, with the end RAM and
+  module image identical.
+
+### A plain game
+
+- **The importer** (`import_game.py`) takes a disc no added pack knows as a
+  plain game:
+  - its slug is `plain-<disc id>` and its name the disc's `TITLE`;
+  - its record says `plain`, with its disc ID and executable hash;
+  - a pack's disc whose executable is not the version the pack supports
+    plays plain too, with a note.
+- **The recipe** (`compile_game.py`) builds it without a replace list or
+  generators. It writes the game's name as a C string (`title.c`, octal
+  outside printable ASCII) and links psprecomp's `title_plain.c`: a
+  `psp_title_info` with that name, and the player's settings schema alone.
+- **Its fingerprint** is the app's part and its executable.
+- **Adding a pack** for a game played plain, with the same disc and exact
+  executable, hands the game over. Its saves and states move to the pack's
+  title, which asks to be prepared once with the pack.
+- **The launcher** lists plain games after the packs' games, by title. It
+  shows them with the player's pages alone, under a note that they play as
+  the plain recompiled game.
+
+### Gates (9 Oct)
+
+- **The tests:**
+  - psprecomp's own, 54 of 54;
+  - The 3rd Birthday's core group, 62 of 62;
+  - the importer's checks, 23, with plain imports, another version of a
+    pack's disc, and a pack taking its plain game over;
+  - the fingerprints' checks, 8;
+  - all three Armored Core boot hosts build on the shared boot.
+- **The package build** with both packs passed every builder check
+  (`build/releases/player-stage11`).
+- **Every real disc through the built app,** twice, each in an isolated
+  home:
+  - with its pack: The 3rd Birthday, then Armored Core;
+  - with no pack at all.
+
+  The four games with no pack were named by their discs. For example, ARMORED
+  CORE LAST RAVEN Portable is keyed `plain-npuh10024`.
+- **Each title's replay through both builds,** with the same settings, gave
+  **byte-identical** GE captures and PCM: The 3rd Birthday's `gameplay`
+  scenario, Last Raven's mission-effects, AC3 Portable's pause-peek and
+  Silent Line's mission. All events were delivered, with 0 bad accesses in
+  every run. The packs change nothing until their features are turned on,
+  and a game with no pack is the stock recompiled game.
+- **The 3rd Birthday's pack, added to the home without packs,** took its
+  plain game over, with its save. The launcher then held the pack and four
+  games, three of them still plain.
 
 ## Testing, all stages
 
