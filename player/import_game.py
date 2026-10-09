@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Prepare a user's ISO locally with the tools contained in the application,
-for the packs the player added.
+"""Prepare a user's ISO locally with the tools contained in the application:
+with the pack the player added for it, or, for a disc no pack knows, as the
+plain recompiled game (docs/PLAYER-LAYER.md, stage 11).
 
 No shell commands, network downloads, system compiler, or game bytes in the
 package. A pack is added from its file into <data>/packs/<id>, checked and
@@ -195,9 +196,39 @@ class Library:
                 staging.rename(final)
         self.load_packs()
         self.migrate(self.packs[pack.id])
+        self.adopt_plain(self.packs[pack.id])
         self.refresh()
         print(f"Added {pack.name}.", flush=True)
         return pack.id
+
+    def adopt_plain(self, pack):
+        """A game played plain that the new pack supports -- its disc, its
+        exact executable -- becomes the pack's: its saves and states move to
+        the pack's title, and it asks for preparation with the pack. A plain
+        build of another version stays plain."""
+        book = self.records()
+        changed = []
+        for profile in pack.profiles():
+            slug = profile["slug"]
+            for plain, game in self.plain_games(book):
+                if game.get("disc_id") != profile["disc_id"] or game.get("elf_sha256") != profile["elf_sha256"]:
+                    continue
+                if slug in book["games"]:
+                    continue
+                for kind in ("saves", "states"):
+                    source, target = self.data / kind / plain, self.data / kind / slug
+                    if source.is_dir() and not target.exists():
+                        source.rename(target)
+                del book["games"][plain]
+                book["games"][slug] = dict(iso=game["iso"], build_id=game["build_id"],
+                                           directory=str(self.data / "games" / slug / "with-pack"),
+                                           elf_sha256=game["elf_sha256"], pack=pack.id)
+                if book.get("selected") == plain:
+                    book["selected"] = slug
+                changed.append(profile["title"])
+        if changed:
+            atomic_write(self.record, (json.dumps(book, indent=2) + "\n").encode())
+            print(f"{', '.join(changed)}: played plain until now; prepare it once with the pack.", flush=True)
 
     def remove_pack(self, pack_id):
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", pack_id or "") or pack_id not in self.packs:
@@ -289,11 +320,30 @@ class Library:
                 raise ValueError("Installed game directory is outside the game library.")
         return value
 
+    @staticmethod
+    def plain_slug(disc_id):
+        """A plain game's slug: its disc ID, lowercase."""
+        slug = re.sub(r"[^a-z0-9]", "", disc_id.lower())[:24]
+        return "plain-" + (slug or "game")
+
+    def plain_games(self, book):
+        """The plain games in the records, by title."""
+        return sorted(((slug, game) for slug, game in book["games"].items()
+                       if game.get("plain") and slug not in self.game_builds),
+                      key=lambda item: (item[1].get("title", "").lower(), item[0]))
+
+    def build_of(self, slug, entry):
+        """What a title's prepared game must have been built as."""
+        if entry.get("plain"):
+            return self.prints.title_identity(self.app_build, None, {"slug": slug, "elf_sha256": entry.get("elf_sha256", "")})
+        return self.game_builds.get(slug)
+
     def compatible(self, slug, entry):
         # Records from before a change of the app, the pack or the title's
         # own inputs need preparation once; nothing is inferred from the
         # whole-application build ID.
-        return slug in self.game_builds and entry.get("game_build_id") == self.game_builds[slug]
+        wanted = self.build_of(slug, entry)
+        return wanted is not None and entry.get("game_build_id") == wanted
 
     def ready(self, slug, entry):
         folder = Path(entry["directory"])
@@ -316,12 +366,12 @@ class Library:
                 except (ValueError, OSError) as error:
                     print(f"{pack.name}: {error}", file=sys.stderr, flush=True)
         fields = ["LRLIB1", book.get("selected", "")]
-        for profile in self.profiles:  # Packs by id, each in its release order.
-            slug = profile["slug"]
-            if slug not in book["games"]:
-                continue
+        listed = [(p["slug"], p["title"]) for p in self.profiles if p["slug"] in book["games"]]
+        # Packs by id, each in its release order; then the plain games.
+        listed += [(slug, game.get("title") or slug) for slug, game in self.plain_games(book)]
+        for slug, title in listed:
             game = book["games"][slug]
-            fields += [slug, profile["title"], str(self.app / "usr/bin/run-game") if self.ready(slug, game) else "",
+            fields += [slug, title, str(self.app / "usr/bin/run-game") if self.ready(slug, game) else "",
                        str(Path(game["directory"]) / "module.elf"), game["iso"]]
         atomic_write(self.data / "library.bin", b"\0".join(x.encode() for x in fields) + b"\0")
         return book
@@ -369,13 +419,11 @@ class Library:
             info = run([ar, "info", iso], capture=True)
             match = re.search(r"DISC_ID\s+(\S+)", info)
             disc_id = match[1] if match else "unknown"
+            match = re.search(r"^\s*TITLE\s+(.+?)\s*$", info, re.M)
+            disc_title = match[1] if match else disc_id
             profile = next((p for p in self.profiles if p["disc_id"] == disc_id), None)
-            if profile is None:
-                if not self.packs:
-                    raise ValueError(f"Add this game's pack first (Packs in the launcher). Its disc is {disc_id}.")
-                raise ValueError(f"No pack you have added supports this disc ({disc_id}).")
-            pack = self.packs[profile["pack"]]
-            print(f"Checking {profile['title']}...", flush=True)
+            pack = self.packs[profile["pack"]] if profile else None
+            print(f"Checking {profile['title'] if profile else disc_title}...", flush=True)
             extracted = tmp / "extracted"
             extracted.mkdir()
             run([ar, "extract", iso, "SYSDIR/EBOOT.BIN", extracted])
@@ -387,27 +435,38 @@ class Library:
                 shutil.copy2(candidates[0], module_path)
             else:
                 run([self.app / "usr/bin/pspdecrypt", "-o", module_path, candidates[0]])
-            if digest(module_path) != profile["elf_sha256"]:
-                raise ValueError(f"{profile['title']} has an unsupported executable version. Your library was not changed.")
+            elf_sha256 = digest(module_path)
+            if profile and elf_sha256 != profile["elf_sha256"]:
+                # The pack's additions are made for one executable; another
+                # version of the game plays without them.
+                print(f"This is not the version of {profile['title']} the {pack.name} pack supports; "
+                      "it plays as the plain recompiled game, without the pack's additions.", flush=True)
+                profile = pack = None
+            if profile is None:
+                profile = dict(slug=self.plain_slug(disc_id), title=disc_title, disc_id=disc_id,
+                               elf_sha256=elf_sha256, plain=True)
             slug = profile["slug"]
+            plain = pack is None
+            build = self.build_of(slug, {"plain": plain, "elf_sha256": elf_sha256})
             # Cache reuse still checks the disc and exact executable above.
             previous = book["games"].get(slug)
-            if (previous and self.compatible(slug, previous)
+            if (previous and bool(previous.get("plain")) == plain and self.compatible(slug, previous)
                     and (Path(previous["directory"]) / "game").is_file()
                     and os.access(Path(previous["directory"]) / "game", os.X_OK)):
                 destination = Path(previous["directory"])
-                if not (destination / "module.elf").is_file() or digest(destination / "module.elf") != profile["elf_sha256"]:
+                if not (destination / "module.elf").is_file() or digest(destination / "module.elf") != elf_sha256:
                     previous = None
             else:
                 previous = None
             if not previous:
-                host_objects = self.ensure_built(pack, jobs)
-                print("Preparing this game for the current runtime...", flush=True)
+                host_objects = self.ensure_built(pack, jobs) if pack else []
+                print("Preparing this game for the current runtime" + (" as the plain recompiled game" if plain else "")
+                      + "...", flush=True)
                 compiler = module("game_compiler", self.resources / "compile_game.py")
                 compiler.compile_game(self.app, pack, host_objects, profile, module_path, tmp / "game", jobs, self.env, log)
                 directory = self.data / "games" / slug
                 directory.mkdir(parents=True, exist_ok=True)
-                destination = directory / (self.game_builds[slug][:16] + "-" + str(time.time_ns()))
+                destination = directory / (build[:16] + "-" + str(time.time_ns()))
                 ready = tmp / "ready"
                 ready.mkdir()
                 shutil.move(tmp / "game", ready / "game")
@@ -417,8 +476,11 @@ class Library:
                 raise ValueError("The ISO changed during preparation. Please import it again.")
             entry = dict(iso=str(iso), iso_size=stat.st_size, iso_mtime_ns=stat.st_mtime_ns,
                          build_id=previous["build_id"] if previous else self.build_id,
-                         game_build_id=self.game_builds[slug], directory=str(destination),
-                         elf_sha256=profile["elf_sha256"], pack=pack.id)
+                         game_build_id=build, directory=str(destination), elf_sha256=elf_sha256)
+            if plain:
+                entry.update(plain=True, title=profile["title"], disc_id=disc_id)
+            else:
+                entry["pack"] = pack.id
             if not previous:
                 (ready / "build.json").write_text(json.dumps(entry, indent=2) + "\n")
                 ready.rename(destination)

@@ -80,8 +80,8 @@ int main(int argc, char **argv) {
     putfile(path, "version=1\nselected=Mine\n[preset Old]\nINPUT=classic\n[preset Mine]\nINPUT=modern\nVOLUME=30\n");
     snprintf(path, sizeof path, "%s/Beta App/settings.ini", data);
     putfile(path, "version=1\nselected=B\n[preset B]\nCAP=120\nVOLUME=90\n");
-    /* The game library: its unknown slug is left out; Second is not
-     * prepared yet. */
+    /* The game library: Zeta has no pack here, and plays plain; Second is
+     * not prepared yet. */
     char library[600];
     snprintf(library, sizeof library, "%s/library.bin", root);
     {
@@ -108,10 +108,11 @@ int main(int argc, char **argv) {
     snprintf(path, sizeof path, "%s/psprecomp/settings.ini", config);
     assert(strstr(a.status, "Alpha") && !a.dirty && access(path, F_OK));
 
-    /* Tabs: the packs in order, each pack's titles in its order; the
-     * library's game of no pack is left out. */
-    assert(a.game_count == 3 && !strcmp(a.games[0].slug, "second") && !strcmp(a.games[1].slug, "first") &&
-           !strcmp(a.games[2].slug, "third") && a.games[2].pack == 1);
+    /* Tabs: the packs in order, each pack's titles in its order, then the
+     * game with no pack. */
+    assert(a.game_count == 4 && !strcmp(a.games[0].slug, "second") && !strcmp(a.games[1].slug, "first") &&
+           !strcmp(a.games[2].slug, "third") && a.games[2].pack == 1 &&
+           !strcmp(a.games[3].slug, "zeta") && a.games[3].pack == -1);
     assert(a.pack == 0 && a.edit.number[PSP_OPT_VOLUME] == 30 && a.edit.number[A_INPUT] == 1);
     assert(a.game == 0 && !a.boot && !strcmp(a.iso, "/i2"));
 
@@ -178,6 +179,9 @@ int main(int argc, char **argv) {
     key(&a, SDLK_ESCAPE); assert(a.view == VIEW_SETTINGS);
     a.view = VIEW_PREPARING; a.work = WORK_INSTALL; draw(&a); a.view = VIEW_SETTINGS;
     select_game(&a, 2); draw(&a);
+    /* The plain game: the player's pages alone. */
+    select_game(&a, 3); draw(&a);
+    assert(a.pack == -1 && !group_pages(&a, GROUP_PACK, names) && group_pages(&a, GROUP_PLAYER, names) == 5);
     close_window(&a);
 
     psp_settings_file_free(a.file);

@@ -11,7 +11,8 @@ static int pack_of(const char *slug) {
             if (!strcmp(*t, slug)) return p;
     return -1;
 }
-/* The packs in order, each pack's titles in its order, then any other slug. */
+/* The packs in order, each pack's titles in its order, then the games with
+ * no pack, by title. */
 static int title_rank(const char *slug) {
     const int p = pack_of(slug);
     if (p < 0) return 1 << 20;
@@ -21,7 +22,9 @@ static int title_rank(const char *slug) {
 }
 static int title_order(const void *left,const void *right) {
     const game_entry *a=left,*b=right; int x=title_rank(a->slug),y=title_rank(b->slug);
-    return x==y?strcmp(a->slug,b->slug):x-y;
+    if (x!=y) return x-y;
+    const int by_title=strcasecmp(a->title,b->title);
+    return by_title?by_title:strcmp(a->slug,b->slug);
 }
 static char *library_field(char **cursor,char *end) {
     if (*cursor>=end) return NULL;
@@ -50,10 +53,9 @@ static int library_load(launcher *a,int imported) {
         for (int k=0;k<5;k++) if (!(*fields[k]=library_field(&cursor,end))) goto invalid;
         if (!*g->slug || !*g->title || !*g->module || !*g->iso ||
             !psp_settings_name_valid(g->slug)) goto invalid;
+        /* A game no pack here has plays as the plain recompiled game, with
+         * the settings for every game alone (stage 11). */
         g->pack=pack_of(g->slug);
-        /* A game of no pack here has no settings to show; it would be an
-         * app built without that pack reading another's library. */
-        if (g->pack<0) { fprintf(stderr,"launcher: no pack here has %s; leaving it out\n",g->slug); continue; }
         count++;
     }
     const char *selected=imported && *wanted?wanted:a->file?psp_settings_file_game(a->file):"";

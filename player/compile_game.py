@@ -1,6 +1,7 @@
 """The on-device build recipes, separate from the library and launcher UI:
 a pack's host code and launcher part when the pack is added, and a title's
-game when its disc is.
+game when its disc is -- with its pack, or, for a disc no pack knows, as the
+plain recompiled game (title_plain.c).
 
 This file is part of every game fingerprint. Changes to commands, flags or
 linking here therefore invalidate games built with a different recipe. It is
@@ -61,24 +62,37 @@ def build_pack(app, pack, out, env, log, jobs=2):
     return sorted(host.glob('*.o'))
 
 
+def c_string(text):
+    """text as a C string literal: printable ASCII as it is, the rest octal."""
+    out = []
+    for byte in text.encode('utf-8'):
+        ch = chr(byte)
+        out.append('\\' + ch if ch in '"\\' else ch if 32 <= byte < 127 and ch != '?' else f'\\{byte:03o}')
+    return '"' + ''.join(out) + '"'
+
+
 def compile_game(app, pack, host_objects, profile, module, output, jobs, env, log):
+    """A title's game; pack None builds it plain, named profile['title']."""
     app, module, output = map(Path, (app, module, output))
     resources, tmp = Path(__file__).resolve().parent, output.parent
     slug = profile['slug']
     run = _runner(tmp, env, log)
     generated, obj = tmp / 'generated', tmp / 'objects'
     generated.mkdir(); obj.mkdir()
-    replacements = pack.device_file(profile['replacements'])
-    replace_list = pack.device_file(profile['replace_list'])
-    run([app / 'usr/bin/allegrexrecomp', 'emit', module, generated, slug,
-         '--replace', '@' + str(replace_list)])
-    # The pack's own generators, such as Last Raven's fps-loop.py.
-    scripts = {p.name: p for p in pack.device_scripts}
-    for script in profile.get('codegen', []):
-        run([sys.executable, '-I', '-B', scripts[script], slug, generated])
+    if pack:
+        replacements = pack.device_file(profile['replacements'])
+        replace_list = pack.device_file(profile['replace_list'])
+        run([app / 'usr/bin/allegrexrecomp', 'emit', module, generated, slug,
+             '--replace', '@' + str(replace_list)])
+        # The pack's own generators, such as Last Raven's fps-loop.py.
+        scripts = {p.name: p for p in pack.device_scripts}
+        for script in profile.get('codegen', []):
+            run([sys.executable, '-I', '-B', scripts[script], slug, generated])
+    else:
+        run([app / 'usr/bin/allegrexrecomp', 'emit', module, generated, slug])
     run([sys.executable, '-I', '-B', resources / 'emit-split.py',
          generated / f'{slug}_funcs.c', obj, '32'])
-    includes = sorted({p.parent for p in pack.device_host})
+    includes = sorted({p.parent for p in pack.device_host}) if pack else []
     cc = [app / 'usr/zig/zig', 'cc', *TARGET,
           '-std=gnu11', '-fno-strict-aliasing', '-fwrapv', '-I', resources / 'include',
           '-I', generated, '-I', obj, *[a for d in includes for a in ('-I', d)]]
@@ -95,7 +109,14 @@ def compile_game(app, pack, host_objects, profile, module, output, jobs, env, lo
             print(f'Compiling game: {i}/{len(chunks)}', flush=True)
     run([*cc, '-O0', '-c', obj / f'{slug}_funcs_reg.c', '-o', obj / 'register.o'])
     run([*cc, '-O2', '-c', generated / f'{slug}_imports.c', '-o', obj / 'imports.o'])
-    run([*cc, '-O2', '-DHAVE_SDL2', '-I', resources / 'include/SDL2', '-c', replacements, '-o', obj / 'replacements.o'])
+    if pack:
+        run([*cc, '-O2', '-DHAVE_SDL2', '-I', resources / 'include/SDL2', '-c', replacements, '-o', obj / 'replacements.o'])
+    else:
+        # The plain game: its name, as its disc gives it, and the player's
+        # settings alone.
+        (obj / 'title.c').write_text('const char psp_plain_title[] = ' + c_string(profile['title']) + ';\n')
+        run([*cc, '-O2', '-c', obj / 'title.c', '-o', obj / 'title.o'])
+        run([*cc, '-O2', '-DHAVE_SDL2', '-c', resources / 'title_plain.c', '-o', obj / 'title_plain.o'])
     print('Finishing game setup...', flush=True)
     run([*cc, '-O2', *sorted(obj.glob('*.o')), *host_objects,
          '-Wl,--start-group', resources / 'libplayer.a', resources / 'libruntime.a', '-Wl,--end-group',

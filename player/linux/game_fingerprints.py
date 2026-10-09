@@ -6,6 +6,7 @@ headers, the generator, the compiler, the build recipes and the shared
 libraries' ABIs (SONAMEs: compatible library updates keep games). A pack's
 part comes from the pack as added: its host code's include closure, and per
 title the replacements' closure, the replace list and the code generators.
+A game with no pack has only the app's part and its executable.
 Launcher, importer UI, packaging recipes, notices and display labels are
 deliberately outside this contract.
 
@@ -50,6 +51,7 @@ def app_identity(app, library_abis):
         'headers': tree_identity(resource / 'include'),
         'recomp_headers': tree_identity(resource / 'recomp'),
         'pack_api': digest(resource / 'pack_api.c'),
+        'plain_title': digest(resource / 'title_plain.c'),
         'generator': digest(Path(app) / 'usr/bin/allegrexrecomp'),
         'compiler': digest(Path(app) / 'usr/zig/zig'),
         'compiler_support': tree_identity(Path(app) / 'usr/zig/lib'),
@@ -88,6 +90,10 @@ def pack_identity(pack):
 
 
 def title_identity(app_id, pack, profile):
+    """A title's fingerprint: with its pack, or plain when pack is None."""
+    if pack is None:
+        return identity({'version': VERSION, 'inputs': {
+            'app': app_id, 'plain': {key: profile[key] for key in ('slug', 'elf_sha256')}}})
     replacements = pack.device_file(profile['replacements'])
     scripts = {p.name: p for p in pack.device_scripts}
     inputs = {

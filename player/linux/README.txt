@@ -6,12 +6,20 @@ computer from your own discs. No game code or assets are included.
 Make the AppImage executable, then open it. On Steam Deck, do the first setup
 in Desktop Mode.
 
-1. Add a pack. A pack adds games: the code that makes each of them run, and
-   their own settings. In the launcher, open Packs and choose Add pack...,
-   then the pack's .zip file. It is built for this computer as it is added.
-2. Add a game. Choose Add game, browse to your PSP ISO and choose it. Drives
+1. Add a game. Choose Add game, browse to your PSP ISO and choose it. Drives
    opens removable media locations. You can also drop an ISO on the window.
    Keep the app open while preparation runs; then choose Save and play.
+2. Add its pack, if it has one. A pack adds what makes a game better than
+   the plain recompiled one -- controls, wider views, higher frame rates,
+   fixes -- and its own settings. In the launcher, open Packs and choose
+   Add pack..., then the pack's .zip file. It is built for this computer as
+   it is added. A game played plain before its pack was added becomes the
+   pack's, with its saves; prepare it once more.
+
+A game with no pack plays as the plain recompiled game: what the recompiler
+makes of the disc, with no additions. It may not work as well as a game with
+a pack, or at all. A pack supports exact executable versions; another
+version of its game plays plain.
 
 The settings under All games apply to every game; each pack adds its own
 pages for its games. In the game, Escape or View + Menu opens the menu: save

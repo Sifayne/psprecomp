@@ -112,7 +112,8 @@ class ImportTests(unittest.TestCase):
 
     def fake_run(self, args, **kwargs):
         if args[1] == 'info':
-            return subprocess.CompletedProcess(args, 0, 'DISC_ID  ' + self.disc + '\n')
+            return subprocess.CompletedProcess(args, 0, '  DISC_ID            ' + self.disc + '\n'
+                                                        '  TITLE              A Game & "Its" Name\n')
         if args[1] == 'extract':
             Path(args[4], 'PSP_GAME_SYSDIR_EBOOT.BIN').write_bytes(self.module)
             return subprocess.CompletedProcess(args, 0, '')
@@ -242,26 +243,66 @@ class ImportTests(unittest.TestCase):
             self.library.import_iso(self.iso)
         self.assertFalse(self.library.record.exists())
 
-    def test_unsupported_disc_and_exact_version_keep_existing_game(self):
+    def test_unknown_disc_plays_plain(self):
+        entry = self.install()
+        self.disc = 'UNKN12345'
+        with patch.object(importer.subprocess, 'run', self.fake_run):
+            self.assertEqual(self.library.import_iso(self.iso), 'plain-unkn12345')
+        book = self.library.records()
+        plain = book['games']['plain-unkn12345']
+        self.assertTrue(plain['plain'] and plain['disc_id'] == 'UNKN12345')
+        self.assertEqual(plain['title'], 'A Game & "Its" Name')
+        self.assertNotIn('pack', plain)
+        self.assertEqual(book['games'][FIRST], entry)
+        self.assertTrue(self.library.ready('plain-unkn12345', plain))
+        fields = (self.data / 'library.bin').read_bytes().split(b'\0')
+        self.assertEqual(fields[2:-1:5], [FIRST.encode(), b'plain-unkn12345'])   # the packs' first
+        self.assertEqual(fields[8], 'A Game & "Its" Name'.encode())
+
+    def test_other_version_of_a_pack_disc_plays_plain(self):
+        entry = self.install()
+        self.module += b'another version'
+        with patch.object(importer.subprocess, 'run', self.fake_run):
+            self.assertEqual(self.library.import_iso(self.iso), 'plain-fixt10000')
+        book = self.library.records()
+        self.assertEqual(book['games'][FIRST], entry)
+        self.assertEqual(book['games']['plain-fixt10000']['elf_sha256'], hashlib.sha256(self.module).hexdigest())
+
+    def test_without_packs_any_disc_plays_plain(self):
+        self.library.remove_pack('fixture')
+        with patch.object(importer.subprocess, 'run', self.fake_run):
+            self.assertEqual(self.library.import_iso(self.iso), 'plain-fixt10000')
+        self.assertTrue(self.library.ready('plain-fixt10000', self.library.records()['games']['plain-fixt10000']))
+
+    def test_pack_added_takes_over_its_plain_game(self):
+        self.library.remove_pack('fixture')
+        with patch.object(importer.subprocess, 'run', self.fake_run):
+            self.library.import_iso(self.iso)
+        save = self.data / 'saves/plain-fixt10000/ms/save'
+        save.parent.mkdir(parents=True); save.write_text('keep my save')
+        self.add(self.pack_dir)
+        book = self.library.records()
+        self.assertNotIn('plain-fixt10000', book['games'])
+        self.assertEqual(book['games'][FIRST]['pack'], 'fixture')
+        self.assertEqual(book['selected'], FIRST)
+        self.assertEqual((self.data / 'saves' / FIRST / 'ms/save').read_text(), 'keep my save')
+        self.assertFalse(self.library.ready(FIRST, book['games'][FIRST]))   # prepared once with the pack
+        fields = (self.data / 'library.bin').read_bytes().split(b'\0')
+        self.assertEqual(fields[2:-1:5], [FIRST.encode()])
+        with patch.object(importer.subprocess, 'run', self.fake_run):
+            self.assertEqual(self.library.import_iso(self.iso), FIRST)
+        self.assertTrue(self.library.ready(FIRST, self.library.records()['games'][FIRST]))
+
+    def test_unsupported_executable_keeps_existing_game(self):
         entry = self.install()
         before = self.library.record.read_bytes()
-        self.disc = 'UNSUPPORTED'
         with patch.object(importer.subprocess, 'run', self.fake_run):
-            with self.assertRaisesRegex(ValueError, 'No pack you have added supports'):
-                self.library.import_iso(self.iso)
             self.disc = 'FIXT10000'
-            self.module += b'wrong executable'
-            with self.assertRaisesRegex(ValueError, 'unsupported executable version'):
+            self.iso.write_bytes(b'short')
+            with self.assertRaisesRegex(ValueError, 'size'):
                 self.library.import_iso(self.iso)
         self.assertEqual(before, self.library.record.read_bytes())
         self.assertTrue(Path(entry['directory'], 'game').exists())
-        self.assertEqual(list((self.data / 'preparing').iterdir()), [])
-
-    def test_without_packs_the_disc_asks_for_one(self):
-        self.library.remove_pack('fixture')
-        with patch.object(importer.subprocess, 'run', self.fake_run):
-            with self.assertRaisesRegex(ValueError, 'Add this game'):
-                self.library.import_iso(self.iso)
 
     def test_corrupt_and_external_records_preserved(self):
         for content in ('bad json', '[]', '{"version":2,"games":{}}',

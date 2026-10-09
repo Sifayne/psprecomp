@@ -34,7 +34,7 @@ class FingerprintTests(unittest.TestCase):
         self.abis = dict(SDL2='libSDL2-2.0.so.0', openh264='libopenh264.so.8',
                          avcodec='libavcodec.so.63', avutil='libavutil.so.61')
         for path in (R + 'libruntime.a', R + 'libplayer.a', R + 'include/shared.h', R + 'recomp/loader.h',
-                     R + 'pack_api.c', R + 'compile_game.py', R + 'emit-split.py',
+                     R + 'pack_api.c', R + 'title_plain.c', R + 'compile_game.py', R + 'emit-split.py',
                      'usr/zig/zig', 'usr/zig/lib/std.zig', 'usr/bin/allegrexrecomp'):
             self.write(self.app / path, 'original ' + path)
         titles = []
@@ -80,8 +80,8 @@ class FingerprintTests(unittest.TestCase):
 
     def test_app_inputs_invalidate_every_title(self):
         for path in (R + 'libruntime.a', R + 'libplayer.a', R + 'include/shared.h', R + 'recomp/loader.h',
-                     R + 'pack_api.c', R + 'compile_game.py', R + 'emit-split.py', 'usr/zig/zig',
-                     'usr/zig/lib/std.zig', 'usr/bin/allegrexrecomp'):
+                     R + 'pack_api.c', R + 'title_plain.c', R + 'compile_game.py', R + 'emit-split.py',
+                     'usr/zig/zig', 'usr/zig/lib/std.zig', 'usr/bin/allegrexrecomp'):
             original = (self.app / path).read_text()
             self.write(self.app / path, 'changed')
             self.assertEqual(self.changed(), {FIRST, SECOND, THIRD}, path)
@@ -116,6 +116,17 @@ class FingerprintTests(unittest.TestCase):
         for name in ('host/settings.c', 'host/launcher_info.c', 'notes.md', 'LICENSE'):
             self.write(self.pack_root / name, 'changed')
         self.assertEqual(self.changed(), set())
+
+    def test_plain_game_follows_the_app_and_its_executable(self):
+        app = builds.app_identity(self.app, self.abis)['id']
+        plain = dict(slug='ulus10567', elf_sha256='9' * 64, title='Any game')
+        first = builds.title_identity(app, None, plain)
+        self.assertEqual(first, builds.title_identity(app, None, dict(plain, title='Renamed')))
+        self.assertNotEqual(first, builds.title_identity(app, None, dict(plain, elf_sha256='8' * 64)))
+        self.write(self.pack_root / 'host/boot.c', 'changed')             # a pack's change: not this game's
+        self.assertEqual(first, builds.title_identity(builds.app_identity(self.app, self.abis)['id'], None, plain))
+        self.write(self.app / R / 'title_plain.c', 'changed')
+        self.assertNotEqual(first, builds.title_identity(builds.app_identity(self.app, self.abis)['id'], None, plain))
 
     def test_missing_app_inputs_fail(self):
         (self.app / R / 'libplayer.a').unlink()

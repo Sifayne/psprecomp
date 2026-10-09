@@ -6,9 +6,10 @@
  * Its packs (psprecomp/host/launcher.h) are those it was linked with -- a
  * game's own development launcher has its pack -- and those installed in the
  * folder --packs names, each with the launcher.so the importer built from
- * the pack's sources (built/launcher.so). Every game of every pack is a tab. The side list has the player's
- * pages, for every game, then the selected game's pack's, then Packs and
- * About. One preferences file holds them all (psprecomp/host/settings.h):
+ * the pack's sources (built/launcher.so). Every game is a tab: each pack's,
+ * then those with no pack, which play as the plain recompiled game. The
+ * side list has the player's pages, for every game, then the selected
+ * game's pack's, then Packs and About. One preferences file holds them all (psprecomp/host/settings.h):
  * the launcher keeps it in memory with every section, edits the player's and
  * the selected pack's, and writes it whole. */
 #include "psprecomp/host/launcher.h"
@@ -515,8 +516,9 @@ static void settings_page(launcher *a) {
 
 static void packs_page(launcher *a) {
     psp_ui_heading("Packs");
-    psp_ui_note("A pack adds games: the code that makes each of them run, and their own settings. "
-                "Add one from its .zip file; it is built for this computer as it is added.");
+    psp_ui_note("A pack makes its games play well -- their controls, fixes and own settings -- where "
+                "a game without one plays as the plain recompiled game. Add one from its .zip file; "
+                "it is built for this computer as it is added.");
     int shown = 0;
     for (int p = 0; p < pack_count; p++) {
         if (packs[p].removed) continue;
@@ -662,6 +664,8 @@ static void render(launcher *a) {
     char heading[160];
     upper(game_title(a), heading, sizeof heading);
     psp_ui_heading(heading);
+    if (a->game_count && a->games[a->game].pack < 0)
+        psp_ui_note("No pack: the plain recompiled game, with the settings for all games.");
     if (a->importer && a->view == VIEW_SETTINGS) {
         psp_ui_right(psp_ui_button_width("Add game"));
         if (psp_ui_button_primary("Add game")) browser_open(a, BROWSE_ISO);
