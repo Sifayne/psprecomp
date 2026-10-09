@@ -23,3 +23,6 @@ include $(PSPSDK)/lib/build.mak
 main.o: patch13_data.inc c14_data.inc c15_data.inc c16_data.inc l17_data.inc l18_data.inc l19_data.inc c20_data.inc c21_data.inc c21p_data.inc \
         c22e_data.inc c22t_data.inc c22n_data.inc c22m_data.inc c22c_data.inc \
         c23c_data.inc c23a_data.inc c23b_data.inc c23z_data.inc
+
+# The title carries PROBE_VERSION: remake it when main.c changes.
+PARAM.SFO: main.c

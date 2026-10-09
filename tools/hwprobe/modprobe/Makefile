@@ -24,3 +24,6 @@ MODULES = a b c d e f
 modules:
 	for m in $(MODULES); do $(MAKE) -C mods/$$m || exit 1; done
 .PHONY: modules
+
+# The title carries PROBE_VERSION: remake it when main.c changes.
+PARAM.SFO: main.c

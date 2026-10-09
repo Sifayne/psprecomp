@@ -21,3 +21,6 @@ PSP_EBOOT_TITLE = SasCore probe v$(shell sed -n 's/^.define PROBE_VERSION //p' m
 
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak
+
+# The title carries PROBE_VERSION: remake it when main.c changes.
+PARAM.SFO: main.c
