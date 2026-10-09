@@ -658,11 +658,17 @@ int psp_collect_pointer_seeds(const uint8_t *d, size_t len, const elf_info *e,
          * game beyond module_start is unreachable. The relocations come in
          * pairs, and the address is (hi << 16) + (int16)lo. The LO16 half
          * is signed, which is why it cannot simply be OR'd in: a low half
-         * of 0x8000 or above borrows from the high half. The packed form
-         * carries the low half in the HI16 itself. */
+         * of 0x8000 or above borrows from the high half.
+         *
+         * The packed form carries the low half in the HI16 itself, as it was
+         * linked. The image is already relocated, so the low half that pairs
+         * with this HI16 now is that one plus the base the loader added. */
         if (r->kind == PSP_RELOC_HI16 || r->kind == PSP_RELOC_HI16_ADDEND) {
-            int32_t lo_imm = r->addend;
-            if (r->kind == PSP_RELOC_HI16) {
+            int32_t lo_imm = 0;
+            if (r->kind == PSP_RELOC_HI16_ADDEND) {
+                if (r->val_seg >= e->nsegments) continue;
+                lo_imm = (int16_t)(((uint32_t)(int32_t)r->addend + e->seg[r->val_seg].addr) & 0xFFFF);
+            } else {
                 if (i + 1 >= total || rel[i + 1].kind != PSP_RELOC_LO16) continue;
                 const uint32_t lo_offset = rel[i + 1].offset;
                 const size_t lo_at = (size_t)ofs_seg->offset + lo_offset;

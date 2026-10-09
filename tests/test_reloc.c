@@ -90,6 +90,26 @@ int main(void) {
     memcpy(d + REL, stream, 20);
     CHECK(psp_relocs_read(d, sizeof d, &e, 0, r, 8) == -1, "packed: a cut offset is malformed");
 
+    /* Seeds from packed upper halves, in the relocated image. The first names
+     * segment 1's 0x8, data; its stored low half alone would name 0x400008,
+     * inside the code. The second names segment 0's 0x4, which is code. */
+    static const uint8_t halves[] = {
+        0, 0, 2, 3,
+        4, 0x01, 0x11, 0x00,
+        8, 1, 2, 3, 4, 5, 6, 7,
+        0x00, 0x00, 0, 0, 0, 0,              /* segment 0, offset 0 */
+        0x26, 0x01, 0x08, 0x00,              /* +4: kind 4, segment 1, addend 8 */
+        0x22, 0x02, 0x04, 0x00,              /* +12: kind 4, segment 0, addend 4 */
+    };
+    module(d, &e, 0x700000A1, sizeof halves);
+    memcpy(d + REL, halves, sizeof halves);
+    e.text_addr = MOVE; e.text_size = 16;
+    CHECK(psp_relocate_image(d, sizeof d, &e, &li) == 0 && li.nrelocs == 2, "halves: both applied");
+    uint32_t seeds[4];
+    const int nseeds = psp_collect_pointer_seeds(d, sizeof d, &e, 0, seeds, 4);
+    CHECK(nseeds == 1 && seeds[0] == MOVE + 4,
+          "halves: only the code address seeds, got %d (%08X)", nseeds, nseeds ? seeds[0] : 0);
+
     /* Elf32_Rel in a segment: r_info is the type, then the patched segment,
      * then the value's. */
     static const uint32_t rel[][2] = {
