@@ -1,7 +1,8 @@
-/* ModuleMgrForUser with a module of the game's own (docs/MODULES.md, M3).
+/* ModuleMgrForUser with a module of the game's own (docs/MODULES.md, M3),
+ * answering as modprobe v1 measured (probe set 25, fw 6.60).
  *
  * The loader here stands in for the boot host's: it recognises the bytes
- * "MODULE-A" and "maps" a module whose code is a few C functions registered
+ * "~PSPMODA" and "maps" a module whose code is a few C functions registered
  * at its addresses, as a recompiled module's registration function would. A
  * guest thread then loads, starts, calls, stops and unloads it. Synthetic: no
  * game data. */
@@ -70,7 +71,7 @@ static void mod_start(void) {
 static void mod_stop(void) { stopped++; psp_cpu.r[PSP_REG_V0] = 0; }
 
 static int loader(const uint8_t *file, size_t len, psp_module_image *out) {
-    if (len != 8 || memcmp(file, "MODULE-A", 8)) return (int)0x8002012F;
+    if (len != 8 || memcmp(file, "~PSPMODA", 8)) return (int)0x8002012F;
     out->lo = MOD_LO; out->hi = MOD_HI; out->gp = MOD_GP;
     out->start = MOD_START; out->stop = MOD_STOP;
     out->attribute = 0; out->version[0] = 1; out->version[1] = 2;
@@ -96,7 +97,15 @@ static void driver(void) {
     CHECK(call("sceKernelLoadModule", path("ms0:/PSP/none.prx"), 0, 0, 0, 0) == 0x80010002u,
           "a missing file is not found");
     CHECK(call("sceKernelLoadModule", path("ms0:/PSP/other.prx"), 0, 0, 0, 0) == 0x8002012Fu,
-          "a file the game was not prepared with is an unknown module file");
+          "a module the game was not prepared with is an unknown module file");
+    CHECK(call("sceKernelLoadModule", path("ms0:/PSP/junk.prx"), 0, 0, 0, 0) == 0x80020148u,
+          "a file that is no module is an unsupported type (modprobe step 2)");
+    {
+        const uint32_t fd = call("sceIoOpen", path("ms0:/PSP/mod.prx"), 1, 0, 0, 0);
+        CHECK((int32_t)fd > 0 && call("sceKernelLoadModuleByID", fd, 0, 0, 0, 0) == 0x80020146u,
+              "LoadModuleByID of a memory stick file is refused for its device (step 11)");
+        call("sceIoClose", fd, 0, 0, 0, 0);
+    }
 
     const uint32_t id = call("sceKernelLoadModule", path("ms0:/PSP/mod.prx"), 0, 0, 0, 0);
     CHECK((int32_t)id > 1, "the module loads, got %08X", id);
@@ -112,7 +121,17 @@ static void driver(void) {
     CHECK(start_gp == MOD_GP, "under the module's $gp, got %08X", start_gp);
     CHECK(start_argsize == 4 && start_arg0 == 0xCAFEF00D, "with the caller's arguments");
     CHECK(start_call == 42, "module_start can call its own exports");
-    CHECK(call("sceKernelStartModule", id, 0, 0, 0, 0) == 0x80020133u, "a module starts once");
+    CHECK(call("sceKernelStartModule", id, 0, 0, 0, 0) == 0x80020001u, "a module starts once (step 7)");
+    {
+        const uint32_t twin = call("sceKernelLoadModule", path("ms0:/PSP/mod.prx"), 0, 0, 0, 0);
+        const int starts = (int)start_argsize;
+        start_argsize = 0;
+        CHECK((int32_t)twin > 0 && twin != id, "the same file loads again, as another module");
+        CHECK(call("sceKernelStartModule", twin, 0, 0, 0, 0) == 0x8002013Bu && start_argsize == 0,
+              "but its library is there already: it does not start (step 10)");
+        CHECK(call("sceKernelUnloadModule", twin, 0, 0, 0, 0) == twin, "and unloads, never started");
+        start_argsize = (uint32_t)starts;
+    }
 
     psp_cpu.r[PSP_REG_V0] = 0;
     psp_hle_call(FN_NID);
@@ -121,7 +140,18 @@ static void driver(void) {
     CHECK(self == driver_thread && shadow_calls == 0, "the runtime's own answer wins over an export");
 
     CHECK(call("sceKernelGetModuleIdByAddress", MOD_FN, 0, 0, 0, 0) == id, "an address in the module is its");
-    CHECK(call("sceKernelGetModuleIdByAddress", 0x08800000u, 0, 0, 0, 0) == 1, "any other is the executable's");
+    CHECK(call("sceKernelGetModuleIdByAddress", 0x08800000u, 0, 0, 0, 0) == 1,
+          "with no executable described, any other is the executable's");
+    {
+        psp_module_image main;
+        memset(&main, 0, sizeof main);
+        main.lo = 0x08804000u; main.hi = 0x08840000u;
+        psp_modules_set_main(&main);
+        CHECK(call("sceKernelGetModuleIdByAddress", 0x08804100u, 0, 0, 0, 0) == 1, "the executable's code is its");
+        CHECK(call("sceKernelGetModuleIdByAddress", 0x08880000u, 0, 0, 0, 0) == 0x8002012Eu &&
+              call("sceKernelGetModuleIdByAddress", 0, 0, 0, 0, 0) == 0x8002012Eu,
+              "a stack or 0 is no module's (step 4)");
+    }
 
     psp_write32(INFO, 0x60);
     CHECK(call("sceKernelQueryModuleInfo", id, INFO, 0, 0, 0) == 0, "the module can be queried");
@@ -132,7 +162,8 @@ static void driver(void) {
           psp_read8(INFO + 0x42) == 1 && psp_read8(INFO + 0x43) == 2 && !strcmp(name, "sceTest_Module"),
           "and reports its segments, entry, gp, version and name");
 
-    CHECK(call("sceKernelUnloadModule", id, 0, 0, 0, 0) == 0x80020137u, "a started module unloads only when stopped");
+    CHECK(call("sceKernelUnloadModule", id, 0, 0, 0, 0) == 0x80020138u,
+          "a started module cannot be removed until it stops (step 7)");
     CHECK(call("sceKernelStopModule", id, 0, 0, STATUS, 0) == 0 && stopped == 1 && psp_read32(STATUS) == 0,
           "it stops, running module_stop");
     CHECK(call("sceKernelStopModule", id, 0, 0, 0, 0) == 0x80020135u, "once");
@@ -159,8 +190,9 @@ int main(void) {
     psp_cpu_reset(); psp_threadman_reset(); psp_sched_reset();
     psp_sysmem_reset(); psp_sched_set_threading(1);
     psp_io_set_root("./modules-root");
-    put_file("ms0:/PSP/mod.prx", "MODULE-A");
-    put_file("ms0:/PSP/other.prx", "MODULE-B");
+    put_file("ms0:/PSP/mod.prx", "~PSPMODA");
+    put_file("ms0:/PSP/other.prx", "~PSPMODB");
+    put_file("ms0:/PSP/junk.prx", "JUNKJUNK");
     psp_modules_set_loader(loader);
 
     CHECK(psp_nid("sceKernelLoadModule") == 0x977DE386u && psp_nid("sceKernelCreateThread") == 0x446D8DE6u &&

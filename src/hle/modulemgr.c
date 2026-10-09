@@ -8,8 +8,12 @@
  * exports the other modules call -- is here.
  *
  * Semantics follow uofw's modulemgr (MIT; src/kd/modulemgr) and PSPSDK's
- * pspmodulemgr.h (BSD). None of it is measured on the console yet: that is
- * MODULES.md's M6 probe. */
+ * pspmodulemgr.h (BSD), measured by modprobe v1 (tools/hwprobe/modprobe,
+ * probe set 25, fw 6.60): the ids, the start and stop threads (name,
+ * priority 0x20, 256 KB, the module's $gp), module_start_thread_parameter,
+ * a module that is not resident, the memory a load takes from the lowest
+ * free address, late linking and the self-unload all matched. Where they
+ * did not, its step is named below. */
 #include "psprecomp/modules.h"
 #include "psprecomp/hle.h"
 #include "psprecomp/cpu.h"
@@ -24,10 +28,13 @@
 #define SCE_ERROR_ERRNO_FILE_NOT_FOUND          0x80010002u
 #define SCE_ERROR_KERNEL_UNKNOWN_MODULE         0x8002012Eu
 #define SCE_ERROR_KERNEL_UNKNOWN_MODULE_FILE    0x8002012Fu
-#define SCE_ERROR_KERNEL_MODULE_ALREADY_STARTED 0x80020133u
 #define SCE_ERROR_KERNEL_MODULE_NOT_STARTED     0x80020134u
 #define SCE_ERROR_KERNEL_MODULE_ALREADY_STOPPED 0x80020135u
-#define SCE_ERROR_KERNEL_MODULE_NOT_STOPPED     0x80020137u
+#define SCE_ERROR_KERNEL_ERROR                  0x80020001u
+#define SCE_ERROR_KERNEL_MODULE_CANNOT_REMOVE   0x80020138u
+#define SCE_ERROR_KERNEL_LIBRARY_ALREADY_EXISTS 0x8002013Bu
+#define SCE_ERROR_KERNEL_PROHIBIT_LOADMODULE_DEVICE 0x80020146u
+#define SCE_ERROR_KERNEL_UNSUPPORTED_PRX_TYPE   0x80020148u
 
 /* module_start's answer: stay loaded, or not. module_stop's: stopped, or
  * refused. */
@@ -68,8 +75,13 @@
  * And an id is the *truthful* answer. The question is "which module owns this
  * address", a self-contained microgame is exactly one module, and the host has
  * loaded it. Reporting 1 states that; reporting UNKNOWN_MODULE denies a module
- * that demonstrably exists. Addresses outside every module a game loaded keep
- * that answer. */
+ * that demonstrably exists.
+ *
+ * Outside every module it is the other way round: modprobe step 4 (fw 6.60)
+ * asks GetModuleIdByAddress about its stack, its heap and 0 and gets
+ * UNKNOWN_MODULE for each, and its own code gets its id. So the executable's
+ * id answers for an address in the executable, when the boot host has said
+ * where that is (psp_modules_set_main); without that, any address. */
 #define PSP_MAIN_MODULE_ID 1u
 
 #define MODULES_MAX 32
@@ -209,6 +221,10 @@ static uint32_t run_thread_busy(const module *m, uint32_t entry, const char *nam
 /* ---- loading -------------------------------------------------------------- */
 
 static uint32_t load(const uint8_t *file, size_t len, const char *what) {
+    /* A file that is no module at all, by its first bytes (modprobe step 2:
+     * 1024 bytes of a pattern). */
+    if (len < 4 || (memcmp(file, "~PSP", 4) && memcmp(file, "~SCE", 4) && memcmp(file, "\x7f" "ELF", 4)))
+        return SCE_ERROR_KERNEL_UNSUPPORTED_PRX_TYPE;
     if (!g_loader) return SCE_ERROR_KERNEL_UNKNOWN_MODULE_FILE;
     module *m = NULL;
     for (int i = 0; i < MODULES_MAX && !m; i++) if (!g_mod[i].used) m = &g_mod[i];
@@ -249,11 +265,16 @@ static void hle_LoadModule(void) {
     free(file);
 }
 
-/* sceKernelLoadModuleByID(fd, flags, option) */
+/* sceKernelLoadModuleByID(fd, flags, option). modprobe step 11: a file the
+ * probe opened on the memory stick is refused for its device, although
+ * sceKernelLoadModule loads the same file by its path. A game's own modules
+ * are on its disc, taken here to be allowed. */
 static void hle_LoadModuleByID(void) {
     size_t len = 0;
-    uint8_t *file = psp_io_read_fd(psp_arg(0), &len);
+    int on_disc = 0;
+    uint8_t *file = psp_io_read_fd(psp_arg(0), &len, &on_disc);
     if (!file) { psp_ret(SCE_ERROR_ERRNO_FILE_NOT_FOUND); return; }
+    if (!on_disc) { free(file); psp_ret(SCE_ERROR_KERNEL_PROHIBIT_LOADMODULE_DEVICE); return; }
     psp_ret(load(file, len, "an open file"));
     free(file);
 }
@@ -281,7 +302,23 @@ static void hle_StartModule(void) {
         psp_ret(id == PSP_MAIN_MODULE_ID ? SCE_KERNEL_ERROR_OK : SCE_ERROR_KERNEL_UNKNOWN_MODULE);
         return;
     }
-    if (m->started) { psp_ret(SCE_ERROR_KERNEL_MODULE_ALREADY_STARTED); return; }
+    /* modprobe step 7: a second start is the generic error, not the module
+     * manager's own ALREADY_STARTED. */
+    if (m->started) { psp_ret(SCE_ERROR_KERNEL_ERROR); return; }
+    /* A library another started module exports already: the same file loaded
+     * twice starts once (step 10); the second neither starts nor runs its
+     * module_start, and stays loaded. By NID, the runtime not keeping the
+     * libraries' names. */
+    for (int i = 0; i < MODULES_MAX; i++) {
+        const module *o = &g_mod[i];
+        if (o == m || !o->used || !o->started || o->stopped) continue;
+        for (int a = 0; a < o->im.nexports; a++)
+            for (int b = 0; b < m->im.nexports; b++)
+                if (o->im.export_nid[a] == m->im.export_nid[b]) {
+                    psp_ret(SCE_ERROR_KERNEL_LIBRARY_ALREADY_EXISTS);
+                    return;
+                }
+    }
     /* Its libraries are registered before module_start runs, which may call
      * them through its own stubs. */
     m->started = 1;
@@ -332,7 +369,8 @@ static void hle_UnloadModule(void) {
         psp_ret(psp_arg(0) == PSP_MAIN_MODULE_ID ? SCE_KERNEL_ERROR_OK : SCE_ERROR_KERNEL_UNKNOWN_MODULE);
         return;
     }
-    if (m->started && !m->stopped) { psp_ret(SCE_ERROR_KERNEL_MODULE_NOT_STOPPED); return; }
+    /* modprobe step 7: CANNOT_REMOVE, not NOT_STOPPED. */
+    if (m->started && !m->stopped) { psp_ret(SCE_ERROR_KERNEL_MODULE_CANNOT_REMOVE); return; }
     const uint32_t id = m->id;
     forget(m);
     psp_ret(id);
@@ -372,8 +410,11 @@ static void hle_GetModuleId(void) {
 }
 
 static void hle_GetModuleIdByAddress(void) {
-    const module *m = by_address(psp_arg(0));
-    psp_ret(m ? m->id : PSP_MAIN_MODULE_ID);
+    const uint32_t addr = psp_arg(0);
+    const module *m = by_address(addr);
+    if (m) { psp_ret(m->id); return; }
+    const int in_main = !g_have_main || (addr >= g_main.lo && addr < g_main.hi);
+    psp_ret(in_main ? PSP_MAIN_MODULE_ID : SCE_ERROR_KERNEL_UNKNOWN_MODULE);
 }
 
 /* sceKernelQueryModuleInfo(modid, info): PSPSDK's SceKernelModuleInfo, as

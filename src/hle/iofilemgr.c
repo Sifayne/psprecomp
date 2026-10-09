@@ -1348,9 +1348,10 @@ uint8_t *psp_io_read_whole(const char *guest, size_t *len) {
     return buf;
 }
 
-uint8_t *psp_io_read_fd(uint32_t fd, size_t *len) {
+uint8_t *psp_io_read_fd(uint32_t fd, size_t *len, int *on_disc) {
     if (fd < 3 || fd - 3 >= MAX_FILES || !g_file[fd - 3].used || !g_file[fd - 3].f) return NULL;
     const io_file *o = &g_file[fd - 3];
+    if (on_disc) *on_disc = o->image;
     return read_window(o->f, o->base, o->len, len);
 }
 
