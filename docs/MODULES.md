@@ -3,7 +3,7 @@
 The plan for games that load modules (PRX files) of their own at run time,
 through `sceKernelLoadModule`. Written 9 Oct 2026 against psprecomp e73adc1.
 Sif chose the approach the same day: the importer recompiles each module on
-the disc, as it does the executable. M1 to M3 are built; the rest is not.
+the disc, as it does the executable. M1 to M5 are built; M6 is the gates.
 
 ## Where things stand
 
@@ -116,6 +116,7 @@ one table, which a second module would replace.
   executable's ModuleMgrForUser answers unchanged.
 - The boot host's half is `src/host/module_loader.c`. A title lists its
   modules in `psp_title.modules` {sha1, image, base, size, registration}.
+  Since M5 their code is registered at boot rather than at load.
 - Semantics follow uofw's modulemgr and PSPSDK's pspmodulemgr.h:
   - LoadModule answers the id. StartModule answers the id (resident) or 0,
     and runs `module_start` on `SceModmgrStart` at priority 32 with 256 KB
@@ -139,8 +140,27 @@ one table, which a second module would replace.
   fingerprint.
 - Plain games first. A pack's profile names the modules its title expects.
 
+*Built for plain games (0914c1e).*
+- The importer reads the disc's listing and takes every `.prx`.
+- Duplicates collapse by content: WipEout's six files are three modules.
+- Modules are placed 64K-aligned after the executable: WipEout's at
+  0x003A0000, 0x003B0000 and 0x003C0000.
+- The images go in the game's `modules/` folder.
+- The generated `title.c` lists one row per disc file.
+- Through the app, WipEout Pulse loads and starts all three.
+- Packs do not list modules yet.
+
 **M5. Save states.** The module table and the extended window go into the
 state, and a state refuses to load into a game whose modules differ.
+
+*Built.*
+- The extended window is part of the module window that states already
+  hold.
+- The table is a state part.
+- Every module's code is registered at boot, so the resume sites a state
+  counts are the same all run.
+- A state is its build's own, so its modules cannot differ.
+- A save is refused only while a module's start or stop is running.
 
 **M6. Evidence and gates.**
 - **A hardware probe** that loads small PRXs from the Memory Stick. It
