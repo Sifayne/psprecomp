@@ -444,22 +444,32 @@ void psp_vrnds(uint32_t vs, int size) {
     eat_prefixes();
 }
 
+/* A vector draw fills its lanes last first: the first value drawn goes to
+ * the last lane and the last to lane 0, and the state moves one draw per
+ * lane (vfpuprobe v6 steps 206-209, fw 6.60, every op and size and register
+ * form, The 3rd Birthday's vrndf2.t C000 among them). Of the destination
+ * prefix only lane 0's controls apply, and they apply to the first draw,
+ * wherever it lands (steps 210-212): masking lane 0 leaves the last lane
+ * as it was, still drawing; saturating lane 0 clamps the first draw, an
+ * integer's bits too, read as a float; the other lanes' controls do
+ * nothing. */
 void psp_vrnd(uint32_t vd, int kind, int size) {
     int r[4];
     const int n = psp_vfpu_regs(vd, size, r);
-    float out[4];
-    for (int i = 0; i < n; i++) {
+    const uint32_t pfx = PFXD;
+    for (int k = 0; k < n; k++) {
         const uint32_t v = vrnd_next();
-        out[i] = psp_bits_to_f32(kind == 0 ? v
-                                 : (kind == 1 ? 0x3F800000u : 0x40000000u) | (v & 0x7FFFFFu));
-    }
-    if (kind == 0) {
-        /* An integer: the destination prefix masks lanes but does not
-         * saturate, as for vf2i. */
-        for (int i = 0; i < n; i++)
-            if (!((PFXD >> (8 + i)) & 1)) psp_cpu.v[r[i]] = out[i];
-    } else {
-        write_dst(vd, size, out);
+        float out = psp_bits_to_f32(kind == 0 ? v
+                                    : (kind == 1 ? 0x3F800000u : 0x40000000u) | (v & 0x7FFFFFu));
+        if (k == 0 && pfx != PFX_D_NONE) {
+            if ((pfx >> 8) & 1) continue;               /* masked: drawn all the same */
+            switch (pfx & 3) {
+            case 1: out = sat0(out); break;             /* clamp to [0, 1]  */
+            case 3: out = sat1(out); break;             /* clamp to [-1, 1] */
+            default: break;
+            }
+        }
+        psp_cpu.v[r[n - 1 - k]] = out;
     }
     eat_prefixes();
 }

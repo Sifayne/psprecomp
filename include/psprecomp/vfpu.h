@@ -122,7 +122,7 @@ void     psp_mtvc(int index, uint32_t value);
 uint32_t psp_mfvc_cc_after_vcmp(void);
 
 /* The random generator. vrnds seeds rcx0..7 from the bits of vs lane 0;
- * psp_vrnd draws one value per lane of vd: `kind` 0 is vrndi (the 32-bit
+ * psp_vrnd draws one value per lane of vd, last lane first: `kind` 0 is vrndi (the 32-bit
  * integer), 1 vrndf1 (a float in [1,2)), 2 vrndf2 (a float in [2,4)). The
  * seeding, the output formats and the generator are fitted to every stream
  * and state the probe read back -- see vfpu.c. */

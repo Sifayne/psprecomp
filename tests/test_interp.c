@@ -79,9 +79,9 @@ static void test_alu(void) {
 
 static void test_vfpu_random_pipeline(void) {
     /* Pipeline instructions in a delay slot must not trap or consume the
-     * destination prefix. The following random triple has one lane masked;
-     * which lane is open (hardware has not been probed for vector vrnd), so
-     * the check is that exactly one lane kept its zero. */
+     * destination prefix. The following random triple masks lane 0, which
+     * on a PSP keeps the last lane, where the first draw would go
+     * (vfpuprobe v6 step 212, fw 6.60). */
     const uint32_t barriers[] = {0xFFFF0000,0xFFFF0320,0xFFFF040D};
     for (int i=0;i<3;i++) {
         const uint32_t code[] = {0xDE000100,0x10000001,barriers[i],
@@ -90,12 +90,9 @@ static void test_vfpu_random_pipeline(void) {
         psp_interp it=run(code,6,100);
         CHECK(it.status==I_OK_RETURN,"VFPU barrier/random interpreter path");
         int r[4]; psp_vfpu_regs(0,3,r);
-        int kept=0, drawn=0;
-        for (int l=0;l<3;l++) {
-            if (psp_cpu.v[r[l]]==0) kept++;
-            else if (psp_cpu.v[r[l]]>=2 && psp_cpu.v[r[l]]<4) drawn++;
-        }
-        CHECK(kept==1 && drawn==2,
+        int drawn=0;
+        for (int l=0;l<2;l++) drawn += psp_cpu.v[r[l]]>=2 && psp_cpu.v[r[l]]<4;
+        CHECK(psp_cpu.v[r[2]]==0 && drawn==2,
               "VFPU barrier preserves prefix through branch delay slot");
     }
 }
