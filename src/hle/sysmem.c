@@ -430,6 +430,9 @@ void psp_sysmem_register(void) {
     /* The 6.60 variant, unnamed for the same reason: uofw's label
      * `sceKernelSetCompiledSdkVersion660` hashes to 0x6E69DB0E. */
     psp_hle_register_unnamed(0x358CA1BB, "SysMemUserForUser", hle_SetCompiledSdkVersion);
+    /* The 3.70 generation's, unnamed for the same reason: UCUS98712 (WipEout
+     * Pulse) imports this ID and supplies 0x03070010. */
+    psp_hle_register_unnamed(0x342061E5, "SysMemUserForUser", hle_SetCompiledSdkVersion);
     psp_hle_register(0xFC114573, "SysMemUserForUser", "sceKernelGetCompiledSdkVersion",hle_GetCompiledSdkVersion);
     psp_hle_register(0xF77D77CB, "SysMemUserForUser", "sceKernelSetCompilerVersion",   hle_SetCompilerVersion);
     psp_hle_register(0x13A5ABEF, "SysMemUserForUser", "sceKernelPrintf",               hle_Printf);

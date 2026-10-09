@@ -196,8 +196,16 @@ static void hle_LibcGettimeofday(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* General-purpose I/O pins, wired to the debug board. Nothing is connected. */
+/* General-purpose I/O pins, wired to the debug board. Nothing is connected,
+ * so the inputs read 0 and what is written to the outputs goes nowhere.
+ * sceKernelSetGPO(value) is named by PSPSDK's UtilsForUser.S; what it returns
+ * is not measured, and 0 is what a caller that checks would take as success. */
 static void hle_GetGPI(void) { psp_ret(0); }
+static void hle_SetGPO(void) { psp_ret(0); }
+
+/* sceHprmIsRemoteExist: "1 if the remote is plugged in, else 0" (PSPSDK
+ * psphprm.h). The host has no headphone remote. */
+static void hle_HprmIsRemoteExist(void) { psp_ret(0); }
 
 /* ---- StdioForUser -------------------------------------------------------- */
 /* These return the file descriptors, which sceIoWrite then recognises. */
@@ -1524,6 +1532,8 @@ void psp_misc_register(void) {
     psp_hle_register(0x91E4F6A7, "UtilsForUser", "sceKernelLibcClock",        hle_LibcClock);
     psp_hle_register(0x71EC4271, "UtilsForUser", "sceKernelLibcGettimeofday", hle_LibcGettimeofday);
     psp_hle_register(0x37FB5C42, "UtilsForUser", "sceKernelGetGPI",           hle_GetGPI);
+    psp_hle_register(0x6AD345D7, "UtilsForUser", "sceKernelSetGPO",           hle_SetGPO);
+    psp_hle_register(0x208DB1BD, "sceHprm",      "sceHprmIsRemoteExist",      hle_HprmIsRemoteExist);
 
     psp_hle_register(0x172D316E, "StdioForUser", "sceKernelStdin",  hle_Stdin);
     psp_hle_register(0xA6BAB2E9, "StdioForUser", "sceKernelStdout", hle_Stdout);
