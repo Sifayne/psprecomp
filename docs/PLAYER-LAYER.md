@@ -993,45 +993,147 @@ them.
 
 ### What a state holds
 
+As built in stage 8 (`include/psprecomp/state.h`, `src/hle/state.c`):
+
 **Header:**
+- magic `PSPSTAT1` and a format version;
+- an FNV-1a hash of the executable's own bytes, and its counts of registered
+  functions and resume sites. A state loads only into the build that wrote
+  it, which is what lets most of it be plain bytes;
+- guest time and poll count.
 
-- magic, format version;
-- toolkit commit and **emitted-module hash**: a state loads only into the
-  build that wrote it;
-- title slug, guest time, poll count;
-- a 480x272 thumbnail.
+The thumbnail is left for stage 9's slots.
 
-**Chunks**, tagged and versioned per module:
+**Guest memory:** RAM, VRAM, the scratchpad and the module image. Each is
+written as a 4 KB page map plus the pages that are not all zero.
 
-- guest RAM (32 MB), VRAM (2 MB, after a forced synchronous GL readback),
-  the module image (6 MB for Last Raven; it shadows the scratchpad);
-- every scheduler slot's register file and state;
-- thread manager, kernel-object, lock, timer, sysmem and interrupt tables.
-  Host pointers (`psp_waitq *`, `ge_queue *`, FPL/TLS heap pointers) are
-  written as indices;
-- clock, display, controller state including the replay cursor;
-- SAS and audio channels;
-- ATRAC (plain state; the decoder is reopened from its extradata and
-  flushed);
-- the GE queue, event ring, timeline and registers. This extends
-  `psp_ge_state_save`, which only covers registers today;
-- file descriptors as path, base, length and position. A path field has to
-  be added; descriptors keep a `FILE*` and nothing else;
-- a game-host chunk that titles register, holding Last Raven's replacement
-  statics and its fps camera and clock state. Pose history can be reset
-  instead of saved.
+**Kept variables.** Each module names its guest-visible statics once, at
+start-up, with `PSP_STATE_KEEP` (`psp_state_keep`). The state writes them
+end to end, after a list of their names, sizes and addresses:
+- the scheduler's slots (register files, park records, ready stamps);
+- the thread manager's threads, semaphores, flags and callbacks;
+- locks, pools, alarms and vtimers, sysmem blocks, interrupt subscriptions;
+- the clock and display;
+- the controller's counters and script lanes;
+- the audio channels and their pacing;
+- SAS voices and reverb;
+- the GE's lists, event ring, timeline, callbacks, registers, immediate-mode
+  vertices and owner;
+- UMD state, the savedata dialog's status words, and the movie
+  stream-handle counter.
 
-**Re-created, not saved:** host threads, locks, `FILE*`s, codecs, the dispatch
-and firmware registries, host callbacks, the GL context and caches (every
-write generation is bumped so textures re-import), audio rings, the clock
-anchor.
+A kept variable holds no host pointer, except into another kept variable.
+All of them sit in one executable, so a load moves every one by the same
+distance (`psp_state_delta`). The parked-thread table (`waitq.c`) and the
+GE's events are relocated by it. With the zero pages skipped, the kept
+variables come to 0.26 MB in a Last Raven mission.
 
-**Size and compression.** About 40 MB raw before compression. Measure what
-zero-page skipping alone achieves before adding a compression dependency.
+The plan's first form was one linker section (`__attribute__((section))`)
+gathering the variables. It was dropped because GCC stores a zero-initialized
+array in a named section as file data. The thread and object tables would
+have put about 17 MB of zeros into every game executable, and the section
+works only on ELF. Naming each variable costs a line, and works on every
+target.
 
-**Load at launch (stage 8).** `--load-state <file>` boots the module and
-registers it as usual, skips `module_start`, restores, spawns each thread in
-resume mode and re-anchors the clock.
+**Parts** hold what is more than bytes (`psp_state_part`: refuse, save, load):
+- FPL free lists and TLSPL owner arrays, saved beside their pools and
+  allocated again;
+- file descriptors: how to open each one again (the disc image, or a host
+  path read-only, relative to the data root when under it), plus its window
+  and position;
+- ATRAC: the contexts are kept. Each decoder is reopened and fed the last
+  four frames it decoded since it was opened or flushed, which is enough
+  because what one frame carries into the next reaches back less than a
+  frame;
+- the replay's cursor and script lane. A run without a replay starts with
+  the lane released, so a state never holds a button down;
+- the savedata script's line;
+- on load: the clock re-anchored to the wall in real time, the GE's target,
+  scissor and depth buffer pushed to the backend again, and every write
+  generation bumped.
+
+**Titles** keep their replacements' statics the same way, through
+`t3b_replacements_keep` and `lr_replacements_keep`. A replaced function that
+is live on a thread's stack needs a resume of its own, which the title
+registers with `psp_resume_override(addr, psp_resume_<addr>, fn)`: the return
+sites the emitted table gives the original go to `fn` instead. Each Armored
+Core title registers its mission loop. With Higher FPS off it enters the
+original body at the site. With it on, it calls `fps_native_loop(site)` and
+then the loop's tail. The plan's frame-start resume was not needed: the
+native loop is the emitted body, so it already has every return site.
+
+**Threads.** At save, every live slot gets one of three ways back, kept in
+`g_resume`:
+- **fresh:** started but never run, so it begins at its entry point;
+- **safe point:** the saving thread, inside the safe point;
+- **wait:** parked in a firmware call that can finish a wait it did not
+  begin (`psp_hle_register_resume`).
+
+On load, every slot gets a new host thread (`resume_main`). A waiting thread
+proceeds as follows:
+
+1. It takes its saved park as answered. `psp_sched_resume_block` and
+   `psp_sched_resume_delay` give the result the original park would have
+   given.
+2. It runs the rest of its handler (the *finish* half), the safe-point check,
+   and what every call ends with (`after_call`).
+3. It climbs its guest stack with `psp_resume_chain`.
+
+The main context drains as it did when the state was saved. Until then the
+token is held for the saving thread.
+
+Finishes are registered for:
+- `sceKernelDelayThread`, `sceKernelDelaySysClockThread`, `sceKernelSleepThread`,
+  `sceKernelWaitThreadEnd` and `sceKernelWaitSema`, with their CB forms;
+- `sceCtrlReadBufferPositive`;
+- `sceAudioOutputBlocking`, `sceAudioOutputPannedBlocking` and
+  `sceAudioOutput2OutputBlocking`.
+
+Each handler was split at its park. The one that parks in two places,
+`sceAudioOutput2OutputBlocking`, records which with `psp_sched_set_step`.
+An uninterrupted run takes the same path through the split handlers as
+before. The 3rd Birthday's gameplay replay and Last Raven's mission-effects
+still give byte-identical GE captures and PCM to the stage 7 and stage 5
+baselines, built with resume entries and with a save taken mid-run.
+
+**Refused,** with each reason printed once:
+- not at the safe point, or the module still starting;
+- a thread under host frames that do not resume (a callback, an interrupt
+  handler, a replaced function no title registered);
+- a thread switched away inside a call (a yield or a preemption);
+- a thread waiting in a call with no finish;
+- a movie context open, or the savedata dialog open;
+- a file open for writing, or a directory open.
+
+In the replays, the only refusals were movies: a save asked for during one
+was taken at the first safe point after it ended.
+
+**Re-created, not saved:**
+- host threads, locks, `FILE*`s and decoders;
+- the dispatch and firmware registries, and host callbacks;
+- the GL context and caches, and the audio rings;
+- census and diagnostics.
+
+**Size.** There is no compression. With the zero pages skipped, a state is:
+- 8.9 MB on The 3rd Birthday's title screen;
+- 22.7 MB on its opening street;
+- 25.1 MB in a Last Raven mission;
+- 22.4 MB in an AC3 Portable sortie.
+
+Guest RAM is most of each.
+
+**Load at launch.** `boot --load-state <file>`, in both games' `host/boot.c`,
+loads and registers the module as usual. It then loads the state in place of
+steps 3 to 5 (the entry stack, the constructors, `module_start`) and
+drains.
+
+**Saving, until stage 9's menu:** `PSPRECOMP_SAVE_STATE=<poll>:<file>[,...]`
+saves at the first safe point, at or after each poll, that nothing refuses.
+
+A save from a GL window also needs the readback the plan names. VRAM is in
+the state, and a render target that is never presented or sampled lives only
+on the GPU. That is stage 9's, along with the menu that will save from a
+window. Every stage 8 save is headless.
 
 **The gate is deterministic, and it is the whole argument.** Run a replay
 headless (unpaced, synthetic clock) and save at poll N. Then either:
@@ -1039,15 +1141,72 @@ headless (unpaced, synthetic clock) and save at poll N. Then either:
 - continue to M, or
 - launch fresh, load the state and run the same replay tail to M.
 
-Lists, commands, bad accesses, input logs and the final framebuffer bytes
-must be identical. Do this at several N per title: menu, garage, mission,
-mid-boost.
+The checks:
+- the GE capture must be the same file;
+- each PCM channel the loaded run wrote must be the tail of the reference's;
+- guest RAM and the module image near the end must be the same files;
+- the replay must end on the same row.
+
+Do this at several N per title: menu, garage, mission, mid-boost.
+
+*Results, 8 Oct.* Every point passed. "1100→1183" means the save was asked
+for at poll 1100 and taken at 1183, when the movie ended.
+
+The 3rd Birthday ran 24 points over 9 replays, saved and replayed headless
+by `build/state/gate.sh`. Each replay ran as `scripts/dev-test.py` runs it,
+modern-control replays included:
+
+| Replay | Saved at | Matched |
+|---|---|---|
+| gameplay | 100, 1100→1183, 1800, 2250, 2400 | capture at 2300, RAM at 2600, PCM |
+| modern-hub (a save loaded into the hub, scripted dialog) | 1200, 1700, 1950 | RAM at 2040, PCM |
+| modern-buttons | 1500→1771, 2300, 2700 | RAM at 2800, PCM |
+| manual-aim | 1500→1771, 2200, 2800 | capture at 2248, RAM at 3140, PCM |
+| free-look | 1800, 2300, 2700 | capture at 2320, RAM at 2920, PCM |
+| camera-follow | 1800, 2400 | RAM at 2720, PCM |
+| modern-walk | 2250, 2500 | RAM at 2600, PCM |
+| controls-look | 2250 | capture at 2300, RAM at 2600, PCM |
+| lighting-hub-probe | 1500, 1900 | capture at 2000, RAM at 2004, PCM |
+
+The Armored Core titles ran 17 points, with movies decoded and the software
+renderer, by `build/state-gate.sh` in the Last Raven worktree. From the
+sortie on, each mission point resumes the mission loop through its title's
+override:
+
+| Title, replay | Saved at | Matched |
+|---|---|---|
+| Last Raven, mission-effects | 600→674, 1950, 2100 | capture at 2200, RAM at 2209, PCM ×3 |
+| the same, Higher FPS | 1950, 2150 | the same |
+| Last Raven, pause-look (garage, play, pause, mouse in the pause menu) | 1200, 2120, 2200, 2300 | capture at 2400, RAM at 2449, PCM |
+| AC3 Portable, pause-peek | 3000, 7300, 7650 | capture at 7700, RAM at 7799, PCM ×3 |
+| the same, Higher FPS | 7400 | the same |
+| Silent Line, mission (stopped at 5300) | 1500, 4000, 5000 | capture at 5200, RAM at 5299, PCM |
+| the same, Higher FPS | 5100 | the same |
+
+Notes on what matched:
+- A capture taken before the state's poll has no counterpart in the loaded
+  run, and is skipped.
+- A PCM channel the game left silent after the save point is skipped for the
+  same reason: AC3 Portable's channel 2 from 7650, and Last Raven's and
+  Silent Line's channel 2 in their pause and late-mission points.
+- "RAM" is guest RAM and the module image, both dumped a poll before the
+  replay's end.
+
+A state saved headless also loads into a GL window. The 3rd Birthday's
+street state continued in a 1920x1080 window at real-time pacing and drew
+the street as expected.
+
+Loading exposed one bug. The GE's backend was first told the restored
+registers from the boot thread, so the GL backend claimed its context there
+and then refused the GE thread. The push now waits for the first list walk.
 
 **Quick load in-process (stage 9).**
 
 1. Every guest host thread unwinds to the base of its `thread_main` by
-   `longjmp`. The thread record already has an `unwind` buffer for
-   `sceKernelExitThread`.
+   `longjmp`. The `unwind` buffer the thread record carried was never used,
+   because `sceKernelExitThread` exits the host thread. Stage 8 removed it,
+   since a `jmp_buf` must not be in a kept table. Stage 9 adds its own, per
+   host thread.
 2. The loader, which is the GE-owner thread at its safe point, restores
    state.
 3. Each slot resumes on a host thread: the existing ones are reused, missing
