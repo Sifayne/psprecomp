@@ -35,10 +35,8 @@ static const psp_option_def options[] = {
      .type=PSP_OPTION_CHOICE,.dflt="classic",.choices="classic|wasd",.labels="Classic|WASD"},
     {.key="MOUSE",.env="PSPRECOMP_MOUSE",.label="Mouse",.page="Controls",.help="",
      .type=PSP_OPTION_CHOICE,.dflt="0",.choices="0|1",.labels="Off|On"},
-    {.key="ACTIVE_PAD",.env="PSPRECOMP_ACTIVE_PAD",.label="Active controller",.page="Controls",.help="",
-     .type=PSP_OPTION_CHOICE,.dflt="first",.choices="first|last",.labels="First connected|Last used"},
 };
-const psp_settings_schema psp_title_settings = { .title = "Input test", .options = options, .count = 3 };
+const psp_settings_schema psp_title_settings = { .title = "Input test", .id = "input-test", .options = options, .count = 2 };
 const psp_title psp_title_info = { .name = "Input test" };
 
 /* ---- the code before, and its title hooks ------------------------------------ */
@@ -401,7 +399,7 @@ static void from_settings(void) {
     psp_settings s;
     char error[PSP_SETTINGS_ERROR];
     psp_settings_defaults(&s);
-    assert(!psp_settings_assign(&s, "KEYS=wasd", PSP_SOURCE_PRESET, error));
+    assert(!psp_settings_assign(&s, "KEYS=wasd", PSP_SOURCE_FILE, error));
     assert(!psp_settings_bind(&s, "key.cross", "F", error));
     assert(!psp_settings_bind(&s, "key.nonsense", "F", error));   /* the host skips it */
     assert(psp_settings_bind(&s, "keyboard.cross", "F", error));
@@ -415,7 +413,7 @@ static void from_settings(void) {
     assert(!psp_settings_bind(&s, "key.cross", NULL, error) && !psp_settings_binding(&s, "key.cross"));
     build(&s);
     assert(bound(DEV_KEY, "cross", "Z") && bound(DEV_KEY, "cross", "Space"));
-    puts("input: the layouts and a preset's bind.* keys build the table");
+    puts("input: the layouts and a pack's bind.* keys build the table");
 }
 
 int main(void) {

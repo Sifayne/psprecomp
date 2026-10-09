@@ -6,7 +6,7 @@ pkg_check_modules(PSPRECOMP_SDL2 REQUIRED IMPORTED_TARGET sdl2 SDL2_ttf)
 if(NOT TARGET psprecomp_imgui)
     message(FATAL_ERROR "the host layer's menu needs a C++ compiler for Dear ImGui")
 endif()
-add_library(psprecomp_host STATIC present.c input.c save_dialog.c render_gl.c overlay.c ui.cpp
+add_library(psprecomp_host STATIC present.c input.c save_dialog.c render_gl.c overlay.c pages.c ui.cpp
     ${PROJECT_SOURCE_DIR}/third_party/imgui/backends/imgui_impl_sdl2.cpp
     ${PROJECT_SOURCE_DIR}/third_party/imgui/backends/imgui_impl_sdlrenderer2.cpp)
 set_source_files_properties(ui.cpp

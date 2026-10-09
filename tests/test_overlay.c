@@ -13,7 +13,7 @@
  *                        nothing until it is let go; mouse capture goes and
  *                        comes back; focus loss leaves it open
  *   test_overlay bind    press-to-bind, a live volume, and the change saved
- *                        to the preset the game was started with
+ *                        to the preferences file the game was started with
  *   test_overlay pad     controller only: open, walk the pages, choose,
  *                        resume */
 #define psp_sched_stop_all fixture_stop_all
@@ -34,19 +34,16 @@ void fixture_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
 }
 void fixture_ctrl_set_look(uint8_t rx, uint8_t ry) { (void)rx; (void)ry; }
 
+enum { T_KEYS = PSP_PLAYER_OPTIONS, T_MOUSE };
 static const psp_option_def options[] = {
-    {.key="WINDOW_SIZE",.env="PSPRECOMP_WINDOW_SIZE",.label="Window size",.page="Graphics",.help="",
-     .type=PSP_OPTION_SIZE,.dflt="960x544",.min=1,.max=16384},
     {.key="KEYS",.env="PSPRECOMP_KEYS",.label="Keyboard",.page="Controls",.help="",
      .type=PSP_OPTION_CHOICE,.dflt="wasd",.choices="classic|wasd",.labels="Classic|WASD",.flags=PSP_OPTION_LIVE},
     {.key="MOUSE",.env="PSPRECOMP_MOUSE",.label="Mouse",.page="Controls",.help="",
      .type=PSP_OPTION_CHOICE,.dflt="0",.choices="0|1",.labels="Off|On"},
-    {.key="VOLUME",.env="PSPRECOMP_VOLUME",.label="Volume",.page="Audio",.help="",
-     .type=PSP_OPTION_NUMBER,.dflt="100",.min=0,.max=100,.step=5,.format="%.0f%%",.flags=PSP_OPTION_LIVE},
 };
-static int resolve_mouse(psp_settings *s, char *error) { (void)error; s->mouse = s->number[2] != 0; return 0; }
+static int resolve_mouse(psp_settings *s, char *error) { (void)error; s->mouse = s->number[T_MOUSE] != 0; return 0; }
 const psp_settings_schema psp_title_settings = {
-    .title = "Menu test", .options = options, .count = 4, .resolve = resolve_mouse,
+    .title = "Menu test", .id = "menu-test", .options = options, .count = 2, .resolve = resolve_mouse,
 };
 const psp_title psp_title_info = { .name = "Menu test" };
 
@@ -59,7 +56,7 @@ static void one_frame(void) {
     psp_ui_begin();
     psp_ui_panel_begin();
     psp_ui_heading("Paused");
-    psp_ui_side_begin(200);
+    psp_ui_side_begin(200, 0);
     psp_ui_nav("Resume", 1);
     psp_ui_side_next();
     psp_ui_text("The game waits here.");
@@ -161,15 +158,14 @@ static void start_loop(const char *mode) {
     if (!strcmp(mode, "bind")) {
         /* A preferences file, as the launcher hands the game. */
         snprintf(preferences, sizeof preferences, "/tmp/psprecomp-menu-%d.ini", (int)getpid());
-        psp_presets book; psp_presets_defaults(&book);
+        psp_settings_file *f = psp_settings_file_new();
         psp_settings s; psp_settings_defaults(&s);
-        assert(!psp_presets_add(&book, "Mine", &s, error));
-        book.selected = book.count - 1;
-        assert(!psp_presets_save(&book, preferences, error));
-        assert(!psp_settings_load(&settings, preferences, NULL, error));
+        assert(f && !psp_settings_file_put(f, &s, error) && !psp_settings_file_write(f, preferences, error));
+        psp_settings_file_free(f);
+        assert(!psp_settings_load(&settings, preferences, error));
     } else {
         setenv("PSPRECOMP_MOUSE", "1", 1);
-        assert(!psp_settings_load(&settings, NULL, NULL, error));
+        assert(!psp_settings_load(&settings, NULL, error));
     }
     psp_settings_use(&settings);
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -339,9 +335,9 @@ static void bind(void) {
     input_row_sources(cross, INPUT_KEYBOARD, sources, sizeof sources);
     assert(!strcmp(sources, "F"));
     /* A live option: the volume. */
-    set_option(option("VOLUME"), "40");
+    set_option(PSP_OPT_VOLUME, "40");
     assert(atomic_load(&g_volume) == (int)(0.4 * 65536 + 0.5));
-    /* Closing saves both to the preset it was started with. */
+    /* Closing saves both to the file it was started with. */
     key(SDLK_ESCAPE, SDL_SCANCODE_ESCAPE, 1);
     key(SDLK_ESCAPE, SDL_SCANCODE_ESCAPE, 0);
     assert(waits_for(menu_shut));
@@ -351,11 +347,13 @@ static void bind(void) {
     assert(becomes(&published, 0x4000));
     key(SDLK_f, SDL_SCANCODE_F, 0);
     assert(becomes(&published, 0));
-    psp_presets book; char error[PSP_SETTINGS_ERROR];
-    assert(!psp_presets_load(&book, preferences, error));
-    const psp_settings *saved = &book.presets[psp_presets_find(&book, "Mine")].settings;
-    assert(!strcmp(psp_settings_binding(saved, "key.cross"), "F"));
-    assert(!strcmp(saved->value[3], "40"));
+    char error[PSP_SETTINGS_ERROR];
+    psp_settings_file *f = psp_settings_file_read(preferences, error);
+    psp_settings saved;
+    assert(f && !psp_settings_file_get(f, &saved, error));
+    psp_settings_file_free(f);
+    assert(!strcmp(psp_settings_binding(&saved, "key.cross"), "F"));
+    assert(!strcmp(saved.value[PSP_OPT_VOLUME], "40"));
     unlink(preferences);
     finish_loop("bind");
 }

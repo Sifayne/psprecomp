@@ -273,14 +273,22 @@ if(PSPRECOMP_HOST)
     # The player's launcher, on a schema of its own; it includes launcher.c.
     # Without a font the drawn half skips.
     # Named apart from the games' own launcher tests, which build alongside.
+    # An installed pack's launcher.so, as the importer builds one, in the
+    # packs folder the test names; its symbols from the launcher resolve
+    # against the test, which exports them as the launcher does.
+    add_library(test_pack_plugin MODULE test_pack_plugin.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/host/pack_api.c)
+    target_include_directories(test_pack_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    set_target_properties(test_pack_plugin PROPERTIES PREFIX "" OUTPUT_NAME launcher
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/packs/gamma)
     add_executable(test_player_launcher test_launcher.c)
-    target_link_libraries(test_player_launcher PRIVATE psprecomp_host)
+    target_link_libraries(test_player_launcher PRIVATE psprecomp_host ${CMAKE_DL_LIBS})
+    set_target_properties(test_player_launcher PROPERTIES ENABLE_EXPORTS ON)
+    add_dependencies(test_player_launcher test_pack_plugin)
     if(MSVC)
         target_compile_options(test_player_launcher PRIVATE /UNDEBUG)
     else()
         target_compile_options(test_player_launcher PRIVATE -UNDEBUG)
     endif()
-    add_test(NAME launcher COMMAND test_player_launcher)
-    set_tests_properties(launcher PROPERTIES
-        SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy")
+    add_test(NAME launcher COMMAND test_player_launcher ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(launcher PROPERTIES TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy")
 endif()

@@ -44,10 +44,26 @@ void psp_ui_clear(void);
  * text ends at "##", which begins what tells it from another. */
 void psp_ui_panel_begin(void);          /* centred over the dimmed game */
 void psp_ui_panel_end(void);
-void psp_ui_side_begin(float width);    /* the list of pages, then the page */
+void psp_ui_screen_begin(void);         /* the whole window: the launcher */
+void psp_ui_screen_end(void);
+/* The list of pages, then the page, leaving footer UI units below them. */
+void psp_ui_side_begin(float width, float footer);
 void psp_ui_side_next(void);
 void psp_ui_side_end(void);
 int  psp_ui_nav(const char *label, int selected);
+void psp_ui_group(const char *text);    /* a caption over a group of nav entries */
+/* One of a row of tabs; the caller puts them on one line. */
+int  psp_ui_tab(const char *label, int selected);
+int  psp_ui_button_primary(const char *label);
+/* The room a button with this label takes, left empty. */
+void psp_ui_gap(const char *label);
+/* The next widget at the right edge, width UI units of buttons wide; and
+ * how wide a button with this label is. */
+void psp_ui_right(float width);
+float psp_ui_button_width(const char *label);
+/* A list that scrolls, footer UI units clear of the bottom. */
+void psp_ui_scroll_begin(const char *id, float footer);
+void psp_ui_scroll_end(void);
 void psp_ui_heading(const char *text);
 void psp_ui_text(const char *text);
 void psp_ui_note(const char *text);     /* muted */
@@ -78,6 +94,12 @@ void psp_ui_prompt(const char *title, const char *text);
 int  psp_ui_confirm(const char *title, const char *text, const char *yes, const char *no);
 /* The question withdrawn without an answer, when its asker no longer waits. */
 void psp_ui_confirm_close(void);
+/* A line of text asked for, edited in buf: 1 when given, 0 when not, -1
+ * while it waits. Escape answers no, as it does a confirmation. */
+int  psp_ui_ask_text(const char *title, const char *hint, char *buf, int size, const char *yes, const char *no);
+/* Whether a popup -- a list opened, a question -- has the keys, so Escape
+ * is its, not the screen's. */
+int  psp_ui_popup_open(void);
 
 /* Pictures the menu shows -- a save state's thumbnail -- by slot,
  * 0..PSP_UI_IMAGES-1: RGBA pixels, w x h, given again whenever they change;

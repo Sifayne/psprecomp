@@ -8,7 +8,7 @@
  *   test_present controller       every button of the PSP layout on a virtual
  *                                 controller, View + Menu held, hot-plug
  *   test_present modern           every button and trigger of the modern layout
- *   test_present rebind           a preset's bind.pad.* keys, through the loop
+ *   test_present rebind           a pack's bind.pad.* keys, through the loop
  *   test_present last             ACTIVE_PAD=last: the pad pressed last has the lane */
 #define psp_sched_stop_all fixture_stop_all
 #define psp_ctrl_set fixture_ctrl_set
@@ -22,25 +22,22 @@ void fixture_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) { (void)ax; (voi
 void fixture_ctrl_set_look(uint8_t rx, uint8_t ry) { (void)rx; (void)ry; }
 
 /* The player options present.c reads. A title's real schema has more. */
+enum { T_KEYS = PSP_PLAYER_OPTIONS, T_MOUSE, T_GAMEPAD };
 static int resolve_gamepad(psp_settings *s, char *error) {
     (void)error;
-    s->gamepad = s->input = s->number[3] != 0;
+    s->gamepad = s->input = s->number[T_GAMEPAD] != 0;
     return 0;
 }
 static const psp_option_def options[] = {
-    {.key="WINDOW_SIZE",.env="PSPRECOMP_WINDOW_SIZE",.label="Window size",.page="Graphics",.help="",
-     .type=PSP_OPTION_SIZE,.dflt="960x544",.min=1,.max=16384},
     {.key="KEYS",.env="PSPRECOMP_KEYS",.label="Keyboard",.page="Controls",.help="",
      .type=PSP_OPTION_CHOICE,.dflt="classic",.choices="classic|wasd",.labels="Classic|WASD"},
     {.key="MOUSE",.env="PSPRECOMP_MOUSE",.label="Mouse",.page="Controls",.help="",
      .type=PSP_OPTION_CHOICE,.dflt="0",.choices="0|1",.labels="Off|On"},
     {.key="GAMEPAD",.env="PSPRECOMP_GAMEPAD",.label="Controller",.page="Controls",.help="",
      .type=PSP_OPTION_CHOICE,.dflt="classic",.choices="classic|modern",.labels="Classic|Modern"},
-    {.key="ACTIVE_PAD",.env="PSPRECOMP_ACTIVE_PAD",.label="Active controller",.page="Controls",.help="",
-     .type=PSP_OPTION_CHOICE,.dflt="first",.choices="first|last",.labels="First connected|Last used"},
 };
 const psp_settings_schema psp_title_settings = {
-    .title = "Presentation test", .options = options, .count = 5, .resolve = resolve_gamepad,
+    .title = "Presentation test", .id = "present-test", .options = options, .count = 3, .resolve = resolve_gamepad,
 };
 /* Every carrier named, as a title with Modern controls names them. */
 static const psp_title_action ACTIONS[10] = {

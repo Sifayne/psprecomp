@@ -10,22 +10,26 @@
  *
  * Its pages come from registries, so a title writes no UI code: Save state
  * and Load state from the state folder (psprecomp/state.h), Bindings from the
- * input's table, one page per page of the title's settings schema, then
- * Performance and Quit. The schema's "Save states" page is shown under the
- * Load state list rather than as a page of its own. A change applies at once where the host can
- * apply it -- the bindings, the keyboard layout, the active controller, the
- * window mode, the volume (PSP_OPTION_LIVE) -- and otherwise the next time
- * the game starts. On closing, changes are written back to the preset the
- * game was started with, never what the environment set.
+ * input's table, one page per page of the settings -- the player's and the
+ * pack's, merged by name, drawn by pages.c as the launcher draws them --
+ * then Performance and Quit. The "Save states" page is shown under the Load
+ * state list rather than as a page of its own. A change applies at once
+ * where the host can apply it -- the bindings, the keyboard layout, the
+ * active controller, the window mode, the volume (PSP_OPTION_LIVE) -- and
+ * otherwise the next time the game starts. On closing, changes are written
+ * back to the preferences file the game was started with, never what the
+ * environment set.
  *
  * The C here is the menu; src/host/ui.cpp draws it with Dear ImGui. Both run
  * on the SDL thread only. */
 #include "overlay.h"
 
 #include "input.h"
+#include "pages.h"
 #include "ui.h"
 
 #include "psprecomp/clock.h"
+#include "psprecomp/hle.h"
 #include "psprecomp/host/present.h"
 #include "psprecomp/host/settings.h"
 #include "psprecomp/host/title.h"
@@ -43,7 +47,7 @@
 #include <direct.h>
 #endif
 
-enum { PAGES_MAX = 12, CAPTURE_MS = 5000, TOAST_MS = 2500 };
+enum { CAPTURE_MS = 5000, TOAST_MS = 2500 };
 enum { PAGE_RESUME, PAGE_SAVE, PAGE_LOAD, PAGE_BINDINGS, PAGE_SCHEMA };   /* then the schema's, Performance, Quit */
 /* The state files: ten slots, the one written on quitting, and the one a
  * load keeps for undoing it. */
@@ -57,9 +61,10 @@ static struct {
     psp_settings edit;          /* what the menu shows and changes */
     int dirty;
     char status[PSP_SETTINGS_ERROR + 64];
-    /* The schema's pages, in the order their options first appear. */
+    /* The settings' pages (pages_list), and how their rows are drawn. */
     const char *pages[PAGES_MAX];
     int page_count;
+    pages_context rows;
     /* Press-to-bind: the row and device waiting for a control. It takes one
      * only after everything held is let go, so the press that chose the cell
      * is not the binding. */
@@ -81,19 +86,8 @@ static struct {
     int shown;                  /* a frame is up: the menu's or a toast's */
 } o;
 
-static const psp_settings_schema *schema(void) { return psp_settings_active_schema(); }
-
-static int option(const char *key) { return psp_settings_find(key); }
-
 static void find_pages(void) {
-    o.page_count = 0;
-    for (int k = 0; k < schema()->count; k++) {
-        const psp_option_def *d = &schema()->options[k];
-        if ((d->flags & PSP_OPTION_HIDDEN) || !d->page || !strcmp(d->page, STATES_PAGE)) continue;
-        int seen = 0;
-        for (int p = 0; p < o.page_count; p++) seen |= !strcmp(o.pages[p], d->page);
-        if (!seen && o.page_count < PAGES_MAX) o.pages[o.page_count++] = d->page;
-    }
+    o.page_count = pages_list(0, psp_settings_count(), STATES_PAGE, o.pages, PAGES_MAX);
 }
 
 static int page_performance(void) { return PAGE_SCHEMA + o.page_count; }
@@ -103,35 +97,31 @@ static int page_quit(void) { return PAGE_SCHEMA + o.page_count + 1; }
 
 static void apply_live(void) {
     input_rebuild(&o.edit);
-    const int volume = option("VOLUME");
-    present_set_volume(volume >= 0 ? o.edit.number[volume] / 100.0 : 1.0, o.mute);
-    const int mode = option("WINDOW_MODE");
-    if (mode >= 0 && (schema()->options[mode].flags & PSP_OPTION_LIVE))
-        present_set_fullscreen(o.edit.number[mode] != 0);
+    present_set_volume(o.edit.number[PSP_OPT_VOLUME] / 100.0, o.mute);
+    present_set_fullscreen(o.edit.number[PSP_OPT_WINDOW_MODE] != 0);
 }
 
 static void set_option(int k, const char *value) {
     char error[PSP_SETTINGS_ERROR];
     psp_settings next = o.edit;
-    if (psp_settings_set(&next, k, value, PSP_SOURCE_PRESET, error) || psp_settings_resolve(&next, error)) {
+    if (psp_settings_set(&next, k, value, PSP_SOURCE_FILE, error) || psp_settings_resolve(&next, error)) {
         snprintf(o.status, sizeof o.status, "%s", error);
         return;
     }
     o.edit = next;
     o.dirty = 1;
-    if (schema()->options[k].flags & PSP_OPTION_LIVE) apply_live();
+    if (psp_settings_option(k)->flags & PSP_OPTION_LIVE) apply_live();
 }
 
 static void save(void) {
     if (!o.dirty) return;
     char error[PSP_SETTINGS_ERROR];
-    const char *preset = NULL;
-    if (!psp_settings_origin(&preset))
+    if (!psp_settings_origin())
         snprintf(o.status, sizeof o.status, "Started without a preferences file: changes last until the game closes.");
     else if (psp_settings_save_origin(&o.edit, error))
         snprintf(o.status, sizeof o.status, "Not saved: %s", error);
     else {
-        snprintf(o.status, sizeof o.status, "Saved to the preset \"%s\".", preset);
+        snprintf(o.status, sizeof o.status, "Settings saved.");
         o.dirty = 0;
     }
     fprintf(stderr, "present: menu: %s\n", o.status);
@@ -222,11 +212,10 @@ static void capture_event(const SDL_Event *e) {
 static void event(const SDL_Event *e) {
     if (!o.open) return;
     if (o.capturing) { capture_event(e); return; }
-    if (o.confirm && e->type == SDL_KEYDOWN && !e->key.repeat && e->key.keysym.sym == SDLK_ESCAPE) {
-        o.confirm = 0;
-        return;
-    }
-    if (e->type == SDL_KEYDOWN && !e->key.repeat && e->key.keysym.sym == SDLK_ESCAPE) { close_menu(); return; }
+    /* Escape closes an open list or answers a question no; otherwise it
+     * closes the menu. */
+    if (e->type == SDL_KEYDOWN && !e->key.repeat && e->key.keysym.sym == SDLK_ESCAPE &&
+        !psp_ui_popup_open() && !o.confirm) { close_menu(); return; }
     if ((e->type == SDL_CONTROLLERBUTTONDOWN || e->type == SDL_CONTROLLERBUTTONUP) && e->cbutton.which == input_pad_id()) {
         const unsigned bit = e->cbutton.button == SDL_CONTROLLER_BUTTON_BACK ? 1u :
                              e->cbutton.button == SDL_CONTROLLER_BUTTON_START ? 2u : 0u;
@@ -248,16 +237,11 @@ static void event(const SDL_Event *e) {
 
 static void option_row(int k);
 
-/* The options on the schema's "Save states" page, by key; a title without
- * them gets "ask first" and "start fresh". */
+/* The player's "Save states" options. */
 static int load_mode(void) {             /* 0 ask first, 1 load at once, 2 keep an undo */
-    const int k = option("STATE_LOAD");
-    return k >= 0 ? (int)o.edit.number[k] : 0;
+    return (int)o.edit.number[PSP_OPT_STATE_LOAD];
 }
-static int continue_at_start(void) {
-    const int k = option("STATE_START");
-    return k >= 0 && o.edit.number[k] != 0;
-}
+static int continue_at_start(void) { return o.edit.number[PSP_OPT_STATE_START] != 0; }
 
 static void slot_path(int slot, char *out, size_t size) {
     char name[24];
@@ -483,10 +467,8 @@ static void load_page(void) {
         }
     }
     psp_ui_separator();
-    for (int k = 0; k < schema()->count; k++) {
-        const psp_option_def *d = &schema()->options[k];
-        if (!(d->flags & PSP_OPTION_HIDDEN) && d->page && !strcmp(d->page, STATES_PAGE)) option_row(k);
-    }
+    for (int k = 0; k < psp_settings_count(); k++)
+        if (pages_on(k, STATES_PAGE)) option_row(k);
 }
 
 static void confirm_prompt(void) {
@@ -509,88 +491,19 @@ static void confirm_prompt(void) {
 
 /* ---- pages -------------------------------------------------------------------------- */
 
-/* The index-th '|'-separated field. */
-static int field(const char *list, int index, char *out, size_t size) {
-    if (!list) return 0;
-    while (index-- > 0) { list = strchr(list, '|'); if (!list) return 0; list++; }
-    const size_t n = strcspn(list, "|");
-    snprintf(out, size, "%.*s", (int)n, list);
-    return 1;
-}
-
 static void option_row(int k) {
-    const psp_option_def *d = &schema()->options[k];
-    const int locked = o.edit.source[k] == PSP_SOURCE_ENV;
-    const int live = (d->flags & PSP_OPTION_LIVE) != 0;
-    char label[160], help[1024];
-    snprintf(label, sizeof label, "%s%s", d->label, live ? "" : " *");
-    snprintf(help, sizeof help, "%s%s%s", d->help ? d->help : "",
-             live ? "" : " Applies the next time the game starts.",
-             locked ? " Set by the environment for this run." : "");
-    psp_ui_disabled_begin(locked);
-    if (d->type == PSP_OPTION_CHOICE) {
-        char names[16][PSP_SETTINGS_VALUE];
-        const char *labels[16];
-        int count = 0;
-        while (count < 16 && field(d->labels ? d->labels : d->choices, count, names[count], sizeof names[count])) {
-            labels[count] = names[count];
-            count++;
-        }
-        int index = (int)o.edit.number[k];
-        if (psp_ui_choice(label, &index, labels, count)) {
-            char value[PSP_SETTINGS_VALUE];
-            if (field(d->choices, index, value, sizeof value)) set_option(k, value);
-        }
-    } else if (d->type == PSP_OPTION_SIZE || (d->type == PSP_OPTION_INTEGER && d->max - d->min > 10000)) {
-        char value[PSP_SETTINGS_VALUE], line[sizeof label + sizeof value + 2];
-        psp_option_label(&o.edit, k, value, sizeof value);
-        snprintf(line, sizeof line, "%s: %s", label, value);
-        psp_ui_text(line);
-    } else {
-        /* A number; one with a special word (Auto, Off, the game's own) is
-         * first a choice between that and a value of the player's. */
-        const double scale = d->scale ? d->scale : 1;
-        int custom = !(d->special && o.edit.number[k] < 0);
-        if (d->special) {
-            char special[64];
-            snprintf(special, sizeof special, "%s", d->special_label ? d->special_label : d->special);
-            if (!d->special_label && special[0] >= 'a' && special[0] <= 'z') special[0] -= 'a' - 'A';
-            const char *labels[2] = { special, "Custom" };
-            if (psp_ui_choice(label, &custom, labels, 2)) {
-                char value[PSP_SETTINGS_VALUE];
-                snprintf(value, sizeof value, "%.9g", d->min > 0 ? d->min : 0);
-                set_option(k, custom ? value : d->special);
-            }
-            psp_ui_help(help);
-        }
-        if (custom) {
-            double v = o.edit.number[k] * scale;
-            char bare[PSP_SETTINGS_NAME + 4];
-            snprintf(bare, sizeof bare, "##%s", d->key);
-            if (psp_ui_number(d->special ? bare : label, &v, d->min * scale, d->max * scale,
-                              d->format ? d->format : "%.2f")) {
-                double n = v / scale;
-                if (d->step > 0) n = d->min + floor((n - d->min) / d->step + 0.5) * d->step;
-                if (d->type == PSP_OPTION_INTEGER) n = floor(n + 0.5);
-                char value[PSP_SETTINGS_VALUE];
-                snprintf(value, sizeof value, "%.9g", n < d->min ? d->min : n > d->max ? d->max : n);
-                set_option(k, value);
-            }
-        }
-    }
-    psp_ui_help(help);
-    psp_ui_disabled_end();
+    char value[PSP_SETTINGS_VALUE];
+    if (pages_option(&o.edit, k, &o.rows, value, sizeof value)) set_option(k, value);
 }
 
 static void schema_page(const char *page) {
     psp_ui_heading(page);
     int later = 0;
-    for (int k = 0; k < schema()->count; k++) {
-        const psp_option_def *d = &schema()->options[k];
-        if ((d->flags & PSP_OPTION_HIDDEN) || !d->page || strcmp(d->page, page)) continue;
+    for (int k = 0; k < psp_settings_count(); k++) {
+        if (!pages_on(k, page)) continue;
         option_row(k);
-        later |= !(d->flags & PSP_OPTION_LIVE);
-        if (!strcmp(d->key, "VOLUME")) {
+        later |= !(psp_settings_option(k)->flags & PSP_OPTION_LIVE);
+        if (k == PSP_OPT_VOLUME) {
             if (psp_ui_toggle("Mute", &o.mute)) apply_live();
             psp_ui_help("Silence the game until it is unmuted. Not saved.");
         }
@@ -647,10 +560,6 @@ static void performance_page(void) {
         snprintf(line, sizeof line, "Played: %.0f s, paused: %.0f s", guest / 1e6, psp_clock_held_us() / 1e6);
         psp_ui_text(line);
     }
-    if (option("VOLUME") < 0) {
-        if (psp_ui_toggle("Mute", &o.mute)) apply_live();
-        psp_ui_help("Silence the game until it is unmuted. Not saved.");
-    }
 }
 
 static void quit_page(void) {
@@ -690,7 +599,7 @@ static void frame(void) {
     char title[160];
     snprintf(title, sizeof title, "%s -- paused", psp_title_info.name ? psp_title_info.name : "Game");
     psp_ui_accent(title);
-    psp_ui_side_begin(220);
+    psp_ui_side_begin(220, 0);
     const int resume = psp_ui_nav("Resume", o.page == PAGE_RESUME);
     if (psp_ui_nav("Save state", o.page == PAGE_SAVE) && o.page != PAGE_SAVE) { o.page = PAGE_SAVE; read_slots(); }
     if (psp_ui_nav("Load state", o.page == PAGE_LOAD) && o.page != PAGE_LOAD) { o.page = PAGE_LOAD; read_slots(); }
@@ -740,6 +649,7 @@ static void start(SDL_Window *win, SDL_Renderer *ren) {
     o.started = 1;
     o.win = win;
     o.edit = *psp_settings_current();
+    o.rows = (pages_context){ .menu = 1, .movie_available = psp_mpeg_decoding_available() };
     find_pages();
     read_slots();
 }

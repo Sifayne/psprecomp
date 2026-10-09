@@ -30,6 +30,7 @@ static struct {
     char shown_help[512];       // ... and what the help area shows
     int focus_next;
     int table_column;
+    float footer;               // what the side list and its page leave below
 } u;
 
 // The launcher's colours (src/host/launcher.c), so the player is one app.
@@ -321,21 +322,95 @@ extern "C" void psp_ui_panel_begin(void) {
 
 extern "C" void psp_ui_panel_end(void) { ImGui::End(); }
 
-extern "C" void psp_ui_side_begin(float width) {
-    ImGui::BeginChild("##side", ImVec2(width * u.scale, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
+extern "C" void psp_ui_screen_begin(void) {
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->Pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(vp->Size, ImGuiCond_Always);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, BG);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::Begin("##screen", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+}
+
+extern "C" void psp_ui_screen_end(void) { ImGui::End(); }
+
+extern "C" void psp_ui_side_begin(float width, float footer) {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, PANEL);
+    ImGui::BeginChild("##side", ImVec2(width * u.scale, -footer * u.scale),
+                      ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
+    u.footer = footer;
 }
 extern "C" void psp_ui_side_next(void) {
     ImGui::EndChild();
     ImGui::SameLine();
-    ImGui::BeginChild("##page", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
+    ImGui::BeginChild("##page", ImVec2(0, -u.footer * u.scale), ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
 }
-extern "C" void psp_ui_side_end(void) { ImGui::EndChild(); }
+extern "C" void psp_ui_side_end(void) {
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
 
 extern "C" int psp_ui_nav(const char *label, int selected) {
     const int chosen = ImGui::Selectable(label, selected != 0);
     if (selected) take_focus();
     return chosen;
 }
+
+extern "C" void psp_ui_group(const char *text) {
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, MUTED);
+    ImGui::PushFont(NULL, ImGui::GetStyle().FontSizeBase * 0.8f);
+    ImGui::TextUnformatted(text);
+    ImGui::PopFont();
+    ImGui::PopStyleColor();
+}
+
+extern "C" int psp_ui_tab(const char *label, int selected) {
+    ImGui::PushStyleColor(ImGuiCol_Text, selected ? TEXT : MUTED);
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    const int chosen = ImGui::Button(label);
+    const ImVec2 size = ImGui::GetItemRectSize();
+    if (selected)
+        ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(at.x, at.y + size.y - 3 * u.scale),
+                                                  ImVec2(at.x + size.x, at.y + size.y), ImGui::GetColorU32(ACCENT));
+    ImGui::PopStyleColor();
+    if (selected) take_focus();
+    return chosen;
+}
+
+extern "C" int psp_ui_button_primary(const char *label) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ACCENT);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, rgb(247, 202, 122));
+    ImGui::PushStyleColor(ImGuiCol_Text, BG);
+    const int chosen = ImGui::Button(label);
+    ImGui::PopStyleColor(3);
+    take_focus();
+    return chosen;
+}
+
+extern "C" void psp_ui_gap(const char *label) {
+    const ImVec2 text = ImGui::CalcTextSize(label, NULL, true);
+    const ImGuiStyle &st = ImGui::GetStyle();
+    ImGui::Dummy(ImVec2(text.x + st.FramePadding.x * 2, text.y + st.FramePadding.y * 2));
+}
+
+extern "C" float psp_ui_button_width(const char *label) {
+    return (ImGui::CalcTextSize(label, NULL, true).x + ImGui::GetStyle().FramePadding.x * 2) / u.scale;
+}
+
+extern "C" void psp_ui_right(float width) {
+    ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - width * u.scale);
+}
+
+extern "C" void psp_ui_scroll_begin(const char *id, float footer) {
+    ImGui::BeginChild(id, ImVec2(0, -footer * u.scale), ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
+}
+
+extern "C" void psp_ui_scroll_end(void) { ImGui::EndChild(); }
 
 extern "C" void psp_ui_heading(const char *text) {
     ImGui::PushFont(NULL, ImGui::GetStyle().FontSizeBase * 1.3f);
@@ -391,7 +466,10 @@ extern "C" int psp_ui_choice(const char *label, int *index, const char *const *l
 extern "C" int psp_ui_number(const char *label, double *value, double min, double max, const char *format) {
     ImGui::PushID(label);
     row_label(label);
-    const int changed = ImGui::SliderScalar("##number", ImGuiDataType_Double, value, &min, &max, format);
+    // A range over decades -- a sensitivity from 0.001 to 1000 -- slides by
+    // ratio, so each part of it gets its share of the bar.
+    const ImGuiSliderFlags flags = min > 0 && max / min >= 100 ? ImGuiSliderFlags_Logarithmic : 0;
+    const int changed = ImGui::SliderScalar("##number", ImGuiDataType_Double, value, &min, &max, format, flags);
     take_focus();
     ImGui::PopID();
     return changed;
@@ -479,11 +557,41 @@ extern "C" int psp_ui_confirm(const char *title, const char *text, const char *y
         // A takes it at once and the arrows move to the other.
         if (ImGui::IsWindowAppearing()) { ImGui::SetItemDefaultFocus(); ImGui::SetNavCursorVisible(true); }
         ImGui::SameLine();
-        if (ImGui::Button(no)) answer = 0;
+        if (ImGui::Button(no) || (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))) answer = 0;
         if (answer >= 0) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
     return answer;
+}
+
+extern "C" int psp_ui_ask_text(const char *title, const char *hint, char *buf, int size, const char *yes, const char *no) {
+    if (!ImGui::IsPopupOpen("##ask")) ImGui::OpenPopup("##ask");
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(520 * u.scale, 0), ImGuiCond_Always);
+    int answer = -1;
+    if (ImGui::BeginPopupModal("##ask", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                               ImGuiWindowFlags_NoSavedSettings)) {
+        psp_ui_heading(title);
+        if (hint) psp_ui_note(hint);
+        // The text has the keys from the start; Enter gives it.
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputText("##text", buf, (size_t)size,
+                             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll)) answer = 1;
+        ImGui::Spacing();
+        if (ImGui::Button(yes)) answer = 1;
+        ImGui::SameLine();
+        if (ImGui::Button(no) || (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))) answer = 0;
+        if (answer >= 0) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    return answer;
+}
+
+extern "C" int psp_ui_popup_open(void) {
+    return u.started && ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
 }
 
 extern "C" void psp_ui_confirm_close(void) {
