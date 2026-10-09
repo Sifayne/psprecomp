@@ -66,7 +66,8 @@ static const psp_title_module *known(const uint8_t *file, size_t len) {
 
 /* The runtime's loader: the module a file is, mapped in where its code was
  * recompiled to run, relocated by the same code the recompiler moved it with
- * (loader.c), so the image and the C agree. */
+ * (loader.c), so the image and the C agree. Its code is registered already
+ * (psp_host_modules_start). */
 static int load(const uint8_t *file, size_t len, psp_module_image *out) {
     const psp_title_module *k = known(file, len);
     if (!k) return (int)SCE_ERROR_KERNEL_UNKNOWN_MODULE_FILE;
@@ -134,7 +135,6 @@ static int load(const uint8_t *file, size_t len, psp_module_image *out) {
     }
     free(ex);
 
-    k->register_code();
     psp_blob_free(&b);
     return 0;
 }
@@ -156,6 +156,18 @@ int psp_host_modules_start(const char *module_path) {
     if (psp_mem_grow_module(end) != 0) {
         fprintf(stderr, "psprecomp: no room for the game's modules up to 0x%08X beside its executable\n", end);
         return -1;
+    }
+    /* Every module's code is registered now rather than when the game loads
+     * it. The set is then the same for the whole run, which is what a save
+     * state counts on: it records how many resume sites the build has, and a
+     * fresh process loading it has loaded no module yet (docs/MODULES.md, M5).
+     * A jump into a module not loaded runs its code on zeroed memory where
+     * the console would fault -- only a game already lost would see it. */
+    for (unsigned i = 0; i < psp_title_info.module_count; i++) {
+        int seen = 0;
+        for (unsigned j = 0; j < i; j++)
+            seen |= psp_title_info.modules[j].register_code == psp_title_info.modules[i].register_code;
+        if (!seen) psp_title_info.modules[i].register_code();
     }
     psp_modules_set_loader(load);
     return 0;

@@ -84,6 +84,9 @@ typedef struct {
 } module;
 
 static module g_mod[MODULES_MAX];
+/* Threads inside a module's start or stop, waiting on it from a host frame
+ * that a save state could not hold. */
+static int g_busy;
 static psp_module_loader g_loader;
 static psp_module_image  g_main;
 static int               g_have_main;
@@ -125,11 +128,17 @@ static module *by_address(uint32_t addr) {
     return NULL;
 }
 
-static void forget(module *m) {
-    if (m->block) psp_sysmem_release(m->block);
+/* An entry's memory, without touching the guest's: a state restores the
+ * allocator itself. */
+static void clear(module *m) {
     free(m->im.export_nid);
     free(m->im.export_addr);
     memset(m, 0, sizeof *m);
+}
+
+static void forget(module *m) {
+    if (m->block) psp_sysmem_release(m->block);
+    clear(m);
 }
 
 /* A firmware call made on the guest's behalf, from inside another. The
@@ -153,8 +162,19 @@ static uint32_t nested(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
  * gave one, else by the module's thread parameter, else the defaults, and
  * created under the module's $gp. Returns 0 with the function's answer in
  * *status, or the error that kept it from running. */
+static uint32_t run_thread_busy(const module *m, uint32_t entry, const char *name,
+                                uint32_t argsize, uint32_t argp, uint32_t opt, uint32_t *status);
+
 static uint32_t run_thread(const module *m, uint32_t entry, const char *name,
                            uint32_t argsize, uint32_t argp, uint32_t opt, uint32_t *status) {
+    g_busy++;
+    const uint32_t rc = run_thread_busy(m, entry, name, argsize, argp, opt, status);
+    g_busy--;
+    return rc;
+}
+
+static uint32_t run_thread_busy(const module *m, uint32_t entry, const char *name,
+                                uint32_t argsize, uint32_t argp, uint32_t opt, uint32_t *status) {
     uint32_t priority = m->im.start_priority ? m->im.start_priority : MODULE_INIT_PRIORITY;
     uint32_t stack = m->im.start_stack;
     uint32_t attr = m->im.start_attr;
@@ -393,12 +413,66 @@ static void hle_QueryModuleInfo(void) {
 
 /* ---- state ----------------------------------------------------------------- */
 
-/* A save state does not hold the module table yet (docs/MODULES.md, M5). */
+/* The module table in a save state (docs/MODULES.md, M5). Guest memory, the
+ * allocator and the interrupt contexts come back with the state; the modules'
+ * code is registered at boot. What is left is this table: each entry as it
+ * stands, then every entry's exports, in order. A state is the build's own,
+ * so the entry is written as it is laid out, its export pointers aside. */
 static const char *refuse(void) {
-    return psp_modules_loaded() ? "the game has loaded a module of its own" : NULL;
+    return g_busy ? "a module of the game's is starting or stopping" : NULL;
 }
 
-static const psp_state_part g_part = { .name = "modules", .refuse = refuse };
+static int state_save(psp_state_writer *w) {
+    module entries[MODULES_MAX];
+    uint32_t exports[2 * 4096];
+    int n = 0, nx = 0;
+    for (int i = 0; i < MODULES_MAX; i++) {
+        if (!g_mod[i].used) continue;
+        entries[n] = g_mod[i];
+        entries[n].im.export_nid = entries[n].im.export_addr = NULL;
+        for (int k = 0; k < g_mod[i].im.nexports; k++) {
+            if (nx + 2 > (int)(sizeof exports / sizeof *exports)) return -1;
+            exports[nx++] = g_mod[i].im.export_nid[k];
+            exports[nx++] = g_mod[i].im.export_addr[k];
+        }
+        n++;
+    }
+    return psp_state_put(w, "modules", entries, (size_t)n * sizeof *entries) ||
+           psp_state_put(w, "modexps", exports, (size_t)nx * sizeof *exports) ? -1 : 0;
+}
+
+static int state_load(psp_state_reader *r, char *why, size_t size) {
+    for (int i = 0; i < MODULES_MAX; i++) clear(&g_mod[i]);
+    size_t bytes = 0, xbytes = 0;
+    const module *in = psp_state_get(r, "modules", &bytes);
+    const uint32_t *x = psp_state_get(r, "modexps", &xbytes);
+    if (!in) return 0;   /* a state from before any module: none loaded */
+    const size_t n = bytes / sizeof *in, nx = x ? xbytes / sizeof *x : 0;
+    size_t at = 0;
+    for (size_t i = 0; i < n && i < MODULES_MAX; i++) {
+        module *m = &g_mod[i];
+        *m = in[i];
+        const int k = m->im.nexports;
+        m->im.export_nid = (uint32_t *)malloc((size_t)(k ? k : 1) * sizeof(uint32_t));
+        m->im.export_addr = (uint32_t *)malloc((size_t)(k ? k : 1) * sizeof(uint32_t));
+        if (!m->im.export_nid || !m->im.export_addr || at + 2 * (size_t)k > nx) {
+            snprintf(why, size, "the state's module table is incomplete");
+            return -1;
+        }
+        for (int e = 0; e < k; e++, at += 2) {
+            m->im.export_nid[e] = x[at];
+            m->im.export_addr[e] = x[at + 1];
+        }
+    }
+    return 0;
+}
+
+static void state_drop(void) {
+    for (int i = 0; i < MODULES_MAX; i++) clear(&g_mod[i]);
+}
+
+static const psp_state_part g_part = { .name = "modules", .refuse = refuse, .save = state_save,
+                                       .load = state_load, .drop = state_drop };
 
 void psp_modulemgr_init(void) {
     for (int i = 0; i < MODULES_MAX; i++) if (g_mod[i].used) forget(&g_mod[i]);

@@ -110,7 +110,7 @@ typedef struct {
     const char *sha1;               /* lowercase hex */
     const char *image;              /* file name, beside module.elf */
     uint32_t base, size;            /* where it lives, and how far it reaches */
-    void (*register_code)(void);    /* psp_recomp_register_module_<n> */
+    void (*register_code)(void);    /* psp_recomp_register_module_<n>, called at boot */
 } psp_title_module;
 
 typedef struct {
