@@ -431,6 +431,12 @@ int psp_io_path_info(const char *guest, uint64_t *size, int *is_dir);
 /* Names directly under a guest directory: up to cap entries of 63 chars.
  * Returns the count, or -1 when not a directory. */
 int psp_io_list_names(const char *guest, char names[][64], int cap);
+/* A file's bytes, whole, as the guest would read them: from the disc image
+ * when the path is on it, else the host tree. Or a file the guest has open.
+ * malloc'd, or NULL when there is no such file. sceKernelLoadModule reads
+ * modules this way (docs/MODULES.md). */
+uint8_t *psp_io_read_whole(const char *guest, size_t *len);
+uint8_t *psp_io_read_fd(uint32_t fd, size_t *len);
 
 void psp_misc_init(void);
 void psp_misc_register(void);

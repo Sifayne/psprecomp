@@ -217,7 +217,7 @@ uint32_t psp_rebase_image(elf_info *e, uint32_t base, int *err) {
     /* Wraps when base < lo, which shifts down; the sums wrap back. */
     const uint32_t shift = base - lo;
     for (int i = 0; i < e->nsegments && i < 8; i++) e->seg[i].addr += shift;
-    e->entry += shift;
+    if (e->entry != 0xFFFFFFFFu) e->entry += shift;   /* none stays none */
     e->text_addr += shift;
     if (e->stub_addr) e->stub_addr += shift;
     if (e->modinfo_addr) e->modinfo_addr += shift;

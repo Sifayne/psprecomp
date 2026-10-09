@@ -34,6 +34,10 @@ add_executable(test_kirk test_kirk.c)
 target_link_libraries(test_kirk PRIVATE allegrex_core)
 add_test(NAME kirk COMMAND test_kirk)
 
+add_executable(test_modules test_modules.c)
+target_link_libraries(test_modules PRIVATE psprecomp allegrex_core)
+add_test(NAME modules COMMAND test_modules)
+
 add_executable(test_reloc test_reloc.c)
 target_link_libraries(test_reloc PRIVATE allegrex_core)
 add_test(NAME reloc COMMAND test_reloc)

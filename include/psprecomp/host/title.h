@@ -102,6 +102,17 @@ static inline uint8_t psp_title_key_axis(const psp_title_input *in, int along, i
 
 struct psp_audio_backend;           /* psprecomp/host/present.h */
 
+/* A module the game loads at run time, recompiled into it when the game was
+ * prepared (docs/MODULES.md). The boot host's loader knows it by the SHA-1 of
+ * the file the game reads, and maps its image -- decrypted and inflated, in
+ * the folder beside module.elf -- at the base its code was recompiled for. */
+typedef struct {
+    const char *sha1;               /* lowercase hex */
+    const char *image;              /* file name, beside module.elf */
+    uint32_t base, size;            /* where it lives, and how far it reaches */
+    void (*register_code)(void);    /* psp_recomp_register_module_<n> */
+} psp_title_module;
+
 typedef struct {
     const char *name;               /* the window title's first part */
     unsigned capabilities;          /* PSP_TITLE_* */
@@ -138,6 +149,10 @@ typedef struct {
     void (*settings)(psp_settings *s);
     int  (*start)(const psp_settings *s);
     void (*keep)(void);
+
+    /* The modules the game loads at run time; none for most. */
+    const psp_title_module *modules;
+    unsigned module_count;
 } psp_title;
 
 extern const psp_title psp_title_info;

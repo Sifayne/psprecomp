@@ -1318,6 +1318,42 @@ int psp_io_path_info(const char *guest, uint64_t *size, int *is_dir) {
     return 0;
 }
 
+/* A window of an open host file, whole. */
+static uint8_t *read_window(FILE *f, uint64_t base, uint64_t len, size_t *out_len) {
+    if (len > 256u * 1024 * 1024) return NULL;
+    uint8_t *buf = (uint8_t *)malloc(len ? (size_t)len : 1);
+    if (!buf) return NULL;
+    if (iso_read_at(f, base, buf, (size_t)len) != 0) { free(buf); return NULL; }
+    *out_len = (size_t)len;
+    return buf;
+}
+
+uint8_t *psp_io_read_whole(const char *guest, size_t *len) {
+    iso_entry e;
+    if (iso_lookup(guest, &e) == 0) {
+        uint8_t *buf = e.is_dir || e.is_device ? NULL : read_window(e.f, e.base, e.len, len);
+        fclose(e.f);
+        return buf;
+    }
+    char host[1024];
+    map_path(guest, host, sizeof host);
+    FILE *f = fopen(host, "rb");
+    if (!f) return NULL;
+    uint8_t *buf = NULL;
+    if (fseeko(f, 0, SEEK_END) == 0) {
+        const off_t size = ftello(f);
+        if (size >= 0) buf = read_window(f, 0, (uint64_t)size, len);
+    }
+    fclose(f);
+    return buf;
+}
+
+uint8_t *psp_io_read_fd(uint32_t fd, size_t *len) {
+    if (fd < 3 || fd - 3 >= MAX_FILES || !g_file[fd - 3].used || !g_file[fd - 3].f) return NULL;
+    const io_file *o = &g_file[fd - 3];
+    return read_window(o->f, o->base, o->len, len);
+}
+
 int psp_io_list_names(const char *guest, char names[][64], int cap) {
     char host[1024];
     map_path(guest, host, sizeof host);

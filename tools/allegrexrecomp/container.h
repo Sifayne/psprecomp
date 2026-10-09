@@ -202,6 +202,22 @@ int psp_collect_exports(const uint8_t *data, size_t len,
                         const psp_module_info *mi, uint32_t load_bias,
                         uint32_t *out, int max);
 
+/* Every export with its NID: functions and variables, of every library the
+ * module exports. The syslib -- the library with no name -- carries
+ * module_start, module_stop and their thread parameters; a loader reads those
+ * from it, and must not offer them to other modules as functions. */
+typedef struct {
+    uint32_t nid;
+    uint32_t addr;
+    uint8_t  variable;   /* a data address rather than a function */
+    uint8_t  syslib;     /* from the module's own unnamed library */
+} psp_export;
+
+/* Returns how many (may exceed `max`: only `max` are written). */
+int psp_collect_export_table(const uint8_t *data, size_t len,
+                             const psp_module_info *mi, uint32_t load_bias,
+                             psp_export *out, int max);
+
 /* ---- imports --------------------------------------------------------------
  * The import table names every firmware function a module calls: which
  * library it comes from, its NID (a hash of the function name), and the

@@ -708,6 +708,42 @@ int psp_collect_pointer_seeds(const uint8_t *d, size_t len, const elf_info *e,
     return found;
 }
 
+int psp_collect_export_table(const uint8_t *d, size_t len,
+                             const psp_module_info *mi, uint32_t load_bias,
+                             psp_export *out, int max) {
+    if (mi->ent_end <= mi->ent_top) return 0;
+    int found = 0;
+    uint32_t e = mi->ent_top;
+    while (e + 0x10 <= mi->ent_end) {
+        const size_t off = (uint32_t)(e + load_bias);
+        if (off + 0x10 > len) break;
+        /* Laid out as in psp_collect_exports, below; the name pointer at 0x00
+         * is zero for the syslib. */
+        const uint32_t name    = rd32(d + off);
+        const uint8_t  ent_len = d[off + 0x08];
+        const uint8_t  nvar    = d[off + 0x09];
+        const uint16_t nfunc   = rd16(d + off + 0x0A);
+        const uint32_t table   = rd32(d + off + 0x0C);
+        const uint32_t total   = (uint32_t)nfunc + nvar;
+        const size_t nids = (uint32_t)(table + load_bias);
+        if (nids + (size_t)total * 8 <= len) {
+            for (uint32_t i = 0; i < total; i++) {
+                if (found < max) {
+                    out[found].nid      = rd32(d + nids + (size_t)i * 4);
+                    out[found].addr     = rd32(d + nids + (size_t)(total + i) * 4);
+                    out[found].variable = i >= nfunc;
+                    out[found].syslib   = name == 0;
+                }
+                found++;
+            }
+        }
+        const uint32_t stride = ent_len ? (uint32_t)ent_len * 4 : 0x10;
+        if (stride < 0x10) break;
+        e += stride;
+    }
+    return found;
+}
+
 int psp_collect_exports(const uint8_t *d, size_t len,
                         const psp_module_info *mi, uint32_t load_bias,
                         uint32_t *out, int max) {

@@ -233,12 +233,15 @@ void psp_dispatch(uint32_t addr) {
 uint32_t psp_dispatch_count(void)  { return g_count; }
 uint64_t psp_dispatch_misses(void) { return g_misses; }
 
+static void resume_reset(void);
+
 void psp_dispatch_reset(void) {
     free(g_table);
     g_table = NULL;
     g_cap = g_count = 0;
     g_misses = 0;
     g_miss = NULL;
+    resume_reset();
 }
 
 /* The last loop back-edge taken.
@@ -414,15 +417,27 @@ uint64_t psp_sp_call_violations(void) { return g_spc_bad; }
 
 /* ---- resuming a guest call chain ------------------------------------------ */
 
-static const psp_resume_site *g_resume;
-static int g_nresume;
+/* One table per module: the executable's, then each module the game loads
+ * registers its own (docs/MODULES.md). Registering a table again replaces it. */
+#define RESUME_TABLES 16
+static struct { const psp_resume_site *sites; int count; } g_resume[RESUME_TABLES];
+static int g_nresume_tables;
 
 void psp_resume_register(const psp_resume_site *sites, int count) {
-    g_resume = sites;
-    g_nresume = count;
+    for (int i = 0; i < g_nresume_tables; i++)
+        if (g_resume[i].sites == sites) { g_resume[i].count = count; return; }
+    if (g_nresume_tables == RESUME_TABLES) return;
+    g_resume[g_nresume_tables].sites = sites;
+    g_resume[g_nresume_tables++].count = count;
 }
 
-int psp_resume_count(void) { return g_nresume; }
+static void resume_reset(void) { g_nresume_tables = 0; }
+
+int psp_resume_count(void) {
+    int n = 0;
+    for (int i = 0; i < g_nresume_tables; i++) n += g_resume[i].count;
+    return n;
+}
 
 static struct { uint32_t addr; psp_resume_fn original, fn; } g_override[8];
 static int g_noverride;
@@ -441,15 +456,18 @@ int psp_resume_overridden(uint32_t addr) {
 }
 
 psp_resume_fn psp_resume_lookup(uint32_t site) {
-    int lo = 0, hi = g_nresume - 1;
-    while (lo <= hi) {
-        const int mid = lo + (hi - lo) / 2;
-        if (g_resume[mid].site == site) {
-            for (int i = 0; i < g_noverride; i++)
-                if (g_override[i].original == g_resume[mid].fn) return g_override[i].fn;
-            return g_resume[mid].fn;
+    for (int t = 0; t < g_nresume_tables; t++) {
+        const psp_resume_site *r = g_resume[t].sites;
+        int lo = 0, hi = g_resume[t].count - 1;
+        while (lo <= hi) {
+            const int mid = lo + (hi - lo) / 2;
+            if (r[mid].site == site) {
+                for (int i = 0; i < g_noverride; i++)
+                    if (g_override[i].original == r[mid].fn) return g_override[i].fn;
+                return r[mid].fn;
+            }
+            if (r[mid].site < site) lo = mid + 1; else hi = mid - 1;
         }
-        if (g_resume[mid].site < site) lo = mid + 1; else hi = mid - 1;
     }
     return NULL;
 }

@@ -59,6 +59,11 @@ void psp_mem_free(void);
  * Call once, before loading segments. Returns 0 on success. */
 int psp_mem_map_module(uint32_t base, uint32_t size);
 
+/* Extend the module window, keeping what it holds, to end at `end`: room for
+ * the modules the game loads later, beside the executable (docs/MODULES.md).
+ * Only before anything holds a pointer into the window. 0, or -1. */
+int psp_mem_grow_module(uint32_t end);
+
 /* Where that mapping currently is, for callers that snapshot guest memory.
  * Reports 0 size when the module lives inside the RAM window and needs no
  * mapping of its own. */

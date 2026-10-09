@@ -1,6 +1,7 @@
 /* psprecomp — HLE dispatch. See include/psprecomp/hle.h. */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/modules.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/dispatch.h"
@@ -285,7 +286,21 @@ void psp_hle_resume(uint32_t nid, uint32_t site, int safepoint) {
     after_call();
 }
 
+/* A call no firmware function answers but a module the game loaded exports
+ * (docs/MODULES.md): the import stub reaches the module's code, as a stub the
+ * console's loader patched would. Not a firmware call -- no tick, no safe
+ * point. The runtime's own answer wins where it has one. */
+static uint32_t module_export(uint32_t nid) {
+    if (!psp_modules_loaded()) return 0;
+    for (int i = 0; i < g_count; i++) if (g_entry[i].nid == nid) return 0;
+    return psp_modules_export(nid);
+}
+
 void psp_hle_call(uint32_t nid) {
+    {
+        const uint32_t to = module_export(nid);
+        if (to) { psp_dispatch(to); return; }
+    }
     g_call_depth++;
     /* Where the guest resumes after this call: its $ra, set by the jal. */
     psp_census_call_enter(nid, psp_cpu.r[PSP_REG_RA]);
@@ -419,6 +434,8 @@ void psp_hle_init(void) {
     psp_io_register();
     psp_misc_init();
     psp_misc_register();
+    psp_modulemgr_init();
+    psp_modulemgr_register();
     psp_net_register();
     psp_umd_init();
     psp_umd_register();
