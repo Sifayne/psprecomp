@@ -45,6 +45,7 @@ static int usage(void) {
         "  allegrexrecomp cover   <file>\n"
         "  allegrexrecomp funcs   <file> [--list]\n"
         "  allegrexrecomp emit    <file> <outdir> [prefix] [--replace <addrs>|@<file>] [--no-resume]\n"
+        "                         [--base <addr>] [--module <n>]\n"
         "  allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs] [--dispatch] [--drain <s>]\n"
         "                         [--argv0 <guest path>] [--base <addr>]\n"
         "  allegrexrecomp decrypt <file> [--keys <path>]\n"
@@ -56,6 +57,11 @@ static int usage(void) {
         "--base loads a relocatable PRX at <addr> (as the PSP's loader would,\n"
         "0x08804000) instead of where it was linked. For probe runs: the emitted\n"
         "C uses the linked addresses, so a moved module is not comparable with it.\n"
+        "\n"
+        "emit --base translates a relocatable PRX moved to <addr>, and --module\n"
+        "names its registration function psp_recomp_register_module_<n> rather\n"
+        "than psp_recomp_register: a module the game loads at run time, linked\n"
+        "into the same program (docs/MODULES.md).\n"
         "\n"
         "--replace names functions (hex addresses, comma-separated, or @file with\n"
         "one per line and # comments) that the host will implement itself. Their\n"
@@ -486,7 +492,7 @@ static int cmd_cover(const char *path) {
 /* Load a decrypted module and run discovery over it. On success the caller
  * owns both `b` (psp_blob_free) and `an` (a_analysis_free). Shared by `funcs`
  * and `emit`, which differ only in what they do with the result. */
-static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
+static int load_and_discover(const char *path, const uint32_t *base, psp_blob *b, elf_info *e,
                              a_analysis *an, int *out_nseeds, int *out_nexports,
                              int *out_nptr, int *out_scanned) {
     if (psp_blob_read(path, b) != 0) { fprintf(stderr, "cannot read %s\n", path); return -1; }
@@ -497,6 +503,20 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
         fprintf(stderr, "(encrypted modules must be decrypted first — see docs/DECRYPT.md)\n");
         psp_blob_free(b);
         return -1;
+    }
+
+    /* Somewhere other than where it was linked: a module the game loads at
+     * run time, at the base its game gives it (docs/MODULES.md). Moved first,
+     * so relocation, discovery and emission all see the final addresses. */
+    if (base) {
+        int err = 0;
+        psp_rebase_image(e, *base, &err);
+        if (err) {
+            if (err == -1) fprintf(stderr, "--base: %s is not a relocatable PRX\n", path);
+            else           fprintf(stderr, "--base: 0x%08X is not 256-byte aligned\n", *base);
+            psp_blob_free(b);
+            return -1;
+        }
     }
 
     /* Relocate before anything reads the code.
@@ -512,7 +532,8 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
      * bakes address literals in when it reads the file, so patching memory
      * would not. Relocating the image up front is what keeps the two agreeing.
      *
-     * Both segments stay at their linked addresses, so no code address moves. */
+     * Without --base, both segments stay at their linked addresses, so no code
+     * address moves. */
     {
         psp_load_info li;
         if (psp_relocate_image(b->data, b->size, e, &li) != 0) {
@@ -635,7 +656,7 @@ static int cmd_funcs(const char *path, int list) {
     a_analysis an;
     int nseeds = 0, nexports = 0, nptr = 0, scanned = 0;
 
-    if (load_and_discover(path, &b, &e, &an, &nseeds, &nexports, &nptr, &scanned) != 0) return 1;
+    if (load_and_discover(path, NULL, &b, &e, &an, &nseeds, &nexports, &nptr, &scanned) != 0) return 1;
 
     printf("module:     %s\n", path);
     printf("code:       0x%08X + %u bytes  (%u instructions)\n",
@@ -831,12 +852,13 @@ static int parse_replace(const char *spec, uint32_t **out) {
 }
 
 static int cmd_emit(const char *path, const char *outdir, const char *prefix,
-                    const uint32_t *replace, int nreplace, int resume) {
+                    const uint32_t *replace, int nreplace, int resume,
+                    const uint32_t *base, int module_index) {
     psp_blob b;
     elf_info e;
     a_analysis an;
 
-    if (load_and_discover(path, &b, &e, &an, NULL, NULL, NULL, NULL) != 0) return 1;
+    if (load_and_discover(path, base, &b, &e, &an, NULL, NULL, NULL, NULL) != 0) return 1;
 
     psp_module_info mi;
     const char *module = "(unknown)";
@@ -867,6 +889,9 @@ static int cmd_emit(const char *path, const char *outdir, const char *prefix,
     o.replace = replace;
     o.nreplace = nreplace;
     o.resume = resume;
+    char register_name[64];
+    snprintf(register_name, sizeof register_name, "psp_recomp_register_module_%d", module_index);
+    o.register_name = module_index ? register_name : NULL;
 
     printf("module:     %s\n", module);
     printf("functions:  %d\n", an.nfuncs);
@@ -1417,12 +1442,19 @@ int main(int argc, char **argv) {
          * argv[4] is not the start of the flags. */
         const char *prefix = (argc > 4 && strncmp(argv[4], "--", 2)) ? argv[4] : NULL;
         uint32_t *replace = NULL;
-        int nreplace = 0, resume = 1;
+        int nreplace = 0, resume = 1, module = 0;
+        uint32_t base = 0;
+        int have_base = 0;
         for (int i = prefix ? 5 : 4; i < argc; i++) {
             if (!strcmp(argv[i], "--resume")) {
                 resume = 1;                 /* the default; accepted as before */
             } else if (!strcmp(argv[i], "--no-resume")) {
                 resume = 0;
+            } else if (!strcmp(argv[i], "--base") && i + 1 < argc) {
+                base = (uint32_t)strtoul(argv[++i], NULL, 0); have_base = 1;
+            } else if (!strcmp(argv[i], "--module") && i + 1 < argc) {
+                module = atoi(argv[++i]);
+                if (module < 1) { fprintf(stderr, "--module: a number from 1\n"); free(replace); return 2; }
             } else if (!strcmp(argv[i], "--replace") && i + 1 < argc) {
                 uint32_t *add = NULL;
                 const int n = parse_replace(argv[++i], &add);
@@ -1440,7 +1472,8 @@ int main(int argc, char **argv) {
                 return usage();
             }
         }
-        const int rc = cmd_emit(argv[2], argv[3], prefix, replace, nreplace, resume);
+        const int rc = cmd_emit(argv[2], argv[3], prefix, replace, nreplace, resume,
+                                have_base ? &base : NULL, module);
         free(replace);
         return rc;
     }

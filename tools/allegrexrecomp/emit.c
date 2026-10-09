@@ -1214,6 +1214,10 @@ static int site_order(const void *x, const void *y) {
     return a < b ? -1 : a > b;
 }
 
+static const char *register_name(const emit_opts *o) {
+    return o->register_name ? o->register_name : "psp_recomp_register";
+}
+
 static void emit_header(FILE *f, const a_analysis *an, const emit_opts *o,
                         const uint8_t *resume_site) {
     fprintf(f,
@@ -1266,13 +1270,13 @@ static void emit_header(FILE *f, const a_analysis *an, const emit_opts *o,
         "\n"
         "/* Register every recompiled function with the dispatch table. Call once\n"
         " * before running anything. */\n"
-        "void psp_recomp_register(void);\n"
+        "void %s(void);\n"
         "\n"
         "/* Provided by the host: a firmware call this module imports, and the\n"
         " * traps for anything not yet translated. */\n"
         "void psp_syscall(uint32_t id);\n"
         "void psp_unimplemented(uint32_t addr, const char *what);\n"
-        "\n");
+        "\n", register_name(o));
 
     for (int i = 0; i < an->nfuncs; i++)
         fprintf(f, "void psp_func_%08X(void);\n", an->funcs[i].addr);
@@ -1449,7 +1453,7 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
         if (!c.nresume) fprintf(f, "    {0, 0},\n");
         fprintf(f, "};\n");
     }
-    fprintf(f, "void psp_recomp_register(void) {\n");
+    fprintf(f, "void %s(void) {\n", register_name(o));
     for (int i = 0; i < an->nfuncs; i++)
         fprintf(f, "    psp_register(0x%08Xu, psp_%s_%08X);\n", an->funcs[i].addr,
                 is_replaced(o, an->funcs[i].addr) ? "replaced" : "func", an->funcs[i].addr);

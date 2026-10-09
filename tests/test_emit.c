@@ -453,6 +453,46 @@ static void test_gap_sweep(void) {
     a_analysis_free(&an);
 }
 
+/* ---- a module's registration function has a name of its own ---------------
+ *
+ * A module the game loads at run time is linked into the same program as the
+ * executable, so its registration function cannot also be called
+ * psp_recomp_register (docs/MODULES.md, M2). */
+
+static void test_register_name(void) {
+    static const uint32_t words[] = { 0x03E00008, 0x00000000 };   /* jr $ra; nop */
+    uint8_t code[sizeof words];
+    for (size_t i = 0; i < 2; i++)
+        for (int k = 0; k < 4; k++) code[i * 4 + k] = (uint8_t)(words[i] >> (8 * k));
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = 0x00400000u;
+    an.size = (uint32_t)sizeof code;
+    const uint32_t seed = an.base;
+    CHECK(a_discover(&an, &seed, 1, 1) == 0, "register name: discovery runs");
+
+    emit_opts o = {0};
+    o.outdir = ".";
+    o.prefix = "t_rn";
+    o.module = "synthetic";
+    o.register_name = "psp_recomp_register_module_2";
+    CHECK(a_emit(&an, &o) == 0, "register name: emission succeeds");
+
+    char *src = slurp("./t_rn_funcs.c", NULL);
+    char *hdr = slurp("./t_rn_funcs.h", NULL);
+    CHECK(src && strstr(src, "void psp_recomp_register_module_2(void) {"),
+          "register name: the function is defined under the module's name");
+    CHECK(hdr && strstr(hdr, "void psp_recomp_register_module_2(void);"),
+          "register name: and declared under it");
+    CHECK(src && hdr && !strstr(src, "psp_recomp_register(") && !strstr(hdr, "psp_recomp_register("),
+          "register name: the program's name is not used");
+    free(src);
+    free(hdr);
+    a_analysis_free(&an);
+}
+
 /* ---- CC latency and FPU traps -----------------------------------------------
  *
  * An mfvc of CC as the word straight after a vcmp reads CC from before that
@@ -716,6 +756,7 @@ int main(void) {
     test_vfpu_branch_condition();
     test_branch_in_slot_keeps_next_label();
     test_gap_sweep();
+    test_register_name();
     test_cc_latency_and_fpu_trap();
     test_replace_leaves_the_symbol_to_the_host();
     test_replace_absent_changes_nothing();
