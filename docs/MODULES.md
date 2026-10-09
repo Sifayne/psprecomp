@@ -137,7 +137,14 @@ state, and a state refuses to load into a game whose modules differ.
 - **The 3rd Birthday and the Armored Core titles**, which load no modules,
   replay byte-identical to stage 11.
 
-## To settle before M3
+## Decided (9 Oct, with Sif)
+
+All three proposals below, as written: a load allocates the module's size
+from the user partition, the runtime's own answer wins over a module's export
+(a pack may reverse that for its title), and a module the importer did not
+see fails as an unknown one.
+
+## Settled before M3
 
 1. **Free memory.** A module's code lives outside RAM, so a load would take
    nothing from the user partition. Games print and check free memory (WipEout
