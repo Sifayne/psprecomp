@@ -384,6 +384,75 @@ static void test_branch_in_slot_keeps_next_label(void) {
     a_analysis_free(&an);
 }
 
+/* ---- code nothing reaches is swept, stubs and data are not ------------------
+ *
+ * WipEout Pulse's MD5 enters its round helpers by adding to an address and
+ * jumping through it, so no walk, call or pointer names them and a run
+ * stopped on a dispatch miss at 0x0000BFA0. The gap sweep seeds such code by
+ * its shape. Two shapes it must leave alone: an unreachable `b .` just before
+ * a function, which the walk would carry on from into that function and
+ * merge with it, and an unclaimed run that starts with data. */
+
+#define GS_BASE 0x08860000u
+
+static const uint32_t GS_CODE[] = {
+    0x03E00008,  /* +00  jr    $ra             A, seeded                    */
+    0x00000000,  /* +04  nop                                                */
+    0x24420001,  /* +08  addiu $v0, $v0, 1     B, nothing names it: swept   */
+    0x03E00008,  /* +0C  jr    $ra                                          */
+    0x00000000,  /* +10  nop                                                */
+    0x1000FFFF,  /* +14  b     .               a stub just before C: not    */
+    0x00000000,  /* +18  nop                                                */
+    0x03E00008,  /* +1C  jr    $ra             C, seeded                    */
+    0x00000000,  /* +20  nop                                                */
+    0x72616552,  /* +24  "Rear"                data: the run is not code    */
+    0x24420001,  /* +28  addiu $v0, $v0, 1                                  */
+    0x03E00008,  /* +2C  jr    $ra                                          */
+    0x00000000,  /* +30  nop                                                */
+};
+
+static void test_gap_sweep(void) {
+    uint8_t code[sizeof GS_CODE];
+    for (size_t i = 0; i < sizeof GS_CODE / sizeof GS_CODE[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(GS_CODE[i]);
+        code[i * 4 + 1] = (uint8_t)(GS_CODE[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(GS_CODE[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(GS_CODE[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = GS_BASE;
+    an.size = (uint32_t)sizeof code;
+    an.sweep_gaps = 1;
+
+    const uint32_t seeds[2] = { GS_BASE, GS_BASE + 0x1C };
+    CHECK(a_discover(&an, seeds, 2, 2) == 0, "gap sweep: discovery runs");
+    CHECK(an.nswept == 1, "gap sweep: one block swept, got %d", an.nswept);
+
+    emit_opts o = {0};
+    o.outdir = ".";
+    o.prefix = "t_gs";
+    o.module = "synthetic";
+    CHECK(a_emit(&an, &o) == 0, "gap sweep: emission succeeds");
+
+    char *src = slurp("./t_gs_funcs.c", NULL);
+    CHECK(src != NULL, "gap sweep: generated .c is readable");
+    if (!src) { a_analysis_free(&an); return; }
+
+    CHECK(strstr(src, "psp_body_08860008") != NULL,
+          "gap sweep: code nothing names becomes a function");
+    CHECK(strstr(src, "psp_body_0886001C") != NULL && strstr(src, "psp_at_0886001C") == NULL,
+          "gap sweep: the function after a `b .` stub stays a function of its own");
+    CHECK(strstr(src, "08860014u") == NULL,
+          "gap sweep: the `b .` stub is not an entry");
+    CHECK(strstr(src, "08860028u") == NULL,
+          "gap sweep: code after data in an unclaimed run is not swept");
+    free(src);
+    a_analysis_free(&an);
+}
+
 /* ---- CC latency and FPU traps -----------------------------------------------
  *
  * An mfvc of CC as the word straight after a vcmp reads CC from before that
@@ -646,6 +715,7 @@ int main(void) {
     test_indirect_call_is_not_terminal();
     test_vfpu_branch_condition();
     test_branch_in_slot_keeps_next_label();
+    test_gap_sweep();
     test_cc_latency_and_fpu_trap();
     test_replace_leaves_the_symbol_to_the_host();
     test_replace_absent_changes_nothing();

@@ -544,6 +544,7 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
     an->stub_addr = e->stub_addr;
     an->stub_size = e->stub_size;
     an->scan_calls = 1;
+    an->sweep_gaps = 1;
     /* The whole loaded segment, so jump tables in .rodata/.data can be read. */
     if (e->nsegments) {
         an->image      = b->data + e->seg[0].offset;
@@ -649,6 +650,8 @@ static int cmd_funcs(const char *path, int list) {
      * the evidence of a data word that happened to decode. */
     printf("suppressed: %d shared blocks left unmerged, %d of them on a soft seed\n",
            an.nsuppressed, an.nsuppressed_soft);
+    /* Code no walk, call or pointer reached, seeded by its shape. */
+    printf("swept:      %d soft entries in unclaimed code (heuristic)\n", an.nswept);
     /* `an.size` is the whole loaded image -- code plus .data plus .bss -- so
      * dividing by it and calling the result "of .text" understates coverage by
      * roughly six times. This module reported 14.18% while actually covering

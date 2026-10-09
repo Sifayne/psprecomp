@@ -82,6 +82,20 @@ typedef struct {
     uint32_t scan_base;
     uint32_t scan_size;
 
+    /* Also seed code that nothing reaches: in the scan range, a word no walk
+     * claimed that starts a run of recognised instructions ending in an
+     * unconditional transfer and its slot becomes a soft entry, and the walk
+     * runs again.
+     *
+     * Hand-written assembly enters code by arithmetic on an address --
+     * WipEout Pulse's MD5 adds 16 to its round helper's address and does
+     * `jr $t7` into the next round's setup -- so neither control flow, a
+     * `jal`, nor a relocation names the target, and a run reaches it as a
+     * dispatch miss. Like the data-pointer scan, this is a heuristic: the
+     * shape filters data out, and a word that is data nonetheless becomes a
+     * soft function nothing calls. Counted in nswept. */
+    int sweep_gaps;
+
     /* The whole loaded module image, not just .text. Jump tables live in
      * .rodata or .data, so resolving a computed jump means reading outside the
      * code extent. Optional: without it, tables are simply not resolved. */
@@ -125,6 +139,7 @@ typedef struct {
      * becomes a dispatch on the address. */
     uint8_t  *split_entry;
     int       nmerged;      /* functions folded into another */
+    int       nswept;       /* soft entries the gap sweep added (sweep_gaps) */
 
     /* Shared blocks that were *not* merged because the target is a known
      * function entry, and how many of those entries are only soft — a pointer
