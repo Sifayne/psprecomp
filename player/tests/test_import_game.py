@@ -41,8 +41,9 @@ def build_pack(app, pack, out, env, log, jobs=2):
     (out / 'launcher.so').write_text('launcher of ' + pack.id)
     (out / 'host/boot.o').write_text('host of ' + pack.id)
     return [out / 'host/boot.o']
-def compile_game(app, pack, host_objects, profile, module, output, jobs, env, log):
-    Path(output).write_text('#!/bin/sh\\nexit 0\\n'); Path(output).chmod(0o755)
+def compile_game(app, pack, host_objects, profile, module, output, jobs, env, log, modules=()):
+    compiled = repr([(m['index'], m['base'], m['size'], m['sha1s']) for m in modules])
+    Path(output).write_text('#!/bin/sh\\n# modules ' + compiled + '\\nexit 0\\n'); Path(output).chmod(0o755)
 '''
 
 
@@ -67,6 +68,7 @@ class ImportTests(unittest.TestCase):
         self.iso = self.root / 'my disc & spaces |.iso'
         self.iso.write_bytes(b'fixture'.ljust(32768, b'\0'))
         self.disc = 'FIXT10000'
+        self.prx = {}   # disc path -> bytes
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -114,8 +116,15 @@ class ImportTests(unittest.TestCase):
         if args[1] == 'info':
             return subprocess.CompletedProcess(args, 0, '  DISC_ID            ' + self.disc + '\n'
                                                         '  TITLE              A Game & "Its" Name\n')
+        if args[1] == 'ls':
+            files = {'/PSP_GAME/SYSDIR/EBOOT.BIN': self.module, **self.prx}
+            return subprocess.CompletedProcess(args, 0, 'd         2048  lba=23       /PSP_GAME\n' + ''.join(
+                f'{len(data):14}  lba={30 + i:<8} {path}\n' for i, (path, data) in enumerate(files.items())))
         if args[1] == 'extract':
-            Path(args[4], 'PSP_GAME_SYSDIR_EBOOT.BIN').write_bytes(self.module)
+            if args[3] == 'SYSDIR/EBOOT.BIN':
+                Path(args[4], 'PSP_GAME_SYSDIR_EBOOT.BIN').write_bytes(self.module)
+            else:
+                Path(args[4], args[3].lstrip('/').replace('/', '_')).write_bytes(self.prx[args[3]])
             return subprocess.CompletedProcess(args, 0, '')
         raise AssertionError('Unexpected helper invocation: ' + repr(args))
 
@@ -258,6 +267,40 @@ class ImportTests(unittest.TestCase):
         fields = (self.data / 'library.bin').read_bytes().split(b'\0')
         self.assertEqual(fields[2:-1:5], [FIRST.encode(), b'plain-unkn12345'])   # the packs' first
         self.assertEqual(fields[8], 'A Game & "Its" Name'.encode())
+
+    @staticmethod
+    def elf(prx, memsz):
+        """A minimal ELF: one PT_LOAD reaching memsz, relocatable (a PRX) or
+        not."""
+        head = bytearray(52 + 32)
+        head[:4] = b'\x7fELF'
+        head[16:18] = (0xFFA0 if prx else 2).to_bytes(2, 'little')
+        head[28:32] = (52).to_bytes(4, 'little')
+        head[42:44] = (32).to_bytes(2, 'little')
+        head[44:46] = (1).to_bytes(2, 'little')
+        head[52:56] = (1).to_bytes(4, 'little')
+        head[72:76] = memsz.to_bytes(4, 'little')
+        return bytes(head)
+
+    def test_plain_game_modules_are_recompiled_beside_it(self):
+        self.disc = 'UNKN12345'
+        self.module = self.elf(False, 0x3A1234)
+        lib = self.elf(True, 0x8770 + 0x238)
+        wrapped = b'~SCE' + (16).to_bytes(4, 'little') + bytes(8) + lib     # the wrapper's own length
+        self.prx = {'/PSP_GAME/USRDIR/PRX/libfont.prx': lib, '/PSP_GAME/USRDIR/OTHER/libfont.PRX': wrapped,
+                    '/PSP_GAME/USRDIR/PRX/notes.prx': b'not a module'}
+        with patch.object(importer.subprocess, 'run', self.fake_run):
+            slug = self.library.import_iso(self.iso)
+        game = self.library.records()['games'][slug]
+        sha1s = sorted(hashlib.sha1(d).hexdigest() for d in (lib, wrapped))
+        self.assertEqual(game['modules'], sha1s)
+        folder = Path(game['directory'])
+        self.assertEqual((folder / 'modules' / (hashlib.sha1(lib).hexdigest() + '.elf')).read_bytes(), lib)
+        # One module from both files, after the executable, 64K-aligned.
+        self.assertIn('# modules ' + repr([(1, 0x3B0000, 0x10000, sha1s)]), (folder / 'game').read_text())
+        self.assertTrue(self.library.ready(slug, game))
+        # Its modules are part of what it was built as.
+        self.assertNotEqual(self.library.build_of(slug, dict(game, modules=[])), game['game_build_id'])
 
     def test_other_version_of_a_pack_disc_plays_plain(self):
         entry = self.install()

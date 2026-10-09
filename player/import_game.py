@@ -12,6 +12,7 @@ variables and the LRLIB1 library format are the contract with the launcher
 (src/host/launcher_library.h).
 """
 import argparse
+import gzip
 import importlib.util
 import fcntl
 import hashlib
@@ -46,6 +47,22 @@ def digest(path):
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def elf_extent(data):
+    """The highest address an ELF's loadable segments reach."""
+    phoff = int.from_bytes(data[28:32], "little")
+    size, count = int.from_bytes(data[42:44], "little"), int.from_bytes(data[44:46], "little")
+    end = 0
+    for i in range(count):
+        at = phoff + i * size
+        if int.from_bytes(data[at:at + 4], "little") == 1:   # PT_LOAD
+            end = max(end, int.from_bytes(data[at + 8:at + 12], "little") + int.from_bytes(data[at + 20:at + 24], "little"))
+    return end
+
+
+MODULE_ALIGN = 0x10000
+MODULES_END = 0x08000000   # where the PSP's RAM begins
 
 
 def atomic_write(path, content):
@@ -335,7 +352,8 @@ class Library:
     def build_of(self, slug, entry):
         """What a title's prepared game must have been built as."""
         if entry.get("plain"):
-            return self.prints.title_identity(self.app_build, None, {"slug": slug, "elf_sha256": entry.get("elf_sha256", "")})
+            return self.prints.title_identity(self.app_build, None, {"slug": slug, "elf_sha256": entry.get("elf_sha256", ""),
+                                                                     "modules": entry.get("modules", [])})
         return self.game_builds.get(slug)
 
     def compatible(self, slug, entry):
@@ -447,7 +465,13 @@ class Library:
                                elf_sha256=elf_sha256, plain=True)
             slug = profile["slug"]
             plain = pack is None
-            build = self.build_of(slug, {"plain": plain, "elf_sha256": elf_sha256})
+            # The modules it loads at run time, recompiled with it
+            # (docs/MODULES.md): for a game with no pack, so far.
+            modules = self.disc_modules(run, ar, iso, tmp, module_path) if plain else []
+            module_sha1s = sorted(s for m in modules for s in m["sha1s"])
+            if plain:
+                profile["modules"] = module_sha1s
+            build = self.build_of(slug, {"plain": plain, "elf_sha256": elf_sha256, "modules": module_sha1s})
             # Cache reuse still checks the disc and exact executable above.
             previous = book["games"].get(slug)
             if (previous and bool(previous.get("plain")) == plain and self.compatible(slug, previous)
@@ -463,7 +487,8 @@ class Library:
                 print("Preparing this game for the current runtime" + (" as the plain recompiled game" if plain else "")
                       + "...", flush=True)
                 compiler = module("game_compiler", self.resources / "compile_game.py")
-                compiler.compile_game(self.app, pack, host_objects, profile, module_path, tmp / "game", jobs, self.env, log)
+                compiler.compile_game(self.app, pack, host_objects, profile, module_path, tmp / "game", jobs, self.env, log,
+                                      modules)
                 directory = self.data / "games" / slug
                 directory.mkdir(parents=True, exist_ok=True)
                 destination = directory / (build[:16] + "-" + str(time.time_ns()))
@@ -471,6 +496,8 @@ class Library:
                 ready.mkdir()
                 shutil.move(tmp / "game", ready / "game")
                 shutil.move(module_path, ready / "module.elf")
+                if modules:
+                    shutil.move(tmp / "modules", ready / "modules")
             after = iso.stat()
             if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
                 raise ValueError("The ISO changed during preparation. Please import it again.")
@@ -479,6 +506,8 @@ class Library:
                          game_build_id=build, directory=str(destination), elf_sha256=elf_sha256)
             if plain:
                 entry.update(plain=True, title=profile["title"], disc_id=disc_id)
+                if module_sha1s:
+                    entry["modules"] = module_sha1s
             else:
                 entry["pack"] = pack.id
             if not previous:
@@ -490,6 +519,65 @@ class Library:
             self.refresh()
             print(f"Ready: {profile['title']}. Choose Save and play.", flush=True)
             return slug
+
+    def disc_modules(self, run, ar, iso, tmp, executable):
+        """Every module on the disc, ready to recompile beside the executable
+        (docs/MODULES.md): each .prx unwrapped, decrypted and inflated,
+        collapsed by content, and given a base of its own after the
+        executable and the modules before it. A module the runtime will know
+        by the SHA-1 of each file it was read from."""
+        listing = run([ar, "ls", iso], capture=True)
+        paths = [m[1] for m in re.finditer(r"^\s+\d+\s+lba=\d+\s+(/.*?)\s*$", listing, re.M)
+                 if m[1].lower().endswith(".prx")]
+        images = {}
+        for i, path in enumerate(paths):
+            out = tmp / "prx" / str(i)
+            out.mkdir(parents=True)
+            run([ar, "extract", iso, path, out])
+            raw = (out / path.lstrip("/").replace("/", "_")).read_bytes()
+            image = self.module_image(run, raw, out)
+            if image is None:
+                print(f"{path} is not a module this app can recompile; the game will not find it.", flush=True)
+                continue
+            m = images.setdefault(hashlib.sha1(image).hexdigest(), dict(image=image, sha1s=[], paths=[]))
+            sha1 = hashlib.sha1(raw).hexdigest()
+            if sha1 not in m["sha1s"]:
+                m["sha1s"].append(sha1)
+            m["paths"].append(path)
+        modules = []
+        base = -(-elf_extent(executable.read_bytes()) // MODULE_ALIGN) * MODULE_ALIGN
+        for index, (key, m) in enumerate(sorted(images.items(), key=lambda item: item[1]["paths"][0]), 1):
+            size = -(-elf_extent(m["image"]) // MODULE_ALIGN) * MODULE_ALIGN
+            if base + size > MODULES_END:
+                raise ValueError("This game's modules do not fit beside its executable.")
+            folder = tmp / "modules"
+            folder.mkdir(exist_ok=True)
+            (folder / (key + ".elf")).write_bytes(m["image"])
+            modules.append(dict(index=index, sha1s=sorted(m["sha1s"]), paths=m["paths"], file=key + ".elf",
+                                image=folder / (key + ".elf"), base=base, size=size))
+            base += size
+        return modules
+
+    def module_image(self, run, data, out):
+        """A module file as the recompiler reads it, or None: the ~SCE wrapper
+        off, the ~PSP decrypted, a gzip inflated; a relocatable PRX."""
+        if data[:4] == b"~SCE":
+            data = data[int.from_bytes(data[4:8], "little"):]
+        if data[:4] == b"~PSP":
+            (out / "module.psp").write_bytes(data)
+            try:
+                run([self.app / "usr/bin/pspdecrypt", "-o", out / "module.dec", out / "module.psp"])
+            except ValueError:
+                return None
+            data = (out / "module.dec").read_bytes()
+        if data[:2] == b"\x1f\x8b":
+            try:
+                data = gzip.decompress(data)
+            except (OSError, EOFError):
+                return None
+        if data[:4] != b"\x7fELF" or int.from_bytes(data[16:18], "little") != 0xFFA0:
+            return None
+        return data
 
     def launch(self, module_path, iso, args):
         module_path = str(Path(module_path).resolve())
