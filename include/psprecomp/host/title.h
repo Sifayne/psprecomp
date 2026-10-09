@@ -126,6 +126,18 @@ typedef struct {
     /* The glow composite the smooth bloom filter recognises; NULL: the
      * title has none, and the filter does nothing. */
     const psp_bloom_composite *bloom;
+
+    /* The boot host's (src/host/boot.c), each optional:
+     * - settings: the title's policy over the loaded settings, before they
+     *   are printed or used -- a default only it needs, or a fallback for a
+     *   host linked without its replacements.
+     * - start: what it sets up from them before the module loads; nonzero
+     *   refuses to run (the reason on stderr).
+     * - keep: names what its replacements carry from one poll to the next
+     *   to a save state (psprecomp/state.h). */
+    void (*settings)(psp_settings *s);
+    int  (*start)(const psp_settings *s);
+    void (*keep)(void);
 } psp_title;
 
 extern const psp_title psp_title_info;

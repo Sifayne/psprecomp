@@ -56,9 +56,12 @@ set(PLAYER_HOST "${TOOLKIT}/src/host/present.c" "${TOOLKIT}/src/host/input.c" "$
 set(PLAYER_LAUNCHER "${TOOLKIT}/src/host/launcher.c")
 
 # What every game links on the player's machine, with its pack's host
-# objects (compile_game.py). Position independent: the on-device link may
-# make a position-independent executable.
-add_library(player STATIC ${PLAYER_HOST} "${RECOMP}/loader.c" "${RECOMP}/container.c" "${RECOMP}/decode.c")
+# objects or, for a game with no pack, title_plain.c (compile_game.py): the
+# shared host and the boot host, whose main the link takes from here.
+# Position independent: the on-device link may make a position-independent
+# executable.
+add_library(player STATIC ${PLAYER_HOST} "${TOOLKIT}/src/host/boot.c"
+    "${RECOMP}/loader.c" "${RECOMP}/container.c" "${RECOMP}/decode.c")
 target_include_directories(player PRIVATE "${RECOMP}")
 target_compile_definitions(player PRIVATE HAVE_SDL2)
 set_target_properties(player PROPERTIES POSITION_INDEPENDENT_CODE ON)

@@ -52,6 +52,7 @@ def stage_tools(b, tools, obj):
     b.copy(obj / "libruntime.a", resource / "libruntime.a")
     b.copy(obj / "libplayer.a", resource / "libplayer.a")
     b.copy(b.TOOLKIT / "src/host/pack_api.c", resource / "pack_api.c")
+    b.copy(b.TOOLKIT / "src/host/title_plain.c", resource / "title_plain.c")
     # Whole-app identity is provenance only. Game compatibility is recorded
     # separately below, after staging and relocating the actual build inputs.
     (resource / "build-id").write_text(b.sha(b.WORKDIR / "INPUTS.json") + "\n")
