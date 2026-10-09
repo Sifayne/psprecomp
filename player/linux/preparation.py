@@ -4,7 +4,7 @@ import json
 import re
 import shutil
 import sys
-from game_fingerprints import fingerprints
+from game_fingerprints import app_identity
 
 
 def build_tools(b):
@@ -38,20 +38,20 @@ def build_tools(b):
 
 def stage_tools(b, tools, obj):
     resource = b.RESOURCES
-    (resource / "games.json").write_text(json.dumps(b.PACK.profiles(), indent=2) + "\n")
-    for name in ("import_game.py", "compile_game.py", "emit-split.py"):
+    # The on-device recipes and what they read: psprecomp's and SDL's
+    # headers, the recompiler's loader headers, the runtime and player
+    # archives every game links, and the pack API marker each pack's
+    # launcher.so is built with.
+    for name in ("import_game.py", "compile_game.py", "emit-split.py", "pack.py"):
         b.copy(b.TOOLKIT / "player" / name, resource / name)
-    # The pack's on-device inputs: its code generators beside the recipe, its
-    # replacements, replace lists and their headers under host/.
-    for script in b.PACK.device_scripts:
-        b.copy(script, resource / script.name)
-    for source in b.PACK.device_host:
-        b.copy(source, resource / "host" / source.name)
+    b.copy(b.RECIPE / "game_fingerprints.py", resource / "game_fingerprints.py")
     shutil.copytree(b.TOOLKIT / "include", resource / "include")
-    for title in b.PACK.titles:
-        slug = title["slug"]
-        b.copy(obj / f"libhost-{slug}.a", resource / f"libhost-{slug}.a")
+    shutil.copytree(b.DEPS / "include/SDL2", resource / "include/SDL2")
+    for header in sorted((b.TOOLKIT / "tools/allegrexrecomp").glob("*.h")):
+        b.copy(header, resource / "recomp" / header.name)
     b.copy(obj / "libruntime.a", resource / "libruntime.a")
+    b.copy(obj / "libplayer.a", resource / "libplayer.a")
+    b.copy(b.TOOLKIT / "src/host/pack_api.c", resource / "pack_api.c")
     # Whole-app identity is provenance only. Game compatibility is recorded
     # separately below, after staging and relocating the actual build inputs.
     (resource / "build-id").write_text(b.sha(b.WORKDIR / "INPUTS.json") + "\n")
@@ -85,7 +85,7 @@ def stage_tools(b, tools, obj):
                          (tools["zig"] / "LICENSE", "Zig/LICENSE")):
         b.copy(source, b.APP / "licenses" / dest)
     b.run([b.APP / "usr/python/bin/python3.12", "-I", "-B", "-c",
-           "import json, hashlib, subprocess, concurrent.futures, fcntl; print(hashlib.sha256(b'check').hexdigest())"])
+           "import json, hashlib, subprocess, concurrent.futures, fcntl, zipfile, zlib; print(hashlib.sha256(b'check').hexdigest())"])
     abis = {}
     for name in ("SDL2", "SDL2_ttf", "openh264", "avcodec", "avutil"):
         dynamic = b.capture(["readelf", "-d", b.APP / f"usr/lib/lib{name}.so"])
@@ -93,5 +93,4 @@ def stage_tools(b, tools, obj):
         if len(soname) != 1:
             raise ValueError(f"Missing or ambiguous library ABI: {name}")
         abis[name] = soname[0]
-    (resource / "game-builds.json").write_text(
-        json.dumps(fingerprints(b.APP, abis, b.PACK.id), indent=2) + "\n")
+    (resource / "app-build.json").write_text(json.dumps(app_identity(b.APP, abis), indent=2) + "\n")

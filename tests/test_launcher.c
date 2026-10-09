@@ -3,7 +3,7 @@
  * one group, the earlier apps' settings brought in, the game library, the
  * page ring on the bumpers, the screens drawn, and a pack's launcher.so
  * loaded from the packs folder. Includes launcher.c for its internals; its
- * first argument is the folder holding packs/gamma/launcher.so
+ * first argument is the folder holding packs/gamma/built/launcher.so
  * (tests/test_pack_plugin.c). */
 #include <SDL2/SDL.h>
 #define main launcher_entry
@@ -103,12 +103,10 @@ int main(int argc, char **argv) {
     assert(a.edit.number[PSP_PLAYER_OPTIONS] == 1 && a.edit.title[0] == 1);
     assert(group_pages(&a, GROUP_PACK, (const char *[PAGES_MAX]){0}) == 1);
     use_pack(&a, 0);
-    /* Brought in, and written at once. */
+    /* Alpha's earlier settings came in as it was first shown; nothing is
+     * written until Save. */
     snprintf(path, sizeof path, "%s/psprecomp/settings.ini", config);
-    assert(strstr(a.status, "Alpha") && strstr(a.status, "Beta") && !a.dirty);
-    assert(contains(path, "[player]\nVOLUME=30\n") && contains(path, "[pack alpha]\nINPUT=modern\n"));
-    assert(contains(path, "[pack beta]\nCAP=120\n") && contains(path, "[preset alpha/Old]\nINPUT=classic\n"));
-    assert(!contains(path, "[preset beta/B]"));          /* the selected one is the settings now */
+    assert(strstr(a.status, "Alpha") && !a.dirty && access(path, F_OK));
 
     /* Tabs: the packs in order, each pack's titles in its order; the
      * library's game of no pack is left out. */
@@ -129,7 +127,8 @@ int main(int argc, char **argv) {
     assert(!psp_settings_set(&a.edit, PSP_OPT_WINDOW_MODE, "borderless", PSP_SOURCE_FILE, error)); changed(&a);
     assert(!psp_settings_set(&a.edit, A_LAG, "0.5", PSP_SOURCE_FILE, error)); changed(&a);
     show_page(&a, GROUP_PACK, "Controls");
-    select_game(&a, 2);
+    select_game(&a, 2);                                 /* Beta's come in now */
+    assert(strstr(a.status, "Beta") && a.edit.number[PSP_OPT_VOLUME] == 30);
     assert(a.pack == 1 && a.edit.number[PSP_OPT_WINDOW_MODE] == 1 && a.edit.number[B_CAP] == 120);
     assert(a.group == GROUP_PLAYER && !a.page);         /* Beta has no Controls page */
     assert(!psp_settings_set(&a.edit, B_CAP, "unlimited", PSP_SOURCE_FILE, error)); changed(&a);
@@ -137,6 +136,9 @@ int main(int argc, char **argv) {
     assert(a.pack == 0 && a.edit.number[A_LAG] == 0.5 && a.edit.number[PSP_OPT_WINDOW_MODE] == 1);
     assert(!save(&a) && !a.dirty);
     assert(contains(path, "WINDOW_MODE=borderless") && contains(path, "LAG=0.5") && contains(path, "CAP=unlimited"));
+    assert(contains(path, "[player]\nVOLUME=30\nRESOLUTION=") && contains(path, "[pack alpha]\nINPUT=modern\n"));
+    assert(contains(path, "[preset alpha/Old]\nINPUT=classic\n"));
+    assert(!contains(path, "[preset beta/B]"));          /* the selected one is the settings now */
     assert(contains(path, "game=second\n"));
 
     /* Reset one group: the pack's, then the player's; the movie stays off

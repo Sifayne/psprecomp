@@ -1,15 +1,23 @@
-"""Compute per-title compatibility from the staged game build ingredients.
+"""Which inputs invalidate a title's prepared game.
 
-Hash actual host/runtime archives, compiler inputs and each title's replacement
-source closure, and the pack's code-generation scripts each title runs.
+The app's part is fixed when the app is built (app_identity, staged as
+usr/share/psprecomp/app-build.json): the runtime and player archives, the
+headers, the generator, the compiler, the build recipes and the shared
+libraries' ABIs (SONAMEs: compatible library updates keep games). A pack's
+part comes from the pack as added: its host code's include closure, and per
+title the replacements' closure, the replace list and the code generators.
 Launcher, importer UI, packaging recipes, notices and display labels are
-deliberately outside this contract. Shared libraries contribute
-SONAMEs: compatible library updates can be used by already-linked games.
+deliberately outside this contract.
+
+Staged in the app beside import_game.py, which reads it; build.py uses it
+at build time.
 """
 import hashlib
 import json
 from pathlib import Path
 import re
+
+VERSION = 2
 
 
 def digest(path):
@@ -34,48 +42,60 @@ def tree_identity(root):
     return identity(files)
 
 
-def replacement_inputs(resource, profile):
-    host, headers = resource / 'host', resource / 'include'
-    pending = [host / profile['replacements']]
-    inputs = {}
-    while pending:
-        source = pending.pop().resolve()
-        name = source.relative_to(resource).as_posix()
-        if name in inputs:
-            continue
-        inputs[name] = digest(source)
-        for include in re.findall(r'^\s*#\s*include\s*"([^"\n]+)"', source.read_text(), re.M):
-            if include == profile['slug'] + '_funcs.h':
-                continue  # Generated from the pinned ELF, generator and replace list.
-            candidates = (source.parent / include, host / include, headers / include)
-            found = next((p for p in candidates if p.is_file()), None)
-            if found is None:
-                raise ValueError(f'Untracked replacement include: {name}: {include}')
-            pending.append(found)
-    inputs['host/' + profile['replace_list']] = digest(host / profile['replace_list'])
-    return inputs
-
-
-def fingerprints(app, library_abis, app_id):
-    app = Path(app).resolve()
-    resource = app / 'usr/share' / app_id
-    shared = {
+def app_identity(app, library_abis):
+    resource = Path(app).resolve() / 'usr/share/psprecomp'
+    inputs = {
         'runtime': digest(resource / 'libruntime.a'),
-        'runtime_headers': tree_identity(resource / 'include'),
-        'generator': digest(app / 'usr/bin/allegrexrecomp'),
-        'compiler': digest(app / 'usr/zig/zig'),
-        'compiler_support': tree_identity(app / 'usr/zig/lib'),
-        'compile_recipe': digest(resource / 'compile_game.py'),
+        'player': digest(resource / 'libplayer.a'),
+        'headers': tree_identity(resource / 'include'),
+        'recomp_headers': tree_identity(resource / 'recomp'),
+        'pack_api': digest(resource / 'pack_api.c'),
+        'generator': digest(Path(app) / 'usr/bin/allegrexrecomp'),
+        'compiler': digest(Path(app) / 'usr/zig/zig'),
+        'compiler_support': tree_identity(Path(app) / 'usr/zig/lib'),
+        'build_recipe': digest(resource / 'compile_game.py'),
         'split_recipe': digest(resource / 'emit-split.py'),
         'library_abis': library_abis,
     }
-    games = {}
-    for profile in json.loads((resource / 'games.json').read_text()):
-        slug = profile['slug']
-        inputs = {**shared,
-                  'profile': {key: profile[key] for key in ('slug', 'elf_sha256', 'replacements', 'replace_list')},
-                  'host': digest(resource / f'libhost-{slug}.a'),
-                  'replacements': replacement_inputs(resource, profile),
-                  'codegen': {script: digest(resource / script) for script in profile.get('codegen', [])}}
-        games[slug] = {'id': identity({'version': 1, 'inputs': inputs}), 'inputs': inputs}
-    return {'version': 1, 'games': games}
+    return {'version': VERSION, 'id': identity({'version': VERSION, 'inputs': inputs}), 'inputs': inputs}
+
+
+def closure(pack_root, starts, generated_skip=None):
+    """Each file starts names and every pack file its quoted includes reach,
+    by path within the pack: digests. An include found nowhere in the pack is
+    the app's (its headers are in the app's part) or generated."""
+    root = Path(pack_root).resolve()
+    pending = [Path(p).resolve() for p in starts]
+    inputs = {}
+    while pending:
+        source = pending.pop()
+        name = source.relative_to(root).as_posix()
+        if name in inputs:
+            continue
+        inputs[name] = digest(source)
+        for include in re.findall(r'^\s*#\s*include\s*"([^"\n]+)"', source.read_text(errors='replace'), re.M):
+            if include == generated_skip:
+                continue
+            found = (source.parent / include).resolve()
+            if found.is_file() and found.is_relative_to(root):
+                pending.append(found)
+    return inputs
+
+
+def pack_identity(pack):
+    """The part of a pack every title of it shares: its host code."""
+    return identity({'version': VERSION, 'host': closure(pack.root, pack.host_sources)})
+
+
+def title_identity(app_id, pack, profile):
+    replacements = pack.device_file(profile['replacements'])
+    scripts = {p.name: p for p in pack.device_scripts}
+    inputs = {
+        'app': app_id,
+        'pack': pack_identity(pack),
+        'profile': {key: profile[key] for key in ('slug', 'elf_sha256', 'replacements', 'replace_list')},
+        'replacements': closure(pack.root, [replacements], profile['slug'] + '_funcs.h'),
+        'replace_list': digest(pack.device_file(profile['replace_list'])),
+        'codegen': {script: digest(scripts[script]) for script in profile.get('codegen', [])},
+    }
+    return identity({'version': VERSION, 'inputs': inputs})

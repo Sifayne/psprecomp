@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Prepare a user's ISO locally with the tools contained in the application.
+"""Prepare a user's ISO locally with the tools contained in the application,
+for the packs the player added.
 
 No shell commands, network downloads, system compiler, or game bytes in the
-package. Install records are committed only after a complete successful build.
-Staged in usr/share/<pack id> with the pack's titles as games.json. The
-LR_*_ROOT variables and the LRLIB1 library format are the contract with the
-launcher, which is still Last Raven's (docs/PLAYER-LAYER.md, stage 2).
+package. A pack is added from its file into <data>/packs/<id>, checked and
+built there (compile_game.build_pack); install records are committed only
+after a complete successful build. Staged in usr/share/psprecomp with
+pack.py, compile_game.py and game_fingerprints.py. The PSPRECOMP_*_ROOT
+variables and the LRLIB1 library format are the contract with the launcher
+(src/host/launcher_library.h).
 """
 import argparse
 import importlib.util
@@ -13,14 +16,27 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import signal
+import stat as st
 import subprocess
 import sys
 import tempfile
 import time
+import zipfile
+
+HERE = Path(__file__).resolve().parent
+PACK_FILE_LIMIT, PACK_SIZE_LIMIT = 4096, 256 * 1024**2
+MOVED_NOTE = "MOVED-TO-PSPRECOMP.txt"
+
+
+def module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
 
 
 def digest(path):
@@ -45,23 +61,18 @@ def atomic_write(path, content):
 
 
 class Library:
-    def __init__(self, app, data, state, app_id):
+    def __init__(self, app, data, state, resources=None):
         self.app, self.data, self.state = map(lambda p: Path(p).resolve(), (app, data, state))
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", app_id or ""):
-            raise ValueError("An app id (the pack's folder name) is required.")
-        self.resources = self.app / "usr/share" / app_id
-        self.profiles = json.loads((self.resources / "games.json").read_text())
+        self.resources = Path(resources).resolve() if resources else self.app / "usr/share/psprecomp"
+        self.packs_module = module("pack", self.resources / "pack.py")
+        self.prints = module("game_fingerprints", self.resources / "game_fingerprints.py")
         self.build_id = (self.resources / "build-id").read_text().strip()
-        manifest = json.loads((self.resources / "game-builds.json").read_text())
-        if not isinstance(manifest, dict) or manifest.get("version") != 1 or not isinstance(manifest.get("games"), dict):
+        manifest = json.loads((self.resources / "app-build.json").read_text())
+        if (not isinstance(manifest, dict) or manifest.get("version") != self.prints.VERSION
+                or not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("id", "")))):
             raise ValueError("This app has an invalid game build manifest.")
-        self.game_builds = {}
-        for profile in self.profiles:
-            entry = manifest["games"].get(profile["slug"], {})
-            fingerprint = entry.get("id") if isinstance(entry, dict) else None
-            if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
-                raise ValueError("This app is missing a valid game build fingerprint.")
-            self.game_builds[profile["slug"]] = fingerprint
+        self.app_build = manifest["id"]
+        self.packs_dir = self.data / "packs"
         self.record = self.data / "installed.json"
         self.env = os.environ.copy()
         self.env.setdefault("PSPRECOMP_UI_FONT", str(self.resources / "DejaVuSans.ttf"))
@@ -73,6 +84,189 @@ class Library:
         # retain precedence; drivers still come from the operating system.
         previous = self.env.get("LD_LIBRARY_PATH", "")
         self.env["LD_LIBRARY_PATH"] = (previous + ":" if previous else "") + str(self.app / "usr/lib")
+        self.load_packs()
+
+    # ---- packs -----------------------------------------------------------------
+
+    def load_packs(self):
+        """The packs added, by id, and their titles in order: packs by id,
+        each one's titles in its release order."""
+        self.packs, self.profiles, self.game_builds = {}, [], {}
+        if not self.packs_dir.is_dir():
+            return
+        for folder in sorted(self.packs_dir.iterdir()):
+            if folder.name.startswith(".") or not folder.is_dir():
+                continue
+            try:
+                pack = self.packs_module.load(folder)
+            except (ValueError, OSError) as error:
+                print(f"Skipping the pack in {folder}: {error}", file=sys.stderr, flush=True)
+                continue
+            if pack.id != folder.name:
+                print(f"Skipping the pack in {folder}: its id is {pack.id}", file=sys.stderr, flush=True)
+                continue
+            self.packs[pack.id] = pack
+            for profile in pack.profiles():
+                if any(p["slug"] == profile["slug"] for p in self.profiles):
+                    print(f"{pack.name}: {profile['slug']} is another pack's title; leaving it out",
+                          file=sys.stderr, flush=True)
+                    continue
+                self.profiles.append(profile)
+                self.game_builds[profile["slug"]] = self.prints.title_identity(self.app_build, pack, profile)
+
+    def built(self, pack):
+        """Whether the pack's launcher part and host objects are this app's."""
+        try:
+            record = json.loads((pack.root / "built/build.json").read_text())
+        except (OSError, ValueError):
+            return False
+        return record == {"app": self.app_build, "pack": self.prints.pack_identity(pack)}
+
+    def build_pack(self, pack, log, jobs=2):
+        compiler = module("game_compiler", self.resources / "compile_game.py")
+        out = pack.root / "built"
+        shutil.rmtree(out, ignore_errors=True)
+        compiler.build_pack(self.app, pack, out, self.env, log, jobs)
+        atomic_write(out / "build.json", json.dumps({"app": self.app_build, "pack": self.prints.pack_identity(pack)}).encode())
+
+    def ensure_built(self, pack, jobs=2):
+        if self.built(pack):
+            return sorted((pack.root / "built/host").glob("*.o"))
+        logs = self.state / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log_path = logs / f"pack-{pack.id}-{time.time_ns()}.log"
+        print(f"Building {pack.name} for this computer...", flush=True)
+        with log_path.open("w") as log:
+            self.build_pack(pack, log, jobs)
+        return sorted((pack.root / "built/host").glob("*.o"))
+
+    def install_pack(self, archive, jobs=2):
+        archive = Path(archive).expanduser().resolve(strict=True)
+        if not archive.is_file() or archive.suffix.lower() != ".zip":
+            raise ValueError("Select a pack's .zip file.")
+        self.data.mkdir(parents=True, exist_ok=True)
+        with (self.data / ".import.lock").open("w") as guard:
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError("A game or a pack is being prepared. Wait for it to finish.")
+            return self._install(archive, jobs)
+
+    def _install(self, archive, jobs):
+        self.packs_dir.mkdir(parents=True, exist_ok=True)
+        logs = self.state / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log_path = logs / f"pack-{time.time_ns()}.log"
+        print(f"Checking the pack. Log: {log_path}", flush=True)
+        with log_path.open("w") as log, tempfile.TemporaryDirectory(prefix=".adding-", dir=self.packs_dir) as tmp:
+            staging = Path(tmp) / "pack"
+            staging.mkdir()
+            try:
+                with zipfile.ZipFile(archive) as z:
+                    members = z.infolist()
+                    if len(members) > PACK_FILE_LIMIT or sum(m.file_size for m in members) > PACK_SIZE_LIMIT:
+                        raise ValueError("This pack is too large.")
+                    for m in members:
+                        name = PurePosixPath(m.filename)
+                        kind = (m.external_attr >> 16) & 0o170000
+                        if (m.filename.startswith("/") or "\\" in m.filename or ".." in name.parts
+                                or kind not in (0, st.S_IFREG, st.S_IFDIR)):
+                            raise ValueError(f"This pack holds a file it may not: {m.filename}")
+                    z.extractall(staging)
+            except zipfile.BadZipFile:
+                raise ValueError("This file is not a pack: it is not a valid .zip.")
+            try:
+                pack = self.packs_module.load(staging)
+            except (ValueError, OSError) as error:
+                raise ValueError(f"This file is not a pack psprecomp can use: {error}")
+            for profile in pack.profiles():
+                other = next((p for p in self.profiles if p["slug"] == profile["slug"] and p["pack"] != pack.id), None)
+                if other:
+                    raise ValueError(f"{pack.name} has {profile['title']}, which the {self.packs[other['pack']].name} pack already has.")
+            print(f"Building {pack.name} for this computer...", flush=True)
+            self.build_pack(pack, log, jobs)
+            final = self.packs_dir / pack.id
+            if final.exists():
+                old = self.packs_dir / f".replaced-{pack.id}-{time.time_ns()}"
+                final.rename(old)
+                staging.rename(final)
+                shutil.rmtree(old, ignore_errors=True)
+            else:
+                staging.rename(final)
+        self.load_packs()
+        self.migrate(self.packs[pack.id])
+        self.refresh()
+        print(f"Added {pack.name}.", flush=True)
+        return pack.id
+
+    def remove_pack(self, pack_id):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", pack_id or "") or pack_id not in self.packs:
+            raise ValueError("That pack is not added.")
+        name = self.packs[pack_id].name
+        with (self.data / ".import.lock").open("w") as guard:
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError("A game or a pack is being prepared. Wait for it to finish.")
+            gone = self.packs_dir / f".removing-{pack_id}-{time.time_ns()}"
+            (self.packs_dir / pack_id).rename(gone)
+            shutil.rmtree(gone, ignore_errors=True)
+        self.load_packs()
+        self.refresh()
+        print(f"Removed {name}.", flush=True)
+
+    def migrate(self, pack):
+        """What the pack's own app kept, in the data folder named by its id,
+        brought in once: its saves and states copied -- saves are never moved
+        without a copy remaining -- and its prepared games moved with their
+        records, which say where each ISO is. What is here already stays;
+        the earlier folder keeps a note of what came over."""
+        old = self.data.parent / pack.id
+        if old == self.data or not old.is_dir() or (old / MOVED_NOTE).exists():
+            return
+        slugs = {p["slug"] for p in pack.profiles()}
+        book = self.records()
+        moved = []
+        for kind in ("saves", "states"):
+            for slug in sorted(slugs):
+                source, target = old / kind / slug, self.data / kind / slug
+                if source.is_dir() and not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    partial = target.with_name(f".copying-{slug}")
+                    shutil.rmtree(partial, ignore_errors=True)
+                    shutil.copytree(source, partial, symlinks=True)
+                    partial.rename(target)
+                    moved.append(f"{kind}/{slug} (copied)")
+        try:
+            earlier = json.loads((old / "installed.json").read_text())
+            games = earlier.get("games", {}) if isinstance(earlier, dict) else {}
+        except (OSError, ValueError):
+            games = {}
+        for slug, entry in sorted(games.items()):
+            if slug not in slugs or slug in book["games"] or not isinstance(entry, dict):
+                continue
+            if not all(isinstance(entry.get(key), str) for key in ("iso", "build_id", "directory")):
+                continue
+            directory = Path(entry["directory"])
+            if not directory.is_relative_to(old / "games" / slug) or not directory.is_dir():
+                continue
+            target = self.data / "games" / slug / directory.name
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(directory), str(target))
+            book["games"][slug] = dict(entry, directory=str(target))
+            moved.append(f"games/{slug}")
+        if moved:
+            atomic_write(self.record, (json.dumps(book, indent=2) + "\n").encode())
+        (old / MOVED_NOTE).write_text(
+            f"{pack.name}'s saves and save states were copied, and its prepared games moved, to\n"
+            f"psprecomp's folder:\n{self.data}\n\n" + "".join(f"  {m}\n" for m in moved)
+            + "\nThe saves here are the copies' originals; psprecomp plays from its own.\n")
+        if moved:
+            print(f"Brought in from {old}: {', '.join(moved)}", flush=True)
+
+    # ---- games -------------------------------------------------------------------
 
     def records(self):
         if not self.record.exists():
@@ -82,9 +276,10 @@ class Library:
             raise ValueError("Cannot read the installed game list. It has been left unchanged.")
         if not isinstance(value.get("selected", ""), str):
             raise ValueError("Invalid selected game; the library has been left unchanged.")
-        known = {p["slug"] for p in self.profiles}
+        # A game of a pack not added (any more) keeps its record, ready again
+        # when the pack is back.
         for slug, game in value["games"].items():
-            if slug not in known or not isinstance(game, dict):
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", slug) or not isinstance(game, dict):
                 raise ValueError("Invalid installed game entry; the library has been left unchanged.")
             for key in ("iso", "build_id", "directory"):
                 if not isinstance(game.get(key), str):
@@ -95,9 +290,10 @@ class Library:
         return value
 
     def compatible(self, slug, entry):
-        # Old preview records lack this field and need preparation once. Never
-        # infer runtime compatibility from the old whole-application build ID.
-        return entry.get("game_build_id") == self.game_builds[slug]
+        # Records from before a change of the app, the pack or the title's
+        # own inputs need preparation once; nothing is inferred from the
+        # whole-application build ID.
+        return slug in self.game_builds and entry.get("game_build_id") == self.game_builds[slug]
 
     def ready(self, slug, entry):
         folder = Path(entry["directory"])
@@ -111,8 +307,16 @@ class Library:
 
     def refresh(self):
         book = self.records()
+        # A pack the app has changed under needs its launcher part again
+        # before the launcher can load it; its host objects wait for a game.
+        for pack in self.packs.values():
+            if not (pack.root / "built/launcher.so").is_file() or not self.built(pack):
+                try:
+                    self.ensure_built(pack)
+                except (ValueError, OSError) as error:
+                    print(f"{pack.name}: {error}", file=sys.stderr, flush=True)
         fields = ["LRLIB1", book.get("selected", "")]
-        for profile in self.profiles:  # Release order: the pack's title order.
+        for profile in self.profiles:  # Packs by id, each in its release order.
             slug = profile["slug"]
             if slug not in book["games"]:
                 continue
@@ -167,8 +371,10 @@ class Library:
             disc_id = match[1] if match else "unknown"
             profile = next((p for p in self.profiles if p["disc_id"] == disc_id), None)
             if profile is None:
-                expected = ", ".join(p["disc_id"] for p in self.profiles)
-                raise ValueError(f"Unsupported disc ({disc_id}). This build supports {expected}.")
+                if not self.packs:
+                    raise ValueError(f"Add this game's pack first (Packs in the launcher). Its disc is {disc_id}.")
+                raise ValueError(f"No pack you have added supports this disc ({disc_id}).")
+            pack = self.packs[profile["pack"]]
             print(f"Checking {profile['title']}...", flush=True)
             extracted = tmp / "extracted"
             extracted.mkdir()
@@ -176,12 +382,12 @@ class Library:
             candidates = list(extracted.glob("*EBOOT.BIN"))
             if len(candidates) != 1 or candidates[0].stat().st_size > 32 * 1024**2:
                 raise ValueError("Could not find a supported game executable on this disc.")
-            module = tmp / "module.elf"
+            module_path = tmp / "module.elf"
             if candidates[0].read_bytes()[:4] == b"\x7fELF":
-                shutil.copy2(candidates[0], module)
+                shutil.copy2(candidates[0], module_path)
             else:
-                run([self.app / "usr/bin/pspdecrypt", "-o", module, candidates[0]])
-            if digest(module) != profile["elf_sha256"]:
+                run([self.app / "usr/bin/pspdecrypt", "-o", module_path, candidates[0]])
+            if digest(module_path) != profile["elf_sha256"]:
                 raise ValueError(f"{profile['title']} has an unsupported executable version. Your library was not changed.")
             slug = profile["slug"]
             # Cache reuse still checks the disc and exact executable above.
@@ -195,25 +401,24 @@ class Library:
             else:
                 previous = None
             if not previous:
+                host_objects = self.ensure_built(pack, jobs)
                 print("Preparing this game for the current runtime...", flush=True)
-                spec = importlib.util.spec_from_file_location("game_compiler", self.resources / "compile_game.py")
-                compiler = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(compiler)
-                compiler.compile_game(self.app, profile, module, tmp / "game", jobs, self.env, log)
+                compiler = module("game_compiler", self.resources / "compile_game.py")
+                compiler.compile_game(self.app, pack, host_objects, profile, module_path, tmp / "game", jobs, self.env, log)
                 directory = self.data / "games" / slug
                 directory.mkdir(parents=True, exist_ok=True)
                 destination = directory / (self.game_builds[slug][:16] + "-" + str(time.time_ns()))
                 ready = tmp / "ready"
                 ready.mkdir()
                 shutil.move(tmp / "game", ready / "game")
-                shutil.move(module, ready / "module.elf")
+                shutil.move(module_path, ready / "module.elf")
             after = iso.stat()
             if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
                 raise ValueError("The ISO changed during preparation. Please import it again.")
             entry = dict(iso=str(iso), iso_size=stat.st_size, iso_mtime_ns=stat.st_mtime_ns,
                          build_id=previous["build_id"] if previous else self.build_id,
                          game_build_id=self.game_builds[slug], directory=str(destination),
-                         elf_sha256=profile["elf_sha256"])
+                         elf_sha256=profile["elf_sha256"], pack=pack.id)
             if not previous:
                 (ready / "build.json").write_text(json.dumps(entry, indent=2) + "\n")
                 ready.rename(destination)
@@ -221,11 +426,11 @@ class Library:
             book["selected"] = slug
             atomic_write(self.record, (json.dumps(book, indent=2) + "\n").encode())
             self.refresh()
-            print(f"Ready: {profile['title']}. Choose Save & Play.", flush=True)
+            print(f"Ready: {profile['title']}. Choose Save and play.", flush=True)
             return slug
 
-    def launch(self, module, iso, args):
-        module = str(Path(module).resolve())
+    def launch(self, module_path, iso, args):
+        module_path = str(Path(module_path).resolve())
         args = list(args)
         for i, arg in enumerate(args):
             if arg == "--config" and i + 1 < len(args):
@@ -234,9 +439,9 @@ class Library:
                 args[i] = "--config=" + str(Path(arg.split("=", 1)[1]).resolve())
         book = self.records()
         found = next(((slug, entry) for slug, entry in book["games"].items()
-                      if Path(entry["directory"]) / "module.elf" == Path(module)), None)
+                      if Path(entry["directory"]) / "module.elf" == Path(module_path)), None)
         if not found or not self.ready(*found):
-            raise ValueError("This game needs preparation or its ISO has moved. Use Add Game to select the ISO again.")
+            raise ValueError("This game needs preparation or its ISO has moved. Use Add game to select the ISO again.")
         slug, entry = found
         save_root = self.data / "saves" / slug
         save_root.mkdir(parents=True, exist_ok=True)
@@ -248,34 +453,46 @@ class Library:
         os.chdir(save_root)
         with log_path.open("w") as log:
             os.dup2(log.fileno(), 1); os.dup2(log.fileno(), 2)
-        os.execve(executable, [executable, module, entry["iso"], *args], self.env)
+        os.execve(executable, [executable, module_path, entry["iso"], *args], self.env)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--app-root", default=os.environ.get("LR_APP_ROOT"))
-    parser.add_argument("--app-id", required=True, help="the pack's id, usr/share/<id>")
-    parser.add_argument("--data-root", default=os.environ.get("LR_DATA_ROOT"))
-    parser.add_argument("--state-root", default=os.environ.get("LR_STATE_ROOT"))
+    parser.add_argument("--app-root", default=os.environ.get("PSPRECOMP_APP_ROOT"))
+    parser.add_argument("--data-root", default=os.environ.get("PSPRECOMP_DATA_ROOT"))
+    parser.add_argument("--state-root", default=os.environ.get("PSPRECOMP_STATE_ROOT"))
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("refresh")
     commands.add_parser("list")
+    commands.add_parser("packs")
     prepare = commands.add_parser("import")
     prepare.add_argument("iso")
     prepare.add_argument("--jobs", type=int, default=2)
+    add = commands.add_parser("install-pack")
+    add.add_argument("archive")
+    add.add_argument("--jobs", type=int, default=2)
+    remove = commands.add_parser("remove-pack")
+    remove.add_argument("pack")
     launch = commands.add_parser("run")
     launch.add_argument("module"); launch.add_argument("iso"); launch.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if not all((args.app_root, args.data_root, args.state_root)):
         parser.error("app, data and state paths are required; normally supplied by AppRun")
     try:
-        library = Library(args.app_root, args.data_root, args.state_root, args.app_id)
+        library = Library(args.app_root, args.data_root, args.state_root)
         if args.command == "import":
             library.import_iso(args.iso, args.jobs)
+        elif args.command == "install-pack":
+            library.install_pack(args.archive, args.jobs)
+        elif args.command == "remove-pack":
+            library.remove_pack(args.pack)
         elif args.command == "run":
             library.launch(args.module, args.iso, args.args)
         elif args.command == "list":
             print(json.dumps(library.records(), indent=2))
+        elif args.command == "packs":
+            print(json.dumps({pid: {"name": p.name, "titles": [t["slug"] for t in p.titles],
+                                    "built": library.built(p)} for pid, p in library.packs.items()}, indent=2))
         else:
             library.refresh()
     except (ValueError, OSError, subprocess.SubprocessError) as error:

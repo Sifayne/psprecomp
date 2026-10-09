@@ -5,8 +5,8 @@
  *
  * Its packs (psprecomp/host/launcher.h) are those it was linked with -- a
  * game's own development launcher has its pack -- and those installed in the
- * folder --packs names, each a launcher.so the importer built from the pack's
- * sources. Every game of every pack is a tab. The side list has the player's
+ * folder --packs names, each with the launcher.so the importer built from
+ * the pack's sources (built/launcher.so). Every game of every pack is a tab. The side list has the player's
  * pages, for every game, then the selected game's pack's, then Packs and
  * About. One preferences file holds them all (psprecomp/host/settings.h):
  * the launcher keeps it in memory with every section, edits the player's and
@@ -104,11 +104,12 @@ static int pack_add(const psp_launcher *info, const psp_settings_schema *setting
     return 0;
 }
 
-/* An installed pack: <packs>/<id>/launcher.so, built for this API. */
+/* An added pack: <packs>/<id>/built/launcher.so, which the importer built
+ * for this API. */
 static void pack_load(const char *dir) {
     for (int p = 0; p < pack_count; p++) if (!strcmp(packs[p].dir, dir)) return;
     char so[1100];
-    snprintf(so, sizeof so, "%s/launcher.so", dir);
+    snprintf(so, sizeof so, "%s/built/launcher.so", dir);
     if (access(so, R_OK)) return;
     void *h = dlopen(so, RTLD_NOW | RTLD_LOCAL);
     if (!h) { fprintf(stderr, "launcher: cannot load the pack in %s: %s\n", dir, dlerror()); return; }
@@ -159,14 +160,54 @@ static void movie_off(launcher *a) {
         psp_settings_set(&a->edit, PSP_OPT_MPEG_DECODE, "0", PSP_SOURCE_FILE, error);
 }
 
+/* An XDG base folder with name under it: the variable when it is absolute,
+ * else fallback under $HOME. */
+static int xdg_path(const char *variable, const char *fallback, const char *name, char *out, size_t cap) {
+    const char *given = getenv(variable), *home = getenv("HOME");
+    int n;
+    if (given && given[0] == '/') n = snprintf(out, cap, "%s/%s", given, name);
+    else if (home && home[0] == '/') n = snprintf(out, cap, "%s/%s/%s", home, fallback, name);
+    else return -1;
+    return n > 0 && (size_t)n < cap ? 0 : -1;
+}
+
+/* A pack's earlier settings come in the first time it is used here, when
+ * the file has no section for it: those of its own app (<XDG
+ * config>/<pack id>/settings.ini) or of its game's own launcher (<XDG
+ * data>/<its earlier name>/settings.ini), bringing the player's section too
+ * when the file has none. The earlier files stay as they were; until Save,
+ * so does this one, and the next start brings them in again. */
+static void adopt_earlier(launcher *a, int p) {
+    char candidates[2][4096], name[1100];
+    snprintf(name, sizeof name, "%s/settings.ini", packs[p].settings->id);
+    if (xdg_path("XDG_CONFIG_HOME", ".config", name, candidates[0], sizeof candidates[0])) candidates[0][0] = 0;
+    snprintf(name, sizeof name, "%s/settings.ini", packs[p].info->earlier ? packs[p].info->earlier : "");
+    if (!packs[p].info->earlier ||
+        xdg_path("XDG_DATA_HOME", ".local/share", name, candidates[1], sizeof candidates[1])) candidates[1][0] = 0;
+    for (int c = 0; c < 2; c++) {
+        if (!candidates[c][0] || access(candidates[c], R_OK)) continue;
+        char error[PSP_SETTINGS_ERROR];
+        psp_settings_file *old = psp_settings_file_read(candidates[c], error);
+        if (!old) { fprintf(stderr, "launcher: cannot bring in %s: %s\n", candidates[c], error); continue; }
+        const int rc = psp_settings_file_adopt(a->file, old, packs[p].settings->id, error);
+        psp_settings_file_free(old);
+        if (rc) { fprintf(stderr, "launcher: cannot bring in %s: %s\n", candidates[c], error); continue; }
+        fprintf(stderr, "launcher: brought in %s\n", candidates[c]);
+        snprintf(a->status, sizeof a->status, "Brought in your earlier settings for %.200s.", packs[p].info->name);
+        return;
+    }
+}
+
 /* Edit pack p's settings and the player's: what is being edited goes back
  * into the file first, so a switch loses nothing; a section the file does
- * not have yet starts from the play defaults. */
+ * not have yet comes from the pack's earlier settings, or else starts from
+ * the play defaults. */
 static void use_pack(launcher *a, int p) {
     char error[PSP_SETTINGS_ERROR];
     if (a->editing && !a->load_failed) psp_settings_file_put(a->file, &a->edit, error);
     a->pack = p;
     psp_settings_schema_use(pack_settings(p));
+    if (p >= 0 && !a->load_failed && !psp_settings_file_has(a->file, 1)) adopt_earlier(a, p);
     const int had_player = psp_settings_file_has(a->file, 0), had_pack = psp_settings_file_has(a->file, 1);
     if (psp_settings_file_get(a->file, &a->edit, error)) {
         a->load_failed = 1;
@@ -245,17 +286,6 @@ static int save(launcher *a) {
     a->dirty = 0;
     snprintf(a->status, sizeof a->status, "Settings saved.");
     return 0;
-}
-
-/* An XDG base folder with name under it: the variable when it is absolute,
- * else fallback under $HOME. */
-static int xdg_path(const char *variable, const char *fallback, const char *name, char *out, size_t cap) {
-    const char *given = getenv(variable), *home = getenv("HOME");
-    int n;
-    if (given && given[0] == '/') n = snprintf(out, cap, "%s/%s", given, name);
-    else if (home && home[0] == '/') n = snprintf(out, cap, "%s/%s/%s", home, fallback, name);
-    else return -1;
-    return n > 0 && (size_t)n < cap ? 0 : -1;
 }
 
 /* The game runs from a per-title save folder, <data root>/saves/<slug>, so a
@@ -409,41 +439,6 @@ static void poll_child(launcher *a) {
              WIFEXITED(status) ? "exit" : "signal", WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
     char title[192]; snprintf(title, sizeof title, "%s could not start", game_title(a));
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, *a->child_error ? a->child_error : a->status, a->window);
-}
-
-/* ---- the earlier apps' settings ------------------------------------------------------ */
-
-/* With no preferences file yet, each pack's earlier settings come in once:
- * those of its own app (<XDG config>/<pack id>/settings.ini) or of its
- * game's own launcher (<XDG data>/<its earlier name>/settings.ini). The
- * earlier files stay as they were. */
-static void adopt_earlier(launcher *a) {
-    char found[1024] = "";
-    for (int p = 0; p < pack_count; p++) {
-        char candidates[2][4096], name[1100];
-        snprintf(name, sizeof name, "%s/settings.ini", packs[p].settings->id);
-        if (xdg_path("XDG_CONFIG_HOME", ".config", name, candidates[0], sizeof candidates[0])) candidates[0][0] = 0;
-        snprintf(name, sizeof name, "%s/settings.ini", packs[p].info->earlier ? packs[p].info->earlier : "");
-        if (!packs[p].info->earlier ||
-            xdg_path("XDG_DATA_HOME", ".local/share", name, candidates[1], sizeof candidates[1])) candidates[1][0] = 0;
-        for (int c = 0; c < 2; c++) {
-            if (!candidates[c][0] || access(candidates[c], R_OK)) continue;
-            char error[PSP_SETTINGS_ERROR];
-            psp_settings_file *old = psp_settings_file_read(candidates[c], error);
-            if (!old) { fprintf(stderr, "launcher: cannot bring in %s: %s\n", candidates[c], error); continue; }
-            const int rc = psp_settings_file_adopt(a->file, old, packs[p].settings->id, error);
-            psp_settings_file_free(old);
-            if (rc) { fprintf(stderr, "launcher: cannot bring in %s: %s\n", candidates[c], error); continue; }
-            fprintf(stderr, "launcher: brought in %s\n", candidates[c]);
-            size_t used = strlen(found);
-            snprintf(found + used, sizeof found - used, "%s%s", used ? ", " : "", packs[p].info->name);
-            break;
-        }
-    }
-    if (!*found) return;
-    a->editing = 0;
-    use_pack(a, a->pack);
-    if (!save(a)) snprintf(a->status, sizeof a->status, "Brought in your earlier settings for %.400s.", found);
 }
 
 /* ---- drawing ------------------------------------------------------------------------ */
@@ -867,13 +862,12 @@ static int start(launcher *a, int argc, char **argv, int *check_startup, const c
             snprintf(a->status, sizeof a->status, "Cannot read your settings, so they will not be saved: %.400s", error);
         }
     }
-    const int fresh = !a->file && !a->load_failed;
     if (!a->file) a->file = psp_settings_file_new();
     if (!a->file) { fprintf(stderr, "out of memory\n"); return 2; }
+    /* A first start shows the play defaults, or what the earlier settings
+     * bring, unsaved until Save or Save and play: nothing the player changed
+     * is at stake. */
     use_pack(a, pack_count ? 0 : -1);
-    /* A first start shows the play defaults, unsaved until Save or Save and
-     * play: nothing the player changed is at stake. */
-    if (fresh) adopt_earlier(a);
     if (library_load(a, 0)) return 2;
     qsort(a->games, (size_t)a->game_count, sizeof a->games[0], title_order);
     if (a->game_count) {

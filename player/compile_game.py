@@ -1,41 +1,87 @@
-"""The game generation/compilation recipe, separate from library and launcher UI.
+"""The on-device build recipes, separate from the library and launcher UI:
+a pack's host code and launcher part when the pack is added, and a title's
+game when its disc is.
 
 This file is part of every game fingerprint. Changes to commands, flags or
 linking here therefore invalidate games built with a different recipe. It is
-staged in the app's resources folder, usr/share/<pack id>, beside the pack's
-host sources and code-generation scripts, and reads them from there.
+staged in the app's resources folder, usr/share/psprecomp, beside the
+headers, the runtime and player archives and emit-split.py, and reads them
+from there.
 """
 import concurrent.futures
 from pathlib import Path
 import subprocess
 import sys
 
+TARGET = ['-target', 'x86_64-linux-gnu.2.35']
+# What the launcher may see of a pack's launcher.so; the rest stays its own.
+EXPORTS = '{ global: psp_title_settings; psp_launcher_info; psp_pack_api; local: *; };\n'
 
-def compile_game(app, profile, module, output, jobs, env, log):
-    app, module, output = map(Path, (app, module, output))
-    resources, tmp = Path(__file__).resolve().parent, output.parent
-    slug = profile['slug']
 
+def _runner(cwd, env, log):
     def run(args):
         log.write('\n$ ' + ' '.join(map(str, args)) + '\n')
         log.flush()
-        result = subprocess.run(list(map(str, args)), cwd=tmp, env=env, stdout=log, stderr=log)
+        result = subprocess.run(list(map(str, args)), cwd=cwd, env=env, stdout=log, stderr=log)
         if result.returncode:
             raise ValueError(f'Preparation failed. See {log.name} for details.')
+    return run
 
+
+def _host_flags(resources, source):
+    # The pack's sources find their headers beside them; psprecomp's and
+    # SDL's are the app's own.
+    return ['-std=gnu11', '-O2', '-DNDEBUG', '-DHAVE_SDL2', '-I', resources / 'include',
+            '-I', resources / 'include/SDL2', '-I', resources / 'recomp', '-I', Path(source).parent]
+
+
+def build_pack(app, pack, out, env, log, jobs=2):
+    """A pack's launcher.so and its host objects, into out."""
+    app, out = Path(app), Path(out)
+    resources = Path(__file__).resolve().parent
+    zig = [app / 'usr/zig/zig', 'cc', *TARGET]
+    out.mkdir(parents=True, exist_ok=True)
+    run = _runner(out, env, log)
+    (out / 'exports.map').write_text(EXPORTS)
+    run([*zig, '-shared', '-fPIC', '-std=gnu11', '-O2', '-DNDEBUG', '-I', resources / 'include',
+         *[a for src in pack.launcher_sources for a in ('-I', src.parent)],
+         *pack.launcher_sources, resources / 'pack_api.c',
+         '-Wl,--version-script=' + str(out / 'exports.map'), '-Wl,-Bsymbolic', '-o', out / 'launcher.so'])
+    host = out / 'host'
+    host.mkdir(exist_ok=True)
+    stems = [src.stem for src in pack.host_sources]
+    if len(stems) != len(set(stems)):
+        raise ValueError(f'{pack.name}: host sources need distinct file names')
+
+    def compile_one(src):
+        run([*zig, *_host_flags(resources, src), '-c', src, '-o', host / (src.stem + '.o')])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        list(pool.map(compile_one, pack.host_sources))
+    return sorted(host.glob('*.o'))
+
+
+def compile_game(app, pack, host_objects, profile, module, output, jobs, env, log):
+    app, module, output = map(Path, (app, module, output))
+    resources, tmp = Path(__file__).resolve().parent, output.parent
+    slug = profile['slug']
+    run = _runner(tmp, env, log)
     generated, obj = tmp / 'generated', tmp / 'objects'
     generated.mkdir(); obj.mkdir()
-    host = resources / 'host'
+    replacements = pack.device_file(profile['replacements'])
+    replace_list = pack.device_file(profile['replace_list'])
     run([app / 'usr/bin/allegrexrecomp', 'emit', module, generated, slug,
-         '--replace', '@' + str(host / profile['replace_list'])])
+         '--replace', '@' + str(replace_list)])
     # The pack's own generators, such as Last Raven's fps-loop.py.
+    scripts = {p.name: p for p in pack.device_scripts}
     for script in profile.get('codegen', []):
-        run([sys.executable, '-I', '-B', resources / script, slug, generated])
+        run([sys.executable, '-I', '-B', scripts[script], slug, generated])
     run([sys.executable, '-I', '-B', resources / 'emit-split.py',
          generated / f'{slug}_funcs.c', obj, '32'])
-    cc = [app / 'usr/zig/zig', 'cc', '-target', 'x86_64-linux-gnu.2.35',
+    includes = sorted({p.parent for p in pack.device_host})
+    cc = [app / 'usr/zig/zig', 'cc', *TARGET,
           '-std=gnu11', '-fno-strict-aliasing', '-fwrapv', '-I', resources / 'include',
-          '-I', generated, '-I', obj, '-I', host]
+          '-I', generated, '-I', obj, *[a for d in includes for a in ('-I', d)]]
     chunks = sorted(obj.glob(f'{slug}_funcs_[0-9][0-9].c'))
 
     def compile_chunk(src):
@@ -49,9 +95,10 @@ def compile_game(app, profile, module, output, jobs, env, log):
             print(f'Compiling game: {i}/{len(chunks)}', flush=True)
     run([*cc, '-O0', '-c', obj / f'{slug}_funcs_reg.c', '-o', obj / 'register.o'])
     run([*cc, '-O2', '-c', generated / f'{slug}_imports.c', '-o', obj / 'imports.o'])
-    run([*cc, '-O2', '-DHAVE_SDL2', '-c', host / profile['replacements'], '-o', obj / 'replacements.o'])
+    run([*cc, '-O2', '-DHAVE_SDL2', '-I', resources / 'include/SDL2', '-c', replacements, '-o', obj / 'replacements.o'])
     print('Finishing game setup...', flush=True)
-    run([*cc, '-O2', *sorted(obj.glob('*.o')), resources / f'libhost-{slug}.a',
-         resources / 'libruntime.a', '-L', app / 'usr/lib', '-lSDL2', '-lSDL2_ttf', '-lopenh264', '-lavcodec', '-lavutil',
+    run([*cc, '-O2', *sorted(obj.glob('*.o')), *host_objects,
+         '-Wl,--start-group', resources / 'libplayer.a', resources / 'libruntime.a', '-Wl,--end-group',
+         '-L', app / 'usr/lib', '-lSDL2', '-lSDL2_ttf', '-lopenh264', '-lavcodec', '-lavutil',
          '-lm', '-lpthread', '-Wl,-rpath,$ORIGIN/lib', '-o', output])
     run([output, '--print-settings'])

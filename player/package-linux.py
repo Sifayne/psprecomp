@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Build the player's AppImage for a title pack, in an unprivileged Ubuntu
-22.04 container.
+"""Build psprecomp's AppImage, and the file of each pack named, in an
+unprivileged Ubuntu 22.04 container.
 
-    player/package-linux.py build --pack PATH [--output DIR] [--work DIR]
+    player/package-linux.py build [--pack PATH]... [--output DIR] [--work DIR]
 
-Only Bubblewrap, Python 3, curl and tar are required on the build host. No
-daemon, root, game dump, generated C, or developer build products are used:
-the container sees this toolkit's sources and the files the pack's manifest
-names (player/pack.py), nothing else. Last Raven's scripts/package-linux.py
-until stage 2 of docs/PLAYER-LAYER.md moved it here.
+The app holds no pack; a player adds a pack's file (<file>-pack.zip) to it.
+Each pack named is checked, written to its file, and added to the staged
+app as a player would add it. Only Bubblewrap, Python 3, curl and tar are
+required on the build host. No daemon, root, game dump, generated C, or
+developer build products are used: the container sees this toolkit's
+sources and the files each pack's manifest names (player/pack.py), nothing
+else. Last Raven's scripts/package-linux.py until stage 2 of
+docs/PLAYER-LAYER.md moved it here.
 """
 import argparse
 import fcntl
@@ -27,8 +30,9 @@ LOCK = json.loads((RECIPE / "dependencies.json").read_text())
 sys.path.insert(0, str(TOOLKIT / "player"))
 import pack as packs  # noqa: E402
 
-# Set by main(): the pack, and the cache the pack's build/package holds.
-PACK = WORK = DOWNLOADS = ROOTFS = None
+# Set by main(): the packs, and the build cache.
+PACKS = []
+WORK = DOWNLOADS = ROOTFS = None
 MARKER = ".player-builder"
 
 
@@ -53,8 +57,9 @@ def fetch():
         dest = DOWNLOADS / name
         if not dest.exists():
             # A development FFmpeg build may already hold the archive.
-            cached = PACK.root / "build/deps/downloads" / name
-            if cached.exists() and sha(cached) == pin["sha256"]:
+            cached = next((p.root / "build/deps/downloads" / name for p in PACKS
+                           if (p.root / "build/deps/downloads" / name).exists()), None)
+            if cached and sha(cached) == pin["sha256"]:
                 shutil.copy2(cached, dest)
             else:
                 part = dest.with_name(name + ".part")
@@ -132,20 +137,22 @@ def copy_tree(source, dest, suffixes=None):
 def copy_inputs(dest):
     # Allowlists keep dumps, keys, generated game code and build products out
     # of both the container and the matching source archive: this toolkit's
-    # runtime, recompiler and player sources, and the pack's named files.
+    # runtime, recompiler and player sources, and each pack's named files.
     toolkit = dest / "psprecomp"
     if not (TOOLKIT / "src/cpu.c").is_file():
         raise ValueError(f"{TOOLKIT} is not a psprecomp checkout")
     for folder in ("src", "include", "player", "third_party/stb", "third_party/imgui", "third_party/ffmpeg"):
         copy_tree(TOOLKIT / folder, toolkit / folder)
     copy_tree(TOOLKIT / "tools/allegrexrecomp", toolkit / "tools/allegrexrecomp", {".c", ".h"})
-    for name in ("LICENSE", "tests/test_present.c", "tests/test_savedata.c", "tests/test_launcher.c"):
+    for name in ("LICENSE", "tests/test_present.c", "tests/test_savedata.c", "tests/test_launcher.c",
+                 "tests/test_pack_plugin.c"):
         (toolkit / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(TOOLKIT / name, toolkit / name)
-    for name in PACK.files():
-        target = dest / "pack" / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(PACK.root / name, target)
+    for pack in PACKS:
+        for name in pack.files():
+            target = dest / "packs" / pack.id / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(pack.root / name, target)
     manifest = {str(p.relative_to(dest)): sha(p) for p in sorted(dest.rglob("*")) if p.is_file()}
     (dest / "INPUTS.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
@@ -172,23 +179,27 @@ def build(output):
             ready = Path(publish) / "ready"
             shutil.copytree(source / "build/release", ready, symlinks=True)
             ready.rename(output)
-    print(f"Validated {PACK.name}: {output}")
+    print(f"Validated psprecomp" + "".join(f" and {p.name}" for p in PACKS) + f": {output}")
 
 
 def main():
-    global PACK, WORK, DOWNLOADS, ROOTFS
+    global PACKS, WORK, DOWNLOADS, ROOTFS
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=("fetch", "bootstrap", "build"), nargs="?", default="build")
-    p.add_argument("--pack", type=Path, required=True, help="a directory holding pack.json")
-    p.add_argument("--work", type=Path, help="download and builder cache (default: <pack>/build/package)")
-    p.add_argument("--output", type=Path, help="a new release directory (default: <pack>/build/releases/launcher-preview)")
+    p.add_argument("--pack", type=Path, action="append", default=[],
+                   help="a directory holding pack.json; repeat for several")
+    p.add_argument("--work", type=Path, help="download and builder cache (default: build/package here)")
+    p.add_argument("--output", type=Path, help="a new release directory (default: build/releases/player here)")
     args = p.parse_args()
     try:
-        PACK = packs.load(args.pack)
-        WORK = (args.work or PACK.root / "build/package").resolve()
+        PACKS = [packs.load(path) for path in args.pack]
+        ids = [pack.id for pack in PACKS]
+        if len(ids) != len(set(ids)):
+            raise ValueError("each pack may be named once")
+        WORK = (args.work or TOOLKIT / "build/package").resolve()
         DOWNLOADS = WORK / "downloads"
         ROOTFS = WORK / "ubuntu-22.04"
-        output = (args.output or PACK.root / "build/releases/launcher-preview").resolve()
+        output = (args.output or TOOLKIT / "build/releases/player").resolve()
         if platform.system() != "Linux" or platform.machine() != "x86_64":
             raise ValueError("this pipeline currently requires an x86-64 Linux build host")
         WORK.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,5 @@
 /* An installed pack's launcher part, for tests/test_launcher.c: built with
- * src/host/pack_api.c into packs/gamma/launcher.so, as the importer builds a
+ * src/host/pack_api.c into packs/gamma/built/launcher.so, as the importer builds a
  * pack's settings.c and launcher_info.c. Its resolve hook calls back into
  * the launcher's settings mechanism, as a pack's helpers do. */
 #include "psprecomp/host/launcher.h"

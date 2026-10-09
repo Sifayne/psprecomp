@@ -3,14 +3,15 @@
 
     test_import_game.py [APP]
 
-With an AppDir, the importer under test is the one it staged; without one,
-player/import_game.py. Either way the titles are three synthetic ones in a
-fixture app: these checks are about the importer, not any pack's titles."""
+With an AppDir, the importer, pack loader and fingerprints under test are
+the ones it staged; without one, this checkout's. Either way they run in a
+fixture app whose build recipes are stand-ins, with a synthetic pack of
+three titles: these checks are about the importer, not any pack's titles or
+the compiler."""
 import fcntl
 import hashlib
 import importlib.util
 import json
-import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -18,20 +19,31 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
 
 APP = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else None
-if APP:
-    STAGED = [p.parent for p in APP.glob('usr/share/*/app.json')]
-    if len(STAGED) != 1:
-        sys.exit(f'{APP}: expected one usr/share/<id>/app.json')
-    SOURCE = STAGED[0] / 'import_game.py'
-else:
-    SOURCE = Path(__file__).resolve().parents[1] / 'import_game.py'
-spec = importlib.util.spec_from_file_location('importer', SOURCE)
-APP_ID = 'fixture-app'
-FIRST, SECOND, THIRD = 'first', 'second', 'third'   # in release order
+CHECKOUT = Path(__file__).resolve().parents[1]
+STAGED = APP / 'usr/share/psprecomp' if APP else None
+SOURCES = {name: (STAGED / name if STAGED else CHECKOUT / path) for name, path in
+           (('import_game.py', 'import_game.py'), ('pack.py', 'pack.py'),
+            ('game_fingerprints.py', 'linux/game_fingerprints.py'))}
+spec = importlib.util.spec_from_file_location('importer', SOURCES['import_game.py'])
 importer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(importer)
+FIRST, SECOND, THIRD = 'first', 'second', 'third'   # in release order
+
+# Stand-ins for the on-device recipes: a pack "builds" to a launcher.so and
+# one host object; a game is a shell script.
+RECIPES = '''
+from pathlib import Path
+def build_pack(app, pack, out, env, log, jobs=2):
+    out = Path(out); (out / 'host').mkdir(parents=True, exist_ok=True)
+    (out / 'launcher.so').write_text('launcher of ' + pack.id)
+    (out / 'host/boot.o').write_text('host of ' + pack.id)
+    return [out / 'host/boot.o']
+def compile_game(app, pack, host_objects, profile, module, output, jobs, env, log):
+    Path(output).write_text('#!/bin/sh\\nexit 0\\n'); Path(output).chmod(0o755)
+'''
 
 
 class ImportTests(unittest.TestCase):
@@ -39,24 +51,64 @@ class ImportTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix='game import checks ')
         self.root = Path(self.tmp.name)
         self.app = self.root / 'app with spaces'
-        resources = self.app / 'usr/share' / APP_ID
-        resources.mkdir(parents=True)
+        self.resources = self.app / 'usr/share/psprecomp'
+        self.resources.mkdir(parents=True)
+        for name, source in SOURCES.items():
+            shutil.copy2(source, self.resources / name)
+        (self.resources / 'compile_game.py').write_text(RECIPES)
+        (self.resources / 'build-id').write_text('fixture-build')
+        (self.resources / 'app-build.json').write_text(json.dumps({'version': 2, 'id': 'a' * 64}))
         self.module = b'\x7fELFsynthetic fixture, not a game'
-        self.profiles = [dict(slug=slug, title=slug.title() + ' Title', disc_id=f'FIXT1000{i}',
-                              elf_sha256=hashlib.sha256(self.module).hexdigest(),
-                              replacements=f'{slug}.c', replace_list=f'{slug}.txt', codegen=[])
-                         for i, slug in enumerate((FIRST, SECOND, THIRD))]
-        (resources / 'games.json').write_text(json.dumps(self.profiles))
-        (resources / 'build-id').write_text('fixture-build')
-        (resources / 'game-builds.json').write_text(json.dumps({'version': 1, 'games': {
-            p['slug']: {'id': hashlib.sha256(p['slug'].encode()).hexdigest()} for p in self.profiles}}))
-        self.library = importer.Library(self.app, self.root / 'data', self.root / 'state', APP_ID)
+        self.pack_dir = self.make_pack(self.root / 'pack source', 'fixture', 'Fixture',
+                                       (FIRST, SECOND, THIRD))
+        self.data = self.root / 'data' / 'psprecomp'
+        self.library = self.library_now()
+        self.add(self.pack_dir)
         self.iso = self.root / 'my disc & spaces |.iso'
         self.iso.write_bytes(b'fixture'.ljust(32768, b'\0'))
-        self.disc = self.profiles[0]['disc_id']
+        self.disc = 'FIXT10000'
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def library_now(self):
+        return importer.Library(self.app, self.data, self.root / 'state')
+
+    def make_pack(self, root, pack_id, name, slugs, version=2):
+        root.mkdir(parents=True)
+        (root / 'LICENSE').write_text('MIT')
+        (root / 'host').mkdir()
+        (root / 'host/boot.c').write_text('#include "shared.h"\nint boot;\n')
+        (root / 'host/shared.h').write_text('#define SHARED 1\n')
+        (root / 'host/settings.c').write_text('int settings;\n')
+        (root / 'host/launcher_info.c').write_text('int info;\n')
+        titles = []
+        for i, slug in enumerate(slugs):
+            (root / f'host/{slug}.c').write_text(f'#include "shared.h"\n#include "{slug}_funcs.h"\n')
+            (root / f'host/{slug}.txt').write_text('00102018\n')
+            titles.append(dict(slug=slug, title=slug.title() + ' Title', disc_id=f'FIXT1000{i}' if pack_id == 'fixture' else f'OTHR1000{i}',
+                               elf_sha256=hashlib.sha256(self.module).hexdigest(),
+                               replacements=f'{slug}.c', replace_list=f'{slug}.txt'))
+        (root / 'pack.json').write_text(json.dumps({
+            'version': version, 'pack': {'id': pack_id, 'name': name, 'license': 'LICENSE'},
+            'titles': titles,
+            'host': {'sources': ['host/boot.c'], 'launcher': ['host/settings.c', 'host/launcher_info.c']},
+            'device': {'host': ['host/shared.h', *[f'host/{s}.{e}' for s in slugs for e in ('c', 'txt')]]}}))
+        return root
+
+    def zip_of(self, root, extra=None):
+        path = root.with_suffix('.zip')
+        with zipfile.ZipFile(path, 'w') as z:
+            for p in sorted(root.rglob('*')):
+                if p.is_file():
+                    z.write(p, p.relative_to(root).as_posix())
+            for name, data in (extra or {}).items():
+                z.writestr(name, data)
+        return path
+
+    def add(self, root):
+        self.library.install_pack(self.zip_of(root))
+        self.library = self.library_now()
 
     def fake_run(self, args, **kwargs):
         if args[1] == 'info':
@@ -67,13 +119,14 @@ class ImportTests(unittest.TestCase):
         raise AssertionError('Unexpected helper invocation: ' + repr(args))
 
     def install(self, slug=FIRST):
-        folder = self.library.data / 'games' / slug / 'previous build'
+        folder = self.data / 'games' / slug / 'previous build'
         folder.mkdir(parents=True)
         (folder / 'game').write_text('#!/bin/sh\nexit 0\n')
         (folder / 'game').chmod(0o755)
         (folder / 'module.elf').write_bytes(self.module)
         stat = self.iso.stat()
-        entry = dict(directory=str(folder), iso=str(self.iso), build_id=self.library.build_id, game_build_id=self.library.game_builds[slug],
+        entry = dict(directory=str(folder), iso=str(self.iso), build_id=self.library.build_id,
+                     game_build_id=self.library.game_builds[slug],
                      iso_size=stat.st_size, iso_mtime_ns=stat.st_mtime_ns)
         book = self.library.records()
         book['games'][slug] = entry
@@ -81,11 +134,100 @@ class ImportTests(unittest.TestCase):
         self.library.record.write_text(json.dumps(book))
         return entry
 
+    # ---- packs -----------------------------------------------------------------
+
+    def test_pack_added_and_built(self):
+        self.assertEqual(list(self.library.packs), ['fixture'])
+        pack = self.library.packs['fixture']
+        self.assertTrue(self.library.built(pack))
+        self.assertEqual((pack.root / 'built/launcher.so').read_text(), 'launcher of fixture')
+        self.assertEqual([p['slug'] for p in self.library.profiles], [FIRST, SECOND, THIRD])
+        self.assertEqual(list((self.data / 'packs').iterdir()), [self.data / 'packs/fixture'])
+
+    def test_bad_pack_files_change_nothing(self):
+        before = sorted(p.relative_to(self.data) for p in self.data.rglob('*'))
+        broken = self.root / 'broken.zip'; broken.write_bytes(b'not a zip')
+        with self.assertRaisesRegex(ValueError, 'not a valid .zip'):
+            self.library.install_pack(broken)
+        with self.assertRaisesRegex(ValueError, 'may not'):
+            self.library.install_pack(self.zip_of(self.make_pack(self.root / 'escape', 'escape', 'Escape', ('esc',)),
+                                                  {'../outside.txt': 'no'}))
+        with self.assertRaisesRegex(ValueError, 'another version'):
+            self.library.install_pack(self.zip_of(self.make_pack(self.root / 'old', 'old', 'Old', ('old',), version=1)))
+        with self.assertRaisesRegex(ValueError, 'already has'):
+            self.library.install_pack(self.zip_of(self.make_pack(self.root / 'twin', 'twin', 'Twin', (FIRST,))))
+        txt = self.root / 'pack.txt'; txt.write_text('x')
+        with self.assertRaisesRegex(ValueError, ".zip"):
+            self.library.install_pack(txt)
+        self.assertEqual(before, sorted(p.relative_to(self.data) for p in self.data.rglob('*')))
+
+    def test_pack_replaced_by_a_newer_one(self):
+        (self.pack_dir / 'host/boot.c').write_text('#include "shared.h"\nint boot_v2;\n')
+        old = dict(self.library.game_builds)
+        self.add(self.pack_dir)
+        self.assertNotEqual(old[FIRST], self.library.game_builds[FIRST])
+        self.assertIn('boot_v2', (self.data / 'packs/fixture/host/boot.c').read_text())
+        self.assertFalse([p for p in (self.data / 'packs').iterdir() if p.name.startswith('.')])
+
+    def test_removed_pack_keeps_records_and_comes_back_ready(self):
+        entry = self.install()
+        self.library.refresh()
+        self.library.remove_pack('fixture')
+        self.assertFalse((self.data / 'packs/fixture').exists())
+        self.assertEqual(self.library.records()['games'][FIRST], entry)
+        self.assertEqual((self.data / 'library.bin').read_bytes(), b'LRLIB1\0first\0')
+        with self.assertRaisesRegex(ValueError, 'not added'):
+            self.library.remove_pack('fixture')
+        self.add(self.pack_dir)
+        self.library.refresh()
+        self.assertTrue(self.library.ready(FIRST, entry))
+
+    def test_stale_pack_rebuilt_on_refresh(self):
+        built = self.data / 'packs/fixture/built'
+        (built / 'build.json').write_text(json.dumps({'app': 'b' * 64, 'pack': 'old'}))
+        (built / 'launcher.so').unlink()
+        self.library.refresh()
+        self.assertTrue((built / 'launcher.so').is_file())
+        self.assertTrue(self.library.built(self.library.packs['fixture']))
+
+    def test_earlier_app_data_moves_in_once(self):
+        old = self.data.parent / 'other'
+        (old / 'saves/oth/ms').mkdir(parents=True)
+        (old / 'saves/oth/ms/save').write_text('keep my save')
+        (old / 'states/oth').mkdir(parents=True)
+        (old / 'states/oth/slot-1.state').write_text('state')
+        game = old / 'games/oth/build-1'
+        game.mkdir(parents=True)
+        (game / 'game').write_text('old game')
+        (old / 'installed.json').write_text(json.dumps({'version': 1, 'selected': 'oth', 'games': {
+            'oth': dict(iso=str(self.iso), build_id='old', directory=str(game))}}))
+        # Saves already here stay as they are.
+        (self.data / 'saves/oth2/ms').mkdir(parents=True)
+        (old / 'saves/oth2/ms').mkdir(parents=True)
+        self.add(self.make_pack(self.root / 'other pack', 'other', 'Other', ('oth', 'oth2')))
+        self.assertEqual((self.data / 'saves/oth/ms/save').read_text(), 'keep my save')
+        self.assertEqual((old / 'saves/oth/ms/save').read_text(), 'keep my save')   # a copy, never moved
+        self.assertTrue((self.data / 'states/oth/slot-1.state').is_file())
+        entry = self.library.records()['games']['oth']
+        self.assertEqual(Path(entry['directory']), self.data / 'games/oth/build-1')
+        self.assertEqual((Path(entry['directory']) / 'game').read_text(), 'old game')
+        self.assertTrue((old / 'saves/oth2').is_dir())
+        note = (old / importer.MOVED_NOTE).read_text()
+        self.assertIn('saves/oth', note)
+        self.assertFalse(self.library.ready('oth', entry))      # prepared by the old app: once more
+        # Not again: what the old folder holds later stays there.
+        (old / 'saves/oth/ms/later').write_text('later')
+        shutil.rmtree(self.data / 'saves/oth')
+        self.add(self.root / 'other pack')
+        self.assertFalse((self.data / 'saves/oth').exists())
+
+    # ---- games -------------------------------------------------------------------
+
     def test_release_order_independent_of_import_order(self):
         for slug in (THIRD, SECOND, FIRST):
             self.install(slug)
         self.library.refresh()
-        fields = (self.library.data / 'library.bin').read_bytes().split(b'\0')
+        fields = (self.data / 'library.bin').read_bytes().split(b'\0')
         self.assertEqual(fields[2:-1:5], [FIRST.encode(), SECOND.encode(), THIRD.encode()])
         self.assertEqual(fields[1], FIRST.encode())
 
@@ -105,35 +247,42 @@ class ImportTests(unittest.TestCase):
         before = self.library.record.read_bytes()
         self.disc = 'UNSUPPORTED'
         with patch.object(importer.subprocess, 'run', self.fake_run):
-            with self.assertRaisesRegex(ValueError, 'Unsupported disc'):
+            with self.assertRaisesRegex(ValueError, 'No pack you have added supports'):
                 self.library.import_iso(self.iso)
-            self.disc = self.profiles[0]['disc_id']
+            self.disc = 'FIXT10000'
             self.module += b'wrong executable'
             with self.assertRaisesRegex(ValueError, 'unsupported executable version'):
                 self.library.import_iso(self.iso)
         self.assertEqual(before, self.library.record.read_bytes())
         self.assertTrue(Path(entry['directory'], 'game').exists())
-        self.assertEqual(list((self.library.data / 'preparing').iterdir()), [])
+        self.assertEqual(list((self.data / 'preparing').iterdir()), [])
+
+    def test_without_packs_the_disc_asks_for_one(self):
+        self.library.remove_pack('fixture')
+        with patch.object(importer.subprocess, 'run', self.fake_run):
+            with self.assertRaisesRegex(ValueError, 'Add this game'):
+                self.library.import_iso(self.iso)
 
     def test_corrupt_and_external_records_preserved(self):
-        self.library.data.mkdir()
         for content in ('bad json', '[]', '{"version":2,"games":{}}',
-                        json.dumps({'version':1, 'games':{FIRST:dict(iso=str(self.iso), build_id='x', directory='/tmp/outside')}})):
+                        json.dumps({'version': 1, 'games': {FIRST: dict(iso=str(self.iso), build_id='x', directory='/tmp/outside')}}),
+                        json.dumps({'version': 1, 'games': {'Bad Slug': {}}})):
             self.library.record.write_text(content)
             with self.assertRaises(ValueError):
                 self.library.refresh()
             self.assertEqual(self.library.record.read_text(), content)
 
     def test_single_import_lock(self):
-        self.library.data.mkdir()
-        with (self.library.data / '.import.lock').open('w') as f:
+        with (self.data / '.import.lock').open('w') as f:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with self.assertRaisesRegex(ValueError, 'Another game'):
                 self.library.import_iso(self.iso)
+            with self.assertRaisesRegex(ValueError, 'being prepared'):
+                self.library.install_pack(self.zip_of(self.pack_dir))
 
     def test_relocated_iso_reuses_verified_cache_and_preserves_saves(self):
         entry = self.install()
-        save = self.library.data / 'saves' / FIRST / 'ms/PSP/SAVEDATA/save'
+        save = self.data / 'saves' / FIRST / 'ms/PSP/SAVEDATA/save'
         save.parent.mkdir(parents=True); save.write_bytes(b'keep my save')
         moved = self.iso.with_name('relocated disc.iso')
         self.iso.rename(moved)
@@ -151,7 +300,7 @@ class ImportTests(unittest.TestCase):
         self.assertTrue(self.library.ready(FIRST, entry))
         self.library.game_builds[FIRST] = 'f' * 64
         self.library.refresh()
-        self.assertEqual((self.library.data / 'library.bin').read_bytes().split(b'\0')[4], b'')
+        self.assertEqual((self.data / 'library.bin').read_bytes().split(b'\0')[4], b'')
         self.library.game_builds[FIRST] = entry['game_build_id']
         Path(entry['directory'], 'game').chmod(0o644)
         self.assertFalse(self.library.ready(FIRST, entry))
@@ -174,12 +323,18 @@ class ImportTests(unittest.TestCase):
     def test_only_changed_title_needs_preparation(self):
         for slug in (FIRST, SECOND, THIRD):
             self.install(slug)
-        self.library.game_builds[SECOND] = 'f' * 64
+        # A change to the second title's replacements alone.
+        (self.data / 'packs/fixture/host/second.c').write_text('#include "shared.h"\nint changed;\n')
+        self.library = self.library_now()
         self.library.refresh()
-        fields = (self.library.data / 'library.bin').read_bytes().split(b'\0')
+        fields = (self.data / 'library.bin').read_bytes().split(b'\0')
         self.assertTrue(fields[4]); self.assertEqual(fields[9], b''); self.assertTrue(fields[14])
         for slug, entry in self.library.records()['games'].items():
             self.assertEqual(self.library.ready(slug, entry), slug != SECOND)
+        # A change to the pack's host code: every title.
+        (self.data / 'packs/fixture/host/shared.h').write_text('#define SHARED 2\n')
+        self.library = self.library_now()
+        self.assertFalse(any(self.library.ready(s, e) for s, e in self.library.records()['games'].items()))
 
     def test_legacy_record_requires_one_preparation_without_data_loss(self):
         entry = self.install()
@@ -192,34 +347,33 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(before, self.library.record.read_bytes())
         self.assertTrue(Path(entry['directory'], 'game').exists())
 
-    def test_invalid_game_build_manifest_is_rejected(self):
-        for manifest in ({'version': 2, 'games': {}}, {'version': 1, 'games': {}},
-                         {'version': 1, 'games': {FIRST: {'id': 'invalid'}}}):
-            (self.library.resources / 'game-builds.json').write_text(json.dumps(manifest))
+    def test_invalid_app_build_manifest_is_rejected(self):
+        for manifest in ({'version': 1, 'id': 'a' * 64}, {'version': 2}, {'version': 2, 'id': 'invalid'}):
+            (self.resources / 'app-build.json').write_text(json.dumps(manifest))
             with self.assertRaises(ValueError):
-                importer.Library(self.app, self.library.data, self.library.state, APP_ID)
+                self.library_now()
 
     def test_runtime_rebuild_switches_only_after_success(self):
         old = self.install()
         sibling = self.install(SECOND)
         before = self.library.record.read_bytes()
         self.library.game_builds[FIRST] = 'f' * 64
-        helper = self.library.resources / 'compile_game.py'
-        helper.write_text('def compile_game(*args):\n    raise ValueError("compiler failed")\n')
+        recipes = self.resources / 'compile_game.py'
+        recipes.write_text(RECIPES + 'def compile_game(*args):\n    raise ValueError("compiler failed")\n')
         with patch.object(importer.subprocess, 'run', self.fake_run):
             with self.assertRaisesRegex(ValueError, 'compiler failed'):
                 self.library.import_iso(self.iso)
         self.assertEqual(self.library.record.read_bytes(), before)
         self.assertTrue(Path(old['directory'], 'game').exists())
-        self.assertEqual(list((self.library.data / 'preparing').iterdir()), [])
-        helper.write_text('def compile_game(app, profile, module, output, jobs, env, log):\n'
-                          '    output.write_text("new executable")\n    output.chmod(0o755)\n')
+        self.assertEqual(list((self.data / 'preparing').iterdir()), [])
+        recipes.write_text(RECIPES)
         with patch.object(importer.subprocess, 'run', self.fake_run):
             self.library.import_iso(self.iso)
         book = self.library.records()
         updated = book['games'][FIRST]
         self.assertNotEqual(updated['directory'], old['directory'])
         self.assertEqual(updated['game_build_id'], 'f' * 64)
+        self.assertEqual(updated['pack'], 'fixture')
         self.assertTrue(self.library.ready(FIRST, updated))
         self.assertEqual(book['games'][SECOND], sibling)
         self.assertTrue(Path(old['directory'], 'game').exists())
@@ -232,7 +386,7 @@ class ImportTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.library.import_iso(self.iso)
         self.assertEqual(before, self.library.record.read_bytes())
-        self.assertEqual(list((self.library.data / 'preparing').iterdir()), [])
+        self.assertEqual(list((self.data / 'preparing').iterdir()), [])
 
 
 if __name__ == '__main__':

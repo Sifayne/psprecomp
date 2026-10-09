@@ -279,7 +279,7 @@ if(PSPRECOMP_HOST)
     add_library(test_pack_plugin MODULE test_pack_plugin.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/host/pack_api.c)
     target_include_directories(test_pack_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
     set_target_properties(test_pack_plugin PROPERTIES PREFIX "" OUTPUT_NAME launcher
-        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/packs/gamma)
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/packs/gamma/built)
     add_executable(test_player_launcher test_launcher.c)
     target_link_libraries(test_player_launcher PRIVATE psprecomp_host ${CMAKE_DL_LIBS})
     set_target_properties(test_player_launcher PROPERTIES ENABLE_EXPORTS ON)

@@ -1,51 +1,59 @@
 """A title pack: everything about one game, or one family of games, that the
-player builds -- as source and data, never game bytes.
+player needs -- as source and data, never game bytes. The player's app holds
+no pack of its own; a player adds a pack's file to it, and the app builds
+the pack on their machine (docs/PLAYER-LAYER.md, stage 10).
 
 A pack is a directory with a pack.json. Its paths are relative to that
-directory and may not leave it. See docs/PLAYER-LAYER.md, section 1, and the
-example in the README next to this file.
+directory and may not leave it. The same manifest is checked where the pack
+is built into its file (package-linux.py) and where it is added
+(import_game.py, which stages this module in the app).
 
     {
-      "version": 1,
-      "app": {
-        "name":    "Armored Core Portable",     the application's display name
-        "id":      "last-raven",                XDG folders, usr/share/<id>, icon
-        "appdir":  "Last-Raven.AppDir",
-        "artifact": "Armored-Core-Portable",    release file names
-        "readme":  "packaging/linux/README.txt",
-        "desktop": "packaging/linux/last-raven.desktop",
+      "version": 2,
+      "pack": {
+        "id":      "last-raven",              its section of the settings file and
+                                              its folder; the id of its own app
+                                              before there was one for every pack
+        "name":    "Armored Core",            how the app names it
+        "file":    "Armored-Core",            optional: its file, <file>-pack.zip
         "license": "LICENSE",
-        "legacy_settings": "Last Raven/settings.ini",   optional, under XDG_DATA_HOME
-        "check_preset": "Controller",           a starter preset the package test expects
-        "resources": {"FPS.md": "docs/FPS.md"}  extra files for usr/share/<id>
+        "resources": {"FPS.md": "docs/FPS.md"}   optional documents shipped with it
       },
-      "titles": [                               release order; the launcher's tabs
+      "titles": [                             release order; the launcher's tabs
         {"slug": "aclr", "title": "...", "disc_id": "NPUH10024",
          "elf_sha256": "<64 hex>", "replacements": "replacements.c",
          "replace_list": "replace.txt", "codegen": ["fps-loop.py"]}
       ],
-      "device": {                               compiled on the player's machine
-        "host":    ["host/replacements.c", ...],   staged flat into usr/share/<id>/host
-        "scripts": ["scripts/fps-loop.py"]         staged into usr/share/<id>; codegen
+      "host": {
+        "sources":  ["host/boot.c", ...],     the pack's host code, compiled when it
+                                              is added and linked into each game
+        "launcher": ["host/settings.c", "host/launcher_info.c"]
+                                              its part of the launcher, launcher.so
+      },
+      "device": {                             compiled with each title's game
+        "host":    ["host/replacements.c", ...],   replacements, replace lists, headers
+        "scripts": ["scripts/fps-loop.py"]         code generators
       },
       "build": {
-        "cmake": "packaging/linux/pack.cmake",  the pack's targets (see linux/CMakeLists.txt)
+        "cmake": "packaging/linux/pack.cmake",  the pack's checks (see linux/CMakeLists.txt)
         "checks": [{"run": ["settings-tests"]}, ...]
       },
-      "sources": ["host/launcher.c", ...]       everything else the build and the
-                                                matching source archive need
+      "sources": ["host/launcher_tests.c", ...] everything else the checks and the
+                                                pack's file must carry
     }
 
-A title's "replacements" and "replace_list" name files in device.host, and its
-"codegen" names files in device.scripts; each runs after the emit as
-`python3 <script> <slug> <generated dir>`.
+A title's "replacements" and "replace_list" name files in device.host by
+their base name, and its "codegen" names files in device.scripts; each runs
+after the emit as `python3 <script> <slug> <generated dir>`. Host sources
+find their headers beside them, among the pack's files.
 """
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 
 SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
+VERSION = 2
 
 
 class PackError(ValueError):
@@ -72,35 +80,35 @@ class Pack:
         _need(manifest.is_file(), f"{self.root}: no pack.json")
         try:
             data = json.loads(manifest.read_text())
-        except json.JSONDecodeError as error:
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise PackError(f"{manifest}: {error}") from None
-        _need(isinstance(data, dict) and data.get("version") == 1, f"{manifest}: version must be 1")
+        _need(isinstance(data, dict) and data.get("version") == VERSION,
+              f"{manifest}: version must be {VERSION}; this pack was made for another version of psprecomp")
         self.data = data
 
-        app = data.get("app")
-        _need(isinstance(app, dict), "pack.json: 'app' must be an object")
-        self.name = _text(app, "name", "app")
-        # It is written into shell quotes and desktop entries.
-        _need(re.fullmatch(r"[^'\\\n\"$`]+", self.name), "app: 'name' may not contain quotes, $, ` or \\")
-        self.id = _text(app, "id", "app")
-        _need(SLUG.fullmatch(self.id), "app: 'id' must be a lowercase folder name")
-        self.appdir = _text(app, "appdir", "app")
-        _need(self.appdir.endswith(".AppDir") and "/" not in self.appdir, "app: 'appdir' must name an .AppDir")
-        self.artifact = _text(app, "artifact", "app")
-        _need(re.fullmatch(r"[A-Za-z0-9._-]+", self.artifact), "app: 'artifact' must be a plain file name")
-        self.readme = self.path(_text(app, "readme", "app"))
-        self.desktop = self.path(_text(app, "desktop", "app"))
-        self.license = self.path(_text(app, "license", "app"))
-        self.legacy_settings = _text(app, "legacy_settings", "app", optional=True) or ""
-        _need(not self.legacy_settings.startswith("/") and ".." not in Path(self.legacy_settings).parts,
-              "app: 'legacy_settings' must be relative to XDG_DATA_HOME")
-        self.check_preset = _text(app, "check_preset", "app", optional=True) or ""
-        resources = app.get("resources", {})
-        _need(isinstance(resources, dict), "app: 'resources' must be an object")
+        pack = data.get("pack")
+        _need(isinstance(pack, dict), "pack.json: 'pack' must be an object")
+        self.id = _text(pack, "id", "pack")
+        _need(SLUG.fullmatch(self.id), "pack: 'id' must be a lowercase folder name")
+        self.name = _text(pack, "name", "pack")
+        _need(re.fullmatch(r"[^'\\\n\"$`]+", self.name), "pack: 'name' may not contain quotes, $, ` or \\")
+        self.file = _text(pack, "file", "pack", optional=True) or self.id
+        _need(re.fullmatch(r"[A-Za-z0-9._-]+", self.file), "pack: 'file' must be a plain file name")
+        self.license = self.path(_text(pack, "license", "pack"))
+        resources = pack.get("resources", {})
+        _need(isinstance(resources, dict), "pack: 'resources' must be an object")
         self.resources = {}
         for name, path in resources.items():
-            _need(re.fullmatch(r"[A-Za-z0-9._-]+", name), f"app.resources: bad name {name!r}")
+            _need(re.fullmatch(r"[A-Za-z0-9._-]+", name), f"pack.resources: bad name {name!r}")
             self.resources[name] = self.path(path)
+
+        host = data.get("host")
+        _need(isinstance(host, dict), "pack.json: 'host' must be an object")
+        self.host_sources = [self.path(p) for p in self._list(host, "sources", "host")]
+        self.launcher_sources = [self.path(p) for p in self._list(host, "launcher", "host")]
+        _need(self.host_sources and self.launcher_sources, "host: 'sources' and 'launcher' must name files")
+        for p in (*self.host_sources, *self.launcher_sources):
+            _need(p.suffix == ".c", f"host: {p.name} is not a C source")
 
         device = data.get("device")
         _need(isinstance(device, dict), "pack.json: 'device' must be an object")
@@ -108,7 +116,7 @@ class Pack:
         self.device_scripts = [self.path(p) for p in self._list(device, "scripts", "device", optional=True)]
         for group in (self.device_host, self.device_scripts):
             names = [p.name for p in group]
-            _need(len(names) == len(set(names)), "device: staged file names must be unique")
+            _need(len(names) == len(set(names)), "device: file names must be unique")
         host_names = {p.name for p in self.device_host}
         script_names = {p.name for p in self.device_scripts}
 
@@ -134,18 +142,20 @@ class Pack:
         discs = [t["disc_id"] for t in self.titles]
         _need(len(discs) == len(set(discs)), "titles: disc IDs must be unique")
 
-        build = data.get("build")
+        build = data.get("build", {})
         _need(isinstance(build, dict), "pack.json: 'build' must be an object")
-        self.cmake = self.path(_text(build, "cmake", "build"))
+        cmake = _text(build, "cmake", "build", optional=True)
+        self.cmake = self.path(cmake) if cmake else None
         checks = build.get("checks", [])
         _need(isinstance(checks, list), "build: 'checks' must be a list")
         for i, check in enumerate(checks):
             _need(isinstance(check, dict) and isinstance(check.get("run"), list) and check["run"]
                   and all(isinstance(a, str) for a in check["run"]), f"build.checks[{i}]: needs a 'run' list")
             _need(isinstance(check.get("env", {}), dict), f"build.checks[{i}]: 'env' must be an object")
+        _need(not checks or self.cmake, "build: checks need a cmake file to build them")
         self.checks = checks
 
-        self.sources = [self.path(p) for p in self._list(data, "sources", "pack.json")]
+        self.sources = [self.path(p) for p in self._list(data, "sources", "pack.json", optional=True)]
 
     def _list(self, table, key, where, optional=False):
         value = table.get(key, [] if optional else None)
@@ -154,7 +164,8 @@ class Pack:
         return value
 
     def path(self, relative):
-        _need(isinstance(relative, str) and relative and not relative.startswith("/"),
+        _need(isinstance(relative, str) and relative and not relative.startswith("/")
+              and "\\" not in relative and ".." not in PurePosixPath(relative).parts,
               f"pack path must be relative: {relative!r}")
         full = (self.root / relative).resolve()
         _need(full.is_relative_to(self.root), f"pack path leaves the pack: {relative}")
@@ -162,19 +173,21 @@ class Pack:
         return full
 
     def files(self):
-        """Every file the build reads from the pack, relative to its root."""
-        paths = {self.root / "pack.json", self.readme, self.desktop, self.license, self.cmake,
-                 *self.resources.values(), *self.device_host, *self.device_scripts, *self.sources}
+        """Every file the pack's file carries, relative to its root."""
+        paths = {self.root / "pack.json", self.license, *self.resources.values(),
+                 *self.host_sources, *self.launcher_sources, *self.device_host, *self.device_scripts,
+                 *self.sources}
+        if self.cmake:
+            paths.add(self.cmake)
         return sorted(p.relative_to(self.root) for p in paths)
 
-    def profiles(self):
-        """The importer's games.json: the titles in release order."""
-        return [dict(t) for t in self.titles]
+    def device_file(self, name):
+        """A device.host file by the base name a title gives it."""
+        return next(p for p in self.device_host if p.name == name)
 
-    def app_info(self):
-        """What the staged app's scripts and tests read about the pack."""
-        return {"name": self.name, "id": self.id, "appdir": self.appdir, "artifact": self.artifact,
-                "legacy_settings": self.legacy_settings, "check_preset": self.check_preset}
+    def profiles(self):
+        """The titles in release order, each with its pack's id."""
+        return [dict(t, pack=self.id) for t in self.titles]
 
 
 def load(root):

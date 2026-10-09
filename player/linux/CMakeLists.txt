@@ -1,22 +1,22 @@
 # The player's programs, built inside the package builder by build.py.
 #
-# This file builds what every pack shares: the runtime, the recompiler and
-# the shared host's own checks. The pack's cmake file (pack.json build.cmake,
-# included below) builds the rest, and must define:
-#   launcher, settings-tool   the two programs the app ships
-#   host-<slug>               per title: the host objects its game links
-#                             on the player's machine (libhost-<slug>.a)
-# plus whatever its build.checks run. It may use the variables and targets
-# set here: TOOLKIT, PACK, RECOMP, PLAYER_SETTINGS, PLAYER_HOST,
-# PLAYER_LAUNCHER, the targets runtime and PkgConfig::SDL. Its launcher is
-# PLAYER_LAUNCHER with the pack's settings schema and its psp_launcher_info
-# (include/psprecomp/host/launcher.h). Last Raven's
-# packaging/linux/CMakeLists.txt until stage 2 of docs/PLAYER-LAYER.md split it.
+# The app's own: the runtime (libruntime.a); the player archive every game
+# links on the player's machine (libplayer.a: the shared host, its menu and
+# Dear ImGui, the settings mechanism and the recompiler's loader); the
+# recompiler; the launcher, which holds no pack and loads the ones added
+# (src/host/launcher_none.c); and the shared host's checks. Then each pack
+# named in PACK_IDS, PACK_ROOTS and PACK_CMAKES: its cmake file (pack.json
+# build.cmake) builds the pack's checks, in a folder of its own whose
+# programs land in pack-<id>/. It may use the variables and targets set
+# here: TOOLKIT, PACK, RECOMP, PLAYER_SETTINGS, PLAYER_HOST, PLAYER_UI,
+# PLAYER_LAUNCHER, the targets runtime and PkgConfig::SDL. Last Raven's
+# packaging/linux/CMakeLists.txt until stage 2 of docs/PLAYER-LAYER.md split
+# it; stage 10 made the app one for every pack.
 cmake_minimum_required(VERSION 3.16)
 project(psprecomp_player C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_BUILD_TYPE Release)
-foreach(var TOOLKIT PACK PACK_CMAKE PACK_SLUGS DEPS FFMPEG)
+foreach(var TOOLKIT DEPS FFMPEG)
     if(NOT DEFINED ${var})
         message(FATAL_ERROR "build.py passes ${var}")
     endif()
@@ -35,48 +35,79 @@ add_executable(allegrexrecomp ${RECOMP_SOURCES})
 target_include_directories(allegrexrecomp PRIVATE "${RECOMP}")
 target_link_libraries(allegrexrecomp PRIVATE runtime)
 
-# The shared host, compiled into the pack's programs by path.
+# The shared host. Dear ImGui (third_party/imgui) and the settings pages
+# draw the menu and the launcher alike; ui.cpp and ImGui are C++ without
+# exceptions, RTTI or thread-safe statics, which needs nothing of the C++
+# runtime, so a game's C link on the player's machine takes them as they are.
 set(PLAYER_SETTINGS "${TOOLKIT}/src/host/settings.c")
-# The in-game menu is Dear ImGui (third_party/imgui) behind ui.cpp, compiled
-# once for every target that takes the host. C++ without exceptions, RTTI or
-# thread-safe statics needs nothing of the C++ runtime, so the game's
-# on-device C link (compile_game.py) takes the host archive as it is.
 set(PLAYER_IMGUI "${TOOLKIT}/third_party/imgui")
-add_library(player_ui OBJECT "${TOOLKIT}/src/host/overlay.c" "${TOOLKIT}/src/host/ui.cpp"
+add_library(player_imgui OBJECT "${TOOLKIT}/src/host/pages.c" "${TOOLKIT}/src/host/ui.cpp"
     "${PLAYER_IMGUI}/imgui.cpp" "${PLAYER_IMGUI}/imgui_draw.cpp" "${PLAYER_IMGUI}/imgui_tables.cpp"
     "${PLAYER_IMGUI}/imgui_widgets.cpp" "${PLAYER_IMGUI}/backends/imgui_impl_sdl2.cpp"
     "${PLAYER_IMGUI}/backends/imgui_impl_sdlrenderer2.cpp")
-target_include_directories(player_ui PRIVATE "${PLAYER_IMGUI}")
-target_compile_definitions(player_ui PRIVATE HAVE_SDL2)
-target_compile_options(player_ui PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti;-fno-threadsafe-statics>")
-target_link_libraries(player_ui PRIVATE runtime PkgConfig::SDL)
+target_include_directories(player_imgui PRIVATE "${PLAYER_IMGUI}")
+target_compile_definitions(player_imgui PRIVATE HAVE_SDL2)
+target_compile_options(player_imgui PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti;-fno-threadsafe-statics>")
+set_target_properties(player_imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(player_imgui PRIVATE runtime PkgConfig::SDL)
+set(PLAYER_UI "${TOOLKIT}/src/host/overlay.c" $<TARGET_OBJECTS:player_imgui>)
 set(PLAYER_HOST "${TOOLKIT}/src/host/present.c" "${TOOLKIT}/src/host/input.c" "${TOOLKIT}/src/host/save_dialog.c"
-    "${TOOLKIT}/src/host/render_gl.c" $<TARGET_OBJECTS:player_ui> "${PLAYER_SETTINGS}")
+    "${TOOLKIT}/src/host/render_gl.c" ${PLAYER_UI} "${PLAYER_SETTINGS}")
 set(PLAYER_LAUNCHER "${TOOLKIT}/src/host/launcher.c")
 
-# Its own checks. Assertions are the fixtures' checks; Release must not
-# compile them out.
+# What every game links on the player's machine, with its pack's host
+# objects (compile_game.py). Position independent: the on-device link may
+# make a position-independent executable.
+add_library(player STATIC ${PLAYER_HOST} "${RECOMP}/loader.c" "${RECOMP}/container.c" "${RECOMP}/decode.c")
+target_include_directories(player PRIVATE "${RECOMP}")
+target_compile_definitions(player PRIVATE HAVE_SDL2)
+set_target_properties(player PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(player PRIVATE runtime PkgConfig::SDL)
+
+# The launcher: no pack linked in; it loads each added pack's launcher.so,
+# whose references to the settings mechanism resolve against it.
+add_executable(launcher ${PLAYER_LAUNCHER} "${TOOLKIT}/src/host/launcher_none.c"
+    $<TARGET_OBJECTS:player_imgui> "${PLAYER_SETTINGS}")
+target_compile_definitions(launcher PRIVATE HAVE_SDL2)
+target_compile_options(launcher PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(launcher PRIVATE runtime PkgConfig::SDL ${CMAKE_DL_LIBS})
+set_target_properties(launcher PROPERTIES ENABLE_EXPORTS ON)
+
+# The shared host's own checks. Assertions are the fixtures' checks; Release
+# must not compile them out.
 add_executable(present-tests "${TOOLKIT}/tests/test_present.c" "${TOOLKIT}/src/host/save_dialog.c" "${PLAYER_SETTINGS}")
 target_compile_definitions(present-tests PRIVATE HAVE_SDL2)
 target_compile_options(present-tests PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_link_libraries(present-tests PRIVATE runtime PkgConfig::SDL)
-# The launcher on a schema of its own; the pack's launcher-tests drive it
-# with the pack's.
-add_executable(player-launcher-tests "${TOOLKIT}/tests/test_launcher.c" "${PLAYER_SETTINGS}")
+# The launcher with two packs of its own and one added (a launcher.so in
+# packs/gamma/built, as the importer builds one); it includes launcher.c.
+add_library(test_pack_plugin MODULE "${TOOLKIT}/tests/test_pack_plugin.c" "${TOOLKIT}/src/host/pack_api.c")
+target_include_directories(test_pack_plugin PRIVATE "${TOOLKIT}/include")
+set_target_properties(test_pack_plugin PROPERTIES PREFIX "" OUTPUT_NAME launcher
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packs/gamma/built")
+add_executable(player-launcher-tests "${TOOLKIT}/tests/test_launcher.c" $<TARGET_OBJECTS:player_imgui> "${PLAYER_SETTINGS}")
+target_compile_definitions(player-launcher-tests PRIVATE HAVE_SDL2)
 target_compile_options(player-launcher-tests PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-target_link_libraries(player-launcher-tests PRIVATE runtime PkgConfig::SDL)
+target_link_libraries(player-launcher-tests PRIVATE runtime PkgConfig::SDL ${CMAKE_DL_LIBS})
+set_target_properties(player-launcher-tests PROPERTIES ENABLE_EXPORTS ON)
+add_dependencies(player-launcher-tests test_pack_plugin)
 add_executable(savedata-tests "${TOOLKIT}/tests/test_savedata.c")
 target_compile_options(savedata-tests PRIVATE -UNDEBUG)
 target_link_libraries(savedata-tests PRIVATE runtime)
 
-include("${PACK_CMAKE}")
-foreach(target launcher settings-tool)
-    if(NOT TARGET ${target})
-        message(FATAL_ERROR "the pack's cmake file must define ${target}")
-    endif()
-endforeach()
-foreach(slug ${PACK_SLUGS})
-    if(NOT TARGET host-${slug})
-        message(FATAL_ERROR "the pack's cmake file must define host-${slug}")
-    endif()
-endforeach()
+# Each pack's checks, in a folder of its own.
+list(LENGTH PACK_IDS pack_count)
+if(pack_count GREATER 0)
+    math(EXPR last "${pack_count} - 1")
+    foreach(i RANGE ${last})
+        list(GET PACK_IDS ${i} id)
+        list(GET PACK_ROOTS ${i} PACK)
+        list(GET PACK_CMAKES ${i} cmake)
+        set(wrapper "${CMAKE_BINARY_DIR}/pack-sources/${id}")
+        file(MAKE_DIRECTORY "${wrapper}")
+        file(WRITE "${wrapper}/CMakeLists.txt"
+            "set(CMAKE_RUNTIME_OUTPUT_DIRECTORY \"${CMAKE_BINARY_DIR}/pack-${id}\")\ninclude(\"${cmake}\")\n")
+        add_subdirectory("${wrapper}" "${CMAKE_BINARY_DIR}/pack-build/${id}")
+    endforeach()
+endif()
