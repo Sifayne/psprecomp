@@ -61,7 +61,7 @@ set(PLAYER_LAUNCHER "${TOOLKIT}/src/host/launcher.c")
 # Position independent: the on-device link may make a position-independent
 # executable.
 add_library(player STATIC ${PLAYER_HOST} "${TOOLKIT}/src/host/boot.c"
-    "${RECOMP}/loader.c" "${RECOMP}/container.c" "${RECOMP}/decode.c")
+    "${RECOMP}/loader.c" "${RECOMP}/container.c" "${RECOMP}/decode.c" "${RECOMP}/reloc.c")
 target_include_directories(player PRIVATE "${RECOMP}")
 target_compile_definitions(player PRIVATE HAVE_SDL2)
 set_target_properties(player PROPERTIES POSITION_INDEPENDENT_CODE ON)
