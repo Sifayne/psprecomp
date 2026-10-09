@@ -2,9 +2,11 @@
  * Secure modes still store plaintext; encryption is a separate capability.
  * Interactive requests never write or delete before explicit confirmation. */
 #include "psprecomp/hle.h"
+#include "census.h"
 #include "psprecomp/cpu.h"
 #include "psprecomp/os.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1203,6 +1205,9 @@ int psp_savedata_set_script(const char *path) {
     }
     return 0;
 }
+/* For the park census (census.h). */
+int psp_utility_census(void) { return g_savedata_state; }
+
 void psp_utility_init(void) {
     g_savedata_state=PSP_UTILITY_DIALOG_NONE;
     g_savedata_param=0; g_savedata_done=0; g_savedata_interactive=0;
@@ -1624,7 +1629,47 @@ static void hle_SavedataShutdownStart(void) {
 static void hle_UtilityLoadModule(void)   { psp_ret(0); }
 static void hle_UtilityUnloadModule(void) { psp_ret(0); }
 
+/* A save state (psprecomp/state.h) waits for the savedata dialog to close:
+ * it is a host window with its own state. Its status words are kept, since a
+ * game reads FINISHED for a while after the dialog is gone. */
+static const char *utility_refuse(void) {
+    return g_savedata_state >= PSP_UTILITY_DIALOG_INIT && g_savedata_state <= PSP_UTILITY_DIALOG_QUIT
+         ? "the savedata dialog is open" : NULL;
+}
+
+/* PSPRECOMP_SAVEDATA_SCRIPT's place, for a run that continues a state with
+ * the same script: the next dialog reads the line the saving run would. */
+static int utility_save(psp_state_writer *w) {
+    const int32_t at[3] = { sd_script_checked, sd_script_failed, (int32_t)sd_script_line };
+    return psp_state_put(w, "sdscript", at, sizeof at);
+}
+
+static int utility_load(psp_state_reader *r, char *why, size_t size) {
+    (void)why; (void)size;
+    size_t n;
+    const int32_t *at = psp_state_get(r, "sdscript", &n);
+    if (!at || n != 3 * sizeof *at || !at[0]) return 0;
+    const char *path = getenv("PSPRECOMP_SAVEDATA_SCRIPT");
+    if (psp_savedata_set_script(path)) fprintf(stderr, "savedata: cannot open script %s\n", path);
+    char line[256];
+    while (sd_script && sd_script_line < (unsigned)at[2] && fgets(line, sizeof line, sd_script)) sd_script_line++;
+    sd_script_failed = sd_script_failed || at[1];
+    return 0;
+}
+
 void psp_utility_register(void) {
+    static const psp_state_part part = { .name = "utility", .refuse = utility_refuse, .save = utility_save, .load = utility_load };
+    PSP_STATE_KEEP(g_savedata_state);
+    PSP_STATE_KEEP(g_savedata_done);
+    PSP_STATE_KEEP(g_savedata_interactive);
+    PSP_STATE_KEEP(g_savedata_param);
+    PSP_STATE_KEEP(g_savedata_shutdown_vblank);
+    PSP_STATE_KEEP(g_savedata_shutdown_thread);
+    PSP_STATE_KEEP(g_savedata_shutdown_releases);
+    PSP_STATE_KEEP(sd_request);
+    PSP_STATE_KEEP(sd_serial);
+    PSP_STATE_KEEP(sd_ordinal);
+    psp_state_register(&part);
     psp_hle_register(0x2A2B3DE0,"sceUtility","sceUtilityLoadModule",hle_UtilityLoadModule);
     psp_hle_register(0xE49BFE92,"sceUtility","sceUtilityUnloadModule",hle_UtilityUnloadModule);
     psp_hle_register(0x50C4CD57,"sceUtility","sceUtilitySavedataInitStart",hle_SavedataInitStart);

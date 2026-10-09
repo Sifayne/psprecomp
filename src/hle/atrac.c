@@ -73,6 +73,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/cpu.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -250,16 +251,29 @@ void psp_at3_flush(psp_at3_dec *d) { (void)d; }
 void psp_at3_close(psp_at3_dec *d) { (void)d; }
 #endif
 
+/* The last frames each decoder was given since it was opened or flushed.
+ * A decoder's own state cannot be saved; a save state's load opens a new one
+ * and gives it these again, which brings it to the same place: what one frame
+ * carries into the next -- the overlap, the filter history -- reaches back
+ * less than a frame. */
+enum { HIST_FRAMES = 4, HIST_BYTES = 2048 };
+static struct { uint32_t n; uint8_t frame[HIST_FRAMES][HIST_BYTES]; } g_hist[ATRAC_IDS];
+
 /* The stream's own decoder, on the context. */
 static void dec_close(atrac_ctx *c) { psp_at3_close((psp_at3_dec *)c->dec); c->dec = NULL; }
 static int dec_open(atrac_ctx *c) {
     dec_close(c);
+    g_hist[c - g_id].n = 0;
     c->dec = psp_at3_open(c->codec, c->block_align, c->channels, c->sample_rate,
                           c->extradata_size ? c->extradata : NULL, c->extradata_size);
     return c->dec ? 0 : -1;
 }
-static void dec_flush(atrac_ctx *c) { psp_at3_flush((psp_at3_dec *)c->dec); }
+static void dec_flush(atrac_ctx *c) { g_hist[c - g_id].n = 0; psp_at3_flush((psp_at3_dec *)c->dec); }
 static int dec_frame(atrac_ctx *c, const uint8_t *in, int16_t *out, uint32_t cap) {
+    if (c->block_align <= HIST_BYTES) {
+        const uint32_t n = g_hist[c - g_id].n++;
+        memcpy(g_hist[c - g_id].frame[n % HIST_FRAMES], in, c->block_align);
+    }
     return psp_at3_decode((psp_at3_dec *)c->dec, in, c->block_align, out, cap);
 }
 
@@ -1042,7 +1056,50 @@ static void hle_IsSecondBufferNeeded(void) {
  * the four PSPSDK lacks: GetOutputChannel, IsSecondBufferNeeded,
  * GetBufferInfoForResetting and Reinit. tests/test_hle.c re-derives every NID from its
  * name, so a wrong pairing here fails the build's tests. */
+/* ---- save states (psprecomp/state.h) ---------------------------------------
+ *
+ * The contexts are kept as they are, with their frame scratch and decoder
+ * made again on load: a saved pointer that is not NULL says there was one. */
+static int atrac_load(psp_state_reader *r, char *why, size_t size) {
+    (void)r;
+    for (int i = 0; i < ATRAC_IDS; i++) {
+        atrac_ctx *c = &g_id[i];
+        const int had_frame = c->frame != NULL, had_dec = c->dec != NULL;
+        c->frame = NULL;
+        c->dec = NULL;
+        if (!c->used) continue;
+        if (had_frame && !(c->frame = (uint8_t *)malloc(c->block_align ? c->block_align : 1))) {
+            snprintf(why, size, "out of memory for an ATRAC stream");
+            return -1;
+        }
+        if (!had_dec) continue;
+        const uint32_t n = g_hist[i].n;
+        if (dec_open(c) != 0) { no_decoder(); continue; }
+        /* dec_open forgot the frames; dec_frame counts them in again. */
+        const uint32_t from = n > HIST_FRAMES ? n - HIST_FRAMES : 0;
+        g_hist[i].n = from;
+        for (uint32_t k = from; k < n; k++) {
+            int16_t pcm[AT3P_FRAME_SAMPLES * ATRAC_OUT_CHANNELS];
+            uint8_t frame[HIST_BYTES];
+            memcpy(frame, g_hist[i].frame[k % HIST_FRAMES], c->block_align);
+            (void)dec_frame(c, frame, pcm, AT3P_FRAME_SAMPLES);
+        }
+        if (c->frame && n) memcpy(c->frame, g_hist[i].frame[(n - 1) % HIST_FRAMES], c->block_align);
+    }
+    return 0;
+}
+
+/* A load into the running game: its decoders and frames go first. */
+static void atrac_drop(void) {
+    for (int i = 0; i < ATRAC_IDS; i++) { dec_close(&g_id[i]); free(g_id[i].frame); g_id[i].frame = NULL; }
+}
+
 void psp_atrac_register(void) {
+    static const psp_state_part part = { .name = "atrac", .load = atrac_load, .drop = atrac_drop };
+    PSP_STATE_KEEP(g_id);
+    PSP_STATE_KEEP(g_slot_codec);
+    PSP_STATE_KEEP(g_hist);
+    psp_state_register(&part);
     psp_hle_register(0x7A20E7AF, "sceAtrac3plus", "sceAtracSetDataAndGetID",          hle_SetDataAndGetID);
     psp_hle_register(0x0FAE370E, "sceAtrac3plus", "sceAtracSetHalfwayBufferAndGetID", hle_SetHalfwayBufferAndGetID);
     psp_hle_register(0xA2BBA8BE, "sceAtrac3plus", "sceAtracGetSoundSample",           hle_GetSoundSample);

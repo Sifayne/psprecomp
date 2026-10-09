@@ -84,9 +84,24 @@ int  psp_clock_is_realtime(void);
 /* A non-perturbing end-of-run measurement of the real-time mapping. Returns
  * zero while the deterministic virtual clock is selected. `guest_us` is the
  * latest time adopted by guest execution and `wall_us` is elapsed monotonic
- * time since the real-time origin; their difference exposes pacing drift
- * without making a clock read change the value being measured. */
+ * time since the mode was enabled, host pauses included; less
+ * psp_clock_held_us, their difference exposes pacing drift without making a
+ * clock read change the value being measured. */
 int psp_clock_realtime_stats(uint64_t *guest_us, uint64_t *wall_us);
+
+/* A host pause (psprecomp/safepoint.h). While held, guest time does not
+ * move; on release the real-time origin moves forward by the time held, so
+ * neither vblank nor the timers catch up, and the run is exactly as far
+ * ahead of or behind the wall as it was. Called by the holding thread. */
+void     psp_clock_hold(void);
+void     psp_clock_release(void);
+/* Wall time spent held, in microseconds, the current hold included. */
+uint64_t psp_clock_held_us(void);
+/* Monotonic nanoseconds less every hold, frozen while held: the wall time
+ * the guest has had. For host measurements of guest-facing intervals --
+ * gaps between audio outputs, a movie's fetch rate -- which a pause would
+ * otherwise read as a stall. Any thread. */
+uint64_t psp_clock_run_ns(void);
 
 #ifdef __cplusplus
 }

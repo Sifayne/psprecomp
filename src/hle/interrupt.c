@@ -8,6 +8,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/vfpu.h"
+#include "psprecomp/state.h"
 #include <string.h>
 
 /* SDK IDs run through 66; the probe checks both ends and subindices 31/32.
@@ -147,7 +148,9 @@ static void deliver(uint32_t entry, uint32_t gp, uint32_t a0, uint32_t a1, uint3
     psp_cpu.r[PSP_REG_RA] = 0;
     if (psp_cpu.r[PSP_REG_SP] >= 16)
         psp_cpu.r[PSP_REG_SP] = (psp_cpu.r[PSP_REG_SP] - 16) & ~15u;
+    psp_nest_enter(PSP_NEST_INTERRUPT, entry);
     psp_dispatch(entry);
+    psp_nest_leave();
     psp_cpu = saved;
     for (unsigned i = 0; i < 16; i++) psp_mtvc(i, controls[i]);
     cpu_enabled = saved_enabled;
@@ -204,6 +207,13 @@ uint64_t psp_interrupt_next_event(void) {
 }
 
 void psp_interrupt_register(void) {
+    /* A save state's (psprecomp/state.h): the modules too, since a title
+     * can load more of them than the boot does. */
+    PSP_STATE_KEEP(subscriptions);
+    PSP_STATE_KEEP(modules);
+    PSP_STATE_KEEP(module_count);
+    PSP_STATE_KEEP(generation);
+    PSP_STATE_KEEP(cpu_enabled);
 #define BIND(nid, library, name, function) psp_hle_register(nid, library, name, function)
     BIND(0xCA04A2B9, "InterruptManager", "sceKernelRegisterSubIntrHandler", register_handler);
     BIND(0xD61E6961, "InterruptManager", "sceKernelReleaseSubIntrHandler", release_handler);

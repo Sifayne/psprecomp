@@ -33,6 +33,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/clock.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -385,6 +386,52 @@ static void publish(void) {
     psp_ctrl_script_set(g_buttons, g_analog_owned, g_ax, g_ay);
     psp_ctrl_script_set_look(g_look_owned, g_rx, g_ry, g_mdx, g_mdy);
     g_mdx = g_mdy = 0;              /* a delta is delivered once */
+}
+
+/* A save state's (psprecomp/state.h): where the scenario is and what it
+ * holds down. A run that loads one with the same scenario carries on from
+ * there; one with none starts with the script's lanes let go, so a state
+ * saved from a scenario never holds a button in someone's hands. */
+static struct {
+    int32_t  cursor, finished;
+    uint32_t prev_poll, buttons;
+    uint64_t prev_us;
+    int32_t  analog_owned, look_owned, mdx, mdy;
+    uint8_t  ax, ay, rx, ry;
+} g_saved;
+
+static int replay_save(psp_state_writer *w) {
+    g_saved.cursor = g_cursor; g_saved.finished = g_finished;
+    g_saved.prev_poll = g_prev_poll; g_saved.prev_us = g_prev_us;
+    g_saved.buttons = g_buttons; g_saved.analog_owned = g_analog_owned;
+    g_saved.ax = g_ax; g_saved.ay = g_ay;
+    g_saved.look_owned = g_look_owned; g_saved.rx = g_rx; g_saved.ry = g_ry;
+    g_saved.mdx = g_mdx; g_saved.mdy = g_mdy;
+    return psp_state_put(w, "replay", &g_saved, sizeof g_saved);
+}
+
+static int replay_load(psp_state_reader *r, char *why, size_t size) {
+    (void)why; (void)size;
+    size_t n;
+    const void *in = psp_state_get(r, "replay", &n);
+    if (g_loaded && in && n == sizeof g_saved) {
+        memcpy(&g_saved, in, sizeof g_saved);
+        g_cursor = g_saved.cursor < g_ev_n ? g_saved.cursor : g_ev_n;
+        g_finished = g_saved.finished;
+        g_prev_poll = g_saved.prev_poll; g_prev_us = g_saved.prev_us;
+        g_buttons = g_saved.buttons; g_analog_owned = g_saved.analog_owned;
+        g_ax = g_saved.ax; g_ay = g_saved.ay;
+        g_look_owned = g_saved.look_owned; g_rx = g_saved.rx; g_ry = g_saved.ry;
+        g_mdx = g_saved.mdx; g_mdy = g_saved.mdy;
+    }
+    psp_ctrl_script_set(g_buttons, g_analog_owned, g_ax, g_ay);
+    psp_ctrl_script_set_look(g_look_owned, g_rx, g_ry, g_mdx, g_mdy);
+    return 0;
+}
+
+void psp_ctrl_replay_keep(void) {
+    static const psp_state_part part = { .name = "replay", .save = replay_save, .load = replay_load };
+    psp_state_register(&part);
 }
 
 void psp_ctrl_replay_reset(void) {

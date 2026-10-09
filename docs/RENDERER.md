@@ -174,7 +174,12 @@ Two facts settled this, both measured rather than assumed.
 
 **It lives in the host.** The core has no external dependencies on purpose and
 SDL2 is the host's, so a backend needing a window and a GL context cannot live
-in the runtime. `psp_render_register()` is the seam: the host builds a backend
+in the runtime. Each game carried its own copy until 5 Oct. Now it is
+`src/host/render_gl.c`, in `psprecomp_host`, and what a title decides for
+itself -- its scene extent, whether its HUD uses the wide bands, how its
+screen-space draws are placed at a wide aspect, the glow composite the smooth
+bloom filter recognises -- comes from its `psp_title_info`
+(`include/psprecomp/host/title.h`). `psp_render_register()` is the seam: the host builds a backend
 and hands the pointer over, after which it is selectable by name like any
 other and the interpreter cannot tell which side it came from. Registration
 refuses a backend missing any of the twelve entry points, because the
@@ -183,7 +188,7 @@ mistake. `tests/test_raster.c` covers the seam with a probe backend and needs
 no GPU to do it.
 
 **The context belongs on the GE thread.** SDL runs on its own thread here
-(`host/present.c`), which owns the window and the event loop, while display
+(`src/host/present.c`), which owns the window and the event loop, while display
 lists execute on whichever guest thread submitted them -- and a GL context
 belongs to exactly one thread. Measured: **the GE is driven by exactly one
 host thread**, 864 lists in the hangar and 3,584 in the mission, all from one.
@@ -228,8 +233,8 @@ does not matter until a game is already drawing:
   (`psp_render_reset_depth` has no GPU meaning) and read zero under any other
   backend; put them behind an optional query first
 
-**First increment — done 3 Sep, and what "done" means here.** `host/render_gl.c`
-is a real backend: it claims the context on the GE thread, batches vertices,
+**First increment — done 3 Sep, and what "done" means here.** `render_gl.c`
+(then Last Raven's `host/render_gl.c`) is a real backend: it claims the context on the GE thread, batches vertices,
 draws them into an off-screen 480x272 target, blits that to the window, and
 reads it back into the guest framebuffer so the project's instruments keep
 working. `PSPRECOMP_RENDER=gl` selects it.

@@ -44,7 +44,7 @@ static int usage(void) {
         "  allegrexrecomp dis     <file> [start-addr] [count]\n"
         "  allegrexrecomp cover   <file>\n"
         "  allegrexrecomp funcs   <file> [--list]\n"
-        "  allegrexrecomp emit    <file> <outdir> [prefix] [--replace <addrs>|@<file>]\n"
+        "  allegrexrecomp emit    <file> <outdir> [prefix] [--replace <addrs>|@<file>] [--no-resume]\n"
         "  allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs] [--dispatch] [--drain <s>]\n"
         "                         [--argv0 <guest path>] [--base <addr>]\n"
         "  allegrexrecomp decrypt <file> [--keys <path>]\n"
@@ -62,6 +62,12 @@ static int usage(void) {
         "translated bodies are emitted as psp_func_<addr>__orig and the public\n"
         "psp_func_<addr> is left for the host to define, so a native version wins\n"
         "at link time and can still call the original.\n"
+        "\n"
+        "Every call's return site is an entry of its function, with a table\n"
+        "psp_resume_chain uses to continue a restored thread natively: what a\n"
+        "save state needs (docs/PLAYER-LAYER.md, section 5). --no-resume leaves\n"
+        "them out, which saves about 6%% of compile time and 7%% of code, and\n"
+        "every save is then refused.\n"
         "\n"
         "Key material is never bundled. Supply it via --keys, $PSPRECOMP_KEYS,\n"
         "or ./keys/psp_keys.txt — see docs/DECRYPT.md.\n");
@@ -822,7 +828,7 @@ static int parse_replace(const char *spec, uint32_t **out) {
 }
 
 static int cmd_emit(const char *path, const char *outdir, const char *prefix,
-                    const uint32_t *replace, int nreplace) {
+                    const uint32_t *replace, int nreplace, int resume) {
     psp_blob b;
     elf_info e;
     a_analysis an;
@@ -857,6 +863,7 @@ static int cmd_emit(const char *path, const char *outdir, const char *prefix,
     o.nimports = nimp;
     o.replace = replace;
     o.nreplace = nreplace;
+    o.resume = resume;
 
     printf("module:     %s\n", module);
     printf("functions:  %d\n", an.nfuncs);
@@ -1407,9 +1414,13 @@ int main(int argc, char **argv) {
          * argv[4] is not the start of the flags. */
         const char *prefix = (argc > 4 && strncmp(argv[4], "--", 2)) ? argv[4] : NULL;
         uint32_t *replace = NULL;
-        int nreplace = 0;
+        int nreplace = 0, resume = 1;
         for (int i = prefix ? 5 : 4; i < argc; i++) {
-            if (!strcmp(argv[i], "--replace") && i + 1 < argc) {
+            if (!strcmp(argv[i], "--resume")) {
+                resume = 1;                 /* the default; accepted as before */
+            } else if (!strcmp(argv[i], "--no-resume")) {
+                resume = 0;
+            } else if (!strcmp(argv[i], "--replace") && i + 1 < argc) {
                 uint32_t *add = NULL;
                 const int n = parse_replace(argv[++i], &add);
                 if (n < 0) { free(replace); return 2; }
@@ -1426,7 +1437,7 @@ int main(int argc, char **argv) {
                 return usage();
             }
         }
-        const int rc = cmd_emit(argv[2], argv[3], prefix, replace, nreplace);
+        const int rc = cmd_emit(argv[2], argv[3], prefix, replace, nreplace, resume);
         free(replace);
         return rc;
     }

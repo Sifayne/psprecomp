@@ -1,7 +1,11 @@
 /* psprecomp — the guest clock. See include/psprecomp/clock.h. */
 
 #include "psprecomp/clock.h"
+#include "psprecomp/state.h"
+#include "census.h"
 #include "psprecomp/os.h"
+
+#include <stdatomic.h>
 
 /* How far a firmware call moves the clock.
  *
@@ -92,6 +96,14 @@ static uint64_t g_us;
 
 static int      g_realtime;
 static uint64_t g_origin_ns;
+static uint64_t g_start_ns;        /* when the mode was enabled; pauses never move it */
+
+/* Host pauses. Written by the holding thread, read by any (the audio thread
+ * measures its gaps with psp_clock_run_ns). A hold publishes the frozen run
+ * time before it starts and clears it only after the total includes it, so a
+ * reader on another thread never sees run time jump either way. */
+static _Atomic uint64_t g_held_ns, g_hold_since_ns, g_frozen_ns;
+static _Atomic int      g_holding;
 
 static uint64_t wall_ns(void) { return psp_os_mono_ns(); }
 
@@ -104,8 +116,14 @@ static void wall_sync(uint64_t us) {
     psp_os_sleep_until_ns(target);
 }
 
+/* Anchored so that the guest's present is the wall's: at start-up that maps
+ * guest 0 to now, and after a save state loads, the saved guest time. The
+ * arithmetic is modular, so a guest that has run longer than the host has
+ * been up still maps exactly. */
+static void anchor(void) { g_origin_ns = g_start_ns = wall_ns() - g_us * 1000u; }
+
 void psp_clock_realtime(int enable) {
-    if (enable && !g_realtime) g_origin_ns = wall_ns();
+    if (enable && !g_realtime) anchor();
     g_realtime = enable;
 }
 
@@ -114,8 +132,40 @@ int psp_clock_is_realtime(void) { return g_realtime; }
 int psp_clock_realtime_stats(uint64_t *guest_us, uint64_t *wall_us) {
     if (!g_realtime) return 0;
     if (guest_us) *guest_us = g_us;
-    if (wall_us) *wall_us = (wall_ns() - g_origin_ns) / 1000u;
+    if (wall_us) *wall_us = (wall_ns() - g_start_ns) / 1000u;
     return 1;
+}
+
+void psp_clock_hold(void) {
+    if (g_holding) return;
+    const uint64_t now = wall_ns();
+    g_hold_since_ns = now;
+    g_frozen_ns = now - g_held_ns;
+    g_holding = 1;
+}
+
+void psp_clock_release(void) {
+    if (!g_holding) return;
+    const uint64_t held = wall_ns() - g_hold_since_ns;
+    if (g_realtime) g_origin_ns += held;
+    g_held_ns += held;
+    g_holding = 0;
+}
+
+uint64_t psp_clock_held_us(void) {
+    return (g_held_ns + (g_holding ? wall_ns() - g_hold_since_ns : 0)) / 1000u;
+}
+
+/* A reader that sampled the wall just as a hold began can have seen a
+ * nanosecond or two past the frozen time; the latest value returned keeps
+ * run time from stepping back to it. */
+static _Atomic uint64_t g_run_seen_ns;
+
+uint64_t psp_clock_run_ns(void) {
+    const uint64_t t = g_holding ? g_frozen_ns : wall_ns() - g_held_ns;
+    uint64_t seen = g_run_seen_ns;
+    while (t > seen && !atomic_compare_exchange_weak(&g_run_seen_ns, &seen, t)) {}
+    return t > seen ? t : seen;
 }
 
 void psp_clock_reset(void) {
@@ -123,10 +173,22 @@ void psp_clock_reset(void) {
     /* Re-anchor if the mode is already on: reset means a new run, and the
      * origin is what makes "microseconds since the module started" mean the
      * same thing on both sides of the mapping. */
-    if (g_realtime) g_origin_ns = wall_ns();
+    if (g_realtime) anchor();
 }
 
 uint64_t psp_clock_peek(void) { return g_us; }
+
+static int clock_load(psp_state_reader *r, char *why, size_t size) {
+    (void)r; (void)why; (void)size;
+    if (g_realtime) anchor();
+    return 0;
+}
+
+void psp_clock_keep(void) {
+    static const psp_state_part part = { .name = "clock", .load = clock_load };
+    PSP_STATE_KEEP(g_us);
+    psp_state_register(&part);
+}
 
 uint64_t psp_clock_read(void) {
     if (g_realtime) {

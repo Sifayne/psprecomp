@@ -6,6 +6,16 @@ add_executable(test_decode test_decode.c)
 target_link_libraries(test_decode PRIVATE allegrex_core)
 add_test(NAME decode COMMAND test_decode)
 
+add_executable(test_settings test_settings.c)
+target_link_libraries(test_settings PRIVATE psprecomp_settings)
+# Its checks are asserts; Release must not compile them out.
+if(MSVC)
+    target_compile_options(test_settings PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test_settings PRIVATE -UNDEBUG)
+endif()
+add_test(NAME settings COMMAND test_settings)
+
 add_executable(test_runtime test_runtime.c)
 target_link_libraries(test_runtime PRIVATE psprecomp)
 add_test(NAME runtime COMMAND test_runtime)
@@ -108,6 +118,24 @@ add_executable(test_interp test_interp.c)
 target_link_libraries(test_interp PRIVATE allegrex_core)
 add_test(NAME interp COMMAND test_interp)
 
+# Resuming a guest call chain natively (docs/PLAYER-LAYER.md §5). A
+# synthetic program is emitted with --resume at build time and compiled into
+# the test, which interrupts it in a firmware call, resumes it, and checks it
+# against the uninterrupted run and the interpreter.
+set(RESUME_GEN ${CMAKE_CURRENT_BINARY_DIR}/resume)
+add_executable(gen_resume gen_resume.c)
+target_link_libraries(gen_resume PRIVATE allegrex_core)
+add_custom_command(
+    OUTPUT ${RESUME_GEN}/t_resume_funcs.c ${RESUME_GEN}/t_resume_imports.c ${RESUME_GEN}/t_resume_funcs.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${RESUME_GEN}
+    COMMAND gen_resume ${RESUME_GEN}
+    DEPENDS gen_resume
+    COMMENT "Emitting the resume test's program")
+add_executable(test_resume test_resume.c ${RESUME_GEN}/t_resume_funcs.c ${RESUME_GEN}/t_resume_imports.c)
+target_include_directories(test_resume PRIVATE ${RESUME_GEN})
+target_link_libraries(test_resume PRIVATE allegrex_core)
+add_test(NAME resume COMMAND test_resume ${RESUME_GEN})
+
 add_executable(test_ctrl_replay test_ctrl_replay.c)
 target_link_libraries(test_ctrl_replay PRIVATE psprecomp)
 add_test(NAME ctrl_replay COMMAND test_ctrl_replay)
@@ -123,6 +151,10 @@ add_test(NAME ramsnap COMMAND test_ramsnap ramsnap-test)
 add_executable(test_watch_arm test_watch_arm.c)
 target_link_libraries(test_watch_arm PRIVATE psprecomp)
 add_test(NAME watch_arm COMMAND test_watch_arm)
+
+add_executable(test_state test_state.c)
+target_link_libraries(test_state PRIVATE psprecomp)
+add_test(NAME state COMMAND test_state ${CMAKE_CURRENT_BINARY_DIR})
 
 add_executable(test_ge_capture test_ge_capture.c)
 target_link_libraries(test_ge_capture PRIVATE psprecomp)
@@ -186,4 +218,77 @@ if(PSPRECOMP_HOST)
     add_test(NAME save_dialog COMMAND test_save_dialog)
     set_tests_properties(save_dialog PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy")
+
+    # Includes present.c for its internals, so it links the host layer only
+    # for the save dialog. The quit shortcuts alone, then the real SDL loop
+    # closed by the keyboard and by a virtual controller.
+    add_executable(test_present test_present.c)
+    target_link_libraries(test_present PRIVATE psprecomp_host)
+    if(MSVC)
+        target_compile_options(test_present PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_present PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME present COMMAND test_present)
+    add_test(NAME present_keyboard COMMAND test_present keyboard)
+    add_test(NAME present_controller COMMAND test_present controller)
+    add_test(NAME present_modern COMMAND test_present modern)
+    add_test(NAME present_rebind COMMAND test_present rebind)
+    add_test(NAME present_last_pad COMMAND test_present last)
+    set_tests_properties(present present_keyboard present_controller present_modern
+                         present_rebind present_last_pad PROPERTIES
+        TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
+
+    # The in-game menu: the toolkit, then the real loop with held input and
+    # with press-to-bind and saving. Linked as C: Dear ImGui needs nothing of
+    # the C++ runtime (third_party/imgui/README.md).
+    add_executable(test_overlay test_overlay.c)
+    target_link_libraries(test_overlay PRIVATE psprecomp_host)
+    set_target_properties(test_overlay PROPERTIES LINKER_LANGUAGE C)
+    if(MSVC)
+        target_compile_options(test_overlay PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_overlay PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME overlay_ui COMMAND test_overlay ui)
+    add_test(NAME overlay_held COMMAND test_overlay held)
+    add_test(NAME overlay_bind COMMAND test_overlay bind)
+    add_test(NAME overlay_pad COMMAND test_overlay pad)
+    set_tests_properties(overlay_ui overlay_held overlay_bind overlay_pad PROPERTIES
+        TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
+
+    # The bindings: the table test against the input code before stage 6
+    # (input_before.h), spelling, rebinding, host actions and the owner. It
+    # includes input.c.
+    add_executable(test_input test_input.c)
+    target_link_libraries(test_input PRIVATE psprecomp_host)
+    if(MSVC)
+        target_compile_options(test_input PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_input PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME input COMMAND test_input)
+    set_tests_properties(input PROPERTIES TIMEOUT 60 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
+
+    # The player's launcher, on a schema of its own; it includes launcher.c.
+    # Without a font the drawn half skips.
+    # Named apart from the games' own launcher tests, which build alongside.
+    # An installed pack's launcher.so, as the importer builds one, in the
+    # packs folder the test names; its symbols from the launcher resolve
+    # against the test, which exports them as the launcher does.
+    add_library(test_pack_plugin MODULE test_pack_plugin.c ${CMAKE_CURRENT_SOURCE_DIR}/../src/host/pack_api.c)
+    target_include_directories(test_pack_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    set_target_properties(test_pack_plugin PROPERTIES PREFIX "" OUTPUT_NAME launcher
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/packs/gamma/built)
+    add_executable(test_player_launcher test_launcher.c)
+    target_link_libraries(test_player_launcher PRIVATE psprecomp_host ${CMAKE_DL_LIBS})
+    set_target_properties(test_player_launcher PROPERTIES ENABLE_EXPORTS ON)
+    add_dependencies(test_player_launcher test_pack_plugin)
+    if(MSVC)
+        target_compile_options(test_player_launcher PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_player_launcher PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME launcher COMMAND test_player_launcher ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(launcher PROPERTIES TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy")
 endif()

@@ -256,10 +256,16 @@ its name.
       name.
 - [ ] Save states, an SDL2 + Dear ImGui frontend, controller remapping.
       The host layer has started: `PSPRECOMP_HOST` builds `src/host/` as
-      `psprecomp_host`, so far the savedata dialog both games shared. The SDL2
-      window, audio and GL backend still live in each game's host (see *Open
-      work*). RAM snapshots (`PSPRECOMP_RAMSNAP`) are an instrument, not save
-      states.
+      `psprecomp_host`, with the savedata dialog and the presentation layer
+      (SDL2 window, input, audio); player settings are `psprecomp_settings`.
+      Last Raven's titles use them; The 3rd Birthday's copies and both
+      games' GL backends remain (see *Open work*). `player/` builds the
+      AppImage for a title pack (`player/README.md`); Last Raven is the
+      first. RAM snapshots (`PSPRECOMP_RAMSNAP`) are an instrument, not save
+      states. The plan is [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md): one
+      player in this repository, every game a title pack compiled on the
+      player's machine, and the three features staged from a shared safe
+      point and host pause.
 
 ## Open work
 
@@ -286,9 +292,11 @@ Gaps found in the code while checking this file, none of them on a phase above:
       holds the hardware's secure saves under known keys.
 - [ ] **Windows** — the Windows half of `src/os.c` has not been through a
       Windows build in this fork.
-- [ ] **The rest of the host** — both games still carry their own copies of
-      `present.c` (SDL2 window, audio, input), `render_gl.c` (the GL backend)
-      and `boot.c`, and they have drifted apart. `boot.c` is where both
+- [ ] **The rest of the host** — `present.c`, the settings mechanism, the
+      launcher and the GL backend (`render_gl.c`) are here (`src/host/`), and
+      both games use them, stating what is theirs in `psp_title_info`. Each
+      still carries its own `boot.c`, and they have drifted apart. The order
+      was stages 1–3 of [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md). `boot.c` is where both
       register `sceKernelStopUnloadSelfModuleWithStatus` (0x8F2DF740, whose
       name does not hash to its NID; uofw `start-stopModule.c`), because its
       exit path needs the host.

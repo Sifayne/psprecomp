@@ -13,11 +13,13 @@
  */
 
 #include "psprecomp/hle.h"
+#include "census.h"
 #include "psprecomp/cpu.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/os.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -241,9 +243,14 @@ void psp_mpeg_dump_sync(FILE *out) {
     }
 }
 
+static void avc_close(void *dec);
+
 void psp_mpeg_reset(void) {
     for (int i = 0; i < MAX_MPEG; i++) {
         psp_at3_close((psp_at3_dec *)g_mpeg[i].adec);
+        avc_close(g_mpeg[i].dec);
+        free(g_mpeg[i].es);
+        free(g_mpeg[i].pic);
         free(g_mpeg[i].aes);
         free(g_mpeg[i].puts);
         free(g_mpeg[i].vpts);
@@ -496,6 +503,19 @@ static void hle_RingbufferAvailableSize(void) {
  * infinite spin the choice of INVALID_VALUE above exists to avoid. Refuse the
  * override instead of quietly doing the harmful thing. */
 static int g_decode_override = -1;
+
+/* For the park census (census.h): contexts in use, and how many hold stream
+ * data a decoder would have to be rebuilt from. */
+int psp_mpeg_census(int *fed) {
+    int used = 0, with_data = 0;
+    for (int i = 0; i < MAX_MPEG; i++) {
+        if (!g_mpeg[i].used) continue;
+        used++;
+        if (g_mpeg[i].es_len || g_mpeg[i].aes_len) with_data++;
+    }
+    if (fed) *fed = with_data;
+    return used;
+}
 
 int psp_mpeg_decoding_available(void) {
 #if PSPRECOMP_HAVE_OPENH264
@@ -909,8 +929,16 @@ static int avc_pump(mpeg_ctx *c) {
     }
     return produced;
 }
+
+static void avc_close(void *dec) {
+    ISVCDecoder *d = (ISVCDecoder *)dec;
+    if (!d) return;
+    (*d)->Uninitialize(d);
+    WelsDestroyDecoder(d);
+}
 #else
 static int avc_pump(mpeg_ctx *c) { (void)c; return 0; }
+static void avc_close(void *dec) { (void)dec; }
 #endif
 
 /* sceMpegRingbufferPut(rb, numPackets, available)
@@ -1041,11 +1069,19 @@ static void hle_QueryStreamSize(void) {
  * recycling nothing. The values lie outside the caller's storage, so their
  * base is not observable; 0x10000 is a host choice. The game hands the
  * handle back to GetAvcAu and friends and never looks inside it. */
+static uint32_t g_next_stream = 0x00010000u;
+
 static void hle_RegistStream(void) {
-    static uint32_t next = 0x00010000u;
     if (!ctx_of(psp_arg(0))) { psp_ret(0); return; }
-    psp_ret(next);
-    next += MPEG_STREAM_HANDLE_STEP;
+    psp_ret(g_next_stream);
+    g_next_stream += MPEG_STREAM_HANDLE_STEP;
+}
+
+/* A save state (psprecomp/state.h) is not taken while a movie is open: its
+ * decoders and demuxed streams are host objects with no way back. The
+ * handle counter, which outlives the movies, is kept. */
+static const char *mpeg_refuse(void) {
+    return psp_mpeg_census(NULL) ? "a movie is playing" : NULL;
 }
 
 static void hle_UnRegistStream(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
@@ -1227,7 +1263,7 @@ static void hle_GetAvcAu(void) {
     if (mpeg_logging() && c->frames <= 3)
         fprintf(stderr, "mpeg: GetAvcAu -> frame %d, pts %u\n", c->frames, c->pts);
     {
-        const uint64_t now = psp_os_mono_ns();
+        const uint64_t now = psp_clock_run_ns();   /* less host pauses */
         if (!c->v_fetched) { c->v_first_ns = now; c->v_first_pts = c->pts; }
         c->v_last_ns = now; c->v_last_pts = c->pts; c->v_fetched++;
     }
@@ -1304,7 +1340,7 @@ static void hle_GetAtracAu(void) {
     }
     c->aes_pos += total;
     {
-        const uint64_t now = psp_os_mono_ns();
+        const uint64_t now = psp_clock_run_ns();   /* less host pauses */
         if (!c->a_fetched) { c->a_first_ns = now; c->a_first_pts = c->atrac_pts; }
         c->a_last_ns = now; c->a_last_pts = c->atrac_pts; c->a_fetched++;
     }
@@ -1515,6 +1551,9 @@ static void hle_FlushAllStream(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_AvcDecodeFlush(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 void psp_mpeg_register(void) {
+    static const psp_state_part part = { .name = "mpeg", .refuse = mpeg_refuse, .drop = psp_mpeg_reset };
+    PSP_STATE_KEEP(g_next_stream);
+    psp_state_register(&part);
     psp_hle_register(0x682A619B, "sceMpeg", "sceMpegInit",            hle_MpegInit);
     psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",          hle_MpegFinish);
     psp_hle_register(0xC132E22F, "sceMpeg", "sceMpegQueryMemSize",    hle_QueryMemSize);

@@ -48,6 +48,18 @@ typedef struct {
      * stock behaviour and the new one. */
     const uint32_t *replace;
     int             nreplace;
+
+    /* Resume entries (docs/PLAYER-LAYER.md §5, "Resuming natively").
+     *
+     * Every call's return site becomes an entry of the function containing
+     * it: a case in that body's entry switch, without a dispatch thunk of its
+     * own. Each function holding one gets a public psp_resume_<addr>(site),
+     * and the module a sorted table of {site, resume function} that
+     * psp_recomp_register hands to psp_resume_register. A thread whose
+     * registers and memory are restored can then continue at its innermost
+     * return site and climb its guest call chain from there
+     * (psp_resume_chain). Off by default until a save state needs it. */
+    int resume;
 } emit_opts;
 
 /* Emit <outdir>/<prefix>_funcs.c, <prefix>_funcs.h and <prefix>_imports.c.

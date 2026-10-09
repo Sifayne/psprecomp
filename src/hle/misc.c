@@ -15,6 +15,8 @@
 #include "psprecomp/clock.h"
 #include "psprecomp/os.h"
 #include "psprecomp/interrupt.h"
+#include "census.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -816,6 +818,15 @@ static void hle_ReadBufferPositive(void) {
     ctrl_fill(ctrl_unread_samples(room));
 }
 
+/* A thread a save state restored inside the read's wait for a sample
+ * (psp_hle_register_resume): the rest of ctrl_wait_sample, then the read. */
+static void read_buffer_resume(void) {
+    (void)psp_sched_resume_delay(NULL);
+    psp_clock_advance_to(g_sample_due);
+    g_sample_due = psp_clock_next_frame();
+    ctrl_fill(ctrl_unread_samples(psp_arg(1)));
+}
+
 static void hle_PeekBufferPositive(void) {
     const uint32_t room = psp_arg(1);
     if (room > CTRL_HISTORY) { psp_ret(SCE_ERROR_INVALID_SIZE); return; }
@@ -1128,6 +1139,12 @@ void psp_audio_set_pending(uint32_t (*fn)(int ch)) { g_audio_pending = fn; }
  * with a line on stderr naming its shape. A headless run has no speaker, and
  * "is there sound" is otherwise a question only a windowed run can answer. */
 static FILE *g_audio_dump[AUDIO_OUTPUTS];
+/* A load into the running game starts the dumps again, so each holds the
+ * game's sound from the last load on. */
+static void audio_dump_drop(void) {
+    for (int ch = 0; ch < AUDIO_OUTPUTS; ch++)
+        if (g_audio_dump[ch]) { fclose(g_audio_dump[ch]); g_audio_dump[ch] = NULL; }
+}
 static const char *audio_dump_prefix(void) {
     static const char *p; static int looked;
     if (!looked) { looked = 1; p = getenv("PSPRECOMP_AUDIO_DUMP"); if (p && !*p) p = NULL; }
@@ -1188,7 +1205,9 @@ typedef struct { uint64_t first_ns, last_ns, max_gap_ns; uint32_t late, outputs;
 static audio_gap g_audio_gap[AUDIO_OUTPUTS];
 static void audio_note_gap(uint32_t ch, uint32_t samples) {
     audio_gap *g = &g_audio_gap[ch];
-    const uint64_t now = psp_os_mono_ns();
+    /* Less host pauses: a held guest outputs nothing, and the speaker is
+     * silenced rather than starved meanwhile. */
+    const uint64_t now = psp_clock_run_ns();
     if (g->first_ns) {
         const uint64_t gap = now - g->last_ns;
         const uint64_t buf = (uint64_t)samples * 1000000000ull / PSP_AUDIO_RATE;
@@ -1272,6 +1291,12 @@ static void hle_OutputPannedBlocking(void) {
     psp_ret(audio_ret());
 }
 
+/* Restored inside the backlog's wait: the buffer was taken before it. */
+static void output_blocking_resume(void) {
+    (void)psp_sched_resume_delay(NULL);
+    psp_ret(audio_ret());
+}
+
 /* Zero remaining means "ready for more", so a game's audio loop keeps going. */
 static void hle_GetChannelRestLength(void) { psp_ret(0); }
 
@@ -1306,6 +1331,10 @@ enum {
     O2_NOT_RESERVED = 0x80260008u, O2_VOLUME = 0x8026000Bu,
     O2_ADDRESS = 0x800200D3u /* PSPSDK src/user/pspkerror.h */
 };
+
+/* Which of Output2Blocking's waits a thread is in (psp_sched_set_step). */
+enum { O2_STEP_DRAIN = 1, O2_STEP_PLAY };
+static void output2_submit(uint32_t volume, uint32_t pcm);
 
 static uint32_t output2_remaining(void) {
     if (g_audio_out)
@@ -1366,10 +1395,19 @@ static void hle_Output2Blocking(void) {
      * If scheduling is disabled (unit probes), report busy without losing it. */
     if (!g_audio_out && output2_remaining()) {
         const uint64_t now = psp_clock_peek() * 1000ull;
-        if (g_output2_until_ns > now)
+        if (g_output2_until_ns > now) {
+            psp_sched_set_step(O2_STEP_DRAIN);
             psp_sched_delay((g_output2_until_ns - now + 999) / 1000);
-        if (output2_remaining()) { psp_ret(O2_BUSY); return; }
+        }
     }
+    output2_submit(volume, pcm);
+}
+
+/* The transfer, once the previous one has drained: here, and on a thread a
+ * save state restored inside that drain (output2_resume). */
+static void output2_submit(uint32_t volume, uint32_t pcm) {
+    audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
+    if (!g_audio_out && output2_remaining()) { psp_ret(O2_BUSY); return; }
     const uint32_t samples = channel->samples;
     g_audio_blocks++;
     audio_note_gap(AUDIO_OUTPUT2_CHANNEL, samples);
@@ -1382,8 +1420,16 @@ static void hle_Output2Blocking(void) {
         g_output2_until_ns = psp_clock_peek() * 1000ull
                           + (uint64_t)samples * 1000000000ull / PSP_AUDIO_RATE;
     }
+    psp_sched_set_step(O2_STEP_PLAY);
     if (wait_us > 0) psp_sched_delay((uint64_t)wait_us);
     psp_ret(0);
+}
+
+/* Restored inside one of the call's two waits, which its step tells apart. */
+static void output2_resume(void) {
+    (void)psp_sched_resume_delay(NULL);
+    if (psp_sched_step() == O2_STEP_DRAIN) output2_submit(psp_arg(0), psp_arg(1));
+    else psp_ret(0);
 }
 
 void psp_misc_reset(void) {
@@ -1422,7 +1468,43 @@ void psp_misc_init(void) {
     psp_ctrl_replay_init();
 }
 
+/* What a save state keeps here (psprecomp/state.h): the controller's
+ * counters and lanes, the volatile-memory lock, the audio channels and their
+ * pacing. Not the RTC's base, which a load works out again: fixed when the
+ * clock is virtual, as before; today's when it is real time. */
+static void misc_keep(void) {
+    PSP_STATE_KEEP(volatile_memory);
+    PSP_STATE_KEEP(g_script_buttons);
+    PSP_STATE_KEEP(g_script_ax);
+    PSP_STATE_KEEP(g_script_ay);
+    PSP_STATE_KEEP(g_script_analog);
+    PSP_STATE_KEEP(g_script_rx);
+    PSP_STATE_KEEP(g_script_ry);
+    PSP_STATE_KEEP(g_script_mdx);
+    PSP_STATE_KEEP(g_script_mdy);
+    PSP_STATE_KEEP(g_script_look);
+    PSP_STATE_KEEP(g_ctrl_frame);
+    PSP_STATE_KEEP(g_ctrl_polls);
+    PSP_STATE_KEEP(g_ctrl_last_buttons);
+    PSP_STATE_KEEP(g_ctrl_pressed_buttons);
+    PSP_STATE_KEEP(g_ctrl_last_ax);
+    PSP_STATE_KEEP(g_ctrl_last_ay);
+    PSP_STATE_KEEP(g_ctrl_last_rx);
+    PSP_STATE_KEEP(g_ctrl_last_ry);
+    PSP_STATE_KEEP(g_ctrl_last_mdx);
+    PSP_STATE_KEEP(g_ctrl_last_mdy);
+    PSP_STATE_KEEP(g_press);
+    PSP_STATE_KEEP(g_sample_due);
+    PSP_STATE_KEEP(g_read_frame);
+    PSP_STATE_KEEP(g_audio);
+    PSP_STATE_KEEP(g_output2_until_ns);
+    static const psp_state_part part = { .name = "audiodump", .drop = audio_dump_drop };
+    psp_state_register(&part);
+    psp_ctrl_replay_keep();
+}
+
 void psp_misc_register(void) {
+    misc_keep();
     psp_hle_register(0x04B7766E, "scePower", "scePowerRegisterCallback", hle_PowerRegisterCallback);
 
     psp_interrupt_register();
@@ -1512,4 +1594,11 @@ void psp_misc_register(void) {
     psp_hle_register(0x63F2889C, "sceAudio", "sceAudioOutput2ChangeLength", hle_Output2ChangeLength);
     psp_hle_register(0x647CEF33, "sceAudio", "sceAudioOutput2GetRestSample", hle_Output2Rest);
     psp_hle_register(0x43196845, "sceAudio", "sceAudioOutput2Release", hle_Output2Release);
+
+    /* The waits a thread can be parked in when a state is saved, finished
+     * on a thread the state restored (psprecomp/state.h). */
+    psp_hle_register_resume(0x1F803938, read_buffer_resume);       /* sceCtrlReadBufferPositive */
+    psp_hle_register_resume(0x136CAF51, output_blocking_resume);   /* sceAudioOutputBlocking */
+    psp_hle_register_resume(0x13F592BC, output_blocking_resume);   /* sceAudioOutputPannedBlocking */
+    psp_hle_register_resume(0x2D53F36E, output2_resume);           /* sceAudioOutput2OutputBlocking */
 }

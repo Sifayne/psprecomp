@@ -1,6 +1,7 @@
 /* psprecomp — address → function dispatch. See include/psprecomp/dispatch.h. */
 
 #include "psprecomp/dispatch.h"
+#include "psprecomp/cpu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -410,3 +411,55 @@ void psp_trace_sp_call(uint32_t callee, uint32_t sp_before, uint32_t sp_after) {
     g_spc_bad++;
 }
 uint64_t psp_sp_call_violations(void) { return g_spc_bad; }
+
+/* ---- resuming a guest call chain ------------------------------------------ */
+
+static const psp_resume_site *g_resume;
+static int g_nresume;
+
+void psp_resume_register(const psp_resume_site *sites, int count) {
+    g_resume = sites;
+    g_nresume = count;
+}
+
+int psp_resume_count(void) { return g_nresume; }
+
+static struct { uint32_t addr; psp_resume_fn original, fn; } g_override[8];
+static int g_noverride;
+
+void psp_resume_override(uint32_t addr, psp_resume_fn original, psp_resume_fn fn) {
+    if (g_noverride >= (int)(sizeof g_override / sizeof *g_override)) return;
+    g_override[g_noverride].addr = addr;
+    g_override[g_noverride].original = original;
+    g_override[g_noverride].fn = fn;
+    g_noverride++;
+}
+
+int psp_resume_overridden(uint32_t addr) {
+    for (int i = 0; i < g_noverride; i++) if (g_override[i].addr == addr) return 1;
+    return 0;
+}
+
+psp_resume_fn psp_resume_lookup(uint32_t site) {
+    int lo = 0, hi = g_nresume - 1;
+    while (lo <= hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (g_resume[mid].site == site) {
+            for (int i = 0; i < g_noverride; i++)
+                if (g_override[i].original == g_resume[mid].fn) return g_override[i].fn;
+            return g_resume[mid].fn;
+        }
+        if (g_resume[mid].site < site) lo = mid + 1; else hi = mid - 1;
+    }
+    return NULL;
+}
+
+int psp_resume_chain(uint32_t site, uint32_t stop, uint32_t *missing) {
+    while (site != stop) {
+        const psp_resume_fn fn = psp_resume_lookup(site);
+        if (!fn) { if (missing) *missing = site; return -1; }
+        fn(site);
+        site = psp_cpu.r[PSP_REG_RA];
+    }
+    return 0;
+}

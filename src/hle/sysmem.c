@@ -13,6 +13,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -398,6 +399,11 @@ static void hle_MaxFreeMemSize(void)   { psp_ret(largest_free_run()); }
 static void hle_DevkitVersion(void) { psp_ret(0x06060010u); }
 
 void psp_sysmem_register(void) {
+    PSP_STATE_KEEP(g_block);            /* a save state's (psprecomp/state.h) */
+    PSP_STATE_KEEP(g_next_uid);
+    PSP_STATE_KEEP(g_heap_lo);
+    PSP_STATE_KEEP(g_heap_hi);
+    PSP_STATE_KEEP(g_sdk_version);
     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every
      * pair below, so a mistyped NID cannot survive. */
     psp_hle_register(0x237DBD4F, "SysMemUserForUser", "sceKernelAllocPartitionMemory", hle_AllocPartitionMemory);

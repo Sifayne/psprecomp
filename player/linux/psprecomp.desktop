@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=psprecomp
+Comment=Add your PSP games' packs, prepare your games and configure graphics and controls
+Exec=AppRun
+Icon=psprecomp
+Terminal=false
+Categories=Game;
+StartupWMClass=psprecomp

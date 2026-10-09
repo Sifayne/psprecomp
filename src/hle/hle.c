@@ -6,6 +6,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/interrupt.h"
 #include "psprecomp/os.h"
+#include "census.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,7 +71,9 @@ uint32_t psp_call_guest(uint32_t addr, const uint32_t *args, int nargs) {
     for (int i = 0; i < nargs && i < 8; i++)
         psp_cpu.r[i < 4 ? PSP_REG_A0 + i : PSP_REG_T0 + (i - 4)] = args[i];
     psp_cpu.r[PSP_REG_RA] = 0;
+    psp_nest_enter(PSP_NEST_CALL_GUEST, addr);
     psp_dispatch(addr);
+    psp_nest_leave();
     const uint32_t v0 = psp_cpu.r[PSP_REG_V0];
     psp_cpu = saved;
     return v0;
@@ -219,8 +222,73 @@ void psp_hle_dump_calls(FILE *out, int top) {
                 (unsigned long long)g_calls_unimpl);
 }
 
+/* What every firmware call ends with, after its handler and the safe point:
+ * the reschedule, then timers and interrupts, which are guest code and must
+ * not run before the call has finished. A restored thread finishing a call
+ * it began in another process ends it here too (psp_hle_resume). */
+static void after_call(void) {
+    /* After the handler, not before: the call has to finish before the
+     * thread can be switched away from, or its result is written into
+     * whoever runs next. */
+    psp_display_tick();
+    psp_interrupt_run_pending();
+    psp_sched_tick();
+    /* After the handler and after the reschedule: a timer handler is
+     * guest code, and running it before the call it interrupted has
+     * finished would write its result into the caller's $v0. */
+    psp_ktimer_tick();
+    psp_display_tick();
+    psp_interrupt_run_pending();
+    psp_census_call_leave();
+    g_call_depth--;
+}
+
+/* ---- finishing a call after a save state loads ------------------------------- */
+
+/* The calls a thread can be parked in when a state is saved, and how each
+ * finishes on a restored thread: its handler's code after the wait, given
+ * what the thread record kept (psp_hle_register_resume). */
+enum { RESUMES_MAX = 32 };
+static struct { uint32_t nid; void (*finish)(void); } g_resumes[RESUMES_MAX];
+static int g_nresumes;
+
+void psp_hle_register_resume(uint32_t nid, void (*finish)(void)) {
+    for (int i = 0; i < g_nresumes; i++)
+        if (g_resumes[i].nid == nid) { g_resumes[i].finish = finish; return; }
+    if (g_nresumes < RESUMES_MAX) { g_resumes[g_nresumes].nid = nid; g_resumes[g_nresumes++].finish = finish; }
+}
+
+int psp_hle_resumable(uint32_t nid) {
+    for (int i = 0; i < g_nresumes; i++) if (g_resumes[i].nid == nid) return 1;
+    return 0;
+}
+
+void psp_hle_thread_reset(void) {
+    g_call_depth = 0;
+    psp_census_thread_reset();
+}
+
+void psp_hle_resume(uint32_t nid, uint32_t site, int safepoint) {
+    g_call_depth = 1;
+    psp_census_call_enter(nid, site);
+    if (safepoint) {
+        /* The thread that saved: its call had finished, and it was inside
+         * the safe point, which ends by arming itself again. */
+        psp_sched_resume_token();
+        psp_safepoint_rearm();
+    } else {
+        for (int i = 0; i < g_nresumes; i++)
+            if (g_resumes[i].nid == nid) { g_resumes[i].finish(); break; }
+        /* The call has finished, as in psp_hle_call. */
+        if (psp_safepoint_armed) psp_safepoint(nid);
+    }
+    after_call();
+}
+
 void psp_hle_call(uint32_t nid) {
     g_call_depth++;
+    /* Where the guest resumes after this call: its $ra, set by the jal. */
+    psp_census_call_enter(nid, psp_cpu.r[PSP_REG_RA]);
     /* Every firmware call costs a tick of guest time.
      *
      * The clock advanced three ways and every one of them could stop. A vblank
@@ -280,19 +348,12 @@ void psp_hle_call(uint32_t nid) {
                 fprintf(stderr, "hle: [%05X] %-36s  = 0x%08X\n",
                         psp_sched_current(), "", psp_cpu.r[PSP_REG_V0]);
             if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name, 1);
-            /* After the handler, not before: the call has to finish before the
-             * thread can be switched away from, or its result is written into
-             * whoever runs next. */
-            psp_display_tick();
-            psp_interrupt_run_pending();
-            psp_sched_tick();
-            /* After the handler and after the reschedule: a timer handler is
-             * guest code, and running it before the call it interrupted has
-             * finished would write its result into the caller's $v0. */
-            psp_ktimer_tick();
-            psp_display_tick();
-            psp_interrupt_run_pending();
-            g_call_depth--;
+            /* The safe point (psprecomp/safepoint.h): this call is finished --
+             * v0 written -- and nothing after it has run yet. Only a call from
+             * the thread's own guest code, never one nested in a callback or
+             * a handler. */
+            if (psp_safepoint_armed && g_call_depth == 1) psp_safepoint(nid);
+            after_call();
             return;
         }
     }
@@ -315,6 +376,7 @@ void psp_hle_call(uint32_t nid) {
         fprintf(stderr, "psprecomp: unimplemented firmware call 0x%08X\n", nid);
     psp_ret(0);
     psp_interrupt_run_pending();
+    psp_census_call_leave();
     g_call_depth--;
 }
 

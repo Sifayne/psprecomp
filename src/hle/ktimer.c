@@ -32,6 +32,7 @@
 #include "psprecomp/mem.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/interrupt.h"
+#include "psprecomp/state.h"
 
 #include <string.h>
 
@@ -207,7 +208,10 @@ static void alarm_list(int type, uint32_t out, int max, int *count) {
     }
 }
 
+static void ktimer_keep(void);
+
 void psp_ktimer_register(void) {
+    ktimer_keep();
     psp_threadman_add_lister(alarm_list);
     psp_hle_register(0x6652B8CA, "ThreadManForUser", "sceKernelSetAlarm",         hle_SetAlarm);
     psp_hle_register(0xB2C25152, "ThreadManForUser", "sceKernelSetSysClockAlarm", hle_SetSysClockAlarm);
@@ -456,10 +460,21 @@ static void hle_ReferVTimerStatus(void) {
 /* Guest memory for the two clocks a handler is handed. One block, reused every
  * firing: a handler cannot be running twice at once, and the structures are
  * only alive for the length of the call. */
+static uint32_t g_clock_scratch;
+
 static uint32_t vtimer_clock_scratch(void) {
-    static uint32_t at;
-    if (!at) at = psp_sysmem_alloc(16, 0);
-    return at;
+    if (!g_clock_scratch) g_clock_scratch = psp_sysmem_alloc(16, 0);
+    return g_clock_scratch;
+}
+
+/* What a save state keeps of the timers (psprecomp/state.h): the scratch
+ * block too, which is a live allocation the guest's heap is laid out around. */
+static void ktimer_keep(void) {
+    PSP_STATE_KEEP(g_alarm);
+    PSP_STATE_KEEP(g_firing);
+    PSP_STATE_KEEP(g_vtimer);
+    PSP_STATE_KEEP(g_vtimer_hi);
+    PSP_STATE_KEEP(g_clock_scratch);
 }
 
 /* Fire any vtimer whose count has reached its schedule. Same contract as an

@@ -48,6 +48,9 @@ add_library(psprecomp STATIC
     src/hle/ktimer.c
     src/hle/interrupt.c
     src/hle/sched.c
+    src/hle/census.c
+    src/hle/safepoint.c
+    src/hle/state.c
     src/hle/clock.c
     src/hle/mpeg.c
     src/hle/display.c
@@ -121,6 +124,43 @@ if(NOT MSVC)
     if(PSPRECOMP_LIBM)
         target_link_libraries(psprecomp PUBLIC ${PSPRECOMP_LIBM})
     endif()
+endif()
+
+# --- player settings ----------------------------------------------------------
+#
+# The settings mechanism every title's launcher, game and tools share
+# (src/host/settings.c). Plain C with no SDL, so it is always built; a title
+# supplies the options as a schema. See include/psprecomp/host/settings.h.
+add_library(psprecomp_settings STATIC src/host/settings.c)
+target_include_directories(psprecomp_settings PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(psprecomp_settings PUBLIC Threads::Threads)
+if(NOT MSVC)
+    find_library(PSPRECOMP_SETTINGS_LIBM m)
+    if(PSPRECOMP_SETTINGS_LIBM)
+        target_link_libraries(psprecomp_settings PUBLIC ${PSPRECOMP_SETTINGS_LIBM})
+    endif()
+endif()
+
+# --- Dear ImGui, for the player's in-game menu ----------------------------------
+#
+# The core (third_party/imgui), without SDL: the host layer's menu draws with
+# it (src/host/ui.cpp). Built here, with the runtime, so that a game whose
+# own scripts compile the host files by path links this archive instead of
+# compiling ImGui every time. C++ without exceptions, RTTI or thread-safe
+# statics needs nothing of the C++ runtime, so a C link takes it as it is
+# (third_party/imgui/README.md). Needs a C++ compiler; without one there is
+# no archive, and no menu.
+include(CheckLanguage)
+check_language(CXX)
+if(CMAKE_CXX_COMPILER)
+    enable_language(CXX)
+    add_library(psprecomp_imgui STATIC
+        third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
+        third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp)
+    target_include_directories(psprecomp_imgui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
+    set(PSPRECOMP_CXX_FLAGS -fno-exceptions -fno-rtti -fno-threadsafe-statics)
+    target_compile_options(psprecomp_imgui PRIVATE ${PSPRECOMP_CXX_FLAGS})
+    set_target_properties(psprecomp_imgui PROPERTIES CXX_STANDARD 11 POSITION_INDEPENDENT_CODE ON)
 endif()
 
 # --- optional: the SDL2 host layer --------------------------------------------

@@ -5,6 +5,7 @@
 #include "psprecomp/sched.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/state.h"
 
 #include <string.h>
 
@@ -56,6 +57,29 @@ int psp_waitq_drop(psp_waitq *q, uint32_t uid) {
 }
 
 void psp_waitq_reset(void) { g_nparked = 0; }
+
+/* A save state keeps the table as it is. Every queue is inside an object the
+ * state keeps too, so a load moves each pointer by the distance they all
+ * moved (psp_state_delta). */
+static const char *waitq_refuse(void) {
+    for (int i = 0; i < g_nparked; i++)
+        if (!psp_state_is_kept(g_parked[i].q)) return "a thread waits on an object the state does not keep";
+    return NULL;
+}
+
+static int waitq_load(psp_state_reader *r, char *why, size_t size) {
+    (void)r; (void)why; (void)size;
+    for (int i = 0; i < g_nparked; i++)
+        g_parked[i].q = (psp_waitq *)((char *)g_parked[i].q + psp_state_delta());
+    return 0;
+}
+
+void psp_waitq_keep(void) {
+    static const psp_state_part part = { .name = "waitq", .refuse = waitq_refuse, .load = waitq_load };
+    PSP_STATE_KEEP(g_parked);
+    PSP_STATE_KEEP(g_nparked);
+    psp_state_register(&part);
+}
 
 int psp_waitq_leave(uint32_t uid) {
     const int p = parked_find(uid);

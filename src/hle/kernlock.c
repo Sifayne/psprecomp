@@ -16,6 +16,7 @@
 #include "psprecomp/sched.h"
 #include "psprecomp/mem.h"
 #include "waitq.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -365,6 +366,7 @@ static void hle_LockMutexCB(void) { psp_threadman_cb_begin(); hle_LockMutex(); p
 static void lw_list(int type, uint32_t out, int max, int *count);
 
 void psp_kernlock_register(void) {
+    PSP_STATE_KEEP(g_mutex);            /* a save state's (psprecomp/state.h) */
     psp_threadman_add_lister(mutex_list);
     psp_threadman_add_lister(lw_list);
     psp_hle_register(0xB7D098C6, "ThreadManForUser", "sceKernelCreateMutex",      hle_CreateMutex);
@@ -755,6 +757,7 @@ static void hle_ReferLwMutexStatusByID(void) {
 static void hle_LockLwMutexCB(void) { psp_threadman_cb_begin(); hle_LockLwMutex(); psp_threadman_cb_end(); }
 
 void psp_kernlock_register_lw(void) {
+    PSP_STATE_KEEP(g_lw);
     psp_hle_register(0x19CFF145, "ThreadManForUser", "sceKernelCreateLwMutex",   hle_CreateLwMutex);
     psp_hle_register(0x60107536, "ThreadManForUser", "sceKernelDeleteLwMutex",   hle_DeleteLwMutex);
     psp_hle_register(0xBEA46419, "ThreadManForUser", "sceKernelLockLwMutex",     hle_LockLwMutex);

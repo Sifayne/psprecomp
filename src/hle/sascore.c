@@ -12,6 +12,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/state.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1863,6 +1864,12 @@ static void hle_RevVON(void) {
 }
 
 void psp_sas_register(void) {
+    PSP_STATE_KEEP(g_voice);            /* a save state's (psprecomp/state.h) */
+    PSP_STATE_KEEP(g_grain);
+    PSP_STATE_KEEP(g_output_mode);
+    PSP_STATE_KEEP(g_sample_rate);
+    PSP_STATE_KEEP(g_s_header_flags);
+    PSP_STATE_KEEP(g_rev);
     psp_hle_register(0x42778A9F, "sceSasCore", "__sceSasInit",              hle_Init);
     psp_hle_register(0xD1E0A01E, "sceSasCore", "__sceSasSetGrain",          hle_SetGrain);
     psp_hle_register(0xBD11B7C2, "sceSasCore", "__sceSasGetGrain",          hle_GetGrain);

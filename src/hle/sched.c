@@ -8,7 +8,11 @@
 #include "psprecomp/hle.h"          /* psp_ktimer_in_handler */
 
 #include "psprecomp/os.h"
+#include "census.h"
+#include "psprecomp/safepoint.h"
+#include "psprecomp/state.h"
 
+#include <setjmp.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -71,11 +75,16 @@ typedef struct {
     uint64_t        run_us, run_since;
     uint32_t        releases, thread_preempts, intr_preempts;
     psp_cpu_state   ctx;           /* valid whenever this slot is not running */
+    psp_park        park;          /* how it last parked: the census (census.h) */
+    uint8_t         step;          /* psp_sched_set_step */
     psp_os_thread   host;
     int             started;
     int             joined;        /* host thread reaped by psp_sched_join_all */
 } sched_slot;
 
+/* The slots and the queue order are a save state's (psprecomp/state.h):
+ * kept, with the host's fields -- the host thread, the diagnostic strings --
+ * cleared when a state is loaded. */
 static sched_slot      g_slot[MAX_SCHED_THREADS];
 /* One past the highest slot ever handed out. Every scan stops here: the
  * reschedule after each firmware call walks the table twice, and a walk of
@@ -88,6 +97,14 @@ static void          (*g_end_hook)(uint32_t uid, uint32_t status);
 static void          (*g_thread_hook)(void);
 static void          (*g_expire_hook)(uint32_t uid);
 static int             g_threading = 1;
+/* Set by loading a save state, until the main context's drain takes it: the
+ * token is the saving thread's, held back until the run is ready, and no
+ * handoff is to choose anyone else. */
+static int             g_token_restored;
+static int             g_restored_running;
+/* How each slot continues from a loaded state; see "save states" below. */
+enum { RESUME_NONE, RESUME_FRESH, RESUME_SAFEPOINT, RESUME_WAIT };
+static struct { uint8_t kind; uint32_t nid, site; } g_resume[MAX_SCHED_THREADS];
 /* The tie-break counter behind every ready stamp; see sched_slot.rq_time. */
 static int64_t         g_rq_seq;
 /* sceKernelSuspendDispatchThread. See psp_sched_set_dispatch. */
@@ -147,6 +164,15 @@ void psp_sched_init(void) {
      * before anything can be waiting on it. */
     psp_os_cond_use_monotonic(&g_turn);
     psp_sched_reset();
+    psp_census_init();
+    psp_safepoint_init();
+    PSP_STATE_KEEP(g_slot);
+    PSP_STATE_KEEP(g_slot_hi);
+    PSP_STATE_KEEP(g_running);
+    PSP_STATE_KEEP(g_rq_seq);
+    PSP_STATE_KEEP(g_dispatch);
+    PSP_STATE_KEEP(g_resume);
+    psp_clock_keep();
 }
 
 void psp_sched_set_threading(int on) { g_threading = on; }
@@ -455,6 +481,7 @@ static int switch_away(int me, psp_sched_state why, const char *what,
     if (psp_interrupt_in_handler()) return -1;
     psp_os_lock(&g_lock);
     g_slot[me].ctx        = psp_cpu;
+    psp_census_note_park(&g_slot[me].park, PSP_PARK_BLOCK, what, deadline_us);
     /* With a deadline the wait *is* a sleep as far as the handoff is concerned:
      * SLEEPING plus wake_at is the state it already knows how to expire, and
      * teaching it a second one would be two mechanisms for one thing. What the
@@ -507,17 +534,10 @@ static int switch_away(int me, psp_sched_state why, const char *what,
 
 /* ---- guest thread bodies --------------------------------------------------- */
 
-static void thread_main(void *arg) {
-    sched_slot *t = (sched_slot *)arg;
+static void thread_end(sched_slot *t);
+
+static void thread_run(sched_slot *t) {
     const int me = (int)(t - g_slot);
-
-    /* Before anything else: this host thread's identity. Everything that asks
-     * "which guest thread am I" reads it, including the firmware calls made
-     * from the hook below. */
-    g_self = me;
-
-    if (g_thread_hook) g_thread_hook();
-
     psp_os_lock(&g_lock);
     if (await_turn_locked(me) != 0) { psp_os_unlock(&g_lock); return; }
     psp_os_unlock(&g_lock);
@@ -542,10 +562,13 @@ static void thread_main(void *arg) {
     psp_cpu.r[PSP_REG_RA] = 0;
 
     psp_dispatch(t->entry);
+    thread_end(t);
+}
 
-    /* Fell off the end of the entry point. Report it before taking the lock:
-     * the hook runs thread-manager code that may take locks of its own, and it
-     * still holds the token, so nothing else can be running. */
+/* Fell off the end of the entry point. Report it before taking the lock:
+ * the hook runs thread-manager code that may take locks of its own, and it
+ * still holds the token, so nothing else can be running. */
+static void thread_end(sched_slot *t) {
     if (g_end_hook) g_end_hook(t->uid, psp_cpu.r[PSP_REG_V0]);
 
     psp_os_lock(&g_lock);
@@ -555,6 +578,26 @@ static void thread_main(void *arg) {
      * is nothing for a dead thread to do about it. */
     (void)handoff_locked();
     psp_os_unlock(&g_lock);
+}
+
+/* Where this host thread's guest thread began. A save state loaded while the
+ * game runs brings the thread that loads it back here, its host frames
+ * abandoned, to continue as the state's saving thread (psp_sched_state_jump). */
+static PSP_THREAD_LOCAL jmp_buf *t_base;
+
+static void resume_slot(sched_slot *t);
+
+static void thread_main(void *arg) {
+    sched_slot *t = (sched_slot *)arg;
+    /* Before anything else: this host thread's identity. Everything that asks
+     * "which guest thread am I" reads it, including the firmware calls made
+     * from the hook below. */
+    g_self = (int)(t - g_slot);
+    if (g_thread_hook) g_thread_hook();
+    jmp_buf base;
+    t_base = &base;
+    if (setjmp(base)) { resume_slot(&g_slot[g_self]); return; }
+    thread_run(t);
 }
 
 int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp, uint32_t k0,
@@ -729,6 +772,7 @@ static void yield_as(int displaced) {
     const int me = g_running;
     if (me < 0) { psp_os_unlock(&g_lock); return; }
     g_slot[me].ctx = psp_cpu;
+    psp_census_note_park(&g_slot[me].park, displaced ? PSP_PARK_PREEMPT : PSP_PARK_YIELD, NULL, 0);
     /* Displaced goes to the head of its queue, a yield to the tail; see
      * sched_slot.rq_time for the measurements. */
     if (displaced) ready_head_locked(me);
@@ -784,6 +828,8 @@ int psp_sched_delay(uint64_t usec) {
     const int me = g_self;
 
     g_slot[me].ctx      = psp_cpu;
+    psp_census_note_park(&g_slot[me].park, PSP_PARK_DELAY, NULL,
+                         psp_clock_peek() + (usec ? usec : 1));
     g_slot[me].state    = PSP_SCHED_SLEEPING;
     g_slot[me].woken    = 0;
     g_slot[me].park_seq = ++g_rq_seq;
@@ -1011,7 +1057,11 @@ int psp_sched_drain(int timeout_s) {
     const uint64_t span_ns = timeout_s > 0
         ? (uint64_t)timeout_s * 1000000000ull
         : 365ull * 24 * 3600 * 1000000000ull;
-    const uint64_t deadline_ns = psp_os_mono_ns() + span_ns;
+    uint64_t deadline_ns = psp_os_mono_ns() + span_ns;
+    /* Time the guest spends held by a host pause (psprecomp/safepoint.h) is
+     * not run time: the limit moves out by it, so a hold does not cut a
+     * timed run short. */
+    uint64_t held_us = psp_clock_held_us();
 
     /* The main context steps aside so the guest threads can run. It becomes
      * runnable again only when they are all finished -- or when none of them
@@ -1019,10 +1069,24 @@ int psp_sched_drain(int timeout_s) {
     psp_os_lock(&g_lock);
     int timed_out = 0, stalled = 0;
     while (live_locked()) {
-        g_slot[MAIN_SLOT].ctx   = psp_cpu;
-        g_slot[MAIN_SLOT].state = PSP_SCHED_BLOCKED;
-        if (handoff_locked() < 0) { stalled = 1; break; }
-        const int rc = await_turn_deadline_locked(MAIN_SLOT, deadline_ns);
+        /* A loaded state's token is already its saving thread's; the main
+         * context was waiting here when it was saved. */
+        if (g_token_restored) {
+            g_token_restored = 0;
+            g_running = g_restored_running;
+            psp_os_cond_broadcast(&g_turn);
+        } else {
+            g_slot[MAIN_SLOT].ctx   = psp_cpu;
+            g_slot[MAIN_SLOT].state = PSP_SCHED_BLOCKED;
+            if (handoff_locked() < 0) { stalled = 1; break; }
+        }
+        int rc;
+        while ((rc = await_turn_deadline_locked(MAIN_SLOT, deadline_ns)) == -1) {
+            const uint64_t held = psp_clock_held_us();
+            if (held == held_us) break;
+            deadline_ns += (held - held_us) * 1000u;
+            held_us = held;
+        }
         if (rc == -2) { stalled = 1; break; }
         if (rc != 0)  { timed_out = 1; break; }
     }
@@ -1055,6 +1119,42 @@ int psp_sched_drain(int timeout_s) {
  * gives up; a wait that cannot be satisfied needs exactly the same list, and
  * printing it there is the difference between "deadlock" and knowing which
  * semaphore nobody is going to signal. */
+/* The census's thread lines: copied under the lock, printed without it,
+ * since the names come from the thread manager. */
+void psp_sched_census(FILE *out, uint32_t self) {
+    static const char *const ST[] = { "ready", "running", "blocked", "sleeping", "dead" };
+    static struct { uint32_t uid, entry; int slot, priority, suspended; psp_sched_state state; psp_park park; }
+        copy[MAX_SCHED_THREADS];
+    int n = 0;
+    psp_os_lock(&g_lock);
+    for (int i = 0; i < g_slot_hi; i++) {
+        const sched_slot *t = &g_slot[i];
+        if (!t->used || t->state == PSP_SCHED_DEAD) continue;
+        copy[n].uid = t->uid; copy[n].entry = t->entry; copy[n].slot = i; copy[n].priority = t->priority;
+        copy[n].suspended = t->suspended; copy[n].state = t->state; copy[n].park = t->park;
+        n++;
+    }
+    psp_os_unlock(&g_lock);
+    for (int i = 0; i < n; i++) {
+        const int me = copy[i].uid == self;
+        /* The host's own context, which ran module_start and now waits for
+         * the threads to end: not a guest thread, and re-created on a load. */
+        if (copy[i].slot == MAIN_SLOT && !me) {
+            fprintf(out, "census:   (host main context: ran module_start, waits for the threads)\n");
+            continue;
+        }
+        const char *name = psp_threadman_thread_name(copy[i].uid);
+        fprintf(out, "census:   0x%08X %-24s prio %3d %-8s ", copy[i].uid, name,
+                copy[i].priority, me ? "SAFE" : ST[copy[i].state]);
+        if (me) fprintf(out, "at the safe point");
+        else if (!copy[i].park.kind) fprintf(out, "not started: entry 0x%08X", copy[i].entry);
+        else psp_census_print_park(out, &copy[i].park);
+        if (copy[i].suspended) fprintf(out, " (suspended)");
+        fprintf(out, "\n");
+        if (!me) psp_census_row(out, copy[i].uid, name, ST[copy[i].state], &copy[i].park, copy[i].entry);
+    }
+}
+
 void psp_sched_dump_threads(FILE *out) {
     psp_os_lock(&g_lock);
     dump_locked(out, 0);
@@ -1230,3 +1330,264 @@ uint32_t psp_sched_current(void) {
     psp_os_unlock(&g_lock);
     return uid;
 }
+
+/* ---- save states (psprecomp/state.h) ----------------------------------------- */
+
+/* How each slot continues from a loaded state (g_resume), decided when it is
+ * saved:
+ *
+ *   FRESH      started and never run: it begins at its entry point, as ever;
+ *   SAFEPOINT  the thread that saved, at the safe point inside its call;
+ *   WAIT       parked in a firmware call that knows how to finish a wait it
+ *              did not begin in this process (psp_hle_register_resume).
+ *
+ * The last two finish their call -- the rest of the handler, then what every
+ * call ends with -- and then climb their guest stack (psp_resume_chain). */
+
+/* A host frame between guest frames is fatal to resuming, unless it is a
+ * replaced function a title resumes itself (psp_resume_override). */
+static int nest_resumes(int n, const uint8_t *kind, const uint32_t *addr) {
+    for (int i = 0; i < n && i < PSP_PARK_NEST_MAX; i++)
+        if (kind[i] != PSP_NEST_REPLACED || !psp_resume_overridden(addr[i])) return 0;
+    return 1;
+}
+
+static const char *sched_refuse(void) {
+    static char why[160];
+    const int me = g_self;
+    if (!psp_safepoint_nid() || g_running != me || me == MAIN_SLOT) return "not at the safe point";
+    if (g_slot[MAIN_SLOT].state != PSP_SCHED_BLOCKED) return "the module is still starting";
+    uint8_t kinds[PSP_PARK_NEST_MAX];
+    uint32_t addrs[PSP_PARK_NEST_MAX];
+    const int nest = psp_census_self_nest(kinds, addrs, PSP_PARK_NEST_MAX);
+    if (!nest_resumes(nest, kinds, addrs)) return "the safe point is inside a callback or a handler";
+    for (int i = 1; i < g_slot_hi; i++) {
+        const sched_slot *t = &g_slot[i];
+        if (i == me || !t->used || t->state == PSP_SCHED_DEAD) continue;
+        const psp_park *p = &t->park;
+        if (!p->kind) continue;                                   /* never run */
+        if (!nest_resumes(p->nest, p->nest_kind, p->nest_addr)) {
+            snprintf(why, sizeof why, "thread 0x%08X is inside a callback or a handler", t->uid);
+            return why;
+        }
+        if (p->kind == PSP_PARK_YIELD || p->kind == PSP_PARK_PREEMPT) {
+            snprintf(why, sizeof why, "thread 0x%08X was switched away inside a firmware call", t->uid);
+            return why;
+        }
+        if (p->calls != 1 || !psp_hle_resumable(p->nid)) {
+            snprintf(why, sizeof why, "thread 0x%08X waits in %s, which cannot be resumed yet", t->uid,
+                     p->nid && psp_hle_name(p->nid) ? psp_hle_name(p->nid) : "an unnamed call");
+            return why;
+        }
+    }
+    return NULL;
+}
+
+/* Called by psp_state_save before the kept variables are written: the
+ * saving thread's registers into its slot, and every slot's way back. */
+static int sched_prepare(void) {
+    g_slot[g_running].ctx = psp_cpu;
+    memset(g_resume, 0, sizeof g_resume);
+    for (int i = 1; i < g_slot_hi; i++) {
+        const sched_slot *t = &g_slot[i];
+        if (!t->used || t->state == PSP_SCHED_DEAD) continue;
+        if (i == g_running) {
+            g_resume[i].kind = RESUME_SAFEPOINT;
+            g_resume[i].nid = psp_safepoint_nid();
+            g_resume[i].site = psp_cpu.r[PSP_REG_RA];
+        } else if (!t->park.kind) {
+            g_resume[i].kind = RESUME_FRESH;
+        } else {
+            g_resume[i].kind = RESUME_WAIT;
+            g_resume[i].nid = t->park.nid;
+            g_resume[i].site = t->park.site;
+        }
+    }
+    return 0;
+}
+
+/* A restored thread's way back: finish the call it was in, then climb its
+ * guest stack to the entry point, then end as a thread ends. */
+static void resume_main(void *arg) {
+    sched_slot *t = (sched_slot *)arg;
+    g_self = (int)(t - g_slot);
+    if (g_thread_hook) g_thread_hook();
+    jmp_buf base;
+    t_base = &base;
+    if (setjmp(base)) { resume_slot(&g_slot[g_self]); return; }
+    resume_slot(t);
+}
+
+static void resume_slot(sched_slot *t) {
+    const int me = (int)(t - g_slot);
+    if (g_resume[me].kind == RESUME_FRESH) { thread_run(t); return; }
+    psp_hle_resume(g_resume[me].nid, g_resume[me].site, g_resume[me].kind == RESUME_SAFEPOINT);
+    uint32_t missing = 0;
+    if (psp_resume_chain(psp_cpu.r[PSP_REG_RA], 0, &missing)) {
+        fprintf(stderr, "state: thread 0x%08X cannot continue: 0x%08X is no return site\n", t->uid, missing);
+        psp_sched_stop_all("a loaded thread could not continue");
+        return;
+    }
+    thread_end(t);
+}
+
+/* The first wait of a restored thread is the saved one: the slot already
+ * says how it is parked. These wait for the token and answer as switch_away
+ * and psp_sched_delay would have, had the wait begun in this process. */
+void psp_sched_set_step(uint8_t step) { g_slot[g_self].step = step; }
+uint8_t psp_sched_step(void) { return g_slot[g_self].step; }
+
+int psp_sched_resume_block(uint64_t *deadline) {
+    const int me = g_self;
+    psp_os_lock(&g_lock);
+    if (await_turn_locked(me) != 0) {
+        g_slot[me].waiting_on = NULL;
+        psp_os_unlock(&g_lock);
+        psp_os_thread_exit();
+        return PSP_SCHED_STRANDED;
+    }
+    const uint64_t deadline_us = g_slot[me].park.deadline;
+    if (deadline) *deadline = deadline_us;
+    const int woken = g_slot[me].woken;
+    const int released = woken && g_slot[me].wake_reason == PSP_SCHED_WAKE_RELEASE;
+    g_slot[me].waiting_on = NULL;
+    g_slot[me].wake_at    = 0;
+    psp_os_unlock(&g_lock);
+    if (released) return PSP_SCHED_RELEASED;
+    if (woken || !deadline_us) return PSP_SCHED_WOKEN;
+    return PSP_SCHED_EXPIRED;
+}
+
+int psp_sched_resume_delay(uint64_t *deadline) {
+    const int me = g_self;
+    psp_os_lock(&g_lock);
+    if (deadline) *deadline = g_slot[me].park.deadline;
+    if (await_turn_locked(me) != 0) {
+        psp_os_unlock(&g_lock);
+        psp_os_thread_exit();
+        return PSP_SCHED_EXPIRED;
+    }
+    const int woken = g_slot[me].woken, reason = g_slot[me].wake_reason;
+    psp_os_unlock(&g_lock);
+    if (woken && reason == PSP_SCHED_WAKE_RELEASE) return PSP_SCHED_RELEASED;
+    return woken ? PSP_SCHED_WOKEN : PSP_SCHED_EXPIRED;
+}
+
+/* The saving thread: the token is its own. */
+void psp_sched_resume_token(void) {
+    psp_os_lock(&g_lock);
+    (void)await_turn_locked(g_self);
+    psp_os_unlock(&g_lock);
+}
+
+/* The restored table's host side, which belonged to the saving process:
+ * every slot is without a host thread until one is started or adopted. */
+static void forget_hosts(void) {
+    for (int i = 0; i < MAX_SCHED_THREADS; i++) {
+        sched_slot *t = &g_slot[i];
+        memset(&t->host, 0, sizeof t->host);
+        t->started = 0;
+        t->joined = 1;
+        /* The saving process's strings: what a restored wait is on is now
+         * only the call it is in, which is enough for the thread dump. */
+        const int parked = i && t->used && (t->state == PSP_SCHED_BLOCKED || t->state == PSP_SCHED_SLEEPING);
+        t->park.what = parked && g_resume[i].kind == RESUME_WAIT ? psp_hle_name(g_resume[i].nid) : NULL;
+        t->waiting_on = t->park.what;
+    }
+}
+
+/* A host thread for every live slot, but `adopt`, whose host thread is
+ * `self`: the loading thread, which becomes it. -1 for none. */
+static int start_hosts(int adopt, psp_os_thread self, char *why, size_t size) {
+    for (int i = 1; i < g_slot_hi; i++) {
+        sched_slot *t = &g_slot[i];
+        if (!t->used || t->state == PSP_SCHED_DEAD) continue;
+        if (g_resume[i].kind == RESUME_NONE) {
+            snprintf(why, size, "thread 0x%08X has no way back", t->uid);
+            return -1;
+        }
+        t->joined = 0;
+        if (i == adopt) t->host = self;
+        else if (psp_os_thread_start(&t->host, resume_main, t, PSP_HOST_STACK_SIZE) != 0) {
+            snprintf(why, size, "cannot start a host thread for 0x%08X", t->uid);
+            return -1;
+        }
+        t->started = 1;
+    }
+    return 0;
+}
+
+static int sched_load(char *why, size_t size) {
+    /* Nobody runs until the main context drains: the boot finishes first. */
+    g_restored_running = g_running;
+    g_running = -1;
+    forget_hosts();
+    psp_os_thread none;
+    memset(&none, 0, sizeof none);
+    if (start_hosts(-1, none, why, size)) return -1;
+    g_token_restored = 1;
+    return 0;
+}
+
+/* ---- a load while the game runs ---------------------------------------------- */
+
+/* The thread at the safe point loads. First every other guest thread ends:
+ * each is parked, waiting for a turn it will now never get -- a dead slot's
+ * wait returns and its host thread exits -- and is joined, so none is left
+ * behind however many loads a run makes. The main context goes on waiting
+ * in its drain. Then the state replaces the table under the lock; the
+ * loading thread takes over the state's saving thread, and every other live
+ * slot gets a new host thread. Last, the loading thread drops its host
+ * frames and continues as the saving thread did (psp_sched_state_jump), so
+ * the GL context, which belongs to it, never changes thread. */
+static psp_os_thread g_loader;
+
+static const char *sched_live_refuse(void) {
+    psp_os_lock(&g_lock);
+    const int me = g_self, ok = me != MAIN_SLOT && g_running == me && t_base && psp_safepoint_nid();
+    psp_os_unlock(&g_lock);
+    return ok ? NULL : "not at the safe point";
+}
+
+static void sched_retire(void) {
+    psp_os_lock(&g_lock);
+    const int me = g_self;
+    g_loader = g_slot[me].host;
+    for (int i = 1; i < g_slot_hi; i++)
+        if (i != me && g_slot[i].used) g_slot[i].state = PSP_SCHED_DEAD;
+    psp_os_cond_broadcast(&g_turn);
+    for (int i = 1; i < g_slot_hi; i++) {
+        sched_slot *t = &g_slot[i];
+        if (i == me || !t->started || t->joined) continue;
+        psp_os_unlock(&g_lock);
+        psp_os_thread_join(&t->host);
+        psp_os_lock(&g_lock);
+        t->joined = 1;
+    }
+    psp_os_unlock(&g_lock);
+}
+
+static int sched_reload(char *why, size_t size) {
+    const int saver = g_running;
+    forget_hosts();
+    if (saver < 1 || saver >= g_slot_hi || g_resume[saver].kind != RESUME_SAFEPOINT) {
+        snprintf(why, size, "the state has no thread at its safe point");
+        return -1;
+    }
+    if (start_hosts(saver, g_loader, why, size)) return -1;
+    g_self = saver;
+    return 0;
+}
+
+void psp_sched_state_jump(void) {
+    psp_hle_thread_reset();
+    longjmp(*t_base, 1);
+}
+
+const char *psp_sched_state_refuse(void) { return sched_refuse(); }
+int psp_sched_state_prepare(void) { return sched_prepare(); }
+int psp_sched_state_load(char *why, size_t size) { return sched_load(why, size); }
+const char *psp_sched_state_live_refuse(void) { return sched_live_refuse(); }
+void psp_sched_state_retire(void) { sched_retire(); }
+int psp_sched_state_reload(char *why, size_t size) { return sched_reload(why, size); }
+void psp_sched_state_lock(int on) { if (on) psp_os_lock(&g_lock); else psp_os_unlock(&g_lock); }
