@@ -3,7 +3,8 @@
 The plan for games that load modules (PRX files) of their own at run time,
 through `sceKernelLoadModule`. Written 9 Oct 2026 against psprecomp e73adc1.
 Sif chose the approach the same day: the importer recompiles each module on
-the disc, as it does the executable. M1 to M5 are built; M6 is the gates.
+the disc, as it does the executable. M1 to M5 are built, and M6's probe has
+measured them (set 25); M5 waits on a game gate.
 
 ## Where things stand
 
@@ -180,6 +181,31 @@ state, and a state refuses to load into a game whose modules differ.
   It loads and starts all three through the app; by its title screen,
   nothing has called libfont yet.
 - **The hardware probe** is `tools/hwprobe/modprobe`, in probe set 25 (9 Oct).
+
+*Measured (set 25, fw 6.60).*
+- Matched: the ids; the start and stop threads (`SceModmgrStart` and
+  `SceKernelModmgrStop`, priority 0x20, 256 KB, the module's `$gp`);
+  `module_start_thread_parameter`; a module that is not resident unloading
+  itself; late linking; the self-unload.
+- A load takes exactly the module's size (0x500 bytes for 0x500), from the
+  lowest free address. That settles decided question 1.
+- Fixed to match (513ee3d):
+  - a file that is no module: `0x80020148`;
+  - GetModuleIdByAddress outside every module (a stack, a heap, 0):
+    unknown;
+  - a second start: `0x80020001`;
+  - unloading a started module: `0x80020138`;
+  - the same file loaded twice does not start twice (`0x8002013B`);
+  - LoadModuleByID of a memory stick file: `0x80020146`.
+- Left as known differences:
+  - the start thread's attributes read `0x800000FF`;
+  - an import nothing provides answers `0x8002013A` on a PSP and 0 here,
+    since the runtime cannot tell a missing module library from a firmware
+    call it does not answer yet;
+  - QueryModuleInfo of the executable reports one segment covering it
+    whole, with data and bss by section, where the runtime counts segments.
+- The UMD steps of `sysprobe` (`sce_lbn`) did not run: no disc in the
+  drive.
 - **The 3rd Birthday and the Armored Core titles**, which load no modules,
   replay byte-identical to stage 11.
 
