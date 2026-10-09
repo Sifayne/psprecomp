@@ -263,6 +263,11 @@ int psp_hle_resumable(uint32_t nid) {
     return 0;
 }
 
+void psp_hle_thread_reset(void) {
+    g_call_depth = 0;
+    psp_census_thread_reset();
+}
+
 void psp_hle_resume(uint32_t nid, uint32_t site, int safepoint) {
     g_call_depth = 1;
     psp_census_call_enter(nid, site);

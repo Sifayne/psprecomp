@@ -1089,8 +1089,13 @@ static int atrac_load(psp_state_reader *r, char *why, size_t size) {
     return 0;
 }
 
+/* A load into the running game: its decoders and frames go first. */
+static void atrac_drop(void) {
+    for (int i = 0; i < ATRAC_IDS; i++) { dec_close(&g_id[i]); free(g_id[i].frame); g_id[i].frame = NULL; }
+}
+
 void psp_atrac_register(void) {
-    static const psp_state_part part = { "atrac", NULL, NULL, atrac_load };
+    static const psp_state_part part = { .name = "atrac", .load = atrac_load, .drop = atrac_drop };
     PSP_STATE_KEEP(g_id);
     PSP_STATE_KEEP(g_slot_codec);
     PSP_STATE_KEEP(g_hist);

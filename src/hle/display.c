@@ -168,6 +168,29 @@ int psp_display_capture(const char *path) {
     return 0;
 }
 
+int psp_display_thumbnail(uint8_t *rgba, int w, int h) {
+    if (!g_fb_addr || w <= 0 || h <= 0) return -1;
+    const int bpp = (g_fb_format == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
+    for (int ty = 0; ty < h; ty++) {
+        const int y0 = ty * PSP_SCREEN_H / h, y1 = (ty + 1) * PSP_SCREEN_H / h;
+        for (int tx = 0; tx < w; tx++) {
+            const int x0 = tx * PSP_SCREEN_W / w, x1 = (tx + 1) * PSP_SCREEN_W / w;
+            unsigned sum[3] = { 0, 0, 0 }, n = 0;
+            for (int y = y0; y < y1; y++)
+                for (int x = x0; x < x1; x++) {
+                    const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_width + x) * (uint32_t)bpp;
+                    uint8_t c[4];
+                    expand(bpp == 4 ? psp_read32(at) : psp_read16(at), g_fb_format, c);
+                    sum[0] += c[0]; sum[1] += c[1]; sum[2] += c[2]; n++;
+                }
+            uint8_t *out = rgba + ((size_t)ty * (size_t)w + (size_t)tx) * 4u;
+            for (int k = 0; k < 3; k++) out[k] = (uint8_t)(n ? sum[k] / n : 0);
+            out[3] = 255;
+        }
+    }
+    return 0;
+}
+
 /* ---- the calls ----------------------------------------------------------- */
 
 static void hle_SetMode(void) {

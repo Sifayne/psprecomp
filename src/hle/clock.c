@@ -185,7 +185,7 @@ static int clock_load(psp_state_reader *r, char *why, size_t size) {
 }
 
 void psp_clock_keep(void) {
-    static const psp_state_part part = { "clock", NULL, NULL, clock_load };
+    static const psp_state_part part = { .name = "clock", .load = clock_load };
     PSP_STATE_KEEP(g_us);
     psp_state_register(&part);
 }

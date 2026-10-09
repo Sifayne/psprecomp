@@ -1742,8 +1742,12 @@ static int fpl_load(psp_state_reader *r, char *why, size_t size) {
     return 0;
 }
 
+static void fpl_drop(void) {
+    for (int i = 0; i < MAX_FPLS; i++) { free(g_fpl[i].freelist); g_fpl[i].freelist = NULL; }
+}
+
 void psp_kernobj_register_fpl(void) {
-    static const psp_state_part part = { "fpl", NULL, fpl_save, fpl_load };
+    static const psp_state_part part = { .name = "fpl", .save = fpl_save, .load = fpl_load, .drop = fpl_drop };
     PSP_STATE_KEEP(g_fpl);
     psp_state_register(&part);
     psp_threadman_add_lister(fpl_list);
@@ -2118,8 +2122,12 @@ static int tls_load(psp_state_reader *r, char *why, size_t size) {
     return 0;
 }
 
+static void tls_drop(void) {
+    for (int i = 0; i < MAX_TLSPLS; i++) { free(g_tls[i].owner); g_tls[i].owner = NULL; }
+}
+
 void psp_kernobj_register_tls(void) {
-    static const psp_state_part part = { "tlspl", NULL, tls_save, tls_load };
+    static const psp_state_part part = { .name = "tlspl", .save = tls_save, .load = tls_load, .drop = tls_drop };
     PSP_STATE_KEEP(g_tls);
     psp_state_register(&part);
     psp_threadman_add_lister(tls_list);

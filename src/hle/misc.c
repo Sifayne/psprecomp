@@ -1139,6 +1139,12 @@ void psp_audio_set_pending(uint32_t (*fn)(int ch)) { g_audio_pending = fn; }
  * with a line on stderr naming its shape. A headless run has no speaker, and
  * "is there sound" is otherwise a question only a windowed run can answer. */
 static FILE *g_audio_dump[AUDIO_OUTPUTS];
+/* A load into the running game starts the dumps again, so each holds the
+ * game's sound from the last load on. */
+static void audio_dump_drop(void) {
+    for (int ch = 0; ch < AUDIO_OUTPUTS; ch++)
+        if (g_audio_dump[ch]) { fclose(g_audio_dump[ch]); g_audio_dump[ch] = NULL; }
+}
 static const char *audio_dump_prefix(void) {
     static const char *p; static int looked;
     if (!looked) { looked = 1; p = getenv("PSPRECOMP_AUDIO_DUMP"); if (p && !*p) p = NULL; }
@@ -1492,6 +1498,8 @@ static void misc_keep(void) {
     PSP_STATE_KEEP(g_read_frame);
     PSP_STATE_KEEP(g_audio);
     PSP_STATE_KEEP(g_output2_until_ns);
+    static const psp_state_part part = { .name = "audiodump", .drop = audio_dump_drop };
+    psp_state_register(&part);
     psp_ctrl_replay_keep();
 }
 

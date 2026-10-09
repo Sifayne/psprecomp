@@ -75,7 +75,7 @@ static int waitq_load(psp_state_reader *r, char *why, size_t size) {
 }
 
 void psp_waitq_keep(void) {
-    static const psp_state_part part = { "waitq", waitq_refuse, NULL, waitq_load };
+    static const psp_state_part part = { .name = "waitq", .refuse = waitq_refuse, .load = waitq_load };
     PSP_STATE_KEEP(g_parked);
     PSP_STATE_KEEP(g_nparked);
     psp_state_register(&part);

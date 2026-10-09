@@ -2,13 +2,15 @@
  * read. Saving and loading a running game are the games' gates
  * (docs/PLAYER-LAYER.md §5); this is the part a unit test can reach: a state
  * is only written from the safe point, by a build with resume entries, and a
- * load reads only a state its own build wrote. */
+ * load reads only a state its own build wrote. A slot list reads what is
+ * there without loading it, and the host's requests wait for the safe point. */
 #include "psprecomp/dispatch.h"
 #include "psprecomp/hle.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/state.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures;
@@ -69,6 +71,36 @@ int main(int argc, char **argv) {
           "a file that is not a state: %s", why);
     CHECK(!psp_state_loaded(), "a failed load leaves the run fresh");
     remove(path);
+
+    /* Slot lists: no file, no state; a file that is not one, no state either. */
+    psp_state_info info;
+    CHECK(psp_state_peek(path, &info, NULL) == -1, "a missing file has no header");
+    f = fopen(path, "wb");
+    if (f) { fputs("not a state at all, but long enough to have a header's worth of bytes in it......", f); fclose(f); }
+    CHECK(psp_state_peek(path, &info, NULL) == -1, "a file that is not a state has no header");
+    remove(path);
+
+    /* Where states live, and their names there. */
+    char file[1024];
+#ifdef _WIN32
+    _putenv_s("PSPRECOMP_STATE_DIR", "");
+#else
+    unsetenv("PSPRECOMP_STATE_DIR");
+#endif
+    CHECK(!strcmp(psp_state_dir(), "states"), "the default folder: %s", psp_state_dir());
+#ifdef _WIN32
+    _putenv_s("PSPRECOMP_STATE_DIR", "somewhere");
+#else
+    setenv("PSPRECOMP_STATE_DIR", "somewhere", 1);
+#endif
+    psp_state_file("slot-3", file, sizeof file);
+    CHECK(!strcmp(file, "somewhere/slot-3.state"), "a slot's file: %s", file);
+
+    /* A request waits for the safe point: nothing has answered it yet. */
+    int ok = -1;
+    const unsigned asked = psp_state_request(PSP_STATE_SAVE, "unused");
+    CHECK(asked > 0 && psp_state_result(&ok, NULL, 0) < asked, "a request is not answered before a safe point");
+    CHECK(psp_state_request(PSP_STATE_LOAD, "unused") == asked + 1, "requests are numbered in order");
 
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("state: ok\n");

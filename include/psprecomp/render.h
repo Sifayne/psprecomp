@@ -297,6 +297,11 @@ typedef struct {
      * so a buffer the CPU or a DMA filled, such as a decoded movie picture,
      * is what the window shows. */
     void (*set_display)(uint32_t addr, uint32_t stride, int fmt);
+
+    /* Optional, NULL for a backend that draws in guest memory: every target
+     * it holds written back there, synchronously, before a save state
+     * copies VRAM. On the GE's thread, at the safe point. */
+    void (*to_memory)(void);
 } psp_render_backend;
 
 /* Select a backend by name ("software", "null", ...). Returns 0 on success,

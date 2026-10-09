@@ -243,9 +243,14 @@ void psp_mpeg_dump_sync(FILE *out) {
     }
 }
 
+static void avc_close(void *dec);
+
 void psp_mpeg_reset(void) {
     for (int i = 0; i < MAX_MPEG; i++) {
         psp_at3_close((psp_at3_dec *)g_mpeg[i].adec);
+        avc_close(g_mpeg[i].dec);
+        free(g_mpeg[i].es);
+        free(g_mpeg[i].pic);
         free(g_mpeg[i].aes);
         free(g_mpeg[i].puts);
         free(g_mpeg[i].vpts);
@@ -924,8 +929,16 @@ static int avc_pump(mpeg_ctx *c) {
     }
     return produced;
 }
+
+static void avc_close(void *dec) {
+    ISVCDecoder *d = (ISVCDecoder *)dec;
+    if (!d) return;
+    (*d)->Uninitialize(d);
+    WelsDestroyDecoder(d);
+}
 #else
 static int avc_pump(mpeg_ctx *c) { (void)c; return 0; }
+static void avc_close(void *dec) { (void)dec; }
 #endif
 
 /* sceMpegRingbufferPut(rb, numPackets, available)
@@ -1538,7 +1551,7 @@ static void hle_FlushAllStream(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_AvcDecodeFlush(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 void psp_mpeg_register(void) {
-    static const psp_state_part part = { "mpeg", mpeg_refuse, NULL, NULL };
+    static const psp_state_part part = { .name = "mpeg", .refuse = mpeg_refuse, .drop = psp_mpeg_reset };
     PSP_STATE_KEEP(g_next_stream);
     psp_state_register(&part);
     psp_hle_register(0x682A619B, "sceMpeg", "sceMpegInit",            hle_MpegInit);

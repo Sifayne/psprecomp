@@ -5284,7 +5284,7 @@ static int ge_load(psp_state_reader *r, char *why, size_t size) {
 }
 
 static void ge_keep(void) {
-    static const psp_state_part part = { "ge", NULL, NULL, ge_load };
+    static const psp_state_part part = { .name = "ge", .load = ge_load };
     PSP_STATE_KEEP(g_queue);
     PSP_STATE_KEEP(g_ge_hang);
     PSP_STATE_KEEP(g_ge_t);

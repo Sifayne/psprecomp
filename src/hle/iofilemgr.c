@@ -1616,7 +1616,7 @@ static int io_load(psp_state_reader *r, char *why, size_t size) {
 }
 
 void psp_io_register(void) {
-    static const psp_state_part part = { "io", io_refuse, io_save, io_load };
+    static const psp_state_part part = { .name = "io", .refuse = io_refuse, .save = io_save, .load = io_load };
     psp_state_register(&part);
     psp_hle_register(0x109F50BC, "IoFileMgrForUser", "sceIoOpen",   hle_Open);
     psp_hle_register(0x810C4BC3, "IoFileMgrForUser", "sceIoClose",  hle_Close);

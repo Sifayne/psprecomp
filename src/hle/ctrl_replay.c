@@ -430,7 +430,7 @@ static int replay_load(psp_state_reader *r, char *why, size_t size) {
 }
 
 void psp_ctrl_replay_keep(void) {
-    static const psp_state_part part = { "replay", NULL, replay_save, replay_load };
+    static const psp_state_part part = { .name = "replay", .save = replay_save, .load = replay_load };
     psp_state_register(&part);
 }
 

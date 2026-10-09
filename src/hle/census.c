@@ -25,6 +25,7 @@ void psp_census_call_enter(uint32_t nid, uint32_t site) {
     t_ncalls++;
 }
 void psp_census_call_leave(void) { if (t_ncalls) t_ncalls--; }
+void psp_census_thread_reset(void) { t_ncalls = 0; t_nnest = 0; }
 
 void psp_nest_enter(int kind, uint32_t addr) {
     if (t_nnest < NEST_MAX) { t_nest[t_nnest].kind = (uint8_t)kind; t_nest[t_nnest].addr = addr; }

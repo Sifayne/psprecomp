@@ -335,6 +335,10 @@ void psp_display_register(void);
 void psp_display_reset(void);
 void psp_display_tick(void);
 int      psp_display_capture(const char *path);
+/* The current framebuffer scaled down to w x h RGBA, each pixel the mean of
+ * the block it covers: a save state's thumbnail. Returns -1 before the game
+ * has shown anything. */
+int      psp_display_thumbnail(uint8_t *rgba, int w, int h);
 uint64_t psp_display_vblanks(void);
 uint32_t psp_display_framebuffer(void);
 /* The fullest frame the run ever presented, and how many non-black pixels it

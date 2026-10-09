@@ -102,6 +102,7 @@ static void hold(uint32_t ms, const char *why) {
     while (!psp_sched_stopping()) {
         const uint64_t now = psp_os_mono_ns();
         if (ms ? now - start >= (uint64_t)ms * 1000000u : !g_request) break;
+        psp_state_held();
         if (g_redraw) { g_redraw(); redraws++; }
         uint64_t next = now + 16666667u;
         if (ms && next > start + (uint64_t)ms * 1000000u) next = start + (uint64_t)ms * 1000000u;
@@ -116,6 +117,7 @@ static void hold(uint32_t ms, const char *why) {
 
 static uint32_t g_at;     /* the call the safe point is in, while it is */
 uint32_t psp_safepoint_nid(void) { return g_at; }
+void psp_safepoint_leave(void) { g_at = 0; }
 
 void psp_safepoint(uint32_t nid) {
     if (!boundary(nid)) return;

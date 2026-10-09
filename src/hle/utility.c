@@ -1658,7 +1658,7 @@ static int utility_load(psp_state_reader *r, char *why, size_t size) {
 }
 
 void psp_utility_register(void) {
-    static const psp_state_part part = { "utility", utility_refuse, utility_save, utility_load };
+    static const psp_state_part part = { .name = "utility", .refuse = utility_refuse, .save = utility_save, .load = utility_load };
     PSP_STATE_KEEP(g_savedata_state);
     PSP_STATE_KEEP(g_savedata_done);
     PSP_STATE_KEEP(g_savedata_interactive);

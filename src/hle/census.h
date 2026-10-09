@@ -57,6 +57,20 @@ void psp_census_check(void);
 const char *psp_sched_state_refuse(void);
 int  psp_sched_state_prepare(void);
 int  psp_sched_state_load(char *why, size_t size);
+/* sched.c, for a load while the game runs: why it cannot happen here; every
+ * other guest thread ended and joined; the restored table given host threads,
+ * this one taking the saving thread's; the scheduler's lock held around the
+ * restore; and this thread back at its base as the saving thread, which does
+ * not return. */
+const char *psp_sched_state_live_refuse(void);
+void psp_sched_state_retire(void);
+int  psp_sched_state_reload(char *why, size_t size);
+void psp_sched_state_lock(int on);
+void psp_sched_state_jump(void);
+/* hle.c and census.c: this host thread's call depth and call and host-frame
+ * stacks forgotten, for a thread whose host frames are being abandoned. */
+void psp_hle_thread_reset(void);
+void psp_census_thread_reset(void);
 /* sched.c, for the calls that finish a wait begun before a load
  * (psp_hle_register_resume): the restored thread's first wait, answered as
  * psp_sched_block_until or psp_sched_delay would have answered it, with the
@@ -81,9 +95,13 @@ int  psp_hle_resumable(uint32_t nid);
 void psp_hle_resume(uint32_t nid, uint32_t site, int safepoint);
 /* safepoint.c: the call the safe point is in, while it is; else 0. */
 uint32_t psp_safepoint_nid(void);
-/* state.c: PSPRECOMP_SAVE_STATE's saves, taken at the safe point. */
+/* state.c: the scripted saves and loads and the host's requests, served at
+ * the safe point; and, while the guest is held there, the saves. */
 int  psp_state_scripted_pending(void);
 void psp_state_scripted(void);
+void psp_state_held(void);
+/* safepoint.c: the safe point given up by a load, which does not return. */
+void psp_safepoint_leave(void);
 
 /* sched.c: one line per live thread, from the records above. */
 void psp_sched_census(FILE *out, uint32_t self);
