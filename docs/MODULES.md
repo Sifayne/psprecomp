@@ -3,8 +3,7 @@
 The plan for games that load modules (PRX files) of their own at run time,
 through `sceKernelLoadModule`. Written 9 Oct 2026 against psprecomp e73adc1.
 Sif chose the approach the same day: the importer recompiles each module on
-the disc, as it does the executable. M1 and M2's emitter half are built;
-the rest is not.
+the disc, as it does the executable. M1 to M3 are built; the rest is not.
 
 ## Where things stand
 
@@ -111,6 +110,25 @@ one table, which a second module would replace.
 - `sceKernelGetModuleIdByAddress` and `sceKernelQueryModuleInfo`.
 - The export table and the stub fallback.
 - Each module's `$gp` for its interrupt handlers and callbacks.
+
+*Built (bcd4cb1).*
+- The runtime half is `src/hle/modulemgr.c`, which also took over the
+  executable's ModuleMgrForUser answers unchanged.
+- The boot host's half is `src/host/module_loader.c`. A title lists its
+  modules in `psp_title.modules` {sha1, image, base, size, registration}.
+- Semantics follow uofw's modulemgr and PSPSDK's pspmodulemgr.h:
+  - LoadModule answers the id. StartModule answers the id (resident) or 0,
+    and runs `module_start` on `SceModmgrStart` at priority 32 with 256 KB
+    under the module's `$gp`.
+  - Errors are `0x8002012E` for an unknown module and `0x8002012F` for a
+    file the game was not prepared with.
+- A started module's exports answer the imports the runtime does not; the
+  runtime's own answer wins.
+- `test_modules` drives a synthetic module through all of it.
+- The game repos build `boot.c` themselves (`scripts/06-boot.sh`, TB's
+  `dev/CMakeLists.txt`). At their next psprecomp pin they also need:
+  - `reloc.c`, `crypto/sha1.c` and `src/host/module_loader.c`;
+  - in Last Raven's `scripts/14-aspect-tests.sh`, `reloc.c`.
 
 **M4. The importer.**
 - Find every module on the disc: each file that is a `~SCE`, `~PSP` or ELF
