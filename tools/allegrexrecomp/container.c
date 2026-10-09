@@ -2,6 +2,7 @@
 
 #include "container.h"
 #include "decode.h"
+#include "reloc.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -609,104 +610,95 @@ static int looks_like_code(const uint8_t *d, size_t len, const elf_info *e,
 
 int psp_collect_pointer_seeds(const uint8_t *d, size_t len, const elf_info *e,
                               uint32_t load_bias, uint32_t *out, int max) {
-    if (!e->shoff || !e->shnum || !e->text_size) return 0;
+    if (!e->text_size) return 0;
 
     const uint32_t text_lo = e->text_addr;
     const uint32_t text_hi = e->text_addr + e->text_size;
     int found = 0;
 
-    for (uint32_t i = 0; i < e->shnum; i++) {
-        size_t sh = (size_t)e->shoff + (size_t)i * e->shentsize;
-        if (sh + 40 > len) break;
+    /* A PSP PRX tags its relocation sections SHT_PRXRELOC (0x700000A0) rather
+     * than the generic SHT_REL (9), or carries them in a segment; reloc.c reads
+     * every form. SHT_REL is read too: a static executable's are absolute, and
+     * only read here. */
+    const int total = psp_relocs_read(d, len, e, PSP_RELOCS_SHT_REL, NULL, 0);
+    if (total <= 0) return 0;
+    psp_reloc *rel = (psp_reloc *)malloc((size_t)total * sizeof *rel);
+    if (!rel) return 0;
+    psp_relocs_read(d, len, e, PSP_RELOCS_SHT_REL, rel, total);
 
-        uint32_t type = rd32(d + sh + 4);
-        /* A PSP PRX tags its relocation sections SHT_PRXRELOC (0x700000A0)
-         * rather than the generic SHT_REL (9). The entry layout is identical —
-         * only the section type differs — so checking for SHT_REL alone finds
-         * nothing at all on a real module. */
-        if (type != 9 && type != 0x700000A0u) continue;
+    for (int i = 0; i < total; i++) {
+        const psp_reloc *r = &rel[i];
 
-        uint32_t off  = rd32(d + sh + 16);
-        uint32_t size = rd32(d + sh + 20);
-        if ((size_t)off + size > len) continue;
+        /* r->offset is measured from the segment named by OFS_BASE, not
+         * from a single module-wide base.
+         *
+         * Using one bias for every relocation silently reads the wrong file
+         * offset for anything in the second segment -- which is where a
+         * PRX puts its data. The word fetched is unrelated, fails the
+         * looks-like-code test, and the pointer is dropped. Nothing
+         * reports it: the harvest simply returns fewer seeds.
+         *
+         * Everything a C++ module reaches through stored pointers lives
+         * there. On Armored Core that was all 151 static constructors in
+         * .cplinit and the vtables in .linkonce.d -- 1,856 relocations of
+         * vtable entries alone, none of them harvested, so the functions
+         * they point at were never discovered and never emitted. The boot
+         * failed on an indirect call to a two-instruction accessor. */
+        if (r->ofs_seg >= e->nsegments) continue;
+        const elf_segment *ofs_seg = &e->seg[r->ofs_seg];
 
-        /* Elf32_Rel is two words: r_offset, r_info. */
-        for (uint32_t r = 0; r + 8 <= size; r += 8) {
-            uint32_t r_offset = rd32(d + off + r);
-            uint32_t r_info   = rd32(d + off + r + 4);
-
-            /* r_offset is measured from the segment named by OFS_BASE, not
-             * from a single module-wide base.
-             *
-             * Using one bias for every relocation silently reads the wrong file
-             * offset for anything in the second segment -- which is where a
-             * PRX puts its data. The word fetched is unrelated, fails the
-             * looks-like-code test, and the pointer is dropped. Nothing
-             * reports it: the harvest simply returns fewer seeds.
-             *
-             * Everything a C++ module reaches through stored pointers lives
-             * there. On Armored Core that was all 151 static constructors in
-             * .cplinit and the vtables in .linkonce.d -- 1,856 relocations of
-             * vtable entries alone, none of them harvested, so the functions
-             * they point at were never discovered and never emitted. The boot
-             * failed on an indirect call to a two-instruction accessor. */
-            const uint32_t ofs_base = (r_info >> 8) & 0xFF;
-            if (ofs_base >= (uint32_t)e->nsegments) continue;
-            const elf_segment *ofs_seg = &e->seg[ofs_base];
-
-            /* HI16/LO16 pairs are how an address gets *computed in code*
-             * rather than stored in a word:
-             *
-             *     lui   $a0, %hi(target)
-             *     addiu $a0, $a0, %lo(target)
-             *
-             * That is exactly how a PSP module passes its main thread's entry
-             * point to sceKernelCreateThread -- so without these, the entire
-             * game beyond module_start is unreachable. The relocations come in
-             * pairs, and the address is (hi << 16) + (int16)lo. The LO16 half
-             * is signed, which is why it cannot simply be OR'd in: a low half
-             * of 0x8000 or above borrows from the high half. */
-            if ((r_info & 0xFF) == R_MIPS_HI16 && r + 16 <= size) {
-                uint32_t lo_info = rd32(d + off + r + 12);
-                if ((lo_info & 0xFF) == R_MIPS_LO16) {
-                    uint32_t lo_offset = rd32(d + off + r + 8);
-                    size_t hi_at, lo_at;
-                    (void)load_bias;
-                    hi_at = (size_t)ofs_seg->offset + r_offset;
-                    lo_at = (size_t)ofs_seg->offset + lo_offset;
-                    if (r_offset + 4 <= ofs_seg->filesz &&
-                        lo_offset + 4 <= ofs_seg->filesz &&
-                        hi_at + 4 <= len && lo_at + 4 <= len) {
-                        uint32_t hi_imm = rd32(d + hi_at) & 0xFFFF;
-                        int32_t  lo_imm = (int16_t)(rd32(d + lo_at) & 0xFFFF);
-                        uint32_t target = (hi_imm << 16) + (uint32_t)lo_imm;
-                        if (target >= text_lo && target < text_hi && !(target & 3)) {
-                            if (found < max) out[found] = target;
-                            found++;
-                        }
-                    }
-                }
-                continue;
+        /* HI16/LO16 pairs are how an address gets *computed in code*
+         * rather than stored in a word:
+         *
+         *     lui   $a0, %hi(target)
+         *     addiu $a0, $a0, %lo(target)
+         *
+         * That is exactly how a PSP module passes its main thread's entry
+         * point to sceKernelCreateThread -- so without these, the entire
+         * game beyond module_start is unreachable. The relocations come in
+         * pairs, and the address is (hi << 16) + (int16)lo. The LO16 half
+         * is signed, which is why it cannot simply be OR'd in: a low half
+         * of 0x8000 or above borrows from the high half. The packed form
+         * carries the low half in the HI16 itself. */
+        if (r->kind == PSP_RELOC_HI16 || r->kind == PSP_RELOC_HI16_ADDEND) {
+            int32_t lo_imm = r->addend;
+            if (r->kind == PSP_RELOC_HI16) {
+                if (i + 1 >= total || rel[i + 1].kind != PSP_RELOC_LO16) continue;
+                const uint32_t lo_offset = rel[i + 1].offset;
+                const size_t lo_at = (size_t)ofs_seg->offset + lo_offset;
+                if (lo_offset + 4 > ofs_seg->filesz || lo_at + 4 > len) continue;
+                lo_imm = (int16_t)(rd32(d + lo_at) & 0xFFFF);
             }
-
-            if ((r_info & 0xFF) != R_MIPS_32) continue;
-
-            /* The relocated word holds the address. A PRX links at zero, so
-             * the stored value is already the module-relative address and
-             * needs no fixing up — only reading. */
-            if (r_offset + 4 > ofs_seg->filesz) continue;   /* .bss has no bytes */
-            size_t at = (size_t)ofs_seg->offset + r_offset;
-            if (at + 4 > len) continue;
-
-            uint32_t target = rd32(d + at);
-            if (target & 3) continue;            /* not instruction-aligned */
-            if (!looks_like_code(d, len, e, load_bias, target, text_lo, text_hi))
-                continue;
-
-            if (found < max) out[found] = target;
-            found++;
+            (void)load_bias;
+            const size_t hi_at = (size_t)ofs_seg->offset + r->offset;
+            if (r->offset + 4 > ofs_seg->filesz || hi_at + 4 > len) continue;
+            const uint32_t hi_imm = rd32(d + hi_at) & 0xFFFF;
+            const uint32_t target = (hi_imm << 16) + (uint32_t)lo_imm;
+            if (target >= text_lo && target < text_hi && !(target & 3)) {
+                if (found < max) out[found] = target;
+                found++;
+            }
+            continue;
         }
+
+        if (r->kind != PSP_RELOC_32) continue;
+
+        /* The relocated word holds the address. A PRX links at zero, so
+         * the stored value is already the module-relative address and
+         * needs no fixing up — only reading. */
+        if (r->offset + 4 > ofs_seg->filesz) continue;   /* .bss has no bytes */
+        size_t at = (size_t)ofs_seg->offset + r->offset;
+        if (at + 4 > len) continue;
+
+        uint32_t target = rd32(d + at);
+        if (target & 3) continue;            /* not instruction-aligned */
+        if (!looks_like_code(d, len, e, load_bias, target, text_lo, text_hi))
+            continue;
+
+        if (found < max) out[found] = target;
+        found++;
     }
+    free(rel);
     return found;
 }
 
