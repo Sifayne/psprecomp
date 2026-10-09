@@ -4,7 +4,9 @@ The plan for Phase 6's last item: save states, an SDL2 + Dear ImGui frontend
 and controller remapping. Written 4 Oct 2026 against psprecomp 95a2759,
 last-raven f5a590b and third-birthday-recomp as they stood that day. Nothing
 here is implemented yet. The choices it left open were settled with
-Sif the same day; see *Decided*.
+Sif the same day; see *Decided*. Stage 10 changed the shape of the player:
+one psprecomp app to which a player adds packs, in source form, and a new
+stage 11 for games without one (§6).
 
 The three items look independent and are not. A menu has to pause the game,
 a save state has to be taken while the game is paused at a known place, and
@@ -96,6 +98,10 @@ aspect camera, gait, and its own launcher pages.
    statically, so there is no plugin interface to keep stable; build
    fingerprints rebuild a game when its inputs change. Each game's
    repository keeps its pack, and the player build takes packs by path.
+   *Revised in stage 10 (9 Oct, with Sif):* the app holds no pack. A player
+   adds a pack's file, its sources, and the app compiles it on their machine
+   with its own headers -- its host code for each game, and its launcher
+   part as a `launcher.so` the launcher loads (§6).
 2. **One safe point, owned by the runtime.** The host gets one hook where
    the guest is quiescent: at a frame-boundary firmware call, on the GE
    thread, not nested inside a callback. Pause, the menu, quick save and
@@ -139,7 +145,8 @@ aspect camera, gait, and its own launcher pages.
 | 7 | The overlay: pause menu, settings, rebinding, volume | 5, 6 | Render checks unchanged with the overlay closed; open/close checks with held input |
 | 8 | Save states, loaded at launch | 4, 5 | Save at poll N, load, run to M: rows identical to the uninterrupted run, every title |
 | 9 | Quick save and load in-process, slots in the overlay | 7, 8 | Repeated load loops: no leaked threads, rows still identical |
-| 10 | The launcher rebuilt on the overlay's generated pages | 2, 7 | Launcher tests, packaged launcher-to-game path |
+| 10 | The launcher rebuilt on the overlay's generated pages; settings split between the player and the pack; one psprecomp app to which packs are added | 2, 7 | Launcher tests, packaged launcher-to-game path, packs added as a player adds them |
+| 11 | Games without a pack: the boot host into psprecomp, an import that takes any disc | 10 | A disc no pack knows imports and boots as the plain recompiled game |
 
 Stage 4 touches only the runtime and the emitter, so it can run alongside
 stages 1–3. It should, even though its payoff comes last, because it is the
@@ -178,7 +185,9 @@ data only, never game bytes.
 generated code. It holds the option table (key, type, default, range or
 choices, labels, page, help, display format), the starter presets, and hooks
 for the title's derived values and notes. An apply policy (live, next
-launch, restart) joins it in stage 7.
+launch, restart) joins it in stage 7. Since stage 10 it holds only the
+pack's own options; the ones every game shares are the player's (§6), and
+presets are gone.
 
 *C sources*, compiled on the device alongside the generated code: the
 replacements, and any host features of the title's own.
@@ -336,16 +345,20 @@ shipped with a release includes every pack it was built with.
          counts.
 
 The launcher stays a separate pre-launch process, and its INI file and
-`--config`/`--preset` arguments remain the contract with each game.
+`--config` argument remain the contract with each game. Stage 10 retired
+`--preset` with the presets.
 
 **Existing installs.** The app's name and its XDG folders (`last-raven`
 today) change once it is no longer only Armored Core. The first launch
 migrates the library, settings and saves, following the rule
 `PACKAGING.md` already uses for its legacy settings. Saves are never moved
-without a copy remaining.
+without a copy remaining. *Built in stage 10* as adding a pack brings in
+its own app's data, and the launcher its settings (§6).
 
 **A disc without a pack is rejected,** as an unknown executable is today.
-Each title's correctness rests on its own measurements.
+Each title's correctness rests on its own measurements. *Stage 11 changes
+this* (decided 9 Oct): a disc no pack knows will play as the plain
+recompiled game, with nothing a pack adds.
 
 ## 2. The safe point and host pause
 
@@ -499,7 +512,8 @@ their carrier bits and default bindings, in its manifest (§1): Last Raven's
 `lr_modern_controls_available`: a title that registers no actions gets the
 classic PSP map.
 
-**Storage.** Bindings are `bind.*` keys in the existing preset INI. A preset
+**Storage.** Bindings are `bind.*` keys in the existing preset INI (since
+stage 10, in the pack's section of the preferences file, §6). A preset
 without them uses the title's defaults. Keys for PSP buttons are shared
 across titles, which matches the decision that presets are shared. A title
 ignores title-action keys it did not register.
@@ -760,7 +774,8 @@ What was built:
   - The host applies its own live options at once: bindings, keyboard
     layout, active controller, window mode and volume.
   - Every other option is marked "applies the next time the game starts".
-- **Saving.** On closing, the menu writes its changes into the preset the
+- **Saving.** (Since stage 10: into the preferences file's `[player]` and
+  `[pack <id>]` sections, §6.) On closing, the menu writes its changes into the preset the
   game was started with (`psp_settings_save_origin`). It never writes what
   the environment set. The launcher re-reads the file when the game exits,
   so a later Save there does not undo the menu's.
@@ -1317,6 +1332,189 @@ Each guest thread's 64 kB signal stack was never freed, and a load starts
 every thread again. A thread-specific key now frees each one when its
 thread ends.
 
+## 6. One app, and packs the player adds (stage 10)
+
+### Decided (9 Oct, with Sif)
+
+- The launcher takes the in-game menu's layout: a side list of pages.
+  Mockups first; then presets were dropped, so there is one set of
+  settings.
+- Settings are split. **The player's** are what the shared host does the
+  same way for every game. **A pack's** are everything its games' code
+  interprets, all control options included.
+- One app, named **psprecomp**, for every game. Its packs are **add-ons a
+  player installs**, in **source form**. The app compiles a pack when it is
+  added and again with each game, so one pack file serves any build of the
+  app.
+- Games **without a pack** will play as the plain recompiled game. That is
+  stage 11; stage 10 still asks for the pack.
+
+### Settings
+
+- **The player's options** are psprecomp's table, `psp_player_options`:
+  - rendering resolution, window mode, window size and display (page
+    Display);
+  - volume (Audio);
+  - the active controller (Controller);
+  - both save-state options (Save states);
+  - renderer, audio lead and preroll, and the intro movie (Advanced);
+  - the hidden WINDOW and REALTIME.
+
+  They come first in every `psp_settings`, so `PSP_OPT_*` are fixed
+  indices. A pack's schema holds only its own options, indexed from
+  `PSP_PLAYER_OPTIONS`. Its enum names the shared ones as aliases of
+  `PSP_OPT_*`, so its code reads them as before. A pack also gives its
+  section's id and its play defaults (Armored Core: dual-stick controls).
+  The player's play defaults are a window, the intro movie and Match window
+  rendering.
+- **The preferences file** (version 2) has `[player]` for every game and
+  `[pack <id>]` for one pack's games, with its bindings. `[preset ...]`
+  sections hold earlier presets, kept but never read. Every section the
+  reader doesn't take is written back as it was.
+  - A version 1 file reads as its selected preset, split between the two
+    sections. Its unnamed pack section is claimed by the first pack that
+    reads it, and the other presets are kept.
+  - `psp_settings_file_*` replaces `psp_presets_*`.
+  - Values the environment or the command line set keep the file's own.
+  - The game's `--preset` is gone.
+- **The in-game menu** merges the two tables' pages by name, with Advanced
+  last, and writes back into both sections.
+- **`src/host/pages.c`** draws one option's row for the menu and the
+  launcher alike:
+  - choices, and stops with *Other...* for a typed value;
+  - the connected displays, and window sizes;
+  - sliders, logarithmic across decades.
+
+  A row proposes a value; its caller sets it.
+- **`src/host/settings_tool.c`** is the packs' shared headless tool.
+
+### The launcher
+
+`src/host/launcher.c` is drawn with `ui.cpp`.
+- **Layout:**
+  - one tab per game of every pack;
+  - a side list with the player's pages under *All games*, then the
+    selected game's pack's under its name, then Packs and About;
+  - *Reset to defaults* resets the group of the page shown, after a
+    question; the bindings stay;
+  - Add game, and the preparation's progress, take the page's place.
+- **Controls:** Escape and B go back. The bumpers step through the pages,
+  and Start plays.
+- **Packs:** those the launcher was linked with (`launcher_one.c`, a game's
+  development launcher), and those in `--packs DIR`. Each added pack has a
+  `launcher.so`, which exports `psp_title_settings`, `psp_launcher_info`
+  and `psp_pack_api`; one built for another `PSP_PACK_API` is refused. The
+  app's launcher links none (`launcher_none.c`) and exports the settings
+  mechanism, which a pack's own helpers call back into.
+- **Switching packs:** a switch puts the edits into the file in memory
+  first, so nothing is lost, and Save writes every section.
+- **Earlier settings:** a pack's earlier settings come in the first time
+  the launcher shows it. They are those of its own app (`<XDG
+  config>/<pack id>/settings.ini`) or of its game's own launcher
+  (`psp_launcher.earlier`).
+- **Tests:**
+  - `tests/test_launcher.c` holds two linked packs and one loaded from a
+    `launcher.so` (`tests/test_pack_plugin.c`), whose resolve hook calls
+    back into the launcher.
+  - Last Raven's `host/launcher_tests.c` draws every page of its pack to
+    BMPs and runs a session to Save and play.
+  - The 3rd Birthday keeps its own development launcher, ported to the
+    file.
+
+### Packs as files, and the app
+
+- **The pack manifest, version 2** (`player/pack.py`):
+  - `pack`: id, name, file and license;
+  - `host.sources`: compiled once, linked into each game;
+  - `host.launcher`: its launcher part;
+  - `device`: replacements and generators, compiled with each title;
+  - optional checks and other files.
+- **The build:** `package-linux.py build [--pack PATH]...` builds the app
+  and, for each pack, runs its checks, writes `<file>-pack.zip` (fixed
+  times and modes, name order) and adds it to a copy of the staged app as
+  a player would. That proves the pack builds with the app's own zig.
+- **The app** carries what a pack's code is built against:
+  - psprecomp's and SDL's headers, and the recompiler's loader headers;
+  - `libruntime.a` and `libplayer.a`: the shared host, the menu, Dear
+    ImGui and the settings mechanism;
+  - `pack_api.c` and the recipes.
+- **`AppRun`** adds `--add-pack`, `--remove-pack` and `--list-packs`. The
+  data roots are `PSPRECOMP_APP_ROOT`, `PSPRECOMP_DATA_ROOT` and
+  `PSPRECOMP_STATE_ROOT`.
+- **Adding a pack** (`import_game.py install-pack`):
+  - checks the zip: no absolute or `..` paths, no links, size limits;
+  - checks its manifest, and that no other pack already has its titles;
+  - builds `built/launcher.so` and `built/host/*.o` with zig, then swaps
+    the pack in whole.
+- **Removing one** keeps its games' records, ready again when it is added
+  back.
+- **When the app changes,** the launcher part of each pack is rebuilt
+  before the launcher starts, and the host objects when a game is next
+  prepared.
+- **Fingerprints, version 2:**
+  - the app's part is fixed at build time (`app-build.json`);
+  - the pack's part is the include closure of its host sources;
+  - each title adds its replacements' closure, replace list and
+    generators.
+- **Existing installs:** adding a pack brings in what its own app kept in
+  `<XDG data>/<pack id>`. Saves and save states are copied, never moved.
+  Prepared games and their records, which say where each ISO is, are
+  moved. The earlier folder keeps a note of what came over.
+
+### Gates (9 Oct)
+
+- **psprecomp's own tests, 54 of 54.** These include:
+  - the settings test: sections, version 1 presets, adoption and failure
+    modes;
+  - the menu's four checks;
+  - the launcher's, with two packs linked and one loaded.
+- **The importer's checks, 20, and the fingerprints', 7,** from a checkout
+  and inside the builder. A synthetic pack covers:
+  - adding a pack: bad files, `..` paths, an old manifest, a slug another
+    pack has;
+  - replacing and removing a pack;
+  - rebuilding a stale launcher part;
+  - bringing in an earlier app's data once.
+- **The packs' own checks:**
+  - The 3rd Birthday's core group, 62 of 62, with its development
+    launcher's layout check;
+  - Last Raven's settings tests;
+  - its launcher session, which draws every page.
+- **`package-linux.py build` with both packs** passed every builder check:
+  - the app's tests;
+  - each pack's checks;
+  - both pack files added to the staged app with its Zig. That takes about
+    3 s each, and the launcher must then report the pack.
+
+  The first build found a real bug: the importer writes
+  `built/launcher.so`, and the launcher was looking one folder up. Since
+  then the builder asks the launcher too, not only the importer.
+- **The real discs, through the built app,** in an isolated home on disk:
+  - both packs added, then The 3rd Birthday and Last Raven imported. Their
+    games compiled in 1 m 20 s and 1 m 1 s;
+  - **The 3rd Birthday's `gameplay` scenario** gave the development build's
+    GE capture (40,567,648 bytes) and PCM (15,269,888 bytes) byte for byte,
+    with 0 bad accesses;
+  - **Last Raven's mission-effects replay** through the packaged game and
+    the development boot host gave the same GE capture (41,816,768 bytes)
+    and the same three PCM channels, with all 87 events and 0 bad accesses
+    in both.
+- **An install made by the previous Armored Core app** had:
+  - a prepared Last Raven, made with that app's own build;
+  - a save and a save state;
+  - settings of three presets, *Mouse & Keyboard* selected.
+
+  Adding the pack to psprecomp in the same home brought its data in:
+  - the save and state were copied, the originals kept;
+  - the game and its record moved, the ISO's location with it;
+  - a note was left in the old folder.
+
+  The launcher loaded the pack, listed the game, and brought the settings
+  in.
+- **The in-game menu in a GL window** shows the merged pages: The 3rd
+  Birthday's Controller page opens with the player's Active controller,
+  and Advanced comes last.
+
 ## Testing, all stages
 
 - **Deterministic rows first.** Every stage has a headless, unpaced gate
@@ -1369,4 +1567,7 @@ thread ends.
   title needs them.
 - A plugin interface for packs, meaning precompiled title code loaded at run
   time. Packs are source compiled with the player's own headers, so the
-  interface can change freely between player builds.
+  interface can change freely between player builds. Stage 10's
+  `launcher.so` is no exception: the app builds it from the pack's sources
+  on the player's machine, again whenever the app changes, and refuses one
+  built for another `PSP_PACK_API`.
