@@ -970,8 +970,13 @@ int main(int argc, char **argv) {
             printf("      window    unavailable -- running headless\n");
         }
     } else if (settings.realtime) {
-        psp_clock_realtime(1);
-        printf("      pacing    real-time (headless)\n");
+        if (psp_clock_paced_requested()) {
+            psp_clock_paced(1);
+            printf("      pacing    paced: the virtual clock at the wall's pace (headless)\n");
+        } else {
+            psp_clock_realtime(1);
+            printf("      pacing    real-time (headless)\n");
+        }
     }
 
     install_watch();
@@ -1154,7 +1159,7 @@ threads:
                    clock_guest_us / 1.0e6, clock_wall_us / 1.0e6,
                    lag_us / 1000.0);
     }
-    if (psp_clock_is_realtime()) { psp_audio_dump_gaps(stdout); psp_mpeg_dump_sync(stdout); }
+    if (psp_clock_is_realtime() || psp_clock_is_paced()) { psp_audio_dump_gaps(stdout); psp_mpeg_dump_sync(stdout); }
     present_audio_report(stdout);
     psp_mem_dump_bad(stdout, g_bad_top);
     if (g_bad_snapshot && g_bad_snapshot[0]) {

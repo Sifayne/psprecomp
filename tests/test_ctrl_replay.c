@@ -473,6 +473,36 @@ static void test_complete_input_round_trip(void) {
     unload();
 }
 
+/* A recording's facts: the date and time zone its session saw. The recorder
+ * writes each the first time the guest asks, and a replay adopts them at
+ * parse, wherever they stand in the file. */
+static void test_session_facts(void) {
+    unsetenv("PSPRECOMP_REPLAY");
+    setenv("PSPRECOMP_REPLAY_REC", "t-facts-rec.pad", 1);
+    psp_misc_init();
+    psp_cpu.r[PSP_REG_A0] = 0; psp_hle_call(0x27CC57F0);         /* sceKernelLibcTime */
+    const uint32_t first = psp_cpu.r[PSP_REG_V0];
+    psp_cpu.r[PSP_REG_A0] = 0; psp_hle_call(0x27CC57F0);
+    unload();
+    FILE *f = fopen("t-facts-rec.pad", "r");
+    char line[256]; int dates = 0;
+    while (f && fgets(line, sizeof line, f)) if (!strncmp(line, "date ", 5)) dates++;
+    if (f) fclose(f);
+    CHECK(dates == 1, "the date is recorded once, when first asked: %d line(s)", dates);
+    (void)first;
+
+    load(write_scenario("t-facts.pad", "@1 tap cross\ndate 1234567000000\nzone 540 1\n"));
+    psp_cpu.r[PSP_REG_A0] = 0; psp_hle_call(0x27CC57F0);
+    const uint32_t secs = psp_cpu.r[PSP_REG_V0];
+    CHECK(secs >= 1234567u && secs < 1234567u + 60u, "the replay's date is the recorded one: %u", secs);
+    psp_cpu.r[PSP_REG_A0] = 6; psp_cpu.r[PSP_REG_A1] = BUF; psp_hle_call(0xA5DA2406);
+    CHECK(psp_read32(BUF) == 540u, "the replay's zone is the recorded one: %d", (int)psp_read32(BUF));
+    psp_cpu.r[PSP_REG_A0] = 7; psp_cpu.r[PSP_REG_A1] = BUF; psp_hle_call(0xA5DA2406);
+    CHECK(psp_read32(BUF) == 1u, "and so is its daylight saving");
+    unload();
+    remove("t-facts.pad"); remove("t-facts-rec.pad");
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -492,6 +522,7 @@ int main(void) {
     test_buffer_capacity();
     test_read_counts_vblanks();
     test_complete_input_round_trip();
+    test_session_facts();
 
     remove("t-directives.pad"); remove("t-bad.pad"); remove("t-tap.pad");
     remove("t-catchup.pad"); remove("t-lanes.pad"); remove("t-host.pad");

@@ -979,6 +979,10 @@ int present_start(void) {
     }
 
     if (audio()->started) audio()->started(g_audio_dev != 0, g_gl_want);
-    psp_clock_realtime(1);
+    /* A window paces the guest against the wall; a run that plays or records
+     * a pad scenario keeps the guest on the virtual clock while doing it, so
+     * the scenario reproduces (psp_clock_paced, clock.h). */
+    if (psp_clock_paced_requested()) psp_clock_paced(1);
+    else psp_clock_realtime(1);
     return 0;
 }

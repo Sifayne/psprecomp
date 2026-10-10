@@ -215,7 +215,7 @@ because each one found a bug that reasoning had missed:
 | Memory write watch | *Which code* writes a given word; `PSPRECOMP_WATCHMEM_FROM` holds the report budget until a chosen pad poll |
 | Stack-balance checking | A callee that consumes stack and never returns it — corrupts every callee-saved restore afterwards |
 | Firmware call log and histogram | What a run did, in order (`PSPRECOMP_HLE_LOG`) or in total, and which call last handed the game a zero |
-| Scripted pad input | A bug three menus deep, made reproducible: `PSPRECOMP_REPLAY` plays a scenario, `PSPRECOMP_REPLAY_REC` records one |
+| Scripted pad input | A bug three menus deep, made reproducible: `PSPRECOMP_REPLAY` plays a scenario, `PSPRECOMP_REPLAY_REC` records one. Either runs a window on the paced clock (`PSPRECOMP_PACED`), so a recorded play session replays exactly in a window |
 | GE capture | Frames of display-list work plus the guest memory they read (`PSPRECOMP_GE_CAPTURE`), for a host to replay against any backend |
 | RAM snapshots | Whole-RAM dumps at chosen pad polls (`PSPRECOMP_RAMSNAP`), for diffing what an input changed |
 

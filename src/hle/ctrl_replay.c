@@ -272,6 +272,20 @@ static int parse_file(const char *path) {
             continue;
         }
 
+        /* Facts of the recorded session (psp_ctrl_replay_note): adopted at
+         * parse, wherever they stand, since the recorder writes each the
+         * first time the guest asks for it. */
+        if (!strcasecmp(dir, "date")) {
+            psp_rtc_set_date_us(strtoull(arg, NULL, 10));
+            continue;
+        }
+        if (!strcasecmp(dir, "zone")) {
+            char *end;
+            const long minutes = strtol(arg, &end, 10);
+            psp_sysparam_set_zone((int)minutes, (int)strtol(end, NULL, 10));
+            continue;
+        }
+
         seen_timed = 1;
 
         if (!strcasecmp(dir, "down") || !strcasecmp(dir, "up")) {
@@ -472,11 +486,18 @@ void psp_ctrl_replay_init(void) {
                 "# recorded by psprecomp\n"
                 "# clock: %s\n"
                 "# @poll stamps reproduce in either clock regime; seconds do not.\n",
-                psp_clock_is_realtime() ? "wall (windowed)" : "virtual (headless)");
+                psp_clock_paced_requested() ? "paced (replays exactly in a paced window)"
+                : psp_clock_is_realtime() ? "wall (windowed)" : "virtual (headless)");
             fflush(g_rec);
             fprintf(stderr, "psprecomp: replay: recording to %s\n", rec);
         }
     }
+}
+
+void psp_ctrl_replay_note(const char *line) {
+    if (!g_rec || !line) return;
+    fprintf(g_rec, "%s\n", line);
+    fflush(g_rec);
 }
 
 int psp_ctrl_replay_active(void) { return g_loaded; }

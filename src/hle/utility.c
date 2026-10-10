@@ -1705,9 +1705,15 @@ int psp_sysparam_confirm_cross(void) { return g_sys_confirm_cross; }
 
 /* The host's offset from UTC outside daylight saving, in minutes, and whether
  * daylight saving is in force now. */
-static void host_zone(int *minutes, int *dst) {
+static int g_zone_have, g_zone_minutes, g_zone_dst;
+
+void psp_sysparam_set_zone(int minutes, int dst) {
+    g_zone_minutes = minutes; g_zone_dst = dst != 0; g_zone_have = 1;
+}
+void psp_sysparam_forget_zone(void) { g_zone_have = 0; }
+
+static void host_zone_now(int *minutes, int *dst) {
     *minutes = *dst = 0;
-    if (!psp_clock_is_realtime()) return;
     const time_t now = time(NULL);
     struct tm tm;
 #ifndef _WIN32
@@ -1720,6 +1726,21 @@ static void host_zone(int *minutes, int *dst) {
     *dst = tm.tm_isdst > 0;
     *minutes = (int)(-west / 60);
 #endif
+}
+
+/* The host's on the wall or paced clock, read once (a recording notes it
+ * for its replay); none on the deterministic clock. */
+static void host_zone(int *minutes, int *dst) {
+    if (!g_zone_have) {
+        if (psp_clock_is_realtime() || psp_clock_is_paced()) {
+            host_zone_now(&g_zone_minutes, &g_zone_dst);
+            char line[40];
+            snprintf(line, sizeof line, "zone %d %d", g_zone_minutes, g_zone_dst);
+            psp_ctrl_replay_note(line);
+        } else g_zone_minutes = g_zone_dst = 0;
+        g_zone_have = 1;
+    }
+    *minutes = g_zone_minutes; *dst = g_zone_dst;
 }
 
 /* sceUtilityGetSystemParamInt(id, int *value): 0, or PSP_SYSTEMPARAM_RETVAL_FAIL

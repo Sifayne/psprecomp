@@ -81,8 +81,32 @@ void psp_clock_advance_to(uint64_t us);
 void psp_clock_realtime(int enable);
 int  psp_clock_is_realtime(void);
 
-/* A non-perturbing end-of-run measurement of the real-time mapping. Returns
- * zero while the deterministic virtual clock is selected. `guest_us` is the
+/* Paced mode: the deterministic virtual clock, presented at the wall's pace.
+ *
+ * Real-time mode makes the guest see the host: every read adopts wall time,
+ * every wait ends when a wall deadline passes, and audio waits on the host
+ * device. Two runs of the same input then differ wherever the host's timing
+ * did, which is why a recorded session drifted off its line within seconds
+ * of replaying. Paced mode keeps everything the guest sees on the virtual
+ * clock -- reads tick, idle jumps to the next deadline -- and only the jump
+ * waits for the wall to catch up, so a session played in it is a function of
+ * its input alone and a recording of it replays exactly in another paced run.
+ * (A headless run keeps the per-call vblank count its gate baselines were
+ * made with, so it is not one.) When the host falls more than
+ * PSP_CLOCK_PACED_SLIP_US behind, the anchor moves rather than the guest
+ * racing to catch up: the game slows down instead of dropping time. Enabling
+ * it turns real-time mode off. */
+#define PSP_CLOCK_PACED_SLIP_US 100000u
+void psp_clock_paced(int enable);
+int  psp_clock_is_paced(void);
+/* Whether this run asked for paced mode: PSPRECOMP_PACED=1 or 0 decides; by
+ * default a run that plays or records a pad scenario (PSPRECOMP_REPLAY,
+ * PSPRECOMP_REPLAY_REC) is paced, so its timing is the scenario's. The host
+ * consults this where it would otherwise turn real-time mode on. */
+int  psp_clock_paced_requested(void);
+
+/* A non-perturbing end-of-run measurement of the real-time (or paced)
+ * mapping. Returns zero while the unpaced virtual clock is selected. `guest_us` is the
  * latest time adopted by guest execution and `wall_us` is elapsed monotonic
  * time since the mode was enabled, host pauses included; less
  * psp_clock_held_us, their difference exposes pacing drift without making a

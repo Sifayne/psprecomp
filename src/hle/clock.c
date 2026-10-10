@@ -6,6 +6,7 @@
 #include "psprecomp/os.h"
 
 #include <stdatomic.h>
+#include <stdlib.h>
 
 /* How far a firmware call moves the clock.
  *
@@ -95,6 +96,7 @@ static uint64_t g_us;
  * clock up to the wall. */
 
 static int      g_realtime;
+static int      g_paced;           /* see psp_clock_paced in clock.h */
 static uint64_t g_origin_ns;
 static uint64_t g_start_ns;        /* when the mode was enabled; pauses never move it */
 
@@ -123,14 +125,42 @@ static void wall_sync(uint64_t us) {
 static void anchor(void) { g_origin_ns = g_start_ns = wall_ns() - g_us * 1000u; }
 
 void psp_clock_realtime(int enable) {
-    if (enable && !g_realtime) anchor();
+    if (enable && !g_realtime && !g_paced) anchor();
     g_realtime = enable;
+    if (enable) g_paced = 0;
 }
 
 int psp_clock_is_realtime(void) { return g_realtime; }
 
+void psp_clock_paced(int enable) {
+    if (enable && !g_paced && !g_realtime) anchor();
+    g_paced = enable;
+    if (enable) g_realtime = 0;
+}
+
+int psp_clock_is_paced(void) { return g_paced; }
+
+int psp_clock_paced_requested(void) {
+    const char *v = getenv("PSPRECOMP_PACED");
+    if (v && *v) return *v != '0';
+    const char *play = getenv("PSPRECOMP_REPLAY"), *rec = getenv("PSPRECOMP_REPLAY_REC");
+    return (play && *play) || (rec && *rec);
+}
+
+/* Paced mode's half of an idle jump: wait for the wall to reach the guest,
+ * or, when the host has fallen more than the slip behind, move the anchor
+ * so it does not race ahead to make the time up. */
+static void paced_sync(uint64_t us) {
+    const uint64_t target = g_origin_ns + us * 1000u, now = wall_ns();
+    if (now + 2000u >= target) {
+        if (now - target > (uint64_t)PSP_CLOCK_PACED_SLIP_US * 1000u) g_origin_ns += now - target;
+        return;
+    }
+    psp_os_sleep_until_ns(target);
+}
+
 int psp_clock_realtime_stats(uint64_t *guest_us, uint64_t *wall_us) {
-    if (!g_realtime) return 0;
+    if (!g_realtime && !g_paced) return 0;
     if (guest_us) *guest_us = g_us;
     if (wall_us) *wall_us = (wall_ns() - g_start_ns) / 1000u;
     return 1;
@@ -147,7 +177,7 @@ void psp_clock_hold(void) {
 void psp_clock_release(void) {
     if (!g_holding) return;
     const uint64_t held = wall_ns() - g_hold_since_ns;
-    if (g_realtime) g_origin_ns += held;
+    if (g_realtime || g_paced) g_origin_ns += held;
     g_held_ns += held;
     g_holding = 0;
 }
@@ -173,14 +203,14 @@ void psp_clock_reset(void) {
     /* Re-anchor if the mode is already on: reset means a new run, and the
      * origin is what makes "microseconds since the module started" mean the
      * same thing on both sides of the mapping. */
-    if (g_realtime) anchor();
+    if (g_realtime || g_paced) anchor();
 }
 
 uint64_t psp_clock_peek(void) { return g_us; }
 
 static int clock_load(psp_state_reader *r, char *why, size_t size) {
     (void)r; (void)why; (void)size;
-    if (g_realtime) anchor();
+    if (g_realtime || g_paced) anchor();
     return 0;
 }
 
@@ -248,6 +278,7 @@ void psp_clock_advance_to(uint64_t us) {
          * is runnable -- that is why this path exists -- so the wait cannot
          * delay anyone who could have made progress. */
         if (g_realtime) wall_sync(us);
+        else if (g_paced) paced_sync(us);
         g_us = us;
     }
 }

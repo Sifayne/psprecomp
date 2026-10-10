@@ -409,8 +409,15 @@ static void hle_WaitVblank(void) {
  * ratio between the two counters staying fixed. */
 #define PSP_HLINES_PER_FRAME 286u
 
+/* On the wall or paced clock the counters follow time; the deterministic
+ * clock's per-call count is a shortcut for headless runs, and paced mode must
+ * not take it: WipEout Pulse waits for the count to change between frames,
+ * and counted per call that wait ended at once, the game drew 167 frames a
+ * second and its clock crawled. */
+static int vcount_follows_time(void) { return psp_clock_is_realtime() || psp_clock_is_paced(); }
+
 static void hle_GetVcount(void) {
-    if (psp_clock_is_realtime()) {
+    if (vcount_follows_time()) {
         psp_ret((uint32_t)(psp_clock_read() / PSP_CLOCK_FRAME_US));
         return;
     }
@@ -418,7 +425,7 @@ static void hle_GetVcount(void) {
 }
 
 static void hle_GetAccumulatedHcount(void) {
-    if (psp_clock_is_realtime()) {
+    if (vcount_follows_time()) {
         const uint64_t us = psp_clock_read();
         psp_ret((uint32_t)((us * PSP_HLINES_PER_FRAME) /
                            PSP_CLOCK_FRAME_US));

@@ -79,6 +79,48 @@ static void test_clock_hold(void) {
     psp_clock_realtime(0);
 }
 
+/* Paced mode (clock.h): the guest's clock is the virtual one -- a read ticks
+ * a microsecond whatever the wall does -- and only an idle jump waits for the
+ * wall. A host more than the slip behind moves the anchor rather than
+ * letting the guest race ahead to make the time up. */
+static void test_clock_paced(void) {
+    psp_clock_paced(1);
+    psp_clock_reset();
+    CHECK(psp_clock_is_paced() && !psp_clock_is_realtime(), "paced mode is not real-time mode");
+    psp_os_sleep_until_ns(psp_os_mono_ns() + 20000000u);
+    const uint64_t r0 = psp_clock_read(), r1 = psp_clock_read();
+    CHECK(r0 < 1000u && r1 == r0 + 1u, "a read ticks, not adopts the wall: %llu then %llu",
+          (unsigned long long)r0, (unsigned long long)r1);
+    /* 20 ms of wall have passed and the guest is at ~0: a jump to 10 ms is
+     * already due, and one to 40 ms waits out the rest. */
+    uint64_t t0 = psp_os_mono_ns();
+    psp_clock_advance_to(10000u);
+    CHECK(psp_os_mono_ns() - t0 < 5000000u, "a jump the wall has passed does not wait");
+    t0 = psp_os_mono_ns();
+    psp_clock_advance_to(40000u);
+    const uint64_t waited = psp_os_mono_ns() - t0;
+    CHECK(waited >= 15000000u && waited < 60000000u, "a jump waits for the wall: %llu ns",
+          (unsigned long long)waited);
+    CHECK(psp_clock_peek() == 40000u, "and lands exactly on the deadline");
+    /* Fall 150 ms behind: the next jump does not wait, the one after a frame
+     * later waits a frame, not nothing. */
+    psp_os_sleep_until_ns(psp_os_mono_ns() + 150000000u);
+    t0 = psp_os_mono_ns();
+    psp_clock_advance_to(50000u);
+    CHECK(psp_os_mono_ns() - t0 < 5000000u, "a host behind does not wait");
+    t0 = psp_os_mono_ns();
+    psp_clock_advance_to(66667u);
+    const uint64_t frame = psp_os_mono_ns() - t0;
+    CHECK(frame >= 12000000u, "past the slip the anchor moves, so the next frame is paced: %llu ns",
+          (unsigned long long)frame);
+    uint64_t guest = 0, wall = 0;
+    CHECK(psp_clock_realtime_stats(&guest, &wall) == 1, "paced mode reports its mapping");
+    psp_clock_realtime(1);
+    CHECK(!psp_clock_is_paced(), "real-time mode turns paced mode off");
+    psp_clock_realtime(0);
+    psp_clock_paced(0);
+}
+
 static void test_division(void) {
     /* MIPS does not trap on divide-by-zero; HI/LO are architecturally
      * unpredictable. We define them so a recompiled game is deterministic and
@@ -786,6 +828,7 @@ int main(void) {
     test_zero_register();
     test_clock_mode_report();
     test_clock_hold();
+    test_clock_paced();
     test_division();
     test_multiply();
     test_shifts();
