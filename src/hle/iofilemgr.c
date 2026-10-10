@@ -26,6 +26,7 @@
 #include <strings.h>
 #else
 #define strcasecmp _stricmp
+#define strncasecmp _strnicmp
 #endif
 
 #ifdef _WIN32
@@ -1228,7 +1229,40 @@ static void hle_Dread(void) {
 /* 0x80010000 | errno, with ENODEV = 19. */
 #define SCE_ERROR_ENODEV   0x80010013u
 
+/* The Memory Stick, as PSPSDK's pspmscm.h asks about it (BSD):
+ *   - "fatms0:" 0x02415821 registers an insert/eject callback, its uid in
+ *     indata, and 0x02415822 unregisters it; the event is the callback's
+ *     arg2, 1 inserted and 2 ejected;
+ *   - "mscmhc0:" 0x02025806 writes 1 to outdata while a stick is inserted.
+ * The stick is always in. A registration is answered with an insertion at
+ * once, as scePowerRegisterCallback fires its callback: WipEout Pulse
+ * registers and then sleeps in sceKernelSleepThreadCB for the event, and
+ * without it tells the player no Memory Stick is inserted and its saves
+ * cannot be loaded. When a PSP raises it is not measured. */
+#define MS_CB_EVENT_INSERTED 1u
+
+static int ms_device(const char *dev, const char *want) {
+    const size_t n = strlen(want);
+    return !strncasecmp(dev, want, n) && (dev[n] == '\0' || dev[n] == '/');
+}
+
 static void hle_Devctl(void) {
+    char dev[64];
+    psp_str(psp_arg(0), dev, sizeof dev);
+    const uint32_t cmd = psp_arg(1), in = psp_arg(2), inlen = psp_arg(3), out = psp_arg(4), outlen = psp_arg(5);
+    if ((ms_device(dev, "fatms0:") || ms_device(dev, "ms0:")) && (cmd == 0x02415821u || cmd == 0x02415822u)) {
+        if (!in || inlen < 4 || !psp_mem_ptr(in, 4)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+        const uint32_t cb = psp_read32(in);
+        if (cmd == 0x02415822u) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+        psp_ret(psp_threadman_notify_callback(cb, MS_CB_EVENT_INSERTED));
+        return;
+    }
+    if (ms_device(dev, "mscmhc0:") && cmd == 0x02025806u) {
+        if (!out || outlen < 4 || !psp_mem_ptr(out, 4)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+        psp_write32(out, 1);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
     psp_ret(SCE_ERROR_ENODEV);
 }
 
