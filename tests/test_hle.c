@@ -1919,8 +1919,10 @@ static void test_audio_output2(void) {
     psp_audio_set_output(output2_sink);
     psp_audio_set_pending(output2_pending);
     output2_sink_calls = output2_pending_frames = 0;
+    /* Each answers its sample count, as sceAudioSRCOutputBlocking does
+     * (uofw audio.c): WipEout Pulse's mixer checks for it. */
     for (int i=0; i<12; i++)
-        CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 0, "sink accepts each buffer exactly once");
+        CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 512, "sink accepts each buffer exactly once");
     CHECK(output2_sink_calls == 12, "all buffers delivered");
     psp_clock_advance_to(1000000);
     CHECK(call(rest, 0, 0, 0, 0) == 6144, "guest time does not consume a device queue");
@@ -1933,7 +1935,7 @@ static void test_audio_output2(void) {
     CHECK(call(release, 0, 0, 0, 0) == 0, "release after device drains");
     psp_audio_set_output(NULL);
     CHECK(call(reserve, 512, 0, 0, 0) == 0, "reserve without device");
-    CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 0, "headless transfer starts");
+    CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 512, "headless transfer starts");
     const uint64_t start = psp_clock_peek();
     psp_clock_advance_to(start + 6000);
     uint32_t remaining = call(rest, 0, 0, 0, 0);
