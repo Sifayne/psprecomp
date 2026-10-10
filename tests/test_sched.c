@@ -31,6 +31,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/cpu.h"
 #include "psprecomp/clock.h"
+#include "psprecomp/os.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -642,7 +643,61 @@ static void test_expired_delay_preempts_a_spinner(void) {
           "before the spinner gave up at %d", spin_at_wake, SPIN_LIMIT);
 }
 
+/* psp_sched_run_on: a function run on a parked thread's own host thread while
+ * the caller waits, as the GE's walk is handed to the thread whose host thread
+ * holds the GL context (src/hle/ge.c). Host-thread-local state tells the two
+ * host threads apart; the function also sees the parked thread's identity. */
+#define ENTRY_HOST_OWNER 0x0000F000u
+#define ENTRY_HOST_ASKER 0x0000F100u
+#define UID_HOST_OWNER   0x00040009u
+#define UID_HOST_ASKER   0x0004000Au
+
+static PSP_THREAD_LOCAL int t_owner_host;
+static int served_on_owner, served_as_owner, served_here, served_missing, owner_resumed;
+
+static void serve_on_owner(void) {
+    served_on_owner = t_owner_host;
+    served_as_owner = psp_sched_current() == UID_HOST_OWNER;
+}
+static void serve_here(void) { served_here = !t_owner_host && psp_sched_current() == UID_HOST_ASKER; }
+static void serve_missing(void) { served_missing = !t_owner_host; }
+
+static void body_host_owner(void) {
+    t_owner_host = 1;
+    psp_sched_block(psp_sched_current(), PSP_SCHED_BLOCKED, "test-owner");
+    owner_resumed = 1;
+}
+
+static void body_host_asker(void) {
+    psp_sched_run_on(UID_HOST_OWNER, serve_on_owner);
+    check_one_running("after a function ran on a parked thread");
+    psp_sched_run_on(UID_HOST_ASKER, serve_here);     /* the caller: here */
+    psp_sched_run_on(0x0004FFFFu, serve_missing);     /* no such thread: here */
+    psp_sched_wake(UID_HOST_OWNER);
+}
+
+static void test_run_on_a_parked_thread(void) {
+    psp_sched_reset();
+    psp_sched_set_threading(1);
+    served_on_owner = served_as_owner = served_here = served_missing = owner_resumed = 0;
+
+    CHECK(psp_sched_spawn(UID_HOST_OWNER, ENTRY_HOST_OWNER, FAKE_SP, 0, 0, 0, 30) == 0,
+          "spawning the owner failed");
+    CHECK(psp_sched_spawn(UID_HOST_ASKER, ENTRY_HOST_ASKER, FAKE_SP, 0, 0, 0, 40) == 0,
+          "spawning the asker failed");
+
+    const int live = psp_sched_drain(5);
+    CHECK(live == 0, "%d thread(s) still alive", live);
+    CHECK(served_on_owner, "the function did not run on the parked thread's host thread");
+    CHECK(served_as_owner, "the function did not see the parked thread's identity");
+    CHECK(served_here, "a function asked of the caller itself did not run on its thread");
+    CHECK(served_missing, "a function asked of no thread did not run on the caller's");
+    CHECK(owner_resumed, "the parked thread did not carry on after serving");
+}
+
 int main(void) {
+    psp_register(ENTRY_HOST_OWNER, body_host_owner);
+    psp_register(ENTRY_HOST_ASKER, body_host_asker);
     psp_register(ENTRY_Q_C + 0x30, body_st);
     psp_register(ENTRY_Q_C + 0x40, body_st_hi);
     psp_register(ENTRY_Q_C + 0x10, body_s_waiter);
@@ -681,6 +736,7 @@ int main(void) {
     test_suspend_is_a_flag_over_the_wait();
     test_dead_slots_are_reused();
     test_thread_counters();
+    test_run_on_a_parked_thread();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

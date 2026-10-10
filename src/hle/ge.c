@@ -4097,14 +4097,20 @@ static void ge_x_done(ge_queue *q, uint64_t start) {
 }
 
 /* A suspending SIGNAL's handler has run (or has no function any more): the
- * GE goes on from the END after it, now. */
+ * GE goes on from the END after it, now. The walk goes on on the GE's own
+ * thread, the last to walk a list: its host thread holds the GL context,
+ * which render_gl.c will not draw through from any other, and a save is
+ * taken on it (safepoint.c). The handler runs on whichever thread took the
+ * interrupt, so from any other the walk is handed to the GE's, parked
+ * meanwhile. */
 static void ge_execute(void);
 static void ge_release(int was_busy);
 static void ge_resume_suspended(const ge_event *e) {
     if (e->kind != GE_EV_HANDLER || e->finish || !ev_live(e) || !e->q->xsuspended) return;
     e->q->xsuspended = e->q->xpaused = 0;
     ge_release(0);
-    ge_execute();
+    if (g_ge_owner) psp_sched_run_on(g_ge_owner, ge_execute);
+    else ge_execute();
 }
 
 /* Run a held handler. `force` runs it whatever the interrupt state (a wait on

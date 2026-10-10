@@ -256,6 +256,14 @@ void psp_sched_dump_threads(FILE *out);
 int      psp_sched_live(void);
 uint32_t psp_sched_current(void);
 
+/* Run `fn` on the host thread of thread `uid`, which is parked waiting for its
+ * turn, while the caller waits for it: one host thread still runs at a time.
+ * For host state that belongs to one host thread, as the GL backend's context
+ * belongs to the GE's (src/hle/ge.c). `fn` runs no guest code and leaves
+ * psp_cpu, the caller's, alone. Where `uid` is the caller, or is not parked
+ * waiting for its turn, `fn` runs on the caller's thread instead. */
+void     psp_sched_run_on(uint32_t uid, void (*fn)(void));
+
 /* A thread's priority, or the least urgent value there is when it has no slot.
  *
  * Asked by the waiter queue, which releases most-urgent-first for objects

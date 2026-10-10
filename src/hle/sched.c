@@ -455,14 +455,48 @@ static int handoff_locked(void) {
  * Waking is not the same as being scheduled. This used to break out of its wait
  * on a deadlock flag and return regardless, so every parked thread resumed at
  * once, none of them holding the token and none with psp_cpu restored -- and
- * psp_cpu is a single global. Nothing may run without g_running == me. */
+ * psp_cpu is a single global. Nothing may run without g_running == me.
+ *
+ * While it waits it can be asked to run something on its host thread
+ * (psp_sched_run_on), first, so that a request is answered even by a slot
+ * that has just been killed. */
+static uint8_t g_parked[MAX_SCHED_THREADS];  /* waiting here: can take a request */
+static int     g_serve = -1;                 /* the slot asked to run g_serve_fn */
+static void  (*g_serve_fn)(void);
+
 static int await_turn_locked(int me) {
     while (g_running != me) {
+        if (g_serve == me) {
+            void (*fn)(void) = g_serve_fn;
+            psp_os_unlock(&g_lock);
+            fn();
+            psp_os_lock(&g_lock);
+            g_serve = -1;
+            psp_os_cond_broadcast(&g_turn);
+            continue;
+        }
         if (g_slot[me].state == PSP_SCHED_DEAD) return -1;
+        g_parked[me] = 1;
         psp_os_cond_wait(&g_turn, &g_lock);
+        g_parked[me] = 0;
     }
     psp_cpu = g_slot[me].ctx;
     return 0;
+}
+
+void psp_sched_run_on(uint32_t uid, void (*fn)(void)) {
+    psp_os_lock(&g_lock);
+    const int s = slot_of(uid);
+    if (s < 0 || s == g_self || !g_parked[s] || g_serve >= 0) {
+        psp_os_unlock(&g_lock);
+        fn();
+        return;
+    }
+    g_serve = s;
+    g_serve_fn = fn;
+    psp_os_cond_broadcast(&g_turn);
+    while (g_serve >= 0) psp_os_cond_wait(&g_turn, &g_lock);
+    psp_os_unlock(&g_lock);
 }
 
 /* Give up the token: save state, change our own, hand over, wait to come back.
