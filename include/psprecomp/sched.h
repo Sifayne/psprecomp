@@ -264,6 +264,10 @@ uint32_t psp_sched_current(void);
  * waiting for its turn, `fn` runs on the caller's thread instead. */
 void     psp_sched_run_on(uint32_t uid, void (*fn)(void));
 
+/* Called on a guest thread's host thread as it ends, before it goes: the
+ * host lets go of what belongs to that host thread alone. */
+void     psp_sched_set_host_exit_hook(void (*fn)(void));
+
 /* A thread's priority, or the least urgent value there is when it has no slot.
  *
  * Asked by the waiter queue, which releases most-urgent-first for objects

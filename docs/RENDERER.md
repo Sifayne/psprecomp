@@ -197,11 +197,21 @@ So the SDL thread creates the window and the context and then releases it with
 keeps it; `present()` swaps from there. No command queue and no cross-thread
 marshalling, which is the design a second GE thread would have forced.
 
-That assumption is load-bearing, so a GL backend must **fail loudly** if the
-thread it is called on ever changes, rather than issuing GL calls against a
-context that is not current. The census in `psp_ge_dump_stats` reports the
-thread count in every run, so the assumption is checked continuously rather
-than once.
+That held for those two games, not for every game. WipEout Pulse draws its
+first eight lists on the thread that boots it and every later one, over a
+million, on a render thread of its own; the backend refused them all, and the
+window stayed black. **The context now follows the GE.** When a list or a
+present arrives on another host thread, the thread holding the context lets
+go of it there, through `psp_sched_run_on`, since it is parked waiting for its
+turn (the boot thread too, in the drain). The new thread then makes it
+current (`claim` in `src/host/render_gl.c`). A thread whose guest thread
+ends lets go as it goes, through the scheduler's host exit hook. Measured
+with SDL: a context left current on a thread that has ended cannot be made
+current again under X11 (BadAccess), and only sometimes under EGL. A move is
+two `MakeCurrent` calls, so the GE settling on one thread stays the cheap
+case, and the census in `psp_ge_dump_stats` still reports the thread count
+in every run; the GL report adds how often the context moved. The backend
+still refuses, loudly, a thread it could not move the context to.
 
 The census caught the one thing that moved it. A SIGNAL that suspends
 (behaviour 1) holds the GE until its handler returns (geprobe v24), so the

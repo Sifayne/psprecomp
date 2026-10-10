@@ -42,6 +42,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/os.h"
 #include "psprecomp/safepoint.h"
+#include "psprecomp/sched.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -482,7 +483,11 @@ static struct {
     int      pixel_w, pixel_h, max_size;
     uint64_t resizes, cpu_uploads, rt_views;
     int      exporting;
+    /* The host thread holding the context (0: none, since the one that held
+     * it let go), its guest thread, and how often it has moved. */
     unsigned long thread;
+    uint32_t uid;
+    uint64_t moves;
 
     GLuint   prog, vao, vbo;
     GLuint   stencil_prog, stencil_copy;
@@ -1823,28 +1828,49 @@ static void rt_resize_all(void) {
     }
 }
 
-/* Claim the context, once, on whichever thread the GE turns out to be. Every
- * entry point goes through here, so a call arriving on a second thread is
- * caught at the boundary rather than as corruption inside the driver. */
+/* Let go of the context on the host thread holding it: when another thread
+ * needs it (claim), and when this one's guest thread ends (the scheduler's
+ * host exit hook). A context left current on a thread that has gone cannot
+ * be made current again under X11 (BadAccess), nor reliably under EGL. */
+static void let_go(void) {
+    if (g.ready && g.thread && g.thread == this_thread()) {
+        present_gl_release();
+        g.thread = 0;
+    }
+}
+
+/* Claim the context on whichever thread the GE is on. Every entry point goes
+ * through here, so a call arriving on another thread is caught at the
+ * boundary rather than as corruption inside the driver. The context follows
+ * the GE when it moves: WipEout Pulse draws its first lists on the thread
+ * that boots it and every later one on a render thread of its own. The
+ * thread holding it is parked, waiting for its turn, while another runs, so
+ * it is asked to let go there (psp_sched_run_on); one whose guest thread has
+ * ended let go as it went. */
 static int claim(void) {
     const unsigned long me = this_thread();
     if (g.ready) {
-        if (g.thread != me) {
+        if (g.thread == me) return 0;
+        if (g.thread) psp_sched_run_on(g.uid, let_go);
+        if (g.thread || present_gl_make_current() != 0) {
             static int said;
             if (!said++)
-                fprintf(stderr, "gl: the GE reached this backend on a second "
-                                "host thread (%lu, expected %lu). A GL context "
-                                "belongs to one thread; refusing rather than "
-                                "drawing through a context that is not "
-                                "current.\n", me, g.thread);
+                fprintf(stderr, "gl: the GE reached this backend on host thread %lu, and the "
+                                "context could not be moved from %lu; refusing rather than "
+                                "drawing through a context that is not current.\n", me, g.thread);
             return -1;
         }
+        g.thread = me;
+        g.uid = psp_sched_current();
+        if (++g.moves <= 4)
+            fprintf(stderr, "gl: the context followed the GE to host thread %lu\n", me);
         return 0;
     }
     if (g.failed) return -1;
 
     if (present_gl_make_current() != 0 || gl_load() != 0) { g.failed = 1; return -1; }
     g.thread = me;
+    g.uid = psp_sched_current();
     GLint tex_limit, rb_limit, viewport_limit[2];
     p_glGetIntegerv(GL_MAX_TEXTURE_SIZE, &tex_limit);
     p_glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &rb_limit);
@@ -1996,6 +2022,7 @@ static int gl_init(int w, int h) {
     g.smooth_bloom = psp_title_info.bloom && setting_number("BLOOM_FILTER") != 0;
     psp_savedata_set_redraw(gl_dialog_redraw);
     psp_pause_set_redraw(gl_pause_redraw);
+    psp_sched_set_host_exit_hook(let_go);
     return 0;
 }
 
@@ -4153,9 +4180,9 @@ void render_gl_report(FILE *out) {
     if (!g.ready && !g.failed) return;
     fprintf(out, "gl:       %s", g.failed ? "failed to start" : "ran");
     if (g.ready)
-        fprintf(out, " -- %llu draw(s), %llu vertices, %llu readback(s)",
+        fprintf(out, " -- %llu draw(s), %llu vertices, %llu readback(s), the context moved %llu time(s)",
                 (unsigned long long)g.draws, (unsigned long long)g.verts,
-                (unsigned long long)g.readbacks);
+                (unsigned long long)g.readbacks, (unsigned long long)g.moves);
     fprintf(out, "\n          transform: %s, %llu model draw(s) in %llu batch(es), %llu vertices; %llu repeated setter(s) skipped, scene state reused %llu of %llu time(s)",
             g.model_unavailable ? "CPU" : "GPU", (unsigned long long)g.model_draws, (unsigned long long)g.mu.batches, (unsigned long long)g.model_verts, (unsigned long long)g.mu.setters_skipped,
             (unsigned long long)g.mu.scene_hits, (unsigned long long)(g.mu.scene_hits + g.mu.scene_misses));

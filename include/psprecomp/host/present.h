@@ -51,10 +51,12 @@ static inline int present_start(void) {
  * called before present_start, asks for a GL-capable window and a 3.3 core
  * context; the SDL thread creates both and releases the context so the GE
  * thread can claim it with present_gl_make_current, which blocks until the
- * window exists. See docs/RENDERER.md. */
+ * window exists; present_gl_release lets go of it on the thread holding it,
+ * so that another can claim it. See docs/RENDERER.md. */
 #ifdef HAVE_SDL2
 void  present_want_gl(void);
 int   present_gl_make_current(void);
+void  present_gl_release(void);
 void  present_gl_drawable_size(int *w, int *h);
 /* Queue a window resize on the SDL thread; useful for settings and checks. */
 void  present_request_window_size(int w, int h);
@@ -81,6 +83,7 @@ void *present_gl_proc(const char *name);
 #else
 static inline void  present_want_gl(void) { }
 static inline int   present_gl_make_current(void) { return -1; }
+static inline void  present_gl_release(void) { }
 static inline void  present_gl_drawable_size(int *w, int *h) {
     if (w) *w = 0;
     if (h) *h = 0;

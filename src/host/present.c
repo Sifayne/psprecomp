@@ -434,6 +434,7 @@ int present_gl_make_current(void) {
 }
 
 void present_gl_swap(void) { if (g_gl_win) SDL_GL_SwapWindow(g_gl_win); }
+void present_gl_release(void) { if (g_gl_win) SDL_GL_MakeCurrent(g_gl_win, NULL); }
 static _Atomic uint64_t g_frames_rendered;
 void present_note_frame(void) { atomic_fetch_add(&g_frames_rendered, 1); }
 

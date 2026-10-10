@@ -464,17 +464,22 @@ static uint8_t g_parked[MAX_SCHED_THREADS];  /* waiting here: can take a request
 static int     g_serve = -1;                 /* the slot asked to run g_serve_fn */
 static void  (*g_serve_fn)(void);
 
+/* A request for this slot's host thread: run it, with the lock let go, and
+ * tell the caller. Returns whether there was one. */
+static int serve_locked(int me) {
+    if (g_serve != me) return 0;
+    void (*fn)(void) = g_serve_fn;
+    psp_os_unlock(&g_lock);
+    fn();
+    psp_os_lock(&g_lock);
+    g_serve = -1;
+    psp_os_cond_broadcast(&g_turn);
+    return 1;
+}
+
 static int await_turn_locked(int me) {
     while (g_running != me) {
-        if (g_serve == me) {
-            void (*fn)(void) = g_serve_fn;
-            psp_os_unlock(&g_lock);
-            fn();
-            psp_os_lock(&g_lock);
-            g_serve = -1;
-            psp_os_cond_broadcast(&g_turn);
-            continue;
-        }
+        if (serve_locked(me)) continue;
         if (g_slot[me].state == PSP_SCHED_DEAD) return -1;
         g_parked[me] = 1;
         psp_os_cond_wait(&g_turn, &g_lock);
@@ -482,6 +487,18 @@ static int await_turn_locked(int me) {
     }
     psp_cpu = g_slot[me].ctx;
     return 0;
+}
+
+/* A guest thread's host thread is ending: the host lets go of what is that
+ * thread's alone first (the GL context, src/host/render_gl.c), since nothing
+ * can make it another thread's once the thread holding it has gone. Called
+ * on that host thread, without the lock. */
+static void (*g_host_exit_hook)(void);
+void psp_sched_set_host_exit_hook(void (*fn)(void)) { g_host_exit_hook = fn; }
+
+static void host_exit(void) {
+    if (g_host_exit_hook) g_host_exit_hook();
+    psp_os_thread_exit();
 }
 
 void psp_sched_run_on(uint32_t uid, void (*fn)(void)) {
@@ -548,7 +565,7 @@ static int switch_away(int me, psp_sched_state why, const char *what,
     if (await_turn_locked(me) != 0) {          /* killed by psp_sched_stop_all */
         g_slot[me].waiting_on = NULL;
         psp_os_unlock(&g_lock);
-        if (me != MAIN_SLOT) psp_os_thread_exit();
+        if (me != MAIN_SLOT) host_exit();
         return PSP_SCHED_STRANDED;
     }
     const int woken = g_slot[me].woken;
@@ -630,8 +647,9 @@ static void thread_main(void *arg) {
     if (g_thread_hook) g_thread_hook();
     jmp_buf base;
     t_base = &base;
-    if (setjmp(base)) { resume_slot(&g_slot[g_self]); return; }
-    thread_run(t);
+    if (setjmp(base)) { resume_slot(&g_slot[g_self]); }
+    else thread_run(t);
+    if (g_host_exit_hook) g_host_exit_hook();
 }
 
 int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp, uint32_t k0,
@@ -836,7 +854,7 @@ static void yield_as(int displaced) {
 
     if (await_turn_locked(me) != 0) {          /* killed by psp_sched_stop_all */
         psp_os_unlock(&g_lock);
-        if (me != MAIN_SLOT) psp_os_thread_exit();
+        if (me != MAIN_SLOT) host_exit();
         return;
     }
     psp_os_unlock(&g_lock);
@@ -885,7 +903,7 @@ int psp_sched_delay(uint64_t usec) {
 
     if (await_turn_locked(me) != 0) {
         psp_os_unlock(&g_lock);
-        if (me != MAIN_SLOT) psp_os_thread_exit();
+        if (me != MAIN_SLOT) host_exit();
         return PSP_SCHED_EXPIRED;
     }
     const int woken = g_slot[me].woken, reason = g_slot[me].wake_reason;
@@ -995,7 +1013,7 @@ void psp_sched_exit(uint32_t uid) {
      * is the drain's to report. This thread is leaving either way. */
     (void)handoff_locked();
     psp_os_unlock(&g_lock);
-    if (me != MAIN_SLOT) psp_os_thread_exit();
+    if (me != MAIN_SLOT) host_exit();
 }
 
 /* Called with the lock held. Like await_turn_locked, but gives up at `deadline`.
@@ -1009,9 +1027,14 @@ void psp_sched_exit(uint32_t uid) {
  * and the process ends with the thread still running. */
 static int await_turn_deadline_locked(int me, uint64_t deadline_ns) {
     while (g_running != me) {
+        /* The main context waits here, and may be asked too: the boot
+         * thread ran the game's entry, and may hold what is its alone. */
+        if (serve_locked(me)) continue;
         if (g_running < 0) return -2;
-        if (psp_os_cond_wait_until(&g_turn, &g_lock, deadline_ns) &&
-            g_running != me)
+        g_parked[me] = 1;
+        const int timed_out = psp_os_cond_wait_until(&g_turn, &g_lock, deadline_ns);
+        g_parked[me] = 0;
+        if (timed_out && g_running != me && g_serve != me)
             return g_running < 0 ? -2 : -1;
     }
     psp_cpu = g_slot[me].ctx;
@@ -1054,7 +1077,7 @@ void psp_sched_stop_all(const char *why) {
     give_token_locked(MAIN_SLOT, psp_clock_peek());
     psp_os_cond_broadcast(&g_turn);
     psp_os_unlock(&g_lock);
-    if (me != MAIN_SLOT) psp_os_thread_exit();
+    if (me != MAIN_SLOT) host_exit();
 }
 
 const char *psp_sched_stop_reason(void) {
@@ -1225,7 +1248,7 @@ int psp_sched_terminate(uint32_t uid) {
          * exiting it ends the thread the process was started on and
          * leaves the runner waiting for threads that will never finish. The
          * same guard psp_sched_exit carries, for the same reason. */
-        if (!self_is_main) psp_os_thread_exit();
+        if (!self_is_main) host_exit();
         return 1;
     }
     psp_os_unlock(&g_lock);
@@ -1477,7 +1500,7 @@ int psp_sched_resume_block(uint64_t *deadline) {
     if (await_turn_locked(me) != 0) {
         g_slot[me].waiting_on = NULL;
         psp_os_unlock(&g_lock);
-        psp_os_thread_exit();
+        host_exit();
         return PSP_SCHED_STRANDED;
     }
     const uint64_t deadline_us = g_slot[me].park.deadline;
@@ -1498,7 +1521,7 @@ int psp_sched_resume_delay(uint64_t *deadline) {
     if (deadline) *deadline = g_slot[me].park.deadline;
     if (await_turn_locked(me) != 0) {
         psp_os_unlock(&g_lock);
-        psp_os_thread_exit();
+        host_exit();
         return PSP_SCHED_EXPIRED;
     }
     const int woken = g_slot[me].woken, reason = g_slot[me].wake_reason;
