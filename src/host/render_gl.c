@@ -40,6 +40,7 @@
 #include "psprecomp/render.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/hle.h"
+#include "psprecomp/clock.h"
 #include "psprecomp/os.h"
 #include "psprecomp/safepoint.h"
 #include "psprecomp/sched.h"
