@@ -168,7 +168,7 @@ int main(int argc, char **argv) {
     assert(a.page && !strcmp(a.page, "Display"));
     int groups[4 * PAGES_MAX], at; const char *ring[4 * PAGES_MAX];
     const int n = page_ring(&a, groups, ring, &at);
-    assert(n == 5 + 1 + 2 && at == 0 && groups[n - 1] == GROUP_ABOUT && groups[n - 2] == GROUP_PACKS);
+    assert(n == 6 + 1 + 2 && at == 0 && groups[n - 1] == GROUP_ABOUT && groups[n - 2] == GROUP_PACKS);
     for (int i = 0; i < n; i++) { step_page(&a, 1); draw(&a); }
     assert(a.group == GROUP_PLAYER && !strcmp(a.page, "Display"));
     step_page(&a, -1); assert(a.group == GROUP_ABOUT);
