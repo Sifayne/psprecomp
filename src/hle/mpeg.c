@@ -112,6 +112,10 @@ typedef struct {
      * put_bytes bytes in all and the two streams stood at these lengths. */
     struct mpeg_put { uint64_t put_bytes; size_t es_len, aes_len; } *puts;
     size_t   nputs, puts_cap, put_iv, put_ia;
+    /* The streams the game registered (sceMpegRegistStream; PSPSDK pspmpeg.h:
+     * 0 video, 1 audio), as bits 1 << id; 0 before any. Only a registered
+     * stream is read, so only it is kept, and only it consumes the ring. */
+    unsigned registered;
     uint64_t put_total;
 
     void    *dec;          /* ISVCDecoder*, opaque here so the header stays out */
@@ -413,7 +417,15 @@ static void hle_RingbufferAvailableSize(void) {
             while (c->put_ia < c->nputs && c->puts[c->put_ia].aes_len <= c->aes_pos) c->put_ia++;
             const uint64_t pv = c->put_iv ? c->puts[c->put_iv - 1].put_bytes : 0;
             const uint64_t pa = c->put_ia ? c->puts[c->put_ia - 1].put_bytes : 0;
-            const uint64_t consumed = pv > pa ? pv : pa;
+            /* Only a stream the game registered reads its packets. WipEout
+             * Pulse plays the movie behind its title screen with no audio
+             * registered: counting the audio as a consumer had it past every
+             * put, the ring read empty for ever, and the game, which waits
+             * for the ring to fill before it decodes, read the whole file
+             * into host memory at 45 MB a second. */
+            const uint64_t consumed = c->registered == 1u ? pv
+                                    : c->registered == 2u ? pa
+                                    : pv > pa ? pv : pa;
             uint64_t held = (c->put_total - consumed + pkt_size - 1) / pkt_size;
             /* The floor of one packet is for playback, not for the end.
              *
@@ -594,7 +606,12 @@ static int buf_append(uint8_t **buf, size_t *len, size_t *cap, const uint8_t *p,
     *len += n;
     return 0;
 }
+/* A stream nobody registered is never read: kept, it would only pile up. */
+static int unwanted(const mpeg_ctx *c, unsigned id) {
+    return c->registered && !(c->registered & (1u << id));
+}
 static int es_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
+    if (unwanted(c, 0)) return 0;
     return buf_append(&c->es, &c->es_len, &c->es_cap, p, n);
 }
 /* Audio payload, less whatever is still owed of the four bytes that open
@@ -606,7 +623,49 @@ static int aes_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
         const size_t k = c->aes_skip < n ? c->aes_skip : n;
         c->aes_skip -= k; p += k; n -= k;
     }
+    if (unwanted(c, 1)) return 0;
     return n ? buf_append(&c->aes, &c->aes_len, &c->aes_cap, p, n) : 0;
+}
+
+/* Let go of what is consumed: the bytes behind the decoder in the video
+ * stream and behind the reader in the audio one, the PTS marks before the
+ * next picture's, and the puts both streams are past (all but the last, whose
+ * count the ring's free space is reckoned from). Nothing was ever dropped, so
+ * every buffer grew by the whole movie as it played. Positions kept elsewhere
+ * are shifted with their buffer. Once at least a megabyte, and half the
+ * buffer, is behind, so each byte moves a bounded number of times. */
+enum { MPEG_COMPACT_MIN = 1 << 20 };
+static void mpeg_compact(mpeg_ctx *c) {
+    const size_t dv = c->es_pos;
+    if (dv >= MPEG_COMPACT_MIN && dv * 2 >= c->es_len) {
+        memmove(c->es, c->es + dv, c->es_len - dv);
+        c->es_len -= dv;
+        c->es_pos = 0;
+        const size_t k = c->vpts_next;
+        if (c->vpts) memmove(c->vpts, c->vpts + k, (c->nvpts - k) * sizeof *c->vpts);
+        c->nvpts -= k;
+        c->vpts_next = 0;
+        for (size_t i = 0; i < c->nvpts; i++)
+            c->vpts[i].es_off = c->vpts[i].es_off > dv ? c->vpts[i].es_off - dv : 0;
+        for (size_t i = 0; i < c->nputs; i++)
+            c->puts[i].es_len = c->puts[i].es_len > dv ? c->puts[i].es_len - dv : 0;
+    }
+    const size_t da = c->aes_pos;
+    if (da >= MPEG_COMPACT_MIN && da * 2 >= c->aes_len) {
+        memmove(c->aes, c->aes + da, c->aes_len - da);
+        c->aes_len -= da;
+        c->aes_pos = 0;
+        for (size_t i = 0; i < c->nputs; i++)
+            c->puts[i].aes_len = c->puts[i].aes_len > da ? c->puts[i].aes_len - da : 0;
+    }
+    const size_t passed = c->put_iv < c->put_ia ? c->put_iv : c->put_ia;
+    if (passed > 4096) {
+        const size_t k = passed - 1;
+        memmove(c->puts, c->puts + k, (c->nputs - k) * sizeof *c->puts);
+        c->nputs -= k;
+        c->put_iv -= k;
+        c->put_ia -= k;
+    }
 }
 
 /* Pull the video payload out of a run of program stream bytes, carrying
@@ -622,6 +681,7 @@ static int aes_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
  * IDR, which read as horizontal streaking in a decode whose early frames were
  * byte-perfect. */
 static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
+    mpeg_compact(c);
     /* Continue a payload that did not fit in the previous chunk. */
     if (c->es_pes_left) {
         const size_t n = c->es_pes_left < len ? c->es_pes_left : len;
@@ -1072,7 +1132,9 @@ static void hle_QueryStreamSize(void) {
 static uint32_t g_next_stream = 0x00010000u;
 
 static void hle_RegistStream(void) {
-    if (!ctx_of(psp_arg(0))) { psp_ret(0); return; }
+    mpeg_ctx *c = ctx_of(psp_arg(0));
+    if (!c) { psp_ret(0); return; }
+    if (psp_arg(1) <= 1) c->registered |= 1u << psp_arg(1);
     psp_ret(g_next_stream);
     g_next_stream += MPEG_STREAM_HANDLE_STEP;
 }
