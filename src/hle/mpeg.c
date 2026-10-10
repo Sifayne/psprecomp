@@ -117,6 +117,11 @@ typedef struct {
      * stream is read, so only it is kept, and only it consumes the ring. */
     unsigned registered;
     uint64_t put_total;
+    /* The last thread to find the ring full, in which vblank, and how many
+     * times it has there (see ring_poll_spins). */
+    uint32_t poll_thread;
+    uint64_t poll_vblank;
+    unsigned poll_count;
 
     void    *dec;          /* ISVCDecoder*, opaque here so the header stays out */
     int      dec_failed;
@@ -381,6 +386,22 @@ static int mpeg_nodrop(void) {
 }
 static mpeg_ctx *ctx_for_ringbuffer(uint32_t rb);
 
+/* Whether this poll of a full ring is a spin: the same thread finding it full
+ * more than MPEG_POLLS_PER_VBLANK times within one vblank. A reader waiting
+ * for room polls it hundreds of times a vblank; a frame loop polls it once or
+ * twice a frame. WipEout Pulse's main thread decodes the movie behind its
+ * menus and polls twice a frame, either side of a callback check; sleeping
+ * those polls took a third of its time and held it to 27 frames a second. */
+enum { MPEG_POLLS_PER_VBLANK = 4 };
+static int ring_poll_spins(mpeg_ctx *c) {
+    const uint32_t me = psp_sched_current();
+    const uint64_t vblank = psp_display_vblanks();
+    if (c->poll_thread != me || c->poll_vblank != vblank) {
+        c->poll_thread = me; c->poll_vblank = vblank; c->poll_count = 0;
+    }
+    return ++c->poll_count > MPEG_POLLS_PER_VBLANK;
+}
+
 /* Free packets.
  *
  * Not simply "all of them". The game reads this as how much of the buffer is
@@ -470,8 +491,9 @@ static void hle_RingbufferAvailableSize(void) {
              * wakes a second -- each a handoff between host threads -- still
              * cost the picture 1.5% of real time. Whole-ring size is not a
              * fair test of "full" -- the reader wants room for a read's
-             * worth -- so an eighth is. */
-            if (held * 8 >= (uint64_t)packets * 7) psp_sched_delay(8000);
+             * worth -- so an eighth is. Only a poll that spins sleeps: see
+             * ring_poll_spins. */
+            if (held * 8 >= (uint64_t)packets * 7 && ring_poll_spins(c)) psp_sched_delay(8000);
             psp_ret(packets - (uint32_t)held);
             return;
         }
