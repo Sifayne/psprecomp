@@ -465,6 +465,16 @@ void psp_umd_reset(void);
 void psp_utility_init(void);
 void psp_utility_register(void);
 
+/* The console's own settings, as a game reads them: sceUtilityGetSystemParamInt
+ * and String, sceImposeGetLanguageMode. The host sets them from the player's
+ * settings before the game starts; until then the PSP is set to English, with
+ * Cross confirming and "PSP" for a nickname. `language` is the PSP's
+ * numbering (PSPSDK psputility_sysparam.h: 0 Japanese, 1 English, ... 11
+ * Chinese, Simplified). */
+void psp_sysparam_set(int language, int confirm_cross, const char *nickname);
+int  psp_sysparam_language(void);
+int  psp_sysparam_confirm_cross(void);
+
 /* sceAtrac3plus without a decoder: the stream opens and its header is read,
  * and the decode itself fails -- the one failure this game's player handles.
  * A decoder that returns zero and writes nothing is the worse lie. See atrac.c. */

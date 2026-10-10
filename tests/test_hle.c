@@ -2033,6 +2033,63 @@ static void test_host_work_boundary(void) {
     CHECK(host_work_calls == 1, "unregistering disables callback");
 }
 
+/* The console's settings (PSPSDK psputility_sysparam.h ids): what the host
+ * set, what follows from it, and FAIL (0x80110103) for an id of the other
+ * kind or none. sceImposeGetLanguageMode reads them until the game sets its
+ * own mode. Original synthetic test. */
+static void test_system_params(void) {
+    const uint32_t OUT = 0x08802400u;
+    const uint32_t INT = 0xA5DA2406u, STR = 0x34B78343u, IGET = 0x24FD7BCFu, ISET = 0x36AA6E91u;
+    psp_clock_realtime(0);
+    psp_sysparam_set(1, 1, "PSP");
+    static const struct { uint32_t id, value; } en[] = {
+        { 2, 0 }, { 3, 0 }, { 4, 1 }, { 5, 1 }, { 6, 0 }, { 7, 0 }, { 8, 1 }, { 9, 1 },
+    };
+    for (size_t i = 0; i < sizeof en / sizeof *en; i++) {
+        psp_write32(OUT, 0xDEADBEEFu);
+        CHECK(call(INT, en[i].id, OUT, 0, 0) == 0 && psp_read32(OUT) == en[i].value,
+              "English: id %u reads %u, got %u", en[i].id, en[i].value, psp_read32(OUT));
+    }
+    psp_write32(OUT, 0xDEADBEEFu);
+    CHECK(call(INT, 1, OUT, 0, 0) == 0x80110103u && psp_read32(OUT) == 0xDEADBEEFu,
+          "the nickname is no integer");
+    CHECK(call(INT, 10, OUT, 0, 0) == 0x80110103u && call(INT, 0, OUT, 0, 0) == 0x80110103u,
+          "nor are ids past the documented ones");
+
+    psp_sysparam_set(0, 0, "\xe3\x82\xa2\xe3\x83\xa4's PSP");
+    call(INT, 8, OUT, 0, 0);
+    CHECK(psp_read32(OUT) == 0, "Japanese");
+    call(INT, 9, OUT, 0, 0);
+    CHECK(psp_read32(OUT) == 0, "Circle confirms");
+    call(INT, 4, OUT, 0, 0);
+    CHECK(psp_read32(OUT) == 0, "a Japanese date is YYYYMMDD");
+    call(INT, 5, OUT, 0, 0);
+    CHECK(psp_read32(OUT) == 0, "on a 24-hour clock");
+    psp_sysparam_set(4, 1, "Aya");
+    call(INT, 4, OUT, 0, 0);
+    CHECK(psp_read32(OUT) == 2, "a German date is DDMMYYYY");
+
+    char name[16];
+    memset(name, 0x55, sizeof name);
+    psp_mem_write_block(OUT, name, sizeof name);
+    CHECK(call(STR, 1, OUT, 16, 0) == 0, "the nickname reads");
+    psp_str(OUT, name, sizeof name);
+    CHECK(!strcmp(name, "Aya"), "as set, got '%s'", name);
+    psp_mem_write_block(OUT, "xxxxxxxx", 8);
+    CHECK(call(STR, 1, OUT, 3, 0) == 0 && psp_read8(OUT + 2) == 0 && psp_read8(OUT + 3) == 'x',
+          "cut to fit its buffer, terminated");
+    CHECK(call(STR, 8, OUT, 16, 0) == 0x80110103u, "the language is no string");
+
+    psp_sysparam_set(2, 1, "PSP");
+    call(IGET, OUT, OUT + 4, 0, 0);
+    CHECK(psp_read32(OUT) == 2 && psp_read32(OUT + 4) == 1, "impose reads the console's settings");
+    CHECK(call(ISET, 5, 0, 0, 0) == 0, "until the game sets its own");
+    call(IGET, OUT, OUT + 4, 0, 0);
+    CHECK(psp_read32(OUT) == 5 && psp_read32(OUT + 4) == 0, "which it then reads back");
+    psp_misc_reset();
+    psp_sysparam_set(1, 1, "PSP");
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -2076,6 +2133,7 @@ int main(void) {
     test_pool_free_pointers();
     test_waits_with_threads();
     test_host_work_boundary();
+    test_system_params();
 
     psp_mem_free();
 

@@ -147,6 +147,46 @@ int main(void) {
     assert(!psp_settings_assign(&s, "  WINDOW=0   INPUT=classic ", PSP_SOURCE_FILE, error));
     assert(!s.number[PSP_OPT_WINDOW] && !s.number[T_INPUT]);
 
+    /* The System page. Automatic language follows the locale (LC_ALL, then
+     * LC_MESSAGES, then LANG), English for one the PSP lacks; automatic
+     * confirm is Circle for Japanese only; the nickname is text the file
+     * keeps as written. */
+    {
+        psp_settings t = s;
+        unsetenv("LC_ALL"); unsetenv("LC_MESSAGES");
+        static const struct { const char *locale; int language; } loc[] = {
+            { "ja_JP.UTF-8", 0 }, { "en_GB.UTF-8", 1 }, { "fr_FR", 2 }, { "pt_BR.UTF-8", 7 },
+            { "ko_KR.UTF-8", 9 }, { "zh_TW.UTF-8", 10 }, { "zh_HK", 10 }, { "zh_CN.UTF-8", 11 },
+            { "C", 1 }, { "POSIX", 1 }, { "fil_PH", 1 }, { "", 1 },
+        };
+        for (size_t i = 0; i < sizeof loc / sizeof *loc; i++) {
+            setenv("LANG", loc[i].locale, 1);
+            assert(!psp_settings_resolve(&t, error));
+            assert(t.language == loc[i].language && t.confirm_cross == (loc[i].language != 0));
+        }
+        setenv("LC_ALL", "de_DE.UTF-8", 1); setenv("LANG", "ja_JP.UTF-8", 1);
+        assert(!psp_settings_resolve(&t, error) && t.language == 4);
+        unsetenv("LC_ALL");
+        assert(!psp_settings_set(&t, PSP_OPT_LANGUAGE, "ko", PSP_SOURCE_FILE, error));
+        assert(!psp_settings_resolve(&t, error) && t.language == 9 && t.confirm_cross);
+        assert(!psp_settings_set(&t, PSP_OPT_LANGUAGE, "ja", PSP_SOURCE_FILE, error));
+        assert(!psp_settings_set(&t, PSP_OPT_CONFIRM, "cross", PSP_SOURCE_FILE, error));
+        assert(!psp_settings_resolve(&t, error) && t.language == 0 && t.confirm_cross);
+        assert(psp_settings_set(&t, PSP_OPT_LANGUAGE, "jp", PSP_SOURCE_FILE, error));
+
+        assert(!strcmp(s.value[PSP_OPT_NICKNAME], "PSP"));
+        static const char *const good[] = { "Sif's PSP", "Aya = #1", "\xe3\x82\xa2\xe3\x83\xa4" };
+        for (size_t i = 0; i < sizeof good / sizeof *good; i++) {
+            assert(!psp_settings_set(&t, PSP_OPT_NICKNAME, good[i], PSP_SOURCE_FILE, error));
+            assert(!strcmp(t.value[PSP_OPT_NICKNAME], good[i]));
+        }
+        static const char *const bad[] = { " lead", "trail ", "tab\there", "two\nlines", "cut\xe3\x82",
+                                           "\xc0\x80", "\xff" };
+        for (size_t i = 0; i < sizeof bad / sizeof *bad; i++)
+            assert(psp_settings_set(&t, PSP_OPT_NICKNAME, bad[i], PSP_SOURCE_FILE, error));
+        setenv("LANG", "en_US.UTF-8", 1);
+    }
+
     /* print: options, the effective line with the title's part, its notes. */
     char dir[] = "/tmp/psp-settings-test-XXXXXX"; assert(mkdtemp(dir));
     char path[256], out[256], older[256];
@@ -156,7 +196,7 @@ int main(void) {
     assert(!psp_settings_set(&s, T_MOUSE, "1", PSP_SOURCE_FILE, error));
     assert(!psp_settings_resolve(&s, error));
     FILE *pf = fopen(out, "w"); assert(pf); psp_settings_print(&s, pf); fclose(pf);
-    assert(contains(out, "effective: renderer=software gamepad=classic window=1 realtime=1 free_look=0\n"));
+    assert(contains(out, "effective: renderer=software gamepad=classic window=1 realtime=1 language=1 confirm=cross free_look=0\n"));
     assert(contains(out, "note: mouse needs Modern\n"));
     assert(contains(out, "LAG                      = 0.5          [file]\n"));
 

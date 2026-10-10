@@ -122,14 +122,28 @@ static void hle_KernelMemset(void) {
 
 /* ---- sceImpose, sceOpenPSID -------------------------------------------------
  *
- * Both games import one call from each and test neither result beyond < 0.
- * sceImposeSetLanguageMode(lang, button) is "< 0 on error" (PSPSDK
- * src/impose/pspimpose.h); nothing here reads the mode back, so it is
- * accepted and not kept. sceOpenPSIDGetOpenPSID(PspOpenPSID *) fills a
- * 16-byte console id (PSPSDK src/openpsid/pspopenpsid.h); there is no
- * console, and any value invented here could end up tied to a save, so the
- * buffer is left as the game passed it -- what the unregistered call did. */
-static void hle_ImposeSetLanguageMode(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+ * sceImposeSetLanguageMode(lang, button) and GetLanguageMode(&lang, &button)
+ * set and read the language and button assignment the system's own overlay
+ * uses, "< 0 on error" (PSPSDK pspimpose_driver.h, which does not know the
+ * values). Until the game sets them they read the console's settings
+ * (psp_sysparam_set), the button taken in the system parameter's numbering,
+ * 1 for Cross confirming: unmeasured. What the game set is a save state's.
+ * sceOpenPSIDGetOpenPSID(PspOpenPSID *) fills a 16-byte console id (PSPSDK
+ * src/openpsid/pspopenpsid.h); there is no console, and any value invented
+ * here could end up tied to a save, so the buffer is left as the game passed
+ * it -- what the unregistered call did. */
+static int32_t g_impose_set, g_impose_lang, g_impose_button;
+static void hle_ImposeSetLanguageMode(void) {
+    g_impose_set = 1;
+    g_impose_lang = (int32_t)psp_arg(0);
+    g_impose_button = (int32_t)psp_arg(1);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+static void hle_ImposeGetLanguageMode(void) {
+    psp_write32(psp_arg(0), (uint32_t)(g_impose_set ? g_impose_lang : psp_sysparam_language()));
+    psp_write32(psp_arg(1), (uint32_t)(g_impose_set ? g_impose_button : psp_sysparam_confirm_cross()));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 static void hle_OpenPSIDGetOpenPSID(void)   { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 /* ---- the wall clock --------------------------------------------------------
@@ -1431,6 +1445,7 @@ void psp_misc_reset(void) {
     g_output2_until_ns = 0;
     memset(g_audio_gap, 0, sizeof g_audio_gap);
     g_audio_blocks = 0;
+    g_impose_set = g_impose_lang = g_impose_button = 0;
     psp_ctrl_replay_reset();
 }
 
@@ -1477,6 +1492,9 @@ static void misc_keep(void) {
     PSP_STATE_KEEP(g_read_frame);
     PSP_STATE_KEEP(g_audio);
     PSP_STATE_KEEP(g_output2_until_ns);
+    PSP_STATE_KEEP(g_impose_set);
+    PSP_STATE_KEEP(g_impose_lang);
+    PSP_STATE_KEEP(g_impose_button);
     static const psp_state_part part = { .name = "audiodump", .drop = audio_dump_drop };
     psp_state_register(&part);
     psp_ctrl_replay_keep();
@@ -1498,6 +1516,7 @@ void psp_misc_register(void) {
     psp_hle_register(0x1839852A, "Kernel_Library", "sceKernelMemcpy", hle_KernelMemcpy);
     psp_hle_register(0xA089ECA4, "Kernel_Library", "sceKernelMemset", hle_KernelMemset);
     psp_hle_register(0x36AA6E91, "sceImpose", "sceImposeSetLanguageMode", hle_ImposeSetLanguageMode);
+    psp_hle_register(0x24FD7BCF, "sceImpose", "sceImposeGetLanguageMode", hle_ImposeGetLanguageMode);
     psp_hle_register(0xC69BEBCE, "sceOpenPSID", "sceOpenPSIDGetOpenPSID", hle_OpenPSIDGetOpenPSID);
     psp_hle_register(0x27CC57F0, "UtilsForUser", "sceKernelLibcTime",         hle_LibcTime);
     psp_hle_register(0x91E4F6A7, "UtilsForUser", "sceKernelLibcClock",        hle_LibcClock);

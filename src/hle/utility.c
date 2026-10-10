@@ -7,10 +7,12 @@
 #include "psprecomp/os.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/state.h"
+#include "psprecomp/clock.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/stat.h>
 #ifndef _WIN32
 #include <sys/statvfs.h>
@@ -1657,6 +1659,85 @@ static int utility_load(psp_state_reader *r, char *why, size_t size) {
     return 0;
 }
 
+/* ---- the console's settings ----------------------------------------------
+ *
+ * What the PSP's System Settings hold, as sceUtilityGetSystemParamInt and
+ * String read them (PSPSDK psputility_sysparam.h). The player's settings give
+ * the language, the confirm button and the nickname (psp_sysparam_set). The
+ * rest follow from them, as unmeasured choices: the date in the order the
+ * language writes it, the clock 12-hour in English, ad hoc on any channel,
+ * WLAN power saving off. The time zone and daylight saving are the host's
+ * when the clock runs against wall time, and UTC on the deterministic clock,
+ * whose wall date is a fixed day (misc.c, wall_us). Not a save state's: they
+ * are the player's, and a state loaded under other settings takes those. */
+#define SYSPARAM_FAIL 0x80110103u   /* PSP_SYSTEMPARAM_RETVAL_FAIL */
+static int  g_sys_language = 1, g_sys_confirm_cross = 1;
+static char g_sys_nickname[128] = "PSP";
+
+void psp_sysparam_set(int language, int confirm_cross, const char *nickname) {
+    g_sys_language = language >= 0 && language <= 11 ? language : 1;
+    g_sys_confirm_cross = confirm_cross != 0;
+    snprintf(g_sys_nickname, sizeof g_sys_nickname, "%s", nickname && *nickname ? nickname : "PSP");
+}
+int psp_sysparam_language(void) { return g_sys_language; }
+int psp_sysparam_confirm_cross(void) { return g_sys_confirm_cross; }
+
+/* The host's offset from UTC outside daylight saving, in minutes, and whether
+ * daylight saving is in force now. */
+static void host_zone(int *minutes, int *dst) {
+    *minutes = *dst = 0;
+    if (!psp_clock_is_realtime()) return;
+    const time_t now = time(NULL);
+    struct tm tm;
+#ifndef _WIN32
+    if (!localtime_r(&now, &tm)) return;
+    *dst = tm.tm_isdst > 0;
+    *minutes = (int)(tm.tm_gmtoff / 60) - (*dst ? 60 : 0);
+#else
+    long west = 0;
+    if (localtime_s(&tm, &now) || _get_timezone(&west)) return;
+    *dst = tm.tm_isdst > 0;
+    *minutes = (int)(-west / 60);
+#endif
+}
+
+/* sceUtilityGetSystemParamInt(id, int *value): 0, or PSP_SYSTEMPARAM_RETVAL_FAIL
+ * for an id that is not an integer's (the nickname's, 1, among them). */
+static void hle_GetSystemParamInt(void) {
+    const uint32_t id = psp_arg(0), out = psp_arg(1);
+    const int lang = g_sys_language;
+    int v, dst, zone;
+    switch (id) {
+    case 2: v = 0; break;                                   /* ad hoc channel: automatic */
+    case 3: v = 0; break;                                   /* WLAN power save: off */
+    case 4: v = lang == 1 ? 1 : (lang == 0 || lang >= 9) ? 0 : 2; break; /* MMDDYYYY, YYYYMMDD, DDMMYYYY */
+    case 5: v = lang == 1; break;                           /* 12-hour in English, else 24 */
+    case 6: host_zone(&zone, &dst); v = zone; break;
+    case 7: host_zone(&zone, &dst); v = dst; break;
+    case 8: v = lang; break;
+    case 9: v = g_sys_confirm_cross; break;                 /* 1: Cross confirms, 0: Circle */
+    default: psp_ret(SYSPARAM_FAIL); return;
+    }
+    psp_write32(out, (uint32_t)v);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* sceUtilityGetSystemParamString(id, char *str, int len): the nickname (1),
+ * cut to fit len with its terminator; PSP_SYSTEMPARAM_RETVAL_FAIL for any
+ * other id. */
+static void hle_GetSystemParamString(void) {
+    const uint32_t id = psp_arg(0), out = psp_arg(1);
+    const int32_t len = (int32_t)psp_arg(2);
+    if (id != 1) { psp_ret(SYSPARAM_FAIL); return; }
+    if (len > 0) {
+        size_t n = strlen(g_sys_nickname);
+        if (n > (size_t)len - 1) n = (size_t)len - 1;
+        psp_mem_write_block(out, g_sys_nickname, (uint32_t)n);
+        psp_write8(out + (uint32_t)n, 0);
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 void psp_utility_register(void) {
     static const psp_state_part part = { .name = "utility", .refuse = utility_refuse, .save = utility_save, .load = utility_load };
     PSP_STATE_KEEP(g_savedata_state);
@@ -1676,4 +1757,6 @@ void psp_utility_register(void) {
     psp_hle_register(0x8874DBE0,"sceUtility","sceUtilitySavedataGetStatus",hle_SavedataGetStatus);
     psp_hle_register(0xD4B95FFB,"sceUtility","sceUtilitySavedataUpdate",hle_SavedataUpdate);
     psp_hle_register(0x9790B33C,"sceUtility","sceUtilitySavedataShutdownStart",hle_SavedataShutdownStart);
+    psp_hle_register(0xA5DA2406,"sceUtility","sceUtilityGetSystemParamInt",hle_GetSystemParamInt);
+    psp_hle_register(0x34B78343,"sceUtility","sceUtilityGetSystemParamString",hle_GetSystemParamString);
 }
