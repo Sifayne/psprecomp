@@ -19,7 +19,8 @@
 #include <stddef.h>
 #include <stdio.h>
 
-enum psp_option_type { PSP_OPTION_CHOICE, PSP_OPTION_NUMBER, PSP_OPTION_SIZE, PSP_OPTION_INTEGER };
+enum psp_option_type { PSP_OPTION_CHOICE, PSP_OPTION_NUMBER, PSP_OPTION_SIZE, PSP_OPTION_INTEGER,
+                       PSP_OPTION_TEXT };
 enum psp_settings_source {
     PSP_SOURCE_DEFAULT, PSP_SOURCE_FILE, PSP_SOURCE_ENV, PSP_SOURCE_COMMAND_LINE,
     PSP_SOURCE_PRESET = PSP_SOURCE_FILE  /* its name while the file held presets */
@@ -66,11 +67,12 @@ typedef struct {
 
 /* The player's options, the first PSP_PLAYER_OPTIONS of every psp_settings,
  * in the order of their pages: Display, Audio, Controller, Save states,
- * Advanced. WINDOW and REALTIME are hidden: the launcher starts games with a
- * window, and a headless run asks for real time itself. */
+ * System, Advanced. WINDOW and REALTIME are hidden: the launcher starts games
+ * with a window, and a headless run asks for real time itself. */
 enum psp_player_option {
     PSP_OPT_RESOLUTION, PSP_OPT_WINDOW_MODE, PSP_OPT_WINDOW_SIZE, PSP_OPT_DISPLAY,
     PSP_OPT_VOLUME, PSP_OPT_ACTIVE_PAD, PSP_OPT_STATE_LOAD, PSP_OPT_STATE_START,
+    PSP_OPT_LANGUAGE, PSP_OPT_CONFIRM, PSP_OPT_NICKNAME,
     PSP_OPT_RENDER, PSP_OPT_AUDIO_LEAD_MS, PSP_OPT_AUDIO_PREROLL_MS, PSP_OPT_MPEG_DECODE,
     PSP_OPT_WINDOW, PSP_OPT_REALTIME,
     PSP_PLAYER_OPTIONS
@@ -97,9 +99,12 @@ typedef struct {
     enum psp_settings_source source[PSP_SETTINGS_MAX];
     int width, height;                        /* WINDOW_SIZE's dimensions. */
     /* Derived once by psp_settings_resolve. The player's options decide
-     * render (1 software, 2 gl, 3 null), window and realtime; the pack's
-     * resolve hook decides gamepad (modern buttons), input and mouse. */
+     * render (1 software, 2 gl, 3 null), window and realtime, and the
+     * console's language (the PSP's numbering: 0 Japanese, 1 English, ...)
+     * and whether Cross confirms; the pack's resolve hook decides gamepad
+     * (modern buttons), input and mouse. */
     int render, gamepad, window, realtime;
+    int language, confirm_cross;
     int input, mouse;
     int title[PSP_SETTINGS_TITLE_DERIVED];    /* Indexed by the pack's own enum. */
     /* Bindings that differ from the title's defaults, from the file. */

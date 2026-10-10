@@ -114,6 +114,12 @@ static void stop_picks(const psp_settings *s, int id, picks *p) {
     pick(p, "Other...", "", 0);
 }
 
+/* Text: what it is now, and a way to type another. */
+static void text_picks(const psp_settings *s, int id, picks *p) {
+    pick(p, s->value[id], s->value[id], 1);
+    pick(p, "Change...", "", 0);
+}
+
 static void choice_picks(const psp_settings *s, int id, picks *p) {
     const psp_option_def *d = psp_settings_option(id);
     char value[PSP_SETTINGS_VALUE], label[PSP_SETTINGS_VALUE];
@@ -177,10 +183,11 @@ int pages_option(const psp_settings *s, int id, const pages_context *c, char *va
         int at = 0;
         const char *labels[1] = { "Desktop size" };
         psp_ui_choice(label, &at, labels, 1);
-    } else if (d->type == PSP_OPTION_CHOICE || d->stops || id == PSP_OPT_DISPLAY) {
+    } else if (d->type == PSP_OPTION_CHOICE || d->type == PSP_OPTION_TEXT || d->stops || id == PSP_OPT_DISPLAY) {
         static picks p;
         memset(&p, 0, sizeof p);
         if (id == PSP_OPT_DISPLAY) display_picks(s, &p);
+        else if (d->type == PSP_OPTION_TEXT) text_picks(s, id, &p);
         else if (d->stops) stop_picks(s, id, &p);
         else choice_picks(s, id, &p);
         const char *labels[CHOICES_MAX];
@@ -198,6 +205,8 @@ int pages_option(const psp_settings *s, int id, const pages_context *c, char *va
     if (other.id == id) {
         char hint[160];
         if (d->type == PSP_OPTION_SIZE) snprintf(hint, sizeof hint, "WIDTHxHEIGHT, such as 1920x1080");
+        else if (d->type == PSP_OPTION_TEXT)
+            snprintf(hint, sizeof hint, "Up to %d bytes, with no spaces at either end", PSP_SETTINGS_VALUE - 1);
         else snprintf(hint, sizeof hint, "A number from %g to %g%s%s", d->min, d->max,
                       d->special ? ", or " : "", d->special ? d->special : "");
         const int answer = psp_ui_ask_text(d->label, hint, other.text, sizeof other.text, "Use", "Cancel");

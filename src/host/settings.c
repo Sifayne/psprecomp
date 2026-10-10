@@ -42,6 +42,16 @@ const psp_option_def psp_player_options[PSP_PLAYER_OPTIONS] = {
     [PSP_OPT_STATE_START] = C(STATE_START,"When the game starts","Save states",
         "Start fresh begins at the game's own start. Continue where I quit saves the game as it is when you quit, and loads it the next time the game starts.",
         "fresh","fresh|continue","Start fresh|Continue where I quit",.flags=PSP_OPTION_LIVE),
+    [PSP_OPT_LANGUAGE] = C(LANGUAGE,"Language","System",
+        "The language the game is told the PSP is set to. Automatic follows this computer's language, or English when the PSP has none like it. A game can only show the languages it was made with.",
+        "auto","auto|ja|en|fr|es|de|it|nl|pt|ru|ko|zh-hant|zh-hans",
+        "Automatic|Japanese|English|French|Spanish|German|Italian|Dutch|Portuguese|Russian|Korean|Chinese (Traditional)|Chinese (Simplified)"),
+    [PSP_OPT_CONFIRM] = C(CONFIRM,"Confirm button","System",
+        "Which button the game is told confirms, as a PSP's own setting does. Automatic is Circle when the language is Japanese and Cross otherwise. Some games keep their own region's button whatever this says.",
+        "auto","auto|cross|circle","Automatic|Cross|Circle"),
+    [PSP_OPT_NICKNAME] = {.key="NICKNAME",.env="PSPRECOMP_NICKNAME",.label="Nickname",.page="System",
+        .help="The name games read as the PSP's owner, shown in multiplayer and some saves.",
+        .type=PSP_OPTION_TEXT,.dflt="PSP"},
     [PSP_OPT_RENDER] = C(RENDER,"Renderer","Advanced",
         "Automatic picks OpenGL when a setting needs it, otherwise software. Software is the reference renderer. Null is for diagnostics and is not offered in the launcher.",
         "auto","auto|software|gl|null","Automatic|Software|OpenGL|Null (diagnostic)"),
@@ -134,6 +144,21 @@ static int listed(const char *list, const char *key) {
     return 0;
 }
 
+/* A value the preferences file keeps as written: well-formed UTF-8, no
+ * control characters (a line ends at a newline), and nothing for the
+ * reader's trim to take from either end. */
+static int text_ok(const char *v) {
+    const unsigned char *p = (const unsigned char *)v;
+    if (isspace(p[0]) || isspace(p[strlen(v) - 1])) return 0;
+    while (*p) {
+        if (*p < 0x20 || *p == 0x7F) return 0;
+        int more = *p < 0x80 ? 0 : (*p & 0xE0) == 0xC0 ? 1 : (*p & 0xF0) == 0xE0 ? 2 : (*p & 0xF8) == 0xF0 ? 3 : -1;
+        if (more < 0 || (*p & 0xFE) == 0xC0) return 0;
+        for (p++; more--; p++) if ((*p & 0xC0) != 0x80) return 0;
+    }
+    return 1;
+}
+
 int psp_settings_set(psp_settings *s, int id, const char *value,
                      enum psp_settings_source source, char *error) {
     const psp_option_def *d = psp_settings_option(id);
@@ -167,6 +192,11 @@ int psp_settings_set(psp_settings *s, int id, const char *value,
             snprintf(error, PSP_SETTINGS_ERROR, "%s: expected %s, got '%s'", d->key, d->choices, value);
             return -1;
         }
+        snprintf(canonical, sizeof canonical, "%s", value);
+    } else if (d->type == PSP_OPTION_TEXT) {
+        if (!text_ok(value))
+            return fail(error, d->key, "expected UTF-8 text with no control characters, "
+                                       "and no spaces at either end");
         snprintf(canonical, sizeof canonical, "%s", value);
     } else if (d->type == PSP_OPTION_SIZE) {
         char *end; errno = 0;
@@ -300,6 +330,24 @@ int psp_settings_env(psp_settings *s, char *error) {
     *s = next; return 0;
 }
 
+/* The PSP's language nearest this computer's: the locale's language from
+ * LC_ALL, LC_MESSAGES or LANG, in that order, by its first letters, and
+ * English for any the PSP does not have ("C" and "POSIX" among them).
+ * Chinese is Traditional for Taiwan, Hong Kong and Macau, and for a locale
+ * that names the script, Simplified otherwise. */
+static int host_language(void) {
+    const char *v = NULL;
+    static const char *const vars[] = { "LC_ALL", "LC_MESSAGES", "LANG" };
+    for (int i = 0; i < 3 && !(v && *v); i++) v = getenv(vars[i]);
+    if (!v || !*v) return 1;
+    static const char *const codes[] = { "ja", "en", "fr", "es", "de", "it", "nl", "pt", "ru", "ko" };
+    for (int i = 0; i < 10; i++)
+        if (!strncmp(v, codes[i], 2) && !isalpha((unsigned char)v[2])) return i;
+    if (!strncmp(v, "zh", 2) && !isalpha((unsigned char)v[2]))
+        return strstr(v, "_TW") || strstr(v, "_HK") || strstr(v, "_MO") || strstr(v, "Hant") ? 10 : 11;
+    return 1;
+}
+
 int psp_settings_resolve(psp_settings *s, char *error) {
     const psp_settings_schema *sc = need_schema();
     int enhanced = 0;
@@ -313,6 +361,8 @@ int psp_settings_resolve(psp_settings *s, char *error) {
     if (sc->resolve && sc->resolve(s, error)) return -1;
     s->window = s->number[PSP_OPT_WINDOW] != 0 || s->number[PSP_OPT_WINDOW_MODE] != 0 || s->render == 2;
     s->realtime = s->window || s->number[PSP_OPT_REALTIME] != 0;
+    s->language = s->number[PSP_OPT_LANGUAGE] ? (int)s->number[PSP_OPT_LANGUAGE] - 1 : host_language();
+    s->confirm_cross = s->number[PSP_OPT_CONFIRM] ? s->number[PSP_OPT_CONFIRM] == 1 : s->language != 0;
     return 0;
 }
 
@@ -340,9 +390,10 @@ void psp_settings_print(const psp_settings *s, FILE *out) {
     }
     for (int i = 0; i < s->bind_count; i++)
         fprintf(out, "bind.%-19s = %-12s [file]\n", s->bind[i].key, s->bind[i].value);
-    fprintf(out, "effective: renderer=%s gamepad=%s window=%d realtime=%d",
+    fprintf(out, "effective: renderer=%s gamepad=%s window=%d realtime=%d language=%d confirm=%s",
             s->render == 2 ? "gl" : s->render == 3 ? "null" : "software",
-            s->gamepad ? "modern" : "classic", s->window, s->realtime);
+            s->gamepad ? "modern" : "classic", s->window, s->realtime,
+            s->language, s->confirm_cross ? "cross" : "circle");
     if (sc->print_effective) sc->print_effective(s, out);
     fputc('\n', out);
     if (sc->print_notes) sc->print_notes(s, out);

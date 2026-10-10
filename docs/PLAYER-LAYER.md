@@ -1357,6 +1357,11 @@ thread ends.
   - volume (Audio);
   - the active controller (Controller);
   - both save-state options (Save states);
+  - the console's language, confirm button and nickname, as a game reads
+    them through `sceUtilityGetSystemParamInt` and `String` and
+    `sceImposeGetLanguageMode` (System). The language follows the host's
+    locale when Automatic, and the confirm button the language (Circle for
+    Japanese only). The nickname is the one text option;
   - renderer, audio lead and preroll, and the intro movie (Advanced);
   - the hidden WINDOW and REALTIME.
 
@@ -1382,6 +1387,7 @@ thread ends.
 - **`src/host/pages.c`** draws one option's row for the menu and the
   launcher alike:
   - choices, and stops with *Other...* for a typed value;
+  - text, with *Change...* to type another;
   - the connected displays, and window sizes;
   - sliders, logarithmic across decades.
 

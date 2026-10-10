@@ -862,6 +862,9 @@ int main(int argc, char **argv) {
     /* 2 — registration and firmware. */
     psp_recomp_register();
     psp_hle_init();
+    /* The console's own settings, as the game will read them: the player's
+     * System page. */
+    psp_sysparam_set(settings.language, settings.confirm_cross, settings.value[PSP_OPT_NICKNAME]);
     if (psp_interrupt_set_module(li.lo, li.hi, li.gp) != 0) {
         fprintf(stderr, "cannot register module interrupt context\n");
         return 1;
