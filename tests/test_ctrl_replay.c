@@ -473,6 +473,23 @@ static void test_complete_input_round_trip(void) {
     unload();
 }
 
+/* A long recording: more events than the list's first allocation (4096),
+ * every one delivered, the last included. A recorded WipEout race had 4402. */
+static void test_long_scenario(void) {
+    FILE *f = fopen("t-long.pad", "w");
+    if (!f) { CHECK(0, "cannot write t-long.pad"); return; }
+    for (int i = 0; i < 2500; i++) fprintf(f, "@%d down cross\n@%d up cross\n", 2 * i + 1, 2 * i + 2);
+    fprintf(f, "@5001 down start\n");
+    fclose(f);
+    load("t-long.pad");
+    int presses = 0; uint32_t b = 0;
+    for (int i = 1; i <= 5001; i++) { b = poll_pad(NULL, NULL); if (b & BTN_CROSS) presses++; }
+    CHECK(presses == 2500, "all 2500 presses of 5001 events delivered: %d", presses);
+    CHECK(b == BTN_START, "and the last event, at poll 5001: %08X", (unsigned)b);
+    unload();
+    remove("t-long.pad");
+}
+
 /* A recording's facts: the date and time zone its session saw. The recorder
  * writes each the first time the guest asks, and a replay adopts them at
  * parse, wherever they stand in the file. */
@@ -523,6 +540,7 @@ int main(void) {
     test_read_counts_vblanks();
     test_complete_input_round_trip();
     test_session_facts();
+    test_long_scenario();
 
     remove("t-directives.pad"); remove("t-bad.pad"); remove("t-tap.pad");
     remove("t-catchup.pad"); remove("t-lanes.pad"); remove("t-host.pad");
