@@ -649,32 +649,42 @@ static void test_texture_lod_rules(void) {
     psp_tex_state t = { 0 };
 
     t.lod_mode = 0;                              /* AUTO */
-    CHECK(psp_render_lod16(&t, 4.0f) == 32,
-          "auto LOD at 4 texels/pixel: %d", psp_render_lod16(&t, 4.0f));
-    CHECK(psp_render_lod16(&t, 0.5f) == -16,
-          "auto LOD at half a texel/pixel: %d", psp_render_lod16(&t, 0.5f));
+    CHECK(psp_render_lod16(&t, 4.0f, 1.0f) == 32,
+          "auto LOD at 4 texels/pixel: %d", psp_render_lod16(&t, 4.0f, 1.0f));
+    CHECK(psp_render_lod16(&t, 0.5f, 1.0f) == -16,
+          "auto LOD at half a texel/pixel: %d", psp_render_lod16(&t, 0.5f, 1.0f));
     t.lod_bias16 = -7;
-    CHECK(psp_render_lod16(&t, 4.0f) == 25,
+    CHECK(psp_render_lod16(&t, 4.0f, 1.0f) == 25,
           "auto LOD applies signed bias after quantising: %d",
-          psp_render_lod16(&t, 4.0f));
+          psp_render_lod16(&t, 4.0f, 1.0f));
 
     t.lod_mode = 1;                              /* CONST */
-    CHECK(psp_render_lod16(&t, 123.0f) == -7,
-          "constant LOD ignores the gradient: %d", psp_render_lod16(&t, 123.0f));
+    CHECK(psp_render_lod16(&t, 123.0f, 1.0f) == -7,
+          "constant LOD ignores the gradient: %d", psp_render_lod16(&t, 123.0f, 1.0f));
     t.lod_mode = 3;                              /* undefined, measured as CONST */
-    CHECK(psp_render_lod16(&t, 123.0f) == -7,
-          "mode 3 follows constant LOD: %d", psp_render_lod16(&t, 123.0f));
+    CHECK(psp_render_lod16(&t, 123.0f, 1.0f) == -7,
+          "mode 3 follows constant LOD: %d", psp_render_lod16(&t, 123.0f, 1.0f));
 
-    t.lod_mode = 2;                              /* SLOPE */
+    t.lod_mode = 2;                              /* SLOPE: log2(2 slope W) */
+    t.lod_bias16 = 0;
+    t.lod_slope = 2.0f;
+    CHECK(psp_render_lod16(&t, 123.0f, 1.0f) == 32,
+          "slope 2 at W 1 is level 2, the measured point: %d", psp_render_lod16(&t, 123.0f, 1.0f));
     t.lod_bias16 = -3;
     t.lod_slope = 2.25f;
-    CHECK(psp_render_lod16(&t, 123.0f) == 33,
-          "slope LOD plus bias: %d", psp_render_lod16(&t, 123.0f));
+    CHECK(psp_render_lod16(&t, 123.0f, 1.0f) == 31,
+          "slope LOD plus bias: %d", psp_render_lod16(&t, 123.0f, 1.0f));
+    /* WipEout Pulse: slope 1/256 and a bias of +3 1/4 read level 0 up to
+     * W of about 13, and a level more for every doubling after that. */
+    t.lod_slope = 1.0f / 256.0f;
+    t.lod_bias16 = 52;
+    CHECK(psp_render_lod16(&t, 123.0f, 8.0f) == -12 && psp_render_lod16(&t, 123.0f, 512.0f) == 84,
+          "slope LOD follows W: %d at 8, %d at 512",
+          psp_render_lod16(&t, 123.0f, 8.0f), psp_render_lod16(&t, 123.0f, 512.0f));
     t.lod_bias16 = 0;
     t.lod_slope = -0.1f;
-    CHECK(psp_render_lod16(&t, 1.0f) == -2,
-          "negative slope LOD floors rather than truncates: %d",
-          psp_render_lod16(&t, 1.0f));
+    CHECK(psp_render_lod16(&t, 1.0f, 1.0f) < 0,
+          "a negative slope reads level 0: %d", psp_render_lod16(&t, 1.0f, 1.0f));
 }
 
 /* A real two-level chain, not just the LOD arithmetic. Level zero is black,

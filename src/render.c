@@ -524,9 +524,14 @@ static uint32_t sample_filtered(float u, float v, int linear) {
  * The level of detail is a count of sixteenths. In AUTO mode it is log2 of
  * the texel-per-pixel ratio -- the larger of the two axes: the test's
  * "Minify 4x W", which shrinks only the width, lands on level 2 -- plus the
- * bias; CONST is the bias alone; SLOPE is the slope register plus the bias
- * (the test sets a slope of 2.0 and reads level 2 with no bias, which this
- * fits and log2 would not); the undefined mode 3 measures exactly like
+ * bias; CONST is the bias alone; SLOPE is log2 of twice the slope register
+ * times the primitive's clip-space W, plus the bias. The test sets a slope of
+ * 2.0 on through-mode sprites (W 1) and reads level 2 with no bias; the depth
+ * term is not measured. It is what WipEout Pulse needs: it sets a slope of
+ * 1/256 and per-draw biases from +2.3 to +3.9, which only give a sharp ship and
+ * crowd near the camera if W pulls the level down there. Without it those
+ * drew from their 16x16 levels -- a crowd of coloured blocks and a ship
+ * without its livery. The undefined mode 3 measures exactly like
  * CONST. The level is the floor, capped at TEX_MODE's top
  * level, and below zero is zero. With a mip-linear minification filter the
  * next level is blended in by the fraction, exact to the sixteenth: bias
@@ -538,15 +543,23 @@ static uint32_t sample_filtered(float u, float v, int linear) {
  * The level is chosen once per primitive, from the primitive's own texture
  * gradient, not per pixel. Within a level the filter is the min filter when
  * minifying and the mag filter when magnifying. */
-int psp_render_lod16(const psp_tex_state *t, float rho) {
+int psp_render_lod16(const psp_tex_state *t, float rho, float w) {
     if (!t) return 0;
     int lod;
     switch (t->lod_mode) {
     case 0:  lod = (rho > 0.0f) ? (int)floorf(log2f(rho) * 16.0f) : -4096; break;
-    case 2:  lod = (int)floorf(t->lod_slope * 16.0f); break;
+    case 2: {
+        const float s = 2.0f * t->lod_slope * w;
+        lod = (s > 0.0f) ? (int)floorf(log2f(s) * 16.0f) : -4096;
+        break;
+    }
     default: lod = 0; break;   /* CONST; and the undefined mode 3 measures the same */
     }
     return lod + t->lod_bias16;
+}
+
+float psp_render_vertex_w(const psp_vertex *v) {
+    return v && v->inv_w > 0.0f ? 1.0f / v->inv_w : 1.0f;
 }
 
 static uint32_t sample_level(float u, float v, int L, int linear) {
@@ -1425,7 +1438,8 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             const float dudx = (du1 * e2y - du2 * e1y) / det, dudy = (du2 * e1x - du1 * e2x) / det;
             const float dvdx = (dv1 * e2y - dv2 * e1y) / det, dvdy = (dv2 * e1x - dv1 * e2x) / det;
             const float rx = sqrtf(dudx * dudx + dvdx * dvdx), ry = sqrtf(dudy * dudy + dvdy * dvdy);
-            lod16 = psp_render_lod16(&g_tex, rx > ry ? rx : ry);
+            const float w = (psp_render_vertex_w(a) + psp_render_vertex_w(b) + psp_render_vertex_w(c)) / 3.0f;
+            lod16 = psp_render_lod16(&g_tex, rx > ry ? rx : ry, w);
         }
     }
 
@@ -1565,7 +1579,8 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
     int lod16 = 0;
     if (textured) {
         const float rx = fabsf(du) * 16.0f, ry = fabsf(dv) * 16.0f;
-        lod16 = psp_render_lod16(&g_tex, rx > ry ? rx : ry);
+        lod16 = psp_render_lod16(&g_tex, rx > ry ? rx : ry,
+                                 (psp_render_vertex_w(a) + psp_render_vertex_w(b)) * 0.5f);
     }
 
     for (int y = py0; y < py1; y++) {
@@ -1789,7 +1804,8 @@ int psp_render_line_lod16(const psp_tex_state *t,
     const float dx = fabsf((float)b->x - (float)a->x) / PSP_SUBPX;
     const float dy = fabsf((float)b->y - (float)a->y) / PSP_SUBPX;
     const float extent = dx > dy ? dx : dy;
-    return psp_render_lod16(t, extent ? hypotf(b->u - a->u, b->v - a->v) / extent : 1);
+    return psp_render_lod16(t, extent ? hypotf(b->u - a->u, b->v - a->v) / extent : 1,
+                            (psp_render_vertex_w(a) + psp_render_vertex_w(b)) * 0.5f);
 }
 
 static void sw_point_sample(const psp_vertex *v, void *opaque) {
@@ -1819,7 +1835,9 @@ static void sw_draw(int prim, const psp_vertex *v, int count) {
     const uint64_t t0 = now_ns();
     switch (prim) {
     case PSP_PRIM_POINTS: {
-        int lod16 = psp_render_lod16(&g_tex, 1.0f);
+        float w = 0.0f;
+        for (int i = 0; i < count; i++) w += psp_render_vertex_w(&v[i]);
+        int lod16 = psp_render_lod16(&g_tex, 1.0f, count ? w / (float)count : 1.0f);
         for (int i = 0; i < count; i++) sw_point_sample(&v[i], &lod16);
         break;
     }

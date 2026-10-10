@@ -695,8 +695,42 @@ static void test_run_on_a_parked_thread(void) {
     CHECK(owner_resumed, "the parked thread did not carry on after serving");
 }
 
+/* The main context serves a request while it drains: the boot thread runs
+ * the game's entry and may hold what is its alone (the GL context). And a
+ * guest thread's host thread, as it ends, calls the host exit hook on itself
+ * first. */
+#define ENTRY_ASK_MAIN 0x0000F200u
+#define UID_ASK_MAIN   0x0004000Bu
+static PSP_THREAD_LOCAL int t_main_host;
+static int served_on_main, exit_hooks, exit_hook_on_own;
+static void serve_on_main(void) { served_on_main = t_main_host; }
+static void body_ask_main(void) {
+    t_owner_host = 2;
+    psp_sched_run_on(0, serve_on_main);       /* uid 0: the main context */
+}
+static void exit_hook(void) { exit_hooks++; exit_hook_on_own |= t_owner_host == 2; }
+
+static void test_main_context_serves_and_exits_are_hooked(void) {
+    psp_sched_reset();
+    psp_sched_set_threading(1);
+    served_on_main = exit_hooks = exit_hook_on_own = 0;
+    t_main_host = 1;
+    psp_sched_set_host_exit_hook(exit_hook);
+    CHECK(psp_sched_spawn(UID_ASK_MAIN, ENTRY_ASK_MAIN, FAKE_SP, 0, 0, 0, 30) == 0,
+          "spawning the asker failed");
+    const int live = psp_sched_drain(5);
+    psp_sched_join_all();
+    psp_sched_set_host_exit_hook(NULL);
+    t_main_host = 0;
+    CHECK(live == 0, "%d thread(s) still alive", live);
+    CHECK(served_on_main, "the draining main context did not run the request on its host thread");
+    CHECK(exit_hooks == 1 && exit_hook_on_own,
+          "the exit hook ran %d time(s), on the ending thread's host thread: %d", exit_hooks, exit_hook_on_own);
+}
+
 int main(void) {
     psp_register(ENTRY_HOST_OWNER, body_host_owner);
+    psp_register(ENTRY_ASK_MAIN, body_ask_main);
     psp_register(ENTRY_HOST_ASKER, body_host_asker);
     psp_register(ENTRY_Q_C + 0x30, body_st);
     psp_register(ENTRY_Q_C + 0x40, body_st_hi);
@@ -737,6 +771,7 @@ int main(void) {
     test_dead_slots_are_reused();
     test_thread_counters();
     test_run_on_a_parked_thread();
+    test_main_context_serves_and_exits_are_hooked();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

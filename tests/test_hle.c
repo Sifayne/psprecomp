@@ -1919,8 +1919,10 @@ static void test_audio_output2(void) {
     psp_audio_set_output(output2_sink);
     psp_audio_set_pending(output2_pending);
     output2_sink_calls = output2_pending_frames = 0;
+    /* Each answers its sample count, as sceAudioSRCOutputBlocking does
+     * (uofw audio.c): WipEout Pulse's mixer checks for it. */
     for (int i=0; i<12; i++)
-        CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 0, "sink accepts each buffer exactly once");
+        CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 512, "sink accepts each buffer exactly once");
     CHECK(output2_sink_calls == 12, "all buffers delivered");
     psp_clock_advance_to(1000000);
     CHECK(call(rest, 0, 0, 0, 0) == 6144, "guest time does not consume a device queue");
@@ -1933,7 +1935,7 @@ static void test_audio_output2(void) {
     CHECK(call(release, 0, 0, 0, 0) == 0, "release after device drains");
     psp_audio_set_output(NULL);
     CHECK(call(reserve, 512, 0, 0, 0) == 0, "reserve without device");
-    CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 0, "headless transfer starts");
+    CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 512, "headless transfer starts");
     const uint64_t start = psp_clock_peek();
     psp_clock_advance_to(start + 6000);
     uint32_t remaining = call(rest, 0, 0, 0, 0);
@@ -1999,6 +2001,32 @@ static void test_umd_activation_callback(void) {
           "unregistration prevents later notifications");
     call(0xEDBA5844, cb, 0, 0, 0);
     psp_umd_reset();
+}
+
+/* The Memory Stick devctls of PSPSDK's pspmscm.h: registering an
+ * insert/eject callback answers 0 and raises "inserted" (arg2 1), the
+ * inserted query writes 1, and a name only an emulator claims still fails. */
+static void test_ms_devctl(void) {
+    psp_threadman_reset();
+    umd_hits = 0;
+    memset(umd_seen, 0, sizeof umd_seen);
+    psp_register(0x08802000, umd_callback);
+    const uint32_t cb = call(0xE81CAF8F, guest_name("MS probe"), 0x08802000, 0x2468ace0, 0);
+    CHECK((int32_t)cb >= 0, "MS callback creation");
+    const uint32_t box = 0x08805000u, dev = 0x08805100u;
+    psp_write32(box, cb);
+    const char *fat = "fatms0:";
+    for (uint32_t i = 0; ; i++) { psp_write8(dev + i, (uint8_t)fat[i]); if (!fat[i]) break; }
+    CHECK(call7(0x54F5FB11, dev, 0x02415821, box, 4, 0, 0, 0) == 0, "MS callback registration answers 0");
+    CHECK(call(0x349D6D6C, 0, 0, 0, 0) == 1 && umd_hits == 1, "registration raises the callback");
+    CHECK(umd_seen[0] == 1 && umd_seen[1] == 1 && umd_seen[2] == 0x2468ace0, "count 1, event inserted, common");
+    CHECK(call7(0x54F5FB11, dev, 0x02415822, box, 4, 0, 0, 0) == 0, "MS callback unregistration answers 0");
+    psp_write32(box + 4, 0);
+    CHECK(call7(0x54F5FB11, guest_name("mscmhc0:"), 0x02025806, 0, 0, box + 4, 4, 0) == 0 &&
+          psp_read32(box + 4) == 1, "a stick is inserted");
+    CHECK(call7(0x54F5FB11, guest_name("kemulator:"), 0x00000003, 0, 0, 0, 0, 0) == 0x80010013,
+          "an emulator's device is still no device");
+    call(0xEDBA5844, cb, 0, 0, 0);
 }
 
 /* Original host-interface test: a completed outer call may offer a scheduling
@@ -2103,6 +2131,7 @@ int main(void) {
     test_sysmem();
     test_audio_output2();
     test_umd_activation_callback();
+    test_ms_devctl();
     test_semaphores();
     test_create_attributes();
     test_event_flags();

@@ -344,10 +344,14 @@ size_t psp_render_decode_level_padded(const psp_tex_state *t, int level,
 
 /* Resolve the PSP's per-primitive level of detail to a signed count of
  * sixteenths. `rho` is the greatest texture-coordinate gradient in texels per
- * screen pixel. Keeping this rule in the runtime lets software and GPU
- * backends make the same AUTO / CONST / SLOPE decision before their samplers
- * choose and blend mip levels. */
-int psp_render_lod16(const psp_tex_state *t, float rho);
+ * screen pixel; `w` is the primitive's clip-space W, the mean of
+ * psp_render_vertex_w over its vertices, which SLOPE mode scales by. Keeping
+ * this rule in the runtime lets software and GPU backends make the same
+ * AUTO / CONST / SLOPE decision before their samplers choose and blend mip
+ * levels. */
+int psp_render_lod16(const psp_tex_state *t, float rho, float w);
+/* A vertex's clip-space W: 1/inv_w, and 1 for through-mode geometry. */
+float psp_render_vertex_w(const psp_vertex *v);
 
 /* One-pixel primitives use explicit coverage, not the host API's line rules.
  * Walk a half-open segment, clipped to inclusive pixel bounds. Each callback
