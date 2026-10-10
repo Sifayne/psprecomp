@@ -529,6 +529,7 @@ static struct {
     int blend_misses;
     uint64_t unsupported_stencil_draws;
     uint64_t partial_pixel_masks;          /* PMSK bytes other than 00 and FF */
+    uint64_t rt_shrinks;                   /* targets cut back to a neighbour */
     uint64_t stencil_draws, stencil_imports, stencil_exports;
 
     /* Texture state as the interpreter last set it, plus what is bound. */
@@ -1691,14 +1692,85 @@ static int rt_prepare_shape(int i, int stride, int fmt, int w, int h, int inheri
     return rt_allocate(r, inherit);
 }
 
-/* The GE's target, shaped by its stride, format and scissor. */
+/* The GE packs surfaces end to end, so a target ends where the next one
+ * that has been drawn into begins, however tall the scissor says it is.
+ * WipEout Pulse keeps two 256x136 half-resolution surfaces and its 128x128
+ * countdown screen back to back at 0x04110000, 0x04132000 and 0x04154000,
+ * and draws the first two under a full-screen scissor. Sized 480x272 from
+ * it, the second reached over the countdown screen, its readbacks wrote over
+ * it, and the screen over the start line drew black; every write into the
+ * overlap also marked both targets for a CPU import. */
+/* A display-sized target keeps every row the screen shows: a target that
+ * starts inside those is a window onto the same surface, not the next one.
+ * WipEout Pulse draws its music ticker into one 249 rows down each display
+ * buffer; cut back to it, the display buffers were re-grown and cut again
+ * every frame. */
+static int rt_min_rows(int stride, int h) {
+    return stride >= g.w ? (h < g.h ? h : g.h) : 1;
+}
+
+static int rt_rows_before_next(int i, uint32_t addr, int stride, int fmt, int h) {
+    const uint64_t row = (uint64_t)stride * (fmt == 3 ? 4u : 2u);
+    if (!row) return h;
+    const int least = rt_min_rows(stride, h);
+    for (int k = 0; k < g.n_rts; k++) {
+        const rendertarget *o = &g.rts[k];
+        if (k == i || !o->configured || o->addr <= addr) continue;
+        const uint64_t gap = o->addr - addr;
+        if (gap >= row * (uint64_t)least && gap < row * (uint64_t)h) h = (int)(gap / row);
+    }
+    return h;
+}
+
+/* Re-shape a configured target smaller, keeping what it holds. */
+static int rt_shrink(int i, int stride, int fmt, int w, int h) {
+    rendertarget *r = &g.rts[i];
+    if (g.rt_shrinks < 8)
+        fprintf(stderr, "gl: target %08X cut back from %dx%d to %dx%d (stride %d, format %d)\n",
+                r->addr, r->guest_w, r->guest_h, w, h, stride, fmt);
+    if (r->dirty || r->cpu_pending) readback_rt(i);
+    rt_release(r);
+    g.rt_shrinks++;
+    return rt_prepare_shape(i, stride, fmt, w, h, 1);
+}
+
+/* An older target that covers a newer one's start gives it the rows. */
+static void rt_yield_to(int i) {
+    const uint32_t start = g.rts[i].addr;
+    for (int k = 0; k < g.n_rts; k++) {
+        const rendertarget *o = &g.rts[k];
+        if (k == i || !o->configured || o->addr >= start) continue;
+        const uint64_t row = (uint64_t)o->stride * (o->fmt == 3 ? 4u : 2u);
+        if (!row || (uint64_t)o->addr + row * (uint64_t)o->guest_h <= start) continue;
+        const int rows = (int)((start - o->addr) / row);
+        if (rows >= rt_min_rows((int)o->stride, o->guest_h))
+            rt_shrink(k, (int)o->stride, o->fmt, o->guest_w, rows);
+    }
+}
+
+/* The GE's target, shaped by its stride, format and scissor. A row is no
+ * wider than its stride -- past it the GE is writing the next row -- and the
+ * target stops at the next one (rt_rows_before_next). */
 static int rt_prepare(int i) {
     const int stride = g.target_stride ? (int)g.target_stride : g.w;
     int w = stride, h = g.sc_valid ? g.sc_y1 + 1 : g.h;
     if (g.sc_valid && g.sc_x1 + 1 > w) w = g.sc_x1 + 1;
     if (w < 1) w = g.w;
     if (h < 1) h = g.h;
-    return rt_prepare_shape(i, stride, g.target_fmt, w, h, 1);
+    if (w > stride) w = stride;
+    h = rt_rows_before_next(i, g.rts[i].addr, stride, g.target_fmt, h);
+    const rendertarget *r = &g.rts[i];
+    int rc = 1;
+    /* A smaller scissor is no reason to shrink; a neighbour or the stride is. */
+    if (r->configured && r->stride == (uint32_t)stride && r->fmt == g.target_fmt) {
+        const int keep_w = r->guest_w > stride ? stride : r->guest_w;
+        const int keep_h = rt_rows_before_next(i, r->addr, stride, g.target_fmt, r->guest_h);
+        if (keep_w < r->guest_w || keep_h < r->guest_h)
+            rc = rt_shrink(i, stride, g.target_fmt, w > keep_w ? w : keep_w, h > keep_h ? h : keep_h);
+    }
+    if (rc == 1) rc = rt_prepare_shape(i, stride, g.target_fmt, w, h, 1);
+    if (rc == 0) rt_yield_to(i);
+    return rc;
 }
 
 /* The target the window shows: the buffer sceDisplaySetFrameBuf named, not
@@ -4257,6 +4329,8 @@ void render_gl_report(FILE *out) {
     if (g.display_targets)
         fprintf(out, ", %llu made for a displayed buffer the GE never drew into",
                 (unsigned long long)g.display_targets);
+    if (g.rt_shrinks)
+        fprintf(out, ", %llu cut back to the next target", (unsigned long long)g.rt_shrinks);
     fprintf(out, ", %llu CPU import(s)", (unsigned long long)g.cpu_uploads);
     for (int i = 0; i < g.n_rts; i++)
         if (g.rts[i].configured)
