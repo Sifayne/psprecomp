@@ -454,6 +454,19 @@ static void fw660_sizes(void) {
     hw(22,"HWNOSUCH",""); psp_write32(p+1532,fr);
     for (unsigned i=0;i<60;i++) psp_write8(fr+i,0);
     assert(run()==0x80110327u && psp_read32(fr+16)==0x8000u && psp_read32(fr+20)>0);
+    /* WipEout Pulse's SIZES: all four sidecars at one scratch buffer 33488
+     * bytes short of the end of RAM, at sizes that run past it. Answered
+     * from the sizes alone: 3 clusters for the save, then 1+3+4+3 for the
+     * sidecars. A SAVE whose ICON0 runs past the end is still refused. */
+    static const uint32_t side[4]={3799,71680,108236,90324};
+    hw(8,"HWNOSUCH",""); psp_write32(p+124,256); psp_write32(p+1496,ud);
+    for (unsigned i=0;i<4;i++) {
+        psp_write32(p+1412+16*i,0x09FF7D30u); psp_write32(p+1416+16*i,side[i]); psp_write32(p+1420+16*i,side[i]);
+    }
+    assert(run()==0 && psp_read32(ud)==14);
+    setup(3,"SLOT00","past the end");
+    psp_write32(p+1412,0x09FF7D30u); psp_write32(p+1416,side[2]); psp_write32(p+1420,side[2]);
+    assert(call(0x50C4CD57,p)==0x80110004u && call(0x8874DBE0,0)==0);
 }
 /* LIST with saveName pattern: the result count (entries at ents). */
 static int list_of(const char *pattern) {

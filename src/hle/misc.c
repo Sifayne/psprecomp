@@ -1415,14 +1415,14 @@ static void output2_submit(uint32_t volume, uint32_t pcm) {
     }
     psp_sched_set_step(O2_STEP_PLAY);
     if (wait_us > 0) psp_sched_delay((uint64_t)wait_us);
-    psp_ret(0);
+    psp_ret(samples);
 }
 
 /* Restored inside one of the call's two waits, which its step tells apart. */
 static void output2_resume(void) {
     (void)psp_sched_resume_delay(NULL);
     if (psp_sched_step() == O2_STEP_DRAIN) output2_submit(psp_arg(0), psp_arg(1));
-    else psp_ret(0);
+    else psp_ret(g_audio[AUDIO_OUTPUT2_CHANNEL].samples);
 }
 
 void psp_misc_reset(void) {

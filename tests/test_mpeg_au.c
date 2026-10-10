@@ -75,6 +75,22 @@ int main(void) {
         CHECK(psp_read32(AU+20)==16);
         CHECK(psp_read8(ES)==0x0f && psp_read8(ES+1)==0xd0);
     }
+    /* A movie with only its video registered: nothing has read the packets
+     * yet, so the ring holds them. The audio, which no one reads, is no
+     * consumer -- counted as one, it was past every put and the ring read
+     * empty for ever (WipEout Pulse's title screen). */
+    {
+        enum { MPEG2 = BASE + 0x80, RB2 = BASE + 0x180, DATA2 = BASE + 0x20000, WORK2 = BASE + 0x30000 };
+        const uint32_t ring2 = call(0xD7A29F46,4,0,0,0,0,0);
+        CHECK(call(0x37295ED8,RB2,4,DATA2,ring2,CALLBACK,0)==0);
+        CHECK(call(0xD8C5F121,MPEG2,WORK2,0x10000,RB2,512,0)==0);
+        CHECK(call(0x42560F23,MPEG2,0,0,0,0,0)!=0);   /* RegistStream: video */
+        memset(packet,0,sizeof packet);
+        pes(0,0xe0,90000,video,sizeof video);
+        CHECK(call(0xB240A59E,RB2,1,4,0,0,0)==1);
+        CHECK(call(0xB240A59E,RB2,1,3,0,0,0)==1);
+        CHECK(call(0xB5F6DC87,RB2,0,0,0,0,0)==2);     /* AvailableSize */
+    }
     call(0x874624D6,0,0,0,0,0,0);
     psp_mem_free();
     puts(failed ? "mpeg_au: FAILED" : "mpeg_au: passed"); return failed!=0;

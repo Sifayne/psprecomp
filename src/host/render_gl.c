@@ -42,6 +42,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/os.h"
 #include "psprecomp/safepoint.h"
+#include "psprecomp/sched.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -482,7 +483,11 @@ static struct {
     int      pixel_w, pixel_h, max_size;
     uint64_t resizes, cpu_uploads, rt_views;
     int      exporting;
+    /* The host thread holding the context (0: none, since the one that held
+     * it let go), its guest thread, and how often it has moved. */
     unsigned long thread;
+    uint32_t uid;
+    uint64_t moves;
 
     GLuint   prog, vao, vbo;
     GLuint   stencil_prog, stencil_copy;
@@ -519,7 +524,12 @@ static struct {
     uint32_t fog_colour;
     psp_blend_state bs;
     uint64_t unsupported_blend_eq, unsupported_blend_factor;
+    /* The first distinct blends counted above, for the report. */
+    struct { int src, dst, eq; uint32_t fixa, fixb; uint64_t draws; } blend_miss[8];
+    int blend_misses;
     uint64_t unsupported_stencil_draws;
+    uint64_t partial_pixel_masks;          /* PMSK bytes other than 00 and FF */
+    uint64_t rt_shrinks;                   /* targets cut back to a neighbour */
     uint64_t stencil_draws, stencil_imports, stencil_exports;
 
     /* Texture state as the interpreter last set it, plus what is bound. */
@@ -961,7 +971,10 @@ static const char *GS_MODEL_SRC =
     "    float rho = rx > ry ? rx : ry;\n"
     "    int lod;\n"
     "    if (X.lodi.x == 0)      lod = (rho > 0.0) ? int(floor(log2(rho) * 16.0)) : -4096;\n"
-    "    else if (X.lodi.x == 2) lod = int(floor(X.guard_slope.z * 16.0));\n"
+    "    else if (X.lodi.x == 2) {\n"
+    "        float s = 2.0 * X.guard_slope.z * (1.0 / a.invw + 1.0 / b.invw + 1.0 / c.invw) / 3.0;\n"
+    "        lod = s > 0.0 ? int(floor(log2(s) * 16.0)) : -4096;\n"
+    "    }\n"
     "    else                  lod = 0;\n"
     "    return lod + X.lodi.y;\n"
     "}\n"
@@ -1679,14 +1692,85 @@ static int rt_prepare_shape(int i, int stride, int fmt, int w, int h, int inheri
     return rt_allocate(r, inherit);
 }
 
-/* The GE's target, shaped by its stride, format and scissor. */
+/* The GE packs surfaces end to end, so a target ends where the next one
+ * that has been drawn into begins, however tall the scissor says it is.
+ * WipEout Pulse keeps two 256x136 half-resolution surfaces and its 128x128
+ * countdown screen back to back at 0x04110000, 0x04132000 and 0x04154000,
+ * and draws the first two under a full-screen scissor. Sized 480x272 from
+ * it, the second reached over the countdown screen, its readbacks wrote over
+ * it, and the screen over the start line drew black; every write into the
+ * overlap also marked both targets for a CPU import. */
+/* A display-sized target keeps every row the screen shows: a target that
+ * starts inside those is a window onto the same surface, not the next one.
+ * WipEout Pulse draws its music ticker into one 249 rows down each display
+ * buffer; cut back to it, the display buffers were re-grown and cut again
+ * every frame. */
+static int rt_min_rows(int stride, int h) {
+    return stride >= g.w ? (h < g.h ? h : g.h) : 1;
+}
+
+static int rt_rows_before_next(int i, uint32_t addr, int stride, int fmt, int h) {
+    const uint64_t row = (uint64_t)stride * (fmt == 3 ? 4u : 2u);
+    if (!row) return h;
+    const int least = rt_min_rows(stride, h);
+    for (int k = 0; k < g.n_rts; k++) {
+        const rendertarget *o = &g.rts[k];
+        if (k == i || !o->configured || o->addr <= addr) continue;
+        const uint64_t gap = o->addr - addr;
+        if (gap >= row * (uint64_t)least && gap < row * (uint64_t)h) h = (int)(gap / row);
+    }
+    return h;
+}
+
+/* Re-shape a configured target smaller, keeping what it holds. */
+static int rt_shrink(int i, int stride, int fmt, int w, int h) {
+    rendertarget *r = &g.rts[i];
+    if (g.rt_shrinks < 8)
+        fprintf(stderr, "gl: target %08X cut back from %dx%d to %dx%d (stride %d, format %d)\n",
+                r->addr, r->guest_w, r->guest_h, w, h, stride, fmt);
+    if (r->dirty || r->cpu_pending) readback_rt(i);
+    rt_release(r);
+    g.rt_shrinks++;
+    return rt_prepare_shape(i, stride, fmt, w, h, 1);
+}
+
+/* An older target that covers a newer one's start gives it the rows. */
+static void rt_yield_to(int i) {
+    const uint32_t start = g.rts[i].addr;
+    for (int k = 0; k < g.n_rts; k++) {
+        const rendertarget *o = &g.rts[k];
+        if (k == i || !o->configured || o->addr >= start) continue;
+        const uint64_t row = (uint64_t)o->stride * (o->fmt == 3 ? 4u : 2u);
+        if (!row || (uint64_t)o->addr + row * (uint64_t)o->guest_h <= start) continue;
+        const int rows = (int)((start - o->addr) / row);
+        if (rows >= rt_min_rows((int)o->stride, o->guest_h))
+            rt_shrink(k, (int)o->stride, o->fmt, o->guest_w, rows);
+    }
+}
+
+/* The GE's target, shaped by its stride, format and scissor. A row is no
+ * wider than its stride -- past it the GE is writing the next row -- and the
+ * target stops at the next one (rt_rows_before_next). */
 static int rt_prepare(int i) {
     const int stride = g.target_stride ? (int)g.target_stride : g.w;
     int w = stride, h = g.sc_valid ? g.sc_y1 + 1 : g.h;
     if (g.sc_valid && g.sc_x1 + 1 > w) w = g.sc_x1 + 1;
     if (w < 1) w = g.w;
     if (h < 1) h = g.h;
-    return rt_prepare_shape(i, stride, g.target_fmt, w, h, 1);
+    if (w > stride) w = stride;
+    h = rt_rows_before_next(i, g.rts[i].addr, stride, g.target_fmt, h);
+    const rendertarget *r = &g.rts[i];
+    int rc = 1;
+    /* A smaller scissor is no reason to shrink; a neighbour or the stride is. */
+    if (r->configured && r->stride == (uint32_t)stride && r->fmt == g.target_fmt) {
+        const int keep_w = r->guest_w > stride ? stride : r->guest_w;
+        const int keep_h = rt_rows_before_next(i, r->addr, stride, g.target_fmt, r->guest_h);
+        if (keep_w < r->guest_w || keep_h < r->guest_h)
+            rc = rt_shrink(i, stride, g.target_fmt, w > keep_w ? w : keep_w, h > keep_h ? h : keep_h);
+    }
+    if (rc == 1) rc = rt_prepare_shape(i, stride, g.target_fmt, w, h, 1);
+    if (rc == 0) rt_yield_to(i);
+    return rc;
 }
 
 /* The target the window shows: the buffer sceDisplaySetFrameBuf named, not
@@ -1823,28 +1907,49 @@ static void rt_resize_all(void) {
     }
 }
 
-/* Claim the context, once, on whichever thread the GE turns out to be. Every
- * entry point goes through here, so a call arriving on a second thread is
- * caught at the boundary rather than as corruption inside the driver. */
+/* Let go of the context on the host thread holding it: when another thread
+ * needs it (claim), and when this one's guest thread ends (the scheduler's
+ * host exit hook). A context left current on a thread that has gone cannot
+ * be made current again under X11 (BadAccess), nor reliably under EGL. */
+static void let_go(void) {
+    if (g.ready && g.thread && g.thread == this_thread()) {
+        present_gl_release();
+        g.thread = 0;
+    }
+}
+
+/* Claim the context on whichever thread the GE is on. Every entry point goes
+ * through here, so a call arriving on another thread is caught at the
+ * boundary rather than as corruption inside the driver. The context follows
+ * the GE when it moves: WipEout Pulse draws its first lists on the thread
+ * that boots it and every later one on a render thread of its own. The
+ * thread holding it is parked, waiting for its turn, while another runs, so
+ * it is asked to let go there (psp_sched_run_on); one whose guest thread has
+ * ended let go as it went. */
 static int claim(void) {
     const unsigned long me = this_thread();
     if (g.ready) {
-        if (g.thread != me) {
+        if (g.thread == me) return 0;
+        if (g.thread) psp_sched_run_on(g.uid, let_go);
+        if (g.thread || present_gl_make_current() != 0) {
             static int said;
             if (!said++)
-                fprintf(stderr, "gl: the GE reached this backend on a second "
-                                "host thread (%lu, expected %lu). A GL context "
-                                "belongs to one thread; refusing rather than "
-                                "drawing through a context that is not "
-                                "current.\n", me, g.thread);
+                fprintf(stderr, "gl: the GE reached this backend on host thread %lu, and the "
+                                "context could not be moved from %lu; refusing rather than "
+                                "drawing through a context that is not current.\n", me, g.thread);
             return -1;
         }
+        g.thread = me;
+        g.uid = psp_sched_current();
+        if (++g.moves <= 4)
+            fprintf(stderr, "gl: the context followed the GE to host thread %lu\n", me);
         return 0;
     }
     if (g.failed) return -1;
 
     if (present_gl_make_current() != 0 || gl_load() != 0) { g.failed = 1; return -1; }
     g.thread = me;
+    g.uid = psp_sched_current();
     GLint tex_limit, rb_limit, viewport_limit[2];
     p_glGetIntegerv(GL_MAX_TEXTURE_SIZE, &tex_limit);
     p_glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &rb_limit);
@@ -1996,6 +2101,7 @@ static int gl_init(int w, int h) {
     g.smooth_bloom = psp_title_info.bloom && setting_number("BLOOM_FILTER") != 0;
     psp_savedata_set_redraw(gl_dialog_redraw);
     psp_pause_set_redraw(gl_pause_redraw);
+    psp_sched_set_host_exit_hook(let_go);
     return 0;
 }
 
@@ -2652,7 +2758,8 @@ static int triangle_lod16(const psp_vertex *a, const psp_vertex *b,
     const float dvdy = (dv2 * e1x - dv1 * e2x) / det;
     const float rx = sqrtf(dudx * dudx + dvdx * dvdx);
     const float ry = sqrtf(dudy * dudy + dvdy * dvdy);
-    return psp_render_lod16(&g.tex, rx > ry ? rx : ry);
+    const float w = (psp_render_vertex_w(a) + psp_render_vertex_w(b) + psp_render_vertex_w(c)) / 3.0f;
+    return psp_render_lod16(&g.tex, rx > ry ? rx : ry, w);
 }
 
 static void push_triangle(const psp_vertex *a, const psp_vertex *b,
@@ -2706,7 +2813,8 @@ static void push_sprite(const psp_vertex *v) {
         const float du = (v[1].u - v[0].u) / (float)uden;
         const float dv = (v[1].v - v[0].v) / (float)vden;
         const float rx = fabsf(du) * 16.0f, ry = fabsf(dv) * 16.0f;
-        lod16 = psp_render_lod16(&g.tex, rx > ry ? rx : ry);
+        lod16 = psp_render_lod16(&g.tex, rx > ry ? rx : ry,
+                                 (psp_render_vertex_w(&v[0]) + psp_render_vertex_w(&v[1])) * 0.5f);
     }
     reserve_vertices(6);
     push(&a, lod16); push(&b, lod16); push(&c, lod16);
@@ -2969,7 +3077,9 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
 
     switch (prim) {
     case PSP_PRIM_POINTS: {
-        int lod16 = psp_render_lod16(&g.tex, 1.0f);
+        float w = 0.0f;
+        for (int i = 0; i < count; i++) w += psp_render_vertex_w(&v[i]);
+        int lod16 = psp_render_lod16(&g.tex, 1.0f, count ? w / (float)count : 1.0f);
         for (int i = 0; i < count; i++) push_point_sample(&v[i], &lod16);
         break;
     }
@@ -3077,6 +3187,22 @@ static GLenum gl_fixed_factor(uint32_t colour, int *uses_constant) {
     return GL_CONSTANT_COLOR;
 }
 
+static void note_blend_miss(void) {
+    int i = 0;
+    while (i < g.blend_misses &&
+           (g.blend_miss[i].src != g.bs.src || g.blend_miss[i].dst != g.bs.dst || g.blend_miss[i].eq != g.bs.eq ||
+            ((g.bs.src == 10 || g.bs.dst == 10) &&
+             (g.blend_miss[i].fixa != (g.bs.fixa & 0xFFFFFFu) || g.blend_miss[i].fixb != (g.bs.fixb & 0xFFFFFFu)))))
+        i++;
+    if (i == g.blend_misses) {
+        if (i == (int)(sizeof g.blend_miss / sizeof g.blend_miss[0])) return;
+        g.blend_miss[i].src = g.bs.src; g.blend_miss[i].dst = g.bs.dst; g.blend_miss[i].eq = g.bs.eq;
+        g.blend_miss[i].fixa = g.bs.fixa & 0xFFFFFFu; g.blend_miss[i].fixb = g.bs.fixb & 0xFFFFFFu;
+        g.blend_misses++;
+    }
+    g.blend_miss[i].draws++;
+}
+
 static GLenum gl_equation(int eq, int *ok) {
     switch (eq) {
     case 0:  return GL_FUNC_ADD;
@@ -3093,7 +3219,8 @@ static GLenum gl_equation(int eq, int *ok) {
 static void apply_state(void) {
     if (g.bs.stencil_test && g.rts[g.cur_rt].fmt == 3) {
         p_glEnable(GL_STENCIL_TEST);
-        p_glStencilMask(255);
+        /* PMSK2 keeps the stencil bits it sets. */
+        p_glStencilMask(~(g.bs.pixel_mask >> 24) & 255u);
         /* GL compares reference against stored stencil; the GE backend
          * contract compares stored stencil against reference. */
         const int func = g.bs.stencil_func;
@@ -3127,10 +3254,22 @@ static void apply_state(void) {
     /* write_colour is clear mode's colour mask. Alpha is the stencil byte and
      * an ordinary draw does not write it, which is why the alpha channel is
      * masked off unless the state says otherwise. */
-    p_glColorMask(g.bs.write_colour ? GL_TRUE : GL_FALSE,
-                  g.bs.write_colour ? GL_TRUE : GL_FALSE,
-                  g.bs.write_colour ? GL_TRUE : GL_FALSE,
-                  g.bs.write_alpha  ? GL_TRUE : GL_FALSE);
+    /* The pixel mask, PMSK1 | PMSK2 << 24 in 0xAABBGGRR, keeps the
+     * framebuffer's bits where it is set (render.h). A byte of FF keeps its
+     * channel whole, which glColorMask says exactly; a byte of anything but
+     * 00 or FF keeps some bits of it, which it cannot, and is counted.
+     * WipEout Pulse draws the shadow volumes under its ships with PMSK1
+     * FFFFFF, for the stencil alone; drawn in colour they were solid blue
+     * blocks under every ship. */
+    const uint32_t pm = g.bs.pixel_mask;
+    for (int ch = 0; ch < 4; ch++) {
+        const uint32_t byte = (pm >> (8 * ch)) & 0xFFu;
+        if (byte && byte != 0xFFu && (ch < 3 ? g.bs.write_colour : g.bs.write_alpha)) { g.partial_pixel_masks++; break; }
+    }
+    p_glColorMask(g.bs.write_colour && (pm & 0x0000FFu) != 0x0000FFu ? GL_TRUE : GL_FALSE,
+                  g.bs.write_colour && (pm & 0x00FF00u) != 0x00FF00u ? GL_TRUE : GL_FALSE,
+                  g.bs.write_colour && (pm & 0xFF0000u) != 0xFF0000u ? GL_TRUE : GL_FALSE,
+                  g.bs.write_alpha  && (pm >> 24) != 0xFFu ? GL_TRUE : GL_FALSE);
 
     if (g.sc_valid) {
         p_glEnable(GL_SCISSOR_TEST);
@@ -3170,16 +3309,27 @@ static void apply_state(void) {
         GLenum src = double_alpha ? GL_ONE : g.bs.src == 10
                    ? gl_fixed_factor(g.bs.fixa, &src_constant)
                    : gl_factor(g.bs.src, 1, &ok);
-        const GLenum dst = double_alpha && g.bs.dst == 7 ? GL_ONE_MINUS_SRC_ALPHA : g.bs.dst == 10
-                         ? gl_fixed_factor(g.bs.fixb, &dst_constant)
-                         : gl_factor(g.bs.dst, 0, &ok);
+        GLenum dst = double_alpha && g.bs.dst == 7 ? GL_ONE_MINUS_SRC_ALPHA : g.bs.dst == 10
+                   ? gl_fixed_factor(g.bs.fixb, &dst_constant)
+                   : gl_factor(g.bs.dst, 0, &ok);
+        /* A crossfade: FIXB the complement of FIXA in every channel, which
+         * the one GL constant says as ONE_MINUS_CONSTANT_COLOR on the
+         * destination. WipEout Pulse blends its race picture this way, FIXA
+         * 606060 and FIXB 9F9F9F; given FIXA on both sides it came out a
+         * quarter too dark. */
+        const int crossfade = src_constant && dst_constant &&
+                              (g.bs.fixb & 0xFFFFFFu) == (~g.bs.fixa & 0xFFFFFFu);
+        if (crossfade) dst = GL_ONE_MINUS_CONSTANT_COLOR;
         if (!ok) g.unsupported_blend_factor++;
-        if (src_constant && dst_constant &&
-            (g.bs.fixa & 0xFFFFFFu) != (g.bs.fixb & 0xFFFFFFu))
+        if (src_constant && dst_constant && !crossfade &&
+            (g.bs.fixa & 0xFFFFFFu) != (g.bs.fixb & 0xFFFFFFu)) {
             g.unsupported_blend_factor++;
+            ok = 0;
+        }
         int eq_ok = 1;
         const GLenum eq = gl_equation(g.bs.eq, &eq_ok);
         if (!eq_ok) g.unsupported_blend_eq++;
+        if (!ok || !eq_ok) note_blend_miss();
         /* This rewrite changes fragment alpha to carry an exact destination
          * factor, so only use it when alpha is the framebuffer's masked-off
          * stencil byte. MIN/MAX ignore factors; abs-difference is not
@@ -3192,8 +3342,8 @@ static void apply_state(void) {
         p_glBlendEquation(eq);
         /* If both sides need a non-trivial, unequal fixed colour the counter
          * above records the case GL's fixed pipeline cannot represent. Equal
-         * constants, or one non-trivial constant paired with zero/one, are
-         * exact. */
+         * constants, complementary ones, or one non-trivial constant paired
+         * with zero/one, are exact. */
         const uint32_t fx = src_constant ? g.bs.fixa : g.bs.fixb;
         p_glBlendColor((float)( fx        & 0xFF) / 255.0f,
                        (float)((fx >>  8) & 0xFF) / 255.0f,
@@ -4153,9 +4303,9 @@ void render_gl_report(FILE *out) {
     if (!g.ready && !g.failed) return;
     fprintf(out, "gl:       %s", g.failed ? "failed to start" : "ran");
     if (g.ready)
-        fprintf(out, " -- %llu draw(s), %llu vertices, %llu readback(s)",
+        fprintf(out, " -- %llu draw(s), %llu vertices, %llu readback(s), the context moved %llu time(s)",
                 (unsigned long long)g.draws, (unsigned long long)g.verts,
-                (unsigned long long)g.readbacks);
+                (unsigned long long)g.readbacks, (unsigned long long)g.moves);
     fprintf(out, "\n          transform: %s, %llu model draw(s) in %llu batch(es), %llu vertices; %llu repeated setter(s) skipped, scene state reused %llu of %llu time(s)",
             g.model_unavailable ? "CPU" : "GPU", (unsigned long long)g.model_draws, (unsigned long long)g.mu.batches, (unsigned long long)g.model_verts, (unsigned long long)g.mu.setters_skipped,
             (unsigned long long)g.mu.scene_hits, (unsigned long long)(g.mu.scene_hits + g.mu.scene_misses));
@@ -4179,6 +4329,8 @@ void render_gl_report(FILE *out) {
     if (g.display_targets)
         fprintf(out, ", %llu made for a displayed buffer the GE never drew into",
                 (unsigned long long)g.display_targets);
+    if (g.rt_shrinks)
+        fprintf(out, ", %llu cut back to the next target", (unsigned long long)g.rt_shrinks);
     fprintf(out, ", %llu CPU import(s)", (unsigned long long)g.cpu_uploads);
     for (int i = 0; i < g.n_rts; i++)
         if (g.rts[i].configured)
@@ -4302,10 +4454,19 @@ void render_gl_report(FILE *out) {
     /* Counted rather than approximated: the doubled blend factors and the
      * absolute-difference equation have no GL equivalent and need the shader.
      * A wrong factor renders a plausible picture; a counted one is a number. */
+    if (g.partial_pixel_masks)
+        fprintf(out, ", %llu draw(s) with a partial pixel mask written whole",
+                (unsigned long long)g.partial_pixel_masks);
     if (g.unsupported_blend_factor || g.unsupported_blend_eq)
         fprintf(out, ", blend not represented: %llu factor, %llu equation",
                 (unsigned long long)g.unsupported_blend_factor,
                 (unsigned long long)g.unsupported_blend_eq);
+    for (int i = 0; i < g.blend_misses; i++)
+        fprintf(out, "%s src %d dst %d eq %d fixa %06X fixb %06X: %llu",
+                i ? ";" : " (", g.blend_miss[i].src, g.blend_miss[i].dst, g.blend_miss[i].eq,
+                (unsigned)g.blend_miss[i].fixa, (unsigned)g.blend_miss[i].fixb,
+                (unsigned long long)g.blend_miss[i].draws);
+    if (g.blend_misses) fputc(')', out);
     if (g.unsupported_stencil_draws)
         fprintf(out, ", %llu draw(s) need alpha-backed stencil",
                 (unsigned long long)g.unsupported_stencil_draws);
