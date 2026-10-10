@@ -78,6 +78,9 @@ enum psp_player_option {
     PSP_PLAYER_OPTIONS
 };
 extern const psp_option_def psp_player_options[PSP_PLAYER_OPTIONS];
+/* The PSP's language nearest this computer's (PSP numbering), which an
+ * Automatic LANGUAGE resolves to. */
+int psp_settings_host_language(void);
 /* What a new preferences file, and Reset to defaults, gives a player over
  * the defaults: a window, the intro movie, and window-resolution rendering,
  * which picks OpenGL. The defaults themselves stay headless and original for

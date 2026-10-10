@@ -335,7 +335,7 @@ int psp_settings_env(psp_settings *s, char *error) {
  * English for any the PSP does not have ("C" and "POSIX" among them).
  * Chinese is Traditional for Taiwan, Hong Kong and Macau, and for a locale
  * that names the script, Simplified otherwise. */
-static int host_language(void) {
+int psp_settings_host_language(void) {
     const char *v = NULL;
     static const char *const vars[] = { "LC_ALL", "LC_MESSAGES", "LANG" };
     for (int i = 0; i < 3 && !(v && *v); i++) v = getenv(vars[i]);
@@ -361,7 +361,7 @@ int psp_settings_resolve(psp_settings *s, char *error) {
     if (sc->resolve && sc->resolve(s, error)) return -1;
     s->window = s->number[PSP_OPT_WINDOW] != 0 || s->number[PSP_OPT_WINDOW_MODE] != 0 || s->render == 2;
     s->realtime = s->window || s->number[PSP_OPT_REALTIME] != 0;
-    s->language = s->number[PSP_OPT_LANGUAGE] ? (int)s->number[PSP_OPT_LANGUAGE] - 1 : host_language();
+    s->language = s->number[PSP_OPT_LANGUAGE] ? (int)s->number[PSP_OPT_LANGUAGE] - 1 : psp_settings_host_language();
     s->confirm_cross = s->number[PSP_OPT_CONFIRM] ? s->number[PSP_OPT_CONFIRM] == 1 : s->language != 0;
     return 0;
 }

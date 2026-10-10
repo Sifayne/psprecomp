@@ -127,6 +127,17 @@ static void choice_picks(const psp_settings *s, int id, picks *p) {
         /* Null is for files and the command line, not for play. */
         if (id == PSP_OPT_RENDER && !strcmp(value, "null") && s->number[id] != i) continue;
         if (!field(d->labels, i, label, sizeof label)) snprintf(label, sizeof label, "%s", value);
+        /* What Automatic gives, for the console's language and its confirm
+         * button, which follows the language. */
+        if ((id == PSP_OPT_LANGUAGE || id == PSP_OPT_CONFIRM) && !strcmp(value, "auto")) {
+            const int lang = id == PSP_OPT_LANGUAGE || !s->number[PSP_OPT_LANGUAGE]
+                           ? psp_settings_host_language() : (int)s->number[PSP_OPT_LANGUAGE] - 1;
+            char named[PSP_SETTINGS_VALUE];
+            if (id == PSP_OPT_CONFIRM) snprintf(named, sizeof named, "%s", lang ? "Cross" : "Circle");
+            else if (!field(psp_settings_option(PSP_OPT_LANGUAGE)->labels, lang + 1, named, sizeof named))
+                snprintf(named, sizeof named, "English");
+            snprintf(label, sizeof label, "Automatic (%.60s)", named);
+        }
         pick(p, label, value, s->number[id] == i);
     }
 }
