@@ -528,6 +528,7 @@ static struct {
     struct { int src, dst, eq; uint32_t fixa, fixb; uint64_t draws; } blend_miss[8];
     int blend_misses;
     uint64_t unsupported_stencil_draws;
+    uint64_t partial_pixel_masks;          /* PMSK bytes other than 00 and FF */
     uint64_t stencil_draws, stencil_imports, stencil_exports;
 
     /* Texture state as the interpreter last set it, plus what is bound. */
@@ -3139,7 +3140,8 @@ static GLenum gl_equation(int eq, int *ok) {
 static void apply_state(void) {
     if (g.bs.stencil_test && g.rts[g.cur_rt].fmt == 3) {
         p_glEnable(GL_STENCIL_TEST);
-        p_glStencilMask(255);
+        /* PMSK2 keeps the stencil bits it sets. */
+        p_glStencilMask(~(g.bs.pixel_mask >> 24) & 255u);
         /* GL compares reference against stored stencil; the GE backend
          * contract compares stored stencil against reference. */
         const int func = g.bs.stencil_func;
@@ -3173,10 +3175,22 @@ static void apply_state(void) {
     /* write_colour is clear mode's colour mask. Alpha is the stencil byte and
      * an ordinary draw does not write it, which is why the alpha channel is
      * masked off unless the state says otherwise. */
-    p_glColorMask(g.bs.write_colour ? GL_TRUE : GL_FALSE,
-                  g.bs.write_colour ? GL_TRUE : GL_FALSE,
-                  g.bs.write_colour ? GL_TRUE : GL_FALSE,
-                  g.bs.write_alpha  ? GL_TRUE : GL_FALSE);
+    /* The pixel mask, PMSK1 | PMSK2 << 24 in 0xAABBGGRR, keeps the
+     * framebuffer's bits where it is set (render.h). A byte of FF keeps its
+     * channel whole, which glColorMask says exactly; a byte of anything but
+     * 00 or FF keeps some bits of it, which it cannot, and is counted.
+     * WipEout Pulse draws the shadow volumes under its ships with PMSK1
+     * FFFFFF, for the stencil alone; drawn in colour they were solid blue
+     * blocks under every ship. */
+    const uint32_t pm = g.bs.pixel_mask;
+    for (int ch = 0; ch < 4; ch++) {
+        const uint32_t byte = (pm >> (8 * ch)) & 0xFFu;
+        if (byte && byte != 0xFFu && (ch < 3 ? g.bs.write_colour : g.bs.write_alpha)) { g.partial_pixel_masks++; break; }
+    }
+    p_glColorMask(g.bs.write_colour && (pm & 0x0000FFu) != 0x0000FFu ? GL_TRUE : GL_FALSE,
+                  g.bs.write_colour && (pm & 0x00FF00u) != 0x00FF00u ? GL_TRUE : GL_FALSE,
+                  g.bs.write_colour && (pm & 0xFF0000u) != 0xFF0000u ? GL_TRUE : GL_FALSE,
+                  g.bs.write_alpha  && (pm >> 24) != 0xFFu ? GL_TRUE : GL_FALSE);
 
     if (g.sc_valid) {
         p_glEnable(GL_SCISSOR_TEST);
@@ -4359,6 +4373,9 @@ void render_gl_report(FILE *out) {
     /* Counted rather than approximated: the doubled blend factors and the
      * absolute-difference equation have no GL equivalent and need the shader.
      * A wrong factor renders a plausible picture; a counted one is a number. */
+    if (g.partial_pixel_masks)
+        fprintf(out, ", %llu draw(s) with a partial pixel mask written whole",
+                (unsigned long long)g.partial_pixel_masks);
     if (g.unsupported_blend_factor || g.unsupported_blend_eq)
         fprintf(out, ", blend not represented: %llu factor, %llu equation",
                 (unsigned long long)g.unsupported_blend_factor,
