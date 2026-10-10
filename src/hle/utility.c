@@ -1471,9 +1471,16 @@ static int sd_validate(uint32_t p) {
     int writing=mode==SD_AUTOSAVE || mode==SD_SAVE || mode==SD_LISTSAVE ||
         mode==SD_MAKEDATA || mode==SD_MAKEDATASECURE || mode==SD_WRITEDATA || mode==SD_WRITEDATASECURE;
     if (writing && n && (!data || n>cap || !psp_mem_ptr(data,n))) return 0;
+    /* A sidecar's buffer is read only by a save that writes it, and then only
+     * the bytes it writes (sd_write_sidecars); every other mode takes its
+     * sizes alone. WipEout Pulse asks SIZES after its autosave notice with
+     * all four sidecars pointing at one scratch buffer 33488 bytes short of
+     * the end of RAM, at sizes up to 108236. The game ships doing that, so
+     * a PSP answers it; refusing it left the game waiting on the memory
+     * stick for ever. */
     for (unsigned off=SD_ICON0;off<=SD_SND0;off+=16) {
         uint32_t a=psp_read32(p+off),len=psp_read32(p+off+8),space=psp_read32(p+off+4);
-        if (a && ((writing && len>space) || (space && !psp_mem_ptr(a,space)))) return 0;
+        if (writing && a && (len>space || ((len || space) && !psp_mem_ptr(a,len?len:space)))) return 0;
     }
     /* Optional ABI fields must fit both the parameter version and guest RAM. */
     const unsigned offsets[]={SD_MSFREE,SD_MSDATA,SD_UTILDATA,SD_IDLIST,SD_FILELIST,SD_SIZEINFO};
