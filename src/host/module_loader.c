@@ -14,44 +14,18 @@
 #define SCE_ERROR_KERNEL_ILLEGAL_OBJECT_FORMAT 0x8002012D
 #define SCE_ERROR_KERNEL_UNKNOWN_MODULE_FILE   0x8002012F
 #define SCE_ERROR_KERNEL_FILE_READ_ERROR       0x80020130
-
-/* The syslib's: module_start, module_stop, and module_start's thread. */
-#define NID_MODULE_START        0xD632ACDBu
-#define NID_MODULE_STOP         0xCEE8593Cu
-#define NID_MODULE_START_THREAD 0x0F7C276Cu
+#define SCE_ERROR_KERNEL_NO_MEMORY             0x80020190
 
 static char g_folder[1024];
 
-static void describe(const psp_blob *b, const elf_info *e, const psp_load_info *li,
-                     psp_module_image *out, psp_module_info *mi) {
-    memset(out, 0, sizeof *out);
-    out->lo = li->lo;
-    out->hi = li->hi;
-    out->text_addr = e->text_addr;
-    out->text_size = e->text_size;
-    out->nsegments = e->nsegments > 4 ? 4 : e->nsegments;
-    for (int i = 0; i < out->nsegments; i++) {
-        out->seg_addr[i] = e->seg[i].addr;
-        out->seg_size[i] = e->seg[i].memsz;
-        if (i > 0) out->data_size += e->seg[i].filesz;
-        out->bss_size += e->seg[i].memsz - e->seg[i].filesz;
-    }
-    memset(mi, 0, sizeof *mi);
-    if (e->modinfo_size && psp_modinfo_parse(b->data, b->size, e->modinfo_offset, mi) == 0) {
-        out->gp = mi->gp_value;
-        out->attribute = (uint16_t)mi->attribute;
-        out->version[0] = mi->version[0];
-        out->version[1] = mi->version[1];
-        memcpy(out->name, mi->name, sizeof out->name);
-    }
-}
-
+/* The executable, described as a module is (psp_module_describe), for
+ * sceKernelQueryModuleInfo. */
 void psp_host_modules_main(const psp_blob *b, const elf_info *e, const psp_load_info *li) {
     psp_module_image im;
-    psp_module_info mi;
-    describe(b, e, li, &im, &mi);
-    im.start = e->entry != 0xFFFFFFFFu ? e->entry : 0;
+    if (psp_module_describe(b, e, li, &im) != 0) return;
     psp_modules_set_main(&im);
+    free(im.export_nid);
+    free(im.export_addr);
 }
 
 static const psp_title_module *known(const uint8_t *file, size_t len) {
@@ -91,52 +65,10 @@ static int load(const uint8_t *file, size_t len, psp_module_image *out) {
         return (int)SCE_ERROR_KERNEL_ILLEGAL_OBJECT_FORMAT;
     }
 
-    /* Every segment, its zero tail included: a module loaded again after an
-     * unload starts as clean as the first time. */
-    for (int i = 0; i < e.nsegments; i++) {
-        const elf_segment *s = &e.seg[i];
-        if ((size_t)s->offset + s->filesz > b.size) continue;
-        psp_mem_write_block(s->addr, b.data + s->offset, s->filesz);
-        static const uint8_t zeros[4096];
-        for (uint32_t z = s->filesz; z < s->memsz; ) {
-            const uint32_t n = s->memsz - z < sizeof zeros ? s->memsz - z : (uint32_t)sizeof zeros;
-            psp_mem_write_block(s->addr + z, zeros, n);
-            z += n;
-        }
-    }
-
-    psp_module_info mi;
-    describe(&b, &e, &li, out, &mi);
-    out->start = e.entry != 0xFFFFFFFFu ? e.entry : 0;
-
-    /* Its exports: module_start, module_stop and module_start's thread from
-     * the syslib, the functions of its named libraries for the others. */
-    const uint32_t bias = e.nsegments ? e.seg[0].offset - e.seg[0].addr : 0;
-    const int n = mi.ent_end > mi.ent_top ? psp_collect_export_table(b.data, b.size, &mi, bias, NULL, 0) : 0;
-    psp_export *ex = n > 0 ? (psp_export *)malloc((size_t)n * sizeof *ex) : NULL;
-    if (ex) psp_collect_export_table(b.data, b.size, &mi, bias, ex, n);
-    out->export_nid = (uint32_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(uint32_t));
-    out->export_addr = (uint32_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(uint32_t));
-    for (int i = 0; ex && i < n; i++) {
-        if (ex[i].syslib) {
-            if (ex[i].nid == NID_MODULE_START && !ex[i].variable) out->start = ex[i].addr;
-            if (ex[i].nid == NID_MODULE_STOP && !ex[i].variable) out->stop = ex[i].addr;
-            if (ex[i].nid == NID_MODULE_START_THREAD && ex[i].variable) {
-                /* {count, priority, stack size, attributes} */
-                out->start_priority = psp_read32(ex[i].addr + 4);
-                out->start_stack    = psp_read32(ex[i].addr + 8);
-                out->start_attr     = psp_read32(ex[i].addr + 12);
-            }
-            continue;
-        }
-        if (ex[i].variable || !out->export_nid || !out->export_addr) continue;
-        out->export_nid[out->nexports] = ex[i].nid;
-        out->export_addr[out->nexports++] = ex[i].addr;
-    }
-    free(ex);
-
+    psp_module_write(&b, &e);
+    const int rc = psp_module_describe(&b, &e, &li, out);
     psp_blob_free(&b);
-    return 0;
+    return rc ? (int)SCE_ERROR_KERNEL_NO_MEMORY : 0;
 }
 
 int psp_host_modules_start(const char *module_path) {

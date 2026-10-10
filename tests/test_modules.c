@@ -73,7 +73,7 @@ static void mod_stop(void) { stopped++; psp_cpu.r[PSP_REG_V0] = 0; }
 static int loader(const uint8_t *file, size_t len, psp_module_image *out) {
     if (len != 8 || memcmp(file, "~PSPMODA", 8)) return (int)0x8002012F;
     out->lo = MOD_LO; out->hi = MOD_HI; out->gp = MOD_GP;
-    out->start = MOD_START; out->stop = MOD_STOP;
+    out->entry = out->start = MOD_START; out->stop = MOD_STOP;
     out->attribute = 0; out->version[0] = 1; out->version[1] = 2;
     strcpy(out->name, "sceTest_Module");
     out->text_addr = MOD_LO; out->text_size = 0x100;
@@ -112,6 +112,19 @@ static void driver(void) {
     CHECK(psp_sysmem_free() == free_before - (MOD_HI - MOD_LO),
           "a load takes the module's size from the user partition");
     CHECK(psp_modules_export(FN_NID) == 0, "nothing is exported before the module starts");
+    /* modprobe step 15 (fw 6.60): an import whose library nothing provides is
+     * not linked. A firmware library's call the runtime does not answer is
+     * an unimplemented call still, and answers 0. */
+    psp_hle_import(FN_NID, "sceTest_Lib");
+    CHECK(psp_cpu.r[PSP_REG_V0] == 0x8002013Au, "the module's library is not linked before its start");
+    psp_hle_import(0x11112222u, "ProbeLibNone");
+    CHECK(psp_cpu.r[PSP_REG_V0] == 0x8002013Au, "nor is a library nothing provides");
+    psp_cpu.r[PSP_REG_V0] = 5;
+    psp_hle_import(0x11112223u, "sceNpService");
+    CHECK(psp_cpu.r[PSP_REG_V0] == 0, "a firmware library's call the runtime lacks answers 0");
+    psp_cpu.r[PSP_REG_V0] = 5;
+    psp_hle_import(0x11112224u, "ModuleMgrForUser");
+    CHECK(psp_cpu.r[PSP_REG_V0] == 0, "so does one of a library the runtime answers others of");
 
     psp_write32(ARGS, 0xCAFEF00D);
     CHECK(call("sceKernelStartModule", id, 4, ARGS, STATUS, 0) == id,
@@ -134,7 +147,7 @@ static void driver(void) {
     }
 
     psp_cpu.r[PSP_REG_V0] = 0;
-    psp_hle_call(FN_NID);
+    psp_hle_import(FN_NID, "sceTest_Lib");
     CHECK(psp_cpu.r[PSP_REG_V0] == 42 && fn_calls == 2, "an import the runtime does not answer reaches the export");
     const uint32_t self = call("sceKernelGetThreadId", 0, 0, 0, 0, 0);
     CHECK(self == driver_thread && shadow_calls == 0, "the runtime's own answer wins over an export");
@@ -168,6 +181,8 @@ static void driver(void) {
           "it stops, running module_stop");
     CHECK(call("sceKernelStopModule", id, 0, 0, 0, 0) == 0x80020135u, "once");
     CHECK(psp_modules_export(FN_NID) == 0, "a stopped module exports nothing");
+    psp_hle_import(FN_NID, "sceTest_Lib");
+    CHECK(psp_cpu.r[PSP_REG_V0] == 0x8002013Au && fn_calls == 2, "and its library is unlinked again");
     CHECK(call("sceKernelUnloadModule", id, 0, 0, 0, 0) == id, "it unloads, answering its id");
     CHECK(psp_sysmem_free() == free_before, "and gives its memory back");
     CHECK(call("sceKernelQueryModuleInfo", id, INFO, 0, 0, 0) == 0x8002012Eu, "then it is unknown");

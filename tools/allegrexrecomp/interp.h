@@ -91,15 +91,24 @@ void psp_interp_init(psp_interp *it, uint32_t entry, uint32_t ra_sentinel,
  * the same way: a pc landing on a thunk calls psp_hle_call() and returns to
  * $ra, exactly as the generated stub does.
  *
- * The table is borrowed, not copied — keep it alive for the run. Passing NULL
- * (or n == 0) clears it and restores the raw-execution behaviour. */
+ * The table is copied. Passing NULL (or n == 0) clears it and restores the
+ * raw-execution behaviour. */
 
 typedef struct {
     uint32_t addr;   /* thunk address in .sceStub.text */
     uint32_t nid;    /* firmware function it stands for */
+    char     lib[32];/* the library it imports from; empty if not known */
 } psp_interp_import;
 
 int psp_interp_set_imports(const psp_interp_import *tbl, int n);
+
+/* Another module's thunks beside the ones set already, for a module loaded at
+ * run time. The table is copied. Returns the number bound, or -1. */
+int psp_interp_add_imports(const psp_interp_import *tbl, int n);
+
+/* Forget the thunks of whatever was in [lo, hi): a module loaded where an
+ * unloaded one was has code where that one's thunks were. */
+void psp_interp_drop_imports(uint32_t lo, uint32_t hi);
 
 /* Frees the lookup index built by psp_interp_set_imports(). */
 void psp_interp_free_imports(void);

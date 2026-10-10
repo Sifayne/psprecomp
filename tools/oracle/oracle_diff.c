@@ -763,10 +763,15 @@ int main(int argc, char **argv) {
             psp_interp_import *tbl = malloc((size_t)n * sizeof *tbl);
             if (imp && tbl) {
                 n = psp_collect_imports(b.data, b.size, &mi, bias, imp, n);
-                for (int i = 0; i < n; i++) { tbl[i].addr = imp[i].addr; tbl[i].nid = imp[i].nid; }
+                for (int i = 0; i < n; i++) {
+                    tbl[i].addr = imp[i].addr;
+                    tbl[i].nid = imp[i].nid;
+                    memcpy(tbl[i].lib, imp[i].lib, sizeof tbl[i].lib);
+                }
                 nimp = psp_interp_set_imports(tbl, n);
             }
             free(imp);
+            free(tbl);
         }
     }
 

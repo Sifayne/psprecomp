@@ -19,7 +19,11 @@ extern "C" {
 /* A module mapped into guest memory, as the loader reports it. */
 typedef struct {
     uint32_t lo, hi;                 /* its extent */
+    /* The user-partition block the loader placed it in, or 0: the runtime
+     * then takes the module's size from the partition itself. */
+    uint32_t block;
     uint32_t gp;
+    uint32_t entry;                  /* the ELF's entry, which QueryModuleInfo reports */
     uint32_t start, stop;            /* module_start and module_stop, or 0 */
     /* module_start_thread_parameter: priority, stack size, attributes, or 0 */
     uint32_t start_priority, start_stack, start_attr;

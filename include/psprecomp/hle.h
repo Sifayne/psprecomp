@@ -48,6 +48,10 @@ int psp_hle_is_named(int index);
 /* Call a firmware function by NID. An unregistered NID reports itself by name
  * where possible and by number otherwise, rather than failing silently. */
 void psp_hle_call(uint32_t nid);
+/* An import thunk's call: psp_hle_call with the library the import names. A
+ * library neither the firmware nor a started module provides answers
+ * SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED, as an unlinked import does. */
+void psp_hle_import(uint32_t nid, const char *lib);
 /* How a call a thread can be parked in finishes on a thread restored from a
  * save state (psprecomp/state.h): the handler's code after its wait, from
  * what the wait left in the thread's record. A call without one refuses a
@@ -157,6 +161,8 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_OK              0
 #define SCE_KERNEL_ERROR_ERROR           0x80020001
 #define SCE_KERNEL_ERROR_NOTIMPLEMENTED  0x80020002
+/* An import whose library no module provides (modprobe step 15, fw 6.60). */
+#define SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED 0x8002013A
 #define SCE_KERNEL_ERROR_ILLEGAL_ADDR    0x80020005
 #define SCE_KERNEL_ERROR_NO_MEMORY       0x80020190
 #define SCE_KERNEL_ERROR_ILLEGAL_ATTR    0x80020191

@@ -1043,12 +1043,10 @@ static void interp_note_reentry(uint32_t addr) {
     g_reentry_count++;
 }
 
-/* Hand the interpreter the thunk-to-NID map, so firmware calls reach HLE
- * instead of running the unlinked `jr $ra` the linker left in the module.
- * Returns the number of thunks registered; the table is owned by the caller
- * and must outlive the run, so it is returned through `out_tbl`. */
-static int interp_bind_imports(const psp_blob *b, const elf_info *e,
-                               psp_interp_import **out_tbl) {
+/* A module's thunk-to-NID map, with each thunk's library. Returns how many,
+ * in a malloc'd table through `out_tbl`. */
+static int interp_collect_imports(const psp_blob *b, const elf_info *e,
+                                  psp_interp_import **out_tbl) {
     *out_tbl = NULL;
     if (!e->modinfo_size) return 0;
 
@@ -1068,14 +1066,78 @@ static int interp_bind_imports(const psp_blob *b, const elf_info *e,
     for (int i = 0; i < n; i++) {
         tbl[i].addr = imp[i].addr;
         tbl[i].nid  = imp[i].nid;
+        memcpy(tbl[i].lib, imp[i].lib, sizeof tbl[i].lib);
     }
     free(imp);
-
-    const int bound = psp_interp_set_imports(tbl, n);
-    if (bound <= 0) { free(tbl); return 0; }
     *out_tbl = tbl;
-    return bound;
-}   /* never mapped: the run stops here */
+    return n;
+}
+
+/* Hand the interpreter the thunk-to-NID map, so firmware calls reach HLE
+ * instead of running the unlinked `jr $ra` the linker left in the module.
+ * Returns the number of thunks registered. */
+static int interp_bind_imports(const psp_blob *b, const elf_info *e) {
+    psp_interp_import *tbl;
+    const int n = interp_collect_imports(b, e, &tbl);
+    const int bound = n > 0 ? psp_interp_set_imports(tbl, n) : 0;
+    free(tbl);
+    return bound > 0 ? bound : 0;
+}
+
+#define SCE_ERROR_KERNEL_UNKNOWN_MODULE_FILE 0x8002012Fu
+
+/* A module the program loads at run time (sceKernelLoadModule), under the
+ * interpreter: any relocatable PRX, placed where the console puts one -- a
+ * block of its size from the lowest free address of the user partition
+ * (modprobe step 6, fw 6.60) -- relocated there, its thunks bound beside the
+ * executable's. Its code runs interpreted, as the executable's does. The
+ * player's loader knows a game's modules by their files instead, and runs
+ * them recompiled (src/host/module_loader.c). */
+static int interp_load_module(const uint8_t *file, size_t len, psp_module_image *out) {
+    psp_blob b;
+    b.size = len;
+    b.data = (uint8_t *)malloc(len ? len : 1);
+    if (!b.data) return (int)SCE_KERNEL_ERROR_NO_MEMORY;
+    memcpy(b.data, file, len);
+
+    elf_info e;
+    if (elf_parse(b.data, b.size, &e) != 0 || e.type != 0xFFA0 || !e.nsegments) {
+        fprintf(stderr, "interp: a module the interpreter can load is a decrypted, relocatable PRX\n");
+        free(b.data);
+        return (int)SCE_ERROR_KERNEL_UNKNOWN_MODULE_FILE;
+    }
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (int i = 0; i < e.nsegments; i++) {
+        if (e.seg[i].addr < lo) lo = e.seg[i].addr;
+        if (e.seg[i].addr + e.seg[i].memsz > hi) hi = e.seg[i].addr + e.seg[i].memsz;
+    }
+    const uint32_t base = psp_sysmem_alloc(hi - lo, 0);
+    if (!base) { free(b.data); return (int)SCE_KERNEL_ERROR_NO_MEMORY; }
+
+    int err = 0;
+    psp_load_info li;
+    psp_rebase_image(&e, base, &err);
+    if (err || psp_relocate_image(b.data, b.size, &e, &li) != 0) {
+        psp_sysmem_release(base);
+        free(b.data);
+        return (int)SCE_ERROR_KERNEL_UNKNOWN_MODULE_FILE;
+    }
+    psp_module_write(&b, &e);
+    psp_interp_drop_imports(li.lo, li.hi);
+    if (psp_module_describe(&b, &e, &li, out) != 0) {
+        psp_sysmem_release(base);
+        free(b.data);
+        return (int)SCE_KERNEL_ERROR_NO_MEMORY;
+    }
+    out->block = base;
+
+    psp_interp_import *tbl;
+    const int n = interp_collect_imports(&b, &e, &tbl);
+    if (n > 0) psp_interp_add_imports(tbl, n);
+    free(tbl);
+    free(b.data);
+    return 0;
+}
 
 /* The path a PSP would pass as the module's argument when it started it from
  * the Memory Stick: ms0:/PSP/GAME/<name>/EBOOT.PBP, with <name> the host
@@ -1145,8 +1207,18 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     psp_hle_init();
     /* After psp_hle_init, which resets the allocator. */
     psp_sysmem_reserve_module(li.lo, li.hi);
-    psp_interp_import *imports = NULL;
-    const int nimports = interp_bind_imports(&b, &e, &imports);
+    const int nimports = interp_bind_imports(&b, &e);
+    /* The executable, for sceKernelQueryModuleInfo, and the modules it may
+     * load. */
+    {
+        psp_module_image im;
+        if (psp_module_describe(&b, &e, &li, &im) == 0) {
+            psp_modules_set_main(&im);
+            free(im.export_nid);
+            free(im.export_addr);
+        }
+    }
+    psp_modules_set_loader(interp_load_module);
 
     /* Some HLE handlers call back into guest code — a thread entry point, a
      * registered callback — and they do it through psp_dispatch(), which only
@@ -1277,7 +1349,6 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     }
 
     psp_interp_free_imports();
-    free(imports);
     psp_mem_free();
     psp_blob_free(&b);
     /* A clean return is success, and so is the guest asking to exit -- a

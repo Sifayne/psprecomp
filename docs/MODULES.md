@@ -4,7 +4,8 @@ The plan for games that load modules (PRX files) of their own at run time,
 through `sceKernelLoadModule`. Written 9 Oct 2026 against psprecomp e73adc1.
 Sif chose the approach the same day: the importer recompiles each module on
 the disc, as it does the executable. M1 to M5 are built, and M6's probe has
-measured them (set 25); M5 waits on a game gate.
+measured them (set 25): psprecomp's run of it now matches the PSP's byte for
+byte. M5 waits on a game gate.
 
 ## Where things stand
 
@@ -197,13 +198,35 @@ state, and a state refuses to load into a game whose modules differ.
   - unloading a started module: `0x80020138`;
   - the same file loaded twice does not start twice (`0x8002013B`);
   - LoadModuleByID of a memory stick file: `0x80020146`.
-- Left as known differences:
-  - the start thread's attributes read `0x800000FF`;
-  - an import nothing provides answers `0x8002013A` on a PSP and 0 here,
-    since the runtime cannot tell a missing module library from a firmware
-    call it does not answer yet;
-  - QueryModuleInfo of the executable reports one segment covering it
-    whole, with data and bss by section, where the runtime counts segments.
+- Fixed after (the three left over from 513ee3d):
+  - An import nothing provides answers `0x8002013A` (step 15). Each emitted
+    thunk now passes its library with its NID (`psp_hle_import`). An
+    unanswered call from a library that is neither firmware nor a started
+    module's is not linked. Firmware's is a library the runtime answers any
+    call of, or one firmware 6.60 gives a game: every library its modules
+    export but the kernel's own, as PSPLibDoc lists them for 6.60. A game's
+    own module's library answers so too, before the module starts and once
+    it stops. Every library the four gated titles and WipEout import is
+    firmware's, so their calls answer as before.
+  - QueryModuleInfo reports the module's loadable segments at their memory
+    size, its ELF entry, and text, data and bss as the PSP's loader counts
+    them (uofw loadcore `CheckElfSectionPRX`). For a PRX that is by section,
+    exact flags only: text is PROGBITS ALLOC or ALLOC|EXEC, data PROGBITS
+    ALLOC|WRITE, bss NOBITS ALLOC|WRITE. So `.rodata` merged as strings,
+    `.sdata`, `.sbss` and `.MIPS.abiflags` count nowhere (step 4: text
+    0x21F18, data 0xF68, bss 0xCA18 for the probe's executable; text 0x4D4
+    for mod_a). A static ELF's is by segment. The boot host and the
+    interpreter describe a module with the same code (`loader.c`,
+    `psp_module_describe`).
+  - The start thread's attributes already read `0x800000FF`, as every
+    thread's do over the bits kept. What the caller's option adds is now
+    masked as uofw's module manager masks it (`THREAD_SM_LEGAL_ATTR`), and an
+    option priority of 0 is none.
+- **The interpreter loads modules** (`allegrexrecomp interp`): any decrypted,
+  relocatable PRX, into a block of its size from the lowest free address,
+  its thunks bound beside the executable's and its code run interpreted.
+  modprobe's log under it is byte-identical to the PSP's, all fifteen
+  steps.
 - The UMD steps of `sysprobe` (`sce_lbn`) did not run: no disc in the
   drive.
 - **The 3rd Birthday and the Armored Core titles**, which load no modules,

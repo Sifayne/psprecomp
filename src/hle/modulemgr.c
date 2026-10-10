@@ -47,6 +47,12 @@
  * caller says otherwise (uofw threadman_kernel.h). */
 #define MODULE_INIT_PRIORITY    32
 #define USER_DEFAULT_STACKSIZE  (256 * 1024)
+/* What of the caller's SceKernelSMOption attributes the thread takes: no
+ * fill, clear and low stack, 0x800000, VFPU, never FPU (uofw modulemgr_int.h
+ * THREAD_SM_LEGAL_ATTR). The top four bits are the mode, which is the
+ * module's own: user, for every module a game loads. */
+#define THREAD_SM_LEGAL_ATTR    0x00F06000u
+#define THREAD_MODE_BITS        0xF0000000u
 
 /* ThreadManForUser, called on the guest's behalf. */
 #define NID_CREATE_THREAD       0x446D8DE6u
@@ -169,11 +175,14 @@ static uint32_t nested(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
 }
 
 /* Run module_start or module_stop on a thread of its own and wait for it, as
- * the module manager does: named, prioritised and sized by the caller's
- * SceKernelSMOption {size, mpidstack, stacksize, priority, attribute} if it
- * gave one, else by the module's thread parameter, else the defaults, and
- * created under the module's $gp. Returns 0 with the function's answer in
- * *status, or the error that kept it from running. */
+ * the module manager does (uofw modulemgr.c _PrologueModule): prioritised and
+ * sized by the caller's SceKernelSMOption {size, mpidstack, stacksize,
+ * priority, attribute} where it gives one (0 is none), else by the module's
+ * thread parameter, else the defaults; with the module's attributes and the
+ * legal ones of the caller's; and created under the module's $gp. Its
+ * attributes read 0x800000FF over those kept, as every thread's do
+ * (ReferThreadStatus; modprobe steps 7 and 13, fw 6.60). Returns 0 with the
+ * function's answer in *status, or the error that kept it from running. */
 static uint32_t run_thread_busy(const module *m, uint32_t entry, const char *name,
                                 uint32_t argsize, uint32_t argp, uint32_t opt, uint32_t *status);
 
@@ -191,10 +200,11 @@ static uint32_t run_thread_busy(const module *m, uint32_t entry, const char *nam
     uint32_t stack = m->im.start_stack;
     uint32_t attr = m->im.start_attr;
     if (opt && psp_read32(opt) >= 20) {
-        priority = psp_read32(opt + 12);
+        if (psp_read32(opt + 12)) priority = psp_read32(opt + 12);
         if (psp_read32(opt + 8)) stack = psp_read32(opt + 8);
-        attr |= psp_read32(opt + 16);
+        attr |= psp_read32(opt + 16) & THREAD_SM_LEGAL_ATTR;
     }
+    attr &= ~THREAD_MODE_BITS;
     if (!stack) stack = USER_DEFAULT_STACKSIZE;
 
     /* The name only has to last the call: below the caller's stack, which
@@ -244,7 +254,7 @@ static uint32_t load(const uint8_t *file, size_t len, const char *what) {
      * games report and check free memory (docs/MODULES.md, decided 9 Oct). */
     memset(m, 0, sizeof *m);
     m->im = im;
-    m->block = psp_sysmem_alloc(im.hi - im.lo, 0);
+    m->block = im.block ? im.block : psp_sysmem_alloc(im.hi - im.lo, 0);
     if (!m->block) { m->used = 0; forget(m); return SCE_KERNEL_ERROR_NO_MEMORY; }
     m->used = 1;
     m->id = psp_threadman_next_uid();
@@ -434,7 +444,7 @@ static void hle_QueryModuleInfo(void) {
         PUT32(0x08 + 4 * i, im->seg_addr[i]);
         PUT32(0x18 + 4 * i, im->seg_size[i]);
     }
-    PUT32(0x28, im->start ? im->start : 0xFFFFFFFFu);
+    PUT32(0x28, im->entry ? im->entry : 0xFFFFFFFFu);
     PUT32(0x2C, im->gp);
     PUT32(0x30, im->text_addr);
     PUT32(0x34, im->text_size);

@@ -336,6 +336,32 @@ static void elf_import_extent(const uint8_t *d, size_t len, elf_info *e) {
     }
 }
 
+void elf_exec_sizes(const uint8_t *d, size_t len, const elf_info *e,
+                    uint32_t *text, uint32_t *data_size, uint32_t *bss) {
+    enum { SHT_PROGBITS = 1, SHT_NOBITS = 8, SHF_WRITE = 1, SHF_ALLOC = 2, SHF_EXECINSTR = 4 };
+    *text = *data_size = *bss = 0;
+    if (e->type != 0xFFA0) {
+        for (int i = 0; i < e->nsegments; i++) {
+            if (e->seg[i].flags & 0x1) *text += e->seg[i].filesz;
+            else                       *data_size += e->seg[i].filesz;
+            if (e->seg[i].memsz > e->seg[i].filesz) *bss += e->seg[i].memsz - e->seg[i].filesz;
+        }
+        return;
+    }
+    if (e->shentsize < 40) return;
+    for (uint32_t i = 0; i < e->shnum; i++) {
+        const size_t at = (size_t)e->shoff + (size_t)i * e->shentsize;
+        if (at + 40 > len) break;
+        const uint32_t type = rd32(d + at + 4), flags = rd32(d + at + 8), size = rd32(d + at + 20);
+        if (type == SHT_PROGBITS) {
+            if (flags == (SHF_ALLOC | SHF_EXECINSTR) || flags == SHF_ALLOC) *text += size;
+            else if (flags == (SHF_ALLOC | SHF_WRITE))                      *data_size += size;
+        } else if (type == SHT_NOBITS && flags == (SHF_ALLOC | SHF_WRITE)) {
+            *bss += size;
+        }
+    }
+}
+
 int elf_parse(const uint8_t *d, size_t len, elf_info *out) {
     if (len < 52 || memcmp(d, "\x7f" "ELF", 4) != 0) return -1;
     if (d[4] != 1 || d[5] != 1) return -1;   /* ELFCLASS32, ELFDATA2LSB */

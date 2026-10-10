@@ -52,6 +52,10 @@ Needs the pspdev toolchain (`psp-gcc`, `psp-config` and PSPSDK) on `PATH`:
 builds `EBOOT.PBP` and `mods/*/mod_*.prx`. All six PRXs go in the probe's
 folder on the memory stick, beside the EBOOT.
 
-Under psprecomp (`allegrexrecomp interp modprobe.prx --dispatch --base
-0x08804000`) every load fails as a file the game was not prepared with: the
-interpreter has no module catalogue. The rest of the log compares as usual.
+Under psprecomp the interpreter loads the PRXs as the console does, into a
+block of their size from the lowest free address, and runs them interpreted:
+
+    mkdir -p ms/PSP/GAME/modprobe && cp mods/*/mod_*.prx ms/PSP/GAME/modprobe/
+    allegrexrecomp interp modprobe.prx --dispatch --base 0x08804000
+
+Its `modprobe.txt` is byte-identical to the PSP's (set 25, fw 6.60).

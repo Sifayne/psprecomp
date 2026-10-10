@@ -49,9 +49,52 @@ static void moved_right(const uint8_t *d, const char *form) {
     CHECK(r32(d + SEG1 + 0) == 0x00400008, "%s: the word moves with segment 0, got %08X", form, r32(d + SEG1));
 }
 
+/* What QueryModuleInfo reports of a module's sizes, as the PSP's loader
+ * counts them (elf_exec_sizes; modprobe step 4, fw 6.60). A PRX's by
+ * section, exact flags only; a static ELF's by segment. */
+static void exec_sizes(void) {
+    enum { SH = 0x40, NS = 9 };
+    static uint8_t d[SH + 40 * NS];
+    memset(d, 0, sizeof d);
+    /* type, flags, size */
+    const uint32_t sh[NS][3] = {
+        { 0, 0, 0 },                     /* the null section */
+        { 1, 0x6, 0x100 },               /* .text: AX, text */
+        { 1, 0x2, 0x20 },                /* .rodata.sceModuleInfo: A, text */
+        { 1, 0x32, 0x10 },               /* .rodata merged strings: AMS, nowhere */
+        { 0x7000002A, 0x2, 0x18 },       /* .MIPS.abiflags: not PROGBITS, nowhere */
+        { 1, 0x3, 0x30 },                /* .data: WA, data */
+        { 1, 0x10000003, 0x8 },          /* .sdata: WA and gp-relative, nowhere */
+        { 8, 0x3, 0x40 },                /* .bss: NOBITS WA, bss */
+        { 8, 0x10000003, 0x4 },          /* .sbss: nowhere */
+    };
+    for (int i = 0; i < NS; i++) {
+        w32(d + SH + 40 * i + 4, sh[i][0]);
+        w32(d + SH + 40 * i + 8, sh[i][1]);
+        w32(d + SH + 40 * i + 20, sh[i][2]);
+    }
+    elf_info e;
+    memset(&e, 0, sizeof e);
+    e.type = ET_PSP_PRX;
+    e.shoff = SH; e.shentsize = 40; e.shnum = NS;
+    uint32_t text, data, bss;
+    elf_exec_sizes(d, sizeof d, &e, &text, &data, &bss);
+    CHECK(text == 0x120 && data == 0x30 && bss == 0x40,
+          "a PRX's sizes by section: text %X data %X bss %X, expected 120 30 40", text, data, bss);
+
+    e.type = 2;                          /* ET_EXEC */
+    e.nsegments = 2;
+    e.seg[0] = (elf_segment){ 0x08804000, 0, 0x100, 0x100, 5 };
+    e.seg[1] = (elf_segment){ 0x08804100, 0, 0x20, 0x60, 6 };
+    elf_exec_sizes(d, sizeof d, &e, &text, &data, &bss);
+    CHECK(text == 0x100 && data == 0x20 && bss == 0x40,
+          "a static ELF's by segment: text %X data %X bss %X, expected 100 20 40", text, data, bss);
+}
+
 int main(void) {
     static uint8_t d[0x400];
     elf_info e;
+    exec_sizes();
 
     /* Packed: part1s 2, part2s 3, one segment bit. First table: entry 0 is
      * the table's own size, 4, which reads as "segment, 32-bit offset

@@ -272,6 +272,84 @@ static uint32_t module_gp(const psp_blob *b, const elf_info *e) {
     return rd32(b->data + e->modinfo_offset + 0x20);
 }
 
+void psp_module_write(const psp_blob *b, const elf_info *e) {
+    static const uint8_t zeros[4096];
+    for (int i = 0; i < e->nsegments; i++) {
+        const elf_segment *s = &e->seg[i];
+        if ((size_t)s->offset + s->filesz > b->size) continue;
+        psp_mem_write_block(s->addr, b->data + s->offset, s->filesz);
+        for (uint32_t z = s->filesz; z < s->memsz; ) {
+            const uint32_t n = s->memsz - z < sizeof zeros ? s->memsz - z : (uint32_t)sizeof zeros;
+            psp_mem_write_block(s->addr + z, zeros, n);
+            z += n;
+        }
+    }
+}
+
+/* The syslib's: module_start, module_stop, and module_start's thread. */
+#define NID_MODULE_START        0xD632ACDBu
+#define NID_MODULE_STOP         0xCEE8593Cu
+#define NID_MODULE_START_THREAD 0x0F7C276Cu
+
+int psp_module_describe(const psp_blob *b, const elf_info *e, const psp_load_info *li,
+                        psp_module_image *out) {
+    memset(out, 0, sizeof *out);
+    out->lo = li->lo;
+    out->hi = li->hi;
+    out->entry = e->entry != 0xFFFFFFFFu ? e->entry : 0;
+    out->start = out->entry;
+    out->text_addr = e->nsegments ? e->seg[0].addr : li->lo;
+    elf_exec_sizes(b->data, b->size, e, &out->text_size, &out->data_size, &out->bss_size);
+    out->nsegments = e->nsegments > 4 ? 4 : e->nsegments;
+    for (int i = 0; i < out->nsegments; i++) {
+        out->seg_addr[i] = e->seg[i].addr;
+        out->seg_size[i] = e->seg[i].memsz;
+    }
+    psp_module_info mi;
+    memset(&mi, 0, sizeof mi);
+    if (e->modinfo_size && psp_modinfo_parse(b->data, b->size, e->modinfo_offset, &mi) == 0) {
+        out->gp = mi.gp_value;
+        out->attribute = (uint16_t)mi.attribute;
+        out->version[0] = mi.version[0];
+        out->version[1] = mi.version[1];
+        memcpy(out->name, mi.name, sizeof out->name);
+    }
+
+    /* Its exports: module_start, module_stop and module_start's thread from
+     * the syslib, the functions of its named libraries for the others. */
+    const uint32_t bias = e->nsegments ? e->seg[0].offset - e->seg[0].addr : 0;
+    const int n = mi.ent_end > mi.ent_top ? psp_collect_export_table(b->data, b->size, &mi, bias, NULL, 0) : 0;
+    psp_export *ex = n > 0 ? (psp_export *)malloc((size_t)n * sizeof *ex) : NULL;
+    if (ex) psp_collect_export_table(b->data, b->size, &mi, bias, ex, n);
+    out->export_nid = (uint32_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(uint32_t));
+    out->export_addr = (uint32_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(uint32_t));
+    if (!out->export_nid || !out->export_addr || (n > 0 && !ex)) {
+        free(ex);
+        free(out->export_nid);
+        free(out->export_addr);
+        out->export_nid = out->export_addr = NULL;
+        return -1;
+    }
+    for (int i = 0; i < n; i++) {
+        if (ex[i].syslib) {
+            if (ex[i].nid == NID_MODULE_START && !ex[i].variable) out->start = ex[i].addr;
+            if (ex[i].nid == NID_MODULE_STOP && !ex[i].variable) out->stop = ex[i].addr;
+            if (ex[i].nid == NID_MODULE_START_THREAD && ex[i].variable) {
+                /* {count, priority, stack size, attributes} */
+                out->start_priority = psp_read32(ex[i].addr + 4);
+                out->start_stack    = psp_read32(ex[i].addr + 8);
+                out->start_attr     = psp_read32(ex[i].addr + 12);
+            }
+            continue;
+        }
+        if (ex[i].variable) continue;
+        out->export_nid[out->nexports] = ex[i].nid;
+        out->export_addr[out->nexports++] = ex[i].addr;
+    }
+    free(ex);
+    return 0;
+}
+
 int psp_load_module(psp_blob *b, const elf_info *e, psp_load_info *out) {
     if (psp_relocate_image(b->data, b->size, e, out) != 0) return -1;
     out->gp = module_gp(b, e);

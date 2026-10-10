@@ -24,6 +24,7 @@
 #define ALLEGREX_LOADER_H
 
 #include "container.h"
+#include "psprecomp/modules.h"
 
 #include <stdint.h>
 
@@ -53,6 +54,23 @@ int psp_relocate_image(uint8_t *data, size_t len, const elf_info *e,
 /* Relocate, then map every PT_LOAD at its linked address.
  * psp_mem_init() must already have been called. Returns 0 on success. */
 int psp_load_module(psp_blob *b, const elf_info *e, psp_load_info *out);
+
+/* A relocated module's segments into guest memory where they now are, each
+ * zero past its file size: a module loaded again after an unload starts as
+ * clean as the first time. For memory that exists already (RAM, or a module
+ * window the host has grown). */
+void psp_module_write(const psp_blob *b, const elf_info *e);
+
+/* A relocated module, as the runtime's module table takes it
+ * (psprecomp/modules.h): its extent and $gp; module_start, module_stop and
+ * module_start's thread parameter from its syslib; the functions of its named
+ * libraries, in malloc'd arrays the caller hands over or frees; and what
+ * sceKernelQueryModuleInfo reports -- its loadable segments, its entry, and
+ * the text, data and bss sizes as the PSP's loader counts them
+ * (elf_exec_sizes). The thread parameter is read from guest memory, so after
+ * psp_module_write. */
+int psp_module_describe(const psp_blob *b, const elf_info *e, const psp_load_info *li,
+                        psp_module_image *out);
 
 /* Move a relocatable module so its lowest segment starts at `base`, as the
  * PSP's loader places one in user memory (the first module at 0x08804000):

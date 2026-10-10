@@ -178,6 +178,17 @@ int psp_collect_pointer_seeds(const uint8_t *data, size_t len, const elf_info *e
 
 int elf_parse(const uint8_t *data, size_t len, elf_info *out);
 
+/* The text, data and bss sizes the PSP's loader records for a module, which
+ * sceKernelQueryModuleInfo reports (uofw loadcore loadelf.c, CheckElfSection
+ * and CheckElfSectionPRX; modprobe step 4, fw 6.60). For a PRX, by section:
+ * text is every PROGBITS section whose flags are exactly ALLOC or
+ * ALLOC|EXECINSTR, data every one exactly ALLOC|WRITE, bss every NOBITS one
+ * exactly ALLOC|WRITE -- so .rodata merged as strings, .sdata and .sbss count
+ * nowhere. For a static ELF, by loadable segment: an executable one's file
+ * size is text, another's data, and memory past the file bss. */
+void elf_exec_sizes(const uint8_t *data, size_t len, const elf_info *e,
+                    uint32_t *text, uint32_t *data_size, uint32_t *bss);
+
 /* ---- PSP module info ------------------------------------------------------
  * The PRX descriptor: where the export and import tables live, and the $gp
  * value the module's code assumes. Exported function addresses are the single
