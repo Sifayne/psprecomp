@@ -524,6 +524,9 @@ static struct {
     uint32_t fog_colour;
     psp_blend_state bs;
     uint64_t unsupported_blend_eq, unsupported_blend_factor;
+    /* The first distinct blends counted above, for the report. */
+    struct { int src, dst, eq; uint32_t fixa, fixb; uint64_t draws; } blend_miss[8];
+    int blend_misses;
     uint64_t unsupported_stencil_draws;
     uint64_t stencil_draws, stencil_imports, stencil_exports;
 
@@ -3104,6 +3107,22 @@ static GLenum gl_fixed_factor(uint32_t colour, int *uses_constant) {
     return GL_CONSTANT_COLOR;
 }
 
+static void note_blend_miss(void) {
+    int i = 0;
+    while (i < g.blend_misses &&
+           (g.blend_miss[i].src != g.bs.src || g.blend_miss[i].dst != g.bs.dst || g.blend_miss[i].eq != g.bs.eq ||
+            ((g.bs.src == 10 || g.bs.dst == 10) &&
+             (g.blend_miss[i].fixa != (g.bs.fixa & 0xFFFFFFu) || g.blend_miss[i].fixb != (g.bs.fixb & 0xFFFFFFu)))))
+        i++;
+    if (i == g.blend_misses) {
+        if (i == (int)(sizeof g.blend_miss / sizeof g.blend_miss[0])) return;
+        g.blend_miss[i].src = g.bs.src; g.blend_miss[i].dst = g.bs.dst; g.blend_miss[i].eq = g.bs.eq;
+        g.blend_miss[i].fixa = g.bs.fixa & 0xFFFFFFu; g.blend_miss[i].fixb = g.bs.fixb & 0xFFFFFFu;
+        g.blend_misses++;
+    }
+    g.blend_miss[i].draws++;
+}
+
 static GLenum gl_equation(int eq, int *ok) {
     switch (eq) {
     case 0:  return GL_FUNC_ADD;
@@ -3197,16 +3216,27 @@ static void apply_state(void) {
         GLenum src = double_alpha ? GL_ONE : g.bs.src == 10
                    ? gl_fixed_factor(g.bs.fixa, &src_constant)
                    : gl_factor(g.bs.src, 1, &ok);
-        const GLenum dst = double_alpha && g.bs.dst == 7 ? GL_ONE_MINUS_SRC_ALPHA : g.bs.dst == 10
-                         ? gl_fixed_factor(g.bs.fixb, &dst_constant)
-                         : gl_factor(g.bs.dst, 0, &ok);
+        GLenum dst = double_alpha && g.bs.dst == 7 ? GL_ONE_MINUS_SRC_ALPHA : g.bs.dst == 10
+                   ? gl_fixed_factor(g.bs.fixb, &dst_constant)
+                   : gl_factor(g.bs.dst, 0, &ok);
+        /* A crossfade: FIXB the complement of FIXA in every channel, which
+         * the one GL constant says as ONE_MINUS_CONSTANT_COLOR on the
+         * destination. WipEout Pulse blends its race picture this way, FIXA
+         * 606060 and FIXB 9F9F9F; given FIXA on both sides it came out a
+         * quarter too dark. */
+        const int crossfade = src_constant && dst_constant &&
+                              (g.bs.fixb & 0xFFFFFFu) == (~g.bs.fixa & 0xFFFFFFu);
+        if (crossfade) dst = GL_ONE_MINUS_CONSTANT_COLOR;
         if (!ok) g.unsupported_blend_factor++;
-        if (src_constant && dst_constant &&
-            (g.bs.fixa & 0xFFFFFFu) != (g.bs.fixb & 0xFFFFFFu))
+        if (src_constant && dst_constant && !crossfade &&
+            (g.bs.fixa & 0xFFFFFFu) != (g.bs.fixb & 0xFFFFFFu)) {
             g.unsupported_blend_factor++;
+            ok = 0;
+        }
         int eq_ok = 1;
         const GLenum eq = gl_equation(g.bs.eq, &eq_ok);
         if (!eq_ok) g.unsupported_blend_eq++;
+        if (!ok || !eq_ok) note_blend_miss();
         /* This rewrite changes fragment alpha to carry an exact destination
          * factor, so only use it when alpha is the framebuffer's masked-off
          * stencil byte. MIN/MAX ignore factors; abs-difference is not
@@ -3219,8 +3249,8 @@ static void apply_state(void) {
         p_glBlendEquation(eq);
         /* If both sides need a non-trivial, unequal fixed colour the counter
          * above records the case GL's fixed pipeline cannot represent. Equal
-         * constants, or one non-trivial constant paired with zero/one, are
-         * exact. */
+         * constants, complementary ones, or one non-trivial constant paired
+         * with zero/one, are exact. */
         const uint32_t fx = src_constant ? g.bs.fixa : g.bs.fixb;
         p_glBlendColor((float)( fx        & 0xFF) / 255.0f,
                        (float)((fx >>  8) & 0xFF) / 255.0f,
@@ -4333,6 +4363,12 @@ void render_gl_report(FILE *out) {
         fprintf(out, ", blend not represented: %llu factor, %llu equation",
                 (unsigned long long)g.unsupported_blend_factor,
                 (unsigned long long)g.unsupported_blend_eq);
+    for (int i = 0; i < g.blend_misses; i++)
+        fprintf(out, "%s src %d dst %d eq %d fixa %06X fixb %06X: %llu",
+                i ? ";" : " (", g.blend_miss[i].src, g.blend_miss[i].dst, g.blend_miss[i].eq,
+                (unsigned)g.blend_miss[i].fixa, (unsigned)g.blend_miss[i].fixb,
+                (unsigned long long)g.blend_miss[i].draws);
+    if (g.blend_misses) fputc(')', out);
     if (g.unsupported_stencil_draws)
         fprintf(out, ", %llu draw(s) need alpha-backed stencil",
                 (unsigned long long)g.unsupported_stencil_draws);
