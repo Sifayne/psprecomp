@@ -4042,6 +4042,20 @@ static void gl_present(void) {
                 (unsigned long long)(g.model_draws - md), (unsigned long long)(g.mu.batches - mb),
                 (unsigned long long)(g.glyph_draws - gl_));
         d = g.draws; sc = g.class_scene; hu = g.class_hud; md = g.model_draws; mb = g.mu.batches; gl_ = g.glyph_draws; gc = cmds; gv = vtx;
+        /* And what the frame cost: wall time since the last present, the
+         * pacers' sleep in it (the rest is the host's work), the run's lag
+         * behind the wall, and the texture and readback work, all in ms. */
+        static uint64_t w0, sl0, dec0, up0, rb0, imp0;
+        const uint64_t now = psp_os_mono_ns(), slept = psp_clock_slept_ns();
+        uint64_t guest = 0, wall = 0;
+        const int mapped = psp_clock_realtime_stats(&guest, &wall);
+        const double lag = mapped ? ((double)wall - (double)psp_clock_held_us() - (double)guest) / 1e3 : 0.0;
+        fprintf(stderr, "frame-time present %llu: guest %.3f s poll %u; wall %.2f slept %.2f lag %.1f; decode %.2f upload %.2f readback %.2f imports %llu\n",
+                (unsigned long long)g.presents, psp_clock_peek() / 1e6, psp_ctrl_polls(),
+                w0 ? (now - w0) / 1e6 : 0.0, w0 ? (slept - sl0) / 1e6 : 0.0, lag,
+                (g.tex_decode_ns - dec0) / 1e6, (g.tex_upload_ns - up0) / 1e6, (g.readback_ns - rb0) / 1e6,
+                (unsigned long long)(g.cpu_uploads - imp0));
+        w0 = now; sl0 = slept; dec0 = g.tex_decode_ns; up0 = g.tex_upload_ns; rb0 = g.readback_ns; imp0 = g.cpu_uploads;
     }
     /* Count deferred alpha/stencil transfers inside the GPU frame timer. */
     for (int i = 0; i < g.n_rts; i++) stencil_to_alpha(&g.rts[i]);

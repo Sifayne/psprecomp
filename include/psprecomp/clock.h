@@ -126,6 +126,8 @@ uint64_t psp_clock_held_us(void);
  * gaps between audio outputs, a movie's fetch rate -- which a pause would
  * otherwise read as a stall. Any thread. */
 uint64_t psp_clock_run_ns(void);
+/* Wall nanoseconds the real-time and paced pacers have slept in all. */
+uint64_t psp_clock_slept_ns(void);
 
 #ifdef __cplusplus
 }

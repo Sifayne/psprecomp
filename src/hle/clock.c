@@ -112,10 +112,20 @@ static uint64_t wall_ns(void) { return psp_os_mono_ns(); }
 /* Sleep until wall moment `origin + us`. Returns immediately when the run is
  * already there or past it. The 2us slack keeps a sync that lands on the
  * boundary from costing a syscall for nothing. */
+/* Wall time the pacers have slept, for the frame log: a frame's wall time
+ * less its sleep is the host's work on it. */
+static _Atomic uint64_t g_slept_ns;
+uint64_t psp_clock_slept_ns(void) { return g_slept_ns; }
+static void sleep_until(uint64_t target) {
+    const uint64_t t0 = wall_ns();
+    psp_os_sleep_until_ns(target);
+    g_slept_ns += wall_ns() - t0;
+}
+
 static void wall_sync(uint64_t us) {
     const uint64_t target = g_origin_ns + us * 1000u;
     if (wall_ns() + 2000u >= target) return;
-    psp_os_sleep_until_ns(target);
+    sleep_until(target);
 }
 
 /* Anchored so that the guest's present is the wall's: at start-up that maps
@@ -156,7 +166,7 @@ static void paced_sync(uint64_t us) {
         if (now - target > (uint64_t)PSP_CLOCK_PACED_SLIP_US * 1000u) g_origin_ns += now - target;
         return;
     }
-    psp_os_sleep_until_ns(target);
+    sleep_until(target);
 }
 
 int psp_clock_realtime_stats(uint64_t *guest_us, uint64_t *wall_us) {
