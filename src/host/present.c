@@ -161,7 +161,10 @@ static void present_frame(uint32_t addr, uint32_t stride, uint32_t fmt) {
  * callback fills with silence: the popping Sif heard through the intro. A
  * pre-roll of 4096 frames is 93 ms of slack against that jitter, paid once as
  * latency at the start of each stream. */
-enum { MIX_CHANNELS = 8, MIX_RING_FRAMES = 44100 * 8 };
+/* The eight channels and Output2's (the runtime numbers it 8): a game whose
+ * sound is all Output2, as WipEout Pulse's is, played nothing through here,
+ * and its mixer, never told to wait, never let the rest of the game run. */
+enum { MIX_CHANNELS = 9, MIX_RING_FRAMES = 44100 * 8 };
 typedef struct {
     int16_t *pcm;
     uint32_t head, tail, count;
@@ -323,9 +326,17 @@ static void mix_flush(void) {
     if (g_audio_dev) SDL_UnlockAudioDevice(g_audio_dev);
 }
 
+/* With no device nothing plays the sound, so nothing paces the threads that
+ * make it: the runtime's own guest-clock queue does, as without a window. */
+static void mix_started(int device, int gl) {
+    (void)gl;
+    if (!device) psp_audio_set_output(NULL);
+}
+
 static const psp_audio_backend host_mixer = {
     .prepare = mix_prepare, .callback = audio_callback, .opened = mix_opened,
     .output = present_audio, .report = mix_report, .flush = mix_flush,
+    .started = mix_started,
 };
 
 /* The title's audio output, or the host's mixer. */
