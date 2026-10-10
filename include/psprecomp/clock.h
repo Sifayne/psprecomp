@@ -99,11 +99,14 @@ int  psp_clock_is_realtime(void);
 #define PSP_CLOCK_PACED_SLIP_US 100000u
 void psp_clock_paced(int enable);
 int  psp_clock_is_paced(void);
-/* Whether this run asked for paced mode: PSPRECOMP_PACED=1 or 0 decides; by
- * default a run that plays or records a pad scenario (PSPRECOMP_REPLAY,
- * PSPRECOMP_REPLAY_REC) is paced, so its timing is the scenario's. The host
+/* Whether this run asked for paced mode: PSPRECOMP_PACED=1 or 0 decides; a
+ * run that plays or records a pad scenario (PSPRECOMP_REPLAY,
+ * PSPRECOMP_REPLAY_REC) is paced, so its timing is the scenario's; and
+ * otherwise the player's preference (its TIMING setting, given to
+ * psp_clock_paced_preference before the window opens) decides. The host
  * consults this where it would otherwise turn real-time mode on. */
 int  psp_clock_paced_requested(void);
+void psp_clock_paced_preference(int paced);
 
 /* A non-perturbing end-of-run measurement of the real-time (or paced)
  * mapping. Returns zero while the unpaced virtual clock is selected. `guest_us` is the

@@ -150,11 +150,14 @@ void psp_clock_paced(int enable) {
 
 int psp_clock_is_paced(void) { return g_paced; }
 
+static int g_paced_preference;
+void psp_clock_paced_preference(int paced) { g_paced_preference = paced != 0; }
+
 int psp_clock_paced_requested(void) {
     const char *v = getenv("PSPRECOMP_PACED");
     if (v && *v) return *v != '0';
     const char *play = getenv("PSPRECOMP_REPLAY"), *rec = getenv("PSPRECOMP_REPLAY_REC");
-    return (play && *play) || (rec && *rec);
+    return (play && *play) || (rec && *rec) || g_paced_preference;
 }
 
 /* Paced mode's half of an idle jump: wait for the wall to reach the guest,

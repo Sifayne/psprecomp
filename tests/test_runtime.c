@@ -11,6 +11,7 @@
 #include "psprecomp/os.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 static int failures;
 
@@ -119,6 +120,20 @@ static void test_clock_paced(void) {
     CHECK(!psp_clock_is_paced(), "real-time mode turns paced mode off");
     psp_clock_realtime(0);
     psp_clock_paced(0);
+
+    /* Who asks: PSPRECOMP_PACED, then a scenario, then the TIMING setting. */
+    unsetenv("PSPRECOMP_PACED"); unsetenv("PSPRECOMP_REPLAY"); unsetenv("PSPRECOMP_REPLAY_REC");
+    psp_clock_paced_preference(0);
+    CHECK(!psp_clock_paced_requested(), "real time when nothing asks for pacing");
+    psp_clock_paced_preference(1);
+    CHECK(psp_clock_paced_requested(), "the TIMING setting asks for it");
+    setenv("PSPRECOMP_PACED", "0", 1);
+    CHECK(!psp_clock_paced_requested(), "PSPRECOMP_PACED=0 overrides the setting");
+    unsetenv("PSPRECOMP_PACED");
+    psp_clock_paced_preference(0);
+    setenv("PSPRECOMP_REPLAY_REC", "x.pad", 1);
+    CHECK(psp_clock_paced_requested(), "a recording asks for it whatever the setting");
+    unsetenv("PSPRECOMP_REPLAY_REC");
 }
 
 static void test_division(void) {

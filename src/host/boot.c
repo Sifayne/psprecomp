@@ -952,13 +952,16 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* TIMING: paced (0) or real time (1). */
+    psp_clock_paced_preference(settings.number[PSP_OPT_TIMING] == 0);
     int windowed = 0;
     if (settings.window) {
         if (want_gl) present_want_gl();
         present_use_overlay();          /* the in-game menu: Escape, or View + Menu */
         if (present_start() == 0) {
             windowed = 1;
-            printf("      window    on (SDL2: video, pad, audio; implies real-time pacing)\n");
+            printf("      window    on (SDL2: video, pad, audio; %s)\n",
+                   psp_clock_is_paced() ? "paced: the game's clock at the screen's pace" : "real-time pacing");
             if (adaptive_aspect)
                 printf("      aspect    window -- expanded view follows the drawable; "
                        "HUD stays in the native safe area\n");
