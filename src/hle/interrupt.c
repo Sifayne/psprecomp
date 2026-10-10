@@ -29,6 +29,13 @@ static irq_module modules[MODULE_CAPACITY];
 static unsigned module_count;
 static uint64_t generation;
 static int cpu_enabled = 1, in_handler, servicing;
+/* Whether any subscription may hold events. psp_interrupt_run_pending runs
+ * at every completed firmware call, and scanning all IRQ_COUNT x SUB_COUNT
+ * subscriptions there each time took a fifth of WipEout Pulse's main thread
+ * in a race. Raised events and a loaded state set it; a complete scan that
+ * delivered everything, with nothing raised meanwhile, clears it. */
+static int maybe_pending = 1;
+static uint64_t raised;
 
 /* Numeric categories independently documented in PSPSDK pspkerror.h. */
 enum {
@@ -44,6 +51,7 @@ void psp_interrupt_reset(void) {
     generation = 0;
     cpu_enabled = 1;
     in_handler = servicing = 0;
+    maybe_pending = 1;
 }
 
 int psp_interrupt_set_module(uint32_t lo, uint32_t hi, uint32_t gp) {
@@ -127,6 +135,7 @@ void psp_interrupt_raise(unsigned irq, uint64_t count) {
         if (!slot->entry || !slot->enabled) continue;
         if (UINT64_MAX - slot->pending < count) slot->pending = UINT64_MAX;
         else slot->pending += count;
+        maybe_pending = 1; raised++;
     }
 }
 
@@ -173,7 +182,9 @@ void psp_interrupt_run_pending(void) {
     if (!cpu_enabled || in_handler || servicing) return;
     servicing = 1;
     unsigned budget = DELIVERY_BUDGET;
-    for (unsigned irq = 0; irq < IRQ_COUNT && budget; irq++) {
+    const uint64_t raised_before = raised;
+    int left = 0;
+    for (unsigned irq = 0; maybe_pending && irq < IRQ_COUNT && budget; irq++) {
         for (unsigned sub = 0; sub < SUB_COUNT && budget; sub++) {
             irq_subscription *slot = &subscriptions[irq][sub];
             /* Snapshot this subscription's work: events raised by a handler
@@ -189,8 +200,10 @@ void psp_interrupt_run_pending(void) {
                 psp_interrupt_call(slot->entry, psp_interrupt_handler_gp(slot->entry),
                                    sub, slot->common, 0);
             }
+            if (slot->pending) left = 1;
         }
     }
+    if (maybe_pending && budget && cpu_enabled && !left && raised == raised_before) maybe_pending = 0;
     /* Device queues retain their own completion events while CPU delivery is
      * masked. Resume them at the same completed HLE boundary as subscriptions. */
     psp_ge_run_pending_callbacks();
@@ -206,7 +219,15 @@ uint64_t psp_interrupt_next_event(void) {
     return 0;
 }
 
+static int interrupt_loaded(psp_state_reader *r, char *why, size_t size) {
+    (void)r; (void)why; (void)size;
+    maybe_pending = 1;       /* the kept subscriptions may hold events */
+    return 0;
+}
+
 void psp_interrupt_register(void) {
+    static const psp_state_part part = { .name = "interrupt", .load = interrupt_loaded };
+    psp_state_register(&part);
     /* A save state's (psprecomp/state.h): the modules too, since a title
      * can load more of them than the boot does. */
     PSP_STATE_KEEP(subscriptions);

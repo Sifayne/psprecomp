@@ -141,6 +141,36 @@ static void native_idle_wakeup(void) {
     psp_sched_join_all();psp_sched_reset();
     invoke(0x28B6489C,idle_sema,0,0,0);
 }
+/* psp_interrupt_run_pending skips its scan when nothing can be pending.
+ * Events raised after a quiet pass still arrive, and so does one a handler
+ * raises for an interrupt the pass has already gone by (IRQ 25 is scanned
+ * before IRQ 30). */
+#define LOW_HANDLER 0x08801100u
+static unsigned quiet_hits,low_hits;
+static void quiet_handler(void) {
+    quiet_hits++;
+    if (quiet_hits==2) psp_interrupt_raise(25,1);
+}
+static void low_handler(void) { low_hits++; }
+static void quiet_pending(void) {
+    reset();quiet_hits=low_hits=0;
+    psp_register(HANDLER,quiet_handler);psp_register(LOW_HANDLER,low_handler);
+    CHECK(invoke(0xCA04A2B9,30,2,HANDLER,0)==0);
+    CHECK(sceKernelEnableSubIntr(30,2)==0);
+    CHECK(invoke(0xCA04A2B9,25,0,LOW_HANDLER,0)==0);
+    CHECK(sceKernelEnableSubIntr(25,0)==0);
+    psp_interrupt_run_pending();psp_interrupt_run_pending();
+    CHECK(quiet_hits==0 && low_hits==0);
+    psp_interrupt_raise(30,1);psp_interrupt_run_pending();
+    CHECK(quiet_hits==1);
+    psp_interrupt_run_pending();CHECK(quiet_hits==1);
+    psp_interrupt_raise(30,1);psp_interrupt_run_pending();
+    CHECK(quiet_hits==2 && low_hits==0);
+    psp_interrupt_run_pending();
+    CHECK(low_hits==1);
+    psp_interrupt_run_pending();CHECK(quiet_hits==2 && low_hits==1);
+    sceKernelDisableSubIntr(30,2);sceKernelDisableSubIntr(25,0);
+}
 int main(int argc,char **argv) {
     if (argc!=2 || !(observations=fopen(argv[1],"r"))) return 2;
     if (psp_mem_init()!=0) return 2;
@@ -149,6 +179,7 @@ int main(int argc,char **argv) {
     CHECK(records==68);CHECK(fgetc(observations)==EOF);fclose(observations);
     native_context();
     native_idle_wakeup();
+    quiet_pending();
     psp_sched_reset();psp_mem_free();
     printf("interrupt: %u observations, %u checks, %u failures\n",records,checks,failures);
     return failures?1:0;
