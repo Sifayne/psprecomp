@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
     /* Pages: the player's, the pack's, then Packs and About. */
     assert(has_page(&a, GROUP_PLAYER, "Display") && has_page(&a, GROUP_PLAYER, "Save states"));
     const char *names[PAGES_MAX];
-    assert(group_pages(&a, GROUP_PLAYER, names) == 5 && !strcmp(names[4], "Advanced"));
+    assert(group_pages(&a, GROUP_PLAYER, names) == 6 && !strcmp(names[4], "System") && !strcmp(names[5], "Advanced"));
     assert(group_pages(&a, GROUP_PACK, names) == 1 && !strcmp(names[0], "Controls"));
 
     /* An edit to each table, then the other pack: the player's carries, the
@@ -181,7 +181,7 @@ int main(int argc, char **argv) {
     select_game(&a, 2); draw(&a);
     /* The plain game: the player's pages alone. */
     select_game(&a, 3); draw(&a);
-    assert(a.pack == -1 && !group_pages(&a, GROUP_PACK, names) && group_pages(&a, GROUP_PLAYER, names) == 5);
+    assert(a.pack == -1 && !group_pages(&a, GROUP_PACK, names) && group_pages(&a, GROUP_PLAYER, names) == 6);
     close_window(&a);
 
     psp_settings_file_free(a.file);
