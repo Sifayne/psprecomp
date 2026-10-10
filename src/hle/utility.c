@@ -104,6 +104,19 @@ static void savedata_log(uint32_t param) {
             psp_read32(param + SD_MODE), game, save, file,
             psp_read32(param + SD_DATABUF),
             psp_read32(param + SD_DATABUFSZ), psp_read32(param + SD_DATASZ));
+    const uint32_t msdata = sd_optional(param, SD_MSDATA);
+    if (msdata && psp_mem_ptr(msdata, 36)) {
+        char mgame[17], msave[21];
+        for (int i = 0; i < 16; i++) mgame[i] = (char)psp_read8(msdata + (uint32_t)i);
+        mgame[16] = '\0';
+        for (int i = 0; i < 20; i++) msave[i] = (char)psp_read8(msdata + 16 + (uint32_t)i);
+        msave[20] = '\0';
+        fprintf(stderr, "savedata: msData game=%.16s save=%.20s\n", mgame, msave);
+    }
+}
+static void savedata_log_result(uint32_t param) {
+    if (savedata_log_on())
+        fprintf(stderr, "savedata: mode=%u result=%08X\n", psp_read32(param + SD_MODE), psp_read32(param + SD_RESULT));
 }
 
 /* ---- M4: savedata data paths ------------------------------------------------
@@ -1224,7 +1237,7 @@ void psp_utility_init(void) {
 }
 static void sd_finish(uint32_t result) {
     sd_view.result=result; sd_view.active=0;
-    psp_write32(g_savedata_param+SD_RESULT,result);
+    psp_write32(g_savedata_param+SD_RESULT,result); savedata_log_result(g_savedata_param);
     g_savedata_done=1; g_savedata_state=PSP_UTILITY_DIALOG_QUIT;
     sd_publish();
 }
@@ -1232,7 +1245,7 @@ static void sd_outcome(uint32_t result, const char *message) {
     sd_view.result=result;
     sd_view.stage=result ? PSP_SAVEDATA_ERROR : PSP_SAVEDATA_DONE;
     snprintf(sd_view.message,sizeof sd_view.message,"%s",message);
-    psp_write32(g_savedata_param+SD_RESULT,result);
+    psp_write32(g_savedata_param+SD_RESULT,result); savedata_log_result(g_savedata_param);
     g_savedata_done=1;
     sd_publish();
 }
@@ -1583,7 +1596,7 @@ static void hle_SavedataUpdate(void) {
             uint32_t mode=psp_read32(g_savedata_param+SD_MODE);
             uint32_t result=!sd_request_valid() ? SD_BAD_PARAM :
                 (mode==SD_AUTOLOAD && sd_recover_card()) ? SD_LOAD_ACCESS : sd_do_mode(g_savedata_param);
-            psp_write32(g_savedata_param+SD_RESULT,result);
+            psp_write32(g_savedata_param+SD_RESULT,result); savedata_log_result(g_savedata_param);
             g_savedata_done=1;
         }
         g_savedata_state=PSP_UTILITY_DIALOG_QUIT;
@@ -1618,6 +1631,7 @@ static void hle_SavedataShutdownStart(void) {
         if (sd_view.active) sd_finish(g_savedata_done?sd_view.result:SD_RESULT_CANCEL);
     } else if (g_savedata_param && !g_savedata_done) {
         psp_write32(g_savedata_param+SD_RESULT,sd_request_valid()?sd_do_mode(g_savedata_param):SD_BAD_PARAM); g_savedata_done=1;
+        savedata_log_result(g_savedata_param);
     }
     g_savedata_state=PSP_UTILITY_DIALOG_FINISHED;
     g_savedata_shutdown_vblank=psp_display_vblanks();
