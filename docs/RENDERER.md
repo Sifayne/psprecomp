@@ -302,7 +302,10 @@ level's address, stride and dimensions rather than only level zero.
 
 Mip selection does not use driver derivatives. The shared
 `psp_render_lod16()` applies the measured AUTO, CONST and SLOPE rules once per
-primitive, including the signed 1/16 bias. The fragment shader uses
+primitive, including the signed 1/16 bias. SLOPE's depth term, log2 of twice
+the slope times the primitive's clip-space W, is not measured: it fits the
+one through-mode test point (W 1) and WipEout Pulse's race, whose ship
+liveries and crowd need it. A geprobe step should pin it down. The fragment shader uses
 `texelFetch` to implement PSP nearest/bilinear precision, wrap, mip-nearest and
 mip-linear explicitly; this avoids OpenGL's different min/mag switchover and
 also permits independently-sized PSP mip levels. A mission run uploaded 47,779

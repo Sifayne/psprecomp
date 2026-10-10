@@ -970,7 +970,10 @@ static const char *GS_MODEL_SRC =
     "    float rho = rx > ry ? rx : ry;\n"
     "    int lod;\n"
     "    if (X.lodi.x == 0)      lod = (rho > 0.0) ? int(floor(log2(rho) * 16.0)) : -4096;\n"
-    "    else if (X.lodi.x == 2) lod = int(floor(X.guard_slope.z * 16.0));\n"
+    "    else if (X.lodi.x == 2) {\n"
+    "        float s = 2.0 * X.guard_slope.z * (1.0 / a.invw + 1.0 / b.invw + 1.0 / c.invw) / 3.0;\n"
+    "        lod = s > 0.0 ? int(floor(log2(s) * 16.0)) : -4096;\n"
+    "    }\n"
     "    else                  lod = 0;\n"
     "    return lod + X.lodi.y;\n"
     "}\n"
@@ -2683,7 +2686,8 @@ static int triangle_lod16(const psp_vertex *a, const psp_vertex *b,
     const float dvdy = (dv2 * e1x - dv1 * e2x) / det;
     const float rx = sqrtf(dudx * dudx + dvdx * dvdx);
     const float ry = sqrtf(dudy * dudy + dvdy * dvdy);
-    return psp_render_lod16(&g.tex, rx > ry ? rx : ry);
+    const float w = (psp_render_vertex_w(a) + psp_render_vertex_w(b) + psp_render_vertex_w(c)) / 3.0f;
+    return psp_render_lod16(&g.tex, rx > ry ? rx : ry, w);
 }
 
 static void push_triangle(const psp_vertex *a, const psp_vertex *b,
@@ -2737,7 +2741,8 @@ static void push_sprite(const psp_vertex *v) {
         const float du = (v[1].u - v[0].u) / (float)uden;
         const float dv = (v[1].v - v[0].v) / (float)vden;
         const float rx = fabsf(du) * 16.0f, ry = fabsf(dv) * 16.0f;
-        lod16 = psp_render_lod16(&g.tex, rx > ry ? rx : ry);
+        lod16 = psp_render_lod16(&g.tex, rx > ry ? rx : ry,
+                                 (psp_render_vertex_w(&v[0]) + psp_render_vertex_w(&v[1])) * 0.5f);
     }
     reserve_vertices(6);
     push(&a, lod16); push(&b, lod16); push(&c, lod16);
@@ -3000,7 +3005,9 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
 
     switch (prim) {
     case PSP_PRIM_POINTS: {
-        int lod16 = psp_render_lod16(&g.tex, 1.0f);
+        float w = 0.0f;
+        for (int i = 0; i < count; i++) w += psp_render_vertex_w(&v[i]);
+        int lod16 = psp_render_lod16(&g.tex, 1.0f, count ? w / (float)count : 1.0f);
         for (int i = 0; i < count; i++) push_point_sample(&v[i], &lod16);
         break;
     }
