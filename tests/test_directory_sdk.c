@@ -35,11 +35,11 @@ int main(void) {
      * tree is used, and every file is authored below. */
     psp_io_set_root("directory-sdk-fixture");psp_io_reset();
     psp_io_mkdir_all("ms0:/");
-    /* A guest mkdir makes the missing parents too (src/hle/iofilemgr.c);
-     * what a PSP does is not measured. */
-    CHECK(path_call("sceIoMkdir","ms0:/absent/child",0700,0)==0);
-    CHECK(path_call("sceIoRmdir","ms0:/absent/child",0,0)==0);
-    CHECK(path_call("sceIoRmdir","ms0:/absent",0,0)==0);
+    /* A guest mkdir is single-level: a missing parent is not found, and
+     * nothing is made (sysprobe step 1, fw 6.60). */
+    CHECK(path_call("sceIoMkdir","ms0:/absent/child",0700,0)==(int)0x80010002);
+    CHECK(error(path_call("sceIoRmdir","ms0:/absent/child",0,0)));
+    CHECK(error(path_call("sceIoRmdir","ms0:/absent",0,0)));
     CHECK(path_call("sceIoMkdir","ms0:/sample",0700,0)==0);
     CHECK(error(path_call("sceIoMkdir","ms0:/sample",0700,0)));
     CHECK(path_call("sceIoChdir","ms0:/sample",0,0)==0);
@@ -57,14 +57,14 @@ int main(void) {
     CHECK(error(path_call("sceIoRmdir","ms0:/sample",0,0)));
     CHECK(error(path_call("sceIoRemove","ms0:/sample",0,0)));
 
-    /* Chstat validates the path and changes nothing on the host
-     * (src/hle/iofilemgr.c): nothing reads modes or times back. */
+    /* Chstat's MODE with no write makes the file read-only (sysprobe step 3,
+     * fw 6.60), which the host keeps as no write bit. */
     psp_write32(DATA,0400);
     CHECK(path_call("sceIoChstat","payload.bin",DATA,1)==0);
     char host[1024];psp_io_host_path("payload.bin",host,sizeof host);
     struct stat status;
     CHECK(stat(host,&status)==0);
-    CHECK((status.st_mode&0200)!=0);
+    CHECK((status.st_mode&0222)==0);
 
     uint32_t dir=path_call("sceIoDopen","ms0:/sample",0,0);
     CHECK(!error(dir));
@@ -83,7 +83,7 @@ int main(void) {
         if (!strcmp(name,"payload.bin")) {
             seen++;
             CHECK((psp_read32(ENTRY)&0xf000)==0x2000); /* SDK regular-file mode */
-            CHECK(psp_read32(ENTRY+4)==0x20); /* SDK regular-file attributes */
+            CHECK(psp_read32(ENTRY+4)==0x21); /* SDK regular-file attributes, read-only */
             CHECK(psp_read32(ENTRY+8)==sizeof payload && psp_read32(ENTRY+12)==0);
         }
     }
@@ -95,6 +95,11 @@ int main(void) {
     CHECK(error(call("sceIoDread",dir,0,0)));
     CHECK(call("sceIoDclose",dir,0,0)==0);
 
+    /* A read-only file cannot be removed (sysprobe step 4); MODE with write
+     * undoes it. */
+    CHECK(path_call("sceIoRemove","payload.bin",0,0)==(int)0x8001000D);
+    psp_write32(DATA,0777);
+    CHECK(path_call("sceIoChstat","payload.bin",DATA,1)==0);
     CHECK(path_call("sceIoRemove","payload.bin",0,0)==0);
     CHECK(error(path_call("sceIoRemove","payload.bin",0,0)));
     CHECK(path_call("sceIoChdir","ms0:/",0,0)==0);

@@ -1,35 +1,18 @@
 /* allegrexrecomp — module loading. See loader.h. */
 
 #include "loader.h"
+#include "reloc.h"
 
 #include "psprecomp/mem.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-/* PRX keeps its relocations in a section of its own type rather than SHT_REL,
- * which is why `readelf -r` reports a module like this as having none. */
-#define SHT_PRXRELOC 0x700000A0u
-
-#define R_MIPS_NONE  0
-#define R_MIPS_16    1
-#define R_MIPS_32    2
-#define R_MIPS_REL32 3
-#define R_MIPS_26    4
-#define R_MIPS_HI16  5
-#define R_MIPS_LO16  6
-#define R_MIPS_GPREL16 7
-
-/* r_info packs the MIPS type with two program-header selectors:
- *
- *   OFS_BASE   which segment r_offset is measured from — i.e. where to patch
- *   ADDR_BASE  which segment's base to add — i.e. what the stored value is
- *              relative to
- *
- * Both are indices into the PT_LOAD list. */
-#define R_TYPE(i)      ((i) & 0xFFu)
-#define R_OFS_BASE(i)  (((i) >> 8) & 0xFFu)
-#define R_ADDR_BASE(i) (((i) >> 16) & 0xFFu)
+/* A PRX keeps its relocations in a section of its own type rather than
+ * SHT_REL, which is why `readelf -r` reports a module like this as having
+ * none, or in a segment; reloc.c reads them. Each names two PT_LOADs: the one
+ * it patches (OFS_BASE) and the one whose base its value is relative to
+ * (ADDR_BASE). */
 
 static uint32_t rd32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -106,42 +89,33 @@ static void apply_lo16(hi_queue *q, uint8_t *lo_p, uint32_t delta) {
     q->n = 0;
 }
 
-static int apply_section(const image *im,
-                         uint32_t sh_off, uint32_t sh_size,
-                         const uint32_t *segbase, int nseg,
-                         psp_load_info *out) {
-    if ((size_t)sh_off + sh_size > im->len) return -1;
-
+static int apply_relocs(const image *im, const psp_reloc *rel, int n,
+                        const uint32_t *segbase, int nseg,
+                        psp_load_info *out) {
     hi_queue q = { {0}, 0, 0 };
 
-    for (uint32_t o = 0; o + 8 <= sh_size; o += 8) {
-        const uint32_t r_offset = rd32(im->data + sh_off + o);
-        const uint32_t r_info   = rd32(im->data + sh_off + o + 4);
-
-        const uint32_t type = R_TYPE(r_info);
-        const uint32_t ofsb = R_OFS_BASE(r_info);
-        const uint32_t addb = R_ADDR_BASE(r_info);
-
-        if (ofsb >= (uint32_t)nseg || addb >= (uint32_t)nseg) {
+    for (int i = 0; i < n; i++) {
+        const psp_reloc *r = &rel[i];
+        if (r->ofs_seg >= nseg || r->val_seg >= nseg) {
             out->nreloc_skipped++;
             continue;
         }
 
-        uint8_t *p = at(im, ofsb, r_offset);
+        uint8_t *p = at(im, r->ofs_seg, r->offset);
         if (!p) { out->nreloc_skipped++; continue; }
 
-        const uint32_t delta = segbase[addb];
+        const uint32_t delta = segbase[r->val_seg];
 
-        switch (type) {
-        case R_MIPS_NONE:
+        switch (r->kind) {
+        case PSP_RELOC_NONE:
             break;
 
-        case R_MIPS_32:
+        case PSP_RELOC_32:
             wr32(p, rd32(p) + delta);
             out->nrelocs++;
             break;
 
-        case R_MIPS_26: {
+        case PSP_RELOC_26: {
             /* The 26-bit field is a word address within the same 256 MB region,
              * so it shifts down by two. */
             const uint32_t op  = rd32(p);
@@ -151,18 +125,29 @@ static int apply_section(const image *im,
             break;
         }
 
-        case R_MIPS_HI16:
+        case PSP_RELOC_HI16:
             if (q.n < MAX_PENDING_HI) q.p[q.n++] = p;
             else                      q.overflow = 1;
             out->nrelocs++;
             break;
 
-        case R_MIPS_LO16:
+        case PSP_RELOC_HI16_ADDEND: {
+            /* The packed form's upper half carries its lower half, so it needs
+             * no partner: the same split as apply_lo16's, done at once. */
+            const uint32_t op   = rd32(p);
+            const uint32_t full = ((op & 0xFFFF) << 16) + (uint32_t)(int32_t)r->addend + delta;
+            const uint32_t hi   = (full - (uint32_t)(int32_t)(int16_t)(full & 0xFFFF)) >> 16;
+            wr32(p, (op & 0xFFFF0000u) | (hi & 0xFFFF));
+            out->nrelocs++;
+            break;
+        }
+
+        case PSP_RELOC_LO16:
             apply_lo16(&q, p, delta);
             out->nrelocs++;
             break;
 
-        case R_MIPS_GPREL16:
+        case PSP_RELOC_GPREL16:
             /* Nothing to patch. The field holds `target - gp`, and a module is
              * relocated as a unit, so both move by the same delta and the
              * difference is already right. What it does need is for $gp to
@@ -208,19 +193,18 @@ int psp_relocate_image(uint8_t *data, size_t len, const elf_info *e,
     out->hi = hi;
     out->nsegments = e->nsegments;
 
-    if (!e->shoff || !e->shnum) return 0;
-
+    /* Sections when the module has them, else its relocation segment, in
+     * either form; see reloc.h. */
+    const int n = psp_relocs_read(data, len, e, 0, NULL, 0);
+    if (n < 0) return -2;
+    if (n == 0) return 0;
+    psp_reloc *rel = (psp_reloc *)malloc((size_t)n * sizeof *rel);
+    if (!rel) return -1;
+    psp_relocs_read(data, len, e, 0, rel, n);
     const image im = { data, len, e->seg, e->nsegments };
-    for (uint32_t i = 0; i < e->shnum; i++) {
-        const size_t so = (size_t)e->shoff + (size_t)i * e->shentsize;
-        if (so + 24 > len) break;
-        if (rd32(data + so + 4) != SHT_PRXRELOC) continue;
-        const uint32_t sh_off  = rd32(data + so + 16);
-        const uint32_t sh_size = rd32(data + so + 20);
-        if (apply_section(&im, sh_off, sh_size, segbase, e->nsegments, out) != 0)
-            return -2;
-    }
-    return 0;
+    const int rc = apply_relocs(&im, rel, n, segbase, e->nsegments, out);
+    free(rel);
+    return rc != 0 ? -2 : 0;
 }
 
 uint32_t psp_rebase_image(elf_info *e, uint32_t base, int *err) {
@@ -233,7 +217,7 @@ uint32_t psp_rebase_image(elf_info *e, uint32_t base, int *err) {
     /* Wraps when base < lo, which shifts down; the sums wrap back. */
     const uint32_t shift = base - lo;
     for (int i = 0; i < e->nsegments && i < 8; i++) e->seg[i].addr += shift;
-    e->entry += shift;
+    if (e->entry != 0xFFFFFFFFu) e->entry += shift;   /* none stays none */
     e->text_addr += shift;
     if (e->stub_addr) e->stub_addr += shift;
     if (e->modinfo_addr) e->modinfo_addr += shift;
@@ -286,6 +270,84 @@ static uint32_t module_gp(const psp_blob *b, const elf_info *e) {
     /* flags(4) + name(28) puts gp_value at 0x20. */
     if (e->modinfo_size < 0x24 || (size_t)e->modinfo_offset + 0x24 > b->size) return 0;
     return rd32(b->data + e->modinfo_offset + 0x20);
+}
+
+void psp_module_write(const psp_blob *b, const elf_info *e) {
+    static const uint8_t zeros[4096];
+    for (int i = 0; i < e->nsegments; i++) {
+        const elf_segment *s = &e->seg[i];
+        if ((size_t)s->offset + s->filesz > b->size) continue;
+        psp_mem_write_block(s->addr, b->data + s->offset, s->filesz);
+        for (uint32_t z = s->filesz; z < s->memsz; ) {
+            const uint32_t n = s->memsz - z < sizeof zeros ? s->memsz - z : (uint32_t)sizeof zeros;
+            psp_mem_write_block(s->addr + z, zeros, n);
+            z += n;
+        }
+    }
+}
+
+/* The syslib's: module_start, module_stop, and module_start's thread. */
+#define NID_MODULE_START        0xD632ACDBu
+#define NID_MODULE_STOP         0xCEE8593Cu
+#define NID_MODULE_START_THREAD 0x0F7C276Cu
+
+int psp_module_describe(const psp_blob *b, const elf_info *e, const psp_load_info *li,
+                        psp_module_image *out) {
+    memset(out, 0, sizeof *out);
+    out->lo = li->lo;
+    out->hi = li->hi;
+    out->entry = e->entry != 0xFFFFFFFFu ? e->entry : 0;
+    out->start = out->entry;
+    out->text_addr = e->nsegments ? e->seg[0].addr : li->lo;
+    elf_exec_sizes(b->data, b->size, e, &out->text_size, &out->data_size, &out->bss_size);
+    out->nsegments = e->nsegments > 4 ? 4 : e->nsegments;
+    for (int i = 0; i < out->nsegments; i++) {
+        out->seg_addr[i] = e->seg[i].addr;
+        out->seg_size[i] = e->seg[i].memsz;
+    }
+    psp_module_info mi;
+    memset(&mi, 0, sizeof mi);
+    if (e->modinfo_size && psp_modinfo_parse(b->data, b->size, e->modinfo_offset, &mi) == 0) {
+        out->gp = mi.gp_value;
+        out->attribute = (uint16_t)mi.attribute;
+        out->version[0] = mi.version[0];
+        out->version[1] = mi.version[1];
+        memcpy(out->name, mi.name, sizeof out->name);
+    }
+
+    /* Its exports: module_start, module_stop and module_start's thread from
+     * the syslib, the functions of its named libraries for the others. */
+    const uint32_t bias = e->nsegments ? e->seg[0].offset - e->seg[0].addr : 0;
+    const int n = mi.ent_end > mi.ent_top ? psp_collect_export_table(b->data, b->size, &mi, bias, NULL, 0) : 0;
+    psp_export *ex = n > 0 ? (psp_export *)malloc((size_t)n * sizeof *ex) : NULL;
+    if (ex) psp_collect_export_table(b->data, b->size, &mi, bias, ex, n);
+    out->export_nid = (uint32_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(uint32_t));
+    out->export_addr = (uint32_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(uint32_t));
+    if (!out->export_nid || !out->export_addr || (n > 0 && !ex)) {
+        free(ex);
+        free(out->export_nid);
+        free(out->export_addr);
+        out->export_nid = out->export_addr = NULL;
+        return -1;
+    }
+    for (int i = 0; i < n; i++) {
+        if (ex[i].syslib) {
+            if (ex[i].nid == NID_MODULE_START && !ex[i].variable) out->start = ex[i].addr;
+            if (ex[i].nid == NID_MODULE_STOP && !ex[i].variable) out->stop = ex[i].addr;
+            if (ex[i].nid == NID_MODULE_START_THREAD && ex[i].variable) {
+                /* {count, priority, stack size, attributes} */
+                out->start_priority = psp_read32(ex[i].addr + 4);
+                out->start_stack    = psp_read32(ex[i].addr + 8);
+                out->start_attr     = psp_read32(ex[i].addr + 12);
+            }
+            continue;
+        }
+        if (ex[i].variable) continue;
+        out->export_nid[out->nexports] = ex[i].nid;
+        out->export_addr[out->nexports++] = ex[i].addr;
+    }
+    free(ex);
+    return 0;
 }
 
 int psp_load_module(psp_blob *b, const elf_info *e, psp_load_info *out) {

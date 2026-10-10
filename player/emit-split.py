@@ -19,7 +19,7 @@ prefix = base[:-len('_funcs.c')] if base.endswith('_funcs.c') else 'recomp'
 lines = open(src, errors='replace').read().split('\n')
 starts = [i for i, l in enumerate(lines) if l.startswith('/* ----') and i + 1 < len(lines) and lines[i+1].startswith(' * psp_func_')]
 prelude = lines[:starts[0]]
-reg = next(i for i, l in enumerate(lines) if l.startswith('void psp_recomp_register('))
+reg = next(i for i, l in enumerate(lines) if re.match(r'void psp_recomp_register(_module_\d+)?\(void\) \{', l))
 tail_start = reg
 while tail_start > 0 and not lines[tail_start-1].startswith('/* ----'): tail_start -= 1
 tail_start -= 1   # include the '/* ----' line itself

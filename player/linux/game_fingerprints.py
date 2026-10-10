@@ -6,7 +6,8 @@ headers, the generator, the compiler, the build recipes and the shared
 libraries' ABIs (SONAMEs: compatible library updates keep games). A pack's
 part comes from the pack as added: its host code's include closure, and per
 title the replacements' closure, the replace list and the code generators.
-A game with no pack has only the app's part and its executable.
+A game with no pack has only the app's part, its executable, and the modules
+it loads at run time.
 Launcher, importer UI, packaging recipes, notices and display labels are
 deliberately outside this contract.
 
@@ -92,8 +93,12 @@ def pack_identity(pack):
 def title_identity(app_id, pack, profile):
     """A title's fingerprint: with its pack, or plain when pack is None."""
     if pack is None:
-        return identity({'version': VERSION, 'inputs': {
-            'app': app_id, 'plain': {key: profile[key] for key in ('slug', 'elf_sha256')}}})
+        plain = {key: profile[key] for key in ('slug', 'elf_sha256')}
+        # The modules it loads at run time, by the SHA-1 of each file
+        # (docs/MODULES.md); absent for a game with none.
+        if profile.get('modules'):
+            plain['modules'] = sorted(profile['modules'])
+        return identity({'version': VERSION, 'inputs': {'app': app_id, 'plain': plain}})
     replacements = pack.device_file(profile['replacements'])
     scripts = {p.name: p for p in pack.device_scripts}
     inputs = {

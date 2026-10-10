@@ -203,6 +203,15 @@ context that is not current. The census in `psp_ge_dump_stats` reports the
 thread count in every run, so the assumption is checked continuously rather
 than once.
 
+The census caught the one thing that moved it. A SIGNAL that suspends
+(behaviour 1) holds the GE until its handler returns (geprobe v24), so the
+walk stops there and goes on once the handler has run. A handler runs on
+whichever thread took the interrupt, and the walk went on there with it: The
+3rd Birthday raises ten such SIGNALs a frame, and its gameplay replay read
+four host threads. The walk now goes back to the GE thread.
+`psp_sched_run_on` runs it on that thread's host thread, which is parked
+waiting for its turn, while the handler's thread waits for it.
+
 **Headless is the limit of this.** A GL backend needs a window, hidden or
 otherwise, so the software-versus-GL comparison runs on a desktop rather than
 in CI. That does not weaken the arrangement in *Validation* below: the

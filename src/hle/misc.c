@@ -1,7 +1,7 @@
 /* psprecomp — the smaller firmware libraries.
  *
  * Kernel_Library, UtilsForUser, StdioForUser, sceSuspendForUser,
- * LoadExecForUser, ModuleMgrForUser, sceCtrl, sceRtc, sceAudio, scePower,
+ * LoadExecForUser, sceCtrl, sceRtc, sceAudio, scePower,
  * sceImpose and sceOpenPSID.
  * Individually small,
  * but collectively they are what a game's C runtime needs before main() gets
@@ -196,8 +196,22 @@ static void hle_LibcGettimeofday(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* General-purpose I/O pins, wired to the debug board. Nothing is connected. */
+/* General-purpose I/O pins, wired to the debug board. Nothing is connected,
+ * so the inputs read 0 and what is written to the outputs goes nowhere:
+ * GetGPI reads 0 and SetGPO answers 0, whatever it is given (sysprobe step
+ * 6, fw 6.60). sceKernelSetGPO(value) is named by PSPSDK's UtilsForUser.S. */
 static void hle_GetGPI(void) { psp_ret(0); }
+static void hle_SetGPO(void) { psp_ret(0); }
+
+/* The headphone remote, with nothing plugged into the socket, as sysprobe
+ * step 7 measured (fw 6.60): IsRemoteExist, IsHeadphoneExist and
+ * IsMicrophoneExist answer 0 ("else 0", PSPSDK psphprm.h), and
+ * PeekCurrentKey answers 0 with no key down. The host has no remote. */
+static void hle_HprmIsRemoteExist(void) { psp_ret(0); }
+static void hle_HprmPeekCurrentKey(void) {
+    if (psp_arg(0)) psp_write32(psp_arg(0), 0);
+    psp_ret(0);
+}
 
 /* ---- StdioForUser -------------------------------------------------------- */
 /* These return the file descriptors, which sceIoWrite then recognises. */
@@ -307,42 +321,7 @@ static void hle_ExitGame(void) {
 
 static void hle_RegisterExitCallback(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
-/* ---- ModuleMgrForUser ---------------------------------------------------- */
-/* A game-sharing microgame is self-contained and does not load further
- * modules, so these report a plausible identity rather than doing anything.
- * A title that genuinely loads PRXs at run time will need real ones. */
-/* These report the id of the one loaded module.
- *
- * A previous note here recorded the opposite -- that returning an id was a
- * "plausible lie" and an error was the truthful answer -- on the strength of a
- * test showing byte-identical output either way. **That test was run while
- * `jal` never assigned `$ra`**, so every non-leaf function in the program was
- * returning through a stale register. A falsification obtained under broken
- * codegen is not a falsification.
- *
- * Re-run after that fix, the two answers differ clearly: returning an id makes
- * the game's own "libc:_getmodreent: no reent structure" diagnostic disappear
- * and drops bad memory accesses from 3 to 0.
- *
- * And an id is the *truthful* answer. The question is "which module owns this
- * address", a self-contained microgame is exactly one module, and the host has
- * loaded it. Reporting 1 states that; reporting UNKNOWN_MODULE denies a module
- * that demonstrably exists. */
-#define SCE_KERNEL_ERROR_UNKNOWN_MODULE 0x80020139u
-#define PSP_MAIN_MODULE_ID 1u
-
-static void hle_GetModuleId(void)          { psp_ret(PSP_MAIN_MODULE_ID); }
-static void hle_GetModuleIdByAddress(void) { psp_ret(PSP_MAIN_MODULE_ID); }
-static void hle_ModuleOk(void)             { psp_ret(SCE_KERNEL_ERROR_OK); }
-
-/* 0xF9275D98 is sceKernelLoadModuleBufferUsbWlan: PSPSDK's import stub
- * (src/user/ModuleMgrForUser.S; BSD) names it, and SHA-1 of the name is the
- * NID. It was registered unnamed, after eighteen ModuleMgr names guessed
- * against SHA-1 missed it. WTF's microgame calls it three times on its
- * heap-setup path, where the unregistered 0 failed heap establishment; a load
- * answers the loaded module's id, and the one module's id is what it went on
- * answering. Nothing is loaded. */
-static void hle_LoadModuleBufferUsbWlan(void) { psp_ret(PSP_MAIN_MODULE_ID); }
+/* ModuleMgrForUser is src/hle/modulemgr.c. */
 
 /* ---- sceCtrl ------------------------------------------------------------- */
 
@@ -1524,6 +1503,11 @@ void psp_misc_register(void) {
     psp_hle_register(0x91E4F6A7, "UtilsForUser", "sceKernelLibcClock",        hle_LibcClock);
     psp_hle_register(0x71EC4271, "UtilsForUser", "sceKernelLibcGettimeofday", hle_LibcGettimeofday);
     psp_hle_register(0x37FB5C42, "UtilsForUser", "sceKernelGetGPI",           hle_GetGPI);
+    psp_hle_register(0x6AD345D7, "UtilsForUser", "sceKernelSetGPO",           hle_SetGPO);
+    psp_hle_register(0x208DB1BD, "sceHprm",      "sceHprmIsRemoteExist",      hle_HprmIsRemoteExist);
+    psp_hle_register(0x7E69EDA4, "sceHprm",      "sceHprmIsHeadphoneExist",   hle_HprmIsRemoteExist);
+    psp_hle_register(0x219C58F1, "sceHprm",      "sceHprmIsMicrophoneExist",  hle_HprmIsRemoteExist);
+    psp_hle_register(0x1910B327, "sceHprm",      "sceHprmPeekCurrentKey",     hle_HprmPeekCurrentKey);
 
     psp_hle_register(0x172D316E, "StdioForUser", "sceKernelStdin",  hle_Stdin);
     psp_hle_register(0xA6BAB2E9, "StdioForUser", "sceKernelStdout", hle_Stdout);
@@ -1541,13 +1525,6 @@ void psp_misc_register(void) {
 
     psp_hle_register(0x05572A5F, "LoadExecForUser", "sceKernelExitGame",             hle_ExitGame);
     psp_hle_register(0x4AC57943, "LoadExecForUser", "sceKernelRegisterExitCallback", hle_RegisterExitCallback);
-
-    psp_hle_register(0xF9275D98, "ModuleMgrForUser", "sceKernelLoadModuleBufferUsbWlan", hle_LoadModuleBufferUsbWlan);
-    psp_hle_register(0xF0A26395, "ModuleMgrForUser", "sceKernelGetModuleId",          hle_GetModuleId);
-    psp_hle_register(0xD8B73127, "ModuleMgrForUser", "sceKernelGetModuleIdByAddress", hle_GetModuleIdByAddress);
-    psp_hle_register(0x50F0C1EC, "ModuleMgrForUser", "sceKernelStartModule",          hle_ModuleOk);
-    psp_hle_register(0xD1FF982A, "ModuleMgrForUser", "sceKernelStopModule",           hle_ModuleOk);
-    psp_hle_register(0x2E0911AA, "ModuleMgrForUser", "sceKernelUnloadModule",         hle_ModuleOk);
 
     psp_hle_register(0x1F4011E6, "sceCtrl", "sceCtrlSetSamplingMode",     hle_CtrlSet);
     psp_hle_register(0x6A2774F3, "sceCtrl", "sceCtrlSetSamplingCycle",    hle_CtrlSet);

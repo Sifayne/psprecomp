@@ -305,10 +305,14 @@ static int fx16_sat(float f) {
 /* SIGNAL behaviour emitted by sceGuSignal(GU_SIGNAL_PAUSE); PSPSDK's pspgu.h
  * defines GU_SIGNAL_PAUSE as 3. */
 #define GE_SIGNAL_HANDLER_PAUSE 0x03
+/* SIGNAL behaviour 1, pspgu.h GU_BEHAVIOR_SUSPEND: the GE waits for its handler. */
+#define GE_SIGNAL_SUSPEND 0x01
 /* PSPSDK pspge.h's PSP_GE_SIGNAL_SYNC: a SIGNAL 08 / END / FINISH / END
  * sequence is a sync point inside the list, not its end. The 3rd
  * Birthday's list writer (003FC590) emits it and goes on writing the HUD
- * after it. Not measured on a PSP. */
+ * after it. geprobe v24 scenes 150, 151 and 154 (fw 6.60): no handler runs
+ * at the pair, neither signal nor finish, the GE goes on past it, and a
+ * stall just after it holds. */
 #define GE_SIGNAL_SYNC 0x08
 
 /* Primitive types, from the PRIM argument's type field. */
@@ -332,7 +336,8 @@ typedef struct {
     int      psig;      /* between a PAUSE's SIGNAL and its FINISH */
     /* Where the walk itself is, which may be ahead. */
     int      xdone;     /* walked to its end */
-    int      xpaused;   /* the walk stopped at a PAUSE's FINISH */
+    int      xpaused;   /* the walk stopped at a PAUSE's FINISH, or at a SIGNAL that suspends */
+    int      xsuspended;/* the walk stopped at a suspending SIGNAL until its handler returns */
     uint64_t t_x;       /* the GE's time where the walk last stopped */
     int      cbid;      /* sceGeSetCallback id given at EnQueue; -1 none */
     int      cont_early;/* sceGeContinue arrived before the pause took hold */
@@ -436,8 +441,12 @@ static unsigned g_ge_fifo_i;
  * What the guest cannot see first is the order. A handler runs after the
  * words behind its SIGNAL or FINISH have been drawn, and a list queued behind
  * another can be drawn before the first one's finish handler runs. A handler
- * that rewrites words the GE has already passed is too late here. On a PSP
- * it may be in time.
+ * that rewrites words the GE has already passed is too late here. geprobe
+ * v24 (fw 6.60) measured where a PSP differs: a SIGNAL that suspends (1)
+ * holds the GE until its handler returns, so the walk stops there too
+ * (GE_SIGNAL); one that continues (2) does not, and on a PSP its handler is
+ * in time for words about 20 ms of drawing on, which here have been drawn
+ * already. That one is left as it is.
  *
  * A held handler. Inside EnQueue, UpdateStallAddr and Continue, and in a
  * Sync that waits, handlers run as the timeline reaches them. When it
@@ -4087,6 +4096,23 @@ static void ge_x_done(ge_queue *q, uint64_t start) {
     else ev_push(GE_EV_DONE, q, 0, 0, 0, start);
 }
 
+/* A suspending SIGNAL's handler has run (or has no function any more): the
+ * GE goes on from the END after it, now. The walk goes on on the GE's own
+ * thread, the last to walk a list: its host thread holds the GL context,
+ * which render_gl.c will not draw through from any other, and a save is
+ * taken on it (safepoint.c). The handler runs on whichever thread took the
+ * interrupt, so from any other the walk is handed to the GE's, parked
+ * meanwhile. */
+static void ge_execute(void);
+static void ge_release(int was_busy);
+static void ge_resume_suspended(const ge_event *e) {
+    if (e->kind != GE_EV_HANDLER || e->finish || !ev_live(e) || !e->q->xsuspended) return;
+    e->q->xsuspended = e->q->xpaused = 0;
+    ge_release(0);
+    if (g_ge_owner) psp_sched_run_on(g_ge_owner, ge_execute);
+    else ge_execute();
+}
+
 /* Run a held handler. `force` runs it whatever the interrupt state (a wait on
  * the GE, which has to see handlers in order), moving the clock up to when
  * the GE reached it; otherwise only with interrupts enabled and once the
@@ -4100,6 +4126,7 @@ static int ge_deliver(int force) {
     g_ge_in_cb = 1;
     ge_callback(e.cbid, e.finish, e.code, e.pc);
     g_ge_in_cb = 0;
+    ge_resume_suspended(&e);
     return 0;
 }
 
@@ -4394,6 +4421,23 @@ static void run_list_body(ge_queue *q) {
             }
             if (((arg >> 16) & 0xFF) >= 1 && ((arg >> 16) & 0xFF) <= 3)
                 ge_x_raise(q, 0, arg, q->list + 4, t0);
+            /* Behaviour 1 suspends the GE until its handler has returned:
+             * geprobe v24 scenes 146 and 152 (fw 6.60). The handler finds
+             * nothing behind its SIGNAL drawn, still nothing 1 ms on, and
+             * every word it rewrites there is the word the GE then draws.
+             * So the walk stops here, before the END, and the timeline
+             * resumes it once the handler has run (ge_resume_suspended).
+             * Behaviour 2 does not: its handler finds the words just behind
+             * it read already (scenes 147 and 153), and only a rewrite some
+             * 20 ms of drawing on is seen -- which the walk, having run on,
+             * does not see. A list with no signal handler, or a capture's
+             * replay, which has no guest to run one, goes on. */
+            if (((arg >> 16) & 0xFF) == GE_SIGNAL_SUSPEND && !q->replay &&
+                q->cbid >= 0 && q->cbid < GE_MAX_CALLBACKS && g_ge_cb[q->cbid].used &&
+                g_ge_cb[q->cbid].signal_func) {
+                q->xpaused = q->xsuspended = 1;
+                return;
+            }
             break;
 
         case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -5115,9 +5159,11 @@ static void ge_advance(uint64_t limit, int defer, int follow, uint32_t through) 
             if (ev_live(&e)) e.q->psig = 1;
             break;
         case GE_EV_HANDLER:
-            if (!ev_has_handler(&e)) break;
-            if (follow) ge_clock_to(e.at);
-            ge_callback(e.cbid, e.finish, e.code, e.pc);
+            if (ev_has_handler(&e)) {
+                if (follow) ge_clock_to(e.at);
+                ge_callback(e.cbid, e.finish, e.code, e.pc);
+            }
+            ge_resume_suspended(&e);
             break;
         }
     }
@@ -5811,7 +5857,7 @@ static void hle_DrawSync(void) {
  * Return values and the rest are not measured. */
 static void break_queue(ge_queue *q) {
     q->done = q->xdone = 1;
-    q->hung = q->paused = q->xpaused = q->psig = 0;
+    q->hung = q->paused = q->xpaused = q->xsuspended = q->psig = 0;
     /* What the walk did past the point the guest has seen never happens,
      * but a handler the timeline has already reached and holds still runs. */
     for (unsigned i = g_ev_held ? 1u : 0u; i < g_ev_n;)

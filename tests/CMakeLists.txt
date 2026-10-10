@@ -34,6 +34,14 @@ add_executable(test_kirk test_kirk.c)
 target_link_libraries(test_kirk PRIVATE allegrex_core)
 add_test(NAME kirk COMMAND test_kirk)
 
+add_executable(test_modules test_modules.c)
+target_link_libraries(test_modules PRIVATE psprecomp allegrex_core)
+add_test(NAME modules COMMAND test_modules)
+
+add_executable(test_reloc test_reloc.c)
+target_link_libraries(test_reloc PRIVATE allegrex_core)
+add_test(NAME reloc COMMAND test_reloc)
+
 add_executable(test_emit test_emit.c)
 target_link_libraries(test_emit PRIVATE allegrex_core)
 add_test(NAME emit COMMAND test_emit)
@@ -208,6 +216,11 @@ add_executable(test_disc_observed test_disc_observed.c)
 target_link_libraries(test_disc_observed PRIVATE psprecomp allegrex_core)
 add_test(NAME disc_observed COMMAND test_disc_observed
          ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/observed.txt
+         ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/probe.iso)
+
+add_executable(test_disc_lbn test_disc_lbn.c)
+target_link_libraries(test_disc_lbn PRIVATE psprecomp allegrex_core)
+add_test(NAME disc_lbn COMMAND test_disc_lbn
          ${CMAKE_CURRENT_SOURCE_DIR}/provenance/disc/probe.iso)
 
 # The SDL2 host layer, when it is built. The dummy video driver keeps it off

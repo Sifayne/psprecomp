@@ -79,9 +79,9 @@ static void test_alu(void) {
 
 static void test_vfpu_random_pipeline(void) {
     /* Pipeline instructions in a delay slot must not trap or consume the
-     * destination prefix. The following random triple has one lane masked;
-     * which lane is open (hardware has not been probed for vector vrnd), so
-     * the check is that exactly one lane kept its zero. */
+     * destination prefix. The following random triple masks lane 0, which
+     * on a PSP keeps the last lane, where the first draw would go
+     * (vfpuprobe v6 step 212, fw 6.60). */
     const uint32_t barriers[] = {0xFFFF0000,0xFFFF0320,0xFFFF040D};
     for (int i=0;i<3;i++) {
         const uint32_t code[] = {0xDE000100,0x10000001,barriers[i],
@@ -90,12 +90,9 @@ static void test_vfpu_random_pipeline(void) {
         psp_interp it=run(code,6,100);
         CHECK(it.status==I_OK_RETURN,"VFPU barrier/random interpreter path");
         int r[4]; psp_vfpu_regs(0,3,r);
-        int kept=0, drawn=0;
-        for (int l=0;l<3;l++) {
-            if (psp_cpu.v[r[l]]==0) kept++;
-            else if (psp_cpu.v[r[l]]>=2 && psp_cpu.v[r[l]]<4) drawn++;
-        }
-        CHECK(kept==1 && drawn==2,
+        int drawn=0;
+        for (int l=0;l<2;l++) drawn += psp_cpu.v[r[l]]>=2 && psp_cpu.v[r[l]]<4;
+        CHECK(psp_cpu.v[r[2]]==0 && drawn==2,
               "VFPU barrier preserves prefix through branch delay slot");
     }
 }
@@ -600,6 +597,44 @@ static void test_threaded_spawn_resumes_a_blocked_starter(void) {
 
 /* -------------------------------------------------------------------------- */
 
+/* A module loaded at run time binds its thunks beside the executable's, each
+ * with its library: one from a library nothing provides answers
+ * LIBRARY_NOT_YET_LINKED (modprobe step 15, fw 6.60). And a module loaded
+ * where an unloaded one was runs its own code there, not the old thunks
+ * (modprobe step 14 put mod_e's code where mod_b's thunks had been). */
+#define MODTHUNK 0x08940000u
+
+static void hle_answer_two(void) { psp_ret(2); }
+
+static void test_module_imports(void) {
+    psp_hle_init();
+    const uint32_t two = psp_nid("testModuleImportTwo");
+    psp_hle_register(two, "test", "testModuleImportTwo", hle_answer_two);
+    static const uint32_t stub[] = { 0x03E00008, 0x00000000 };
+    load(MODTHUNK, stub, 2);
+    load(MODTHUNK + 8, stub, 2);
+    /* lui $t9,0x0894 ; [addiu $t9,$t9,8] ; jr $t9 ; nop */
+    static const uint32_t first[] = { 0x3C190894, 0x03200008, 0x00000000 };
+    static const uint32_t second[] = { 0x3C190894, 0x27390008, 0x03200008, 0x00000000 };
+
+    const psp_interp_import mod[] = { { MODTHUNK, two, "test" }, { MODTHUNK + 8, 0x22223333u, "ProbeLibNone" } };
+    CHECK(psp_interp_set_imports(NULL, 0) == 0, "no executable's table");
+    CHECK(psp_interp_add_imports(mod, 2) == 2, "a module's table");
+    psp_interp it = run(first, 3, 1000);
+    CHECK(it.status == I_OK_RETURN && R(V0) == 2, "its thunk reaches the firmware: %u", R(V0));
+    it = run(second, 4, 1000);
+    CHECK(it.status == I_OK_RETURN && R(V0) == 0x8002013Au,
+          "one from a library nothing provides is not linked: %08X", R(V0));
+
+    /* Another module's code where those thunks were: addiu $v0,$zero,9. */
+    psp_interp_drop_imports(MODTHUNK, MODTHUNK + 0x100);
+    static const uint32_t code[] = { 0x24020009, 0x03E00008, 0x00000000 };
+    load(MODTHUNK, code, 3);
+    it = run(first, 3, 1000);
+    CHECK(it.status == I_OK_RETURN && R(V0) == 9, "the new module's code runs, not the old thunk: %u", R(V0));
+    psp_interp_free_imports();
+}
+
 int main(void) {
     if (psp_mem_init() != 0) {
         printf("FAIL: psp_mem_init\n");
@@ -622,6 +657,7 @@ int main(void) {
     test_budget_stops_infinite_loop();
     test_syscall_traps();
     test_dispatch_serving();
+    test_module_imports();
     test_spawn_serving();
     test_threaded_spawn_resumes_a_blocked_starter();
 

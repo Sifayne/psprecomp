@@ -45,6 +45,7 @@ static int usage(void) {
         "  allegrexrecomp cover   <file>\n"
         "  allegrexrecomp funcs   <file> [--list]\n"
         "  allegrexrecomp emit    <file> <outdir> [prefix] [--replace <addrs>|@<file>] [--no-resume]\n"
+        "                         [--base <addr>] [--module <n>]\n"
         "  allegrexrecomp interp  <file> [--from <addr>] [--budget <n>] [--trace] [--regs] [--dispatch] [--drain <s>]\n"
         "                         [--argv0 <guest path>] [--base <addr>]\n"
         "  allegrexrecomp decrypt <file> [--keys <path>]\n"
@@ -56,6 +57,11 @@ static int usage(void) {
         "--base loads a relocatable PRX at <addr> (as the PSP's loader would,\n"
         "0x08804000) instead of where it was linked. For probe runs: the emitted\n"
         "C uses the linked addresses, so a moved module is not comparable with it.\n"
+        "\n"
+        "emit --base translates a relocatable PRX moved to <addr>, and --module\n"
+        "names its registration function psp_recomp_register_module_<n> rather\n"
+        "than psp_recomp_register: a module the game loads at run time, linked\n"
+        "into the same program (docs/MODULES.md).\n"
         "\n"
         "--replace names functions (hex addresses, comma-separated, or @file with\n"
         "one per line and # comments) that the host will implement itself. Their\n"
@@ -486,7 +492,7 @@ static int cmd_cover(const char *path) {
 /* Load a decrypted module and run discovery over it. On success the caller
  * owns both `b` (psp_blob_free) and `an` (a_analysis_free). Shared by `funcs`
  * and `emit`, which differ only in what they do with the result. */
-static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
+static int load_and_discover(const char *path, const uint32_t *base, psp_blob *b, elf_info *e,
                              a_analysis *an, int *out_nseeds, int *out_nexports,
                              int *out_nptr, int *out_scanned) {
     if (psp_blob_read(path, b) != 0) { fprintf(stderr, "cannot read %s\n", path); return -1; }
@@ -497,6 +503,20 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
         fprintf(stderr, "(encrypted modules must be decrypted first — see docs/DECRYPT.md)\n");
         psp_blob_free(b);
         return -1;
+    }
+
+    /* Somewhere other than where it was linked: a module the game loads at
+     * run time, at the base its game gives it (docs/MODULES.md). Moved first,
+     * so relocation, discovery and emission all see the final addresses. */
+    if (base) {
+        int err = 0;
+        psp_rebase_image(e, *base, &err);
+        if (err) {
+            if (err == -1) fprintf(stderr, "--base: %s is not a relocatable PRX\n", path);
+            else           fprintf(stderr, "--base: 0x%08X is not 256-byte aligned\n", *base);
+            psp_blob_free(b);
+            return -1;
+        }
     }
 
     /* Relocate before anything reads the code.
@@ -512,7 +532,8 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
      * bakes address literals in when it reads the file, so patching memory
      * would not. Relocating the image up front is what keeps the two agreeing.
      *
-     * Both segments stay at their linked addresses, so no code address moves. */
+     * Without --base, both segments stay at their linked addresses, so no code
+     * address moves. */
     {
         psp_load_info li;
         if (psp_relocate_image(b->data, b->size, e, &li) != 0) {
@@ -544,6 +565,7 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
     an->stub_addr = e->stub_addr;
     an->stub_size = e->stub_size;
     an->scan_calls = 1;
+    an->sweep_gaps = 1;
     /* The whole loaded segment, so jump tables in .rodata/.data can be read. */
     if (e->nsegments) {
         an->image      = b->data + e->seg[0].offset;
@@ -634,7 +656,7 @@ static int cmd_funcs(const char *path, int list) {
     a_analysis an;
     int nseeds = 0, nexports = 0, nptr = 0, scanned = 0;
 
-    if (load_and_discover(path, &b, &e, &an, &nseeds, &nexports, &nptr, &scanned) != 0) return 1;
+    if (load_and_discover(path, NULL, &b, &e, &an, &nseeds, &nexports, &nptr, &scanned) != 0) return 1;
 
     printf("module:     %s\n", path);
     printf("code:       0x%08X + %u bytes  (%u instructions)\n",
@@ -649,6 +671,8 @@ static int cmd_funcs(const char *path, int list) {
      * the evidence of a data word that happened to decode. */
     printf("suppressed: %d shared blocks left unmerged, %d of them on a soft seed\n",
            an.nsuppressed, an.nsuppressed_soft);
+    /* Code no walk, call or pointer reached, seeded by its shape. */
+    printf("swept:      %d soft entries in unclaimed code (heuristic)\n", an.nswept);
     /* `an.size` is the whole loaded image -- code plus .data plus .bss -- so
      * dividing by it and calling the result "of .text" understates coverage by
      * roughly six times. This module reported 14.18% while actually covering
@@ -828,12 +852,13 @@ static int parse_replace(const char *spec, uint32_t **out) {
 }
 
 static int cmd_emit(const char *path, const char *outdir, const char *prefix,
-                    const uint32_t *replace, int nreplace, int resume) {
+                    const uint32_t *replace, int nreplace, int resume,
+                    const uint32_t *base, int module_index) {
     psp_blob b;
     elf_info e;
     a_analysis an;
 
-    if (load_and_discover(path, &b, &e, &an, NULL, NULL, NULL, NULL) != 0) return 1;
+    if (load_and_discover(path, base, &b, &e, &an, NULL, NULL, NULL, NULL) != 0) return 1;
 
     psp_module_info mi;
     const char *module = "(unknown)";
@@ -864,6 +889,9 @@ static int cmd_emit(const char *path, const char *outdir, const char *prefix,
     o.replace = replace;
     o.nreplace = nreplace;
     o.resume = resume;
+    char register_name[64];
+    snprintf(register_name, sizeof register_name, "psp_recomp_register_module_%d", module_index);
+    o.register_name = module_index ? register_name : NULL;
 
     printf("module:     %s\n", module);
     printf("functions:  %d\n", an.nfuncs);
@@ -1015,12 +1043,10 @@ static void interp_note_reentry(uint32_t addr) {
     g_reentry_count++;
 }
 
-/* Hand the interpreter the thunk-to-NID map, so firmware calls reach HLE
- * instead of running the unlinked `jr $ra` the linker left in the module.
- * Returns the number of thunks registered; the table is owned by the caller
- * and must outlive the run, so it is returned through `out_tbl`. */
-static int interp_bind_imports(const psp_blob *b, const elf_info *e,
-                               psp_interp_import **out_tbl) {
+/* A module's thunk-to-NID map, with each thunk's library. Returns how many,
+ * in a malloc'd table through `out_tbl`. */
+static int interp_collect_imports(const psp_blob *b, const elf_info *e,
+                                  psp_interp_import **out_tbl) {
     *out_tbl = NULL;
     if (!e->modinfo_size) return 0;
 
@@ -1040,14 +1066,78 @@ static int interp_bind_imports(const psp_blob *b, const elf_info *e,
     for (int i = 0; i < n; i++) {
         tbl[i].addr = imp[i].addr;
         tbl[i].nid  = imp[i].nid;
+        memcpy(tbl[i].lib, imp[i].lib, sizeof tbl[i].lib);
     }
     free(imp);
-
-    const int bound = psp_interp_set_imports(tbl, n);
-    if (bound <= 0) { free(tbl); return 0; }
     *out_tbl = tbl;
-    return bound;
-}   /* never mapped: the run stops here */
+    return n;
+}
+
+/* Hand the interpreter the thunk-to-NID map, so firmware calls reach HLE
+ * instead of running the unlinked `jr $ra` the linker left in the module.
+ * Returns the number of thunks registered. */
+static int interp_bind_imports(const psp_blob *b, const elf_info *e) {
+    psp_interp_import *tbl;
+    const int n = interp_collect_imports(b, e, &tbl);
+    const int bound = n > 0 ? psp_interp_set_imports(tbl, n) : 0;
+    free(tbl);
+    return bound > 0 ? bound : 0;
+}
+
+#define SCE_ERROR_KERNEL_UNKNOWN_MODULE_FILE 0x8002012Fu
+
+/* A module the program loads at run time (sceKernelLoadModule), under the
+ * interpreter: any relocatable PRX, placed where the console puts one -- a
+ * block of its size from the lowest free address of the user partition
+ * (modprobe step 6, fw 6.60) -- relocated there, its thunks bound beside the
+ * executable's. Its code runs interpreted, as the executable's does. The
+ * player's loader knows a game's modules by their files instead, and runs
+ * them recompiled (src/host/module_loader.c). */
+static int interp_load_module(const uint8_t *file, size_t len, psp_module_image *out) {
+    psp_blob b;
+    b.size = len;
+    b.data = (uint8_t *)malloc(len ? len : 1);
+    if (!b.data) return (int)SCE_KERNEL_ERROR_NO_MEMORY;
+    memcpy(b.data, file, len);
+
+    elf_info e;
+    if (elf_parse(b.data, b.size, &e) != 0 || e.type != 0xFFA0 || !e.nsegments) {
+        fprintf(stderr, "interp: a module the interpreter can load is a decrypted, relocatable PRX\n");
+        free(b.data);
+        return (int)SCE_ERROR_KERNEL_UNKNOWN_MODULE_FILE;
+    }
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (int i = 0; i < e.nsegments; i++) {
+        if (e.seg[i].addr < lo) lo = e.seg[i].addr;
+        if (e.seg[i].addr + e.seg[i].memsz > hi) hi = e.seg[i].addr + e.seg[i].memsz;
+    }
+    const uint32_t base = psp_sysmem_alloc(hi - lo, 0);
+    if (!base) { free(b.data); return (int)SCE_KERNEL_ERROR_NO_MEMORY; }
+
+    int err = 0;
+    psp_load_info li;
+    psp_rebase_image(&e, base, &err);
+    if (err || psp_relocate_image(b.data, b.size, &e, &li) != 0) {
+        psp_sysmem_release(base);
+        free(b.data);
+        return (int)SCE_ERROR_KERNEL_UNKNOWN_MODULE_FILE;
+    }
+    psp_module_write(&b, &e);
+    psp_interp_drop_imports(li.lo, li.hi);
+    if (psp_module_describe(&b, &e, &li, out) != 0) {
+        psp_sysmem_release(base);
+        free(b.data);
+        return (int)SCE_KERNEL_ERROR_NO_MEMORY;
+    }
+    out->block = base;
+
+    psp_interp_import *tbl;
+    const int n = interp_collect_imports(&b, &e, &tbl);
+    if (n > 0) psp_interp_add_imports(tbl, n);
+    free(tbl);
+    free(b.data);
+    return 0;
+}
 
 /* The path a PSP would pass as the module's argument when it started it from
  * the Memory Stick: ms0:/PSP/GAME/<name>/EBOOT.PBP, with <name> the host
@@ -1117,8 +1207,18 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     psp_hle_init();
     /* After psp_hle_init, which resets the allocator. */
     psp_sysmem_reserve_module(li.lo, li.hi);
-    psp_interp_import *imports = NULL;
-    const int nimports = interp_bind_imports(&b, &e, &imports);
+    const int nimports = interp_bind_imports(&b, &e);
+    /* The executable, for sceKernelQueryModuleInfo, and the modules it may
+     * load. */
+    {
+        psp_module_image im;
+        if (psp_module_describe(&b, &e, &li, &im) == 0) {
+            psp_modules_set_main(&im);
+            free(im.export_nid);
+            free(im.export_addr);
+        }
+    }
+    psp_modules_set_loader(interp_load_module);
 
     /* Some HLE handlers call back into guest code — a thread entry point, a
      * registered callback — and they do it through psp_dispatch(), which only
@@ -1249,7 +1349,6 @@ static int cmd_interp(const char *path, uint32_t from, int have_from,
     }
 
     psp_interp_free_imports();
-    free(imports);
     psp_mem_free();
     psp_blob_free(&b);
     /* A clean return is success, and so is the guest asking to exit -- a
@@ -1414,12 +1513,19 @@ int main(int argc, char **argv) {
          * argv[4] is not the start of the flags. */
         const char *prefix = (argc > 4 && strncmp(argv[4], "--", 2)) ? argv[4] : NULL;
         uint32_t *replace = NULL;
-        int nreplace = 0, resume = 1;
+        int nreplace = 0, resume = 1, module = 0;
+        uint32_t base = 0;
+        int have_base = 0;
         for (int i = prefix ? 5 : 4; i < argc; i++) {
             if (!strcmp(argv[i], "--resume")) {
                 resume = 1;                 /* the default; accepted as before */
             } else if (!strcmp(argv[i], "--no-resume")) {
                 resume = 0;
+            } else if (!strcmp(argv[i], "--base") && i + 1 < argc) {
+                base = (uint32_t)strtoul(argv[++i], NULL, 0); have_base = 1;
+            } else if (!strcmp(argv[i], "--module") && i + 1 < argc) {
+                module = atoi(argv[++i]);
+                if (module < 1) { fprintf(stderr, "--module: a number from 1\n"); free(replace); return 2; }
             } else if (!strcmp(argv[i], "--replace") && i + 1 < argc) {
                 uint32_t *add = NULL;
                 const int n = parse_replace(argv[++i], &add);
@@ -1437,7 +1543,8 @@ int main(int argc, char **argv) {
                 return usage();
             }
         }
-        const int rc = cmd_emit(argv[2], argv[3], prefix, replace, nreplace, resume);
+        const int rc = cmd_emit(argv[2], argv[3], prefix, replace, nreplace, resume,
+                                have_base ? &base : NULL, module);
         free(replace);
         return rc;
     }

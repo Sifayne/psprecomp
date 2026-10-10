@@ -654,6 +654,79 @@ static int merge_shared(a_analysis *an, a_func *funcs, int nfuncs,
     return out;
 }
 
+/* ---- code nothing reaches ------------------------------------------------ */
+
+/* Does `in` leave unconditionally, other than by a call? `b` is assembled as
+ * `beq $zero, $zero`, which the decoder reports as the conditional branch it
+ * is encoded as. */
+static int leaves(const a_insn *in) {
+    if (in->is_call) return 0;
+    if (in->is_jump) return 1;                     /* j, jr */
+    return in->op == A_BEQ && in->rs == 0 && in->rt == 0;
+}
+
+/* A word that may begin code: recognised, and not a VFPU encoding nothing
+ * names, which is where data lands most often. */
+static int decodes(const a_analysis *an, uint32_t a, a_insn *in) {
+    return a_decode(fetch(an, a), a, in) && in->op != A_INVALID && in->op != A_VFPU_UNKNOWN;
+}
+
+/* From `a`, a run of instructions ending in an unconditional transfer and its
+ * slot, every word decoding, unclaimed, and no transfer naming an address
+ * outside the module. Returns the address past the slot, or 0 for no such
+ * run before `limit`.
+ *
+ * A run ending in `b` also needs the word after its slot unclaimed. The walk
+ * reads `b` as the conditional branch it is encoded as and carries on past
+ * it, and carrying on into a claimed function merges the two -- which is all
+ * that seeding The 3rd Birthday's 104 unreachable `b .` stubs, each just
+ * before a function, achieved. */
+static uint32_t gap_block(const a_analysis *an, const uint32_t *owner,
+                          uint32_t a, uint32_t limit) {
+    for (uint32_t p = a; p + 4 < limit && a_in_range(an, p + 4); p += 4) {
+        a_insn in;
+        if (owner[word_index(an, p)] != A_NO_OWNER || !decodes(an, p, &in)) return 0;
+        if (in.has_target && !in.is_indirect && !a_in_range(an, in.target)) return 0;
+        if (!leaves(&in)) continue;
+        a_insn slot;
+        if (owner[word_index(an, p + 4)] != A_NO_OWNER || !decodes(an, p + 4, &slot) ||
+            slot.has_delay_slot)
+            return 0;
+        if (!in.is_jump && (!a_in_range(an, p + 8) || owner[word_index(an, p + 8)] != A_NO_OWNER))
+            return 0;
+        return p + 8;
+    }
+    return 0;
+}
+
+/* Soft entries for the code in the scan range that no walk claimed; see
+ * sweep_gaps in analyze.h. Within an unclaimed run, each block after the
+ * first starts where the one before it left, past any nops that pad to an
+ * alignment. The first word that fails ends the run: what follows it is
+ * data, or code a better-founded entry will reach. Returns how many. */
+static int sweep_gaps(const a_analysis *an, const uint32_t *owner, uint8_t *entry_map) {
+    const uint32_t lo = an->scan_size ? an->scan_base : an->base;
+    const uint32_t hi = lo + (an->scan_size ? an->scan_size : an->size);
+    int added = 0;
+    uint32_t a = lo;
+    while (a < hi) {
+        if (!a_in_range(an, a) || is_import_stub(an, a) ||
+            owner[word_index(an, a)] != A_NO_OWNER || fetch(an, a) == 0) {
+            a += 4;
+            continue;
+        }
+        const uint32_t next = entry_map[word_index(an, a)] ? 0 : gap_block(an, owner, a, hi);
+        if (!next) {
+            while (a < hi && a_in_range(an, a) && owner[word_index(an, a)] == A_NO_OWNER) a += 4;
+            continue;
+        }
+        entry_map[word_index(an, a)] = A_ENTRY_SOFT;
+        added++;
+        a = next;
+    }
+    return added;
+}
+
 int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds, int nhard) {
     an->funcs = NULL; an->nfuncs = 0;
     an->imports = NULL; an->nimports = 0;
@@ -662,6 +735,7 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds, int nhard) {
     an->ntables = an->ntable_targets = 0;
     an->bytes_reached = 0;
     an->nsuppressed = an->nsuppressed_soft = 0;
+    an->nswept = 0;
     /* The import stubs sit at the end of .text, so their extent is the best
      * available executable bound when no section header gives one. */
     if (!an->text_size && an->stub_addr && an->stub_size)
@@ -744,39 +818,46 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds, int nhard) {
     if (round > 0) {
         /* Merges no longer drive another round: they change ownership, not the
          * entry set, so re-walking would produce exactly the same split. Only
-         * jump tables can still reveal new entries. */
-        if (!an->image && !indirects.n) break;
-        u32list targets = { 0 };
-        for (int i = 0; i < indirects.n; i++) {
-            int n = resolve_jump_table(an, indirects.v[i], &targets);
-            if (n > 0) { an->ntables++; an->ntable_targets += n; }
-        }
-        /* Keep the sites. They are cleared just below and the round that
-         * finds nothing new exits before any walk refills them, so by the time
-         * ownership is final `indirects` is empty -- and the table targets have
-         * to be reconciled against ownership, which only exists then. */
-        jr_sites.n = 0;
-        for (int i = 0; i < indirects.n; i++) u32_push(&jr_sites, indirects.v[i]);
-        indirects.n = 0;
+         * jump tables, and then the gap sweep, can still reveal new entries. */
         int added = 0;
-        for (int i = 0; i < targets.n; i++) {
-            uint32_t t = targets.v[i];
-            if (!a_in_range(an, t)) continue;
-            uint32_t ti = word_index(an, t);
-            if (entry_map[ti] != A_ENTRY_NONE) continue;
-            /* Soft, not hard. A resolved table target is a real destination of
-             * a `jr`, but a switch case is a *block inside* a function, not a
-             * function -- it has no prologue, and reached as an entry it is
-             * exactly the split that leaves an epilogue stranded.
-             *
-             * Making it soft does not make it unreachable: merge_shared records
-             * every folded entry in split_entry, so the emitter still gives it
-             * a label and a dispatch thunk, which is what the `jr` needs. It
-             * only stops the address from *vetoing* a merge. */
-            entry_map[ti] = A_ENTRY_SOFT;
-            added++;
+        if (an->image || indirects.n) {
+            u32list targets = { 0 };
+            for (int i = 0; i < indirects.n; i++) {
+                int n = resolve_jump_table(an, indirects.v[i], &targets);
+                if (n > 0) { an->ntables++; an->ntable_targets += n; }
+            }
+            /* Keep the sites. They are cleared just below and the round that
+             * finds nothing new exits before any walk refills them, so by the time
+             * ownership is final `indirects` is empty -- and the table targets have
+             * to be reconciled against ownership, which only exists then. */
+            jr_sites.n = 0;
+            for (int i = 0; i < indirects.n; i++) u32_push(&jr_sites, indirects.v[i]);
+            indirects.n = 0;
+            for (int i = 0; i < targets.n; i++) {
+                uint32_t t = targets.v[i];
+                if (!a_in_range(an, t)) continue;
+                uint32_t ti = word_index(an, t);
+                if (entry_map[ti] != A_ENTRY_NONE) continue;
+                /* Soft, not hard. A resolved table target is a real destination of
+                 * a `jr`, but a switch case is a *block inside* a function, not a
+                 * function -- it has no prologue, and reached as an entry it is
+                 * exactly the split that leaves an epilogue stranded.
+                 *
+                 * Making it soft does not make it unreachable: merge_shared records
+                 * every folded entry in split_entry, so the emitter still gives it
+                 * a label and a dispatch thunk, which is what the `jr` needs. It
+                 * only stops the address from *vetoing* a merge. */
+                entry_map[ti] = A_ENTRY_SOFT;
+                added++;
+            }
+            free(targets.v);
         }
-        free(targets.v);
+        /* Only once the tables are exhausted: a table target is better
+         * evidence than a shape, and claims its words first. */
+        if (!added && an->sweep_gaps) {
+            added = sweep_gaps(an, owner, entry_map);
+            an->nswept += added;
+        }
         if (!added) break;
 
         /* Re-walk everything from a clean slate rather than walking only the

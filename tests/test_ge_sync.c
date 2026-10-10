@@ -15,6 +15,7 @@
 #define CALLBACK 0x08830000u
 #define HANDLER 0x08840000u
 #define SIGNAL_HANDLER 0x08840010u
+#define SIGNAL_REWRITE 0x08840020u
 #define FB 0x04000000u
 static unsigned failures, words, finish_calls, signal_calls, cases;
 static unsigned final_finish;
@@ -108,6 +109,39 @@ static void queued(unsigned streaming, unsigned callbacks) {
     check_pixels();
     cases++;
 }
+/* A SIGNAL that suspends (behaviour 1) holds the GE until its handler has
+ * returned, so the handler's rewrite of the words behind it is what is drawn;
+ * one that continues (2) is not waited for, and the walk has drawn on
+ * (geprobe v24 scenes 146, 147, 152 and 153, fw 6.60). */
+static uint32_t rewrite_at;
+static void rewriting_handler(void) {
+    signal_calls++;
+    CHECK((psp_arg(0) & 0xffff) == 0x42);
+    psp_write32(rewrite_at, 0);              /* NOP: no green rectangle */
+}
+static void suspending(unsigned behaviour) {
+    setup();                                 /* vertices and a clear frame */
+    words = 0;
+    cmd(0x10080000); cmd(0x9c000000); cmd(0x9d0401e0); cmd(0xd2000003); cmd(0x1280011c);
+    cmd(0x01820000);
+    cmd(0x04060002);                         /* red rectangle */
+    cmd(0x0e000042 | behaviour << 16); cmd(0x0c000000);
+    rewrite_at = LIST + 4 * words;
+    cmd(0x04060002);                         /* green, unless the handler was in time */
+    cmd(0x0f000000); cmd(0x0c000000);
+    psp_write32(CALLBACK, SIGNAL_REWRITE); psp_write32(CALLBACK + 4, 0);
+    psp_write32(CALLBACK + 8, 0); psp_write32(CALLBACK + 12, 0);
+    const int cb = (int)call(0xa4fc06a4, CALLBACK, 0, 0);
+    CHECK(cb >= 0);
+    const uint32_t id = call(0xab49e76a, LIST, 0, (uint32_t)cb);
+    call(0xb287bd61, 0, 0, 0);
+    CHECK(call(0x03444eb4, id, 1, 0) == 0x80000100u);
+    CHECK(signal_calls == 1);
+    CHECK(pixel(1) == 0xff);
+    CHECK(pixel(5) == (behaviour == 1 ? 0 : 0xff00));
+    call(0x05db22ce, (uint32_t)cb, 0, 0);    /* sceGeUnsetCallback */
+    cases++;
+}
 static void environment(const char *key, const char *value) {
 #ifdef _WIN32
     _putenv_s(key, value);
@@ -158,10 +192,13 @@ int main(int argc, char **argv) {
     CHECK(psp_render_select("software") == 0);
     CHECK(psp_interrupt_set_module(0x08800000, 0x08900000, 0) == 0);
     psp_register(HANDLER, finish); psp_register(SIGNAL_HANDLER, signal_handler);
+    psp_register(SIGNAL_REWRITE, rewriting_handler);
     if (argc == 2) capture_lifetime(argv[1]);
     else {
         for (unsigned streaming = 0; streaming < 2; streaming++)
             for (unsigned callbacks = 0; callbacks < 2; callbacks++) queued(streaming, callbacks);
+        suspending(1);
+        suspending(2);
         setup();
         psp_ge_replay_list(LIST, 0, 0);
         check_pixels();

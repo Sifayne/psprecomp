@@ -59,17 +59,34 @@ static int follows_vcmp(uint32_t addr) {
  * fastest structure: this is consulted once per instruction, and a linear scan
  * over a couple of hundred imports would dominate the interpreter's run time. */
 
-static uint32_t *g_imp_nid;    /* [ (addr - lo) / 4 ] -> NID, 0 = not a thunk */
-static uint32_t  g_imp_lo, g_imp_hi;
+/* One table per module: the executable's, then each module a game loads
+ * (psp_interp_add_imports), its thunks dense in its own .sceStub.text. */
+typedef struct {
+    uint32_t  lo, hi;
+    uint32_t *nid;           /* [ (addr - lo) / 4 ] -> NID, 0 = not a thunk */
+    char    (*lib)[32];      /* the library each thunk imports from */
+} imp_range;
+#define IMP_RANGES 33
+static imp_range g_imp[IMP_RANGES];
+static int       g_nimp;
 
-void psp_interp_free_imports(void) {
-    free(g_imp_nid);
-    g_imp_nid = NULL;
-    g_imp_lo = g_imp_hi = 0;
+static void drop_range(int i) {
+    free(g_imp[i].nid);
+    free(g_imp[i].lib);
+    g_imp[i] = g_imp[--g_nimp];
+    memset(&g_imp[g_nimp], 0, sizeof g_imp[g_nimp]);
 }
 
-int psp_interp_set_imports(const psp_interp_import *tbl, int n) {
-    psp_interp_free_imports();
+void psp_interp_free_imports(void) {
+    while (g_nimp) drop_range(g_nimp - 1);
+}
+
+void psp_interp_drop_imports(uint32_t lo, uint32_t hi) {
+    for (int i = 0; i < g_nimp;)
+        if (g_imp[i].lo < hi && lo < g_imp[i].hi) drop_range(i); else i++;
+}
+
+int psp_interp_add_imports(const psp_interp_import *tbl, int n) {
     if (!tbl || n <= 0) return 0;
 
     uint32_t lo = UINT32_MAX, hi = 0;
@@ -78,12 +95,17 @@ int psp_interp_set_imports(const psp_interp_import *tbl, int n) {
         if (tbl[i].addr + 4 > hi) hi = tbl[i].addr + 4;
     }
     if (lo >= hi) return 0;
+    psp_interp_drop_imports(lo, hi);
+    if (g_nimp >= IMP_RANGES) return -1;
 
     const size_t slots = (hi - lo) / 4;
-    g_imp_nid = (uint32_t *)calloc(slots, sizeof *g_imp_nid);
-    if (!g_imp_nid) return -1;
-    g_imp_lo = lo;
-    g_imp_hi = hi;
+    imp_range *r = &g_imp[g_nimp];
+    r->nid = (uint32_t *)calloc(slots, sizeof *r->nid);
+    r->lib = (char (*)[32])calloc(slots, sizeof *r->lib);
+    if (!r->nid || !r->lib) { free(r->nid); free(r->lib); memset(r, 0, sizeof *r); return -1; }
+    r->lo = lo;
+    r->hi = hi;
+    g_nimp++;
 
     /* A NID of 0 would be indistinguishable from an empty slot. No real import
      * hashes to 0, but rather than rely on that, such an entry is dropped and
@@ -91,10 +113,18 @@ int psp_interp_set_imports(const psp_interp_import *tbl, int n) {
     int kept = 0;
     for (int i = 0; i < n; i++) {
         if (!tbl[i].nid) continue;
-        g_imp_nid[(tbl[i].addr - lo) / 4] = tbl[i].nid;
+        const size_t k = (tbl[i].addr - lo) / 4;
+        r->nid[k] = tbl[i].nid;
+        memcpy(r->lib[k], tbl[i].lib, sizeof r->lib[k]);
+        r->lib[k][sizeof r->lib[k] - 1] = '\0';
         kept++;
     }
     return kept;
+}
+
+int psp_interp_set_imports(const psp_interp_import *tbl, int n) {
+    psp_interp_free_imports();
+    return psp_interp_add_imports(tbl, n);
 }
 
 /* Which firmware call a run leaned on hardest.
@@ -154,9 +184,14 @@ static void note_pc(uint32_t pc) {
     if (i < g_prof_words) g_prof[i]++;
 }
 
-static uint32_t import_nid_at(uint32_t pc) {
-    if (!g_imp_nid || pc < g_imp_lo || pc >= g_imp_hi) return 0;
-    return g_imp_nid[(pc - g_imp_lo) / 4];
+static uint32_t import_nid_at(uint32_t pc, const char **lib) {
+    for (int i = 0; i < g_nimp; i++) {
+        const imp_range *r = &g_imp[i];
+        if (pc < r->lo || pc >= r->hi) continue;
+        *lib = r->lib[(pc - r->lo) / 4];
+        return r->nid[(pc - r->lo) / 4];
+    }
+    return 0;
 }
 
 /* ---- tracing --------------------------------------------------------------
@@ -1000,11 +1035,12 @@ psp_interp_status psp_interp_step(psp_interp *it) {
      *
      * The whole thunk is consumed: control resumes at $ra, not after the two
      * instructions, because the call has already happened. */
-    const uint32_t nid = import_nid_at(pc);
+    const char *lib = NULL;
+    const uint32_t nid = import_nid_at(pc, &lib);
     if (nid) {
         if (it->trace) fprintf(it->trace, "%08X  <hle 0x%08X>", pc, nid);
         note_hle(nid);
-        psp_hle_call(nid);
+        if (lib && *lib) psp_hle_import(nid, lib); else psp_hle_call(nid);
         it->pc = R(PSP_RA_INDEX);
         it->executed += 2;
         if (it->trace) {

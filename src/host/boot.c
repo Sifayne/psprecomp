@@ -26,6 +26,7 @@
 
 #include "loader.h"
 #include "container.h"
+#include "module_loader.h"
 #include "psprecomp/host/present.h"
 #include "psprecomp/host/render_gl.h"
 #include "psprecomp/host/settings.h"
@@ -867,6 +868,12 @@ int main(int argc, char **argv) {
     }
     /* After psp_hle_init, which resets the allocator. */
     psp_sysmem_reserve_module(li.lo, li.hi);
+    /* The executable as sceKernelQueryModuleInfo describes it, and room and a
+     * loader for the modules the title loads at run time (docs/MODULES.md):
+     * before any guest code runs, while nothing holds a pointer into the
+     * module window. */
+    psp_host_modules_main(&b, &e, &li);
+    if (psp_host_modules_start(module) != 0) return 1;
     if (iso) psp_io_set_umd_image(iso);
     psp_hle_register(0x8F2DF740u, "ModuleMgrForUser", "StopUnloadSelfModule",
                      hle_stop_unload_self);

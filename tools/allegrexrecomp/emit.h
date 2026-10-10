@@ -60,6 +60,11 @@ typedef struct {
      * return site and climb its guest call chain from there
      * (psp_resume_chain). Off by default until a save state needs it. */
     int resume;
+
+    /* The registration function's name. NULL is psp_recomp_register, the
+     * program's. A module the game loads at run time has one of its own, called
+     * when it loads (docs/MODULES.md). */
+    const char *register_name;
 } emit_opts;
 
 /* Emit <outdir>/<prefix>_funcs.c, <prefix>_funcs.h and <prefix>_imports.c.

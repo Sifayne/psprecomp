@@ -18,9 +18,15 @@
 #include "io_observed.h"
 #include "psprecomp/state.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <strings.h>
+#else
+#define strcasecmp _stricmp
+#endif
 
 #ifdef _WIN32
 #  include <io.h>
@@ -651,8 +657,11 @@ static void write_date(uint32_t at, time_t t, int time_of_day) {
 static void write_fat_stat(uint32_t out, const struct stat *st) {
     const int dir = S_ISDIR(st->st_mode);
     const uint64_t size = dir ? 0 : (uint64_t)st->st_size;
-    psp_write32(out + 0, (dir ? FIO_S_IFDIR : FIO_S_IFREG) | 0x01FFu);
-    psp_write32(out + 4, dir ? FIO_SO_IFDIR : FIO_SO_IFREG);
+    /* Read-only (sysprobe step 3, after Chstat): mode 0x016D, r-x for all,
+     * and attr bit 0x01. The host keeps it as a file with no write bit. */
+    const int ro = !(st->st_mode & 0222);
+    psp_write32(out + 0, (dir ? FIO_S_IFDIR : FIO_S_IFREG) | (ro ? 0x016Du : 0x01FFu));
+    psp_write32(out + 4, (dir ? FIO_SO_IFDIR : FIO_SO_IFREG) | (ro ? 0x01u : 0));
     psp_write32(out + 8,  (uint32_t)size);
     psp_write32(out + 12, (uint32_t)(size >> 32));
     write_date(out + 16, st->st_ctime, 1);
@@ -851,6 +860,41 @@ static int iso_lookup_in(FILE *f, uint32_t lba, uint32_t bytes,
     return rc;
 }
 
+/* One number of an extent name: hexadecimal after `0x`, else decimal. Moves
+ * *s past it; 0 if there are no digits. */
+static int lbn_number(const char **s, uint32_t *out) {
+    const char *p = *s;
+    const int hex = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
+    if (hex) p += 2;
+    uint64_t v = 0;
+    const char *digits = p;
+    for (;; p++) {
+        int d;
+        if (*p >= '0' && *p <= '9') d = *p - '0';
+        else if (hex && *p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
+        else if (hex && *p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
+        else break;
+        v = v * (hex ? 16 : 10) + (uint64_t)d;
+        if (v > 0xFFFFFFFFu) return 0;
+    }
+    if (p == digits) return 0;
+    *s = p; *out = (uint32_t)v;
+    return 1;
+}
+
+/* `sce_lbn<sector>_size<bytes>`: the bytes starting at that sector of the
+ * disc, as a file. UCUS98712 (WipEout Pulse) opens its archives this way:
+ * `disc0:/sce_lbn0xf100_size0x12c6f640` is Data.wad's extent exactly, sector
+ * 61696 and 315,029,056 bytes. That form is the one observed; decimal is
+ * accepted too, and nothing past the size. */
+static int lbn_name(const char *p, uint32_t *lbn, uint32_t *bytes) {
+    if (strncmp(p, "sce_lbn", 7) != 0) return 0;
+    p += 7;
+    if (!lbn_number(&p, lbn) || strncmp(p, "_size", 5) != 0) return 0;
+    p += 5;
+    return lbn_number(&p, bytes) && *p == '\0';
+}
+
 /* Resolve a guest path inside the disc image. Returns 0 and fills `e` with
  * the byte range of what the path names, the image left open in e->f, or -1
  * if there is no image or no such path. */
@@ -889,6 +933,14 @@ static int iso_lookup(const char *guest, iso_entry *e)
         }
         e->base = (uint64_t)root_lba * ISO_SECTOR;   /* disc0:/ is the root */
         e->len = root_len; e->is_dir = e->is_root = 1;
+        return 0;
+    }
+
+    /* A file named by its extent rather than its path. */
+    uint32_t lbn = 0, bytes = 0;
+    if (lbn_name(p, &lbn, &bytes)) {
+        e->base = (uint64_t)lbn * ISO_SECTOR;
+        e->len = bytes;
         return 0;
     }
 
@@ -1205,28 +1257,62 @@ static void hle_Dclose(void) {
  * The game only ever passes absolute device paths (no measured open names
  * anything else), so this starts as the root and is recorded, not resolved,
  * until something relative arrives. */
+/* Single-level, as sysprobe steps 1-2 measured on a Memory Stick (fw 6.60): a
+ * missing parent is FILE_NOT_FOUND and nothing is made, an existing name
+ * FILE_ALREADY_EXISTS, and a trailing slash INVALID_ARGUMENT (0x80010016).
+ * A missing parent that is part of the tree a stick always has -- PSP,
+ * PSP/SAVEDATA, PSP/GAME -- is made first (mkdir_parents explains why). */
 static void hle_Mkdir(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
 
+    const size_t n = strlen(guest);
+    if (n >= 2 && (guest[n - 1] == '/' || guest[n - 1] == '\\') && guest[n - 2] != ':') {
+        psp_ret(0x80010016);
+        return;
+    }
     struct stat st;
     if (stat(host, &st) == 0) { psp_ret(0x80010011); return; }  /* EEXIST */
-    mkdir_parents(host);
-    psp_ret(stat(host, &st) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
+    {
+        static const char *const always[] = { "ms0:/PSP", "ms0:/PSP/SAVEDATA", "ms0:/PSP/GAME" };
+        char up[512];
+        snprintf(up, sizeof up, "%s", guest);
+        char *cut = strrchr(up, '/');
+        if (cut) *cut = '\0';
+        for (size_t i = 0; i < sizeof always / sizeof *always; i++)
+            if (!strcasecmp(up, always[i])) psp_io_mkdir_all(up);
+    }
+    char parent[1024];
+    snprintf(parent, sizeof parent, "%s", host);
+    char *slash = strrchr(parent, '/');
+    if (slash) *slash = '\0';
+    if (slash && (stat(parent, &st) != 0 || !STAT_ISDIR(st))) { psp_ret(0x80010002); return; }
+    psp_ret(MKDIR_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
 }
 
+/* A directory with something in it is ACCESS_DENIED (0x8001000D, sysprobe
+ * step 2), not FILE_NOT_FOUND. */
 static void hle_Rmdir(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
-    psp_ret(RMDIR_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
+    if (RMDIR_ONE(host) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+    psp_ret(errno == ENOTEMPTY || errno == EEXIST ? 0x8001000D : 0x80010002);
 }
 
+/* A read-only file is ACCESS_DENIED (sysprobe step 4, after Chstat made it
+ * so); a host would remove it, its directory being writable. */
 static void hle_Remove(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
+    struct stat st;
+    if (stat(host, &st) == 0 && !STAT_ISDIR(st) && !(st.st_mode & 0222)) {
+        psp_ret(0x8001000D);
+        io_park();
+        return;
+    }
     psp_ret(UNLINK_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
     io_park();
 }
@@ -1241,17 +1327,50 @@ static void hle_Chdir(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Attribute changes have no observable consumer -- nothing reads back modes
- * or times -- so this validates the path and reports success without changing
- * anything. Mapping chmod bits onto host bits would be a second attributes
- * model to keep correct. */
+/* sceIoChstat(file, stat, bits), bit by bit as sysprobe step 3 measured on
+ * a Memory Stick (fw 6.60), each answering 0:
+ *   MODE (0x01)  read-only when the mode gives no write: 0444 makes it so,
+ *                0777 undoes it. Getstat then shows mode r-x and attr 0x01.
+ *   ATTR (0x02)  the FAT attributes as given: 0x01 read-only.
+ *   CT (0x08), MT (0x20)  set, to the second (FAT's modification time is
+ *                kept to two seconds; the probe's even second came back).
+ *   SIZE, AT, PRVT, 0  nothing.
+ * Two deviations, for what the host keeps no place for: ATTR's other bits
+ * (the archive bit went with ATTR 0x01), and the creation time, which Linux
+ * cannot set. Getstat reports the host's status-change time there. */
+#define CST_MODE 0x01u
+#define CST_ATTR 0x02u
+#define CST_CT   0x08u
+#define CST_MT   0x20u
 static void hle_Chstat(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
     struct stat st;
     if (stat(host, &st) != 0) { psp_ret(0x80010002); return; }
-    (void)st;
+    const uint32_t in = psp_arg(1), bits = psp_arg(2);
+#ifndef _WIN32
+    int ro = !(st.st_mode & 0222);
+    if (bits & CST_MODE) ro = !(psp_read32(in + 0) & 0222);
+    if (bits & CST_ATTR) ro = (psp_read32(in + 4) & 0x01) != 0;
+    if (bits & (CST_MODE | CST_ATTR))
+        chmod(host, ro ? (st.st_mode & 07555) : (st.st_mode | 0200));
+    if (bits & CST_MT) {
+        struct tm tm;
+        memset(&tm, 0, sizeof tm);
+        tm.tm_year = psp_read16(in + 48) - 1900;
+        tm.tm_mon  = psp_read16(in + 50) - 1;
+        tm.tm_mday = psp_read16(in + 52);
+        tm.tm_hour = psp_read16(in + 54);
+        tm.tm_min  = psp_read16(in + 56);
+        tm.tm_sec  = psp_read16(in + 58);
+        tm.tm_isdst = -1;
+        const struct timespec times[2] = { { 0, UTIME_OMIT }, { mktime(&tm), 0 } };
+        utimensat(AT_FDCWD, host, times, 0);
+    }
+#else
+    (void)in; (void)bits;
+#endif
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1273,6 +1392,43 @@ int psp_io_path_info(const char *guest, uint64_t *size, int *is_dir) {
     if (size) *size = STAT_ISDIR(st) ? 0 : (uint64_t)st.st_size;
     if (is_dir) *is_dir = STAT_ISDIR(st) ? 1 : 0;
     return 0;
+}
+
+/* A window of an open host file, whole. */
+static uint8_t *read_window(FILE *f, uint64_t base, uint64_t len, size_t *out_len) {
+    if (len > 256u * 1024 * 1024) return NULL;
+    uint8_t *buf = (uint8_t *)malloc(len ? (size_t)len : 1);
+    if (!buf) return NULL;
+    if (iso_read_at(f, base, buf, (size_t)len) != 0) { free(buf); return NULL; }
+    *out_len = (size_t)len;
+    return buf;
+}
+
+uint8_t *psp_io_read_whole(const char *guest, size_t *len) {
+    iso_entry e;
+    if (iso_lookup(guest, &e) == 0) {
+        uint8_t *buf = e.is_dir || e.is_device ? NULL : read_window(e.f, e.base, e.len, len);
+        fclose(e.f);
+        return buf;
+    }
+    char host[1024];
+    map_path(guest, host, sizeof host);
+    FILE *f = fopen(host, "rb");
+    if (!f) return NULL;
+    uint8_t *buf = NULL;
+    if (fseeko(f, 0, SEEK_END) == 0) {
+        const off_t size = ftello(f);
+        if (size >= 0) buf = read_window(f, 0, (uint64_t)size, len);
+    }
+    fclose(f);
+    return buf;
+}
+
+uint8_t *psp_io_read_fd(uint32_t fd, size_t *len, int *on_disc) {
+    if (fd < 3 || fd - 3 >= MAX_FILES || !g_file[fd - 3].used || !g_file[fd - 3].f) return NULL;
+    const io_file *o = &g_file[fd - 3];
+    if (on_disc) *on_disc = o->image;
+    return read_window(o->f, o->base, o->len, len);
 }
 
 int psp_io_list_names(const char *guest, char names[][64], int cap) {

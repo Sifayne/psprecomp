@@ -1,6 +1,7 @@
 /* psprecomp — HLE dispatch. See include/psprecomp/hle.h. */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/modules.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/dispatch.h"
@@ -162,7 +163,7 @@ void psp_hle_dump_recent(FILE *out) {
  * __sceSasCore and no sceDisplayWaitVblank is an audio loop with no frame loop,
  * and that is visible here in one line and nowhere else. */
 static uint64_t g_calls[HLE_MAX];
-static uint64_t g_calls_unimpl;
+static uint64_t g_calls_unimpl, g_calls_unlinked;
 
 /* An ordered log of every firmware call, enabled by PSPRECOMP_HLE_LOG=1.
  *
@@ -220,6 +221,9 @@ void psp_hle_dump_calls(FILE *out, int top) {
     if (g_calls_unimpl)
         fprintf(out, "  %10llu  (unimplemented)\n",
                 (unsigned long long)g_calls_unimpl);
+    if (g_calls_unlinked)
+        fprintf(out, "  %10llu  (not linked: no module provides the library)\n",
+                (unsigned long long)g_calls_unlinked);
 }
 
 /* What every firmware call ends with, after its handler and the safe point:
@@ -285,7 +289,81 @@ void psp_hle_resume(uint32_t nid, uint32_t site, int safepoint) {
     after_call();
 }
 
-void psp_hle_call(uint32_t nid) {
+/* A call no firmware function answers but a module the game loaded exports
+ * (docs/MODULES.md): the import stub reaches the module's code, as a stub the
+ * console's loader patched would. Not a firmware call -- no tick, no safe
+ * point. The runtime's own answer wins where it has one. */
+/* The libraries firmware 6.60 gives a game: every one its modules export
+ * but the kernel's own (_driver, ForKernel), as PSPLibDoc lists them for
+ * 6.60 (github.com/Spenon-dev/PSPLibDoc, PSPLibDoc/6.60). A call into one the
+ * runtime does not answer is a firmware call it does not implement yet; the
+ * libraries it answers any call of are firmware's by registration. */
+static const char *const g_firmware_libs[] = {
+    "content_browser", "InterruptManager", "IoFileMgrForUser", "Kernel_Library",
+    "LflashFatfmt", "LoadExecForUser", "marlindownloader", "mcore", "memlmd",
+    "mlnapp_proxy", "mlnapp_proxy_hwd", "mlnbb", "mlncmn", "mlnusb",
+    "ModuleMgrForUser", "mp4msv", "music_browser", "music_parser",
+    "music_player", "onesegCore", "onesegHalToolbox", "onesegSal", "onesegSdk",
+    "onesegSdkCore", "photo_browser", "photo_player", "pspvmc",
+    "recommend_browser", "rss_browser", "rss_downloader", "sceAac",
+    "sceAsfParser", "sceAtrac3plus", "sceAudio", "sceAudiocodec",
+    "sceAudiocodec2", "sceAudioRouting", "sceCertLoader", "sceChnnlsv",
+    "sceCtrl", "sceDdrdb", "sceDisplay", "sceDmac", "sceDNAS_lib",
+    "sceDNASCore_lib", "sceFileParserBase", "sceG729", "sceGameUpdate",
+    "sceGe_lazy", "sceGe_user", "sceHprm", "sceHtmlViewerHelper", "sceHttp",
+    "sceHttpStorage", "sceHttpStorage_bridge", "sceHVAuth", "sceHVFlash_Module",
+    "sceHVNetfront_Module", "sceHVSlim_Library", "sceHVUI_Module",
+    "sceHVWWW_Library", "sceImpose", "sceJpeg", "sceLibFont_ARIB",
+    "sceLibFont_HV", "sceLibUpdateDL", "sceMcctrl", "sceMeAudio",
+    "sceMlnBridge", "sceMlnBridge_msapp", "sceMp3", "sceMp4", "sceMpeg",
+    "sceMpegbase", "sceMsVideo", "sceMsVideoPluginHeap", "sceNet", "sceNet_lib",
+    "sceNetAdhoc", "sceNetAdhoc_lib", "sceNetAdhocAuth_lib", "sceNetAdhocctl",
+    "sceNetAdhocctl_lib", "sceNetAdhocDiscover", "sceNetAdhocDownload",
+    "sceNetAdhocMatching", "sceNetAdhocTransInt", "sceNetApctl",
+    "sceNetApctl_internal_user", "sceNetApctl_lib", "sceNetApctl_lib2",
+    "sceNetIfhandle", "sceNetIfhandle_lib", "sceNetInet", "sceNetInet_lib",
+    "sceNetResolver", "sceNetStun", "sceNetUpnp", "sceNetWispr", "sceNp",
+    "sceNpAuth", "sceNpCamp", "sceNpCommerce2", "sceNpCommerce2RegCam",
+    "sceNpCommerce2Store", "sceNpCore", "sceNpInstall_user", "sceNpMatching2",
+    "sceNpService", "sceOnesegLnch", "sceOpenPSID", "sceP3da", "scePaf",
+    "sceParseHttp", "sceParseUri", "scePauth", "scePopsMan", "scePower",
+    "scePsheet", "scePspNpDrm_user", "sceReg", "sceResmgr", "sceRtc",
+    "sceSasCore", "sceSemawm", "sceSircs", "sceSkypeIo", "sceSsl", "sceSsl_lib",
+    "sceSuspendForUser", "sceUmd", "sceUmdCacheUser", "sceUmdUser", "sceUsb",
+    "sceUsb1Seg", "sceUsbAcc", "sceUsbAcc_internal", "sceUsbCam", "sceUsbDmb",
+    "sceUsbGps", "sceUsbMic", "sceUsbstor", "sceUsbstor_internal",
+    "sceUsbstormln", "sceUtility", "sceUtility_netparam_internal",
+    "sceUtility_private", "sceVaudio", "sceVe", "sceVideo", "sceVideocodec",
+    "sceVshBridge", "sceVshBridge_msapp", "sceVshCommonGui", "sceVshCommonUtil",
+    "sceVshLftvMw", "sceVshNetconf", "sceVshNetconfAoss", "sceVshNetconfRaku",
+    "sceVshRssCommon", "sceWlanDrv", "sceWlanDrv_lib", "semaphore",
+    "StdioForUser", "SysMemUserForUser", "ThreadManForUser", "UtilsForUser",
+    "vsh",
+};
+
+static int firmware_library(const char *lib) {
+    for (size_t i = 0; i < sizeof g_firmware_libs / sizeof *g_firmware_libs; i++)
+        if (!strcmp(g_firmware_libs[i], lib)) return 1;
+    for (int i = 0; i < g_count; i++)
+        if (g_entry[i].lib && !strcmp(g_entry[i].lib, lib)) return 1;
+    return 0;
+}
+
+static uint32_t module_export(uint32_t nid) {
+    if (!psp_modules_loaded()) return 0;
+    for (int i = 0; i < g_count; i++) if (g_entry[i].nid == nid) return 0;
+    return psp_modules_export(nid);
+}
+
+static void hle_call(uint32_t nid, const char *lib);
+void psp_hle_call(uint32_t nid) { hle_call(nid, NULL); }
+void psp_hle_import(uint32_t nid, const char *lib) { hle_call(nid, lib); }
+
+static void hle_call(uint32_t nid, const char *lib) {
+    {
+        const uint32_t to = module_export(nid);
+        if (to) { psp_dispatch(to); return; }
+    }
     g_call_depth++;
     /* Where the guest resumes after this call: its $ra, set by the jal. */
     psp_census_call_enter(nid, psp_cpu.r[PSP_REG_RA]);
@@ -357,6 +435,26 @@ void psp_hle_call(uint32_t nid) {
             return;
         }
     }
+    /* An import from a library neither the firmware nor any started module
+     * provides is not linked: modprobe step 15 (fw 6.60) calls one from
+     * module_start and gets SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED. A
+     * game's own module's library answers that too, before the module has
+     * started or once it has stopped. */
+    if (lib && !firmware_library(lib)) {
+        g_calls_unlinked++;
+        if (logging())
+            fprintf(stderr, "hle: [%05X] 0x%08X <not linked: %s>(0x%08X, 0x%08X, 0x%08X, 0x%08X)\n",
+                    psp_sched_current(), nid, lib,
+                    psp_arg(0), psp_arg(1), psp_arg(2), psp_arg(3));
+        if (!g_quiet)
+            fprintf(stderr, "psprecomp: 0x%08X of %s is not linked: no module provides the library\n",
+                    nid, lib);
+        psp_ret(SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED);
+        psp_interrupt_run_pending();
+        psp_census_call_leave();
+        g_call_depth--;
+        return;
+    }
     note_zero(nid, NULL, 0);
     g_calls_unimpl++;
     if (logging())
@@ -419,6 +517,8 @@ void psp_hle_init(void) {
     psp_io_register();
     psp_misc_init();
     psp_misc_register();
+    psp_modulemgr_init();
+    psp_modulemgr_register();
     psp_net_register();
     psp_umd_init();
     psp_umd_register();

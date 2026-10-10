@@ -848,11 +848,13 @@ static void test_transcendentals(void) {
  * forms, and the streams the model reproduces exactly -- from the reset state
  * and from seeds 0, 1 and 12345678 -- and, with the carry rule fitted to
  * v3 steps 179-187, from FFFFFFFF and 3F800000, rcx included. */
+/* Four draws in the order they were drawn: a quad fills its last lane first
+ * (vfpuprobe v6 steps 206-208). */
 static void draw_quad(int kind, uint32_t out[4]) {
     int q[4];
     psp_vfpu_regs(0x00, 4, q);
     psp_vrnd(0x00, kind, 4);
-    for (int i = 0; i < 4; i++) out[i] = psp_f32_to_bits(psp_cpu.v[q[i]]);
+    for (int i = 0; i < 4; i++) out[i] = psp_f32_to_bits(psp_cpu.v[q[3 - i]]);
 }
 
 static void test_random(void) {

@@ -767,7 +767,7 @@ static void test_io_dirs(void) {
     call(RMDIR, guest_name("ms0:/PSP"), 0, 0, 0);
 
     CHECK(call(MKDIR, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0777, 0, 0) == 0,
-          "mkdir makes the whole chain");
+          "mkdir makes its parents when they are the tree a stick always has");
     CHECK(call(MKDIR, guest_name("ms0:/PSP/SAVEDATA/ZZZ"), 0777, 0, 0) == 0x80010011,
           "mkdir of an existing dir says EEXIST");
     CHECK(call(CHDIR, guest_name("ms0:/PSP"), 0, 0, 0) == 0, "chdir in");

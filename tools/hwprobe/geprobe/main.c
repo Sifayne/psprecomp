@@ -57,7 +57,7 @@ PSP_MODULE_INFO("geprobe", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(8192);
 
-#define PROBE_VERSION 23
+#define PROBE_VERSION 24
 
 typedef unsigned int w32;   /* PSPSDK's u32 is uint32_t, a long here, which %X does not take */
 
@@ -4407,6 +4407,382 @@ static void section_callbacks(void) {
     }
 }
 
+/* ---- version 24: list words rewritten behind a SIGNAL (scenes 146-154) ---
+ *
+ * psprecomp's GE runs a list as soon as its words are released and calls the
+ * SIGNAL and FINISH handlers afterwards, on the guest clock (src/hle/ge.c,
+ * "Drawing now, reporting on the clock"). What a guest can see of that: a
+ * handler that rewrites words behind its SIGNAL, words the GE has not
+ * reached when the signal is raised, is too late there. On a PSP it may be
+ * in time. These scenes ask, each with one raw list:
+ *
+ *     marker A, the trigger, markers at +0, +4, +8, +16, +32, +64, +128 and
+ *     +256 words past it (NOPs between), 100 filler sprites, a far marker,
+ *     FINISH
+ *
+ * A marker is a 16 x 16 sprite whose VADDR points at a red pair of vertices.
+ * The handler rewrites each marker's VADDR word, nearest first, to point at
+ * a green pair in the same place. A marker read back green is a rewrite the
+ * GE saw, red one whose word it had read before the rewrite, black one it
+ * never drew. The trigger's last word ends a 64-byte line, so where the
+ * ladder turns green says how far ahead the GE had read when the handler
+ * wrote: nothing, a line, more. The fillers (480 x 160, below the markers)
+ * keep the GE busy for about 20 ms at step 81's rate, so the far marker is
+ * that much GE time past the trigger, where even a handler racing a running
+ * GE wins. Scenes 152-154's handlers wait 1 ms before they write, which
+ * tells the two apart: a GE that waits for its handler still sees the
+ * nearest rewrite, one that runs on sees only the far one. Each handler
+ * also reads three pixels as it starts, and again after its wait: marker A,
+ * drawn before the trigger, and its row's +0 and far markers. +0 still
+ * black after the wait is a GE that waited.
+ *
+ * The handler writes each word through the cache and writes its line back
+ * (sceKernelDcacheWritebackRange), as a game rewriting a list it built
+ * through the cache has to: the GE reads memory, not the cache (geprobe 5,
+ * where a dirty line's write-back replaced a list). It then reads the word
+ * through the uncached alias and counts it if memory already holds it.
+ * Scene 148 leaves the write-back out, as a game that forgot it would: the
+ * rewrite reaches memory only when its line is evicted, or at once if the
+ * cache does not allocate a line on a write miss, which the count shows.
+ *
+ * The triggers: SIGNAL behaviour 1 (pspgu.h GU_BEHAVIOR_SUSPEND, "wait for
+ * callback to finish") and 2 (CONTINUE, "do not wait"), each with its END;
+ * PAUSE (3) as sceGuSignal writes it, SIGNAL, END, FINISH, END, where
+ * geprobe 5 found the list stopped until sceGeContinue, and the thread
+ * rewrites a second row while it waits (words behind a stopped GE: does it
+ * read ahead?); and the four words The 3rd Birthday's list writer puts in
+ * the middle of a list (its function at 003FC590), SIGNAL 08, END, FINISH 0,
+ * END, with more drawing after them. psprecomp calls no handler at that pair
+ * and runs on past it (ge.c GE_SIGNAL_SYNC), unmeasured. Here a signal
+ * handler for id 0 rewrites row 1 and a finish handler for id 0 row 2, so
+ * the rows say which handlers ran at the pair and whether the GE went on
+ * past it; the log lists every handler call with its argument, and the
+ * list's own FINISH has another id. Scene 151 queues that list with its
+ * stall just after the pair, as a game writing the list as it goes would,
+ * and moves the stall to the end 100 ms later.
+ *
+ * Every scene peeks 100 ms after EnQueue; a list paused then is continued
+ * from the thread (scene 149's is meant to be), and one still running a
+ * second after that is broken off (ge_wait). g_phase: 1 inside EnQueue, 2
+ * after it, 3 inside sceGeListUpdateStallAddr or sceGeContinue, 4 after.
+ * The handlers that wait (152-154) spin in interrupt context for 1 ms, so
+ * they come last. */
+
+#define SG_WORDS 1024
+#define SG_STEPS 8                          /* the ladder; column SG_STEPS is the far marker */
+#define SG_COLS  (SG_STEPS + 1)
+#define SG_ROWS  2
+#define SG_FILL  100
+#define SG_PRIM  (0x04000000u | (GU_SPRITES << 16) | 2)
+static const short SG_AT[SG_STEPS] = { 0, 4, 8, 16, 32, 64, 128, 256 };
+
+enum { SG_SIG = 1, SG_FIN, SG_THREAD };     /* what rewrites a row */
+
+static unsigned int g_sg[SG_WORDS] __attribute__((aligned(64)));
+/* A, the filler, then each marker's red pair and green pair */
+static CV g_sgv[4 + SG_ROWS * SG_COLS * 4] __attribute__((aligned(64)));
+static PspGeCallbackData g_sgcb;
+
+static int g_sgrows;
+static int g_sgtrig[SG_ROWS], g_sgid[SG_ROWS];
+static int g_sgat[SG_ROWS * SG_COLS];       /* each marker's VADDR word */
+static w32 g_sgto[SG_ROWS * SG_COLS];       /* and what it is rewritten to */
+static w32 g_sgdelay;                       /* microseconds a handler waits before it writes */
+static int g_sgwb;                          /* write each rewritten word's line back */
+
+/* A record per rewrite: who made it, A, +0 and far as it began and after
+ * its wait, the words written and how many memory held at once. */
+#define SG_MAXH 8
+typedef struct { int trig, id, row, nrw, nmem; w32 px[2][3]; } sg_rec;
+static sg_rec g_sgh[SG_MAXH];
+static volatile int g_sgnh;
+
+static w32 sg_vaddr(int v) { return 0x01000000u | ((w32)&g_sgv[v] & 0xFFFFFFu); }
+static void sg_xy(int row, int col, int *x, int *y) { *x = 40 + 32 * col; *y = 8 + 32 * row; }
+
+static void sg_pair(int v, int x0, int y0, int x1, int y1, w32 c) {
+    g_sgv[v]     = (CV){ c, (float)x0, (float)y0, 0 };
+    g_sgv[v + 1] = (CV){ c, (float)x1, (float)y1, 0 };
+}
+
+/* A pixel's colour as the GE left it in VRAM, alpha aside. */
+static w32 sg_px(int x, int y) { return ((volatile w32 *)VRAM_UNCACHED)[y * FB_W + x] & 0xFFFFFFu; }
+static w32 sg_mpx(int row, int col) {
+    int x, y;
+    sg_xy(row, col, &x, &y);
+    return sg_px(x + 8, y + 8);
+}
+static void sg_read3(int row, w32 *p) { p[0] = sg_px(16, 16); p[1] = sg_mpx(row, 0); p[2] = sg_mpx(row, SG_STEPS); }
+
+/* W marker A, R a marker as written, G as rewritten, - nothing drawn. */
+static const char *sg_cls(w32 p, char *buf) {
+    switch (p) {
+    case 0x000000: return "-";
+    case 0x0000FF: return "R";
+    case 0x00FF00: return "G";
+    case 0xFFFFFF: return "W";
+    }
+    snprintf(buf, 12, "%06X", (unsigned)p);
+    return buf;
+}
+
+static void sg_spin(w32 us) {
+    const w32 t0 = sceKernelGetSystemTimeLow();
+    for (int i = 0; i < 1000000; i++)
+        if (sceKernelGetSystemTimeLow() - t0 >= us) break;
+}
+
+static int sg_row_fires(int r, int trig, int id) {
+    return g_sgtrig[r] == trig && (trig == SG_THREAD || g_sgid[r] == id);
+}
+
+/* Rewrite the rows `trig` with `id` owns, nearest marker first. Runs in the
+ * handler (interrupt context), or on the thread for SG_THREAD. */
+static void sg_fire(int trig, int id) {
+    int row = -1;
+    for (int r = 0; r < g_sgrows && row < 0; r++)
+        if (sg_row_fires(r, trig, id)) row = r;
+    if (row < 0) return;
+    w32 px[2][3] = { { 0 } };
+    sg_read3(row, px[0]);
+    if (g_sgdelay) {
+        sg_spin(g_sgdelay);
+        sg_read3(row, px[1]);
+    }
+    int nrw = 0, nmem = 0;
+    for (int r = 0; r < g_sgrows; r++) {
+        if (!sg_row_fires(r, trig, id)) continue;
+        for (int c = 0; c < SG_COLS; c++) {
+            const int m = r * SG_COLS + c, i = g_sgat[m];
+            ((volatile unsigned int *)g_sg)[i] = g_sgto[m];      /* through the cache */
+            if (g_sgwb) sceKernelDcacheWritebackRange(&g_sg[i], 4);
+            __asm__ volatile("sync" ::: "memory");
+            nrw++;
+            if (((volatile unsigned int *)UNCACHED(g_sg))[i] == g_sgto[m]) nmem++;
+        }
+    }
+    const int h = g_sgnh;
+    if (h < SG_MAXH) {
+        sg_rec *rc = &g_sgh[h];
+        rc->trig = trig; rc->id = id; rc->row = row; rc->nrw = nrw; rc->nmem = nmem;
+        memcpy(rc->px, px, sizeof px);
+        g_sgnh = h + 1;
+    }
+}
+
+static void sg_signal_cb(int id, void *arg) { note(3, id | ((int)arg & 0xFF) << 16); sg_fire(SG_SIG, id); }
+static void sg_finish_cb(int id, void *arg) { note(4, id | ((int)arg & 0xFF) << 16); sg_fire(SG_FIN, id); }
+
+static void sg_marker(int *k, int r, int c) {
+    const int m = r * SG_COLS + c;
+    g_sgat[m] = *k;
+    g_sgto[m] = sg_vaddr(6 + 4 * m);
+    g_sg[(*k)++] = sg_vaddr(4 + 4 * m);
+    g_sg[(*k)++] = SG_PRIM;
+}
+
+static const char *sg_who(int r, char *buf) {
+    if (g_sgtrig[r] == SG_THREAD) return "the thread";
+    snprintf(buf, 24, "%s id %04X", g_sgtrig[r] == SG_SIG ? "signal" : "finish", (unsigned)g_sgid[r]);
+    return buf;
+}
+
+/* A, and each row's +0 and far markers, while the list is held. */
+static void sg_now(void) {
+    char b[12];
+    out("  markers now: A %s", sg_cls(sg_px(16, 16), b));
+    for (int r = 0; r < g_sgrows; r++) {
+        out("; row %d +0 %s", r + 1, sg_cls(sg_mpx(r, 0), b));
+        out(", far %s", sg_cls(sg_mpx(r, SG_STEPS), b));
+    }
+    out("\n");
+}
+
+/* 100 ms on: the handlers so far and the peeks; the markers too if the list
+ * is not done. Returns sceGeListSync(peek). */
+static int sg_peek(int lid, const char *when) {
+    sceKernelDelayThread(100000);
+    const int ls = sceGeListSync(lid, 1), ds = sceGeDrawSync(1);
+    out("  %s: %d callback(s); sceGeListSync(peek) = %08X, sceGeDrawSync(peek) = %08X\n",
+        when, g_nev, (w32)ls, (w32)ds);
+    if (ls >= 1 && ls <= 4) sg_now();
+    return ls;
+}
+
+struct sg_spec {
+    int scene;
+    const char *name, *title;
+    int shape;        /* 1, 2: SIGNAL of that behaviour, END; 3: PAUSE, SIGNAL, END, FINISH, END;
+                       * 8: SIGNAL 08, END, FINISH 0, END (The 3rd Birthday's pair) */
+    int stall;        /* queued with the stall just after the trigger, then moved to the end */
+    w32 delay;        /* microseconds each handler waits before it rewrites */
+    int wb;           /* the handler writes the cache back over each word it rewrites */
+};
+
+static const struct sg_spec SG24[] = {
+    { 146, "sigsuspend", "SIGNAL suspend: its handler rewrites the words behind it", 1, 0, 0, 1 },
+    { 147, "sigcontinue", "SIGNAL continue: its handler rewrites the words behind it", 2, 0, 0, 1 },
+    { 148, "sigsuspend_nowb", "SIGNAL suspend: its handler rewrites them without writing the cache back", 1, 0, 0, 0 },
+    { 149, "sigpause", "SIGNAL pause: its handler rewrites row 1, the thread row 2 before sceGeContinue", 3, 0, 0, 1 },
+    { 150, "sigsync", "SIGNAL 08, END, FINISH 0, END inside a list: handlers rewrite the words after it", 8, 0, 0, 1 },
+    { 151, "sigsync_stall", "the SIGNAL 08 pair with the stall just after it, then the stall moved to the end", 8, 1, 0, 1 },
+    { 152, "sigsuspend_late", "SIGNAL suspend: its handler waits 1 ms, then rewrites", 1, 0, 1000, 1 },
+    { 153, "sigcontinue_late", "SIGNAL continue: its handler waits 1 ms, then rewrites", 2, 0, 1000, 1 },
+    { 154, "sigsync_late", "the SIGNAL 08 pair: its handlers wait 1 ms, then rewrite", 8, 0, 1000, 1 },
+};
+#define SG24_N ((int)(sizeof SG24 / sizeof SG24[0]))
+
+static void sg_scene(const struct sg_spec *sp) {
+    g_scene = sp->scene;
+    if (step("scene %02d: %s", sp->scene, sp->title)) return;
+    const int sh = sp->shape;
+    char b[24];
+
+    /* The frame: cleared and its state set by a libgu list, done before the
+     * raw list starts; the GE keeps the state. */
+    scene_begin(GU_PSM_8888, 0xFF000000);
+    sceGuFinish();
+    ge_wait();
+
+    g_sgrows = (sh == 1 || sh == 2) ? 1 : 2;
+    g_sgtrig[0] = SG_SIG;
+    g_sgid[0] = sh == 8 ? 0 : sp->scene;
+    g_sgtrig[1] = sh == 3 ? SG_THREAD : SG_FIN;
+    g_sgid[1] = 0;
+    g_sgdelay = sp->delay;
+    g_sgwb = sp->wb;
+    g_sgnh = 0;
+
+    sg_pair(0, 8, 8, 24, 24, 0xFFFFFFFF);                  /* A */
+    sg_pair(2, 0, 112, SCR_W, SCR_H, 0xFF404040);          /* the filler */
+    for (int m = 0; m < g_sgrows * SG_COLS; m++) {
+        int x, y;
+        sg_xy(m / SG_COLS, m % SG_COLS, &x, &y);
+        sg_pair(4 + 4 * m, x, y, x + 16, y + 16, 0xFF0000FF);
+        sg_pair(6 + 4 * m, x, y, x + 16, y + 16, 0xFF00FF00);
+    }
+    sceKernelDcacheWritebackInvalidateRange(g_sgv, sizeof g_sgv);
+    const w32 va = (w32)g_sgv;
+    if ((va ^ (va + sizeof g_sgv - 1)) & 0x0F000000u)
+        out("  the vertices cross a 16 MB boundary: one BASE does not reach them all\n");
+
+    int k = 0;
+    g_sg[k++] = 0x12000000 | FMT_CV2D;                     /* VTYPE */
+    g_sg[k++] = 0x10000000 | ((va >> 8) & 0x0F0000);       /* BASE */
+    g_sg[k++] = sg_vaddr(0);                               /* A */
+    g_sg[k++] = SG_PRIM;
+    const int tw = (sh == 1 || sh == 2) ? 2 : 4;
+    while ((k + tw) % 16) g_sg[k++] = 0;                   /* NOP: the trigger ends a 64-byte line */
+    if (tw == 2) {
+        g_sg[k++] = 0x0E000000u | (w32)sh << 16 | (w32)sp->scene;   /* SIGNAL behaviour sh, id scene */
+        g_sg[k++] = 0x0C000000;                                    /* END */
+    } else if (sh == 3) {
+        g_sg[k++] = 0x0E030000u | (w32)sp->scene;                   /* SIGNAL pause, id scene */
+        g_sg[k++] = 0x0C000000;
+        g_sg[k++] = 0x0F002000u | (w32)sp->scene;                   /* FINISH 0x2000 + scene */
+        g_sg[k++] = 0x0C000000;
+    } else {
+        g_sg[k++] = 0x0E080000;                                     /* SIGNAL 08, id 0 */
+        g_sg[k++] = 0x0C000000;
+        g_sg[k++] = 0x0F000000;                                     /* FINISH 0 */
+        g_sg[k++] = 0x0C000000;
+    }
+    const int t0 = k;
+    for (int s = 0; s < SG_STEPS; s++) {
+        while (k < t0 + SG_AT[s]) g_sg[k++] = 0;
+        for (int r = 0; r < g_sgrows; r++) sg_marker(&k, r, s);
+    }
+    for (int i = 0; i < SG_FILL; i++) {
+        g_sg[k++] = sg_vaddr(2);
+        g_sg[k++] = SG_PRIM;
+    }
+    const int far = k - t0;
+    for (int r = 0; r < g_sgrows; r++) sg_marker(&k, r, SG_STEPS);
+    g_sg[k++] = 0x0F001000u | (w32)sp->scene;              /* FINISH 0x1000 + scene */
+    g_sg[k++] = 0x0C000000;
+    const int n = k;
+    g_sg[k++] = 0;
+    sceKernelDcacheWritebackInvalidateRange(g_sg, sizeof g_sg);
+    out("  %d words; ladder +0 to +%d, %d fillers, far markers at +%d; FINISH %04X\n",
+        n, SG_AT[SG_STEPS - 1], SG_FILL, far, 0x1000 + sp->scene);
+
+    memset(&g_sgcb, 0, sizeof g_sgcb);
+    g_sgcb.signal_func = sg_signal_cb;
+    g_sgcb.signal_arg  = (void *)0x5A;
+    g_sgcb.finish_func = sg_finish_cb;
+    g_sgcb.finish_arg  = (void *)0xA5;
+    g_nev = 0; g_phase = 0;
+    const int cbid = sceGeSetCallback(&g_sgcb);
+    if (cbid < 0) {
+        out("  sceGeSetCallback error\n");
+        ret(cbid);
+        return;
+    }
+    g_phase = 1;
+    const int lid = sceGeListEnQueue(UNCACHED(g_sg), sp->stall ? UNCACHED(g_sg + t0) : NULL, cbid, NULL);
+    g_phase = 2;
+    const int nev = g_nev;
+    if (lid < 0) {
+        out("  sceGeListEnQueue error\n");
+        ret(lid);
+    } else {
+        const int ls0 = sceGeListSync(lid, 1), ds0 = sceGeDrawSync(1);
+        out("  sceGeListEnQueue ok (id >= 0); %d callback(s) before it returned;"
+            " sceGeListSync(peek) = %08X, sceGeDrawSync(peek) = %08X\n", nev, (w32)ls0, (w32)ds0);
+        int ls = sg_peek(lid, "after 100 ms");
+        if (sh == 3) {
+            sg_fire(SG_THREAD, 0);
+            out("  the thread rewrote row 2\n");
+        }
+        if (sp->stall) {
+            g_phase = 3;
+            const int u = sceGeListUpdateStallAddr(lid, UNCACHED(g_sg + n));
+            g_phase = 4;
+            out("  sceGeListUpdateStallAddr to the end = %08X; %d callback(s) by its return\n", (w32)u, g_nev);
+            ls = sg_peek(lid, "100 ms later");
+        }
+        if (ls == 4) {                                     /* paused (step 73) */
+            g_phase = 3;
+            const int c = sceGeContinue();
+            g_phase = 4;
+            out("  paused: sceGeContinue = %08X\n", (w32)c);
+        }
+        const int w = ge_wait();
+        out("  wait %08X; sceGeListSync(peek) = %08X\n", (w32)w, (w32)sceGeListSync(lid, 1));
+    }
+    log_events();
+    out("  sceGeUnsetCallback = %08X\n", (w32)sceGeUnsetCallback(cbid));
+
+    for (int h = 0; h < g_sgnh; h++) {
+        const sg_rec *rc = &g_sgh[h];
+        char p[3][12];
+        if (rc->trig == SG_THREAD) out("  rewrite %d, the thread", h + 1);
+        else out("  rewrite %d, %s handler id %04X", h + 1, rc->trig == SG_SIG ? "signal" : "finish", (w32)rc->id);
+        out(", row %d: %d word(s), %d in memory at once; as it began A %s, +0 %s, far %s", rc->row + 1,
+            rc->nrw, rc->nmem, sg_cls(rc->px[0][0], p[0]), sg_cls(rc->px[0][1], p[1]), sg_cls(rc->px[0][2], p[2]));
+        if (g_sgdelay)
+            out("; after %u us A %s, +0 %s, far %s", (unsigned)g_sgdelay,
+                sg_cls(rc->px[1][0], p[0]), sg_cls(rc->px[1][1], p[1]), sg_cls(rc->px[1][2], p[2]));
+        out("\n");
+    }
+    int inmem = 0;
+    for (int m = 0; m < g_sgrows * SG_COLS; m++)
+        inmem += ((volatile unsigned int *)UNCACHED(g_sg))[g_sgat[m]] == g_sgto[m];
+    out("  after the list memory holds %d of %d marker words rewritten\n", inmem, g_sgrows * SG_COLS);
+
+    /* The answer: each marker as the GE left it. */
+    out("  A (before the trigger) %s\n", sg_cls(sg_px(16, 16), b));
+    for (int r = 0; r < g_sgrows; r++) {
+        char who[24];
+        out("  row %d (%s):", r + 1, sg_who(r, who));
+        for (int c = 0; c < SG_STEPS; c++) out(" +%d %s", SG_AT[c], sg_cls(sg_mpx(r, c), b));
+        out(" far %s\n", sg_cls(sg_mpx(r, SG_STEPS), b));
+    }
+
+    sceGuStart(GU_DIRECT, g_list);
+    scene_end(sp->name, GU_PSM_8888, 0);
+}
+
 /* ---- main ---------------------------------------------------------------- */
 
 int main(int argc, char **argv) {
@@ -4555,6 +4931,11 @@ int main(int argc, char **argv) {
     for (int k = 0; k < C23A_NSTEPS; k++) c14_run(&C23A_STEPS[k]);
     for (int k = 0; k < C23B_NSTEPS; k++) c14_run(&C23B_STEPS[k]);
     for (int k = 0; k < C23Z_NSTEPS; k++) c14_run(&C23Z_STEPS[k]);
+
+    /* Version 24: SIGNAL handlers that rewrite the list behind them; the ones
+     * whose handlers wait in interrupt context last. */
+    section("scenes, version 24");
+    for (int k = 0; k < SG24_N; k++) sg_scene(&SG24[k]);
 
     probe_screen(1);
     probe_done();

@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 psp_memory psp_mem;
 uint64_t   psp_mem_bad_access;
@@ -491,6 +492,28 @@ int psp_mem_map_module(uint32_t base, uint32_t size) {
         return -1;
     }
     g_module_base = base;
+    g_module_size = size;
+    g_module_in_ram     = module_overlaps(PSP_RAM_BASE, PSP_RAM_SIZE);
+    g_module_in_vram    = module_overlaps(PSP_VRAM_BASE, PSP_VRAM_SIZE);
+    g_module_in_scratch = module_overlaps(PSP_SCRATCH_BASE, PSP_SCRATCH_SIZE);
+    if (++g_write_serial == 0) g_write_serial++;
+    return 0;
+}
+
+int psp_mem_grow_module(uint32_t end) {
+    if (!g_module_size || end <= g_module_base) return -1;
+    const uint32_t size = end - g_module_base;
+    if (size <= g_module_size) return 0;
+    uint8_t *mem = (uint8_t *)realloc(g_module, size);
+    if (!mem) return -1;
+    g_module = mem;
+    memset(g_module + g_module_size, 0, size - g_module_size);
+    const size_t had = ((size_t)g_module_size + WRITE_GRANULE - 1) / WRITE_GRANULE;
+    const size_t pages = ((size_t)size + WRITE_GRANULE - 1) / WRITE_GRANULE;
+    uint64_t *write = (uint64_t *)realloc(g_module_write, pages * sizeof(uint64_t));
+    if (!write) return -1;
+    g_module_write = write;
+    memset(g_module_write + had, 0, (pages - had) * sizeof(uint64_t));
     g_module_size = size;
     g_module_in_ram     = module_overlaps(PSP_RAM_BASE, PSP_RAM_SIZE);
     g_module_in_vram    = module_overlaps(PSP_VRAM_BASE, PSP_VRAM_SIZE);

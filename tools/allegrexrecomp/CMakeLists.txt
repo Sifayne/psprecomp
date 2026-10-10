@@ -11,6 +11,7 @@ add_library(allegrex_core STATIC
     emit.c
     interp.c
     loader.c
+    reloc.c
     keys.c
     crypto/aes.c
     crypto/cmac.c

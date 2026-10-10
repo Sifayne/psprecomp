@@ -60,8 +60,9 @@ set(PLAYER_LAUNCHER "${TOOLKIT}/src/host/launcher.c")
 # shared host and the boot host, whose main the link takes from here.
 # Position independent: the on-device link may make a position-independent
 # executable.
-add_library(player STATIC ${PLAYER_HOST} "${TOOLKIT}/src/host/boot.c"
-    "${RECOMP}/loader.c" "${RECOMP}/container.c" "${RECOMP}/decode.c")
+add_library(player STATIC ${PLAYER_HOST} "${TOOLKIT}/src/host/boot.c" "${TOOLKIT}/src/host/module_loader.c"
+    "${RECOMP}/loader.c" "${RECOMP}/container.c" "${RECOMP}/decode.c" "${RECOMP}/reloc.c"
+    "${RECOMP}/crypto/sha1.c")
 target_include_directories(player PRIVATE "${RECOMP}")
 target_compile_definitions(player PRIVATE HAVE_SDL2)
 set_target_properties(player PROPERTIES POSITION_INDEPENDENT_CODE ON)

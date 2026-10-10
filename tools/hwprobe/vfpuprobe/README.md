@@ -45,9 +45,33 @@ on pspautotests captures:
     From v5, two more (204-205) into `vfpu_core5_vlog2.bin` and
     `vfpu_core5_vlog2w.bin`, about 4.7 MB: the vlog2 results v4's rule for
     x >= 4 still missed.
+14. From v6, the vector forms of the random instructions, in the log only
+    (steps 206-212):
+    - vrndi, vrndf1 and vrndf2 at .p, .t and .q from four seeds, each
+      against six .s draws of the same op from the same seed, so the log
+      shows which lane receives the first value drawn and how far rcx0-7
+      moved (`src/vfpu.c` fills lane 0 first);
+    - the same in rows, offset pairs and triples and matrices 0, 3 and 7,
+      among them The 3rd Birthday's `vrndf2.t C000`;
+    - each op at .s, .p, .t and .q after 15 `vpfxd` prefixes, from two
+      seeds: one lane, two, all but one and all four masked, `[0,1]` and
+      `[-1,1]` saturation on one lane or all, and a mask with a saturation.
+      Whether a masked lane still advances the state, whether saturation
+      applies to vrndf1/vrndf2 and to vrndi's integer, which lane each
+      control acts on, and the pfxd the draw leaves.
+
+    A case's line lists its lanes in lane order, then each as the reference
+    draw it equals: `= s4 s3 s2 s1, rcx s4` means lane 0 holds the fourth .s
+    draw and rcx0-7 equal the state after four. `--` is a lane left at its
+    5A5A5A5A, `??` a value no draw had (a saturated one), `rcx ??` a state
+    no number of .s draws reaches, logged in full on the next line. Lane 0
+    first reads `s1 s2 s3 s4`, the last lane first `s4 s3 s2 s1`; with one
+    lane masked, `rcx s4` says the masked lane still drew and `rcx s3` that
+    it did not.
 
 Version 3 runs 4, then 12, then 13 after the others. Versions 4 and 5 keep
-every earlier step under the same number and append to section 13.
+every earlier step under the same number and append to section 13. Version
+6 keeps steps 1-205 and adds section 14 after 13.
 
 ## Build
 
@@ -63,7 +87,8 @@ Copy `EBOOT.PBP` to `ms0:/PSP/GAME/vfpuprobe/` and start it from the XMB. It
 needs no input and returns to the XMB by itself. Sections 0-12 take a few
 seconds; section 13 writes about 103 MB (91 MB in v3, 98 MB in v4), a
 minute or so at 1.5-2 MB/s and three or four at 0.5 MB/s, so the stick
-needs 110 MB free.
+needs 110 MB free. Section 14 comes after it and takes a second or two; a
+stick that fills up in section 13 loses its log lines too.
 
 It writes, beside the EBOOT:
 

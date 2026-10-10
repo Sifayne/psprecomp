@@ -14,6 +14,8 @@ PPSSPP or pspautotests' sources.
 | [threadprobe](threadprobe/) | thread manager, callbacks, timers, TLS, RTC | pspautotests threads captures |
 | [syncprobe](syncprobe/) | semaphores, event flags, mutexes, mailboxes, pipes, VPL/FPL | pspautotests kernel-object captures |
 | [sasprobe](sasprobe/) | sceSasCore argument checks, envelopes, rendered voices | pspautotests audio captures |
+| [modprobe](modprobe/) | the module manager with a game's own modules: ids, start and stop threads, free memory, linking, self-unload | uofw's modulemgr and PSPSDK's pspmodulemgr.h, which `src/hle/modulemgr.c` follows |
+| [sysprobe](sysprobe/) | Mkdir with a missing parent, Chstat, `sce_lbn` extents (needs a UMD), GPO/GPI, the headphone remote, the SDK 3.70 call | answers `src/hle` gives unmeasured |
 
 All but mpegprobe run without input: start one from the XMB, it writes
 `<name>.txt` (and sometimes `.bin` or `.raw` files) beside its EBOOT and

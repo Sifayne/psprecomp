@@ -311,6 +311,188 @@ static void test_vfpu_branch_condition(void) {
     a_analysis_free(&an);
 }
 
+/* ---- a branch in a delay slot does not hide the word after it ---------------
+ *
+ * Regression test for WipEout Pulse's compile error, `use of undeclared label
+ * 'L_0029148C'`.
+ *
+ * Real code never puts a branch in a delay slot, but data decoded as code
+ * does. The first pass marked the slot of *every* transfer as consumed,
+ * including a transfer that was itself a slot -- which the main pass never
+ * emits as a branch, so nothing consumes its slot. The word after it was then
+ * skipped as a slot that no branch emitted, and when another branch targeted
+ * it the `goto` named a label no one printed.
+ *
+ * Only the slots the main pass really consumes count: a slot's own slot is an
+ * ordinary instruction. */
+
+#define SS_BASE 0x08850000u
+
+static const uint32_t SS_CODE[] = {
+    0x50850003,  /* +00  beql  $a0, $a1, +10   targets the word after +0C   */
+    0x00000000,  /* +04  nop                                                */
+    0x1CC00002,  /* +08  bgtz  $a2, +14                                     */
+    0x14E00001,  /* +0C  bne   $a3, $zero, +14 a branch in a delay slot     */
+    0x24420001,  /* +10  addiu $v0, $v0, 1     not a slot: +0C's own slot    */
+    0x03E00008,  /* +14  jr    $ra                                          */
+    0x00000000,  /* +18  nop                                                */
+};
+
+static void test_branch_in_slot_keeps_next_label(void) {
+    uint8_t code[sizeof SS_CODE];
+    for (size_t i = 0; i < sizeof SS_CODE / sizeof SS_CODE[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(SS_CODE[i]);
+        code[i * 4 + 1] = (uint8_t)(SS_CODE[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(SS_CODE[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(SS_CODE[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = SS_BASE;
+    an.size = (uint32_t)sizeof code;
+
+    const uint32_t seed = SS_BASE;
+    CHECK(a_discover(&an, &seed, 1, 1) == 0, "slot branch: discovery runs");
+
+    emit_opts o = {0};
+    o.outdir = ".";
+    o.prefix = "t_ss";
+    o.module = "synthetic";
+    CHECK(a_emit(&an, &o) == 0, "slot branch: emission succeeds");
+
+    char *src = slurp("./t_ss_funcs.c", NULL);
+    CHECK(src != NULL, "slot branch: generated .c is readable");
+    if (!src) { a_analysis_free(&an); return; }
+
+    CHECK(strstr(src, "goto L_08850010;") != NULL,
+          "slot branch: the beql jumps to the word after the slot branch");
+    CHECK(strstr(src, "L_08850010:") != NULL,
+          "slot branch: the word after a branch in a delay slot is emitted\n"
+          "  under its label -- otherwise the `goto` does not compile");
+
+    /* Every goto in the file names a label the file declares. */
+    for (const char *p = src; (p = strstr(p, "goto L_")) != NULL; p += 7) {
+        char label[16];
+        memcpy(label, p + 5, 10);
+        label[10] = ':';
+        label[11] = 0;
+        CHECK(strstr(src, label) != NULL, "slot branch: `goto %.10s` has a label", p + 5);
+    }
+    free(src);
+    a_analysis_free(&an);
+}
+
+/* ---- code nothing reaches is swept, stubs and data are not ------------------
+ *
+ * WipEout Pulse's MD5 enters its round helpers by adding to an address and
+ * jumping through it, so no walk, call or pointer names them and a run
+ * stopped on a dispatch miss at 0x0000BFA0. The gap sweep seeds such code by
+ * its shape. Two shapes it must leave alone: an unreachable `b .` just before
+ * a function, which the walk would carry on from into that function and
+ * merge with it, and an unclaimed run that starts with data. */
+
+#define GS_BASE 0x08860000u
+
+static const uint32_t GS_CODE[] = {
+    0x03E00008,  /* +00  jr    $ra             A, seeded                    */
+    0x00000000,  /* +04  nop                                                */
+    0x24420001,  /* +08  addiu $v0, $v0, 1     B, nothing names it: swept   */
+    0x03E00008,  /* +0C  jr    $ra                                          */
+    0x00000000,  /* +10  nop                                                */
+    0x1000FFFF,  /* +14  b     .               a stub just before C: not    */
+    0x00000000,  /* +18  nop                                                */
+    0x03E00008,  /* +1C  jr    $ra             C, seeded                    */
+    0x00000000,  /* +20  nop                                                */
+    0x72616552,  /* +24  "Rear"                data: the run is not code    */
+    0x24420001,  /* +28  addiu $v0, $v0, 1                                  */
+    0x03E00008,  /* +2C  jr    $ra                                          */
+    0x00000000,  /* +30  nop                                                */
+};
+
+static void test_gap_sweep(void) {
+    uint8_t code[sizeof GS_CODE];
+    for (size_t i = 0; i < sizeof GS_CODE / sizeof GS_CODE[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(GS_CODE[i]);
+        code[i * 4 + 1] = (uint8_t)(GS_CODE[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(GS_CODE[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(GS_CODE[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = GS_BASE;
+    an.size = (uint32_t)sizeof code;
+    an.sweep_gaps = 1;
+
+    const uint32_t seeds[2] = { GS_BASE, GS_BASE + 0x1C };
+    CHECK(a_discover(&an, seeds, 2, 2) == 0, "gap sweep: discovery runs");
+    CHECK(an.nswept == 1, "gap sweep: one block swept, got %d", an.nswept);
+
+    emit_opts o = {0};
+    o.outdir = ".";
+    o.prefix = "t_gs";
+    o.module = "synthetic";
+    CHECK(a_emit(&an, &o) == 0, "gap sweep: emission succeeds");
+
+    char *src = slurp("./t_gs_funcs.c", NULL);
+    CHECK(src != NULL, "gap sweep: generated .c is readable");
+    if (!src) { a_analysis_free(&an); return; }
+
+    CHECK(strstr(src, "psp_body_08860008") != NULL,
+          "gap sweep: code nothing names becomes a function");
+    CHECK(strstr(src, "psp_body_0886001C") != NULL && strstr(src, "psp_at_0886001C") == NULL,
+          "gap sweep: the function after a `b .` stub stays a function of its own");
+    CHECK(strstr(src, "08860014u") == NULL,
+          "gap sweep: the `b .` stub is not an entry");
+    CHECK(strstr(src, "08860028u") == NULL,
+          "gap sweep: code after data in an unclaimed run is not swept");
+    free(src);
+    a_analysis_free(&an);
+}
+
+/* ---- a module's registration function has a name of its own ---------------
+ *
+ * A module the game loads at run time is linked into the same program as the
+ * executable, so its registration function cannot also be called
+ * psp_recomp_register (docs/MODULES.md, M2). */
+
+static void test_register_name(void) {
+    static const uint32_t words[] = { 0x03E00008, 0x00000000 };   /* jr $ra; nop */
+    uint8_t code[sizeof words];
+    for (size_t i = 0; i < 2; i++)
+        for (int k = 0; k < 4; k++) code[i * 4 + k] = (uint8_t)(words[i] >> (8 * k));
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = 0x00400000u;
+    an.size = (uint32_t)sizeof code;
+    const uint32_t seed = an.base;
+    CHECK(a_discover(&an, &seed, 1, 1) == 0, "register name: discovery runs");
+
+    emit_opts o = {0};
+    o.outdir = ".";
+    o.prefix = "t_rn";
+    o.module = "synthetic";
+    o.register_name = "psp_recomp_register_module_2";
+    CHECK(a_emit(&an, &o) == 0, "register name: emission succeeds");
+
+    char *src = slurp("./t_rn_funcs.c", NULL);
+    char *hdr = slurp("./t_rn_funcs.h", NULL);
+    CHECK(src && strstr(src, "void psp_recomp_register_module_2(void) {"),
+          "register name: the function is defined under the module's name");
+    CHECK(hdr && strstr(hdr, "void psp_recomp_register_module_2(void);"),
+          "register name: and declared under it");
+    CHECK(src && hdr && !strstr(src, "psp_recomp_register(") && !strstr(hdr, "psp_recomp_register("),
+          "register name: the program's name is not used");
+    free(src);
+    free(hdr);
+    a_analysis_free(&an);
+}
+
 /* ---- CC latency and FPU traps -----------------------------------------------
  *
  * An mfvc of CC as the word straight after a vcmp reads CC from before that
@@ -572,6 +754,9 @@ int main(void) {
     test_return_delay_slot_not_owned();
     test_indirect_call_is_not_terminal();
     test_vfpu_branch_condition();
+    test_branch_in_slot_keeps_next_label();
+    test_gap_sweep();
+    test_register_name();
     test_cc_latency_and_fpu_trap();
     test_replace_leaves_the_symbol_to_the_host();
     test_replace_absent_changes_nothing();
