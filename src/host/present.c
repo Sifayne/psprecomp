@@ -155,14 +155,6 @@ enum { AUDIO_RATE = 44100 };      /* frames a second, the PSP's and the device's
  * how far a channel may run ahead before it is made to wait -- short enough
  * that an effect is heard when it happens, long enough to ride out a frame
  * that rasterizes slowly. */
-/* A channel does not play until it holds a pre-roll, and after running dry it
- * waits for one again. A stream the game paces itself -- the movie's sound
- * thread waits on the movie's own clock, not on our backlog -- arrives one
- * block at a time at exactly the rate it is consumed, so the ring hovers near
- * empty and every push that lands a few milliseconds late is a gap the
- * callback fills with silence: the popping Sif heard through the intro. A
- * pre-roll of 4096 frames is 93 ms of slack against that jitter, paid once as
- * latency at the start of each stream. */
 /* The eight channels and Output2's (the runtime numbers it 8): a game whose
  * sound is all Output2, as WipEout Pulse's is, played nothing through here,
  * and its mixer, never told to wait, never let the rest of the game run. */
@@ -194,6 +186,14 @@ static mix_ring g_mix[MIX_CHANNELS];
  * overrides it, and PSPRECOMP_AUDIO_PREROLL_MS the pre-roll, for listening
  * without a rebuild. */
 static uint32_t g_audio_target_frames  = 0;      /* 0: two of the channel's buffers */
+/* A channel does not play until it holds a pre-roll, and after running dry it
+ * waits for one again. A stream the game paces itself -- the movie's sound
+ * thread waits on the movie's own clock, not on our backlog -- arrives one
+ * block at a time at exactly the rate it is consumed, so the ring hovers near
+ * empty and every push that lands a few milliseconds late is a gap the
+ * callback fills with silence: the popping Sif heard through the intro. A
+ * pre-roll of 4096 frames is 93 ms of slack against that jitter, paid once as
+ * latency at the start of each stream. */
 static uint32_t g_audio_preroll_frames = 4096;
 static int      g_audio_warned_fmt;
 
@@ -350,13 +350,13 @@ static const psp_audio_backend *audio(void) {
  * nothing of the old game's sound queued. */
 static void audio_drop(void) { if (audio()->flush) audio()->flush(); }
 
-/* While the guest is held the device plays silence and the mixer is not
- * asked: its rings keep what was queued, and resume where the pause cut
- * them, without counting the pause as an underrun. */
 /* The menu's master volume, 0..65536 for silence..unity, scaled on the way
  * out so the guest and the mixers never see it. */
 static _Atomic int g_volume = 65536;
 
+/* While the guest is held the device plays silence and the mixer is not
+ * asked: its rings keep what was queued, and resume where the pause cut
+ * them, without counting the pause as an underrun. */
 static void audio_device_callback(void *ud, Uint8 *stream, int len) {
     if (psp_paused()) { memset(stream, 0, (size_t)len); return; }
     audio()->callback(ud, stream, len);
@@ -1026,9 +1026,6 @@ int present_start(void) {
     if (audio()->pending) psp_audio_set_pending(audio()->pending);
     static const psp_state_part part = { .name = "audio", .drop = audio_drop };
     psp_state_register(&part);
-
-    /* Queue depth target: two buffers -- deep enough that jitter never
-     * underruns, shallow enough that the backlog tracks real playback. */
 
     if (pthread_cond_init(&g_frame_cv, NULL) != 0) {
         unhook_guest();
