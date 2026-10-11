@@ -589,13 +589,17 @@ static void mouse_grab(int on) {
  * the game until the menu takes the controls. */
 static struct { unsigned buttons; int fired; } g_chord;
 
+unsigned input_chord_bit(int button) {
+    return button == SDL_CONTROLLER_BUTTON_BACK ? INPUT_CHORD_VIEW :
+           button == SDL_CONTROLLER_BUTTON_START ? INPUT_CHORD_MENU : 0u;
+}
+
 static int chord_button(uint8_t button, int is_down) {
-    const unsigned bit = button == SDL_CONTROLLER_BUTTON_BACK ? 1u :
-                         button == SDL_CONTROLLER_BUTTON_START ? 2u : 0u;
+    const unsigned bit = input_chord_bit(button);
     if (!bit) return 0;
     if (is_down) g_chord.buttons |= bit;
     else g_chord.buttons &= ~bit;
-    if (g_chord.buttons != 3) { g_chord.fired = 0; return 0; }
+    if (g_chord.buttons != INPUT_CHORD_BOTH) { g_chord.fired = 0; return 0; }
     if (g_chord.fired) return 0;
     g_chord.fired = 1;
     return 1;
@@ -635,7 +639,7 @@ static void sample_controller(void) {
         chord_button((uint8_t)b, g_pad_down[b]);
     }
     /* A pair already held when the pad is sampled is not a press. */
-    g_chord.fired = g_chord.buttons == 3;
+    g_chord.fired = g_chord.buttons == INPUT_CHORD_BOTH;
     for (int a = 0; a < SDL_CONTROLLER_AXIS_MAX; a++)
         g_pad_axis[a] = SDL_GameControllerGetAxis(g_controller, (SDL_GameControllerAxis)a);
 }
@@ -741,8 +745,7 @@ void input_return(int owner) {
     g_return_at = 0;
 }
 
-/* Nothing held anywhere: every key, mouse button and button of the pad. */
-static int neutral(void) {
+int input_neutral(void) {
     int n;
     const Uint8 *keys = SDL_GetKeyboardState(&n);
     for (int i = 0; i < n; i++) if (keys[i]) return 0;
@@ -759,7 +762,7 @@ static void returning(void) {
     if (!g_returning) return;
     const Uint64 now = SDL_GetTicks64();
     if (!g_return_at) g_return_at = now;
-    const int calm = neutral();
+    const int calm = input_neutral();
     if (!calm && now - g_return_at < 1000) return;
     if (!calm)
         fprintf(stderr, "present: input still held a second after the %s closed; resuming game input\n",

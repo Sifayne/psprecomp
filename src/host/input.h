@@ -65,5 +65,13 @@ void input_release_mouse(void);
 /* The active controller, or NULL. */
 SDL_GameController *input_pad(void);
 SDL_JoystickID input_pad_id(void);
+/* Nothing held anywhere: every key, mouse button and button of the active
+ * controller. */
+int input_neutral(void);
+
+/* View (Back) and Menu (Start) as bits of the menu chord, which is both. */
+enum { INPUT_CHORD_VIEW = 1, INPUT_CHORD_MENU = 2, INPUT_CHORD_BOTH = 3 };
+/* A controller button's chord bit, or 0 for any other button. */
+unsigned input_chord_bit(int button);
 
 #endif
