@@ -2109,6 +2109,41 @@ static void hle_ReferCallbackStatus(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* `status` is the kernel's own enumeration, not this file's TH_*, and a
+ * thread that has never been started reports STOPPED (16).
+ *
+ * For a live thread the scheduler is the authority, not the TH_* field:
+ * this file records that a thread was started and never that it parked, so
+ * a thread sitting in sceKernelSleepThread read back as READY. It is
+ * WAITING, and threads/threadend puts the two next to each other --
+ * `before start status=00000010`, `after start status=00000004` -- with
+ * nothing between them but the start of a thread whose whole body is a
+ * sleep. `sched` is what the scheduler says the thread is doing. */
+static uint32_t thread_status(const psp_thread *t, psp_sched_state sched) {
+    if (thread_dormant(t)) return PSP_THREAD_STATUS_STOPPED;
+    uint32_t status = PSP_THREAD_STATUS_STOPPED;
+    switch (sched) {
+        case PSP_SCHED_RUNNING:   status = PSP_THREAD_STATUS_RUNNING; break;
+        case PSP_SCHED_READY:     status = PSP_THREAD_STATUS_READY;   break;
+        case PSP_SCHED_BLOCKED:
+        case PSP_SCHED_SLEEPING:  status = PSP_THREAD_STATUS_WAITING; break;
+        /* No live slot: threading is off, or it was never spawned. Fall
+         * back to what this file knows. */
+        case PSP_SCHED_DEAD:
+            status = t->state == TH_RUNNING ? PSP_THREAD_STATUS_RUNNING
+                                            : PSP_THREAD_STATUS_READY;
+            break;
+    }
+    /* Suspension sits on top: WAITING|SUSPEND (0x0C) for a suspended
+     * waiter, and SUSPEND alone -- not READY|SUSPEND -- once its wait is
+     * over or when it had none (threadprobe steps 36, 53, 54, fw 6.60). */
+    if (t->suspended)
+        status = status == PSP_THREAD_STATUS_WAITING
+               ? (PSP_THREAD_STATUS_WAITING | PSP_THREAD_STATUS_SUSPEND)
+               : PSP_THREAD_STATUS_SUSPEND;
+    return status;
+}
+
 /* sceKernelReferThreadStatus: the whole of what a thread is, in 104 bytes.
  *
  * The size is not a guess -- threads/refer.expected reports `=> 104` for a
@@ -2129,40 +2164,9 @@ static void hle_ReferThreadStatus(void) {
      * with 0 and `attr=807000ff` for one created with 0x700000. */
     const uint32_t attr = 0x800000FFu | t->attr;
 
-    /* `status` is the kernel's own enumeration, not this file's TH_*, and a
-     * thread that has never been started reports STOPPED (16).
-     *
-     * For a live thread the scheduler is the authority, not the TH_* field:
-     * this file records that a thread was started and never that it parked, so
-     * a thread sitting in sceKernelSleepThread read back as READY. It is
-     * WAITING, and threads/threadend puts the two next to each other --
-     * `before start status=00000010`, `after start status=00000004` -- with
-     * nothing between them but the start of a thread whose whole body is a
-     * sleep. */
     const int dormant = thread_dormant(t);
     const psp_sched_state sched = dormant ? PSP_SCHED_DEAD : psp_sched_state_of(t->uid);
-    uint32_t status = PSP_THREAD_STATUS_STOPPED;
-    if (!dormant) {
-        switch (sched) {
-            case PSP_SCHED_RUNNING:   status = PSP_THREAD_STATUS_RUNNING; break;
-            case PSP_SCHED_READY:     status = PSP_THREAD_STATUS_READY;   break;
-            case PSP_SCHED_BLOCKED:
-            case PSP_SCHED_SLEEPING:  status = PSP_THREAD_STATUS_WAITING; break;
-            /* No live slot: threading is off, or it was never spawned. Fall
-             * back to what this file knows. */
-            case PSP_SCHED_DEAD:
-                status = t->state == TH_RUNNING ? PSP_THREAD_STATUS_RUNNING
-                                                : PSP_THREAD_STATUS_READY;
-                break;
-        }
-        /* Suspension sits on top: WAITING|SUSPEND (0x0C) for a suspended
-         * waiter, and SUSPEND alone -- not READY|SUSPEND -- once its wait is
-         * over or when it had none (threadprobe steps 36, 53, 54, fw 6.60). */
-        if (t->suspended)
-            status = status == PSP_THREAD_STATUS_WAITING
-                   ? (PSP_THREAD_STATUS_WAITING | PSP_THREAD_STATUS_SUSPEND)
-                   : PSP_THREAD_STATUS_SUSPEND;
-    }
+    const uint32_t status = thread_status(t, sched);
 
     /* Three different answers for `exitStatus`, and none of them is zero:
      * DORMANT for a thread never started, NOT_DORMANT for one still running --
