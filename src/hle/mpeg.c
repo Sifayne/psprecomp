@@ -452,6 +452,51 @@ static int ring_poll_spins(mpeg_ctx *c) {
  * lives in host memory, which is where the elementary streams live anyway.
  * One packet stays held until the stream is over, so the ring never reads as
  * entirely free before it is. */
+static uint32_t ring_packets_held(mpeg_ctx *c, uint32_t packets, uint32_t pkt_size) {
+    /* The last put each decoder has wholly consumed, in ring bytes. */
+    while (c->put_iv < c->nputs && c->puts[c->put_iv].es_len  <= c->es_pos)  c->put_iv++;
+    while (c->put_ia < c->nputs && c->puts[c->put_ia].aes_len <= c->aes_pos) c->put_ia++;
+    const uint64_t pv = c->put_iv ? c->puts[c->put_iv - 1].put_bytes : 0;
+    const uint64_t pa = c->put_ia ? c->puts[c->put_ia - 1].put_bytes : 0;
+    /* Only a stream the game registered reads its packets. WipEout
+     * Pulse plays the movie behind its title screen with no audio
+     * registered: counting the audio as a consumer had it past every
+     * put, the ring read empty for ever, and the game, which waits
+     * for the ring to fill before it decodes, read the whole file
+     * into host memory at 45 MB a second. */
+    const uint64_t consumed = c->registered == 1u ? pv
+                            : c->registered == 2u ? pa
+                            : pv > pa ? pv : pa;
+    uint64_t held = (c->put_total - consumed + pkt_size - 1) / pkt_size;
+    /* The floor of one packet is for playback, not for the end.
+     *
+     * It is there because the game reads an entirely free ring as
+     * nothing having been buffered; what it does at the *end* is the
+     * mirror of that, and it is what the movie waits on -- its reader
+     * thread stops putting and polls this until the ring reads empty,
+     * 759 million times in one run when the answer never came. So the
+     * floor lifts once the file has been fully delivered: everything
+     * the ring ever held is on our side by then, and an empty ring is
+     * the truth as well as the signal.
+     *
+     * Until the file has been fully delivered, hold what the
+     * decoders have not taken -- the game reads an entirely free ring
+     * as nothing having been buffered, and gives up. Once it has been
+     * delivered, the ring is empty, and saying so is both true and
+     * necessary: the ring is a transport, everything it ever carried
+     * is on our side by then, and the player waits for exactly this
+     * to finish a movie. Waiting for the decoders instead deadlocks
+     * it, because it stops fetching about three seconds before the
+     * data ends -- the stream's tail is padding it does not want --
+     * so the last packets are never accounted consumed. Its drain
+     * thread then spins for a frame buffer that its display side,
+     * finished, will never return: 850 million ring polls in a run
+     * that never left the movie. */
+    if (c->es_eof) held = 0;
+    else if (held == 0) held = 1;
+    if (held > packets) held = packets;
+    return (uint32_t)held;
+}
 static void hle_RingbufferAvailableSize(void) {
     const uint32_t rb = psp_arg(0);
     mpeg_ctx *bound=rb?ctx_of(psp_read32(rb+RB_MPEG)):NULL;
@@ -462,55 +507,7 @@ static void hle_RingbufferAvailableSize(void) {
         const uint32_t packets  = psp_read32(rb + RB_PACKETS);
         const uint32_t pkt_size = psp_read32(rb + RB_PACKET_SIZE);
         if (c && packets && pkt_size) {
-            /* The last put each decoder has wholly consumed, in ring bytes. */
-            while (c->put_iv < c->nputs && c->puts[c->put_iv].es_len  <= c->es_pos)  c->put_iv++;
-            while (c->put_ia < c->nputs && c->puts[c->put_ia].aes_len <= c->aes_pos) c->put_ia++;
-            const uint64_t pv = c->put_iv ? c->puts[c->put_iv - 1].put_bytes : 0;
-            const uint64_t pa = c->put_ia ? c->puts[c->put_ia - 1].put_bytes : 0;
-            /* Only a stream the game registered reads its packets. WipEout
-             * Pulse plays the movie behind its title screen with no audio
-             * registered: counting the audio as a consumer had it past every
-             * put, the ring read empty for ever, and the game, which waits
-             * for the ring to fill before it decodes, read the whole file
-             * into host memory at 45 MB a second. */
-            const uint64_t consumed = c->registered == 1u ? pv
-                                    : c->registered == 2u ? pa
-                                    : pv > pa ? pv : pa;
-            uint64_t held = (c->put_total - consumed + pkt_size - 1) / pkt_size;
-            /* The floor of one packet is for playback, not for the end.
-             *
-             * It is there because the game reads an entirely free ring as
-             * nothing having been buffered; what it does at the *end* is the
-             * mirror of that, and it is what the movie waits on -- its reader
-             * thread stops putting and polls this until the ring reads empty,
-             * 759 million times in one run when the answer never came. So the
-             * floor lifts once the file has been fully delivered: everything
-             * the ring ever held is on our side by then, and an empty ring is
-             * the truth as well as the signal.
-             *
-             * Consumption still governs the count, with one correction. The
-             * video's read position stops at the start of the last NAL it
-             * decoded and so never reaches the end of its stream, which would
-             * leave a put forever unaccounted; the audio's does reach the end
-             * of its own, exactly, since frames are walked whole. So when the
-             * audio has taken everything, or either stream has said it is
-             * drained, the ring is empty. */
-            /* Until the file has been fully delivered, hold what the
-             * decoders have not taken -- the game reads an entirely free ring
-             * as nothing having been buffered, and gives up. Once it has been
-             * delivered, the ring is empty, and saying so is both true and
-             * necessary: the ring is a transport, everything it ever carried
-             * is on our side by then, and the player waits for exactly this
-             * to finish a movie. Waiting for the decoders instead deadlocks
-             * it, because it stops fetching about three seconds before the
-             * data ends -- the stream's tail is padding it does not want --
-             * so the last packets are never accounted consumed. Its drain
-             * thread then spins for a frame buffer that its display side,
-             * finished, will never return: 850 million ring polls in a run
-             * that never left the movie. */
-            if (c->es_eof) held = 0;
-            else if (held == 0) held = 1;
-            if (held > packets) held = packets;
+            const uint32_t held = ring_packets_held(c, packets, pkt_size);
             /* The game's reader polls this in a hot loop while the ring is
              * full -- 284 million calls in a 75-second run. A packet frees when
              * a decoder consumes one, never sooner than a frame later, so a
@@ -522,8 +519,8 @@ static void hle_RingbufferAvailableSize(void) {
              * fair test of "full" -- the reader wants room for a read's
              * worth -- so an eighth is. Only a poll that spins sleeps: see
              * ring_poll_spins. */
-            if (held * 8 >= (uint64_t)packets * 7 && ring_poll_spins(c)) psp_sched_delay(8000);
-            psp_ret(packets - (uint32_t)held);
+            if ((uint64_t)held * 8 >= (uint64_t)packets * 7 && ring_poll_spins(c)) psp_sched_delay(8000);
+            psp_ret(packets - held);
             return;
         }
     }
