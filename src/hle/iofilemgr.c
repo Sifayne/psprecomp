@@ -51,6 +51,15 @@
 #define PSP_O_CREAT  0x0200
 #define PSP_O_TRUNC  0x0400
 
+/* Results that are 0x80010000 | errno (uofw include/common/errors.h); NOENT
+ * and BADF come from the disc probe, in io_observed.h. */
+#define SCE_ERROR_ENOMEM   0x8001000Cu   /* errno 12 */
+#define SCE_ERROR_EACCES   0x8001000Du   /* 13 */
+#define SCE_ERROR_EEXIST   0x80010011u   /* 17 */
+#define SCE_ERROR_ENODEV   0x80010013u   /* 19 */
+#define SCE_ERROR_EINVAL   0x80010016u   /* 22 */
+#define SCE_ERROR_EMFILE   0x80010018u   /* 24: every descriptor taken */
+
 /* An open file. `base`/`len` describe a window inside `f`, which is what makes
  * a file inside a disc image indistinguishable from a host file to everything
  * downstream: the ISO is one host file and every asset is a range within it.
@@ -245,7 +254,7 @@ static void hle_open_body(void) {
                 return;
             }
             fclose(e.f);
-            psp_ret(0x80010018);
+            psp_ret(SCE_ERROR_EMFILE);
             return;
         }
     }
@@ -281,7 +290,7 @@ static void hle_open_body(void) {
             return;
         }
         fclose(f);
-        psp_ret(0x80010018);
+        psp_ret(SCE_ERROR_EMFILE);
         return;
     }
 
@@ -298,7 +307,7 @@ static void hle_open_body(void) {
             unsigned char u = (unsigned char)*c;
             if (u < 32 || u == '?' || u == '*' || u == '<' || u == '>' ||
                 u == '|' || u == '"') {
-                psp_ret(0x80010016);
+                psp_ret(SCE_ERROR_EINVAL);
                 return;
             }
         }
@@ -313,7 +322,7 @@ static void hle_open_body(void) {
         struct stat st;
         if (stat(host, &st) == 0 && S_ISDIR(st.st_mode)) {
             const size_t n = strlen(guest);
-            psp_ret(n && (guest[n - 1] == '/' || guest[n - 1] == '\\') ? 0x80010016u : 0x8001000Du);
+            psp_ret(n && (guest[n - 1] == '/' || guest[n - 1] == '\\') ? SCE_ERROR_EINVAL : SCE_ERROR_EACCES);
             return;
         }
     }
@@ -374,7 +383,7 @@ static void hle_open_body(void) {
         return;
     }
     fclose(f);
-    psp_ret(0x80010018);              /* too many open files */
+    psp_ret(SCE_ERROR_EMFILE);
 }
 
 /* A file system call gives up the CPU while its driver works.
@@ -467,7 +476,7 @@ static void hle_read_body(io_file *h, uint32_t dst, uint32_t size) {
     if (size > h->len - h->pos) size = (uint32_t)(h->len - h->pos);
 
     uint8_t *tmp = (uint8_t *)malloc(size);
-    if (!tmp) { psp_ret(0x80020190); return; }
+    if (!tmp) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     size_t got = 0;
     if (fseeko(h->f, (off_t)(h->base + h->pos), SEEK_SET) == 0)
@@ -520,7 +529,7 @@ static void hle_Write(void) {
     }
 
     uint8_t *tmp = (uint8_t *)malloc(size ? size : 1);
-    if (!tmp) { psp_ret(0x80020190); return; }
+    if (!tmp) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
     for (uint32_t i = 0; i < size; i++) tmp[i] = psp_read8(src + i);
     size_t put = fwrite(tmp, 1, size, h->f);
     free(tmp);
@@ -960,7 +969,7 @@ static void hle_Rename(void) {
     psp_str(psp_arg(1), b, sizeof b);
     map_path(a, ha, sizeof ha);
     map_path(b, hb, sizeof hb);
-    psp_ret(rename(ha, hb) == 0 ? 0 : 0x80010002);
+    psp_ret(rename(ha, hb) == 0 ? 0 : IO_ERROR_NOENT);
 }
 
 /* ---- directories --------------------------------------------------------- */
@@ -1084,7 +1093,7 @@ static void hle_Dopen(void) {
                 return;
             }
             fclose(e.f);
-            psp_ret(0x80010018);
+            psp_ret(SCE_ERROR_EMFILE);
             return;
         }
     }
@@ -1102,7 +1111,7 @@ static void hle_Dopen(void) {
         struct _finddata_t fd;
         snprintf(pattern, sizeof pattern, "%s/*", host);
         intptr_t h = _findfirst(pattern, &fd);
-        if (h == -1) { psp_ret(0x80010002); return; }
+        if (h == -1) { psp_ret(IO_ERROR_NOENT); return; }
         do {
             if (!(ok = dir_add(d, &cap, fd.name))) break;
             io_dirent *e = &d->ent[d->n - 1];
@@ -1113,7 +1122,7 @@ static void hle_Dopen(void) {
         _findclose(h);
 #else
         DIR *dd = opendir(host);
-        if (!dd) { psp_ret(0x80010002); return; }
+        if (!dd) { psp_ret(IO_ERROR_NOENT); return; }
         for (struct dirent *de; (de = readdir(dd)) != NULL;) {
             if (!(ok = dir_add(d, &cap, de->d_name))) break;
             char path[1300];
@@ -1122,7 +1131,7 @@ static void hle_Dopen(void) {
         }
         closedir(dd);
 #endif
-        if (!ok) { free(d->ent); d->ent = NULL; psp_ret(0x8001000C); return; }   /* ENOMEM */
+        if (!ok) { free(d->ent); d->ent = NULL; psp_ret(SCE_ERROR_ENOMEM); return; }
         d->used = 1;
         d->fat = is_ms_path(guest);
         g_dir_sort_fat = d->fat;
@@ -1131,7 +1140,7 @@ static void hle_Dopen(void) {
         psp_ret((uint32_t)(i + 1));
         return;
     }
-    psp_ret(0x80010018);
+    psp_ret(SCE_ERROR_EMFILE);
 }
 
 /* Fill a SceIoDirent: the entry's SceIoStat (88 bytes, as sceIoGetstat
@@ -1142,7 +1151,7 @@ static void hle_Dopen(void) {
 static void hle_Dread(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
     uint32_t dirent = psp_arg(1);
-    if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(0x80020323); return; }
+    if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(IO_ERROR_BADF); return; }
     /* An entry is an 88-byte stat and a 256-byte name. A buffer that is not
      * there is refused (PSPSDK's ILLEGAL_ADDR; not measured) rather than
      * written through, and the listing does not advance. */
@@ -1223,8 +1232,6 @@ static void hle_Dread(void) {
  * into an emulator-specific path we do not implement.
  *
  * Left unimplemented it printed once per call and the caller kept asking. */
-/* 0x80010000 | errno, with ENODEV = 19. */
-#define SCE_ERROR_ENODEV   0x80010013u
 
 /* The Memory Stick, as PSPSDK's pspmscm.h asks about it (BSD):
  *   - "fatms0:" 0x02415821 registers an insert/eject callback, its uid in
@@ -1265,7 +1272,7 @@ static void hle_Devctl(void) {
 
 static void hle_Dclose(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
-    if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(0x80020323); return; }
+    if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(IO_ERROR_BADF); return; }
     free(g_dir[id].ent);
     g_dir[id].ent = NULL;
     g_dir[id].n = g_dir[id].pos = 0;
@@ -1300,11 +1307,11 @@ static void hle_Mkdir(void) {
 
     const size_t n = strlen(guest);
     if (n >= 2 && (guest[n - 1] == '/' || guest[n - 1] == '\\') && guest[n - 2] != ':') {
-        psp_ret(0x80010016);
+        psp_ret(SCE_ERROR_EINVAL);
         return;
     }
     struct stat st;
-    if (stat(host, &st) == 0) { psp_ret(0x80010011); return; }  /* EEXIST */
+    if (stat(host, &st) == 0) { psp_ret(SCE_ERROR_EEXIST); return; }
     {
         static const char *const always[] = { "ms0:/PSP", "ms0:/PSP/SAVEDATA", "ms0:/PSP/GAME" };
         char up[512];
@@ -1318,8 +1325,8 @@ static void hle_Mkdir(void) {
     snprintf(parent, sizeof parent, "%s", host);
     char *slash = strrchr(parent, '/');
     if (slash) *slash = '\0';
-    if (slash && (stat(parent, &st) != 0 || !STAT_ISDIR(st))) { psp_ret(0x80010002); return; }
-    psp_ret(MKDIR_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
+    if (slash && (stat(parent, &st) != 0 || !STAT_ISDIR(st))) { psp_ret(IO_ERROR_NOENT); return; }
+    psp_ret(MKDIR_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : IO_ERROR_NOENT);
 }
 
 /* A directory with something in it is ACCESS_DENIED (0x8001000D, sysprobe
@@ -1329,7 +1336,7 @@ static void hle_Rmdir(void) {
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
     if (RMDIR_ONE(host) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
-    psp_ret(errno == ENOTEMPTY || errno == EEXIST ? 0x8001000D : 0x80010002);
+    psp_ret(errno == ENOTEMPTY || errno == EEXIST ? SCE_ERROR_EACCES : IO_ERROR_NOENT);
 }
 
 /* A read-only file is ACCESS_DENIED (sysprobe step 4, after Chstat made it
@@ -1340,11 +1347,11 @@ static void hle_Remove(void) {
     map_path(guest, host, sizeof host);
     struct stat st;
     if (stat(host, &st) == 0 && !STAT_ISDIR(st) && !(st.st_mode & 0222)) {
-        psp_ret(0x8001000D);
+        psp_ret(SCE_ERROR_EACCES);
         io_park();
         return;
     }
-    psp_ret(UNLINK_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
+    psp_ret(UNLINK_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : IO_ERROR_NOENT);
     io_park();
 }
 
@@ -1353,7 +1360,7 @@ static void hle_Chdir(void) {
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
     struct stat st;
-    if (stat(host, &st) != 0 || !STAT_ISDIR(st)) { psp_ret(0x80010002); return; }
+    if (stat(host, &st) != 0 || !STAT_ISDIR(st)) { psp_ret(IO_ERROR_NOENT); return; }
     snprintf(g_cwd, sizeof g_cwd, "%s", host);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1378,7 +1385,7 @@ static void hle_Chstat(void) {
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
     struct stat st;
-    if (stat(host, &st) != 0) { psp_ret(0x80010002); return; }
+    if (stat(host, &st) != 0) { psp_ret(IO_ERROR_NOENT); return; }
     const uint32_t in = psp_arg(1), bits = psp_arg(2);
 #ifndef _WIN32
     int ro = !(st.st_mode & 0222);
@@ -1559,10 +1566,6 @@ int psp_io_remove_tree(const char *guest) {
  *   - collecting sceIoCloseAsync releases the descriptor, and a bad or
  *     released descriptor is IO_ERROR_BADF.
  */
-/* uofw include/common/errors.h: BAD_FILE_DESCRIPTOR and NO_ASYNC_OP. */
-#define SCE_ERROR_BADF     0x80020323u
-#define SCE_ERROR_NOASYNC  0x8002032Au
-
 static void async_done(io_file *h, int64_t value) {
     h->result = value;
     h->has_result = 1;
