@@ -33,11 +33,9 @@ uint64_t psp_render_flat_pixels(void) { return g_px_flat; }
 uint64_t psp_render_zfail_pixels(void) { return g_px_zfail; }
 
 uint64_t psp_render_pixels(void) { return g_pixels; }
-static uint64_t g_filter_split;
 static uint64_t g_raster_ns;         /* see sw_draw */
 void     psp_render_reset_pixels(void) {
     g_pixels = g_px_tex = g_px_flat = g_px_zfail = g_px_blend = g_px_atest = 0;
-    g_filter_split = 0;
     g_raster_ns = 0;
 }
 
@@ -71,12 +69,6 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
 }
 
 /* ---- texture sampling -----------------------------------------------------
- *
- * One format, 5650, and one function, modulate. That is not a simplification
- * of the hardware but a description of this game: over a full run it sets no
- * other, and the GE state report says so. Anything else draws untextured, so a
- * format arriving that is not handled shows up as flat colour rather than as
- * plausible-looking wrong pixels.
  *
  * Sampled at pixel centres, nearest or bilinear as GE_TEXFILTER asks. The claim
  * that used to stand here -- that a 1:1 blit "samples texel centres either
@@ -170,8 +162,8 @@ static uint32_t clut_entry(uint32_t raw, decode_bounds *bounds) {
  * (int) rounds toward zero, so a u in (-1, 0) lands on texel 0 rather than -1:
  * invisible while the sampler clamps, half a texture out the moment one
  * repeats, and an inverted fractional part for anything that wants the weights.
- * floorf would do it, but this file has no <math.h> and on the SSE2 baseline
- * that is a libm call in a per-pixel loop. */
+ * floorf would do it, but on the SSE2 baseline that is a libm call in a
+ * per-pixel loop. */
 static int ifloor(float f) { const int i = (int)f; return i - (f < (float)i); }
 
 /* One axis of a texel coordinate, wrapped the way the game asked.
@@ -293,38 +285,10 @@ static void dump_texture(void) {
     g_dumped_n++;
 }
 
-/* ---- filtering -----------------------------------------------------------
- *
- * GE_TEXFILTER was parsed into the GE's state from the beginning and read by
- * nothing: set_texture had no filter parameter, so the state could not reach a
- * backend even in principle. This game asks for linear on both fields.
- *
- * Values are GU_NEAREST 0 and GU_LINEAR 1, then 4..7 for the mipmap variants
- * (2 and 3 are not legal). Bit 0 selects linear *within* the level across all
- * six, so the mip chain -- which nothing here builds -- does not have to exist
- * for the in-level choice to be right. */
+/* Nothing counts primitives whose two filters differ: the counter this
+ * reported was never incremented. */
+uint64_t psp_render_filter_split(void) { return 0; }
 
-uint64_t psp_render_filter_split(void) { return g_filter_split; }
-
-
-/* Bilinear, with the half-texel that makes it agree with nearest at 1:1.
- *
- * Texel k covers [k, k+1), so its centre is at k + 0.5 and the four taps belong
- * around u - 0.5. Dropping that offset is the usual way to get this wrong: it
- * averages every texel with its neighbour during a 1:1 blit and softens a UI
- * layer that the hardware leaves sharp. With it, a 1:1 blit lands on frac 0,
- * puts all the weight on one tap, and comes out bit-identical to nearest.
- *
- * All four channels, alpha included. This game's logo is an alpha mask -- white
- * throughout, the letterforms entirely in the alpha channel -- so filtering
- * only RGB and taking alpha from a single tap would leave the edges exactly as
- * hard as nearest and look like the filter had never been implemented. */
-/* Bilinear, with the weights hardware uses: the fraction of a texel is kept to
- * four bits, floored. gpu/filtering/precisionlinear2d stretches two texels over
- * 256 pixels, so a continuous filter would start changing the colour at pixel
- * 64, by one step; hardware first changes it at pixel 72 -- one sixteenth of a
- * texel in -- and by 0x10 (ff -> ef), and on the reversed sprite starts at 64,
- * where the fraction is already fifteen sixteenths. Sixteen levels, floored. */
 /* Decode one mip level into a caller's RGBA8 buffer, through the same sampler
  * the software path draws with.
  *
@@ -408,6 +372,17 @@ size_t psp_render_decode_level_padded(const psp_tex_state *t, int level,
     return count;
 }
 
+/* ---- filtering -----------------------------------------------------------
+ *
+ * GE_TEXFILTER was parsed into the GE's state from the beginning and read by
+ * nothing: set_texture had no filter parameter, so the state could not reach a
+ * backend even in principle. This game asks for linear on both fields.
+ *
+ * Values are GU_NEAREST 0 and GU_LINEAR 1, then 4..7 for the mipmap variants
+ * (2 and 3 are not legal). Bit 0 selects linear *within* the level across all
+ * six, so the mip chain -- which nothing here builds -- does not have to exist
+ * for the in-level choice to be right. */
+
 /* A bilinear coordinate in sixteenths of a texel, the half texel taken off:
  * the coordinate cut toward zero to a sixteenth first, as nearest's is
  * (nearest_texel), then less 8. geprobe 23 (fw 6.60) scene 144 reads the
@@ -421,6 +396,25 @@ static int linear_sixteenths(float t) {
     return (int)(s >= 0.0f ? s + 1.0e-3f : s - 1.0e-3f) - 8;
 }
 
+/* Bilinear, with the half-texel that makes it agree with nearest at 1:1.
+ *
+ * Texel k covers [k, k+1), so its centre is at k + 0.5 and the four taps belong
+ * around u - 0.5. Dropping that offset is the usual way to get this wrong: it
+ * averages every texel with its neighbour during a 1:1 blit and softens a UI
+ * layer that the hardware leaves sharp. With it, a 1:1 blit lands on frac 0,
+ * puts all the weight on one tap, and comes out bit-identical to nearest.
+ *
+ * All four channels, alpha included. This game's logo is an alpha mask -- white
+ * throughout, the letterforms entirely in the alpha channel -- so filtering
+ * only RGB and taking alpha from a single tap would leave the edges exactly as
+ * hard as nearest and look like the filter had never been implemented.
+ *
+ * The weights are the hardware's: the fraction of a texel is kept to four
+ * bits, floored. gpu/filtering/precisionlinear2d stretches two texels over
+ * 256 pixels, so a continuous filter would start changing the colour at pixel
+ * 64, by one step; hardware first changes it at pixel 72 -- one sixteenth of a
+ * texel in -- and by 0x10 (ff -> ef), and on the reversed sprite starts at 64,
+ * where the fraction is already fifteen sixteenths. Sixteen levels, floored. */
 static uint32_t sample_bilinear(float u, float v) {
     /* The coordinate is quantised to sixteenths, floored, and split into the
      * texel and the weight. Floored, not rounded: gpu/filtering's linear tests

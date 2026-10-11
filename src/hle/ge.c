@@ -8,20 +8,10 @@
  *
  * So `sceGu*` (the list-building library) is ordinary user code and gets
  * recompiled like anything else. Only list *execution* is emulated, and that is
- * this file.
- *
- * ## What this does and does not do
- *
- * It walks the list, follows control flow (JUMP/CALL/RET/END/FINISH), and
- * tracks the state commands that matter — framebuffer, vertex format,
- * primitive counts. It does **not rasterize**. No triangles are drawn.
- *
- * That is deliberately the useful half to build first. During bring-up the
- * question is not "does it look right" but "is the game drawing anything at
- * all, and what?" — and a command-stream summary answers that, while a
- * half-working rasterizer answers it misleadingly. psp_ge_dump_stats() reports
- * what the game asked for; making those triangles appear is a separate phase
- * with its own correctness problem.
+ * this file: it walks the list and follows its control flow, keeps the GE's
+ * registers, decodes, transforms, lights and clips the vertices, and hands
+ * the primitives to the render backend (render.h), which rasterizes them.
+ * psp_ge_dump_stats() reports what the game asked for.
  */
 
 #include <limits.h>
@@ -80,9 +70,8 @@ static void ge_prof_init(void) {
     if (g_prof_on) { g_prof_tsc0 = GE_PROF_TSC(); g_prof_ns0 = ge_prof_ns(); }
 }
 
-/* A screen coordinate onto the rasterizer's 1/16-pixel grid, floored. Written
- * out rather than calling floorf: this file has no <math.h>, and a cast rounds
- * toward zero, which puts -0.0625 on the wrong side of pixel 0. */
+/* A screen coordinate onto the rasterizer's 1/16-pixel grid, floored. A cast
+ * alone rounds toward zero, which puts -0.0625 on the wrong side of pixel 0. */
 static int fx16_floor(float f) {
     const float s = f * (float)PSP_SUBPX;
     const int i = (int)s;
@@ -852,28 +841,16 @@ static void dump_texture_state(FILE *out) {
         fprintf(out, "  (%llu clut loads, fmt %u)",
                 (unsigned long long)g_ge.clut_loads, g_ge.clut_format);
     fprintf(out, "\n");
-    /* Sampling state, which the report has never carried. It decides
-     * whether a glyph edge is a hard texel boundary or a ramp, so "the
-     * letters are ragged" cannot be reasoned about without it. Both are
-     * tracked and neither reaches the backend yet; printing them says which
-     * of the two is worth wiring up for this game rather than for the
-     * hardware in general. */
-    {
-        static const char *const FI[8] = {
-            "nearest","linear","?","?",
-            "near/mip-near","lin/mip-near","near/mip-lin","lin/mip-lin" };
-        fprintf(out, "    sampling   filter min %s mag %s, wrap s %s t %s",
-                FI[g_ge.tex_filter & 7], FI[(g_ge.tex_filter >> 8) & 7],
-                (g_ge.tex_wrap & 1) ? "clamp" : "repeat",
-                ((g_ge.tex_wrap >> 8) & 1) ? "clamp" : "repeat");
-        /* The backend samples with the magnification filter, having no
-         * scale factor to choose with. This is how many primitives that
-         * choice was actually visible on. */
-        if (psp_render_filter_split())
-            fprintf(out, "  (%llu prims where min/mag differ)",
-                    (unsigned long long)psp_render_filter_split());
-        fprintf(out, "\n");
-    }
+    /* Sampling state. It decides whether a glyph edge is a hard texel
+     * boundary or a ramp, so "the letters are ragged" cannot be reasoned
+     * about without it. */
+    static const char *const FI[8] = {
+        "nearest","linear","?","?",
+        "near/mip-near","lin/mip-near","near/mip-lin","lin/mip-lin" };
+    fprintf(out, "    sampling   filter min %s mag %s, wrap s %s t %s\n",
+            FI[g_ge.tex_filter & 7], FI[(g_ge.tex_filter >> 8) & 7],
+            (g_ge.tex_wrap & 1) ? "clamp" : "repeat",
+            ((g_ge.tex_wrap >> 8) & 1) ? "clamp" : "repeat");
 }
 
 /* The host threads that ran lists, and the render targets drawn into. */
@@ -1026,35 +1003,6 @@ void psp_ge_dump_stats(FILE *out) {
 uint64_t psp_ge_command_count(void) { return g_ge.commands; }
 uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
 
-/* ---- rasterizer ----------------------------------------------------------
- *
- * Enough of the GE to put pixels in the framebuffer. Deliberately narrow:
- *
- *  - "through" mode only (VTYPE bit 23), where vertex coordinates are already
- *    in screen space. That is what 2D games and every UI layer use. Transformed
- *    geometry needs the matrix pipeline and is not attempted here -- drawing it
- *    with the wrong transform would look like a rendering bug rather than a
- *    missing feature.
- *  - Position as 16-bit or float; colour as 8888 or none.
- *  - Flat/interpolated colour, no texturing, no depth, no blending.
- *
- * The point is to close the loop from display list to visible pixels so the
- * rest can be measured against something. Everything omitted is omitted
- * loudly: unsupported vertex formats are counted, not guessed at.
- */
-
-
-
-/* Where the GE actually writes.
- *
- * FBP is an offset into VRAM, not an address: the base is implicit in the
- * hardware and never appears in the display list. This game sets 0x00088000
- * and expects 0x04088000 -- which it confirms itself, by flushing the cache
- * over exactly that address before it presents.
- *
- * Taking the offset literally does not merely draw in the wrong place. The
- * module image is mapped at zero, so 0x00088000 lands inside the game's own
- * code, and every rasterized pixel overwrites an instruction. */
 /* ---- block transfer --------------------------------------------------------
  *
  * The GE's 2D copy, and the only way a texture reaches VRAM: a game decodes or
@@ -1145,6 +1093,16 @@ static void ge_note_target(uint32_t addr, uint32_t stride, uint32_t fmt) {
     g_ge.cur_target = i;
 }
 
+/* Where the GE actually writes.
+ *
+ * FBP is an offset into VRAM, not an address: the base is implicit in the
+ * hardware and never appears in the display list. This game sets 0x00088000
+ * and expects 0x04088000 -- which it confirms itself, by flushing the cache
+ * over exactly that address before it presents.
+ *
+ * Taking the offset literally does not merely draw in the wrong place. The
+ * module image is mapped at zero, so 0x00088000 lands inside the game's own
+ * code, and every rasterized pixel overwrites an instruction. */
 static uint32_t ge_fb_address(uint32_t fbp) {
     return PSP_VRAM_BASE | (fbp & 0x001FFFF0u);
 }
@@ -1458,9 +1416,6 @@ static void mul_4x3(const float m[12], const float in[3], float out[3]) {
     out[2] = m[2]*in[0] + m[5]*in[1] + m[8]*in[2] + m[11];
 }
 
-/* Projection is a full 4x4, column-major, and produces the w that the divide
- * needs -- which is the whole reason it is not folded into the 4x3 above. */
-/* The rotation part alone, for normals. The translation lives in m[9..11]. */
 /* A GE colour register is 0xBBGGRR; our pixels are 0xAABBGGRR with red low,
  * so the three bytes land in the same order. */
 static void ge_colour3(uint32_t arg, float c[3]) {
@@ -1469,6 +1424,7 @@ static void ge_colour3(uint32_t arg, float c[3]) {
     c[2] = (float)((arg >> 16) & 0xFFu) / 255.0f;
 }
 
+/* The rotation part alone, for normals. The translation lives in m[9..11]. */
 static void mul_3x3(const float m[12], const float in[3], float out[3]) {
     out[0] = m[0]*in[0] + m[3]*in[1] + m[6]*in[2];
     out[1] = m[1]*in[0] + m[4]*in[1] + m[7]*in[2];
@@ -5247,9 +5203,6 @@ int psp_ge_idle_run(uint64_t until_us) {
     return 0;
 }
 
-/* Flush for paths that present or inspect pixels without going through Sync
- * -- SetFrameBuf's present hook and the unit tests. No yield: this is not a
- * wait, and it must be safe where no thread holds the token. */
 /* ---- display-list capture ---------------------------------------------------
  *
  * One frame of GE work, written to a file so it can be replayed into any
@@ -5769,6 +5722,9 @@ static void view_log_frame_mark(void) {
         fprintf(g_view_log, "F %u\n", psp_ctrl_polls());
 }
 
+/* Flush for paths that present or inspect pixels without going through Sync
+ * -- SetFrameBuf's present hook and the unit tests. No yield: this is not a
+ * wait, and it must be safe where no thread holds the token. */
 void psp_ge_drain_all(void) {
     if (!g_tl_in) {
         ge_execute();
