@@ -602,14 +602,16 @@ static void hle_StartThread(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* A negative status is not kept: threadprobe step 43 (fw 6.60) exits with -5
+ * and reads 800200D2 back from both WaitThreadEnd and GetThreadExitStatus
+ * (ILLEGAL_ARGUMENT in PSPSDK's naming; see hle.h). A negative value returned
+ * from the entry is treated the same way (on_thread_end). */
+static uint32_t kept_exit_status(uint32_t status) {
+    return (int32_t)status < 0 ? SCE_KERNEL_ERROR_ILLEGAL_PARTITION : status;
+}
+
 static void hle_ExitThread(void) {
-    /* A negative status is not kept: threadprobe step 43 (fw 6.60) exits with
-     * -5 and reads 800200D2 back from both WaitThreadEnd and
-     * GetThreadExitStatus (ILLEGAL_ARGUMENT in PSPSDK's naming; see hle.h).
-     * A negative value returned from the entry is treated the same way
-     * (on_thread_end). */
-    uint32_t status = psp_arg(0);
-    if ((int32_t)status < 0) status = SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
+    const uint32_t status = kept_exit_status(psp_arg(0));
 
     /* A thread ending is the last chance to see how it got there, and a thread
      * that ends with a nonzero status is usually reporting a failure its caller
@@ -629,8 +631,21 @@ static void hle_ExitThread(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-static void hle_TerminateThread(void);
-static void release_stack(psp_thread *t);
+/* A callback belongs to the thread that created it and does not outlive it.
+ * callbacks/delete terminates and deletes the thread that registered one, then
+ * deletes the callback and gets UNKNOWN_CBID -- so the thread took it with it.
+ * Both delete calls need this, which is why it is not written out twice. */
+static void drop_callbacks_of(uint32_t thread_uid) {
+    for (int i = 0; i < g_cb_hi; i++)
+        if (g_cb[i].used && g_cb[i].thread == thread_uid) g_cb[i].used = 0;
+}
+
+/* What deleting a thread frees: its stack, its callbacks and its record. */
+static void free_thread(psp_thread *t) {
+    release_stack(t);
+    drop_callbacks_of(t->uid);
+    t->used = 0;
+}
 
 /* sceKernelExitDeleteThread(status): ExitThread, and the thread's record and
  * stack are freed as it goes. threadprobe step 44 (fw 6.60): its waiter gets
@@ -643,15 +658,12 @@ static void hle_ExitDeleteThread(void) {
         psp_ret(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
         return;
     }
-    uint32_t status = psp_arg(0);
-    if ((int32_t)status < 0) status = SCE_KERNEL_ERROR_ILLEGAL_PARTITION;  /* as ExitThread */
+    const uint32_t status = kept_exit_status(psp_arg(0));
     const uint32_t me = psp_sched_current();
     psp_thread *t = find_thread(me);
     if (t) {
         thread_ended(t, status);
-        release_stack(t);
-        drop_callbacks_of(t->uid);
-        t->used = 0;
+        free_thread(t);
     }
     psp_sched_exit(me);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -703,15 +715,6 @@ static void hle_CheckThreadStack(void) {
  * terminate-delete and delete, and delete is the only one of the three that
  * answers `800201a4` to a thread that is ready, waiting, suspended or running
  * -- including the caller itself, which is what an id of 0 names here. */
-/* A callback belongs to the thread that created it and does not outlive it.
- * callbacks/delete terminates and deletes the thread that registered one, then
- * deletes the callback and gets UNKNOWN_CBID -- so the thread took it with it.
- * Both delete calls need this, which is why it is not written out twice. */
-static void drop_callbacks_of(uint32_t thread_uid) {
-    for (int i = 0; i < g_cb_hi; i++)
-        if (g_cb[i].used && g_cb[i].thread == thread_uid) g_cb[i].used = 0;
-}
-
 static void hle_DeleteThread(void) {
     const uint32_t id = psp_arg(0) ? psp_arg(0) : psp_sched_current();
     psp_thread *t = find_thread(id);
@@ -724,9 +727,7 @@ static void hle_DeleteThread(void) {
      * sched.h says this happens here and it did not. Harmless when the thread
      * is already gone, which is the common case. */
     psp_sched_cancel_spawn(t->uid);
-    release_stack(t);
-    drop_callbacks_of(t->uid);
-    t->used = 0;
+    free_thread(t);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -836,8 +837,7 @@ static void drop_ender(psp_thread *t, uint32_t w) {
 static void on_thread_end(uint32_t uid, uint32_t status) {
     psp_thread *t = find_thread(uid);
     if (!t) return;
-    if ((int32_t)status < 0) status = SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
-    thread_ended(t, status);
+    thread_ended(t, kept_exit_status(status));
 }
 
 /* sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout)
@@ -1279,9 +1279,7 @@ static void hle_TerminateDeleteThread(void) {
         thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
     }
     psp_sched_cancel_spawn(t->uid);
-    release_stack(t);
-    drop_callbacks_of(t->uid);
-    t->used = 0;
+    free_thread(t);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
