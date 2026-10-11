@@ -105,6 +105,13 @@ typedef struct {
     uint64_t scr_last;
     int      scr_seen, es_splice, es_skip;
     unsigned splices;
+    /* The clock of the pack each run of video payload came in, by where it
+     * starts in `es`, for avc_in_sequence; and the clock of the last picture
+     * taken. */
+    struct mpeg_vscr { size_t es_off; uint64_t scr; } *vscr;
+    size_t   nvscr, vscr_cap, vscr_next;
+    uint64_t pic_scr;
+    int      pic_timed;
     /* The audio elementary stream, the same way: ATRAC3+ frames back to back,
      * each an 8-byte 0F D0 header and its payload, with the 4-byte private
      * header every audio PES starts with taken off. */
@@ -131,6 +138,12 @@ typedef struct {
 
     void    *dec;          /* ISVCDecoder*, opaque here so the header stays out */
     int      dec_failed;
+    /* The coded sequence's picture numbering (avc_in_sequence): the active
+     * SPS's log2_max_frame_num, 0 when unknown or when gaps are allowed;
+     * the last reference picture's frame_num, once an IDR has set it; and
+     * how many pictures were refused for being out of sequence. */
+    int      fn_bits, ref_seen;
+    unsigned ref_frame_num, out_of_sequence;
     int      frames;       /* decoded so far */
 
     /* The most recently decoded picture, copied out of the decoder.
@@ -237,7 +250,9 @@ void psp_mpeg_dump_sync(FILE *out) {
             fprintf(out, "    movie: %u of %u pictures decoded and dropped to hold the sound\n",
                     c->dropped, c->frames);
         if (c->splices)
-            fprintf(out, "    movie: %u NALs cut by a splice in the stream left out\n", c->splices);
+            fprintf(out, "    movie: %u splices in the stream, each ending the NAL it cut\n", c->splices);
+        if (c->out_of_sequence)
+            fprintf(out, "    movie: %u slices refused, out of sequence in number or time\n", c->out_of_sequence);
         fprintf(out, "    movie: lead every 250 pictures, ms:");
         for (int k = 0; k < 8 && k * 250 < c->frames; k++) fprintf(out, " %.0f", c->sync_trend[k] / 90.0);
         fprintf(out, "\n");
@@ -272,6 +287,7 @@ static void ctx_release(mpeg_ctx *c) {
     free(c->aes); c->aes = NULL; c->aes_len = c->aes_cap = c->aes_pos = 0;
     free(c->puts); c->puts = NULL; c->nputs = c->puts_cap = c->put_iv = c->put_ia = 0;
     free(c->vpts); c->vpts = NULL; c->nvpts = c->vpts_cap = c->vpts_next = 0;
+    free(c->vscr); c->vscr = NULL; c->nvscr = c->vscr_cap = c->vscr_next = 0;
 }
 
 void psp_mpeg_reset(void) {
@@ -656,6 +672,18 @@ static int es_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
         p += k;
         n -= k;
     }
+    if (n && c->scr_seen && (!c->nvscr || c->vscr[c->nvscr - 1].scr != c->scr_last)) {
+        if (c->nvscr == c->vscr_cap) {
+            const size_t cap = c->vscr_cap ? c->vscr_cap * 2 : 1024;
+            struct mpeg_vscr *grown = (struct mpeg_vscr *)realloc(c->vscr, cap * sizeof *grown);
+            if (grown) { c->vscr = grown; c->vscr_cap = cap; }
+        }
+        if (c->nvscr < c->vscr_cap) {
+            c->vscr[c->nvscr].es_off = c->es_len;
+            c->vscr[c->nvscr].scr = c->scr_last;
+            c->nvscr++;
+        }
+    }
     return buf_append(&c->es, &c->es_len, &c->es_cap, p, n);
 }
 
@@ -669,21 +697,21 @@ static int es_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
  * previous lap -- at a different place each lap. A PSP gets the same bytes.
  * On one, Sif saw a little smearing as it loops and no garbled blocks;
  * decoded as it came, the same stream threw purple and white blocks across
- * the ship, for up to twenty pictures at a time.
+ * the ship, then dragged a blocky trail behind it.
  *
- * The blocks come from the NAL each splice cuts through: its first part
- * from one place in the file and its last from another, which the decoder
- * takes for a picture. The repeated pictures between splices are whole and
- * decode as themselves on the wrong reference, which is the smear. So the
- * NAL a splice cuts through is left out with what opens its access unit,
- * and nothing else.
+ * Two things make those. The NAL a splice cuts through runs on into bytes
+ * from another place in the file, which the decoder takes for the rest of
+ * the picture: so a splice ends that NAL where it falls, and what follows
+ * up to the next start code is skipped. The NAL keeps its first part, a
+ * damaged picture the decoder conceals; dropping it whole instead lost the
+ * loop's first IDR when a splice fell in it, and every picture after it.
+ * And the runs between splices are whole pictures in the wrong order,
+ * which avc_in_sequence refuses.
  *
- * A pack's clock tells where: it rises through a stream, by at most 0.2 s
- * a pack in the menu movie, so one that goes back, or forward by more than
- * a second, starts another run. That is a cut only if the run does
- * not start on a NAL of its own; a loop that rereads its file from the
- * start begins with one, and the NAL before it is merely short, which the
- * decoder conceals. */
+ * A pack's clock tells where a run starts: it rises through a stream, by
+ * at most 0.2 s a pack in the menu movie, so one that goes back, or forward
+ * by more than a second, starts another run. A run that opens on a start
+ * code -- a loop that rereads its file from the start -- cuts nothing. */
 enum { MPEG_SCR_JUMP = 90000 };   /* one second of the 90 kHz clock */
 /* The 33-bit base of an MPEG-2 pack header's system clock reference, from
  * the six bytes after the start code: 3, 15 and 15 bits between markers. */
@@ -695,60 +723,6 @@ static void pack_clock(mpeg_ctx *c, const uint8_t *b) {
     if (c->scr_seen && (scr <= c->scr_last || scr - c->scr_last > MPEG_SCR_JUMP)) c->es_splice = 1;
     c->scr_last = scr;
     c->scr_seen = 1;
-}
-/* What opens an access unit ahead of its picture: SEI, the parameter sets
- * and the delimiter (H.264 nal_unit_type 6 to 9). */
-static int au_prefix_nal(uint8_t header) {
-    const unsigned type = header & 0x1Fu;
-    return type >= 6 && type <= 9;
-}
-/* The start, back over any zeros ahead of it, of the last start code that
- * opens a NAL before `to` and at or after the decoder's position; `to` if
- * there is none. */
-static size_t es_last_nal(const mpeg_ctx *c, size_t to) {
-    for (size_t k = to; k >= c->es_pos + 3; k--)
-        if (c->es[k-3] == 0 && c->es[k-2] == 0 && c->es[k-1] == 1 && k < to) {
-            size_t s = k - 3;
-            while (s > c->es_pos && c->es[s - 1] == 0) s--;
-            return s;
-        }
-    return to;
-}
-/* Leave out the NAL a splice cut through: back to its start code here, and
- * on to the next start code in what follows. It has not reached the
- * decoder, which takes a NAL only once the next one's start code has
- * arrived.
- *
- * With it goes the rest of its access unit ahead of it, back to the
- * delimiter, which the decoder holds back until the picture is whole
- * (avc_pump). Left in, an IDR's parameter sets without the IDR began a new
- * sequence for openh264: it dropped every picture to the next IDR there and
- * then showed one it had half made, a garbled strip across the top of the
- * menu (WipEout Pulse, the movie's second lap). */
-static void es_cut(mpeg_ctx *c) {
-    size_t end = c->es_len;
-    {   /* The NAL in progress: from its start code to the end. */
-        size_t k = c->es_len;
-        while (k >= c->es_pos + 3 && !(c->es[k-3] == 0 && c->es[k-2] == 0 && c->es[k-1] == 1)) k--;
-        end = k >= c->es_pos + 3 ? k - 3 : c->es_pos;
-        while (end > c->es_pos && c->es[end - 1] == 0) end--;
-    }
-    for (;;) {   /* its access unit's opening NALs */
-        const size_t s = es_last_nal(c, end);
-        if (s == end) break;
-        size_t h = s;
-        while (c->es[h] == 0) h++;
-        const uint8_t header = c->es[h + 1];
-        if (!au_prefix_nal(header)) break;
-        end = s;
-        if ((header & 0x1Fu) == 9) break;   /* the delimiter opens it */
-    }
-    c->es_len = end;
-    while (c->nvpts > c->vpts_next && c->vpts[c->nvpts - 1].es_off >= end) c->nvpts--;
-    for (size_t i = c->put_iv; i < c->nputs; i++)
-        if (c->puts[i].es_len > end) c->puts[i].es_len = end;
-    c->es_skip = 1;
-    c->splices++;
 }
 /* Audio payload, less whatever is still owed of the four bytes that open
  * every audio PES payload in this game's streams. Their meaning is not
@@ -783,6 +757,13 @@ static void mpeg_compact(mpeg_ctx *c) {
         c->vpts_next = 0;
         for (size_t i = 0; i < c->nvpts; i++)
             c->vpts[i].es_off = c->vpts[i].es_off > dv ? c->vpts[i].es_off - dv : 0;
+        /* The clock map keeps the entry the decoder's position lies in. */
+        const size_t kc = c->vscr_next;
+        if (c->vscr) memmove(c->vscr, c->vscr + kc, (c->nvscr - kc) * sizeof *c->vscr);
+        c->nvscr -= kc;
+        c->vscr_next = 0;
+        for (size_t i = 0; i < c->nvscr; i++)
+            c->vscr[i].es_off = c->vscr[i].es_off > dv ? c->vscr[i].es_off - dv : 0;
         for (size_t i = 0; i < c->nputs; i++)
             c->puts[i].es_len = c->puts[i].es_len > dv ? c->puts[i].es_len - dv : 0;
     }
@@ -871,12 +852,13 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
              * its three pieces. The low 32 bits are what the PSP keeps. */
             if (audio) c->npes_a++; else c->npes_v++;
             if (!audio && c->es_splice && off + 4 <= plen_all) {
-                /* The first video since the clock jumped: a cut unless it
-                 * opens on a start code. Before the stamp below, which
-                 * belongs to what is kept. */
+                /* The first video since the clock jumped: unless it opens
+                 * on a start code, skipped to the next, which ends the NAL
+                 * the splice cut through. */
                 const uint8_t *q = p + off;
                 c->es_splice = 0;
-                if (!(q[0] == 0 && q[1] == 0 && (q[2] == 1 || (q[2] == 0 && q[3] == 1)))) es_cut(c);
+                if (!(q[0] == 0 && q[1] == 0 && (q[2] == 1 || (q[2] == 0 && q[3] == 1))))
+                    { c->es_skip = 1; c->splices++; }
             }
             if ((p[i+7] & 0x80) && hdrlen >= 5 && i + 14 <= plen_all) {
                 const uint8_t *t = p + i + 9;
@@ -964,6 +946,124 @@ static size_t nal_next(const uint8_t *p, size_t len, size_t from) {
     return len;
 }
 
+/* The first bytes of a NAL's payload with its emulation prevention bytes
+ * taken out (H.264 7.4.1), read a bit at a time: enough for the fields of
+ * an SPS and a slice header this file needs. A read past them sets bad. */
+typedef struct { uint8_t b[64]; size_t n, i; int bad; } rbsp_bits;
+static void rbsp_load(rbsp_bits *r, const uint8_t *p, size_t len) {
+    int zeros = 0;
+    r->n = r->i = 0;
+    r->bad = 0;
+    for (size_t k = 0; k < len && r->n < sizeof r->b; k++) {
+        if (zeros >= 2 && p[k] == 3) { zeros = 0; continue; }
+        r->b[r->n++] = p[k];
+        zeros = p[k] ? 0 : zeros + 1;
+    }
+}
+static unsigned rbsp_u(rbsp_bits *r, int n) {
+    unsigned v = 0;
+    while (n-- > 0) {
+        if (r->i >= r->n * 8) { r->bad = 1; return 0; }
+        v = v << 1 | ((r->b[r->i >> 3] >> (7 - (r->i & 7))) & 1u);
+        r->i++;
+    }
+    return v;
+}
+static unsigned rbsp_ue(rbsp_bits *r) {   /* Exp-Golomb, ue(v) */
+    int zeros = 0;
+    while (!r->bad && rbsp_u(r, 1) == 0)
+        if (++zeros > 31) { r->bad = 1; return 0; }
+    return r->bad ? 0 : (1u << zeros) - 1 + rbsp_u(r, zeros);
+}
+
+/* Pictures out of sequence.
+ *
+ * Each picture carries frame_num, one past the last reference picture's,
+ * modulo 2^log2_max_frame_num; an SPS that does not allow gaps makes any
+ * other value a sign that pictures were lost (H.264 7.4.3), and what a
+ * decoder does then is its own choice. openh264 decodes the picture
+ * anyway, on whatever reference it holds.
+ *
+ * WipEout Pulse's menu movie needs the other choice. Its ring callback
+ * repeats a run of the file each time the movie loops (see the splices
+ * above), and the repeated pictures, decoded again on top of later ones,
+ * dragged a blocky trail behind the ship -- where Sif's PSP shows only a
+ * little smearing. A picture whose frame_num does not follow is refused,
+ * so the repeat passes unseen and the stream resumes, on the right
+ * reference, at the picture that does follow.
+ *
+ * The numbers alone are fooled when a stale run happens to carry the
+ * numbers that come next: a lap took the movie's last pictures for the
+ * ship's approach and then refused the approach for 37 pictures. So a
+ * picture must also continue the packs' clock: from the last picture
+ * taken, not back and not more than a second on. An IDR is always taken
+ * and restarts both, so a stream that jumps on purpose resumes there.
+ * Over the stream the game supplied, every lap shows the whole approach
+ * but the one whose IDR the splice cut short, and the worst picture is
+ * MSE 46 against the movie decoded from the disc, where it was 156 with
+ * the pictures all decoded. A stream whose SPS allows gaps, or this code
+ * cannot read, keeps only the clock test; one without pack headers
+ * neither. */
+static void avc_note_sps(mpeg_ctx *c, const uint8_t *p, size_t len) {
+    rbsp_bits r;
+    rbsp_load(&r, p, len);
+    c->fn_bits = 0;
+    const unsigned profile = rbsp_u(&r, 8);
+    rbsp_u(&r, 16);                       /* constraint flags, level */
+    rbsp_ue(&r);                          /* seq_parameter_set_id */
+    if (profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 ||
+        profile == 83 || profile == 86 || profile == 118 || profile == 128) {
+        if (rbsp_ue(&r) == 3) return;     /* 4:4:4 may code colour planes apart */
+        rbsp_ue(&r); rbsp_ue(&r);         /* bit depths */
+        rbsp_u(&r, 1);
+        if (rbsp_u(&r, 1)) return;        /* scaling matrices: not read here */
+    }
+    const unsigned bits = rbsp_ue(&r) + 4;
+    const unsigned poc = rbsp_ue(&r);
+    if (poc == 0) rbsp_ue(&r);
+    else if (poc == 1) {
+        rbsp_u(&r, 1); rbsp_ue(&r); rbsp_ue(&r);
+        for (unsigned n = rbsp_ue(&r); n && !r.bad; n--) rbsp_ue(&r);
+    }
+    rbsp_ue(&r);                          /* max_num_ref_frames */
+    const unsigned gaps = rbsp_u(&r, 1);
+    if (!r.bad && !gaps && bits <= 16) c->fn_bits = (int)bits;
+}
+/* Whether the NAL at `at` in the elementary stream goes to the decoder:
+ * anything but a slice does; an IDR does; another slice does if it follows
+ * in number and in time. */
+static int avc_in_sequence(mpeg_ctx *c, size_t at, size_t len) {
+    const uint8_t *p = c->es + at;
+    const unsigned type = p[0] & 0x1Fu, ref_idc = (p[0] >> 5) & 3u;
+    if (type != 1 && type != 5) return 1;
+    /* The clock of the pack the slice starts in. */
+    while (c->vscr_next + 1 < c->nvscr && c->vscr[c->vscr_next + 1].es_off <= at) c->vscr_next++;
+    const int timed = c->vscr_next < c->nvscr && c->vscr[c->vscr_next].es_off <= at;
+    const uint64_t scr = timed ? c->vscr[c->vscr_next].scr : 0;
+    if (type == 5) {   /* an IDR's frame_num is 0 */
+        c->ref_frame_num = 0;
+        c->ref_seen = 1;
+    } else {
+        if (timed && c->pic_timed && (scr < c->pic_scr || scr - c->pic_scr > MPEG_SCR_JUMP)) {
+            c->out_of_sequence++;
+            return 0;
+        }
+        if (c->fn_bits && c->ref_seen) {
+            rbsp_bits r;
+            rbsp_load(&r, p + 1, len - 1);
+            rbsp_ue(&r); rbsp_ue(&r); rbsp_ue(&r);    /* first_mb_in_slice, slice_type, pps id */
+            const unsigned fn = rbsp_u(&r, c->fn_bits);
+            if (!r.bad) {
+                const unsigned max = 1u << c->fn_bits;
+                if (fn != c->ref_frame_num && fn != (c->ref_frame_num + 1) % max) { c->out_of_sequence++; return 0; }
+                if (ref_idc) c->ref_frame_num = fn;
+            }
+        }
+    }
+    if (timed) { c->pic_scr = scr; c->pic_timed = 1; }
+    return 1;
+}
+
 /* Write one decoded I420 picture as a PPM. Bring-up only: it proves the whole
  * chain -- the game's own callback, our demux, and the decoder -- produced a
  * real picture, before any of it is wired to the guest's frame buffer. */
@@ -1032,14 +1132,6 @@ static int avc_pump(mpeg_ctx *c) {
     while (pos < c->es_len) {
         const size_t start = nal_next(c->es, c->es_len, pos);
         if (start >= c->es_len) break;
-        if (!c->es_eof && au_prefix_nal(c->es[start])) {
-            /* What opens an access unit goes in with its picture: held
-             * until the slice after it has arrived whole, so that a splice
-             * cutting the slice can take them too (es_cut). */
-            size_t v = start;
-            while (v < c->es_len && au_prefix_nal(c->es[v])) v = nal_next(c->es, c->es_len, v);
-            if (v >= c->es_len || nal_next(c->es, c->es_len, v) >= c->es_len) break;
-        }
         size_t end = nal_next(c->es, c->es_len, start);
         size_t nal_end;
         if (end >= c->es_len) {
@@ -1054,6 +1146,12 @@ static int avc_pump(mpeg_ctx *c) {
              * any trailing zero of a four-byte start code. */
             nal_end = end - 3;
             while (nal_end > start && c->es[nal_end - 1] == 0) nal_end--;
+        }
+        if ((c->es[start] & 0x1F) == 7) avc_note_sps(c, c->es + start + 1, nal_end - start - 1);
+        if (!avc_in_sequence(c, start, nal_end - start)) {
+            pos = nal_end;
+            c->es_pos = pos;
+            continue;
         }
 
         unsigned char *planes[3] = { 0, 0, 0 };
