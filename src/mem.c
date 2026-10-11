@@ -32,9 +32,11 @@ static uint64_t *g_module_write;
  * every recompiled store atomic would buy no additional ordering and charge
  * the hottest path in the runtime for it. */
 enum { WRITE_GRANULE_SHIFT = 8, WRITE_GRANULE = 1 << WRITE_GRANULE_SHIFT };
-static uint64_t g_ram_write[(PSP_RAM_SIZE + WRITE_GRANULE - 1) / WRITE_GRANULE];
-static uint64_t g_vram_write[(PSP_VRAM_SIZE + WRITE_GRANULE - 1) / WRITE_GRANULE];
-static uint64_t g_scratch_write[(PSP_SCRATCH_SIZE + WRITE_GRANULE - 1) / WRITE_GRANULE];
+/* The granules that cover a size in bytes. */
+#define GRANULES(bytes) (((bytes) + WRITE_GRANULE - 1) / WRITE_GRANULE)
+static uint64_t g_ram_write[GRANULES(PSP_RAM_SIZE)];
+static uint64_t g_vram_write[GRANULES(PSP_VRAM_SIZE)];
+static uint64_t g_scratch_write[GRANULES(PSP_SCRATCH_SIZE)];
 static uint64_t g_write_serial;
 
 /* Whether the module image overlaps each fixed region, set when it is mapped.
@@ -47,6 +49,12 @@ static int module_overlaps(uint32_t base, uint32_t size) {
     return g_module_size && g_module_write &&
            g_module_base < (uint64_t)base + size &&
            (uint64_t)g_module_base + g_module_size > base;
+}
+/* After the module is mapped or grown. */
+static void find_module_overlaps(void) {
+    g_module_in_ram     = module_overlaps(PSP_RAM_BASE, PSP_RAM_SIZE);
+    g_module_in_vram    = module_overlaps(PSP_VRAM_BASE, PSP_VRAM_SIZE);
+    g_module_in_scratch = module_overlaps(PSP_SCRATCH_BASE, PSP_SCRATCH_SIZE);
 }
 static int range_hits_module(uint32_t a, uint64_t end) {
     return a < (uint64_t)g_module_base + g_module_size && end > g_module_base;
@@ -126,6 +134,23 @@ static uint64_t next_stamp(void) {
     return stamp;
 }
 
+/* The newest generation among the granules of size bytes at off in table. */
+static uint64_t newest_in(const uint64_t *table, uint32_t off, uint64_t size) {
+    const uint32_t first = off >> WRITE_GRANULE_SHIFT;
+    const uint32_t last = (uint32_t)(((uint64_t)off + size - 1u) >> WRITE_GRANULE_SHIFT);
+    uint64_t newest = 0;
+    for (uint32_t i = first; i <= last; i++)
+        if (table[i] > newest) newest = table[i];
+    return newest;
+}
+
+/* Every granule of size bytes at off in table, given one generation. */
+static void stamp_in(uint64_t *table, uint32_t off, uint64_t size, uint64_t stamp) {
+    const uint32_t first = off >> WRITE_GRANULE_SHIFT;
+    const uint32_t last = (uint32_t)(((uint64_t)off + size - 1u) >> WRITE_GRANULE_SHIFT);
+    for (uint32_t i = first; i <= last; i++) table[i] = stamp;
+}
+
 #if defined(_MSC_VER)
 #  define MEM_NOINLINE __declspec(noinline)
 #else
@@ -147,15 +172,12 @@ static MEM_NOINLINE uint64_t walk_range(uint32_t addr, uint32_t size, int mark) 
         uint64_t stop = 0;
         uint64_t *table = backing_piece((uint32_t)at, &off, &stop);
         if (stop > end) stop = end;
-        if (table) {
-            if (mark && !result) result = next_stamp();
-            const uint32_t first = off >> WRITE_GRANULE_SHIFT;
-            const uint32_t last = (uint32_t)(((uint64_t)off + (stop - at) - 1u) >>
-                                             WRITE_GRANULE_SHIFT);
-            for (uint32_t i = first; i <= last; i++) {
-                if (mark) table[i] = result;
-                else if (table[i] > result) result = table[i];
-            }
+        if (table && mark) {
+            if (!result) result = next_stamp();
+            stamp_in(table, off, stop - at, result);
+        } else if (table) {
+            const uint64_t newest = newest_in(table, off, stop - at);
+            if (newest > result) result = newest;
         }
         at = stop;
     }
@@ -169,13 +191,7 @@ uint64_t psp_mem_range_generation(uint32_t addr, uint32_t size) {
     uint32_t off = 0;
     uint64_t *table = write_table(addr, size, &off);
     if (!table) return walk_range(addr, size, 0);
-    const uint32_t first = off >> WRITE_GRANULE_SHIFT;
-    const uint32_t last = (uint32_t)(((uint64_t)off + size - 1u) >>
-                                     WRITE_GRANULE_SHIFT);
-    uint64_t newest = 0;
-    for (uint32_t i = first; i <= last; i++)
-        if (table[i] > newest) newest = table[i];
-    return newest;
+    return newest_in(table, off, size);
 }
 
 static void (*g_write_observer)(uint32_t, uint32_t);
@@ -204,11 +220,7 @@ void psp_mem_mark_write(uint32_t addr, uint32_t size) {
     uint32_t off = 0;
     uint64_t *table = write_table(addr, size, &off);
     if (table) {
-        const uint64_t stamp = next_stamp();
-        const uint32_t first = off >> WRITE_GRANULE_SHIFT;
-        const uint32_t last = (uint32_t)(((uint64_t)off + size - 1u) >>
-                                         WRITE_GRANULE_SHIFT);
-        for (uint32_t i = first; i <= last; i++) table[i] = stamp;
+        stamp_in(table, off, size, next_stamp());
     } else if (!walk_range(addr, size, 1)) {
         return;   /* nothing of it is mapped */
     }
@@ -454,7 +466,7 @@ int psp_mem_init(void) {
     /* A host may reuse the runtime in one process. Force any external cache
      * that survived the old allocation to revalidate against the now-pristine
      * page tables rather than taking its global-serial fast path. */
-    if (++g_write_serial == 0) g_write_serial++;
+    next_stamp();
     return 0;
 }
 
@@ -477,7 +489,7 @@ int psp_mem_map_module(uint32_t base, uint32_t size) {
     free(g_module);
     free(g_module_write);
     g_module = (uint8_t *)calloc(1, size ? size : 1);
-    const size_t pages = ((size_t)size + WRITE_GRANULE - 1) / WRITE_GRANULE;
+    const size_t pages = GRANULES((size_t)size);
     g_module_write = (uint64_t *)calloc(pages ? pages : 1, sizeof(uint64_t));
     if (!g_module || !g_module_write) {
         free(g_module);
@@ -490,10 +502,8 @@ int psp_mem_map_module(uint32_t base, uint32_t size) {
     }
     g_module_base = base;
     g_module_size = size;
-    g_module_in_ram     = module_overlaps(PSP_RAM_BASE, PSP_RAM_SIZE);
-    g_module_in_vram    = module_overlaps(PSP_VRAM_BASE, PSP_VRAM_SIZE);
-    g_module_in_scratch = module_overlaps(PSP_SCRATCH_BASE, PSP_SCRATCH_SIZE);
-    if (++g_write_serial == 0) g_write_serial++;
+    find_module_overlaps();
+    next_stamp();
     return 0;
 }
 
@@ -505,17 +515,15 @@ int psp_mem_grow_module(uint32_t end) {
     if (!mem) return -1;
     g_module = mem;
     memset(g_module + g_module_size, 0, size - g_module_size);
-    const size_t had = ((size_t)g_module_size + WRITE_GRANULE - 1) / WRITE_GRANULE;
-    const size_t pages = ((size_t)size + WRITE_GRANULE - 1) / WRITE_GRANULE;
+    const size_t had = GRANULES((size_t)g_module_size);
+    const size_t pages = GRANULES((size_t)size);
     uint64_t *write = (uint64_t *)realloc(g_module_write, pages * sizeof(uint64_t));
     if (!write) return -1;
     g_module_write = write;
     memset(g_module_write + had, 0, (pages - had) * sizeof(uint64_t));
     g_module_size = size;
-    g_module_in_ram     = module_overlaps(PSP_RAM_BASE, PSP_RAM_SIZE);
-    g_module_in_vram    = module_overlaps(PSP_VRAM_BASE, PSP_VRAM_SIZE);
-    g_module_in_scratch = module_overlaps(PSP_SCRATCH_BASE, PSP_SCRATCH_SIZE);
-    if (++g_write_serial == 0) g_write_serial++;
+    find_module_overlaps();
+    next_stamp();
     return 0;
 }
 
