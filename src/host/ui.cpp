@@ -93,6 +93,7 @@ static void style(float scale) {
     c[ImGuiCol_HeaderActive] = rgb(239, 184, 90, 0.40f);
     c[ImGuiCol_CheckMark] = ACCENT;         c[ImGuiCol_SliderGrab] = ACCENT;
     c[ImGuiCol_SliderGrabActive] = ACCENT;  c[ImGuiCol_NavCursor] = ACCENT;
+    c[ImGuiCol_PlotHistogram] = ACCENT;     // a progress bar's fill
     c[ImGuiCol_TableHeaderBg] = PANEL;      c[ImGuiCol_TableBorderStrong] = BORDER;
     c[ImGuiCol_TableBorderLight] = BORDER;  c[ImGuiCol_TableRowBg] = BG;
     c[ImGuiCol_TableRowBgAlt] = rgb(20, 27, 35);
@@ -690,6 +691,12 @@ extern "C" int psp_ui_stops(const char *label, int *at, int count, const char *t
     take_focus();
     ImGui::PopID();
     return changed;
+}
+
+extern "C" void psp_ui_progress(float fraction, const char *text, float right) {
+    const float width = right > 0 ? ImGui::GetContentRegionAvail().x - right * u.scale : -FLT_MIN;
+    // ImGui animates a negative fraction along with time.
+    ImGui::ProgressBar(fraction < 0 ? -(float)ImGui::GetTime() : fraction, ImVec2(width, 0), text);
 }
 
 extern "C" int psp_ui_toggle(const char *label, int *value) {

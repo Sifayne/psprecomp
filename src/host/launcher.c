@@ -34,15 +34,16 @@
 extern char **environ;
 
 enum { UI_W = 1120, UI_H = 800, MAX_GAMES = 32, MAX_FILES = 1024, MAX_PACKS = 16 };
-enum { VIEW_SETTINGS, VIEW_BROWSE, VIEW_PREPARING };
+enum { VIEW_SETTINGS, VIEW_BROWSE };
 enum { GROUP_PLAYER, GROUP_PACK, GROUP_PACKS, GROUP_ABOUT };
-enum { CONFIRM_NONE, CONFIRM_RESET, CONFIRM_DISCARD, CONFIRM_REMOVE };
+enum { CONFIRM_NONE, CONFIRM_RESET, CONFIRM_DISCARD, CONFIRM_REMOVE, CONFIRM_STOP };
 /* What the browser looks for, and what the importer is doing. */
 enum { BROWSE_ISO, BROWSE_PACK };
 enum { WORK_IMPORT, WORK_INSTALL, WORK_REMOVE };
-/* UI units: the side list's width, and what the side list and its page
- * leave below them for the status, the buttons and the hints. */
-static const float SIDE = 240, FOOTER = 104;
+/* UI units: the side list's width, what the side list and its page leave
+ * below them for the status, the buttons and the hints, and what more while
+ * the importer works, for its progress. */
+static const float SIDE = 240, FOOTER = 104, WORK = 66;
 
 /* One built title, from a --game argument or the importer's library: the
  * slug and name, the boot host to exec, its module, its disc (NULL or empty
@@ -258,6 +259,11 @@ static void select_game(launcher *a, int at) {
     refresh(a);
 }
 
+/* The importer at work -- preparing a game, adding or removing a pack. The
+ * settings stay open meanwhile, with its progress under them; what would
+ * start other work, or play, waits for it. */
+static int working(const launcher *a) { return a->import_pid != 0; }
+
 #include "launcher_library.h"
 
 /* ---- saving and launching ------------------------------------------------------------ */
@@ -325,6 +331,11 @@ static int absolute(const char *path, char *out, size_t cap) {
 
 static void launch_game(launcher *a) {
     refresh(a);
+    if (working(a)) {
+        strcpy(a->status, a->work == WORK_IMPORT ? "Wait for the game to be prepared, or stop it, to play."
+                                                 : "Wait for the pack to finish, to play.");
+        return;
+    }
     if (!a->valid || a->load_failed) return;
     if (!a->boot || !a->module) {
         if (a->importer && a->iso && !access(a->iso, R_OK)) import_start(a, WORK_IMPORT, a->iso);
@@ -536,14 +547,20 @@ static void packs_page(launcher *a) {
         else if (a->importer) {
             char label[64];
             snprintf(label, sizeof label, "Remove##%d", p);
+            psp_ui_disabled_begin(working(a));
             if (psp_ui_button(label)) { a->remove_pack = p; a->confirm = CONFIRM_REMOVE; }
+            psp_ui_disabled_end();
             psp_ui_help("Remove this pack. Its games stay in your library, ready again when the pack is added back; "
                         "your saves and settings are kept.");
         }
     }
     psp_ui_separator();
     if (!shown) psp_ui_text("No packs yet.");
-    if (a->importer && a->packs_dir && psp_ui_button("Add pack...")) browser_open(a, BROWSE_PACK);
+    if (a->importer && a->packs_dir) {
+        psp_ui_disabled_begin(working(a));
+        if (psp_ui_button("Add pack...")) browser_open(a, BROWSE_PACK);
+        psp_ui_disabled_end();
+    }
 }
 
 static void about_page(void) {
@@ -582,13 +599,29 @@ static void browse_view(launcher *a) {
     if (enter >= 0) browser_enter(a, enter);
 }
 
-static void preparing_view(launcher *a) {
-    psp_ui_heading(a->work == WORK_IMPORT ? "Preparing your game" : a->work == WORK_INSTALL ? "Adding the pack" : "Removing the pack");
-    psp_ui_accent(a->import_status);
-    psp_ui_note("Keep the launcher open until this finishes.");
+/* The importer's progress, under the settings: what it is doing, how far
+ * the game's compile has got (it says "Compiling game: 12/32"; before and
+ * after that the bar moves with no measure), and Stop. */
+static void work_strip(launcher *a) {
+    static const char *const doing[] = { "Preparing your game", "Adding the pack", "Removing the pack" };
+    char line[1100];
+    snprintf(line, sizeof line, "%s: %s", doing[a->work], a->import_status);
+    psp_ui_accent(line);
+    int done = 0, all = 0;
+    const float fraction = sscanf(a->import_status, "Compiling game: %d/%d", &done, &all) == 2 && all > 0
+                         ? (float)done / (float)all : -1.0f;
+    const int stoppable = a->work != WORK_REMOVE && !a->import_cancelled;
+    psp_ui_progress(fraction, NULL, stoppable ? psp_ui_button_width("Stop") + 10 : 0);
+    if (stoppable) {
+        psp_ui_same_line();
+        if (psp_ui_button("Stop")) import_cancel(a);
+        psp_ui_help(a->work == WORK_IMPORT ? "Stop preparing. Your games and saves stay as they were."
+                                           : "Stop adding the pack. Your packs stay as they were.");
+    }
 }
 
 static void footer(launcher *a) {
+    if (working(a)) work_strip(a);
     const char *status = a->load_failed ? a->status : !a->valid ? a->validation : *a->status ? a->status :
                          a->dirty ? "Unsaved changes." : "Changes take effect when the game starts.";
     if (a->load_failed || !a->valid) psp_ui_accent(status); else psp_ui_note(status);
@@ -597,22 +630,25 @@ static void footer(launcher *a) {
         if (a->group > GROUP_PACK) psp_ui_gap("Reset to defaults");
         else if (psp_ui_button("Reset to defaults")) a->confirm = CONFIRM_RESET;
         const int ready = a->boot && a->module, prepare = !ready && a->game_count && a->importer;
-        const char *play = ready ? "Save and play" : prepare ? "Prepare game" : NULL;
+        const char *play = working(a) && a->work == WORK_IMPORT ? "Preparing..." :
+                           ready ? "Save and play" : prepare ? "Prepare game" : NULL;
         const float w = psp_ui_button_width("Cancel") + psp_ui_button_width("Save") +
                         (play ? psp_ui_button_width(play) + 10 : 0) + 10;
         psp_ui_right(w);
         if (psp_ui_button("Cancel")) activate_back(a);
         psp_ui_same_line();
         if (psp_ui_button("Save")) save(a);
-        if (play) { psp_ui_same_line(); if (psp_ui_button_primary(play)) launch_game(a); }
+        if (play) {
+            psp_ui_same_line();
+            psp_ui_disabled_begin(working(a));
+            if (psp_ui_button_primary(play)) launch_game(a);
+            psp_ui_disabled_end();
+        }
         psp_ui_note("Arrows or D-pad: move   Enter or A: choose   Esc or B: back   Bumpers: pages   Start: play");
-    } else if (a->view == VIEW_BROWSE) {
+    } else {
         psp_ui_right(psp_ui_button_width("Cancel"));
         if (psp_ui_button("Cancel")) activate_back(a);
         psp_ui_note("Arrows or D-pad: move   Enter or A: open   Esc or B: back");
-    } else {
-        psp_ui_right(psp_ui_button_width("Cancel"));
-        if (a->work != WORK_REMOVE && psp_ui_button("Cancel")) import_cancel(a);
     }
 }
 
@@ -631,6 +667,11 @@ static void confirm_prompt(launcher *a) {
     } else if (a->confirm == CONFIRM_DISCARD) {
         title = "Discard your changes?"; yes = "Discard";
         snprintf(text, sizeof text, "Your unsaved changes will be lost. The saved settings stay as they were.");
+    } else if (a->confirm == CONFIRM_STOP) {
+        title = a->work == WORK_IMPORT ? "Stop preparing?" : "Stop adding the pack?"; yes = "Stop and close";
+        snprintf(text, sizeof text, "%s", a->work == WORK_IMPORT
+                 ? "Closing the launcher stops preparing your game. Your games and saves stay as they were."
+                 : "Closing the launcher stops adding the pack. Your packs stay as they were.");
     } else {
         title = "Remove the pack?"; yes = "Remove";
         snprintf(text, sizeof text, "Remove %s? Its games can't be played until it is added again. Your saves and settings are kept.",
@@ -647,6 +688,7 @@ static void confirm_prompt(launcher *a) {
         changed(a);
         strcpy(a->status, "Reset. Save to keep it.");
     } else if (kind == CONFIRM_DISCARD) a->running = 0;
+    else if (kind == CONFIRM_STOP) { a->quit_after_import = 1; import_cancel(a); }
     else pack_remove(a, a->remove_pack);
 }
 
@@ -668,7 +710,9 @@ static void render(launcher *a) {
         psp_ui_note("No pack: the plain recompiled game, with the settings for all games.");
     if (a->importer && a->view == VIEW_SETTINGS) {
         psp_ui_right(psp_ui_button_width("Add game"));
+        psp_ui_disabled_begin(working(a));
         if (psp_ui_button_primary("Add game")) browser_open(a, BROWSE_ISO);
+        psp_ui_disabled_end();
     }
     if (a->game_count > 1 && a->view == VIEW_SETTINGS) {
         int pick = -1;
@@ -681,7 +725,7 @@ static void render(launcher *a) {
         if (pick >= 0) select_game(a, pick);
     }
     if (a->view == VIEW_SETTINGS) {
-        psp_ui_side_begin(SIDE, FOOTER);
+        psp_ui_side_begin(SIDE, FOOTER + (working(a) ? WORK : 0));
         const char *names[PAGES_MAX];
         for (int g = GROUP_PLAYER; g <= GROUP_ABOUT; g++) {
             const int n = group_pages(a, g, names);
@@ -706,8 +750,7 @@ static void render(launcher *a) {
         psp_ui_side_end();
     } else {
         psp_ui_scroll_begin("##work", FOOTER);
-        if (a->view == VIEW_BROWSE) browse_view(a);
-        else preparing_view(a);
+        browse_view(a);
         psp_ui_scroll_end();
     }
     footer(a);
@@ -726,12 +769,18 @@ static void draw(launcher *a) {
 
 /* ---- input ------------------------------------------------------------------------- */
 
-/* Escape, B or Cancel: out of the browser, out of a preparation, or out of
- * the launcher, asking first about unsaved changes. B on a page goes back
- * to its entry in the list first (psp_ui_back). */
+/* Escape, B or Cancel: out of the browser, or out of the launcher -- asking
+ * first whether to stop the importer at work, and about unsaved changes. A
+ * pack's removal is quick and not to be cut short: the launcher closes once
+ * it is done. B on a page goes back to its entry in the list first
+ * (psp_ui_back). */
 static void activate_back(launcher *a) {
-    if (a->view == VIEW_PREPARING) { import_cancel(a); return; }
     if (a->view == VIEW_BROWSE) { a->view = VIEW_SETTINGS; psp_ui_focus_next(); return; }
+    if (working(a)) {
+        if (a->work == WORK_REMOVE) a->quit_after_import = 1;
+        else a->confirm = CONFIRM_STOP;
+        return;
+    }
     if (a->dirty) a->confirm = CONFIRM_DISCARD;
     else a->running = 0;
 }
@@ -753,7 +802,7 @@ static void event(launcher *a, const SDL_Event *e) {
     }
     if (e->type == SDL_DROPFILE) {
         const char *ext = strrchr(e->drop.file, '.');
-        if (a->view != VIEW_PREPARING) import_start(a, ext && !strcasecmp(ext, ".zip") ? WORK_INSTALL : WORK_IMPORT, e->drop.file);
+        import_start(a, ext && !strcasecmp(ext, ".zip") ? WORK_INSTALL : WORK_IMPORT, e->drop.file);
         SDL_free(e->drop.file);
         return;
     }

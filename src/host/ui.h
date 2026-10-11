@@ -85,6 +85,10 @@ int  psp_ui_number(const char *label, double *value, double min, double max, con
 /* A slider over the stops 0 to count, at *at, showing text: a press of the
  * D-pad or an arrow moves it one stop over a range of up to 100. */
 int  psp_ui_stops(const char *label, int *at, int count, const char *text);
+/* A progress bar, fraction 0..1 done, or moving with no measure for a
+ * negative one; text on it, or NULL. It leaves right UI units free at its
+ * right for what follows on its line. */
+void psp_ui_progress(float fraction, const char *text, float right);
 int  psp_ui_toggle(const char *label, int *value);
 void psp_ui_disabled_begin(int disabled);
 void psp_ui_disabled_end(void);

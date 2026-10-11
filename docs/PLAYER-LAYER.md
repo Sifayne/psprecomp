@@ -1435,7 +1435,12 @@ thread ends.
     selected game's pack's under its name, then Packs and About;
   - *Reset to defaults* resets the group of the page shown, after a
     question; the bindings stay;
-  - Add game, and the preparation's progress, take the page's place.
+  - Add game takes the page's place.
+  - While a game is prepared or a pack added or removed, the settings stay
+    open, with the progress under them: what it is doing, a bar (filled from
+    the compile's "Compiling game: n/N", moving with no measure before and
+    after), and Stop. Play, Add game and the pack buttons wait for it, and
+    leaving asks first (10 Oct).
 - **Controls:** Escape and B go back; B on a page goes to its entry first
   (§4, 10 Oct). The bumpers step through the pages, and Start plays.
 - **Packs:** those the launcher was linked with (`launcher_one.c`, a game's

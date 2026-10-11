@@ -196,7 +196,32 @@ int main(int argc, char **argv) {
     a.importer = "/bin/false";
     browser_open(&a, BROWSE_ISO); assert(a.view == VIEW_BROWSE); draw(&a);
     key(&a, SDLK_ESCAPE); assert(a.view == VIEW_SETTINGS);
-    a.view = VIEW_PREPARING; a.work = WORK_INSTALL; draw(&a); a.view = VIEW_SETTINGS;
+    /* A preparation keeps the settings open, its progress under them. A
+     * stand-in importer reports the compile and waits: play, Add game and
+     * Add pack wait for it, closing asks first, and Stop ends it. */
+    snprintf(path, sizeof path, "%s/importer.sh", root);
+    putfile(path, "#!/bin/sh\necho 'Compiling game: 12/32'\nexec sleep 30\n");
+    assert(!chmod(path, 0755));
+    a.importer = path;
+    import_start(&a, WORK_IMPORT, "/no/such.iso");
+    assert(working(&a) && a.view == VIEW_SETTINGS);
+    for (int i = 0; i < 300 && strcmp(a.import_status, "Compiling game: 12/32"); i++) { SDL_Delay(10); import_poll(&a); }
+    assert(!strcmp(a.import_status, "Compiling game: 12/32"));
+    show_page(&a, GROUP_PACKS, "Packs"); draw(&a);
+    show_page(&a, GROUP_PLAYER, "Display"); draw(&a);
+    a.status[0] = 0;
+    launch_game(&a);
+    assert(strstr(a.status, "Wait for the game") && !a.child);
+    browser_open(&a, BROWSE_ISO);
+    assert(a.view == VIEW_SETTINGS);
+    activate_back(&a);
+    assert(a.confirm == CONFIRM_STOP && a.running);
+    draw(&a); draw(&a);
+    a.confirm = CONFIRM_NONE; draw(&a);
+    import_cancel(&a);
+    for (int i = 0; i < 300 && working(&a); i++) { SDL_Delay(10); import_poll(&a); }
+    assert(!working(&a) && strstr(a.status, "Preparation canceled") && a.running);
+    a.importer = "/bin/false";
     select_game(&a, 2); draw(&a);
     /* The plain game: the player's pages alone. */
     select_game(&a, 3); draw(&a);
