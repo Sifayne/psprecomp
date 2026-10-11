@@ -566,6 +566,30 @@ void psp_sched_run_on(uint32_t uid, void (*fn)(void)) {
     psp_os_unlock(&g_lock);
 }
 
+/* How a block that has the token back ended, as psp_sched_block_until
+ * answers, with what the wait left on the slot cleared.
+ *
+ * Only the flag says why. A signal that arrived after the deadline still
+ * counts as a signal: it was delivered. A forced release is neither, and has
+ * its own answer, so that a wait which does not know about it still leaves
+ * its queue rather than taking it for a signal. */
+static int block_ended_locked(int me, uint64_t deadline_us) {
+    const int woken = g_slot[me].woken;
+    const int released = woken && g_slot[me].wake_reason == PSP_SCHED_WAKE_RELEASE;
+    g_slot[me].waiting_on = NULL;
+    g_slot[me].wake_at    = 0;
+    if (released) return PSP_SCHED_RELEASED;
+    if (woken || !deadline_us) return PSP_SCHED_WOKEN;
+    return PSP_SCHED_EXPIRED;
+}
+
+/* The same for a delay, which always has a deadline. */
+static int delay_ended_locked(int me) {
+    const int woken = g_slot[me].woken, reason = g_slot[me].wake_reason;
+    if (woken && reason == PSP_SCHED_WAKE_RELEASE) return PSP_SCHED_RELEASED;
+    return woken ? PSP_SCHED_WOKEN : PSP_SCHED_EXPIRED;
+}
+
 /* Give up the token: save state, change our own, hand over, wait to come back.
  *
  * Returns 0 once the caller is running again, or -1 if parking would have
@@ -618,19 +642,9 @@ static int switch_away(int me, psp_sched_state why, const char *what,
         if (me != MAIN_SLOT) host_exit();
         return PSP_SCHED_STRANDED;
     }
-    const int woken = g_slot[me].woken;
-    const int released = woken && g_slot[me].wake_reason == PSP_SCHED_WAKE_RELEASE;
-    g_slot[me].waiting_on = NULL;
-    g_slot[me].wake_at    = 0;
+    const int rc = block_ended_locked(me, deadline_us);
     psp_os_unlock(&g_lock);
-    /* Running again, and only the flag says why. A signal that arrived after
-     * the deadline still counts as a signal: it was delivered. A forced
-     * release is neither, and has its own answer, so that a wait which does
-     * not know about it still leaves its queue rather than taking it for a
-     * signal. */
-    if (released) return PSP_SCHED_RELEASED;
-    if (woken || !deadline_us) return PSP_SCHED_WOKEN;
-    return PSP_SCHED_EXPIRED;
+    return rc;
 }
 
 /* ---- guest thread bodies --------------------------------------------------- */
@@ -961,10 +975,9 @@ int psp_sched_delay(uint64_t usec) {
         if (me != MAIN_SLOT) host_exit();
         return PSP_SCHED_EXPIRED;
     }
-    const int woken = g_slot[me].woken, reason = g_slot[me].wake_reason;
+    const int rc = delay_ended_locked(me);
     psp_os_unlock(&g_lock);
-    if (woken && reason == PSP_SCHED_WAKE_RELEASE) return PSP_SCHED_RELEASED;
-    return woken ? PSP_SCHED_WOKEN : PSP_SCHED_EXPIRED;
+    return rc;
 }
 
 /* The reschedule every firmware call ends with.
@@ -1564,14 +1577,9 @@ int psp_sched_resume_block(uint64_t *deadline) {
     }
     const uint64_t deadline_us = g_slot[me].park.deadline;
     if (deadline) *deadline = deadline_us;
-    const int woken = g_slot[me].woken;
-    const int released = woken && g_slot[me].wake_reason == PSP_SCHED_WAKE_RELEASE;
-    g_slot[me].waiting_on = NULL;
-    g_slot[me].wake_at    = 0;
+    const int rc = block_ended_locked(me, deadline_us);
     psp_os_unlock(&g_lock);
-    if (released) return PSP_SCHED_RELEASED;
-    if (woken || !deadline_us) return PSP_SCHED_WOKEN;
-    return PSP_SCHED_EXPIRED;
+    return rc;
 }
 
 int psp_sched_resume_delay(uint64_t *deadline) {
@@ -1583,10 +1591,9 @@ int psp_sched_resume_delay(uint64_t *deadline) {
         host_exit();
         return PSP_SCHED_EXPIRED;
     }
-    const int woken = g_slot[me].woken, reason = g_slot[me].wake_reason;
+    const int rc = delay_ended_locked(me);
     psp_os_unlock(&g_lock);
-    if (woken && reason == PSP_SCHED_WAKE_RELEASE) return PSP_SCHED_RELEASED;
-    return woken ? PSP_SCHED_WOKEN : PSP_SCHED_EXPIRED;
+    return rc;
 }
 
 /* The saving thread: the token is its own. */
