@@ -511,9 +511,6 @@ void psp_hle_init(void) {
     psp_sysmem_register();
     psp_sched_init();
     psp_threadman_init();
-    psp_kernlock_reset();
-    psp_kernobj_reset();
-    psp_ktimer_reset();
     psp_mpeg_register();
     psp_mpeg_reset();
     psp_threadman_register();
