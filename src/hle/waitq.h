@@ -119,8 +119,8 @@ typedef enum { PSP_WAIT_POLL, PSP_WAIT_BLOCK } psp_wait_form;
  *   woken any other way            OK: the waker settled it on our behalf
  *   still queued                   the caller leaves the queue, then gives up
  *
- * Each of these writes the timeout back and returns the answer to the guest.
- * The first two return 1 when they ended the wait. */
+ * Each of the three below writes the timeout back and returns the answer to
+ * the guest; the first two return 1 when they ended the wait. */
 
 /* The answers only the waker knew. Neither depends on whether the object is
  * still there: what was handed over is not taken back by a delete that
@@ -134,8 +134,9 @@ int  psp_wait_end_woken(int rc, uint32_t tmo_ptr, uint64_t deadline);
 int  psp_wait_end_found(int rc, const void *object, uint32_t tmo_ptr,
                         uint64_t deadline);
 
-/* A wait that is still queued, after the caller has left the queue: its
- * deadline passed, or sceKernelReleaseWaitThread forced it out. */
+/* A wait that is still queued, after the caller has left the queue:
+ * RELEASE_WAIT when sceKernelReleaseWaitThread forced it out, WAIT_TIMEOUT
+ * otherwise. */
 void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline);
 
 /* The attribute bit that selects most-urgent-first over first-come. */
