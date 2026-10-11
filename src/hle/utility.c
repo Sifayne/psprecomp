@@ -95,15 +95,22 @@ static uint32_t sd_optional(uint32_t p, uint32_t off) {
     return psp_read32(p) >= off+4 ? psp_read32(p+off) : 0;
 }
 
+static void sd_getstr(uint32_t param, uint32_t off, uint32_t max, char *dst, size_t cap) {
+    uint32_t i;
+    for (i = 0; i < max && i + 1 < cap; i++) {
+        char c = (char)psp_read8(param + off + i);
+        if (!c) break;
+        dst[i] = c;
+    }
+    dst[i] = '\0';
+}
+
 static void savedata_log(uint32_t param) {
     if (!savedata_log_on()) return;
     char game[14], save[21], file[14];
-    for (int i = 0; i < 13; i++) game[i] = (char)psp_read8(param + SD_GAMENAME + (uint32_t)i);
-    game[13] = '\0';
-    for (int i = 0; i < 20; i++) save[i] = (char)psp_read8(param + SD_SAVENAME + (uint32_t)i);
-    save[20] = '\0';
-    for (int i = 0; i < 13; i++) file[i] = (char)psp_read8(param + SD_FILENAME + (uint32_t)i);
-    file[13] = '\0';
+    sd_getstr(param, SD_GAMENAME, 13, game, sizeof game);
+    sd_getstr(param, SD_SAVENAME, 20, save, sizeof save);
+    sd_getstr(param, SD_FILENAME, 13, file, sizeof file);
     fprintf(stderr, "savedata: mode=%u game=%.13s save=%.20s file=%.13s databuf=%08X bufsz=%u datasz=%u\n",
             psp_read32(param + SD_MODE), game, save, file,
             psp_read32(param + SD_DATABUF),
@@ -111,10 +118,8 @@ static void savedata_log(uint32_t param) {
     const uint32_t msdata = sd_optional(param, SD_MSDATA);
     if (msdata && psp_mem_ptr(msdata, 36)) {
         char mgame[17], msave[21];
-        for (int i = 0; i < 16; i++) mgame[i] = (char)psp_read8(msdata + (uint32_t)i);
-        mgame[16] = '\0';
-        for (int i = 0; i < 20; i++) msave[i] = (char)psp_read8(msdata + 16 + (uint32_t)i);
-        msave[20] = '\0';
+        sd_getstr(msdata, 0, 16, mgame, sizeof mgame);
+        sd_getstr(msdata, 16, 20, msave, sizeof msave);
         fprintf(stderr, "savedata: msData game=%.16s save=%.20s\n", mgame, msave);
     }
 }
@@ -205,16 +210,6 @@ static void savedata_log_result(uint32_t param) {
 #define SD_READDATASECURE 15u
 #define SD_WRITEDATASECURE 17u
 #define SD_ERASESECURE 19u
-
-static void sd_getstr(uint32_t param, uint32_t off, uint32_t max, char *dst, size_t cap) {
-    uint32_t i;
-    for (i = 0; i < max && i + 1 < cap; i++) {
-        char c = (char)psp_read8(param + off + i);
-        if (!c) break;
-        dst[i] = c;
-    }
-    dst[i] = '\0';
-}
 
 /* ms0:/PSP/SAVEDATA/<game><save> for a candidate save name. */
 static void sd_dir(const char *game, const char *save, char *out, size_t cap) {
