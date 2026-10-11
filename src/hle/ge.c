@@ -4370,6 +4370,455 @@ static int set_light(uint32_t cmd, uint32_t arg) {
     return 1;
 }
 
+/* FBP, FBW or the pixel format changed: the census and the backend follow. */
+static void ge_retarget(void) {
+    ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
+    psp_render_current()->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
+}
+
+/* A command that only sets state: everything but drawing, the list's flow
+ * and the addresses relative to its BASE, which run_list_body handles. */
+static void set_register(uint32_t cmd, uint32_t arg) {
+    switch (cmd) {
+    case GE_VTYPE: g_ge.vtype = arg; break;
+
+    /* ---- transform state ----------------------------------------------
+     *
+     * NUMBER sets the write cursor, DATA advances it. Writes past the end
+     * are dropped: a list can be read while the CPU is still writing it,
+     * and wrapping the cursor would scribble over elements already set. */
+    case GE_WORLDMATRIXNUMBER:
+        if (drawlog_aux()) fprintf(stderr, "mtx: WORLD NUMBER arg=%06X -> %d\n",
+                                    arg, (int)(arg & 0xF));
+        g_tl.world_n = (int)(arg & 0xF); break;
+    case GE_VIEWMATRIXNUMBER:  g_tl.view_n  = (int)(arg & 0xF); break;
+    case GE_PROJMATRIXNUMBER:  g_tl.proj_n  = (int)(arg & 0x1F); break;
+    case GE_WORLDMATRIXDATA:
+        if (drawlog_aux()) fprintf(stderr, "mtx: WORLD DATA  arg=%06X -> [%d] = %.2f\n",
+                                    arg, g_tl.world_n, ge_float(arg));
+        if (g_tl.world_n < 12) {
+            g_tl.world[g_tl.world_n++] = ge_float(arg);
+            if (g_tl.world_n == 12) view_log_note_world();
+        }
+        g_tl.world_words++;
+        break;
+    case GE_VIEWMATRIXDATA:
+        if (g_tl.view_n < 12) {
+            g_tl.view[g_tl.view_n++] = ge_float(arg);
+            /* The twelfth word completes an upload. Noted here and not at
+             * the frame boundary: the HUD draws last and sets a view of
+             * its own, so by drain time the scene's matrix is gone. */
+            if (g_tl.view_n == 12) view_log_note();
+        }
+        g_tl.view_words++;
+        break;
+    case GE_PROJMATRIXDATA:
+        if (g_tl.proj_n < 16) g_tl.proj[g_tl.proj_n++] = ge_float(arg);
+        g_tl.proj_words++;
+        break;
+    case GE_BONEMATRIXNUMBER: g_tl.bone_n = (int)(arg & 0x7F); break;
+    case GE_BONEMATRIXDATA:
+        if (g_tl.bone_n < 8 * 12) { g_tl.bone[g_tl.bone_n++] = ge_float(arg); g_bone16_ok = 0; }
+        break;
+    case GE_MORPHWEIGHT0:     case GE_MORPHWEIGHT0 + 1: case GE_MORPHWEIGHT0 + 2:
+    case GE_MORPHWEIGHT0 + 3: case GE_MORPHWEIGHT0 + 4: case GE_MORPHWEIGHT0 + 5:
+    case GE_MORPHWEIGHT0 + 6: case GE_MORPHWEIGHT0 + 7:
+        g_tl.morph_w[cmd - GE_MORPHWEIGHT0] = ge_float(arg);
+        break;
+    case GE_PATCHDIVISION:
+        g_ge.patch_du = (int)(arg & 0x7F);            /* 7 bits: geprobe 13 */
+        g_ge.patch_dv = (int)((arg >> 8) & 0x7F);
+        break;
+    case GE_PATCHPRIMITIVE: g_ge.patch_prim = (int)(arg & 3); break;
+    case GE_PATCHFACING:    g_ge.patch_face = (int)(arg & 1); break;
+
+    case GE_VIEWPORTXSCALE:  g_tl.vp_xs = ge_float(arg); g_tl.vp_set = 1; break;
+    case GE_VIEWPORTYSCALE:  g_tl.vp_ys = ge_float(arg); g_tl.vp_set = 1; break;
+    case GE_VIEWPORTZSCALE:  g_tl.vp_zs = ge_float(arg); break;
+    case GE_VIEWPORTXCENTER: g_tl.vp_xc = ge_float(arg); break;
+    case GE_VIEWPORTYCENTER: g_tl.vp_yc = ge_float(arg); break;
+    case GE_VIEWPORTZCENTER: g_tl.vp_zc = ge_float(arg); break;
+
+    /* Offsets are in sixteenths of a pixel: sceGuOffset sends x << 4. */
+    case GE_OFFSETX: g_tl.off_x = (float)(arg & 0xFFFFFu) / 16.0f; break;
+    case GE_OFFSETY: g_tl.off_y = (float)(arg & 0xFFFFFu) / 16.0f; break;
+
+    case GE_COLORTESTENABLE: g_tl.blend.colour_test  = (int)(arg & 1); break;
+    case GE_COLORTEST:       g_tl.blend.colour_func  = (int)(arg & 3); break;
+    case GE_COLORREF:        g_tl.blend.colour_ref   = arg & 0xFFFFFFu; break;
+    case GE_COLORTESTMASK:   g_tl.blend.colour_mask  = arg & 0xFFFFFFu; break;
+    case GE_LOGICOPENABLE:   g_tl.blend.logic_enable = (int)(arg & 1); break;
+    case GE_LOGICOP:         g_tl.blend.logic_op     = (int)(arg & 15); break;
+    case GE_PIXELMASKRGB:
+        g_tl.blend.pixel_mask = (g_tl.blend.pixel_mask & 0xFF000000u) | (arg & 0xFFFFFFu);
+        break;
+    case GE_PIXELMASKALPHA:
+        g_tl.blend.pixel_mask = (g_tl.blend.pixel_mask & 0x00FFFFFFu) | ((arg & 0xFFu) << 24);
+        break;
+    case GE_CULLFACEENABLE: g_tl.cull_enable = (int)(arg & 1); break;
+    case GE_CULL:           g_tl.cull_ccw    = (int)(arg & 1); break;
+    /* Stored inverted, so the reset state (all zero) stays Gouraud, as it
+     * was before this register was decoded. */
+    case GE_SHADE:          g_tl.blend.shade_flat = !(arg & 1); break;
+    case GE_DITHERENABLE:   g_tl.blend.dither = (int)(arg & 1); break;
+    /* One matrix row each, four signed nibbles, element 0 lowest:
+     * sceGuSetDither's row {-4, 0, -3, 1} arrives as 0x001D0C. */
+    case GE_DITHER0: case GE_DITHER0 + 1: case GE_DITHER0 + 2: case GE_DITHER0 + 3:
+        for (int j = 0; j < 4; j++)
+            g_tl.blend.dither_m[cmd - GE_DITHER0][j] =
+                (int8_t)((int)((arg >> (4 * j)) & 0xF) - (int)(((arg >> (4 * j)) & 0x8) << 1));
+        break;
+    /* ---- texture state -------------------------------------------------
+     *
+     * Recorded here and handed to the backend, which samples it: the
+     * software one in render.c, against geprobe's texel readings
+     * (docs/RENDERER.md). */
+    case GE_TEXFORMAT:
+        g_ge.tex_format = arg & 0xF;
+        g_ge.tex_formats_seen |= 1u << (arg & 0xF);
+        break;
+    case GE_TEXLEVEL:
+        g_ge.tex_lod_mode   = (int)(arg & 3);
+        g_ge.tex_lod_bias16 = (int)(int8_t)((arg >> 16) & 0xFF);
+        break;
+    case GE_TEXLODSLOPE: g_ge.tex_lod_slope = ge_float(arg); break;
+    case GE_TEXMODE:
+        g_ge.tex_max_level = (int)((arg >> 16) & 7);
+        g_ge.tex_swizzled = arg & 1;        /* bit 0 selects swizzled */
+        break;
+    case GE_CLUTFORMAT:
+        /* The low two bits are the palette format; the rest is how a texel
+         * indexes it -- shift, mask and a start offset. Keeping only the
+         * format, which is what this did, samples entry (texel & 0xFF) of
+         * whichever palette page happens to be first. */
+        g_ge.clut_raw    = arg;
+        g_ge.clut_format = arg & 3;
+        break;
+    case GE_CLUTADDR:      g_ge.clut_addr = split_addr_lo(g_ge.clut_addr, arg); break;
+    case GE_CLUTADDRUPPER: g_ge.clut_addr = split_addr_hi(g_ge.clut_addr, arg); break;
+    case GE_TEXFUNC:
+        g_ge.tex_func   = arg & 7;
+        g_ge.tex_tcc    = (arg >> 8) & 1;     /* RGBA: the texel's alpha takes part */
+        g_ge.tex_double = (arg >> 16) & 1;    /* colour doubling */
+        g_ge.tex_funcs_seen |= 1u << (arg & 7);
+        break;
+    case GE_TEXENVCOLOR:
+        g_ge.tex_env = arg & 0xFFFFFFu;
+        break;
+    case GE_TEXFILTER:
+        g_ge.tex_filter = arg & 0xFFFF;
+        break;
+    case GE_TEXMAPMODE:
+        g_tl.tex_map_mode  = (int)(arg & 3);
+        g_tl.tex_proj_mode = (int)((arg >> 8) & 3);
+        break;
+    case GE_TEXSHADELS:
+        g_tl.tex_shade_u = (int)(arg & 3);
+        g_tl.tex_shade_v = (int)((arg >> 8) & 3);
+        break;
+    case GE_DEPTHCLIPENABLE: g_tl.depth_clamp = (int)(arg & 1); break;
+    case GE_LIGHTINGENABLE: g_tl.lighting = (int)(arg & 1); break;
+    case GE_FOGENABLE: g_tl.fog_enable = (int)(arg & 1); break;
+    case GE_FOG1:      g_tl.fog_end   = ge_float(arg); break;
+    case GE_FOG2:      g_tl.fog_range = ge_float(arg); break;
+    case GE_FOGCOLOR:  ge_colour3(arg, g_tl.fog_colour); g_tl.fog_colour_raw = arg & 0xFFFFFFu; break;
+    case GE_IMM_VSCX: g_imm.x   = arg & 0xFFFFFFu; break;
+    case GE_IMM_VSCY: g_imm.y   = arg & 0xFFFFFFu; break;
+    case GE_IMM_VSCZ: g_imm.z   = arg & 0xFFFFu;   break;
+    case GE_IMM_VTCS: case GE_IMM_VTCT: case GE_IMM_VTCQ: case GE_IMM_SCV: break;
+    case GE_IMM_CV:   g_imm.rgb = arg & 0xFFFFFFu; break;
+    case GE_IMM_FC:   g_imm.fog = arg & 0xFFu;     break;
+    case GE_IMM_AP:   imm_vertex(arg);             break;
+    case GE_LIGHTMODE:      g_tl.light_mode = (int)(arg & 1); break;
+    case GE_MATERIALUPDATE: g_tl.mat_update = (int)(arg & 7); break;
+    case GE_MATERIALEMISSIVE: ge_colour3(arg, g_tl.mat_emissive); break;
+    case GE_AMBIENTCOLOR:     ge_colour3(arg, g_tl.mat_ambient);  break;
+    case GE_MATERIALDIFFUSE:  ge_colour3(arg, g_tl.mat_diffuse);  break;
+    case GE_MATERIALSPECULAR: ge_colour3(arg, g_tl.mat_specular); break;
+    case GE_AMBIENTALPHA:     g_tl.mat_alpha = (int)(arg & 0xFF); break;
+    case GE_MATERIALSPECCOEF: g_tl.mat_spec_coef = ge_float(arg); break;
+    case GE_AMBIENTLIGHT:     ge_colour3(arg, g_tl.global_amb); break;
+    case GE_AMBIENTLIGHTALPHA: break;   /* the global ambient's alpha does not reach a vertex */
+
+    case GE_FRAMEBUFPIXFORMAT:
+        g_ge.fbfmt = arg & 3;
+        ge_retarget();
+        break;
+    case GE_SCISSOR1: g_ge.sc_x0 = (int)(arg & 0x3FF); g_ge.sc_y0 = (int)((arg >> 10) & 0x3FF); break;
+    case GE_SCISSOR2:
+        g_ge.sc_x1 = (int)(arg & 0x3FF); g_ge.sc_y1 = (int)((arg >> 10) & 0x3FF);
+        g_ge.sc_set = 1;
+        psp_render_current()->set_scissor(g_ge.sc_x0, g_ge.sc_y0, g_ge.sc_x1, g_ge.sc_y1);
+        break;
+    case GE_TGENMATRIXNUMBER: g_tl.tgen_n = (int)(arg & 0xF); break;
+    case GE_TGENMATRIXDATA:
+        if (g_tl.tgen_n < 12) g_tl.tgen[g_tl.tgen_n++] = ge_float(arg);
+        break;
+    case GE_TEXSCALEU:  g_ge.tex_scale_u  = ge_float(arg); break;
+    case GE_TEXSCALEV:  g_ge.tex_scale_v  = ge_float(arg); break;
+    case GE_TEXOFFSETU: g_ge.tex_offset_u = ge_float(arg); break;
+    case GE_TEXOFFSETV: g_ge.tex_offset_v = ge_float(arg); break;
+    case GE_TEXWRAP:
+        g_ge.tex_wrap = arg & 0xFFFF;
+        break;
+    case GE_LOADCLUT:
+        g_ge.clut_loads++;
+        break;
+
+    case GE_TEXTUREMAPENABLE: g_ge.tex_enable = arg & 1; break;
+
+    case GE_ALPHABLENDENABLE: g_tl.blend.enable     = (int)(arg & 1); break;
+    case GE_ALPHATESTENABLE:  g_tl.blend.alpha_test = (int)(arg & 1); break;
+    case GE_STENCILTESTENABLE: g_tl.blend.stencil_test = (int)(arg & 1); break;
+    case GE_STENCILTEST:
+        g_tl.blend.stencil_func = (int)(arg & 7);
+        g_tl.blend.stencil_ref  = (int)((arg >> 8) & 0xFF);
+        g_tl.blend.stencil_mask = (int)((arg >> 16) & 0xFF);
+        break;
+    case GE_STENCILOP:
+        g_tl.blend.op_sfail = (int)(arg & 7);
+        g_tl.blend.op_zfail = (int)((arg >> 8) & 7);
+        g_tl.blend.op_zpass = (int)((arg >> 16) & 7);
+        break;
+    case GE_BLENDMODE:
+        g_tl.blend.src = (int)(arg & 0xF);
+        g_tl.blend.dst = (int)((arg >> 4) & 0xF);
+        g_tl.blend.eq  = (int)((arg >> 8) & 7);
+        break;
+    case GE_BLENDFIXEDA: g_tl.blend.fixa = arg & 0xFFFFFFu; break;
+    case GE_BLENDFIXEDB: g_tl.blend.fixb = arg & 0xFFFFFFu; break;
+    case GE_ALPHATEST:
+        g_tl.blend.alpha_func = (int)(arg & 7);
+        g_tl.blend.alpha_ref  = (int)((arg >> 8) & 0xFF);
+        g_tl.blend.alpha_mask = (int)((arg >> 16) & 0xFF);
+        break;
+    case GE_ZTESTENABLE:   g_tl.ztest_enable = (int)(arg & 1); break;
+    case GE_ZTEST:         g_tl.ztest_func   = (int)(arg & 7); break;
+    case GE_ZWRITEDISABLE: g_tl.zwrite_off   = (int)(arg & 1); break;
+    /* Clear mode turns the draw into a blit of the clear values: the depth
+     * test is bypassed and depth is written only when the Z bit is set. */
+    case GE_CLEARMODE:
+        if (drawlog_aux())
+            fprintf(stderr, "clr: CLEARMODE arg=%06X  enable %d  colour %d "
+                            "alpha %d  depth %d\n",
+                    arg, (int)(arg & 1), (int)((arg >> 8) & 1),
+                    (int)((arg >> 9) & 1), (int)((arg >> 10) & 1));
+        g_tl.clear_mode   = (int)(arg & 1);
+        g_tl.clear_stencil = (int)((arg >> 9) & 1);
+        g_tl.clear_colour = (int)((arg >> 8) & 1);
+        g_tl.clear_z      = (int)((arg >> 10) & 1);
+        break;
+
+    case GE_TRANSFERSRC:    g_ge.xfer_src    = arg; break;
+    case GE_TRANSFERSRCW:   g_ge.xfer_srcw   = arg; break;
+    case GE_TRANSFERDST:    g_ge.xfer_dst    = arg; break;
+    case GE_TRANSFERDSTW:   g_ge.xfer_dstw   = arg; break;
+    case GE_TRANSFERSRCPOS: g_ge.xfer_srcpos = arg; break;
+    case GE_TRANSFERDSTPOS: g_ge.xfer_dstpos = arg; break;
+    case GE_TRANSFERSIZE:   g_ge.xfer_size   = arg; break;
+    case GE_TRANSFERSTART:
+        g_ge.xfer_start = arg;
+        do_block_transfer();
+        break;
+
+    case GE_FBP:
+        g_ge.fbp = buf_addr_lo(g_ge.fbp, arg);
+        ge_retarget();
+        break;
+    case GE_FBW:
+        g_ge.fbw = arg & 0xFFFF;
+        g_ge.fbp = buf_addr_hi(g_ge.fbp, arg);
+        ge_retarget();
+        break;
+
+    /* The depth buffer: low 24 bits of the address in ZBP, the high byte
+     * and the stride in ZBW, the same split as FBP/FBW. */
+    case GE_ZBP:
+        g_ge.zbp = buf_addr_lo(g_ge.zbp, arg);
+        psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
+        break;
+    case GE_ZBW:
+        g_ge.zbw = arg & 0xFFFF;
+        g_ge.zbp = buf_addr_hi(g_ge.zbp, arg);
+        psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
+        break;
+
+    default:
+        if (set_texture_level(cmd, arg) || set_light(cmd, arg)) break;
+        /* A real state command we do not decode individually. Counted --
+         * and, for the first few, named. "240 commands not individually
+         * decoded" hides whether the game is configuring a draw or just
+         * poking state, which is the difference between a rendering bug
+         * and a game that has not asked to render yet. */
+        if (g_ge.unknown < 64)
+            fprintf(stderr, "  GE cmd 0x%02X arg 0x%06X\n", cmd, arg);
+        g_ge.unknown++;
+        break;
+    }
+}
+
+/* ---- the walk ------------------------------------------------------------ */
+
+/* The list's next word. Words are fetched through one host pointer over a
+ * span of the list, looked up again only when a command redirects the list
+ * or the span runs out: a translated load per word was a sixth of the walk.
+ * The span lookup is the same translation, so an unmapped list still counts
+ * a bad access, and a list in VRAM still reaches the access observer. */
+typedef struct { const uint8_t *p; uint32_t addr, end; } list_span;
+static uint32_t fetch_word(list_span *s, uint32_t list) {
+    uint32_t word;
+    if (list != s->addr || list + 4 > s->end || !s->p) {
+        uint32_t span = 4096;
+        s->p = (const uint8_t *)psp_mem_ptr(list, span);
+        if (!s->p) { span = 4; s->p = (const uint8_t *)psp_mem_ptr(list, span); }
+        s->addr = list; s->end = s->p ? list + span : 0;
+    }
+    if (s->p) { memcpy(&word, s->p, 4); s->p += 4; s->addr += 4; }
+    else word = psp_read32(list);
+    return word;
+}
+
+/* Where a JUMP, CALL or BJUMP goes: an offset from the list's BASE. */
+static uint32_t list_target(const ge_queue *q, uint32_t arg) { return q->base | (arg & 0xFFFFFC); }
+
+static void run_prim(uint32_t arg) {
+    uint32_t type  = (arg >> 16) & 7;
+    uint32_t count = arg & 0xFFFF;
+    g_ge.prims[type]++;
+    /* A game that never writes FBP still draws somewhere -- register
+     * the default target lazily so the census is never empty. */
+    if (g_ge.n_targets == 0)
+        ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
+    g_ge.targets[g_ge.cur_target].prims++;
+    g_ge.vertices += count;
+    const uint64_t px0 = psp_render_pixels();
+    draw_prim(type, count);
+    advance_vertices(count);
+    g_ge_t += GE_PRIM_UNITS + GE_VERTEX_UNITS * count;
+    ge_back_push(psp_render_pixels() - px0);
+}
+
+/* BEZIER or SPLINE. Answers 0 when the patch hangs the GE (g_ge_hang). */
+static int run_patch(uint32_t cmd, uint32_t arg) {
+    g_ge.prims[3]++;
+    const uint64_t px0 = psp_render_pixels();
+    draw_patch(cmd == GE_SPLINE, arg);
+    if (g_ge_hang) { g_ge_hang = 0; return 0; }
+    g_ge_t += GE_PRIM_UNITS + GE_VERTEX_UNITS * (arg & 0xFF) * ((arg >> 8) & 0xFF);
+    ge_back_push(psp_render_pixels() - px0);
+    return 1;
+}
+
+/* FINISH, END and SIGNAL answer 1 when the walk stops at them; t0 is the
+ * GE's time at the command's start. */
+static int run_finish(ge_queue *q, uint32_t arg, uint64_t t0) {
+    if (q->signal == GE_SIGNAL_SYNC) {
+        /* A sync point's FINISH flushes what came before it and the
+         * list goes on: no finish handler, no capture snapshot, and
+         * the list is not done. The END after it clears the mark. */
+        psp_render_current()->finish();
+        return 0;
+    }
+    if (q->signal == GE_SIGNAL_HANDLER_PAUSE) {
+        /* sceGuSignal(GU_SIGNAL_PAUSE) writes SIGNAL, END, FINISH,
+         * END. geprobe 5 step 57 (fw 6.60): the signal handler runs
+         * at the SIGNAL, inside EnQueue; then the list stops until
+         * sceGeContinue -- 20 ms on, one handler has run,
+         * ListSync(peek) reads 4 and DrawSync(peek) 2 -- and this
+         * FINISH calls no finish handler. After sceGeContinue the
+         * rest runs, inside the call as a new list would. It stops
+         * here, at the FINISH, and resumes at the END after it. A
+         * sceGeContinue that came first (from the signal handler)
+         * lets it through; not measured. */
+        psp_render_current()->finish();
+        if (q->cont_early) { q->cont_early = 0; return 0; }
+        /* A capture's replay has no guest to call sceGeContinue, so
+         * it goes on through to the list's real FINISH. */
+        if (q->replay) return 0;
+        q->xpaused = 1;
+        ev_push(GE_EV_PAUSE, q, 0, 0, 0, t0);
+        return 1;
+    }
+    g_ge.finishes++;
+    cap_snapshot_memory();
+    /* The end of a list is what finish() means, and until now nothing
+     * called it -- the interface has documented it as "a good point to
+     * flush batched work" since it was written, and the software path
+     * never noticed because it draws each primitive immediately and
+     * has nothing to batch. A backend that accumulates geometry has no
+     * flush point without this, so its batch spans a whole frame. */
+    psp_render_current()->finish();
+    /* The list is done before its handler runs, so a handler that
+     * asks after it is told so. Not measured. */
+    ge_x_done(q, t0);
+    ge_x_raise(q, 1, arg, q->list + 4, t0);
+    return 1;
+}
+
+static int run_end(ge_queue *q, uint64_t t0) {
+    /* END is also the second word of every SIGNAL encoding. Treating
+     * it as list completion drops everything after a signal -- in
+     * this game, the rest of the scene and the entire HUD. */
+    uint32_t signal = psp_read32(q->list - 8);
+    if ((signal >> 24) != GE_SIGNAL) {
+        if ((signal >> 24) == GE_FINISH &&
+            (q->signal == GE_SIGNAL_HANDLER_PAUSE || q->signal == GE_SIGNAL_SYNC)) {
+            q->signal = 0;
+            return 0;
+        }
+        /* Preserve the old bare-END fallback. Normal completed lists
+         * stop at FINISH above and never reach their trailing END. */
+        cap_snapshot_memory();
+        psp_render_current()->finish();
+        ge_x_done(q, t0);
+        return 1;
+    }
+
+    uint32_t behaviour = (signal >> 16) & 0xFF;
+    if (behaviour == GE_SIGNAL_HANDLER_PAUSE || behaviour == GE_SIGNAL_SYNC) {
+        q->signal = (int)behaviour;
+    }
+    return 0;
+}
+
+static int run_signal(ge_queue *q, uint32_t arg, uint64_t t0) {
+    const uint32_t behaviour = (arg >> 16) & 0xFF;
+    /* Behaviours 1-3 (PSPSDK pspgu.h GU_SIGNAL_WAIT, NOWAIT, PAUSE)
+     * call the signal handler; the list then carries on, the PAUSE
+     * variant through its FINISH/END pair (run_finish). The jump/call/ret
+     * and other behaviours are not modelled and call nobody. A
+     * PAUSE is marked here, before its handler runs, so that a
+     * sceGeContinue from that handler finds it (cont_early);
+     * without the mark the handler's call did nothing and the list
+     * paused anyway. Which of the two the PSP does is not measured
+     * (geprobe 6 asks). The guest's Continue looks for the mark once
+     * the timeline has reached it (psig). */
+    if (behaviour == GE_SIGNAL_HANDLER_PAUSE) {
+        q->signal = GE_SIGNAL_HANDLER_PAUSE;
+        if (!q->replay) ev_push(GE_EV_PSIG, q, 0, 0, 0, t0);
+    }
+    if (behaviour >= 1 && behaviour <= 3)
+        ge_x_raise(q, 0, arg, q->list + 4, t0);
+    /* Behaviour 1 suspends the GE until its handler has returned:
+     * geprobe v24 scenes 146 and 152 (fw 6.60). The handler finds
+     * nothing behind its SIGNAL drawn, still nothing 1 ms on, and
+     * every word it rewrites there is the word the GE then draws.
+     * So the walk stops here, before the END, and the timeline
+     * resumes it once the handler has run (ge_resume_suspended).
+     * Behaviour 2 does not: its handler finds the words just behind
+     * it read already (scenes 147 and 153), and only a rewrite some
+     * 20 ms of drawing on is seen -- which the walk, having run on,
+     * does not see. A list with no signal handler, or a capture's
+     * replay, which has no guest to run one, goes on. */
+    if (behaviour == GE_SIGNAL_SUSPEND && !q->replay &&
+        q->cbid >= 0 && q->cbid < GE_MAX_CALLBACKS && g_ge_cb[q->cbid].used &&
+        g_ge_cb[q->cbid].signal_func) {
+        q->xpaused = q->xsuspended = 1;
+        return 1;
+    }
+    return 0;
+}
+
 static void run_list_body(ge_queue *q) {
     ge_note_thread();
     if (g_backend_stale) { g_backend_stale = 0; psp_ge_sync_backend(); }
@@ -4380,28 +4829,14 @@ static void run_list_body(ge_queue *q) {
      * once. Counting runs made the total depend on how many stall updates
      * the CPU interleaved. */
 
-    /* Words are fetched through one host pointer over a span of the list,
-     * looked up again only when a command redirects the list or the span
-     * runs out: a translated load per word was a sixth of the walk. The span
-     * lookup is the same translation, so an unmapped list still counts a bad
-     * access, and a list in VRAM still reaches the access observer. */
-    const uint8_t *lp = NULL;
-    uint32_t lp_addr = 0, lp_end = 0;
+    list_span span = { NULL, 0, 0 };
     while (budget--) {
         if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
         /* A command adds at most two events; the walk goes on once the
          * timeline has made room (ge_advance). */
         if (!q->replay && g_ev_n + 2 > GE_EVENTS) { g_ge_xfull = 1; break; }
 
-        uint32_t word;
-        if (q->list != lp_addr || q->list + 4 > lp_end || !lp) {
-            uint32_t span = 4096;
-            lp = (const uint8_t *)psp_mem_ptr(q->list, span);
-            if (!lp) { span = 4; lp = (const uint8_t *)psp_mem_ptr(q->list, span); }
-            lp_addr = q->list; lp_end = lp ? q->list + span : 0;
-        }
-        if (lp) { memcpy(&word, lp, 4); lp += 4; lp_addr += 4; }
-        else word = psp_read32(q->list);
+        const uint32_t word = fetch_word(&span, q->list);
         uint32_t cmd  = word >> 24;
         uint32_t arg  = word & 0x00FFFFFF;
         /* A FINISH waits for the drawing before it (see "When the GE
@@ -4416,41 +4851,20 @@ static void run_list_body(ge_queue *q) {
         switch (cmd) {
         case GE_NOP:
             break;
-
-        case GE_PRIM: {
-            uint32_t type  = (arg >> 16) & 7;
-            uint32_t count = arg & 0xFFFF;
-            g_ge.prims[type]++;
-            /* A game that never writes FBP still draws somewhere -- register
-             * the default target lazily so the census is never empty. */
-            if (g_ge.n_targets == 0)
-                ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
-            g_ge.targets[g_ge.cur_target].prims++;
-            g_ge.vertices += count;
-            const uint64_t px0 = psp_render_pixels();
-            draw_prim(type, count);
-            advance_vertices(count);
-            g_ge_t += GE_PRIM_UNITS + GE_VERTEX_UNITS * count;
-            ge_back_push(psp_render_pixels() - px0);
+        case GE_PRIM:
+            run_prim(arg);
             break;
-        }
         case GE_BEZIER:
-        case GE_SPLINE: {
-            g_ge.prims[3]++;
-            const uint64_t px0 = psp_render_pixels();
-            draw_patch(cmd == GE_SPLINE, arg);
-            if (g_ge_hang) { g_ge_hang = 0; q->hung = 1; return; }
-            g_ge_t += GE_PRIM_UNITS + GE_VERTEX_UNITS * (arg & 0xFF) * ((arg >> 8) & 0xFF);
-            ge_back_push(psp_render_pixels() - px0);
+        case GE_SPLINE:
+            if (!run_patch(cmd, arg)) { q->hung = 1; return; }
             break;
-        }
 
         case GE_JUMP:
-            q->list = (q->base | (arg & 0xFFFFFC));
+            q->list = list_target(q, arg);
             break;
         case GE_CALL:
             if (q->sp < GE_STACK) q->stack[q->sp++] = q->list;
-            q->list = (q->base | (arg & 0xFFFFFC));
+            q->list = list_target(q, arg);
             break;
         case GE_RET:
             if (q->sp > 0) q->list = q->stack[--q->sp];
@@ -4464,397 +4878,21 @@ static void run_list_body(ge_queue *q) {
              * is read only once the stall address has passed it, so the
              * placeholder libgu's sceGuBeginObject writes is never taken:
              * sceGuEndObject has patched it by then. */
-            if (g_ge.bbox_hidden) q->list = (q->base | (arg & 0xFFFFFC));
+            if (g_ge.bbox_hidden) q->list = list_target(q, arg);
             break;
 
-        case GE_FINISH:
-            if (q->signal == GE_SIGNAL_SYNC) {
-                /* A sync point's FINISH flushes what came before it and the
-                 * list goes on: no finish handler, no capture snapshot, and
-                 * the list is not done. The END after it clears the mark. */
-                psp_render_current()->finish();
-                break;
-            }
-            if (q->signal == GE_SIGNAL_HANDLER_PAUSE) {
-                /* sceGuSignal(GU_SIGNAL_PAUSE) writes SIGNAL, END, FINISH,
-                 * END. geprobe 5 step 57 (fw 6.60): the signal handler runs
-                 * at the SIGNAL, inside EnQueue; then the list stops until
-                 * sceGeContinue -- 20 ms on, one handler has run,
-                 * ListSync(peek) reads 4 and DrawSync(peek) 2 -- and this
-                 * FINISH calls no finish handler. After sceGeContinue the
-                 * rest runs, inside the call as a new list would. It stops
-                 * here, at the FINISH, and resumes at the END after it. A
-                 * sceGeContinue that came first (from the signal handler)
-                 * lets it through; not measured. */
-                psp_render_current()->finish();
-                if (q->cont_early) { q->cont_early = 0; break; }
-                /* A capture's replay has no guest to call sceGeContinue, so
-                 * it goes on through to the list's real FINISH. */
-                if (q->replay) break;
-                q->xpaused = 1;
-                ev_push(GE_EV_PAUSE, q, 0, 0, 0, t0);
-                return;
-            }
-            g_ge.finishes++;
-            cap_snapshot_memory();
-            /* The end of a list is what finish() means, and until now nothing
-             * called it -- the interface has documented it as "a good point to
-             * flush batched work" since it was written, and the software path
-             * never noticed because it draws each primitive immediately and
-             * has nothing to batch. A backend that accumulates geometry has no
-             * flush point without this, so its batch spans a whole frame. */
-            psp_render_current()->finish();
-            /* The list is done before its handler runs, so a handler that
-             * asks after it is told so. Not measured. */
-            ge_x_done(q, t0);
-            ge_x_raise(q, 1, arg, q->list + 4, t0);
-            return;
-
-        case GE_END: {
-            /* END is also the second word of every SIGNAL encoding. Treating
-             * it as list completion drops everything after a signal -- in
-             * this game, the rest of the scene and the entire HUD. */
-            uint32_t signal = psp_read32(q->list - 8);
-            if ((signal >> 24) != GE_SIGNAL) {
-                if ((signal >> 24) == GE_FINISH &&
-                    (q->signal == GE_SIGNAL_HANDLER_PAUSE || q->signal == GE_SIGNAL_SYNC)) {
-                    q->signal = 0;
-                    break;
-                }
-                /* Preserve the old bare-END fallback. Normal completed lists
-                 * stop at FINISH above and never reach their trailing END. */
-                cap_snapshot_memory();
-                psp_render_current()->finish();
-                ge_x_done(q, t0);
-                return;
-            }
-
-            uint32_t behaviour = (signal >> 16) & 0xFF;
-            if (behaviour == GE_SIGNAL_HANDLER_PAUSE || behaviour == GE_SIGNAL_SYNC) {
-                q->signal = (int)behaviour;
-            }
-            break;
-        }
-
-        case GE_SIGNAL:
-            /* Behaviours 1-3 (PSPSDK pspgu.h GU_SIGNAL_WAIT, NOWAIT, PAUSE)
-             * call the signal handler; the list then carries on, the PAUSE
-             * variant through its FINISH/END pair below. The jump/call/ret
-             * and other behaviours are not modelled and call nobody. A
-             * PAUSE is marked here, before its handler runs, so that a
-             * sceGeContinue from that handler finds it (cont_early);
-             * without the mark the handler's call did nothing and the list
-             * paused anyway. Which of the two the PSP does is not measured
-             * (geprobe 6 asks). The guest's Continue looks for the mark once
-             * the timeline has reached it (psig). */
-            if (((arg >> 16) & 0xFF) == GE_SIGNAL_HANDLER_PAUSE) {
-                q->signal = GE_SIGNAL_HANDLER_PAUSE;
-                if (!q->replay) ev_push(GE_EV_PSIG, q, 0, 0, 0, t0);
-            }
-            if (((arg >> 16) & 0xFF) >= 1 && ((arg >> 16) & 0xFF) <= 3)
-                ge_x_raise(q, 0, arg, q->list + 4, t0);
-            /* Behaviour 1 suspends the GE until its handler has returned:
-             * geprobe v24 scenes 146 and 152 (fw 6.60). The handler finds
-             * nothing behind its SIGNAL drawn, still nothing 1 ms on, and
-             * every word it rewrites there is the word the GE then draws.
-             * So the walk stops here, before the END, and the timeline
-             * resumes it once the handler has run (ge_resume_suspended).
-             * Behaviour 2 does not: its handler finds the words just behind
-             * it read already (scenes 147 and 153), and only a rewrite some
-             * 20 ms of drawing on is seen -- which the walk, having run on,
-             * does not see. A list with no signal handler, or a capture's
-             * replay, which has no guest to run one, goes on. */
-            if (((arg >> 16) & 0xFF) == GE_SIGNAL_SUSPEND && !q->replay &&
-                q->cbid >= 0 && q->cbid < GE_MAX_CALLBACKS && g_ge_cb[q->cbid].used &&
-                g_ge_cb[q->cbid].signal_func) {
-                q->xpaused = q->xsuspended = 1;
-                return;
-            }
-            break;
+        case GE_FINISH: if (run_finish(q, arg, t0)) return; break;
+        case GE_END:    if (run_end(q, t0))         return; break;
+        case GE_SIGNAL: if (run_signal(q, arg, t0)) return; break;
 
         case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
         case GE_ORIGIN_ADDR: q->origin = q->list - 4; break;
         case GE_OFFSET_ADDR: q->base = arg << 8; break;
-
-        case GE_VTYPE: g_ge.vtype = arg; break;
-
-        /* ---- transform state ----------------------------------------------
-         *
-         * NUMBER sets the write cursor, DATA advances it. Writes past the end
-         * are dropped: a list can be read while the CPU is still writing it,
-         * and wrapping the cursor would scribble over elements already set. */
-        case GE_WORLDMATRIXNUMBER:
-            if (drawlog_aux()) fprintf(stderr, "mtx: WORLD NUMBER arg=%06X -> %d\n",
-                                        arg, (int)(arg & 0xF));
-            g_tl.world_n = (int)(arg & 0xF); break;
-        case GE_VIEWMATRIXNUMBER:  g_tl.view_n  = (int)(arg & 0xF); break;
-        case GE_PROJMATRIXNUMBER:  g_tl.proj_n  = (int)(arg & 0x1F); break;
-        case GE_WORLDMATRIXDATA:
-            if (drawlog_aux()) fprintf(stderr, "mtx: WORLD DATA  arg=%06X -> [%d] = %.2f\n",
-                                        arg, g_tl.world_n, ge_float(arg));
-            if (g_tl.world_n < 12) {
-                g_tl.world[g_tl.world_n++] = ge_float(arg);
-                if (g_tl.world_n == 12) view_log_note_world();
-            }
-            g_tl.world_words++;
-            break;
-        case GE_VIEWMATRIXDATA:
-            if (g_tl.view_n < 12) {
-                g_tl.view[g_tl.view_n++] = ge_float(arg);
-                /* The twelfth word completes an upload. Noted here and not at
-                 * the frame boundary: the HUD draws last and sets a view of
-                 * its own, so by drain time the scene's matrix is gone. */
-                if (g_tl.view_n == 12) view_log_note();
-            }
-            g_tl.view_words++;
-            break;
-        case GE_PROJMATRIXDATA:
-            if (g_tl.proj_n < 16) g_tl.proj[g_tl.proj_n++] = ge_float(arg);
-            g_tl.proj_words++;
-            break;
-        case GE_BONEMATRIXNUMBER: g_tl.bone_n = (int)(arg & 0x7F); break;
-        case GE_BONEMATRIXDATA:
-            if (g_tl.bone_n < 8 * 12) { g_tl.bone[g_tl.bone_n++] = ge_float(arg); g_bone16_ok = 0; }
-            break;
-        case GE_MORPHWEIGHT0:     case GE_MORPHWEIGHT0 + 1: case GE_MORPHWEIGHT0 + 2:
-        case GE_MORPHWEIGHT0 + 3: case GE_MORPHWEIGHT0 + 4: case GE_MORPHWEIGHT0 + 5:
-        case GE_MORPHWEIGHT0 + 6: case GE_MORPHWEIGHT0 + 7:
-            g_tl.morph_w[cmd - GE_MORPHWEIGHT0] = ge_float(arg);
-            break;
-        case GE_PATCHDIVISION:
-            g_ge.patch_du = (int)(arg & 0x7F);            /* 7 bits: geprobe 13 */
-            g_ge.patch_dv = (int)((arg >> 8) & 0x7F);
-            break;
-        case GE_PATCHPRIMITIVE: g_ge.patch_prim = (int)(arg & 3); break;
-        case GE_PATCHFACING:    g_ge.patch_face = (int)(arg & 1); break;
-
-        case GE_VIEWPORTXSCALE:  g_tl.vp_xs = ge_float(arg); g_tl.vp_set = 1; break;
-        case GE_VIEWPORTYSCALE:  g_tl.vp_ys = ge_float(arg); g_tl.vp_set = 1; break;
-        case GE_VIEWPORTZSCALE:  g_tl.vp_zs = ge_float(arg); break;
-        case GE_VIEWPORTXCENTER: g_tl.vp_xc = ge_float(arg); break;
-        case GE_VIEWPORTYCENTER: g_tl.vp_yc = ge_float(arg); break;
-        case GE_VIEWPORTZCENTER: g_tl.vp_zc = ge_float(arg); break;
-
-        /* Offsets are in sixteenths of a pixel: sceGuOffset sends x << 4. */
-        case GE_OFFSETX: g_tl.off_x = (float)(arg & 0xFFFFFu) / 16.0f; break;
-        case GE_OFFSETY: g_tl.off_y = (float)(arg & 0xFFFFFu) / 16.0f; break;
-
-        case GE_COLORTESTENABLE: g_tl.blend.colour_test  = (int)(arg & 1); break;
-        case GE_COLORTEST:       g_tl.blend.colour_func  = (int)(arg & 3); break;
-        case GE_COLORREF:        g_tl.blend.colour_ref   = arg & 0xFFFFFFu; break;
-        case GE_COLORTESTMASK:   g_tl.blend.colour_mask  = arg & 0xFFFFFFu; break;
-        case GE_LOGICOPENABLE:   g_tl.blend.logic_enable = (int)(arg & 1); break;
-        case GE_LOGICOP:         g_tl.blend.logic_op     = (int)(arg & 15); break;
-        case GE_PIXELMASKRGB:
-            g_tl.blend.pixel_mask = (g_tl.blend.pixel_mask & 0xFF000000u) | (arg & 0xFFFFFFu);
-            break;
-        case GE_PIXELMASKALPHA:
-            g_tl.blend.pixel_mask = (g_tl.blend.pixel_mask & 0x00FFFFFFu) | ((arg & 0xFFu) << 24);
-            break;
-        case GE_CULLFACEENABLE: g_tl.cull_enable = (int)(arg & 1); break;
-        case GE_CULL:           g_tl.cull_ccw    = (int)(arg & 1); break;
-        /* Stored inverted, so the reset state (all zero) stays Gouraud, as it
-         * was before this register was decoded. */
-        case GE_SHADE:          g_tl.blend.shade_flat = !(arg & 1); break;
-        case GE_DITHERENABLE:   g_tl.blend.dither = (int)(arg & 1); break;
-        /* One matrix row each, four signed nibbles, element 0 lowest:
-         * sceGuSetDither's row {-4, 0, -3, 1} arrives as 0x001D0C. */
-        case GE_DITHER0: case GE_DITHER0 + 1: case GE_DITHER0 + 2: case GE_DITHER0 + 3:
-            for (int j = 0; j < 4; j++)
-                g_tl.blend.dither_m[cmd - GE_DITHER0][j] =
-                    (int8_t)((int)((arg >> (4 * j)) & 0xF) - (int)(((arg >> (4 * j)) & 0x8) << 1));
-            break;
-        /* ---- texture state -------------------------------------------------
-         *
-         * Recorded here and handed to the backend, which samples it: the
-         * software one in render.c, against geprobe's texel readings
-         * (docs/RENDERER.md). */
-        case GE_TEXFORMAT:
-            g_ge.tex_format = arg & 0xF;
-            g_ge.tex_formats_seen |= 1u << (arg & 0xF);
-            break;
-        case GE_TEXLEVEL:
-            g_ge.tex_lod_mode   = (int)(arg & 3);
-            g_ge.tex_lod_bias16 = (int)(int8_t)((arg >> 16) & 0xFF);
-            break;
-        case GE_TEXLODSLOPE: g_ge.tex_lod_slope = ge_float(arg); break;
-        case GE_TEXMODE:
-            g_ge.tex_max_level = (int)((arg >> 16) & 7);
-            g_ge.tex_swizzled = arg & 1;        /* bit 0 selects swizzled */
-            break;
-        case GE_CLUTFORMAT:
-            /* The low two bits are the palette format; the rest is how a texel
-             * indexes it -- shift, mask and a start offset. Keeping only the
-             * format, which is what this did, samples entry (texel & 0xFF) of
-             * whichever palette page happens to be first. */
-            g_ge.clut_raw    = arg;
-            g_ge.clut_format = arg & 3;
-            break;
-        case GE_CLUTADDR:      g_ge.clut_addr = split_addr_lo(g_ge.clut_addr, arg); break;
-        case GE_CLUTADDRUPPER: g_ge.clut_addr = split_addr_hi(g_ge.clut_addr, arg); break;
-        case GE_TEXFUNC:
-            g_ge.tex_func   = arg & 7;
-            g_ge.tex_tcc    = (arg >> 8) & 1;     /* RGBA: the texel's alpha takes part */
-            g_ge.tex_double = (arg >> 16) & 1;    /* colour doubling */
-            g_ge.tex_funcs_seen |= 1u << (arg & 7);
-            break;
-        case GE_TEXENVCOLOR:
-            g_ge.tex_env = arg & 0xFFFFFFu;
-            break;
-        case GE_TEXFILTER:
-            g_ge.tex_filter = arg & 0xFFFF;
-            break;
-        case GE_TEXMAPMODE:
-            g_tl.tex_map_mode  = (int)(arg & 3);
-            g_tl.tex_proj_mode = (int)((arg >> 8) & 3);
-            break;
-        case GE_TEXSHADELS:
-            g_tl.tex_shade_u = (int)(arg & 3);
-            g_tl.tex_shade_v = (int)((arg >> 8) & 3);
-            break;
-        case GE_DEPTHCLIPENABLE: g_tl.depth_clamp = (int)(arg & 1); break;
-        case GE_LIGHTINGENABLE: g_tl.lighting = (int)(arg & 1); break;
-        case GE_FOGENABLE: g_tl.fog_enable = (int)(arg & 1); break;
-        case GE_FOG1:      g_tl.fog_end   = ge_float(arg); break;
-        case GE_FOG2:      g_tl.fog_range = ge_float(arg); break;
-        case GE_FOGCOLOR:  ge_colour3(arg, g_tl.fog_colour); g_tl.fog_colour_raw = arg & 0xFFFFFFu; break;
-        case GE_IMM_VSCX: g_imm.x   = arg & 0xFFFFFFu; break;
-        case GE_IMM_VSCY: g_imm.y   = arg & 0xFFFFFFu; break;
-        case GE_IMM_VSCZ: g_imm.z   = arg & 0xFFFFu;   break;
-        case GE_IMM_VTCS: case GE_IMM_VTCT: case GE_IMM_VTCQ: case GE_IMM_SCV: break;
-        case GE_IMM_CV:   g_imm.rgb = arg & 0xFFFFFFu; break;
-        case GE_IMM_FC:   g_imm.fog = arg & 0xFFu;     break;
-        case GE_IMM_AP:   imm_vertex(arg);             break;
-        case GE_LIGHTMODE:      g_tl.light_mode = (int)(arg & 1); break;
-        case GE_MATERIALUPDATE: g_tl.mat_update = (int)(arg & 7); break;
-        case GE_MATERIALEMISSIVE: ge_colour3(arg, g_tl.mat_emissive); break;
-        case GE_AMBIENTCOLOR:     ge_colour3(arg, g_tl.mat_ambient);  break;
-        case GE_MATERIALDIFFUSE:  ge_colour3(arg, g_tl.mat_diffuse);  break;
-        case GE_MATERIALSPECULAR: ge_colour3(arg, g_tl.mat_specular); break;
-        case GE_AMBIENTALPHA:     g_tl.mat_alpha = (int)(arg & 0xFF); break;
-        case GE_MATERIALSPECCOEF: g_tl.mat_spec_coef = ge_float(arg); break;
-        case GE_AMBIENTLIGHT:     ge_colour3(arg, g_tl.global_amb); break;
-        case GE_AMBIENTLIGHTALPHA: break;   /* the global ambient's alpha does not reach a vertex */
-
-        case GE_FRAMEBUFPIXFORMAT:
-            g_ge.fbfmt = arg & 3;
-            ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
-            psp_render_current()->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
-            break;
-        case GE_SCISSOR1: g_ge.sc_x0 = (int)(arg & 0x3FF); g_ge.sc_y0 = (int)((arg >> 10) & 0x3FF); break;
-        case GE_SCISSOR2:
-            g_ge.sc_x1 = (int)(arg & 0x3FF); g_ge.sc_y1 = (int)((arg >> 10) & 0x3FF);
-            g_ge.sc_set = 1;
-            psp_render_current()->set_scissor(g_ge.sc_x0, g_ge.sc_y0, g_ge.sc_x1, g_ge.sc_y1);
-            break;
-        case GE_TGENMATRIXNUMBER: g_tl.tgen_n = (int)(arg & 0xF); break;
-        case GE_TGENMATRIXDATA:
-            if (g_tl.tgen_n < 12) g_tl.tgen[g_tl.tgen_n++] = ge_float(arg);
-            break;
-        case GE_TEXSCALEU:  g_ge.tex_scale_u  = ge_float(arg); break;
-        case GE_TEXSCALEV:  g_ge.tex_scale_v  = ge_float(arg); break;
-        case GE_TEXOFFSETU: g_ge.tex_offset_u = ge_float(arg); break;
-        case GE_TEXOFFSETV: g_ge.tex_offset_v = ge_float(arg); break;
-        case GE_TEXWRAP:
-            g_ge.tex_wrap = arg & 0xFFFF;
-            break;
-        case GE_LOADCLUT:
-            g_ge.clut_loads++;
-            break;
-
-        case GE_TEXTUREMAPENABLE: g_ge.tex_enable = arg & 1; break;
-
-        case GE_ALPHABLENDENABLE: g_tl.blend.enable     = (int)(arg & 1); break;
-        case GE_ALPHATESTENABLE:  g_tl.blend.alpha_test = (int)(arg & 1); break;
-        case GE_STENCILTESTENABLE: g_tl.blend.stencil_test = (int)(arg & 1); break;
-        case GE_STENCILTEST:
-            g_tl.blend.stencil_func = (int)(arg & 7);
-            g_tl.blend.stencil_ref  = (int)((arg >> 8) & 0xFF);
-            g_tl.blend.stencil_mask = (int)((arg >> 16) & 0xFF);
-            break;
-        case GE_STENCILOP:
-            g_tl.blend.op_sfail = (int)(arg & 7);
-            g_tl.blend.op_zfail = (int)((arg >> 8) & 7);
-            g_tl.blend.op_zpass = (int)((arg >> 16) & 7);
-            break;
-        case GE_BLENDMODE:
-            g_tl.blend.src = (int)(arg & 0xF);
-            g_tl.blend.dst = (int)((arg >> 4) & 0xF);
-            g_tl.blend.eq  = (int)((arg >> 8) & 7);
-            break;
-        case GE_BLENDFIXEDA: g_tl.blend.fixa = arg & 0xFFFFFFu; break;
-        case GE_BLENDFIXEDB: g_tl.blend.fixb = arg & 0xFFFFFFu; break;
-        case GE_ALPHATEST:
-            g_tl.blend.alpha_func = (int)(arg & 7);
-            g_tl.blend.alpha_ref  = (int)((arg >> 8) & 0xFF);
-            g_tl.blend.alpha_mask = (int)((arg >> 16) & 0xFF);
-            break;
-        case GE_ZTESTENABLE:   g_tl.ztest_enable = (int)(arg & 1); break;
-        case GE_ZTEST:         g_tl.ztest_func   = (int)(arg & 7); break;
-        case GE_ZWRITEDISABLE: g_tl.zwrite_off   = (int)(arg & 1); break;
-        /* Clear mode turns the draw into a blit of the clear values: the depth
-         * test is bypassed and depth is written only when the Z bit is set. */
-        case GE_CLEARMODE:
-            if (drawlog_aux())
-                fprintf(stderr, "clr: CLEARMODE arg=%06X  enable %d  colour %d "
-                                "alpha %d  depth %d\n",
-                        arg, (int)(arg & 1), (int)((arg >> 8) & 1),
-                        (int)((arg >> 9) & 1), (int)((arg >> 10) & 1));
-            g_tl.clear_mode   = (int)(arg & 1);
-            g_tl.clear_stencil = (int)((arg >> 9) & 1);
-            g_tl.clear_colour = (int)((arg >> 8) & 1);
-            g_tl.clear_z      = (int)((arg >> 10) & 1);
-            break;
-
-        case GE_TRANSFERSRC:    g_ge.xfer_src    = arg; break;
-        case GE_TRANSFERSRCW:   g_ge.xfer_srcw   = arg; break;
-        case GE_TRANSFERDST:    g_ge.xfer_dst    = arg; break;
-        case GE_TRANSFERDSTW:   g_ge.xfer_dstw   = arg; break;
-        case GE_TRANSFERSRCPOS: g_ge.xfer_srcpos = arg; break;
-        case GE_TRANSFERDSTPOS: g_ge.xfer_dstpos = arg; break;
-        case GE_TRANSFERSIZE:   g_ge.xfer_size   = arg; break;
-        case GE_TRANSFERSTART:
-            g_ge.xfer_start = arg;
-            do_block_transfer();
-            break;
-
-        case GE_FBP:
-            g_ge.fbp = buf_addr_lo(g_ge.fbp, arg);
-            ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
-            psp_render_current()->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
-            break;
-        case GE_FBW:
-            g_ge.fbw = arg & 0xFFFF;
-            g_ge.fbp = buf_addr_hi(g_ge.fbp, arg);
-            ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
-            psp_render_current()->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
-            break;
-
-        /* The depth buffer: low 24 bits of the address in ZBP, the high byte
-         * and the stride in ZBW, the same split as FBP/FBW. */
-        case GE_ZBP:
-            g_ge.zbp = buf_addr_lo(g_ge.zbp, arg);
-            psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
-            break;
-        case GE_ZBW:
-            g_ge.zbw = arg & 0xFFFF;
-            g_ge.zbp = buf_addr_hi(g_ge.zbp, arg);
-            psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
-            break;
-
         case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
         case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)); break;
 
         default:
-            if (set_texture_level(cmd, arg) || set_light(cmd, arg)) break;
-            /* A real state command we do not decode individually. Counted --
-             * and, for the first few, named. "240 commands not individually
-             * decoded" hides whether the game is configuring a draw or just
-             * poking state, which is the difference between a rendering bug
-             * and a game that has not asked to render yet. */
-            if (g_ge.unknown < 64)
-                fprintf(stderr, "  GE cmd 0x%02X arg 0x%06X\n", cmd, arg);
-            g_ge.unknown++;
+            set_register(cmd, arg);
             break;
         }
         if (g_prof_on > 0) { g_prof_op[cmd] += ge_prof_now() - _c0; g_prof_opn[cmd]++; }
