@@ -118,7 +118,9 @@ static const psp_pad_bind PAD_MODERN[] = {
 
 /* ---- sources, targets, bindings -------------------------------------------- */
 
-enum { DEV_KEY, DEV_PAD, DEV_MOUSE, DEVICES };
+/* The devices, numbered as the menu's INPUT_KEYBOARD, INPUT_CONTROLLER and
+ * INPUT_MOUSE (input.h). */
+enum { DEV_KEY = INPUT_KEYBOARD, DEV_PAD = INPUT_CONTROLLER, DEV_MOUSE = INPUT_MOUSE, DEVICES = INPUT_DEVICES };
 static const char *const DEVICE_NAME[DEVICES] = { "key", "pad", "mouse" };
 
 enum {
@@ -334,10 +336,12 @@ static const char *mismatch(const binding *b) {
 
 /* ---- building the table ------------------------------------------------------ */
 
-static void add(int device, int src, int32_t code, int tgt, uint32_t value) {
-    if (g_nbinds >= BINDINGS_MAX) return;
-    g_binds[g_nbinds++] = (binding){ .device = (uint8_t)device, .src = (uint8_t)src, .code = code,
-                                     .tgt = (uint8_t)tgt, .value = value };
+static binding *add(int device, int src, int32_t code, int tgt, uint32_t value) {
+    if (g_nbinds >= BINDINGS_MAX) return NULL;
+    binding *b = &g_binds[g_nbinds++];
+    *b = (binding){ .device = (uint8_t)device, .src = (uint8_t)src, .code = code,
+                    .tgt = (uint8_t)tgt, .value = value };
+    return b;
 }
 
 static int same_target(const binding *a, const binding *b) {
@@ -372,8 +376,8 @@ static void build_defaults(void) {
     add(DEV_KEY, SRC_KEY, SDLK_F9, TGT_ACTION, INPUT_ACTION_QUICK_LOAD);
     add(DEV_KEY, SRC_KEY, SDLK_F6, TGT_ACTION, INPUT_ACTION_SLOT_PREV);
     add(DEV_KEY, SRC_KEY, SDLK_F7, TGT_ACTION, INPUT_ACTION_SLOT_NEXT);
-    add(DEV_KEY, SRC_KEY, SDLK_q, TGT_ACTION, INPUT_ACTION_QUIT);
-    g_binds[g_nbinds - 1].mods = KMOD_CTRL | KMOD_SHIFT;
+    binding *quit = add(DEV_KEY, SRC_KEY, SDLK_q, TGT_ACTION, INPUT_ACTION_QUIT);
+    if (quit) quit->mods = KMOD_CTRL | KMOD_SHIFT;
 
     /* The mouse: its buttons under WASD, its motion whenever it is captured. */
     if (g_keys_wasd) {
@@ -453,7 +457,18 @@ static void find_keys(void) {
         if (g_binds[i].src == SRC_KEY) g_binds[i].scancode = SDL_GetScancodeFromKey(g_binds[i].code);
 }
 
+/* The table: the layouts in force, then s's bind.* keys over them. */
+static void bind_table(const psp_settings *s) {
+    build_defaults();
+    for (int i = 0; i < s->bind_count; i++) apply_binding(s->bind[i].key, s->bind[i].value);
+    find_keys();
+}
+
 /* ---- working out the pad ------------------------------------------------------ */
+
+/* An axis half is pressed from halfway and let go below a quarter: separate
+ * points avoid chatter around one without making a light touch sticky. */
+enum { AXIS_PRESS = 16384, AXIS_RELEASE = 8192 };
 
 static uint8_t axis_byte(int16_t value) {
     /* The whole SDL range. The title's control profile applies one radial
@@ -470,11 +485,9 @@ static int down(binding *b) {
     case SRC_SCANCODE: return g_key_down[b->code];
     case SRC_BUTTON: return g_pad_down[b->code];
     case SRC_AXIS_POS: case SRC_AXIS_NEG: {
-        /* Separate 50%/25% press and release points avoid chatter around
-         * the actuation point without making a light touch sticky. */
         const int v = b->src == SRC_AXIS_POS ? g_pad_axis[b->code] : -(int)g_pad_axis[b->code];
-        if (!b->held && v >= 16384) b->held = 1;
-        if ( b->held && v <=  8192) b->held = 0;
+        if (!b->held && v >= AXIS_PRESS) b->held = 1;
+        if ( b->held && v <= AXIS_RELEASE) b->held = 0;
         return b->held;
     }
     case SRC_MOUSE_BUTTON: return (g_mouse_down & SDL_BUTTON(b->code)) != 0;
@@ -690,7 +703,7 @@ static int pressed_elsewhere(const SDL_Event *e) {
     if (!g_pad_last) return 0;
     SDL_JoystickID id;
     if (e->type == SDL_CONTROLLERBUTTONDOWN) id = e->cbutton.which;
-    else if (e->type == SDL_CONTROLLERAXISMOTION && abs(e->caxis.value) >= 16384) id = e->caxis.which;
+    else if (e->type == SDL_CONTROLLERAXISMOTION && abs(e->caxis.value) >= AXIS_PRESS) id = e->caxis.which;
     else return 0;
     if (id == g_controller_id) return 0;
     const int i = pad_slot(id);
@@ -1054,7 +1067,7 @@ int input_spell(const SDL_Event *e, int device, char *out, size_t size) {
         snprintf(out, size, "%s", SDL_GameControllerGetStringForButton((SDL_GameControllerButton)e->cbutton.button));
         return 1;
     case SDL_CONTROLLERAXISMOTION: {
-        if (device != DEV_PAD || abs(e->caxis.value) < 16384) return 0;
+        if (device != DEV_PAD || abs(e->caxis.value) < AXIS_PRESS) return 0;
         const SDL_GameControllerAxis a = (SDL_GameControllerAxis)e->caxis.axis;
         const int trigger = a == SDL_CONTROLLER_AXIS_TRIGGERLEFT || a == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
         if (trigger && e->caxis.value < 0) return 0;
@@ -1102,9 +1115,7 @@ void input_rebuild(const psp_settings *s) {
     g_keys_wasd = option_value(s, "KEYS", 0) != 0;
     const int was_last = g_pad_last;
     g_pad_last = option_value(s, "ACTIVE_PAD", 0) != 0;
-    build_defaults();
-    for (int i = 0; i < s->bind_count; i++) apply_binding(s->bind[i].key, s->bind[i].value);
-    find_keys();
+    bind_table(s);
     if (g_pad_last && !was_last) open_controllers();
     publish();
 }
@@ -1116,9 +1127,7 @@ static void build(const psp_settings *s) {
     g_keys_wasd = option_value(s, "KEYS", 0) != 0;
     g_gamepad_modern = gamepad_modern(s);
     g_keys_modern = s->input && (g_title->capabilities & PSP_TITLE_MODERN_CONTROLS);
-    build_defaults();
-    for (int i = 0; i < s->bind_count; i++) apply_binding(s->bind[i].key, s->bind[i].value);
-    find_keys();
+    bind_table(s);
 }
 
 static void print_controls(const psp_settings *s) {
