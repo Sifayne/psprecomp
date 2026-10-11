@@ -76,14 +76,15 @@ void psp_census_print_park(FILE *out, const psp_park *p) {
 
 /* PSPRECOMP_PARK_CENSUS: the polls to take a census at, ascending. */
 uint32_t psp_census_next;
-static uint32_t g_polls[32];
+enum { POLLS_MAX = 32 };
+static uint32_t g_polls[POLLS_MAX];
 static int g_npolls, g_at;
 
 void psp_census_init(void) {
     const char *spec = getenv("PSPRECOMP_PARK_CENSUS");
     g_npolls = g_at = 0;
     psp_census_next = 0;
-    while (spec && *spec && g_npolls < 32) {
+    while (spec && *spec && g_npolls < POLLS_MAX) {
         char *end;
         const unsigned long v = strtoul(spec, &end, 10);
         if (end == spec) break;

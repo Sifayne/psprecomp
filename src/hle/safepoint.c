@@ -50,7 +50,8 @@ static int boundary(uint32_t nid) {
 static _Atomic int g_request, g_held;
 static _Atomic uint64_t g_holds;
 static void (*g_redraw)(void);
-static struct { uint32_t poll, ms; } g_script[32];
+enum { SCRIPT_MAX = 32 };
+static struct { uint32_t poll, ms; } g_script[SCRIPT_MAX];
 static int g_nscript, g_script_at;
 
 void psp_pause_request(int hold) {
@@ -75,7 +76,7 @@ void psp_safepoint_init(void) {
     psp_state_init();
     const char *spec = getenv("PSPRECOMP_PAUSE_AT");
     g_nscript = g_script_at = 0;
-    while (spec && *spec && g_nscript < 32) {
+    while (spec && *spec && g_nscript < SCRIPT_MAX) {
         char *end;
         const unsigned long poll = strtoul(spec, &end, 10);
         if (end == spec || *end != ':') break;
@@ -92,8 +93,11 @@ void psp_safepoint_init(void) {
  * withdrawn. This thread keeps the scheduler token, so nothing of the guest
  * runs; the redraw keeps the window alive at about display rate. A host
  * that is stopping the run ends the hold at once. */
+#define REDRAW_NS 16666667u     /* a frame at 60 Hz */
+
 static void hold(uint32_t ms, const char *why) {
     const uint64_t start = psp_os_mono_ns();
+    const uint64_t span = (uint64_t)ms * 1000000u;
     fprintf(stderr, "pause: %s at poll %u, guest time %.3f s\n", why, psp_ctrl_polls(),
             psp_clock_peek() / 1e6);
     psp_clock_hold();
@@ -101,11 +105,11 @@ static void hold(uint32_t ms, const char *why) {
     unsigned redraws = 0;
     while (!psp_sched_stopping()) {
         const uint64_t now = psp_os_mono_ns();
-        if (ms ? now - start >= (uint64_t)ms * 1000000u : !g_request) break;
+        if (ms ? now - start >= span : !g_request) break;
         psp_state_held();
         if (g_redraw) { g_redraw(); redraws++; }
-        uint64_t next = now + 16666667u;
-        if (ms && next > start + (uint64_t)ms * 1000000u) next = start + (uint64_t)ms * 1000000u;
+        uint64_t next = now + REDRAW_NS;
+        if (ms && next > start + span) next = start + span;
         psp_os_sleep_until_ns(next);
     }
     g_held = 0;
