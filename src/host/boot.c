@@ -909,7 +909,7 @@ int main(int argc, char **argv) {
     const int aspect_option = psp_settings_find("ASPECT");
     const int adaptive_aspect = aspect_option >= 0 && settings.number[aspect_option] != 0;
     const int resolution = (int)settings.number[PSP_OPT_RESOLUTION];
-    const char *render = settings.render == 2 ? "gl" : settings.render == 3 ? "null" : "software";
+    const char *render = psp_renderer_name(settings.render);
 
     /* Backends the runtime cannot carry are registered before anything can
      * select one. "gl" is absent from the list on a host built without SDL2,

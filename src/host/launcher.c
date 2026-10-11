@@ -348,7 +348,7 @@ static void launch_game(launcher *a) {
     }
     psp_settings effective = a->edit;
     char error[PSP_SETTINGS_ERROR];
-    if (!psp_settings_env(&effective, error) && !psp_settings_resolve(&effective, error) && effective.render == 3) {
+    if (!psp_settings_env(&effective, error) && !psp_settings_resolve(&effective, error) && effective.render == PSP_RENDERER_NULL) {
         strcpy(a->status, "The null renderer is for diagnostics. Choose OpenGL or software before playing."); return;
     }
     if (save(a)) return;

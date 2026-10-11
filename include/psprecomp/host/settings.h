@@ -116,6 +116,13 @@ typedef struct {
     psp_binding bind[PSP_BINDS_MAX];
 } psp_settings;
 
+/* psp_settings.render: RENDER's choices, which Automatic resolves to one of. */
+enum { PSP_RENDERER_SOFTWARE = 1, PSP_RENDERER_GL = 2, PSP_RENDERER_NULL = 3 };
+/* The render backend's name for a psp_settings.render. */
+static inline const char *psp_renderer_name(int render) {
+    return render == PSP_RENDERER_GL ? "gl" : render == PSP_RENDERER_NULL ? "null" : "software";
+}
+
 typedef struct {
     /* The pack's name, heading its pages in the launcher; and its id, which
      * names its section of the preferences file, [pack <id>] -- the folder

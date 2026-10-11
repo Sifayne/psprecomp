@@ -357,12 +357,12 @@ int psp_settings_resolve(psp_settings *s, char *error) {
     for (int i = 0; i < psp_settings_count(); i++)
         if ((psp_settings_option(i)->flags & PSP_OPTION_NEEDS_GL) && s->number[i]) enhanced = 1;
     s->render = (int)s->number[PSP_OPT_RENDER];
-    if (!s->render) s->render = enhanced ? 2 : 1; /* software=1, gl=2, null=3 */
-    if (enhanced && s->render != 2)
+    if (!s->render) s->render = enhanced ? PSP_RENDERER_GL : PSP_RENDERER_SOFTWARE;
+    if (enhanced && s->render != PSP_RENDERER_GL)
         return fail(error, "RENDER", sc->gl_error ? sc->gl_error
                                      : "this choice requires OpenGL; choose Automatic or OpenGL");
     if (sc->resolve && sc->resolve(s, error)) return -1;
-    s->window = s->number[PSP_OPT_WINDOW] != 0 || s->number[PSP_OPT_WINDOW_MODE] != 0 || s->render == 2;
+    s->window = s->number[PSP_OPT_WINDOW] != 0 || s->number[PSP_OPT_WINDOW_MODE] != 0 || s->render == PSP_RENDERER_GL;
     s->realtime = s->window || s->number[PSP_OPT_REALTIME] != 0;
     s->language = s->number[PSP_OPT_LANGUAGE] ? (int)s->number[PSP_OPT_LANGUAGE] - 1 : psp_settings_host_language();
     s->confirm_cross = s->number[PSP_OPT_CONFIRM] ? s->number[PSP_OPT_CONFIRM] == 1 : s->language != 0;
@@ -394,7 +394,7 @@ void psp_settings_print(const psp_settings *s, FILE *out) {
     for (int i = 0; i < s->bind_count; i++)
         fprintf(out, "bind.%-19s = %-12s [file]\n", s->bind[i].key, s->bind[i].value);
     fprintf(out, "effective: renderer=%s gamepad=%s window=%d realtime=%d language=%d confirm=%s",
-            s->render == 2 ? "gl" : s->render == 3 ? "null" : "software",
+            psp_renderer_name(s->render),
             s->gamepad ? "modern" : "classic", s->window, s->realtime,
             s->language, s->confirm_cross ? "cross" : "circle");
     if (sc->print_effective) sc->print_effective(s, out);
