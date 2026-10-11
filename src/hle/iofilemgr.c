@@ -775,7 +775,20 @@ static void hle_getstat_body(void) {
  * compiles in are the 8.3-style ones this reads.
  */
 #define ISO_PVD_SECTOR  16u
+#define ISO_PVD_ROOT    156u    /* the root directory's record in the descriptor */
 #define ISO_DIR_IS_DIR  0x02u   /* flags byte in a directory record */
+/* A directory record's fields by offset (ECMA-119 9.1), after its length
+ * byte: the extent's first sector and its length, each the little-endian
+ * half of a both-endian pair; the flags; the name's length; the name. */
+#define ISO_REC_LBA      2u
+#define ISO_REC_SIZE     10u
+#define ISO_REC_FLAGS    25u
+#define ISO_REC_NAME_LEN 32u
+#define ISO_REC_NAME     33u
+
+/* An extent on the disc: its first sector, its length in bytes, and whether
+ * it holds a directory. */
+typedef struct { uint32_t lba, len; int is_dir; } iso_extent;
 
 static uint32_t rd32le(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -806,11 +819,24 @@ static int iso_name_eq(const uint8_t *rec_name, unsigned rec_len, const char *wa
     return i == n && want[i] == '\0';
 }
 
-/* Find `path` under the directory extent at `lba`, `bytes` long. On success
- * fills the extent and length of what it found. */
-static int iso_lookup_in(FILE *f, uint32_t lba, uint32_t bytes,
-                         const char *path, uint32_t *out_lba, uint32_t *out_len,
-                         int *out_is_dir) {
+/* The directory record at *off in an extent of `bytes`, with *off moved past
+ * it; NULL at the end, or at a record that runs past it. A directory record
+ * never straddles a sector, so a zero length is padding to the end of this
+ * one. */
+static const uint8_t *iso_record(const uint8_t *dir, uint32_t bytes, uint32_t *off) {
+    while (*off + ISO_REC_NAME <= bytes) {
+        const uint8_t *r = dir + *off;
+        if (!r[0]) { *off = (*off / ISO_SECTOR + 1) * ISO_SECTOR; continue; }
+        if (*off + r[0] > bytes) return NULL;
+        *off += r[0];
+        return r;
+    }
+    return NULL;
+}
+
+/* Find `path` under the directory extent `dir`. On success fills `found`
+ * with the extent of what it found. */
+static int iso_lookup_in(FILE *f, iso_extent dir, const char *path, iso_extent *found) {
     /* Split off the first component. */
     while (*path == '/' || *path == '\\') path++;
     if (!*path) return -1;
@@ -822,37 +848,28 @@ static int iso_lookup_in(FILE *f, uint32_t lba, uint32_t bytes,
     comp[c] = '\0';
     const char *rest = path + c;
 
-    uint8_t *dir = (uint8_t *)malloc(bytes ? bytes : 1);
-    if (!dir) return -1;
-    if (iso_read_at(f, (uint64_t)lba * ISO_SECTOR, dir, bytes) != 0) { free(dir); return -1; }
+    uint8_t *recs = (uint8_t *)malloc(dir.len ? dir.len : 1);
+    if (!recs) return -1;
+    if (iso_read_at(f, (uint64_t)dir.lba * ISO_SECTOR, recs, dir.len) != 0) { free(recs); return -1; }
 
     int rc = -1;
-    for (uint32_t off = 0; off + 33 <= bytes; ) {
-        const uint32_t rec = dir[off];
-        if (!rec) {
-            /* A directory record never straddles a sector, so a zero length is
-             * padding to the end of this one. */
-            off = (off / ISO_SECTOR + 1) * ISO_SECTOR;
-            continue;
+    uint32_t off = 0;
+    for (const uint8_t *r; (r = iso_record(recs, dir.len, &off)) != NULL; ) {
+        const unsigned nlen = r[ISO_REC_NAME_LEN];
+        if ((uint32_t)(r - recs) + ISO_REC_NAME + nlen > dir.len ||
+            !iso_name_eq(r + ISO_REC_NAME, nlen, comp)) continue;
+        const iso_extent e = { rd32le(r + ISO_REC_LBA), rd32le(r + ISO_REC_SIZE),
+                               (r[ISO_REC_FLAGS] & ISO_DIR_IS_DIR) != 0 };
+        while (*rest == '/' || *rest == '\\') rest++;
+        if (!*rest) {
+            *found = e;
+            rc = 0;
+        } else if (e.is_dir) {
+            rc = iso_lookup_in(f, e, rest, found);
         }
-        if (off + rec > bytes) break;
-        const uint8_t *r = dir + off;
-        const unsigned nlen = r[32];
-        if (off + 33 + nlen <= bytes && iso_name_eq(r + 33, nlen, comp)) {
-            const uint32_t elba = rd32le(r + 2), elen = rd32le(r + 10);
-            const int isdir = (r[25] & ISO_DIR_IS_DIR) != 0;
-            while (*rest == '/' || *rest == '\\') rest++;
-            if (!*rest) {
-                *out_lba = elba; *out_len = elen; *out_is_dir = isdir;
-                rc = 0;
-            } else if (isdir) {
-                rc = iso_lookup_in(f, elba, elen, rest, out_lba, out_len, out_is_dir);
-            }
-            break;
-        }
-        off += rec;
+        break;
     }
-    free(dir);
+    free(recs);
     return rc;
 }
 
@@ -915,8 +932,8 @@ static int iso_lookup(const char *guest, iso_entry *e)
     }
 
     /* The root directory record sits at offset 156 of the descriptor. */
-    const uint8_t *root = pvd + 156;
-    const uint32_t root_lba = rd32le(root + 2), root_len = rd32le(root + 10);
+    const uint8_t *rr = pvd + ISO_PVD_ROOT;
+    const iso_extent root = { rd32le(rr + ISO_REC_LBA), rd32le(rr + ISO_REC_SIZE), 1 };
 
     memset(e, 0, sizeof *e);
     e->f = f;
@@ -927,8 +944,8 @@ static int iso_lookup(const char *guest, iso_entry *e)
             e->len = (uint64_t)ftello(f); e->is_device = 1;
             return 0;
         }
-        e->base = (uint64_t)root_lba * ISO_SECTOR;   /* disc0:/ is the root */
-        e->len = root_len; e->is_dir = e->is_root = 1;
+        e->base = (uint64_t)root.lba * ISO_SECTOR;   /* disc0:/ is the root */
+        e->len = root.len; e->is_dir = e->is_root = 1;
         return 0;
     }
 
@@ -940,15 +957,14 @@ static int iso_lookup(const char *guest, iso_entry *e)
         return 0;
     }
 
-    uint32_t lba = 0, blen = 0;
-    int isdir = 0;
-    if (iso_lookup_in(f, root_lba, root_len, p, &lba, &blen, &isdir) != 0) {
+    iso_extent found;
+    if (iso_lookup_in(f, root, p, &found) != 0) {
         fclose(f);
         return -1;
     }
-    e->base = (uint64_t)lba * ISO_SECTOR;
-    e->len = blen;
-    e->is_dir = isdir;
+    e->base = (uint64_t)found.lba * ISO_SECTOR;
+    e->len = found.len;
+    e->is_dir = found.is_dir;
     return 0;
 }
 
@@ -1152,21 +1168,14 @@ static void hle_Dread(void) {
         /* Walk the extent's records in stored order, skipping the self and
          * parent records: the probe's root listing was SUB, ALPHA.BIN,
          * BETA.TXT, with no "." or "..". */
-        while (entry->off + 33 <= entry->bytes) {
-            const uint8_t *r = entry->records + entry->off;
-            const uint32_t rec = r[0];
-            if (!rec) {                   /* padding to the end of this sector */
-                entry->off = (entry->off / ISO_SECTOR + 1) * ISO_SECTOR;
-                continue;
-            }
-            if (entry->off + rec > entry->bytes) break;
-            entry->off += rec;
-            const unsigned nlen = r[32];
-            if (33 + nlen > rec || (nlen == 1 && r[33] <= 1)) continue;
-            write_disc_stat(destination, (r[25] & ISO_DIR_IS_DIR) != 0, rd32le(r + 10), rd32le(r + 2));
+        for (const uint8_t *r; (r = iso_record(entry->records, entry->bytes, &entry->off)) != NULL; ) {
+            const unsigned nlen = r[ISO_REC_NAME_LEN];
+            if (ISO_REC_NAME + nlen > (uint32_t)r[0] || (nlen == 1 && r[ISO_REC_NAME] <= 1)) continue;
+            write_disc_stat(destination, (r[ISO_REC_FLAGS] & ISO_DIR_IS_DIR) != 0,
+                            rd32le(r + ISO_REC_SIZE), rd32le(r + ISO_REC_LBA));
             char output[256] = {0};
-            const unsigned length = iso_name_len(r + 33, nlen);
-            memcpy(output, r + 33, length < 255 ? length : 255);
+            const unsigned length = iso_name_len(r + ISO_REC_NAME, nlen);
+            memcpy(output, r + ISO_REC_NAME, length < 255 ? length : 255);
             psp_mem_write_block(destination + PSP_STAT_LEN, output, sizeof output);
             psp_ret(1);
             return;
