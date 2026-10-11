@@ -963,180 +963,206 @@ static void sd_write_save(uint32_t param, const char *dir, const char *dirname, 
 
 #include "savedata_io.h"
 
+/* What the modes read of the request, read once, in this order, before any
+ * of them acts. */
+typedef struct {
+    uint32_t param;
+    char     game[14], save[21], file[14];
+    uint32_t mode, buf, bufsz, datasz;
+} sd_req;
+
+/* AUTOSAVE into a save that exists already goes to the first entry of
+ * saveNameList that names no save, else to the list's first entry; with no
+ * list, or an empty first entry, to saveName after all. The save's dir goes
+ * to `dir`; SD_SAVE_ACCESS for a list entry it cannot use. */
+static uint32_t sd_autosave_dir(const sd_req *r, char *dir, size_t cap) {
+    const uint32_t list = psp_read32(r->param + SD_SAVENAMELIST);
+    char cand[21];
+    if (list) {
+        for (uint32_t i = 0; i < 100; i++) {
+            const uint64_t entry = (uint64_t)list + i * 20u;
+            if (entry > UINT32_MAX || !psp_mem_ptr((uint32_t)entry, 20)) return SD_SAVE_ACCESS;
+            sd_getstr((uint32_t)entry, 0, 20, cand, sizeof cand);
+            if (!cand[0]) break;
+            if (!sd_component(cand, 0) || strlen(cand) > 19) return SD_SAVE_ACCESS;
+            sd_dir(r->game, cand, dir, cap);
+            if (!sd_exists(dir)) return SD_OK;
+        }
+        sd_getstr(list, 0, 20, cand, sizeof cand);
+        if (!sd_component(cand, 1) || strlen(cand) > 19) return SD_SAVE_ACCESS;
+        if (cand[0]) { sd_dir(r->game, cand, dir, cap); return SD_OK; }
+    }
+    sd_dir(r->game, r->save, dir, cap);
+    return SD_OK;
+}
+
+/* The SAVE family and MAKEDATA. Target: param.saveName when it names a free
+ * slot, else the first free list entry, else the first entry (AUTOSAVE flow,
+ * matching the suite: ABC free beats F1/M2/L3). */
+static uint32_t sd_do_save(const sd_req *r) {
+    /* The SAVE family refuses the zero key before it writes anything
+     * (sd_zero_key; saveprobe steps 1, 112 and 115 leave no directory).
+     * MAKEDATA takes it: DPLAIN was made and written with the zero key at
+     * secureVersion 0 (steps 40-41). */
+    if ((r->mode == SD_AUTOSAVE || r->mode == SD_SAVE || r->mode == SD_LISTSAVE) && sd_zero_key(r->param))
+        return SD_SAVE_BAD_PARAMS;
+    char dir[512];
+    sd_dir(r->game, r->save, dir, sizeof dir);
+    if (r->mode == SD_AUTOSAVE && r->save[0] && sd_exists(dir)) {
+        const uint32_t rc = sd_autosave_dir(r, dir, sizeof dir);
+        if (rc != SD_OK) return rc;
+    }
+    /* The data file's class goes into PARAM.SFO's secure-file list. */
+    sd_transaction_write(r->param, dir, r->file);
+    return sd_io_error ? SD_SAVE_ACCESS : SD_OK;
+}
+
+/* The data file at `guest` into the request's buffer, and its length into
+ * dataSize: the bytes read when there is a buffer, the file's size when
+ * there is none. -1, with dataSize as it was, when the read fails. */
+static int sd_read_data(const sd_req *r, const char *guest) {
+    if (r->buf && r->bufsz) {
+        const int64_t n = sd_read_file(guest, r->buf, r->bufsz);
+        if (n < 0) return -1;
+        psp_write32(r->param + SD_DATASZ, (uint32_t)n);
+    } else {
+        psp_write32(r->param + SD_DATASZ, (uint32_t)sd_fsize(guest));
+    }
+    return 0;
+}
+
+/* The load family reads saveName directly -- an empty name denotes the
+ * bare game dir, and the list plays no role on these paths. Missing dir
+ * is NO_DATA, SFO-less is BROKEN, missing file is FILE_NOT_FOUND.
+ * Interactive selection has already written the chosen saveName. */
+static uint32_t sd_do_load(const sd_req *r) {
+    char dir[512], guest[512];
+    sd_dir(r->game, r->save, dir, sizeof dir);
+    if (!sd_exists(dir)) return SD_LOAD_NO_DATA;
+    if (!sd_has_sfo(dir)) return SD_LOAD_BROKEN;
+    if (!r->file[0]) return SD_OK;
+    /* Before the data file's own checks (step 72). Whether it also comes
+     * before a missing data file is unmeasured. */
+    if (sd_zero_key(r->param)) return SD_LOAD_BAD_PARAMS;
+    snprintf(guest, sizeof guest, "%s/%s", dir, r->file);
+    if (!sd_exists(guest)) return SD_LOAD_FILE;
+    /* Refused: dataSize and the buffer stay as they were. */
+    const uint32_t rc = sd_load_key_check(r->param, dir, r->file);
+    if (rc != SD_OK) return rc;
+    return sd_read_data(r, guest) ? SD_LOAD_ACCESS : SD_OK;
+}
+
+/* The named data file goes, PARAM.SFO and the dir stay (the suite's
+ * erase blocks list a lone System:PARAM.SFO afterwards). With no
+ * data file at all there is nothing to erase: RW_FILE_NOT_FOUND,
+ * which is what SFO-only fixtures report. */
+static uint32_t sd_do_erase(const sd_req *r) {
+    char dir[512], guest[512];
+    sd_dir(r->game, r->save, dir, sizeof dir);
+    if (!sd_exists(dir)) return SD_RW_NO_DATA;
+    if (!sd_has_sfo(dir)) return SD_RW_BROKEN;
+    if (!sd_has_data(dir)) return SD_RW_FILE;
+    const char *df = r->file[0] ? r->file : "DATA.BIN";
+    snprintf(guest, sizeof guest, "%s/%s", dir, df);
+    if (sd_exists(guest) && sd_remove_tree(guest,0)) return SD_RW_ACCESS;
+    return SD_OK;
+}
+
+static uint32_t sd_do_readdata(const sd_req *r) {
+    const int secmode = (r->mode == SD_READDATASECURE);
+    /* An empty filename reads nothing and succeeds (the emptyfilename
+     * trials leave loaddata untouched with result 0); a named file
+     * goes through the dir/file/broken checks. */
+    if (!r->file[0]) return SD_OK;
+    char dir[512], guest[512];
+    sd_dir(r->game, r->save, dir, sizeof dir);
+    if (!sd_exists(dir)) return SD_RW_NO_DATA;
+    if (!sd_has_sfo(dir)) return SD_RW_BROKEN;
+    snprintf(guest, sizeof guest, "%s/%s", dir, r->file);
+    /* A secure-made file that is gone reads as FILE_NOT_FOUND; a file
+     * never made at all reads as NO_DATA. The suite removes DATA.BIN
+     * from one fixture and never creates it in the other. */
+    static sd_sfo_state st;
+    sd_sfo_read_state(dir, &st);
+    const int secure = sd_fl_secure(&st, r->file);
+    if (!sd_exists(guest)) return secure ? SD_RW_FILE : SD_RW_NO_DATA;
+    /* Across modes, fw 6.60 answers differently from the suite's
+     * RW_DATA_BROKEN for both pairings (saveprobe steps 48-49):
+     * READDATASECURE of a plain file is RW_FILE_NOT_FOUND, and READDATA
+     * of a secure one succeeds with the file as stored -- ciphertext
+     * and its 16-byte header on hardware, the plaintext here until the
+     * savedata crypto exists. */
+    if (secmode && !secure) return SD_RW_FILE;
+    /* READDATASECURE keeps the LOAD family's key rule: DSEC, made with
+     * key A, reads RW_DATA_BROKEN with key B (step 74). The class half
+     * of sd_key_refused is inferred for this mode. */
+    if (secmode && st.params[0] && sd_key_refused(r->param, &st, r->file)) return SD_RW_BROKEN;
+    return sd_read_data(r, guest) ? SD_RW_ACCESS : SD_OK;
+}
+
+static uint32_t sd_do_writedata(const sd_req *r) {
+    if (!r->file[0]) return SD_RW_NO_DATA;
+    char dir[512], guest[512];
+    sd_dir(r->game, r->save, dir, sizeof dir);
+    if (!sd_exists(dir)) return SD_RW_NO_DATA;
+    snprintf(guest, sizeof guest, "%s/%s", dir, r->file);
+    sd_write_file(guest, r->buf, r->datasz);
+    if (sd_io_error) return SD_RW_ACCESS;
+    /* PARAM.SFO is rewritten too, with the file's class: DSEC's SFO
+     * changed between its MAKEDATASECURE and its WRITEDATASECURE
+     * (saveprobe steps 37-38, CRC CC490645 -> 03F941FA). A second
+     * secure file joins the list after the first and leaves the first
+     * file as it was: TWO's list reads DATA.BIN DATA2.BIN, DATA.BIN
+     * keeps its CRC, and both read back (steps 85-89). */
+    sd_write_sfo(dir, dir + strlen(SD_ROOT "/"), r->param);
+    return sd_io_error ? SD_RW_ACCESS : SD_OK;
+}
+
 /* Execute on the guest thread after a decision, or for a noninteractive mode. */
 static uint32_t sd_do_mode(uint32_t param) {
-    char game[14], save[21], file[14];
-    sd_getstr(param, SD_GAMENAME, 13, game, sizeof game);
-    sd_getstr(param, SD_SAVENAME, 20, save, sizeof save);
-    sd_getstr(param, SD_FILENAME, 13, file, sizeof file);
-    uint32_t mode = psp_read32(param + SD_MODE);
-    uint32_t buf = psp_read32(param + SD_DATABUF);
-    uint32_t bufsz = psp_read32(param + SD_DATABUFSZ);
-    uint32_t datasz = psp_read32(param + SD_DATASZ);
-    char dir[512], guest[512];
-    char cand[21];
+    sd_req r;
+    r.param = param;
+    sd_getstr(param, SD_GAMENAME, 13, r.game, sizeof r.game);
+    sd_getstr(param, SD_SAVENAME, 20, r.save, sizeof r.save);
+    sd_getstr(param, SD_FILENAME, 13, r.file, sizeof r.file);
+    r.mode = psp_read32(param + SD_MODE);
+    r.buf = psp_read32(param + SD_DATABUF);
+    r.bufsz = psp_read32(param + SD_DATABUFSZ);
+    r.datasz = psp_read32(param + SD_DATASZ);
+    char dir[512];
     sd_io_error = 0;
 
-    switch (mode) {
+    switch (r.mode) {
     case SD_SAVE:
     case SD_AUTOSAVE:
     case SD_LISTSAVE:
     case SD_MAKEDATA:
-    case SD_MAKEDATASECURE: {
-        /* Target: param.saveName when it names a free slot, else the first
-         * free list entry, else the first entry (AUTOSAVE flow, matching the
-         * suite: ABC free beats F1/M2/L3). */
-        const char *target = save;
-        /* The SAVE family refuses the zero key before it writes anything
-         * (sd_zero_key; saveprobe steps 1, 112 and 115 leave no directory).
-         * MAKEDATA takes it: DPLAIN was made and written with the zero key at
-         * secureVersion 0 (steps 40-41). */
-        if ((mode == SD_AUTOSAVE || mode == SD_SAVE || mode == SD_LISTSAVE) && sd_zero_key(param))
-            return SD_SAVE_BAD_PARAMS;
-        sd_dir(game, save, dir, sizeof dir);
-        if (mode == SD_AUTOSAVE && save[0] && sd_exists(dir)) {
-            uint32_t list = psp_read32(param + SD_SAVENAMELIST);
-            target = NULL;
-            if (list) {
-                for (int i = 0; i < 100; i++) {
-                    if ((uint64_t)list+(uint32_t)i*20u>UINT32_MAX || !psp_mem_ptr(list+(uint32_t)i*20u,20)) return SD_SAVE_ACCESS;
-                    sd_getstr(list + (uint32_t)i * 20u, 0, 20, cand, sizeof cand);
-                    if (!cand[0]) break;
-                    if (!psp_mem_ptr(list+(uint32_t)i*20u,20) || !sd_component(cand,0) || strlen(cand)>19) return SD_SAVE_ACCESS;
-                    sd_dir(game, cand, dir, sizeof dir);
-                    if (!sd_exists(dir)) { target = cand; break; }
-                }
-                if (!target) {
-                    sd_getstr(list, 0, 20, cand, sizeof cand);
-                    if (!sd_component(cand,1) || strlen(cand)>19) return SD_SAVE_ACCESS;
-                    if (cand[0]) { target = cand; sd_dir(game, cand, dir, sizeof dir); }
-                    else if (!save[0]) return SD_RW_NO_DATA;
-                    else { target = save; sd_dir(game, save, dir, sizeof dir); }
-                }
-            } else if (!save[0]) return SD_RW_NO_DATA;
-        }
-        if (!target) { target = save; sd_dir(game, save, dir, sizeof dir); }
-        /* The data file's class goes into PARAM.SFO's secure-file list. */
-        sd_transaction_write(param, dir, file);
-        return sd_io_error ? SD_SAVE_ACCESS : SD_OK;
-    }
+    case SD_MAKEDATASECURE:
+        return sd_do_save(&r);
 
-    /* The load family reads saveName directly -- an empty name denotes the
-     * bare game dir, and the list plays no role on these paths. Missing dir
-     * is NO_DATA, SFO-less is BROKEN, missing file is FILE_NOT_FOUND.
-     * Interactive selection has already written the chosen saveName. */
     case SD_LOAD:
     case SD_LISTLOAD:
-    case SD_AUTOLOAD: {
-        uint32_t rc;
-        sd_dir(game, save, dir, sizeof dir);
-        if (!sd_exists(dir)) rc = SD_LOAD_NO_DATA;
-        else if (!sd_has_sfo(dir)) rc = SD_LOAD_BROKEN;
-        else if (!file[0]) rc = SD_OK;
-        /* Before the data file's own checks (step 72). Whether it also comes
-         * before a missing data file is unmeasured. */
-        else if (sd_zero_key(param)) rc = SD_LOAD_BAD_PARAMS;
-        else {
-            snprintf(guest, sizeof guest, "%s/%s", dir, file);
-            if (!sd_exists(guest)) rc = SD_LOAD_FILE;
-            else if ((rc = sd_load_key_check(param, dir, file)) != SD_OK) {
-                /* Refused: dataSize and the buffer stay as they were. */
-            } else {
-                if (buf && bufsz) {
-                    int64_t n = sd_read_file(guest, buf, bufsz);
-                    if (n < 0) return SD_LOAD_ACCESS;
-                    psp_write32(param + SD_DATASZ, (uint32_t)n);
-                } else {
-                    psp_write32(param + SD_DATASZ, (uint32_t)sd_fsize(guest));
-                }
-                rc = SD_OK;
-            }
-        }
-        return rc;
-    }
+    case SD_AUTOLOAD:
+        return sd_do_load(&r);
 
     case SD_DELETE:
     case SD_AUTODELETE:
-        sd_dir(game, save, dir, sizeof dir);
-        if (!sd_exists(dir)) return SD_DELETE_NO_DATA;
-        return sd_remove_tree(dir,0) == 0 ? SD_OK : SD_DELETE_ACCESS;
-
     case SD_DELETEDATA:
-        sd_dir(game, save, dir, sizeof dir);
+        sd_dir(r.game, r.save, dir, sizeof dir);
         if (!sd_exists(dir)) return SD_DELETE_NO_DATA;
         return sd_remove_tree(dir,0) == 0 ? SD_OK : SD_DELETE_ACCESS;
 
     case SD_ERASE:
-    case SD_ERASESECURE: {
-        /* The named data file goes, PARAM.SFO and the dir stay (the suite's
-         * erase blocks list a lone System:PARAM.SFO afterwards). With no
-         * data file at all there is nothing to erase: RW_FILE_NOT_FOUND,
-         * which is what SFO-only fixtures report. */
-        sd_dir(game, save, dir, sizeof dir);
-        if (!sd_exists(dir)) return SD_RW_NO_DATA;
-        if (!sd_has_sfo(dir)) return SD_RW_BROKEN;
-        if (!sd_has_data(dir)) return SD_RW_FILE;
-        const char *df = file[0] ? file : "DATA.BIN";
-        snprintf(guest, sizeof guest, "%s/%s", dir, df);
-        if (sd_exists(guest) && sd_remove_tree(guest,0)) return SD_RW_ACCESS;
-        return SD_OK;
-    }
+    case SD_ERASESECURE:
+        return sd_do_erase(&r);
 
     case SD_READDATA:
-    case SD_READDATASECURE: {
-        int secmode = (mode == SD_READDATASECURE);
-        /* An empty filename reads nothing and succeeds (the emptyfilename
-         * trials leave loaddata untouched with result 0); a named file
-         * goes through the dir/file/broken checks. */
-        if (!file[0]) return SD_OK;
-        sd_dir(game, save, dir, sizeof dir);
-        if (!sd_exists(dir)) return SD_RW_NO_DATA;
-        if (!sd_has_sfo(dir)) return SD_RW_BROKEN;
-        snprintf(guest, sizeof guest, "%s/%s", dir, file);
-        /* A secure-made file that is gone reads as FILE_NOT_FOUND; a file
-         * never made at all reads as NO_DATA. The suite removes DATA.BIN
-         * from one fixture and never creates it in the other. */
-        static sd_sfo_state st;
-        sd_sfo_read_state(dir, &st);
-        int secure = sd_fl_secure(&st, file);
-        if (!sd_exists(guest)) return secure ? SD_RW_FILE : SD_RW_NO_DATA;
-        /* Across modes, fw 6.60 answers differently from the suite's
-         * RW_DATA_BROKEN for both pairings (saveprobe steps 48-49):
-         * READDATASECURE of a plain file is RW_FILE_NOT_FOUND, and READDATA
-         * of a secure one succeeds with the file as stored -- ciphertext
-         * and its 16-byte header on hardware, the plaintext here until the
-         * savedata crypto exists. */
-        if (secmode && !secure) return SD_RW_FILE;
-        /* READDATASECURE keeps the LOAD family's key rule: DSEC, made with
-         * key A, reads RW_DATA_BROKEN with key B (step 74). The class half
-         * of sd_key_refused is inferred for this mode. */
-        if (secmode && st.params[0] && sd_key_refused(param, &st, file)) return SD_RW_BROKEN;
-        if (buf && bufsz) {
-            int64_t n = sd_read_file(guest, buf, bufsz);
-            if (n<0) return SD_RW_ACCESS;
-            psp_write32(param + SD_DATASZ, (uint32_t)n);
-        } else {
-            psp_write32(param + SD_DATASZ, (uint32_t)sd_fsize(guest));
-        }
-        return SD_OK;
-    }
+    case SD_READDATASECURE:
+        return sd_do_readdata(&r);
 
     case SD_WRITEDATA:
     case SD_WRITEDATASECURE:
-        if (!file[0]) return SD_RW_NO_DATA;
-        sd_dir(game, save, dir, sizeof dir);
-        if (!sd_exists(dir)) return SD_RW_NO_DATA;
-        snprintf(guest, sizeof guest, "%s/%s", dir, file);
-        sd_write_file(guest,buf,datasz);
-        if (sd_io_error) return SD_RW_ACCESS;
-        /* PARAM.SFO is rewritten too, with the file's class: DSEC's SFO
-         * changed between its MAKEDATASECURE and its WRITEDATASECURE
-         * (saveprobe steps 37-38, CRC CC490645 -> 03F941FA). A second
-         * secure file joins the list after the first and leaves the first
-         * file as it was: TWO's list reads DATA.BIN DATA2.BIN, DATA.BIN
-         * keeps its CRC, and both read back (steps 85-89). */
-        sd_write_sfo(dir, dir + strlen(SD_ROOT "/"), param);
-        return sd_io_error ? SD_RW_ACCESS : SD_OK;
+        return sd_do_writedata(&r);
 
     case SD_SIZES: return sd_fill_sizes(param);
     case SD_GETSIZE:
@@ -1144,15 +1170,15 @@ static uint32_t sd_do_mode(uint32_t param) {
          * RW_NO_DATA (SZNEW, saveprobe step 97; BIG, which exists, reads 0
          * in step 98). */
         sd_fill_sizes(param);
-        sd_dir(game, save, dir, sizeof dir);
+        sd_dir(r.game, r.save, dir, sizeof dir);
         return sd_exists(dir) ? SD_OK : SD_RW_NO_DATA;
 
     case SD_FILES:
-        sd_dir(game, save, dir, sizeof dir);
+        sd_dir(r.game, r.save, dir, sizeof dir);
         return sd_do_files(param, dir);
 
     case SD_LIST:
-        return sd_do_list(param, game, save);
+        return sd_do_list(param, r.game, r.save);
 
     default:
         return SCE_KERNEL_ERROR_NOTIMPLEMENTED;
