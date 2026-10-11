@@ -2228,12 +2228,11 @@ static int is_clut_format(int fmt) { return fmt >= PSP_TFMT_CLUT4 && fmt <= PSP_
  * tracking only visible rows would miss a write to a texel the swizzle maps
  * beyond stride*height. */
 static uint32_t level_bytes(const psp_tex_state *t, int level) {
-    static const int halfbytes[8] = { 4, 4, 4, 8, 1, 2, 4, 8 };
-    const int fmt = t->fmt;
+    const int halfbytes = psp_texel_halfbytes(t->fmt);
     const uint32_t stride = level_stride(t, level);
     const int h = level_h(t, level);
-    if (fmt < 0 || fmt >= 8 || !stride || h <= 0) return 0;
-    const uint64_t row = ((uint64_t)stride * (uint64_t)halfbytes[fmt]) / 2u;
+    if (!halfbytes || !stride || h <= 0) return 0;
+    const uint64_t row = ((uint64_t)stride * (uint64_t)halfbytes) / 2u;
     const uint64_t rows = t->swizzled && row >= 16u
                         ? (uint64_t)(h + 7) & ~UINT64_C(7)
                         : (uint64_t)h;

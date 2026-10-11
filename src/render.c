@@ -106,21 +106,9 @@ static void sw_clut(uint32_t addr, int format, int shift, int mask, int start) {
     g_clut = c;
 }
 
-/* Bytes per texel, doubled, so the 4-bit format can be expressed as 1. */
-static int tex_halfbytes(int fmt) {
-    switch (fmt) {
-    case PSP_TFMT_CLUT4:                     return 1;
-    case PSP_TFMT_CLUT8:                     return 2;
-    case PSP_TFMT_5650: case PSP_TFMT_5551:
-    case PSP_TFMT_4444: case PSP_TFMT_CLUT16: return 4;
-    case PSP_TFMT_8888: case PSP_TFMT_CLUT32: return 8;
-    default:                                return 0;
-    }
-}
-
 static int texture_usable(void) {
     if (!g_tex.addr || g_tex.w <= 0 || g_tex.h <= 0) return 0;
-    if (!tex_halfbytes(g_tex.fmt)) return 0;
+    if (!psp_texel_halfbytes(g_tex.fmt)) return 0;
     if (g_tex.fmt >= PSP_TFMT_CLUT4 && !g_clut.addr) return 0;
     return 1;
 }
@@ -180,7 +168,7 @@ static uint32_t sample_texel_bounded(int u, int v, decode_bounds *bounds) {
     u = wrap_axis(u, g_tex.w, g_tex.wrap_s);
     v = wrap_axis(v, g_tex.h, g_tex.wrap_t);
 
-    const int hb = tex_halfbytes(g_tex.fmt);
+    const int hb = psp_texel_halfbytes(g_tex.fmt);
     const uint32_t row_bytes = ((uint32_t)g_tex.stride * (uint32_t)hb) / 2u;
     if (bounds) {
         const uint32_t bx = ((uint32_t)u * (uint32_t)hb) / 2u;

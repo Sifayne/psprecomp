@@ -135,6 +135,19 @@ enum {
     PSP_TFMT_DXT1, PSP_TFMT_DXT3, PSP_TFMT_DXT5
 };
 
+/* A texel's size in half-bytes, so CLUT4's half a byte is 1; 0 for the
+ * compressed formats and anything past them. */
+static inline int psp_texel_halfbytes(int fmt) {
+    switch (fmt) {
+    case PSP_TFMT_CLUT4:                      return 1;
+    case PSP_TFMT_CLUT8:                      return 2;
+    case PSP_TFMT_5650: case PSP_TFMT_5551:
+    case PSP_TFMT_4444: case PSP_TFMT_CLUT16: return 4;
+    case PSP_TFMT_8888: case PSP_TFMT_CLUT32: return 8;
+    default:                                  return 0;
+    }
+}
+
 /* The GE's codes for the texture function and the draw state below, in
  * PSPSDK pspgu.h's order. TEXFUNC (psp_tex_state.func): */
 enum { PSP_TFX_MODULATE = 0, PSP_TFX_DECAL, PSP_TFX_BLEND, PSP_TFX_REPLACE, PSP_TFX_ADD };
