@@ -469,6 +469,93 @@ static int start_args_ok(uint32_t arglen, uint32_t argp) {
     return psp_mem_ptr(argp, arglen) != NULL;
 }
 
+/* The top 0x100 bytes of every thread stack: the k0 area, where the thread's
+ * control block sits (psp_sched_spawn) and where its argument block stops. */
+#define THREAD_K0_SIZE 0x100u
+/* How far below its argument block a thread's $sp starts. */
+#define THREAD_SP_GAP  0x40u
+
+static uint32_t k0_area(const psp_thread *t) {
+    return t->stack_base + t->stack_size - THREAD_K0_SIZE;
+}
+
+/* A fresh thread's stack is filled with 0xFF, not left as it was found.
+ *
+ * That is the pattern sceKernelGetThreadStackFreeSize walks looking for
+ * (threadprobe step 85), and it is directly observable: a short argument
+ * block on hardware reads back with 0xFF above it. Verified against the game before shipping, which is not idle: filling
+ * a stack changes what every uninitialised local reads.
+ *
+ * PSP_THREAD_ATTR_NO_FILLSTACK turns it off, and threads/start proves the
+ * attribute is honoured rather than ignored: it scribbles 0xCC over the
+ * stack area first and then reports `stack not set to FF, instead:
+ * cccccccc` -- a line that only appears because the fill did *not* happen.
+ *
+ * Then the kernel's own words: one at the very bottom, and the top 16
+ * words of the stack, which threadprobe steps 19 and 25 (fw 6.60) dump with
+ * and without NO_FILLSTACK and read the same both times:
+ *
+ *     stack[0]          == thread id
+ *     stackEnd[-16]     == thread id
+ *     stackEnd[-14]     == stack base
+ *     stackEnd[-2..-1]  == 0xFFFFFFFF
+ *     everything else in stackEnd[-16..-3] == 0
+ *
+ * The zeros are the kernel's too: this used to leave the 0xFF fill between
+ * the four words (0xCC in step 25, whose thread scribbles over the stack
+ * first), and hardware has none. The last pair look like the fill and are
+ * not, for the same reason. What the rest of the 0x100 area above the
+ * argument block holds was not logged.
+ *
+ * That is the k0 area a PSP keeps at the top of every thread stack, and the
+ * top 0x100 bytes of the stack are reserved for it -- which is also where
+ * the argument block stops, so the two facts check each other. */
+static void prepare_stack(const psp_thread *t) {
+    void *p = t->stack_base ? psp_mem_ptr(t->stack_base, t->stack_size) : NULL;
+    if (!p) return;
+    if (!(t->attr & PSP_THREAD_ATTR_NO_FILLSTACK)) {
+        memset(p, 0xFF, t->stack_size);
+        psp_mem_mark_write(t->stack_base, t->stack_size);
+    }
+    const uint32_t end = t->stack_base + t->stack_size;    /* stackEnd */
+    for (uint32_t a = end - 16 * 4; a < end - 2 * 4; a += 4)
+        psp_write32(a, 0);
+    psp_write32(t->stack_base, t->uid);
+    psp_write32(end - 16 * 4, t->uid);
+    psp_write32(end - 14 * 4, t->stack_base);
+    psp_write32(end -  2 * 4, 0xFFFFFFFFu);
+    psp_write32(end -  1 * 4, 0xFFFFFFFFu);
+}
+
+/* The block is *copied* onto the thread's own stack, and the thread is
+ * handed the copy. threads/start measures where it lands, for a 0x800
+ * stack:
+ *
+ *     1..8 bytes  -> stack+0x6f0      80 bytes -> stack+0x6b0
+ *     90 bytes    -> stack+0x6a0      0x600    -> stack+0x100
+ *
+ * which is `top - 0x100 - roundup(len, 16)` in every case. The 0x100 is the
+ * k0 area reserved above, so the two measurements agree with each other.
+ *
+ * $sp starts 0x40 below the copy, or 0x40 below the k0 area when there are
+ * no arguments: threadprobe steps 19-24 (fw 6.60) read sp = stk+EB0, E70,
+ * E60, 8C0 and EC0 in a 0x1000 stack for 8, 80, 90, 0x600 and 0 bytes. It
+ * used to start at the copy itself. */
+static uint32_t copy_start_args(const psp_thread *t, uint32_t arglen, uint32_t *argp) {
+    uint32_t block = k0_area(t);
+    if (arglen) {
+        block -= (arglen + 15u) & ~15u;
+        void *dst = psp_mem_ptr(block, arglen);
+        void *src = psp_mem_ptr(*argp, arglen);
+        if (dst && src) {
+            memcpy(dst, src, arglen);
+            psp_mem_mark_write(block, arglen);
+            *argp = block;
+        }
+    }
+    return block - THREAD_SP_GAP;
+}
+
 static void hle_StartThread(void) {
     /* (thid, arglen, argp)
      *
@@ -496,85 +583,12 @@ static void hle_StartThread(void) {
      * the 0x08 is gone by the time the thread runs. */
     t->priority = t->init_priority;
 
-    /* A fresh thread's stack is filled with 0xFF, not left as it was found.
-     *
-     * That is the pattern sceKernelGetThreadStackFreeSize walks looking for
-     * (threadprobe step 85), and it is directly observable: a short argument
-     * block on hardware reads back with 0xFF above it. Verified against the game before shipping, which is not idle: filling
-     * a stack changes what every uninitialised local reads.
-     *
-     * PSP_THREAD_ATTR_NO_FILLSTACK turns it off, and threads/start proves the
-     * attribute is honoured rather than ignored: it scribbles 0xCC over the
-     * stack area first and then reports `stack not set to FF, instead:
-     * cccccccc` -- a line that only appears because the fill did *not* happen.
-     *
-     * Then the kernel's own words: one at the very bottom, and the top 16
-     * words of the stack, which threadprobe steps 19 and 25 (fw 6.60) dump with
-     * and without NO_FILLSTACK and read the same both times:
-     *
-     *     stack[0]          == thread id
-     *     stackEnd[-16]     == thread id
-     *     stackEnd[-14]     == stack base
-     *     stackEnd[-2..-1]  == 0xFFFFFFFF
-     *     everything else in stackEnd[-16..-3] == 0
-     *
-     * The zeros are the kernel's too: this used to leave the 0xFF fill between
-     * the four words (0xCC in step 25, whose thread scribbles over the stack
-     * first), and hardware has none. The last pair look like the fill and are
-     * not, for the same reason. What the rest of the 0x100 area above the
-     * argument block holds was not logged.
-     *
-     * That is the k0 area a PSP keeps at the top of every thread stack, and the
-     * top 0x100 bytes of the stack are reserved for it -- which is also where
-     * the argument block stops, so the two facts check each other. */
-    if (t->stack_base) {
-        void *p = psp_mem_ptr(t->stack_base, t->stack_size);
-        if (p && !(t->attr & PSP_THREAD_ATTR_NO_FILLSTACK)) {
-            memset(p, 0xFF, t->stack_size);
-            psp_mem_mark_write(t->stack_base, t->stack_size);
-        }
-        if (p) {
-            const uint32_t top = t->stack_base + t->stack_size;
-            for (uint32_t a = top - 16 * 4; a < top - 2 * 4; a += 4)
-                psp_write32(a, 0);
-            psp_write32(t->stack_base, t->uid);
-            psp_write32(top - 16 * 4, t->uid);
-            psp_write32(top - 14 * 4, t->stack_base);
-            psp_write32(top -  2 * 4, 0xFFFFFFFFu);
-            psp_write32(top -  1 * 4, 0xFFFFFFFFu);
-        }
-    }
+    prepare_stack(t);
 
     uint32_t arglen = psp_arg(1);
     uint32_t argp   = start_arg_block(&arglen, psp_arg(2));
 
-    /* The block is *copied* onto the thread's own stack, and the thread is
-     * handed the copy. threads/start measures where it lands, for a 0x800
-     * stack:
-     *
-     *     1..8 bytes  -> stack+0x6f0      80 bytes -> stack+0x6b0
-     *     90 bytes    -> stack+0x6a0      0x600    -> stack+0x100
-     *
-     * which is `top - 0x100 - roundup(len, 16)` in every case. The 0x100 is the
-     * k0 area reserved above, so the two measurements agree with each other.
-     *
-     * $sp starts 0x40 below the copy, or 0x40 below the k0 area when there are
-     * no arguments: threadprobe steps 19-24 (fw 6.60) read sp = stk+EB0, E70,
-     * E60, 8C0 and EC0 in a 0x1000 stack for 8, 80, 90, 0x600 and 0 bytes. It
-     * used to start at the copy itself. */
-    const uint32_t stack_top = t->stack_base + t->stack_size - 0x100u;
-    uint32_t block = stack_top;
-    if (arglen) {
-        block = stack_top - ((arglen + 15u) & ~15u);
-        void *dst = psp_mem_ptr(block, arglen);
-        void *src = psp_mem_ptr(argp, arglen);
-        if (dst && src) {
-            memcpy(dst, src, arglen);
-            psp_mem_mark_write(block, arglen);
-            argp = block;
-        }
-    }
-    const uint32_t sp = block - 0x40u;
+    const uint32_t sp = copy_start_args(t, arglen, &argp);
 
     /* The thread becomes runnable; it does not run here.
      *
@@ -600,7 +614,7 @@ static void hle_StartThread(void) {
     t->has_final_stats = 0;
     /* The control block sits in the 0x100 bytes at the top of the stack, which
      * is the same reservation the argument block stops below. */
-    const uint32_t k0 = t->stack_base ? t->stack_base + t->stack_size - 0x100u : 0;
+    const uint32_t k0 = t->stack_base ? k0_area(t) : 0;
     if (psp_sched_spawn(t->uid, t->entry, sp, k0, arglen, argp,
                         (int)t->priority) != 0) {
         t->state = was_state;
