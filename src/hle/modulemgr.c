@@ -316,19 +316,31 @@ static void hle_LoadModuleBufferUsbWlan(void) { psp_ret(PSP_MAIN_MODULE_ID); }
 
 /* ---- starting and stopping ------------------------------------------------- */
 
+/* The loaded module a start, stop or unload names. The executable is started
+ * already and answers OK; nothing else answers to an id the table does not
+ * hold. NULL once that is answered. */
+static module *named_module(uint32_t id) {
+    module *m = by_id(id);
+    if (!m) psp_ret(id == PSP_MAIN_MODULE_ID ? SCE_KERNEL_ERROR_OK : SCE_ERROR_KERNEL_UNKNOWN_MODULE);
+    return m;
+}
+
+/* Whether two modules export a NID in common. */
+static int exports_overlap(const module *a, const module *b) {
+    for (int i = 0; i < a->im.nexports; i++)
+        for (int k = 0; k < b->im.nexports; k++)
+            if (a->im.export_nid[i] == b->im.export_nid[k]) return 1;
+    return 0;
+}
+
 /* sceKernelStartModule(modid, argsize, argp, status, option): the module's id
  * if it stays resident, 0 if module_start said it would not, else the error. */
 static void hle_StartModule(void) {
     const uint32_t id = psp_arg(0);
     const module_args args = { psp_arg(1), psp_arg(2), psp_arg(4) };
     const uint32_t statusp = psp_arg(3);
-    module *m = by_id(id);
-    if (!m) {
-        /* The executable is started already; nothing else answers to an id
-         * the table does not hold. */
-        psp_ret(id == PSP_MAIN_MODULE_ID ? SCE_KERNEL_ERROR_OK : SCE_ERROR_KERNEL_UNKNOWN_MODULE);
-        return;
-    }
+    module *m = named_module(id);
+    if (!m) return;
     /* modprobe step 7: a second start is the generic error, not the module
      * manager's own ALREADY_STARTED. */
     if (m->started) { psp_ret(SCE_ERROR_KERNEL_ERROR); return; }
@@ -339,12 +351,7 @@ static void hle_StartModule(void) {
     for (int i = 0; i < MODULES_MAX; i++) {
         const module *o = &g_mod[i];
         if (o == m || !o->used || !o->started || o->stopped) continue;
-        for (int a = 0; a < o->im.nexports; a++)
-            for (int b = 0; b < m->im.nexports; b++)
-                if (o->im.export_nid[a] == m->im.export_nid[b]) {
-                    psp_ret(SCE_ERROR_KERNEL_LIBRARY_ALREADY_EXISTS);
-                    return;
-                }
+        if (exports_overlap(o, m)) { psp_ret(SCE_ERROR_KERNEL_LIBRARY_ALREADY_EXISTS); return; }
     }
     /* Its libraries are registered before module_start runs, which may call
      * them through its own stubs. */
@@ -375,11 +382,8 @@ static uint32_t stop(module *m, const module_args *args, uint32_t *status) {
 /* sceKernelStopModule(modid, argsize, argp, status, option): 0, or the
  * module's id if module_stop refused. */
 static void hle_StopModule(void) {
-    module *m = by_id(psp_arg(0));
-    if (!m) {
-        psp_ret(psp_arg(0) == PSP_MAIN_MODULE_ID ? SCE_KERNEL_ERROR_OK : SCE_ERROR_KERNEL_UNKNOWN_MODULE);
-        return;
-    }
+    module *m = named_module(psp_arg(0));
+    if (!m) return;
     if (!m->started) { psp_ret(SCE_ERROR_KERNEL_MODULE_NOT_STARTED); return; }
     if (m->stopped) { psp_ret(SCE_ERROR_KERNEL_MODULE_ALREADY_STOPPED); return; }
     uint32_t status;
@@ -392,11 +396,8 @@ static void hle_StopModule(void) {
 
 /* sceKernelUnloadModule(modid): its id. */
 static void hle_UnloadModule(void) {
-    module *m = by_id(psp_arg(0));
-    if (!m) {
-        psp_ret(psp_arg(0) == PSP_MAIN_MODULE_ID ? SCE_KERNEL_ERROR_OK : SCE_ERROR_KERNEL_UNKNOWN_MODULE);
-        return;
-    }
+    module *m = named_module(psp_arg(0));
+    if (!m) return;
     /* modprobe step 7: CANNOT_REMOVE, not NOT_STOPPED. */
     if (m->started && !m->stopped) { psp_ret(SCE_ERROR_KERNEL_MODULE_CANNOT_REMOVE); return; }
     const uint32_t id = m->id;
