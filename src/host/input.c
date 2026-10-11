@@ -825,18 +825,20 @@ static int input_types(Uint32 type) {
            type == SDL_CONTROLLERAXISMOTION;
 }
 
-int input_event(const SDL_Event *e) {
+/* Devices coming and going, the keyboard layout and focus, whoever owns the
+ * controls: 1 when e was one of those. */
+static int device_event(const SDL_Event *e) {
     switch (e->type) {
     case SDL_CONTROLLERDEVICEADDED:
         open_controller(e->cdevice.which);
-        return INPUT_ACTION_NONE;
+        return 1;
     case SDL_CONTROLLERDEVICEREMOVED:
         controller_removed(e->cdevice.which);
-        return INPUT_ACTION_NONE;
+        return 1;
     case SDL_KEYMAPCHANGED:
         find_keys();
         publish();
-        return INPUT_ACTION_NONE;
+        return 1;
     case SDL_WINDOWEVENT:
         if (e->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
             mouse_grab(0);
@@ -848,42 +850,51 @@ int input_event(const SDL_Event *e) {
             sample_controller();
             publish();
         }
-        return INPUT_ACTION_NONE;
-    default: break;
+        return 1;
+    default: return 0;
     }
-    if (!input_types(e->type)) return INPUT_ACTION_NONE;
-    if (g_owner != INPUT_GAME) { input_chord_event(e); return INPUT_ACTION_NONE; }
-    int menu = 0;
+}
 
+/* The host action bound to this key with modifiers, or NULL. */
+static const binding *modified_key_action(const SDL_Keysym *k) {
+    for (int i = 0; i < g_nbinds; i++)
+        if (g_binds[i].tgt == TGT_ACTION && g_binds[i].mods && key_matches(&g_binds[i], k)) return &g_binds[i];
+    return NULL;
+}
+
+/* What one control the game owns did, kept as the state the pad is worked
+ * out from: 0 when it is to be worked out again, -1 when the event changed
+ * nothing it reads. *menu is set when the event completed the menu chord. */
+static int note_control(const SDL_Event *e, int *menu) {
     switch (e->type) {
     case SDL_CONTROLLERBUTTONDOWN:
     case SDL_CONTROLLERBUTTONUP:
-        if (e->cbutton.which != g_controller_id && !pressed_elsewhere(e)) return INPUT_ACTION_NONE;
-        menu = chord_button(e->cbutton.button, e->cbutton.state);
+        if (e->cbutton.which != g_controller_id && !pressed_elsewhere(e)) return -1;
+        *menu = chord_button(e->cbutton.button, e->cbutton.state);
         if (e->cbutton.button < SDL_CONTROLLER_BUTTON_MAX) g_pad_down[e->cbutton.button] = e->cbutton.state != 0;
-        break;
+        return 0;
     case SDL_CONTROLLERAXISMOTION:
-        if (e->caxis.which != g_controller_id && !pressed_elsewhere(e)) return INPUT_ACTION_NONE;
+        if (e->caxis.which != g_controller_id && !pressed_elsewhere(e)) return -1;
         if (e->caxis.axis < SDL_CONTROLLER_AXIS_MAX) g_pad_axis[e->caxis.axis] = e->caxis.value;
-        break;
+        return 0;
     case SDL_MOUSEMOTION:
         /* Relative motion only while captured: a pointer crossing an
          * uncaptured window is not a look. */
         if (g_mouse_grabbed)
             for (int i = 0; i < g_nbinds; i++)
                 if (g_binds[i].src == SRC_MOTION) { psp_ctrl_add_mouse(e->motion.xrel, e->motion.yrel); break; }
-        return INPUT_ACTION_NONE;
+        return -1;
     case SDL_MOUSEBUTTONDOWN:
     case SDL_MOUSEBUTTONUP:
         /* The click that captures the pointer is not also a shot. */
-        if (!g_mouse_grabbed) { if (e->type == SDL_MOUSEBUTTONDOWN) mouse_grab(1); return INPUT_ACTION_NONE; }
+        if (!g_mouse_grabbed) { if (e->type == SDL_MOUSEBUTTONDOWN) mouse_grab(1); return -1; }
         if (e->button.button >= 1 && e->button.button <= 5) {
             if (e->type == SDL_MOUSEBUTTONDOWN) g_mouse_down |= SDL_BUTTON(e->button.button);
             else g_mouse_down &= ~SDL_BUTTON(e->button.button);
         }
-        break;
+        return 0;
     case SDL_MOUSEWHEEL: {
-        if (!g_mouse_grabbed) return INPUT_ACTION_NONE;
+        if (!g_mouse_grabbed) return -1;
         const int which = wheel_notch(&e->wheel);
         /* A wheel notch is a press the game sees for two of its polls. */
         for (int i = 0; i < g_nbinds; i++)
@@ -891,18 +902,25 @@ int input_event(const SDL_Event *e) {
                 g_binds[i].held = 1;
                 g_binds[i].until = psp_ctrl_polls() + 2;
             }
-        break;
+        return 0;
     }
     case SDL_KEYDOWN:
     case SDL_KEYUP:
-        if (e->type == SDL_KEYDOWN && !e->key.repeat)
-            for (int i = 0; i < g_nbinds; i++)
-                if (g_binds[i].tgt == TGT_ACTION && g_binds[i].mods && key_matches(&g_binds[i], &e->key.keysym))
-                    return carry_out((int)g_binds[i].value);
         if (e->key.keysym.scancode > SDL_SCANCODE_UNKNOWN && e->key.keysym.scancode < SDL_NUM_SCANCODES)
             g_key_down[e->key.keysym.scancode] = e->key.state == SDL_PRESSED;
-        break;
+        return 0;
+    default: return 0;
     }
+}
+
+int input_event(const SDL_Event *e) {
+    if (device_event(e) || !input_types(e->type)) return INPUT_ACTION_NONE;
+    if (g_owner != INPUT_GAME) { input_chord_event(e); return INPUT_ACTION_NONE; }
+    /* A host action on a key with modifiers takes the key event whole. */
+    const binding *modified = e->type == SDL_KEYDOWN && !e->key.repeat ? modified_key_action(&e->key.keysym) : NULL;
+    if (modified) return carry_out((int)modified->value);
+    int menu = 0;
+    if (note_control(e, &menu)) return INPUT_ACTION_NONE;
     const int action = carry_out(actions());
     publish();
     return menu ? INPUT_ACTION_MENU : action;
