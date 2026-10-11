@@ -2346,6 +2346,36 @@ static void cache_record(texcache_entry *e, const psp_tex_state *t, int top,
     e->last_used = g.cache_clock;
 }
 
+/* The decoders' output buffer, one for every upload. */
+static uint32_t *texel_scratch(void) {
+    static uint32_t *texels;
+    if (!texels) texels = malloc(TEXEL_CAP * sizeof(uint32_t));
+    return texels;
+}
+
+/* One level of t decoded through the current palette into texels, its time
+ * and any padding counted for the report. */
+static size_t decode_level_counted(const psp_tex_state *t, int level, uint32_t *texels,
+                                   int *dw, int *dh) {
+    const psp_clut_state clut = g.clut;
+    const uint64_t decode_t0 = psp_os_mono_ns();
+    size_t padded = 0;
+    const size_t decoded = psp_render_decode_level_padded(t, level, &clut, texels, TEXEL_CAP,
+                                                          dw, dh, &padded);
+    g.tex_padded_pixels += padded;
+    g.tex_padded_uploads += padded != 0;
+    g.tex_decode_ns += psp_os_mono_ns() - decode_t0;
+    return decoded;
+}
+
+/* Texture t is exactly target r's pixels -- 8888, unswizzled, one level,
+ * the same stride and size -- at native resolution, where r's attachment
+ * can be sampled as it is. The caller compares the addresses. */
+static int samples_target_whole(const rendertarget *r, const psp_tex_state *t) {
+    return !g.resolution && r->fmt == 3 && t->fmt == 3 && !t->swizzled &&
+           t->stride == r->stride && t->w == r->w && t->h == r->h && texture_top(t) == 0;
+}
+
 /* A cached texture whose bytes changed under it is re-decoded only where
  * they changed: the rows whose write generation moved past the entry's,
  * merged across short gaps and sent with glTexSubImage2D. The display
@@ -2362,10 +2392,8 @@ static int texcache_refresh_rows(texcache_entry *e, const psp_tex_state *t, uint
     const uint32_t row_bytes = (uint32_t)t->stride * (uint32_t)bpp;
     if (!row_bytes || (size_t)t->w * (size_t)t->h > TEXEL_CAP) return 0;
     const uint32_t base = level_addr(t, 0);
-    static uint32_t *texels;
-    if (!texels) texels = malloc(TEXEL_CAP * sizeof(uint32_t));
+    uint32_t *texels = texel_scratch();
     if (!texels) return 0;
-    const psp_clut_state clut = g.clut;
     enum { GAP = 16, RUNS_MAX = 16 };
     int runs = 0, bound = 0;
     for (int y = 0; y < t->h;) {
@@ -2382,13 +2410,7 @@ static int texcache_refresh_rows(texcache_entry *e, const psp_tex_state *t, uint
         sub.h = y1 - y;
         sub.lv_addr[0] = sub.addr; sub.lv_h[0] = sub.h;
         int dw = 0, dh = 0;
-        const uint64_t decode_t0 = psp_os_mono_ns();
-        size_t padded = 0;
-        const size_t decoded = psp_render_decode_level_padded(&sub, 0, &clut, texels,
-                                                               TEXEL_CAP, &dw, &dh, &padded);
-        g.tex_padded_pixels += padded;
-        g.tex_padded_uploads += padded != 0;
-        g.tex_decode_ns += psp_os_mono_ns() - decode_t0;
+        const size_t decoded = decode_level_counted(&sub, 0, texels, &dw, &dh);
         if (!decoded || dw != t->w || dh != y1 - y) return 0;
         if (!bound) { p_glBindTexture(GL_TEXTURE_2D, e->tex); bound = 1; }
         const uint64_t upload_t0 = psp_os_mono_ns();
@@ -2402,6 +2424,102 @@ static int texcache_refresh_rows(texcache_entry *e, const psp_tex_state *t, uint
     e->validated_serial = psp_mem_write_serial();
     g.tex_row_refreshes++;
     return 1;
+}
+
+/* Look t up in the probe window from its hash slot. A hit -- revalidated,
+ * or refreshed row by row where its bytes changed -- answers 1 with its
+ * texture in *tex. Otherwise *slot is where to upload it: the matching
+ * entry whose bytes changed past a row refresh, the first free entry, or
+ * the least recently used. */
+static int texcache_lookup(const psp_tex_state *t, int top, uint32_t supplied, size_t *slot,
+                           GLuint *tex) {
+    const uint64_t memory_serial = psp_mem_write_serial();
+    g.cache_clock++;
+    size_t victim = *slot;
+    uint64_t oldest = UINT64_MAX;
+    for (size_t probe = 0; probe < TEXCACHE_PROBES; probe++) {
+        const size_t at = (*slot + probe) % TEXCACHE_MAX;
+        texcache_entry *e = &g.cache[at];
+        if (cache_matches(e, t, top)) {
+            if (e->validated_serial == memory_serial) {
+                g.tex_fast_hits++;
+            } else {
+                const uint64_t gen_t0 = psp_os_mono_ns();
+                const uint64_t generation = texture_generation(t, top, supplied);
+                g.tex_generation_ns += psp_os_mono_ns() - gen_t0;
+                if (generation != e->content_generation) {
+                    g.tex_invalidations++;
+                    if (!texcache_refresh_rows(e, t, supplied, generation)) {
+                        *slot = at;
+                        return 0;
+                    }
+                } else {
+                    e->validated_serial = memory_serial;
+                    g.tex_revalidated++;
+                }
+            }
+            g.tex_hits++;
+            e->last_used = g.cache_clock;
+            g.bound_top = e->uploaded_top;
+            *tex = e->tex;
+            return 1;
+        }
+        if (!e->used) { *slot = at; return 0; }
+        if (e->last_used < oldest) { oldest = e->last_used; victim = at; }
+    }
+    /* The bounded probe window keeps lookup cost predictable. If it fills,
+     * retain the hot entries instead of repeatedly replacing the hash's first
+     * slot; the eviction counter says whether 512 entries/32 probes suffices. */
+    *slot = victim;
+    g.tex_evictions++;
+    return 0;
+}
+
+/* Decode every level of t and upload it into cache entry e. */
+static GLuint texcache_upload(texcache_entry *e, const psp_tex_state *t, int top, uint32_t supplied,
+                              int in_vram) {
+    if (!cache_matches(e, t, top)) g.tex_misses++;
+    uint32_t *texels = texel_scratch();
+    if (!texels) return 0;
+
+    /* One decoder for every backend -- the formats, the CLUT paging and the
+     * swizzle are the runtime's, not repeated here. */
+    if (!e->tex) p_glGenTextures(1, &e->tex);
+    p_glBindTexture(GL_TEXTURE_2D, e->tex);
+    int uploaded_top = -1;
+    for (int level = 0; level <= top; level++) {
+        int dw = 0, dh = 0;
+        const size_t decoded = decode_level_counted(t, level, texels, &dw, &dh);
+        if (decoded == 0)
+            break;
+        const uint64_t upload_t0 = psp_os_mono_ns();
+        p_glTexImage2D(GL_TEXTURE_2D, level, GL_RGBA8, dw, dh, 0,
+                       GL_RGBA, GL_UNSIGNED_BYTE, texels);
+        g.tex_upload_ns += psp_os_mono_ns() - upload_t0;
+        g.tex_upload_pixels += decoded;
+        uploaded_top = level;
+        if (level) g.mip_levels++;
+    }
+    if (uploaded_top < 0) return 0;
+    if (uploaded_top < top) g.mip_incomplete++;
+    if (uploaded_top > 0) g.mip_chains++;
+    /* texelFetch performs the PSP's filtering in the shader. Keeping the GL
+     * sampler itself non-mipmapped also permits the PSP's independently-sized
+     * levels without making the texture incomplete under GL's stricter
+     * halving rule. */
+    p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+    p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, uploaded_top);
+    const uint64_t gen_t0 = psp_os_mono_ns();
+    const uint64_t generation = texture_generation(t, top, supplied);
+    g.tex_generation_ns += psp_os_mono_ns() - gen_t0;
+    cache_record(e, t, top, uploaded_top, generation,
+                 psp_mem_write_serial());
+    g.bound_top = uploaded_top;
+    g.tex_uploads++;
+    if (in_vram) g.tex_vram_uploads++;
+    return e->tex;
 }
 
 static GLuint texcache_native(const psp_tex_state *t, uint32_t supplied) {
@@ -2419,9 +2537,7 @@ static GLuint texcache_native(const psp_tex_state *t, uint32_t supplied) {
         if (g.rts[i].used && g.rts[i].addr == t->addr) {
             g.tex_from_rt++;
             rendertarget *r = &g.rts[i];
-            if (!g.resolution && r->configured && r->fmt == 3 && t->fmt == 3 &&
-                !t->swizzled && t->stride == r->stride &&
-                t->w == r->w && t->h == r->h && top == 0) {
+            if (r->configured && samples_target_whole(r, t)) {
                 g.bound_top = 0;
                 stencil_to_alpha(r);
                 return r->colour;
@@ -2455,8 +2571,6 @@ static GLuint texcache_native(const psp_tex_state *t, uint32_t supplied) {
             return 0;
         }
 
-    size_t slot = texture_slot(t, top);
-
     /* Textures in VRAM used to skip this lookup altogether. That avoided a
      * stale render-to-texture result, but decoded and uploaded every binding --
      * 232,297 times in the first full mission measurement. Write generations
@@ -2466,98 +2580,10 @@ static GLuint texcache_native(const psp_tex_state *t, uint32_t supplied) {
         if ((level_addr(t, level) & 0xFF000000u) == PSP_VRAM_BASE)
             in_vram = 1;
 
-    const uint64_t memory_serial = psp_mem_write_serial();
-    g.cache_clock++;
-    size_t victim = slot;
-    uint64_t oldest = UINT64_MAX;
-    for (size_t probe = 0; probe < TEXCACHE_PROBES; probe++) {
-        const size_t at = (slot + probe) % TEXCACHE_MAX;
-        texcache_entry *e = &g.cache[at];
-        if (cache_matches(e, t, top)) {
-            if (e->validated_serial == memory_serial) {
-                g.tex_fast_hits++;
-            } else {
-                const uint64_t gen_t0 = psp_os_mono_ns();
-                const uint64_t generation = texture_generation(t, top, supplied);
-                g.tex_generation_ns += psp_os_mono_ns() - gen_t0;
-                if (generation != e->content_generation) {
-                    g.tex_invalidations++;
-                    if (!texcache_refresh_rows(e, t, supplied, generation)) {
-                        slot = at;
-                        goto upload;
-                    }
-                } else {
-                    e->validated_serial = memory_serial;
-                    g.tex_revalidated++;
-                }
-            }
-            g.tex_hits++;
-            e->last_used = g.cache_clock;
-            g.bound_top = e->uploaded_top;
-            return e->tex;
-        }
-        if (!e->used) { slot = (slot + probe) % TEXCACHE_MAX; goto upload; }
-        if (e->last_used < oldest) { oldest = e->last_used; victim = at; }
-    }
-    /* The bounded probe window keeps lookup cost predictable. If it fills,
-     * retain the hot entries instead of repeatedly replacing the hash's first
-     * slot; the eviction counter says whether 512 entries/32 probes suffices. */
-    slot = victim;
-    g.tex_evictions++;
-upload: {
-    texcache_entry *e = &g.cache[slot];
-    if (!cache_matches(e, t, top)) g.tex_misses++;
-    static uint32_t *texels;
-    if (!texels) texels = malloc(TEXEL_CAP * sizeof(uint32_t));
-    if (!texels) return 0;
-
-    /* One decoder for every backend -- the formats, the CLUT paging and the
-     * swizzle are the runtime's, not repeated here. */
-    const psp_clut_state clut = g.clut;
-    if (!e->tex) p_glGenTextures(1, &e->tex);
-    p_glBindTexture(GL_TEXTURE_2D, e->tex);
-    int uploaded_top = -1;
-    for (int level = 0; level <= top; level++) {
-        int dw = 0, dh = 0;
-        const uint64_t decode_t0 = psp_os_mono_ns();
-        size_t padded = 0;
-        const size_t decoded = psp_render_decode_level_padded(t, level, &clut,
-                                                       texels, TEXEL_CAP,
-                                                       &dw, &dh, &padded);
-        g.tex_padded_pixels += padded;
-        g.tex_padded_uploads += padded != 0;
-        g.tex_decode_ns += psp_os_mono_ns() - decode_t0;
-        if (decoded == 0)
-            break;
-        const uint64_t upload_t0 = psp_os_mono_ns();
-        p_glTexImage2D(GL_TEXTURE_2D, level, GL_RGBA8, dw, dh, 0,
-                       GL_RGBA, GL_UNSIGNED_BYTE, texels);
-        g.tex_upload_ns += psp_os_mono_ns() - upload_t0;
-        g.tex_upload_pixels += decoded;
-        uploaded_top = level;
-        if (level) g.mip_levels++;
-    }
-    if (uploaded_top < 0) return 0;
-    if (uploaded_top < top) g.mip_incomplete++;
-    if (uploaded_top > 0) g.mip_chains++;
-    /* texelFetch performs the PSP's filtering in the shader. Keeping the GL
-     * sampler itself non-mipmapped also permits the PSP's independently-sized
-     * levels without making the texture incomplete under GL's stricter
-     * halving rule. */
-    p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-    p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, uploaded_top);
-    const uint64_t gen_t0 = psp_os_mono_ns();
-    const uint64_t generation = texture_generation(t, top, supplied);
-    g.tex_generation_ns += psp_os_mono_ns() - gen_t0;
-    cache_record(e, t, top, uploaded_top, generation,
-                 psp_mem_write_serial());
-    g.bound_top = uploaded_top;
-    g.tex_uploads++;
-    if (in_vram) g.tex_vram_uploads++;
-    return e->tex;
-}
+    size_t slot = texture_slot(t, top);
+    GLuint tex;
+    if (texcache_lookup(t, top, supplied, &slot, &tex)) return tex;
+    return texcache_upload(&g.cache[slot], t, top, supplied, in_vram);
 }
 
 /* A view has the texture's declared extent, populated from guest bytes and
@@ -2576,29 +2602,26 @@ static GLuint texcache_get(const psp_tex_state *t) {
      * texcache_native serves better -- a texture that is exactly the target,
      * at native -- is left to it, and samples the attachment itself. */
     for (int i = 0; i < g.n_rts; i++) {
-            rendertarget *r = &g.rts[i];
-            const uint64_t re = rt_end(r);
-            if (!r->configured || base >= re || end <= r->addr) continue;
-            const int exact_alias = !g.resolution && r->addr == base && r->fmt == 3 && t->fmt == 3 &&
-                                    !t->swizzled && t->stride == r->stride && t->w == r->w &&
-                                    t->h == r->h && texture_top(t) == 0;
-            if (exact_alias) continue;
-            const int view_ok = t->fmt == 3 && r->fmt == 3 && !t->swizzled && texture_top(t) == 0 &&
-                                t->stride == r->stride &&
-                                ((int64_t)r->addr - base) % ((int64_t)t->stride * 4) == 0;
-            if (view_ok) {
-                /* The target's part comes from the GPU below; only the CPU's
-                 * pending writes into it need to reach it, and no readback. */
-                if (r->cpu_pending) rt_import(r);
-                hit = 1;
-                supplied |= 1u << i;
-                if (r->sx > sx) sx = r->sx;
-                if (r->sy > sy) sy = r->sy;
-            } else if (r->dirty || r->cpu_pending) {
-                readback_rt(i);
-                r->dirty = 0;
-            }
+        rendertarget *r = &g.rts[i];
+        const uint64_t re = rt_end(r);
+        if (!r->configured || base >= re || end <= r->addr) continue;
+        if (r->addr == base && samples_target_whole(r, t)) continue;
+        const int view_ok = t->fmt == 3 && r->fmt == 3 && !t->swizzled && texture_top(t) == 0 &&
+                            t->stride == r->stride &&
+                            ((int64_t)r->addr - base) % ((int64_t)t->stride * 4) == 0;
+        if (view_ok) {
+            /* The target's part comes from the GPU below; only the CPU's
+             * pending writes into it need to reach it, and no readback. */
+            if (r->cpu_pending) rt_import(r);
+            hit = 1;
+            supplied |= 1u << i;
+            if (r->sx > sx) sx = r->sx;
+            if (r->sy > sy) sy = r->sy;
+        } else if (r->dirty || r->cpu_pending) {
+            readback_rt(i);
+            r->dirty = 0;
         }
+    }
     GLuint native = texcache_native(t, supplied);
     if (!hit || !native) return native;
     const int w = (int)ceil(t->w * sx), h = (int)ceil(t->h * sy);
