@@ -1565,39 +1565,15 @@ static void rt_release(rendertarget *r) {
     rt_watch_writes();
 }
 
+/* A target's pixel to 8888 and back. A display format outside 0..3 (the
+ * guest's own, through sceDisplaySetFrameBuf) reads as 5551 and writes as
+ * 4444. */
 static uint32_t decode_pixel(uint32_t v, int fmt) {
     if (fmt == 3) return v;
-    unsigned red, green, blue, alpha;
-    if (fmt == 2) {
-        red = (v & 15) * 17;
-        green = ((v >> 4) & 15) * 17;
-        blue = ((v >> 8) & 15) * 17;
-        alpha = ((v >> 12) & 15) * 17;
-    } else {
-        red = v & 31;
-        red = (red << 3) | (red >> 2);
-        if (fmt == 0) {
-            green = (v >> 5) & 63;
-            green = (green << 2) | (green >> 4);
-            blue = (v >> 11) & 31;
-            alpha = 255;
-        } else {
-            green = (v >> 5) & 31;
-            green = (green << 3) | (green >> 2);
-            blue = (v >> 10) & 31;
-            alpha = (v & 0x8000) ? 255 : 0;
-        }
-        blue = (blue << 3) | (blue >> 2);
-    }
-    return red | (green << 8) | (blue << 16) | (alpha << 24);
+    return psp_pixel_unpack16(v, fmt == 0 || fmt == 2 ? fmt : 1);
 }
-
 static uint32_t pack_pixel(uint32_t rgba, int fmt) {
-    if (fmt == 3) return rgba;
-    unsigned r = rgba & 255, g = (rgba >> 8) & 255, b = (rgba >> 16) & 255, a = rgba >> 24;
-    if (fmt == 0) return (r >> 3) | ((g >> 2) << 5) | ((b >> 3) << 11);
-    if (fmt == 1) return (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >> 7) << 15);
-    return (r >> 4) | ((g >> 4) << 4) | ((b >> 4) << 8) | ((a >> 4) << 12);
+    return fmt == 3 ? rgba : psp_pixel_pack16(rgba, fmt);
 }
 
 static uint32_t guest_pixel(const rendertarget *r, int x, int y) {
@@ -3604,19 +3580,9 @@ static void readback_copy(rendertarget *r, const uint8_t *pixels, int rw, int rh
         }
         uint16_t *row16 = (uint16_t *)(out + (size_t)y * r->stride * 2u);
         for (int x = 0; x < copy_w; x++) {
-            const uint32_t red   = row[x * 4 + 0];
-            const uint32_t green = row[x * 4 + 1];
-            const uint32_t blue  = row[x * 4 + 2];
-            const uint32_t alpha = row[x * 4 + 3];
-            if (r->fmt == 0)
-                row16[x] = (uint16_t)((red >> 3) | ((green >> 2) << 5) |
-                                      ((blue >> 3) << 11));
-            else if (r->fmt == 1)
-                row16[x] = (uint16_t)((red >> 3) | ((green >> 3) << 5) |
-                                      ((blue >> 3) << 10) | ((alpha >> 7) << 15));
-            else
-                row16[x] = (uint16_t)((red >> 4) | ((green >> 4) << 4) |
-                                      ((blue >> 4) << 8) | ((alpha >> 4) << 12));
+            const uint32_t rgba = (uint32_t)row[x * 4 + 0] | (uint32_t)row[x * 4 + 1] << 8 |
+                                  (uint32_t)row[x * 4 + 2] << 16 | (uint32_t)row[x * 4 + 3] << 24;
+            row16[x] = (uint16_t)psp_pixel_pack16(rgba, r->fmt);
         }
     }
     g.exporting = i+1;

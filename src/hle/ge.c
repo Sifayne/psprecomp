@@ -1225,16 +1225,8 @@ static uint32_t current_colour(void) {
  * material colour. The alpha is not read (a frame's alpha byte is the
  * stencil). */
 static uint32_t widen_colour(uint32_t fmt, uint32_t c) {
-    uint32_t r, g, b, a;
-    switch (fmt) {
-    case 4: r = c & 31; g = (c >> 5) & 63; b = (c >> 11) & 31;
-            return 0xFF000000u | (b << 3 | b >> 2) << 16 | (g << 2 | g >> 4) << 8 | (r << 3 | r >> 2);
-    case 5: r = c & 31; g = (c >> 5) & 31; b = (c >> 10) & 31; a = (c >> 15) & 1;
-            return (a ? 0xFF000000u : 0u) | (b << 3 | b >> 2) << 16 | (g << 3 | g >> 2) << 8 | (r << 3 | r >> 2);
-    case 6: r = c & 15; g = (c >> 4) & 15; b = (c >> 8) & 15; a = (c >> 12) & 15;
-            return (a * 17) << 24 | (b * 17) << 16 | (g * 17) << 8 | r * 17;
-    default: return c;
-    }
+    /* The vertex colour formats 4, 5 and 6 are pixel formats 0, 1 and 2. */
+    return fmt >= 4 && fmt <= 6 ? psp_pixel_unpack16(c, (int)fmt - 4) : c;
 }
 static uint32_t read_colour_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int col_off) {
     const uint32_t fmt = VT_COLOR(vtype);
@@ -5471,7 +5463,7 @@ static uint64_t cap_framebuffer_rgb_sum(uint64_t *samples) {
         for (int j = 0; j < n_seen; j++)
             if (seen[j] == t->addr) duplicate = 1;
         if (duplicate) continue;
-        const uint32_t bpp = t->fmt == 3 ? 4u : 2u;
+        const uint32_t bpp = (uint32_t)psp_pixel_bytes((int)t->fmt);
         const uint64_t off = (uint64_t)t->addr - PSP_VRAM_BASE;
         const uint64_t last = off + ((uint64_t)271 * t->stride + 480u) * bpp;
         if (last > PSP_VRAM_SIZE) continue;
@@ -5486,24 +5478,8 @@ static uint64_t cap_framebuffer_rgb_sum(uint64_t *samples) {
                 } else {
                     const uint16_t px = (uint16_t)row[x * 2u] |
                         (uint16_t)((uint16_t)row[x * 2u + 1u] << 8);
-                    if (t->fmt == 0) {
-                        const uint32_t r = px & 31u;
-                        const uint32_t g = (px >> 5) & 63u;
-                        const uint32_t b = (px >> 11) & 31u;
-                        sum += (r << 3 | r >> 2) + (g << 2 | g >> 4) +
-                               (b << 3 | b >> 2);
-                    } else if (t->fmt == 1) {
-                        const uint32_t r = px & 31u;
-                        const uint32_t g = (px >> 5) & 31u;
-                        const uint32_t b = (px >> 10) & 31u;
-                        sum += (r << 3 | r >> 2) + (g << 3 | g >> 2) +
-                               (b << 3 | b >> 2);
-                    } else {
-                        const uint32_t r = px & 15u;
-                        const uint32_t g = (px >> 4) & 15u;
-                        const uint32_t b = (px >> 8) & 15u;
-                        sum += (r << 4 | r) + (g << 4 | g) + (b << 4 | b);
-                    }
+                    const uint32_t c = psp_pixel_unpack16(px, (int)t->fmt);
+                    sum += (c & 0xFFu) + ((c >> 8) & 0xFFu) + ((c >> 16) & 0xFFu);
                 }
                 n += 3;
             }

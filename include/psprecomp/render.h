@@ -188,6 +188,45 @@ enum {
     PSP_PRIM_SPRITES
 };
 
+/* The GE's pixel formats -- FRAMEBUF_PIX_FORMAT's, and the direct-colour
+ * texture and palette formats': 0 5650, 1 5551, 2 4444, 3 8888, red in the
+ * low bits. A 16-bit pixel widens to 8888 with each field's top bits
+ * repeated below it, so full scale stays 0xFF; 5650 is opaque and 5551's
+ * alpha bit reads 0 or 0xFF. Narrowing keeps each field's top bits. Both
+ * take any format but 0 and 1 as 4444. */
+static inline int psp_pixel_bytes(int fmt) { return fmt == 3 ? 4 : 2; }
+
+static inline uint32_t psp_pixel_unpack16(uint32_t p, int fmt) {
+    uint32_t r, g, b, a;
+    switch (fmt) {
+    case 0:
+        r = p & 0x1F;         r = (r << 3) | (r >> 2);
+        g = (p >> 5)  & 0x3F; g = (g << 2) | (g >> 4);
+        b = (p >> 11) & 0x1F; b = (b << 3) | (b >> 2);
+        a = 0xFF; break;
+    case 1:
+        r = p & 0x1F;         r = (r << 3) | (r >> 2);
+        g = (p >> 5)  & 0x1F; g = (g << 3) | (g >> 2);
+        b = (p >> 10) & 0x1F; b = (b << 3) | (b >> 2);
+        a = (p >> 15) ? 0xFF : 0x00; break;
+    default:
+        r = p & 0xF;          r = (r << 4) | r;
+        g = (p >> 4)  & 0xF;  g = (g << 4) | g;
+        b = (p >> 8)  & 0xF;  b = (b << 4) | b;
+        a = (p >> 12) & 0xF;  a = (a << 4) | a; break;
+    }
+    return (a << 24) | (b << 16) | (g << 8) | r;
+}
+
+static inline uint32_t psp_pixel_pack16(uint32_t rgba, int fmt) {
+    const uint32_t r = rgba & 0xFF, g = (rgba >> 8) & 0xFF, b = (rgba >> 16) & 0xFF, a = rgba >> 24;
+    switch (fmt) {
+    case 0:  return (r >> 3) | ((g >> 2) << 5) | ((b >> 3) << 11);
+    case 1:  return (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >> 7) << 15);
+    default: return (r >> 4) | ((g >> 4) << 4) | ((b >> 4) << 8) | ((a >> 4) << 12);
+    }
+}
+
 /* A vertex as the display list stores it, decoded but not yet transformed:
  * what draw_model receives. The colour is the vertex's own or, when the
  * format carries none, the material colour the CPU path would have used; u and

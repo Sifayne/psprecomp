@@ -70,15 +70,6 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
     g_fb_fmt = fmt & 3;
 }
 
-static uint32_t pack16(uint32_t rgba, int fmt) {
-    const uint32_t r = rgba & 0xFF, g = (rgba >> 8) & 0xFF, b = (rgba >> 16) & 0xFF, a = rgba >> 24;
-    switch (fmt) {
-    case 0:  return (r >> 3) | ((g >> 2) << 5) | ((b >> 3) << 11);
-    case 1:  return (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >> 7) << 15);
-    default: return (r >> 4) | ((g >> 4) << 4) | ((b >> 4) << 8) | ((a >> 4) << 12);
-    }
-}
-
 /* ---- texture sampling -----------------------------------------------------
  *
  * One format, 5650, and one function, modulate. That is not a simplification
@@ -160,44 +151,18 @@ static uint32_t swizzled_byte(uint32_t byte_x, uint32_t y, uint32_t row_bytes) {
     return block + (y % 8) * 16 + (byte_x % 16);
 }
 
-/* 16-bit palette and texel formats, expanded to eight bits a channel with the
- * high bits replicated down so full-scale stays 0xFF rather than 0xF8. */
-static uint32_t expand16(uint32_t p, int fmt) {
-    uint32_t r, g, b, a;
-    switch (fmt) {
-    case GE_TFMT_5650:
-        r = p & 0x1F;         r = (r << 3) | (r >> 2);
-        g = (p >> 5)  & 0x3F; g = (g << 2) | (g >> 4);
-        b = (p >> 11) & 0x1F; b = (b << 3) | (b >> 2);
-        a = 0xFF; break;
-    case GE_TFMT_5551:
-        r = p & 0x1F;         r = (r << 3) | (r >> 2);
-        g = (p >> 5)  & 0x1F; g = (g << 3) | (g >> 2);
-        b = (p >> 10) & 0x1F; b = (b << 3) | (b >> 2);
-        a = (p >> 15) ? 0xFF : 0x00; break;
-    default: /* 4444 */
-        r = p & 0xF;          r = (r << 4) | r;
-        g = (p >> 4)  & 0xF;  g = (g << 4) | g;
-        b = (p >> 8)  & 0xF;  b = (b << 4) | b;
-        a = (p >> 12) & 0xF;  a = (a << 4) | a; break;
-    }
-    return (a << 24) | (b << 16) | (g << 8) | r;
-}
-
 typedef struct { uint32_t tex_bytes, clut_bytes; size_t padded; } decode_bounds;
 
 static uint32_t clut_entry(uint32_t raw, decode_bounds *bounds) {
     const uint32_t idx =
         (uint32_t)((((int)raw >> g_clut.shift) & g_clut.mask) | g_clut.start);
-    const uint32_t bytes = g_clut.fmt == 3 ? 4u : 2u;
+    const uint32_t bytes = (uint32_t)psp_pixel_bytes(g_clut.fmt);
     if (bounds && ((uint64_t)idx + 1) * bytes > bounds->clut_bytes) {
         bounds->padded++;
         return 0;
     }
     if (g_clut.fmt == 3) return psp_read32(g_clut.addr + idx * 4u);
-    return expand16((uint32_t)psp_read16(g_clut.addr + idx * 2u),
-                    g_clut.fmt == 0 ? GE_TFMT_5650 :
-                    g_clut.fmt == 1 ? GE_TFMT_5551 : GE_TFMT_4444);
+    return psp_pixel_unpack16((uint32_t)psp_read16(g_clut.addr + idx * 2u), g_clut.fmt);
 }
 
 /* Floor, not truncate.
@@ -272,7 +237,7 @@ static uint32_t sample_texel_bounded(int u, int v, decode_bounds *bounds) {
         return psp_read32(g_tex.addr + off);
     }
     const uint32_t off = swizzled_byte((uint32_t)u * 2u, (uint32_t)v, row_bytes);
-    return expand16((uint32_t)psp_read16(g_tex.addr + off), g_tex.fmt);
+    return psp_pixel_unpack16((uint32_t)psp_read16(g_tex.addr + off), g_tex.fmt);
 }
 
 static uint32_t sample_texel(int u, int v) {
@@ -669,10 +634,10 @@ static void put_pixel(int x, int y, uint32_t rgba, int stencil) {
         const uint32_t at16 = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
         if (stencil >= 0) rgba = (rgba & 0x00FFFFFFu) | ((uint32_t)stencil << 24);
         else if (!g_bs.write_alpha && g_fb_fmt != 0)
-            rgba = (rgba & 0x00FFFFFFu) | (expand16((uint32_t)psp_read16(at16), g_fb_fmt) & 0xFF000000u);
-        uint32_t px = pack16(rgba, g_fb_fmt);
+            rgba = (rgba & 0x00FFFFFFu) | (psp_pixel_unpack16((uint32_t)psp_read16(at16), g_fb_fmt) & 0xFF000000u);
+        uint32_t px = psp_pixel_pack16(rgba, g_fb_fmt);
         if (g_bs.pixel_mask) {
-            const uint32_t keep = pack16(g_bs.pixel_mask, g_fb_fmt);
+            const uint32_t keep = psp_pixel_pack16(g_bs.pixel_mask, g_fb_fmt);
             px = ((uint32_t)psp_read16(at16) & keep) | (px & ~keep);
         }
         psp_write16(at16, (uint16_t)px);
@@ -924,8 +889,8 @@ static void write_stencil_only(int x, int y, uint32_t value) {
     if (g_fb_fmt != 3) {
         const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
         const uint32_t old = (uint32_t)psp_read16(at);
-        const uint32_t px = pack16((expand16(old, g_fb_fmt) & 0x00FFFFFFu) | (value << 24), g_fb_fmt);
-        const uint32_t k16 = pack16(keep, g_fb_fmt);
+        const uint32_t px = psp_pixel_pack16((psp_pixel_unpack16(old, g_fb_fmt) & 0x00FFFFFFu) | (value << 24), g_fb_fmt);
+        const uint32_t k16 = psp_pixel_pack16(keep, g_fb_fmt);
         psp_write16(at, (uint16_t)((old & k16) | (px & ~k16)));
         return;
     }
@@ -995,12 +960,12 @@ static int alpha_pass(uint32_t rgba) {
 static uint32_t get_pixel(int x, int y) {
     if (!g_fb_addr || !g_fb_stride) return 0;
     if (g_fb_fmt != 3) {
-        const uint32_t px = expand16((uint32_t)psp_read16(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2), g_fb_fmt);
+        const uint32_t px = psp_pixel_unpack16((uint32_t)psp_read16(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2), g_fb_fmt);
         /* A 5650 target has no alpha and no stencil, and the blend reads its
          * destination alpha as zero: gpu/commands/blend565's "Double dest
          * alpha" rows are black and its "Inverse double dest alpha" rows are
          * the source colour whole. The texture sampler's 5650 is opaque, which
-         * is why this is not in expand16. */
+         * is why this is not in psp_pixel_unpack16. */
         return g_fb_fmt == 0 ? (px & 0x00FFFFFFu) : px;
     }
     return psp_read32(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4);
@@ -1080,7 +1045,7 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
     }
     if (g_bs.enable) { rgba = blend(rgba, get_pixel(x, y)); g_px_blend++; }
     /* Dither: an offset per screen position, then the 16-bit formats keep
-     * the top bits as always (pack16). geprobe step 10 (fw 6.60) dithers
+     * the top bits as always (psp_pixel_pack16). geprobe step 10 (fw 6.60) dithers
      * 8888 too: its grey ramp, 7F and 80 at (240,136) and (241,136), reads
      * 86 and 78 there under the probe's +7/-8 matrix row. Placed after the
      * blend; the order against blending is not measured. */
