@@ -74,7 +74,8 @@ void psp_recomp_register(void);
 
 static sigjmp_buf g_abort;
 static volatile sig_atomic_t g_abort_valid;
-static int        g_reason;         /* 1 trap, 2 timeout, 3 fault, 4 dispatch miss */
+/* Why the guarded call stopped. */
+static enum { STOP_NONE, STOP_TRAP, STOP_TIMEOUT, STOP_FAULT, STOP_MISS, STOP_EXIT } g_reason;
 static uint32_t   g_reason_addr;
 static const char *g_reason_what;
 
@@ -98,17 +99,17 @@ static void abort_to_main(void) {
 }
 
 void psp_unimplemented(uint32_t addr, const char *what) {
-    g_reason = 1; g_reason_addr = addr; g_reason_what = what;
+    g_reason = STOP_TRAP; g_reason_addr = addr; g_reason_what = what;
     abort_to_main();
 }
 
 void psp_syscall(uint32_t id) {
-    g_reason = 1; g_reason_addr = id; g_reason_what = "syscall";
+    g_reason = STOP_TRAP; g_reason_addr = id; g_reason_what = "syscall";
     abort_to_main();
 }
 
 static void on_miss(uint32_t addr) {
-    g_reason = 4; g_reason_addr = addr; g_reason_what = "dispatch miss";
+    g_reason = STOP_MISS; g_reason_addr = addr; g_reason_what = "dispatch miss";
     abort_to_main();
 }
 
@@ -135,7 +136,7 @@ static uint32_t g_exit_status;
 static void hle_stop_unload_self(void) {
     g_guest_exited = 1;
     g_exit_status  = psp_arg(0);
-    g_reason = 5;
+    g_reason = STOP_EXIT;
 
     /* Only the main context may jump: g_abort belongs to its stack. A guest
      * thread stops the scheduler instead, and the main context reports the exit
@@ -675,7 +676,7 @@ static void on_signal_info(int sig, siginfo_t *si, void *uc) {
 }
 
 static void on_signal(int sig) {
-    g_reason = (sig == SIGALRM) ? 2 : 3;
+    g_reason = (sig == SIGALRM) ? STOP_TIMEOUT : STOP_FAULT;
 
     /* A guest thread cannot jump to g_abort: that belongs to the main stack.
      * Nor can it be unwound -- it is part-way down a host call stack of
@@ -696,11 +697,12 @@ static void on_signal(int sig) {
 
 static const char *reason_str(void) {
     switch (g_reason) {
-    case 1: return g_reason_what ? g_reason_what : "unimplemented";
-    case 2: return "timed out";
-    case 3: return "host fault (SIGSEGV/SIGBUS)";
-    case 4: return "dispatch miss";
-    case 5: return "guest called exit";
+    case STOP_NONE:    break;
+    case STOP_TRAP:    return g_reason_what ? g_reason_what : "unimplemented";
+    case STOP_TIMEOUT: return "timed out";
+    case STOP_FAULT:   return "host fault (SIGSEGV/SIGBUS)";
+    case STOP_MISS:    return "dispatch miss";
+    case STOP_EXIT:    return "guest called exit";
     }
     return "?";
 }
@@ -723,7 +725,7 @@ static void install_handlers(void) {
 
 /* Run one guest call with a wall-clock bound, reporting rather than dying. */
 static int guarded_call(uint32_t addr, unsigned timeout_s, const char *what) {
-    g_reason = 0;
+    g_reason = STOP_NONE;
     if (sigsetjmp(g_abort, 1) == 0) {
         g_abort_valid = 1;
         alarm(timeout_s);
@@ -735,8 +737,8 @@ static int guarded_call(uint32_t addr, unsigned timeout_s, const char *what) {
     alarm(0);
     g_abort_valid = 0;
     printf("    %-28s stopped: %s", what, reason_str());
-    if (g_reason == 1 || g_reason == 4) printf(" at 0x%08X", g_reason_addr);
-    if (g_reason == 5) printf("(%u)", g_exit_status);
+    if (g_reason == STOP_TRAP || g_reason == STOP_MISS) printf(" at 0x%08X", g_reason_addr);
+    if (g_reason == STOP_EXIT) printf("(%u)", g_exit_status);
     printf("\n");
     /* However the call stopped, the functions entered on the way there are the
      * useful part -- and a timeout needs them most, because unlike a trap it
