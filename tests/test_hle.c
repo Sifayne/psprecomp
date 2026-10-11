@@ -857,6 +857,43 @@ static void test_io_dirs(void) {
     }
 #endif
 
+    /* A write moves the descriptor's position and grows its file: the same
+     * descriptor finds the new end and reads back what it wrote, a write
+     * after a seek lands there, and an append lands at the end. */
+    {
+        const uint32_t LSEEK32 = psp_nid("sceIoLseek32");
+        const uint32_t RW = guest_name("ms0:/PSP/SAVEDATA/ZZZ/RW.BIN");
+        fd = call(OPEN, RW, 0x603 /* RDWR | CREAT | TRUNC */, 0777, 0);
+        CHECK(call(WRITE, fd, SRC, 64, 0) == 64, "a read-write descriptor writes");
+        uint32_t at = call(LSEEK32, fd, 0, 1 /* SEEK_CUR */, 0);
+        CHECK(at == 64, "a write moves the position, got %u", at);
+        at = call(LSEEK32, fd, 0, 2 /* SEEK_END */, 0);
+        CHECK(at == 64, "a write grows the file its descriptor sees, got %u", at);
+        CHECK(call(LSEEK32, fd, 16, 0 /* SEEK_SET */, 0) == 16, "a seek inside what was written");
+        for (uint32_t i = 0; i < 16; i++) psp_write8(DST + i, 0);
+        uint32_t got = call(READ, fd, DST, 16, 0);
+        same = got == 16;
+        for (uint32_t i = 0; i < 16; i++) same &= psp_read8(DST + i) == (uint8_t)((16 + i) * 3 + 1);
+        CHECK(same, "the same descriptor reads back what it wrote, %u bytes", got);
+        call(LSEEK32, fd, 8, 0 /* SEEK_SET */, 0);
+        CHECK(call(WRITE, fd, SRC + 40, 4, 0) == 4, "a write after a seek");
+        CHECK(call(CLOSE, fd, 0, 0, 0) == 0, "close succeeds");
+        fd = call(OPEN, RW, 0x0102 /* WRONLY | APPEND */, 0, 0);
+        CHECK(call(WRITE, fd, SRC, 4, 0) == 4, "an append writes");
+        at = call(LSEEK32, fd, 0, 1 /* SEEK_CUR */, 0);
+        CHECK(at == 68, "an append leaves the position at the end, got %u", at);
+        CHECK(call(CLOSE, fd, 0, 0, 0) == 0, "close succeeds");
+        fd = call(OPEN, RW, 0x0001, 0, 0);
+        got = call(READ, fd, DST, 128, 0);
+        same = got == 68;
+        for (uint32_t i = 0; i < 64; i++)
+            same &= psp_read8(DST + i) == (uint8_t)(((i >= 8 && i < 12) ? i + 32 : i) * 3 + 1);
+        for (uint32_t i = 0; i < 4; i++) same &= psp_read8(DST + 64 + i) == (uint8_t)(i * 3 + 1);
+        CHECK(same, "the seeked write landed at 8 and the append at 64, %u bytes", got);
+        call(CLOSE, fd, 0, 0, 0);
+        call(REMOVE, RW, 0, 0, 0);
+    }
+
     CHECK(call(REMOVE, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0, 0, 0) == 0,
           "remove deletes");
     CHECK(call(REMOVE, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0, 0, 0) == 0x80010002,

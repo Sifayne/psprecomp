@@ -359,8 +359,8 @@ static void open_host_file(const char *guest, uint32_t flags) {
     io_file *h = &g_file[i];
     h->writable = strcmp(mode, "rb") != 0;
     snprintf(h->host, sizeof h->host, "%s", host);
-    /* A host file's window is the whole file. Writable files start empty
-     * and grow, so the length is refreshed on write rather than fixed. */
+    /* A host file's window is the whole file. A write past its end grows it
+     * (hle_Write), so the length is refreshed on write rather than fixed. */
     h->len = host_file_size(f);
     rewind(f);
     psp_ret((uint32_t)(i + FD_FIRST));
@@ -533,8 +533,16 @@ static void hle_Write(void) {
     uint8_t *tmp = (uint8_t *)malloc(size ? size : 1);
     if (!tmp) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
     for (uint32_t i = 0; i < size; i++) tmp[i] = psp_read8(src + i);
-    size_t put = fwrite(tmp, 1, size, h->f);
+    /* At the descriptor's position, which moves past what was written and
+     * may grow the file. An append open writes at the end whatever the
+     * position said, so the host says where the write ended. */
+    size_t put = 0;
+    if (fseeko(h->f, (off_t)(h->base + h->pos), SEEK_SET) == 0)
+        put = fwrite(tmp, 1, size, h->f);
     free(tmp);
+    const off_t end = ftello(h->f);
+    h->pos = end >= 0 ? (uint64_t)end - h->base : h->pos + put;
+    if (h->pos > h->len) h->len = h->pos;
     if (size) h->dirty = 1;
     psp_ret((uint32_t)put);
     if (size) io_park();
