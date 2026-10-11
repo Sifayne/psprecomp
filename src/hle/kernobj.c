@@ -633,8 +633,8 @@ static int mpp_abandon(psp_waitq *q, int reason) {
 static void hle_DeleteMsgPipe(void) {
     psp_msgpipe *p = find_pipe(psp_arg(0));
     if (!p) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MPPID); return; }
-    int urgent = mpp_abandon(&p->send_q, 0);
-    urgent |= mpp_abandon(&p->recv_q, 0);
+    int urgent = mpp_abandon(&p->send_q, PSP_WAIT_WOKE_NORMAL);
+    urgent |= mpp_abandon(&p->recv_q, PSP_WAIT_WOKE_NORMAL);
     if (p->base) psp_sysmem_release(p->base);
     p->alive = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
