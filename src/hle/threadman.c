@@ -66,7 +66,8 @@ enum { WAIT_NONE = 0, WAIT_SLEEP, WAIT_DELAY };
 #define PSP_THREAD_STATUS_SUSPEND 8
 #define PSP_THREAD_STATUS_STOPPED 16
 
-#define MAX_SEMA_WAITERS 32
+/* Threads one thread's end can release (psp_thread.enders). */
+#define MAX_THREAD_ENDERS 32
 
 typedef struct {
     uint32_t uid;
@@ -103,7 +104,7 @@ typedef struct {
     int      cb_wait;
     int      cb_wake;
     /* Threads parked in sceKernelWaitThreadEnd on this one. */
-    uint32_t enders[MAX_SEMA_WAITERS];
+    uint32_t enders[MAX_THREAD_ENDERS];
     int      nenders;
     /* The exit status of the thread this one was last released from
      * sceKernelWaitThreadEnd by. Kept here, on the waiter, because the thread
@@ -199,7 +200,6 @@ static void sema_wait_end(uint32_t id, uint32_t tmo_ptr, uint64_t deadline, uint
 static void delay_cb_until(uint64_t until, int restored);
 static void sleep_cb(int restored);
 static psp_callback *find_cb(uint32_t id);
-static int          g_warned_block;
 /* psp_thread.end_status for the main context, which has no record. */
 static uint32_t     g_main_end_status;
 
@@ -211,7 +211,6 @@ void psp_threadman_reset(void) {
     memset(g_cb, 0, sizeof g_cb);
     g_cb_hi = g_sema_hi = g_flag_hi = g_thread_hi = 0;
     g_next_uid = UID_BASE;
-    g_warned_block = 0;
     /* The clock first: the scheduler's ready-queue stamps are guest times, and
      * a clock reset after them would leave stamps in the future. */
     psp_clock_reset();
@@ -226,17 +225,6 @@ static void thread_ended(psp_thread *t, uint32_t status);
 static void drop_callbacks_of(uint32_t thread_uid);
 /* An emptied psp_thread.enders entry. Not 0, which is the main context. */
 #define NO_ENDER 0xFFFFFFFFu
-
-/* ReferThreadStatus waitType values, threadprobe steps 9-12 (fw 6.60): Sleep
- * 1, Delay 2, WaitSema 3 (waitId the semaphore), WaitEventFlag 4 (the flag),
- * WaitThreadEnd 9 (the thread waited for). They were all reported as 0. The
- * waits in kernobj.c and kernlock.c mark theirs through
- * psp_threadman_wait_mark (hle.h has the values). */
-#define WAITTYPE_SLEEP     PSP_WAITTYPE_SLEEP
-#define WAITTYPE_DELAY     PSP_WAITTYPE_DELAY
-#define WAITTYPE_SEMA      PSP_WAITTYPE_SEMA
-#define WAITTYPE_EVF       PSP_WAITTYPE_EVF
-#define WAITTYPE_THREADEND PSP_WAITTYPE_THREADEND
 
 /* A timed wait ran out: out of its object's queue now (see psp_waitq_leave). */
 static void on_wait_expired(uint32_t uid) { (void)psp_waitq_leave(uid); }
@@ -290,8 +278,6 @@ static psp_evflag *find_flag(uint32_t id) {
     return NULL;
 }
 
-/* Report a wait that nothing could satisfy, exactly once. Repeating it for
- * every frame of a game that polls a semaphore drowns out everything else. */
 /* A wait that can never complete, made by a caller that asked for no timeout.
  *
  * Reporting a timeout here is a lie, and a load-bearing one: this game's
@@ -312,12 +298,6 @@ static void wait_deadlock(const char *what) {
      * one that finished -- both leave zero threads alive. */
     psp_sched_stop_all(what);
 }
-
-/* warn_block used to sit here: a wait that could not block reported a timeout
- * and said so once. Nothing reaches it now. A caller that supplies a timeout
- * gets a real one -- the wait parks with a deadline and the scheduler moves the
- * clock to it -- and a caller that supplies none is not lied to, it stops the
- * run through wait_deadlock. There is no third case left to warn about. */
 
 /* Defined down with the waits, but needed above them: by the signal, and by
  * sceKernelWaitThreadEnd, which is a thread operation that happens to be a
@@ -827,7 +807,7 @@ static void thread_ended(psp_thread *t, uint32_t status) {
     drop_callbacks_of(t->uid);
     psp_kernobj_thread_ended(t->uid);
     psp_kernlock_thread_ended(t->uid);
-    for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++) {
+    for (int i = 0; i < t->nenders && i < MAX_THREAD_ENDERS; i++) {
         const uint32_t w = t->enders[i];
         if (w == NO_ENDER) continue;
         psp_thread *wr = find_thread(w);
@@ -839,7 +819,13 @@ static void thread_ended(psp_thread *t, uint32_t status) {
 }
 
 /* Record what the current thread is about to wait on, or (0, 0) once the
- * wait is over, for ReferThreadStatus. */
+ * wait is over, for ReferThreadStatus.
+ *
+ * Its waitType values, threadprobe steps 9-12 (fw 6.60): Sleep 1, Delay 2,
+ * WaitSema 3 (waitId the semaphore), WaitEventFlag 4 (the flag),
+ * WaitThreadEnd 9 (the thread waited for). They were all reported as 0. The
+ * waits in kernobj.c and kernlock.c mark theirs through
+ * psp_threadman_wait_mark (hle.h has the values). */
 static void wait_mark(uint32_t type, uint32_t id) {
     psp_thread *t = current_thread();
     if (t) { t->wait_type = type; t->wait_id = id; }
@@ -849,7 +835,7 @@ void psp_threadman_wait_mark(uint32_t type, uint32_t id) { wait_mark(type, id); 
 /* A waiter that gave up (timeout or release) takes itself off the list, or the
  * end would wake it later out of whatever it was waiting on by then. */
 static void drop_ender(psp_thread *t, uint32_t w) {
-    for (int i = 0; i < t->nenders && i < MAX_SEMA_WAITERS; i++)
+    for (int i = 0; i < t->nenders && i < MAX_THREAD_ENDERS; i++)
         if (t->enders[i] == w) t->enders[i] = NO_ENDER;
 }
 
@@ -907,8 +893,8 @@ static void thread_end_wait(uint32_t thid, uint32_t timeout, uint64_t deadline, 
         const uint32_t me = psp_sched_current();
         int rc = restored;
         if (restored == WAIT_BEGINS) {
-            t->enders[t->nenders++ % MAX_SEMA_WAITERS] = me;
-            wait_mark(WAITTYPE_THREADEND, thid);
+            t->enders[t->nenders++ % MAX_THREAD_ENDERS] = me;
+            wait_mark(PSP_WAITTYPE_THREADEND, thid);
             rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                        "sceKernelWaitThreadEnd", deadline);
         }
@@ -1609,35 +1595,6 @@ static void hle_DeleteCallback(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* ---- the shape every kernel wait has ---------------------------------------
- *
- * The timeout argument is a *pointer*, and it is in and out. Hardware reads how
- * long to wait and, when the wait ends, writes back how much of it was left --
- * which the tests print, so it is observable rather than a nicety.
- * semaphores/wait.expected pins all three cases:
- *
- *     Signaled: OK (500ms left)                 immediate, nothing spent
- *     Wait timeout: ... remaining=4             blocked, woken with 4ms of 5000 left
- *     Never signaled: Failed (800201A8, 0ms)    ran out
- *
- * and a fourth, which is why the write-back is conditional: a call that fails
- * on its *arguments* -- `Greater than max: Failed (800201BD, 500ms left)` --
- * leaves the word alone, because it never waited.
- *
- * This was previously read only for its non-NULL-ness, to decide whether a
- * fabricated timeout was allowed. The duration itself was discarded. */
-
-/* Hand the count to whoever is next in line, as far as it will go.
- *
- * The head blocks the queue -- a waiter the count cannot satisfy is not skipped
- * over, and a *later* caller does not take what it is waiting for.
- * threads/semaphores/fifo measures both halves in eight lines: with a count of
- * 1, a thread asking for 5 parks; a second thread asking for 1 parks behind it
- * rather than taking what is there; and only when the first times out and
- * leaves the queue does the second get it.
- *
- * That is also why this runs whenever the queue *changes*, not only on a
- * signal. A waiter leaving on its own timeout can unblock the one behind it. */
 /* How much of `count` the queue would take if it were released now. The
  * overflow check needs it: a signal that puts the count past the maximum is
  * refused, but only if it would still be past it once the waiters have had
@@ -1659,6 +1616,17 @@ static int32_t sema_would_absorb(const psp_sema *s, int32_t count) {
     return taken;
 }
 
+/* Hand the count to whoever is next in line, as far as it will go.
+ *
+ * The head blocks the queue -- a waiter the count cannot satisfy is not skipped
+ * over, and a *later* caller does not take what it is waiting for.
+ * threads/semaphores/fifo measures both halves in eight lines: with a count of
+ * 1, a thread asking for 5 parks; a second thread asking for 1 parks behind it
+ * rather than taking what is there; and only when the first times out and
+ * leaves the queue does the second get it.
+ *
+ * That is also why this runs whenever the queue *changes*, not only on a
+ * signal. A waiter leaving on its own timeout can unblock the one behind it. */
 static int sema_release(psp_sema *s) {
     int urgent = 0;
     for (;;) {
@@ -1711,7 +1679,7 @@ static void hle_WaitSema(void) {
         return;
     }
 
-    wait_mark(WAITTYPE_SEMA, id);
+    wait_mark(PSP_WAITTYPE_SEMA, id);
     sema_wait_end(id, tmo_ptr, deadline, me,
                   psp_sched_block_until(me, PSP_SCHED_BLOCKED, s->waitdesc, deadline));
 }
@@ -1984,7 +1952,7 @@ static void hle_WaitEventFlag(void) {
         return;
     }
 
-    wait_mark(WAITTYPE_EVF, id);
+    wait_mark(PSP_WAITTYPE_EVF, id);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, f->waitdesc,
                                          deadline);
     wait_mark(0, 0);
@@ -2227,8 +2195,8 @@ static void hle_ReferThreadStatus(void) {
     if (!dormant) {
         const psp_sched_state st = psp_sched_state_of(t->uid);
         if (st == PSP_SCHED_BLOCKED || st == PSP_SCHED_SLEEPING) {
-            if (t->wait_kind == WAIT_SLEEP)      wait_type = WAITTYPE_SLEEP;
-            else if (t->wait_kind == WAIT_DELAY) wait_type = WAITTYPE_DELAY;
+            if (t->wait_kind == WAIT_SLEEP)      wait_type = PSP_WAITTYPE_SLEEP;
+            else if (t->wait_kind == WAIT_DELAY) wait_type = PSP_WAITTYPE_DELAY;
             else { wait_type = t->wait_type; wait_id = t->wait_id; }
         }
     }
