@@ -444,21 +444,21 @@ static void hle_Close(void) {
     if (flush) io_park();
 }
 
-static void hle_read_body(io_file *h, uint32_t dst, uint32_t size);
+static void hle_read_body(io_file *h, uint32_t dst, uint32_t asked);
 
 static void hle_Read(void) {
     io_file *h = fd_arg();
-    uint32_t dst = psp_arg(1), size = psp_arg(2);
+    uint32_t dst = psp_arg(1), asked = psp_arg(2);
     if (!h || !h->f) { psp_ret(IO_ERROR_BADF); return; }
-    if (!size) { psp_ret(0); return; }
-    if (h->sector_mode) size *= ISO_SECTOR;   /* the count is in sectors */
-    hle_read_body(h, dst, size);
+    if (!asked) { psp_ret(0); return; }
+    hle_read_body(h, dst, asked);
     io_park();
 }
 
-static void hle_read_body(io_file *h, uint32_t dst, uint32_t size) {
-    /* What the caller asked for, in its own unit: sectors on the raw device. */
-    const uint32_t asked = h->sector_mode ? size / ISO_SECTOR : size;
+/* `asked` is in the caller's own unit: sectors on the raw device. */
+static void hle_read_body(io_file *h, uint32_t dst, uint32_t asked) {
+    /* In bytes, 64 bits wide: 2^21 sectors are 4 GiB. */
+    uint64_t size = h->sector_mode ? (uint64_t)asked * ISO_SECTOR : asked;
 
     /* Read through a host buffer and then place it, so a read that straddles
      * the end of a guest region is rejected by the memory layer rather than
@@ -475,14 +475,14 @@ static void hle_read_body(io_file *h, uint32_t dst, uint32_t size) {
         psp_ret(0);
         return;
     }
-    if (size > h->len - h->pos) size = (uint32_t)(h->len - h->pos);
+    if (size > h->len - h->pos) size = h->len - h->pos;
 
-    uint8_t *tmp = (uint8_t *)malloc(size);
+    uint8_t *tmp = (uint8_t *)malloc((size_t)size);
     if (!tmp) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     size_t got = 0;
     if (fseeko(h->f, (off_t)(h->base + h->pos), SEEK_SET) == 0)
-        got = fread(tmp, 1, size, h->f);
+        got = fread(tmp, 1, (size_t)size, h->f);
     h->pos += got;
     if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
         /* Fall back to byte-at-a-time so a partially mapped destination still

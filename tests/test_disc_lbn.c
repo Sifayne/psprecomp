@@ -54,6 +54,25 @@ int main(int argc, char **argv) {
     CHECK(open_path("disc0:/sce_lbn0x16_size0x10.bin") < 0, "nothing may follow the size");
     CHECK(open_path("disc0:/sce_lbn_size0x10") < 0, "an extent needs a sector");
 
+    /* The raw device counts in sectors, and 2^21 of them are 4 GiB: such a
+     * count is the caller's, not a byte count that wraps. Past the image's
+     * end the device answers the count it was asked for; inside it, the
+     * sectors that are there. */
+    fd = open_path("umd0:");
+    CHECK(fd > 0, "the raw device opens, got %08X", (unsigned)fd);
+    const uint32_t sectors = call("sceIoLseek32", (uint32_t)fd, 0, 2 /* SEEK_END */, 0, 0);
+    call("sceIoLseek32", (uint32_t)fd, 100, 0 /* SEEK_SET */, 0, 0);
+    uint32_t got = call("sceIoRead", (uint32_t)fd, DATA, 0x200000u, 0, 0);
+    CHECK(got == 0x200000u, "past the end, 2^21 sectors answer 2^21, got %08X", got);
+    got = call("sceIoLseek32", (uint32_t)fd, 0, 1 /* SEEK_CUR */, 0, 0);
+    CHECK(got == 100u + 0x200000u, "and move the position past them, got %08X", got);
+    call("sceIoLseek32", (uint32_t)fd, 22, 0 /* SEEK_SET */, 0, 0);
+    got = call("sceIoRead", (uint32_t)fd, DATA, 0x200001u, 0, 0);
+    CHECK(got == sectors - 22, "from sector 22, 2^21 + 1 sectors read the %u left, got %u",
+          sectors - 22, got);
+    CHECK(word(0) == 0x00160000u, "from sector 22, got %08X", word(0));
+    call("sceIoClose", (uint32_t)fd, 0, 0, 0, 0);
+
     psp_mem_free();
     printf("disc extents: %u checks, %u failures\n", checks, failures);
     return failures ? 1 : 0;
