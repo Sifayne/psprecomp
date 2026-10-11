@@ -55,6 +55,25 @@ enum {
 
 enum { WHEN_POLL, WHEN_US };
 
+/* The pad as the script lane holds it, or as the recorder last wrote it: the
+ * buttons, the stick, the look channel's second stick, and one poll's mouse
+ * travel. Neutral is nothing held, both sticks centred, the mouse still. */
+typedef struct {
+    uint32_t buttons;
+    uint8_t  ax, ay, rx, ry;
+    int      mdx, mdy;
+} pad_state;
+#define STICK_CENTRE 128
+#define PAD_NEUTRAL { 0, STICK_CENTRE, STICK_CENTRE, STICK_CENTRE, STICK_CENTRE, 0, 0 }
+
+static int look_neutral(const pad_state *p) {
+    return p->rx == STICK_CENTRE && p->ry == STICK_CENTRE && !p->mdx && !p->mdy;
+}
+static int pad_same(const pad_state *a, const pad_state *b) {
+    return a->buttons == b->buttons && a->ax == b->ax && a->ay == b->ay &&
+           a->rx == b->rx && a->ry == b->ry && a->mdx == b->mdx && a->mdy == b->mdy;
+}
+
 typedef struct {
     int      kind;
     int      when_unit;     /* WHEN_POLL | WHEN_US                         */
@@ -87,23 +106,18 @@ static int       g_tainted;
 static uint32_t  g_prev_poll;
 static uint64_t  g_prev_us;
 
-/* The script lane's current value, owned here and published to misc.c. */
-static uint32_t  g_buttons;
-static uint8_t   g_ax = 128, g_ay = 128;
+/* The script lane's current value, owned here and published to misc.c, and
+ * whether it holds the stick and the look channel; the mouse delta is spent
+ * once. */
+static pad_state g_lane = PAD_NEUTRAL;
 static int       g_analog_owned;
-/* The look channel, owned the same way; the mouse delta is spent once. */
-static uint8_t   g_rx = 128, g_ry = 128;
-static int       g_mdx, g_mdy;
 static int       g_look_owned;
 
 /* ---- the recorder -------------------------------------------------------- */
 
 static FILE     *g_rec;
 static int       g_rec_first = 1;
-static uint32_t  g_rec_buttons;
-static uint8_t   g_rec_ax = 128, g_rec_ay = 128;
-static uint8_t   g_rec_rx = 128, g_rec_ry = 128;
-static int       g_rec_mdx, g_rec_mdy;
+static pad_state g_rec_pad = PAD_NEUTRAL;
 static uint32_t  g_rec_events;
 
 /* ---- parsing ------------------------------------------------------------- */
@@ -405,10 +419,14 @@ static int parse_file(const char *path) {
 
 /* ---- the player ---------------------------------------------------------- */
 
+static void tell_lane(void) {
+    psp_ctrl_script_set(g_lane.buttons, g_analog_owned, g_lane.ax, g_lane.ay);
+    psp_ctrl_script_set_look(g_look_owned, g_lane.rx, g_lane.ry, g_lane.mdx, g_lane.mdy);
+}
+
 static void publish(void) {
-    psp_ctrl_script_set(g_buttons, g_analog_owned, g_ax, g_ay);
-    psp_ctrl_script_set_look(g_look_owned, g_rx, g_ry, g_mdx, g_mdy);
-    g_mdx = g_mdy = 0;              /* a delta is delivered once */
+    tell_lane();
+    g_lane.mdx = g_lane.mdy = 0;    /* a delta is delivered once */
 }
 
 /* A save state's (psprecomp/state.h): where the scenario is and what it
@@ -426,10 +444,10 @@ static struct {
 static int replay_save(psp_state_writer *w) {
     g_saved.cursor = g_cursor; g_saved.finished = g_finished;
     g_saved.prev_poll = g_prev_poll; g_saved.prev_us = g_prev_us;
-    g_saved.buttons = g_buttons; g_saved.analog_owned = g_analog_owned;
-    g_saved.ax = g_ax; g_saved.ay = g_ay;
-    g_saved.look_owned = g_look_owned; g_saved.rx = g_rx; g_saved.ry = g_ry;
-    g_saved.mdx = g_mdx; g_saved.mdy = g_mdy;
+    g_saved.buttons = g_lane.buttons; g_saved.analog_owned = g_analog_owned;
+    g_saved.ax = g_lane.ax; g_saved.ay = g_lane.ay;
+    g_saved.look_owned = g_look_owned; g_saved.rx = g_lane.rx; g_saved.ry = g_lane.ry;
+    g_saved.mdx = g_lane.mdx; g_saved.mdy = g_lane.mdy;
     return psp_state_put(w, "replay", &g_saved, sizeof g_saved);
 }
 
@@ -442,13 +460,12 @@ static int replay_load(psp_state_reader *r, char *why, size_t size) {
         g_cursor = g_saved.cursor < g_ev_n ? g_saved.cursor : g_ev_n;
         g_finished = g_saved.finished;
         g_prev_poll = g_saved.prev_poll; g_prev_us = g_saved.prev_us;
-        g_buttons = g_saved.buttons; g_analog_owned = g_saved.analog_owned;
-        g_ax = g_saved.ax; g_ay = g_saved.ay;
-        g_look_owned = g_saved.look_owned; g_rx = g_saved.rx; g_ry = g_saved.ry;
-        g_mdx = g_saved.mdx; g_mdy = g_saved.mdy;
+        g_lane.buttons = g_saved.buttons; g_analog_owned = g_saved.analog_owned;
+        g_lane.ax = g_saved.ax; g_lane.ay = g_saved.ay;
+        g_look_owned = g_saved.look_owned; g_lane.rx = g_saved.rx; g_lane.ry = g_saved.ry;
+        g_lane.mdx = g_saved.mdx; g_lane.mdy = g_saved.mdy;
     }
-    psp_ctrl_script_set(g_buttons, g_analog_owned, g_ax, g_ay);
-    psp_ctrl_script_set_look(g_look_owned, g_rx, g_ry, g_mdx, g_mdy);
+    tell_lane();
     return 0;
 }
 
@@ -464,11 +481,9 @@ void psp_ctrl_replay_reset(void) {
     g_minhold = 2; g_drain = 0;
     g_loaded = g_finished = g_tainted = 0;
     g_prev_poll = 0; g_prev_us = 0;
-    g_buttons = 0; g_ax = g_ay = 128; g_analog_owned = 0;
-    g_rx = g_ry = 128; g_mdx = g_mdy = 0; g_look_owned = 0;
+    g_lane = (pad_state)PAD_NEUTRAL; g_analog_owned = g_look_owned = 0;
     if (g_rec) { fclose(g_rec); g_rec = NULL; }
-    g_rec_first = 1; g_rec_buttons = 0; g_rec_ax = g_rec_ay = 128;
-    g_rec_rx = g_rec_ry = 128; g_rec_mdx = g_rec_mdy = 0;
+    g_rec_first = 1; g_rec_pad = (pad_state)PAD_NEUTRAL;
     g_rec_events = 0;
 }
 
@@ -523,6 +538,15 @@ static int due(const ev *e, uint32_t polls, uint64_t us) {
     return us >= at;
 }
 
+/* A state or analog line's stick, and its look channel if it gave one. */
+static void take_sticks(const ev *e) {
+    g_lane.ax = e->ax; g_lane.ay = e->ay; g_analog_owned = 1;
+    if (e->look) {
+        g_lane.rx = e->rx; g_lane.ry = e->ry; g_lane.mdx = e->mdx; g_lane.mdy = e->mdy;
+        g_look_owned = 1;
+    }
+}
+
 void psp_ctrl_replay_step(uint32_t polls, uint64_t us) {
     if (!g_loaded || g_finished) return;
 
@@ -546,32 +570,24 @@ void psp_ctrl_replay_step(uint32_t polls, uint64_t us) {
         int edge = 0;
 
         switch (e->kind) {
-        case EV_DOWN:    g_buttons |= e->mask;  edge = 1; break;
-        case EV_UP:      g_buttons &= ~e->mask; edge = 1; break;
+        case EV_DOWN:    g_lane.buttons |= e->mask;  edge = 1; break;
+        case EV_UP:      g_lane.buttons &= ~e->mask; edge = 1; break;
         case EV_STATE:
-            g_buttons = e->mask;
-            g_ax = e->ax; g_ay = e->ay; g_analog_owned = 1;
-            if (e->look) {
-                g_rx = e->rx; g_ry = e->ry; g_mdx = e->mdx; g_mdy = e->mdy;
-                g_look_owned = 1;
-            }
+            g_lane.buttons = e->mask;
+            take_sticks(e);
             edge = 1;
             break;
         case EV_ANALOG:
-            g_ax = e->ax; g_ay = e->ay; g_analog_owned = 1;
-            if (e->look) {
-                g_rx = e->rx; g_ry = e->ry; g_mdx = e->mdx; g_mdy = e->mdy;
-                g_look_owned = 1;
-            }
+            take_sticks(e);
             edge = 1;
             break;
         case EV_MOUSE:
-            g_mdx = e->mdx; g_mdy = e->mdy; g_look_owned = 1;
+            g_lane.mdx = e->mdx; g_lane.mdy = e->mdy; g_look_owned = 1;
             edge = 1;
             break;
         case EV_NEUTRAL:
-            g_buttons = 0; g_analog_owned = 0; g_ax = g_ay = 128;
-            g_look_owned = 0; g_rx = g_ry = 128; g_mdx = g_mdy = 0;
+            g_lane = (pad_state)PAD_NEUTRAL;
+            g_analog_owned = g_look_owned = 0;
             edge = 1;
             break;
         case EV_MARK:
@@ -637,26 +653,18 @@ void psp_ctrl_replay_record(uint32_t polls, uint64_t us,
                             uint32_t buttons, uint8_t ax, uint8_t ay,
                             uint8_t rx, uint8_t ry, int mdx, int mdy) {
     if (!g_rec) return;
-    if (!g_rec_first && buttons == g_rec_buttons &&
-        ax == g_rec_ax && ay == g_rec_ay &&
-        rx == g_rec_rx && ry == g_rec_ry && mdx == g_rec_mdx && mdy == g_rec_mdy)
-        return;
+    const pad_state now = { buttons, ax, ay, rx, ry, mdx, mdy };
+    if (!g_rec_first && pad_same(&now, &g_rec_pad)) return;
 
-    const int look_neutral = rx == 128 && ry == 128 && !mdx && !mdy;
-    const int was_look = !g_rec_first &&
-        !(g_rec_rx == 128 && g_rec_ry == 128 && !g_rec_mdx && !g_rec_mdy);
+    const int look_still = look_neutral(&now);
+    const int was_look = !g_rec_first && !look_neutral(&g_rec_pad);
 
     /* The first poll establishes the baseline; only write it if it is not
      * already the neutral the player starts from. */
-    if (g_rec_first) {
-        g_rec_first = 0;
-        g_rec_buttons = buttons; g_rec_ax = ax; g_rec_ay = ay;
-        g_rec_rx = rx; g_rec_ry = ry; g_rec_mdx = mdx; g_rec_mdy = mdy;
-        if (!buttons && ax == 128 && ay == 128 && look_neutral) return;
-    } else {
-        g_rec_buttons = buttons; g_rec_ax = ax; g_rec_ay = ay;
-        g_rec_rx = rx; g_rec_ry = ry; g_rec_mdx = mdx; g_rec_mdy = mdy;
-    }
+    const int first = g_rec_first;
+    g_rec_first = 0;
+    g_rec_pad = now;
+    if (first && !buttons && ax == STICK_CENTRE && ay == STICK_CENTRE && look_still) return;
 
     fprintf(g_rec, "@%-6u state ", polls);
     write_buttons(g_rec, buttons);
@@ -665,7 +673,7 @@ void psp_ctrl_replay_record(uint32_t polls, uint64_t us,
      * it returns to neutral, so a replay releases it where the player did. A
      * line without it leaves the channel as it was. The mouse delta, when
      * there is one, follows the stick pair. */
-    if (!look_neutral || was_look) {
+    if (!look_still || was_look) {
         fprintf(g_rec, " %u %u", rx, ry);
         if (mdx || mdy) fprintf(g_rec, " %d %d", mdx, mdy);
     }
