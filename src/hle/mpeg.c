@@ -923,6 +923,16 @@ static int avc_pump(mpeg_ctx *c) {
         unsigned char *planes[3] = { 0, 0, 0 };
         SBufferInfo info;
         memset(&info, 0, sizeof info);
+        {   /* PSPRECOMP_MPEG_ES=<file>: every NAL as it is given the decoder,
+             * start code and all -- an Annex B stream another decoder reads. */
+            static FILE *es_dump; static int es_checked;
+            if (!es_checked) {
+                const char *path = getenv("PSPRECOMP_MPEG_ES");
+                es_checked = 1;
+                if (path && *path) es_dump = fopen(path, "wb");
+            }
+            if (es_dump) { fwrite(c->es + start - 3, 1, nal_end - (start - 3), es_dump); fflush(es_dump); }
+        }
         const uint64_t t0 = psp_os_mono_ns();
         (*d)->DecodeFrameNoDelay(d, c->es + start - 3, (int)(nal_end - (start - 3)),
                                  planes, &info);
@@ -947,6 +957,15 @@ static int avc_pump(mpeg_ctx *c) {
                         for (int y = 0; y < b->iHeight / 2; y++, d += b->iWidth / 2)
                             memcpy(d, planes[pl] + (size_t)y * b->iStride[1], (size_t)b->iWidth / 2);
                     c->pic_ready = 1;
+                    {   /* PSPRECOMP_MPEG_YUV=<file>: every picture, raw I420, as decoded. */
+                        static FILE *yuv_dump; static int yuv_checked;
+                        if (!yuv_checked) {
+                            const char *path = getenv("PSPRECOMP_MPEG_YUV");
+                            yuv_checked = 1;
+                            if (path && *path) yuv_dump = fopen(path, "wb");
+                        }
+                        if (yuv_dump) { fwrite(c->pic, 1, need, yuv_dump); fflush(yuv_dump); }
+                    }
                     /* The picture's own timestamp, from its PES; 25fps from
                      * the frame count only if the stream carried none -- which
                      * this game's intro does not do, and which ran its picture
@@ -1061,6 +1080,15 @@ static void hle_RingbufferPut(void) {
         uint32_t bytes=(uint32_t)copied*stride;
         const uint8_t *payload=psp_mem_ptr(target,bytes);
         if (!payload) { psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }
+        {   /* PSPRECOMP_MPEG_PS=<file>: the program stream as the game supplies it. */
+            static FILE *ps_dump; static int ps_checked;
+            if (!ps_checked) {
+                const char *path=getenv("PSPRECOMP_MPEG_PS");
+                ps_checked=1;
+                if (path && *path) ps_dump=fopen(path,"wb");
+            }
+            if (ps_dump) { fwrite(payload,1,bytes,ps_dump); fflush(ps_dump); }
+        }
         ps_demux(context,payload,bytes);
         context->put_total+=bytes;
         if (context->nputs==context->puts_cap) {
