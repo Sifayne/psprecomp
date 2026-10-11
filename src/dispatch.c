@@ -28,10 +28,21 @@ static psp_miss_ctx_fn_t g_miss_ctx;
 void psp_set_miss_context(psp_miss_ctx_fn_t fn) { g_miss_ctx = fn; }
 void psp_miss_context(void) { if (g_miss_ctx) g_miss_ctx(); }
 
+/* Knuth's multiplicative hash constant, 2^32 divided by the golden ratio. */
+static const uint32_t KNUTH = 2654435761u;
+
 static uint32_t hash_addr(uint32_t a) {
     /* Knuth multiplicative. The low two bits are always zero, so shift them
      * out first or a quarter of the table would never be used. */
-    return (a >> 2) * 2654435761u;
+    return (a >> 2) * KNUTH;
+}
+
+/* The slot holding addr, or the empty one where it would go. */
+static slot *find_slot(uint32_t addr) {
+    const uint32_t m = g_cap - 1;
+    uint32_t j = hash_addr(addr) & m;
+    while (g_table[j].used && g_table[j].addr != addr) j = (j + 1) & m;
+    return &g_table[j];
 }
 
 static void grow(void) {
@@ -39,32 +50,26 @@ static void grow(void) {
     slot *nt = (slot *)calloc(ncap, sizeof *nt);
     if (!nt) return;
 
-    for (uint32_t i = 0; i < g_cap; i++) {
-        if (!g_table[i].used) continue;
-        uint32_t m = ncap - 1;
-        uint32_t j = hash_addr(g_table[i].addr) & m;
-        while (nt[j].used) j = (j + 1) & m;
-        nt[j] = g_table[i];
-    }
-    free(g_table);
+    slot *old = g_table;
+    const uint32_t old_cap = g_cap;
     g_table = nt;
     g_cap = ncap;
+    for (uint32_t i = 0; i < old_cap; i++)
+        if (old[i].used) *find_slot(old[i].addr) = old[i];
+    free(old);
+}
+
+/* Room for one more entry, the load kept under 0.75; 0 when there is. */
+static int make_room(void) {
+    if (!g_table || (g_count + 1) * 4 >= g_cap * 3) grow();
+    return g_table ? 0 : -1;
 }
 
 void psp_register(uint32_t addr, psp_fn_t fn) {
-    if (!g_table || (g_count + 1) * 4 >= g_cap * 3) grow();   /* keep load < 0.75 */
-    if (!g_table) return;
-
-    uint32_t m = g_cap - 1;
-    uint32_t j = hash_addr(addr) & m;
-    while (g_table[j].used) {
-        if (g_table[j].addr == addr) { g_table[j].fn = fn; return; }  /* replace */
-        j = (j + 1) & m;
-    }
-    g_table[j].addr = addr;
-    g_table[j].fn = fn;
-    g_table[j].used = 1;
-    g_count++;
+    if (make_room()) return;
+    slot *s = find_slot(addr);
+    if (!s->used) { s->addr = addr; s->used = 1; g_count++; }
+    s->fn = fn;                                     /* new, or a replacement */
 }
 
 /* Register an interior label -- a block in the middle of a function that some
@@ -72,30 +77,19 @@ void psp_register(uint32_t addr, psp_fn_t fn) {
  * function entry runs the whole function, a label thunk enters partway through,
  * and if an address is both then the entry is the correct answer. */
 void psp_register_label(uint32_t addr, psp_fn_t fn) {
-    if (!g_table || (g_count + 1) * 4 >= g_cap * 3) grow();
-    if (!g_table) return;
-
-    uint32_t m = g_cap - 1;
-    uint32_t j = hash_addr(addr) & m;
-    while (g_table[j].used) {
-        if (g_table[j].addr == addr) return;      /* already known: keep it */
-        j = (j + 1) & m;
-    }
-    g_table[j].addr = addr;
-    g_table[j].fn = fn;
-    g_table[j].used = 1;
+    if (make_room()) return;
+    slot *s = find_slot(addr);
+    if (s->used) return;                            /* already known: keep it */
+    s->addr = addr;
+    s->fn = fn;
+    s->used = 1;
     g_count++;
 }
 
 psp_fn_t psp_lookup(uint32_t addr) {
     if (!g_table) return NULL;
-    uint32_t m = g_cap - 1;
-    uint32_t j = hash_addr(addr) & m;
-    while (g_table[j].used) {
-        if (g_table[j].addr == addr) return g_table[j].fn;
-        j = (j + 1) & m;
-    }
-    return NULL;
+    const slot *s = find_slot(addr);
+    return s->used ? s->fn : NULL;
 }
 
 /* ---- function-entry trace ------------------------------------------------ */
@@ -178,6 +172,10 @@ void psp_set_miss_handler(psp_miss_fn_t fn) { g_miss = fn; }
 static psp_dispatch_hook_t g_hook;
 void psp_set_dispatch_hook(psp_dispatch_hook_t fn) { g_hook = fn; }
 
+/* Nothing here sets it: set from a debugger, it logs the first successful
+ * indirect calls. */
+int psp_log_indirect;
+
 /* A budget on dispatched calls.
  *
  * A game's main loop does not return, and during bring-up it is just as likely
@@ -211,7 +209,6 @@ void psp_dispatch(uint32_t addr) {
         /* Log the first few *successful* indirect calls. Every session so far
          * has examined only the failures; a working virtual call sitting next
          * to a broken one says where vptrs come from. */
-        extern int psp_log_indirect;
         static int logged;
         if (psp_log_indirect && logged < 12) {
             logged++;
@@ -257,9 +254,6 @@ static uint64_t g_loop_hits;
 void psp_trace_loop(uint32_t addr) { g_loop_addr = addr; g_loop_hits++; }
 uint32_t psp_trace_loop_addr(void) { return g_loop_addr; }
 uint64_t psp_trace_loop_hits(void) { return g_loop_hits; }
-
-int psp_log_indirect;
-
 
 /* Label-level reachability.
  *
@@ -342,7 +336,7 @@ static unsigned g_sp_nsites;
 static uint64_t g_sp_dropped;
 
 static void sp_record(uint32_t fn, int32_t delta) {
-    unsigned h = (unsigned)((fn * 2654435761u) >> 13) & (SP_SITES - 1);
+    unsigned h = (unsigned)((fn * KNUTH) >> 13) & (SP_SITES - 1);
     for (unsigned n = 0; n < SP_SITES; n++) {
         sp_site *s = &g_sp_site[(h + n) & (SP_SITES - 1)];
         if (s->hits && s->fn != fn) continue;
