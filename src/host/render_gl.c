@@ -475,9 +475,7 @@ typedef struct {
 
 /* ---- state ------------------------------------------------------------------
  *
- * Everything the interpreter sets is recorded. Most of it is not acted on yet;
- * see the scope note at the top. It is kept rather than dropped so that the
- * increment that implements a rule has the value already arriving. */
+ * Everything the interpreter sets is recorded. */
 static struct {
     int      w, h;
     int      ready, failed;
@@ -3671,17 +3669,6 @@ static int stage_prepare(int w, int h) {
     return 0;
 }
 
-/* Read one colour attachment back into the guest's framebuffer.
- *
- * This is what keeps the rest of the project working. score_frame,
- * dump_frame_seq, dump_framebuffer, survey_vram and the frame comparison that
- * passed the M2 gate all read guest memory, and render-target aliases need the
- * actual PSP bytes before the shared texture decoder can reinterpret them.
- *
- * One glReadPixels for the whole surface matters: the old row-at-a-time path
- * forced 272 GPU/CPU synchronisation points at every flip, which made complex
- * mission frames disproportionately slow.  Rows are flipped and packed on the
- * CPU after that single transfer. */
 /* ---- the readback ----------------------------------------------------------
  *
  * Every presented frame is read back into the guest framebuffer, because the
@@ -3806,6 +3793,18 @@ static void readback_issue(int i) {
     g_rb.issued++;
     readback_watch();
 }
+
+/* Read one colour attachment back into the guest's framebuffer.
+ *
+ * This is what keeps the rest of the project working. score_frame,
+ * dump_frame_seq, dump_framebuffer, survey_vram and the frame comparison that
+ * passed the M2 gate all read guest memory, and render-target aliases need the
+ * actual PSP bytes before the shared texture decoder can reinterpret them.
+ *
+ * One glReadPixels for the whole surface matters: the old row-at-a-time path
+ * forced 272 GPU/CPU synchronisation points at every flip, which made complex
+ * mission frames disproportionately slow.  Rows are flipped and packed on the
+ * CPU after that single transfer. */
 static void readback_rt(int i) {
     rendertarget *r = &g.rts[i];
     if (!r->configured || !r->addr || !r->stride) return;
