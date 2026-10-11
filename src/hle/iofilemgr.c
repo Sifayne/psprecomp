@@ -448,7 +448,6 @@ static void hle_Read(void) {
     uint32_t dst = psp_arg(1), size = psp_arg(2);
     if (!h || !h->f) { psp_ret(IO_ERROR_BADF); return; }
     if (!size) { psp_ret(0); return; }
-    const uint32_t asked = size;
     if (h->sector_mode) size *= ISO_SECTOR;   /* the count is in sectors */
     hle_read_body(h, dst, size);
     io_park();
