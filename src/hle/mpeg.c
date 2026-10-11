@@ -1624,13 +1624,18 @@ static void hle_GetAvcAu(void) {
 #define AT3P_SYNC1 0xD0u
 #define AT3P_HDR   8u
 
+/* The payload size a frame's header gives: in 8-byte units, less one. */
+static uint32_t at3p_payload(const uint8_t *h) {
+    return ((((uint32_t)h[2] & 3u) << 8) | h[3]) * 8u + 8u;
+}
+
 /* The frame at aes_pos: its total size with the header, or 0 if there is not
  * a whole one yet. Resyncs on the 0F D0 pair if the position has drifted. */
 static size_t aes_frame(mpeg_ctx *c) {
     while (c->aes_pos + AT3P_HDR <= c->aes_len) {
         const uint8_t *h = c->aes + c->aes_pos;
         if (h[0] == AT3P_SYNC0 && h[1] == AT3P_SYNC1) {
-            const size_t payload = ((((size_t)h[2] & 3u) << 8) | h[3]) * 8u + 8u;
+            const size_t payload = at3p_payload(h);
             return c->aes_pos + AT3P_HDR + payload <= c->aes_len ? AT3P_HDR + payload : 0;
         }
         c->aes_pos++;
@@ -1797,7 +1802,7 @@ static void hle_AtracDecode(void) {
         if (esbuf && essz >= AT3P_HDR && essz <= sizeof frame &&
             psp_mem_read_block(frame, esbuf, essz) == 0 &&
             frame[0] == AT3P_SYNC0 && frame[1] == AT3P_SYNC1) {
-            const uint32_t payload = ((((uint32_t)frame[2] & 3u) << 8) | frame[3]) * 8u + 8u;
+            const uint32_t payload = at3p_payload(frame);
             /* Sample rate index and channel configuration, as the OMA/AA3
              * container spells them: rates 32000, 44100, 48000, 88200, 96000;
              * channel configuration 1 is mono and 2 stereo. */
