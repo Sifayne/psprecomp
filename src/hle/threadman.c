@@ -2209,18 +2209,15 @@ static void hle_ReferThreadStatus(void) {
         st.intr_preempts, st.thread_preempts, st.releases,
     };
     uint8_t buf[104];
-    for (int w = 0; w < 26; w++)
-        for (int b = 0; b < 4; b++) buf[w * 4 + b] = (uint8_t)(words[w] >> (b * 8));
-    for (int i = 0; i < 31 && t->name[i]; i++) buf[4 + i] = (uint8_t)t->name[i];
+    for (int w = 0; w < 26; w++) psp_refer_img32(buf, (uint32_t)w * 4, words[w]);
+    psp_refer_imgname(buf, t->name);
 
     /* Only as many bytes as the caller says it has room for. refer.expected
      * sweeps the size field and watches the exit word, which starts at offset
      * 80: untouched at 80, half written at 82 (`ffff01a4`), whole at 108. A
      * refer that wrote all 104 regardless differs on every row of that sweep,
      * and one asked for zero bytes writes none at all. */
-    uint32_t room = psp_read32(info);
-    if (room > sizeof buf) room = sizeof buf;
-    for (uint32_t i = 0; i < room; i++) psp_write8(info + i, buf[i]);
+    psp_refer_put(info, buf, sizeof buf);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

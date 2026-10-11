@@ -136,12 +136,8 @@ static void hle_ReferAlarmStatus(void) {
         20, (uint32_t)a->schedule, (uint32_t)(a->schedule >> 32),
         a->handler, a->common,
     };
-    for (int w = 0; w < 5; w++)
-        for (int b = 0; b < 4; b++) buf[w * 4 + b] = (uint8_t)(words[w] >> (b * 8));
-
-    uint32_t room = psp_read32(info);
-    if (room > sizeof buf) room = sizeof buf;
-    for (uint32_t i = 0; i < room; i++) psp_write8(info + i, buf[i]);
+    for (int w = 0; w < 5; w++) psp_refer_img32(buf, (uint32_t)w * 4, words[w]);
+    psp_refer_put(info, buf, sizeof buf);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
