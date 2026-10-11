@@ -45,12 +45,20 @@ static int failures;
 enum { PRIM_LINES = 1, PRIM_LINE_STRIP, PRIM_TRIANGLES, PRIM_STRIP, PRIM_FAN, PRIM_SPRITES };
 
 /* The real backend, and the copy the GE draws through: it counts the model
- * path's draws, so a 3D case can tell which path it took. */
+ * path's draws, so a 3D case can tell which path it took, and can give
+ * set_texture its address with the uncached bit, as a caller other than
+ * ge.c may (the GE's own texture addresses are 28 bits). */
 static const psp_render_backend *real_gl;
 static unsigned model_draws;
+static int uncached_textures;
 static void counted_model(int prim, const psp_model_vertex *v, int count, const psp_xform_state *xs) {
     model_draws++;
     real_gl->draw_model(prim, v, count, xs);
+}
+static void texture_as_given(const psp_tex_state *t) {
+    psp_tex_state u = *t;
+    if (uncached_textures && u.addr) u.addr |= 0x40000000u;
+    real_gl->set_texture(&u);
 }
 
 static uint32_t call(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2) {
@@ -280,6 +288,34 @@ static void test_texture_span(void) {
           shot(18, 210), GREEN);
 }
 
+/* A texture that is exactly a render target, at native resolution, samples
+ * the target's own attachment, which holds what the GPU drew there. The
+ * texture's address is compared without the cached/uncached bit, as
+ * texcache_get compares it: texcache_get left the target to the direct
+ * path without reading it back, and an unmasked comparison there missed it,
+ * so the decoder read guest memory from before the draw. */
+static void test_texture_alias(void) {
+    const uint32_t TARGET = 0x04150000u;
+    begin_list(TARGET, 64, VTYPE_2D);
+    cmd(0xD4, 0); cmd(0xD5, 63u | 63u << 10);           /* SCISSOR: 64x64 */
+    vertex_2d(0, 0, 0, BLUE); vertex_2d(1, 64, 64, BLUE);
+    cmd(0x04, (PRIM_SPRITES << 16) | 2);
+    end_list();
+    int w = 0, h = 0;
+    free(render_gl_capture(TARGET, &w, &h));
+    CHECK(w == 64 && h == 64, "the target is %dx%d, want 64x64 for the direct path", w, h);
+
+    uncached_textures = 1;
+    begin_list(FB, 480, VTYPE_2D_TEX);
+    texture(TARGET, 64, 6, 6, 3);                       /* 8888 */
+    sprite_tex(100, 160, 64, 64);
+    end_list();
+    uncached_textures = 0;
+    shoot(FB);
+    CHECK(shot(130, 190) == BLUE, "the target as an uncached texture reads %06X, want the GPU's %06X",
+          shot(130, 190), BLUE);
+}
+
 int main(void) {
     if (psp_mem_init()) return 2;
     psp_hle_init(); psp_cpu_reset(); psp_sched_set_threading(0); psp_clock_reset();
@@ -295,23 +331,25 @@ int main(void) {
     psp_settings_use(&settings);
     real_gl = render_gl_backend();
     if (!real_gl) return 2;
-    psp_render_backend counted = *real_gl;
-    counted.name = "counted-gl";
-    counted.draw_model = counted_model;
-    if (psp_render_register(&counted) || psp_render_select("counted-gl")) return 2;
+    psp_render_backend wrapped = *real_gl;
+    wrapped.name = "wrapped-gl";
+    wrapped.draw_model = counted_model;
+    wrapped.set_texture = texture_as_given;
+    if (psp_render_register(&wrapped) || psp_render_select("wrapped-gl")) return 2;
     present_want_gl();
     if (present_start() != 0) {
         printf("GL backend: no window, skipped\n");
         return 77;
     }
-    if (counted.init(480, 272) != 0) return 2;
+    if (wrapped.init(480, 272) != 0) return 2;
 
     test_flat_through();
     test_flat_3d();
     test_texture_span();
+    test_texture_alias();
 
     free(g_shot);
-    counted.shutdown();
+    wrapped.shutdown();
     psp_mem_free();
     printf("GL backend: %d failure(s)\n", failures);
     return failures ? 1 : 0;

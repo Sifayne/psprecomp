@@ -2553,9 +2553,11 @@ static GLuint texcache_native(const psp_tex_state *t, uint32_t supplied) {
      * palette.  Returning its RGBA attachment used to skip that byte-level
      * reinterpretation and produced the bright menu shards and mirrored
      * mission foreground.  Synchronise such aliases to guest memory and send
-     * them through the common decoder instead. */
+     * them through the common decoder instead. Targets are found by the
+     * address without its cache bits, as texcache_get finds them. */
+    const uint32_t base = t->addr & PSP_ADDR_MASK;
     for (int i = 0; i < g.n_rts; i++) {
-        if (g.rts[i].used && g.rts[i].addr == t->addr) {
+        if (g.rts[i].used && g.rts[i].addr == base) {
             g.tex_from_rt++;
             rendertarget *r = &g.rts[i];
             if (r->configured && samples_target_whole(r, t)) {
@@ -2575,7 +2577,7 @@ static GLuint texcache_native(const psp_tex_state *t, uint32_t supplied) {
      * level the sampler can reach before decoding; checking only level zero
      * leaves a perfectly keyed cache holding yesterday's generated mip. */
     for (int level = 1; level <= top; level++) {
-        const uint32_t addr = level_addr(t, level);
+        const uint32_t addr = level_addr(t, level) & PSP_ADDR_MASK;
         for (int i = 0; addr && i < g.n_rts; i++) {
             rendertarget *r = &g.rts[i];
             if (!r->used || r->addr != addr) continue;
