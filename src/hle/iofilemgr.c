@@ -256,65 +256,59 @@ static void hle_open_body(void);
 /* See io_park: an open gives up the CPU whether or not it finds the file. */
 static void hle_Open(void) { hle_open_body(); io_park(); }
 
-static void hle_open_body(void) {
-    char guest[512], host[1024];
-    psp_str(psp_arg(0), guest, sizeof guest);
-    uint32_t flags = psp_arg(1);
-
-    /* A disc path is served from the image if there is one. The raw device
-     * falls out of this as the case with nothing after the colon. A directory
-     * opens too: the disc probe opened disc0:/SUB as a file and read its raw
-     * directory records back, with the extent's size at SEEK_END. */
-    if (!(flags & (PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC))) {
-        iso_entry e;
-        if (iso_lookup(guest, &e) == 0) {
-            const int i = io_file_take(e.f, 1, e.base, e.len, e.is_device);
-            if (i < 0) { fclose(e.f); psp_ret(SCE_ERROR_EMFILE); return; }
-            psp_ret((uint32_t)(i + FD_FIRST));
-            return;
-        }
-    }
-
-    if (is_raw_umd(guest)) {
-        if (!g_umd_image[0]) {
-            static int complained;
-            if (!complained++)
-                fprintf(stderr, "psprecomp: %s opened as a raw device, but no disc "
-                                "image is set (psp_io_set_umd_image)\n", guest);
-            psp_ret(IO_ERROR_NOENT);
-            return;
-        }
-        FILE *f = fopen(g_umd_image, "rb");
-        if (!f) {
-            fprintf(stderr, "psprecomp: cannot open disc image %s\n", g_umd_image);
-            psp_ret(IO_ERROR_NOENT);
-            return;
-        }
-        const int i = io_file_take(f, 1, 0, 0, 1);
-        if (i < 0) { fclose(f); psp_ret(SCE_ERROR_EMFILE); return; }
-        g_file[i].len = host_file_size(f);
-        psp_ret((uint32_t)(i + FD_FIRST));
+/* The raw device: the whole image, counted in sectors. */
+static void open_raw_device(const char *guest) {
+    if (!g_umd_image[0]) {
+        static int complained;
+        if (!complained++)
+            fprintf(stderr, "psprecomp: %s opened as a raw device, but no disc "
+                            "image is set (psp_io_set_umd_image)\n", guest);
+        psp_ret(IO_ERROR_NOENT);
         return;
     }
+    FILE *f = fopen(g_umd_image, "rb");
+    if (!f) {
+        fprintf(stderr, "psprecomp: cannot open disc image %s\n", g_umd_image);
+        psp_ret(IO_ERROR_NOENT);
+        return;
+    }
+    const int i = io_file_take(f, 1, 0, 0, 1);
+    if (i < 0) { fclose(f); psp_ret(SCE_ERROR_EMFILE); return; }
+    g_file[i].len = host_file_size(f);
+    psp_ret((uint32_t)(i + FD_FIRST));
+}
 
+/* FAT-illegal names fail at open with INVALID_ARG (the savedata suite's
+ * A?C probe): ? * < > | " and controls never name a real file. Only the
+ * host branch -- disc names are fixed. Checked on the guest subpath so
+ * no host root can smuggle a character in. */
+static int fat_name_illegal(const char *guest) {
+    const char *colon = strchr(guest, ':');
+    const char *sub = colon ? colon + 1 : guest;
+    for (const char *c = sub; *c; c++) {
+        unsigned char u = (unsigned char)*c;
+        if (u < 32 || u == '?' || u == '*' || u == '<' || u == '>' ||
+            u == '|' || u == '"')
+            return 1;
+    }
+    return 0;
+}
+
+/* The host fopen mode for the guest's open flags. */
+static const char *fopen_mode(uint32_t flags) {
+    if (flags & PSP_O_TRUNC)                     return (flags & PSP_O_RDWR) == PSP_O_RDWR ? "w+b" : "wb";
+    if (flags & PSP_O_APPEND)                    return "ab";
+    if ((flags & PSP_O_RDWR) == PSP_O_RDWR)      return "r+b";
+    if (flags & PSP_O_WRONLY)                    return (flags & PSP_O_CREAT) ? "wb" : "r+b";
+    return "rb";
+}
+
+/* A path under the host root. */
+static void open_host_file(const char *guest, uint32_t flags) {
+    char host[1024];
     map_path(guest, host, sizeof host);
 
-    /* FAT-illegal names fail at open with INVALID_ARG (the savedata suite's
-     * A?C probe): ? * < > | " and controls never name a real file. Only the
-     * host branch -- disc names are fixed. Checked on the guest subpath so
-     * no host root can smuggle a character in. */
-    {
-        const char *colon = strchr(guest, ':');
-        const char *sub = colon ? colon + 1 : guest;
-        for (const char *c = sub; *c; c++) {
-            unsigned char u = (unsigned char)*c;
-            if (u < 32 || u == '?' || u == '*' || u == '<' || u == '>' ||
-                u == '|' || u == '"') {
-                psp_ret(SCE_ERROR_EINVAL);
-                return;
-            }
-        }
-    }
+    if (fat_name_illegal(guest)) { psp_ret(SCE_ERROR_EINVAL); return; }
 
 #ifndef _WIN32
     /* A Memory Stick directory does not open as a file: EACCES, or EINVAL
@@ -342,12 +336,7 @@ static void hle_open_body(void) {
         if (slash) { *slash = '\0'; mkdir_parents(dir); }
     }
 
-    const char *mode = "rb";
-    if (flags & PSP_O_TRUNC)                  mode = (flags & PSP_O_RDWR) == PSP_O_RDWR ? "w+b" : "wb";
-    else if (flags & PSP_O_APPEND)            mode = "ab";
-    else if ((flags & PSP_O_RDWR) == PSP_O_RDWR) mode = "r+b";
-    else if (flags & PSP_O_WRONLY)            mode = (flags & PSP_O_CREAT) ? "wb" : "r+b";
-
+    const char *mode = fopen_mode(flags);
     FILE *f = fopen(host, mode);
     if (!f && (flags & PSP_O_CREAT)) f = fopen(host, "w+b");
     if (!f) {
@@ -375,6 +364,29 @@ static void hle_open_body(void) {
     h->len = host_file_size(f);
     rewind(f);
     psp_ret((uint32_t)(i + FD_FIRST));
+}
+
+static void hle_open_body(void) {
+    char guest[512];
+    psp_str(psp_arg(0), guest, sizeof guest);
+    uint32_t flags = psp_arg(1);
+
+    /* A disc path is served from the image if there is one. The raw device
+     * falls out of this as the case with nothing after the colon. A directory
+     * opens too: the disc probe opened disc0:/SUB as a file and read its raw
+     * directory records back, with the extent's size at SEEK_END. */
+    if (!(flags & (PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC))) {
+        iso_entry e;
+        if (iso_lookup(guest, &e) == 0) {
+            const int i = io_file_take(e.f, 1, e.base, e.len, e.is_device);
+            if (i < 0) { fclose(e.f); psp_ret(SCE_ERROR_EMFILE); return; }
+            psp_ret((uint32_t)(i + FD_FIRST));
+            return;
+        }
+    }
+
+    if (is_raw_umd(guest)) open_raw_device(guest);
+    else open_host_file(guest, flags);
 }
 
 /* A file system call gives up the CPU while its driver works.
