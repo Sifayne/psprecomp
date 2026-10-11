@@ -675,7 +675,8 @@ static int es_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
  * from one place in the file and its last from another, which the decoder
  * takes for a picture. The repeated pictures between splices are whole and
  * decode as themselves on the wrong reference, which is the smear. So the
- * NAL a splice cuts through is left out, and nothing else.
+ * NAL a splice cuts through is left out with what opens its access unit,
+ * and nothing else.
  *
  * A pack's clock tells where: it rises through a stream, by at most 0.2 s
  * a pack in the menu movie, so one that goes back, or forward by more than
@@ -695,14 +696,53 @@ static void pack_clock(mpeg_ctx *c, const uint8_t *b) {
     c->scr_last = scr;
     c->scr_seen = 1;
 }
+/* What opens an access unit ahead of its picture: SEI, the parameter sets
+ * and the delimiter (H.264 nal_unit_type 6 to 9). */
+static int au_prefix_nal(uint8_t header) {
+    const unsigned type = header & 0x1Fu;
+    return type >= 6 && type <= 9;
+}
+/* The start, back over any zeros ahead of it, of the last start code that
+ * opens a NAL before `to` and at or after the decoder's position; `to` if
+ * there is none. */
+static size_t es_last_nal(const mpeg_ctx *c, size_t to) {
+    for (size_t k = to; k >= c->es_pos + 3; k--)
+        if (c->es[k-3] == 0 && c->es[k-2] == 0 && c->es[k-1] == 1 && k < to) {
+            size_t s = k - 3;
+            while (s > c->es_pos && c->es[s - 1] == 0) s--;
+            return s;
+        }
+    return to;
+}
 /* Leave out the NAL a splice cut through: back to its start code here, and
- * on to the next start code in what follows. It has not reached the decoder,
- * which takes a NAL only once the next one's start code has arrived. */
+ * on to the next start code in what follows. It has not reached the
+ * decoder, which takes a NAL only once the next one's start code has
+ * arrived.
+ *
+ * With it goes the rest of its access unit ahead of it, back to the
+ * delimiter, which the decoder holds back until the picture is whole
+ * (avc_pump). Left in, an IDR's parameter sets without the IDR began a new
+ * sequence for openh264: it dropped every picture to the next IDR there and
+ * then showed one it had half made, a garbled strip across the top of the
+ * menu (WipEout Pulse, the movie's second lap). */
 static void es_cut(mpeg_ctx *c) {
-    size_t end = c->es_pos;
-    for (size_t k = c->es_len; k >= c->es_pos + 3; k--)
-        if (c->es[k-3] == 0 && c->es[k-2] == 0 && c->es[k-1] == 1) { end = k - 3; break; }
-    while (end > c->es_pos && c->es[end - 1] == 0) end--;
+    size_t end = c->es_len;
+    {   /* The NAL in progress: from its start code to the end. */
+        size_t k = c->es_len;
+        while (k >= c->es_pos + 3 && !(c->es[k-3] == 0 && c->es[k-2] == 0 && c->es[k-1] == 1)) k--;
+        end = k >= c->es_pos + 3 ? k - 3 : c->es_pos;
+        while (end > c->es_pos && c->es[end - 1] == 0) end--;
+    }
+    for (;;) {   /* its access unit's opening NALs */
+        const size_t s = es_last_nal(c, end);
+        if (s == end) break;
+        size_t h = s;
+        while (c->es[h] == 0) h++;
+        const uint8_t header = c->es[h + 1];
+        if (!au_prefix_nal(header)) break;
+        end = s;
+        if ((header & 0x1Fu) == 9) break;   /* the delimiter opens it */
+    }
     c->es_len = end;
     while (c->nvpts > c->vpts_next && c->vpts[c->nvpts - 1].es_off >= end) c->nvpts--;
     for (size_t i = c->put_iv; i < c->nputs; i++)
@@ -992,6 +1032,14 @@ static int avc_pump(mpeg_ctx *c) {
     while (pos < c->es_len) {
         const size_t start = nal_next(c->es, c->es_len, pos);
         if (start >= c->es_len) break;
+        if (!c->es_eof && au_prefix_nal(c->es[start])) {
+            /* What opens an access unit goes in with its picture: held
+             * until the slice after it has arrived whole, so that a splice
+             * cutting the slice can take them too (es_cut). */
+            size_t v = start;
+            while (v < c->es_len && au_prefix_nal(c->es[v])) v = nal_next(c->es, c->es_len, v);
+            if (v >= c->es_len || nal_next(c->es, c->es_len, v) >= c->es_len) break;
+        }
         size_t end = nal_next(c->es, c->es_len, start);
         size_t nal_end;
         if (end >= c->es_len) {

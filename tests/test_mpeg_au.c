@@ -4,7 +4,9 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/dispatch.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define BASE 0x08810000u
 #define MPEG BASE
@@ -56,6 +58,11 @@ static void feed(void) {
     psp_ret(1);
 }
 int main(void) {
+    /* Every NAL the decoder is given, for the splice test at the end:
+     * PSPRECOMP_MPEG_ES is read once, at the first decode. */
+    char es_path[] = "/tmp/mpeg_au_es_XXXXXX";
+    const int es_fd = mkstemp(es_path);
+    if (es_fd >= 0) { close(es_fd); setenv("PSPRECOMP_MPEG_ES", es_path, 1); }
     CHECK(psp_mem_init()==0); psp_cpu_reset(); psp_hle_init();
     psp_cpu.r[PSP_REG_SP]=BASE+0x8000;
     if (!psp_mpeg_decoding_available()) { puts("mpeg_au: skipped (no OpenH264)"); return 77; }
@@ -178,6 +185,80 @@ int main(void) {
             CHECK(call(0x606A4649,M,0,0,0,0,0)==0);
         }
     }
+    /* A splice through an IDR: what opens its access unit -- the delimiter,
+     * an SEI and the parameter sets -- goes with it, though they are whole
+     * and the decoder has been asked for pictures since they came. The
+     * parameter sets of an IDR that never comes began a new sequence for
+     * openh264, which then dropped the pictures to the next IDR (WipEout
+     * Pulse's menu). Each run's SEI carries its own mark, and the decoder's
+     * input shows which it was given. */
+    {
+        enum { M = BASE + 0x500, R = BASE + 0x580, D = BASE + 0x60000, WK = BASE + 0x70000,
+               PIC = BASE + 0x40000, PICP = BASE + 0x2F0, INIT = BASE + 0x2F8 };
+        static const unsigned char aud[] = {0,0,0,1,9,0x30}, aud_i[] = {0,0,0,1,9,0x10},
+                                   slice[] = {0,0,0,1,0x41,0x9a,0x38,0x15,0xea},
+                                   idr_head[] = {0,0,0,1,0x65,0x88,0x84},
+                                   junk[] = {0xff,0xff,0x13,0x37};
+        static const char *const mark[2] = {"psprecomp-rises", "psprecomp-falls"};
+        for (int back = 0; back < 2; back++) {
+            /* user_data_unregistered: a 16-byte UUID, the mark, and 4 bytes. */
+            unsigned char sei[4 + 3 + 20 + 1] = {0,0,0,1, 6, 5, 20};
+            memcpy(sei + 7, mark[back], 16);
+            memcpy(sei + 23, "SEI!", 4);
+            sei[27] = 0x80;
+            const unsigned char *sps = video + 6;   /* the SPS and PPS, up to the IDR */
+            size_t sps_len = 0;
+            while (!(sps[sps_len]==0 && sps[sps_len+1]==0 && sps[sps_len+2]==0 && sps[sps_len+3]==1 &&
+                     sps[sps_len+4]==0x65)) sps_len++;
+            unsigned char first[sizeof video + sizeof aud_i + sizeof sei + 64 + sizeof idr_head];
+            size_t n = 0;
+            memcpy(first + n, video, sizeof video); n += sizeof video;
+            memcpy(first + n, aud_i, sizeof aud_i); n += sizeof aud_i;
+            memcpy(first + n, sei, sizeof sei); n += sizeof sei;
+            memcpy(first + n, sps, sps_len); n += sps_len;
+            memcpy(first + n, idr_head, sizeof idr_head); n += sizeof idr_head;
+            unsigned char second[sizeof junk + 2 * (sizeof aud + sizeof slice) + sizeof aud];
+            size_t m = 0;
+            memcpy(second + m, junk, sizeof junk); m += sizeof junk;
+            for (int k = 0; k < 2; k++) {
+                memcpy(second + m, aud, sizeof aud); m += sizeof aud;
+                memcpy(second + m, slice, sizeof slice); m += sizeof slice;
+            }
+            memcpy(second + m, aud, sizeof aud); m += sizeof aud;
+
+            const uint32_t size = call(0xD7A29F46,4,0,0,0,0,0);
+            CHECK(call(0x37295ED8,R,4,D,size,CALLBACK,0)==0);
+            CHECK(call(0xD8C5F121,M,WK,0x10000,R,512,0)==0);
+            CHECK(call(0x42560F23,M,0,0,0,0,0)!=0);   /* RegistStream: video */
+            psp_write32(PICP,PIC);
+            memset(packet,0,sizeof packet);
+            pes(pack(9000),0xe0,90000,first,(unsigned)n);
+            CHECK(call(0xB240A59E,R,1,4,0,0,0)==1);
+            for (int k = 0; k < 8 && call(0xFE246728,M,0,AU,0,0,0)==0; k++)
+                CHECK(call(0x0E3C2E9D,M,AU,16,PICP,INIT,0)==0);
+            memset(packet,0,sizeof packet);
+            pes(pack(back ? 3000 : 12000),0xe0,99009,second,(unsigned)m);
+            CHECK(call(0xB240A59E,R,1,3,0,0,0)==1);
+            for (int k = 0; k < 8 && call(0xFE246728,M,0,AU,0,0,0)==0; k++)
+                CHECK(call(0x0E3C2E9D,M,AU,16,PICP,INIT,0)==0);
+            CHECK(call(0x606A4649,M,0,0,0,0,0)==0);
+        }
+        /* The decoder's input: the rising run's SEI, not the falling one's. */
+        FILE *f = es_fd >= 0 ? fopen(es_path, "rb") : NULL;
+        CHECK(f != NULL);
+        if (f) {
+            static unsigned char given[1 << 16];
+            const size_t len = fread(given, 1, sizeof given, f);
+            fclose(f);
+            int seen[2] = {0, 0};
+            for (int k = 0; k < 2; k++)
+                for (size_t i = 0; i + 16 <= len && !seen[k]; i++)
+                    seen[k] = !memcmp(given + i, mark[k], 16);
+            CHECK(seen[0]);
+            CHECK(!seen[1]);
+        }
+    }
+    if (es_fd >= 0) unlink(es_path);
     call(0x874624D6,0,0,0,0,0,0);
     psp_mem_free();
     puts(failed ? "mpeg_au: FAILED" : "mpeg_au: passed"); return failed!=0;
