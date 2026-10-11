@@ -1812,6 +1812,41 @@ static void hle_AvcDecode(void) {
     if (init_ptr) psp_write32(init_ptr, got ? 1u : 0u);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
+/* The access unit's frame decoded into `pcm`: the samples it made, or -1
+ * when there is no whole frame or no decoder. */
+static int atrac_au_decode(mpeg_ctx *c, uint32_t au, uint32_t init, int16_t pcm[2048 * 2]) {
+    if (!au) return -1;
+    const uint32_t esbuf = au_buffer(c,au);
+    const uint32_t essz  = psp_read32(au + AU_ES_SIZE);
+    uint8_t frame[MPEG_ATRAC_ES_SIZE];
+    if (!esbuf || essz < AT3P_HDR || essz > sizeof frame ||
+        psp_mem_read_block(frame, esbuf, essz) != 0 ||
+        frame[0] != AT3P_SYNC0 || frame[1] != AT3P_SYNC1) return -1;
+    const uint32_t payload = at3p_payload(frame);
+    /* Sample rate index and channel configuration, as the OMA/AA3
+     * container spells them: rates 32000, 44100, 48000, 88200, 96000;
+     * channel configuration 1 is mono and 2 stereo. */
+    static const uint32_t rates[8] = { 32000, 44100, 48000, 88200, 96000, 44100, 44100, 44100 };
+    const uint32_t rate = rates[(frame[2] >> 5) & 7];
+    const uint32_t chan = ((frame[2] >> 2) & 7) == 1 ? 1u : 2u;
+    if (payload + AT3P_HDR > essz) return -1;
+    if (c->adec && c->adec_block != payload) { psp_at3_close((psp_at3_dec *)c->adec); c->adec = NULL; }
+    if (!c->adec) {
+        c->adec = psp_at3_open(0x1000u, payload, chan, rate, NULL, 0);
+        c->adec_block = payload;
+        if (!c->adec) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "psprecomp: sceMpegAtracDecode has no decoder for the movie's "
+                                "audio; it plays silent.\n");
+        }
+    } else if (init) psp_at3_flush((psp_at3_dec *)c->adec);
+    const uint64_t t0 = psp_os_mono_ns();
+    const int n = psp_at3_decode((psp_at3_dec *)c->adec, frame + AT3P_HDR, payload, pcm, 2048);
+    c->adec_ns += psp_os_mono_ns() - t0;
+    return n;
+}
+
 /* sceMpegAtracDecode(mpeg, au, buffer, init): the frame the access unit
  * holds, decoded to 2048 stereo samples in the caller's buffer
  * (sceMpegQueryAtracEsSize's second answer, 8192 bytes). The decoder is
@@ -1828,41 +1863,9 @@ static void hle_AtracDecode(void) {
     }
     const uint32_t au = psp_arg(1), dst = psp_arg(2), init = psp_arg(3);
     int16_t pcm[2048 * 2];
-    int n = -1;
     if (mpeg_trace_file() && psp_mem_ptr(au,AU_ES_SIZE+4))
         mpeg_trace(MPEG_TRACE_ATRAC_IN,au,au_buffer(c,au),psp_read32(au+AU_ES_BUFFER),psp_read32(au+AU_ES_SIZE));
-    if (au) {
-        const uint32_t esbuf = au_buffer(c,au);
-        const uint32_t essz  = psp_read32(au + AU_ES_SIZE);
-        uint8_t frame[MPEG_ATRAC_ES_SIZE];
-        if (esbuf && essz >= AT3P_HDR && essz <= sizeof frame &&
-            psp_mem_read_block(frame, esbuf, essz) == 0 &&
-            frame[0] == AT3P_SYNC0 && frame[1] == AT3P_SYNC1) {
-            const uint32_t payload = at3p_payload(frame);
-            /* Sample rate index and channel configuration, as the OMA/AA3
-             * container spells them: rates 32000, 44100, 48000, 88200, 96000;
-             * channel configuration 1 is mono and 2 stereo. */
-            static const uint32_t rates[8] = { 32000, 44100, 48000, 88200, 96000, 44100, 44100, 44100 };
-            const uint32_t rate = rates[(frame[2] >> 5) & 7];
-            const uint32_t chan = ((frame[2] >> 2) & 7) == 1 ? 1u : 2u;
-            if (payload + AT3P_HDR <= essz) {
-                if (c->adec && c->adec_block != payload) { psp_at3_close((psp_at3_dec *)c->adec); c->adec = NULL; }
-                if (!c->adec) {
-                    c->adec = psp_at3_open(0x1000u, payload, chan, rate, NULL, 0);
-                    c->adec_block = payload;
-                    if (!c->adec) {
-                        static int said;
-                        if (!said++)
-                            fprintf(stderr, "psprecomp: sceMpegAtracDecode has no decoder for the movie's "
-                                            "audio; it plays silent.\n");
-                    }
-                } else if (init) psp_at3_flush((psp_at3_dec *)c->adec);
-                const uint64_t t0 = psp_os_mono_ns();
-                n = psp_at3_decode((psp_at3_dec *)c->adec, frame + AT3P_HDR, payload, pcm, 2048);
-                c->adec_ns += psp_os_mono_ns() - t0;
-            }
-        }
-    }
+    int n = atrac_au_decode(c, au, init, pcm);
     int decoded=n;
     if (n < 0) { memset(pcm, 0, sizeof pcm); n = 2048; }
     if (mpeg_trace_file() && psp_mem_ptr(au,AU_PTS+8)) {
