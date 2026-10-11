@@ -920,6 +920,22 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
  * then reports one ready, which saves this code from having to work out where
  * access units begin -- a job that needs more of the bitstream syntax than is
  * worth parsing twice. */
+
+/* One pixel of a decoded picture as R, G, B. BT.601, and *limited* range:
+ * this stream declares tv range, so Y runs 16..235 and passing it through
+ * unscaled lifts the blacks -- a first frame that should read 16 came out 30
+ * against ffmpeg's decode of the same bytes. */
+static void yuv_to_rgb(int y, int u, int v, uint8_t rgb[3]) {
+    const int Y = y - 16, U = u - 128, V = v - 128;
+    const int Yr = 76309 * Y;
+    const int r = (Yr + 104597 * V) >> 16;
+    const int g = (Yr -  53279 * V - 25674 * U) >> 16;
+    const int b = (Yr + 132201 * U) >> 16;
+    rgb[0] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+    rgb[1] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g);
+    rgb[2] = (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b);
+}
+
 #if PSPRECOMP_HAVE_OPENH264
 #include <wels/codec_api.h>
 
@@ -1059,21 +1075,10 @@ static void dump_ppm(const char *path, unsigned char *pl[3], const SSysMEMBuffer
     fprintf(f, "P6\n%d %d\n255\n", w, h);
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++) {
-            /* BT.601, and *limited* range: this stream declares tv range, so Y
-             * runs 16..235 and passing it through unscaled lifts the blacks --
-             * a first frame that should read 16 came out 30 against ffmpeg's
-             * decode of the same bytes. */
-            const int Y = pl[0][y * b->iStride[0] + x] - 16;
-            const int U = pl[1][(y / 2) * b->iStride[1] + x / 2] - 128;
-            const int V = pl[2][(y / 2) * b->iStride[1] + x / 2] - 128;
-            const int Yr = 76309 * Y;
-            int r  = (Yr + 104597 * V) >> 16;
-            int g  = (Yr -  53279 * V - 25674 * U) >> 16;
-            int bl = (Yr + 132201 * U) >> 16;
-            unsigned char px[3] = {
-                (unsigned char)(r < 0 ? 0 : r > 255 ? 255 : r),
-                (unsigned char)(g < 0 ? 0 : g > 255 ? 255 : g),
-                (unsigned char)(bl < 0 ? 0 : bl > 255 ? 255 : bl) };
+            uint8_t px[3];
+            yuv_to_rgb(pl[0][y * b->iStride[0] + x],
+                       pl[1][(y / 2) * b->iStride[1] + x / 2],
+                       pl[2][(y / 2) * b->iStride[1] + x / 2], px);
             fwrite(px, 1, 3, f);
         }
     fclose(f);
@@ -1704,18 +1709,12 @@ static void write_picture(mpeg_ctx *c, uint32_t dst, uint32_t stride) {
 
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
-            const int yy = Y[(size_t)y * w + x] - 16;
-            const int u  = U[(size_t)(y / 2) * (w / 2) + x / 2] - 128;
-            const int v  = V[(size_t)(y / 2) * (w / 2) + x / 2] - 128;
-            const int yr = 76309 * yy;
-            int r  = (yr + 104597 * v) >> 16;
-            int g  = (yr -  53279 * v - 25674 * u) >> 16;
-            int b  = (yr + 132201 * u) >> 16;
-            r = r < 0 ? 0 : r > 255 ? 255 : r;
-            g = g < 0 ? 0 : g > 255 ? 255 : g;
-            b = b < 0 ? 0 : b > 255 ? 255 : b;
+            uint8_t px[3];
+            yuv_to_rgb(Y[(size_t)y * w + x],
+                       U[(size_t)(y / 2) * (w / 2) + x / 2],
+                       V[(size_t)(y / 2) * (w / 2) + x / 2], px);
             psp_write32(dst + ((uint32_t)y * stride + (uint32_t)x) * 4,
-                        0xFF000000u | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r);
+                        0xFF000000u | ((uint32_t)px[2] << 16) | ((uint32_t)px[1] << 8) | (uint32_t)px[0]);
         }
     }
 }
