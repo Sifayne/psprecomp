@@ -232,6 +232,15 @@ static uint64_t sd_fsize(const char *guest) {
     return size;
 }
 
+/* PARAM.SFO and the icon/sound sidecars: what a save holds besides its
+ * data. */
+static int sd_system_file(const char *name) {
+    static const char *const sys[] = { "PARAM.SFO", "ICON0.PNG", "ICON1.PMF", "PIC1.PNG", "SND0.AT3" };
+    for (size_t i = 0; i < sizeof sys / sizeof sys[0]; i++)
+        if (!strcmp(name, sys[i])) return 1;
+    return 0;
+}
+
 /* A save dir holding anything but PARAM.SFO and the icon/sound sidecars.
  * ERASE keys off this: SFO-only fixtures end RW_FILE_NOT_FOUND. (DELETE
  * itself takes any existing dir -- the suite deletes SFO-only fixtures
@@ -240,13 +249,8 @@ static int sd_has_data(const char *dir) {
     char names[256][64];
     int n = psp_io_list_names(dir, names, 256);
     if (n < 0) return 0;
-    for (int i = 0; i < n; i++) {
-        if (!strcmp(names[i], "PARAM.SFO") ||
-            !strcmp(names[i], "ICON0.PNG") || !strcmp(names[i], "ICON1.PMF") ||
-            !strcmp(names[i], "PIC1.PNG") || !strcmp(names[i], "SND0.AT3"))
-            continue;
-        return 1;
-    }
+    for (int i = 0; i < n; i++)
+        if (!sd_system_file(names[i])) return 1;
     return 0;
 }
 
@@ -720,9 +724,7 @@ static int sd_cmp_str(const void *a, const void *b) {
  * still store plaintext, so the list is the only on-card difference, and
  * FILES needs it to tell a secure DATA.BIN from a WRITEDATA-made OTHER.BIN. */
 static int sd_classify(const sd_sfo_state *st, const char *file) {
-    static const char *const sys[] = { "PARAM.SFO", "ICON0.PNG", "ICON1.PMF", "PIC1.PNG", "SND0.AT3" };
-    for (size_t i = 0; i < sizeof sys / sizeof sys[0]; i++)
-        if (!strcmp(file, sys[i])) return 2;
+    if (sd_system_file(file)) return 2;
     return sd_fl_secure(st, file) ? 0 : 1;
 }
 
