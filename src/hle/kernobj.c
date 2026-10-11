@@ -1418,6 +1418,32 @@ static psp_fpl *find_fpl(uint32_t id) {
     return NULL;
 }
 
+/* What a block of a fixed or thread-local pool costs: its size rounded up to
+ * the alignment in the option block's second word, and never below four.
+ * Returns 0 when that alignment is neither zero nor a power of two.
+ *
+ * Both pools refuse that with the *partition* code, which is the one thing
+ * about either that could not have been guessed. fpl/create sweeps it: 0, 1,
+ * 2, 4 and 8 are accepted; -1, 3, 5, 6 and 7 are refused.
+ *
+ * And it spaces the blocks out rather than merely placing the pool.
+ * fpl/tryallocate creates 0x10-byte blocks with alignment 32 and measures 32
+ * bytes between two of them; every other section of that test leaves the
+ * options null and measures 16. tls/get creates one-byte blocks three times
+ * over, with alignment 0x100, 1 and 0, and reads the spacing back as 0x100, 4
+ * and 4 -- so anything below four is four, which is also what a pool created
+ * without options gets. */
+static int pool_stride(uint32_t opt, uint32_t bsize, uint32_t *stride) {
+    uint32_t align = 4;
+    if (opt && psp_mem_ptr(opt, 8)) {
+        const uint32_t a = psp_read32(opt + 4);
+        if (a && (a & (a - 1))) return 0;
+        if (a > align) align = a;
+    }
+    *stride = (bsize + align - 1) & ~(align - 1);
+    return 1;
+}
+
 static void hle_CreateFpl(void) {
     /* (name, partition, attr, blockSize, numBlocks, option) */
     const uint32_t name  = psp_arg(0);
@@ -1439,25 +1465,11 @@ static void hle_CreateFpl(void) {
      * ILLEGAL_MEMSIZE where merely asking for too much answers NO_MEMORY. */
     if (count > 0xFFFFFFFFu / bsize) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
 
-    /* The option block's second word is an alignment, and it must be zero or a
-     * power of two. create.expected sweeps it: 0, 1, 2, 4 and 8 are accepted;
-     * -1, 3, 5, 6 and 7 are refused -- and refused with the *partition* code,
-     * which is the one thing about it that could not have been guessed. */
-    const uint32_t opt = psp_arg(5);
-    uint32_t align = 4;
-    if (opt && psp_mem_ptr(opt, 8)) {
-        const uint32_t a = psp_read32(opt + 4);
-        if (a && (a & (a - 1))) {
-            psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
-            return;
-        }
-        if (a > align) align = a;
+    uint32_t stride;
+    if (!pool_stride(psp_arg(5), bsize, &stride)) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
+        return;
     }
-    /* And having been checked, it spaces the blocks out, the same way a
-     * tlspl's does. fpl/tryallocate creates 0x10-byte blocks with alignment 32
-     * and measures 32 bytes between two of them; every other section of that
-     * test leaves the options null and measures 16. */
-    const uint32_t stride = (bsize + align - 1) & ~(align - 1);
 
     if (count > 0xFFFFFFFFu / stride) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
     const uint32_t base = psp_sysmem_alloc(stride * count, 0);
@@ -1759,25 +1771,11 @@ static void hle_CreateTlspl(void) {
     if (bsize == 0 || (int32_t)bsize < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
     if (count == 0 || (int32_t)count < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
 
-    /* The option block's second word is an alignment, and it rounds the block
-     * up rather than merely placing the pool. tls/get creates one-byte blocks
-     * three times over, with alignment 0x100, 1 and 0, and reads the spacing
-     * back as 0x100, 4 and 4 -- so anything below four is four, which is also
-     * what a pool created without options gets. */
-    const uint32_t opt = psp_arg(5);
-    uint32_t align = 4;
-    if (opt && psp_mem_ptr(opt, 8)) {
-        const uint32_t a = psp_read32(opt + 4);
-        /* And it must be a power of two, refused with the *partition* code --
-         * which is what an fpl does with the same field, and the one thing
-         * about either that could not have been guessed. */
-        if (a && (a & (a - 1))) {
-            psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
-            return;
-        }
-        if (a > align) align = a;
+    uint32_t stride;
+    if (!pool_stride(psp_arg(5), bsize, &stride)) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
+        return;
     }
-    const uint32_t stride = (bsize + align - 1) & ~(align - 1);
     /* A pool whose size does not fit in a word is an illegal *size*, where one
      * that merely does not fit in memory is out of memory: 0x1000 blocks of
      * 0x100 is a megabyte and succeeds, 0x10000 of them answers NO_MEMORY, and
