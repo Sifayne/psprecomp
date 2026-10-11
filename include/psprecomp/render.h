@@ -127,6 +127,35 @@ typedef struct {
     float    lod_slope;
 } psp_tex_state;
 
+/* The GE's codes for the texture function and the draw state below, in
+ * PSPSDK pspgu.h's order. TEXFUNC (psp_tex_state.func): */
+enum { PSP_TFX_MODULATE = 0, PSP_TFX_DECAL, PSP_TFX_BLEND, PSP_TFX_REPLACE, PSP_TFX_ADD };
+/* Comparisons, shared by the depth, alpha and stencil tests; the colour test
+ * takes the first four. */
+enum {
+    PSP_CMP_NEVER = 0, PSP_CMP_ALWAYS, PSP_CMP_EQUAL, PSP_CMP_NOTEQUAL,
+    PSP_CMP_LESS, PSP_CMP_LEQUAL, PSP_CMP_GREATER, PSP_CMP_GEQUAL
+};
+/* Blend factors (src, dst). The first two are the other side's colour. */
+enum {
+    PSP_BF_OTHER_COLOUR = 0, PSP_BF_ONE_MINUS_OTHER_COLOUR,
+    PSP_BF_SRC_ALPHA, PSP_BF_ONE_MINUS_SRC_ALPHA,
+    PSP_BF_DST_ALPHA, PSP_BF_ONE_MINUS_DST_ALPHA,
+    PSP_BF_DOUBLE_SRC_ALPHA, PSP_BF_ONE_MINUS_DOUBLE_SRC_ALPHA,
+    PSP_BF_DOUBLE_DST_ALPHA, PSP_BF_ONE_MINUS_DOUBLE_DST_ALPHA,
+    PSP_BF_FIXED                 /* FIXA for the source, FIXB for the destination */
+};
+/* Blend equations (eq). */
+enum {
+    PSP_BEQ_ADD = 0, PSP_BEQ_SUBTRACT, PSP_BEQ_REVERSE_SUBTRACT,
+    PSP_BEQ_MIN, PSP_BEQ_MAX, PSP_BEQ_ABS
+};
+/* Stencil operations (op_sfail, op_zfail, op_zpass). */
+enum {
+    PSP_STENCIL_KEEP = 0, PSP_STENCIL_ZERO, PSP_STENCIL_REPLACE,
+    PSP_STENCIL_INVERT, PSP_STENCIL_INCR, PSP_STENCIL_DECR
+};
+
 /* Blend and alpha-test state, as the GE encodes it. Factors and the equation
  * are GEBlendSrcFactor / GEBlendDstFactor / GEBlendMode codes; the alpha-test
  * function shares the GE's comparison codes with the depth test. */

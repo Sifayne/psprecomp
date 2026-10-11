@@ -2849,7 +2849,7 @@ static int bitmap_glyph_draw(int prim, const psp_vertex *v, int count) {
     const rendertarget *r = &g.rts[g.cur_rt];
     if (!g.resolution || !r->display || r->sy <= 1.0 || !g.tex_enable || g.tex.fmt != 4 ||
         g.tex.w != 512 || g.tex.h != 512 || g.bound_top || prim != PSP_PRIM_TRIANGLES ||
-        count <= 0 || count % 3 || (g.z_test && g.z_func != 1))
+        count <= 0 || count % 3 || (g.z_test && g.z_func != PSP_CMP_ALWAYS))
         return 0;
     for (int i = 0; i < count; i += 3) {
         int x0 = v[i].x, x1 = x0, y0 = v[i].y, y1 = y0;
@@ -3058,7 +3058,7 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
                                 max_y <= 0 || min_y >= g.h * PSP_SUBPX;
             const int lines = prim == PSP_PRIM_LINES || prim == PSP_PRIM_LINE_STRIP;
             band = hud_bands_available() && cls == CLASS_HUD && g.rts[g.cur_rt].scene_drawn &&
-                   (outside || (beyond && (lines || (g.z_test && g.z_func != 1)))) &&
+                   (outside || (beyond && (lines || (g.z_test && g.z_func != PSP_CMP_ALWAYS)))) &&
                    max_y - min_y < g.h * PSP_SUBPX && max_x - min_x < g.w * PSP_SUBPX;
             if (cls == CLASS_HUD && beyond && getenv("PSPRECOMP_ASPECT_LOG")) {
                 static int said2;
@@ -3070,7 +3070,7 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
                             g.tex_enable ? g.tex.addr : 0u, g.tex.w, g.tex.h,
                             (unsigned long long)g.presents, shot_counters[0]);
             }
-            if (ss && !full && g.z_test && g.z_func != 1 && getenv("PSPRECOMP_ASPECT_LOG")) {
+            if (ss && !full && g.z_test && g.z_func != PSP_CMP_ALWAYS && getenv("PSPRECOMP_ASPECT_LOG")) {
                 /* PSPRECOMP_ASPECT_LOG=2: every such draw, not the first 16. */
                 static int said;
                 if (said++ < 16 || atoi(getenv("PSPRECOMP_ASPECT_LOG")) >= 2)
@@ -3142,36 +3142,51 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
 }
 
 /* The GE's comparison codes, shared by the depth test, the alpha test and the
- * stencil test. Same order as software's depth_pass(). */
+ * stencil test. */
 static GLenum gl_compare(int func) {
     switch (func) {
-    case 0:  return GL_NEVER;
-    case 2:  return GL_EQUAL;
-    case 3:  return GL_NOTEQUAL;
-    case 4:  return GL_LESS;
-    case 5:  return GL_LEQUAL;
-    case 6:  return GL_GREATER;
-    case 7:  return GL_GEQUAL;
-    default: return GL_ALWAYS;
+    case PSP_CMP_NEVER:    return GL_NEVER;
+    case PSP_CMP_EQUAL:    return GL_EQUAL;
+    case PSP_CMP_NOTEQUAL: return GL_NOTEQUAL;
+    case PSP_CMP_LESS:     return GL_LESS;
+    case PSP_CMP_LEQUAL:   return GL_LEQUAL;
+    case PSP_CMP_GREATER:  return GL_GREATER;
+    case PSP_CMP_GEQUAL:   return GL_GEQUAL;
+    default:               return GL_ALWAYS;
+    }
+}
+
+/* The same test with its operands swapped: LESS for GREATER, LEQUAL for
+ * GEQUAL and the other way round; the rest read the same either way. */
+static int swap_compare(int func) {
+    switch (func) {
+    case PSP_CMP_LESS:    return PSP_CMP_GREATER;
+    case PSP_CMP_LEQUAL:  return PSP_CMP_GEQUAL;
+    case PSP_CMP_GREATER: return PSP_CMP_LESS;
+    case PSP_CMP_GEQUAL:  return PSP_CMP_LEQUAL;
+    default:              return func;
     }
 }
 
 static GLenum gl_stencil_op(int op) {
     switch (op) {
-    case 1: return GL_ZERO;
-    case 2: return GL_REPLACE;
-    case 3: return GL_INVERT;
-    case 4: return GL_INCR;
-    case 5: return GL_DECR;
-    default: return GL_KEEP;
+    case PSP_STENCIL_ZERO:    return GL_ZERO;
+    case PSP_STENCIL_REPLACE: return GL_REPLACE;
+    case PSP_STENCIL_INVERT:  return GL_INVERT;
+    case PSP_STENCIL_INCR:    return GL_INCR;
+    case PSP_STENCIL_DECR:    return GL_DECR;
+    default:                  return GL_KEEP;
     }
 }
 
+/* A blend factor that reads the destination's alpha. */
+static int reads_dst_alpha(int f) {
+    return f == PSP_BF_DST_ALPHA || f == PSP_BF_ONE_MINUS_DST_ALPHA ||
+           f == PSP_BF_DOUBLE_DST_ALPHA || f == PSP_BF_ONE_MINUS_DOUBLE_DST_ALPHA;
+}
+
 static int uses_dest_alpha(void) {
-    return g.bs.enable && ((g.bs.src >= 4 && g.bs.src <= 5) ||
-                           (g.bs.src >= 8 && g.bs.src <= 9) ||
-                           (g.bs.dst >= 4 && g.bs.dst <= 5) ||
-                           (g.bs.dst >= 8 && g.bs.dst <= 9));
+    return g.bs.enable && (reads_dst_alpha(g.bs.src) || reads_dst_alpha(g.bs.dst));
 }
 
 /* Codes 6..9 have no direct GL factor. apply_state handles the additive 6/7
@@ -3179,12 +3194,12 @@ static int uses_dest_alpha(void) {
  * counter so they are visible in reports. */
 static GLenum gl_factor(int f, int is_src, int *ok) {
     switch (f) {
-    case 0:  return is_src ? GL_DST_COLOR : GL_SRC_COLOR;
-    case 1:  return is_src ? GL_ONE_MINUS_DST_COLOR : GL_ONE_MINUS_SRC_COLOR;
-    case 2:  return GL_SRC_ALPHA;
-    case 3:  return GL_ONE_MINUS_SRC_ALPHA;
-    case 4:  return GL_DST_ALPHA;
-    case 5:  return GL_ONE_MINUS_DST_ALPHA;
+    case PSP_BF_OTHER_COLOUR:           return is_src ? GL_DST_COLOR : GL_SRC_COLOR;
+    case PSP_BF_ONE_MINUS_OTHER_COLOUR: return is_src ? GL_ONE_MINUS_DST_COLOR : GL_ONE_MINUS_SRC_COLOR;
+    case PSP_BF_SRC_ALPHA:              return GL_SRC_ALPHA;
+    case PSP_BF_ONE_MINUS_SRC_ALPHA:    return GL_ONE_MINUS_SRC_ALPHA;
+    case PSP_BF_DST_ALPHA:              return GL_DST_ALPHA;
+    case PSP_BF_ONE_MINUS_DST_ALPHA:    return GL_ONE_MINUS_DST_ALPHA;
     default: *ok = 0; return GL_ONE;
     }
 }
@@ -3207,7 +3222,7 @@ static void note_blend_miss(void) {
     int i = 0;
     while (i < g.blend_misses &&
            (g.blend_miss[i].src != g.bs.src || g.blend_miss[i].dst != g.bs.dst || g.blend_miss[i].eq != g.bs.eq ||
-            ((g.bs.src == 10 || g.bs.dst == 10) &&
+            ((g.bs.src == PSP_BF_FIXED || g.bs.dst == PSP_BF_FIXED) &&
              (g.blend_miss[i].fixa != (g.bs.fixa & 0xFFFFFFu) || g.blend_miss[i].fixb != (g.bs.fixb & 0xFFFFFFu)))))
         i++;
     if (i == g.blend_misses) {
@@ -3221,12 +3236,12 @@ static void note_blend_miss(void) {
 
 static GLenum gl_equation(int eq, int *ok) {
     switch (eq) {
-    case 0:  return GL_FUNC_ADD;
-    case 1:  return GL_FUNC_SUBTRACT;
-    case 2:  return GL_FUNC_REVERSE_SUBTRACT;
-    case 3:  return GL_MIN;
-    case 4:  return GL_MAX;
-    default: *ok = 0; return GL_FUNC_ADD;   /* 5 is |src-dst|, shader work */
+    case PSP_BEQ_ADD:              return GL_FUNC_ADD;
+    case PSP_BEQ_SUBTRACT:         return GL_FUNC_SUBTRACT;
+    case PSP_BEQ_REVERSE_SUBTRACT: return GL_FUNC_REVERSE_SUBTRACT;
+    case PSP_BEQ_MIN:              return GL_MIN;
+    case PSP_BEQ_MAX:              return GL_MAX;
+    default: *ok = 0; return GL_FUNC_ADD;   /* PSP_BEQ_ABS is |src-dst|, shader work */
     }
 }
 
@@ -3239,8 +3254,7 @@ static void apply_state(void) {
         p_glStencilMask(~(g.bs.pixel_mask >> 24) & 255u);
         /* GL compares reference against stored stencil; the GE backend
          * contract compares stored stencil against reference. */
-        const int func = g.bs.stencil_func;
-        p_glStencilFunc(gl_compare(func >= 4 && func <= 7 ? func ^ 2 : func),
+        p_glStencilFunc(gl_compare(swap_compare(g.bs.stencil_func)),
                          g.bs.stencil_ref & 255, (GLuint)g.bs.stencil_mask & 255);
         p_glStencilOp(gl_stencil_op(g.bs.op_sfail), gl_stencil_op(g.bs.op_zfail),
                        gl_stencil_op(g.bs.op_zpass));
@@ -3318,14 +3332,16 @@ static void apply_state(void) {
     if (g.bs.enable) {
         int ok = 1;
         int src_constant = 0, dst_constant = 0;
-        const int double_alpha = g.bs.src == 6 && g.bs.eq == 0 && !g.bs.write_alpha &&
-                                 (g.bs.dst == 7 || (g.bs.dst == 10 &&
+        const int double_alpha = g.bs.src == PSP_BF_DOUBLE_SRC_ALPHA && g.bs.eq == PSP_BEQ_ADD &&
+                                 !g.bs.write_alpha &&
+                                 (g.bs.dst == PSP_BF_ONE_MINUS_DOUBLE_SRC_ALPHA || (g.bs.dst == PSP_BF_FIXED &&
                                   ((g.bs.fixb & 0xffffffu) == 0 ||
                                    (g.bs.fixb & 0xffffffu) == 0xffffffu)));
-        GLenum src = double_alpha ? GL_ONE : g.bs.src == 10
+        GLenum src = double_alpha ? GL_ONE : g.bs.src == PSP_BF_FIXED
                    ? gl_fixed_factor(g.bs.fixa, &src_constant)
                    : gl_factor(g.bs.src, 1, &ok);
-        GLenum dst = double_alpha && g.bs.dst == 7 ? GL_ONE_MINUS_SRC_ALPHA : g.bs.dst == 10
+        GLenum dst = double_alpha && g.bs.dst == PSP_BF_ONE_MINUS_DOUBLE_SRC_ALPHA ? GL_ONE_MINUS_SRC_ALPHA
+                   : g.bs.dst == PSP_BF_FIXED
                    ? gl_fixed_factor(g.bs.fixb, &dst_constant)
                    : gl_factor(g.bs.dst, 0, &ok);
         /* A crossfade: FIXB the complement of FIXA in every channel, which
@@ -3350,7 +3366,7 @@ static void apply_state(void) {
          * factor, so only use it when alpha is the framebuffer's masked-off
          * stencil byte. MIN/MAX ignore factors; abs-difference is not
          * represented by this fixed-function path. */
-        const int preblend_src = g.bs.src == 2 && g.bs.eq <= 2 &&
+        const int preblend_src = g.bs.src == PSP_BF_SRC_ALPHA && g.bs.eq <= PSP_BEQ_REVERSE_SUBTRACT &&
                                  !g.bs.write_alpha;
         if (preblend_src) src = GL_ONE;
         p_glEnable(GL_BLEND);
@@ -3366,7 +3382,7 @@ static void apply_state(void) {
                        (float)((fx >> 16) & 0xFF) / 255.0f,
                        (float)((fx >> 24) & 0xFF) / 255.0f);
         p_glUniform1i(g.u->preblend_src,
-                      double_alpha ? 3 : preblend_src ? (g.bs.dst == 3 ? 2 : 1) : 0);
+                      double_alpha ? 3 : preblend_src ? (g.bs.dst == PSP_BF_ONE_MINUS_SRC_ALPHA ? 2 : 1) : 0);
     } else {
         p_glDisable(GL_BLEND);
         p_glUniform1i(g.u->preblend_src, 0);
@@ -3447,7 +3463,7 @@ static void flush(void) {
          * handled: neither game's HUD is expected to do it. */
         if (g.z_test) {
             g.hud_depth_func[g.z_func & 7]++;
-            if (g.z_func != 1) g.hud_depth_tests++;   /* ALWAYS reads nothing */
+            if (g.z_func != PSP_CMP_ALWAYS) g.hud_depth_tests++;   /* ALWAYS reads nothing */
         }
         if (getenv("PSPRECOMP_ASPECT_LOG")) {
             const uint32_t key = g.tex_enable ? g.tex.addr : 0u;
@@ -3461,7 +3477,7 @@ static void flush(void) {
             }
             if (k < 48) {
                 g.hud_by_tex[k].batches++;
-                if (g.z_test && g.z_func != 1) g.hud_by_tex[k].tested++;
+                if (g.z_test && g.z_func != PSP_CMP_ALWAYS) g.hud_by_tex[k].tested++;
                 for (size_t i = 0; i < g.batch_n; i++) {
                     const float z = g.batch[i * FLOATS_PER_VERT + 2];
                     const float x = g.batch[i * FLOATS_PER_VERT + 0];

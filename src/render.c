@@ -598,19 +598,19 @@ static uint32_t apply_texfunc(uint32_t tex, uint32_t col) {
         const uint32_t t = chan(tex, i), c = chan(col, i), e = chan(g_tex.env, i);
         uint32_t o;
         switch (g_tex.func) {
-        case 1:  o = g_tex.tcc_rgba ? (t * ta + c * (255u - ta) + 255u) >> sh : t << d; break;  /* DECAL */
-        case 2:  o = (c * (255u - t) + e * t + 255u) >> sh;                            break;  /* BLEND   */
-        case 3:  o = t << d;                                                            break;  /* REPLACE */
-        case 4:  o = (t + c) << d;                                                      break;  /* ADD     */
-        default: o = (t * (c + 1u)) >> sh;                                              break;  /* MODULATE */
+        case PSP_TFX_DECAL:   o = g_tex.tcc_rgba ? (t * ta + c * (255u - ta) + 255u) >> sh : t << d; break;
+        case PSP_TFX_BLEND:   o = (c * (255u - t) + e * t + 255u) >> sh;                            break;
+        case PSP_TFX_REPLACE: o = t << d;                                                            break;
+        case PSP_TFX_ADD:     o = (t + c) << d;                                                      break;
+        default:              o = (t * (c + 1u)) >> sh;                                              break;  /* MODULATE */
         }
         out |= (o > 255u ? 255u : o) << (i * 8);
     }
     uint32_t a;
     switch (g_tex.func) {
-    case 1:  a = ca;                                             break;  /* DECAL keeps the vertex alpha */
-    case 3:  a = g_tex.tcc_rgba ? ta : ca;                       break;  /* REPLACE */
-    default: a = g_tex.tcc_rgba ? (ta * (ca + 1u)) >> 8 : ca;    break;  /* MODULATE, BLEND, ADD */
+    case PSP_TFX_DECAL:   a = ca;                                          break;  /* keeps the vertex alpha */
+    case PSP_TFX_REPLACE: a = g_tex.tcc_rgba ? ta : ca;                    break;
+    default:              a = g_tex.tcc_rgba ? (ta * (ca + 1u)) >> 8 : ca; break;  /* MODULATE, BLEND, ADD */
     }
     return out | (a << 24);
 }
@@ -673,7 +673,7 @@ static void put_pixel(int x, int y, uint32_t rgba, int stencil) {
  * zero on a fresh start. For a GEQUAL title that rejects nothing, as the old
  * host-side DEPTH_RESET of 0 was chosen to. */
 static uint32_t g_zb_addr = PSP_VRAM_BASE, g_zb_stride = 512;
-static struct { int test, func, write; } g_zs = { 0, 1 /* always */, 0 };
+static struct { int test, func, write; } g_zs = { 0, PSP_CMP_ALWAYS, 0 };
 
 static void sw_depth(int test_enable, int func, int write_enable) {
     g_zs.test = test_enable; g_zs.func = func; g_zs.write = write_enable;
@@ -723,21 +723,25 @@ static int depth_value(float z) {
     return (int)z;
 }
 
-/* GE comparison codes: 0 never, 1 always, 2 equal, 3 notequal, 4 less,
- * 5 lequal, 6 greater, 7 gequal. */
+/* a against b by one of the GE's comparison codes (PSP_CMP_*), shared by
+ * the depth, stencil, alpha and colour tests. */
+static int compare(int func, int a, int b) {
+    switch (func) {
+    case PSP_CMP_NEVER:    return 0;
+    case PSP_CMP_EQUAL:    return a == b;
+    case PSP_CMP_NOTEQUAL: return a != b;
+    case PSP_CMP_LESS:     return a <  b;
+    case PSP_CMP_LEQUAL:   return a <= b;
+    case PSP_CMP_GREATER:  return a >  b;
+    case PSP_CMP_GEQUAL:   return a >= b;
+    default:               return 1;
+    }
+}
+
 static int depth_pass(int x, int y, int z) {
     if (!g_zs.test) return 1;
     const int d = psp_read16(depth_addr(x, y));
-    switch (g_zs.func) {
-    case 0: return 0;
-    case 2: return z == d;
-    case 3: return z != d;
-    case 4: return z <  d;
-    case 5: return z <= d;
-    case 6: return z >  d;
-    case 7: return z >= d;
-    default: return 1;
-    }
+    return compare(g_zs.func, z, d);
 }
 
 /* ---- blending ------------------------------------------------------------ */
@@ -810,17 +814,17 @@ static int blend_scaled(int code, int i, uint32_t src, uint32_t dst, int is_src)
     const int other = (int)(is_src ? chan(dst, i) : chan(src, i));
     const int sa = (int)chan(src, 3), da = (int)chan(dst, 3);
     switch (code) {
-    case 0:  return blend_term(c, other);
-    case 1:  return blend_term(c, 255 - other);
-    case 2:  return blend_term(c, sa);
-    case 3:  return blend_term(c, 255 - sa);
-    case 4:  return blend_term(c, da);
-    case 5:  return blend_term(c, 255 - da);
-    case 6:  return blend_term(c, 2 * sa);
-    case 7:  return blend_term(c, 255 - 2 * sa);
-    case 8:  return blend_term(c, 2 * da);
-    case 9:  return blend_term(c, 255 - 2 * da);
-    default: return blend_term(c, (int)chan(is_src ? g_bs.fixa : g_bs.fixb, i));
+    case PSP_BF_OTHER_COLOUR:               return blend_term(c, other);
+    case PSP_BF_ONE_MINUS_OTHER_COLOUR:     return blend_term(c, 255 - other);
+    case PSP_BF_SRC_ALPHA:                  return blend_term(c, sa);
+    case PSP_BF_ONE_MINUS_SRC_ALPHA:        return blend_term(c, 255 - sa);
+    case PSP_BF_DST_ALPHA:                  return blend_term(c, da);
+    case PSP_BF_ONE_MINUS_DST_ALPHA:        return blend_term(c, 255 - da);
+    case PSP_BF_DOUBLE_SRC_ALPHA:           return blend_term(c, 2 * sa);
+    case PSP_BF_ONE_MINUS_DOUBLE_SRC_ALPHA: return blend_term(c, 255 - 2 * sa);
+    case PSP_BF_DOUBLE_DST_ALPHA:           return blend_term(c, 2 * da);
+    case PSP_BF_ONE_MINUS_DOUBLE_DST_ALPHA: return blend_term(c, 255 - 2 * da);
+    default:   /* PSP_BF_FIXED */           return blend_term(c, (int)chan(is_src ? g_bs.fixa : g_bs.fixb, i));
     }
 }
 
@@ -832,33 +836,23 @@ static uint32_t blend(uint32_t src, uint32_t dst) {
         const int dd = blend_scaled(g_bs.dst, i, src, dst, 0);
         int v;
         switch (g_bs.eq) {
-        case 1:  v = ss - dd; break;
-        case 2:  v = dd - ss; break;
-        case 3:  v = s < d ? s : d; break;
-        case 4:  v = s > d ? s : d; break;
-        case 5:  v = s > d ? s - d : d - s; break;
-        default: v = ss + dd; break;
+        case PSP_BEQ_SUBTRACT:         v = ss - dd; break;
+        case PSP_BEQ_REVERSE_SUBTRACT: v = dd - ss; break;
+        case PSP_BEQ_MIN:              v = s < d ? s : d; break;
+        case PSP_BEQ_MAX:              v = s > d ? s : d; break;
+        case PSP_BEQ_ABS:              v = s > d ? s - d : d - s; break;
+        default:                       v = ss + dd; break;   /* ADD */
         }
         out |= clamp255(v) << (i * 8);
     }
     return out;
 }
 
-/* The stencil test, against the framebuffer's alpha byte. Same function codes
- * as the depth and alpha tests. */
+/* The stencil test, against the framebuffer's alpha byte. */
 static int stencil_pass(uint32_t cur) {
     const int a = (int)(cur & (uint32_t)g_bs.stencil_mask);
     const int r = g_bs.stencil_ref & g_bs.stencil_mask;
-    switch (g_bs.stencil_func) {
-    case 0: return 0;
-    case 2: return a == r;
-    case 3: return a != r;
-    case 4: return a <  r;
-    case 5: return a <= r;
-    case 6: return a >  r;
-    case 7: return a >= r;
-    default: return 1;
-    }
+    return compare(g_bs.stencil_func, a, r);
 }
 
 /* INCR and DECR count in the target's own stencil width: one step of a 4444
@@ -869,12 +863,12 @@ static int stencil_pass(uint32_t cur) {
 static uint32_t stencil_op(int op, uint32_t cur) {
     const uint32_t step = g_fb_fmt == 2 ? 0x11u : (g_fb_fmt == 1 ? 0xFFu : 1u);
     switch (op) {
-    case 1:  return 0u;                                  /* ZERO    */
-    case 2:  return (uint32_t)g_bs.stencil_ref & 0xFFu;  /* REPLACE */
-    case 3:  return ~cur & 0xFFu;                        /* INVERT  */
-    case 4:  return cur <= 255u - step ? cur + step : 255u;   /* INCR */
-    case 5:  return cur >= step ? cur - step : 0u;            /* DECR */
-    default: return cur;                                 /* KEEP    */
+    case PSP_STENCIL_ZERO:    return 0u;
+    case PSP_STENCIL_REPLACE: return (uint32_t)g_bs.stencil_ref & 0xFFu;
+    case PSP_STENCIL_INVERT:  return ~cur & 0xFFu;
+    case PSP_STENCIL_INCR:    return cur <= 255u - step ? cur + step : 255u;
+    case PSP_STENCIL_DECR:    return cur >= step ? cur - step : 0u;
+    default:                  return cur;   /* KEEP */
     }
 }
 
@@ -907,12 +901,7 @@ static int colour_pass(uint32_t rgba) {
     if (!g_bs.colour_test) return 1;
     const uint32_t c = rgba & g_bs.colour_mask & 0x00FFFFFFu;
     const uint32_t r = g_bs.colour_ref & g_bs.colour_mask & 0x00FFFFFFu;
-    switch (g_bs.colour_func & 3) {
-    case 0:  return 0;
-    case 2:  return c == r;
-    case 3:  return c != r;
-    default: return 1;
-    }
+    return compare(g_bs.colour_func & 3, (int)c, (int)r);
 }
 
 /* Logic op (LOE 0x28, LOP 0xE6), source s against destination d, in the
@@ -945,16 +934,7 @@ static int alpha_pass(uint32_t rgba) {
     if (!g_bs.alpha_test) return 1;
     const int a = (int)(chan(rgba, 3) & (uint32_t)g_bs.alpha_mask);
     const int r = g_bs.alpha_ref & g_bs.alpha_mask;
-    switch (g_bs.alpha_func) {
-    case 0: return 0;
-    case 2: return a == r;
-    case 3: return a != r;
-    case 4: return a <  r;
-    case 5: return a <= r;
-    case 6: return a >  r;
-    case 7: return a >= r;
-    default: return 1;
-    }
+    return compare(g_bs.alpha_func, a, r);
 }
 
 static uint32_t get_pixel(int x, int y) {

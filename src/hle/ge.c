@@ -3570,7 +3570,7 @@ static void push_pixel_state_body(void) {
      * was never cleared at all. */
     psp_render_current()->set_depth(
         g_tl.clear_mode ? 1 : g_tl.ztest_enable,
-        g_tl.clear_mode ? 1 : g_tl.ztest_func,
+        g_tl.clear_mode ? PSP_CMP_ALWAYS : g_tl.ztest_func,
         g_tl.clear_mode ? g_tl.clear_z : !g_tl.zwrite_off);
     psp_render_current()->set_fog(g_tl.fog_enable, g_tl.fog_colour_raw);
 }
