@@ -65,6 +65,8 @@ void psp_recomp_register(void);
  * arriving here is unambiguous rather than something that might be real code. */
 #define RA_DONE     0x0DEAD000u
 
+enum { SCREEN_W = 480, SCREEN_H = 272 };   /* the PSP's panel, fixed */
+
 /* ---- surviving the guest ---------------------------------------------------
  *
  * Recompiled code has no error return: an instruction it could not translate
@@ -444,6 +446,20 @@ static void survey_vram(void) {
     printf("\n");
 }
 
+/* A panel-sized PPM, its header written; NULL when it cannot be created. */
+static FILE *ppm_create(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (f) fprintf(f, "P6\n%d %d\n255\n", SCREEN_W, SCREEN_H);
+    return f;
+}
+
+/* An 8888 pixel's red, green and blue: its low three bytes. */
+static void rgb_of_8888(uint32_t p, uint8_t rgb[3]) {
+    rgb[0] = (uint8_t)(p & 0xFF);
+    rgb[1] = (uint8_t)((p >> 8) & 0xFF);
+    rgb[2] = (uint8_t)((p >> 16) & 0xFF);
+}
+
 /* Dump one buffer.
  *
  * Both are written, because picking one has already been misleading. The GE's
@@ -458,23 +474,19 @@ static void dump_one(uint32_t base, const char *path, const char *label) {
         return;
     }
 
-    enum { W = 480, H = 272 };          /* the panel, whatever the stride is */
-    FILE *f = fopen(path, "wb");
+    /* The panel, whatever the stride is. */
+    FILE *f = ppm_create(path);
     if (!f) { printf("frame:    cannot write %s\n", path); return; }
-    fprintf(f, "P6\n%d %d\n255\n", W, H);
 
     const uint32_t fmt = psp_display_format();
     uint64_t nonzero = 0;
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) {
+    for (int y = 0; y < SCREEN_H; y++) {
+        for (int x = 0; x < SCREEN_W; x++) {
             const uint32_t at = base + (uint32_t)(y * (int)stride + x) *
                                 (fmt == 3 ? 4u : 2u);
             uint8_t rgb[3];
             if (fmt == 3) {                       /* 8888 */
-                const uint32_t p = psp_read32(at);
-                rgb[0] = (uint8_t)(p & 0xFF);
-                rgb[1] = (uint8_t)((p >> 8) & 0xFF);
-                rgb[2] = (uint8_t)((p >> 16) & 0xFF);
+                rgb_of_8888(psp_read32(at), rgb);
             } else {                              /* 5650 / 5551 / 4444 */
                 const uint16_t p = (uint16_t)psp_read16(at);
                 rgb[0] = (uint8_t)((p & 0x1F) << 3);
@@ -487,7 +499,31 @@ static void dump_one(uint32_t base, const char *path, const char *label) {
     }
     fclose(f);
     printf("frame%s:  %s  (0x%08X stride %u fmt %u, %llu of %d pixels differing from the corner)\n",
-           label, path, base, stride, fmt, (unsigned long long)nonzero, W * H);
+           label, path, base, stride, fmt, (unsigned long long)nonzero, SCREEN_W * SCREEN_H);
+}
+
+/* And the fullest frame the run ever presented, which is the one that
+ * answers "did anything appear" -- the two buffers dumped above only say what
+ * was in them at the instant the run stopped. */
+static void dump_best_frame(const char *path) {
+    const uint64_t score = psp_display_best_score();
+    if (!score) {
+        printf("frame(best): no presented frame had a non-black pixel\n");
+        return;
+    }
+    char best[1024];
+    snprintf(best, sizeof best, "%s.best.ppm", path);
+    FILE *f = ppm_create(best);
+    if (!f) { printf("frame(best): cannot write %s\n", best); return; }
+    const uint32_t *px = psp_display_best();
+    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
+        uint8_t rgb[3];
+        rgb_of_8888(px[i], rgb);
+        fwrite(rgb, 1, 3, f);
+    }
+    fclose(f);
+    printf("frame(best): %s  (0x%08X, %llu of %d pixels differing from the corner)\n",
+           best, psp_display_best_addr(), (unsigned long long)score, SCREEN_W * SCREEN_H);
 }
 
 /* Write the framebuffer the display is scanning out to a PPM.
@@ -500,8 +536,8 @@ static void dump_one(uint32_t base, const char *path, const char *label) {
  * from its last sceDisplaySetFrameBuf -- so an empty file is a real answer
  * too: it means the game never pointed the display anywhere. */
 static void dump_framebuffer(void) {
-    const char *path = getenv("PSPRECOMP_FRAME");
-    if (!path || !*path) path = "frame.ppm";
+    const char *asked = getenv("PSPRECOMP_FRAME");
+    const char *path = asked && *asked ? asked : "frame.ppm";
 
     const uint32_t ge = psp_ge_target();
     const uint32_t disp = psp_display_framebuffer();
@@ -513,35 +549,10 @@ static void dump_framebuffer(void) {
         dump_one(disp, alt, "(shown)");
     }
 
-    /* And the fullest frame the run ever presented, which is the one that
-     * answers "did anything appear" -- the two above only say what was in the
-     * buffers at the instant the run stopped. */
-    const char *asked = getenv("PSPRECOMP_FRAME");
-    if (!asked || !*asked) {
+    if (asked && *asked)
+        dump_best_frame(path);
+    else
         printf("frame(best): not scored -- set PSPRECOMP_FRAME to keep the fullest presented frame\n");
-        return;
-    }
-    const uint64_t score = psp_display_best_score();
-    if (!score) {
-        printf("frame(best): no presented frame had a non-black pixel\n");
-        return;
-    }
-    char best[1024];
-    snprintf(best, sizeof best, "%s.best.ppm", path);
-    FILE *f = fopen(best, "wb");
-    if (!f) { printf("frame(best): cannot write %s\n", best); return; }
-    enum { W = 480, H = 272 };
-    fprintf(f, "P6\n%d %d\n255\n", W, H);
-    const uint32_t *px = psp_display_best();
-    for (int i = 0; i < W * H; i++) {
-        const uint32_t p = px[i];
-        const uint8_t rgb[3] = { (uint8_t)(p & 0xFF), (uint8_t)((p >> 8) & 0xFF),
-                                 (uint8_t)((p >> 16) & 0xFF) };
-        fwrite(rgb, 1, 3, f);
-    }
-    fclose(f);
-    printf("frame(best): %s  (0x%08X, %llu of %d pixels differing from the corner)\n",
-           best, psp_display_best_addr(), (unsigned long long)score, W * H);
 }
 
 static void install_watch(void) {
@@ -917,7 +928,6 @@ int main(int argc, char **argv) {
     }
     /* Chosen or defaulted, the backend gets its init(). Both current backends
      * return 0 without doing anything; a windowed one will not. */
-    enum { SCREEN_W = 480, SCREEN_H = 272 };   /* the PSP's panel, fixed */
     if (psp_render_current()->init(SCREEN_W, SCREEN_H) != 0) {
         fprintf(stderr, "render backend \"%s\" failed to initialise\n",
                 psp_render_current()->name);
