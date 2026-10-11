@@ -63,18 +63,19 @@ static psp_mutex *find_mutex(uint32_t id) {
     return NULL;
 }
 
-/* How much a lock may ask for.
+/* How much a lock may ask for, and an unlock give back.
  *
  * A non-recursive mutex takes exactly one; a recursive one takes any positive
  * number that does not carry the total past INT_MAX. Both halves are measured:
  * `Lock 0 => 2` is refused with ILLEGAL_COUNT without the attribute and
  * accepted with it, and `Lock 1 => INT_MAX` is refused with LOCK_OVERFLOW where
- * `Lock 1 => INT_MAX - 1` succeeds at exactly INT_MAX. */
-static uint32_t lock_count_error(const psp_mutex *m, int32_t count) {
+ * `Lock 1 => INT_MAX - 1` succeeds at exactly INT_MAX. An unlock follows the
+ * same rules, minus the overflow check. */
+static uint32_t mutex_count_error(const psp_mutex *m, int32_t count, int locking) {
     if (count <= 0) return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
     if (count > 1 && !(m->attr & MUTEX_ATTR_RECURSE))
         return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-    if (m->count > INT32_MAX - count) return SCE_KERNEL_ERROR_MUTEX_LOCK_OVERFLOW;
+    if (locking && m->count > INT32_MAX - count) return SCE_KERNEL_ERROR_MUTEX_LOCK_OVERFLOW;
     return SCE_KERNEL_ERROR_OK;
 }
 
@@ -157,7 +158,7 @@ static void mutex_lock(psp_wait_form form) {
     psp_mutex *m = find_mutex(id);
     if (!m) { psp_ret(SCE_KERNEL_ERROR_NOT_FOUND_MUTEX); return; }
 
-    const uint32_t bad = lock_count_error(m, count);
+    const uint32_t bad = mutex_count_error(m, count, 1);
     if (bad) { psp_ret(bad); return; }
 
     const uint32_t me = psp_sched_current();
@@ -227,11 +228,8 @@ static void hle_UnlockMutex(void) {
     psp_mutex *m = find_mutex(id);
     if (!m) { psp_ret(SCE_KERNEL_ERROR_NOT_FOUND_MUTEX); return; }
 
-    /* The count rules are the lock's, minus the overflow check. */
-    if (count <= 0 || (count > 1 && !(m->attr & MUTEX_ATTR_RECURSE))) {
-        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
-        return;
-    }
+    const uint32_t bad = mutex_count_error(m, count, 0);
+    if (bad) { psp_ret(bad); return; }
     /* Not held at all, and holding it fewer times than is being given back:
      * two different mistakes with two different codes, both measured. */
     if (m->count == 0)     { psp_ret(SCE_KERNEL_ERROR_MUTEX_UNLOCKED); return; }
