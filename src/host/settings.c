@@ -377,17 +377,22 @@ int psp_settings_env(psp_settings *s, char *error) {
  * English for any the PSP does not have ("C" and "POSIX" among them).
  * Chinese is Traditional for Taiwan, Hong Kong and Macau, and for a locale
  * that names the script, Simplified otherwise. */
+/* The PSP's numbering of the languages that need naming here. */
+enum { LANG_JAPANESE = 0, LANG_ENGLISH = 1, LANG_CHINESE_TRADITIONAL = 10, LANG_CHINESE_SIMPLIFIED = 11 };
+
 int psp_settings_host_language(void) {
     const char *v = NULL;
     static const char *const vars[] = { "LC_ALL", "LC_MESSAGES", "LANG" };
     for (int i = 0; i < 3 && !(v && *v); i++) v = getenv(vars[i]);
-    if (!v || !*v) return 1;
+    if (!v || !*v) return LANG_ENGLISH;
+    /* In the PSP's order, from Japanese at 0 up to Korean. */
     static const char *const codes[] = { "ja", "en", "fr", "es", "de", "it", "nl", "pt", "ru", "ko" };
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < (int)(sizeof codes / sizeof *codes); i++)
         if (!strncmp(v, codes[i], 2) && !isalpha((unsigned char)v[2])) return i;
     if (!strncmp(v, "zh", 2) && !isalpha((unsigned char)v[2]))
-        return strstr(v, "_TW") || strstr(v, "_HK") || strstr(v, "_MO") || strstr(v, "Hant") ? 10 : 11;
-    return 1;
+        return strstr(v, "_TW") || strstr(v, "_HK") || strstr(v, "_MO") || strstr(v, "Hant")
+               ? LANG_CHINESE_TRADITIONAL : LANG_CHINESE_SIMPLIFIED;
+    return LANG_ENGLISH;
 }
 
 int psp_settings_resolve(psp_settings *s, char *error) {
@@ -404,7 +409,7 @@ int psp_settings_resolve(psp_settings *s, char *error) {
     s->window = s->number[PSP_OPT_WINDOW] != 0 || s->number[PSP_OPT_WINDOW_MODE] != 0 || s->render == PSP_RENDERER_GL;
     s->realtime = s->window || s->number[PSP_OPT_REALTIME] != 0;
     s->language = s->number[PSP_OPT_LANGUAGE] ? (int)s->number[PSP_OPT_LANGUAGE] - 1 : psp_settings_host_language();
-    s->confirm_cross = s->number[PSP_OPT_CONFIRM] ? s->number[PSP_OPT_CONFIRM] == 1 : s->language != 0;
+    s->confirm_cross = s->number[PSP_OPT_CONFIRM] ? s->number[PSP_OPT_CONFIRM] == 1 : s->language != LANG_JAPANESE;
     return 0;
 }
 
