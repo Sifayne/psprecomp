@@ -1275,6 +1275,11 @@ static void sd_finish(uint32_t result) {
     g_savedata_done=1; g_savedata_state=PSP_UTILITY_DIALOG_QUIT;
     sd_publish();
 }
+/* Close the dialog with the outcome it reached, or with `otherwise` when it
+ * reached none. */
+static void sd_finish_or(uint32_t otherwise) {
+    sd_finish(g_savedata_done ? sd_view.result : otherwise);
+}
 static void sd_outcome(uint32_t result, const char *message) {
     sd_view.result=result;
     sd_view.stage=result ? PSP_SAVEDATA_ERROR : PSP_SAVEDATA_DONE;
@@ -1433,6 +1438,13 @@ static void sd_confirm(void) {
         sd_loading() ? "Load this save data?" : "Delete this save data? This cannot be undone.");
     sd_publish();
 }
+/* What the dialog says when a request is done, by its family and by
+ * whether it succeeded. */
+static const char *sd_done_message(uint32_t result) {
+    if (sd_loading()) return result ? "Unable to load this save data." : "Load completed.";
+    if (sd_saving()) return result ? "Unable to save. Previous data has been retained where possible." : "Save completed.";
+    return result ? "Unable to delete this save data." : "Save data deleted.";
+}
 static void sd_execute_selection(void) {
     if (!sd_request_valid()) {
         sd_outcome(SD_BAD_PARAM,"Save request changed while the dialog was open."); return;
@@ -1456,10 +1468,7 @@ static void sd_execute_selection(void) {
     }
     if (savedata_log_on()) fprintf(stderr,"savedata: session=%llu slot=%s result=%08X\n",
         (unsigned long long)sd_ordinal,slot->name,result);
-    const char *message=result ? (sd_loading() ? "Unable to load this save data." :
-        sd_saving() ? "Unable to save. Previous data has been retained where possible." : "Unable to delete this save data.") :
-        sd_saving() ? "Save completed." : sd_loading() ? "Load completed." : "Save data deleted.";
-    sd_outcome(result,message);
+    sd_outcome(result,sd_done_message(result));
 }
 static void sd_apply_response(int action,int index) {
     if (action==PSP_SAVEDATA_SELECT) {
@@ -1502,7 +1511,7 @@ static void sd_script_step(void) {
     fprintf(stderr,"savedata: script mismatch/EOF at line %u (dialog %llu, mode %u, game %s)\n",
         sd_script_line,(unsigned long long)sd_ordinal,sd_view.mode,sd_view.game);
     sd_script_failed=1;
-    sd_finish(g_savedata_done ? sd_view.result : SD_RESULT_ABORT);
+    sd_finish_or(SD_RESULT_ABORT);
 }
 static int sd_validate(uint32_t p) {
     if (!p || (p&3) || !psp_mem_ptr(p,4)) return 0;
@@ -1647,17 +1656,17 @@ static void hle_SavedataUpdate(void) {
             action=sd_response.action; index=sd_response.index;
         }
         sd_pending=0; psp_os_unlock(&sd_bridge_lock);
-        if (sd_script_failed) sd_finish(g_savedata_done?sd_view.result:SD_RESULT_ABORT);
+        if (sd_script_failed) sd_finish_or(SD_RESULT_ABORT);
         else if (sd_script) sd_script_step();
         else if (!host) {
             fprintf(stderr,"savedata: interactive mode %u cancelled: no dialog host or script\n",sd_view.mode);
-            sd_finish(g_savedata_done?sd_view.result:SD_RESULT_CANCEL);
+            sd_finish_or(SD_RESULT_CANCEL);
         } else if (action) sd_apply_response(action,index);
         /* A negative redraw means presentation is gone for good; a backend
          * that merely cannot draw from this thread returns 0 and skips. */
         if (redraw && redraw()<0 && sd_view.active) {
             fprintf(stderr,"savedata: dialog presentation unavailable; cancelling\n");
-            sd_finish(g_savedata_done?sd_view.result:SD_RESULT_CANCEL);
+            sd_finish_or(SD_RESULT_CANCEL);
         }
     }
     psp_ret(0);
@@ -1667,7 +1676,7 @@ static void hle_SavedataShutdownStart(void) {
         psp_ret(SD_BUSY); return;
     }
     if (g_savedata_interactive) {
-        if (sd_view.active) sd_finish(g_savedata_done?sd_view.result:SD_RESULT_CANCEL);
+        if (sd_view.active) sd_finish_or(SD_RESULT_CANCEL);
     } else if (g_savedata_param && !g_savedata_done) {
         psp_write32(g_savedata_param+SD_RESULT,sd_request_valid()?sd_do_mode(g_savedata_param):SD_BAD_PARAM); g_savedata_done=1;
         savedata_log_result(g_savedata_param);
