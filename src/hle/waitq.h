@@ -97,6 +97,10 @@ void     psp_wait_writeback(uint32_t tmo_ptr, uint64_t deadline);
  * type that woke such a waiter with plain psp_sched_wake -- NORMAL -- and
  * worked the answer out by looking the object up again would say DELETE. */
 
+/* The two forms of a call that can wait: the plain one parks, with the
+ * caller's timeout, and the Try or Poll one answers at once and takes none. */
+typedef enum { PSP_WAIT_POLL, PSP_WAIT_BLOCK } psp_wait_form;
+
 /* ---- how a wait that parked ends -------------------------------------------
  *
  * Every object type answers in the same order, from what

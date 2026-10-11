@@ -148,13 +148,13 @@ void psp_kernlock_thread_ended(uint32_t uid) {
 }
 
 /* The common body of the two blocking locks and the non-blocking one. */
-static void mutex_lock(int may_block, int has_timeout) {
-    if (may_block && !psp_sched_can_wait()) {
+static void mutex_lock(psp_wait_form form) {
+    if (form == PSP_WAIT_BLOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t id      = psp_arg(0);
     const int32_t  count   = (int32_t)psp_arg(1);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
+    const uint32_t tmo_ptr = form == PSP_WAIT_BLOCK ? psp_arg(2) : 0;
 
     psp_mutex *m = find_mutex(id);
     if (!m) { psp_ret(SCE_KERNEL_ERROR_NOT_FOUND_MUTEX); return; }
@@ -195,7 +195,7 @@ static void mutex_lock(int may_block, int has_timeout) {
         return;
     }
 
-    if (!may_block) { psp_ret(SCE_KERNEL_ERROR_MUTEX_LOCKED); return; }
+    if (form == PSP_WAIT_POLL) { psp_ret(SCE_KERNEL_ERROR_MUTEX_LOCKED); return; }
 
     if (psp_waitq_add(&m->q, me, (uint32_t)count, 0, 0) != 0) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
@@ -219,8 +219,8 @@ static void mutex_lock(int may_block, int has_timeout) {
     psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
-static void hle_LockMutex(void)    { mutex_lock(1, 1); }
-static void hle_TryLockMutex(void) { mutex_lock(0, 0); }
+static void hle_LockMutex(void)    { mutex_lock(PSP_WAIT_BLOCK); }
+static void hle_TryLockMutex(void) { mutex_lock(PSP_WAIT_POLL); }
 
 static void hle_UnlockMutex(void) {
     const uint32_t id    = psp_arg(0);
@@ -541,33 +541,36 @@ static uint32_t lw_count_error(uint32_t wa, int32_t count, int locking) {
     return SCE_KERNEL_ERROR_OK;
 }
 
-/* The pre-6.00 sceKernelTryLockLwMutex reports one code for every failure.
+/* The three lock calls: the one that waits, and the two that do not. */
+typedef enum { LW_LOCK, LW_TRY, LW_TRY_600 } lw_call;
+
+/* What a lock that fails answers. The pre-6.00 sceKernelTryLockLwMutex
+ * reports one code for every failure.
  *
  * Not a simplification on our part: try.expected has fifteen failing cases and
  * every one of them answers 0x800201C4, where try600.expected gives the precise
  * code for the same call on the same inputs. The `_600` suffix is a firmware
  * revision that made the error vocabulary specific, and both exports are still
  * present with their own NIDs. */
-static void lw_lock(int may_block, int has_timeout, int flatten) {
-    if (may_block && !psp_sched_can_wait()) {
+static uint32_t lw_lock_error(lw_call call, uint32_t code) {
+    return call == LW_TRY ? SCE_KERNEL_ERROR_LWMUTEX_TRY_FAILED : code;
+}
+
+static void lw_lock(lw_call call) {
+    if (call == LW_LOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t wa      = psp_arg(0);
     const int32_t  count   = (int32_t)psp_arg(1);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
-
-#define LW_FAIL(code) do { \
-        psp_ret(flatten ? SCE_KERNEL_ERROR_LWMUTEX_TRY_FAILED : (code)); \
-        return; \
-    } while (0)
+    const uint32_t tmo_ptr = call == LW_LOCK ? psp_arg(2) : 0;
 
     if (lw_bad_pointer(wa)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
     const uint32_t bad = lw_count_error(wa, count, 1);
-    if (bad) LW_FAIL(bad);
+    if (bad) { psp_ret(lw_lock_error(call, bad)); return; }
 
     psp_lwmutex *rec = NULL;
     const uint32_t gone = lw_resolve(wa, &rec, 0);
-    if (gone) LW_FAIL(gone);
+    if (gone) { psp_ret(lw_lock_error(call, gone)); return; }
 
     const uint64_t deadline = psp_wait_deadline(tmo_ptr);
     const uint32_t me   = psp_sched_current();
@@ -583,14 +586,20 @@ static void lw_lock(int may_block, int has_timeout, int flatten) {
     }
 
     if (psp_read32(wa + LW_THREAD) == me) {
-        if (!(attr & LWMUTEX_ATTR_RECURSE)) LW_FAIL(SCE_KERNEL_ERROR_LWMUTEX_RECURSIVE);
+        if (!(attr & LWMUTEX_ATTR_RECURSE)) {
+            psp_ret(lw_lock_error(call, SCE_KERNEL_ERROR_LWMUTEX_RECURSIVE));
+            return;
+        }
         psp_write32(wa + LW_COUNT, (uint32_t)(cur + count));
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
 
-    if (!may_block) LW_FAIL(SCE_KERNEL_ERROR_LWMUTEX_LOCKED);
+    if (call != LW_LOCK) {
+        psp_ret(lw_lock_error(call, SCE_KERNEL_ERROR_LWMUTEX_LOCKED));
+        return;
+    }
 
     /* Only here does the kernel need to exist: a thread cannot be parked
      * against a workarea alone. */
@@ -622,12 +631,11 @@ static void lw_lock(int may_block, int has_timeout, int flatten) {
     psp_waitq_drop(&m->q, me);
     psp_write32(wa + LW_WAITING, (uint32_t)psp_waitq_count(&m->q));
     psp_wait_give_up(rc, tmo_ptr, deadline);
-#undef LW_FAIL
 }
 
-static void hle_LockLwMutex(void)        { lw_lock(1, 1, 0); }
-static void hle_TryLockLwMutex(void)     { lw_lock(0, 0, 1); }
-static void hle_TryLockLwMutex600(void)  { lw_lock(0, 0, 0); }
+static void hle_LockLwMutex(void)        { lw_lock(LW_LOCK); }
+static void hle_TryLockLwMutex(void)     { lw_lock(LW_TRY); }
+static void hle_TryLockLwMutex600(void)  { lw_lock(LW_TRY_600); }
 
 static void hle_UnlockLwMutex(void) {
     const uint32_t wa    = psp_arg(0);

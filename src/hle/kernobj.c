@@ -329,14 +329,14 @@ static int vpl_release(psp_vpl *v) {
     return urgent;
 }
 
-static void vpl_allocate(int may_block, int has_timeout) {
-    if (may_block && !psp_sched_can_wait()) {
+static void vpl_allocate(psp_wait_form form) {
+    if (form == PSP_WAIT_BLOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t id      = psp_arg(0);
     const uint32_t bytes   = psp_arg(1);
     const uint32_t out     = psp_arg(2);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(3) : 0;
+    const uint32_t tmo_ptr = form == PSP_WAIT_BLOCK ? psp_arg(3) : 0;
 
     psp_vpl *v = find_vpl(id);
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VPLID); return; }
@@ -365,7 +365,7 @@ static void vpl_allocate(int may_block, int has_timeout) {
         return;
     }
 
-    if (!may_block) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    if (form == PSP_WAIT_POLL) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     if (psp_waitq_add(&v->q, me, bytes, 0, out) != 0) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
@@ -386,8 +386,8 @@ static void vpl_allocate(int may_block, int has_timeout) {
     psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
-static void hle_AllocateVpl(void)    { vpl_allocate(1, 1); }
-static void hle_TryAllocateVpl(void) { vpl_allocate(0, 0); }
+static void hle_AllocateVpl(void)    { vpl_allocate(PSP_WAIT_BLOCK); }
+static void hle_TryAllocateVpl(void) { vpl_allocate(PSP_WAIT_POLL); }
 
 static void hle_FreeVpl(void) {
     const uint32_t id  = psp_arg(0);
@@ -814,16 +814,23 @@ static void mpp_pump(psp_msgpipe *p, uint32_t exclude, int *urgent) {
     }
 }
 
+typedef enum { MPP_SEND, MPP_RECEIVE } mpp_dir;
+
+/* The queue a transfer in direction `dir` waits in. */
+static psp_waitq *mpp_queue(psp_msgpipe *p, mpp_dir dir) {
+    return dir == MPP_SEND ? &p->send_q : &p->recv_q;
+}
+
 /* send and receive are the same shape with the direction reversed, so they
- * share a body: `sending` picks which queue is ours and which is theirs, which
- * error a full-or-empty poll gives, and which way the bytes go.
+ * share a body: the direction picks which queue is ours and which is theirs,
+ * which error a full-or-empty poll gives, and which way the bytes go.
  *
  * The caller joins its own queue before anything moves, rather than trying the
  * transfer first and queueing only on failure. That is what puts it in the
  * right place in the order relative to threads already waiting, and it means
  * the immediate case and the blocking case are the same code. */
-static void mpp_transfer(int sending, int may_block, int has_timeout) {
-    if (may_block && !psp_sched_can_wait()) {
+static void mpp_transfer(mpp_dir dir, psp_wait_form form) {
+    if (form == PSP_WAIT_BLOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t id      = psp_arg(0);
@@ -831,7 +838,7 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
     const uint32_t len     = psp_arg(2);
     const uint32_t mode    = psp_arg(3);
     const uint32_t out     = psp_arg(4);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(5) : 0;
+    const uint32_t tmo_ptr = form == PSP_WAIT_BLOCK ? psp_arg(5) : 0;
 
     psp_msgpipe *p = find_pipe(id);
     if (!p) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MPPID); return; }
@@ -877,20 +884,20 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
      * What it may not do is half-succeed. So it asks how much could move,
      * decides, and only then joins the queue -- by which point completing is
      * certain, and the ordinary pump does the work. */
-    if (!may_block) {
-        const uint32_t cap = sending ? mpp_send_capacity(p) : mpp_recv_capacity(p);
+    if (form == PSP_WAIT_POLL) {
+        const uint32_t cap = dir == MPP_SEND ? mpp_send_capacity(p) : mpp_recv_capacity(p);
         const uint32_t now = (mode & MPP_MODE_ASAP) ? mpp_min(cap, len) : len;
         if (!now || now > cap) {
             /* ASAP moved nothing, and says so: `ASAP: Failed (800201b3,
              * bytes=0)`. A full-wait failure leaves the word alone, which is
              * how the tests tell the two apart -- they pre-seed it 0x1337. */
             if ((mode & MPP_MODE_ASAP) && out) psp_write32(out, 0);
-            psp_ret(sending ? SCE_KERNEL_ERROR_MSGPIPE_FULL
-                            : SCE_KERNEL_ERROR_MSGPIPE_EMPTY);
+            psp_ret(dir == MPP_SEND ? SCE_KERNEL_ERROR_MSGPIPE_FULL
+                                    : SCE_KERNEL_ERROR_MSGPIPE_EMPTY);
             if (urgent) psp_sched_preempt();
             return;
         }
-        psp_waitq *pq = sending ? &p->send_q : &p->recv_q;
+        psp_waitq *pq = mpp_queue(p, dir);
         /* Asking for exactly what is there, as a full-wait: the pump then fills
          * it precisely rather than stopping at the first byte. */
         if (psp_waitq_add(pq, me, now, 0, buf) != 0) {
@@ -907,7 +914,7 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
         return;
     }
 
-    psp_waitq *q = sending ? &p->send_q : &p->recv_q;
+    psp_waitq *q = mpp_queue(p, dir);
     if (psp_waitq_add(q, me, len, mode, buf) != 0) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
         return;
@@ -935,7 +942,7 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
     if (urgent) psp_sched_preempt();
     psp_threadman_wait_mark(PSP_WAITTYPE_MSGPIPE, p->uid);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
-                                         sending ? p->senddesc : p->recvdesc,
+                                         dir == MPP_SEND ? p->senddesc : p->recvdesc,
                                          deadline);
     psp_threadman_wait_mark(0, 0);
     /* A pipe deleted between our release and our turn on the CPU does not
@@ -946,7 +953,7 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
     if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
     p = find_pipe(id);
     if (psp_wait_end_found(rc, p, tmo_ptr, deadline)) return;
-    q = sending ? &p->send_q : &p->recv_q;
+    q = mpp_queue(p, dir);
 
     /* A wait that ran out reports what it did get, which for a full-wait is
      * nothing: `bytes=0`, where an *argument* failure leaves the caller's
@@ -957,10 +964,10 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
     psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
-static void hle_SendMsgPipe(void)       { mpp_transfer(1, 1, 1); }
-static void hle_TrySendMsgPipe(void)    { mpp_transfer(1, 0, 0); }
-static void hle_ReceiveMsgPipe(void)    { mpp_transfer(0, 1, 1); }
-static void hle_TryReceiveMsgPipe(void) { mpp_transfer(0, 0, 0); }
+static void hle_SendMsgPipe(void)       { mpp_transfer(MPP_SEND, PSP_WAIT_BLOCK); }
+static void hle_TrySendMsgPipe(void)    { mpp_transfer(MPP_SEND, PSP_WAIT_POLL); }
+static void hle_ReceiveMsgPipe(void)    { mpp_transfer(MPP_RECEIVE, PSP_WAIT_BLOCK); }
+static void hle_TryReceiveMsgPipe(void) { mpp_transfer(MPP_RECEIVE, PSP_WAIT_POLL); }
 
 static void hle_CancelMsgPipe(void) {
     psp_msgpipe *p = find_pipe(psp_arg(0));
@@ -1232,13 +1239,13 @@ static void hle_SendMbx(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-static void mbx_receive(int may_block, int has_timeout) {
-    if (may_block && !psp_sched_can_wait()) {
+static void mbx_receive(psp_wait_form form) {
+    if (form == PSP_WAIT_BLOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t id      = psp_arg(0);
     const uint32_t out     = psp_arg(1);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
+    const uint32_t tmo_ptr = form == PSP_WAIT_BLOCK ? psp_arg(2) : 0;
 
     psp_mbx *m = find_mbx(id);
     if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MBXID); return; }
@@ -1268,7 +1275,7 @@ static void mbx_receive(int may_block, int has_timeout) {
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
-    if (!may_block) { psp_ret(SCE_KERNEL_ERROR_MBOX_NOMSG); return; }
+    if (form == PSP_WAIT_POLL) { psp_ret(SCE_KERNEL_ERROR_MBOX_NOMSG); return; }
 
     const uint32_t me = psp_sched_current();
     if (psp_waitq_add(&m->q, me, 0, 0, out) != 0) {
@@ -1288,8 +1295,8 @@ static void mbx_receive(int may_block, int has_timeout) {
     psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
-static void hle_ReceiveMbx(void) { mbx_receive(1, 1); }
-static void hle_PollMbx(void)    { mbx_receive(0, 0); }
+static void hle_ReceiveMbx(void) { mbx_receive(PSP_WAIT_BLOCK); }
+static void hle_PollMbx(void)    { mbx_receive(PSP_WAIT_POLL); }
 
 static void hle_CancelReceiveMbx(void) {
     psp_mbx *m = find_mbx(psp_arg(0));
@@ -1520,13 +1527,13 @@ static int fpl_release(psp_fpl *f) {
     return urgent;
 }
 
-static void fpl_allocate(int may_block, int has_timeout) {
-    if (may_block && !psp_sched_can_wait()) {
+static void fpl_allocate(psp_wait_form form) {
+    if (form == PSP_WAIT_BLOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t id      = psp_arg(0);
     const uint32_t out     = psp_arg(1);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
+    const uint32_t tmo_ptr = form == PSP_WAIT_BLOCK ? psp_arg(2) : 0;
 
     psp_fpl *f = find_fpl(id);
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_FPLID); return; }
@@ -1540,7 +1547,7 @@ static void fpl_allocate(int may_block, int has_timeout) {
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
-    if (!may_block) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    if (form == PSP_WAIT_POLL) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     const uint32_t me = psp_sched_current();
     if (psp_waitq_add(&f->q, me, 0, 0, out) != 0) {
@@ -1558,8 +1565,8 @@ static void fpl_allocate(int may_block, int has_timeout) {
     psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
-static void hle_AllocateFpl(void)    { fpl_allocate(1, 1); }
-static void hle_TryAllocateFpl(void) { fpl_allocate(0, 0); }
+static void hle_AllocateFpl(void)    { fpl_allocate(PSP_WAIT_BLOCK); }
+static void hle_TryAllocateFpl(void) { fpl_allocate(PSP_WAIT_POLL); }
 
 static void hle_FreeFpl(void) {
     const uint32_t id  = psp_arg(0);
