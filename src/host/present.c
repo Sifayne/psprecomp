@@ -555,10 +555,12 @@ void present_ui_unlock(void) { if (g_overlay) g_overlay->gl_unlock(); }
 double present_fps(void) { return g_shown_fps; }
 void present_quit(void) { g_quit_requested = 1; }
 const char *present_renderer_name(void) { return g_gl_want ? "OpenGL" : "Software"; }
+
+static int is_fullscreen(void) { return (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0; }
+
 void present_set_fullscreen(int on) {
     if (!g_window) return;
-    const int full = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0;
-    if (full != (on != 0)) SDL_SetWindowFullscreen(g_window, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+    if (is_fullscreen() != (on != 0)) SDL_SetWindowFullscreen(g_window, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
 }
 
 /* Window close and both shortcuts share the scheduler's normal shutdown. */
@@ -577,33 +579,29 @@ static void close_game_window(void) {
     psp_sched_stop_all("window closed");
 }
 
-static void *sdl_thread(void *arg) {
-    (void)arg;
+/* Startup failed before there was a window: whoever waits on the GL
+ * context, then present_start, hears it. */
+static void publish_failure(void) {
+    if (g_gl_want) gl_publish(NULL, NULL, 0);
+    start_publish(0);
+}
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO) != 0) {
-        fprintf(stderr, "present: SDL_Init: %s -- running headless\n",
-                SDL_GetError());
-        if (g_gl_want) gl_publish(NULL, NULL, 0);
-        start_publish(0);
-        return NULL;
-    }
+/* 4.0 core first: the GL backend's model program (the transform on the
+ * GPU) needs GLSL 4.0 for its doubles. A driver that cannot give 4.0
+ * gets the 3.3 core context the rest of the backend needs, and the model
+ * program stays unbuilt. */
+static void request_gl_context(void) {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                        SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+}
 
-    /* 4.0 core first: the GL backend's model program (the transform on the
-     * GPU) needs GLSL 4.0 for its doubles. A driver that cannot give 4.0
-     * gets the 3.3 core context the rest of the backend needs, and the model
-     * program stays unbuilt. */
-    int gl_major = 4, gl_minor = 0;
-    if (g_gl_want) {
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, gl_major);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, gl_minor);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
-                            SDL_GL_CONTEXT_PROFILE_CORE);
-        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    }
-    /* Windowed mode uses the saved size; borderless fullscreen uses the
-     * current desktop resolution without switching the display mode. */
+/* Windowed mode uses the saved size; borderless fullscreen uses the
+ * current desktop resolution without switching the display mode. */
+static SDL_Window *create_window(void) {
     const psp_settings *settings = psp_settings_current();
-    int win_w = settings->width, win_h = settings->height;
     const double display_setting = setting("DISPLAY", -1);
     int display = display_setting < 0 ? 0 : (int)display_setting - 1;
     if (display >= SDL_GetNumVideoDisplays()) {
@@ -615,72 +613,71 @@ static void *sdl_thread(void *arg) {
     SDL_Window *win = SDL_CreateWindow(
         window_title,
         SDL_WINDOWPOS_CENTERED_DISPLAY(display), SDL_WINDOWPOS_CENTERED_DISPLAY(display),
-        win_w, win_h,
+        settings->width, settings->height,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
         (setting("WINDOW_MODE", 0) ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) |
         (g_gl_want ? SDL_WINDOW_OPENGL : 0));
-    if (!win) {
+    if (!win)
         fprintf(stderr, "present: cannot create window: %s -- running headless\n",
                 SDL_GetError());
-        if (g_gl_want) gl_publish(NULL, NULL, 0);
-        start_publish(0);
-        SDL_Quit();
-        return NULL;
-    }
+    return win;
+}
 
-    /* With GL the renderer, the streaming texture and the blit below are all
-     * skipped: the backend draws into the window itself. Creating an
-     * SDL_Renderer on the same window would fight it for the context. */
-    if (g_gl_want) {
-        SDL_GLContext ctx = win ? SDL_GL_CreateContext(win) : NULL;
-        if (!ctx && win) {
-            gl_major = 3; gl_minor = 3;
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, gl_major);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, gl_minor);
-            ctx = SDL_GL_CreateContext(win);
-        }
-        if (ctx) {
-            /* Created here because SDL wants it on the thread that made the
-             * window, released here because it has to be current on the GE
-             * thread instead. */
-            SDL_GL_MakeCurrent(win, NULL);
-            int dw = 0, dh = 0;
-            SDL_GL_GetDrawableSize(win, &dw, &dh);
-            atomic_store(&g_gl_draw_size, ((uint64_t)(uint32_t)dw << 32) | (uint32_t)dh);
-            fprintf(stderr, "present: GL %d.%d core context created, "
-                            "handed to the GE thread\n", gl_major, gl_minor);
-        } else {
-            fprintf(stderr, "present: no GL 3.3 core context: %s\n",
-                    SDL_GetError());
-        }
-        gl_publish(win, ctx, ctx != NULL);
-        if (!ctx) {
-            start_publish(0);
-            SDL_DestroyWindow(win);
-            SDL_Quit();
-            return NULL;
-        }
-    }
+/* The GL drawable's size in physical pixels, for the GE thread. */
+static void publish_drawable_size(SDL_Window *win) {
+    int dw = 0, dh = 0;
+    SDL_GL_GetDrawableSize(win, &dw, &dh);
+    atomic_store(&g_gl_draw_size, pack_size(dw, dh));
+}
 
-    SDL_Renderer *ren = (win && !g_gl_want) ?
-        SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED |
-                                    SDL_RENDERER_PRESENTVSYNC) : NULL;
-    if (ren) SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
-    /* The window is resizable, so pin the aspect: SDL letterboxes 480x272
-     * inside whatever the user drags it to rather than stretching it. */
-    if (ren) SDL_RenderSetLogicalSize(ren, SCREEN_W, SCREEN_H);
-    SDL_Texture *tex = ren ?
-        SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888,
-                          SDL_TEXTUREACCESS_STREAMING, SCREEN_W, SCREEN_H) : NULL;
-    if (!tex && !g_gl_want) {
+/* Create the GL context, then publish it for the GE thread -- or that there
+ * is none. */
+static int hand_gl_to_ge_thread(SDL_Window *win) {
+    int gl_major = 4, gl_minor = 0;          /* as request_gl_context asked */
+    SDL_GLContext ctx = SDL_GL_CreateContext(win);
+    if (!ctx) {
+        gl_major = 3; gl_minor = 3;
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, gl_major);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, gl_minor);
+        ctx = SDL_GL_CreateContext(win);
+    }
+    if (ctx) {
+        /* Created here because SDL wants it on the thread that made the
+         * window, released here because it has to be current on the GE
+         * thread instead. */
+        SDL_GL_MakeCurrent(win, NULL);
+        publish_drawable_size(win);
+        fprintf(stderr, "present: GL %d.%d core context created, "
+                        "handed to the GE thread\n", gl_major, gl_minor);
+    } else {
+        fprintf(stderr, "present: no GL 3.3 core context: %s\n",
+                SDL_GetError());
+    }
+    gl_publish(win, ctx, ctx != NULL);
+    return ctx ? 0 : -1;
+}
+
+/* Without GL, SDL's renderer shows the converted frames: a streaming
+ * texture, copied to the window every loop. */
+static int create_software_target(SDL_Window *win, SDL_Renderer **ren, SDL_Texture **tex) {
+    *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED |
+                                       SDL_RENDERER_PRESENTVSYNC);
+    if (*ren) {
+        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+        /* The window is resizable, so pin the aspect: SDL letterboxes 480x272
+         * inside whatever the user drags it to rather than stretching it. */
+        SDL_RenderSetLogicalSize(*ren, SCREEN_W, SCREEN_H);
+        *tex = SDL_CreateTexture(*ren, SDL_PIXELFORMAT_ABGR8888,
+                                 SDL_TEXTUREACCESS_STREAMING, SCREEN_W, SCREEN_H);
+    }
+    if (!*tex) {
         fprintf(stderr, "present: no window/renderer -- frames go nowhere\n");
-        start_publish(0);
-        if (ren) SDL_DestroyRenderer(ren);
-        SDL_DestroyWindow(win);
-        SDL_Quit();
-        return NULL;
+        return -1;
     }
+    return 0;
+}
 
+static void open_audio(void) {
     SDL_AudioSpec want = { 0 };
     want.freq     = AUDIO_RATE;
     want.format   = AUDIO_S16SYS;
@@ -697,14 +694,263 @@ static void *sdl_thread(void *arg) {
         SDL_PauseAudioDevice(g_audio_dev, 0);
     }
     else fprintf(stderr, "present: no audio device: %s\n", SDL_GetError());
+}
 
+/* ---- checks that drive the window ----------------------------------------
+ *
+ * Read from the environment once the window is open, and timed from then:
+ *
+ * PSPRECOMP_WINDOW_RESIZE=<seconds>:WxH resizes the window once, that many
+ * seconds after it opened, so the renderer's resize path is a command rather
+ * than a drag.
+ *
+ * PSPRECOMP_MENU_AT=<seconds>[:<page>] opens the menu once, that many seconds
+ * after the window opened, on a page by its name: the menu in a check, or a
+ * capture, where no player can open it.
+ *
+ * PSPRECOMP_KEYS_AT=<seconds>:<key>[,<seconds>:<key>...] presses a key (by
+ * SDL's name: F5, Return, Down; Ctrl+, Shift+ and Alt+ before it hold those)
+ * that many seconds after the window opened, for checks of what the keys do
+ * where nobody can press them. */
+enum { SCRIPT_KEYS = 16 };
+typedef struct {
+    uint32_t t0;                         /* SDL ticks when the window opened */
+    int resize_at, resize_w, resize_h, resize_done;
+    int menu_at, menu_done;
+    char menu_page[64];
+    struct { uint32_t ms; SDL_Keycode key; Uint16 mod; } keys[SCRIPT_KEYS];
+    int keys_n, keys_next;
+} window_script;
+
+/* "Ctrl+", "Shift+" and "Alt+" before a key's name: the modifiers it holds,
+ * and the bare name after them. */
+static Uint16 key_modifiers(const char **name) {
+    Uint16 mod = 0;
+    for (;;) {
+        if (!strncmp(*name, "Ctrl+", 5)) { mod |= KMOD_LCTRL; *name += 5; }
+        else if (!strncmp(*name, "Shift+", 6)) { mod |= KMOD_LSHIFT; *name += 6; }
+        else if (!strncmp(*name, "Alt+", 4)) { mod |= KMOD_LALT; *name += 4; }
+        else return mod;
+    }
+}
+
+static void read_scripted_keys(window_script *s) {
+    const char *spec = getenv("PSPRECOMP_KEYS_AT");
+    while (spec && *spec && s->keys_n < SCRIPT_KEYS) {
+        char *end;
+        const double at = strtod(spec, &end);
+        if (end == spec || *end != ':') break;
+        const char *name = end + 1;
+        const size_t len = strcspn(name, ",");
+        char key[32];
+        snprintf(key, sizeof key, "%.*s", (int)(len < sizeof key ? len : sizeof key - 1), name);
+        const char *bare = key;
+        s->keys[s->keys_n].ms = (uint32_t)(at * 1000.0);
+        s->keys[s->keys_n].mod = key_modifiers(&bare);
+        s->keys[s->keys_n].key = SDL_GetKeyFromName(bare);
+        s->keys_n++;
+        spec = name[len] ? name + len + 1 : name + len;
+    }
+}
+
+static void read_window_script(window_script *s) {
+    memset(s, 0, sizeof *s);
+
+    const char *rs = getenv("PSPRECOMP_WINDOW_RESIZE");
+    int a = 0, w = 0, h = 0;
+    s->resize_at = rs && sscanf(rs, "%d:%dx%d", &a, &w, &h) == 3 &&
+                   a > 0 && w > 0 && h > 0 ? a : 0;
+    if (s->resize_at <= 0) s->resize_done = 1;
+    s->resize_w = w; s->resize_h = h;
+
+    const char *spec = getenv("PSPRECOMP_MENU_AT");
+    s->menu_at = spec ? atoi(spec) : 0;
+    const char *colon = spec ? strchr(spec, ':') : NULL;
+    snprintf(s->menu_page, sizeof s->menu_page, "%s", colon ? colon + 1 : "");
+    if (s->menu_at <= 0) s->menu_done = 1;
+
+    read_scripted_keys(s);
+    s->t0 = SDL_GetTicks();
+}
+
+/* A key press and its release, as if typed into the window. */
+static void press_key(SDL_Window *win, SDL_Keycode key, Uint16 mod) {
+    SDL_Event e;
+    memset(&e, 0, sizeof e);
+    e.type = SDL_KEYDOWN;
+    e.key.state = SDL_PRESSED;
+    e.key.keysym.sym = key;
+    e.key.keysym.scancode = SDL_GetScancodeFromKey(key);
+    e.key.keysym.mod = mod;
+    e.key.windowID = SDL_GetWindowID(win);
+    SDL_PushEvent(&e);
+    e.type = SDL_KEYUP;
+    e.key.state = SDL_RELEASED;
+    SDL_PushEvent(&e);
+}
+
+/* Whatever the script has come due for: at most one key a loop. */
+static void run_window_script(window_script *s, SDL_Window *win) {
+    if (!s->resize_done && SDL_GetTicks() - s->t0 >= (uint32_t)s->resize_at * 1000u) {
+        SDL_SetWindowSize(win, s->resize_w, s->resize_h);
+        fprintf(stderr, "present: resized the window to %dx%d\n", s->resize_w, s->resize_h);
+        s->resize_done = 1;
+    }
+    if (g_overlay && !s->menu_done && SDL_GetTicks() - s->t0 >= (uint32_t)s->menu_at * 1000u) {
+        g_overlay->open_page(s->menu_page);
+        s->menu_done = 1;
+    }
+    if (s->keys_next < s->keys_n && SDL_GetTicks() - s->t0 >= s->keys[s->keys_next].ms) {
+        press_key(win, s->keys[s->keys_next].key, s->keys[s->keys_next].mod);
+        fprintf(stderr, "present: key %s pressed for a check\n", SDL_GetKeyName(s->keys[s->keys_next].key));
+        s->keys_next++;
+    }
+}
+
+/* ---- the loop ------------------------------------------------------------- */
+
+/* Take the latest frame, if the guest has produced one. Waiting bounded
+ * rather than forever keeps the window alive -- and showing its last
+ * frame -- when the guest stalls, which it does. */
+static int take_frame(void) {
+    struct timespec due;
+    clock_gettime(CLOCK_REALTIME, &due);
+    due.tv_nsec += 17 * 1000000;
+    if (due.tv_nsec >= 1000000000) {
+        due.tv_nsec -= 1000000000;
+        due.tv_sec  += 1;
+    }
+
+    pthread_mutex_lock(&g_frame_lock);
+    if (!g_frame_fresh)
+        pthread_cond_timedwait(&g_frame_cv, &g_frame_lock, &due);
+    const int fresh = g_frame_fresh;
+    if (fresh) {
+        memcpy(g_frame_present, g_frame_rgba, sizeof g_frame_present);
+        g_frame_fresh = 0;
+    }
+    pthread_mutex_unlock(&g_frame_lock);
+    return fresh;
+}
+
+/* The frame rate in the title, once a second: rendered frames over
+ * wall time, whichever backend rendered them. Set from this thread,
+ * which owns the window. While the guest is held the title says so,
+ * and the count starts again when it is let go. */
+static void update_title(SDL_Window *win) {
+    static uint32_t title_t0; static uint64_t title_frames; static char last[128];
+    static int was_paused;
+    const uint32_t now = SDL_GetTicks();
+    const int paused = psp_paused();
+    if (!title_t0 || paused != was_paused) { title_t0 = now; title_frames = atomic_load(&g_frames_rendered); }
+    if (now - title_t0 < 1000 && paused == was_paused) return;
+    if (now - title_t0 >= 1000) {
+        const uint64_t frames = atomic_load(&g_frames_rendered);
+        if (!paused)
+            g_shown_fps = (double)(frames - title_frames) * 1000.0 / (double)(now - title_t0);
+        title_t0 = now; title_frames = frames;
+    }
+    char title[128];
+    if (paused)
+        snprintf(title, sizeof title, "%s -- recompiled  |  paused", title_name());
+    else
+        snprintf(title, sizeof title, "%s -- recompiled  |  %.0f fps", title_name(), g_shown_fps);
+    if (strcmp(title, last) != 0) { SDL_SetWindowTitle(win, title); snprintf(last, sizeof last, "%s", title); }
+    was_paused = paused;
+}
+
+/* The save dialog takes the controls while it is open, and gives
+ * them back once they are let go (src/host/input.c). */
+static void update_save_dialog(void) {
+    const int was_dialog = save_dialog_active();
+    save_dialog_update(input_pad());
+    if (save_dialog_active() && !was_dialog) input_take(INPUT_DIALOG);
+    else if (!save_dialog_active()) input_return(INPUT_DIALOG);
+}
+
+/* A bound action the menu or the window carries out. */
+static void run_action(int action) {
+    const int states = action == INPUT_ACTION_QUICK_SAVE || action == INPUT_ACTION_QUICK_LOAD ||
+                       action == INPUT_ACTION_SLOT_NEXT || action == INPUT_ACTION_SLOT_PREV;
+    if (action == INPUT_ACTION_FULLSCREEN) {
+        present_set_fullscreen(!is_fullscreen());
+    } else if (states && g_overlay) {
+        g_overlay->action(action);
+    } else if (action != INPUT_ACTION_NONE) {
+        /* Screenshots are still to come, and save states need the
+         * menu (docs/PLAYER-LAYER.md). */
+        static unsigned said;
+        if (!(said & 1u << action)) {
+            said |= 1u << action;
+            fprintf(stderr, "present: %s is bound but not available yet\n", input_action_name(action));
+        }
+    }
+}
+
+/* One event from SDL's queue; 1 when it ends the run. */
+static int handle_event(SDL_Event *e) {
+    if (input_quit_event(e)) {
+        fprintf(stderr, "present: keyboard quit shortcut\n");
+        e->type = SDL_QUIT;
+    }
+    if (save_dialog_event(e, input_pad_id())) { input_chord_event(e); return 0; }
+    if (e->type == SDL_QUIT) return 1;
+    /* An open menu sees every event first; the input layer still
+     * sees devices come and go and focus, and keeps the rest from
+     * the game while the menu owns the controls. */
+    if (g_overlay && g_overlay->is_open()) g_overlay->event(e);
+    const int action = input_event(e);
+    if (action == INPUT_ACTION_MENU) {
+        if (g_overlay) g_overlay->toggle();
+        else input_release_mouse();     /* what Escape did before the menu */
+        return 0;
+    }
+    if (action == INPUT_ACTION_QUIT) {
+        fprintf(stderr, "present: quit binding\n");
+        return 1;
+    }
+    run_action(action);
+    return 0;
+}
+
+static void *sdl_thread(void *arg) {
+    (void)arg;
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO) != 0) {
+        fprintf(stderr, "present: SDL_Init: %s -- running headless\n",
+                SDL_GetError());
+        publish_failure();
+        return NULL;
+    }
+    if (g_gl_want) request_gl_context();
+    SDL_Window *win = create_window();
+    if (!win) {
+        publish_failure();
+        SDL_Quit();
+        return NULL;
+    }
+
+    /* With GL the renderer, the streaming texture and the blit below are all
+     * skipped: the backend draws into the window itself. Creating an
+     * SDL_Renderer on the same window would fight it for the context. */
+    SDL_Renderer *ren = NULL;
+    SDL_Texture *tex = NULL;
+    if (g_gl_want ? hand_gl_to_ge_thread(win) != 0 : create_software_target(win, &ren, &tex) != 0) {
+        start_publish(0);
+        if (ren) SDL_DestroyRenderer(ren);
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return NULL;
+    }
+
+    open_audio();
     /* The controls, their help, mouse-look and the first controller. After
      * the GL handoff above on purpose -- that block owns the context
      * juggling and does not need company. */
-    input_start(settings);
+    input_start(psp_settings_current());
     present_set_volume(setting("VOLUME", 100) / 100.0, 0);
     g_window = win;
-    if (g_overlay && win) g_overlay->start(win, g_gl_want ? NULL : ren);
+    if (g_overlay) g_overlay->start(win, g_gl_want ? NULL : ren);
 
     if (save_dialog_init() != 0)
         fprintf(stderr, "present: in-game save dialog unavailable (%s); interactive save/load requests will be cancelled\n",
@@ -712,171 +958,31 @@ static void *sdl_thread(void *arg) {
 
     start_publish(1);
 
+    window_script script;
+    read_window_script(&script);
     for (;;) {
-        /* PSPRECOMP_WINDOW_RESIZE=<seconds>:WxH resizes the window once, that
-         * many seconds after it opened, so the renderer's resize path is a
-         * command rather than a drag. */
-        {
-            static int done, at_s = -1, rw, rh;
-            static uint32_t t0;
-            if (at_s < 0) {
-                const char *rs = getenv("PSPRECOMP_WINDOW_RESIZE");
-                int a = 0, w = 0, h = 0;
-                at_s = rs && sscanf(rs, "%d:%dx%d", &a, &w, &h) == 3 &&
-                       a > 0 && w > 0 && h > 0 ? a : 0;
-                if (at_s <= 0) done = 1;
-                rw = w; rh = h; t0 = SDL_GetTicks();
-            }
-            if (!done && win && SDL_GetTicks() - t0 >= (uint32_t)at_s * 1000u) {
-                SDL_SetWindowSize(win, rw, rh);
-                fprintf(stderr, "present: resized the window to %dx%d\n", rw, rh);
-                done = 1;
-            }
-        }
-        /* PSPRECOMP_MENU_AT=<seconds>[:<page>] opens the menu once, that many
-         * seconds after the window opened, on a page by its name: the menu
-         * in a check, or a capture, where no player can open it. */
-        if (g_overlay) {
-            static int menu_done, menu_at = -1;
-            static char menu_page[64];
-            static uint32_t menu_t0;
-            if (menu_at < 0) {
-                const char *spec = getenv("PSPRECOMP_MENU_AT");
-                menu_at = spec ? atoi(spec) : 0;
-                const char *colon = spec ? strchr(spec, ':') : NULL;
-                snprintf(menu_page, sizeof menu_page, "%s", colon ? colon + 1 : "");
-                if (menu_at <= 0) menu_done = 1;
-                menu_t0 = SDL_GetTicks();
-            }
-            if (!menu_done && SDL_GetTicks() - menu_t0 >= (uint32_t)menu_at * 1000u) {
-                g_overlay->open_page(menu_page);
-                menu_done = 1;
-            }
-        }
-        /* PSPRECOMP_KEYS_AT=<seconds>:<key>[,<seconds>:<key>...] presses a
-         * key (by SDL's name: F5, Return, Down; Ctrl+, Shift+ and Alt+ before
-         * it hold those) that many seconds after the window opened, for checks
-         * of what the keys do where nobody can press them. */
-        {
-            static int keys_read;
-            static struct { uint32_t ms; SDL_Keycode key; Uint16 mod; } keys_at[16];
-            static int keys_n, keys_next;
-            static uint32_t keys_t0;
-            if (!keys_read) {
-                keys_read = 1;
-                keys_t0 = SDL_GetTicks();
-                const char *spec = getenv("PSPRECOMP_KEYS_AT");
-                while (spec && *spec && keys_n < 16) {
-                    char *end;
-                    const double at = strtod(spec, &end);
-                    if (end == spec || *end != ':') break;
-                    const char *name = end + 1;
-                    const size_t len = strcspn(name, ",");
-                    char key[32];
-                    snprintf(key, sizeof key, "%.*s", (int)(len < sizeof key ? len : sizeof key - 1), name);
-                    keys_at[keys_n].ms = (uint32_t)(at * 1000.0);
-                    keys_at[keys_n].mod = 0;
-                    const char *bare = key;
-                    for (;;) {
-                        if (!strncmp(bare, "Ctrl+", 5)) { keys_at[keys_n].mod |= KMOD_LCTRL; bare += 5; }
-                        else if (!strncmp(bare, "Shift+", 6)) { keys_at[keys_n].mod |= KMOD_LSHIFT; bare += 6; }
-                        else if (!strncmp(bare, "Alt+", 4)) { keys_at[keys_n].mod |= KMOD_LALT; bare += 4; }
-                        else break;
-                    }
-                    keys_at[keys_n].key = SDL_GetKeyFromName(bare);
-                    keys_n++;
-                    spec = name[len] ? name + len + 1 : name + len;
-                }
-            }
-            if (keys_next < keys_n && SDL_GetTicks() - keys_t0 >= keys_at[keys_next].ms) {
-                SDL_Event e;
-                memset(&e, 0, sizeof e);
-                e.type = SDL_KEYDOWN;
-                e.key.state = SDL_PRESSED;
-                e.key.keysym.sym = keys_at[keys_next].key;
-                e.key.keysym.scancode = SDL_GetScancodeFromKey(keys_at[keys_next].key);
-                e.key.keysym.mod = keys_at[keys_next].mod;
-                e.key.windowID = win ? SDL_GetWindowID(win) : 0;
-                SDL_PushEvent(&e);
-                e.type = SDL_KEYUP;
-                e.key.state = SDL_RELEASED;
-                SDL_PushEvent(&e);
-                fprintf(stderr, "present: key %s pressed for a check\n", SDL_GetKeyName(keys_at[keys_next].key));
-                keys_next++;
-            }
-        }
+        run_window_script(&script, win);
         const uint64_t requested = atomic_exchange(&g_requested_size, 0);
-        if (requested && win)
-            SDL_SetWindowSize(win, (int)(requested >> 32), (int)(requested & UINT32_MAX));
+        if (requested) {
+            int w, h;
+            unpack_size(requested, &w, &h);
+            SDL_SetWindowSize(win, w, h);
+        }
         /* Logical window pixels and GL drawable pixels differ under desktop
          * scaling.  Refresh this on the SDL thread so resize and display-scale
          * changes are reflected by the next GL presentation. */
-        if (g_gl_want && win) {
-            int dw = 0, dh = 0;
-            SDL_GL_GetDrawableSize(win, &dw, &dh);
-            atomic_store(&g_gl_draw_size, ((uint64_t)(uint32_t)dw << 32) | (uint32_t)dh);
-        }
+        if (g_gl_want) publish_drawable_size(win);
 
-        /* Publish the latest frame, if the guest has produced one. Waiting
-         * bounded rather than forever keeps the window alive -- and showing
-         * its last frame -- when the guest stalls, which it does. */
-        struct timespec due;
-        clock_gettime(CLOCK_REALTIME, &due);
-        due.tv_nsec += 17 * 1000000;
-        if (due.tv_nsec >= 1000000000) {
-            due.tv_nsec -= 1000000000;
-            due.tv_sec  += 1;
-        }
-
-        pthread_mutex_lock(&g_frame_lock);
-        if (!g_frame_fresh)
-            pthread_cond_timedwait(&g_frame_cv, &g_frame_lock, &due);
-        const int fresh = g_frame_fresh;
-        if (fresh) {
-            memcpy(g_frame_present, g_frame_rgba, sizeof g_frame_present);
-            g_frame_fresh = 0;
-        }
-        pthread_mutex_unlock(&g_frame_lock);
-
-        /* Outside the lock. On a timeout there is no new frame, so the texture
-         * keeps the last one and the window still repaints -- which is the
-         * point of the bounded wait. */
+        /* Outside the frame lock. On a timeout there is no new frame, so the
+         * texture keeps the last one and the window still repaints -- which
+         * is the point of the bounded wait. */
+        const int fresh = take_frame();
         if (tex && fresh)
             SDL_UpdateTexture(tex, NULL, g_frame_present, SCREEN_W * 4);
         if (fresh && !g_gl_want) present_note_frame();
-        /* The frame rate in the title, once a second: rendered frames over
-         * wall time, whichever backend rendered them. Set from this thread,
-         * which owns the window. While the guest is held the title says so,
-         * and the count starts again when it is let go. */
-        {
-            static uint32_t title_t0; static uint64_t title_frames; static char last[128];
-            static int was_paused;
-            const uint32_t now = SDL_GetTicks();
-            const int paused = psp_paused();
-            if (!title_t0 || paused != was_paused) { title_t0 = now; title_frames = atomic_load(&g_frames_rendered); }
-            if ((now - title_t0 >= 1000 || paused != was_paused) && win) {
-                if (now - title_t0 >= 1000) {
-                    const uint64_t frames = atomic_load(&g_frames_rendered);
-                    if (!paused)
-                        g_shown_fps = (double)(frames - title_frames) * 1000.0 / (double)(now - title_t0);
-                    title_t0 = now; title_frames = frames;
-                }
-                char title[128];
-                if (paused)
-                    snprintf(title, sizeof title, "%s -- recompiled  |  paused", title_name());
-                else
-                    snprintf(title, sizeof title, "%s -- recompiled  |  %.0f fps", title_name(), g_shown_fps);
-                if (strcmp(title, last) != 0) { SDL_SetWindowTitle(win, title); snprintf(last, sizeof last, "%s", title); }
-                was_paused = paused;
-            }
-        }
+        update_title(win);
 
-        /* The save dialog takes the controls while it is open, and gives
-         * them back once they are let go (src/host/input.c). */
-        const int was_dialog = save_dialog_active();
-        save_dialog_update(input_pad());
-        if (save_dialog_active() && !was_dialog) input_take(INPUT_DIALOG);
-        else if (!save_dialog_active()) input_return(INPUT_DIALOG);
+        update_save_dialog();
         input_tick();
         /* The menu lays out its frame here, every loop -- closed, only a
          * line saying what a key just did, for a moment: drawn below under
@@ -891,45 +997,9 @@ static void *sdl_thread(void *arg) {
 
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
-            if (input_quit_event(&e)) {
-                fprintf(stderr, "present: keyboard quit shortcut\n");
-                e.type = SDL_QUIT;
-            }
-            if (save_dialog_event(&e, input_pad_id())) { input_chord_event(&e); continue; }
-            if (e.type == SDL_QUIT) {
+            if (handle_event(&e)) {
                 close_game_window();
                 return NULL;
-            }
-            /* An open menu sees every event first; the input layer still
-             * sees devices come and go and focus, and keeps the rest from
-             * the game while the menu owns the controls. */
-            if (g_overlay && g_overlay->is_open()) g_overlay->event(&e);
-            const int action = input_event(&e);
-            if (action == INPUT_ACTION_MENU) {
-                if (g_overlay) g_overlay->toggle();
-                else input_release_mouse();     /* what Escape did before the menu */
-                continue;
-            }
-            if (action == INPUT_ACTION_QUIT) {
-                fprintf(stderr, "present: quit binding\n");
-                close_game_window();
-                return NULL;
-            }
-            const int states = action == INPUT_ACTION_QUICK_SAVE || action == INPUT_ACTION_QUICK_LOAD ||
-                               action == INPUT_ACTION_SLOT_NEXT || action == INPUT_ACTION_SLOT_PREV;
-            if (action == INPUT_ACTION_FULLSCREEN && win) {
-                const int full = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) != 0;
-                SDL_SetWindowFullscreen(win, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
-            } else if (states && g_overlay) {
-                g_overlay->action(action);
-            } else if (action != INPUT_ACTION_NONE && action != INPUT_ACTION_FULLSCREEN) {
-                /* Screenshots are still to come, and save states need the
-                 * menu (docs/PLAYER-LAYER.md). */
-                static unsigned said;
-                if (!(said & 1u << action)) {
-                    said |= 1u << action;
-                    fprintf(stderr, "present: %s is bound but not available yet\n", input_action_name(action));
-                }
             }
         }
         if (g_quit_requested) {
