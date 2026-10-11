@@ -939,17 +939,8 @@ static void confirm_prompt(launcher *a) {
     else pack_remove(a, a->remove_pack);
 }
 
-/* One frame, into the renderer; draw presents it. */
-static void render(launcher *a) {
-    refresh(a);
-    if (!a->page) {
-        const char *names[PAGES_MAX];
-        a->group = GROUP_PLAYER;
-        if (group_pages(a, GROUP_PLAYER, names)) a->page = names[0];
-    }
-    psp_ui_set_pad(a->pad);
-    psp_ui_begin();
-    psp_ui_screen_begin();
+/* The title at the top, and Add game beside it. */
+static void title_bar(launcher *a) {
     psp_ui_accent("PSPRECOMP");
     char heading[160];
     upper(game_title(a), heading, sizeof heading);
@@ -962,40 +953,62 @@ static void render(launcher *a) {
         if (psp_ui_button_primary("Add game")) browser_open(a, BROWSE_ISO);
         psp_ui_disabled_end();
     }
-    if (a->game_count > 1 && a->view == VIEW_SETTINGS) {
-        int pick = -1;
-        for (int k = 0; k < a->game_count; k++) {
-            char label[300];
-            snprintf(label, sizeof label, "%s##game%d", a->games[k].title, k);
-            if (k) psp_ui_same_line();
-            if (psp_ui_tab(label, k == a->game) && k != a->game) pick = k;
-        }
-        if (pick >= 0) select_game(a, pick);
+}
+
+/* A tab for each game, when there is more than one. */
+static void game_tabs(launcher *a) {
+    int pick = -1;
+    for (int k = 0; k < a->game_count; k++) {
+        char label[300];
+        snprintf(label, sizeof label, "%s##game%d", a->games[k].title, k);
+        if (k) psp_ui_same_line();
+        if (psp_ui_tab(label, k == a->game) && k != a->game) pick = k;
     }
-    if (a->view == VIEW_SETTINGS) {
-        psp_ui_side_begin(SIDE, FOOTER + (working(a) ? WORK : 0));
-        const char *names[PAGES_MAX];
-        for (int g = GROUP_PLAYER; g <= GROUP_ABOUT; g++) {
-            const int n = group_pages(a, g, names);
-            if (!n) continue;
-            if (g == GROUP_PLAYER) psp_ui_group("ALL GAMES");
-            else if (g == GROUP_PACK) {
-                char caption[160];
-                upper(pack_settings(a->pack)->title, caption, sizeof caption);
-                psp_ui_group(caption);
-            } else if (g == GROUP_PACKS) psp_ui_separator();
-            for (int i = 0; i < n; i++) {
-                char label[160];
-                snprintf(label, sizeof label, "%s##%d", names[i], g);
-                if (psp_ui_nav(label, g == a->group && a->page && !strcmp(names[i], a->page))) show_page(a, g, names[i]);
-            }
+    if (pick >= 0) select_game(a, pick);
+}
+
+/* The side list of pages, group by group, and the page shown beside it. */
+static void settings_view(launcher *a) {
+    psp_ui_side_begin(SIDE, FOOTER + (working(a) ? WORK : 0));
+    const char *names[PAGES_MAX];
+    for (int g = GROUP_PLAYER; g <= GROUP_ABOUT; g++) {
+        const int n = group_pages(a, g, names);
+        if (!n) continue;
+        if (g == GROUP_PLAYER) psp_ui_group("ALL GAMES");
+        else if (g == GROUP_PACK) {
+            char caption[160];
+            upper(pack_settings(a->pack)->title, caption, sizeof caption);
+            psp_ui_group(caption);
+        } else if (g == GROUP_PACKS) psp_ui_separator();
+        for (int i = 0; i < n; i++) {
+            char label[160];
+            snprintf(label, sizeof label, "%s##%d", names[i], g);
+            if (psp_ui_nav(label, g == a->group && a->page && !strcmp(names[i], a->page))) show_page(a, g, names[i]);
         }
-        psp_ui_side_next();
-        if (a->group == GROUP_PACKS) packs_page(a);
-        else if (a->group == GROUP_ABOUT) about_page();
-        else if (a->page) settings_page(a);
-        psp_ui_help_area();
-        psp_ui_side_end();
+    }
+    psp_ui_side_next();
+    if (a->group == GROUP_PACKS) packs_page(a);
+    else if (a->group == GROUP_ABOUT) about_page();
+    else if (a->page) settings_page(a);
+    psp_ui_help_area();
+    psp_ui_side_end();
+}
+
+/* One frame, into the renderer; draw presents it. */
+static void render(launcher *a) {
+    refresh(a);
+    if (!a->page) {
+        const char *names[PAGES_MAX];
+        a->group = GROUP_PLAYER;
+        if (group_pages(a, GROUP_PLAYER, names)) a->page = names[0];
+    }
+    psp_ui_set_pad(a->pad);
+    psp_ui_begin();
+    psp_ui_screen_begin();
+    title_bar(a);
+    if (a->game_count > 1 && a->view == VIEW_SETTINGS) game_tabs(a);
+    if (a->view == VIEW_SETTINGS) {
+        settings_view(a);
     } else {
         psp_ui_scroll_begin("##work", FOOTER);
         browse_view(a);
