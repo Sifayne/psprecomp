@@ -44,16 +44,16 @@ int psp_waitq_add(psp_waitq *q, uint32_t uid, uint32_t need, uint32_t mode,
     return 0;
 }
 
+int psp_waitq_find(const psp_waitq *q, uint32_t uid) {
+    for (int i = 0; i < q->n; i++) if (q->w[i].uid == uid) return i;
+    return -1;
+}
+
 int psp_waitq_drop(psp_waitq *q, uint32_t uid) {
-    for (int i = 0; i < q->n; i++) {
-        if (q->w[i].uid != uid) continue;
-        memmove(&q->w[i], &q->w[i + 1],
-                (size_t)(q->n - i - 1) * sizeof q->w[0]);
-        q->n--;
-        parked_clear(uid, q);
-        return 1;
-    }
-    return 0;
+    const int i = psp_waitq_find(q, uid);
+    if (i < 0) return 0;
+    (void)psp_waitq_take(q, i);
+    return 1;
 }
 
 void psp_waitq_reset(void) { g_nparked = 0; }
@@ -85,15 +85,15 @@ int psp_waitq_leave(uint32_t uid) {
     const int p = parked_find(uid);
     if (p < 0) return 0;
     psp_waitq *q = g_parked[p].q;
-    for (int i = 0; i < q->n; i++) {
-        if (q->w[i].uid != uid) continue;
-        if (q->w[i].nout) psp_write32(q->w[i].nout, q->w[i].done);
-        (void)psp_waitq_drop(q, uid);
-        if (q->mirror) psp_write32(q->mirror, (uint32_t)q->n);
-        return 1;
+    const int i = psp_waitq_find(q, uid);
+    if (i < 0) {
+        g_parked[p] = g_parked[--g_nparked];
+        return 0;
     }
-    g_parked[p] = g_parked[--g_nparked];
-    return 0;
+    if (q->w[i].nout) psp_write32(q->w[i].nout, q->w[i].done);
+    (void)psp_waitq_take(q, i);
+    if (q->mirror) psp_write32(q->mirror, (uint32_t)q->n);
+    return 1;
 }
 
 int psp_waitq_pick(const psp_waitq *q, uint32_t attr) {

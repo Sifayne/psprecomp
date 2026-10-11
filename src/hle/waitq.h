@@ -168,6 +168,9 @@ typedef struct {
 int  psp_waitq_add(psp_waitq *q, uint32_t uid, uint32_t need, uint32_t mode,
                    uint32_t out);
 
+/* The index of `uid`'s entry, or -1 when it has none. */
+int  psp_waitq_find(const psp_waitq *q, uint32_t uid);
+
 /* Remove a waiter by uid, wherever it sits. For a thread that stopped waiting
  * without being released -- its timeout elapsed, the object was deleted under
  * it, or the guest terminated it. Returns 1 if it was there. */
