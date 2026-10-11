@@ -901,9 +901,7 @@ static void thread_end_wait(uint32_t thid, uint32_t timeout, uint64_t deadline, 
         wait_mark(0, 0);
         if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
             if ((t = find_thread(thid)) != NULL) drop_ender(t, me);
-            psp_wait_writeback(timeout, deadline);
-            psp_ret(rc == PSP_SCHED_EXPIRED ? SCE_KERNEL_ERROR_WAIT_TIMEOUT
-                                            : SCE_KERNEL_ERROR_RELEASE_WAIT);
+            psp_wait_give_up(rc, timeout, deadline);
             return;
         }
         if (rc != PSP_SCHED_WOKEN) {
