@@ -261,6 +261,24 @@ static psp_thread *current_thread(void) {
     return uid ? find_thread(uid) : NULL;
 }
 
+/* The thread a call names that may not be the caller itself: 0 and the
+ * caller's own id are ILLEGAL_THID, refused before the id is looked up, and
+ * an id that names nothing is UNKNOWN_THID. NULL once that is answered. */
+static psp_thread *other_thread(uint32_t id) {
+    if (id == 0 || id == psp_sched_current()) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
+        return NULL;
+    }
+    psp_thread *t = find_thread(id);
+    if (!t) psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID);
+    return t;
+}
+
+/* Never started, or started and since ended. */
+static int thread_dormant(const psp_thread *t) {
+    return !t->ever_started || t->state == TH_DORMANT;
+}
+
 static psp_sema *find_sema(uint32_t id) {
     for (int i = 0; i < g_sema_hi; i++)
         if (g_sema[i].used && g_sema[i].uid == id) return &g_sema[i];
@@ -452,7 +470,7 @@ static void hle_StartThread(void) {
     if (psp_arg(0) == 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
     psp_thread *t = find_thread(psp_arg(0));
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
-    if (t->ever_started && t->state != TH_DORMANT) {
+    if (!thread_dormant(t)) {
         psp_ret(SCE_KERNEL_ERROR_NOT_DORMANT);
         return;
     }
@@ -653,16 +671,10 @@ static void hle_ExitDeleteThread(void) {
  * kernlock.c and kernobj.c (see PSP_SCHED_RELEASED). A released GetTlsAddr
  * returns NULL; that one is unmeasured. */
 static void hle_ReleaseWaitThread(void) {
-    const uint32_t id = psp_arg(0);
-    if (id == 0 || id == psp_sched_current()) {
-        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
-        return;
-    }
-    psp_thread *t = find_thread(id);
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    psp_thread *t = other_thread(psp_arg(0));
+    if (!t) return;
     const psp_sched_state st = psp_sched_state_of(t->uid);
-    if (!t->ever_started || t->state == TH_DORMANT ||
-        (st != PSP_SCHED_BLOCKED && st != PSP_SCHED_SLEEPING)) {
+    if (thread_dormant(t) || (st != PSP_SCHED_BLOCKED && st != PSP_SCHED_SLEEPING)) {
         psp_ret(SCE_KERNEL_ERROR_NOT_WAIT);
         return;
     }
@@ -704,7 +716,7 @@ static void hle_DeleteThread(void) {
     const uint32_t id = psp_arg(0) ? psp_arg(0) : psp_sched_current();
     psp_thread *t = find_thread(id);
     if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
-    if (t->ever_started && t->state != TH_DORMANT) {
+    if (!thread_dormant(t)) {
         psp_ret(SCE_KERNEL_ERROR_NOT_DORMANT);
         return;
     }
@@ -845,12 +857,8 @@ static void hle_WaitThreadEnd(void) {
      * threads/threadend prints them next to an id that names nothing, which is
      * the different code: `Zero: 80020197`, `Self: 80020197`,
      * `Invalid: 80020198`. */
-    if (thid == 0 || thid == psp_sched_current()) {
-        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
-        return;
-    }
-    psp_thread *t = find_thread(thid);
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    psp_thread *t = other_thread(thid);
+    if (!t) return;
     /* A thread that was never started will never end, so there is nothing to
      * wait for -- DORMANT, immediately, rather than the timeout. One that has
      * *finished* is also dormant and returns its exit status, so the test is
@@ -1005,13 +1013,8 @@ static void hle_SysClock2USecWide(void) {
  * and letting a thread apply it to itself deadlocked that test outright, and it
  * printed nothing at all -- the checkpoint buffer is only flushed at the end. */
 static void hle_SuspendThread(void) {
-    const uint32_t id = psp_arg(0);
-    if (id == 0 || id == psp_sched_current()) {
-        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
-        return;
-    }
-    psp_thread *t = find_thread(id);
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    psp_thread *t = other_thread(psp_arg(0));
+    if (!t) return;
     /* Never started, or already finished. */
     if (t->state == TH_DORMANT) { psp_ret(SCE_KERNEL_ERROR_DORMANT); return; }
     if (t->suspended)           { psp_ret(SCE_KERNEL_ERROR_SUSPEND); return; }
@@ -1022,13 +1025,8 @@ static void hle_SuspendThread(void) {
 }
 
 static void hle_ResumeThread(void) {
-    const uint32_t id = psp_arg(0);
-    if (id == 0 || id == psp_sched_current()) {
-        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
-        return;
-    }
-    psp_thread *t = find_thread(id);
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    psp_thread *t = other_thread(psp_arg(0));
+    if (!t) return;
     /* Resuming anything that is not suspended is an error, including a thread
      * that is merely ready -- the call is not idempotent. */
     if (!t->suspended) { psp_ret(SCE_KERNEL_ERROR_NOT_SUSPEND); return; }
@@ -1051,7 +1049,7 @@ static void hle_ChangeThreadPriority(void) {
     /* A thread that has never run, or has finished, has no priority to change:
      * threads/change.expected answers DORMANT for `Created` and `Finished`
      * where it answers 0 for `Ready`, `Suspended` and `Waiting`. */
-    if (!t->ever_started || t->state == TH_DORMANT) {
+    if (thread_dormant(t)) {
         psp_ret(SCE_KERNEL_ERROR_DORMANT);
         return;
     }
@@ -1137,14 +1135,9 @@ static void sleep_resume(void) { sleep_end(psp_sched_resume_block(NULL)); }
  * thread that is not asleep has one banked. Any other wait (a delay, a
  * semaphore) is not ended by a wakeup; it is banked like the rest. */
 static void hle_WakeupThread(void) {
-    const uint32_t id = psp_arg(0);
-    if (id == 0 || id == psp_sched_current()) {
-        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
-        return;
-    }
-    psp_thread *t = find_thread(id);
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
-    if (!t->ever_started || t->state == TH_DORMANT) {
+    psp_thread *t = other_thread(psp_arg(0));
+    if (!t) return;
+    if (thread_dormant(t)) {
         psp_ret(SCE_KERNEL_ERROR_DORMANT);
         return;
     }
@@ -1252,15 +1245,10 @@ static void hle_GetThreadCurrentPriority(void) {
  * thread that was going to flush the checkpoint buffer -- so the whole file
  * emitted nothing at all. A rule that reads like a nicety, silencing a test. */
 static void hle_TerminateThread(void) {
-    const uint32_t id = psp_arg(0);
-    if (id == 0 || id == psp_sched_current()) {
-        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
-        return;
-    }
-    psp_thread *t = find_thread(id);
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
+    psp_thread *t = other_thread(psp_arg(0));
+    if (!t) return;
     /* Never started, or already finished: there is nothing to terminate. */
-    if (!t->ever_started || t->state == TH_DORMANT) {
+    if (thread_dormant(t)) {
         psp_ret(SCE_KERNEL_ERROR_DORMANT);
         return;
     }
@@ -1284,14 +1272,9 @@ static void hle_TerminateThread(void) {
  * id checks are terminate's, though, including the one that forbids a thread
  * from ending itself. */
 static void hle_TerminateDeleteThread(void) {
-    const uint32_t id = psp_arg(0);
-    if (id == 0 || id == psp_sched_current()) {
-        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID);
-        return;
-    }
-    psp_thread *t = find_thread(id);
-    if (!t) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
-    if (t->ever_started && t->state != TH_DORMANT) {
+    psp_thread *t = other_thread(psp_arg(0));
+    if (!t) return;
+    if (!thread_dormant(t)) {
         psp_sched_terminate(t->uid);
         thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
     }
@@ -2178,7 +2161,7 @@ static void hle_ReferThreadStatus(void) {
      * `before start status=00000010`, `after start status=00000004` -- with
      * nothing between them but the start of a thread whose whole body is a
      * sleep. */
-    const int dormant = !t->ever_started || t->state == TH_DORMANT;
+    const int dormant = thread_dormant(t);
     uint32_t status = PSP_THREAD_STATUS_STOPPED;
     if (!dormant) {
         switch (psp_sched_state_of(t->uid)) {
@@ -2286,7 +2269,7 @@ void psp_threadman_list_put(uint32_t uid, uint32_t out, int max, int *count) {
 }
 
 static int thread_matches(const psp_thread *t, int type) {
-    const int dormant = !t->ever_started || t->state == TH_DORMANT;
+    const int dormant = thread_dormant(t);
     switch (type) {
         case PSP_TMID_THREAD:    return 1;
         case PSP_TMID_DORMANT:   return dormant;
