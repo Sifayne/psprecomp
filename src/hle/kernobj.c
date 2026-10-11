@@ -821,6 +821,102 @@ static psp_waitq *mpp_queue(psp_msgpipe *p, mpp_dir dir) {
     return dir == MPP_SEND ? &p->send_q : &p->recv_q;
 }
 
+/* A send or receive as the guest asked for it. */
+typedef struct {
+    mpp_dir  dir;
+    uint32_t buf, len, mode, out;
+} mpp_request;
+
+/* A poll reaches past the buffer exactly as a blocking call does -- a
+ * try-receive on a pipe with no buffer at all still succeeds when a sender
+ * is blocked on the other side, and msgpipe/tryreceive says so twice:
+ * `Partial packet: OK (bytes=128)` and `Complete packet: OK (bytes=256)`,
+ * both against `buffer=0`.
+ *
+ * What it may not do is half-succeed. So it asks how much could move,
+ * decides, and only then joins the queue -- by which point completing is
+ * certain, and the ordinary pump does the work. */
+static void mpp_poll(psp_msgpipe *p, const mpp_request *rq, int urgent) {
+    const uint32_t me  = psp_sched_current();
+    const uint32_t cap = rq->dir == MPP_SEND ? mpp_send_capacity(p) : mpp_recv_capacity(p);
+    const uint32_t now = (rq->mode & MPP_MODE_ASAP) ? mpp_min(cap, rq->len) : rq->len;
+    if (!now || now > cap) {
+        /* ASAP moved nothing, and says so: `ASAP: Failed (800201b3,
+         * bytes=0)`. A full-wait failure leaves the word alone, which is
+         * how the tests tell the two apart -- they pre-seed it 0x1337. */
+        if ((rq->mode & MPP_MODE_ASAP) && rq->out) psp_write32(rq->out, 0);
+        psp_ret(rq->dir == MPP_SEND ? SCE_KERNEL_ERROR_MSGPIPE_FULL
+                                    : SCE_KERNEL_ERROR_MSGPIPE_EMPTY);
+        if (urgent) psp_sched_preempt();
+        return;
+    }
+    psp_waitq *q = mpp_queue(p, rq->dir);
+    /* Asking for exactly what is there, as a full-wait: the pump then fills
+     * it precisely rather than stopping at the first byte. */
+    if (psp_waitq_add(q, me, now, 0, rq->buf) != 0) {
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+    mpp_pump(p, me, &urgent);
+    (void)psp_waitq_drop(q, me);
+    mpp_pump(p, 0, &urgent);
+    if (rq->out) psp_write32(rq->out, now);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_preempt();
+}
+
+/* The blocking form: finished by the pump if it can be, parked otherwise. */
+static void mpp_wait(psp_msgpipe *p, const mpp_request *rq, uint32_t tmo_ptr,
+                     uint64_t deadline, int urgent) {
+    const uint32_t id = p->uid, me = psp_sched_current();
+    psp_waitq *q = mpp_queue(p, rq->dir);
+    if (psp_waitq_add(q, me, rq->len, rq->mode, rq->buf) != 0) {
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+    q->w[q->n - 1].nout = rq->out;
+    mpp_pump(p, me, &urgent);
+
+    const int i = psp_waitq_find(q, me);
+    if (i < 0 || mpp_satisfied(&q->w[i])) {
+        const uint32_t done = i >= 0 ? q->w[i].done : rq->len;
+        if (i >= 0) {
+            psp_waitq_take(q, i);
+            /* Out of the way: whoever was behind us can move now. */
+            mpp_pump(p, 0, &urgent);
+        }
+        if (rq->out) psp_write32(rq->out, done);
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        if (urgent) psp_sched_preempt();
+        return;
+    }
+
+    if (urgent) psp_sched_preempt();
+    psp_threadman_wait_mark(PSP_WAITTYPE_MSGPIPE, p->uid);
+    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
+                                         rq->dir == MPP_SEND ? p->senddesc : p->recvdesc,
+                                         deadline);
+    psp_threadman_wait_mark(0, 0);
+    /* A pipe deleted between our release and our turn on the CPU does not
+     * undo the transfer. The other side moved the bytes on our behalf, took
+     * us out of the queue, and wrote how many -- it is the only one that
+     * knew, since an ASAP waiter can be released with less than it asked
+     * for. */
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
+    p = find_pipe(id);
+    if (psp_wait_end_found(rc, p, tmo_ptr, deadline)) return;
+    q = mpp_queue(p, rq->dir);
+
+    /* A wait that ran out reports what it did get, which for a full-wait is
+     * nothing: `bytes=0`, where an *argument* failure leaves the caller's
+     * 0x1337 in place because it never waited. */
+    const int left = psp_waitq_find(q, me);
+    if (left >= 0 && rq->out) psp_write32(rq->out, q->w[left].done);
+    psp_waitq_drop(q, me);
+    psp_wait_give_up(rc, tmo_ptr, deadline);
+}
+
 /* send and receive are the same shape with the direction reversed, so they
  * share a body: the direction picks which queue is ours and which is theirs,
  * which error a full-or-empty poll gives, and which way the bytes go.
@@ -873,95 +969,9 @@ static void mpp_transfer(mpp_dir dir, psp_wait_form form) {
      * takes changes what is left. */
     mpp_pump(p, 0, &urgent);
 
-    const uint32_t me = psp_sched_current();
-
-    /* A poll reaches past the buffer exactly as a blocking call does -- a
-     * try-receive on a pipe with no buffer at all still succeeds when a sender
-     * is blocked on the other side, and msgpipe/tryreceive says so twice:
-     * `Partial packet: OK (bytes=128)` and `Complete packet: OK (bytes=256)`,
-     * both against `buffer=0`.
-     *
-     * What it may not do is half-succeed. So it asks how much could move,
-     * decides, and only then joins the queue -- by which point completing is
-     * certain, and the ordinary pump does the work. */
-    if (form == PSP_WAIT_POLL) {
-        const uint32_t cap = dir == MPP_SEND ? mpp_send_capacity(p) : mpp_recv_capacity(p);
-        const uint32_t now = (mode & MPP_MODE_ASAP) ? mpp_min(cap, len) : len;
-        if (!now || now > cap) {
-            /* ASAP moved nothing, and says so: `ASAP: Failed (800201b3,
-             * bytes=0)`. A full-wait failure leaves the word alone, which is
-             * how the tests tell the two apart -- they pre-seed it 0x1337. */
-            if ((mode & MPP_MODE_ASAP) && out) psp_write32(out, 0);
-            psp_ret(dir == MPP_SEND ? SCE_KERNEL_ERROR_MSGPIPE_FULL
-                                    : SCE_KERNEL_ERROR_MSGPIPE_EMPTY);
-            if (urgent) psp_sched_preempt();
-            return;
-        }
-        psp_waitq *pq = mpp_queue(p, dir);
-        /* Asking for exactly what is there, as a full-wait: the pump then fills
-         * it precisely rather than stopping at the first byte. */
-        if (psp_waitq_add(pq, me, now, 0, buf) != 0) {
-            psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
-            return;
-        }
-        mpp_pump(p, me, &urgent);
-        for (int k = 0; k < pq->n; k++)
-            if (pq->w[k].uid == me) { psp_waitq_take(pq, k); break; }
-        mpp_pump(p, 0, &urgent);
-        if (out) psp_write32(out, now);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        if (urgent) psp_sched_preempt();
-        return;
-    }
-
-    psp_waitq *q = mpp_queue(p, dir);
-    if (psp_waitq_add(q, me, len, mode, buf) != 0) {
-        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
-        return;
-    }
-    q->w[q->n - 1].nout = out;
-    mpp_pump(p, me, &urgent);
-
-    int i = -1;
-    for (int k = 0; k < q->n; k++) if (q->w[k].uid == me) { i = k; break; }
-    const uint32_t done = i >= 0 ? q->w[i].done : len;
-
-    if (i < 0 || mpp_satisfied(&q->w[i])) {
-        if (i >= 0) {
-            psp_waitq_take(q, i);
-            /* Out of the way: whoever was behind us can move now. */
-            mpp_pump(p, 0, &urgent);
-        }
-        if (out) psp_write32(out, done);
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        if (urgent) psp_sched_preempt();
-        return;
-    }
-
-    if (urgent) psp_sched_preempt();
-    psp_threadman_wait_mark(PSP_WAITTYPE_MSGPIPE, p->uid);
-    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
-                                         dir == MPP_SEND ? p->senddesc : p->recvdesc,
-                                         deadline);
-    psp_threadman_wait_mark(0, 0);
-    /* A pipe deleted between our release and our turn on the CPU does not
-     * undo the transfer. The other side moved the bytes on our behalf, took
-     * us out of the queue, and wrote how many -- it is the only one that
-     * knew, since an ASAP waiter can be released with less than it asked
-     * for. */
-    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
-    p = find_pipe(id);
-    if (psp_wait_end_found(rc, p, tmo_ptr, deadline)) return;
-    q = mpp_queue(p, dir);
-
-    /* A wait that ran out reports what it did get, which for a full-wait is
-     * nothing: `bytes=0`, where an *argument* failure leaves the caller's
-     * 0x1337 in place because it never waited. */
-    for (int k = 0; k < q->n; k++)
-        if (q->w[k].uid == me && out) { psp_write32(out, q->w[k].done); break; }
-    psp_waitq_drop(q, me);
-    psp_wait_give_up(rc, tmo_ptr, deadline);
+    const mpp_request rq = { dir, buf, len, mode, out };
+    if (form == PSP_WAIT_POLL) mpp_poll(p, &rq, urgent);
+    else                       mpp_wait(p, &rq, tmo_ptr, deadline, urgent);
 }
 
 static void hle_SendMsgPipe(void)       { mpp_transfer(MPP_SEND, PSP_WAIT_BLOCK); }
