@@ -276,6 +276,17 @@ typedef struct {
     float    u, v;
 } psp_model_vertex;
 
+/* The lighting and texture-mapping codes psp_xform_state carries, as the
+ * GE's registers give them (PSPSDK pspgu.h's order): a light's type and
+ * kind (LIGHTTYPE), the material colours the vertex colour supplies
+ * (MATERIALUPDATE, bits), where texture coordinates come from and what the
+ * texture matrix is applied to (TEXMAPMODE). */
+enum { PSP_LIGHT_DIRECTIONAL = 0, PSP_LIGHT_POINT, PSP_LIGHT_SPOT };
+enum { PSP_LIGHTKIND_DIFFUSE = 0, PSP_LIGHTKIND_SPECULAR, PSP_LIGHTKIND_POWERED };
+enum { PSP_MAT_AMBIENT = 1, PSP_MAT_DIFFUSE = 2, PSP_MAT_SPECULAR = 4 };
+enum { PSP_TEXMAP_UV = 0, PSP_TEXMAP_MATRIX, PSP_TEXMAP_SHADE };
+enum { PSP_TEXPROJ_POSITION = 0, PSP_TEXPROJ_UV, PSP_TEXPROJ_UNIT_NORMAL, PSP_TEXPROJ_NORMAL };
+
 /* Everything ge.c's transform pipeline applies between a psp_model_vertex and
  * the psp_vertex it hands to draw(), captured at the draw. Matrices are the
  * GE's 4x3 (three columns of three, then the translation) and 4x4; lights are

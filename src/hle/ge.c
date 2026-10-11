@@ -294,6 +294,9 @@ static int fx16_sat(float f) {
 #define VT_MORPH(v)   ((((v) >> 18) & 7) + 1)   /* vertex sets blended by morphing */
 #define VT_THROUGH(v) (((v) >> 23) & 1)
 
+/* PATCHPRIMITIVE: what a patch is drawn as. */
+enum { GE_PATCH_TRIANGLES = 0, GE_PATCH_LINES = 1, GE_PATCH_POINTS = 2 };
+
 #define MAX_QUEUES 8
 #define GE_STACK   8
 
@@ -642,8 +645,7 @@ typedef struct {
 static struct {
     uint32_t fbp, fbw, fbfmt, vtype, vaddr, iaddr;
     uint32_t zbp, zbw;
-    /* PATCHDIVISION, PATCHPRIMITIVE (0 triangles, 1 lines, 2 points) and
-     * PATCHFACING. */
+    /* PATCHDIVISION, PATCHPRIMITIVE (GE_PATCH_*) and PATCHFACING. */
     int      patch_du, patch_dv, patch_prim, patch_face;
     ge_target targets[GE_MAX_TARGETS];
     int       n_targets, cur_target;
@@ -2549,8 +2551,8 @@ static void lights_to_eye(void) {
     g_light_eye_from = now;
     for (int i = 0; i < 4; i++) {
         if (!g_tl.light[i].enable) continue;
-        if (g_tl.light[i].type == 0) mul_3x3(g_tl.view, g_tl.light[i].pos, g_light_eye[i].pos);
-        else                         mul_4x3(g_tl.view, g_tl.light[i].pos, g_light_eye[i].pos);
+        if (g_tl.light[i].type == PSP_LIGHT_DIRECTIONAL) mul_3x3(g_tl.view, g_tl.light[i].pos, g_light_eye[i].pos);
+        else                                             mul_4x3(g_tl.view, g_tl.light[i].pos, g_light_eye[i].pos);
         mul_3x3(g_tl.view, g_tl.light[i].dir, g_light_eye[i].dir);
     }
 }
@@ -2789,7 +2791,7 @@ static void light_setup(void) {
             g_ls.light[i].dif[k]  = lit_colour_byte(g_tl.light[i].dif[k]);
             g_ls.light[i].spec[k] = lit_colour_byte(g_tl.light[i].spec[k]);
         }
-        if (g_tl.light[i].type == 0) {
+        if (g_tl.light[i].type == PSP_LIGHT_DIRECTIONAL) {
             const double Lv[3] = { g_tl.light[i].pos[0], g_tl.light[i].pos[1], g_tl.light[i].pos[2] };
             double L[3], H[3];
             gl_unit(Lv, L);
@@ -2804,7 +2806,7 @@ static void light_setup(void) {
                 g_ls.light[i].tp[k] = ge_sp_of(ge_sum(tp, 2));
             }
         }
-        if (g_tl.light[i].type == 2) {
+        if (g_tl.light[i].type == PSP_LIGHT_SPOT) {
             const double D[3] = { g_tl.light[i].dir[0], g_tl.light[i].dir[1], g_tl.light[i].dir[2] };
             for (int k = 0; k < 3; k++) g_ls.light[i].D[k] = ge_sp_of(D[k]);
             const double dd = gl_dot3(D, D);
@@ -2857,7 +2859,7 @@ static void accumulate_lights(const float model[3], const float nm[3], const lit
         ge_sp Ls[3];
         const ge_sp *Lp = Ls;
         float att = 1.0f, spot = 1.0f;
-        if (g_tl.light[i].type == 0) {
+        if (g_tl.light[i].type == PSP_LIGHT_DIRECTIONAL) {
             Lp = g_ls.light[i].L;
         } else {
             for (int k = 0; k < 3; k++) {
@@ -2875,7 +2877,7 @@ static void accumulate_lights(const float model[3], const float nm[3], const lit
             for (int k = 0; k < 3; k++) Ls[k] = ge_sp_of(L[k]);
         }
 
-        if (g_tl.light[i].type == 2) {
+        if (g_tl.light[i].type == PSP_LIGHT_SPOT) {
             const double sdot = gl_dot_pre(g_ls.light[i].d_ok, g_ls.light[i].d_rs, g_ls.light[i].D, Lp);
             if (!(sdot >= g_tl.light[i].cutoff)) continue;
             spot = gl_pow_k(sdot, g_ls.light[i].spot_k);
@@ -2883,13 +2885,13 @@ static void accumulate_lights(const float model[3], const float nm[3], const lit
 
         const double ndl = gl_dot_pre(n_ok, n_rs, Ns, Lp);
         float dfac = ndl > 0.0 ? (float)ndl : 0.0f;
-        if (g_tl.light[i].kind == 2 && dfac > 0.0f) dfac = gl_pow_k(dfac, g_ls.spec_k);
+        if (g_tl.light[i].kind == PSP_LIGHTKIND_POWERED && dfac > 0.0f) dfac = gl_pow_k(dfac, g_ls.spec_k);
 
         float sfac = 0.0f;
-        if (g_tl.light[i].kind == 1 && ndl >= 0.0) {
+        if (g_tl.light[i].kind == PSP_LIGHTKIND_SPECULAR && ndl >= 0.0) {
             ge_sp Hs[3];
             const ge_sp *H = g_ls.light[i].H;
-            if (g_tl.light[i].type != 0) {
+            if (g_tl.light[i].type != PSP_LIGHT_DIRECTIONAL) {
                 double Hb[3];
                 half_vector(L, Hb);
                 for (int k = 0; k < 3; k++) Hs[k] = ge_sp_of(Hb[k]);
@@ -2916,9 +2918,9 @@ static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba
      * supplies: bit 0 ambient, bit 1 diffuse, bit 2 specular. */
     lit_material m;
     for (int k = 0; k < 3; k++) {
-        m.amb[k] = (g_tl.mat_update & 1) ? vc[k] : g_ls.mat_amb[k];
-        m.dif[k] = (g_tl.mat_update & 2) ? vc[k] : g_ls.mat_dif[k];
-        m.spc[k] = (g_tl.mat_update & 4) ? vc[k] : g_ls.mat_spc[k];
+        m.amb[k] = (g_tl.mat_update & PSP_MAT_AMBIENT)  ? vc[k] : g_ls.mat_amb[k];
+        m.dif[k] = (g_tl.mat_update & PSP_MAT_DIFFUSE)  ? vc[k] : g_ls.mat_dif[k];
+        m.spc[k] = (g_tl.mat_update & PSP_MAT_SPECULAR) ? vc[k] : g_ls.mat_spc[k];
     }
 
     int out[3], sec[3] = { 0, 0, 0 };
@@ -2931,7 +2933,7 @@ static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba
 
     /* The alpha comes from the material, or from the vertex when the vertex
      * is supplying the ambient. */
-    uint32_t c = (g_tl.mat_update & 1) ? (*rgba & 0xFF000000u)
+    uint32_t c = (g_tl.mat_update & PSP_MAT_AMBIENT) ? (*rgba & 0xFF000000u)
                                        : ((uint32_t)(g_tl.mat_alpha & 0xFF) << 24);
     uint32_t s = 0;
     for (int k = 0; k < 3; k++) {
@@ -3122,7 +3124,7 @@ static uint32_t decode_model_batch(const ge_vlayout *vl, uint32_t first, uint32_
          * stays the backend's: a second pass over the same geometry
          * tests for equal depth, and WipEout Pulse's buildings draw
          * their concrete that way over the shade pass. */
-        if (g_tl.tex_map_mode == 2) shade_map_uv(m->nrm, &uv);
+        if (g_tl.tex_map_mode == PSP_TEXMAP_SHADE) shade_map_uv(m->nrm, &uv);
         m->u = uv.u; m->v = uv.v;
         note_colour(m->rgba);
     }
@@ -3189,7 +3191,7 @@ static int fog_byte(float eye_z) {
  * does not read, so they fall back to the position rather than to nothing. */
 static void texgen_uv(const float model[3], psp_vertex *o) {
     float src[3];
-    if (g_tl.tex_proj_mode == 1) {
+    if (g_tl.tex_proj_mode == PSP_TEXPROJ_UV) {
         src[0] = o->u / (float)(g_ge.tex_w ? g_ge.tex_w : 1);
         src[1] = o->v / (float)(g_ge.tex_h ? g_ge.tex_h : 1);
         src[2] = 0.0f;
@@ -3268,13 +3270,13 @@ static int decode_xform_vertex(const xform_draw *d, uint32_t i, psp_vertex *o, f
     note_colour(o->rgba);
     if (d->blended) { o->u = mv.u; o->v = mv.v; }
     else read_uv_model_at(vp, a, vtype, vl->tex_off, o);
-    if (g_tl.tex_map_mode == 2) {
+    if (g_tl.tex_map_mode == PSP_TEXMAP_SHADE) {
         float nm[3];
         if (d->blended) memcpy(nm, mv.nrm, sizeof nm);
         else read_normal_model_at(vp, a, vtype, vl->norm_off, nm);
         shade_map_uv(nm, o);
     }
-    if (g_tl.tex_map_mode == 1) texgen_uv(model, o);
+    if (g_tl.tex_map_mode == PSP_TEXMAP_MATRIX) texgen_uv(model, o);
 
     const uint64_t _p4 = ge_prof_now();
     float sx, sy, sz;
@@ -3390,7 +3392,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count, const ge_vlayou
     if (g_tl.lighting) { lights_to_eye(); light_setup(); }
     d.any_light = g_tl.lighting && any_light_enabled();
     /* The normal, read for lighting, and for shade mapping lit or not. */
-    d.want_normal = d.any_light || g_tl.tex_map_mode == 2;
+    d.want_normal = d.any_light || g_tl.tex_map_mode == PSP_TEXMAP_SHADE;
 
     /* The backend's transform, when it offers one. Triangles only (points,
      * lines and sprites stay here), and not screen-space projections, whose
@@ -3976,12 +3978,12 @@ static void eval_patch_point(const ge_mvert *cp, int ucount, const patch_sample 
 static uint32_t patch_primitives(const ge_mvert *grid, int nu, int nv, int du, int dv,
                                  ge_mvert *list, uint32_t *type) {
     uint32_t n = 0;
-    if (g_ge.patch_prim == 2) {
+    if (g_ge.patch_prim == GE_PATCH_POINTS) {
         *type = PSP_PRIM_POINTS;
         for (int k = 0; k < nu * nv; k++) list[n++] = grid[k];
         return n;
     }
-    *type = g_ge.patch_prim == 1 ? PSP_PRIM_LINES : PSP_PRIM_TRIANGLES;
+    *type = g_ge.patch_prim == GE_PATCH_LINES ? PSP_PRIM_LINES : PSP_PRIM_TRIANGLES;
     for (int ja = 0; ja + 1 < nv; ja += dv) {
         const int jb = ja + dv < nv ? ja + dv : nv - 1;
         for (int ia = 0; ia + 1 < nu; ia += du) {
@@ -4031,7 +4033,7 @@ static void draw_patch(int spline, uint32_t arg) {
     if (du > 64 || dv > 64) { g_ge_hang = 1; return; }
 
     static patch_sample su[PATCH_MAX_SAMPLES], sv[PATCH_MAX_SAMPLES];
-    g_patch_dup = g_ge.patch_prim == 2;
+    g_patch_dup = g_ge.patch_prim == GE_PATCH_POINTS;
     const int nu = spline ? spline_samples(ucount, du, uedge, su, PATCH_MAX_SAMPLES)
                           : bezier_samples(ucount, du, su, PATCH_MAX_SAMPLES);
     const int nv = spline ? spline_samples(vcount, dv, vedge, sv, PATCH_MAX_SAMPLES)
