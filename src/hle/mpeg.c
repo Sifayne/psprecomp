@@ -426,8 +426,8 @@ static int mpeg_decoding(void);
 static int mpeg_logging(void);
 /* PSPRECOMP_MPEG_NODROP=1 keeps every picture, drift and all: the control for
  * any question of the form "is the dropping doing this?" The host can set the
- * same policy through psp_mpeg_set_drop; see the catch-up comment in
- * hle_GetAvcAu for what each choice costs this game. */
+ * same policy through psp_mpeg_set_drop; see the comment on avc_catch_up
+ * for what each choice costs this game. */
 static int g_drop_override = -1;
 int psp_mpeg_set_drop(int enabled) {
     if (enabled < -1 || enabled > 1) return -1;
@@ -1520,6 +1520,53 @@ static void no_decoder(const char *what) {
             "  audio will not play; everything else continues.\n", what);
 }
 
+/* Catching up, by not drawing a picture.
+ *
+ * The sound plays at its own rate whatever the host is doing -- a speaker
+ * drains at 44.1kHz -- and the picture goes as fast as this machine
+ * decodes and draws it, which here is 98.5% of real time. The difference
+ * is small and it only accumulates: Sif watched the whole intro and the
+ * sound ran away from the picture, a second by the end.
+ *
+ * So a picture that is already late is decoded and dropped rather than
+ * handed over, and the game draws the next one instead. That trade is
+ * lopsided in our favour: the decode of a 480x272 frame costs about 2 ms
+ * and its drawing about 6, so a drop buys back most of a frame's time.
+ *
+ * It has a cost this game makes visible: it times its subtitles by
+ * counting the pictures it decodes, so every dropped picture puts the
+ * captions one frame behind the sound, and 4% of them withheld put the
+ * captions seconds behind by the end of the intro (Sif confirmed the
+ * drift disappears with PSPRECOMP_MPEG_NODROP=1). Skipping only the pixel
+ * copy while still handing every picture over was tried and freezes the
+ * screen instead: the game asks for a picture every two vertical blanks,
+ * so once behind it cannot catch up without content being skipped. The
+ * host therefore offers both policies -- hold every picture (captions
+ * exact, the sound gradually ahead) or drop (the sound held, captions
+ * gradually behind) -- through psp_mpeg_set_drop, and the cure for both
+ * is a picture loop that never straddles a third blank.
+ *
+ * Measured against the lead at the first picture rather than zero, since
+ * a movie may legitimately start with its audio ahead; two frames of
+ * slack so ordinary jitter does not drop anything; and at most two in a
+ * row, so a machine that cannot keep up at all shows a slow picture
+ * rather than a frozen one. Only when the run is paced against a clock:
+ * an unpaced headless replay has no real time to be late against, and
+ * dropping there would make replays depend on how fast the host is. Not
+ * once the file has been fully delivered either: dropping walks the
+ * elementary stream ahead of the player, and at the end of a movie that
+ * means running out of pictures while it is still asking for them. */
+static void avc_catch_up(mpeg_ctx *c) {
+    if (!(psp_clock_is_realtime() && c->sync_based && !c->es_eof && !mpeg_nodrop())) return;
+    for (int drop = 0; drop < 2; drop++) {
+        if ((int32_t)(c->atrac_pts - c->pts) - c->sync_base <= 2 * (int32_t)c->frame_dur) break;
+        const uint32_t kept = c->pts;
+        c->pic_ready = 0;
+        if (!avc_pump(c)) { c->pic_ready = 1; c->pts = kept; break; }
+        c->dropped++;
+    }
+}
+
 /* Two answers, and which one is right depends on whether a frame can ever
  * arrive -- see the header comment for the disassembly behind this.
  *
@@ -1576,51 +1623,7 @@ static void hle_GetAvcAu(void) {
         return;
     }
 
-    /* Catching up, by not drawing a picture.
-     *
-     * The sound plays at its own rate whatever the host is doing -- a speaker
-     * drains at 44.1kHz -- and the picture goes as fast as this machine
-     * decodes and draws it, which here is 98.5% of real time. The difference
-     * is small and it only accumulates: Sif watched the whole intro and the
-     * sound ran away from the picture, a second by the end.
-     *
-     * So a picture that is already late is decoded and dropped rather than
-     * handed over, and the game draws the next one instead. That trade is
-     * lopsided in our favour: the decode of a 480x272 frame costs about 2 ms
-     * and its drawing about 6, so a drop buys back most of a frame's time.
-     *
-     * It has a cost this game makes visible: it times its subtitles by
-     * counting the pictures it decodes, so every dropped picture puts the
-     * captions one frame behind the sound, and 4% of them withheld put the
-     * captions seconds behind by the end of the intro (Sif confirmed the
-     * drift disappears with PSPRECOMP_MPEG_NODROP=1). Skipping only the pixel
-     * copy while still handing every picture over was tried and freezes the
-     * screen instead: the game asks for a picture every two vertical blanks,
-     * so once behind it cannot catch up without content being skipped. The
-     * host therefore offers both policies -- hold every picture (captions
-     * exact, the sound gradually ahead) or drop (the sound held, captions
-     * gradually behind) -- through psp_mpeg_set_drop, and the cure for both
-     * is a picture loop that never straddles a third blank.
-     *
-     * Measured against the lead at the first picture rather than zero, since
-     * a movie may legitimately start with its audio ahead; two frames of
-     * slack so ordinary jitter does not drop anything; and at most two in a
-     * row, so a machine that cannot keep up at all shows a slow picture
-     * rather than a frozen one. Only when the run is paced against a clock:
-     * an unpaced headless replay has no real time to be late against, and
-     * dropping there would make replays depend on how fast the host is. Not
-     * once the file has been fully delivered either: dropping walks the
-     * elementary stream ahead of the player, and at the end of a movie that
-     * means running out of pictures while it is still asking for them. */
-    if (psp_clock_is_realtime() && c->sync_based && !c->es_eof && !mpeg_nodrop()) {
-        for (int drop = 0; drop < 2; drop++) {
-            if ((int32_t)(c->atrac_pts - c->pts) - c->sync_base <= 2 * (int32_t)c->frame_dur) break;
-            const uint32_t kept = c->pts;
-            c->pic_ready = 0;
-            if (!avc_pump(c)) { c->pic_ready = 1; c->pts = kept; break; }
-            c->dropped++;
-        }
-    }
+    avc_catch_up(c);
 
     const uint32_t au = psp_arg(2);
     if (au) {
