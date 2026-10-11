@@ -201,8 +201,33 @@ int psp_wait_end_found(int rc, const void *object, uint32_t tmo_ptr,
 
 /* Forced out by sceKernelReleaseWaitThread it is RELEASE_WAIT (threadprobe
  * step 70, fw 6.60), not a timeout. */
-void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline) {
+void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline,
+                      const char *call) {
+    if (rc == PSP_SCHED_STRANDED && !tmo_ptr) {
+        psp_wait_deadlock(call);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
     psp_wait_writeback(tmo_ptr, deadline);
     psp_ret(rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
                                      : SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+}
+
+/* Reporting a timeout here is a lie, and a load-bearing one: Armored Core's
+ * user_main waits on its game thread with no timeout, and on being told the
+ * wait timed out it deletes that thread -- still live, mid-frame -- and quits.
+ * The whole run ended in a screen clear because of it.
+ *
+ * So the run stops and says why. A caller that *did* pass a timeout gets one,
+ * because for that caller a timeout is a true answer. */
+void psp_wait_deadlock(const char *call) {
+    fprintf(stderr,
+        "psprecomp: %s cannot be satisfied -- no thread is runnable, so nothing\n"
+        "  can ever signal it, and the caller passed no timeout. Reporting a\n"
+        "  timeout would make the guest act on a falsehood, so the run stops\n"
+        "  here instead. Live threads:\n", call);
+    psp_sched_dump_threads(stderr);
+    /* The reason rides along so the boot summary can tell a stopped run from
+     * one that finished -- both leave zero threads alive. */
+    psp_sched_stop_all(call);
 }

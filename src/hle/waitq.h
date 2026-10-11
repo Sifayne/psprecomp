@@ -120,7 +120,14 @@ typedef enum { PSP_WAIT_POLL, PSP_WAIT_BLOCK } psp_wait_form;
  *   still queued                   the caller leaves the queue, then gives up
  *
  * Each of the three below writes the timeout back and returns the answer to
- * the guest; the first two return 1 when they ended the wait. */
+ * the guest; the first two return 1 when they ended the wait.
+ *
+ * A wait that could not park at all -- PSP_SCHED_STRANDED: nothing is
+ * runnable and nothing is due, so nothing can ever end it -- is still queued,
+ * and gives up like any other. That is a timeout for a caller that passed
+ * one -- which happens only where no wait can park (threading off), or to the
+ * main context parked as the run is stopped -- and a caller that passed none
+ * stops the run instead (psp_wait_deadlock). */
 
 /* The answers only the waker knew. Neither depends on whether the object is
  * still there: what was handed over is not taken back by a delete that
@@ -136,8 +143,14 @@ int  psp_wait_end_found(int rc, const void *object, uint32_t tmo_ptr,
 
 /* A wait that is still queued, after the caller has left the queue:
  * RELEASE_WAIT when sceKernelReleaseWaitThread forced it out, WAIT_TIMEOUT
- * otherwise. */
-void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline);
+ * otherwise -- or, stranded with no timeout, psp_wait_deadlock(`call`). */
+void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline,
+                      const char *call);
+
+/* A wait nothing can ever end, made by a caller that asked for no timeout:
+ * the run stops, and says why. `call` is the stop's reason, so it has to
+ * outlive the run (a string literal). */
+void psp_wait_deadlock(const char *call);
 
 /* The attribute bit that selects most-urgent-first over first-come. */
 #define PSP_WAITQ_PRIORITY 0x100u

@@ -381,7 +381,7 @@ static void vpl_allocate(psp_wait_form form) {
     v = find_vpl(id);
     if (psp_wait_end_found(rc, v, tmo_ptr, deadline)) return;
     psp_waitq_drop(&v->q, me);
-    psp_wait_give_up(rc, tmo_ptr, deadline);
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelAllocateVpl");
 }
 
 static void hle_AllocateVpl(void)    { vpl_allocate(PSP_WAIT_BLOCK); }
@@ -913,7 +913,8 @@ static void mpp_wait(psp_msgpipe *p, const mpp_request *rq, uint32_t tmo_ptr,
     const int left = psp_waitq_find(q, me);
     if (left >= 0 && rq->out) psp_write32(rq->out, q->w[left].done);
     psp_waitq_drop(q, me);
-    psp_wait_give_up(rc, tmo_ptr, deadline);
+    psp_wait_give_up(rc, tmo_ptr, deadline,
+                     rq->dir == MPP_SEND ? "sceKernelSendMsgPipe" : "sceKernelReceiveMsgPipe");
     /* A wait that never parked -- its deadline had already arrived -- has not
      * yet let that thread run. */
     if (urgent) psp_sched_preempt();
@@ -1302,7 +1303,7 @@ static void mbx_receive(psp_wait_form form) {
     m = find_mbx(id);
     if (psp_wait_end_found(rc, m, tmo_ptr, deadline)) return;
     psp_waitq_drop(&m->q, me);
-    psp_wait_give_up(rc, tmo_ptr, deadline);
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelReceiveMbx");
 }
 
 static void hle_ReceiveMbx(void) { mbx_receive(PSP_WAIT_BLOCK); }
@@ -1582,7 +1583,7 @@ static void fpl_allocate(psp_wait_form form) {
     f = find_fpl(id);
     if (psp_wait_end_found(rc, f, tmo_ptr, deadline)) return;
     psp_waitq_drop(&f->q, me);
-    psp_wait_give_up(rc, tmo_ptr, deadline);
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelAllocateFpl");
 }
 
 static void hle_AllocateFpl(void)    { fpl_allocate(PSP_WAIT_BLOCK); }

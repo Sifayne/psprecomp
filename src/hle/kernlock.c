@@ -213,9 +213,7 @@ static void mutex_lock(psp_wait_form form) {
     if (psp_wait_end_found(rc, m, tmo_ptr, deadline)) return;
 
     psp_waitq_drop(&m->q, me);
-    /* Stranded: a timeout, with the timeout word left as it was. */
-    if (rc == PSP_SCHED_STRANDED) { psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT); return; }
-    psp_wait_give_up(rc, tmo_ptr, deadline);
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelLockMutex");
 }
 
 static void hle_LockMutex(void)    { mutex_lock(PSP_WAIT_BLOCK); }
@@ -624,7 +622,7 @@ static void lw_lock(lw_call call) {
 
     psp_waitq_drop(&m->q, me);
     psp_write32(wa + LW_WAITING, (uint32_t)psp_waitq_count(&m->q));
-    psp_wait_give_up(rc, tmo_ptr, deadline);
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelLockLwMutex");
 }
 
 static void hle_LockLwMutex(void)        { lw_lock(LW_LOCK); }

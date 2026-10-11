@@ -20,7 +20,7 @@
  * a wait that nothing could ever satisfy -- because no other thread is runnable
  * -- cannot be waited out. A caller that supplied a timeout is told it elapsed;
  * one that did not is not lied to, because a fabricated timeout is something a
- * game acts on. See wait_deadlock.
+ * game acts on. See psp_wait_deadlock.
  */
 
 #include "psprecomp/hle.h"
@@ -275,27 +275,6 @@ static psp_evflag *find_flag(uint32_t id) {
     for (int i = 0; i < g_flag_hi; i++)
         if (g_flag[i].used && g_flag[i].uid == id) return &g_flag[i];
     return NULL;
-}
-
-/* A wait that can never complete, made by a caller that asked for no timeout.
- *
- * Reporting a timeout here is a lie, and a load-bearing one: this game's
- * user_main waits on its game thread with no timeout, and on being told the
- * wait timed out it deletes that thread -- still live, mid-frame -- and quits.
- * The whole run ended in a screen clear because of it.
- *
- * So the run stops and says why. A caller that *did* pass a timeout still gets
- * one, because for that caller a timeout is a true answer. */
-static void wait_deadlock(const char *what) {
-    fprintf(stderr,
-        "psprecomp: %s cannot be satisfied -- no thread is runnable, so nothing\n"
-        "  can ever signal it, and the caller passed no timeout. Reporting a\n"
-        "  timeout would make the guest act on a falsehood, so the run stops\n"
-        "  here instead. Live threads:\n", what);
-    psp_sched_dump_threads(stderr);
-    /* The reason rides along so the boot summary can tell a stopped run from
-     * one that finished -- both leave zero threads alive. */
-    psp_sched_stop_all(what);
 }
 
 /* Defined down with the waits, but needed above them: by the signal, and by
@@ -899,14 +878,9 @@ static void thread_end_wait(uint32_t thid, uint32_t timeout, uint64_t deadline, 
         }
         restored = WAIT_BEGINS;
         wait_mark(0, 0);
-        if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
-            if ((t = find_thread(thid)) != NULL) drop_ender(t, me);
-            psp_wait_give_up(rc, timeout, deadline);
-            return;
-        }
         if (rc != PSP_SCHED_WOKEN) {
-            wait_deadlock("sceKernelWaitThreadEnd");
-            psp_ret(SCE_KERNEL_ERROR_OK);
+            if ((t = find_thread(thid)) != NULL) drop_ender(t, me);
+            psp_wait_give_up(rc, timeout, deadline, "sceKernelWaitThreadEnd");
             return;
         }
         /* Woken, and the thread is gone: it was freed as it ended, by
@@ -1118,7 +1092,7 @@ static void sleep_end(int rc) {
         return;
     }
     if (rc != PSP_SCHED_WOKEN) {
-        wait_deadlock("sceKernelSleepThread");
+        psp_wait_deadlock("sceKernelSleepThread");
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
@@ -1694,16 +1668,7 @@ static void sema_wait_end(uint32_t id, uint32_t tmo_ptr, uint64_t deadline, uint
      * behind us -- that is the second half of what fifo.expected measures. */
     psp_waitq_drop(&s->q, me);
     const int urgent = sema_release(s);
-
-    /* Stranded: nothing is runnable and no deadline can release us, so nobody
-     * could ever signal this. A caller that asked for no timeout is not told
-     * one elapsed -- a fabricated timeout is something a game acts on. */
-    if (rc == PSP_SCHED_STRANDED) {
-        wait_deadlock("sceKernelWaitSema");
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
-    psp_wait_give_up(rc, tmo_ptr, deadline);
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelWaitSema");
     if (urgent) psp_sched_preempt();
 }
 
@@ -1966,12 +1931,7 @@ static void hle_WaitEventFlag(void) {
      * from the 5ms one next to it. */
     if (out && !no_wait) psp_write32(out, f->pattern);
 
-    if (rc == PSP_SCHED_STRANDED) {
-        wait_deadlock("sceKernelWaitEventFlag");
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
-    psp_wait_give_up(rc, tmo_ptr, deadline);
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelWaitEventFlag");
 }
 
 /* ---- callbacks ----------------------------------------------------------- */
@@ -2611,7 +2571,7 @@ static void sleep_cb(int restored) {
             return;
         }
         if (rc != PSP_SCHED_WOKEN) {
-            wait_deadlock("sceKernelSleepThreadCB");
+            psp_wait_deadlock("sceKernelSleepThreadCB");
             psp_ret(SCE_KERNEL_ERROR_OK);
             return;
         }

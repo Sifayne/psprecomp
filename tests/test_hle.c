@@ -1947,6 +1947,81 @@ static void test_msgpipe_wait_ends_as_it_parks(void) {
     psp_threadman_reset();
 }
 
+/* A wait nothing can ever end -- no thread runnable, nothing due -- has one
+ * answer whatever it waits on. With a timeout it times out, because for that
+ * caller a timeout is the truth; with none the run stops, because a timeout
+ * it never asked for is something a game acts on. Threading off is where
+ * every wait is such a wait, timed or not: none can park. */
+#define ST_HOLD 0x08802500u
+#define ST_LW   0x08806600u   /* the lwmutex's workarea */
+#define ST_OUT  0x08806700u
+
+static uint32_t st_mutex;
+
+/* Takes both locks and sleeps for good, so neither is ever let go. */
+static void body_st_hold(void) {
+    call(psp_nid("sceKernelLockMutex"), st_mutex, 1, 0, 0);
+    call(psp_nid("sceKernelLockLwMutex"), ST_LW, 1, 0, 0);
+    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
+}
+
+static void test_stranded_waits(void) {
+    psp_register(ST_HOLD, body_st_hold);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t nm = guest_name("stranded");
+    st_mutex = call(psp_nid("sceKernelCreateMutex"), nm, 0, 0, 0);
+    call5(psp_nid("sceKernelCreateLwMutex"), ST_LW, nm, 0, 0, 0);
+    const uint32_t holder = tw_start_at(ST_HOLD, 0x10);
+    const uint32_t sema = call5(psp_nid("sceKernelCreateSema"), nm, 0, 0, 1, 0);
+    const uint32_t flag = call(psp_nid("sceKernelCreateEventFlag"), nm, 0, 0, 0);
+    const uint32_t vpl  = call5(psp_nid("sceKernelCreateVpl"), nm, 2, 0, 0x100, 0);
+    call(psp_nid("sceKernelTryAllocateVpl"), vpl, 8, ST_OUT, 0);
+    const uint32_t fpl  = call7(psp_nid("sceKernelCreateFpl"), nm, 2, 0, 16, 1, 0, 0);
+    call(psp_nid("sceKernelTryAllocateFpl"), fpl, ST_OUT, 0, 0);
+    const uint32_t mbx  = call(psp_nid("sceKernelCreateMbx"), nm, 0, 0, 0);
+    const uint32_t pipe = call5(psp_nid("sceKernelCreateMsgPipe"), nm, 2, 0, 0, 0);
+    psp_sched_set_threading(0);
+
+    static const char *const what[] = {
+        "WaitSema", "WaitEventFlag", "LockMutex", "LockLwMutex", "AllocateVpl",
+        "AllocateFpl", "ReceiveMbx", "ReceiveMsgPipe", "WaitThreadEnd",
+    };
+    for (int timed = 1; timed >= 0; timed--) {
+        for (int k = 0; k < (int)(sizeof what / sizeof *what); k++) {
+            psp_write32(TW_TMO, 1000);
+            const uint32_t tmo = timed ? TW_TMO : 0;
+            uint32_t rc = 0;
+            switch (k) {
+            case 0: rc = call(psp_nid("sceKernelWaitSema"), sema, 1, tmo, 0); break;
+            case 1: rc = call5(psp_nid("sceKernelWaitEventFlag"), flag, 1, 1, ST_OUT, tmo); break;
+            case 2: rc = call(psp_nid("sceKernelLockMutex"), st_mutex, 1, tmo, 0); break;
+            case 3: rc = call(psp_nid("sceKernelLockLwMutex"), ST_LW, 1, tmo, 0); break;
+            case 4: rc = call(psp_nid("sceKernelAllocateVpl"), vpl, 0xE0, ST_OUT, tmo); break;
+            case 5: rc = call(psp_nid("sceKernelAllocateFpl"), fpl, ST_OUT, tmo, 0); break;
+            case 6: rc = call(psp_nid("sceKernelReceiveMbx"), mbx, ST_OUT, tmo, 0); break;
+            case 7: rc = call7(psp_nid("sceKernelReceiveMsgPipe"), pipe, ST_OUT, 4, 0, 0, tmo, 0); break;
+            case 8: rc = call(psp_nid("sceKernelWaitThreadEnd"), holder, tmo, 0, 0); break;
+            }
+            const int stopped = psp_sched_stop_reason() != NULL;
+            if (timed)
+                CHECK(rc == SCE_KERNEL_ERROR_WAIT_TIMEOUT && !stopped,
+                      "a stranded %s with a timeout answered %08X%s", what[k], rc,
+                      stopped ? " and stopped the run" : "");
+            else
+                CHECK(stopped, "a stranded %s with no timeout answered %08X and the run went on",
+                      what[k], rc);
+            /* The stop ended the holder; a reset lets the next wait be seen. */
+            if (stopped) { psp_sched_join_all(); psp_sched_reset(); }
+        }
+    }
+
+    psp_sched_stop_all("test_stranded_waits");
+    psp_sched_join_all();
+    psp_threadman_reset();
+}
+
 /* PSPSDK 654ac51, src/audio/pspaudio.h and sceAudio.S supply the public
  * contract and NIDs. These tests assert that contract plus our host queue
  * behavior; undocumented firmware quirks are not used as an oracle. */
@@ -2241,6 +2316,7 @@ int main(void) {
     test_pool_free_pointers();
     test_waits_with_threads();
     test_msgpipe_wait_ends_as_it_parks();
+    test_stranded_waits();
     test_host_work_boundary();
     test_system_params();
 
