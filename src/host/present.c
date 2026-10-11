@@ -138,6 +138,8 @@ static void present_frame(uint32_t addr, uint32_t stride, uint32_t fmt) {
 
 /* ---- audio ---------------------------------------------------------------- */
 
+enum { AUDIO_RATE = 44100 };      /* frames a second, the PSP's and the device's */
+
 /* A mixer, not a queue.
  *
  * This used to hand every channel's buffer to SDL_QueueAudio, which is one
@@ -164,7 +166,7 @@ static void present_frame(uint32_t addr, uint32_t stride, uint32_t fmt) {
 /* The eight channels and Output2's (the runtime numbers it 8): a game whose
  * sound is all Output2, as WipEout Pulse's is, played nothing through here,
  * and its mixer, never told to wait, never let the rest of the game run. */
-enum { MIX_CHANNELS = 9, MIX_RING_FRAMES = 44100 * 8 };
+enum { MIX_CHANNELS = 9, MIX_RING_FRAMES = AUDIO_RATE * 8 };
 typedef struct {
     int16_t *pcm;
     uint32_t head, tail, count;
@@ -198,7 +200,7 @@ static int      g_audio_warned_fmt;
 static uint32_t settings_ms_frames(const char *key, uint32_t dflt_frames) {
     const double ms = setting(key, -1);
     if (ms < 0) return dflt_frames;
-    uint64_t f = (uint64_t)(ms * 44100.0 / 1000.0);
+    uint64_t f = (uint64_t)(ms * (double)AUDIO_RATE / 1000.0);
     if (f >= MIX_RING_FRAMES / 2) f = MIX_RING_FRAMES / 2;
     return (uint32_t)f;
 }
@@ -271,7 +273,7 @@ static int64_t present_audio(int ch, uint32_t samples, uint32_t fmt,
     else {
         const uint64_t gap = now - m->last_ms;
         if (gap > m->max_gap_ms) m->max_gap_ms = gap;
-        if (gap * 44100u / 1000u > g_audio_preroll_frames) m->long_gaps++;
+        if (gap * AUDIO_RATE / 1000u > g_audio_preroll_frames) m->long_gaps++;
     }
     m->last_ms = now;
     for (uint32_t i = 0; i < samples; i++) {
@@ -294,7 +296,7 @@ static int64_t present_audio(int ch, uint32_t samples, uint32_t fmt,
     if (allow < (int64_t)g_audio_preroll_frames) allow = g_audio_preroll_frames;
     const int64_t over = queued - allow;
     if (over <= 0) return 0;
-    const int64_t us = over * 1000000 / 44100;
+    const int64_t us = over * 1000000 / AUDIO_RATE;
     return us > 100000 ? 100000 : us;          /* never claim more than 100ms */
 }
 
@@ -309,9 +311,9 @@ static void mix_report(FILE *out) {
             fprintf(out, "present: audio ch %d  %.1f s pushed over %.1f s  %u dropped  "
                          "%u underruns (%.2f s of silence)  longest wait between pushes %llu ms, "
                          "%u waits longer than the pre-roll\n",
-                    ch, m->pushed / 44100.0,
+                    ch, m->pushed / (double)AUDIO_RATE,
                     (m->last_ms - m->first_ms) / 1000.0, m->dropped,
-                    m->underruns, m->silence / 44100.0,
+                    m->underruns, m->silence / (double)AUDIO_RATE,
                     (unsigned long long)m->max_gap_ms, m->long_gaps);
     }
     SDL_UnlockAudioDevice(g_audio_dev);
@@ -391,6 +393,13 @@ static _Atomic uint64_t g_requested_size;
 static pthread_mutex_t g_gl_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_gl_cv   = PTHREAD_COND_INITIALIZER;
 
+/* A width and height in one atomic word, the width in the high half. */
+static uint64_t pack_size(int w, int h) { return ((uint64_t)(uint32_t)w << 32) | (uint32_t)h; }
+static void unpack_size(uint64_t size, int *w, int *h) {
+    *w = (int)(size >> 32);
+    *h = (int)(size & UINT32_MAX);
+}
+
 /* GL has its own handoff because its context is claimed later by the GE
  * thread. This second handshake covers both presentation paths and is waited
  * by present_start itself. Without it, SDL window/context/audio setup happened
@@ -453,14 +462,15 @@ void present_note_frame(void) { atomic_fetch_add(&g_frames_rendered, 1); }
  * drawable size through atomics so the GE thread can scale its final blit
  * correctly on high-DPI displays without reaching back into SDL. */
 void present_gl_drawable_size(int *w, int *h) {
-    const uint64_t size = atomic_load(&g_gl_draw_size);
-    if (w) *w = (int)(size >> 32);
-    if (h) *h = (int)(size & UINT32_MAX);
+    int dw, dh;
+    unpack_size(atomic_load(&g_gl_draw_size), &dw, &dh);
+    if (w) *w = dw;
+    if (h) *h = dh;
 }
 
 void present_request_window_size(int w, int h) {
     if (w > 0 && h > 0)
-        atomic_store(&g_requested_size, ((uint64_t)(uint32_t)w << 32) | (uint32_t)h);
+        atomic_store(&g_requested_size, pack_size(w, h));
 }
 
 /* As the modern pad above: the wide mapping in the GL backend spreads a scene
@@ -488,7 +498,7 @@ int present_adaptive_aspect(void) {
 static _Atomic uint64_t g_scene_latch;
 void present_aspect_latch_scene_size(int w, int h) {
     if (w > 0 && h > 0)
-        atomic_store(&g_scene_latch, ((uint64_t)(uint32_t)w << 32) | (uint32_t)h);
+        atomic_store(&g_scene_latch, pack_size(w, h));
 }
 
 /* The drawable's shape at 272 rows, never narrower than 480. */
@@ -510,8 +520,7 @@ void present_aspect_scene_size(int *scene_w, int *scene_h) {
     if (!present_adaptive_aspect()) return;
     const uint64_t latched = atomic_load(&g_scene_latch);
     if (latched) {
-        *scene_w = (int)(latched >> 32);
-        *scene_h = (int)(latched & UINT32_MAX);
+        unpack_size(latched, scene_w, scene_h);
         return;
     }
     int w = 0, h = 0;
@@ -673,7 +682,7 @@ static void *sdl_thread(void *arg) {
     }
 
     SDL_AudioSpec want = { 0 };
-    want.freq     = 44100;
+    want.freq     = AUDIO_RATE;
     want.format   = AUDIO_S16SYS;
     want.channels = 2;
     want.samples  = 1024;
@@ -931,6 +940,13 @@ static void *sdl_thread(void *arg) {
     }
 }
 
+/* Take the display and audio hooks back from the runtime. */
+static void unhook_guest(void) {
+    psp_display_set_present(NULL);
+    psp_audio_set_output(NULL);
+    psp_audio_set_pending(NULL);
+}
+
 int present_start(void) {
     /* Under GL the backend owns the window and swaps for itself, so the
      * guest-thread conversion this hook does -- 130k pixels into RGBA, every
@@ -945,16 +961,12 @@ int present_start(void) {
      * underruns, shallow enough that the backlog tracks real playback. */
 
     if (pthread_cond_init(&g_frame_cv, NULL) != 0) {
-        psp_display_set_present(NULL);
-        psp_audio_set_output(NULL);
-        psp_audio_set_pending(NULL);
+        unhook_guest();
         return -1;
     }
     if (pthread_create(&g_thread, NULL, sdl_thread, NULL) != 0) {
         fprintf(stderr, "present: cannot start the SDL thread\n");
-        psp_display_set_present(NULL);
-        psp_audio_set_output(NULL);
-        psp_audio_set_pending(NULL);
+        unhook_guest();
         pthread_cond_destroy(&g_frame_cv);
         return -1;
     }
@@ -970,9 +982,7 @@ int present_start(void) {
     const int ready = g_start_state > 0;
     pthread_mutex_unlock(&g_start_lock);
     if (!ready) {
-        psp_display_set_present(NULL);
-        psp_audio_set_output(NULL);
-        psp_audio_set_pending(NULL);
+        unhook_guest();
         pthread_join(g_thread, NULL);
         pthread_cond_destroy(&g_frame_cv);
         return -1;
