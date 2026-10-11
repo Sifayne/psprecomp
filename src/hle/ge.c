@@ -1993,22 +1993,30 @@ static int read_mvert(uint32_t a, const ge_vlayout *vl, int want_normal, ge_mver
  * here rather than from the vertex array. */
 static const ge_mvert *g_mv_src;
 
-/* Clip space to screen. The viewport is the game's if it set one; the fallback
- * is the standard 480x272 arrangement, with y scaled negative because screen y
- * grows downward and clip y grows up. */
+/* The viewport a list that never sets one is drawn with: the 480x272
+ * screen about its centre, y scaled negative because screen y grows
+ * downward and clip y grows up. Its screen offset, for the guard band, is
+ * the one libgu sets, 2048 less half the screen. */
+#define GE_HALF_W        240.0f
+#define GE_HALF_H        136.0f
+#define GE_DEFAULT_OFF_X (2048.0f - GE_HALF_W)
+#define GE_DEFAULT_OFF_Y (2048.0f - GE_HALF_H)
+
+/* The z terms are set independently of the x/y ones, so a game can leave
+ * them at zero; that would collapse every depth to one value and make the
+ * test meaningless, so fall back to the full 0..65535 window range. */
+static float default_depth(float nz) { return (nz * 0.5f + 0.5f) * 65535.0f; }
+
+/* Clip space to screen. The viewport is the game's if it set one. */
 static void ndc_to_screen(float nx, float ny, float nz, float *sx, float *sy, float *sz) {
     if (g_tl.vp_set) {
         *sx = nx * g_tl.vp_xs + g_tl.vp_xc - g_tl.off_x;
         *sy = ny * g_tl.vp_ys + g_tl.vp_yc - g_tl.off_y;
     } else {
-        *sx = nx * 240.0f + 240.0f;
-        *sy = ny * -136.0f + 136.0f;
+        *sx = nx * GE_HALF_W + GE_HALF_W;
+        *sy = ny * -GE_HALF_H + GE_HALF_H;
     }
-    /* The z terms are set independently of the x/y ones, so a game can leave
-     * them at zero; that would collapse every depth to one value and make the
-     * test meaningless, so fall back to the full 0..65535 window range. */
-    *sz = (g_tl.vp_zs != 0.0f) ? nz * g_tl.vp_zs + g_tl.vp_zc
-                               : (nz * 0.5f + 0.5f) * 65535.0f;
+    *sz = (g_tl.vp_zs != 0.0f) ? nz * g_tl.vp_zs + g_tl.vp_zc : default_depth(nz);
 }
 
 /* Screen depth from clip z and w, as ge_sum says: zc plus zs times clip z
@@ -2016,7 +2024,7 @@ static void ndc_to_screen(float nx, float ny, float nz, float *sx, float *sy, fl
  * (it halves 65535 as an integer). geprobe 11 (fw 6.60) scene 59's 3840
  * points at w = 1 pinned the sum by itself; geprobe 12 the rest. */
 static float ge_screen_z(float cz, float w) {
-    if (g_tl.vp_zs == 0.0f) return ((cz / w) * 0.5f + 0.5f) * 65535.0f;
+    if (g_tl.vp_zs == 0.0f) return default_depth(cz / w);
     const double nz = ge_over_w(cz, w);
     const ge_term t[2] = { ge_mul(g_tl.vp_zs, nz), ge_mul(g_tl.vp_zc, 1.0) };
     return (float)ge_floor(ge_sum(t, 2));
@@ -2033,12 +2041,18 @@ static void to_screen(const float clip[4], float *sx, float *sy, float *sz) {
  * offset. With the centre at 2048 the sum's grid is a sixteenth, so this is
  * screen_axis_fx16's rule -- the product taken to sixteenths toward the
  * centre -- without its float product. */
-static int ge_screen_axis(double ndc, float scale, float centre, float off) {
-    const ge_term t[2] = { ge_mul(scale, ndc), ge_mul(centre, 1.0) };
-    double v = (ge_sum(t, 2) - (double)off) * PSP_SUBPX;
+/* A sum the GE formed, less the screen offset, onto the 1/16 grid: floored
+ * and saturated. */
+static int screen_sum_fx16(double sum, float off) {
+    double v = (sum - (double)off) * PSP_SUBPX;
     if (!(v > -1073741824.0)) v = -1073741824.0;   /* NaN too */
     if (v > 1073741824.0) v = 1073741824.0;
     return (int)ge_floor(v);
+}
+
+static int ge_screen_axis(double ndc, float scale, float centre, float off) {
+    const ge_term t[2] = { ge_mul(scale, ndc), ge_mul(centre, 1.0) };
+    return screen_sum_fx16(ge_sum(t, 2), off);
 }
 
 /* The same projection onto the rasterizer's grid, as screen_axis_fx16 says.
@@ -2066,15 +2080,9 @@ static void clip_to_fx16(const float clip[4], int *x, int *y) {
     if (g_tl.vp_set) {
         *x = ge_screen_axis(gx, g_tl.vp_xs, g_tl.vp_xc, g_tl.off_x);
         *y = ge_screen_axis(gy, g_tl.vp_ys, g_tl.vp_yc, g_tl.off_y);
-        return;
-    }
-    const float nx = (float)gx, ny = (float)gy;
-    if (g_tl.vp_set) {
-        *x = screen_axis_fx16(nx, g_tl.vp_xs, g_tl.vp_xc - g_tl.off_x);
-        *y = screen_axis_fx16(ny, g_tl.vp_ys, g_tl.vp_yc - g_tl.off_y);
     } else {
-        *x = screen_axis_fx16(nx, 240.0f, 240.0f);
-        *y = screen_axis_fx16(ny, -136.0f, 136.0f);
+        *x = screen_axis_fx16((float)gx, GE_HALF_W, GE_HALF_W);
+        *y = screen_axis_fx16((float)gy, -GE_HALF_H, GE_HALF_H);
     }
 }
 
@@ -2084,10 +2092,7 @@ static int ge_screen_axis_m(double ndc, float scale, float centre, float off, ge
     const ge_sp n = ge_sp_of(ndc);
     const ge_term t[2] = { ge_mul_sp(ge_sp_memo_of(&m[0], scale), &n),
                            ge_mul_sp(ge_sp_memo_of(&m[1], centre), &GE_SP_ONE) };
-    double v = (ge_sum(t, 2) - (double)off) * PSP_SUBPX;
-    if (!(v > -1073741824.0)) v = -1073741824.0;   /* NaN too */
-    if (v > 1073741824.0) v = 1073741824.0;
-    return (int)ge_floor(v);
+    return screen_sum_fx16(ge_sum(t, 2), off);
 }
 
 /* to_screen and clip_to_fx16 for one vertex at once: their three ge_over_w
@@ -2099,7 +2104,7 @@ static void clip_to_screen(const float clip[4], float *sx, float *sy, float *sz,
     ndc_to_screen(clip[0] * inv, clip[1] * inv, clip[2] * inv, sx, sy, &unused);
     static ge_sp_memo mz[2], mx[2], my[2];
     const double r = ge_rcp16(clip[3]);
-    if (g_tl.vp_zs == 0.0f) *sz = ((clip[2] / clip[3]) * 0.5f + 0.5f) * 65535.0f;
+    if (g_tl.vp_zs == 0.0f) *sz = default_depth(clip[2] / clip[3]);
     else {
         const ge_sp nz = ge_sp_of(ge_cut(clip[2] * r, 16, 0));
         const ge_term t[2] = { ge_mul_sp(ge_sp_memo_of(&mz[0], g_tl.vp_zs), &nz),
@@ -2111,8 +2116,8 @@ static void clip_to_screen(const float clip[4], float *sx, float *sy, float *sz,
         *x = ge_screen_axis_m(gx, g_tl.vp_xs, g_tl.vp_xc, g_tl.off_x, mx);
         *y = ge_screen_axis_m(gy, g_tl.vp_ys, g_tl.vp_yc, g_tl.off_y, my);
     } else {
-        *x = screen_axis_fx16((float)gx, 240.0f, 240.0f);
-        *y = screen_axis_fx16((float)gy, -136.0f, 136.0f);
+        *x = screen_axis_fx16((float)gx, GE_HALF_W, GE_HALF_W);
+        *y = screen_axis_fx16((float)gy, -GE_HALF_H, GE_HALF_H);
     }
 }
 
@@ -2385,8 +2390,8 @@ static void emit_point_line(const psp_render_backend *be, clipvert p[2], int n) 
         }
     }
     psp_vertex v[2];
-    const float ox = g_tl.vp_set ? g_tl.off_x : 1808.0f;
-    const float oy = g_tl.vp_set ? g_tl.off_y : 1912.0f;
+    const float ox = g_tl.vp_set ? g_tl.off_x : GE_DEFAULT_OFF_X;
+    const float oy = g_tl.vp_set ? g_tl.off_y : GE_DEFAULT_OFF_Y;
     for (int i = 0; i < n; i++) {
         if (!(p[i].c[3] > 0)) { g_skip_nearplane += (uint64_t)n; return; }
         float x, y, z;
@@ -2428,6 +2433,32 @@ static int tri_beyond_one_plane(const float *a, const float *b, const float *c) 
     return 0;
 }
 
+/* Past the guard band: the 4096-pixel drawing space, the screen offset
+ * taken off. */
+static int beyond_guard_band(float sx, float sy) {
+    const float ox = g_tl.vp_set ? g_tl.off_x : GE_DEFAULT_OFF_X;
+    const float oy = g_tl.vp_set ? g_tl.off_y : GE_DEFAULT_OFF_Y;
+    return sx < -ox || sx >= 4096.0f - ox || sy < -oy || sy >= 4096.0f - oy;
+}
+
+/* A screen depth under depth clamping. */
+static float clamp_screen_z(float z) {
+    if (z < 0.0f) z = 0.0f;
+    if (z > 65535.0f) z = 65535.0f;
+    return z;
+}
+
+/* The cull, on a triangle's winding on the 1/16 grid; flip for a strip's
+ * every other triangle. Counts what it culls. */
+static int tri_culled(const psp_vertex p[3], int flip) {
+    const long ax = p[1].x - p[0].x, ay = p[1].y - p[0].y;
+    const long bx = p[2].x - p[0].x, by = p[2].y - p[0].y;
+    long area = ax * by - ay * bx;
+    if (flip) area = -area;
+    if (g_tl.cull_enable && area != 0 && ((area < 0) == (g_tl.cull_ccw != 0))) { g_culled += 3; return 1; }
+    return 0;
+}
+
 /* Widen the screen-space box transformed geometry lands in (g_tl.bb_*). */
 static void note_screen_bbox(float sx, float sy) {
     if (!g_tl.bb_seen) { g_tl.bb_x0 = g_tl.bb_x1 = sx; g_tl.bb_y0 = g_tl.bb_y1 = sy; g_tl.bb_seen = 1; }
@@ -2460,8 +2491,6 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
 
     /* Divide, project, then the guard band. A vertex at w = 0 exactly has no
      * projection, and hardware draws nothing for it ("Flat W=0"). */
-    const float ox = g_tl.vp_set ? g_tl.off_x : 1808.0f;
-    const float oy = g_tl.vp_set ? g_tl.off_y : 1912.0f;
     psp_vertex p[9];
     unsigned any_out = 0;
     for (int i = 0; i < n; i++) {
@@ -2470,11 +2499,8 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
         float sx, sy, sz;
         ndc_to_screen(poly[i].c[0] * inv, poly[i].c[1] * inv, poly[i].c[2] * inv, &sx, &sy, &sz);
         sz = ge_screen_z(poly[i].c[2], poly[i].c[3]);
-        if (g_tl.depth_clamp) {
-            if (sz < 0.0f) sz = 0.0f;
-            if (sz > 65535.0f) sz = 65535.0f;
-        }
-        if (sx < -ox || sx >= 4096.0f - ox || sy < -oy || sy >= 4096.0f - oy) any_out = 1;
+        if (g_tl.depth_clamp) sz = clamp_screen_z(sz);
+        if (beyond_guard_band(sx, sy)) any_out = 1;
         p[i] = poly[i].v;
         clip_to_fx16(poly[i].c, &p[i].x, &p[i].y);
         p[i].precise_x = sx; p[i].precise_y = sy; p[i].precise = 1;
@@ -2486,12 +2512,7 @@ static void emit_tri(const psp_render_backend *be, const clipvert tri[3], int fl
         note_screen_bbox(sx, sy);
     }
     if (any_out) { g_clip_guard += 3; return; }
-
-    const long ax = p[1].x - p[0].x, ay = p[1].y - p[0].y;
-    const long bx = p[2].x - p[0].x, by = p[2].y - p[0].y;
-    long area = ax * by - ay * bx;
-    if (flip) area = -area;
-    if (g_tl.cull_enable && area != 0 && ((area < 0) == (g_tl.cull_ccw != 0))) { g_culled += 3; return; }
+    if (tri_culled(p, flip)) return;
 
     /* A flat triangle is its last vertex's colour; the clip's cut vertices
      * would otherwise hand the rasterizer an interpolated one as the last. */
@@ -3088,24 +3109,14 @@ static void emit_tri_indexed(const psp_render_backend *be, const psp_vertex *v,
         emit_tri(be, tri, flip);
         return;
     }
-    const float ox = g_tl.vp_set ? g_tl.off_x : 1808.0f;
-    const float oy = g_tl.vp_set ? g_tl.off_y : 1912.0f;
     psp_vertex t[3];
     for (int k = 0; k < 3; k++) {
         const psp_vertex *sv = &v[idx[k]];
-        const float sx = sv->precise_x, sy = sv->precise_y;
-        if (sx < -ox || sx >= 4096.0f - ox || sy < -oy || sy >= 4096.0f - oy) { g_clip_guard += 3; return; }
+        if (beyond_guard_band(sv->precise_x, sv->precise_y)) { g_clip_guard += 3; return; }
         t[k] = *sv;
-        if (g_tl.depth_clamp) {
-            if (t[k].z < 0.0f) t[k].z = 0.0f;
-            if (t[k].z > 65535.0f) t[k].z = 65535.0f;
-        }
+        if (g_tl.depth_clamp) t[k].z = clamp_screen_z(t[k].z);
     }
-    const long ax = t[1].x - t[0].x, ay = t[1].y - t[0].y;
-    const long bx = t[2].x - t[0].x, by = t[2].y - t[0].y;
-    long area = ax * by - ay * bx;
-    if (flip) area = -area;
-    if (g_tl.cull_enable && area != 0 && ((area < 0) == (g_tl.cull_ccw != 0))) { g_culled += 3; return; }
+    if (tri_culled(t, flip)) return;
     be->draw(PSP_PRIM_TRIANGLES, t, 3);
 }
 
@@ -3531,10 +3542,10 @@ static void push_pixel_state(void) {
 static void push_pixel_state_body(void) {
     const psp_render_backend *be = psp_render_current();
     if (be->set_viewport) {
-        const float hx = g_tl.vp_set ? fabsf(g_tl.vp_xs) : 240.0f;
-        const float hy = g_tl.vp_set ? fabsf(g_tl.vp_ys) : 136.0f;
-        const float cx = g_tl.vp_set ? g_tl.vp_xc - g_tl.off_x : 240.0f;
-        const float cy = g_tl.vp_set ? g_tl.vp_yc - g_tl.off_y : 136.0f;
+        const float hx = g_tl.vp_set ? fabsf(g_tl.vp_xs) : GE_HALF_W;
+        const float hy = g_tl.vp_set ? fabsf(g_tl.vp_ys) : GE_HALF_H;
+        const float cx = g_tl.vp_set ? g_tl.vp_xc - g_tl.off_x : GE_HALF_W;
+        const float cy = g_tl.vp_set ? g_tl.vp_yc - g_tl.off_y : GE_HALF_H;
         be->set_viewport(cx - hx, cy - hy, 2.0f * hx, 2.0f * hy);
     }
     {
