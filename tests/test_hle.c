@@ -2022,6 +2022,68 @@ static void test_stranded_waits(void) {
     psp_threadman_reset();
 }
 
+/* Every thread parked in sceKernelWaitThreadEnd is woken when the thread
+ * ends: one that waits for good, however many timed waits come and go beside
+ * it, and each of 32 that wait at once. A 33rd is refused, as a full object
+ * queue refuses one, rather than taking the place of one already there. */
+#define TE_SLEEP 0x08802600u
+#define TE_WAIT  0x08802700u
+#define TE_MANY  33
+
+static uint32_t te_target, te_rc[TE_MANY];
+static int      te_next;
+
+static void body_te_sleep(void) { call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0); }
+static void body_te_wait(void) {
+    const int me = te_next++;
+    te_rc[me] = call(psp_nid("sceKernelWaitThreadEnd"), te_target, 0, 0, 0);
+}
+
+static void test_thread_end_waiters(void) {
+    psp_register(TE_SLEEP, body_te_sleep);
+    psp_register(TE_WAIT, body_te_wait);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t DELAY = psp_nid("sceKernelDelayThread");
+    const uint32_t ENDED = SCE_KERNEL_ERROR_THREAD_TERMINATED;
+
+    /* One for good, and forty that give up beside it. */
+    te_target = tw_start(TE_SLEEP);
+    te_next = 0;
+    te_rc[0] = 0xEEEEEEEEu;
+    tw_start(TE_WAIT);
+    call(DELAY, 1000, 0, 0, 0);
+    for (int i = 0; i < 40; i++) {
+        psp_write32(TW_TMO, 100);
+        const uint32_t rc = call(psp_nid("sceKernelWaitThreadEnd"), te_target, TW_TMO, 0, 0);
+        if (rc != SCE_KERNEL_ERROR_WAIT_TIMEOUT) {
+            CHECK(0, "timed wait %d for a sleeping thread answered %08X", i, rc);
+            break;
+        }
+    }
+    call(psp_nid("sceKernelTerminateThread"), te_target, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(te_rc[0] == ENDED, "the waiter beside forty timed waits answered %08X", te_rc[0]);
+
+    /* Thirty-three at once. */
+    te_target = tw_start(TE_SLEEP);
+    te_next = 0;
+    for (int i = 0; i < TE_MANY; i++) { te_rc[i] = 0xEEEEEEEEu; tw_start(TE_WAIT); }
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(te_rc[TE_MANY - 1] == SCE_KERNEL_ERROR_NO_MEMORY,
+          "waiter %d of %d answered %08X before the end", TE_MANY, TE_MANY, te_rc[TE_MANY - 1]);
+    call(psp_nid("sceKernelTerminateThread"), te_target, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    for (int i = 0; i < TE_MANY - 1; i++)
+        CHECK(te_rc[i] == ENDED, "waiter %d of %d answered %08X", i + 1, TE_MANY, te_rc[i]);
+
+    psp_sched_stop_all("test_thread_end_waiters");
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
 /* PSPSDK 654ac51, src/audio/pspaudio.h and sceAudio.S supply the public
  * contract and NIDs. These tests assert that contract plus our host queue
  * behavior; undocumented firmware quirks are not used as an oracle. */
@@ -2317,6 +2379,7 @@ int main(void) {
     test_waits_with_threads();
     test_msgpipe_wait_ends_as_it_parks();
     test_stranded_waits();
+    test_thread_end_waiters();
     test_host_work_boundary();
     test_system_params();
 

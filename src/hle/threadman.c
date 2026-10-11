@@ -65,7 +65,8 @@ enum { WAIT_NONE = 0, WAIT_SLEEP, WAIT_DELAY };
 #define PSP_THREAD_STATUS_SUSPEND 8
 #define PSP_THREAD_STATUS_STOPPED 16
 
-/* Threads one thread's end can release (psp_thread.enders). */
+/* Threads one thread's end can release (psp_thread.enders): as many as can
+ * wait on one object (PSP_WAITQ_MAX), and a 33rd is refused the same way. */
 #define MAX_THREAD_ENDERS 32
 
 typedef struct {
@@ -222,9 +223,6 @@ void psp_threadman_reset(void) {
 static void on_thread_end(uint32_t uid, uint32_t status);
 static void thread_ended(psp_thread *t, uint32_t status);
 static void drop_callbacks_of(uint32_t thread_uid);
-/* An emptied psp_thread.enders entry. Not 0, which is the main context. */
-#define NO_ENDER 0xFFFFFFFFu
-
 /* A timed wait ran out: out of its object's queue now (see psp_waitq_leave). */
 static void on_wait_expired(uint32_t uid) { (void)psp_waitq_leave(uid); }
 
@@ -785,9 +783,8 @@ static void thread_ended(psp_thread *t, uint32_t status) {
     drop_callbacks_of(t->uid);
     psp_kernobj_thread_ended(t->uid);
     psp_kernlock_thread_ended(t->uid);
-    for (int i = 0; i < t->nenders && i < MAX_THREAD_ENDERS; i++) {
+    for (int i = 0; i < t->nenders; i++) {
         const uint32_t w = t->enders[i];
-        if (w == NO_ENDER) continue;
         psp_thread *wr = find_thread(w);
         if (wr) wr->end_status = status;
         else if (w == 0) g_main_end_status = status;
@@ -810,11 +807,27 @@ static void wait_mark(uint32_t type, uint32_t id) {
 }
 void psp_threadman_wait_mark(uint32_t type, uint32_t id) { wait_mark(type, id); }
 
+/* Join the threads waiting for `t` to end, in arrival order. -1 when the
+ * list is full, which the wait refuses as a full object queue refuses one
+ * (psp_waitq_add): a list that wrapped instead wrote over its first waiters,
+ * which then never woke. */
+static int add_ender(psp_thread *t, uint32_t w) {
+    if (t->nenders >= MAX_THREAD_ENDERS) return -1;
+    t->enders[t->nenders++] = w;
+    return 0;
+}
+
 /* A waiter that gave up (timeout or release) takes itself off the list, or the
- * end would wake it later out of whatever it was waiting on by then. */
+ * end would wake it later out of whatever it was waiting on by then. The list
+ * stays packed, so a thread polled with short timeouts does not fill it. */
 static void drop_ender(psp_thread *t, uint32_t w) {
-    for (int i = 0; i < t->nenders && i < MAX_THREAD_ENDERS; i++)
-        if (t->enders[i] == w) t->enders[i] = NO_ENDER;
+    for (int i = 0; i < t->nenders; i++) {
+        if (t->enders[i] != w) continue;
+        memmove(&t->enders[i], &t->enders[i + 1],
+                (size_t)(t->nenders - i - 1) * sizeof t->enders[0]);
+        t->nenders--;
+        return;
+    }
 }
 
 /* An entry that returns ends the thread with its $v0, and a negative one is
@@ -871,7 +884,7 @@ static void thread_end_wait(uint32_t thid, uint32_t timeout, uint64_t deadline, 
         const uint32_t me = psp_sched_current();
         int rc = restored;
         if (restored == WAIT_BEGINS) {
-            t->enders[t->nenders++ % MAX_THREAD_ENDERS] = me;
+            if (add_ender(t, me) != 0) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
             wait_mark(PSP_WAITTYPE_THREADEND, thid);
             rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                        "sceKernelWaitThreadEnd", deadline);
