@@ -717,6 +717,14 @@ static void note_uv(float u, float v) {
     if (v > g_ge.v_hi) g_ge.v_hi = v;
 }
 
+/* Texture level l's registers. Level 0 has fields of its own and the mip
+ * levels 1-7 the tex_lv_ arrays, whose element 0 is unused. */
+typedef struct { uint32_t *addr, *stride, *w, *h; } tex_level_regs;
+static tex_level_regs tex_level(int l) {
+    if (l == 0) return (tex_level_regs){ &g_ge.tex_addr, &g_ge.tex_stride, &g_ge.tex_w, &g_ge.tex_h };
+    return (tex_level_regs){ &g_ge.tex_lv_addr[l], &g_ge.tex_lv_stride[l], &g_ge.tex_lv_w[l], &g_ge.tex_lv_h[l] };
+}
+
 
 /* Which host threads execute display lists. A GL context belongs to exactly
  * one thread, and the GE runs on whichever guest thread submitted the list --
@@ -3453,11 +3461,10 @@ static void push_texture_state(int has_uv) {
             .lod_bias16 = g_ge.tex_lod_bias16,
             .lod_slope  = g_ge.tex_lod_slope,
         };
-        t.lv_addr[0] = g_ge.tex_addr; t.lv_stride[0] = g_ge.tex_stride;
-        t.lv_w[0] = (int)g_ge.tex_w;  t.lv_h[0] = (int)g_ge.tex_h;
-        for (int L = 1; L < 8; L++) {
-            t.lv_addr[L] = g_ge.tex_lv_addr[L]; t.lv_stride[L] = g_ge.tex_lv_stride[L];
-            t.lv_w[L] = (int)g_ge.tex_lv_w[L];  t.lv_h[L] = (int)g_ge.tex_lv_h[L];
+        for (int L = 0; L < 8; L++) {
+            const tex_level_regs r = tex_level(L);
+            t.lv_addr[L] = *r.addr; t.lv_stride[L] = *r.stride;
+            t.lv_w[L] = (int)*r.w;  t.lv_h[L] = (int)*r.h;
         }
         if (has_uv && g_ge.tex_max_level > 0) g_draw_mip++;
         psp_render_current()->set_texture(&t);
@@ -4285,6 +4292,84 @@ static void run_list(ge_queue *q) {
  * GE's, not the boot's. */
 static int g_backend_stale;
 
+/* ---- register families --------------------------------------------------- */
+
+/* Addresses that arrive in two registers. A texture's and a palette's: the
+ * second register carries the high *nibble* -- bits 24..27 -- in its own
+ * bits 16..19, not in its low byte. Both addresses are 16-byte aligned, so
+ * the low four bits of the base are not part of it either. Taking the low
+ * byte instead reads the palette from a completely different place, which
+ * leaves texel *indices* right and every colour wrong: legible shapes,
+ * speckled everywhere. */
+static uint32_t split_addr_lo(uint32_t addr, uint32_t arg) { return (addr & 0x0F000000u) | (arg & 0x00FFFFF0u); }
+static uint32_t split_addr_hi(uint32_t addr, uint32_t arg) { return (addr & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u); }
+/* A frame or depth buffer's: the low 24 bits in FBP or ZBP, the high byte in
+ * bits 16..23 of FBW or ZBW. */
+static uint32_t buf_addr_lo(uint32_t addr, uint32_t arg) { return (addr & 0xFF000000u) | arg; }
+static uint32_t buf_addr_hi(uint32_t addr, uint32_t arg) { return (addr & 0x00FFFFFFu) | ((arg & 0xFF0000) << 8); }
+
+/* Where cmd falls in a run of n registers starting at first, or -1. */
+static int reg_index(uint32_t cmd, uint32_t first, uint32_t n) {
+    return cmd >= first && cmd < first + n ? (int)(cmd - first) : -1;
+}
+
+/* TEXADDR, TEXBUFWIDTH and TEXSIZE, eight of each, one per texture level.
+ * Answers 0 for any other command. */
+static int set_texture_level(uint32_t cmd, uint32_t arg) {
+    int l;
+    if ((l = reg_index(cmd, GE_TEXADDR0, 8)) >= 0) {
+        const tex_level_regs r = tex_level(l);
+        *r.addr = split_addr_lo(*r.addr, arg);
+    } else if ((l = reg_index(cmd, GE_TEXBUFWIDTH0, 8)) >= 0) {
+        const tex_level_regs r = tex_level(l);
+        *r.stride = arg & 0x7FF;
+        *r.addr   = split_addr_hi(*r.addr, arg);
+    } else if ((l = reg_index(cmd, GE_TEXSIZE0, 8)) >= 0) {
+        /* log2 of each dimension, four bits each. Masking a whole byte
+         * lets a stray high bit ask for a 1 << 200 texture. */
+        /* 512 is the largest texture the hardware samples, whatever the
+         * size field says. gpu/textures/size asks for 1024 up to 8192 and
+         * every one of them reads texel 511 at its far edge -- so the
+         * dimension saturates rather than wrapping or scaling. */
+        const tex_level_regs r = tex_level(l);
+        *r.w = 1u << (arg & 0xF);
+        *r.h = 1u << ((arg >> 8) & 0xF);
+        if (*r.w > 512) *r.w = 512;
+        if (*r.h > 512) *r.h = 512;
+    } else
+        return 0;
+    return 1;
+}
+
+/* The four lights' registers: enable and type, one a light; position,
+ * direction and attenuation, three a light (x, y, z); spot exponent and
+ * cutoff, one a light; and the ambient, diffuse and specular colours, three
+ * a light in that order. Answers 0 for any other command. */
+static int set_light(uint32_t cmd, uint32_t arg) {
+    int i;
+    if ((i = reg_index(cmd, GE_LIGHTENABLE0, 4)) >= 0)
+        g_tl.light[i].enable = (int)(arg & 1);
+    else if ((i = reg_index(cmd, GE_LIGHTTYPE0, 4)) >= 0) {
+        g_tl.light[i].kind = (int)(arg & 3);
+        g_tl.light[i].type = (int)((arg >> 8) & 3);
+    } else if ((i = reg_index(cmd, GE_LIGHT0X, 12)) >= 0)
+        g_tl.light[i / 3].pos[i % 3] = ge_float(arg);
+    else if ((i = reg_index(cmd, GE_LIGHT0DIRX, 12)) >= 0)
+        g_tl.light[i / 3].dir[i % 3] = ge_float(arg);
+    else if ((i = reg_index(cmd, GE_LIGHT0ATTEN0, 12)) >= 0)
+        g_tl.light[i / 3].atten[i % 3] = ge_float(arg);
+    else if ((i = reg_index(cmd, GE_LIGHT0EXPONENT, 4)) >= 0)
+        g_tl.light[i].exponent = ge_float(arg);
+    else if ((i = reg_index(cmd, GE_LIGHT0CUTOFF, 4)) >= 0)
+        g_tl.light[i].cutoff = ge_float(arg);
+    else if ((i = reg_index(cmd, GE_LIGHT0AMBIENT, 12)) >= 0) {
+        float *const colour[3] = { g_tl.light[i / 3].amb, g_tl.light[i / 3].dif, g_tl.light[i / 3].spec };
+        ge_colour3(arg, colour[i % 3]);
+    } else
+        return 0;
+    return 1;
+}
+
 static void run_list_body(ge_queue *q) {
     ge_note_thread();
     if (g_backend_stale) { g_backend_stale = 0; psp_ge_sync_backend(); }
@@ -4584,123 +4669,6 @@ static void run_list_body(ge_queue *q) {
          * Recorded here and handed to the backend, which samples it: the
          * software one in render.c, against geprobe's texel readings
          * (docs/RENDERER.md). */
-        /* Texture and palette addresses arrive in two registers, and the
-         * second one carries the high *nibble* -- bits 24..27 -- in its own
-         * bits 16..19, not in its low byte. Both addresses are 16-byte
-         * aligned, so the low four bits of the base are not part of it
-         * either. Taking the low byte instead reads the palette from a
-         * completely different place, which leaves texel *indices* right and
-         * every colour wrong: legible shapes, speckled everywhere. */
-        case GE_TEXADDR0 + 1:
-            g_ge.tex_lv_addr[1] = (g_ge.tex_lv_addr[1] & 0x0F000000u) | (arg & 0x00FFFFF0u);
-            break;
-        case GE_TEXBUFWIDTH0 + 1:
-            g_ge.tex_lv_stride[1] = arg & 0x7FF;
-            g_ge.tex_lv_addr[1]   = (g_ge.tex_lv_addr[1] & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
-            break;
-        case GE_TEXSIZE0 + 1:
-            g_ge.tex_lv_w[1] = 1u << (arg & 0xF);
-            g_ge.tex_lv_h[1] = 1u << ((arg >> 8) & 0xF);
-            if (g_ge.tex_lv_w[1] > 512) g_ge.tex_lv_w[1] = 512;
-            if (g_ge.tex_lv_h[1] > 512) g_ge.tex_lv_h[1] = 512;
-            break;
-        case GE_TEXADDR0 + 2:
-            g_ge.tex_lv_addr[2] = (g_ge.tex_lv_addr[2] & 0x0F000000u) | (arg & 0x00FFFFF0u);
-            break;
-        case GE_TEXBUFWIDTH0 + 2:
-            g_ge.tex_lv_stride[2] = arg & 0x7FF;
-            g_ge.tex_lv_addr[2]   = (g_ge.tex_lv_addr[2] & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
-            break;
-        case GE_TEXSIZE0 + 2:
-            g_ge.tex_lv_w[2] = 1u << (arg & 0xF);
-            g_ge.tex_lv_h[2] = 1u << ((arg >> 8) & 0xF);
-            if (g_ge.tex_lv_w[2] > 512) g_ge.tex_lv_w[2] = 512;
-            if (g_ge.tex_lv_h[2] > 512) g_ge.tex_lv_h[2] = 512;
-            break;
-        case GE_TEXADDR0 + 3:
-            g_ge.tex_lv_addr[3] = (g_ge.tex_lv_addr[3] & 0x0F000000u) | (arg & 0x00FFFFF0u);
-            break;
-        case GE_TEXBUFWIDTH0 + 3:
-            g_ge.tex_lv_stride[3] = arg & 0x7FF;
-            g_ge.tex_lv_addr[3]   = (g_ge.tex_lv_addr[3] & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
-            break;
-        case GE_TEXSIZE0 + 3:
-            g_ge.tex_lv_w[3] = 1u << (arg & 0xF);
-            g_ge.tex_lv_h[3] = 1u << ((arg >> 8) & 0xF);
-            if (g_ge.tex_lv_w[3] > 512) g_ge.tex_lv_w[3] = 512;
-            if (g_ge.tex_lv_h[3] > 512) g_ge.tex_lv_h[3] = 512;
-            break;
-        case GE_TEXADDR0 + 4:
-            g_ge.tex_lv_addr[4] = (g_ge.tex_lv_addr[4] & 0x0F000000u) | (arg & 0x00FFFFF0u);
-            break;
-        case GE_TEXBUFWIDTH0 + 4:
-            g_ge.tex_lv_stride[4] = arg & 0x7FF;
-            g_ge.tex_lv_addr[4]   = (g_ge.tex_lv_addr[4] & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
-            break;
-        case GE_TEXSIZE0 + 4:
-            g_ge.tex_lv_w[4] = 1u << (arg & 0xF);
-            g_ge.tex_lv_h[4] = 1u << ((arg >> 8) & 0xF);
-            if (g_ge.tex_lv_w[4] > 512) g_ge.tex_lv_w[4] = 512;
-            if (g_ge.tex_lv_h[4] > 512) g_ge.tex_lv_h[4] = 512;
-            break;
-        case GE_TEXADDR0 + 5:
-            g_ge.tex_lv_addr[5] = (g_ge.tex_lv_addr[5] & 0x0F000000u) | (arg & 0x00FFFFF0u);
-            break;
-        case GE_TEXBUFWIDTH0 + 5:
-            g_ge.tex_lv_stride[5] = arg & 0x7FF;
-            g_ge.tex_lv_addr[5]   = (g_ge.tex_lv_addr[5] & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
-            break;
-        case GE_TEXSIZE0 + 5:
-            g_ge.tex_lv_w[5] = 1u << (arg & 0xF);
-            g_ge.tex_lv_h[5] = 1u << ((arg >> 8) & 0xF);
-            if (g_ge.tex_lv_w[5] > 512) g_ge.tex_lv_w[5] = 512;
-            if (g_ge.tex_lv_h[5] > 512) g_ge.tex_lv_h[5] = 512;
-            break;
-        case GE_TEXADDR0 + 6:
-            g_ge.tex_lv_addr[6] = (g_ge.tex_lv_addr[6] & 0x0F000000u) | (arg & 0x00FFFFF0u);
-            break;
-        case GE_TEXBUFWIDTH0 + 6:
-            g_ge.tex_lv_stride[6] = arg & 0x7FF;
-            g_ge.tex_lv_addr[6]   = (g_ge.tex_lv_addr[6] & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
-            break;
-        case GE_TEXSIZE0 + 6:
-            g_ge.tex_lv_w[6] = 1u << (arg & 0xF);
-            g_ge.tex_lv_h[6] = 1u << ((arg >> 8) & 0xF);
-            if (g_ge.tex_lv_w[6] > 512) g_ge.tex_lv_w[6] = 512;
-            if (g_ge.tex_lv_h[6] > 512) g_ge.tex_lv_h[6] = 512;
-            break;
-        case GE_TEXADDR0 + 7:
-            g_ge.tex_lv_addr[7] = (g_ge.tex_lv_addr[7] & 0x0F000000u) | (arg & 0x00FFFFF0u);
-            break;
-        case GE_TEXBUFWIDTH0 + 7:
-            g_ge.tex_lv_stride[7] = arg & 0x7FF;
-            g_ge.tex_lv_addr[7]   = (g_ge.tex_lv_addr[7] & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
-            break;
-        case GE_TEXSIZE0 + 7:
-            g_ge.tex_lv_w[7] = 1u << (arg & 0xF);
-            g_ge.tex_lv_h[7] = 1u << ((arg >> 8) & 0xF);
-            if (g_ge.tex_lv_w[7] > 512) g_ge.tex_lv_w[7] = 512;
-            if (g_ge.tex_lv_h[7] > 512) g_ge.tex_lv_h[7] = 512;
-            break;
-        case GE_TEXADDR0:
-            g_ge.tex_addr = (g_ge.tex_addr & 0x0F000000u) | (arg & 0x00FFFFF0u);
-            break;
-        case GE_TEXBUFWIDTH0:
-            g_ge.tex_stride = arg & 0x7FF;
-            g_ge.tex_addr   = (g_ge.tex_addr & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
-            break;
-        case GE_TEXSIZE0:
-            /* log2 of each dimension, four bits each. Masking a whole byte
-             * lets a stray high bit ask for a 1 << 200 texture. */
-            /* 512 is the largest texture the hardware samples, whatever the
-             * size field says. gpu/textures/size asks for 1024 up to 8192 and
-             * every one of them reads texel 511 at its far edge -- so the
-             * dimension saturates rather than wrapping or scaling. */
-            g_ge.tex_w = 1u << (arg & 0xF);
-            g_ge.tex_h = 1u << ((arg >> 8) & 0xF);
-            if (g_ge.tex_w > 512) g_ge.tex_w = 512;
-            if (g_ge.tex_h > 512) g_ge.tex_h = 512;
-            break;
         case GE_TEXFORMAT:
             g_ge.tex_format = arg & 0xF;
             g_ge.tex_formats_seen |= 1u << (arg & 0xF);
@@ -4722,12 +4690,8 @@ static void run_list_body(ge_queue *q) {
             g_ge.clut_raw    = arg;
             g_ge.clut_format = arg & 3;
             break;
-        case GE_CLUTADDR:
-            g_ge.clut_addr = (g_ge.clut_addr & 0x0F000000u) | (arg & 0x00FFFFF0u);
-            break;
-        case GE_CLUTADDRUPPER:
-            g_ge.clut_addr = (g_ge.clut_addr & 0x00FFFFF0u) | ((arg << 8) & 0x0F000000u);
-            break;
+        case GE_CLUTADDR:      g_ge.clut_addr = split_addr_lo(g_ge.clut_addr, arg); break;
+        case GE_CLUTADDRUPPER: g_ge.clut_addr = split_addr_hi(g_ge.clut_addr, arg); break;
         case GE_TEXFUNC:
             g_ge.tex_func   = arg & 7;
             g_ge.tex_tcc    = (arg >> 8) & 1;     /* RGBA: the texel's alpha takes part */
@@ -4771,82 +4735,6 @@ static void run_list_body(ge_queue *q) {
         case GE_MATERIALSPECCOEF: g_tl.mat_spec_coef = ge_float(arg); break;
         case GE_AMBIENTLIGHT:     ge_colour3(arg, g_tl.global_amb); break;
         case GE_AMBIENTLIGHTALPHA: break;   /* the global ambient's alpha does not reach a vertex */
-        case GE_LIGHTENABLE0 + 0: g_tl.light[0].enable = (int)(arg & 1); break;
-        case GE_LIGHTTYPE0 + 0:
-            g_tl.light[0].kind = (int)(arg & 3);
-            g_tl.light[0].type = (int)((arg >> 8) & 3);
-            break;
-        case GE_LIGHT0X + 0 * 3:     g_tl.light[0].pos[0]   = ge_float(arg); break;
-        case GE_LIGHT0X + 0 * 3 + 1: g_tl.light[0].pos[1]   = ge_float(arg); break;
-        case GE_LIGHT0X + 0 * 3 + 2: g_tl.light[0].pos[2]   = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 0 * 3:     g_tl.light[0].dir[0] = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 0 * 3 + 1: g_tl.light[0].dir[1] = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 0 * 3 + 2: g_tl.light[0].dir[2] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 0 * 3:     g_tl.light[0].atten[0] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 0 * 3 + 1: g_tl.light[0].atten[1] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 0 * 3 + 2: g_tl.light[0].atten[2] = ge_float(arg); break;
-        case GE_LIGHT0EXPONENT + 0: g_tl.light[0].exponent = ge_float(arg); break;
-        case GE_LIGHT0CUTOFF + 0:   g_tl.light[0].cutoff   = ge_float(arg); break;
-        case GE_LIGHT0AMBIENT + 0 * 3:     ge_colour3(arg, g_tl.light[0].amb);  break;
-        case GE_LIGHT0AMBIENT + 0 * 3 + 1: ge_colour3(arg, g_tl.light[0].dif);  break;
-        case GE_LIGHT0AMBIENT + 0 * 3 + 2: ge_colour3(arg, g_tl.light[0].spec); break;
-        case GE_LIGHTENABLE0 + 1: g_tl.light[1].enable = (int)(arg & 1); break;
-        case GE_LIGHTTYPE0 + 1:
-            g_tl.light[1].kind = (int)(arg & 3);
-            g_tl.light[1].type = (int)((arg >> 8) & 3);
-            break;
-        case GE_LIGHT0X + 1 * 3:     g_tl.light[1].pos[0]   = ge_float(arg); break;
-        case GE_LIGHT0X + 1 * 3 + 1: g_tl.light[1].pos[1]   = ge_float(arg); break;
-        case GE_LIGHT0X + 1 * 3 + 2: g_tl.light[1].pos[2]   = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 1 * 3:     g_tl.light[1].dir[0] = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 1 * 3 + 1: g_tl.light[1].dir[1] = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 1 * 3 + 2: g_tl.light[1].dir[2] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 1 * 3:     g_tl.light[1].atten[0] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 1 * 3 + 1: g_tl.light[1].atten[1] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 1 * 3 + 2: g_tl.light[1].atten[2] = ge_float(arg); break;
-        case GE_LIGHT0EXPONENT + 1: g_tl.light[1].exponent = ge_float(arg); break;
-        case GE_LIGHT0CUTOFF + 1:   g_tl.light[1].cutoff   = ge_float(arg); break;
-        case GE_LIGHT0AMBIENT + 1 * 3:     ge_colour3(arg, g_tl.light[1].amb);  break;
-        case GE_LIGHT0AMBIENT + 1 * 3 + 1: ge_colour3(arg, g_tl.light[1].dif);  break;
-        case GE_LIGHT0AMBIENT + 1 * 3 + 2: ge_colour3(arg, g_tl.light[1].spec); break;
-        case GE_LIGHTENABLE0 + 2: g_tl.light[2].enable = (int)(arg & 1); break;
-        case GE_LIGHTTYPE0 + 2:
-            g_tl.light[2].kind = (int)(arg & 3);
-            g_tl.light[2].type = (int)((arg >> 8) & 3);
-            break;
-        case GE_LIGHT0X + 2 * 3:     g_tl.light[2].pos[0]   = ge_float(arg); break;
-        case GE_LIGHT0X + 2 * 3 + 1: g_tl.light[2].pos[1]   = ge_float(arg); break;
-        case GE_LIGHT0X + 2 * 3 + 2: g_tl.light[2].pos[2]   = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 2 * 3:     g_tl.light[2].dir[0] = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 2 * 3 + 1: g_tl.light[2].dir[1] = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 2 * 3 + 2: g_tl.light[2].dir[2] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 2 * 3:     g_tl.light[2].atten[0] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 2 * 3 + 1: g_tl.light[2].atten[1] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 2 * 3 + 2: g_tl.light[2].atten[2] = ge_float(arg); break;
-        case GE_LIGHT0EXPONENT + 2: g_tl.light[2].exponent = ge_float(arg); break;
-        case GE_LIGHT0CUTOFF + 2:   g_tl.light[2].cutoff   = ge_float(arg); break;
-        case GE_LIGHT0AMBIENT + 2 * 3:     ge_colour3(arg, g_tl.light[2].amb);  break;
-        case GE_LIGHT0AMBIENT + 2 * 3 + 1: ge_colour3(arg, g_tl.light[2].dif);  break;
-        case GE_LIGHT0AMBIENT + 2 * 3 + 2: ge_colour3(arg, g_tl.light[2].spec); break;
-        case GE_LIGHTENABLE0 + 3: g_tl.light[3].enable = (int)(arg & 1); break;
-        case GE_LIGHTTYPE0 + 3:
-            g_tl.light[3].kind = (int)(arg & 3);
-            g_tl.light[3].type = (int)((arg >> 8) & 3);
-            break;
-        case GE_LIGHT0X + 3 * 3:     g_tl.light[3].pos[0]   = ge_float(arg); break;
-        case GE_LIGHT0X + 3 * 3 + 1: g_tl.light[3].pos[1]   = ge_float(arg); break;
-        case GE_LIGHT0X + 3 * 3 + 2: g_tl.light[3].pos[2]   = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 3 * 3:     g_tl.light[3].dir[0] = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 3 * 3 + 1: g_tl.light[3].dir[1] = ge_float(arg); break;
-        case GE_LIGHT0DIRX + 3 * 3 + 2: g_tl.light[3].dir[2] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 3 * 3:     g_tl.light[3].atten[0] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 3 * 3 + 1: g_tl.light[3].atten[1] = ge_float(arg); break;
-        case GE_LIGHT0ATTEN0 + 3 * 3 + 2: g_tl.light[3].atten[2] = ge_float(arg); break;
-        case GE_LIGHT0EXPONENT + 3: g_tl.light[3].exponent = ge_float(arg); break;
-        case GE_LIGHT0CUTOFF + 3:   g_tl.light[3].cutoff   = ge_float(arg); break;
-        case GE_LIGHT0AMBIENT + 3 * 3:     ge_colour3(arg, g_tl.light[3].amb);  break;
-        case GE_LIGHT0AMBIENT + 3 * 3 + 1: ge_colour3(arg, g_tl.light[3].dif);  break;
-        case GE_LIGHT0AMBIENT + 3 * 3 + 2: ge_colour3(arg, g_tl.light[3].spec); break;
 
         case GE_FRAMEBUFPIXFORMAT:
             g_ge.fbfmt = arg & 3;
@@ -4931,13 +4819,13 @@ static void run_list_body(ge_queue *q) {
             break;
 
         case GE_FBP:
-            g_ge.fbp = (g_ge.fbp & 0xFF000000u) | arg;
+            g_ge.fbp = buf_addr_lo(g_ge.fbp, arg);
             ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
             psp_render_current()->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
             break;
         case GE_FBW:
             g_ge.fbw = arg & 0xFFFF;
-            g_ge.fbp = (g_ge.fbp & 0x00FFFFFFu) | ((arg & 0xFF0000) << 8);
+            g_ge.fbp = buf_addr_hi(g_ge.fbp, arg);
             ge_note_target(ge_fb_address(g_ge.fbp), g_ge.fbw, g_ge.fbfmt);
             psp_render_current()->set_target(ge_fb_address(g_ge.fbp), g_ge.fbw, (int)g_ge.fbfmt);
             break;
@@ -4945,12 +4833,12 @@ static void run_list_body(ge_queue *q) {
         /* The depth buffer: low 24 bits of the address in ZBP, the high byte
          * and the stride in ZBW, the same split as FBP/FBW. */
         case GE_ZBP:
-            g_ge.zbp = (g_ge.zbp & 0xFF000000u) | arg;
+            g_ge.zbp = buf_addr_lo(g_ge.zbp, arg);
             psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
             break;
         case GE_ZBW:
             g_ge.zbw = arg & 0xFFFF;
-            g_ge.zbp = (g_ge.zbp & 0x00FFFFFFu) | ((arg & 0xFF0000) << 8);
+            g_ge.zbp = buf_addr_hi(g_ge.zbp, arg);
             psp_render_set_depth_buffer(g_ge.zbp, g_ge.zbw);
             break;
 
@@ -4958,6 +4846,7 @@ static void run_list_body(ge_queue *q) {
         case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)); break;
 
         default:
+            if (set_texture_level(cmd, arg) || set_light(cmd, arg)) break;
             /* A real state command we do not decode individually. Counted --
              * and, for the first few, named. "240 commands not individually
              * decoded" hides whether the game is configuring a draw or just
