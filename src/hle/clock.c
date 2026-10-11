@@ -109,9 +109,6 @@ static _Atomic int      g_holding;
 
 static uint64_t wall_ns(void) { return psp_os_mono_ns(); }
 
-/* Sleep until wall moment `origin + us`. Returns immediately when the run is
- * already there or past it. The 2us slack keeps a sync that lands on the
- * boundary from costing a syscall for nothing. */
 /* Wall time the pacers have slept, for the frame log: a frame's wall time
  * less its sleep is the host's work on it. */
 static _Atomic uint64_t g_slept_ns;
@@ -122,9 +119,15 @@ static void sleep_until(uint64_t target) {
     g_slept_ns += wall_ns() - t0;
 }
 
+/* How close to its target a sync counts as there. */
+#define SYNC_SLACK_NS 2000u
+
+/* Sleep until wall moment `origin + us`. Returns immediately when the run is
+ * already there or past it. The 2us slack keeps a sync that lands on the
+ * boundary from costing a syscall for nothing. */
 static void wall_sync(uint64_t us) {
     const uint64_t target = g_origin_ns + us * 1000u;
-    if (wall_ns() + 2000u >= target) return;
+    if (wall_ns() + SYNC_SLACK_NS >= target) return;
     sleep_until(target);
 }
 
@@ -165,7 +168,7 @@ int psp_clock_paced_requested(void) {
  * so it does not race ahead to make the time up. */
 static void paced_sync(uint64_t us) {
     const uint64_t target = g_origin_ns + us * 1000u, now = wall_ns();
-    if (now + 2000u >= target) {
+    if (now + SYNC_SLACK_NS >= target) {
         if (now - target > (uint64_t)PSP_CLOCK_PACED_SLIP_US * 1000u) g_origin_ns += now - target;
         return;
     }
@@ -221,6 +224,13 @@ void psp_clock_reset(void) {
 
 uint64_t psp_clock_peek(void) { return g_us; }
 
+/* Real-time mode's tick: guest time catches up with the wall, and never goes
+ * back. */
+static void adopt_wall(void) {
+    const uint64_t wall = (wall_ns() - g_origin_ns) / 1000u;
+    if (wall > g_us) g_us = wall;
+}
+
 static int clock_load(psp_state_reader *r, char *why, size_t size) {
     (void)r; (void)why; (void)size;
     if (g_realtime || g_paced) anchor();
@@ -239,8 +249,7 @@ uint64_t psp_clock_read(void) {
          * the tick serves terminates because the wall moves, and a tick would
          * break the one-to-one mapping the pacers depend on. Two reads inside
          * one instant can agree, which is the honest report. */
-        const uint64_t wall = (wall_ns() - g_origin_ns) / 1000u;
-        if (wall > g_us) g_us = wall;
+        adopt_wall();
         return g_us;
     }
     const uint64_t now = g_us;
@@ -276,11 +285,7 @@ uint64_t psp_clock_next_frame(void) {
  * a clock read reaches a thread that never sleeps and never asks; the spin
  * now asks every call. */
 void psp_clock_tick(void) {
-    if (g_realtime) {
-        const uint64_t wall = (wall_ns() - g_origin_ns) / 1000u;
-        if (wall > g_us) g_us = wall;
-        return;
-    }
+    if (g_realtime) { adopt_wall(); return; }
     g_us += PSP_CALL_TICK_US;
 }
 
