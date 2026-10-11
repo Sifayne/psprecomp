@@ -530,48 +530,60 @@ static int absolute(const char *path, char *out, size_t cap) {
     return format_path(out, cap, "%s/%s", cwd, path);
 }
 
-static void launch_game(launcher *a) {
+/* Whether the selected game can start now. When it cannot, the status says
+ * why -- or the importer or the browser opens to prepare it. */
+static int launch_ready(launcher *a) {
     refresh(a);
     if (working(a)) {
         set_status(a, "%s", a->work == WORK_IMPORT ? "Wait for the game to be prepared, or stop it, to play."
                                                  : "Wait for the pack to finish, to play.");
-        return;
+        return 0;
     }
-    if (!a->valid || a->load_failed) return;
+    if (!a->valid || a->load_failed) return 0;
     if (!a->boot || !a->module) {
         if (a->importer && a->iso && !access(a->iso, R_OK)) import_start(a, WORK_IMPORT, a->iso);
         else if (a->importer) browser_open(a, BROWSE_ISO);
         else set_status(a, "No game installed. You can still save your settings.");
-        return;
+        return 0;
     }
     if (access(a->boot, X_OK) || access(a->module, R_OK) || (a->iso && access(a->iso, R_OK))) {
-        set_status(a, "Cannot reach the game, its module or its disc: %s", strerror(errno)); return;
+        set_status(a, "Cannot reach the game, its module or its disc: %s", strerror(errno)); return 0;
     }
     psp_settings effective = a->edit;
     char error[PSP_SETTINGS_ERROR];
     if (!psp_settings_env(&effective, error) && !psp_settings_resolve(&effective, error) && effective.render == PSP_RENDERER_NULL) {
-        set_status(a, "The null renderer is for diagnostics. Choose OpenGL or software before playing."); return;
+        set_status(a, "The null renderer is for diagnostics. Choose OpenGL or software before playing."); return 0;
     }
-    if (save(a)) return;
-    char save_root[4096], state_root[4096], boot[4096], module[4096], iso[4096], config[4096];
-    if (game_folder(a, "saves", save_root, sizeof save_root)) {
-        set_status(a, "Cannot find the save folder: PSPRECOMP_DATA_ROOT, XDG_DATA_HOME or HOME must be an absolute path."); return;
+    return 1;
+}
+
+/* What the game host is started with: its paths in absolute form, and the
+ * save folder it runs in (empty when no title is selected). */
+typedef struct { char save_root[4096], boot[4096], module[4096], iso[4096], config[4096]; } launch_paths;
+
+static int find_launch_paths(launcher *a, launch_paths *p) {
+    if (game_folder(a, "saves", p->save_root, sizeof p->save_root)) {
+        set_status(a, "Cannot find the save folder: PSPRECOMP_DATA_ROOT, XDG_DATA_HOME or HOME must be an absolute path."); return -1;
     }
-    if (*save_root && make_directories(save_root)) {
-        set_status(a, "Cannot make the save folder %.300s: %s", save_root, strerror(errno)); return;
+    if (*p->save_root && make_directories(p->save_root)) {
+        set_status(a, "Cannot make the save folder %.300s: %s", p->save_root, strerror(errno)); return -1;
     }
-    if (absolute(a->boot, boot, sizeof boot) || absolute(a->module, module, sizeof module) ||
-        (a->iso && absolute(a->iso, iso, sizeof iso)) || absolute(a->path, config, sizeof config)) {
-        set_status(a, "Cannot launch: a game path is too long."); return;
+    if (absolute(a->boot, p->boot, sizeof p->boot) || absolute(a->module, p->module, sizeof p->module) ||
+        (a->iso && absolute(a->iso, p->iso, sizeof p->iso)) || absolute(a->path, p->config, sizeof p->config)) {
+        set_status(a, "Cannot launch: a game path is too long."); return -1;
     }
-    if (*save_root) fprintf(stderr, "launcher: saves %s\n", save_root);
-    /* The game's environment, with its state folder: built before the fork,
-     * since only async-signal-safe calls may follow it. */
+    return 0;
+}
+
+/* The game's environment, with its state folder: built before the fork,
+ * since only async-signal-safe calls may follow it. NULL when out of memory. */
+static char **child_environment(launcher *a) {
     static char state_var[4200];
+    char state_root[4096];
     size_t nenv = 0;
     while (environ[nenv]) nenv++;
     char **env = malloc((nenv + 2) * sizeof *env);
-    if (!env) { set_status(a, "Cannot launch: out of memory."); return; }
+    if (!env) return NULL;
     size_t k = 0;
     for (size_t i = 0; i < nenv; i++) if (strncmp(environ[i], "PSPRECOMP_STATE_DIR=", 20)) env[k++] = environ[i];
     if (!game_folder(a, "states", state_root, sizeof state_root) && *state_root) {
@@ -580,36 +592,56 @@ static void launch_game(launcher *a) {
         fprintf(stderr, "launcher: states %s\n", state_root);
     }
     env[k] = NULL;
+    return env;
+}
+
+/* The child's side of the fork: the game host in the save folder, its
+ * stderr into the pipe. Only async-signal-safe operations between fork and
+ * exec: SDL may have other threads with libc locks held at the fork
+ * boundary. */
+static _Noreturn void exec_game(const launch_paths *p, int with_iso, char **env, const int pipes[2]) {
+    close(pipes[0]); dup2(pipes[1], STDERR_FILENO); close(pipes[1]);
+    const char *args[8]; int n = 0;
+    args[n++] = p->boot; args[n++] = p->module; if (with_iso) args[n++] = p->iso;
+    args[n++] = "--config"; args[n++] = p->config;
+    args[n++] = "--window"; args[n] = NULL;
+    static const char exec_failed[] = "Could not execute the game host. Check its path and permissions.\n",
+                      chdir_failed[] = "Could not enter the save folder. Check its permissions.\n";
+    const char *message = exec_failed; size_t sent = 0, total = sizeof exec_failed - 1;
+    if (*p->save_root && chdir(p->save_root)) { message = chdir_failed; total = sizeof chdir_failed - 1; }
+    else execve(p->boot, (char *const *)args, env);
+    while (sent < total) {
+        ssize_t w = write(STDERR_FILENO, message + sent, total - sent);
+        if (w > 0) sent += (size_t)w;
+        else if (w < 0 && errno == EINTR) continue;
+        else break;
+    }
+    _exit(127);
+}
+
+/* The game host, started with env; what it writes to stderr comes back
+ * through a pipe for poll_child. */
+static void spawn_game(launcher *a, const launch_paths *p, char **env) {
     int pipes[2];
-    if (pipe(pipes)) { free(env); set_status(a, "Cannot launch: %s", strerror(errno)); return; }
+    if (pipe(pipes)) { set_status(a, "Cannot launch: %s", strerror(errno)); return; }
     fflush(NULL);
     pid_t child = fork();
-    if (child < 0) { free(env); close(pipes[0]); close(pipes[1]); set_status(a, "Cannot launch: %s", strerror(errno)); return; }
-    if (!child) {
-        close(pipes[0]); dup2(pipes[1], STDERR_FILENO); close(pipes[1]);
-        const char *args[8]; int n = 0;
-        args[n++] = boot; args[n++] = module; if (a->iso) args[n++] = iso;
-        args[n++] = "--config"; args[n++] = config;
-        args[n++] = "--window"; args[n] = NULL;
-        /* Only async-signal-safe operations between fork and exec: SDL may
-         * have other threads with libc locks held at the fork boundary. */
-        static const char exec_failed[] = "Could not execute the game host. Check its path and permissions.\n",
-                          chdir_failed[] = "Could not enter the save folder. Check its permissions.\n";
-        const char *message = exec_failed; size_t sent = 0, total = sizeof exec_failed - 1;
-        if (*save_root && chdir(save_root)) { message = chdir_failed; total = sizeof chdir_failed - 1; }
-        else execve(boot, (char *const *)args, env);
-        while (sent < total) {
-            ssize_t w = write(STDERR_FILENO, message + sent, total - sent);
-            if (w > 0) sent += (size_t)w;
-            else if (w < 0 && errno == EINTR) continue;
-            else break;
-        }
-        _exit(127);
-    }
-    free(env);
+    if (child < 0) { close(pipes[0]); close(pipes[1]); set_status(a, "Cannot launch: %s", strerror(errno)); return; }
+    if (!child) exec_game(p, a->iso != NULL, env, pipes);
     close(pipes[1]); fcntl(pipes[0], F_SETFL, O_NONBLOCK);
     a->child = child; a->child_error_fd = pipes[0]; a->child_error_len = 0; a->child_error[0] = 0;
     SDL_HideWindow(a->window);
+}
+
+static void launch_game(launcher *a) {
+    if (!launch_ready(a) || save(a)) return;
+    launch_paths p;
+    if (find_launch_paths(a, &p)) return;
+    if (*p.save_root) fprintf(stderr, "launcher: saves %s\n", p.save_root);
+    char **env = child_environment(a);
+    if (!env) { set_status(a, "Cannot launch: out of memory."); return; }
+    spawn_game(a, &p, env);
+    free(env);
 }
 
 /* The file again, as the game's menu may have left it: unless something
