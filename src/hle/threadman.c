@@ -20,8 +20,7 @@
  * a wait that nothing could ever satisfy -- because no other thread is runnable
  * -- cannot be waited out. A caller that supplied a timeout is told it elapsed;
  * one that did not is not lied to, because a fabricated timeout is something a
- * game acts on. See wait_deadlock. sceKernelDelayThread yields rather than
- * sleeping, for the same want of a clock.
+ * game acts on. See wait_deadlock.
  */
 
 #include "psprecomp/hle.h"

@@ -1,11 +1,11 @@
 /* psprecomp — the kernel's memory and message objects.
  *
- * Variable-size pools (vpl) here; fixed pools, mailboxes and message pipes to
- * follow. What they have in common is that their *internals* are observable:
- * pspautotests reports a pool's free size after every operation, so the header
- * size, the alignment and the per-pool overhead are all pinned by the captures
- * rather than being ours to choose. An allocator that merely worked would
- * disagree with hardware on every line.
+ * Variable-size pools (vpl), message pipes, mailboxes, fixed pools and
+ * thread-local pools. What they have in common is that their *internals* are
+ * observable: pspautotests reports a pool's free size after every operation,
+ * so the header size, the alignment and the per-pool overhead are all pinned
+ * by the captures rather than being ours to choose. An allocator that merely
+ * worked would disagree with hardware on every line.
  */
 
 #include "psprecomp/hle.h"
