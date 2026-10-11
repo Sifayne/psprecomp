@@ -2151,9 +2151,10 @@ static void hle_ReferThreadStatus(void) {
      * nothing between them but the start of a thread whose whole body is a
      * sleep. */
     const int dormant = thread_dormant(t);
+    const psp_sched_state sched = dormant ? PSP_SCHED_DEAD : psp_sched_state_of(t->uid);
     uint32_t status = PSP_THREAD_STATUS_STOPPED;
     if (!dormant) {
-        switch (psp_sched_state_of(t->uid)) {
+        switch (sched) {
             case PSP_SCHED_RUNNING:   status = PSP_THREAD_STATUS_RUNNING; break;
             case PSP_SCHED_READY:     status = PSP_THREAD_STATUS_READY;   break;
             case PSP_SCHED_BLOCKED:
@@ -2192,13 +2193,10 @@ static void hle_ReferThreadStatus(void) {
      * kept under a suspension). A wait that has ended -- the thread woken but
      * not yet run -- reports none. */
     uint32_t wait_type = 0, wait_id = 0;
-    if (!dormant) {
-        const psp_sched_state st = psp_sched_state_of(t->uid);
-        if (st == PSP_SCHED_BLOCKED || st == PSP_SCHED_SLEEPING) {
-            if (t->wait_kind == WAIT_SLEEP)      wait_type = PSP_WAITTYPE_SLEEP;
-            else if (t->wait_kind == WAIT_DELAY) wait_type = PSP_WAITTYPE_DELAY;
-            else { wait_type = t->wait_type; wait_id = t->wait_id; }
-        }
+    if (!dormant && (sched == PSP_SCHED_BLOCKED || sched == PSP_SCHED_SLEEPING)) {
+        if (t->wait_kind == WAIT_SLEEP)      wait_type = PSP_WAITTYPE_SLEEP;
+        else if (t->wait_kind == WAIT_DELAY) wait_type = PSP_WAITTYPE_DELAY;
+        else { wait_type = t->wait_type; wait_id = t->wait_id; }
     }
 
     /* runClocks, then the interrupt-preemption, thread-preemption and release
