@@ -79,6 +79,7 @@ static int savedata_log_on(void) {
 #define SD_ICON1 1428u
 #define SD_PIC1  1444u
 #define SD_SND0  1460u
+#define SD_NEWDATA 1476u
 #define SD_FOCUS 1480u
 #define SD_MSFREE 1488u
 #define SD_MSDATA 1492u
@@ -339,6 +340,7 @@ static void sd_write_file(const char *guest, uint32_t src, uint32_t cap) {
  * the SFO's stay zero, and a secure file's slot holds a psprecomp key tag
  * instead (sd_key_tag), so a load can tell which key made the save. */
 #define SD_SFO_SIZE     4912u
+#define SD_SFO_MAGIC    0x46535000u   /* "\0PSF" */
 #define SD_FL_ENTRIES   99u
 #define SD_FL_LEN       (SD_FL_ENTRIES * 32u)
 #define SD_PARAMS_LEN   128u
@@ -391,7 +393,7 @@ typedef struct {
 } sd_sfo_state;
 
 static const uint8_t *sd_sfo_value(const uint8_t *b, size_t n, const char *key, uint32_t *len) {
-    if (n < 20 || sd_le32(b) != 0x46535000u) return NULL;
+    if (n < 20 || sd_le32(b) != SD_SFO_MAGIC) return NULL;
     uint32_t keys = sd_le32(b + 8), data = sd_le32(b + 12), count = sd_le32(b + 16);
     if (count > (n - 20) / 16 || keys >= n || data > n) return NULL;
     for (uint32_t i = 0; i < count; i++) {
@@ -593,7 +595,7 @@ static void sd_write_sfo(const char *dir, const char *dirname, uint32_t param) {
     static uint8_t buf[SD_SFO_SIZE];
     if (dstart + dlen != SD_SFO_SIZE) { sd_io_error = 1; return; }
     memset(buf, 0, sizeof buf);
-    sd_put32(buf + 0, 0x46535000u);
+    sd_put32(buf + 0, SD_SFO_MAGIC);
     sd_put32(buf + 4, 0x101u);
     sd_put32(buf + 8, kstart);
     sd_put32(buf + 12, dstart);
@@ -1294,7 +1296,7 @@ static int sd_metadata(const char *dir, psp_savedata_slot *slot) {
     FILE *f=fopen(host,"rb"); if (!f) return -1;
     unsigned char b[16384]; size_t n=fread(b,1,sizeof b,f); int bad=ferror(f);
     if (fclose(f)) bad=1;
-    if (bad || n<20 || sd_le32(b)!=0x46535000u) return -1;
+    if (bad || n<20 || sd_le32(b)!=SD_SFO_MAGIC) return -1;
     uint32_t keys=sd_le32(b+8),data=sd_le32(b+12),count=sd_le32(b+16);
     if (count>(n-20)/16 || keys>=n || data>=n) return -1;
     for (uint32_t i=0;i<count;i++) {
@@ -1339,7 +1341,7 @@ static int sd_add_candidate(const char *name) {
         if (sd_plain_path(guest,0)==1) psp_io_host_path(guest,slot->pic1_path,sizeof slot->pic1_path);
     } else {
         snprintf(slot->title,sizeof slot->title,"New save data");
-        uint32_t nd=sd_optional(g_savedata_param,1476);
+        uint32_t nd=sd_optional(g_savedata_param,SD_NEWDATA);
         if (nd && psp_mem_ptr(nd,20)) {
             uint32_t title=psp_read32(nd+16);
             if (title && psp_mem_ptr(title,128)) sd_getstr(title,0,127,slot->title,sizeof slot->title);
@@ -1366,20 +1368,25 @@ static int sd_expand_candidates(void) {
     }
     return 0;
 }
+/* The param's focus word: which slot the list opens on. */
+enum {
+    SD_FOCUS_NAMED, SD_FOCUS_FIRST, SD_FOCUS_LAST, SD_FOCUS_NEWEST, SD_FOCUS_OLDEST,
+    SD_FOCUS_FIRST_DATA, SD_FOCUS_LAST_DATA, SD_FOCUS_FIRST_EMPTY, SD_FOCUS_LAST_EMPTY,
+};
 static void sd_initial_focus(const char *name) {
     uint32_t focus=sd_optional(g_savedata_param,SD_FOCUS);
     int selected=0,found=0;
     for (int i=0;i<sd_view.count;i++) {
         psp_savedata_slot *s=&sd_view.slots[i]; int match=0;
         switch (focus) {
-        case 0: match=!strcmp(name,s->name); break;
-        case 1: match=i==0; break;
-        case 2: match=1; break;
-        case 3: case 4:
-            match=s->exists && (!found || (focus==3 ? s->modified>sd_view.slots[selected].modified :
-                                                         s->modified<sd_view.slots[selected].modified)); break;
-        case 5: case 6: match=s->exists && (!found || focus==6); break;
-        case 7: case 8: match=!s->exists && (!found || focus==8); break;
+        case SD_FOCUS_NAMED: match=!strcmp(name,s->name); break;
+        case SD_FOCUS_FIRST: match=i==0; break;
+        case SD_FOCUS_LAST: match=1; break;
+        case SD_FOCUS_NEWEST: case SD_FOCUS_OLDEST:
+            match=s->exists && (!found || (focus==SD_FOCUS_NEWEST ? s->modified>sd_view.slots[selected].modified :
+                                                                    s->modified<sd_view.slots[selected].modified)); break;
+        case SD_FOCUS_FIRST_DATA: case SD_FOCUS_LAST_DATA: match=s->exists && (!found || focus==SD_FOCUS_LAST_DATA); break;
+        case SD_FOCUS_FIRST_EMPTY: case SD_FOCUS_LAST_EMPTY: match=!s->exists && (!found || focus==SD_FOCUS_LAST_EMPTY); break;
         default: break;
         }
         if (match) { selected=i; found=1; }
@@ -1406,7 +1413,7 @@ static int sd_build_candidates(void) {
         else if (sd_add_candidate(name)) return -1;
     } else if (sd_add_candidate(name)) return -1;
     sd_initial_focus(name);
-    uint32_t nd=sd_optional(g_savedata_param,1476);
+    uint32_t nd=sd_optional(g_savedata_param,SD_NEWDATA);
     if (nd && psp_mem_ptr(nd,20)) {
         uint32_t addr=psp_read32(nd),size=psp_read32(nd+8);
         if (size && size<=PSP_SAVEDATA_ICON_MAX && psp_mem_ptr(addr,size)) {
