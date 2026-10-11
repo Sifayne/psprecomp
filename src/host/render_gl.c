@@ -463,11 +463,11 @@ enum { CLASS_SCENE = 0, CLASS_HUD = 1, CLASS_PREVIEW = 2 };
 
 typedef struct {
     int      used;
-    uint32_t addr, stride, clut_addr;
+    uint32_t addr, stride;
     int      w, h, fmt, swizzled, max_level, uploaded_top;
     uint32_t lv_addr[8], lv_stride[8];
     int      lv_w[8], lv_h[8];
-    int      clut_fmt, clut_shift, clut_mask, clut_start;
+    psp_clut_state clut;
     uint64_t content_generation, validated_serial;
     uint64_t last_used;
     GLuint   tex;
@@ -537,8 +537,7 @@ static struct {
     /* Texture state as the interpreter last set it, plus what is bound. */
     psp_tex_state tex;
     int      tex_enable;
-    uint32_t clut_addr;
-    int      clut_fmt, clut_shift, clut_mask, clut_start;
+    psp_clut_state clut;
     GLuint   bound;
     int      bound_top;
 
@@ -2266,13 +2265,13 @@ static uint64_t texture_generation(const psp_tex_state *t, int top, uint32_t sup
                                                              level_bytes(t, level), supplied);
         if (gen > newest) newest = gen;
     }
-    if (t->fmt >= 4 && t->fmt <= 7 && g.clut_addr) {
+    if (t->fmt >= 4 && t->fmt <= 7 && g.clut.addr) {
         /* CLUT start is already in entries (multiples of sixteen), and mask is
          * applied before ORing it. Tracking through their greatest possible
          * index covers every palette read without knowing the texel values. */
-        const uint32_t entries = (uint32_t)(g.clut_start | g.clut_mask) + 1u;
-        const uint32_t bytes = entries * (uint32_t)psp_pixel_bytes(g.clut_fmt);
-        const uint64_t gen = range_generation_excluding_rts(g.clut_addr, bytes, 0);
+        const uint32_t entries = (uint32_t)(g.clut.start | g.clut.mask) + 1u;
+        const uint32_t bytes = entries * (uint32_t)psp_pixel_bytes(g.clut.fmt);
+        const uint64_t gen = range_generation_excluding_rts(g.clut.addr, bytes, 0);
         if (gen > newest) newest = gen;
     }
     return newest;
@@ -2294,13 +2293,18 @@ static size_t texture_slot(const psp_tex_state *t, int top) {
         hash = hash_word(hash, (uint32_t)level_h(t, level));
     }
     if (t->fmt >= 4 && t->fmt <= 7) {
-        hash = hash_word(hash, g.clut_addr);
-        hash = hash_word(hash, (uint32_t)g.clut_fmt);
-        hash = hash_word(hash, (uint32_t)g.clut_shift);
-        hash = hash_word(hash, (uint32_t)g.clut_mask);
-        hash = hash_word(hash, (uint32_t)g.clut_start);
+        hash = hash_word(hash, g.clut.addr);
+        hash = hash_word(hash, (uint32_t)g.clut.fmt);
+        hash = hash_word(hash, (uint32_t)g.clut.shift);
+        hash = hash_word(hash, (uint32_t)g.clut.mask);
+        hash = hash_word(hash, (uint32_t)g.clut.start);
     }
     return (size_t)hash % TEXCACHE_MAX;
+}
+
+static int same_clut(const psp_clut_state *a, const psp_clut_state *b) {
+    return a->addr == b->addr && a->fmt == b->fmt && a->shift == b->shift &&
+           a->mask == b->mask && a->start == b->start;
 }
 
 static int cache_matches(const texcache_entry *e, const psp_tex_state *t,
@@ -2311,10 +2315,7 @@ static int cache_matches(const texcache_entry *e, const psp_tex_state *t,
     /* Palette state has no bearing on direct-colour formats. Including the
      * GE's incidental last CLUT there multiplied identical cache entries and
      * was responsible for most of the mission's post-generation evictions. */
-    if (t->fmt >= 4 && t->fmt <= 7 &&
-        (e->clut_addr != g.clut_addr || e->clut_fmt != g.clut_fmt ||
-         e->clut_shift != g.clut_shift || e->clut_mask != g.clut_mask ||
-         e->clut_start != g.clut_start))
+    if (t->fmt >= 4 && t->fmt <= 7 && !same_clut(&e->clut, &g.clut))
         return 0;
     for (int level = 0; level <= top; level++)
         if (e->lv_addr[level] != level_addr(t, level) ||
@@ -2339,9 +2340,7 @@ static void cache_record(texcache_entry *e, const psp_tex_state *t, int top,
         e->lv_w[level] = level_w(t, level);
         e->lv_h[level] = level_h(t, level);
     }
-    e->clut_addr = g.clut_addr; e->clut_fmt = g.clut_fmt;
-    e->clut_shift = g.clut_shift; e->clut_mask = g.clut_mask;
-    e->clut_start = g.clut_start;
+    e->clut = g.clut;
     e->content_generation = generation;
     e->validated_serial = serial;
     e->last_used = g.cache_clock;
@@ -2366,8 +2365,7 @@ static int texcache_refresh_rows(texcache_entry *e, const psp_tex_state *t, uint
     static uint32_t *texels;
     if (!texels) texels = malloc(TEXEL_CAP * sizeof(uint32_t));
     if (!texels) return 0;
-    const psp_clut_state clut = { g.clut_addr, g.clut_fmt, g.clut_shift,
-                                  g.clut_mask, g.clut_start };
+    const psp_clut_state clut = g.clut;
     enum { GAP = 16, RUNS_MAX = 16 };
     int runs = 0, bound = 0;
     for (int y = 0; y < t->h;) {
@@ -2515,8 +2513,7 @@ upload: {
 
     /* One decoder for every backend -- the formats, the CLUT paging and the
      * swizzle are the runtime's, not repeated here. */
-    const psp_clut_state clut = { g.clut_addr, g.clut_fmt, g.clut_shift,
-                                  g.clut_mask, g.clut_start };
+    const psp_clut_state clut = g.clut;
     if (!e->tex) p_glGenTextures(1, &e->tex);
     p_glBindTexture(GL_TEXTURE_2D, e->tex);
     int uploaded_top = -1;
@@ -2679,14 +2676,14 @@ static void gl_texture(const psp_tex_state *t) {
 }
 static void gl_clut(uint32_t a, int f, int sh, int m, int st) {
     if (claim() != 0) return;
-    if (g.clut_addr == a && g.clut_fmt == f && g.clut_shift == sh && g.clut_mask == m && g.clut_start == st) { g.mu.setters_skipped++; return; }
+    const psp_clut_state c = { a, f, sh, m, st };
+    if (same_clut(&g.clut, &c)) { g.mu.setters_skipped++; return; }
     g.mu.state_gen++; g.mu.clut_gen++;
     flush_ends(FB_CLUT); flush();
     /* Part of the cache key rather than state of its own: the palette is what
      * a CLUT texture's texels decode through, so a new palette is a new
      * texture even at the same address. */
-    g.clut_addr = a; g.clut_fmt = f;
-    g.clut_shift = sh; g.clut_mask = m; g.clut_start = st;
+    g.clut = c;
 }
 static void gl_depth(int test, int func, int write) {
     if (claim() != 0) return;
