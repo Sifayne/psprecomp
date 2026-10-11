@@ -65,8 +65,13 @@
 static int      g_prof_on = -1;
 static uint64_t g_model_verts;      /* vertices handed to the backend's own transform */
 static uint64_t g_prof[6], g_prof_verts, g_prof_batches, g_prof_tsc0, g_prof_ns0;
-/* The interpreter on a GPU-transform backend: decode, append, state pushes, the rest of the walk. */
-static uint64_t g_prof_m[8], g_prof_lists, g_prof_op[256], g_prof_opn[256];
+/* The interpreter on a GPU-transform backend, in g_prof_m: the model path's
+ * decode and its backend append, the pixel-state pushes, whole list runs,
+ * and inside PRIM the texture push, the transform-state fill and the draw's
+ * prelude. g_prof_op and g_prof_opn are each command's time and count. */
+enum { PROF_DECODE, PROF_APPEND, PROF_PIXEL_STATE, PROF_LIST, PROF_TEXTURE, PROF_XFORM_STATE,
+       PROF_PRELUDE, PROF_M_N };
+static uint64_t g_prof_m[PROF_M_N], g_prof_lists, g_prof_op[256], g_prof_opn[256];
 static inline uint64_t ge_prof_now(void) { return g_prof_on > 0 ? GE_PROF_TSC() : 0; }
 static uint64_t ge_prof_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static void ge_prof_init(void) {
@@ -786,100 +791,93 @@ void psp_ge_reset(void) {
 
 void psp_ge_init(void) { psp_ge_reset(); ge_prof_init(); }
 
-void psp_ge_dump_stats(FILE *out) {
-    fprintf(out, "GE: %llu lists, %llu commands, %llu finishes\n",
-            (unsigned long long)g_ge.lists,
-            (unsigned long long)g_ge.commands,
-            (unsigned long long)g_ge.finishes);
-    if (g_model_verts)
-        fprintf(out, "    transformed on the backend: %llu vertices\n", (unsigned long long)g_model_verts);
-    if (g_prof_on > 0 && g_prof_verts) {
-        const double cyc_per_ns = (double)(GE_PROF_TSC() - g_prof_tsc0) / (double)(ge_prof_ns() - g_prof_ns0 + 1);
-        static const char *const NAMES[6] = { "position decode", "matrix products", "colour+fog+lighting", "uv+texgen", "screen+bbox", "clip+draw (per batch)" };
-        double tot = 0; for (int i = 0; i < 6; i++) tot += (double)g_prof[i];
-        fprintf(out, "GE profile: %llu vertices in %llu batches, %.1f ms in the transform pipeline (%.0f ns/vertex)\n",
-                (unsigned long long)g_prof_verts, (unsigned long long)g_prof_batches, tot / cyc_per_ns / 1e6, tot / cyc_per_ns / (double)g_prof_verts);
-        for (int i = 0; i < 6; i++)
-            fprintf(out, "    %-24s %7.1f ms  %4.1f%%\n", NAMES[i], (double)g_prof[i] / cyc_per_ns / 1e6, 100.0 * (double)g_prof[i] / (tot > 0 ? tot : 1));
-    }
-    if (g_prof_on > 0 && g_prof_lists) {
-        const double cyc_per_ns = (double)(GE_PROF_TSC() - g_prof_tsc0) / (double)(ge_prof_ns() - g_prof_ns0 + 1);
-        const double total = (double)g_prof_m[3] / cyc_per_ns / 1e6, dec = (double)g_prof_m[0] / cyc_per_ns / 1e6,
-                     app = (double)g_prof_m[1] / cyc_per_ns / 1e6, st = (double)g_prof_m[2] / cyc_per_ns / 1e6;
-        fprintf(out, "GE interpreter: %.1f ms in %llu list run(s): model decode %.1f ms (%.0f%%), backend append %.1f ms (%.0f%%), pixel-state pushes %.1f ms (%.0f%%), the rest of the walk %.1f ms (%.0f%%)\n",
-                total, (unsigned long long)g_prof_lists, dec, 100*dec/total, app, 100*app/total, st, 100*st/total, total-dec-app-st, 100*(total-dec-app-st)/total);
-        {
-            uint64_t opsum = 0; for (int i = 0; i < 256; i++) opsum += g_prof_op[i];
-            fprintf(out, "    inside PRIM as well: texture push %.1f ms, transform-state fill %.1f ms, draw prelude %.1f ms; outside every command (fetch, stall test, dispatch): %.1f ms\n",
-                    (double)g_prof_m[4] / cyc_per_ns / 1e6, (double)g_prof_m[5] / cyc_per_ns / 1e6, (double)g_prof_m[6] / cyc_per_ns / 1e6,
-                    total - (double)opsum / cyc_per_ns / 1e6);
-        }
-        int order[256]; for (int i = 0; i < 256; i++) order[i] = i;
-        for (int a = 0; a < 256; a++) for (int b = a + 1; b < 256; b++) if (g_prof_op[order[b]] > g_prof_op[order[a]]) { int t = order[a]; order[a] = order[b]; order[b] = t; }
-        fprintf(out, "    by command, top 12:");
-        for (int i = 0; i < 12 && g_prof_opn[order[i]]; i++)
-            fprintf(out, " %02X:%.0fms/%lluk(%.0fns)", order[i], (double)g_prof_op[order[i]] / cyc_per_ns / 1e6,
-                    (unsigned long long)(g_prof_opn[order[i]] / 1000), (double)g_prof_op[order[i]] / cyc_per_ns / (double)g_prof_opn[order[i]]);
+/* The TSC's rate over the run so far, for the profile's milliseconds. */
+static double prof_cyc_per_ns(void) {
+    return (double)(GE_PROF_TSC() - g_prof_tsc0) / (double)(ge_prof_ns() - g_prof_ns0 + 1);
+}
+static double prof_ms(double cycles, double cyc_per_ns) { return cycles / cyc_per_ns / 1e6; }
+
+/* PSPRECOMP_GE_PROFILE's transform pipeline, by stage. */
+static void dump_transform_profile(FILE *out) {
+    const double cyc_per_ns = prof_cyc_per_ns();
+    static const char *const NAMES[6] = { "position decode", "matrix products", "colour+fog+lighting", "uv+texgen", "screen+bbox", "clip+draw (per batch)" };
+    double tot = 0; for (int i = 0; i < 6; i++) tot += (double)g_prof[i];
+    fprintf(out, "GE profile: %llu vertices in %llu batches, %.1f ms in the transform pipeline (%.0f ns/vertex)\n",
+            (unsigned long long)g_prof_verts, (unsigned long long)g_prof_batches, prof_ms(tot, cyc_per_ns), tot / cyc_per_ns / (double)g_prof_verts);
+    for (int i = 0; i < 6; i++)
+        fprintf(out, "    %-24s %7.1f ms  %4.1f%%\n", NAMES[i], prof_ms((double)g_prof[i], cyc_per_ns), 100.0 * (double)g_prof[i] / (tot > 0 ? tot : 1));
+}
+
+/* PSPRECOMP_GE_PROFILE's list walk: its parts, and the twelve costliest
+ * commands. */
+static void dump_interpreter_profile(FILE *out) {
+    const double cyc_per_ns = prof_cyc_per_ns();
+    const double total = prof_ms((double)g_prof_m[PROF_LIST], cyc_per_ns);
+    const double dec = prof_ms((double)g_prof_m[PROF_DECODE], cyc_per_ns);
+    const double app = prof_ms((double)g_prof_m[PROF_APPEND], cyc_per_ns);
+    const double st = prof_ms((double)g_prof_m[PROF_PIXEL_STATE], cyc_per_ns);
+    fprintf(out, "GE interpreter: %.1f ms in %llu list run(s): model decode %.1f ms (%.0f%%), backend append %.1f ms (%.0f%%), pixel-state pushes %.1f ms (%.0f%%), the rest of the walk %.1f ms (%.0f%%)\n",
+            total, (unsigned long long)g_prof_lists, dec, 100*dec/total, app, 100*app/total, st, 100*st/total, total-dec-app-st, 100*(total-dec-app-st)/total);
+    uint64_t opsum = 0; for (int i = 0; i < 256; i++) opsum += g_prof_op[i];
+    fprintf(out, "    inside PRIM as well: texture push %.1f ms, transform-state fill %.1f ms, draw prelude %.1f ms; outside every command (fetch, stall test, dispatch): %.1f ms\n",
+            prof_ms((double)g_prof_m[PROF_TEXTURE], cyc_per_ns), prof_ms((double)g_prof_m[PROF_XFORM_STATE], cyc_per_ns),
+            prof_ms((double)g_prof_m[PROF_PRELUDE], cyc_per_ns), total - prof_ms((double)opsum, cyc_per_ns));
+    /* Costliest first, ties left where this exchange sort leaves them. */
+    int order[256]; for (int i = 0; i < 256; i++) order[i] = i;
+    for (int a = 0; a < 256; a++) for (int b = a + 1; b < 256; b++) if (g_prof_op[order[b]] > g_prof_op[order[a]]) { int t = order[a]; order[a] = order[b]; order[b] = t; }
+    fprintf(out, "    by command, top 12:");
+    for (int i = 0; i < 12 && g_prof_opn[order[i]]; i++)
+        fprintf(out, " %02X:%.0fms/%lluk(%.0fns)", order[i], prof_ms((double)g_prof_op[order[i]], cyc_per_ns),
+                (unsigned long long)(g_prof_opn[order[i]] / 1000), (double)g_prof_op[order[i]] / cyc_per_ns / (double)g_prof_opn[order[i]]);
+    fprintf(out, "\n");
+}
+
+/* The texture state as last set, and every format and function used. */
+static void dump_texture_state(FILE *out) {
+    static const char *const TF[16] = {
+        "5650","5551","4444","8888","clut4","clut8","clut16","clut32",
+        "dxt1","dxt3","dxt5","?","?","?","?","?" };
+    static const char *const FN[8] = {
+        "modulate","decal","blend","replace","add","?","?","?" };
+    fprintf(out, "    texture    0x%08X %ux%u stride %u, %s, %s%s\n",
+            g_ge.tex_addr, g_ge.tex_w, g_ge.tex_h, g_ge.tex_stride,
+            TF[g_ge.tex_format & 15], FN[g_ge.tex_func & 7],
+            g_ge.tex_swizzled ? ", swizzled" : "");
+    fprintf(out, "    formats used:");
+    for (int i = 0; i < 16; i++)
+        if (g_ge.tex_formats_seen & (1u << i)) fprintf(out, " %s", TF[i]);
+    for (int i = 0; i < 8; i++)
+        if (g_ge.tex_funcs_seen & (1u << i)) fprintf(out, " %s", FN[i]);
+    if (g_ge.clut_loads)
+        fprintf(out, "  (%llu clut loads, fmt %u)",
+                (unsigned long long)g_ge.clut_loads, g_ge.clut_format);
+    fprintf(out, "\n");
+    /* Sampling state, which the report has never carried. It decides
+     * whether a glyph edge is a hard texel boundary or a ramp, so "the
+     * letters are ragged" cannot be reasoned about without it. Both are
+     * tracked and neither reaches the backend yet; printing them says which
+     * of the two is worth wiring up for this game rather than for the
+     * hardware in general. */
+    {
+        static const char *const FI[8] = {
+            "nearest","linear","?","?",
+            "near/mip-near","lin/mip-near","near/mip-lin","lin/mip-lin" };
+        fprintf(out, "    sampling   filter min %s mag %s, wrap s %s t %s",
+                FI[g_ge.tex_filter & 7], FI[(g_ge.tex_filter >> 8) & 7],
+                (g_ge.tex_wrap & 1) ? "clamp" : "repeat",
+                ((g_ge.tex_wrap >> 8) & 1) ? "clamp" : "repeat");
+        /* The backend samples with the magnification filter, having no
+         * scale factor to choose with. This is how many primitives that
+         * choice was actually visible on. */
+        if (psp_render_filter_split())
+            fprintf(out, "  (%llu prims where min/mag differ)",
+                    (unsigned long long)psp_render_filter_split());
         fprintf(out, "\n");
     }
-    if (g_ge.tex_addr || g_ge.tex_formats_seen) {
-        static const char *const TF[16] = {
-            "5650","5551","4444","8888","clut4","clut8","clut16","clut32",
-            "dxt1","dxt3","dxt5","?","?","?","?","?" };
-        static const char *const FN[8] = {
-            "modulate","decal","blend","replace","add","?","?","?" };
-        fprintf(out, "    texture    0x%08X %ux%u stride %u, %s, %s%s\n",
-                g_ge.tex_addr, g_ge.tex_w, g_ge.tex_h, g_ge.tex_stride,
-                TF[g_ge.tex_format & 15], FN[g_ge.tex_func & 7],
-                g_ge.tex_swizzled ? ", swizzled" : "");
-        fprintf(out, "    formats used:");
-        for (int i = 0; i < 16; i++)
-            if (g_ge.tex_formats_seen & (1u << i)) fprintf(out, " %s", TF[i]);
-        for (int i = 0; i < 8; i++)
-            if (g_ge.tex_funcs_seen & (1u << i)) fprintf(out, " %s", FN[i]);
-        if (g_ge.clut_loads)
-            fprintf(out, "  (%llu clut loads, fmt %u)",
-                    (unsigned long long)g_ge.clut_loads, g_ge.clut_format);
-        fprintf(out, "\n");
-        /* Sampling state, which the report has never carried. It decides
-         * whether a glyph edge is a hard texel boundary or a ramp, so "the
-         * letters are ragged" cannot be reasoned about without it. Both are
-         * tracked and neither reaches the backend yet; printing them says which
-         * of the two is worth wiring up for this game rather than for the
-         * hardware in general. */
-        {
-            static const char *const FI[8] = {
-                "nearest","linear","?","?",
-                "near/mip-near","lin/mip-near","near/mip-lin","lin/mip-lin" };
-            fprintf(out, "    sampling   filter min %s mag %s, wrap s %s t %s",
-                    FI[g_ge.tex_filter & 7], FI[(g_ge.tex_filter >> 8) & 7],
-                    (g_ge.tex_wrap & 1) ? "clamp" : "repeat",
-                    ((g_ge.tex_wrap >> 8) & 1) ? "clamp" : "repeat");
-            /* The backend samples with the magnification filter, having no
-             * scale factor to choose with. This is how many primitives that
-             * choice was actually visible on. */
-            if (psp_render_filter_split())
-                fprintf(out, "  (%llu prims where min/mag differ)",
-                        (unsigned long long)psp_render_filter_split());
-            fprintf(out, "\n");
-        }
-    }
-    if (g_ge.drawn_prims)
-        fprintf(out, "    drawn      %llu prims, vertex type 0x%06X"
-                     " (tex %u colour %u pos %u through %u), u %.1f..%.1f v %.1f..%.1f, texturing %s\n",
-                (unsigned long long)g_ge.drawn_prims, g_ge.drawn_vtype,
-                VT_TEX(g_ge.drawn_vtype), VT_COLOR(g_ge.drawn_vtype),
-                VT_POS(g_ge.drawn_vtype), VT_THROUGH(g_ge.drawn_vtype),
-                (double)g_ge.u_lo, (double)g_ge.u_hi,
-                (double)g_ge.v_lo, (double)g_ge.v_hi,
-                g_ge.tex_enable ? "on" : "off");
-    if (g_ge.xfer_starts)
-        fprintf(out, "    transfers  %llu asked, %llu done (%llu bytes), %llu rejected\n",
-                (unsigned long long)g_ge.xfer_starts, (unsigned long long)g_ge.xfers,
-                (unsigned long long)g_ge.xfer_bytes,
-                (unsigned long long)g_ge.xfer_rejected);
-    fprintf(out, "    framebuffer 0x%08X stride %u, vertex type 0x%06X\n",
-            g_ge.fbp, g_ge.fbw, g_ge.vtype);
+}
+
+/* The host threads that ran lists, and the render targets drawn into. */
+static void dump_targets(FILE *out) {
     /* Distinct render targets. Two of these (the display pair) means a GPU
      * backend can own its colour buffer; more means render-to-texture, and
      * targets have to be tracked. Primitives are attributed to the target
@@ -906,6 +904,82 @@ void psp_ge_dump_stats(FILE *out) {
                 (unsigned long long)g_ge.targets[i].sets,
                 (unsigned long long)g_ge.targets[i].prims,
                 (g_ge.targets[i].addr & 0xFF000000u) == PSP_VRAM_BASE ? "" : "  <- not VRAM");
+}
+
+/* What the transform pipeline did with the vertices it was given. */
+static void dump_transform(FILE *out) {
+    fprintf(out, "    transformed %llu vertices; viewport %s",
+            (unsigned long long)g_xformed,
+            g_tl.vp_set ? "set" : "defaulted");
+    if (g_tl.vp_set)
+        fprintf(out, " (scale %.1f,%.1f centre %.1f,%.1f offset %.1f,%.1f)",
+                g_tl.vp_xs, g_tl.vp_ys, g_tl.vp_xc, g_tl.vp_yc,
+                g_tl.off_x, g_tl.off_y);
+    fprintf(out, ", cull %s\n", g_tl.cull_enable ? (g_tl.cull_ccw ? "ccw" : "cw") : "off");
+    fprintf(out, "    draws: 2d %llu textured / %llu flat, 3d %llu textured / %llu flat\n",
+            (unsigned long long)g_draw_2d_tex, (unsigned long long)g_draw_2d_flat,
+            (unsigned long long)g_draw_3d_tex, (unsigned long long)g_draw_3d_flat);
+    fprintf(out, "    vertex colours seen (first %d):", g_col_n);
+    for (int i = 0; i < g_col_n; i++) fprintf(out, " %08X", g_col_seen[i]);
+    fprintf(out, "\n");
+    fprintf(out, "    matrix words: world %u, view %u, proj %u\n",
+            g_tl.world_words, g_tl.view_words, g_tl.proj_words);
+    if (g_tl.bb_seen)
+        fprintf(out, "    screen bounds: x %.1f..%.1f  y %.1f..%.1f\n",
+                g_tl.bb_x0, g_tl.bb_x1, g_tl.bb_y0, g_tl.bb_y1);
+    if (g_fog_verts)
+        fprintf(out, "    fogged     %llu vertices transformed with fog on; colour %02X%02X%02X end %.1f range %.4f\n",
+                (unsigned long long)g_fog_verts,
+                (unsigned)(g_tl.fog_colour[0] * 255.0f + 0.5f), (unsigned)(g_tl.fog_colour[1] * 255.0f + 0.5f),
+                (unsigned)(g_tl.fog_colour[2] * 255.0f + 0.5f), (double)g_tl.fog_end, (double)g_tl.fog_range);
+    if (g_lit_verts)
+    {
+        int nlights = 0;
+        for (int i = 0; i < 4; i++) if (g_tl.light[i].enable) nlights++;
+        fprintf(out, "    lit        %llu vertices, %d light(s) on, %s specular, material update %d\n",
+                (unsigned long long)g_lit_verts, nlights,
+                g_tl.light_mode ? "separate" : "single", g_tl.mat_update);
+    }
+    if (g_draw_mip)
+        fprintf(out, "    mipmapped  %llu textured draws carried a mip chain\n", (unsigned long long)g_draw_mip);
+    if (g_clip_eye || g_clip_z || g_clip_guard || g_clip_split)
+        fprintf(out, "    clipped    %llu verts all behind the eye, %llu beyond near/far, "
+                     "%llu outside the guard band, %llu added by splits; depth %s\n",
+                (unsigned long long)g_clip_eye, (unsigned long long)g_clip_z,
+                (unsigned long long)g_clip_guard, (unsigned long long)g_clip_split,
+                g_tl.depth_clamp ? "clamp" : "clip");
+    if (g_culled)
+        fprintf(out, "    %llu vertices culled as backfacing\n",
+                (unsigned long long)g_culled);
+}
+
+void psp_ge_dump_stats(FILE *out) {
+    fprintf(out, "GE: %llu lists, %llu commands, %llu finishes\n",
+            (unsigned long long)g_ge.lists,
+            (unsigned long long)g_ge.commands,
+            (unsigned long long)g_ge.finishes);
+    if (g_model_verts)
+        fprintf(out, "    transformed on the backend: %llu vertices\n", (unsigned long long)g_model_verts);
+    if (g_prof_on > 0 && g_prof_verts) dump_transform_profile(out);
+    if (g_prof_on > 0 && g_prof_lists) dump_interpreter_profile(out);
+    if (g_ge.tex_addr || g_ge.tex_formats_seen) dump_texture_state(out);
+    if (g_ge.drawn_prims)
+        fprintf(out, "    drawn      %llu prims, vertex type 0x%06X"
+                     " (tex %u colour %u pos %u through %u), u %.1f..%.1f v %.1f..%.1f, texturing %s\n",
+                (unsigned long long)g_ge.drawn_prims, g_ge.drawn_vtype,
+                VT_TEX(g_ge.drawn_vtype), VT_COLOR(g_ge.drawn_vtype),
+                VT_POS(g_ge.drawn_vtype), VT_THROUGH(g_ge.drawn_vtype),
+                (double)g_ge.u_lo, (double)g_ge.u_hi,
+                (double)g_ge.v_lo, (double)g_ge.v_hi,
+                g_ge.tex_enable ? "on" : "off");
+    if (g_ge.xfer_starts)
+        fprintf(out, "    transfers  %llu asked, %llu done (%llu bytes), %llu rejected\n",
+                (unsigned long long)g_ge.xfer_starts, (unsigned long long)g_ge.xfers,
+                (unsigned long long)g_ge.xfer_bytes,
+                (unsigned long long)g_ge.xfer_rejected);
+    fprintf(out, "    framebuffer 0x%08X stride %u, vertex type 0x%06X\n",
+            g_ge.fbp, g_ge.fbw, g_ge.vtype);
+    dump_targets(out);
     fprintf(out, "    vertices submitted: %llu\n", (unsigned long long)g_ge.vertices);
     for (int i = 0; i < 8; i++)
         if (g_ge.prims[i])
@@ -940,51 +1014,7 @@ void psp_ge_dump_stats(FILE *out) {
             (unsigned long long)g_clear_draws, (unsigned long long)g_clear_z_draws);
     if (g_imm_draws)
         fprintf(out, "    immediate-mode draws: %llu (untextured)\n", (unsigned long long)g_imm_draws);
-    if (g_xformed) {
-        fprintf(out, "    transformed %llu vertices; viewport %s",
-                (unsigned long long)g_xformed,
-                g_tl.vp_set ? "set" : "defaulted");
-        if (g_tl.vp_set)
-            fprintf(out, " (scale %.1f,%.1f centre %.1f,%.1f offset %.1f,%.1f)",
-                    g_tl.vp_xs, g_tl.vp_ys, g_tl.vp_xc, g_tl.vp_yc,
-                    g_tl.off_x, g_tl.off_y);
-        fprintf(out, ", cull %s\n", g_tl.cull_enable ? (g_tl.cull_ccw ? "ccw" : "cw") : "off");
-        fprintf(out, "    draws: 2d %llu textured / %llu flat, 3d %llu textured / %llu flat\n",
-                (unsigned long long)g_draw_2d_tex, (unsigned long long)g_draw_2d_flat,
-                (unsigned long long)g_draw_3d_tex, (unsigned long long)g_draw_3d_flat);
-        fprintf(out, "    vertex colours seen (first %d):", g_col_n);
-        for (int i = 0; i < g_col_n; i++) fprintf(out, " %08X", g_col_seen[i]);
-        fprintf(out, "\n");
-        fprintf(out, "    matrix words: world %u, view %u, proj %u\n",
-                g_tl.world_words, g_tl.view_words, g_tl.proj_words);
-        if (g_tl.bb_seen)
-            fprintf(out, "    screen bounds: x %.1f..%.1f  y %.1f..%.1f\n",
-                    g_tl.bb_x0, g_tl.bb_x1, g_tl.bb_y0, g_tl.bb_y1);
-        if (g_fog_verts)
-            fprintf(out, "    fogged     %llu vertices transformed with fog on; colour %02X%02X%02X end %.1f range %.4f\n",
-                    (unsigned long long)g_fog_verts,
-                    (unsigned)(g_tl.fog_colour[0] * 255.0f + 0.5f), (unsigned)(g_tl.fog_colour[1] * 255.0f + 0.5f),
-                    (unsigned)(g_tl.fog_colour[2] * 255.0f + 0.5f), (double)g_tl.fog_end, (double)g_tl.fog_range);
-        if (g_lit_verts)
-        {
-            int nlights = 0;
-            for (int i = 0; i < 4; i++) if (g_tl.light[i].enable) nlights++;
-            fprintf(out, "    lit        %llu vertices, %d light(s) on, %s specular, material update %d\n",
-                    (unsigned long long)g_lit_verts, nlights,
-                    g_tl.light_mode ? "separate" : "single", g_tl.mat_update);
-        }
-        if (g_draw_mip)
-            fprintf(out, "    mipmapped  %llu textured draws carried a mip chain\n", (unsigned long long)g_draw_mip);
-        if (g_clip_eye || g_clip_z || g_clip_guard || g_clip_split)
-            fprintf(out, "    clipped    %llu verts all behind the eye, %llu beyond near/far, "
-                         "%llu outside the guard band, %llu added by splits; depth %s\n",
-                    (unsigned long long)g_clip_eye, (unsigned long long)g_clip_z,
-                    (unsigned long long)g_clip_guard, (unsigned long long)g_clip_split,
-                    g_tl.depth_clamp ? "clamp" : "clip");
-        if (g_culled)
-            fprintf(out, "    %llu vertices culled as backfacing\n",
-                    (unsigned long long)g_culled);
-    }
+    if (g_xformed) dump_transform(out);
     if (g_skip_noaddr)
         fprintf(out, "    %llu vertices dropped: no vertex address set\n",
                 (unsigned long long)g_skip_noaddr);
@@ -3147,7 +3177,7 @@ static void draw_model_batches(const psp_render_backend *be, uint32_t type, uint
                                const ge_vlayout *vl, int want_normal, uint64_t t_start) {
     psp_xform_state xs;
     fill_xform_state(&xs);
-    if (g_prof_on > 0) g_prof_m[5] += ge_prof_now() - t_start;
+    if (g_prof_on > 0) g_prof_m[PROF_XFORM_STATE] += ge_prof_now() - t_start;
     psp_model_vertex mv[GE_VERTEX_BATCH], centre;
     uint32_t done = 0;
     while (done < count) {
@@ -3163,7 +3193,7 @@ static void draw_model_batches(const psp_render_backend *be, uint32_t type, uint
         }
         const uint64_t _m1 = ge_prof_now();
         be->draw_model((int)type, mv, (int)decoded, &xs);
-        if (g_prof_on > 0) { const uint64_t _m2 = ge_prof_now(); g_prof_m[0] += _m1 - _m0; g_prof_m[1] += _m2 - _m1; }
+        if (g_prof_on > 0) { const uint64_t _m2 = ge_prof_now(); g_prof_m[PROF_DECODE] += _m1 - _m0; g_prof_m[PROF_APPEND] += _m2 - _m1; }
         g_model_verts += decoded;
         if (decoded <= lead) break;
         done = batch_next(type, done, decoded, lead, count);
@@ -3494,7 +3524,7 @@ static void push_pixel_state_body(void);
 static void push_pixel_state(void) {
     const uint64_t _s0 = ge_prof_now();
     push_pixel_state_body();
-    if (g_prof_on > 0) g_prof_m[2] += ge_prof_now() - _s0;
+    if (g_prof_on > 0) g_prof_m[PROF_PIXEL_STATE] += ge_prof_now() - _s0;
 }
 static void push_pixel_state_body(void) {
     const psp_render_backend *be = psp_render_current();
@@ -3673,7 +3703,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
     const int has_uv = g_ge.tex_enable && g_ge.tex_addr;
     const uint64_t _d1 = ge_prof_now();
     push_texture_state(has_uv);
-    if (g_prof_on > 0) { const uint64_t _d2 = ge_prof_now(); g_prof_m[4] += _d2 - _d1; g_prof_m[6] += _d1 - _d0; }
+    if (g_prof_on > 0) { const uint64_t _d2 = ge_prof_now(); g_prof_m[PROF_TEXTURE] += _d2 - _d1; g_prof_m[PROF_PRELUDE] += _d1 - _d0; }
     if (g_tl.clear_mode) { g_clear_draws++; if (g_tl.clear_z) g_clear_z_draws++; }
     if (VT_THROUGH(g_ge.vtype)) { if (has_uv) g_draw_2d_tex++; else g_draw_2d_flat++; }
     else                        { if (has_uv) g_draw_3d_tex++; else g_draw_3d_flat++; }
@@ -4306,7 +4336,7 @@ static void run_list(ge_queue *q) {
     const uint64_t _r0 = ge_prof_now();
     run_list_body(q);
     q->t_x = g_ge_t;
-    if (g_prof_on > 0) { g_prof_m[3] += ge_prof_now() - _r0; g_prof_lists++; }
+    if (g_prof_on > 0) { g_prof_m[PROF_LIST] += ge_prof_now() - _r0; g_prof_lists++; }
     g_ge_walking = 0;
 }
 /* Set by a save state's load: the backend has not been told the registers.
