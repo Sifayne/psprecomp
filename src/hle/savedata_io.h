@@ -114,11 +114,7 @@ static int sd_copy_tree(const char *src, const char *dst, int depth) {
                 if (fwrite(bytes,1,got,out)!=got) { bad=1; break; }
             if (ferror(in)) bad=1;
             if (fclose(in)) bad=1;
-            if (fflush(out)) bad=1;
-#ifndef _WIN32
-            if (fsync(fileno(out))) bad=1;
-#endif
-            if (fclose(out)) bad=1;
+            if (sd_close_synced(out)) bad=1;
             if (bad) return -1;
         }
     }

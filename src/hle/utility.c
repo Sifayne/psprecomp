@@ -292,6 +292,17 @@ static void sd_make_parents(const char *guest) {
     }
 }
 
+/* Close a file written for a save once it is on the card: flushed, synced
+ * where the host can, closed. -1 if any of that failed. */
+static int sd_close_synced(FILE *f) {
+    int bad = fflush(f) != 0;
+#ifndef _WIN32
+    if (fsync(fileno(f))) bad = 1;
+#endif
+    if (fclose(f)) bad = 1;
+    return bad ? -1 : 0;
+}
+
 static void sd_write_file(const char *guest, uint32_t src, uint32_t cap) {
     sd_make_parents(guest);
     char host[1024];
@@ -301,11 +312,7 @@ static void sd_write_file(const char *guest, uint32_t src, uint32_t cap) {
     FILE *f = fopen(host, "wb");
     if (!f) { sd_io_error = 1; return; }
     if (cap && fwrite(bytes, 1, cap, f) != cap) sd_io_error = 1;
-    if (fflush(f)) sd_io_error = 1;
-#ifndef _WIN32
-    if (fsync(fileno(f))) sd_io_error = 1;
-#endif
-    if (fclose(f)) sd_io_error = 1;
+    if (sd_close_synced(f)) sd_io_error = 1;
 }
 
 /* ---- PARAM.SFO ---------------------------------------------------------
@@ -623,14 +630,9 @@ static void sd_write_sfo(const char *dir, const char *dirname, uint32_t param) {
      * reads DATA.BIN DATA2.BIN PARAM.SFO (saveprobe v2 step 86, fw 6.60). */
     remove(host);
     FILE *f = fopen(host, "wb");
-    if (!f) sd_io_error = 1;
-    else {
-        if (fwrite(buf, 1, SD_SFO_SIZE, f) != SD_SFO_SIZE || fflush(f)) sd_io_error = 1;
-#ifndef _WIN32
-        if (fsync(fileno(f))) sd_io_error = 1;
-#endif
-        if (fclose(f)) sd_io_error = 1;
-    }
+    if (!f) { sd_io_error = 1; return; }
+    if (fwrite(buf, 1, SD_SFO_SIZE, f) != SD_SFO_SIZE) sd_io_error = 1;
+    if (sd_close_synced(f)) sd_io_error = 1;
 }
 
 /* Icon/sound sidecars: ICON0.PNG, ICON1.PMF, PIC1.PNG, SND0.AT3. Written
