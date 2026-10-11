@@ -726,6 +726,45 @@ static int sd_classify(const sd_sfo_state *st, const char *file) {
     return sd_fl_secure(st, file) ? 0 : 1;
 }
 
+/* Free space as msFree and sizeInfo both lay it out: the cluster size, the
+ * free clusters, the free KB, and the KB as a string. */
+static void sd_write_free(uint32_t at, uint32_t freecl, uint64_t freekb) {
+    sd_write_u32(at + 0, SD_CLUSTER);
+    sd_write_u32(at + 4, freecl);
+    sd_write_u32(at + 8, (uint32_t)freekb);
+    sd_kb_str(freekb, at + 12);
+}
+
+/* The space a save takes, as msData and utilityData both lay it out: its
+ * clusters, then the KB they make twice over, each as a number and a
+ * string. */
+static void sd_write_used(uint32_t at, uint32_t cl) {
+    sd_write_u32(at + 0, cl);
+    sd_write_u32(at + 4, cl * 32u);
+    sd_kb_str((uint64_t)cl * 32u, at + 8);
+    sd_write_u32(at + 16, cl * 32u);
+    sd_kb_str((uint64_t)cl * 32u, at + 20);
+}
+
+/* The host's free space under the save directory, in bytes; 0 when it
+ * cannot be measured (statvfs is not on every host). */
+static uint64_t sd_host_free_bytes(void) {
+    uint64_t freebytes = 0;
+#ifndef _WIN32
+    /* Read-only: no mkdir here (unlike the write paths) -- a size query
+     * must not create the tree it measures. Missing tree reads as an
+     * empty card on top of the fallback constants. */
+    char host[1024];
+    psp_io_host_path(SD_ROOT, host, sizeof host);
+    struct statvfs sv;
+    uint64_t sz = 0; int is_dir = 0;
+    if (psp_io_path_info(SD_ROOT, &sz, &is_dir) == 0 && is_dir &&
+        statvfs(host, &sv) == 0)
+        freebytes = (uint64_t)sv.f_bavail * (uint64_t)sv.f_frsize;
+#endif
+    return freebytes;
+}
+
 /* Fill the SIZES-family structs. Free space is the host's (statvfs where
  * available, a big stick otherwise), so free* lines track this machine the
  * way the suite's track a 16GB card -- environmental either way. msData is
@@ -741,29 +780,10 @@ static uint32_t sd_fill_sizes(uint32_t param) {
     uint32_t rc = SD_OK;
     if (!msfree && !msdata && !utild && !sinfo) return rc;
 
-    uint64_t freebytes = 0;
-#ifndef _WIN32
-    {
-        /* Read-only: no mkdir here (unlike the write paths) -- a size query
-         * must not create the tree it measures. Missing tree reads as an
-         * empty card on top of the fallback constants. */
-        char host[1024];
-        psp_io_host_path(SD_ROOT, host, sizeof host);
-        struct statvfs sv;
-        uint64_t sz = 0; int is_dir = 0;
-        if (psp_io_path_info(SD_ROOT, &sz, &is_dir) == 0 && is_dir &&
-            statvfs(host, &sv) == 0)
-            freebytes = (uint64_t)sv.f_bavail * (uint64_t)sv.f_frsize;
-    }
-#endif
+    const uint64_t freebytes = sd_host_free_bytes();
     uint32_t freecl = freebytes ? (uint32_t)(freebytes / SD_CLUSTER) : 0x7FFFFu;
     uint64_t freekb = freebytes ? freebytes / 1024 : 0xFFFFFBu;
-    if (msfree) {
-        sd_write_u32(msfree + 0, 0x8000u);
-        sd_write_u32(msfree + 4, freecl);
-        sd_write_u32(msfree + 8, (uint32_t)freekb);
-        sd_kb_str(freekb, msfree + 12);
-    }
+    if (msfree) sd_write_free(msfree, freecl, freekb);
     /* msData measures one save: its own struct names when set, else the
      * param's (the suite points msData at ABC while asking about ASDF). A
      * missing dir leaves the whole struct alone (not even "0 KB" strings
@@ -780,17 +800,8 @@ static uint32_t sd_fill_sizes(uint32_t param) {
             if (!msave[0]) snprintf(msave, sizeof msave, "%s", save);
         }
         sd_dir(mgame, msave, mdir, sizeof mdir);
-        if (sd_exists(mdir)) {
-            uint64_t bytes = 0;
-            uint32_t cl = sd_dir_clusters(mdir, 1, &bytes);
-            sd_write_u32(msdata + 36, cl);
-            sd_write_u32(msdata + 40, cl * 32u);
-            sd_kb_str((uint64_t)cl * 32u, msdata + 44);
-            sd_write_u32(msdata + 52, cl * 32u);
-            sd_kb_str((uint64_t)cl * 32u, msdata + 56);
-        } else {
-            rc = SD_SIZES_NO_DATA;
-        }
+        if (sd_exists(mdir)) sd_write_used(msdata + 36, sd_dir_clusters(mdir, 1, NULL));
+        else rc = SD_SIZES_NO_DATA;
     }
     /* utilityData is the space the requested save takes, worked out from
      * the request rather than the card: fw 6.60 answered 3 clusters (96 KB)
@@ -811,18 +822,11 @@ static uint32_t sd_fill_sizes(uint32_t param) {
                      sz = psp_read32(param + off + 8);
             if (buf && (sz || bsz)) cl += sd_clusters(sz ? sz : bsz);
         }
-        sd_write_u32(utild + 0, cl);
-        sd_write_u32(utild + 4, cl * 32u);
-        sd_kb_str((uint64_t)cl * 32u, utild + 8);
-        sd_write_u32(utild + 16, cl * 32u);
-        sd_kb_str((uint64_t)cl * 32u, utild + 20);
+        sd_write_used(utild, cl);
     }
     if (sinfo) {
         uint32_t datasz = psp_read32(param + SD_DATASZ);
-        sd_write_u32(sinfo + 16, 0x8000u);
-        sd_write_u32(sinfo + 20, freecl);
-        sd_write_u32(sinfo + 24, (uint32_t)freekb);
-        sd_kb_str(freekb, sinfo + 28);
+        sd_write_free(sinfo + 16, freecl, freekb);
         /* Needed in whole KB for this save; a 16-byte fixture needs none.
          * fw 6.60 answered 0 and '' for both with entries of 32768 and
          * 100000 bytes and dataSize 0 (saveprobe steps 97-98): the entries
