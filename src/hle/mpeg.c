@@ -658,6 +658,17 @@ static int buf_append(uint8_t **buf, size_t *len, size_t *cap, const uint8_t *p,
     *len += n;
     return 0;
 }
+/* An array of `n` elements of `size` bytes with room for one more: as it was
+ * if it has room, else doubled (to `first` when empty); as it was, and still
+ * full, if it cannot grow. */
+static void *grow_for_one(void *arr, size_t n, size_t *cap, size_t first, size_t size) {
+    if (n < *cap) return arr;
+    const size_t want = *cap ? *cap * 2 : first;
+    void *grown = realloc(arr, want * size);
+    if (!grown) return arr;
+    *cap = want;
+    return grown;
+}
 /* A stream nobody registered is never read: kept, it would only pile up. */
 static int unwanted(const mpeg_ctx *c, unsigned id) {
     return c->registered && !(c->registered & (1u << id));
@@ -673,11 +684,7 @@ static int es_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
         n -= k;
     }
     if (n && c->scr_seen && (!c->nvscr || c->vscr[c->nvscr - 1].scr != c->scr_last)) {
-        if (c->nvscr == c->vscr_cap) {
-            const size_t cap = c->vscr_cap ? c->vscr_cap * 2 : 1024;
-            struct mpeg_vscr *grown = (struct mpeg_vscr *)realloc(c->vscr, cap * sizeof *grown);
-            if (grown) { c->vscr = grown; c->vscr_cap = cap; }
-        }
+        c->vscr = grow_for_one(c->vscr, c->nvscr, &c->vscr_cap, 1024, sizeof *c->vscr);
         if (c->nvscr < c->vscr_cap) {
             c->vscr[c->nvscr].es_off = c->es_len;
             c->vscr[c->nvscr].scr = c->scr_last;
@@ -870,11 +877,7 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
                     if (!c->apts_seen) { c->apts0 = pts; c->apts_seen = 1; c->atrac_pts = pts; }
                 } else {
                     c->npes_v_pts++;
-                    if (c->nvpts == c->vpts_cap) {
-                        const size_t cap = c->vpts_cap ? c->vpts_cap * 2 : 4096;
-                        struct mpeg_vpts *nv = (struct mpeg_vpts *)realloc(c->vpts, cap * sizeof *nv);
-                        if (nv) { c->vpts = nv; c->vpts_cap = cap; }
-                    }
+                    c->vpts = grow_for_one(c->vpts, c->nvpts, &c->vpts_cap, 4096, sizeof *c->vpts);
                     if (c->nvpts < c->vpts_cap) {
                         c->vpts[c->nvpts].es_off = c->es_len;
                         c->vpts[c->nvpts].pts    = pts;
@@ -1325,11 +1328,7 @@ static void hle_RingbufferPut(void) {
         }
         ps_demux(context,payload,bytes);
         context->put_total+=bytes;
-        if (context->nputs==context->puts_cap) {
-            size_t capacity=context->puts_cap?context->puts_cap*2:1024;
-            struct mpeg_put *grown=realloc(context->puts,capacity*sizeof *grown);
-            if (grown) { context->puts=grown;context->puts_cap=capacity; }
-        }
+        context->puts=grow_for_one(context->puts,context->nputs,&context->puts_cap,1024,sizeof *context->puts);
         if (context->nputs<context->puts_cap) {
             struct mpeg_put *put=context->puts+context->nputs++;
             put->put_bytes=context->put_total;put->es_len=context->es_len;put->aes_len=context->aes_len;
