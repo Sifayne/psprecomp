@@ -2084,6 +2084,59 @@ static void test_thread_end_waiters(void) {
     psp_threadman_reset();
 }
 
+/* Every thread parked in an object's queue leaves it the moment its wait is
+ * ended from outside (threadprobe step 78) -- the 600th as much as the first.
+ * 600 waiters take nineteen semaphores, at most 32 to a queue. */
+#define PK_WAIT  0x08802800u
+#define PK_MANY  600
+#define PK_SEMAS ((PK_MANY + 31) / 32)
+
+static uint32_t pk_sema[PK_SEMAS], pk_rc[PK_MANY];
+static int      pk_next;
+
+static void body_pk_wait(void) {
+    const int me = pk_next++;
+    pk_rc[me] = call(psp_nid("sceKernelWaitSema"), pk_sema[me / 32], 1, 0, 0);
+}
+
+static uint32_t pk_waiters(uint32_t sema) {
+    psp_write32(TW_INFO, 56);
+    call(psp_nid("sceKernelReferSemaStatus"), sema, TW_INFO, 0, 0);
+    return psp_read32(TW_INFO + 52);
+}
+
+static void test_many_parked_threads(void) {
+    psp_register(PK_WAIT, body_pk_wait);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+
+    for (int i = 0; i < PK_SEMAS; i++)
+        pk_sema[i] = call5(psp_nid("sceKernelCreateSema"), guest_name("pk"), 0, 0, 1, 0);
+    static uint32_t th[PK_MANY];
+    pk_next = 0;
+    for (int i = 0; i < PK_MANY; i++) th[i] = tw_start(PK_WAIT);
+    call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0);
+    CHECK(pk_next == PK_MANY, "%d of %d threads are waiting", pk_next, PK_MANY);
+
+    const uint32_t last = pk_sema[(PK_MANY - 1) / 32];
+    const uint32_t before = pk_waiters(last);
+    CHECK(call(psp_nid("sceKernelReleaseWaitThread"), th[PK_MANY - 1], 0, 0, 0) == 0,
+          "release the last thread to park");
+    CHECK(pk_waiters(last) == before - 1, "its semaphore has %u waiters after the release, %u before",
+          pk_waiters(last), before);
+
+    call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0);
+    CHECK(pk_rc[PK_MANY - 1] == SCE_KERNEL_ERROR_RELEASE_WAIT,
+          "the released thread answered %08X", pk_rc[PK_MANY - 1]);
+
+    for (int i = 0; i < PK_SEMAS; i++) call(psp_nid("sceKernelDeleteSema"), pk_sema[i], 0, 0, 0);
+    CHECK(psp_sched_drain(5) == 0, "every waiter finished");
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
 /* PSPSDK 654ac51, src/audio/pspaudio.h and sceAudio.S supply the public
  * contract and NIDs. These tests assert that contract plus our host queue
  * behavior; undocumented firmware quirks are not used as an oracle. */
@@ -2380,6 +2433,7 @@ int main(void) {
     test_msgpipe_wait_ends_as_it_parks();
     test_stranded_waits();
     test_thread_end_waiters();
+    test_many_parked_threads();
     test_host_work_boundary();
     test_system_params();
 
