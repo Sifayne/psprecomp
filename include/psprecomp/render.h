@@ -436,6 +436,10 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
                           psp_line_pixel_fn emit, void *opaque);
 int psp_render_line_lod16(const psp_tex_state *t,
                           const psp_vertex *a, const psp_vertex *b);
+/* A triangle's level of detail, from the greater of its texture gradients
+ * along x and y; 0 for a triangle with no area. */
+int psp_render_tri_lod16(const psp_tex_state *t, const psp_vertex *a,
+                         const psp_vertex *b, const psp_vertex *c);
 
 /* Add a backend the runtime does not carry. Anything needing a window or a GL
  * context lives in the host -- the core has no external dependencies and SDL2

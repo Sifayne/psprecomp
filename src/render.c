@@ -1048,13 +1048,8 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
     put_pixel(x, y, rgba, stencil);
 }
 
-/* Sample positions per pixel edge. Two is enough to express the pixel centre
- * as an integer -- 2*(x + 0.5) is 2x + 1 -- which is all this needs today.
- *
- * Named rather than written as literal 2s because sub-pixel vertex precision
- * is the same substitution: the hardware rasterizes at sixteenths, so SUBPX 16
- * with positions snapped to 28.4 turns this function into that one without
- * touching its structure. */
+/* Sample positions per pixel edge, the hardware's sixteenths, and a pixel
+ * centre's offset in them. */
 #define SUBPX      PSP_SUBPX
 #define SUBPX_HALF (PSP_SUBPX / 2)
 
@@ -1110,6 +1105,144 @@ static uint32_t plane_chan(int64_t acc) {
     return v < 0 ? 0u : (v > 255 ? 255u : (uint32_t)v);
 }
 
+static int min3(int a, int b, int c) { return a < b ? (a < c ? a : c) : (b < c ? b : c); }
+static int max3(int a, int b, int c) { return a > b ? (a > c ? a : c) : (b > c ? b : c); }
+
+/* A tall triangle's long edge, in aligned groups of four pixels: when 3
+ * times the triangle's height in sixteenths reaches 2^17 (2731 pixels),
+ * the pixel of each group farthest from the inside along that edge takes
+ * the nearest's decision -- the last of the group (x = 3 mod 4) on an
+ * edge with the inside to its left, the first (x = 0 mod 4) with it to
+ * the right -- as if its three steps across had been dropped. geprobe 20
+ * (fw 6.60) scenes 125-127: 660 windows, each crossed by one edge, and
+ * every one of the 241 long edges past that height drawn so, none of the
+ * 419 others; the threshold lies between 130,533 and 131,364. Scene 98's
+ * window 1, the 80 pixels it was off, is such an edge. The copy happens
+ * only where the far pixel's centre plus a sixteenth lies within the
+ * triangle's x extent, min x <= 16 x + 9 <= max x: geprobe 21 scene 128,
+ * 220 windows on edges leaning 0 to 184 pixels, the small leans' far
+ * pixels falling either side of a corner's x -- which also leaves a
+ * vertical edge alone, its far pixels all beyond the extent (scene 98's
+ * window 4, 2981 pixels tall: 136 pixels off when it was not) -- and
+ * geprobe 22 scene 134, far pixels -2 to +2 sixteenths from min and max
+ * x: a centre one sixteenth short of min x copies, one on max x does not.
+ * A triangle level at its top or bottom has two edges of full height, and
+ * only its left one, the inside to its right, takes it, whichever corner
+ * comes first (scenes 129 and 134: 364 windows, the level corners in all
+ * six orders). Coverage only: the pixel's colour and depth are its own.
+ *
+ * Per edge k: the pixel in each group of four that copies (at[k], -1 for
+ * none) and what its edge function is lifted by (lift[k]). */
+typedef struct { int at[3]; int64_t lift[3]; int on; } tall_edge;
+
+static tall_edge tall_edge_quirk(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
+                                 const int64_t dys[3]) {
+    tall_edge q = { { -1, -1, -1 }, { 0, 0, 0 }, 0 };
+    const int64_t ylo = min3(a->y, b->y, c->y), yhi = max3(a->y, b->y, c->y);
+    const int64_t h = yhi - ylo;
+    if (3 * h >= (1 << 17)) {
+        int left = 0;
+        for (int k = 0; k < 3; k++) left |= dys[k] == -h;
+        for (int k = 0; k < 3; k++)
+            if (dys[k] == -h || (dys[k] == h && !left)) {
+                q.at[k] = dys[k] > 0 ? 3 : 0;
+                q.lift[k] = 3 * h * SUBPX;
+            }
+    }
+    q.on = q.at[0] >= 0 || q.at[1] >= 0 || q.at[2] >= 0;
+    return q;
+}
+
+/* The corner every plane starts from: the end of the long edge (top to
+ * bottom) on the long edge's side. With the middle corner left of that edge
+ * the long edge is the right side and the planes start from the rightmost
+ * corner; with it right, from the leftmost; ties to the upper. */
+static int plane_anchor(const psp_vertex *const vs[3]) {
+    int o[3] = { 0, 1, 2 };                           /* by y, then x */
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2 - i; j++) {
+            const psp_vertex *p = vs[o[j]], *q = vs[o[j + 1]];
+            if (p->y > q->y || (p->y == q->y && p->x > q->x)) { const int s = o[j]; o[j] = o[j + 1]; o[j + 1] = s; }
+        }
+    /* Two corners level at the bottom: the left one is the bottom,
+     * as at the top the left one is the top, so a flat-topped or
+     * flat-bottomed triangle starts from its leftmost corner
+     * (geprobe 5 scene 27's flat-bottomed triangle; scenes 46 and 50's
+     * flat-topped ones). */
+    if (vs[o[1]]->y == vs[o[2]]->y) { const int s = o[1]; o[1] = o[2]; o[2] = s; }
+    const psp_vertex *tv = vs[o[0]], *mv = vs[o[1]], *bv = vs[o[2]];
+    const int from_right = (int64_t)(bv->x - tv->x) * (mv->y - tv->y) - (int64_t)(bv->y - tv->y) * (mv->x - tv->x) >= 0;
+    int k0 = -1;
+    for (int k = 0; k < 3; k++)
+        if (k0 < 0 || (from_right ? vs[k]->x > vs[k0]->x : vs[k]->x < vs[k0]->x) ||
+            (vs[k]->x == vs[k0]->x && vs[k]->y < vs[k0]->y))
+            k0 = k;
+    return k0;
+}
+
+/* What every plane of a triangle shares: its corners, the one the planes
+ * start from, 1/area as area_rcp gives it, and the first pixel's centre. */
+typedef struct {
+    const psp_vertex *v[3];
+    int     k0;
+    int64_t rq;
+    int     rsh;
+    int64_t px, py;
+} tri_planes;
+
+/* One plane's value at the first pixel centre and its steps a pixel across
+ * and down, in 1/16384ths. */
+typedef struct { int64_t acc, dx, dy; } plane;
+
+/* The plane through the three corner values val[]: the gradient is the
+ * numerator times area_rcp's 1/area, floored to 1/1024 a pixel, and the
+ * plane starts from corner k0's value. */
+static plane plane_setup(const tri_planes *t, const int64_t val[3]) {
+    const psp_vertex *a = t->v[0], *b = t->v[1], *c = t->v[2], *k = t->v[t->k0];
+    const int64_t nx = (val[1] - val[0]) * (c->y - a->y) - (val[2] - val[0]) * (b->y - a->y);
+    const int64_t ny = (val[2] - val[0]) * (b->x - a->x) - (val[1] - val[0]) * (c->x - a->x);
+    const int64_t gx = floor_shr(nx * t->rq, t->rsh - 14), gy = floor_shr(ny * t->rq, t->rsh - 14);
+    const plane p = { val[t->k0] * 16384 + gx * (t->px - k->x) + gy * (t->py - k->y),
+                      gx * SUBPX, gy * SUBPX };
+    return p;
+}
+
+/* Plane i's corner values: the colour's channels 0-3, the fog coefficient
+ * 4, the secondary colour's channels 5-7. */
+static void plane_values(int i, const psp_vertex *const v[3], int64_t val[3]) {
+    for (int k = 0; k < 3; k++) {
+        if (i == 4)     val[k] = v[k]->fog;
+        else if (i > 4) val[k] = v[k]->spec_set ? chan(v[k]->spec, i - 5) : 0;
+        else            val[k] = chan(v[k]->rgba, i);
+    }
+}
+
+/* col's RGB plus a secondary colour (0xBBGGRR), each channel clamped. */
+static uint32_t add_secondary(uint32_t col, uint32_t spec) {
+    for (int k = 0; k < 3; k++) {
+        const uint32_t s = chan(col, k) + chan(spec, k);
+        col = (col & ~(0xFFu << (8 * k))) | (s > 255 ? 255u : s) << (8 * k);
+    }
+    return col;
+}
+
+/* A pixel's texture coordinates from its exact edge weights w0..w2. They
+ * stay exact until the homogeneous divide: normalizing each one to float
+ * first can put an exact integer UV just below its texel boundary, and
+ * half-pixel aligned UI quads expose that as ragged nearest edges.
+ * Transformed vertices retain reciprocal clip W (and a texture projection
+ * Q), so this is the divide the PSP uses on oblique geometry; through-mode
+ * vertices carry ones and reduce exactly to the affine result. */
+static void tri_uv(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
+                   int64_t w0, int64_t w1, int64_t w2, float *u, float *v) {
+    const double q0 = (double)w0 * a->inv_w;
+    const double q1 = (double)w1 * b->inv_w;
+    const double q2 = (double)w2 * c->inv_w;
+    const double den = q0 * a->tex_q + q1 * b->tex_q + q2 * c->tex_q;
+    *u = den != 0.0 ? (float)((q0 * a->u + q1 * b->u + q2 * c->u) / den) : 0.0f;
+    *v = den != 0.0 ? (float)((q0 * a->v + q1 * b->v + q2 * c->v) / den) : 0.0f;
+}
+
 /* Barycentric fill with integer edge functions, evaluated at pixel centres.
  *
  * Sampling at the pixel *corner* -- which is what this did -- puts the sample
@@ -1131,10 +1264,8 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     /* Positions arrive in 1/16 pixel; the pixel box that can contain a centre
      * inside them is floor(min/16) .. floor((max + 15)/16), and the shifts
      * floor for negatives where a division would not. */
-    int minx = a->x < b->x ? (a->x < c->x ? a->x : c->x) : (b->x < c->x ? b->x : c->x);
-    int maxx = a->x > b->x ? (a->x > c->x ? a->x : c->x) : (b->x > c->x ? b->x : c->x);
-    int miny = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
-    int maxy = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
+    int minx = min3(a->x, b->x, c->x), maxx = max3(a->x, b->x, c->x);
+    int miny = min3(a->y, b->y, c->y), maxy = max3(a->y, b->y, c->y);
     const int64_t xlo = minx, xhi = maxx;
     minx >>= 4; miny >>= 4;
     maxx = (maxx + 15) >> 4; maxy = (maxy + 15) >> 4;
@@ -1171,46 +1302,8 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     const int64_t bias1 = edge_is_top_left(d1x, d1y) ? 0 : -1;
     const int64_t bias2 = edge_is_top_left(d2x, d2y) ? 0 : -1;
 
-    /* A tall triangle's long edge, in aligned groups of four pixels: when 3
-     * times the triangle's height in sixteenths reaches 2^17 (2731 pixels),
-     * the pixel of each group farthest from the inside along that edge takes
-     * the nearest's decision -- the last of the group (x = 3 mod 4) on an
-     * edge with the inside to its left, the first (x = 0 mod 4) with it to
-     * the right -- as if its three steps across had been dropped. geprobe 20
-     * (fw 6.60) scenes 125-127: 660 windows, each crossed by one edge, and
-     * every one of the 241 long edges past that height drawn so, none of the
-     * 419 others; the threshold lies between 130,533 and 131,364. Scene 98's
-     * window 1, the 80 pixels it was off, is such an edge. The copy happens
-     * only where the far pixel's centre plus a sixteenth lies within the
-     * triangle's x extent, min x <= 16 x + 9 <= max x: geprobe 21 scene 128,
-     * 220 windows on edges leaning 0 to 184 pixels, the small leans' far
-     * pixels falling either side of a corner's x -- which also leaves a
-     * vertical edge alone, its far pixels all beyond the extent (scene 98's
-     * window 4, 2981 pixels tall: 136 pixels off when it was not) -- and
-     * geprobe 22 scene 134, far pixels -2 to +2 sixteenths from min and max
-     * x: a centre one sixteenth short of min x copies, one on max x does not.
-     * A triangle level at its top or bottom has two edges of full height, and
-     * only its left one, the inside to its right, takes it, whichever corner
-     * comes first (scenes 129 and 134: 364 windows, the level corners in all
-     * six orders). Coverage only: the pixel's colour and depth are its own. */
-    int64_t far_lift[3] = { 0, 0, 0 };
-    int far_at[3] = { -1, -1, -1 };
-    {
-        const int64_t ylo = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
-        const int64_t yhi = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
-        const int64_t h = yhi - ylo;
-        if (3 * h >= (1 << 17)) {
-            const int64_t dys[3] = { d0y, d1y, d2y };
-            int left = 0;
-            for (int k = 0; k < 3; k++) left |= dys[k] == -h;
-            for (int k = 0; k < 3; k++)
-                if (dys[k] == -h || (dys[k] == h && !left)) {
-                    far_at[k] = dys[k] > 0 ? 3 : 0;
-                    far_lift[k] = 3 * h * SUBPX;
-                }
-        }
-    }
-    const int quirk = far_at[0] >= 0 || far_at[1] >= 0 || far_at[2] >= 0;
+    const int64_t dys[3] = { d0y, d1y, d2y };
+    const tall_edge quirk = tall_edge_quirk(a, b, c, dys);
 
     /* The three edge functions at the centre of the first pixel, in the same
      * 1/16 units the positions came in. They sum to area, so they are the
@@ -1223,7 +1316,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     int64_t row2 = d2x * (py - b->y) - d2y * (px - b->x);
 
     /* Colour is a plane per channel, and not the barycentric blend that
-     * depth and texture coordinates use below: geprobe (fw 6.60) measured
+     * texture coordinates use below: geprobe (fw 6.60) measured
      *
      *     c(px, py) = cA + gx * (px - xA) + gy * (py - yA)
      *
@@ -1238,7 +1331,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * the long edge (top to bottom) on that edge's side -- the rightmost
      * corner when the middle one lies left of the long edge, the leftmost
      * when it lies right, ties to the upper, and of two corners level at
-     * the bottom the left one (see zk0 below). All three corners compete,
+     * the bottom the left one (plane_anchor). All three corners compete,
      * on screen or off and inside the scissor or not. geprobe 14 (fw 6.60)
      * scenes 83-98 settle it: one triangle at 48 orientations, 8 shapes in
      * 6 vertex orders, ties swept through by sixteenths, every sub-pixel
@@ -1267,168 +1360,78 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      *
      * Kept in 1/16384ths of a channel (1/1024 of a step times the 1/16 grid)
      * so every pixel is exact integer arithmetic. */
-    int64_t col_acc[8] = { 0 }, col_dx[8] = { 0 }, col_dy[8] = { 0 };
-    int64_t z_acc = 0, z_dx = 0, z_dy = 0;
+    plane col[8] = { { 0, 0, 0 } };
     const int flat = g_bs.shade_flat;
     const int sec = !flat && (a->spec_set || b->spec_set || c->spec_set);
     const int nplanes = sec ? 8 : 5;
-    {
-        const psp_vertex *vs[3] = { a, b, c };
-        /* Every plane starts from the end of the long edge (top to bottom)
-         * on the long edge's side. With the middle corner left of that edge
-         * the long edge is the right side and the planes start from the
-         * rightmost corner; with it right, from the leftmost. */
-        int z_from_right, zk0 = -1;
-        {
-            int o[3] = { 0, 1, 2 };                           /* by y, then x */
-            for (int i = 0; i < 2; i++)
-                for (int j = 0; j < 2 - i; j++) {
-                    const psp_vertex *p = vs[o[j]], *q = vs[o[j + 1]];
-                    if (p->y > q->y || (p->y == q->y && p->x > q->x)) { const int s = o[j]; o[j] = o[j + 1]; o[j + 1] = s; }
-                }
-            /* Two corners level at the bottom: the left one is the bottom,
-             * as at the top the left one is the top, so a flat-topped or
-             * flat-bottomed triangle starts from its leftmost corner
-             * (geprobe 5 scene 27's flat-bottomed triangle; scenes 46 and 50's
-             * flat-topped ones). */
-            if (vs[o[1]]->y == vs[o[2]]->y) { const int s = o[1]; o[1] = o[2]; o[2] = s; }
-            const psp_vertex *tv = vs[o[0]], *mv = vs[o[1]], *bv = vs[o[2]];
-            z_from_right = (int64_t)(bv->x - tv->x) * (mv->y - tv->y) - (int64_t)(bv->y - tv->y) * (mv->x - tv->x) >= 0;
-        }
-        for (int k = 0; k < 3; k++)
-            if (zk0 < 0 || (z_from_right ? vs[k]->x > vs[zk0]->x : vs[k]->x < vs[zk0]->x) ||
-                (vs[k]->x == vs[zk0]->x && vs[k]->y < vs[zk0]->y))
-                zk0 = k;
-        const int k0 = zk0;
-        int64_t rq; int rsh;
-        area_rcp(area, &rq, &rsh);
-        for (int i = flat ? 4 : 0; i < nplanes; i++) {
-            int64_t c0, c1, c2, ck;
-            if (i == 4) {
-                c0 = a->fog; c1 = b->fog; c2 = c->fog; ck = vs[k0]->fog;
-            } else if (i > 4) {
-                c0 = a->spec_set ? chan(a->spec, i - 5) : 0;
-                c1 = b->spec_set ? chan(b->spec, i - 5) : 0;
-                c2 = c->spec_set ? chan(c->spec, i - 5) : 0;
-                ck = vs[k0]->spec_set ? chan(vs[k0]->spec, i - 5) : 0;
-            } else {
-                c0 = chan(a->rgba, i); c1 = chan(b->rgba, i); c2 = chan(c->rgba, i);
-                ck = chan(vs[k0]->rgba, i);
-            }
-            const int64_t nx = (c1 - c0) * (c->y - a->y) - (c2 - c0) * (b->y - a->y);
-            const int64_t ny = (c2 - c0) * (b->x - a->x) - (c1 - c0) * (c->x - a->x);
-            const int64_t gx = floor_shr(nx * rq, rsh - 14), gy = floor_shr(ny * rq, rsh - 14);
-            col_acc[i] = ck * 16384
-                       + gx * (px - vs[k0]->x) + gy * (py - vs[k0]->y);
-            col_dx[i] = gx * SUBPX;
-            col_dy[i] = gy * SUBPX;
-        }
-        /* Depth is a plane too, in the same 1/16384 units, with the same
-         * gradient: the numerator times area_rcp's 1/area, floored to 1/1024
-         * a pixel. The vertex depths are integers -- through mode's as
-         * given, a transformed vertex's floored from ge_screen_z -- but the
-         * plane starts from its own corner, zk0 above: the end of the long
-         * edge on that edge's side, the rightmost corner when the middle one
-         * lies left of the long edge and the leftmost when it lies right.
-         * geprobe 10 (fw 6.60) scene 57 shows it. It draws scene 48's 48 3D
-         * triangles again in through mode at psprecomp's corners, with the
-         * depth the PSP gives each corner as a point: this rule reproduces
-         * every pixel of all 48, where the colour's leftmost corner fits 28
-         * and no single corner, nor top, bottom, depth or angle, fits more
-         * than 31. With those corner depths scene 48's 3D planes match too,
-         * 47 of 48 (one corner a sixteenth off), so the 3D path is the same.
-         * The right triangles of scenes 27, 46 and 50, which settled the
-         * plane, have their middle corner right of a vertical long edge, so
-         * there the rule is the leftmost, as before; scenes 17 and 36 go to
-         * no pixel off and scene 27 from 1867 to 1290; with geprobe 12's
-         * vertex depths every 3D depth plane matches. Corners outside the
-         * scissor compete too: geprobe 14 scene 97 draws scene 87's
-         * triangles with corner depths, and an anchor among the corners
-         * inside the scissor is 10,584 depth pixels off where this is none. */
-        {
-            int64_t zv[3];
-            for (int k = 0; k < 3; k++) {
-                const float z = vs[k]->z;
-                zv[k] = !(z > 0.0f) ? 0 : (z >= 65535.0f ? 65535 : (int64_t)z);
-            }
-            const int64_t nx = (zv[1] - zv[0]) * (c->y - a->y) - (zv[2] - zv[0]) * (b->y - a->y);
-            const int64_t ny = (zv[2] - zv[0]) * (b->x - a->x) - (zv[1] - zv[0]) * (c->x - a->x);
-            const int64_t gx = floor_shr(nx * rq, rsh - 14), gy = floor_shr(ny * rq, rsh - 14);
-            z_acc = zv[zk0] * 16384 + gx * (px - vs[zk0]->x) + gy * (py - vs[zk0]->y);
-            z_dx = gx * SUBPX;
-            z_dy = gy * SUBPX;
-        }
+    tri_planes tp = { { a, b, c }, 0, 0, 0, px, py };
+    tp.k0 = plane_anchor(tp.v);
+    area_rcp(area, &tp.rq, &tp.rsh);
+    for (int i = flat ? 4 : 0; i < nplanes; i++) {
+        int64_t val[3];
+        plane_values(i, tp.v, val);
+        col[i] = plane_setup(&tp, val);
     }
+    /* Depth is a plane too, in the same 1/16384 units, with the same
+     * gradient: the numerator times area_rcp's 1/area, floored to 1/1024
+     * a pixel. The vertex depths are integers -- through mode's as
+     * given, a transformed vertex's floored from ge_screen_z -- but the
+     * plane starts from its own corner, plane_anchor's: the end of the long
+     * edge on that edge's side, the rightmost corner when the middle one
+     * lies left of the long edge and the leftmost when it lies right.
+     * geprobe 10 (fw 6.60) scene 57 shows it. It draws scene 48's 48 3D
+     * triangles again in through mode at psprecomp's corners, with the
+     * depth the PSP gives each corner as a point: this rule reproduces
+     * every pixel of all 48, where the colour's leftmost corner fits 28
+     * and no single corner, nor top, bottom, depth or angle, fits more
+     * than 31. With those corner depths scene 48's 3D planes match too,
+     * 47 of 48 (one corner a sixteenth off), so the 3D path is the same.
+     * The right triangles of scenes 27, 46 and 50, which settled the
+     * plane, have their middle corner right of a vertical long edge, so
+     * there the rule is the leftmost, as before; scenes 17 and 36 go to
+     * no pixel off and scene 27 from 1867 to 1290; with geprobe 12's
+     * vertex depths every 3D depth plane matches. Corners outside the
+     * scissor compete too: geprobe 14 scene 97 draws scene 87's
+     * triangles with corner depths, and an anchor among the corners
+     * inside the scissor is 10,584 depth pixels off where this is none. */
+    const int64_t zv[3] = { depth_value(a->z), depth_value(b->z), depth_value(c->z) };
+    plane depth = plane_setup(&tp, zv);
 
-    /* The edge functions are already the barycentric numerators, so texture
+    /* The edge functions are the barycentric numerators, so texture
      * coordinates come out of the same three values the coverage test
-     * computes.
-     *
-     * Texture coordinates
-     * are not: transformed vertices retain reciprocal clip W (and a texture
-     * projection Q), so the textured branch below performs the homogeneous
-     * divide the PSP uses on oblique geometry. Through-mode vertices carry
-     * ones and reduce exactly to the old affine result. */
-    const float inv = 1.0f / (float)area;
+     * computes (tri_uv). */
     const int textured = texture_usable();
-    int lod16 = 0;
-    if (textured) {
-        /* The texture gradient across the triangle: solve the affine map from
-         * pixels to texels on the two edges from a. */
-        const float e1x = (float)(b->x - a->x) / 16.0f, e1y = (float)(b->y - a->y) / 16.0f;
-        const float e2x = (float)(c->x - a->x) / 16.0f, e2y = (float)(c->y - a->y) / 16.0f;
-        const float det = e1x * e2y - e1y * e2x;
-        if (det != 0.0f) {
-            const float du1 = b->u - a->u, du2 = c->u - a->u, dv1 = b->v - a->v, dv2 = c->v - a->v;
-            const float dudx = (du1 * e2y - du2 * e1y) / det, dudy = (du2 * e1x - du1 * e2x) / det;
-            const float dvdx = (dv1 * e2y - dv2 * e1y) / det, dvdy = (dv2 * e1x - dv1 * e2x) / det;
-            const float rx = sqrtf(dudx * dudx + dvdx * dvdx), ry = sqrtf(dudy * dudy + dvdy * dvdy);
-            const float w = (psp_render_vertex_w(a) + psp_render_vertex_w(b) + psp_render_vertex_w(c)) / 3.0f;
-            lod16 = psp_render_lod16(&g_tex, rx > ry ? rx : ry, w);
-        }
-    }
+    const int lod16 = textured ? psp_render_tri_lod16(&g_tex, a, b, c) : 0;
 
     for (int y = miny; y <= maxy; y++) {
         int64_t w0 = row0, w1 = row1, w2 = row2;
         int64_t acc[8];
-        for (int i = 0; i < nplanes; i++) acc[i] = col_acc[i];
-        int64_t zacc = z_acc;
+        for (int i = 0; i < nplanes; i++) acc[i] = col[i].acc;
+        int64_t zacc = depth.acc;
         for (int x = minx; x <= maxx; x++) {
             int64_t t0 = w0, t1 = w1, t2 = w2;
-            if (quirk) {
+            if (quirk.on) {
                 const int64_t xc = (int64_t)SUBPX * x + SUBPX_HALF + 1;
                 if (xc >= xlo && xc <= xhi) {
-                    if ((x & 3) == far_at[0]) t0 += far_lift[0];
-                    if ((x & 3) == far_at[1]) t1 += far_lift[1];
-                    if ((x & 3) == far_at[2]) t2 += far_lift[2];
+                    if ((x & 3) == quirk.at[0]) t0 += quirk.lift[0];
+                    if ((x & 3) == quirk.at[1]) t1 += quirk.lift[1];
+                    if ((x & 3) == quirk.at[2]) t2 += quirk.lift[2];
                 }
             }
             if (t0 + bias0 >= 0 && t1 + bias1 >= 0 && t2 + bias2 >= 0) {
-                const float l0 = (float)w0 * inv;
-                const float l1 = (float)w1 * inv;
-                const float l2 = (float)w2 * inv;
-
                 const int64_t zi = zacc >> 14;
                 const float z = zi < 0 ? 0.0f : (zi > 65535 ? 65535.0f : (float)zi);
 
                 const int fg = (int)plane_chan(acc[4]);
 
-                uint32_t col = last_rgba;
+                uint32_t rgba = last_rgba;
                 if (!flat)
-                    col = plane_chan(acc[0]) | plane_chan(acc[1]) << 8 |
-                          plane_chan(acc[2]) << 16 | plane_chan(acc[3]) << 24;
+                    rgba = plane_chan(acc[0]) | plane_chan(acc[1]) << 8 |
+                           plane_chan(acc[2]) << 16 | plane_chan(acc[3]) << 24;
 
                 if (textured) {
-                    /* Keep exact edge weights until the homogeneous divide.
-                     * Normalizing each one to float first can put an exact
-                     * integer UV just below its texel boundary. Half-pixel
-                     * aligned UI quads expose this as ragged nearest edges. */
-                    const double q0 = (double)w0 * a->inv_w;
-                    const double q1 = (double)w1 * b->inv_w;
-                    const double q2 = (double)w2 * c->inv_w;
-                    const double den = q0 * a->tex_q + q1 * b->tex_q + q2 * c->tex_q;
-                    const float u = den != 0.0 ? (float)((q0 * a->u + q1 * b->u + q2 * c->u) / den) : 0.0f;
-                    const float v = den != 0.0 ? (float)((q0 * a->v + q1 * b->v + q2 * c->v) / den) : 0.0f;
+                    float u, v;
+                    tri_uv(a, b, c, w0, w1, w2, &u, &v);
                     const uint32_t texel = sample_mip(u, v, lod16);
                     /* The watched pixel's two inputs, separately: which of the
                      * texel and the shaded vertex colour is the dark one is
@@ -1436,29 +1439,27 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                     if (x == g_pw_x && y == g_pw_y)
                         fprintf(stderr, "pixsrc: (%d,%d) vcol %08X texel %08X uv %.1f,%.1f "
                                         "func %d tcc %d tex %08X %dx%d fmt %d lod %d\n",
-                                x, y, col, texel, (double)u, (double)v, g_tex.func,
+                                x, y, rgba, texel, (double)u, (double)v, g_tex.func,
                                 g_tex.tcc_rgba, g_tex.addr, g_tex.w, g_tex.h, g_tex.fmt, lod16);
-                    col = apply_texfunc(texel, col);
+                    rgba = apply_texfunc(texel, rgba);
                     g_px_tex++;
                 } else g_px_flat++;
                 /* After the texture function, which is what the mode is for:
                  * geprobe 14 scene 95's secondary-alone row draws through a
                  * black REPLACE texture and reads the secondary colour. */
                 if (sec)
-                    for (int k = 0; k < 3; k++) {
-                        const uint32_t v = chan(col, k) + plane_chan(acc[5 + k]);
-                        col = (col & ~(0xFFu << (8 * k))) | (v > 255 ? 255u : v) << (8 * k);
-                    }
-                col = apply_fog(col, fg);
-                shade_pixel(x, y, z, col);
+                    rgba = add_secondary(rgba, plane_chan(acc[5]) | plane_chan(acc[6]) << 8 |
+                                               plane_chan(acc[7]) << 16);
+                rgba = apply_fog(rgba, fg);
+                shade_pixel(x, y, z, rgba);
             }
             w0 -= d0y * SUBPX; w1 -= d1y * SUBPX; w2 -= d2y * SUBPX;
-            for (int i = 0; i < nplanes; i++) acc[i] += col_dx[i];
-            zacc += z_dx;
+            for (int i = 0; i < nplanes; i++) acc[i] += col[i].dx;
+            zacc += depth.dx;
         }
         row0 += d0x * SUBPX; row1 += d1x * SUBPX; row2 += d2x * SUBPX;
-        for (int i = 0; i < nplanes; i++) col_acc[i] += col_dy[i];
-        z_acc += z_dy;
+        for (int i = 0; i < nplanes; i++) col[i].acc += col[i].dy;
+        depth.acc += depth.dy;
     }
 }
 
@@ -1700,8 +1701,7 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
             const int64_t sb = b->spec_set ? chan(b->spec, c) : 0;
             sg[c] = floor_shr((sb - sv[c]) * 16384 * lq, lsh);
         }
-    const int64_t za = !(a->z > 0.0f) ? 0 : (a->z >= 65535.0f ? 65535 : (int64_t)a->z);
-    const int64_t zb = !(b->z > 0.0f) ? 0 : (b->z >= 65535.0f ? 65535 : (int64_t)b->z);
+    const int64_t za = depth_value(a->z), zb = depth_value(b->z);
     const int64_t zg = floor_shr((zb - za) * 16384 * lq, lsh);
     /* Texture coordinates at the same point. Unprojected (through
      * mode), the texture coordinates go by a fixed step, texels a sixteenth,
@@ -1744,6 +1744,22 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
     }
 }
 
+int psp_render_tri_lod16(const psp_tex_state *t, const psp_vertex *a,
+                         const psp_vertex *b, const psp_vertex *c) {
+    /* The texture gradient across the triangle: solve the affine map from
+     * pixels to texels on the two edges from a. */
+    const float e1x = (float)(b->x - a->x) / 16.0f, e1y = (float)(b->y - a->y) / 16.0f;
+    const float e2x = (float)(c->x - a->x) / 16.0f, e2y = (float)(c->y - a->y) / 16.0f;
+    const float det = e1x * e2y - e1y * e2x;
+    if (det == 0.0f) return 0;
+    const float du1 = b->u - a->u, du2 = c->u - a->u, dv1 = b->v - a->v, dv2 = c->v - a->v;
+    const float dudx = (du1 * e2y - du2 * e1y) / det, dudy = (du2 * e1x - du1 * e2x) / det;
+    const float dvdx = (dv1 * e2y - dv2 * e1y) / det, dvdy = (dv2 * e1x - dv1 * e2x) / det;
+    const float rx = sqrtf(dudx * dudx + dvdx * dvdx), ry = sqrtf(dudy * dudy + dvdy * dvdy);
+    const float w = (psp_render_vertex_w(a) + psp_render_vertex_w(b) + psp_render_vertex_w(c)) / 3.0f;
+    return psp_render_lod16(t, rx > ry ? rx : ry, w);
+}
+
 int psp_render_line_lod16(const psp_tex_state *t,
                           const psp_vertex *a, const psp_vertex *b) {
     const float dx = fabsf((float)b->x - (float)a->x) / PSP_SUBPX;
@@ -1767,11 +1783,7 @@ static void sw_point_sample(const psp_vertex *v, void *opaque) {
      * triangle's does: geprobe 14 (fw 6.60) scene 95's corner points read
      * primary plus secondary, and through a black REPLACE texture the
      * secondary alone. */
-    if (v->spec_set)
-        for (int k = 0; k < 3; k++) {
-            const uint32_t s = chan(col, k) + chan(v->spec, k);
-            col = (col & ~(0xFFu << (8 * k))) | (s > 255 ? 255u : s) << (8 * k);
-        }
+    if (v->spec_set) col = add_secondary(col, v->spec);
     shade_pixel(x, y, v->z, apply_fog(col, v->fog));
 }
 

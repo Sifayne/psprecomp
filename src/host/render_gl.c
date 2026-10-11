@@ -2730,23 +2730,7 @@ static void push(const psp_vertex *v, int lod16) {
  * once for the primitive and quantised to a sixteenth before adding its bias. */
 static int triangle_lod16(const psp_vertex *a, const psp_vertex *b,
                           const psp_vertex *c) {
-    if (!g.tex_enable) return 0;
-    const float e1x = (float)(b->x - a->x) / 16.0f;
-    const float e1y = (float)(b->y - a->y) / 16.0f;
-    const float e2x = (float)(c->x - a->x) / 16.0f;
-    const float e2y = (float)(c->y - a->y) / 16.0f;
-    const float det = e1x * e2y - e1y * e2x;
-    if (det == 0.0f) return 0;
-    const float du1 = b->u - a->u, du2 = c->u - a->u;
-    const float dv1 = b->v - a->v, dv2 = c->v - a->v;
-    const float dudx = (du1 * e2y - du2 * e1y) / det;
-    const float dudy = (du2 * e1x - du1 * e2x) / det;
-    const float dvdx = (dv1 * e2y - dv2 * e1y) / det;
-    const float dvdy = (dv2 * e1x - dv1 * e2x) / det;
-    const float rx = sqrtf(dudx * dudx + dvdx * dvdx);
-    const float ry = sqrtf(dudy * dudy + dvdy * dvdy);
-    const float w = (psp_render_vertex_w(a) + psp_render_vertex_w(b) + psp_render_vertex_w(c)) / 3.0f;
-    return psp_render_lod16(&g.tex, rx > ry ? rx : ry, w);
+    return g.tex_enable ? psp_render_tri_lod16(&g.tex, a, b, c) : 0;
 }
 
 static void push_triangle(const psp_vertex *a, const psp_vertex *b,
