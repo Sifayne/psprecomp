@@ -218,8 +218,11 @@ static void watch_hit(uint32_t addr) {
         for (int j = 0; j < 3; j++) {
             const uint32_t m = ms[j];
             /* Module data as well as the heap: a static matrix buffer lives
-             * in the loaded image, and excluding it printed nothing at all. */
-            if (m <= 0x1000u || m + 64 >= PSP_RAM_BASE + PSP_RAM_SIZE) continue;
+             * in the loaded image, and excluding it printed nothing at all.
+             * Only where all 64 bytes are mapped, though: a read anywhere
+             * else counts as a bad access, and those decide the run's exit
+             * status. Small numbers are not pointers. */
+            if (m <= 0x1000u || psp_mem_mapped_span(m) < 64) continue;
             fprintf(stderr, "         [%s as 4x4]", mn[j]);
             for (int i = 0; i < 16; i++) {
                 union { uint32_t u; float f; } c; c.u = psp_read32(m + (uint32_t)i * 4);
