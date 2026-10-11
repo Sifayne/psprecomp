@@ -1488,6 +1488,12 @@ static target_map target_mapping(const rendertarget *r) {
     return m;
 }
 
+/* One past the last guest byte target r covers, rows of its stride down to
+ * its guest height. */
+static uint64_t rt_end(const rendertarget *r) {
+    return (uint64_t)r->addr + (uint64_t)r->stride * r->guest_h * psp_pixel_bytes(r->fmt);
+}
+
 /* Channel i (0 red) of a 0xAABBGGRR colour, as 0..1. */
 static float channel01(uint32_t c, int i) { return (float)((c >> (8 * i)) & 0xFF) / 255.0f; }
 
@@ -1562,7 +1568,7 @@ static void rt_watch_writes(void) {
     for (int i = 0; i < g.n_rts; i++) {
         const rendertarget *r = &g.rts[i];
         if (!r->configured) continue;
-        const uint64_t end = (uint64_t)r->addr + (uint64_t)r->stride * r->guest_h * (r->fmt == 3 ? 4 : 2);
+        const uint64_t end = rt_end(r);
         if (r->addr < lo) lo = r->addr;
         if (end > hi) hi = end;
     }
@@ -1593,7 +1599,7 @@ static uint32_t pack_pixel(uint32_t rgba, int fmt) {
 
 static uint32_t guest_pixel(const rendertarget *r, int x, int y) {
     if (x >= (int)r->stride) return 0;
-    const int bpp = r->fmt == 3 ? 4 : 2;
+    const int bpp = psp_pixel_bytes(r->fmt);
     const void *p = psp_mem_ptr(r->addr + (uint32_t)(y * r->stride + x) * bpp, bpp);
     uint32_t v = 0;
     if (p) memcpy(&v, p, bpp);
@@ -1606,7 +1612,7 @@ static void rt_guest_write(uint32_t addr, uint32_t size) {
     for (int i = 0; i < g.n_rts; i++) {
         rendertarget *r = &g.rts[i];
         if (!r->configured || !r->cpu_dirty || g.exporting == i + 1) continue;
-        const unsigned bpp = r->fmt == 3 ? 4 : 2;
+        const unsigned bpp = (unsigned)psp_pixel_bytes(r->fmt);
         const uint64_t end = (uint64_t)r->addr + (uint64_t)r->stride * r->guest_h * bpp;
         if ((uint64_t)addr + size <= r->addr || addr >= end) continue;
         /* A readback of this target still in flight has already landed: the
@@ -1712,7 +1718,7 @@ static int rt_min_rows(int stride, int h) {
 }
 
 static int rt_rows_before_next(int i, uint32_t addr, int stride, int fmt, int h) {
-    const uint64_t row = (uint64_t)stride * (fmt == 3 ? 4u : 2u);
+    const uint64_t row = (uint64_t)stride * (uint64_t)psp_pixel_bytes(fmt);
     if (!row) return h;
     const int least = rt_min_rows(stride, h);
     for (int k = 0; k < g.n_rts; k++) {
@@ -1742,7 +1748,7 @@ static void rt_yield_to(int i) {
     for (int k = 0; k < g.n_rts; k++) {
         const rendertarget *o = &g.rts[k];
         if (k == i || !o->configured || o->addr >= start) continue;
-        const uint64_t row = (uint64_t)o->stride * (o->fmt == 3 ? 4u : 2u);
+        const uint64_t row = (uint64_t)o->stride * (uint64_t)psp_pixel_bytes(o->fmt);
         if (!row || (uint64_t)o->addr + row * (uint64_t)o->guest_h <= start) continue;
         const int rows = (int)((start - o->addr) / row);
         if (rows >= rt_min_rows((int)o->stride, o->guest_h))
@@ -1824,7 +1830,7 @@ static void rt_import(rendertarget *r) {
             if (right > r->w) right = r->w;
             if (gy1 > r->h) gy1 = r->h;
             if (right <= left || gy1 <= gy0) continue;
-            const int bpp = r->fmt == 3 ? 4 : 2;
+            const int bpp = psp_pixel_bytes(r->fmt);
             const unsigned full = (1u << bpp) - 1;
             int partial = 0;
             for (int gx = start; gx < x; gx++) {
@@ -2084,7 +2090,7 @@ static int claim(void) {
     rt_watch_writes();
     /* Whatever the GE last named, or the primary display buffer if it has not
      * named one yet -- a target has to exist before the first draw. */
-    g.cur_rt = rt_for(g.target_addr ? g.target_addr : 0x04000000u);
+    g.cur_rt = rt_for(g.target_addr ? g.target_addr : PSP_VRAM_BASE);
     return 0;
 }
 
@@ -2236,7 +2242,7 @@ static uint64_t range_generation_excluding_rts(uint32_t addr, uint32_t size, uin
     for (int i = 0; i < g.n_rts; i++) {
         rendertarget *r = &g.rts[i];
         if (!r->configured || !(supplied & (1u << i))) continue;
-        const uint64_t ra = r->addr, rb = (uint64_t)r->addr + (uint64_t)r->stride * r->guest_h * (r->fmt == 3 ? 4 : 2);
+        const uint64_t ra = r->addr, rb = rt_end(r);
         for (int k = 0; k < n; k++) {
             const uint64_t a = pieces[k][0], b = pieces[k][1];
             if (rb <= a || ra >= b) continue;
@@ -2265,7 +2271,7 @@ static uint64_t texture_generation(const psp_tex_state *t, int top, uint32_t sup
          * applied before ORing it. Tracking through their greatest possible
          * index covers every palette read without knowing the texel values. */
         const uint32_t entries = (uint32_t)(g.clut_start | g.clut_mask) + 1u;
-        const uint32_t bytes = entries * (g.clut_fmt == 3 ? 4u : 2u);
+        const uint32_t bytes = entries * (uint32_t)psp_pixel_bytes(g.clut_fmt);
         const uint64_t gen = range_generation_excluding_rts(g.clut_addr, bytes, 0);
         if (gen > newest) newest = gen;
     }
@@ -2353,7 +2359,7 @@ static int texcache_refresh_rows(texcache_entry *e, const psp_tex_state *t, uint
                                  uint64_t generation) {
     if (texture_top(t) != 0 || e->uploaded_top != 0 || t->swizzled || t->fmt > 3 || !e->tex) return 0;
     if (t->w <= 0 || t->h <= 0) return 0;
-    const int bpp = t->fmt == 3 ? 4 : 2;
+    const int bpp = psp_pixel_bytes(t->fmt);
     const uint32_t row_bytes = (uint32_t)t->stride * (uint32_t)bpp;
     if (!row_bytes || (size_t)t->w * (size_t)t->h > TEXEL_CAP) return 0;
     const uint32_t base = level_addr(t, 0);
@@ -2459,7 +2465,7 @@ static GLuint texcache_native(const psp_tex_state *t, uint32_t supplied) {
      * let VRAM use the same cache while preserving the in-place update. */
     int in_vram = 0;
     for (int level = 0; level <= top; level++)
-        if ((level_addr(t, level) & 0xFF000000u) == 0x04000000u)
+        if ((level_addr(t, level) & 0xFF000000u) == PSP_VRAM_BASE)
             in_vram = 1;
 
     const uint64_t memory_serial = psp_mem_write_serial();
@@ -2574,8 +2580,7 @@ static GLuint texcache_get(const psp_tex_state *t) {
      * at native -- is left to it, and samples the attachment itself. */
     for (int i = 0; i < g.n_rts; i++) {
             rendertarget *r = &g.rts[i];
-            const uint64_t re =
-                (uint64_t)r->addr + (uint64_t)r->stride * r->guest_h * (r->fmt == 3 ? 4 : 2);
+            const uint64_t re = rt_end(r);
             if (!r->configured || base >= re || end <= r->addr) continue;
             const int exact_alias = !g.resolution && r->addr == base && r->fmt == 3 && t->fmt == 3 &&
                                     !t->swizzled && t->stride == r->stride && t->w == r->w &&
@@ -2977,8 +2982,7 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
             const uint32_t tex_addr = g.tex.addr & PSP_ADDR_MASK;
             for (int i = 0; by_source && g.tex_enable && i < g.n_rts; i++) {
                 const rendertarget *source = &g.rts[i];
-                const uint64_t end = (uint64_t)source->addr + (uint64_t)source->stride * source->guest_h *
-                                     (source->fmt == 3 ? 4 : 2);
+                const uint64_t end = rt_end(source);
                 /* A palette may reinterpret each rendered pixel without
                  * changing its location: The 3rd Birthday's 128x64 bloom is
                  * drawn as 4444, then composited through CLUT16. Match those
@@ -3604,7 +3608,7 @@ static int stage_prepare(int w, int h) {
  * target about to be sampled as a texture, or shutdown -- completes what is
  * pending for it first, so an older frame never lands after a newer one. */
 static void readback_copy(rendertarget *r, const uint8_t *pixels, int rw, int rh, int i) {
-    const int bpp = r->fmt == 3 ? 4 : 2;
+    const int bpp = psp_pixel_bytes(r->fmt);
     const size_t bytes = (size_t)r->stride * (size_t)r->guest_h * (size_t)bpp;
     void *dst = psp_mem_ptr(r->addr, bytes);
     if (!dst) return;
@@ -3676,7 +3680,7 @@ static void rt_guest_access(uint32_t addr, uint32_t size) {
     for (int k = 0; k < RB_SLOTS; k++) {
         if (!g_rb.pend[k].valid) continue;
         const rendertarget *r = &g.rts[g_rb.pend[k].rt];
-        const uint64_t end = (uint64_t)r->addr + (uint64_t)r->stride * r->guest_h * (r->fmt == 3 ? 4 : 2);
+        const uint64_t end = rt_end(r);
         if ((uint64_t)addr + size <= r->addr || addr >= end) continue;
         g_rb.demanded++;
         readback_complete(g_rb.pend[k].rt);
@@ -3689,7 +3693,7 @@ static void readback_watch(void) {
     for (int k = 0; k < RB_SLOTS; k++) {
         if (!g_rb.pend[k].valid) continue;
         const rendertarget *r = &g.rts[g_rb.pend[k].rt];
-        const uint64_t end = (uint64_t)r->addr + (uint64_t)r->stride * r->guest_h * (r->fmt == 3 ? 4 : 2);
+        const uint64_t end = rt_end(r);
         if (r->addr < lo) lo = r->addr;
         if (end > hi) hi = end;
     }
