@@ -170,7 +170,7 @@ static void savedata_log_result(uint32_t param) {
 #define SD_LOAD_ACCESS     0x80110305u   /* LOAD_ACCESS_ERROR: read failed */
 #define SD_SAVE_ACCESS     0x80110385u   /* SAVE_ACCESS_ERROR: write, list */
 #define SD_DELETE_ACCESS   0x80110345u   /* DELETE_ACCESS_ERROR */
-#define SD_ERASE_ACCESS    0x80110325u   /* RW_ACCESS_ERROR */
+#define SD_RW_ACCESS       0x80110325u   /* RW_ACCESS_ERROR */
 /* The two common-utility codes: a rejected parameter block
  * (INVALID_PARAM_SIZE), and a utility already running (INVALID_STATUS). */
 #define SD_BAD_PARAM       0x80110004u
@@ -1078,7 +1078,7 @@ static uint32_t sd_do_mode(uint32_t param) {
         if (!sd_has_data(dir)) return SD_RW_FILE;
         const char *df = file[0] ? file : "DATA.BIN";
         snprintf(guest, sizeof guest, "%s/%s", dir, df);
-        if (sd_exists(guest) && sd_remove_tree(guest,0)) return SD_ERASE_ACCESS;
+        if (sd_exists(guest) && sd_remove_tree(guest,0)) return SD_RW_ACCESS;
         return SD_OK;
     }
 
@@ -1113,7 +1113,7 @@ static uint32_t sd_do_mode(uint32_t param) {
         if (secmode && st.params[0] && sd_key_refused(param, &st, file)) return SD_RW_BROKEN;
         if (buf && bufsz) {
             int64_t n = sd_read_file(guest, buf, bufsz);
-            if (n<0) return SD_ERASE_ACCESS;
+            if (n<0) return SD_RW_ACCESS;
             psp_write32(param + SD_DATASZ, (uint32_t)n);
         } else {
             psp_write32(param + SD_DATASZ, (uint32_t)sd_fsize(guest));
@@ -1128,7 +1128,7 @@ static uint32_t sd_do_mode(uint32_t param) {
         if (!sd_exists(dir)) return SD_RW_NO_DATA;
         snprintf(guest, sizeof guest, "%s/%s", dir, file);
         sd_write_file(guest,buf,datasz);
-        if (sd_io_error) return SD_ERASE_ACCESS;
+        if (sd_io_error) return SD_RW_ACCESS;
         /* PARAM.SFO is rewritten too, with the file's class: DSEC's SFO
          * changed between its MAKEDATASECURE and its WRITEDATASECURE
          * (saveprobe steps 37-38, CRC CC490645 -> 03F941FA). A second
@@ -1136,7 +1136,7 @@ static uint32_t sd_do_mode(uint32_t param) {
          * file as it was: TWO's list reads DATA.BIN DATA2.BIN, DATA.BIN
          * keeps its CRC, and both read back (steps 85-89). */
         sd_write_sfo(dir, dir + strlen(SD_ROOT "/"), param);
-        return sd_io_error ? SD_ERASE_ACCESS : SD_OK;
+        return sd_io_error ? SD_RW_ACCESS : SD_OK;
 
     case SD_SIZES: return sd_fill_sizes(param);
     case SD_GETSIZE:
