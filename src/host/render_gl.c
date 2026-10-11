@@ -386,6 +386,7 @@ typedef struct {
     GLint fogenable, fogcolour;
     GLint texscale, bloom;
     GLint snap, snaph;
+    GLint flat;
 } uniforms;
 /* The std140 block both model shaders read (Xform), laid out by hand: every
  * member is a vec4 / ivec4 / mat4 so the C offsets are the GLSL ones. */
@@ -905,6 +906,7 @@ static const char *GS_MODEL_SRC =
     "layout(std140) uniform Xform { XformBlock xb[16]; };\n"
     "#define X xb[v[0].draw]\n"
     "uniform int u_texenable;\n"
+    "uniform int u_flat;\n"
     "uniform vec2 u_viewport; uniform vec4 u_placement; uniform float u_ybias;\n"
     "out vec4 v_col;\n"
     "noperspective out vec3 v_uvq;\n"
@@ -991,6 +993,7 @@ static const char *GS_MODEL_SRC =
     "/* emit_tri, ge.c, for one triangle of the batch. */\n"
     "void main() {\n"
     "    CV tri[3]; tri[0] = cv_of(0); tri[1] = cv_of(1); tri[2] = cv_of(2);\n"
+    "    if (u_flat != 0) { tri[0].col = tri[2].col; tri[1].col = tri[2].col; }\n"
     "    int behind = 0;\n"
     "    for (int i = 0; i < 3; i++) if (tri[i].c.w <= 0.0) behind++;\n"
     "    if (behind == 3) return;\n"
@@ -1366,7 +1369,7 @@ static void lookup_uniforms(GLuint prog, uniforms *u) {
     U(env, "u_env"); U(tex, "u_tex"); U(texscale, "u_texscale"); U(bloom, "u_bloom");
     U(minfilter, "u_minfilter"); U(magfilter, "u_magfilter"); U(wraps, "u_wraps"); U(wrapt, "u_wrapt");
     U(miptop, "u_miptop"); U(fogenable, "u_fogenable"); U(fogcolour, "u_fogcolour");
-    U(snap, "u_snap"); U(snaph, "u_snaph");
+    U(snap, "u_snap"); U(snaph, "u_snaph"); U(flat, "u_flat");
 #undef U
 }
 static void use_program(GLuint prog, uniforms *u) { p_glUseProgram(prog); g.cur_prog = prog; g.u = u; }
@@ -2790,11 +2793,15 @@ static int triangle_lod16(const psp_vertex *a, const psp_vertex *b,
     return g.tex_enable ? psp_render_tri_lod16(&g.tex, a, b, c) : 0;
 }
 
+/* Flat shading (SHADE clear) makes the triangle its last vertex's colour,
+ * c as gl_draw passes it, the rule render.c's sw_tri keeps. */
 static void push_triangle(const psp_vertex *a, const psp_vertex *b,
                           const psp_vertex *c) {
     const int lod16 = triangle_lod16(a, b, c);
     reserve_vertices(3);
-    push(a, lod16); push(b, lod16); push(c, lod16);
+    psp_vertex fa = *a, fb = *b;
+    if (g.bs.shade_flat) fa.rgba = fb.rgba = c->rgba;
+    push(&fa, lod16); push(&fb, lod16); push(c, lod16);
 }
 
 /* A sprite is two triangles from opposite corners, axis-aligned, taking its
@@ -3199,7 +3206,11 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
         const int y1 = reach_y ? g.h - 1 + reach_y : g.sc_valid && g.sc_y1 < r->guest_h - 1 ? g.sc_y1 : r->guest_h - 1;
         for (int i = 0; i + 1 < count; i += prim == PSP_PRIM_LINES ? 2 : 1) {
             int lod16 = psp_render_line_lod16(&g.tex, &v[i], &v[i + 1]);
-            psp_render_walk_line(&v[i], &v[i + 1], x0, y0, x1, y1, push_point_sample, &lod16);
+            /* A flat-shaded line is its second vertex's colour throughout,
+             * as in render.c. */
+            psp_vertex fa = v[i];
+            if (g.bs.shade_flat) fa.rgba = v[i + 1].rgba;
+            psp_render_walk_line(&fa, &v[i + 1], x0, y0, x1, y1, push_point_sample, &lod16);
         }
         break;
     }
@@ -3487,7 +3498,7 @@ static void apply_blend(void) {
                   double_alpha ? 3 : preblend_src ? (g.bs.dst == PSP_BF_ONE_MINUS_SRC_ALPHA ? 2 : 1) : 0);
 }
 
-/* The shader's texture, fog and alpha-test uniforms. */
+/* The shader's texture, fog, shading and alpha-test uniforms. */
 static void apply_uniforms(void) {
     p_glUniform1i(g.u->texenable, g.tex_enable ? 1 : 0);
     p_glUniform1i(g.u->texfunc, g.tex.func);
@@ -3516,6 +3527,8 @@ static void apply_uniforms(void) {
     p_glUniform1i(g.u->fogenable, g.fog_enable ? 1 : 0);
     p_glUniform3f(g.u->fogcolour, channel01(g.fog_colour, 0), channel01(g.fog_colour, 1),
                   channel01(g.fog_colour, 2));
+    /* The model path's only: the CPU path's vertices are flattened in C. */
+    p_glUniform1i(g.u->flat, g.bs.shade_flat ? 1 : 0);
 
     p_glUniform1i(g.u->atest, g.bs.alpha_test ? g.bs.alpha_func : 1);
     p_glUniform1i(g.u->aref,  g.bs.alpha_ref);

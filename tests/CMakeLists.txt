@@ -285,6 +285,14 @@ if(PSPRECOMP_HOST)
     add_test(NAME input COMMAND test_input)
     set_tests_properties(input PROPERTIES TIMEOUT 60 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
 
+    # The GL backend, through display lists, in a context SDL's offscreen
+    # driver makes; without one it skips.
+    add_executable(test_render_gl test_render_gl.c)
+    target_link_libraries(test_render_gl PRIVATE psprecomp_host)
+    add_test(NAME render_gl COMMAND test_render_gl)
+    set_tests_properties(render_gl PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "SDL_VIDEODRIVER=offscreen;SDL_AUDIODRIVER=dummy")
+
     # The player's launcher, on a schema of its own; it includes launcher.c.
     # Without a font the drawn half skips.
     # Named apart from the games' own launcher tests, which build alongside.
