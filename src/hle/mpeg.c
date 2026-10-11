@@ -890,7 +890,12 @@ static int avc_pump(mpeg_ctx *c) {
         if (WelsCreateDecoder(&d) != 0 || !d) { c->dec_failed = 1; return 0; }
         SDecodingParam prm;
         memset(&prm, 0, sizeof prm);
-        prm.eEcActiveIdc = ERROR_CON_SLICE_COPY;
+        /* What a damaged picture lacks comes from the picture before it, an
+         * IDR included. Plain slice copy fills an IDR's missing part with
+         * mid-gray instead (openh264, error_concealment.cpp): WipEout Pulse
+         * cuts the IDR at its menu movie's loop point, and a gray band
+         * flashed across the menu each time the movie looped. */
+        prm.eEcActiveIdc = ERROR_CON_SLICE_COPY_CROSS_IDR;
         prm.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
         if ((*d)->Initialize(d, &prm) != 0) {
             WelsDestroyDecoder(d); c->dec_failed = 1; return 0;

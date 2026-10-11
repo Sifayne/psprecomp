@@ -91,6 +91,39 @@ int main(void) {
         CHECK(call(0xB240A59E,RB2,1,3,0,0,0)==1);
         CHECK(call(0xB5F6DC87,RB2,0,0,0,0,0)==2);     /* AvailableSize */
     }
+    /* An IDR cut short after the three black pictures: what it lacks is
+     * concealed from the picture before it, black, not filled with mid-gray
+     * -- the band that flashed over WipEout Pulse's menu where its movie
+     * loops. */
+    {
+        enum { MPEG3 = BASE + 0x480, RB3 = BASE + 0x400, DATA3 = BASE + 0x48000, WORK3 = BASE + 0x50000,
+               PIC = BASE + 0x40000, PICP = BASE + 0x2F0, INIT = BASE + 0x2F8 };
+        static const unsigned char cut[] = {
+            0,0,0,1,9,0x10, 0,0,0,1,0x65,0x88,0x84,          /* the IDR's slice, two bytes of it */
+            0,0,0,1,9,0x30, 0,0,0,1,0x41,0x9a,0x38,0x15,0xea,
+            0,0,0,1,9,0x30
+        };
+        unsigned char es[sizeof video + sizeof cut];
+        memcpy(es, video, sizeof video); memcpy(es + sizeof video, cut, sizeof cut);
+        const uint32_t ring3 = call(0xD7A29F46,4,0,0,0,0,0);
+        CHECK(call(0x37295ED8,RB3,4,DATA3,ring3,CALLBACK,0)==0);
+        CHECK(call(0xD8C5F121,MPEG3,WORK3,0x10000,RB3,512,0)==0);
+        CHECK(call(0x42560F23,MPEG3,0,0,0,0,0)!=0);   /* RegistStream: video */
+        memset(packet,0,sizeof packet);
+        pes(0,0xe0,90000,es,sizeof es);
+        CHECK(call(0xB240A59E,RB3,1,4,0,0,0)==1);
+        psp_write32(PICP,PIC);
+        uint32_t pixel[4] = {0};
+        for (unsigned i=0;i<4;i++) {
+            psp_write32(PIC,0x12345678);
+            CHECK(call(0xFE246728,MPEG3,0,AU,0,0,0)==0);              /* GetAvcAu */
+            CHECK(call(0x0E3C2E9D,MPEG3,AU,16,PICP,INIT,0)==0);      /* AvcDecode */
+            CHECK(psp_read32(INIT)==1);
+            pixel[i]=psp_read32(PIC);
+        }
+        CHECK(pixel[2]==0xFF000000u);
+        CHECK(pixel[3]==0xFF000000u);
+    }
     call(0x874624D6,0,0,0,0,0,0);
     psp_mem_free();
     puts(failed ? "mpeg_au: FAILED" : "mpeg_au: passed"); return failed!=0;
