@@ -2221,6 +2221,8 @@ static int level_h(const psp_tex_state *t, int level) {
     return level ? t->lv_h[level] : t->h;
 }
 
+static int is_clut_format(int fmt) { return fmt >= PSP_TFMT_CLUT4 && fmt <= PSP_TFMT_CLUT32; }
+
 /* Bytes the shared decoder can touch for one level. A swizzled texture is laid
  * out in eight-row blocks, so a short final block occupies its padded height;
  * tracking only visible rows would miss a write to a texel the swizzle maps
@@ -2284,7 +2286,7 @@ static uint64_t texture_generation(const psp_tex_state *t, int top, uint32_t sup
                                                              level_bytes(t, level), supplied);
         if (gen > newest) newest = gen;
     }
-    if (t->fmt >= 4 && t->fmt <= 7 && g.clut.addr) {
+    if (is_clut_format(t->fmt) && g.clut.addr) {
         /* CLUT start is already in entries (multiples of sixteen), and mask is
          * applied before ORing it. Tracking through their greatest possible
          * index covers every palette read without knowing the texel values. */
@@ -2311,7 +2313,7 @@ static size_t texture_slot(const psp_tex_state *t, int top) {
         hash = hash_word(hash, (uint32_t)level_w(t, level));
         hash = hash_word(hash, (uint32_t)level_h(t, level));
     }
-    if (t->fmt >= 4 && t->fmt <= 7) {
+    if (is_clut_format(t->fmt)) {
         hash = hash_word(hash, g.clut.addr);
         hash = hash_word(hash, (uint32_t)g.clut.fmt);
         hash = hash_word(hash, (uint32_t)g.clut.shift);
@@ -2334,7 +2336,7 @@ static int cache_matches(const texcache_entry *e, const psp_tex_state *t,
     /* Palette state has no bearing on direct-colour formats. Including the
      * GE's incidental last CLUT there multiplied identical cache entries and
      * was responsible for most of the mission's post-generation evictions. */
-    if (t->fmt >= 4 && t->fmt <= 7 && !same_clut(&e->clut, &g.clut))
+    if (is_clut_format(t->fmt) && !same_clut(&e->clut, &g.clut))
         return 0;
     for (int level = 0; level <= top; level++)
         if (e->lv_addr[level] != level_addr(t, level) ||
@@ -2405,7 +2407,7 @@ static int samples_target_whole(const rendertarget *r, const psp_tex_state *t) {
  * which then overwrites whatever rows this may already have refreshed. */
 static int texcache_refresh_rows(texcache_entry *e, const psp_tex_state *t, uint32_t supplied,
                                  uint64_t generation) {
-    if (texture_top(t) != 0 || e->uploaded_top != 0 || t->swizzled || t->fmt > 3 || !e->tex) return 0;
+    if (texture_top(t) != 0 || e->uploaded_top != 0 || t->swizzled || t->fmt > PSP_TFMT_8888 || !e->tex) return 0;
     if (t->w <= 0 || t->h <= 0) return 0;
     const int bpp = psp_pixel_bytes(t->fmt);
     const uint32_t row_bytes = (uint32_t)t->stride * (uint32_t)bpp;
@@ -2887,7 +2889,7 @@ static void push_point_sample(const psp_vertex *v, void *opaque) {
  * applied to every title, as both games' backends did before they merged. */
 static int bitmap_glyph_draw(int prim, const psp_vertex *v, int count) {
     const rendertarget *r = &g.rts[g.cur_rt];
-    if (!g.resolution || !r->display || r->sy <= 1.0 || !g.tex_enable || g.tex.fmt != 4 ||
+    if (!g.resolution || !r->display || r->sy <= 1.0 || !g.tex_enable || g.tex.fmt != PSP_TFMT_CLUT4 ||
         g.tex.w != 512 || g.tex.h != 512 || g.bound_top || prim != PSP_PRIM_TRIANGLES ||
         count <= 0 || count % 3 || (g.z_test && g.z_func != PSP_CMP_ALWAYS))
         return 0;
@@ -3003,8 +3005,8 @@ static int texture_reads_target(void) {
          * strides do not preserve that layout (nor does movie memory
          * reuse). */
         const int same_pixels = g.tex.fmt == source->fmt ||
-            (g.tex.fmt == 6 && source->fmt >= 0 && source->fmt <= 2) ||
-            (g.tex.fmt == 7 && source->fmt == 3);
+            (g.tex.fmt == PSP_TFMT_CLUT16 && source->fmt >= 0 && source->fmt <= 2) ||
+            (g.tex.fmt == PSP_TFMT_CLUT32 && source->fmt == 3);
         if (source->configured && !g.tex.swizzled && same_pixels &&
             g.tex.stride == source->stride && tex_addr >= source->addr && tex_addr < end)
             return 1;

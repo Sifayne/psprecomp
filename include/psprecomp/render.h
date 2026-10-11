@@ -127,6 +127,14 @@ typedef struct {
     float    lod_slope;
 } psp_tex_state;
 
+/* TEXFORMAT (psp_tex_state.fmt): the direct-colour formats are the pixel
+ * formats, then come the palette indices and the compressed formats. */
+enum {
+    PSP_TFMT_5650 = 0, PSP_TFMT_5551, PSP_TFMT_4444, PSP_TFMT_8888,
+    PSP_TFMT_CLUT4, PSP_TFMT_CLUT8, PSP_TFMT_CLUT16, PSP_TFMT_CLUT32,
+    PSP_TFMT_DXT1, PSP_TFMT_DXT3, PSP_TFMT_DXT5
+};
+
 /* The GE's codes for the texture function and the draw state below, in
  * PSPSDK pspgu.h's order. TEXFUNC (psp_tex_state.func): */
 enum { PSP_TFX_MODULATE = 0, PSP_TFX_DECAL, PSP_TFX_BLEND, PSP_TFX_REPLACE, PSP_TFX_ADD };

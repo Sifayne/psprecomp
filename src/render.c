@@ -99,11 +99,6 @@ static void sw_texture(const psp_tex_state *t) {
     dump_texture();
 }
 
-enum {
-    GE_TFMT_5650 = 0, GE_TFMT_5551 = 1, GE_TFMT_4444 = 2, GE_TFMT_8888 = 3,
-    GE_TFMT_CLUT4 = 4, GE_TFMT_CLUT8 = 5, GE_TFMT_CLUT16 = 6, GE_TFMT_CLUT32 = 7
-};
-
 static psp_clut_state g_clut;
 
 static void sw_clut(uint32_t addr, int format, int shift, int mask, int start) {
@@ -114,11 +109,11 @@ static void sw_clut(uint32_t addr, int format, int shift, int mask, int start) {
 /* Bytes per texel, doubled, so the 4-bit format can be expressed as 1. */
 static int tex_halfbytes(int fmt) {
     switch (fmt) {
-    case GE_TFMT_CLUT4:                     return 1;
-    case GE_TFMT_CLUT8:                     return 2;
-    case GE_TFMT_5650: case GE_TFMT_5551:
-    case GE_TFMT_4444: case GE_TFMT_CLUT16: return 4;
-    case GE_TFMT_8888: case GE_TFMT_CLUT32: return 8;
+    case PSP_TFMT_CLUT4:                     return 1;
+    case PSP_TFMT_CLUT8:                     return 2;
+    case PSP_TFMT_5650: case PSP_TFMT_5551:
+    case PSP_TFMT_4444: case PSP_TFMT_CLUT16: return 4;
+    case PSP_TFMT_8888: case PSP_TFMT_CLUT32: return 8;
     default:                                return 0;
     }
 }
@@ -126,7 +121,7 @@ static int tex_halfbytes(int fmt) {
 static int texture_usable(void) {
     if (!g_tex.addr || g_tex.w <= 0 || g_tex.h <= 0) return 0;
     if (!tex_halfbytes(g_tex.fmt)) return 0;
-    if (g_tex.fmt >= GE_TFMT_CLUT4 && !g_clut.addr) return 0;
+    if (g_tex.fmt >= PSP_TFMT_CLUT4 && !g_clut.addr) return 0;
     return 1;
 }
 
@@ -197,13 +192,13 @@ static uint32_t sample_texel_bounded(int u, int v, decode_bounds *bounds) {
         }
     }
 
-    if (g_tex.fmt == GE_TFMT_CLUT4) {
+    if (g_tex.fmt == PSP_TFMT_CLUT4) {
         const uint32_t bx = (uint32_t)u / 2u;
         const uint32_t off = swizzled_byte(bx, (uint32_t)v, row_bytes);
         const uint32_t byte = psp_read8(g_tex.addr + off);
         return clut_entry((u & 1) ? (byte >> 4) : (byte & 0xF), bounds);
     }
-    if (g_tex.fmt == GE_TFMT_CLUT8) {
+    if (g_tex.fmt == PSP_TFMT_CLUT8) {
         const uint32_t off = swizzled_byte((uint32_t)u, (uint32_t)v, row_bytes);
         return clut_entry(psp_read8(g_tex.addr + off), bounds);
     }
@@ -213,15 +208,15 @@ static uint32_t sample_texel_bounded(int u, int v, decode_bounds *bounds) {
      * masked ff indexes entry 67 -- and they drew flat white while the formats
      * were refused. This game's census has never named either; the tests are
      * the reason they exist. */
-    if (g_tex.fmt == GE_TFMT_CLUT16) {
+    if (g_tex.fmt == PSP_TFMT_CLUT16) {
         const uint32_t off = swizzled_byte((uint32_t)u * 2u, (uint32_t)v, row_bytes);
         return clut_entry(psp_read16(g_tex.addr + off), bounds);
     }
-    if (g_tex.fmt == GE_TFMT_CLUT32) {
+    if (g_tex.fmt == PSP_TFMT_CLUT32) {
         const uint32_t off = swizzled_byte((uint32_t)u * 4u, (uint32_t)v, row_bytes);
         return clut_entry(psp_read32(g_tex.addr + off), bounds);
     }
-    if (g_tex.fmt == GE_TFMT_8888) {
+    if (g_tex.fmt == PSP_TFMT_8888) {
         const uint32_t off = swizzled_byte((uint32_t)u * 4u, (uint32_t)v, row_bytes);
         return psp_read32(g_tex.addr + off);
     }
