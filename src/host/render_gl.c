@@ -3233,7 +3233,7 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
     case PSP_PRIM_SPRITES:                         /* in pairs */
         for (int i = 0; i + 1 < count; i += 2) push_sprite(&v[i]);
         break;
-    default:
+    default:                                       /* type 7, which names no primitive */
         g.unsupported_prims++;
         break;
     }
@@ -4636,7 +4636,7 @@ static void report_unrepresented(FILE *out) {
         fprintf(out, ", %llu batch flush(es) from overflow",
                 (unsigned long long)g.batch_overflows);
     if (g.unsupported_prims)
-        fprintf(out, ", %llu point/line draw(s) skipped",
+        fprintf(out, ", %llu draw(s) of primitive type 7 skipped",
                 (unsigned long long)g.unsupported_prims);
     if (g.partial_pixel_masks)
         fprintf(out, ", %llu draw(s) with a partial pixel mask written whole",
