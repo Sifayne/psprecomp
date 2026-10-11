@@ -320,6 +320,15 @@ static atrac_ctx *ctx_arg(void) {
     return (id < ATRAC_IDS && g_id[id].used) ? &g_id[id] : NULL;
 }
 
+/* The context the first argument names, once its data is set; NULL, with the
+ * error already returned, when the id names none or it has no data yet. */
+static atrac_ctx *ctx_with_data(void) {
+    atrac_ctx *c = ctx_arg();
+    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return NULL; }
+    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return NULL; }
+    return c;
+}
+
 /* PSPRECOMP_ATRAC_LOG=1 narrates every call with its arguments: which of the
  * thirteen the game makes, in what order, with what buffer. */
 static int atrac_log_on(void) {
@@ -656,9 +665,8 @@ static void hle_SetHalfwayBuffer(void) {
  * -1337 in the test comes back -1337 in both cases). */
 static void hle_GetRemainFrame(void) {
     ATRAC_LOG("GetRemainFrame");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     put32(psp_arg(1), (uint32_t)remain_value(c));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -704,9 +712,8 @@ static void stream_info(const atrac_ctx *c, uint32_t *ptr, uint32_t *bytes, uint
 /* (id, u8 **writePtr, u32 *writableBytes, u32 *readOffset). */
 static void hle_GetStreamDataInfo(void) {
     ATRAC_LOG("GetStreamDataInfo");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     uint32_t ptr, bytes, fpos;
     stream_info(c, &ptr, &bytes, &fpos);
     put32(psp_arg(1), ptr);
@@ -718,9 +725,8 @@ static void hle_GetStreamDataInfo(void) {
 /* (id, bytes) -- the caller wrote this much where GetStreamDataInfo said. */
 static void hle_AddStreamData(void) {
     ATRAC_LOG("AddStreamData");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     const uint32_t bytes = psp_arg(1);
     /* addstreamdata.expected: with the whole file in a buffer that holds it,
      * any add -- even of zero bytes -- answers 80630009. A streamed file that
@@ -752,9 +758,8 @@ static void hle_AddStreamData(void) {
 /* (id, u16 *pcm, int *samples, int *end, int *remainFrame). */
 static void hle_DecodeData(void) {
     ATRAC_LOG("DecodeData");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     const uint32_t out_addr = psp_arg(1);
 
     if (!c->dec) {
@@ -834,9 +839,8 @@ static void hle_GetInternalErrorInfo(void) {
  * for -1: forever. */
 static void hle_SetLoopNum(void) {
     ATRAC_LOG("SetLoopNum");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     if (!c->has_loop) { psp_ret(PSP_ATRAC_ERROR_UNSET_PARAM); return; }
     c->loop_num = (int)psp_arg(1);
     c->loops_left = c->loop_num;
@@ -848,9 +852,8 @@ static void hle_SetLoopNum(void) {
  * file without loop information and (0, 1) for one with it. */
 static void hle_GetLoopStatus(void) {
     ATRAC_LOG("GetLoopStatus");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     put32(psp_arg(1), (uint32_t)c->loop_num);
     put32(psp_arg(2), (uint32_t)c->has_loop);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -866,9 +869,8 @@ static void hle_GetLoopStatus(void) {
  * refused as the codec failing. */
 static void hle_ResetPlayPosition(void) {
     ATRAC_LOG("ResetPlayPosition");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     const uint32_t sample = psp_arg(1);
     if (!c->in_memory || sample >= c->total_out) {
         c->internal_error = PSP_ATRAC_ERROR_API_FAIL;
@@ -881,9 +883,8 @@ static void hle_ResetPlayPosition(void) {
 
 static void hle_no_position(void) {
     ATRAC_LOG("GetBufferInfoForResetting");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     c->internal_error = PSP_ATRAC_ERROR_API_FAIL;
     psp_ret(PSP_ATRAC_ERROR_API_FAIL);
 }
@@ -959,9 +960,8 @@ static uint32_t next_samples(const atrac_ctx *c) {
  * the loop points on the same scale, or -1 when the file has none. */
 static void hle_GetSoundSample(void) {
     ATRAC_LOG("GetSoundSample");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     put32(psp_arg(1), c->total_out ? c->total_out - 1 : 0);
     put32(psp_arg(2), c->has_loop ? (uint32_t)c->loop_start : 0xFFFFFFFFu);
     put32(psp_arg(3), c->has_loop ? (uint32_t)c->loop_end : 0xFFFFFFFFu);
@@ -970,9 +970,8 @@ static void hle_GetSoundSample(void) {
 
 static void hle_GetChannel(void) {
     ATRAC_LOG("GetChannel");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     put32(psp_arg(1), c->channels);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -980,27 +979,24 @@ static void hle_GetChannel(void) {
 /* The decoder's output is always two channels. */
 static void hle_GetOutputChannel(void) {
     ATRAC_LOG("GetOutputChannel");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     put32(psp_arg(1), ATRAC_OUT_CHANNELS);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_GetMaxSample(void) {
     ATRAC_LOG("GetMaxSample");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     put32(psp_arg(1), c->frame_samples);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_GetNextSample(void) {
     ATRAC_LOG("GetNextSample");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     put32(psp_arg(1), next_samples(c));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1009,9 +1005,8 @@ static void hle_GetNextSample(void) {
  * 64 (stream.expected). Truncated, as that value says. */
 static void hle_GetBitrate(void) {
     ATRAC_LOG("GetBitrate");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     const uint64_t bps = (uint64_t)c->block_align * 8u * c->sample_rate / c->frame_samples;
     put32(psp_arg(1), (uint32_t)(bps / 1000u));
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -1020,9 +1015,8 @@ static void hle_GetBitrate(void) {
 /* (id, int *pos): the output-sample position the next decode starts at. */
 static void hle_GetNextDecodePosition(void) {
     ATRAC_LOG("GetNextDecodePosition");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     if (c->finished) { psp_ret(PSP_ATRAC_ERROR_ALLDATA_WAS_DECODED); return; }
     put32(psp_arg(1), c->pos);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -1035,9 +1029,8 @@ static void hle_GetNextDecodePosition(void) {
 #define PSP_ATRAC_ERROR_NO_SECOND_BUF 0x80630022u
 static void hle_GetSecondBufferInfo(void) {
     ATRAC_LOG("GetSecondBufferInfo");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     put32(psp_arg(1), 0);
     put32(psp_arg(2), 0);
     psp_ret(PSP_ATRAC_ERROR_NO_SECOND_BUF);
@@ -1045,9 +1038,8 @@ static void hle_GetSecondBufferInfo(void) {
 
 static void hle_IsSecondBufferNeeded(void) {
     ATRAC_LOG("IsSecondBufferNeeded");
-    atrac_ctx *c = ctx_arg();
-    if (!c) { psp_ret(PSP_ATRAC_ERROR_BAD_ATRACID); return; }
-    if (!c->has_data) { psp_ret(PSP_ATRAC_ERROR_UNSET_DATA); return; }
+    atrac_ctx *c = ctx_with_data();
+    if (!c) return;
     psp_ret(0);
 }
 
