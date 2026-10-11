@@ -262,16 +262,20 @@ void psp_mpeg_dump_sync(FILE *out) {
 
 static void avc_close(void *dec);
 
+/* What a movie holds on the host: its decoders, its streams and its last
+ * picture. Its counters stay for the report at exit. */
+static void ctx_release(mpeg_ctx *c) {
+    psp_at3_close((psp_at3_dec *)c->adec); c->adec = NULL;
+    avc_close(c->dec); c->dec = NULL;
+    free(c->es); c->es = NULL; c->es_len = c->es_cap = c->es_pos = 0;
+    free(c->pic); c->pic = NULL;
+    free(c->aes); c->aes = NULL; c->aes_len = c->aes_cap = c->aes_pos = 0;
+    free(c->puts); c->puts = NULL; c->nputs = c->puts_cap = c->put_iv = c->put_ia = 0;
+    free(c->vpts); c->vpts = NULL; c->nvpts = c->vpts_cap = c->vpts_next = 0;
+}
+
 void psp_mpeg_reset(void) {
-    for (int i = 0; i < MAX_MPEG; i++) {
-        psp_at3_close((psp_at3_dec *)g_mpeg[i].adec);
-        avc_close(g_mpeg[i].dec);
-        free(g_mpeg[i].es);
-        free(g_mpeg[i].pic);
-        free(g_mpeg[i].aes);
-        free(g_mpeg[i].puts);
-        free(g_mpeg[i].vpts);
-    }
+    for (int i = 0; i < MAX_MPEG; i++) ctx_release(&g_mpeg[i]);
     memset(g_mpeg, 0, sizeof g_mpeg);
 }
 
@@ -344,9 +348,11 @@ static void hle_MpegCreate(void) {
     }
     psp_ret(SCE_MPEG_ERROR_NO_MEMORY);
 }
+/* The next Create clears the slot, so what the movie held is let go here:
+ * left, every movie but the last leaked its decoders and its streams. */
 static void hle_MpegDelete(void) {
     mpeg_ctx *context=ctx_of(psp_arg(0));
-    if (context) context->used=0;
+    if (context) { ctx_release(context); context->used=0; }
     psp_ret(0);
 }
 static void hle_RingbufferQueryMemSize(void) {
