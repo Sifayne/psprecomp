@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -91,6 +92,15 @@ typedef struct {
     pid_t child; int child_error_fd;
     char child_error[2048]; size_t child_error_len;
 } launcher;
+
+/* The status line under the page, as printf would write it. */
+__attribute__((format(printf, 2, 3)))
+static void set_status(launcher *a, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    vsnprintf(a->status, sizeof a->status, format, args);
+    va_end(args);
+}
 
 /* ---- packs ------------------------------------------------------------------------ */
 
@@ -162,15 +172,23 @@ static void movie_off(launcher *a) {
         psp_settings_set(&a->edit, PSP_OPT_MPEG_DECODE, "0", PSP_SOURCE_FILE, error);
 }
 
+/* A path written into out: 0 when all of it fits, else -1. */
+__attribute__((format(printf, 3, 4)))
+static int format_path(char *out, size_t cap, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    const int n = vsnprintf(out, cap, format, args);
+    va_end(args);
+    return n > 0 && (size_t)n < cap ? 0 : -1;
+}
+
 /* An XDG base folder with name under it: the variable when it is absolute,
  * else fallback under $HOME. */
 static int xdg_path(const char *variable, const char *fallback, const char *name, char *out, size_t cap) {
     const char *given = getenv(variable), *home = getenv("HOME");
-    int n;
-    if (given && given[0] == '/') n = snprintf(out, cap, "%s/%s", given, name);
-    else if (home && home[0] == '/') n = snprintf(out, cap, "%s/%s/%s", home, fallback, name);
-    else return -1;
-    return n > 0 && (size_t)n < cap ? 0 : -1;
+    if (given && given[0] == '/') return format_path(out, cap, "%s/%s", given, name);
+    if (home && home[0] == '/') return format_path(out, cap, "%s/%s/%s", home, fallback, name);
+    return -1;
 }
 
 /* A pack's earlier settings come in the first time it is used here, when
@@ -195,7 +213,7 @@ static void adopt_earlier(launcher *a, int p) {
         psp_settings_file_free(old);
         if (rc) { fprintf(stderr, "launcher: cannot bring in %s: %s\n", candidates[c], error); continue; }
         fprintf(stderr, "launcher: brought in %s\n", candidates[c]);
-        snprintf(a->status, sizeof a->status, "Brought in your earlier settings for %.200s.", packs[p].info->name);
+        set_status(a, "Brought in your earlier settings for %.200s.", packs[p].info->name);
         return;
     }
 }
@@ -213,7 +231,7 @@ static void use_pack(launcher *a, int p) {
     const int had_player = psp_settings_file_has(a->file, 0), had_pack = psp_settings_file_has(a->file, 1);
     if (psp_settings_file_get(a->file, &a->edit, error)) {
         a->load_failed = 1;
-        snprintf(a->status, sizeof a->status, "Cannot read your settings, so they will not be saved: %.400s", error);
+        set_status(a, "Cannot read your settings, so they will not be saved: %.400s", error);
         psp_settings_play_defaults(&a->edit);
     } else {
         if (!had_player) { psp_settings_reset(&a->edit, 0); movie_off(a); }
@@ -304,7 +322,7 @@ static char *library_field(char **cursor,char *end) {
 static int library_load(launcher *a,int imported) {
     if (!a->library) return 0;
     FILE *f=fopen(a->library,"rb");
-    if (!f) { if (errno==ENOENT) return 0; snprintf(a->status,sizeof a->status,"Cannot read game library: %s",strerror(errno)); return -1; }
+    if (!f) { if (errno==ENOENT) return 0; set_status(a, "Cannot read game library: %s",strerror(errno)); return -1; }
     size_t cap=MAX_GAMES*5*4096+128;
     char *data=malloc(cap); if (!data) { fclose(f); return -1; }
     size_t bytes=fread(data,1,cap,f); int bad=ferror(f) || !feof(f); fclose(f);
@@ -339,7 +357,7 @@ static int library_load(launcher *a,int imported) {
     }
     return 0;
 invalid:
-    free(data); snprintf(a->status,sizeof a->status,"Cannot read game library. Installed files have not been changed."); return -1;
+    free(data); set_status(a, "Cannot read game library. Installed files have not been changed."); return -1;
 }
 
 static int file_order(const void *left,const void *right) {
@@ -383,7 +401,7 @@ static void import_start(launcher *a,int work,const char *what) {
     if (!a->importer || a->import_pid || a->child) return;
     static const char *const commands[]={"import","install-pack","remove-pack"};
     int pipes[2];
-    if (pipe(pipes)) { snprintf(a->status,sizeof a->status,"Cannot prepare game: %s",strerror(errno)); return; }
+    if (pipe(pipes)) { set_status(a, "Cannot prepare game: %s",strerror(errno)); return; }
     /* SDL installs a SIGTERM handler. Block cancellation across fork until
      * the child has replaced that inherited handler, so an immediate Cancel
      * cannot be consumed as an SDL event in the child before exec. */
@@ -428,22 +446,22 @@ static void import_poll(launcher *a) {
     int status; if (waitpid(a->import_pid,&status,WNOHANG)<=0) return;
     close(a->import_fd); a->import_pid=0;
     const int ok=!a->import_cancelled && WIFEXITED(status) && WEXITSTATUS(status)==0;
-    if (a->import_cancelled) snprintf(a->status,sizeof a->status,"%s",a->work==WORK_IMPORT?
+    if (a->import_cancelled) set_status(a, "%s",a->work==WORK_IMPORT?
         "Preparation canceled. Existing games and saves are unchanged.":"Canceled. Your packs are unchanged.");
-    else if (!ok) snprintf(a->status,sizeof a->status,"%.250s",a->import_status);
+    else if (!ok) set_status(a, "%.250s",a->import_status);
     else if (a->work==WORK_IMPORT) {
-        if (!library_load(a,1)) snprintf(a->status,sizeof a->status,"Your game is ready. Choose Save and play.");
+        if (!library_load(a,1)) set_status(a, "Your game is ready. Choose Save and play.");
     } else if (a->work==WORK_INSTALL) {
         const int before=pack_count;
         packs_load(a);
         library_load(a,0);
-        if (pack_count>before) snprintf(a->status,sizeof a->status,"Added %.200s. Add a game of it with Add game.",packs[pack_count-1].info->name);
-        else snprintf(a->status,sizeof a->status,"The pack was added, but this launcher could not load it. See the log.");
+        if (pack_count>before) set_status(a, "Added %.200s. Add a game of it with Add game.",packs[pack_count-1].info->name);
+        else set_status(a, "The pack was added, but this launcher could not load it. See the log.");
     } else {
         packs[a->remove_pack].removed=1;
         if (a->pack==a->remove_pack) use_pack(a,-1);
         library_load(a,0);
-        snprintf(a->status,sizeof a->status,"Removed %.200s.",packs[a->remove_pack].info->name);
+        set_status(a, "Removed %.200s.",packs[a->remove_pack].info->name);
     }
     if (a->quit_after_import) { a->quit_after_import=0; activate_back(a); }
 }
@@ -479,7 +497,7 @@ static int save(launcher *a) {
     if (psp_settings_file_put(a->file, &a->edit, a->status) || psp_settings_file_write(a->file, a->path, a->status))
         return -1;
     a->dirty = 0;
-    snprintf(a->status, sizeof a->status, "Settings saved.");
+    set_status(a, "Settings saved.");
     return 0;
 }
 
@@ -490,7 +508,7 @@ static int save(launcher *a) {
  * $XDG_DATA_HOME/psprecomp, else ~/.local/share/psprecomp. */
 static int data_root(char *out, size_t cap) {
     const char *given = getenv("PSPRECOMP_DATA_ROOT");
-    if (given && given[0] == '/') { int n = snprintf(out, cap, "%s", given); return n > 0 && (size_t)n < cap ? 0 : -1; }
+    if (given && given[0] == '/') return format_path(out, cap, "%s", given);
     return xdg_path("XDG_DATA_HOME", ".local/share", "psprecomp", out, cap);
 }
 /* Empty when no title is selected; -1 when no data root can be found. Save
@@ -501,26 +519,21 @@ static int game_folder(launcher *a, const char *kind, char *out, size_t cap) {
     char root[4096]; out[0] = 0;
     if (!a->game_count) return 0;
     if (data_root(root, sizeof root)) return -1;
-    int n = snprintf(out, cap, "%s/%s/%s", root, kind, a->games[a->game].slug);
-    return n > 0 && (size_t)n < cap ? 0 : -1;
+    return format_path(out, cap, "%s/%s/%s", root, kind, a->games[a->game].slug);
 }
 /* A launch path in absolute form, so it still resolves after the child
  * changes directory. Nothing is canonicalised; the spelling is kept. */
 static int absolute(const char *path, char *out, size_t cap) {
-    int n;
-    if (path[0] == '/') n = snprintf(out, cap, "%s", path);
-    else {
-        char cwd[4096];
-        if (!getcwd(cwd, sizeof cwd)) return -1;
-        n = snprintf(out, cap, "%s/%s", cwd, path);
-    }
-    return n > 0 && (size_t)n < cap ? 0 : -1;
+    if (path[0] == '/') return format_path(out, cap, "%s", path);
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof cwd)) return -1;
+    return format_path(out, cap, "%s/%s", cwd, path);
 }
 
 static void launch_game(launcher *a) {
     refresh(a);
     if (working(a)) {
-        strcpy(a->status, a->work == WORK_IMPORT ? "Wait for the game to be prepared, or stop it, to play."
+        set_status(a, "%s", a->work == WORK_IMPORT ? "Wait for the game to be prepared, or stop it, to play."
                                                  : "Wait for the pack to finish, to play.");
         return;
     }
@@ -528,28 +541,28 @@ static void launch_game(launcher *a) {
     if (!a->boot || !a->module) {
         if (a->importer && a->iso && !access(a->iso, R_OK)) import_start(a, WORK_IMPORT, a->iso);
         else if (a->importer) browser_open(a, BROWSE_ISO);
-        else strcpy(a->status, "No game installed. You can still save your settings.");
+        else set_status(a, "No game installed. You can still save your settings.");
         return;
     }
     if (access(a->boot, X_OK) || access(a->module, R_OK) || (a->iso && access(a->iso, R_OK))) {
-        snprintf(a->status, sizeof a->status, "Cannot reach the game, its module or its disc: %s", strerror(errno)); return;
+        set_status(a, "Cannot reach the game, its module or its disc: %s", strerror(errno)); return;
     }
     psp_settings effective = a->edit;
     char error[PSP_SETTINGS_ERROR];
     if (!psp_settings_env(&effective, error) && !psp_settings_resolve(&effective, error) && effective.render == PSP_RENDERER_NULL) {
-        strcpy(a->status, "The null renderer is for diagnostics. Choose OpenGL or software before playing."); return;
+        set_status(a, "The null renderer is for diagnostics. Choose OpenGL or software before playing."); return;
     }
     if (save(a)) return;
     char save_root[4096], state_root[4096], boot[4096], module[4096], iso[4096], config[4096];
     if (game_folder(a, "saves", save_root, sizeof save_root)) {
-        strcpy(a->status, "Cannot find the save folder: PSPRECOMP_DATA_ROOT, XDG_DATA_HOME or HOME must be an absolute path."); return;
+        set_status(a, "Cannot find the save folder: PSPRECOMP_DATA_ROOT, XDG_DATA_HOME or HOME must be an absolute path."); return;
     }
     if (*save_root && make_directories(save_root)) {
-        snprintf(a->status, sizeof a->status, "Cannot make the save folder %.300s: %s", save_root, strerror(errno)); return;
+        set_status(a, "Cannot make the save folder %.300s: %s", save_root, strerror(errno)); return;
     }
     if (absolute(a->boot, boot, sizeof boot) || absolute(a->module, module, sizeof module) ||
         (a->iso && absolute(a->iso, iso, sizeof iso)) || absolute(a->path, config, sizeof config)) {
-        strcpy(a->status, "Cannot launch: a game path is too long."); return;
+        set_status(a, "Cannot launch: a game path is too long."); return;
     }
     if (*save_root) fprintf(stderr, "launcher: saves %s\n", save_root);
     /* The game's environment, with its state folder: built before the fork,
@@ -558,7 +571,7 @@ static void launch_game(launcher *a) {
     size_t nenv = 0;
     while (environ[nenv]) nenv++;
     char **env = malloc((nenv + 2) * sizeof *env);
-    if (!env) { strcpy(a->status, "Cannot launch: out of memory."); return; }
+    if (!env) { set_status(a, "Cannot launch: out of memory."); return; }
     size_t k = 0;
     for (size_t i = 0; i < nenv; i++) if (strncmp(environ[i], "PSPRECOMP_STATE_DIR=", 20)) env[k++] = environ[i];
     if (!game_folder(a, "states", state_root, sizeof state_root) && *state_root) {
@@ -568,10 +581,10 @@ static void launch_game(launcher *a) {
     }
     env[k] = NULL;
     int pipes[2];
-    if (pipe(pipes)) { free(env); snprintf(a->status, sizeof a->status, "Cannot launch: %s", strerror(errno)); return; }
+    if (pipe(pipes)) { free(env); set_status(a, "Cannot launch: %s", strerror(errno)); return; }
     fflush(NULL);
     pid_t child = fork();
-    if (child < 0) { free(env); close(pipes[0]); close(pipes[1]); snprintf(a->status, sizeof a->status, "Cannot launch: %s", strerror(errno)); return; }
+    if (child < 0) { free(env); close(pipes[0]); close(pipes[1]); set_status(a, "Cannot launch: %s", strerror(errno)); return; }
     if (!child) {
         close(pipes[0]); dup2(pipes[1], STDERR_FILENO); close(pipes[1]);
         const char *args[8]; int n = 0;
@@ -635,7 +648,7 @@ static void poll_child(launcher *a) {
     reread(a);
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) { a->running = 0; return; }
     SDL_ShowWindow(a->window); SDL_RaiseWindow(a->window);
-    snprintf(a->status, sizeof a->status, "The game stopped (%s %d). See the log for details.",
+    set_status(a, "The game stopped (%s %d). See the log for details.",
              WIFEXITED(status) ? "exit" : "signal", WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
     char title[192]; snprintf(title, sizeof title, "%s could not start", game_title(a));
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, *a->child_error ? a->child_error : a->status, a->window);
@@ -874,7 +887,7 @@ static void confirm_prompt(launcher *a) {
         psp_settings_reset(&a->edit, a->group == GROUP_PLAYER ? 0 : PSP_PLAYER_OPTIONS);
         if (a->group == GROUP_PLAYER) movie_off(a);
         changed(a);
-        strcpy(a->status, "Reset. Save to keep it.");
+        set_status(a, "Reset. Save to keep it.");
     } else if (kind == CONFIRM_DISCARD) a->running = 0;
     else if (kind == CONFIRM_STOP) { a->quit_after_import = 1; import_cancel(a); }
     else pack_remove(a, a->remove_pack);
@@ -1101,7 +1114,7 @@ static int start(launcher *a, int argc, char **argv, int *check_startup, const c
     if (access(a->path, F_OK) == 0 || errno != ENOENT) {
         if (!(a->file = psp_settings_file_read(a->path, error))) {
             a->load_failed = 1;
-            snprintf(a->status, sizeof a->status, "Cannot read your settings, so they will not be saved: %.400s", error);
+            set_status(a, "Cannot read your settings, so they will not be saved: %.400s", error);
         }
     }
     if (!a->file) a->file = psp_settings_file_new();
