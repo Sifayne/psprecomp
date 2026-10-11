@@ -1058,12 +1058,12 @@ static void avc_note_sps(mpeg_ctx *c, const uint8_t *p, size_t len) {
 static int avc_in_sequence(mpeg_ctx *c, size_t at, size_t len) {
     const uint8_t *p = c->es + at;
     const unsigned type = p[0] & 0x1Fu, ref_idc = (p[0] >> 5) & 3u;
-    if (type != 1 && type != 5) return 1;
+    if (type != NAL_SLICE && type != NAL_SLICE_IDR) return 1;
     /* The clock of the pack the slice starts in. */
     while (c->vscr_next + 1 < c->nvscr && c->vscr[c->vscr_next + 1].es_off <= at) c->vscr_next++;
     const int timed = c->vscr_next < c->nvscr && c->vscr[c->vscr_next].es_off <= at;
     const uint64_t scr = timed ? c->vscr[c->vscr_next].scr : 0;
-    if (type == 5) {   /* an IDR's frame_num is 0 */
+    if (type == NAL_SLICE_IDR) {   /* an IDR's frame_num is 0 */
         c->ref_frame_num = 0;
         c->ref_seen = 1;
     } else {
@@ -1106,6 +1106,126 @@ static void dump_ppm(const char *path, unsigned char *pl[3], const SSysMEMBuffer
     fclose(f);
 }
 
+/* The decoder, created the first time it is needed; NULL, and never tried
+ * again, if openh264 will not make one. */
+static ISVCDecoder *avc_open(mpeg_ctx *c) {
+    if (c->dec) return (ISVCDecoder *)c->dec;
+    ISVCDecoder *dec = NULL;
+    if (WelsCreateDecoder(&dec) != 0 || !dec) { c->dec_failed = 1; return NULL; }
+    SDecodingParam prm;
+    memset(&prm, 0, sizeof prm);
+    /* What a damaged picture lacks comes from the picture before it, an
+     * IDR included. Plain slice copy fills an IDR's missing part with
+     * mid-gray instead (openh264, error_concealment.cpp): WipEout Pulse
+     * cuts the IDR at its menu movie's loop point, and a gray band
+     * flashed across the menu each time the movie looped. */
+    prm.eEcActiveIdc = ERROR_CON_SLICE_COPY_CROSS_IDR;
+    prm.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+    if ((*dec)->Initialize(dec, &prm) != 0) {
+        WelsDestroyDecoder(dec); c->dec_failed = 1; return NULL;
+    }
+    c->dec = dec;
+    return dec;
+}
+
+/* The next whole NAL at or after the decoder's position: its header byte at
+ * *start, and *end where its bytes stop. 0 if there is none yet. */
+static int nal_bounds(const mpeg_ctx *c, size_t *start, size_t *end) {
+    const size_t s = nal_next(c->es, c->es_len, c->es_pos);
+    if (s >= c->es_len) return 0;
+    const size_t next = nal_next(c->es, c->es_len, s);
+    size_t e;
+    if (next >= c->es_len) {
+        /* No following start code. Mid-stream that means "incomplete, wait
+         * for more"; at end of stream it means this is the last NAL and
+         * everything left is it -- a tail that would otherwise never
+         * decode, and the last frames of the movie would silently drop. */
+        if (!c->es_eof) return 0;
+        e = c->es_len;
+    } else {
+        /* next points past the next start code's 0x01; back up over it and
+         * any trailing zero of a four-byte start code. */
+        e = next - 3;
+        while (e > s && c->es[e - 1] == 0) e--;
+    }
+    *start = s;
+    *end = e;
+    return 1;
+}
+
+/* Copy the picture out while it is still ours to read. 0 if there was no
+ * memory for it. */
+static int pic_copy_out(mpeg_ctx *c, unsigned char *planes[3], const SSysMEMBuffer *b) {
+    const size_t need = (size_t)b->iWidth * (size_t)b->iHeight * 3 / 2;
+    if (!c->pic || c->pic_w != b->iWidth || c->pic_h != b->iHeight) {
+        free(c->pic);
+        c->pic = (uint8_t *)malloc(need);
+        c->pic_w = b->iWidth;
+        c->pic_h = b->iHeight;
+    }
+    if (!c->pic) return 0;
+    uint8_t *out = c->pic;
+    for (int y = 0; y < b->iHeight; y++, out += b->iWidth)
+        memcpy(out, planes[0] + (size_t)y * b->iStride[0], (size_t)b->iWidth);
+    for (int pl = 1; pl <= 2; pl++)
+        for (int y = 0; y < b->iHeight / 2; y++, out += b->iWidth / 2)
+            memcpy(out, planes[pl] + (size_t)y * b->iStride[1], (size_t)b->iWidth / 2);
+    c->pic_ready = 1;
+    /* PSPRECOMP_MPEG_YUV=<file>: every picture, raw I420, as decoded. */
+    static mpeg_dump yuv_dump = { .var = "PSPRECOMP_MPEG_YUV" };
+    dump_write(&yuv_dump, c->pic, need);
+    return 1;
+}
+
+/* 90 kHz ticks between pictures: 29.97fps until measured, and a measurement
+ * taken only between 60 and 12.5 fps. */
+enum { MPEG_FRAME_DUR_GUESS = 3003, MPEG_FRAME_DUR_MIN = 1500, MPEG_FRAME_DUR_MAX = 7200 };
+
+/* The picture's own timestamp, from its PES; 25fps from
+ * the frame count only if the stream carried none -- which
+ * this game's intro does not do, and which ran its picture
+ * 20% slow against the sound. `nal_end` is where the picture's data ends. */
+static void pic_assign_pts(mpeg_ctx *c, size_t nal_end) {
+    /* An anchor inside this picture's data takes it; any
+     * earlier unused anchor is stale and dropped. */
+    int anchored = 0;
+    while (c->vpts_next < c->nvpts && c->vpts[c->vpts_next].es_off < nal_end) {
+        c->pts = c->vpts[c->vpts_next].pts;
+        anchored = 1;
+        c->vpts_next++;
+    }
+    if (!c->frame_dur) c->frame_dur = MPEG_FRAME_DUR_GUESS;
+    if (anchored) {
+        /* Measured over the whole run, first anchor to
+         * this one: two adjacent anchors a dozen frames
+         * apart gave 35.6 ms for a 33.4 ms stream. */
+        if (!c->anchor0_frame) { c->anchor0_pts = c->pts; c->anchor0_frame = c->frames; }
+        else if (c->frames > c->anchor0_frame) {
+            const uint32_t dur = (c->pts - c->anchor0_pts) / (uint32_t)(c->frames - c->anchor0_frame);
+            if (dur >= MPEG_FRAME_DUR_MIN && dur <= MPEG_FRAME_DUR_MAX) c->frame_dur = dur;
+        }
+        c->anchor_pts   = c->pts;
+        c->anchor_frame = c->frames;
+    } else if (c->anchor_frame) {
+        c->pts = c->anchor_pts + c->frame_dur * (uint32_t)(c->frames - c->anchor_frame);
+    } else {
+        c->pts = c->frame_dur * (uint32_t)c->frames;
+    }
+}
+
+/* PSPRECOMP_MPEG_FRAME=<file>: picture PSPRECOMP_MPEG_FRAME_NO (the first
+ * when unset) as a PPM. */
+static void pic_dump_ppm(const mpeg_ctx *c, unsigned char *planes[3], const SSysMEMBuffer *b) {
+    const char *fp = getenv("PSPRECOMP_MPEG_FRAME");
+    const char *fn = getenv("PSPRECOMP_MPEG_FRAME_NO");
+    const int want = fn ? atoi(fn) : 1;
+    if (fp && c->frames == want) {
+        dump_ppm(fp, planes, b);
+        fprintf(stderr, "mpeg: decoded frame %d, %dx%d -> %s\n", c->frames,
+                b->iWidth, b->iHeight, fp);
+    }
+}
+
 /* Decode up to ONE picture and stop. Returns 1 if it produced one.
  *
  * Decoding everything available in a single call looks like the efficient
@@ -1120,49 +1240,15 @@ static void dump_ppm(const char *path, unsigned char *pl[3], const SSysMEMBuffer
  * that difference zero, so the buffer always looks empty. */
 static int avc_pump(mpeg_ctx *c) {
     if (c->dec_failed) return 0;
-    if (!c->dec) {
-        ISVCDecoder *d = NULL;
-        if (WelsCreateDecoder(&d) != 0 || !d) { c->dec_failed = 1; return 0; }
-        SDecodingParam prm;
-        memset(&prm, 0, sizeof prm);
-        /* What a damaged picture lacks comes from the picture before it, an
-         * IDR included. Plain slice copy fills an IDR's missing part with
-         * mid-gray instead (openh264, error_concealment.cpp): WipEout Pulse
-         * cuts the IDR at its menu movie's loop point, and a gray band
-         * flashed across the menu each time the movie looped. */
-        prm.eEcActiveIdc = ERROR_CON_SLICE_COPY_CROSS_IDR;
-        prm.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-        if ((*d)->Initialize(d, &prm) != 0) {
-            WelsDestroyDecoder(d); c->dec_failed = 1; return 0;
-        }
-        c->dec = d;
-    }
-    ISVCDecoder *d = (ISVCDecoder *)c->dec;
+    ISVCDecoder *dec = avc_open(c);
+    if (!dec) return 0;
 
     int produced = 0;
-    size_t pos = c->es_pos;
-    while (pos < c->es_len) {
-        const size_t start = nal_next(c->es, c->es_len, pos);
-        if (start >= c->es_len) break;
-        size_t end = nal_next(c->es, c->es_len, start);
-        size_t nal_end;
-        if (end >= c->es_len) {
-            /* No following start code. Mid-stream that means "incomplete, wait
-             * for more"; at end of stream it means this is the last NAL and
-             * everything left is it -- a tail that would otherwise never
-             * decode, and the last frames of the movie would silently drop. */
-            if (!c->es_eof) break;
-            nal_end = c->es_len;
-        } else {
-            /* end points past the next start code's 0x01; back up over it and
-             * any trailing zero of a four-byte start code. */
-            nal_end = end - 3;
-            while (nal_end > start && c->es[nal_end - 1] == 0) nal_end--;
-        }
-        if ((c->es[start] & 0x1F) == 7) avc_note_sps(c, c->es + start + 1, nal_end - start - 1);
+    size_t start, nal_end;
+    while (nal_bounds(c, &start, &nal_end)) {
+        if ((c->es[start] & 0x1F) == NAL_SPS) avc_note_sps(c, c->es + start + 1, nal_end - start - 1);
         if (!avc_in_sequence(c, start, nal_end - start)) {
-            pos = nal_end;
-            c->es_pos = pos;
+            c->es_pos = nal_end;
             continue;
         }
 
@@ -1174,76 +1260,17 @@ static int avc_pump(mpeg_ctx *c) {
         static mpeg_dump es_dump = { .var = "PSPRECOMP_MPEG_ES" };
         dump_write(&es_dump, c->es + start - 3, nal_end - (start - 3));
         const uint64_t t0 = psp_os_mono_ns();
-        (*d)->DecodeFrameNoDelay(d, c->es + start - 3, (int)(nal_end - (start - 3)),
-                                 planes, &info);
+        (*dec)->DecodeFrameNoDelay(dec, c->es + start - 3, (int)(nal_end - (start - 3)),
+                                   planes, &info);
         c->dec_ns += psp_os_mono_ns() - t0;
         if (info.iBufferStatus == 1 && planes[0]) {
+            const SSysMEMBuffer *b = &info.UsrData.sSystemBuffer;
             c->frames++;
             produced++;
-            {   /* Copy the picture out while it is still ours to read. */
-                const SSysMEMBuffer *b = &info.UsrData.sSystemBuffer;
-                const size_t need = (size_t)b->iWidth * (size_t)b->iHeight * 3 / 2;
-                if (!c->pic || c->pic_w != b->iWidth || c->pic_h != b->iHeight) {
-                    free(c->pic);
-                    c->pic = (uint8_t *)malloc(need);
-                    c->pic_w = b->iWidth;
-                    c->pic_h = b->iHeight;
-                }
-                if (c->pic) {
-                    uint8_t *d = c->pic;
-                    for (int y = 0; y < b->iHeight; y++, d += b->iWidth)
-                        memcpy(d, planes[0] + (size_t)y * b->iStride[0], (size_t)b->iWidth);
-                    for (int pl = 1; pl <= 2; pl++)
-                        for (int y = 0; y < b->iHeight / 2; y++, d += b->iWidth / 2)
-                            memcpy(d, planes[pl] + (size_t)y * b->iStride[1], (size_t)b->iWidth / 2);
-                    c->pic_ready = 1;
-                    /* PSPRECOMP_MPEG_YUV=<file>: every picture, raw I420, as decoded. */
-                    static mpeg_dump yuv_dump = { .var = "PSPRECOMP_MPEG_YUV" };
-                    dump_write(&yuv_dump, c->pic, need);
-                    /* The picture's own timestamp, from its PES; 25fps from
-                     * the frame count only if the stream carried none -- which
-                     * this game's intro does not do, and which ran its picture
-                     * 20% slow against the sound. */
-                    {
-                        /* An anchor inside this picture's data takes it; any
-                         * earlier unused anchor is stale and dropped. */
-                        int anchored = 0;
-                        while (c->vpts_next < c->nvpts && c->vpts[c->vpts_next].es_off < nal_end) {
-                            c->pts = c->vpts[c->vpts_next].pts;
-                            anchored = 1;
-                            c->vpts_next++;
-                        }
-                        if (!c->frame_dur) c->frame_dur = 3003;   /* 29.97fps until measured */
-                        if (anchored) {
-                            /* Measured over the whole run, first anchor to
-                             * this one: two adjacent anchors a dozen frames
-                             * apart gave 35.6 ms for a 33.4 ms stream. */
-                            if (!c->anchor0_frame) { c->anchor0_pts = c->pts; c->anchor0_frame = c->frames; }
-                            else if (c->frames > c->anchor0_frame) {
-                                const uint32_t d = (c->pts - c->anchor0_pts) / (uint32_t)(c->frames - c->anchor0_frame);
-                                if (d >= 1500 && d <= 7200) c->frame_dur = d;
-                            }
-                            c->anchor_pts   = c->pts;
-                            c->anchor_frame = c->frames;
-                        } else if (c->anchor_frame) {
-                            c->pts = c->anchor_pts + c->frame_dur * (uint32_t)(c->frames - c->anchor_frame);
-                        } else {
-                            c->pts = c->frame_dur * (uint32_t)c->frames;
-                        }
-                    }
-                }
-            }
+            if (pic_copy_out(c, planes, b)) pic_assign_pts(c, nal_end);
             if (mpeg_logging() && (c->frames == 1 || c->frames % 50 == 0))
                 fprintf(stderr, "mpeg: %d frames decoded\n", c->frames);
-            const char *fp = getenv("PSPRECOMP_MPEG_FRAME");
-            const char *fn = getenv("PSPRECOMP_MPEG_FRAME_NO");
-            const int want = fn ? atoi(fn) : 1;
-            if (fp && c->frames == want) {
-                dump_ppm(fp, planes, &info.UsrData.sSystemBuffer);
-                fprintf(stderr, "mpeg: decoded frame %d, %dx%d -> %s\n", c->frames,
-                        info.UsrData.sSystemBuffer.iWidth,
-                        info.UsrData.sSystemBuffer.iHeight, fp);
-            }
+            pic_dump_ppm(c, planes, b);
         }
         /* Past the NAL just decoded, not back to its start.
          *
@@ -1258,8 +1285,7 @@ static int avc_pump(mpeg_ctx *c) {
          * thread stops putting at the end of the file and polls that count
          * until the ring reads empty -- 753 million times in one run, the
          * game never finishing the movie. */
-        pos = nal_end;
-        c->es_pos = pos;
+        c->es_pos = nal_end;
         if (produced) break;          /* one picture per call */
     }
     return produced;
