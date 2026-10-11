@@ -1804,78 +1804,91 @@ static int rt_shown(void) {
     return i;
 }
 
+/* A pixel the CPU wrote only some bytes of (bit b of mask for byte b, in
+ * the target's format): those bytes from the CPU's value, the rest from
+ * what the GPU drew. */
+static uint32_t merge_cpu_bytes(uint32_t gpu, uint32_t cpu, unsigned mask, int fmt) {
+    const uint32_t old = pack_pixel(gpu, fmt);
+    uint32_t packed = pack_pixel(cpu, fmt), bits = 0;
+    for (int b = 0; b < psp_pixel_bytes(fmt); b++)
+        if (mask & (1u << b)) bits |= 255u << (b * 8);
+    return decode_pixel((old & ~bits) | (packed & bits), fmt);
+}
+
+/* The CPU's writes to guest row y, columns start..end-1, into r's
+ * attachment, every physical row and column they cover. values and row are
+ * scratch, a guest row and an attachment row wide. Answers 0 when out of
+ * memory. */
+static int import_run(rendertarget *r, int y, int start, int end, uint32_t *values, uint32_t *row) {
+    const int gy0 = pixel_edge(y * r->sy);
+    int gy1 = pixel_edge((y + 1) * r->sy);
+    int left = pixel_edge(start * r->sx), right = pixel_edge(end * r->sx);
+    if (right > r->w) right = r->w;
+    if (gy1 > r->h) gy1 = r->h;
+    if (right <= left || gy1 <= gy0) return 1;
+    const unsigned full = (1u << psp_pixel_bytes(r->fmt)) - 1;
+    const uint8_t *dirty = &r->cpu_dirty[(size_t)y * r->stride];
+    int partial = 0;
+    for (int gx = start; gx < end; gx++) {
+        values[gx] = guest_pixel(r, gx, y);
+        if (dirty[gx] != full) partial = 1;
+    }
+    /* A byte write owns only those channels. Preserve every physical
+     * sample of the others, not just one resolved PSP pixel -- an
+     * alpha-only CPU write must not erase a fine RGB edge. Full-pixel
+     * uploads keep the fast path with no GPU read. */
+    uint32_t *previous = NULL;
+    if (partial) {
+        previous = malloc((size_t)(right - left) * (gy1 - gy0) * 4);
+        if (!previous) return 0;
+        p_glBindFramebuffer(GL_READ_FRAMEBUFFER, r->fbo);
+        p_glReadPixels(left, r->h - gy1, right - left, gy1 - gy0, GL_RGBA, GL_UNSIGNED_BYTE,
+                       previous);
+    }
+    for (int py = gy0; py < gy1; py++) {
+        for (int k = left; k < right; k++) {
+            const int gx = (int)((k + 0.5) / r->sx);
+            const unsigned mask = dirty[gx];
+            uint32_t value = values[gx];
+            if (mask != full)
+                value = merge_cpu_bytes(previous[(size_t)(gy1 - 1 - py) * (right - left) + k - left],
+                                        value, mask, r->fmt);
+            row[k - left] = value;
+        }
+        p_glTexSubImage2D(GL_TEXTURE_2D, 0, left, r->h - 1 - py, right - left, 1, GL_RGBA,
+                          GL_UNSIGNED_BYTE, row);
+    }
+    free(previous);
+    return 1;
+}
+
 static void rt_import(rendertarget *r) {
     if (!r->cpu_pending || !r->configured) return;
     g.mu.disturbed = 1;
     stencil_to_alpha(r);
     uint32_t *row = malloc((size_t)r->w * 4), *values = malloc((size_t)r->stride * 4);
-    if (!row || !values) {
-        free(row);
-        free(values);
-        g.failed = 1;
-        return;
-    }
-    p_glBindTexture(GL_TEXTURE_2D, r->colour);
-    for (int y = 0; y < r->guest_h; y++) {
-        int gy0 = pixel_edge(y * r->sy), gy1 = pixel_edge((y + 1) * r->sy);
-        for (int x = 0; x < (int)r->stride;) {
-            if (!r->cpu_dirty[(size_t)y * r->stride + x]) {
-                x++;
-                continue;
-            }
-            const int start = x;
-            while (x < (int)r->stride && r->cpu_dirty[(size_t)y * r->stride + x]) x++;
-            int left = pixel_edge(start * r->sx), right = pixel_edge(x * r->sx);
-            if (right > r->w) right = r->w;
-            if (gy1 > r->h) gy1 = r->h;
-            if (right <= left || gy1 <= gy0) continue;
-            const int bpp = psp_pixel_bytes(r->fmt);
-            const unsigned full = (1u << bpp) - 1;
-            int partial = 0;
-            for (int gx = start; gx < x; gx++) {
-                values[gx] = guest_pixel(r, gx, y);
-                if (r->cpu_dirty[(size_t)y * r->stride + gx] != full) partial = 1;
-            }
-            /* A byte write owns only those channels. Preserve every physical
-             * sample of the others, not just one resolved PSP pixel -- an
-             * alpha-only CPU write must not erase a fine RGB edge. Full-pixel
-             * uploads keep the fast path with no GPU read. */
-            uint32_t *previous = NULL;
-            if (partial) {
-                previous = malloc((size_t)(right - left) * (gy1 - gy0) * 4);
-                if (!previous) {
-                    free(row);
-                    free(values);
-                    g.failed = 1;
-                    return;
+    int ok = row && values;
+    if (ok) {
+        p_glBindTexture(GL_TEXTURE_2D, r->colour);
+        for (int y = 0; ok && y < r->guest_h; y++) {
+            const uint8_t *dirty = &r->cpu_dirty[(size_t)y * r->stride];
+            for (int x = 0; ok && x < (int)r->stride;) {
+                if (!dirty[x]) {
+                    x++;
+                    continue;
                 }
-                p_glBindFramebuffer(GL_READ_FRAMEBUFFER, r->fbo);
-                p_glReadPixels(left, r->h - gy1, right - left, gy1 - gy0, GL_RGBA, GL_UNSIGNED_BYTE,
-                               previous);
+                const int start = x;
+                while (x < (int)r->stride && dirty[x]) x++;
+                ok = import_run(r, y, start, x, values, row);
             }
-            for (int py = gy0; py < gy1; py++) {
-                for (int k = left; k < right; k++) {
-                    const int gx = (int)((k + 0.5) / r->sx);
-                    const unsigned mask = r->cpu_dirty[(size_t)y * r->stride + gx];
-                    uint32_t value = values[gx];
-                    if (mask != full) {
-                        uint32_t old = pack_pixel(
-                            previous[(size_t)(gy1 - 1 - py) * (right - left) + k - left], r->fmt);
-                        uint32_t cpu = pack_pixel(value, r->fmt), bits = 0;
-                        for (int b = 0; b < bpp; b++)
-                            if (mask & (1u << b)) bits |= 255u << (b * 8);
-                        value = decode_pixel((old & ~bits) | (cpu & bits), r->fmt);
-                    }
-                    row[k - left] = value;
-                }
-                p_glTexSubImage2D(GL_TEXTURE_2D, 0, left, r->h - 1 - py, right - left, 1, GL_RGBA,
-                                  GL_UNSIGNED_BYTE, row);
-            }
-            free(previous);
         }
     }
     free(row);
     free(values);
+    if (!ok) {
+        g.failed = 1;
+        return;
+    }
     memset(r->cpu_dirty, 0, (size_t)r->stride * r->guest_h);
     r->cpu_pending = 0;
     r->stencil_valid = 0;
@@ -1933,30 +1946,28 @@ static void let_go(void) {
  * thread holding it is parked, waiting for its turn, while another runs, so
  * it is asked to let go there (psp_sched_run_on); one whose guest thread has
  * ended let go as it went. */
-static int claim(void) {
-    const unsigned long me = this_thread();
-    if (g.ready) {
-        if (g.thread == me) return 0;
-        if (g.thread) psp_sched_run_on(g.uid, let_go);
-        if (g.thread || present_gl_make_current() != 0) {
-            static int said;
-            if (!said++)
-                fprintf(stderr, "gl: the GE reached this backend on host thread %lu, and the "
-                                "context could not be moved from %lu; refusing rather than "
-                                "drawing through a context that is not current.\n", me, g.thread);
-            return -1;
-        }
-        g.thread = me;
-        g.uid = psp_sched_current();
-        if (++g.moves <= 4)
-            fprintf(stderr, "gl: the context followed the GE to host thread %lu\n", me);
-        return 0;
+/* The context, already set up, moved to this host thread (claim). */
+static int reclaim_context(unsigned long me) {
+    if (g.thread == me) return 0;
+    if (g.thread) psp_sched_run_on(g.uid, let_go);
+    if (g.thread || present_gl_make_current() != 0) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "gl: the GE reached this backend on host thread %lu, and the "
+                            "context could not be moved from %lu; refusing rather than "
+                            "drawing through a context that is not current.\n", me, g.thread);
+        return -1;
     }
-    if (g.failed) return -1;
-
-    if (present_gl_make_current() != 0 || gl_load() != 0) { g.failed = 1; return -1; }
     g.thread = me;
     g.uid = psp_sched_current();
+    if (++g.moves <= 4)
+        fprintf(stderr, "gl: the context followed the GE to host thread %lu\n", me);
+    return 0;
+}
+
+/* The largest target or texture this context takes: the least of its
+ * texture, renderbuffer and viewport limits. */
+static void query_max_size(void) {
     GLint tex_limit, rb_limit, viewport_limit[2];
     p_glGetIntegerv(GL_MAX_TEXTURE_SIZE, &tex_limit);
     p_glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &rb_limit);
@@ -1964,115 +1975,97 @@ static int claim(void) {
     g.max_size = tex_limit < rb_limit ? tex_limit : rb_limit;
     if (viewport_limit[0] < g.max_size) g.max_size = viewport_limit[0];
     if (viewport_limit[1] < g.max_size) g.max_size = viewport_limit[1];
+}
 
-    if (build_program() != 0) { g.failed = 1; return -1; }
-    if (build_stencil_program() != 0) { g.failed = 1; return -1; }
-    /* The model program needs GLSL 4.0; without it the CPU path stands. */
-    {
-        const char *e = getenv("PSPRECOMP_GL_TRANSFORM");
-        if (e && strcmp(e, "cpu") == 0) g.model_unavailable = 1;
-        else if (build_model_program() != 0) { g.model_unavailable = 1; fprintf(stderr, "gl: model program unavailable, transforming on the CPU\n"); }
-        else {
-            p_glGenVertexArrays(1, &g.vao_model);
-            p_glBindVertexArray(g.vao_model);
-            ring_create(RING_VBO, GL_ARRAY_BUFFER, (size_t)4 * MODEL_RING_VERTS * sizeof(psp_model_vertex));
-            g.vbo_model = g_rings.r[RING_VBO].buf;
-            g.mu.vbo_head = 0;
-            p_glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &g.mu.ubo_align);
-            if (g.mu.ubo_align < 16) g.mu.ubo_align = 16;
-            g.mu.ubo_slot_bytes = (int)((XFORM_MAXB * sizeof(xform_block) + g.mu.ubo_align - 1) / g.mu.ubo_align * g.mu.ubo_align);
-            ring_create(RING_UBO, GL_UNIFORM_BUFFER, (size_t)4 * 1024 * 1024);
-            g.mu.ubo = g_rings.r[RING_UBO].buf;
-            g.mu.ubo_slot = 0;
-            p_glBindBuffer(GL_ARRAY_BUFFER, g.vbo_model);
-            p_glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(psp_model_vertex), (void *)offsetof(psp_model_vertex, pos));
-            p_glEnableVertexAttribArray(0);
-            p_glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(psp_model_vertex), (void *)offsetof(psp_model_vertex, nrm));
-            p_glEnableVertexAttribArray(1);
-            p_glVertexAttribIPointer(2, 1, GL_UNSIGNED_INT, sizeof(psp_model_vertex), (void *)offsetof(psp_model_vertex, rgba));
-            p_glEnableVertexAttribArray(2);
-            p_glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(psp_model_vertex), (void *)offsetof(psp_model_vertex, u));
-            p_glEnableVertexAttribArray(3);
-            ring_create(RING_DRAW, GL_ARRAY_BUFFER, (size_t)4 * MODEL_RING_VERTS * sizeof(GLuint));
-            g.mu.vbo_draw = g_rings.r[RING_DRAW].buf;
-            p_glVertexAttribIPointer(4, 1, GL_UNSIGNED_INT, sizeof(GLuint), (void *)0);
-            p_glEnableVertexAttribArray(4);
-            /* The triangle indices of every draw are a prefix of one of three
-             * patterns -- a list counts up, a strip is (t, t+1, t+2), a fan
-             * (0, t+1, t+2) -- so they live in one static buffer and a draw
-             * names its pattern and length. Nothing is written per batch. */
-            {
-                enum { NPAT = MODEL_MAX_VERTS + 2 * 3 * (MODEL_MAX_VERTS - 2) };
-                static GLushort pat[NPAT]; int k = 0;
-                for (int t = 0; t < MODEL_MAX_VERTS; t++) pat[k++] = (GLushort)t;
-                for (int t = 0; t + 2 < MODEL_MAX_VERTS; t++) { pat[k++] = (GLushort)t; pat[k++] = (GLushort)(t + 1); pat[k++] = (GLushort)(t + 2); }
-                for (int t = 0; t + 2 < MODEL_MAX_VERTS; t++) { pat[k++] = 0; pat[k++] = (GLushort)(t + 1); pat[k++] = (GLushort)(t + 2); }
-                p_glGenBuffers(1, &g.mu.ebo_ring);
-                p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.mu.ebo_ring);
-                p_glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)((size_t)k * sizeof(GLushort)), pat, GL_STATIC_DRAW);
-            }
-            g.mu.profile = getenv("PSPRECOMP_GL_PROFILE") != NULL;
-            p_glBindVertexArray(0);
-            {
-                /* Asynchronous unless asked otherwise: the pixels land in guest
-                 * memory at the next present, or earlier the moment anything
-                 * reaches for them (rt_guest_access). PSPRECOMP_GL_READBACK=sync
-                 * keeps the glReadPixels in the present. */
-                const char *rb = getenv("PSPRECOMP_GL_READBACK");
-                if (!(rb && strcmp(rb, "sync") == 0) && g_rings.persistent) {
-                    const GLbitfield flags = GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
-                    p_glGenBuffers(1, &g_rb.pbo);
-                    p_glBindBuffer(GL_PIXEL_PACK_BUFFER, g_rb.pbo);
-                    p_glBufferStorage(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)(RB_SLOTS * RB_SLOT_BYTES), NULL, flags);
-                    g_rb.map = (uint8_t *)p_glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)(RB_SLOTS * RB_SLOT_BYTES), flags);
-                    p_glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-                    g_rb.async = g_rb.map != NULL;
-                }
-            }
-        }
+static void setup_async_readback(void) {
+    /* Asynchronous unless asked otherwise: the pixels land in guest
+     * memory at the next present, or earlier the moment anything
+     * reaches for them (rt_guest_access). PSPRECOMP_GL_READBACK=sync
+     * keeps the glReadPixels in the present. */
+    const char *rb = getenv("PSPRECOMP_GL_READBACK");
+    if (!(rb && strcmp(rb, "sync") == 0) && g_rings.persistent) {
+        const GLbitfield flags = GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+        p_glGenBuffers(1, &g_rb.pbo);
+        p_glBindBuffer(GL_PIXEL_PACK_BUFFER, g_rb.pbo);
+        p_glBufferStorage(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)(RB_SLOTS * RB_SLOT_BYTES), NULL, flags);
+        g_rb.map = (uint8_t *)p_glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)(RB_SLOTS * RB_SLOT_BYTES), flags);
+        p_glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        g_rb.async = g_rb.map != NULL;
     }
+}
 
-    /* Desktop GL starts with dithering enabled. The backend contract is the
-     * currently undithered software GE, so an implicit host dither pattern is
-     * never valid state and turns exact RGBA8 arithmetic back into LSB noise. */
-    p_glDisable(GL_DITHER);
+/* The model program and its buffers. It needs GLSL 4.0; without it the CPU
+ * path stands. */
+static void setup_model_pipeline(void) {
+    const char *e = getenv("PSPRECOMP_GL_TRANSFORM");
+    if (e && strcmp(e, "cpu") == 0) { g.model_unavailable = 1; return; }
+    if (build_model_program() != 0) {
+        g.model_unavailable = 1;
+        fprintf(stderr, "gl: model program unavailable, transforming on the CPU\n");
+        return;
+    }
+    p_glGenVertexArrays(1, &g.vao_model);
+    p_glBindVertexArray(g.vao_model);
+    ring_create(RING_VBO, GL_ARRAY_BUFFER, (size_t)4 * MODEL_RING_VERTS * sizeof(psp_model_vertex));
+    g.vbo_model = g_rings.r[RING_VBO].buf;
+    g.mu.vbo_head = 0;
+    p_glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &g.mu.ubo_align);
+    if (g.mu.ubo_align < 16) g.mu.ubo_align = 16;
+    g.mu.ubo_slot_bytes = (int)((XFORM_MAXB * sizeof(xform_block) + g.mu.ubo_align - 1) / g.mu.ubo_align * g.mu.ubo_align);
+    ring_create(RING_UBO, GL_UNIFORM_BUFFER, (size_t)4 * 1024 * 1024);
+    g.mu.ubo = g_rings.r[RING_UBO].buf;
+    g.mu.ubo_slot = 0;
+    p_glBindBuffer(GL_ARRAY_BUFFER, g.vbo_model);
+    p_glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(psp_model_vertex), (void *)offsetof(psp_model_vertex, pos));
+    p_glEnableVertexAttribArray(0);
+    p_glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(psp_model_vertex), (void *)offsetof(psp_model_vertex, nrm));
+    p_glEnableVertexAttribArray(1);
+    p_glVertexAttribIPointer(2, 1, GL_UNSIGNED_INT, sizeof(psp_model_vertex), (void *)offsetof(psp_model_vertex, rgba));
+    p_glEnableVertexAttribArray(2);
+    p_glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(psp_model_vertex), (void *)offsetof(psp_model_vertex, u));
+    p_glEnableVertexAttribArray(3);
+    ring_create(RING_DRAW, GL_ARRAY_BUFFER, (size_t)4 * MODEL_RING_VERTS * sizeof(GLuint));
+    g.mu.vbo_draw = g_rings.r[RING_DRAW].buf;
+    p_glVertexAttribIPointer(4, 1, GL_UNSIGNED_INT, sizeof(GLuint), (void *)0);
+    p_glEnableVertexAttribArray(4);
+    /* The triangle indices of every draw are a prefix of one of three
+     * patterns -- a list counts up, a strip is (t, t+1, t+2), a fan
+     * (0, t+1, t+2) -- so they live in one static buffer and a draw
+     * names its pattern and length. Nothing is written per batch. */
+    {
+        enum { NPAT = MODEL_MAX_VERTS + 2 * 3 * (MODEL_MAX_VERTS - 2) };
+        static GLushort pat[NPAT]; int k = 0;
+        for (int t = 0; t < MODEL_MAX_VERTS; t++) pat[k++] = (GLushort)t;
+        for (int t = 0; t + 2 < MODEL_MAX_VERTS; t++) { pat[k++] = (GLushort)t; pat[k++] = (GLushort)(t + 1); pat[k++] = (GLushort)(t + 2); }
+        for (int t = 0; t + 2 < MODEL_MAX_VERTS; t++) { pat[k++] = 0; pat[k++] = (GLushort)(t + 1); pat[k++] = (GLushort)(t + 2); }
+        p_glGenBuffers(1, &g.mu.ebo_ring);
+        p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.mu.ebo_ring);
+        p_glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)((size_t)k * sizeof(GLushort)), pat, GL_STATIC_DRAW);
+    }
+    g.mu.profile = getenv("PSPRECOMP_GL_PROFILE") != NULL;
+    p_glBindVertexArray(0);
+    setup_async_readback();
+}
 
+/* The CPU path's vertex array: position, colour, texture coordinates, fog,
+ * 1/w, texture q and level of detail, in push()'s order. */
+static void setup_batch_pipeline(void) {
+    static const struct { GLint size; int at; } attr[] = {
+        { 3, 0 }, { 4, 3 }, { 2, 7 }, { 1, 9 }, { 1, 10 }, { 1, 11 }, { 1, 12 },
+    };
     p_glGenVertexArrays(1, &g.vao);
     p_glBindVertexArray(g.vao);
     ring_create(RING_BATCH, GL_ARRAY_BUFFER, (size_t)4 * GL_MAX_VERTS * FLOATS_PER_VERT * sizeof(float));
     g.vbo = g_rings.r[RING_BATCH].buf;
-    p_glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
-                            FLOATS_PER_VERT * sizeof(float), (void *)0);
-    p_glEnableVertexAttribArray(0);
-    p_glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE,
-                            FLOATS_PER_VERT * sizeof(float),
-                            (void *)(3 * sizeof(float)));
-    p_glEnableVertexAttribArray(1);
-    p_glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE,
-                            FLOATS_PER_VERT * sizeof(float),
-                            (void *)(7 * sizeof(float)));
-    p_glEnableVertexAttribArray(2);
-    p_glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE,
-                            FLOATS_PER_VERT * sizeof(float),
-                            (void *)(9 * sizeof(float)));
-    p_glEnableVertexAttribArray(3);
-    p_glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE,
-                            FLOATS_PER_VERT * sizeof(float),
-                            (void *)(10 * sizeof(float)));
-    p_glEnableVertexAttribArray(4);
-    p_glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE,
-                            FLOATS_PER_VERT * sizeof(float),
-                            (void *)(11 * sizeof(float)));
-    p_glEnableVertexAttribArray(5);
-    p_glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE,
-                            FLOATS_PER_VERT * sizeof(float),
-                            (void *)(12 * sizeof(float)));
-    p_glEnableVertexAttribArray(6);
+    for (GLuint i = 0; i < sizeof attr / sizeof attr[0]; i++) {
+        p_glVertexAttribPointer(i, attr[i].size, GL_FLOAT, GL_FALSE,
+                                FLOATS_PER_VERT * sizeof(float),
+                                (void *)(attr[i].at * sizeof(float)));
+        p_glEnableVertexAttribArray(i);
+    }
+}
 
-    g.batch = calloc(GL_MAX_VERTS * FLOATS_PER_VERT, sizeof(float));
-    if (!g.batch) { g.failed = 1; return -1; }
-    p_glGenQueries(GPU_QUERY_RING, g.gpu_query);
-
+static void log_context(unsigned long me) {
     fprintf(stderr, "gl: context claimed on thread %lu, %dx%d target\n",
             me, g.w, g.h);
     const GLubyte *(APIENTRY *get_string)(GLenum) = present_gl_proc("glGetString");
@@ -2083,6 +2076,34 @@ static int claim(void) {
     fprintf(stderr, "gl: vendor %s\ngl: version %s\n",
             vendor ? (const char *)vendor : "unknown",
             version ? (const char *)version : "unknown");
+}
+
+static int claim(void) {
+    const unsigned long me = this_thread();
+    if (g.ready) return reclaim_context(me);
+    if (g.failed) return -1;
+
+    if (present_gl_make_current() != 0 || gl_load() != 0) { g.failed = 1; return -1; }
+    g.thread = me;
+    g.uid = psp_sched_current();
+    query_max_size();
+
+    if (build_program() != 0) { g.failed = 1; return -1; }
+    if (build_stencil_program() != 0) { g.failed = 1; return -1; }
+    setup_model_pipeline();
+
+    /* Desktop GL starts with dithering enabled. The backend contract is the
+     * currently undithered software GE, so an implicit host dither pattern is
+     * never valid state and turns exact RGBA8 arithmetic back into LSB noise. */
+    p_glDisable(GL_DITHER);
+
+    setup_batch_pipeline();
+
+    g.batch = calloc(GL_MAX_VERTS * FLOATS_PER_VERT, sizeof(float));
+    if (!g.batch) { g.failed = 1; return -1; }
+    p_glGenQueries(GPU_QUERY_RING, g.gpu_query);
+
+    log_context(me);
     g.ready = 1;
     resolution_size();
     psp_mem_set_write_observer(rt_guest_write);
