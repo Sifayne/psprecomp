@@ -4447,13 +4447,22 @@ static const psp_render_backend gl_backend = {
 
 const psp_render_backend *render_gl_backend(void) { return &gl_backend; }
 
-void render_gl_report(FILE *out) {
-    if (!g.ready && !g.failed) return;
-    fprintf(out, "gl:       %s", g.failed ? "failed to start" : "ran");
-    if (g.ready)
-        fprintf(out, " -- %llu draw(s), %llu vertices, %llu readback(s), the context moved %llu time(s)",
-                (unsigned long long)g.draws, (unsigned long long)g.verts,
-                (unsigned long long)g.readbacks, (unsigned long long)g.moves);
+/* The bins of an n-bin histogram of total samples that hold the 50th and
+ * the 95th percentile; -1 for one never reached. */
+static void histogram_p50_p95(const uint64_t *bins, int n, uint64_t total, int *p50, int *p95) {
+    const uint64_t p50_at = (total + 1) / 2;
+    const uint64_t p95_at = (total * 95 + 99) / 100;
+    uint64_t seen = 0;
+    *p50 = *p95 = -1;
+    for (int i = 0; i < n; i++) {
+        seen += bins[i];
+        if (*p50 < 0 && seen >= p50_at) *p50 = i;
+        if (seen >= p95_at) { *p95 = i; break; }
+    }
+}
+
+/* render_gl_report's sections, each continuing its line or starting its own. */
+static void report_paths(FILE *out) {
     fprintf(out, "\n          transform: %s, %llu model draw(s) in %llu batch(es), %llu vertices; %llu repeated setter(s) skipped, scene state reused %llu of %llu time(s)",
             g.model_unavailable ? "CPU" : "GPU", (unsigned long long)g.model_draws, (unsigned long long)g.mu.batches, (unsigned long long)g.model_verts, (unsigned long long)g.mu.setters_skipped,
             (unsigned long long)g.mu.scene_hits, (unsigned long long)(g.mu.scene_hits + g.mu.scene_misses));
@@ -4472,6 +4481,9 @@ void render_gl_report(FILE *out) {
     if (g.mu.profile)
         fprintf(out, "\n          present readback: %llu target(s) in %.1f ms (%.2f ms each)",
                 (unsigned long long)g.mu.readbacks, g.mu.t_readback / 1e3, g.mu.readbacks ? g.mu.t_readback / 1e3 / (double)g.mu.readbacks : 0.0);
+}
+
+static void report_targets(FILE *out) {
     fprintf(out, "\n          targets: %d%s", g.n_rts,
             g.rt_overflow ? " (more than the table holds)" : "");
     if (g.display_targets)
@@ -4493,6 +4505,9 @@ void render_gl_report(FILE *out) {
                 (unsigned long long)g.glyph_draws, (unsigned long long)g.snap_draws);
     if (g.smooth_bloom)
         fprintf(out, "\n          bloom: smooth, %llu composite draw(s)", (unsigned long long)g.bloom_draws);
+}
+
+static void report_aspect(FILE *out) {
     if (g.adaptive_aspect)
         fprintf(out, "\n          aspect: virtual size %dx%d (x%.4f), %llu scene draw(s),"
                      " %llu HUD draw(s) in %llu batch(es), %llu HUD batch(es) depth-tested,"
@@ -4520,6 +4535,9 @@ void render_gl_report(FILE *out) {
             if (g.hud_depth_func[f])
                 fprintf(out, " %d:%llu", f, (unsigned long long)g.hud_depth_func[f]);
     }
+}
+
+static void report_textures(FILE *out) {
     fprintf(out, "\n          textures: %llu request(s), %llu upload(s), %llu hit(s)"
                  " (%llu immediate, %llu revalidated), %llu dirty invalidation(s),"
                  " %llu miss(es), %llu eviction(s), %d/%d resident, %llu too big, %llu from VRAM,"
@@ -4556,16 +4574,12 @@ void render_gl_report(FILE *out) {
             g.tex_decode_ns / 1.0e9, g.tex_upload_ns / 1.0e9,
             g.tex_upload_pixels * 4.0 / (1024.0 * 1024.0),
             g.readback_ns / 1.0e9);
+}
+
+static void report_frame_times(FILE *out) {
     if (g.gpu_samples) {
-        const uint64_t p50_at = (g.gpu_samples + 1) / 2;
-        const uint64_t p95_at = (g.gpu_samples * 95 + 99) / 100;
-        uint64_t seen = 0;
-        int p50 = -1, p95 = -1;
-        for (int tenth = 0; tenth < 256; tenth++) {
-            seen += g.gpu_tenth_ms[tenth];
-            if (p50 < 0 && seen >= p50_at) p50 = tenth;
-            if (seen >= p95_at) { p95 = tenth; break; }
-        }
+        int p50, p95;
+        histogram_p50_p95(g.gpu_tenth_ms, 256, g.gpu_samples, &p50, &p95);
         fprintf(out, "\n          gpu: %llu draw+blit sample(s), mean %.2f ms, "
                      "p50 %.1f ms, p95 %.1f ms, max %.2f ms",
                 (unsigned long long)g.gpu_samples,
@@ -4578,30 +4592,28 @@ void render_gl_report(FILE *out) {
     }
     if (g.frames > 1 && g.frame_last_ns > g.frame_first_ns) {
         const uint64_t intervals = g.frames - 1;
-        const uint64_t p50_at = (intervals + 1) / 2;
-        const uint64_t p95_at = (intervals * 95 + 99) / 100;
-        uint64_t seen = 0;
-        int p50 = -1, p95 = -1;
-        for (int ms = 0; ms < 256; ms++) {
-            seen += g.frame_ms[ms];
-            if (p50 < 0 && seen >= p50_at) p50 = ms;
-            if (seen >= p95_at) { p95 = ms; break; }
-        }
+        int p50, p95;
+        histogram_p50_p95(g.frame_ms, 256, intervals, &p50, &p95);
         const double seconds = (g.frame_last_ns - g.frame_first_ns) / 1.0e9;
         fprintf(out, "\n          frames: %llu rendered / %llu present call(s) over %.3f s"
                      " (%.2f/s), interval p50 %d ms, p95 %d ms, max %.1f ms",
                 (unsigned long long)g.frames, (unsigned long long)g.presents, seconds,
                 intervals / seconds, p50, p95, g.frame_max_ns / 1.0e6);
     }
+}
+
+/* The rest of the last line: batch overflows, and what the GL pipeline
+ * could not express. Counted rather than approximated: the doubled blend
+ * factors and the absolute-difference equation have no GL equivalent and
+ * need the shader. A wrong factor renders a plausible picture; a counted
+ * one is a number. */
+static void report_unrepresented(FILE *out) {
     if (g.batch_overflows)
         fprintf(out, ", %llu batch flush(es) from overflow",
                 (unsigned long long)g.batch_overflows);
     if (g.unsupported_prims)
         fprintf(out, ", %llu point/line draw(s) skipped",
                 (unsigned long long)g.unsupported_prims);
-    /* Counted rather than approximated: the doubled blend factors and the
-     * absolute-difference equation have no GL equivalent and need the shader.
-     * A wrong factor renders a plausible picture; a counted one is a number. */
     if (g.partial_pixel_masks)
         fprintf(out, ", %llu draw(s) with a partial pixel mask written whole",
                 (unsigned long long)g.partial_pixel_masks);
@@ -4622,6 +4634,21 @@ void render_gl_report(FILE *out) {
         fprintf(out, "\n          stencil: %llu RGBA8888 draw(s), %llu alpha import(s), %llu export(s)",
                 (unsigned long long)g.stencil_draws,
                 (unsigned long long)g.stencil_imports, (unsigned long long)g.stencil_exports);
+}
+
+void render_gl_report(FILE *out) {
+    if (!g.ready && !g.failed) return;
+    fprintf(out, "gl:       %s", g.failed ? "failed to start" : "ran");
+    if (g.ready)
+        fprintf(out, " -- %llu draw(s), %llu vertices, %llu readback(s), the context moved %llu time(s)",
+                (unsigned long long)g.draws, (unsigned long long)g.verts,
+                (unsigned long long)g.readbacks, (unsigned long long)g.moves);
+    report_paths(out);
+    report_targets(out);
+    report_aspect(out);
+    report_textures(out);
+    report_frame_times(out);
+    report_unrepresented(out);
     fprintf(out, "\n");
 }
 
