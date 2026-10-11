@@ -559,47 +559,70 @@ static int convert_presets(psp_settings_file *f, const char *selected, char *why
     return 0;
 }
 
+/* A file being read: the section its lines go to, and what its header said. */
+typedef struct {
+    psp_settings_file *f;
+    section *at;                /* NULL before the first section */
+    int version;
+    char selected[PSP_SETTINGS_NAME];
+} reader;
+
+/* Why a line is refused, into why: -1. */
+static int refuse(char *why, const char *message) {
+    snprintf(why, PSP_SETTINGS_ERROR, "%s", message);
+    return -1;
+}
+
+/* "[name]": the section the next lines go to. */
+static int read_section(reader *r, char *v, char *why) {
+    size_t n = strlen(v);
+    if (n < 3 || v[n-1] != ']') return refuse(why, "expected [section]");
+    v[n-1] = 0; v++;
+    if (!r->version) return refuse(why, "expected version= before the first section");
+    if (r->version == 1 ? strncmp(v, "preset ", 7) || !psp_settings_name_valid(v + 7) : !section_name_valid(v)) {
+        snprintf(why, PSP_SETTINGS_ERROR, "unexpected section [%.200s]", v); return -1;
+    }
+    if (section_find(r->f, v)) { snprintf(why, PSP_SETTINGS_ERROR, "duplicate section [%.200s]", v); return -1; }
+    if (!(r->at = section_add(r->f, v))) return refuse(why, "out of memory");
+    return 0;
+}
+
+/* Before the first section: version=, game= and, in version 1, selected=. */
+static int read_header(reader *r, const char *key, const char *v, char *why) {
+    if (!strcmp(key, "version") && !r->version && (!strcmp(v, "1") || !strcmp(v, "2"))) r->version = *v - '0';
+    else if (!strcmp(key, "selected") && r->version == 1 && !*r->selected && psp_settings_name_valid(v)) strcpy(r->selected, v);
+    else if (!strcmp(key, "game") && !*r->f->game && psp_settings_name_valid(v)) strcpy(r->f->game, v);
+    else return refuse(why, "expected version=1 or 2, at most one game=Slug and, in version 1, selected=Name, before the sections");
+    return 0;
+}
+
+/* One line: blank or a comment, a section header, or key=value. */
+static int read_line(reader *r, char *line, char *why) {
+    char *v = trim(line);
+    if (!*v || *v == '#' || *v == ';') return 0;
+    if (*v == '[') return read_section(r, v, why);
+    char *eq = strchr(v, '=');
+    if (!eq) return refuse(why, "expected key=value");
+    *eq = 0; char *key = trim(v); v = trim(eq + 1);
+    if (!r->at) return read_header(r, key, v, why);
+    if (!*key) return refuse(why, "expected key=value");
+    if (section_get(r->at, key)) { snprintf(why, PSP_SETTINGS_ERROR, "duplicate key '%.200s'", key); return -1; }
+    if (section_set(r->at, key, v)) return refuse(why, "out of memory");
+    return 0;
+}
+
 psp_settings_file *psp_settings_file_read(const char *path, char *error) {
     FILE *in = fopen(path, "r");
     if (!in) { fail(error, path, strerror(errno)); return NULL; }
     psp_settings_file *f = psp_settings_file_new();
     if (!f) { fclose(in); fail(error, path, "out of memory"); return NULL; }
-    char line[512], selected[PSP_SETTINGS_NAME] = "", why[PSP_SETTINGS_ERROR] = "";
-    int version = 0, lineno = 0, bad = 0;
-    section *at = NULL;
-    while (fgets(line, sizeof line, in)) {
+    reader r = { .f = f };
+    char line[512], why[PSP_SETTINGS_ERROR] = "";
+    int lineno = 0, bad = 0;
+    while (!bad && fgets(line, sizeof line, in)) {
         lineno++;
-        if (!strchr(line, '\n') && !feof(in)) { strcpy(why, "line too long"); bad = 1; break; }
-        char *v = trim(line);
-        if (!*v || *v == '#' || *v == ';') continue;
-        if (*v == '[') {
-            size_t n = strlen(v);
-            if (n < 3 || v[n-1] != ']') { strcpy(why, "expected [section]"); bad = 1; break; }
-            v[n-1] = 0; v++;
-            if (!version) { strcpy(why, "expected version= before the first section"); bad = 1; break; }
-            if (version == 1 ? strncmp(v, "preset ", 7) || !psp_settings_name_valid(v + 7) : !section_name_valid(v)) {
-                snprintf(why, sizeof why, "unexpected section [%.200s]", v); bad = 1; break;
-            }
-            if (section_find(f, v)) { snprintf(why, sizeof why, "duplicate section [%.200s]", v); bad = 1; break; }
-            if (!(at = section_add(f, v))) { strcpy(why, "out of memory"); bad = 1; break; }
-            continue;
-        }
-        char *eq = strchr(v, '=');
-        if (!eq) { strcpy(why, "expected key=value"); bad = 1; break; }
-        *eq = 0; char *key = trim(v); v = trim(eq + 1);
-        if (!at) {
-            if (!strcmp(key, "version") && !version && (!strcmp(v, "1") || !strcmp(v, "2"))) version = *v - '0';
-            else if (!strcmp(key, "selected") && version == 1 && !*selected && psp_settings_name_valid(v)) strcpy(selected, v);
-            else if (!strcmp(key, "game") && !*f->game && psp_settings_name_valid(v)) strcpy(f->game, v);
-            else {
-                strcpy(why, "expected version=1 or 2, at most one game=Slug and, in version 1, selected=Name, before the sections");
-                bad = 1; break;
-            }
-            continue;
-        }
-        if (!*key) { strcpy(why, "expected key=value"); bad = 1; break; }
-        if (section_get(at, key)) { snprintf(why, sizeof why, "duplicate key '%.200s'", key); bad = 1; break; }
-        if (section_set(at, key, v)) { strcpy(why, "out of memory"); bad = 1; break; }
+        if (!strchr(line, '\n') && !feof(in)) bad = refuse(why, "line too long");
+        else bad = read_line(&r, line, why);
     }
     if (!bad && ferror(in)) { snprintf(why, sizeof why, "read failed: %s", strerror(errno)); bad = 1; }
     fclose(in);
@@ -608,9 +631,9 @@ psp_settings_file *psp_settings_file_read(const char *path, char *error) {
         psp_settings_file_free(f);
         return NULL;
     }
-    if (!version) strcpy(why, "requires version=1 or 2");
-    else if (version == 1 && (!f->count || !*selected)) strcpy(why, "a version 1 file needs at least one preset and selected=Name");
-    else if (version == 1) convert_presets(f, selected, why);
+    if (!r.version) strcpy(why, "requires version=1 or 2");
+    else if (r.version == 1 && (!f->count || !*r.selected)) strcpy(why, "a version 1 file needs at least one preset and selected=Name");
+    else if (r.version == 1) convert_presets(f, r.selected, why);
     if (*why) {
         snprintf(error, PSP_SETTINGS_ERROR, "%s: %.300s", path, why);
         psp_settings_file_free(f);
