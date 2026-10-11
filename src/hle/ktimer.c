@@ -104,8 +104,7 @@ static void hle_SetSysClockAlarm(void) {
     const uint32_t clk = psp_arg(0);
     if (!psp_arg(1)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
     if (!clk || !psp_mem_ptr(clk, 8)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
-    const uint64_t usec = (uint64_t)psp_read32(clk) |
-                          ((uint64_t)psp_read32(clk + 4) << 32);
+    const uint64_t usec = psp_read64(clk);
     const uint32_t uid = alarm_arm(usec, psp_arg(1), psp_arg(2));
     psp_ret(uid ? uid : SCE_KERNEL_ERROR_NO_MEMORY);
 }
@@ -362,7 +361,7 @@ static void hle_GetVTimerTime(void) {
     const uint32_t out = psp_arg(1);
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
     const uint64_t t = vtimer_now(v);
-    if (out) { psp_write32(out, (uint32_t)t); psp_write32(out + 4, (uint32_t)(t >> 32)); }
+    if (out) psp_write64(out, t);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -377,8 +376,7 @@ static void hle_GetVTimerBase(void) {
     const psp_vtimer *v = find_vtimer(psp_arg(0));
     const uint32_t out = psp_arg(1);
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
-    if (out) { psp_write32(out, (uint32_t)v->base);
-               psp_write32(out + 4, (uint32_t)(v->base >> 32)); }
+    if (out) psp_write64(out, v->base);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -400,9 +398,8 @@ static void hle_SetVTimerTime(void) {
     /* In and out, like the Wide form's return value: the clock comes back
      * holding the time it replaced (threadprobe step 124, fw 6.60). */
     const uint64_t was = vtimer_now(v);
-    vtimer_set(v, (uint64_t)psp_read32(in) | ((uint64_t)psp_read32(in + 4) << 32));
-    psp_write32(in, (uint32_t)was);
-    psp_write32(in + 4, (uint32_t)(was >> 32));
+    vtimer_set(v, psp_read64(in));
+    psp_write64(in, was);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -410,8 +407,7 @@ static void hle_SetVTimerHandler(void) {
     psp_vtimer *v = find_vtimer(psp_arg(0));
     const uint32_t sched = psp_arg(1);
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VTID); return; }
-    v->schedule = sched ? ((uint64_t)psp_read32(sched) |
-                           ((uint64_t)psp_read32(sched + 4) << 32)) : 0;
+    v->schedule = sched ? psp_read64(sched) : 0;
     v->handler  = psp_arg(2);
     v->common   = psp_arg(3);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -446,12 +442,9 @@ static void hle_ReferVTimerStatus(void) {
     psp_write32(info +  0, 72);
     psp_threadman_write_name(info + 4, v->name);
     psp_write32(info + 36, (uint32_t)v->active);
-    psp_write32(info + 40, (uint32_t)v->base);
-    psp_write32(info + 44, (uint32_t)(v->base >> 32));
-    psp_write32(info + 48, (uint32_t)cur);
-    psp_write32(info + 52, (uint32_t)(cur >> 32));
-    psp_write32(info + 56, (uint32_t)v->schedule);
-    psp_write32(info + 60, (uint32_t)(v->schedule >> 32));
+    psp_write64(info + 40, v->base);
+    psp_write64(info + 48, cur);
+    psp_write64(info + 56, v->schedule);
     psp_write32(info + 64, v->handler);
     psp_write32(info + 68, v->common);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -506,10 +499,8 @@ static int vtimer_tick(void) {
          * call, which is what this block is for. */
         const uint32_t clocks = vtimer_clock_scratch();
         if (clocks) {
-            psp_write32(clocks + 0, (uint32_t)sched);
-            psp_write32(clocks + 4, (uint32_t)(sched >> 32));
-            psp_write32(clocks + 8, (uint32_t)real);
-            psp_write32(clocks + 12, (uint32_t)(real >> 32));
+            psp_write64(clocks + 0, sched);
+            psp_write64(clocks + 8, real);
         }
 
         g_firing = 1;

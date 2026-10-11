@@ -756,7 +756,7 @@ static void hle_DelayThread(void) { delay_for(psp_arg(0)); }
 static int sysclock_arg(uint64_t *us) {
     const uint32_t p = psp_arg(0);
     if (!p) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return 0; }
-    *us = (uint64_t)psp_read32(p) | ((uint64_t)psp_read32(p + 4) << 32);
+    *us = psp_read64(p);
     return 1;
 }
 
@@ -947,10 +947,7 @@ static void hle_GetSystemTimeLow(void) {
 static void hle_GetSystemTime(void) {
     const uint32_t out = psp_arg(0);
     const uint64_t us  = psp_clock_read();
-    if (out) {
-        psp_write32(out,     (uint32_t)us);
-        psp_write32(out + 4, (uint32_t)(us >> 32));
-    }
+    if (out) psp_write64(out, us);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -979,7 +976,7 @@ static void sysclock_split(uint64_t clk, uint32_t sec_out, uint32_t usec_out) {
 /* (const SceKernelSysClock *, u32 *sec, u32 *usec) */
 static void hle_SysClock2USec(void) {
     const uint32_t in = psp_arg(0);
-    const uint64_t clk = in ? (uint64_t)psp_read32(in) | ((uint64_t)psp_read32(in + 4) << 32) : 0;
+    const uint64_t clk = in ? psp_read64(in) : 0;
     sysclock_split(clk, psp_arg(1), psp_arg(2));
 }
 

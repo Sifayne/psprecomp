@@ -611,8 +611,7 @@ static void write_stat(uint32_t out, int is_dir, uint64_t size, uint32_t lba) {
     for (uint32_t i = 0; i < PSP_STAT_LEN; i += 4) psp_write32(out + i, 0);
     psp_write32(out + 0, (is_dir ? FIO_S_IFDIR : FIO_S_IFREG) | FIO_S_IRWXU);
     psp_write32(out + 4, is_dir ? FIO_SO_IFDIR : FIO_SO_IFREG);
-    psp_write32(out + 8,  (uint32_t)size);
-    psp_write32(out + 12, (uint32_t)(size >> 32));
+    psp_write64(out + 8, size);
 
     /* st_private[0] is the file's first sector on the disc.
      *
@@ -663,8 +662,7 @@ static void write_fat_stat(uint32_t out, const struct stat *st) {
     const int ro = !(st->st_mode & 0222);
     psp_write32(out + 0, (dir ? FIO_S_IFDIR : FIO_S_IFREG) | (ro ? 0x016Du : 0x01FFu));
     psp_write32(out + 4, (dir ? FIO_SO_IFDIR : FIO_SO_IFREG) | (ro ? 0x01u : 0));
-    psp_write32(out + 8,  (uint32_t)size);
-    psp_write32(out + 12, (uint32_t)(size >> 32));
+    psp_write64(out + 8, size);
     write_date(out + 16, st->st_ctime, 1);
     write_date(out + 32, st->st_atime, 0);
     write_date(out + 48, st->st_mtime, 1);
@@ -683,8 +681,7 @@ static void hle_Getstat(void) { hle_getstat_body(); io_park(); }   /* io_park */
 static void write_disc_stat(uint32_t out, int is_dir, uint64_t size, uint32_t lba) {
     psp_write32(out + 0, is_dir ? IO_DISC_DIR_MODE : IO_DISC_FILE_MODE);
     psp_write32(out + 4, is_dir ? IO_DISC_DIR_ATTR : IO_DISC_FILE_ATTR);
-    psp_write32(out + 8,  (uint32_t)size);
-    psp_write32(out + 12, (uint32_t)(size >> 32));
+    psp_write64(out + 8, size);
     for (uint32_t t = 16; t < 64; t += 16) {
         psp_write32(out + t, IO_DISC_TIME_WORD0);
         psp_write32(out + t + 4, 0);
@@ -1673,10 +1670,7 @@ static void hle_CloseAsync(void) {
 }
 
 static void collect_async(io_file *h, uint32_t out) {
-    if (out) {
-        psp_write32(out,     (uint32_t)(uint64_t)h->result);
-        psp_write32(out + 4, (uint32_t)((uint64_t)h->result >> 32));
-    }
+    if (out) psp_write64(out, (uint64_t)h->result);
     h->has_result = h->running = 0;
     if (h->close_pending) {
         if (h->f) fclose(h->f);
