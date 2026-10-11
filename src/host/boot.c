@@ -56,8 +56,6 @@
 
 void psp_recomp_register(void);
 
-/* The guest's user-mode stack. PSP puts it at the top of user RAM and grows it
- * down; the exact value matters less than leaving room below for the heap. */
 /* The entry stack. 256K is generous for module_start, and generous is right:
  * a recompiled frame is larger than the MIPS one it came from, and a stack
  * that overflows here corrupts the heap it was allocated from. */
@@ -137,10 +135,6 @@ static uint32_t g_exit_status;
 static void hle_stop_unload_self(void) {
     g_guest_exited = 1;
     g_exit_status  = psp_arg(0);
-    /* Built with -DPSPRECOMP_TRACE this prints the functions entered on the way
-     * here, which is the only practical way to tell *which* abort fired: the
-     * abort wrapper has several callers and static analysis cannot say which
-     * one ran. Without the define it compiles to nothing and says so. */
     g_reason = 5;
 
     /* Only the main context may jump: g_abort belongs to its stack. A guest
@@ -150,6 +144,10 @@ static void hle_stop_unload_self(void) {
         psp_sched_stop_all("sceKernelExitGame");   /* does not return */
         return;
     }
+    /* Built with -DPSPRECOMP_TRACE this prints the functions entered on the way
+     * here, which is the only practical way to tell *which* abort fired: the
+     * abort wrapper has several callers and static analysis cannot say which
+     * one ran. Without the define it compiles to nothing and says so. */
     abort_to_main();
 }
 
@@ -235,21 +233,6 @@ static void watch_hit(uint32_t addr) {
     psp_trace_dump();
 }
 
-/* Write the framebuffer the display is scanning out to a PPM.
- *
- * The whole point of a rasterizer is that you can look at what it produced,
- * and until now nothing here could: the GE counted geometry and the summary
- * reported numbers. A PPM because it needs no library and any viewer opens it.
- *
- * The image is what the *guest* believes it is showing -- the address comes
- * from its last sceDisplaySetFrameBuf -- so an empty file is a real answer
- * too: it means the game never pointed the display anywhere. */
-/* Which parts of VRAM have anything in them.
- *
- * "The texture sampled black" has two very different causes -- the texture is
- * not there, or it is somewhere else -- and guessing between them has already
- * cost more than measuring would have. This walks VRAM in 64K blocks and says
- * which ones are non-zero, so the answer is visible rather than inferred. */
 /* PSPRECOMP_FINDPTR=<hex> reports every address in the loaded module holding
  * that value as a 32-bit word.
  *
@@ -293,30 +276,6 @@ static void find_pointer(uint32_t lo, uint32_t size) {
     printf("\n");
 }
 
-/* PSPRECOMP_REACHED=<hex>[,<hex>...] says, for each address, whether control
- * ever arrived there.
- *
- * "Does this code run" has been answered here with gdb breakpoints and with
- * PSPRECOMP_WATCH. Breakpoints are external and one batch per run; the watch
- * hooks PSP_ENTER, which the emitter writes once per function *body*, so a
- * watch on anything that is not a function entry never fires and reports a
- * negative it cannot actually see. dispatch.c records that flaw producing a
- * confidently wrong conclusion. The mark bitmap covers every label instead.
- *
- * It has a smaller version of the same limit, and it matters. PSP_MARK is
- * emitted only at *labels* -- branch and jump targets, function entries, split
- * entries, fall-through targets. A `jal` site, or a store in the middle of a
- * block, is not a label and can never be marked, so asking about one gets
- * "not reached" when the truth is "cannot be seen from here".
- * psp_trace_was_marked only reports -1 for an address outside the module; it
- * cannot tell an unlabelled address from an unvisited one. So map an address
- * to the label that covers it before asking:
- *
- *     grep -o 'L_[0-9A-F]\{8\}: PSP_MARK' generated/<slug>_funcs.c | sort -u
- *
- * and take the greatest label <= the address within the same function. Control
- * reaching that label is control reaching the block the instruction sits in,
- * which is the question worth asking anyway. */
 /* PSPRECOMP_PEEK=<hex>[,<hex>...] prints what is at each address when the run
  * stops: the word, and the byte, because guest structs mix both and which one
  * a field is decides what "zero" means.
@@ -365,10 +324,64 @@ static void watch_memory(void) {
     }
 }
 
+/* PSPRECOMP_REACHED=<hex>[,<hex>...] says, for each address, whether control
+ * ever arrived there.
+ *
+ * "Does this code run" has been answered here with gdb breakpoints and with
+ * PSPRECOMP_WATCH. Breakpoints are external and one batch per run; the watch
+ * hooks PSP_ENTER, which the emitter writes once per function *body*, so a
+ * watch on anything that is not a function entry never fires and reports a
+ * negative it cannot actually see. dispatch.c records that flaw producing a
+ * confidently wrong conclusion. The mark bitmap covers every label instead.
+ *
+ * It has a smaller version of the same limit, and it matters. PSP_MARK is
+ * emitted only at *labels* -- branch and jump targets, function entries, split
+ * entries, fall-through targets. A `jal` site, or a store in the middle of a
+ * block, is not a label and can never be marked, so asking about one gets
+ * "not reached" when the truth is "cannot be seen from here".
+ * psp_trace_was_marked only reports -1 for an address outside the module; it
+ * cannot tell an unlabelled address from an unvisited one. So map an address
+ * to the label that covers it before asking:
+ *
+ *     grep -o 'L_[0-9A-F]\{8\}: PSP_MARK' generated/<slug>_funcs.c | sort -u
+ *
+ * and take the greatest label <= the address within the same function. Control
+ * reaching that label is control reaching the block the instruction sits in,
+ * which is the question worth asking anyway. */
 enum { MAX_REACHED = 32 };
 static uint32_t g_reached[MAX_REACHED];
 static int      g_reached_n;
 static uint32_t g_marks_lo, g_marks_hi;
+
+static void reached_init(uint32_t lo, uint32_t hi) {
+    const char *v = getenv("PSPRECOMP_REACHED");
+    const char *d = getenv("PSPRECOMP_REACHED_DUMP");
+    /* The dump reads the same bitmap, so either request has to allocate it --
+     * otherwise asking only for the dump gets an empty one and reads as "no
+     * code ran". */
+    if ((!v || !*v) && (!d || !*d)) return;
+    for (const char *p = v ? v : ""; *p && g_reached_n < MAX_REACHED; ) {
+        char *end;
+        const uint32_t a = (uint32_t)strtoul(p, &end, 0);
+        if (end == p) break;
+        g_reached[g_reached_n++] = a;
+        p = (*end == ',') ? end + 1 : end;
+    }
+    g_marks_lo = lo;
+    g_marks_hi = hi;
+    psp_trace_marks_init(lo, (hi - lo) / 4);
+    printf("      reached   %d address(es) watched (needs a PSPRECOMP_TRACE build)\n",
+           g_reached_n);
+}
+
+static void reached_report(void) {
+    for (int i = 0; i < g_reached_n; i++) {
+        const int m = psp_trace_was_marked(g_reached[i]);
+        printf("reached:  0x%08X  %s\n", g_reached[i],
+               m < 0 ? "not observable -- outside the loaded module"
+                     : m ? "reached" : "not reached (or not a label -- see PSPRECOMP_REACHED)");
+    }
+}
 
 /* PSPRECOMP_REACHED_DUMP=<file> writes every label control actually reached.
  *
@@ -406,36 +419,12 @@ static void reached_dump(void) {
            (unsigned long long)n, v);
 }
 
-static void reached_init(uint32_t lo, uint32_t hi) {
-    const char *v = getenv("PSPRECOMP_REACHED");
-    const char *d = getenv("PSPRECOMP_REACHED_DUMP");
-    /* The dump reads the same bitmap, so either request has to allocate it --
-     * otherwise asking only for the dump gets an empty one and reads as "no
-     * code ran". */
-    if ((!v || !*v) && (!d || !*d)) return;
-    for (const char *p = v ? v : ""; *p && g_reached_n < MAX_REACHED; ) {
-        char *end;
-        const uint32_t a = (uint32_t)strtoul(p, &end, 0);
-        if (end == p) break;
-        g_reached[g_reached_n++] = a;
-        p = (*end == ',') ? end + 1 : end;
-    }
-    g_marks_lo = lo;
-    g_marks_hi = hi;
-    psp_trace_marks_init(lo, (hi - lo) / 4);
-    printf("      reached   %d address(es) watched (needs a PSPRECOMP_TRACE build)\n",
-           g_reached_n);
-}
-
-static void reached_report(void) {
-    for (int i = 0; i < g_reached_n; i++) {
-        const int m = psp_trace_was_marked(g_reached[i]);
-        printf("reached:  0x%08X  %s\n", g_reached[i],
-               m < 0 ? "not observable -- outside the loaded module"
-                     : m ? "reached" : "not reached (or not a label -- see PSPRECOMP_REACHED)");
-    }
-}
-
+/* Which parts of VRAM have anything in them.
+ *
+ * "The texture sampled black" has two very different causes -- the texture is
+ * not there, or it is somewhere else -- and guessing between them has already
+ * cost more than measuring would have. This walks VRAM in 64K blocks and says
+ * which ones are non-zero, so the answer is visible rather than inferred. */
 static void survey_vram(void) {
     enum { BLOCK = 0x10000 };
     printf("vram:     ");
@@ -500,6 +489,15 @@ static void dump_one(uint32_t base, const char *path, const char *label) {
            label, path, base, stride, fmt, (unsigned long long)nonzero, W * H);
 }
 
+/* Write the framebuffer the display is scanning out to a PPM.
+ *
+ * The whole point of a rasterizer is that you can look at what it produced,
+ * and until now nothing here could: the GE counted geometry and the summary
+ * reported numbers. A PPM because it needs no library and any viewer opens it.
+ *
+ * The image is what the *guest* believes it is showing -- the address comes
+ * from its last sceDisplaySetFrameBuf -- so an empty file is a real answer
+ * too: it means the game never pointed the display anywhere. */
 static void dump_framebuffer(void) {
     const char *path = getenv("PSPRECOMP_FRAME");
     if (!path || !*path) path = "frame.ppm";
@@ -637,8 +635,6 @@ static void install_bad_hook(void) {
 
 #define ALT_STACK_SIZE ((size_t)(SIGSTKSZ < 65536 ? 65536 : SIGSTKSZ))
 
-/* Each thread needs its own: sigaltstack is per-thread, and the fault most
- * worth catching is a blown stack, which leaves no room to run a handler. */
 /* Freed when its thread ends: a save state loaded while the game runs ends
  * and starts every guest thread, so a run may start thousands. */
 static pthread_key_t g_alt_key;
@@ -652,6 +648,8 @@ static void alt_stack_free(void *sp) {
 }
 static void alt_stack_key(void) { pthread_key_create(&g_alt_key, alt_stack_free); }
 
+/* Each thread needs its own: sigaltstack is per-thread, and the fault most
+ * worth catching is a blown stack, which leaves no room to run a handler. */
 static void install_alt_stack(void) {
     stack_t ss;
     ss.ss_sp    = malloc(ALT_STACK_SIZE);
@@ -883,12 +881,6 @@ int main(int argc, char **argv) {
     if (psp_title_info.keep) psp_title_info.keep();
     printf("  [2] runtime   %u functions registered\n", psp_dispatch_count());
 
-    /* Presentation, before the module loads: the real-time clock anchors to
-     * the moment it is enabled, and that moment should be the start of the
-     * run rather than the end of the load. PSPRECOMP_WINDOW enables the SDL
-     * layer -- window, pad, audio -- and implies pacing; PSPRECOMP_REALTIME
-     * paces a headless run on its own, which is what makes a wall-clock
-     * measurement of a real scene honest. */
     /* PSPRECOMP_RENDER picks the presentation backend. Until now nothing
      * outside tests/test_raster.c called psp_render_select, so the software
      * backend was the only one a real run could ever have -- "chosen at run
@@ -952,6 +944,12 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* Presentation, before the module loads: the real-time clock anchors to
+     * the moment it is enabled, and that moment should be the start of the
+     * run rather than the end of the load. PSPRECOMP_WINDOW enables the SDL
+     * layer -- window, pad, audio -- and implies pacing; PSPRECOMP_REALTIME
+     * paces a headless run on its own, which is what makes a wall-clock
+     * measurement of a real scene honest. */
     /* TIMING: paced (0) or real time (1). */
     psp_clock_paced_preference(settings.number[PSP_OPT_TIMING] == 0);
     int windowed = 0;
