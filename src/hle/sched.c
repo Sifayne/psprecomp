@@ -702,38 +702,26 @@ static void thread_main(void *arg) {
     if (g_host_exit_hook) g_host_exit_hook();
 }
 
-int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp, uint32_t k0,
-                    uint32_t a0, uint32_t a1, int priority) {
-    /* The spawn hook is consulted first, before threading: an interpreter run
-     * that services thread starts wants them synchronously, nested, whatever
-     * the host's threading setting is. */
-    if (g_spawn_hook && g_spawn_hook(uid, entry, sp, a0, a1, priority)) return 0;
-
-    /* Threading off: the thread exists as far as the guest is concerned and
-     * never runs. Reporting failure instead would send a game down its
-     * out-of-memory path, which is a different and less useful lie. */
-    if (!g_threading) { (void)uid; (void)entry; (void)sp; (void)k0;
-                        (void)a0; (void)a1; (void)priority; return 0; }
-
-    psp_os_lock(&g_lock);
-
-    /* A dead slot is reused, but only once its host thread has been joined.
-     *
-     * Without the join it is unsafe. The dead thread's host thread may still be
-     * parked in await_turn_locked, which refuses to proceed only while the slot
-     * reads DEAD; hand that slot to a new thread and the old one's wait
-     * *succeeds*, so two host threads run guest code at once against the single
-     * global psp_cpu. Measured: threads/create went to 131,929,071 bad memory
-     * accesses the moment reuse was first allowed, without a join.
-     *
-     * And it has to happen. With no reuse the table was a count of every start
-     * in the run, and threadprobe alone makes 115 of them; the 130th start of
-     * any run failed with NO_MEMORY however few threads were alive (findings
-     * G8). A dead slot is preferred to a fresh one so that the host threads,
-     * and the range every scan here walks, stay the size of what is alive. */
-    int idx = -1, dead = -1;
+/* A slot for a new thread, or -1 when the table is full.
+ *
+ * A dead slot is reused, but only once its host thread has been joined.
+ *
+ * Without the join it is unsafe. The dead thread's host thread may still be
+ * parked in await_turn_locked, which refuses to proceed only while the slot
+ * reads DEAD; hand that slot to a new thread and the old one's wait
+ * *succeeds*, so two host threads run guest code at once against the single
+ * global psp_cpu. Measured: threads/create went to 131,929,071 bad memory
+ * accesses the moment reuse was first allowed, without a join.
+ *
+ * And it has to happen. With no reuse the table was a count of every start
+ * in the run, and threadprobe alone makes 115 of them; the 130th start of
+ * any run failed with NO_MEMORY however few threads were alive (findings
+ * G8). A dead slot is preferred to a fresh one so that the host threads,
+ * and the range every scan here walks, stay the size of what is alive. */
+static int claim_slot_locked(void) {
+    int unused = -1, dead = -1;
     for (int i = 1; i < g_slot_hi; i++) {
-        if (!g_slot[i].used) { if (idx < 0) idx = i; }
+        if (!g_slot[i].used) { if (unused < 0) unused = i; }
         else if (g_slot[i].state == PSP_SCHED_DEAD && dead < 0) dead = i;
     }
     if (dead >= 0) {
@@ -748,9 +736,26 @@ int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp, uint32_t k0,
             psp_os_lock(&g_lock);
             d->joined = 1;
         }
-        idx = dead;
+        return dead;
     }
-    if (idx < 0 && g_slot_hi < MAX_SCHED_THREADS) idx = g_slot_hi++;
+    if (unused < 0 && g_slot_hi < MAX_SCHED_THREADS) unused = g_slot_hi++;
+    return unused;
+}
+
+int psp_sched_spawn(uint32_t uid, uint32_t entry, uint32_t sp, uint32_t k0,
+                    uint32_t a0, uint32_t a1, int priority) {
+    /* The spawn hook is consulted first, before threading: an interpreter run
+     * that services thread starts wants them synchronously, nested, whatever
+     * the host's threading setting is. */
+    if (g_spawn_hook && g_spawn_hook(uid, entry, sp, a0, a1, priority)) return 0;
+
+    /* Threading off: the thread exists as far as the guest is concerned and
+     * never runs. Reporting failure instead would send a game down its
+     * out-of-memory path, which is a different and less useful lie. */
+    if (!g_threading) return 0;
+
+    psp_os_lock(&g_lock);
+    const int idx = claim_slot_locked();
     if (idx < 0) { psp_os_unlock(&g_lock); return -1; }
 
     sched_slot *t = &g_slot[idx];
