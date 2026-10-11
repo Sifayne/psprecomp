@@ -1509,7 +1509,7 @@ static void no_decoder(const char *what) {
  * picture, honest behaviour, and no hang. */
 static void hle_GetAvcAu(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
-    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_getavc++; }
+    if (c && c->es_eof) c->post_getavc++;
     if (c && !c->es_len && !c->es_eof) { psp_ret(SCE_MPEG_ERROR_NO_DATA); return; }
     if (!mpeg_decoding()) {
         no_decoder("sceMpegGetAvcAu");
@@ -1657,7 +1657,7 @@ static size_t aes_frame(mpeg_ctx *c) {
 
 static void hle_GetAtracAu(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
-    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_getatrac++; }
+    if (c && c->es_eof) c->post_getatrac++;
     if (!mpeg_decoding() || !c) {
         no_decoder("sceMpegGetAtracAu");
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
@@ -1744,7 +1744,7 @@ static void write_picture(mpeg_ctx *c, uint32_t dst, uint32_t stride) {
 
 static void hle_AvcDecode(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
-    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_avcdec++; }
+    if (c && c->es_eof) c->post_avcdec++;
     if (!mpeg_decoding() || !c) {
         no_decoder("sceMpegAvcDecode");
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
@@ -1802,7 +1802,7 @@ static void hle_AvcDecode(void) {
  * silence of the same length -- the movie keeps its clock either way. */
 static void hle_AtracDecode(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
-    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_atracdec++; }
+    if (c && c->es_eof) c->post_atracdec++;
     if (!mpeg_decoding() || !c) {
         no_decoder("sceMpegAtracDecode");
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
