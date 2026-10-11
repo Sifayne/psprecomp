@@ -246,7 +246,7 @@ static struct {
     unsigned fences, waits;
     double wait_us;                        /* time actually spent in glClientWaitSync */
 } g_rings;
-static double rings_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e6 + t.tv_nsec / 1e3; }
+static double gl_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e6 + t.tv_nsec / 1e3; }
 static void rings_decide(void) {
     if (g_rings.decided) return;
     g_rings.decided = 1;
@@ -288,9 +288,9 @@ static void rings_fence(void) {
     for (int i = 0; i < RING_COUNT; i++) if (g_rings.r[i].head != g_rings.frame_start[i] || g_rings.r[i].wrapped) wrote = 1;
     if (!wrote) return;
     if (g_rings.fq_n == RING_FRAMES) {
-        const double t0 = rings_now_us();
+        const double t0 = gl_now_us();
         p_glClientWaitSync(g_rings.fq[0].sync, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
-        g_rings.wait_us += rings_now_us() - t0;
+        g_rings.wait_us += gl_now_us() - t0;
         p_glDeleteSync(g_rings.fq[0].sync);
         memmove(&g_rings.fq[0], &g_rings.fq[1], sizeof g_rings.fq[0] * (RING_FRAMES - 1));
         g_rings.fq_n--; g_rings.waits++;
@@ -316,9 +316,9 @@ static void ring_wait(int i, size_t a0, size_t a1) {
     for (int k = 0; k < g_rings.fq_n; k++)
         if (span_overlaps(a0, a1, g_rings.fq[k].start[i], g_rings.fq[k].end[i], g_rings.r[i].size)) retire = k;
     if (retire < 0) return;
-    const double t0 = rings_now_us();
+    const double t0 = gl_now_us();
     p_glClientWaitSync(g_rings.fq[retire].sync, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
-    g_rings.wait_us += rings_now_us() - t0;
+    g_rings.wait_us += gl_now_us() - t0;
     for (int k = 0; k <= retire; k++) p_glDeleteSync(g_rings.fq[k].sync);
     memmove(&g_rings.fq[0], &g_rings.fq[retire + 1], sizeof g_rings.fq[0] * (size_t)(g_rings.fq_n - retire - 1));
     g_rings.fq_n -= retire + 1; g_rings.waits++;
@@ -1475,6 +1475,21 @@ static double rt_off_y(const rendertarget *r) {
 static int rt_scene_w(const rendertarget *r) {
     return (int)lround(r->guest_w * r->sx);
 }
+
+/* How the current batch's guest pixels land on target r: a HUD batch (any
+ * class but the scene) on a wide target keeps the guest's aspect at
+ * ui_scale about the centring offset, everything else takes the target's
+ * own x and y scale. */
+typedef struct { int hud; double sx, sy, off_x, off_y; } target_map;
+static target_map target_mapping(const rendertarget *r) {
+    const int hud = r->wide && g.batch_class != CLASS_SCENE;
+    const target_map m = { hud, hud ? r->ui_scale : r->sx, hud ? r->ui_scale : r->sy,
+                           hud ? rt_off(r) : 0, hud ? rt_off_y(r) : 0 };
+    return m;
+}
+
+/* Channel i (0 red) of a 0xAABBGGRR colour, as 0..1. */
+static float channel01(uint32_t c, int i) { return (float)((c >> (8 * i)) & 0xFF) / 255.0f; }
 
 /* One coherent drawable snapshot drives allocation for the next frame. */
 static void resolution_size(void) {
@@ -2708,10 +2723,7 @@ static void push(const psp_vertex *v, int lod16) {
     o[0] = precise ? v->precise_x : (float)v->x / PSP_SUBPX;
     o[1] = precise ? v->precise_y : (float)v->y / PSP_SUBPX;
     o[2] = v->z / 65535.0f;                /* the PSP's window depth scale */
-    o[3] = (float)( v->rgba        & 0xFF) / 255.0f;
-    o[4] = (float)((v->rgba >>  8) & 0xFF) / 255.0f;
-    o[5] = (float)((v->rgba >> 16) & 0xFF) / 255.0f;
-    o[6] = (float)((v->rgba >> 24) & 0xFF) / 255.0f;
+    for (int i = 0; i < 4; i++) o[3 + i] = channel01(v->rgba, i);
     /* Keep UVs in the texel units the backend contract supplies. The shader
      * scales those units for each mip level; normalising here and multiplying
      * back there moves exact 1/16 boundaries through an avoidable round trip. */
@@ -3173,6 +3185,13 @@ static int uses_dest_alpha(void) {
     return g.bs.enable && (reads_dst_alpha(g.bs.src) || reads_dst_alpha(g.bs.dst));
 }
 
+/* Whether a draw into r changes its stencil: only an 8888 target has one,
+ * and only a stencil operation other than KEEP writes it. */
+static int stencil_writes(const rendertarget *r) {
+    return g.bs.stencil_test && r->fmt == 3 &&
+           (g.bs.op_sfail || g.bs.op_zfail || g.bs.op_zpass);
+}
+
 /* Codes 6..9 have no direct GL factor. apply_state handles the additive 6/7
  * pair in the fragment shader; remaining combinations retain the unsupported
  * counter so they are visible in reports. */
@@ -3231,7 +3250,7 @@ static GLenum gl_equation(int eq, int *ok) {
 
 /* Apply what the interpreter last set. Called once per flush rather than per
  * primitive: the batch is by construction all one state. */
-static void apply_state(void) {
+static void apply_stencil(void) {
     if (g.bs.stencil_test && g.rts[g.cur_rt].fmt == 3) {
         p_glEnable(GL_STENCIL_TEST);
         /* PMSK2 keeps the stencil bits it sets. */
@@ -3246,17 +3265,20 @@ static void apply_state(void) {
         p_glDisable(GL_STENCIL_TEST);
         p_glStencilMask(0);
     }
-    /* In OpenGL, disabling GL_DEPTH_TEST also disables depth-buffer writes,
-     * regardless of glDepthMask, and the hardware agrees: ZMSK on its own does
-     * not write depth through a disabled test. An earlier revision kept the GL
-     * test alive with ALWAYS whenever a write was asked for, so that clear-mode
-     * draws -- which the GE layer used to encode as a *disabled* test -- would
-     * still establish the depth later geometry tests against. That also let
-     * every ordinary draw with the test off stamp the depth buffer: in AC3
-     * Portable's garage the panel's translucent tint is drawn that way, at the
-     * near plane, and it occluded the AC and part previews entirely (only the
-     * foot below its bottom edge survived). Clear mode now arrives as an
-     * enabled ALWAYS test instead, so both cases are right. */
+}
+
+/* In OpenGL, disabling GL_DEPTH_TEST also disables depth-buffer writes,
+ * regardless of glDepthMask, and the hardware agrees: ZMSK on its own does
+ * not write depth through a disabled test. An earlier revision kept the GL
+ * test alive with ALWAYS whenever a write was asked for, so that clear-mode
+ * draws -- which the GE layer used to encode as a *disabled* test -- would
+ * still establish the depth later geometry tests against. That also let
+ * every ordinary draw with the test off stamp the depth buffer: in AC3
+ * Portable's garage the panel's translucent tint is drawn that way, at the
+ * near plane, and it occluded the AC and part previews entirely (only the
+ * foot below its bottom edge survived). Clear mode now arrives as an
+ * enabled ALWAYS test instead, so both cases are right. */
+static void apply_depth(void) {
     if (g.z_test) {
         p_glEnable(GL_DEPTH_TEST);
         p_glDepthFunc(gl_compare(g.z_func));
@@ -3264,17 +3286,19 @@ static void apply_state(void) {
         p_glDisable(GL_DEPTH_TEST);
     }
     p_glDepthMask(g.z_write ? GL_TRUE : GL_FALSE);
+}
 
-    /* write_colour is clear mode's colour mask. Alpha is the stencil byte and
-     * an ordinary draw does not write it, which is why the alpha channel is
-     * masked off unless the state says otherwise. */
-    /* The pixel mask, PMSK1 | PMSK2 << 24 in 0xAABBGGRR, keeps the
-     * framebuffer's bits where it is set (render.h). A byte of FF keeps its
-     * channel whole, which glColorMask says exactly; a byte of anything but
-     * 00 or FF keeps some bits of it, which it cannot, and is counted.
-     * WipEout Pulse draws the shadow volumes under its ships with PMSK1
-     * FFFFFF, for the stencil alone; drawn in colour they were solid blue
-     * blocks under every ship. */
+/* write_colour is clear mode's colour mask. Alpha is the stencil byte and
+ * an ordinary draw does not write it, which is why the alpha channel is
+ * masked off unless the state says otherwise. */
+/* The pixel mask, PMSK1 | PMSK2 << 24 in 0xAABBGGRR, keeps the
+ * framebuffer's bits where it is set (render.h). A byte of FF keeps its
+ * channel whole, which glColorMask says exactly; a byte of anything but
+ * 00 or FF keeps some bits of it, which it cannot, and is counted.
+ * WipEout Pulse draws the shadow volumes under its ships with PMSK1
+ * FFFFFF, for the stencil alone; drawn in colour they were solid blue
+ * blocks under every ship. */
+static void apply_colour_mask(void) {
     const uint32_t pm = g.bs.pixel_mask;
     for (int ch = 0; ch < 4; ch++) {
         const uint32_t byte = (pm >> (8 * ch)) & 0xFFu;
@@ -3284,101 +3308,101 @@ static void apply_state(void) {
                   g.bs.write_colour && (pm & 0x00FF00u) != 0x00FF00u ? GL_TRUE : GL_FALSE,
                   g.bs.write_colour && (pm & 0xFF0000u) != 0xFF0000u ? GL_TRUE : GL_FALSE,
                   g.bs.write_alpha  && (pm >> 24) != 0xFFu ? GL_TRUE : GL_FALSE);
+}
 
-    if (g.sc_valid) {
-        p_glEnable(GL_SCISSOR_TEST);
-        const rendertarget *r = &g.rts[g.cur_rt];
-        const int hud = r->wide && g.batch_class != CLASS_SCENE;
-        const double sx = hud ? r->ui_scale : r->sx;
-        const double sy = hud ? r->ui_scale : r->sy;
-        const double off = hud ? rt_off(r) : 0;
-        const double off_y = hud ? rt_off_y(r) : 0;
-        int x0, x1, y0, y1;
-        if (g.resolution) {
-            x0 = pixel_edge(g.sc_x0*sx+off);
-            x1 = pixel_edge((g.sc_x1+1)*sx+off);
-            y0 = pixel_edge(g.sc_y0*sy+off_y);
-            y1 = pixel_edge((g.sc_y1+1)*sy+off_y);
-        } else {
-            x0 = (int)floor(g.sc_x0*sx+off);
-            x1 = (int)ceil((g.sc_x1+1)*sx+off);
-            y0 = (int)floor(g.sc_y0*sy+off_y); y1 = (int)ceil((g.sc_y1+1)*sy+off_y);
-        }
-        /* A band batch under the game's whole-screen scissor may use the
-         * whole target; a narrower scissor still applies where it maps. */
-        if (hud && g.batch_band && g.sc_x0 <= 0 && g.sc_x1 >= g.w - 1) { x0 = 0; x1 = r->visible_w; }
-        if (hud && g.batch_band && g.sc_y0 <= 0 && g.sc_y1 >= g.h - 1) { y0 = 0; y1 = r->visible_h; }
-        p_glScissor(x0, r->h-y1, x1>x0?x1-x0:0, y1>y0?y1-y0:0);
-    } else {
+static void apply_scissor(void) {
+    if (!g.sc_valid) {
         p_glDisable(GL_SCISSOR_TEST);
+        return;
     }
-
-    if (g.bs.enable) {
-        int ok = 1;
-        int src_constant = 0, dst_constant = 0;
-        const int double_alpha = g.bs.src == PSP_BF_DOUBLE_SRC_ALPHA && g.bs.eq == PSP_BEQ_ADD &&
-                                 !g.bs.write_alpha &&
-                                 (g.bs.dst == PSP_BF_ONE_MINUS_DOUBLE_SRC_ALPHA || (g.bs.dst == PSP_BF_FIXED &&
-                                  ((g.bs.fixb & 0xffffffu) == 0 ||
-                                   (g.bs.fixb & 0xffffffu) == 0xffffffu)));
-        GLenum src = double_alpha ? GL_ONE : g.bs.src == PSP_BF_FIXED
-                   ? gl_fixed_factor(g.bs.fixa, &src_constant)
-                   : gl_factor(g.bs.src, 1, &ok);
-        GLenum dst = double_alpha && g.bs.dst == PSP_BF_ONE_MINUS_DOUBLE_SRC_ALPHA ? GL_ONE_MINUS_SRC_ALPHA
-                   : g.bs.dst == PSP_BF_FIXED
-                   ? gl_fixed_factor(g.bs.fixb, &dst_constant)
-                   : gl_factor(g.bs.dst, 0, &ok);
-        /* A crossfade: FIXB the complement of FIXA in every channel, which
-         * the one GL constant says as ONE_MINUS_CONSTANT_COLOR on the
-         * destination. WipEout Pulse blends its race picture this way, FIXA
-         * 606060 and FIXB 9F9F9F; given FIXA on both sides it came out a
-         * quarter too dark. */
-        const int crossfade = src_constant && dst_constant &&
-                              (g.bs.fixb & 0xFFFFFFu) == (~g.bs.fixa & 0xFFFFFFu);
-        if (crossfade) dst = GL_ONE_MINUS_CONSTANT_COLOR;
-        if (!ok) g.unsupported_blend_factor++;
-        if (src_constant && dst_constant && !crossfade &&
-            (g.bs.fixa & 0xFFFFFFu) != (g.bs.fixb & 0xFFFFFFu)) {
-            g.unsupported_blend_factor++;
-            ok = 0;
-        }
-        int eq_ok = 1;
-        const GLenum eq = gl_equation(g.bs.eq, &eq_ok);
-        if (!eq_ok) g.unsupported_blend_eq++;
-        if (!ok || !eq_ok) note_blend_miss();
-        /* This rewrite changes fragment alpha to carry an exact destination
-         * factor, so only use it when alpha is the framebuffer's masked-off
-         * stencil byte. MIN/MAX ignore factors; abs-difference is not
-         * represented by this fixed-function path. */
-        const int preblend_src = g.bs.src == PSP_BF_SRC_ALPHA && g.bs.eq <= PSP_BEQ_REVERSE_SUBTRACT &&
-                                 !g.bs.write_alpha;
-        if (preblend_src) src = GL_ONE;
-        p_glEnable(GL_BLEND);
-        p_glBlendFunc(src, dst);
-        p_glBlendEquation(eq);
-        /* If both sides need a non-trivial, unequal fixed colour the counter
-         * above records the case GL's fixed pipeline cannot represent. Equal
-         * constants, complementary ones, or one non-trivial constant paired
-         * with zero/one, are exact. */
-        const uint32_t fx = src_constant ? g.bs.fixa : g.bs.fixb;
-        p_glBlendColor((float)( fx        & 0xFF) / 255.0f,
-                       (float)((fx >>  8) & 0xFF) / 255.0f,
-                       (float)((fx >> 16) & 0xFF) / 255.0f,
-                       (float)((fx >> 24) & 0xFF) / 255.0f);
-        p_glUniform1i(g.u->preblend_src,
-                      double_alpha ? 3 : preblend_src ? (g.bs.dst == PSP_BF_ONE_MINUS_SRC_ALPHA ? 2 : 1) : 0);
+    p_glEnable(GL_SCISSOR_TEST);
+    const rendertarget *r = &g.rts[g.cur_rt];
+    const target_map m = target_mapping(r);
+    int x0, x1, y0, y1;
+    if (g.resolution) {
+        x0 = pixel_edge(g.sc_x0*m.sx+m.off_x);
+        x1 = pixel_edge((g.sc_x1+1)*m.sx+m.off_x);
+        y0 = pixel_edge(g.sc_y0*m.sy+m.off_y);
+        y1 = pixel_edge((g.sc_y1+1)*m.sy+m.off_y);
     } else {
+        x0 = (int)floor(g.sc_x0*m.sx+m.off_x);
+        x1 = (int)ceil((g.sc_x1+1)*m.sx+m.off_x);
+        y0 = (int)floor(g.sc_y0*m.sy+m.off_y); y1 = (int)ceil((g.sc_y1+1)*m.sy+m.off_y);
+    }
+    /* A band batch under the game's whole-screen scissor may use the
+     * whole target; a narrower scissor still applies where it maps. */
+    if (m.hud && g.batch_band && g.sc_x0 <= 0 && g.sc_x1 >= g.w - 1) { x0 = 0; x1 = r->visible_w; }
+    if (m.hud && g.batch_band && g.sc_y0 <= 0 && g.sc_y1 >= g.h - 1) { y0 = 0; y1 = r->visible_h; }
+    p_glScissor(x0, r->h-y1, x1>x0?x1-x0:0, y1>y0?y1-y0:0);
+}
+
+/* The GL factor for a GE blend factor, FIXA or FIXB (fix) through the
+ * constant colour. */
+static GLenum blend_factor(int f, uint32_t fix, int is_src, int *uses_constant, int *ok) {
+    return f == PSP_BF_FIXED ? gl_fixed_factor(fix, uses_constant) : gl_factor(f, is_src, ok);
+}
+
+static void apply_blend(void) {
+    if (!g.bs.enable) {
         p_glDisable(GL_BLEND);
         p_glUniform1i(g.u->preblend_src, 0);
+        return;
     }
+    int ok = 1;
+    int src_constant = 0, dst_constant = 0;
+    const int double_alpha = g.bs.src == PSP_BF_DOUBLE_SRC_ALPHA && g.bs.eq == PSP_BEQ_ADD &&
+                             !g.bs.write_alpha &&
+                             (g.bs.dst == PSP_BF_ONE_MINUS_DOUBLE_SRC_ALPHA || (g.bs.dst == PSP_BF_FIXED &&
+                              ((g.bs.fixb & 0xffffffu) == 0 ||
+                               (g.bs.fixb & 0xffffffu) == 0xffffffu)));
+    GLenum src = double_alpha ? GL_ONE : blend_factor(g.bs.src, g.bs.fixa, 1, &src_constant, &ok);
+    GLenum dst = double_alpha && g.bs.dst == PSP_BF_ONE_MINUS_DOUBLE_SRC_ALPHA ? GL_ONE_MINUS_SRC_ALPHA
+               : blend_factor(g.bs.dst, g.bs.fixb, 0, &dst_constant, &ok);
+    /* A crossfade: FIXB the complement of FIXA in every channel, which
+     * the one GL constant says as ONE_MINUS_CONSTANT_COLOR on the
+     * destination. WipEout Pulse blends its race picture this way, FIXA
+     * 606060 and FIXB 9F9F9F; given FIXA on both sides it came out a
+     * quarter too dark. */
+    const int crossfade = src_constant && dst_constant &&
+                          (g.bs.fixb & 0xFFFFFFu) == (~g.bs.fixa & 0xFFFFFFu);
+    if (crossfade) dst = GL_ONE_MINUS_CONSTANT_COLOR;
+    if (!ok) g.unsupported_blend_factor++;
+    if (src_constant && dst_constant && !crossfade &&
+        (g.bs.fixa & 0xFFFFFFu) != (g.bs.fixb & 0xFFFFFFu)) {
+        g.unsupported_blend_factor++;
+        ok = 0;
+    }
+    int eq_ok = 1;
+    const GLenum eq = gl_equation(g.bs.eq, &eq_ok);
+    if (!eq_ok) g.unsupported_blend_eq++;
+    if (!ok || !eq_ok) note_blend_miss();
+    /* This rewrite changes fragment alpha to carry an exact destination
+     * factor, so only use it when alpha is the framebuffer's masked-off
+     * stencil byte. MIN/MAX ignore factors; abs-difference is not
+     * represented by this fixed-function path. */
+    const int preblend_src = g.bs.src == PSP_BF_SRC_ALPHA && g.bs.eq <= PSP_BEQ_REVERSE_SUBTRACT &&
+                             !g.bs.write_alpha;
+    if (preblend_src) src = GL_ONE;
+    p_glEnable(GL_BLEND);
+    p_glBlendFunc(src, dst);
+    p_glBlendEquation(eq);
+    /* If both sides need a non-trivial, unequal fixed colour the counter
+     * above records the case GL's fixed pipeline cannot represent. Equal
+     * constants, complementary ones, or one non-trivial constant paired
+     * with zero/one, are exact. */
+    const uint32_t fx = src_constant ? g.bs.fixa : g.bs.fixb;
+    p_glBlendColor(channel01(fx, 0), channel01(fx, 1), channel01(fx, 2), channel01(fx, 3));
+    p_glUniform1i(g.u->preblend_src,
+                  double_alpha ? 3 : preblend_src ? (g.bs.dst == PSP_BF_ONE_MINUS_SRC_ALPHA ? 2 : 1) : 0);
+}
 
+/* The shader's texture, fog and alpha-test uniforms. */
+static void apply_uniforms(void) {
     p_glUniform1i(g.u->texenable, g.tex_enable ? 1 : 0);
     p_glUniform1i(g.u->texfunc, g.tex.func);
     p_glUniform1i(g.u->tcc, g.tex.tcc_rgba ? 1 : 0);
     p_glUniform1i(g.u->dbl, g.tex.color_double ? 1 : 0);
-    p_glUniform3f(g.u->env, (float)( g.tex.env        & 0xFF) / 255.0f,
-                           (float)((g.tex.env >>  8) & 0xFF) / 255.0f,
-                           (float)((g.tex.env >> 16) & 0xFF) / 255.0f);
+    p_glUniform3f(g.u->env, channel01(g.tex.env, 0), channel01(g.tex.env, 1), channel01(g.tex.env, 2));
     p_glUniform1i(g.u->tex, 0);
     p_glUniform2f(g.u->texscale, g.tex_sx, g.tex_sy);
     p_glUniform1i(g.u->bloom, g.batch_bloom);
@@ -3387,9 +3411,8 @@ static void apply_state(void) {
     if (g.batch_snap) {
         /* The guest-to-target mapping the scissor uses. */
         const rendertarget *r = &g.rts[g.cur_rt];
-        const int hud = r->wide && g.batch_class != CLASS_SCENE;
-        p_glUniform4f(g.u->snap, (float)(hud ? r->ui_scale : r->sx), (float)(hud ? r->ui_scale : r->sy),
-                      (float)(hud ? rt_off(r) : 0), (float)(hud ? rt_off_y(r) : 0));
+        const target_map m = target_mapping(r);
+        p_glUniform4f(g.u->snap, (float)m.sx, (float)m.sy, (float)m.off_x, (float)m.off_y);
         p_glUniform1f(g.u->snaph, (float)r->h);
     } else {
         p_glUniform4f(g.u->snap, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -3400,32 +3423,36 @@ static void apply_state(void) {
     if (g.bound) p_glBindTexture(GL_TEXTURE_2D, g.bound);
 
     p_glUniform1i(g.u->fogenable, g.fog_enable ? 1 : 0);
-    p_glUniform3f(g.u->fogcolour,
-                  (float)( g.fog_colour        & 0xFF) / 255.0f,
-                  (float)((g.fog_colour >>  8) & 0xFF) / 255.0f,
-                  (float)((g.fog_colour >> 16) & 0xFF) / 255.0f);
+    p_glUniform3f(g.u->fogcolour, channel01(g.fog_colour, 0), channel01(g.fog_colour, 1),
+                  channel01(g.fog_colour, 2));
 
     p_glUniform1i(g.u->atest, g.bs.alpha_test ? g.bs.alpha_func : 1);
     p_glUniform1i(g.u->aref,  g.bs.alpha_ref);
     p_glUniform1i(g.u->amask, g.bs.alpha_mask);
 }
 
+static void apply_state(void) {
+    apply_stencil();
+    apply_depth();
+    apply_colour_mask();
+    apply_scissor();
+    apply_blend();
+    apply_uniforms();
+}
+
 static void apply_placement(const rendertarget *r) {
-    const int hud = r->wide && g.batch_class != CLASS_SCENE;
+    const target_map m = target_mapping(r);
     p_glUseProgram(g.cur_prog);
     p_glViewport(0, 0, r->w, r->h);
     p_glUniform2f(g.u->viewport, (float)r->w, (float)r->h);
-    p_glUniform4f(g.u->placement, hud ? r->ui_scale : r->sx,
-                  hud ? r->ui_scale : r->sy, hud ? rt_off(r) : 0,
-                  hud ? rt_off_y(r) : 0);
+    p_glUniform4f(g.u->placement, m.sx, m.sy, m.off_x, m.off_y);
     p_glUniform1f(g.u->ybias, 1.0f/256.0f);
 }
 
-static void flush(void) {
-    if (g.ready && g.mu.npend) flush_model();
-    if (!g.ready || g.batch_n == 0) return;
-    if (rt_prepare(g.cur_rt) != 0) { g.batch_n = 0; return; }
-    rendertarget *r = &g.rts[g.cur_rt];
+/* What every batch drawn into r does first: its guest pixels imported, the
+ * stencil and alpha brought into step for what the draw reads and writes,
+ * and its framebuffer bound and marked dirty. */
+static void begin_target_draw(rendertarget *r) {
     gpu_query_begin_frame();
     rt_import(r);
     /* Clear-mode alpha writes invalidate the hardware stencil. Synchronise
@@ -3434,6 +3461,20 @@ static void flush(void) {
     if (g.bs.stencil_test) alpha_to_stencil(r);
     p_glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
     r->dirty = 1;
+}
+
+/* And last: which of r's alpha byte and stencil now holds the truth. */
+static void end_target_draw(rendertarget *r) {
+    if (stencil_writes(r)) r->alpha_dirty = 1;
+    if (g.bs.write_alpha) { r->stencil_valid = 0; r->alpha_dirty = 0; }
+}
+
+static void flush(void) {
+    if (g.ready && g.mu.npend) flush_model();
+    if (!g.ready || g.batch_n == 0) return;
+    if (rt_prepare(g.cur_rt) != 0) { g.batch_n = 0; return; }
+    rendertarget *r = &g.rts[g.cur_rt];
+    begin_target_draw(r);
     /* Retain the aspect diagnostics; apply_placement sets the final viewport
      * and, in window-resolution mode, the physical coordinate transform. */
     if (r->wide && g.batch_class == CLASS_HUD) {
@@ -3487,9 +3528,7 @@ static void flush(void) {
     const size_t boff = ring_alloc(RING_BATCH, bbytes, FLOATS_PER_VERT * sizeof(float), 0);
     ring_write(RING_BATCH, boff, g.batch, bbytes);
     const GLint bfirst = (GLint)(boff / (FLOATS_PER_VERT * sizeof(float)));
-    const int stencil_writes = g.bs.stencil_test && r->fmt == 3 &&
-                              (g.bs.op_sfail || g.bs.op_zfail || g.bs.op_zpass);
-    if (stencil_writes && uses_dest_alpha()) {
+    if (stencil_writes(r) && uses_dest_alpha()) {
         /* Later overlapping primitives must blend against the updated alpha,
          * not the value at the start of the batch. Only this dependency needs
          * a synchronisation per triangle; ordinary stencil batches stay batched. */
@@ -3504,9 +3543,8 @@ static void flush(void) {
         }
     } else {
         p_glDrawArrays(GL_TRIANGLES, bfirst, (GLsizei)g.batch_n);
-        if (stencil_writes) r->alpha_dirty = 1;
     }
-    if (g.bs.write_alpha) { r->stencil_valid = 0; r->alpha_dirty = 0; }
+    end_target_draw(r);
     g.batch_n = 0;
 }
 
@@ -3615,9 +3653,9 @@ static int readback_bind(rendertarget *r, int *rw, int *rh) {
 static void readback_complete(int i) {
     for (int k = 0; k < RB_SLOTS; k++) {
         if (!g_rb.pend[k].valid || (i >= 0 && g_rb.pend[k].rt != i)) continue;
-        const double t0 = rings_now_us();
+        const double t0 = gl_now_us();
         p_glClientWaitSync(g_rb.pend[k].sync, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
-        g_rb.wait_us += rings_now_us() - t0;
+        g_rb.wait_us += gl_now_us() - t0;
         p_glDeleteSync(g_rb.pend[k].sync);
         /* Retired before the copy: the copy's own pointer lookup into the
          * target reaches the access observer, which must find nothing left. */
@@ -4023,7 +4061,7 @@ static int gl_dialog_redraw(void) {
     if (!g.ready) return 0;
     if (g.thread!=this_thread()) return 0;
     static double last_us;
-    const double now_us = rings_now_us();
+    const double now_us = gl_now_us();
     if (last_us && now_us - last_us < 15000.0) return 0;
     last_us = now_us;
     GLint viewport[4]; p_glGetIntegerv(GL_VIEWPORT,viewport);
@@ -4086,7 +4124,7 @@ static void gl_present(void) {
      * buffer they read is not this backend's to know -- so all of them are
      * made true rather than guessing at one. */
     int rendered = 0;
-    const double rb_t0 = g.mu.profile ? rings_now_us() : 0;
+    const double rb_t0 = g.mu.profile ? gl_now_us() : 0;
     for (int i = 0; i < g.n_rts; i++) {
         if (!g.rts[i].dirty && !g.rts[i].cpu_pending) continue;
         if (g_rb.async) { readback_complete(i); readback_issue(i); }
@@ -4094,7 +4132,7 @@ static void gl_present(void) {
         g.rts[i].dirty = 0;
         rendered = 1; g.mu.readbacks++;
     }
-    if (g.mu.profile) g.mu.t_readback += rings_now_us() - rb_t0;
+    if (g.mu.profile) g.mu.t_readback += gl_now_us() - rb_t0;
     gpu_query_poll();
 
     for (int i=0; i<g.n_rts; i++) g.rts[i].scene_drawn = 0;
@@ -4143,13 +4181,9 @@ unsigned char *render_gl_capture(uint32_t addr, int *w, int *h) {
  * writes with a destination-alpha blend), which the CPU path keeps. */
 static int gl_model_ok(void) {
     if (!g.ready || g.failed || g.model_unavailable || !g.prog_model) return 0;
-    const rendertarget *r = &g.rts[g.cur_rt];
-    const int stencil_writes = g.bs.stencil_test && r->fmt == 3 &&
-                              (g.bs.op_sfail || g.bs.op_zfail || g.bs.op_zpass);
-    if (stencil_writes && uses_dest_alpha()) return 0;
+    if (stencil_writes(&g.rts[g.cur_rt]) && uses_dest_alpha()) return 0;
     return 1;
 }
-static double gl_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e6 + t.tv_nsec / 1e3; }
 /* Draw the pending model draws as one multi-draw: their blocks go into one
  * UBO slot, their triangles into the index ring in the PSP's vertex order,
  * and each draw's base vertex points at its records in the vertex ring. GL
@@ -4159,12 +4193,7 @@ static void flush_model(void) {
     const int nb = g.mu.npend; g.mu.npend = 0;
     rendertarget *r = &g.rts[g.cur_rt];
     const double t0 = g.mu.profile ? gl_now_us() : 0;
-    gpu_query_begin_frame();
-    rt_import(r);
-    if (g.bs.write_alpha || uses_dest_alpha()) stencil_to_alpha(r);
-    if (g.bs.stencil_test) alpha_to_stencil(r);
-    p_glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
-    r->dirty = 1;
+    begin_target_draw(r);
     use_program(g.prog_model, &g.ug);
     /* Placement owns the viewport too. Resetting it to SCENE here would
      * undo a cached PREVIEW placement after a model batch fills at PSP
@@ -4201,10 +4230,7 @@ static void flush_model(void) {
     const double t3 = g.mu.profile ? gl_now_us() : 0;
     p_glMultiDrawElementsBaseVertex(GL_TRIANGLES, counts, GL_UNSIGNED_SHORT, offs, nb, bases);
     p_glBindVertexArray(0);
-    const int stencil_writes = g.bs.stencil_test && r->fmt == 3 &&
-                              (g.bs.op_sfail || g.bs.op_zfail || g.bs.op_zpass);
-    if (stencil_writes) r->alpha_dirty = 1;
-    if (g.bs.write_alpha) { r->stencil_valid = 0; r->alpha_dirty = 0; }
+    end_target_draw(r);
     g.mu.batches++;
     if (g.mu.profile) { const double t4 = gl_now_us(); g.mu.t_state += t1 - t0; g.mu.t_ubo += t2 - t1; g.mu.t_ebo += t3 - t2; g.mu.t_draw += t4 - t3; }
 }
