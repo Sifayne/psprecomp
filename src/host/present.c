@@ -45,13 +45,13 @@ static const char *title_name(void) {
     return psp_title_info.name ? psp_title_info.name : "PSP";
 }
 
-/* An option the title's schema may or may not have, by key. The shared
- * resolve already turned the player options into settings fields; these are
- * the rest the host reads. */
+/* An option the title's schema may or may not have, by key. The player's
+ * own options are read by their PSP_OPT_* index. */
 static double setting(const char *key, double absent) {
-    const int id = psp_settings_find(key);
-    return id < 0 ? absent : psp_settings_current()->number[id];
+    return psp_settings_number(psp_settings_current(), key, absent);
 }
+
+static double player_option(int id) { return psp_settings_current()->number[id]; }
 
 /* ---- frames -------------------------------------------------------------- */
 
@@ -197,8 +197,8 @@ static uint32_t g_audio_target_frames  = 0;      /* 0: two of the channel's buff
 static uint32_t g_audio_preroll_frames = 4096;
 static int      g_audio_warned_fmt;
 
-static uint32_t settings_ms_frames(const char *key, uint32_t dflt_frames) {
-    const double ms = setting(key, -1);
+static uint32_t settings_ms_frames(int id, uint32_t dflt_frames) {
+    const double ms = player_option(id);
     if (ms < 0) return dflt_frames;
     uint64_t f = (uint64_t)(ms * (double)AUDIO_RATE / 1000.0);
     if (f >= MIX_RING_FRAMES / 2) f = MIX_RING_FRAMES / 2;
@@ -602,7 +602,7 @@ static void request_gl_context(void) {
  * current desktop resolution without switching the display mode. */
 static SDL_Window *create_window(void) {
     const psp_settings *settings = psp_settings_current();
-    const double display_setting = setting("DISPLAY", -1);
+    const double display_setting = player_option(PSP_OPT_DISPLAY);
     int display = display_setting < 0 ? 0 : (int)display_setting - 1;
     if (display >= SDL_GetNumVideoDisplays()) {
         fprintf(stderr, "present: display %d unavailable -- using primary display\n", display + 1);
@@ -615,7 +615,7 @@ static SDL_Window *create_window(void) {
         SDL_WINDOWPOS_CENTERED_DISPLAY(display), SDL_WINDOWPOS_CENTERED_DISPLAY(display),
         settings->width, settings->height,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
-        (setting("WINDOW_MODE", 0) ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) |
+        (player_option(PSP_OPT_WINDOW_MODE) ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) |
         (g_gl_want ? SDL_WINDOW_OPENGL : 0));
     if (!win)
         fprintf(stderr, "present: cannot create window: %s -- running headless\n",
@@ -686,8 +686,8 @@ static void open_audio(void) {
     want.callback = audio_device_callback;
     SDL_AudioSpec have;
     /* Lead 0 is two of the channel's own buffers; the pre-roll is 93 ms. */
-    audio()->prepare(settings_ms_frames("AUDIO_LEAD_MS", 0),
-                     settings_ms_frames("AUDIO_PREROLL_MS", 4096));
+    audio()->prepare(settings_ms_frames(PSP_OPT_AUDIO_LEAD_MS, 0),
+                     settings_ms_frames(PSP_OPT_AUDIO_PREROLL_MS, 4096));
     g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (g_audio_dev) {
         audio()->opened(g_audio_dev);
@@ -948,7 +948,7 @@ static void *sdl_thread(void *arg) {
      * the GL handoff above on purpose -- that block owns the context
      * juggling and does not need company. */
     input_start(psp_settings_current());
-    present_set_volume(setting("VOLUME", 100) / 100.0, 0);
+    present_set_volume(player_option(PSP_OPT_VOLUME) / 100.0, 0);
     g_window = win;
     if (g_overlay) g_overlay->start(win, g_gl_want ? NULL : ren);
 

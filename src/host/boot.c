@@ -912,8 +912,7 @@ static int start_runtime(const boot_args *a, const psp_settings *settings, const
 
 /* ASPECT=window: the title's option, when its schema has one. */
 static int adaptive_aspect(const psp_settings *settings) {
-    const int option = psp_settings_find("ASPECT");
-    return option >= 0 && settings->number[option] != 0;
+    return psp_settings_number(settings, "ASPECT", 0) != 0;
 }
 
 static int renderer_is_gl(void) { return strcmp(psp_render_current()->name, "gl") == 0; }

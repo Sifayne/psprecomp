@@ -1114,11 +1114,6 @@ void input_release_mouse(void) { mouse_grab(0); }
 
 /* ---- starting -------------------------------------------------------------------------- */
 
-static double option_value(const psp_settings *s, const char *key, double absent) {
-    const int id = psp_settings_find(key);
-    return id >= 0 ? s->number[id] : absent;
-}
-
 /* The modern layout's carriers only mean something to a title whose
  * replacements read them. */
 static int gamepad_modern(const psp_settings *s) {
@@ -1133,9 +1128,9 @@ static int gamepad_modern(const psp_settings *s) {
  * menu changed: what the host can apply while the game runs. The title's
  * input and its Modern controls stay as they started. */
 void input_rebuild(const psp_settings *s) {
-    g_keys_wasd = option_value(s, "KEYS", 0) != 0;
+    g_keys_wasd = psp_settings_number(s, "KEYS", 0) != 0;
     const int was_last = g_pad_last;
-    g_pad_last = option_value(s, "ACTIVE_PAD", 0) != 0;
+    g_pad_last = s->number[PSP_OPT_ACTIVE_PAD] != 0;
     bind_table(s);
     if (g_pad_last && !was_last) open_controllers();
     publish();
@@ -1145,7 +1140,7 @@ void input_rebuild(const psp_settings *s) {
 static void build(const psp_settings *s) {
     memset(&g_tin, 0, sizeof g_tin);
     if (g_title->input) g_title->input(s, &g_tin);
-    g_keys_wasd = option_value(s, "KEYS", 0) != 0;
+    g_keys_wasd = psp_settings_number(s, "KEYS", 0) != 0;
     g_gamepad_modern = gamepad_modern(s);
     g_keys_modern = s->input && (g_title->capabilities & PSP_TITLE_MODERN_CONTROLS);
     bind_table(s);
@@ -1188,7 +1183,7 @@ static void print_controls(const psp_settings *s) {
 void input_start(const psp_settings *s) {
     build(s);
     print_controls(s);
-    g_pad_last = option_value(s, "ACTIVE_PAD", 0) != 0;
+    g_pad_last = s->number[PSP_OPT_ACTIVE_PAD] != 0;
     /* Mouse-look, only when asked for. Captured from the start so a run
      * launched for it is playable at once; Escape lets go, a click retakes. */
     g_mouse_want = s->mouse;

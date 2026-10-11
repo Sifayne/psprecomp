@@ -170,6 +170,12 @@ int psp_settings_count(void);
 const psp_option_def *psp_settings_option(int id);
 /* The option's index, or -1. */
 int psp_settings_find(const char *key);
+/* An option's number by key -- one of the pack's, which another schema may
+ * not have -- or absent when the active schema has none by that key. */
+static inline double psp_settings_number(const psp_settings *s, const char *key, double absent) {
+    const int id = psp_settings_find(key);
+    return id < 0 ? absent : s->number[id];
+}
 
 void psp_settings_defaults(psp_settings *s);
 /* The defaults with both tables' play defaults over them. */
