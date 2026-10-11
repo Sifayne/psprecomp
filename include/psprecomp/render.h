@@ -436,6 +436,9 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
                           psp_line_pixel_fn emit, void *opaque);
 int psp_render_line_lod16(const psp_tex_state *t,
                           const psp_vertex *a, const psp_vertex *b);
+/* A point list's level of detail: a gradient of one texel a pixel, at the
+ * mean w of its points. */
+int psp_render_points_lod16(const psp_tex_state *t, const psp_vertex *v, int count);
 /* A triangle's level of detail, from the greater of its texture gradients
  * along x and y; 0 for a triangle with no area. */
 int psp_render_tri_lod16(const psp_tex_state *t, const psp_vertex *a,

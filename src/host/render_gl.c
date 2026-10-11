@@ -2925,6 +2925,181 @@ static int bloom_composite(int prim, const psp_vertex *v, int count) {
     return 0;
 }
 
+/* PSPRECOMP_ASPECT_LOG: set to anything, it logs the first few aspect
+ * decisions of each kind; at 2 or more, every one. Read once. */
+static struct { int read, on, all; } g_aspect_log;
+static void aspect_log_read(void) {
+    if (g_aspect_log.read) return;
+    const char *e = getenv("PSPRECOMP_ASPECT_LOG");
+    g_aspect_log.on = e != NULL;
+    g_aspect_log.all = e && atoi(e) >= 2;
+    g_aspect_log.read = 1;
+}
+static int aspect_log(void)     { aspect_log_read(); return g_aspect_log.on; }
+static int aspect_log_all(void) { aspect_log_read(); return g_aspect_log.all; }
+
+/* Whether every vertex is in screen space, and the x extent on the 1/16
+ * grid of those before the first that is not. */
+static int screen_space_extent(const psp_vertex *v, int count, int *min_x, int *max_x) {
+    *min_x = *max_x = v[0].x;
+    for (int i = 0; i < count; i++) {
+        if (!v[i].screen_space) return 0;
+        if (v[i].x < *min_x) *min_x = v[i].x;
+        if (v[i].x > *max_x) *max_x = v[i].x;
+    }
+    return 1;
+}
+
+/* Whether the bound texture is a render target's pixels, laid out as the
+ * target wrote them. */
+static int texture_reads_target(void) {
+    const uint32_t tex_addr = g.tex.addr & PSP_ADDR_MASK;
+    for (int i = 0; g.tex_enable && i < g.n_rts; i++) {
+        const rendertarget *source = &g.rts[i];
+        const uint64_t end = rt_end(source);
+        /* A palette may reinterpret each rendered pixel without
+         * changing its location: The 3rd Birthday's 128x64 bloom is
+         * drawn as 4444, then composited through CLUT16. Match those
+         * equal-width texels too. Byte/nibble indices and different
+         * strides do not preserve that layout (nor does movie memory
+         * reuse). */
+        const int same_pixels = g.tex.fmt == source->fmt ||
+            (g.tex.fmt == 6 && source->fmt >= 0 && source->fmt <= 2) ||
+            (g.tex.fmt == 7 && source->fmt == 3);
+        if (source->configured && !g.tex.swizzled && same_pixels &&
+            g.tex.stride == source->stride && tex_addr >= source->addr && tex_addr < end)
+            return 1;
+    }
+    return 0;
+}
+
+/* The class of a screen-space or perspective draw on a wide target, and
+ * whether a HUD draw goes to the bands beside the centred area (*band). */
+static int classify_wide_draw(int prim, const psp_vertex *v, int count, int *band) {
+    int cls = CLASS_SCENE;
+    int min_x, max_x;
+    const int ss = screen_space_extent(v, count, &min_x, &max_x);
+    const int full = min_x <= PSP_SUBPX && max_x >= (g.w - 1) * PSP_SUBPX;
+    /* Every other screen-space draw is HUD, including the ones that
+     * test depth (the lock-on reticle: two 64x64 sprites, GREATER).
+     * The game projects those on the CPU with the display camera's
+     * own matrices, which the camera replacement keeps at the native
+     * 480x272 focal length; a target d pixels from the centre gets
+     * its reticle d guest pixels from x=240, and the HUD mapping
+     * puts that at wide/2 + d -- the same target pixel the scene
+     * mapping gave the target (vertical FOV, so pixel scale, is
+     * unchanged). Its depth test therefore meets the target's own
+     * depth. The scene mapping would multiply d by wide/480 again. */
+    /* Which other screen-space draws fill the scene is the title's
+     * choice (psp_title_info, PSP_TITLE_ASPECT_BY_SOURCE). */
+    const int by_source = psp_title_can(PSP_TITLE_ASPECT_BY_SOURCE);
+    const int target_texture = by_source && texture_reads_target();
+    if (by_source) {
+        /* The 3rd Birthday's movie and menu strips keep their
+         * authored composition; a movie's separate strips stay
+         * together. A draw reading a render target composites pixels
+         * the scene mapping placed, so it takes that mapping whatever
+         * its width: a post effect drawn as several partial strips
+         * must not be squeezed into the safe area (the hub-lighting
+         * failure). Movies and HUD read authored textures, never a
+         * target (hub, street, aim, free-look, status-menu and movie
+         * captures: that repository's docs/ASPECT-VALIDATION.md).
+         * Only full-width untextured draws -- clears, fades -- join
+         * them. */
+        if (ss && !target_texture && (!full || g.tex_enable)) cls = CLASS_HUD;
+    } else {
+        /* Armored Core's: any screen-space draw spanning the full
+         * guest width -- clears, fades, a movie in strips, a bar --
+         * must cover the wide target, so it fills the scene. */
+        if (ss && !full) cls = CLASS_HUD;
+    }
+    if (!ss) g.rts[g.cur_rt].scene_drawn = 1;
+    if (ss && target_texture && aspect_log()) {
+        static int said3;
+        if (said3++ < 16 || aspect_log_all())
+            fprintf(stderr, "aspect: %s draw reads target %08X %dx%d fmt %d -> scene:"
+                            " prim %d, %d verts, x %.1f..%.1f, at present %llu\n",
+                    full ? "full-width" : "partial-width", g.tex.addr, g.tex.w, g.tex.h,
+                    g.tex.fmt, prim, count, (float)min_x / PSP_SUBPX, (float)max_x / PSP_SUBPX,
+                    (unsigned long long)g.presents);
+    }
+    int min_y = v[0].y, max_y = v[0].y;
+    for (int i = 0; i < count; i++) {
+        if (v[i].y < min_y) min_y = v[i].y;
+        if (v[i].y > max_y) max_y = v[i].y;
+    }
+    const int beyond = min_x < 0 || max_x > g.w * PSP_SUBPX || min_y < 0 || max_y > g.h * PSP_SUBPX;
+    /* World-tracking HUD -- a lock marker, lock-on rings -- is drawn
+     * wherever its target projects, off the native screen included
+     * (the PSP's scissor removed those; a Last Raven run logs ring x
+     * from -31580 to 1380). On a wide target such a draw is placed in
+     * the bands beside the centred area: the HUD mapping, with a
+     * viewport and scissor spanning the whole target. Only a title
+     * whose psp_title_info claims PSP_TITLE_HUD_BANDS does this, once
+     * its menus and missions are audited for 2D parked off the
+     * screen (AC3 Portable's menus draw thousands of untextured
+     * pieces there).
+     *
+     * The PSP's scissor clips 2D at 480x272, and HUD that merely
+     * overhangs the edge must stay clipped there: The 3rd Birthday's
+     * street HUD frame pieces run one pixel past it (x -1, 481,
+     * y -1), its status menu's pieces reach x -17 and 490, and panels
+     * slide in across it; Armored Core's menus tile a backdrop whose
+     * last column spans x 448..512. So a draw that misses the native
+     * screen entirely goes to the bands -- plus line strokes (Last
+     * Raven's lock box slides past the edge with its target) and
+     * depth-tested reticles, which no 2D backdrop uses. A marker
+     * crossing the edge otherwise is clipped like fixed HUD: The 3rd
+     * Birthday draws both with the same matrix, vertex type and
+     * state. Only after world geometry this frame, since a pure 2D
+     * menu parks pieces off screen (x -37..-5), and only for a draw
+     * smaller than the screen. The screen's right edge is x = 480
+     * exclusive: a quad ending there is on screen, not beyond it. */
+    const int outside = max_x <= 0 || min_x >= g.w * PSP_SUBPX ||
+                        max_y <= 0 || min_y >= g.h * PSP_SUBPX;
+    const int lines = prim == PSP_PRIM_LINES || prim == PSP_PRIM_LINE_STRIP;
+    *band = hud_bands_available() && cls == CLASS_HUD && g.rts[g.cur_rt].scene_drawn &&
+           (outside || (beyond && (lines || (g.z_test && g.z_func != PSP_CMP_ALWAYS)))) &&
+           max_y - min_y < g.h * PSP_SUBPX && max_x - min_x < g.w * PSP_SUBPX;
+    if (cls == CLASS_HUD && beyond && aspect_log()) {
+        static int said2;
+        if (said2++ < 64 || aspect_log_all())
+            fprintf(stderr, "aspect: 2D draw beyond the screen%s: prim %d, %d verts, x %.1f..%.1f,"
+                            " y %.1f..%.1f, rgba %08X, tex %08X %dx%d, at present %llu, window image %u\n",
+                    *band ? " (band)" : "", prim, count, (float)min_x / PSP_SUBPX, (float)max_x / PSP_SUBPX,
+                    (float)min_y / PSP_SUBPX, (float)max_y / PSP_SUBPX, v[0].rgba,
+                    g.tex_enable ? g.tex.addr : 0u, g.tex.w, g.tex.h,
+                    (unsigned long long)g.presents, shot_counters[0]);
+    }
+    if (ss && !full && g.z_test && g.z_func != PSP_CMP_ALWAYS && aspect_log()) {
+        /* PSPRECOMP_ASPECT_LOG=2: every such draw, not the first 16. */
+        static int said;
+        if (said++ < 16 || aspect_log_all())
+            fprintf(stderr, "aspect: screen-space draw tests depth (func %d)"
+                            " -> HUD%s: %d verts, x %.1f..%.1f, tex %08X %dx%d,"
+                            " at present %llu, window image %u\n",
+                    g.z_func, *band ? " (band)" : "", count, (float)min_x / PSP_SUBPX,
+                    (float)max_x / PSP_SUBPX,
+                    g.tex_enable ? g.tex.addr : 0u, g.tex.w, g.tex.h,
+                    (unsigned long long)g.presents, shot_counters[0]);
+    }
+    return cls;
+}
+
+/* A batch is drawn whole in one sampling mode: a draw that changes one ends
+ * the batch before it (why, for flush_ends). Answers whether it changed. */
+static int set_batch_mode(int *mode, int on, int why) {
+    if (on == *mode) return 0;
+    flush_ends(why); flush();
+    *mode = on;
+    return 1;
+}
+
+static void count_class(int cls) {
+    if (cls == CLASS_PREVIEW) g.class_preview++;
+    else if (cls == CLASS_HUD) g.class_hud++; else g.class_scene++;
+}
+
 static void gl_draw(int prim, const psp_vertex *v, int count) {
     if (claim() != 0) return;
     if (g.mu.npend) flush_model();
@@ -2937,15 +3112,13 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
     }
     if ((g.resolution || g.smooth_bloom || prim <= PSP_PRIM_LINE_STRIP) && rt_prepare(g.cur_rt) != 0) return;
     const int glyph = bitmap_glyph_draw(prim, v, count);
-    if (glyph != g.batch_glyph) { flush_ends(FB_GLYPH); flush(); g.batch_glyph = glyph; }
+    set_batch_mode(&g.batch_glyph, glyph, FB_GLYPH);
     if (glyph) g.glyph_draws++;
     const int snap = !glyph && native_texel_draw(prim, v, count);
-    if (snap != g.batch_snap) { flush_ends(FB_SNAP); flush(); g.batch_snap = snap; }
+    set_batch_mode(&g.batch_snap, snap, FB_SNAP);
     if (snap) g.snap_draws++;
     const int bloom = bloom_composite(prim, v, count);
-    if (bloom != g.batch_bloom) {
-        flush_ends(FB_CLASS); flush(); g.batch_bloom = bloom; g.mu.state_gen++;
-    }
+    if (set_batch_mode(&g.batch_bloom, bloom, FB_CLASS)) g.mu.state_gen++;
     if (bloom) g.bloom_draws++;
 
     /* Insets follow the centred safe area. Perspective geometry fills the
@@ -2958,144 +3131,18 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
         if (menu_preview(&g.rts[g.cur_rt])) {
             cls = CLASS_PREVIEW;
         } else if (g.rts[g.cur_rt].wide && count > 0) {
-            int ss = 1, min_x = v[0].x, max_x = v[0].x;
-            for (int i = 0; i < count; i++) {
-                if (!v[i].screen_space) { ss = 0; break; }
-                if (v[i].x < min_x) min_x = v[i].x;
-                if (v[i].x > max_x) max_x = v[i].x;
-            }
-            const int full = min_x <= PSP_SUBPX && max_x >= (g.w - 1) * PSP_SUBPX;
-            /* Every other screen-space draw is HUD, including the ones that
-             * test depth (the lock-on reticle: two 64x64 sprites, GREATER).
-             * The game projects those on the CPU with the display camera's
-             * own matrices, which the camera replacement keeps at the native
-             * 480x272 focal length; a target d pixels from the centre gets
-             * its reticle d guest pixels from x=240, and the HUD mapping
-             * puts that at wide/2 + d -- the same target pixel the scene
-             * mapping gave the target (vertical FOV, so pixel scale, is
-             * unchanged). Its depth test therefore meets the target's own
-             * depth. The scene mapping would multiply d by wide/480 again. */
-            /* Which other screen-space draws fill the scene is the title's
-             * choice (psp_title_info, PSP_TITLE_ASPECT_BY_SOURCE). */
-            int target_texture = 0;
-            const int by_source = psp_title_can(PSP_TITLE_ASPECT_BY_SOURCE);
-            const uint32_t tex_addr = g.tex.addr & PSP_ADDR_MASK;
-            for (int i = 0; by_source && g.tex_enable && i < g.n_rts; i++) {
-                const rendertarget *source = &g.rts[i];
-                const uint64_t end = rt_end(source);
-                /* A palette may reinterpret each rendered pixel without
-                 * changing its location: The 3rd Birthday's 128x64 bloom is
-                 * drawn as 4444, then composited through CLUT16. Match those
-                 * equal-width texels too. Byte/nibble indices and different
-                 * strides do not preserve that layout (nor does movie memory
-                 * reuse). */
-                const int same_pixels = g.tex.fmt == source->fmt ||
-                    (g.tex.fmt == 6 && source->fmt >= 0 && source->fmt <= 2) ||
-                    (g.tex.fmt == 7 && source->fmt == 3);
-                if (source->configured && !g.tex.swizzled && same_pixels &&
-                    g.tex.stride == source->stride && tex_addr >= source->addr && tex_addr < end)
-                    target_texture = 1;
-            }
-            if (by_source) {
-                /* The 3rd Birthday's movie and menu strips keep their
-                 * authored composition; a movie's separate strips stay
-                 * together. A draw reading a render target composites pixels
-                 * the scene mapping placed, so it takes that mapping whatever
-                 * its width: a post effect drawn as several partial strips
-                 * must not be squeezed into the safe area (the hub-lighting
-                 * failure). Movies and HUD read authored textures, never a
-                 * target (hub, street, aim, free-look, status-menu and movie
-                 * captures: that repository's docs/ASPECT-VALIDATION.md).
-                 * Only full-width untextured draws -- clears, fades -- join
-                 * them. */
-                if (ss && !target_texture && (!full || g.tex_enable)) cls = CLASS_HUD;
-            } else {
-                /* Armored Core's: any screen-space draw spanning the full
-                 * guest width -- clears, fades, a movie in strips, a bar --
-                 * must cover the wide target, so it fills the scene. */
-                if (ss && !full) cls = CLASS_HUD;
-            }
-            if (!ss) g.rts[g.cur_rt].scene_drawn = 1;
-            if (ss && target_texture && getenv("PSPRECOMP_ASPECT_LOG")) {
-                static int said3;
-                if (said3++ < 16 || atoi(getenv("PSPRECOMP_ASPECT_LOG")) >= 2)
-                    fprintf(stderr, "aspect: %s draw reads target %08X %dx%d fmt %d -> scene:"
-                                    " prim %d, %d verts, x %.1f..%.1f, at present %llu\n",
-                            full ? "full-width" : "partial-width", g.tex.addr, g.tex.w, g.tex.h,
-                            g.tex.fmt, prim, count, (float)min_x / PSP_SUBPX, (float)max_x / PSP_SUBPX,
-                            (unsigned long long)g.presents);
-            }
-            int min_y = v[0].y, max_y = v[0].y;
-            for (int i = 0; i < count; i++) { if (v[i].y < min_y) min_y = v[i].y; if (v[i].y > max_y) max_y = v[i].y; }
-            const int beyond = min_x < 0 || max_x > g.w * PSP_SUBPX || min_y < 0 || max_y > g.h * PSP_SUBPX;
-            /* World-tracking HUD -- a lock marker, lock-on rings -- is drawn
-             * wherever its target projects, off the native screen included
-             * (the PSP's scissor removed those; a Last Raven run logs ring x
-             * from -31580 to 1380). On a wide target such a draw is placed in
-             * the bands beside the centred area: the HUD mapping, with a
-             * viewport and scissor spanning the whole target. Only a title
-             * whose psp_title_info claims PSP_TITLE_HUD_BANDS does this, once
-             * its menus and missions are audited for 2D parked off the
-             * screen (AC3 Portable's menus draw thousands of untextured
-             * pieces there).
-             *
-             * The PSP's scissor clips 2D at 480x272, and HUD that merely
-             * overhangs the edge must stay clipped there: The 3rd Birthday's
-             * street HUD frame pieces run one pixel past it (x -1, 481,
-             * y -1), its status menu's pieces reach x -17 and 490, and panels
-             * slide in across it; Armored Core's menus tile a backdrop whose
-             * last column spans x 448..512. So a draw that misses the native
-             * screen entirely goes to the bands -- plus line strokes (Last
-             * Raven's lock box slides past the edge with its target) and
-             * depth-tested reticles, which no 2D backdrop uses. A marker
-             * crossing the edge otherwise is clipped like fixed HUD: The 3rd
-             * Birthday draws both with the same matrix, vertex type and
-             * state. Only after world geometry this frame, since a pure 2D
-             * menu parks pieces off screen (x -37..-5), and only for a draw
-             * smaller than the screen. The screen's right edge is x = 480
-             * exclusive: a quad ending there is on screen, not beyond it. */
-            const int outside = max_x <= 0 || min_x >= g.w * PSP_SUBPX ||
-                                max_y <= 0 || min_y >= g.h * PSP_SUBPX;
-            const int lines = prim == PSP_PRIM_LINES || prim == PSP_PRIM_LINE_STRIP;
-            band = hud_bands_available() && cls == CLASS_HUD && g.rts[g.cur_rt].scene_drawn &&
-                   (outside || (beyond && (lines || (g.z_test && g.z_func != PSP_CMP_ALWAYS)))) &&
-                   max_y - min_y < g.h * PSP_SUBPX && max_x - min_x < g.w * PSP_SUBPX;
-            if (cls == CLASS_HUD && beyond && getenv("PSPRECOMP_ASPECT_LOG")) {
-                static int said2;
-                if (said2++ < 64 || atoi(getenv("PSPRECOMP_ASPECT_LOG")) >= 2)
-                    fprintf(stderr, "aspect: 2D draw beyond the screen%s: prim %d, %d verts, x %.1f..%.1f,"
-                                    " y %.1f..%.1f, rgba %08X, tex %08X %dx%d, at present %llu, window image %u\n",
-                            band ? " (band)" : "", prim, count, (float)min_x / PSP_SUBPX, (float)max_x / PSP_SUBPX,
-                            (float)min_y / PSP_SUBPX, (float)max_y / PSP_SUBPX, v[0].rgba,
-                            g.tex_enable ? g.tex.addr : 0u, g.tex.w, g.tex.h,
-                            (unsigned long long)g.presents, shot_counters[0]);
-            }
-            if (ss && !full && g.z_test && g.z_func != PSP_CMP_ALWAYS && getenv("PSPRECOMP_ASPECT_LOG")) {
-                /* PSPRECOMP_ASPECT_LOG=2: every such draw, not the first 16. */
-                static int said;
-                if (said++ < 16 || atoi(getenv("PSPRECOMP_ASPECT_LOG")) >= 2)
-                    fprintf(stderr, "aspect: screen-space draw tests depth (func %d)"
-                                    " -> HUD%s: %d verts, x %.1f..%.1f, tex %08X %dx%d,"
-                                    " at present %llu, window image %u\n",
-                            g.z_func, band ? " (band)" : "", count, (float)min_x / PSP_SUBPX,
-                            (float)max_x / PSP_SUBPX,
-                            g.tex_enable ? g.tex.addr : 0u, g.tex.w, g.tex.h,
-                            (unsigned long long)g.presents, shot_counters[0]);
-            }
+            cls = classify_wide_draw(prim, v, count, &band);
         }
         if (cls != g.batch_class || band != g.batch_band) {
             flush_ends(FB_CLASS); flush();
             g.batch_class = cls; g.batch_band = band; g.mu.state_gen++;
         }
-        if (cls == CLASS_PREVIEW) g.class_preview++;
-        else if (cls == CLASS_HUD) g.class_hud++; else g.class_scene++;
+        count_class(cls);
     }
 
     switch (prim) {
     case PSP_PRIM_POINTS: {
-        float w = 0.0f;
-        for (int i = 0; i < count; i++) w += psp_render_vertex_w(&v[i]);
-        int lod16 = psp_render_lod16(&g.tex, 1.0f, count ? w / (float)count : 1.0f);
+        int lod16 = psp_render_points_lod16(&g.tex, v, count);
         for (int i = 0; i < count; i++) push_point_sample(&v[i], &lod16);
         break;
     }
@@ -3116,11 +3163,11 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
         }
         break;
     }
-    case 3:                                        /* triangles */
+    case PSP_PRIM_TRIANGLES:
         for (int i = 0; i + 2 < count; i += 3)
             push_triangle(&v[i], &v[i + 1], &v[i + 2]);
         break;
-    case 4:                                        /* triangle strip */
+    case PSP_PRIM_TRIANGLE_STRIP:
         for (int i = 0; i + 2 < count; i++) {
             /* Winding alternates along a strip; preserve it so a later
              * increment can turn face culling on without the strip flipping. */
@@ -3128,11 +3175,11 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
             else       push_triangle(&v[i], &v[i + 1], &v[i + 2]);
         }
         break;
-    case 5:                                        /* triangle fan */
+    case PSP_PRIM_TRIANGLE_FAN:
         for (int i = 1; i + 1 < count; i++)
             push_triangle(&v[0], &v[i], &v[i + 1]);
         break;
-    case 6:                                        /* sprites, in pairs */
+    case PSP_PRIM_SPRITES:                         /* in pairs */
         for (int i = 0; i + 1 < count; i += 2) push_sprite(&v[i]);
         break;
     default:
@@ -3494,7 +3541,7 @@ static void flush(void) {
             g.hud_depth_func[g.z_func & 7]++;
             if (g.z_func != PSP_CMP_ALWAYS) g.hud_depth_tests++;   /* ALWAYS reads nothing */
         }
-        if (getenv("PSPRECOMP_ASPECT_LOG")) {
+        if (aspect_log()) {
             const uint32_t key = g.tex_enable ? g.tex.addr : 0u;
             int k = 0;
             while (k < g.hud_by_tex_n && g.hud_by_tex[k].addr != key) k++;
@@ -4246,9 +4293,9 @@ static void gl_draw_model(int prim, const psp_model_vertex *v, int count, const 
     if (claim() != 0) return;
     if (count < 3 || count > MODEL_MAX_VERTS) return;
     if (rt_prepare(g.cur_rt) != 0) return;
-    if (g.batch_glyph) { flush_ends(FB_GLYPH); flush(); g.batch_glyph = 0; }
-    if (g.batch_snap) { flush_ends(FB_SNAP); flush(); g.batch_snap = 0; }
-    if (g.batch_bloom) { flush_ends(FB_CLASS); flush(); g.batch_bloom = 0; g.mu.state_gen++; }
+    set_batch_mode(&g.batch_glyph, 0, FB_GLYPH);
+    set_batch_mode(&g.batch_snap, 0, FB_SNAP);
+    if (set_batch_mode(&g.batch_bloom, 0, FB_CLASS)) g.mu.state_gen++;
     if (g.adaptive_aspect) {
         /* ge.c sends only perspective geometry through draw_model. Affine
          * UI is already classified through the CPU-transform draw path. */
@@ -4257,8 +4304,7 @@ static void gl_draw_model(int prim, const psp_model_vertex *v, int count, const 
         if (cls != g.batch_class) {
             flush_ends(FB_CLASS); flush(); g.batch_class = cls; g.mu.state_gen++;
         }
-        if (cls == CLASS_PREVIEW) g.class_preview++;
-        else if (cls == CLASS_HUD) g.class_hud++; else g.class_scene++;
+        count_class(cls);
     }
     if (g.batch_n) { flush_ends(FB_CPU); flush(); }
     /* A batch ends when its block slots are used up. It may span a wrap of

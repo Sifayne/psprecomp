@@ -1740,6 +1740,12 @@ int psp_render_tri_lod16(const psp_tex_state *t, const psp_vertex *a,
     return psp_render_lod16(t, rx > ry ? rx : ry, w);
 }
 
+int psp_render_points_lod16(const psp_tex_state *t, const psp_vertex *v, int count) {
+    float w = 0.0f;
+    for (int i = 0; i < count; i++) w += psp_render_vertex_w(&v[i]);
+    return psp_render_lod16(t, 1.0f, count ? w / (float)count : 1.0f);
+}
+
 int psp_render_line_lod16(const psp_tex_state *t,
                           const psp_vertex *a, const psp_vertex *b) {
     const float dx = fabsf((float)b->x - (float)a->x) / PSP_SUBPX;
@@ -1772,9 +1778,7 @@ static void sw_draw(int prim, const psp_vertex *v, int count) {
     const uint64_t t0 = now_ns();
     switch (prim) {
     case PSP_PRIM_POINTS: {
-        float w = 0.0f;
-        for (int i = 0; i < count; i++) w += psp_render_vertex_w(&v[i]);
-        int lod16 = psp_render_lod16(&g_tex, 1.0f, count ? w / (float)count : 1.0f);
+        int lod16 = psp_render_points_lod16(&g_tex, v, count);
         for (int i = 0; i < count; i++) sw_point_sample(&v[i], &lod16);
         break;
     }
