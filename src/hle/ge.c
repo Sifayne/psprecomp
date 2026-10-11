@@ -1300,59 +1300,64 @@ static int read_vertex(uint32_t addr, const ge_vlayout *vl, psp_vertex *out) {
 }
 
 
-/* Model-space position, for transformed geometry.
- *
- * Narrow components are normalised here and raw in through-mode: an s16 is a
- * signed fraction of 32768, an s8 of 128. Reading them raw instead puts a unit
- * cube 32768 units across, which projects to nothing recognisable and looks
- * like a broken matrix rather than a scaling mistake. */
-/* The vertex normal, in model space. A vertex type with no normal still gets
- * lit -- the game draws such batches -- so it falls back to facing the eye. */
-static void read_normal_model(uint32_t addr, uint32_t vtype, int norm_off, float n[3]) {
-    n[0] = n[1] = 0.0f; n[2] = 1.0f;
-    if (norm_off < 0) return;
-    const uint32_t a = addr + (uint32_t)norm_off;
-    switch (VT_NORMAL(vtype)) {
-    case 1:
-        n[0] = (float)(int8_t)psp_read8(a)       / 128.0f;
-        n[1] = (float)(int8_t)psp_read8(a + 1)   / 128.0f;
-        n[2] = (float)(int8_t)psp_read8(a + 2)   / 128.0f;
-        break;
-    case 2:
-        n[0] = (float)(int16_t)psp_read16(a)     / 32768.0f;
-        n[1] = (float)(int16_t)psp_read16(a + 2) / 32768.0f;
-        n[2] = (float)(int16_t)psp_read16(a + 4) / 32768.0f;
-        break;
-    case 3:
-        n[0] = psp_read_f32(a);
-        n[1] = psp_read_f32(a + 4);
-        n[2] = psp_read_f32(a + 8);
-        break;
-    default: break;
-    }
+/* The model-space readers below take a vertex record two ways: vp, a host
+ * pointer over the whole record, or, when the span cannot cover it
+ * (vp == NULL), its guest address, read field by field through the hooked
+ * reads, which is what reports a bad access. draw_prim_transformed
+ * translates each vertex's address once with psp_mem_ptr and reads the
+ * components from that pointer; the hooked per-component reads cost a
+ * translation and a range check each, eight to eleven times a vertex, and
+ * were the largest single item in the PSPRECOMP_GE_PROFILE breakdown outside
+ * lighting. The bytes and the conversions are the same, so the values are
+ * the same. */
+static inline uint8_t rd_u8(const uint8_t *vp, uint32_t addr, int off) {
+    return vp ? vp[off] : psp_read8(addr + (uint32_t)off);
+}
+static inline uint16_t rd_u16(const uint8_t *vp, uint32_t addr, int off) {
+    if (!vp) return psp_read16(addr + (uint32_t)off);
+    uint16_t v; memcpy(&v, vp + off, 2); return v;
+}
+static inline float rd_f32(const uint8_t *vp, uint32_t addr, int off) {
+    if (!vp) return psp_read_f32(addr + (uint32_t)off);
+    float v; memcpy(&v, vp + off, 4); return v;
 }
 
-static int read_pos_model(uint32_t addr, uint32_t vtype, int pos_off, float p[3]) {
-    const uint32_t a = addr + (uint32_t)pos_off;
-    switch (VT_POS(vtype)) {
+/* Three signed components of a position or normal, in the format VT_POS or
+ * VT_NORMAL gives (1 s8, 2 s16, 3 float), at byte off. Narrow components
+ * are normalised here and raw in through-mode: an s16 is a signed fraction
+ * of 32768, an s8 of 128. Reading them raw instead puts a unit cube 32768
+ * units across, which projects to nothing recognisable and looks like a
+ * broken matrix rather than a scaling mistake. Answers 0 for format 0. */
+static int read_vec3_model(const uint8_t *vp, uint32_t addr, int fmt, int off, float out[3]) {
+    switch (fmt) {
     case 1:
-        p[0] = (float)(int8_t)psp_read8(a)       / 128.0f;
-        p[1] = (float)(int8_t)psp_read8(a + 1)   / 128.0f;
-        p[2] = (float)(int8_t)psp_read8(a + 2)   / 128.0f;
+        for (int k = 0; k < 3; k++) out[k] = (float)(int8_t)rd_u8(vp, addr, off + k) / 128.0f;
         return 1;
     case 2:
-        p[0] = (float)(int16_t)psp_read16(a)     / 32768.0f;
-        p[1] = (float)(int16_t)psp_read16(a + 2) / 32768.0f;
-        p[2] = (float)(int16_t)psp_read16(a + 4) / 32768.0f;
+        for (int k = 0; k < 3; k++) out[k] = (float)(int16_t)rd_u16(vp, addr, off + 2 * k) / 32768.0f;
         return 1;
     case 3:
-        p[0] = psp_read_f32(a);
-        p[1] = psp_read_f32(a + 4);
-        p[2] = psp_read_f32(a + 8);
+        for (int k = 0; k < 3; k++) out[k] = rd_f32(vp, addr, off + 4 * k);
         return 1;
     default:
         return 0;
     }
+}
+
+/* Model-space position, for transformed geometry. */
+static int read_pos_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int pos_off, float p[3]) {
+    return read_vec3_model(vp, addr, VT_POS(vtype), pos_off, p);
+}
+static int read_pos_model(uint32_t addr, uint32_t vtype, int pos_off, float p[3]) {
+    return read_pos_model_at(NULL, addr, vtype, pos_off, p);
+}
+
+/* The vertex normal, in model space. A vertex type with no normal still gets
+ * lit -- the game draws such batches -- so it falls back to facing the eye. */
+static void read_normal_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int norm_off, float n[3]) {
+    n[0] = n[1] = 0.0f; n[2] = 1.0f;
+    if (norm_off < 0) return;
+    read_vec3_model(vp, addr, VT_NORMAL(vtype), norm_off, n);
 }
 
 /* Texture coordinates for transformed geometry are normalised, not texels: the
@@ -1366,67 +1371,19 @@ static int read_pos_model(uint32_t addr, uint32_t vtype, int pos_off, float p[3]
  * -1.0 and the right edge came out texel 0. Neither TEXSCALE nor TEXOFFSET was
  * decoded before: gpu/filtering/precisionnearest3d scales by 0.5, and its texel
  * boundary landed at a quarter of the sprite instead of the middle. */
-static int read_uv_raw(uint32_t addr, uint32_t vtype, int tex_off, float *u, float *v) {
+static int read_uv_raw_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, float *u, float *v) {
     *u = *v = 0.0f;
     if (tex_off < 0) return 0;
-    const uint32_t a = addr + (uint32_t)tex_off;
     switch (VT_TEX(vtype)) {
-    case 1: *u = (float)psp_read8(a)       / 128.0f;
-            *v = (float)psp_read8(a + 1)   / 128.0f;   return 1;
-    case 2: *u = (float)psp_read16(a)      / 32768.0f;
-            *v = (float)psp_read16(a + 2)  / 32768.0f; return 1;
-    case 3: *u = psp_read_f32(a); *v = psp_read_f32(a + 4); return 1;
+    case 1: *u = (float)rd_u8(vp, addr, tex_off)      / 128.0f;
+            *v = (float)rd_u8(vp, addr, tex_off + 1)  / 128.0f;   return 1;
+    case 2: *u = (float)rd_u16(vp, addr, tex_off)     / 32768.0f;
+            *v = (float)rd_u16(vp, addr, tex_off + 2) / 32768.0f; return 1;
+    case 3: *u = rd_f32(vp, addr, tex_off); *v = rd_f32(vp, addr, tex_off + 4); return 1;
     default: return 0;
     }
 }
 static void uv_to_texels(float u, float v, psp_vertex *out);
-
-/* The same three decoders over one host span for the whole record.
- *
- * draw_prim_transformed translates each vertex's address once with
- * psp_mem_ptr and reads the components from that pointer; the hooked
- * per-component reads above cost a translation and a range check each, eight
- * to eleven times a vertex, and were the largest single item in the
- * PSPRECOMP_GE_PROFILE breakdown outside lighting. The bytes and the
- * conversions are the same, so the values are the same. A record the span
- * cannot cover (vp == NULL) takes the hooked path, which is what reports the
- * bad access. */
-static inline int16_t rd_s16(const uint8_t *p) { int16_t v; memcpy(&v, p, 2); return v; }
-static inline float   rd_f32(const uint8_t *p) { float v; memcpy(&v, p, 4); return v; }
-static int read_pos_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int pos_off, float p[3]) {
-    if (!vp) return read_pos_model(addr, vtype, pos_off, p);
-    const uint8_t *a = vp + pos_off;
-    switch (VT_POS(vtype)) {
-    case 1: p[0] = (float)(int8_t)a[0] / 128.0f; p[1] = (float)(int8_t)a[1] / 128.0f; p[2] = (float)(int8_t)a[2] / 128.0f; return 1;
-    case 2: p[0] = (float)rd_s16(a) / 32768.0f; p[1] = (float)rd_s16(a + 2) / 32768.0f; p[2] = (float)rd_s16(a + 4) / 32768.0f; return 1;
-    case 3: p[0] = rd_f32(a); p[1] = rd_f32(a + 4); p[2] = rd_f32(a + 8); return 1;
-    default: return 0;
-    }
-}
-static void read_normal_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int norm_off, float n[3]) {
-    if (!vp) { read_normal_model(addr, vtype, norm_off, n); return; }
-    n[0] = n[1] = 0.0f; n[2] = 1.0f;
-    if (norm_off < 0) return;
-    const uint8_t *a = vp + norm_off;
-    switch (VT_NORMAL(vtype)) {
-    case 1: n[0] = (float)(int8_t)a[0] / 128.0f; n[1] = (float)(int8_t)a[1] / 128.0f; n[2] = (float)(int8_t)a[2] / 128.0f; break;
-    case 2: n[0] = (float)rd_s16(a) / 32768.0f; n[1] = (float)rd_s16(a + 2) / 32768.0f; n[2] = (float)rd_s16(a + 4) / 32768.0f; break;
-    case 3: n[0] = rd_f32(a); n[1] = rd_f32(a + 4); n[2] = rd_f32(a + 8); break;
-    default: break;
-    }
-}
-static int read_uv_raw_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, float *u, float *v) {
-    if (!vp) return read_uv_raw(addr, vtype, tex_off, u, v);
-    *u = *v = 0.0f;
-    if (tex_off < 0) return 0;
-    const uint8_t *a = vp + tex_off;
-    switch (VT_TEX(vtype)) {
-    case 1: *u = (float)a[0] / 128.0f;                  *v = (float)a[1] / 128.0f;                    return 1;
-    case 2: *u = (float)(uint16_t)rd_s16(a) / 32768.0f; *v = (float)(uint16_t)rd_s16(a + 2) / 32768.0f; return 1;
-    case 3: *u = rd_f32(a); *v = rd_f32(a + 4); return 1;
-    default: return 0;
-    }
-}
 static void read_uv_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, psp_vertex *out) {
     float u, v;
     out->u = out->v = 0.0f;
