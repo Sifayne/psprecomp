@@ -264,7 +264,6 @@ static void expire_locked(uint64_t now) {
     }
 }
 
-/* The earliest deadline any timed wait has, or 0 for none. */
 /* Whether a guest thread is waiting or sleeping: something an interrupt
  * handler could still release. The main context counts only while it waits
  * on a guest object, not while it merely drains. */
@@ -276,6 +275,7 @@ static int has_waiter_locked(void) {
     return 0;
 }
 
+/* The earliest deadline any timed wait has, or 0 for none. */
 static uint64_t soonest_locked(void) {
     uint64_t soonest = 0;
     for (int i = 0; i < g_slot_hi; i++)
@@ -348,12 +348,10 @@ static void leave_if_stopped_locked(void) {
     host_exit();
 }
 
-static int handoff_locked(void) {
-    leave_if_stopped_locked();
-
-    /* One token, one RUNNING slot. Cheap -- the selection scan below already
-     * walks the same array -- and it turns a silent corruption into a named
-     * one, which is the whole reason the bug above took as long as it did. */
+/* One token, one RUNNING slot. Cheap -- the selection scan already walks the
+ * same array -- and it turns a silent corruption into a named one, which is
+ * the whole reason the bug above took as long as it did. */
+static void check_one_running_locked(void) {
     int cur = -1, dup = -1;
     for (int i = 0; i < g_slot_hi; i++) {
         if (!g_slot[i].used || g_slot[i].state != PSP_SCHED_RUNNING) continue;
@@ -363,33 +361,63 @@ static int handoff_locked(void) {
         fprintf(stderr, "psprecomp: scheduler invariant broken -- uid 0x%08X and "
                         "uid 0x%08X are both RUNNING\n",
                 g_slot[cur].uid, g_slot[dup].uid);
+}
 
-    /* The moment the outgoing thread stopped, before any idle time below. */
-    const uint64_t t0 = psp_clock_peek();
+/* What the handoff would run now that guest time has moved. */
+static int expire_and_pick_locked(void) {
+    expire_locked(psp_clock_peek());
+    return pick_locked();
+}
 
-    /* Anything whose delay has expired is runnable again. psp_sched_tick
-     * notices most expiries at the firmware call where they fall due; this
-     * catches the rest. */
-    expire_locked(t0);
-    int best = pick_locked();
+/* The three things that run while the CPU idles, each with the lock let go:
+ * they make firmware calls, or reach code that does. */
 
-    /* Nothing is runnable, but something may be sleeping on a deadline that has
-     * not arrived. Waiting for it is not idling, it is hanging: the clock only
-     * advances because a thread advanced it, and no thread is running. So move
-     * time to the earliest deadline and let that thread go -- which is what a
-     * kernel with a real timer would do, arriving at the same instant by a
-     * different route. */
-    /* An alarm or vtimer falling due first is an interrupt arriving while the
-     * CPU idles, and its handler runs at that moment rather than at the next
-     * firmware call some thread makes: threadprobe step 115 (fw 6.60) sets a
-     * 2ms alarm, delays 10ms, and the handler has run before the delay ends.
-     * It runs here, on the outgoing thread's host thread, whose registers are
-     * already saved and which still holds the token; the lock is dropped for
-     * it because the handler makes firmware calls. Whatever it readies is
-     * picked up below. Without this a program whose threads all wait on
-     * something only a timer handler provides was declared stranded. The cap
-     * only stops a periodic handler that never readies anyone from spinning
-     * guest time on for ever. */
+/* The GE goes on with what it was given, up to `until`. Whether it ran. */
+static int idle_ge_locked(uint64_t until) {
+    psp_os_unlock(&g_lock);
+    const int ran = psp_ge_idle_run(until);
+    psp_os_lock(&g_lock);
+    return ran;
+}
+
+/* The vblank at `at`, and the interrupt handlers it raises. */
+static void idle_vblank_locked(uint64_t at) {
+    psp_clock_advance_to(at);
+    psp_os_unlock(&g_lock);
+    psp_display_tick();
+    psp_interrupt_run_pending();
+    psp_os_lock(&g_lock);
+}
+
+/* The alarms and vtimers due at `at`. How many handlers ran. */
+static int idle_timers_locked(uint64_t at) {
+    psp_clock_advance_to(at);
+    psp_os_unlock(&g_lock);
+    const int ran = psp_ktimer_fire_idle();
+    psp_os_lock(&g_lock);
+    return ran;
+}
+
+/* Nothing is runnable, but something may be sleeping on a deadline that has
+ * not arrived. Waiting for it is not idling, it is hanging: the clock only
+ * advances because a thread advanced it, and no thread is running. So move
+ * time to the earliest deadline and let that thread go -- which is what a
+ * kernel with a real timer would do, arriving at the same instant by a
+ * different route. Returns the slot that became runnable, or -1.
+ *
+ * An alarm or vtimer falling due first is an interrupt arriving while the
+ * CPU idles, and its handler runs at that moment rather than at the next
+ * firmware call some thread makes: threadprobe step 115 (fw 6.60) sets a
+ * 2ms alarm, delays 10ms, and the handler has run before the delay ends.
+ * It runs here, on the outgoing thread's host thread, whose registers are
+ * already saved and which still holds the token; the lock is dropped for
+ * it because the handler makes firmware calls. Whatever it readies is
+ * picked up below. Without this a program whose threads all wait on
+ * something only a timer handler provides was declared stranded. The cap
+ * only stops a periodic handler that never readies anyone from spinning
+ * guest time on for ever. */
+static int idle_locked(void) {
+    int best = -1;
     int timer_runs = 0, ge_runs = 0, intr_runs = 0;
     while (best < 0) {
         leave_if_stopped_locked();
@@ -403,13 +431,9 @@ static int handoff_locked(void) {
          * stops a list that raises handlers without end. */
         if (ge_runs < IDLE_GE_CAP) {
             const uint64_t next = timer && (!soonest || timer < soonest) ? timer : soonest;
-            psp_os_unlock(&g_lock);
-            const int ran = psp_ge_idle_run(next);
-            psp_os_lock(&g_lock);
-            if (ran) {
+            if (idle_ge_locked(next)) {
                 ge_runs++;
-                expire_locked(psp_clock_peek());
-                best = pick_locked();
+                best = expire_and_pick_locked();
                 continue;
             }
         }
@@ -421,31 +445,37 @@ static int handoff_locked(void) {
         const uint64_t intr = intr_runs < IDLE_TIMER_CAP && has_waiter_locked()
                             ? psp_interrupt_next_event() : 0;
         if (intr && (!soonest || intr <= soonest) && (!timer || intr < timer)) {
-            psp_clock_advance_to(intr);
-            psp_os_unlock(&g_lock);
-            psp_display_tick();
-            psp_interrupt_run_pending();
-            psp_os_lock(&g_lock);
+            idle_vblank_locked(intr);
             intr_runs++;
-            expire_locked(psp_clock_peek());
-            best = pick_locked();
+            best = expire_and_pick_locked();
             continue;
         }
         if (timer && (!soonest || timer <= soonest)) {
-            psp_clock_advance_to(timer);
-            psp_os_unlock(&g_lock);
-            const int ran = psp_ktimer_fire_idle();
-            psp_os_lock(&g_lock);
+            const int ran = idle_timers_locked(timer);
             timer_runs = ran ? timer_runs + ran : IDLE_TIMER_CAP;
-            expire_locked(psp_clock_peek());
-            best = pick_locked();
+            best = expire_and_pick_locked();
             continue;
         }
         if (!soonest) break;
         psp_clock_advance_to(soonest);
-        expire_locked(psp_clock_peek());
-        best = pick_locked();
+        best = expire_and_pick_locked();
     }
+    return best;
+}
+
+static int handoff_locked(void) {
+    leave_if_stopped_locked();
+    check_one_running_locked();
+
+    /* The moment the outgoing thread stopped, before any idle time below. */
+    const uint64_t t0 = psp_clock_peek();
+
+    /* Anything whose delay has expired is runnable again. psp_sched_tick
+     * notices most expiries at the firmware call where they fall due; this
+     * catches the rest. */
+    expire_locked(t0);
+    int best = pick_locked();
+    if (best < 0) best = idle_locked();
     leave_if_stopped_locked();
 
     if (best < 0) {
