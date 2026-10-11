@@ -192,9 +192,7 @@ typedef struct {
      * access units were fetched and what they were stamped. A stream fetched
      * at real time advances its stamps as fast as the wall; slower means the
      * decoder cannot keep up, and the other stream runs away from it. */
-    uint64_t v_first_ns, v_last_ns, a_first_ns, a_last_ns;
-    uint32_t v_first_pts, v_last_pts, a_first_pts, a_last_pts;
-    uint32_t v_fetched, a_fetched;
+    struct mpeg_fetches { uint64_t first_ns, last_ns; uint32_t first_pts, last_pts, n; } vfetch, afetch;
     uint64_t dec_ns, copy_ns, adec_ns;   /* host time in the H.264 decoder, the picture copy, the audio decoder */
 } mpeg_ctx;
 
@@ -258,6 +256,19 @@ static void dump_write(mpeg_dump *d, const void *p, size_t n) {
     if (d->file) { fwrite(p, 1, n, d->file); fflush(d->file); }
 }
 
+/* An access unit fetched at `pts`, against the clock less host pauses. */
+static void fetch_note(struct mpeg_fetches *f, uint32_t pts) {
+    const uint64_t now = psp_clock_run_ns();
+    if (!f->n) { f->first_ns = now; f->first_pts = pts; }
+    f->last_ns = now; f->last_pts = pts; f->n++;
+}
+static void fetch_report(FILE *out, const char *stream, const char *what, const struct mpeg_fetches *f) {
+    if (f->n > 1)
+        fprintf(out, "    movie: %s  %u AUs fetched, stamps %u..%u (%.1f s of %s) over %.1f s of wall clock\n",
+                stream, f->n, f->first_pts, f->last_pts,
+                (f->last_pts - f->first_pts) / 90000.0, what, (f->last_ns - f->first_ns) / 1e9);
+}
+
 /* The audio clock's lead over the picture, in milliseconds, over the run. */
 void psp_mpeg_dump_sync(FILE *out) {
     for (int i = 0; i < MAX_MPEG; i++) {
@@ -277,14 +288,8 @@ void psp_mpeg_dump_sync(FILE *out) {
         fprintf(out, "    movie: lead every 250 pictures, ms:");
         for (int k = 0; k < 8 && k * 250 < c->frames; k++) fprintf(out, " %.0f", c->sync_trend[k] / 90.0);
         fprintf(out, "\n");
-        if (c->v_fetched > 1)
-            fprintf(out, "    movie: video  %u AUs fetched, stamps %u..%u (%.1f s of picture) over %.1f s of wall clock\n",
-                    c->v_fetched, c->v_first_pts, c->v_last_pts,
-                    (c->v_last_pts - c->v_first_pts) / 90000.0, (c->v_last_ns - c->v_first_ns) / 1e9);
-        if (c->a_fetched > 1)
-            fprintf(out, "    movie: audio  %u AUs fetched, stamps %u..%u (%.1f s of sound) over %.1f s of wall clock\n",
-                    c->a_fetched, c->a_first_pts, c->a_last_pts,
-                    (c->a_last_pts - c->a_first_pts) / 90000.0, (c->a_last_ns - c->a_first_ns) / 1e9);
+        fetch_report(out, "video", "picture", &c->vfetch);
+        fetch_report(out, "audio", "sound", &c->afetch);
         if (c->post_avail || c->post_put)
             fprintf(out, "    movie: after the file ended -- ring polls %llu, puts %llu, "
                          "video fetch %llu decode %llu, audio fetch %llu decode %llu\n",
@@ -1630,11 +1635,7 @@ static void hle_GetAvcAu(void) {
     }
     if (mpeg_logging() && c->frames <= 3)
         fprintf(stderr, "mpeg: GetAvcAu -> frame %d, pts %u\n", c->frames, c->pts);
-    {
-        const uint64_t now = psp_clock_run_ns();   /* less host pauses */
-        if (!c->v_fetched) { c->v_first_ns = now; c->v_first_pts = c->pts; }
-        c->v_last_ns = now; c->v_last_pts = c->pts; c->v_fetched++;
-    }
+    fetch_note(&c->vfetch, c->pts);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 /* The audio access unit: the next ATRAC3+ frame of the movie.
@@ -1712,11 +1713,7 @@ static void hle_GetAtracAu(void) {
         psp_write32(au + AU_ES_SIZE, (uint32_t)total);
     }
     c->aes_pos += total;
-    {
-        const uint64_t now = psp_clock_run_ns();   /* less host pauses */
-        if (!c->a_fetched) { c->a_first_ns = now; c->a_first_pts = c->atrac_pts; }
-        c->a_last_ns = now; c->a_last_pts = c->atrac_pts; c->a_fetched++;
-    }
+    fetch_note(&c->afetch, c->atrac_pts);
     c->atrac_pts += MPEG_ATRAC_PTS_STEP;
     mpeg_trace(MPEG_TRACE_ATRAC_AU,au,au_buffer(c,au),(uint32_t)total,c->atrac_pts-MPEG_ATRAC_PTS_STEP);
     psp_ret(SCE_KERNEL_ERROR_OK);
