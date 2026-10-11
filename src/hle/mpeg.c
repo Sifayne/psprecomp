@@ -669,6 +669,10 @@ static void *grow_for_one(void *arr, size_t n, size_t *cap, size_t first, size_t
     *cap = want;
     return grown;
 }
+/* Whether a start code, 00 00 01, opens `p`. */
+static int start_code(const uint8_t *p) {
+    return p[0] == 0 && p[1] == 0 && p[2] == 1;
+}
 /* A stream nobody registered is never read: kept, it would only pile up. */
 static int unwanted(const mpeg_ctx *c, unsigned id) {
     return c->registered && !(c->registered & (1u << id));
@@ -677,7 +681,7 @@ static int es_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
     if (unwanted(c, 0)) return 0;
     if (c->es_skip) {   /* the rest of a NAL a splice cut through */
         size_t k = 0;
-        while (k + 3 <= n && !(p[k] == 0 && p[k+1] == 0 && p[k+2] == 1)) k++;
+        while (k + 3 <= n && !start_code(p + k)) k++;
         if (k + 3 > n) return 0;
         c->es_skip = 0;
         p += k;
@@ -832,7 +836,7 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
 
     size_t i = 0;
     while (i + 4 <= plen_all) {
-        if (!(p[i] == 0 && p[i+1] == 0 && p[i+2] == 1)) { i++; continue; }
+        if (!start_code(p + i)) { i++; continue; }
         const uint8_t id = p[i+3];
 
         if (id == PS_PACK_START) {
@@ -864,7 +868,7 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
                  * the splice cut through. */
                 const uint8_t *q = p + off;
                 c->es_splice = 0;
-                if (!(q[0] == 0 && q[1] == 0 && (q[2] == 1 || (q[2] == 0 && q[3] == 1))))
+                if (!(start_code(q) || (q[0] == 0 && start_code(q + 1))))
                     { c->es_skip = 1; c->splices++; }
             }
             if ((p[i+7] & 0x80) && hdrlen >= 5 && i + 14 <= plen_all) {
@@ -945,7 +949,7 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
  * or len if there is none. */
 static size_t nal_next(const uint8_t *p, size_t len, size_t from) {
     for (size_t i = from; i + 3 <= len; i++)
-        if (p[i] == 0 && p[i+1] == 0 && p[i+2] == 1) return i + 3;
+        if (start_code(p + i)) return i + 3;
     return len;
 }
 
