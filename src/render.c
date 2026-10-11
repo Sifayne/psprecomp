@@ -104,14 +104,11 @@ enum {
     GE_TFMT_CLUT4 = 4, GE_TFMT_CLUT8 = 5, GE_TFMT_CLUT16 = 6, GE_TFMT_CLUT32 = 7
 };
 
-static struct {
-    uint32_t addr;
-    int      fmt, shift, mask, start;
-} g_clut;
+static psp_clut_state g_clut;
 
 static void sw_clut(uint32_t addr, int format, int shift, int mask, int start) {
-    g_clut.addr = addr; g_clut.fmt = format;
-    g_clut.shift = shift; g_clut.mask = mask; g_clut.start = start;
+    const psp_clut_state c = { addr, format, shift, mask, start };
+    g_clut = c;
 }
 
 /* Bytes per texel, doubled, so the 4-bit format can be expressed as 1. */
@@ -314,14 +311,8 @@ static size_t decode_level(const psp_tex_state *t, int level,
      * that state, so a GPU backend decoding through here would have found a
      * stale palette -- silently, and only for the CLUT formats, which is the
      * kind of wrongness that looks like a sampler bug for a day. */
-    const struct { uint32_t addr; int fmt, shift, mask, start; } saved_clut = {
-        g_clut.addr, g_clut.fmt, g_clut.shift, g_clut.mask, g_clut.start
-    };
-    if (clut) {
-        g_clut.addr = clut->addr; g_clut.fmt = clut->fmt;
-        g_clut.shift = clut->shift; g_clut.mask = clut->mask;
-        g_clut.start = clut->start;
-    }
+    const psp_clut_state saved_clut = g_clut;
+    if (clut) g_clut = *clut;
     g_tex = *t;
     if (level > 0) {
         g_tex.addr   = t->lv_addr[level];
@@ -337,23 +328,18 @@ static size_t decode_level(const psp_tex_state *t, int level,
         bounds->clut_bytes = psp_mem_mapped_span(g_clut.addr);
     }
     const int w = g_tex.w, h = g_tex.h;
-    if (w <= 0 || h <= 0 || (size_t)w * (size_t)h > cap) {
-        g_tex = saved;
-        g_clut.addr = saved_clut.addr; g_clut.fmt = saved_clut.fmt;
-        g_clut.shift = saved_clut.shift; g_clut.mask = saved_clut.mask;
-        g_clut.start = saved_clut.start;
-        return 0;
+    size_t n = 0;
+    if (w > 0 && h > 0 && (size_t)w * (size_t)h <= cap) {
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                out[(size_t)y * (size_t)w + (size_t)x] = sample_texel_bounded(x, y, bounds);
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        n = (size_t)w * (size_t)h;
     }
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-            out[(size_t)y * (size_t)w + (size_t)x] = sample_texel_bounded(x, y, bounds);
-    if (out_w) *out_w = w;
-    if (out_h) *out_h = h;
     g_tex = saved;
-    g_clut.addr = saved_clut.addr; g_clut.fmt = saved_clut.fmt;
-    g_clut.shift = saved_clut.shift; g_clut.mask = saved_clut.mask;
-    g_clut.start = saved_clut.start;
-    return (size_t)w * (size_t)h;
+    g_clut = saved_clut;
+    return n;
 }
 
 size_t psp_render_decode_level(const psp_tex_state *t, int level,
