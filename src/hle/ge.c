@@ -3860,8 +3860,6 @@ static double patch_param(int i, int div) {
     return (2 * i <= div ? (i * q) >> 6 : 256 - (((div - i) * q) >> 6)) / 256.0;
 }
 
-/* A Bezier direction: (count - 1) / 3 cubic pieces sharing end points, each
- * cut into `div` steps. Returns the number of samples. */
 /* Set while a patch is drawn as points: each piece or span then emits its
  * own end samples, so a sample two of them share is drawn twice (geprobe 13
  * scene 73, fw 6.60: with additive blending those points read doubled).
@@ -3869,6 +3867,8 @@ static double patch_param(int i, int div) {
  * Triangles and lines share it as one vertex. */
 static int g_patch_dup;
 
+/* A Bezier direction: (count - 1) / 3 cubic pieces sharing end points, each
+ * cut into `div` steps. Returns the number of samples. */
 static int bezier_samples(int count, int div, patch_sample *out, int max) {
     const int pieces = (count - 1) / 3;
     int n = 0;
@@ -3923,13 +3923,148 @@ static int spline_samples(int count, int div, int edge, patch_sample *out, int m
 
 enum { PATCH_MAX_SAMPLES = 4096 };   /* geprobe 13 scene 82: rows past 256 draw whole */
 
+/* Control point (column q, row r) of the sixteen sample (su, sv) blends. */
+static const ge_mvert *patch_cp(const ge_mvert *cp, int ucount, const patch_sample *su,
+                                const patch_sample *sv, int q, int r) {
+    return &cp[(sv->first + r) * ucount + su->first + q];
+}
+
+/* One generated vertex of the surface, at samples su across and sv down. */
+static void eval_patch_point(const ge_mvert *cp, int ucount, const patch_sample *su,
+                             const patch_sample *sv, int has_uv, ge_mvert *o) {
+    float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, u = 0, v = 0;
+    for (int b = 0; b < 4; b++)
+        for (int a = 0; a < 4; a++) {
+            const double wd = sv->w[b] * su->w[a];
+            const float w = (float)wd;
+            if (wd == 0.0) continue;
+            const ge_mvert *c = patch_cp(cp, ucount, su, sv, a, b);
+            for (int k = 0; k < 3; k++) nrm[k] += w * c->nrm[k];
+            u += w * c->u; v += w * c->v;
+        }
+    /* A position is de Boor's algorithm too, each coordinate on its
+     * own, every lerp la_lerp's: along v for each of the four
+     * control columns, then along u over the four results, from
+     * controls cut to 16 bits (s16 and s8 controls are exact
+     * fractions). geprobe 13 (fw 6.60) reads 134,198 generated
+     * points whole through depth (scenes 67-82), over every
+     * division to 64, edge mode, sign, binade, format, morph and
+     * skin, and this places every one on its pixel with its depth;
+     * u first misses 8767 of them. The weights above stay for
+     * normals and texture coordinates. */
+    for (int k = 0; k < 3; k++) {
+        double C[4];
+        for (int q = 0; q < 4; q++) {
+            double in[4];
+            for (int r = 0; r < 4; r++)
+                in[r] = ge_cut(patch_cp(cp, ucount, su, sv, q, r)->pos[k], 16, 0);
+            C[q] = deboor_la(in, sv->a);
+        }
+        pos[k] = (float)deboor_la(C, su->a);
+    }
+    memcpy(o->pos, pos, sizeof pos);
+    memcpy(o->nrm, nrm, sizeof nrm);
+    /* A generated vertex's colour is not a blend by weights: the GE
+     * runs de Boor's algorithm on each channel of the control
+     * colours, with deboor_params' 8-bit parameters, along v for
+     * each of the four control columns and then along u, every lerp
+     * floored to 1/128 of a step and the end rounded up to a whole
+     * one (deboor_fix). geprobe 9 and 10 (fw 6.60) scenes 52-54 read
+     * 19,546 single and paired control columns at three levels over
+     * every edge mode, and this reproduces every one; weights by
+     * Cox-de Boor, through the cut-to-1/256 rule this replaces, fit
+     * 13,452 of scenes 53 and 54's 16,302. The tiny weights near a
+     * span's end that read low are those 1/128 cuts. Bezier pieces
+     * are the same with every parameter t, which is why exact
+     * weights fit them. v goes first, as for positions: geprobe 13
+     * scene 72's colour-order cells read 747 pixels a step off u
+     * first and none this way. */
+    o->rgba = 0;
+    for (int k = 0; k < 4; k++) {
+        int64_t Q[4];
+        for (int q = 0; q < 4; q++) {
+            int64_t in[4];
+            for (int r = 0; r < 4; r++)
+                in[r] = (int64_t)((patch_cp(cp, ucount, su, sv, q, r)->rgba >> (8 * k)) & 0xFFu) * 128;
+            Q[q] = deboor_fix(in, sv->a);
+        }
+        int c = (int)((deboor_fix(Q, su->a) + 127) >> 7);
+        if (c < 0) c = 0;
+        if (c > 255) c = 255;
+        o->rgba |= (uint32_t)c << (8 * k);
+    }
+    if (!has_uv) {
+        u = su->param * g_ge.tex_scale_u + g_ge.tex_offset_u;
+        v = sv->param * g_ge.tex_scale_v + g_ge.tex_offset_v;
+        u *= (float)g_ge.tex_w;
+        v *= (float)g_ge.tex_h;
+    }
+    o->u = u; o->v = v;
+}
+
+/* The grid of nu x nv generated vertices as the primitives PATCHPRIMITIVE
+ * asks for, into list; returns the vertex count and sets *type.
+ *
+ * The grid goes out as the GE's own strips would: one per pair of rows,
+ * alternating between them, (0,j) (0,j+1) (1,j) (1,j+1) ... As lines that
+ * sequence is a zigzag -- each column's rung and a diagonal to the next
+ * -- with no line along the rows at all: geprobe 2 scene 22 (fw 6.60)
+ * draws its line patch exactly so (627 differing pixels against 1407 for
+ * a plain grid of rows and columns). Points are the grid itself.
+ *
+ * Each span goes out on its own, over its own du x dv samples, the spans
+ * a row of them at a time, so a column or row two spans share is drawn
+ * by both: geprobe 21 (fw 6.60) scenes 131-133 draw nine patches as
+ * lines smooth, flat and adding, and this order fits every pixel of
+ * them, the whole grid's 204 off where segments cross or rungs are
+ * drawn twice, spans a column at a time's 1 off. Triangles take the
+ * same order, which no probe has told apart. */
+static uint32_t patch_primitives(const ge_mvert *grid, int nu, int nv, int du, int dv,
+                                 ge_mvert *list, uint32_t *type) {
+    uint32_t n = 0;
+    if (g_ge.patch_prim == 2) {
+        *type = PSP_PRIM_POINTS;
+        for (int k = 0; k < nu * nv; k++) list[n++] = grid[k];
+        return n;
+    }
+    *type = g_ge.patch_prim == 1 ? PSP_PRIM_LINES : PSP_PRIM_TRIANGLES;
+    for (int ja = 0; ja + 1 < nv; ja += dv) {
+        const int jb = ja + dv < nv ? ja + dv : nv - 1;
+        for (int ia = 0; ia + 1 < nu; ia += du) {
+            const int ib = ia + du < nu ? ia + du : nu - 1;
+            for (int j = ja; j < jb; j++)
+                for (int i = ia; i < ib; i++) {
+                    const ge_mvert *s0 = &grid[j * nu + i], *s1 = &grid[(j + 1) * nu + i];
+                    const ge_mvert *s2 = &grid[j * nu + i + 1], *s3 = &grid[(j + 1) * nu + i + 1];
+                    if (*type == PSP_PRIM_LINES) {
+                        list[n++] = *s0; list[n++] = *s1;
+                        list[n++] = *s1; list[n++] = *s2;
+                        if (i + 1 == ib) { list[n++] = *s2; list[n++] = *s3; }
+                    } else {
+                        list[n++] = *s0; list[n++] = *s1; list[n++] = *s2;
+                        list[n++] = *s1; list[n++] = *s2; list[n++] = *s3;
+                    }
+                }
+        }
+    }
+    return n;
+}
+
+/* The ucount x vcount control points, skinned or morphed as the vertex type
+ * asks. Answers 0 when one cannot be read. */
+static int read_patch_controls(ge_mvert *cp, int n, const ge_vlayout *vl) {
+    const int lit = g_tl.lighting && any_light_enabled();
+    for (int k = 0; k < n; k++)
+        if (!read_mvert(vertex_addr((uint32_t)k, vl->stride), vl, lit, &cp[k])) return 0;
+    return 1;
+}
+
 static void draw_patch(int spline, uint32_t arg) {
     const int ucount = (int)(arg & 0xFF), vcount = (int)((arg >> 8) & 0xFF);
     const int uedge = (int)((arg >> 16) & 3), vedge = (int)((arg >> 18) & 3);
     if (!g_ge.vaddr || VT_THROUGH(g_ge.vtype) || ucount < 4 || vcount < 4) return;
     ge_vlayout vl;
-    const int stride = vertex_layout(g_ge.vtype, &vl);
-    if (!stride) return;
+    if (!vertex_layout(g_ge.vtype, &vl)) return;
     /* The GE takes 7 bits of each division and draws up to 64. geprobe 13
      * (fw 6.60) scenes 80 and 81: 49 to 64 draw, and 65 (d 193 too) to 127
      * (d 255) hang the GE: nothing of the patch, nothing more of the list,
@@ -3952,129 +4087,16 @@ static void draw_patch(int spline, uint32_t arg) {
     ge_mvert *cp = malloc(sizeof *cp * (size_t)(ucount * vcount));
     ge_mvert *grid = malloc(sizeof *grid * (size_t)(nu * nv));
     ge_mvert *list = malloc(sizeof *list * (size_t)(nu * nv * 6));
-    if (!cp || !grid || !list) { free(cp); free(grid); free(list); return; }
-    const int lit = g_tl.lighting && any_light_enabled();
-    int ok = 1;
-    for (int k = 0; k < ucount * vcount && ok; k++)
-        ok = read_mvert(vertex_addr((uint32_t)k, stride), &vl, lit, &cp[k]);
-    if (!ok) { free(cp); free(grid); free(list); return; }
-
-    for (int j = 0; j < nv; j++)
-        for (int i = 0; i < nu; i++) {
-            float pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, u = 0, v = 0;
-            for (int b = 0; b < 4; b++)
-                for (int a = 0; a < 4; a++) {
-                    const double wd = sv[j].w[b] * su[i].w[a];
-                    const float w = (float)wd;
-                    if (wd == 0.0) continue;
-                    const ge_mvert *c = &cp[(sv[j].first + b) * ucount + su[i].first + a];
-                    for (int k = 0; k < 3; k++) nrm[k] += w * c->nrm[k];
-                    u += w * c->u; v += w * c->v;
-                }
-            /* A position is de Boor's algorithm too, each coordinate on its
-             * own, every lerp la_lerp's: along v for each of the four
-             * control columns, then along u over the four results, from
-             * controls cut to 16 bits (s16 and s8 controls are exact
-             * fractions). geprobe 13 (fw 6.60) reads 134,198 generated
-             * points whole through depth (scenes 67-82), over every
-             * division to 64, edge mode, sign, binade, format, morph and
-             * skin, and this places every one on its pixel with its depth;
-             * u first misses 8767 of them. The weights above stay for
-             * normals and texture coordinates. */
-            for (int k = 0; k < 3; k++) {
-                double C[4];
-                for (int q = 0; q < 4; q++) {
-                    double in[4];
-                    for (int r = 0; r < 4; r++)
-                        in[r] = ge_cut(cp[(sv[j].first + r) * ucount + su[i].first + q].pos[k], 16, 0);
-                    C[q] = deboor_la(in, sv[j].a);
-                }
-                pos[k] = (float)deboor_la(C, su[i].a);
-            }
-            ge_mvert *o = &grid[j * nu + i];
-            memcpy(o->pos, pos, sizeof pos);
-            memcpy(o->nrm, nrm, sizeof nrm);
-            /* A generated vertex's colour is not a blend by weights: the GE
-             * runs de Boor's algorithm on each channel of the control
-             * colours, with deboor_params' 8-bit parameters, along v for
-             * each of the four control columns and then along u, every lerp
-             * floored to 1/128 of a step and the end rounded up to a whole
-             * one (deboor_fix). geprobe 9 and 10 (fw 6.60) scenes 52-54 read
-             * 19,546 single and paired control columns at three levels over
-             * every edge mode, and this reproduces every one; weights by
-             * Cox-de Boor, through the cut-to-1/256 rule this replaces, fit
-             * 13,452 of scenes 53 and 54's 16,302. The tiny weights near a
-             * span's end that read low are those 1/128 cuts. Bezier pieces
-             * are the same with every parameter t, which is why exact
-             * weights fit them. v goes first, as for positions: geprobe 13
-             * scene 72's colour-order cells read 747 pixels a step off u
-             * first and none this way. */
-            o->rgba = 0;
-            for (int k = 0; k < 4; k++) {
-                int64_t Q[4];
-                for (int q = 0; q < 4; q++) {
-                    int64_t in[4];
-                    for (int r = 0; r < 4; r++)
-                        in[r] = (int64_t)((cp[(sv[j].first + r) * ucount + su[i].first + q].rgba >> (8 * k)) & 0xFFu) * 128;
-                    Q[q] = deboor_fix(in, sv[j].a);
-                }
-                int c = (int)((deboor_fix(Q, su[i].a) + 127) >> 7);
-                if (c < 0) c = 0;
-                if (c > 255) c = 255;
-                o->rgba |= (uint32_t)c << (8 * k);
-            }
-            if (vl.tex_off < 0) {
-                u = su[i].param * g_ge.tex_scale_u + g_ge.tex_offset_u;
-                v = sv[j].param * g_ge.tex_scale_v + g_ge.tex_offset_v;
-                u *= (float)g_ge.tex_w;
-                v *= (float)g_ge.tex_h;
-            }
-            o->u = u; o->v = v;
-        }
-
-    /* The grid goes out as the GE's own strips would: one per pair of rows,
-     * alternating between them, (0,j) (0,j+1) (1,j) (1,j+1) ... As lines that
-     * sequence is a zigzag -- each column's rung and a diagonal to the next
-     * -- with no line along the rows at all: geprobe 2 scene 22 (fw 6.60)
-     * draws its line patch exactly so (627 differing pixels against 1407 for
-     * a plain grid of rows and columns). Points are the grid itself.
-     *
-     * Each span goes out on its own, over its own du x dv samples, the spans
-     * a row of them at a time, so a column or row two spans share is drawn
-     * by both: geprobe 21 (fw 6.60) scenes 131-133 draw nine patches as
-     * lines smooth, flat and adding, and this order fits every pixel of
-     * them, the whole grid's 204 off where segments cross or rungs are
-     * drawn twice, spans a column at a time's 1 off. Triangles take the
-     * same order, which no probe has told apart. */
-    uint32_t n = 0, type;
-    if (g_ge.patch_prim == 2) {
-        type = PSP_PRIM_POINTS;
-        for (int k = 0; k < nu * nv; k++) list[n++] = grid[k];
-    } else {
-        type = g_ge.patch_prim == 1 ? PSP_PRIM_LINES : PSP_PRIM_TRIANGLES;
-        for (int ja = 0; ja + 1 < nv; ja += dv) {
-            const int jb = ja + dv < nv ? ja + dv : nv - 1;
-            for (int ia = 0; ia + 1 < nu; ia += du) {
-                const int ib = ia + du < nu ? ia + du : nu - 1;
-                for (int j = ja; j < jb; j++)
-                    for (int i = ia; i < ib; i++) {
-                        const ge_mvert *s0 = &grid[j * nu + i], *s1 = &grid[(j + 1) * nu + i];
-                        const ge_mvert *s2 = &grid[j * nu + i + 1], *s3 = &grid[(j + 1) * nu + i + 1];
-                        if (type == PSP_PRIM_LINES) {
-                            list[n++] = *s0; list[n++] = *s1;
-                            list[n++] = *s1; list[n++] = *s2;
-                            if (i + 1 == ib) { list[n++] = *s2; list[n++] = *s3; }
-                        } else {
-                            list[n++] = *s0; list[n++] = *s1; list[n++] = *s2;
-                            list[n++] = *s1; list[n++] = *s2; list[n++] = *s3;
-                        }
-                    }
-            }
-        }
+    if (cp && grid && list && read_patch_controls(cp, ucount * vcount, &vl)) {
+        for (int j = 0; j < nv; j++)
+            for (int i = 0; i < nu; i++)
+                eval_patch_point(cp, ucount, &su[i], &sv[j], vl.tex_off >= 0, &grid[j * nu + i]);
+        uint32_t type;
+        const uint32_t n = patch_primitives(grid, nu, nv, du, dv, list, &type);
+        g_mv_src = list;
+        draw_prim(type, n);
+        g_mv_src = NULL;
     }
-    g_mv_src = list;
-    draw_prim(type, n);
-    g_mv_src = NULL;
     free(cp); free(grid); free(list);
 }
 
