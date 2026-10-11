@@ -1130,50 +1130,47 @@ uint32_t psp_ge_target(void) { return g_ge.fbp ? ge_fb_address(g_ge.fbp) : 0; }
  * worth computing rather than assuming.
  *
  * With morphing (VT_MORPH > 1) the whole record repeats once per vertex set,
- * weights included, and the stride returned is the full vertex's: geprobe 2
- * scene 21 (fw 6.60) draws weights (1, 0) from records 0, 2 and 4 of a
- * two-set array and (0, 1) from 1, 3 and 5. g_vl keeps the rest. */
-static struct {
+ * weights included, and the stride is the full vertex's: geprobe 2 scene 21
+ * (fw 6.60) draws weights (1, 0) from records 0, 2 and 4 of a two-set array
+ * and (0, 1) from 1, 3 and 5. */
+typedef struct {
+    uint32_t vtype;
+    int stride;              /* the whole vertex, every set; 0: no position, nothing to draw */
+    int tex_off, col_off, norm_off, pos_off;   /* -1: not in the vertex */
     int w_fmt, w_n;          /* weight format (VT_WEIGHT) and count; w_fmt 0: none */
     int set_stride, morph_n; /* one vertex set's size, and how many sets */
-} g_vl;
+} ge_vlayout;
 
-static int vertex_layout(uint32_t vtype, int *col_off, int *pos_off, int *tex_off, int *norm_off) {
-    static const int tex_sz[4]   = { 0, 1, 2, 4 };
-    static const int col_sz[8]   = { 0, 0, 0, 0, 2, 2, 2, 4 };
-    static const int norm_sz[4]  = { 0, 1, 2, 4 };
-    static const int pos_sz[4]   = { 0, 1, 2, 4 };
-    static const int w_sz[4]     = { 0, 1, 2, 4 };
+/* A component of `bytes` bytes aligned to `size`, placed at the running
+ * offset; -1, and nothing placed, when it is absent (size 0). */
+static int vertex_place(int *off, int *align, int size, int bytes) {
+    if (!size) return -1;
+    *off = (*off + size - 1) & ~(size - 1);
+    const int at = *off;
+    *off += bytes;
+    if (size > *align) *align = size;
+    return at;
+}
+
+static int vertex_layout(uint32_t vtype, ge_vlayout *vl) {
+    static const int sz[4]     = { 0, 1, 2, 4 };   /* weight, texture, normal and position fields */
+    static const int col_sz[8] = { 0, 0, 0, 0, 2, 2, 2, 4 };
 
     int off = 0, align = 1;
-    int t = tex_sz[VT_TEX(vtype)] * 2;
-    int c = col_sz[VT_COLOR(vtype)];
-    int n = norm_sz[VT_NORMAL(vtype)] * 3;
-    int p = pos_sz[VT_POS(vtype)] * 3;
+    vl->vtype = vtype;
+    vl->w_fmt = VT_WEIGHT(vtype);
+    vl->w_n = vl->w_fmt ? VT_WCOUNT(vtype) : 0;
+    vl->morph_n = VT_MORPH(vtype);
+    vertex_place(&off, &align, sz[vl->w_fmt], sz[vl->w_fmt] * vl->w_n);
+    vl->tex_off  = vertex_place(&off, &align, sz[VT_TEX(vtype)], sz[VT_TEX(vtype)] * 2);
+    vl->col_off  = vertex_place(&off, &align, col_sz[VT_COLOR(vtype)], col_sz[VT_COLOR(vtype)]);
+    vl->norm_off = vertex_place(&off, &align, sz[VT_NORMAL(vtype)], sz[VT_NORMAL(vtype)] * 3);
+    vl->pos_off  = vertex_place(&off, &align, sz[VT_POS(vtype)], sz[VT_POS(vtype)] * 3);
+    if (vl->pos_off < 0) { vl->set_stride = vl->stride = 0; return 0; }
 
-    g_vl.w_fmt = VT_WEIGHT(vtype);
-    g_vl.w_n = g_vl.w_fmt ? VT_WCOUNT(vtype) : 0;
-    g_vl.morph_n = VT_MORPH(vtype);
-    if (g_vl.w_fmt) { off = w_sz[g_vl.w_fmt] * g_vl.w_n; align = w_sz[g_vl.w_fmt]; }
-
-    int ts = tex_sz[VT_TEX(vtype)];
-    if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t;
-              if (ts > align) align = ts; }
-    else *tex_off = -1;
-    int cs = col_sz[VT_COLOR(vtype)];
-    if (cs) { off = (off + cs - 1) & ~(cs - 1); *col_off = off; off += c; if (cs > align) align = cs; }
-    else *col_off = -1;
-    int ns = norm_sz[VT_NORMAL(vtype)];
-    if (ns) { off = (off + ns - 1) & ~(ns - 1); *norm_off = off; off += n;
-              if (ns > align) align = ns; }
-    else *norm_off = -1;
-    int ps = pos_sz[VT_POS(vtype)];
-    if (!ps) return 0;                        /* no position: nothing to draw */
-    off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
-    if (ps > align) align = ps;
-
-    g_vl.set_stride = (off + align - 1) & ~(align - 1);
-    return g_vl.set_stride * g_vl.morph_n;    /* stride */
+    vl->set_stride = (off + align - 1) & ~(align - 1);
+    vl->stride = vl->set_stride * vl->morph_n;
+    return vl->stride;
 }
 
 /* The address of element i of the current draw. Bits 11..12 of the vertex
@@ -1252,8 +1249,9 @@ static uint32_t read_colour_at(const uint8_t *vp, uint32_t addr, uint32_t vtype,
     return widen_colour(fmt, c);
 }
 
-static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
-                       int tex_off, psp_vertex *out) {
+static int read_vertex(uint32_t addr, const ge_vlayout *vl, psp_vertex *out) {
+    const uint32_t vtype = vl->vtype;
+    const int col_off = vl->col_off, pos_off = vl->pos_off, tex_off = vl->tex_off;
     out->spec = 0; out->spec_set = 0;
     out->rgba = current_colour();
     out->u = out->v = 0.0f;
@@ -1818,9 +1816,9 @@ typedef struct { float pos[3], nrm[3]; uint32_t rgba; float u, v; } ge_mvert;
  * 8-bit weight of 0x80 is 1.0 -- geprobe 2 scene 20 (fw 6.60) draws weights
  * 0x80, 0x40+0x40 and 0xFF where 1.0, 0.5+0.5 and 1.99 put them -- and a
  * 16-bit one of 0x8000 is assumed to be by the same rule. */
-static void read_weights(uint32_t a, float *w) {
-    for (int i = 0; i < g_vl.w_n; i++) {
-        switch (g_vl.w_fmt) {
+static void read_weights(const ge_vlayout *vl, uint32_t a, float *w) {
+    for (int i = 0; i < vl->w_n; i++) {
+        switch (vl->w_fmt) {
         case 1:  w[i] = (float)psp_read8(a + (uint32_t)i) / 128.0f; break;
         case 2:  w[i] = (float)psp_read16(a + 2u * (uint32_t)i) / 32768.0f; break;
         default: w[i] = psp_read_f32(a + 4u * (uint32_t)i); break;
@@ -1890,12 +1888,12 @@ static void bones_cut(void) {
     g_bone16_ok = 1;
 }
 
-/* One axis of a skinned position (B[c][k] = bone[3k + c]), from the weights
- * and the position already cut (v[3] = 1). */
-static float ge_skin_axis(const double *wi, const double v[4], int c) {
+/* One axis of a skinned position (B[c][k] = bone[3k + c]), from the nw
+ * weights and the position already cut (v[3] = 1). */
+static float ge_skin_axis(const double *wi, int nw, const double v[4], int c) {
     static const int order[4] = { 3, 0, 1, 2 };
     double acc = 0.0;
-    for (int i = 0; i < g_vl.w_n; i++) {
+    for (int i = 0; i < nw; i++) {
         for (int j = 0; j < 4; j++) {
             const int k = order[j];
             const double b = ge_c16(wi[i] * g_bone16[12 * i + 3 * k + c]);
@@ -1907,9 +1905,9 @@ static float ge_skin_axis(const double *wi, const double v[4], int c) {
 
 /* One axis of a skinned normal: the x, y and z terms of each bone in turn,
  * as a position's without its translation. */
-static float ge_skin_normal_axis(const double *wi, const double v[3], int c) {
+static float ge_skin_normal_axis(const double *wi, int nw, const double v[3], int c) {
     double acc = 0.0;
-    for (int i = 0; i < g_vl.w_n; i++) {
+    for (int i = 0; i < nw; i++) {
         for (int k = 0; k < 3; k++) {
             const double b = ge_c16(wi[i] * g_bone16[12 * i + 3 * k + c]);
             acc = ge_acc(acc, ge_c16(b * v[k]));
@@ -1918,17 +1916,18 @@ static float ge_skin_normal_axis(const double *wi, const double v[3], int c) {
     return (float)acc;
 }
 
-/* Skin a vertex in place, position and normal, by the GE's arithmetic. */
-static void skin_mvert(ge_mvert *o, const float *w, int want_normal) {
+/* Skin a vertex in place, position and normal, by the GE's arithmetic, with
+ * its nw weights. */
+static void skin_mvert(ge_mvert *o, const float *w, int nw, int want_normal) {
     if (!g_bone16_ok) bones_cut();
     double wi[8];
-    for (int i = 0; i < g_vl.w_n; i++) wi[i] = ge_c16(w[i]);
+    for (int i = 0; i < nw; i++) wi[i] = ge_c16(w[i]);
     const double v[4] = { ge_c16(o->pos[0]), ge_c16(o->pos[1]), ge_c16(o->pos[2]), 1.0 };
     float p[3], sn[3];
-    for (int c = 0; c < 3; c++) p[c] = ge_skin_axis(wi, v, c);
+    for (int c = 0; c < 3; c++) p[c] = ge_skin_axis(wi, nw, v, c);
     if (want_normal) {
         const double nv[3] = { ge_c16(o->nrm[0]), ge_c16(o->nrm[1]), ge_c16(o->nrm[2]) };
-        for (int c = 0; c < 3; c++) sn[c] = ge_skin_normal_axis(wi, nv, c);
+        for (int c = 0; c < 3; c++) sn[c] = ge_skin_normal_axis(wi, nw, nv, c);
         memcpy(o->nrm, sn, sizeof sn);
     }
     memcpy(o->pos, p, sizeof p);
@@ -1936,16 +1935,16 @@ static void skin_mvert(ge_mvert *o, const float *w, int want_normal) {
 
 /* One vertex set of a record: its fields and, when it carries them, its
  * weights (w; left alone otherwise). Nothing is skinned yet. */
-static int read_vertex_set(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
-                           int norm_off, int want_normal, ge_mvert *o, float *w) {
-    const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)g_vl.set_stride);
-    if (!read_pos_model_at(vp, a, vtype, pos_off, o->pos)) return 0;
-    if (want_normal) read_normal_model_at(vp, a, vtype, norm_off, o->nrm);
+static int read_vertex_set(uint32_t a, const ge_vlayout *vl, int want_normal, ge_mvert *o, float *w) {
+    const uint32_t vtype = vl->vtype;
+    const uint8_t *vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)vl->set_stride);
+    if (!read_pos_model_at(vp, a, vtype, vl->pos_off, o->pos)) return 0;
+    if (want_normal) read_normal_model_at(vp, a, vtype, vl->norm_off, o->nrm);
     else { o->nrm[0] = o->nrm[1] = 0.0f; o->nrm[2] = 1.0f; }
     o->rgba = current_colour();
-    if (col_off >= 0 && VT_COLOR(vtype) >= 4) o->rgba = read_colour_at(vp, a, vtype, col_off);
-    read_uv_raw_at(vp, a, vtype, tex_off, &o->u, &o->v);       /* in units: read_mvert scales */
-    if (g_vl.w_fmt) read_weights(a, w);
+    if (vl->col_off >= 0 && VT_COLOR(vtype) >= 4) o->rgba = read_colour_at(vp, a, vtype, vl->col_off);
+    read_uv_raw_at(vp, a, vtype, vl->tex_off, &o->u, &o->v);   /* in units: read_mvert scales */
+    if (vl->w_fmt) read_weights(vl, a, w);
     return 1;
 }
 
@@ -1960,29 +1959,27 @@ static void mvert_texels(ge_mvert *o, uint32_t vtype, int tex_off) {
 /* A whole record: its vertex sets blended by the morph weights, when there
  * is more than one, then skinned. Every field is blended, each through the
  * accumulator above (see there for colour's sign and clamp). */
-static int read_mvert(uint32_t a, uint32_t vtype, int col_off, int pos_off, int tex_off,
-                      int norm_off, int want_normal, ge_mvert *o) {
+static int read_mvert(uint32_t a, const ge_vlayout *vl, int want_normal, ge_mvert *o) {
     float w[8] = { 0 };
-    if (g_vl.morph_n <= 1) {
-        if (!read_vertex_set(a, vtype, col_off, pos_off, tex_off, norm_off, want_normal, o, w))
+    if (vl->morph_n <= 1) {
+        if (!read_vertex_set(a, vl, want_normal, o, w))
             return 0;
-        mvert_texels(o, vtype, tex_off);
-        if (g_vl.w_fmt) skin_mvert(o, w, want_normal);
+        mvert_texels(o, vl->vtype, vl->tex_off);
+        if (vl->w_fmt) skin_mvert(o, w, vl->w_n, want_normal);
         return 1;
     }
     double pos[3] = { 0, 0, 0 }, nrm[3] = { 0, 0, 0 }, col[4] = { 0, 0, 0, 0 }, uv[2] = { 0, 0 }, mw8[8] = { 0 };
-    for (int k = 0; k < g_vl.morph_n; k++) {
+    for (int k = 0; k < vl->morph_n; k++) {
         ge_mvert s1;
         float w1[8] = { 0 };
-        if (!read_vertex_set(a + (uint32_t)(k * g_vl.set_stride), vtype, col_off, pos_off, tex_off,
-                             norm_off, want_normal, &s1, w1))
+        if (!read_vertex_set(a + (uint32_t)(k * vl->set_stride), vl, want_normal, &s1, w1))
             return 0;
         const double m16 = ge_c16(g_tl.morph_w[k]);
         for (int i = 0; i < 3; i++) {
             pos[i] = ge_acc(pos[i], m16 * ge_c16(s1.pos[i]));
             nrm[i] = ge_acc(nrm[i], m16 * ge_c16(s1.nrm[i]));
         }
-        for (int i = 0; i < g_vl.w_n && g_vl.w_fmt; i++) mw8[i] = ge_acc(mw8[i], m16 * ge_c16(w1[i]));
+        for (int i = 0; i < vl->w_n && vl->w_fmt; i++) mw8[i] = ge_acc(mw8[i], m16 * ge_c16(w1[i]));
         for (int i = 0; i < 4; i++) col[i] = ge_acc(col[i], m16 * (double)((s1.rgba >> (8 * i)) & 0xFFu));
         uv[0] = ge_acc(uv[0], m16 * ge_c16(s1.u));
         uv[1] = ge_acc(uv[1], m16 * ge_c16(s1.v));
@@ -1995,8 +1992,8 @@ static int read_mvert(uint32_t a, uint32_t vtype, int col_off, int pos_off, int 
         o->rgba |= (uint32_t)(c > 255.0 ? 255.0 : c) << (8 * i);
     }
     o->u = (float)uv[0]; o->v = (float)uv[1];
-    mvert_texels(o, vtype, tex_off);
-    if (g_vl.w_fmt) skin_mvert(o, w, want_normal);
+    mvert_texels(o, vl->vtype, vl->tex_off);
+    if (vl->w_fmt) skin_mvert(o, w, vl->w_n, want_normal);
     return 1;
 }
 
@@ -3065,9 +3062,9 @@ static void emit_tri_indexed(const psp_render_backend *be, const psp_vertex *v,
     be->draw(PSP_PRIM_TRIANGLES, t, 3);
 }
 
-static void draw_prim_transformed(uint32_t type, uint32_t count,
-                                  int col_off, int pos_off, int tex_off,
-                                  int norm_off, int stride) {
+static void draw_prim_transformed(uint32_t type, uint32_t count, const ge_vlayout *vl) {
+    const int col_off = vl->col_off, pos_off = vl->pos_off, tex_off = vl->tex_off;
+    const int norm_off = vl->norm_off, stride = vl->stride;
     psp_vertex v[GE_VERTEX_BATCH];
     float      cl[GE_VERTEX_BATCH][4];
     const psp_render_backend *be = psp_render_current();
@@ -3089,7 +3086,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
     /* The backend's transform, when it offers one. Triangles only (points,
      * lines and sprites stay here), and not screen-space projections, whose
      * flag the GL backend reads to tell HUD from scene. */
-    const int blended = g_mv_src || g_vl.w_fmt || g_vl.morph_n > 1;
+    const int blended = g_mv_src || vl->w_fmt || vl->morph_n > 1;
     if (be->draw_model && be->model_ok && !screen_space && !blended &&
         (type == PSP_PRIM_TRIANGLES || type == PSP_PRIM_TRIANGLE_STRIP ||
          type == PSP_PRIM_TRIANGLE_FAN) && be->model_ok()) {
@@ -3213,7 +3210,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             } else {
                 a = vertex_addr(done + decoded, stride);
                 if (blended) {
-                    if (!read_mvert(a, g_ge.vtype, col_off, pos_off, tex_off, norm_off, want_normal, &mv)) break;
+                    if (!read_mvert(a, vl, want_normal, &mv)) break;
                     memcpy(model, mv.pos, sizeof model);
                 } else {
                     vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)stride);
@@ -3602,9 +3599,8 @@ static void draw_prim(uint32_t type, uint32_t count) {
     if (!g_ge.vaddr) { g_skip_noaddr += count; return; }
     const uint64_t _d0 = ge_prof_now();
 
-    int col_off = -1, pos_off = 0, tex_off = -1;
-    int norm_off;
-    int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
+    ge_vlayout vl;
+    const int stride = vertex_layout(g_ge.vtype, &vl);
     if (!stride) { g_skip_layout += count; return; }
 
     /* Bound whenever texture mapping is enabled and a texture is set --
@@ -3639,7 +3635,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
      * backend means every backend is wrong in its own way. Wrong once,
      * centrally, is at least diagnosable. */
     if (!VT_THROUGH(g_ge.vtype)) {
-        draw_prim_transformed(type, count, col_off, pos_off, tex_off, norm_off, stride);
+        draw_prim_transformed(type, count, &vl);
         return;
     }
 
@@ -3657,8 +3653,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
 
         uint32_t decoded = 0;
         for (; decoded < n; decoded++) {
-            if (!read_vertex(vertex_addr(done + decoded, stride),
-                             g_ge.vtype, col_off, pos_off, tex_off, &v[decoded]))
+            if (!read_vertex(vertex_addr(done + decoded, stride), &vl, &v[decoded]))
                 break;
         }
         if (!decoded) break;
@@ -3689,7 +3684,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
                 for (int b = 0; b < stride && b < 16; b++)
                     fprintf(stderr, "%02X", psp_read8(a + (uint32_t)b));
             }
-            fprintf(stderr, "  stride %d col_off %d pos_off %d\n", stride, col_off, pos_off);
+            fprintf(stderr, "  stride %d col_off %d pos_off %d\n", stride, vl.col_off, vl.pos_off);
             fprintf(stderr, "      clear %s (z %d)  blend %s src %d dst %d  "
                             "atest %s func %d ref %d\n",
                     g_tl.clear_mode ? "ON" : "off", g_tl.clear_z,
@@ -3893,8 +3888,8 @@ static void draw_patch(int spline, uint32_t arg) {
     const int ucount = (int)(arg & 0xFF), vcount = (int)((arg >> 8) & 0xFF);
     const int uedge = (int)((arg >> 16) & 3), vedge = (int)((arg >> 18) & 3);
     if (!g_ge.vaddr || VT_THROUGH(g_ge.vtype) || ucount < 4 || vcount < 4) return;
-    int col_off = -1, pos_off = 0, tex_off = -1, norm_off = -1;
-    const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
+    ge_vlayout vl;
+    const int stride = vertex_layout(g_ge.vtype, &vl);
     if (!stride) return;
     /* The GE takes 7 bits of each division and draws up to 64. geprobe 13
      * (fw 6.60) scenes 80 and 81: 49 to 64 draw, and 65 (d 193 too) to 127
@@ -3922,8 +3917,7 @@ static void draw_patch(int spline, uint32_t arg) {
     const int lit = g_tl.lighting && any_light_enabled();
     int ok = 1;
     for (int k = 0; k < ucount * vcount && ok; k++)
-        ok = read_mvert(vertex_addr((uint32_t)k, stride), g_ge.vtype, col_off, pos_off, tex_off,
-                        norm_off, lit, &cp[k]);
+        ok = read_mvert(vertex_addr((uint32_t)k, stride), &vl, lit, &cp[k]);
     if (!ok) { free(cp); free(grid); free(list); return; }
 
     for (int j = 0; j < nv; j++)
@@ -3990,7 +3984,7 @@ static void draw_patch(int spline, uint32_t arg) {
                 if (c > 255) c = 255;
                 o->rgba |= (uint32_t)c << (8 * k);
             }
-            if (tex_off < 0) {
+            if (vl.tex_off < 0) {
                 u = su[i].param * g_ge.tex_scale_u + g_ge.tex_offset_u;
                 v = sv[j].param * g_ge.tex_scale_v + g_ge.tex_offset_v;
                 u *= (float)g_ge.tex_w;
@@ -4223,8 +4217,8 @@ void psp_ge_run_pending_callbacks(void) {
  * Not measured: skinned or morphed corners (the first vertex set, unskinned,
  * is used), indexed boxes, and through-mode boxes (taken as visible). */
 static int bbox_hidden(uint32_t count) {
-    int col_off, pos_off, tex_off, norm_off;
-    const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
+    ge_vlayout vl;
+    const int stride = vertex_layout(g_ge.vtype, &vl);
     if (!stride || !count || VT_THROUGH(g_ge.vtype)) return 0;
     const int x0 = g_ge.sc_set ? g_ge.sc_x0 : 0,   y0 = g_ge.sc_set ? g_ge.sc_y0 : 0;
     const int x1 = g_ge.sc_set ? g_ge.sc_x1 : 479, y1 = g_ge.sc_set ? g_ge.sc_y1 : 271;
@@ -4233,7 +4227,7 @@ static int bbox_hidden(uint32_t count) {
     ge_wvp(wvp);
     for (uint32_t i = 0; i < count; i++) {
         float m[3], c[4];
-        if (!read_pos_model(vertex_addr(i, stride), g_ge.vtype, pos_off, m)) return 0;
+        if (!read_pos_model(vertex_addr(i, stride), g_ge.vtype, vl.pos_off, m)) return 0;
         ge_clip(wvp, m, c);
         c[2] = 0.0f;
         c[3] = fabsf(c[3]);
@@ -4257,8 +4251,8 @@ static int bbox_hidden(uint32_t count) {
  * indexed case, with 8- and 16-bit indices: PRIM and BBOX move IADDR on by
  * count indices and leave VADDR where it was. */
 static void advance_vertices(uint32_t count) {
-    int col_off, pos_off, tex_off, norm_off;
-    const int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off, &tex_off, &norm_off);
+    ge_vlayout vl;
+    const int stride = vertex_layout(g_ge.vtype, &vl);
     switch (VT_INDEX(g_ge.vtype)) {
     case 1:  g_ge.iaddr += count;      break;
     case 2:  g_ge.iaddr += 2u * count; break;
