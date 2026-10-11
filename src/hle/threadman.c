@@ -358,6 +358,15 @@ static void release_stack(psp_thread *t) {
 #define PSP_THREAD_ATTR_REFUSED 0x070F9F00u
 #define PSP_THREAD_ATTR_KEPT    0x00706000u
 
+/* The priorities a user thread can have. Creating, changing and rotating
+ * all refuse 0x07 and 0x78 either side (below). */
+#define PSP_THREAD_PRIORITY_MIN 0x08u
+#define PSP_THREAD_PRIORITY_MAX 0x77u
+
+static int priority_legal(uint32_t prio) {
+    return prio >= PSP_THREAD_PRIORITY_MIN && prio <= PSP_THREAD_PRIORITY_MAX;
+}
+
 /* sceKernelCreateThread(name, entry, priority, stackSize, attr, option)
  *
  * threadprobe (fw 6.60) steps 2, 3 and 5 measure three argument checks, which
@@ -383,7 +392,7 @@ static void hle_CreateThread(void) {
     const uint32_t prio = psp_arg(2), size = psp_arg(3), attr = psp_arg(4);
     if (psp_arg(1) & 0x80000000u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
     if (attr & PSP_THREAD_ATTR_REFUSED) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
-    if (prio < 0x08u || prio > 0x77u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY); return; }
+    if (!priority_legal(prio)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY); return; }
     if (size < 0x200u) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE); return; }
     if (!psp_arg(0)) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
     const uint64_t rounded = ((uint64_t)size + 0xFFu) & ~(uint64_t)0xFFu;
@@ -1066,7 +1075,7 @@ static void hle_ChangeThreadPriority(void) {
      * because the comparison is unsigned. */
     uint32_t prio = psp_arg(1);
     if (prio == 0) prio = psp_threadman_current_priority();
-    else if (prio < 0x08u || prio > 0x77u) {
+    else if (!priority_legal(prio)) {
         psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
         return;
     }
@@ -1567,7 +1576,7 @@ static void hle_RotateReadyQueue(void) {
      * and draws the line at 0x08 and 0x77, refusing 0x07 and 0x78 either side
      * along with negatives. */
     const int32_t prio = (int32_t)psp_arg(0);
-    if (prio != 0 && (prio < 0x08 || prio > 0x77)) {
+    if (prio != 0 && !priority_legal((uint32_t)prio)) {
         psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
         return;
     }
