@@ -41,6 +41,7 @@
 #endif
 
 #define MAX_FILES 64
+#define FD_FIRST  3   /* descriptors 0-2 are the std streams: g_file[i] is i + FD_FIRST */
 #define MAX_DIRS  16
 
 /* Open flags, as the guest passes them. */
@@ -226,6 +227,30 @@ typedef struct {
 } iso_entry;
 static int iso_lookup(const char *guest, iso_entry *e);
 
+/* Take a free descriptor for `f`, a read-only window of `len` bytes from
+ * `base`, read from its start, counted in sectors on the raw device. The
+ * slot's index, or -1 when every one is taken. */
+static int io_file_take(FILE *f, int image, uint64_t base, uint64_t len, int sector_mode) {
+    for (int i = 0; i < MAX_FILES; i++) {
+        io_file *h = &g_file[i];
+        if (h->used) continue;
+        h->f = f; h->used = 1; h->dirty = 0;
+        h->image = image; h->writable = 0; h->host[0] = '\0';
+        h->base = base; h->len = len; h->pos = 0;
+        h->has_result = h->close_pending = h->running = 0;
+        h->sector_mode = sector_mode;
+        return i;
+    }
+    return -1;
+}
+
+/* An open host file's size, leaving it at its end; 0 when it cannot be told. */
+static uint64_t host_file_size(FILE *f) {
+    if (fseeko(f, 0, SEEK_END) != 0) return 0;
+    const off_t n = ftello(f);
+    return n > 0 ? (uint64_t)n : 0;
+}
+
 static void io_park(void);
 static void hle_open_body(void);
 /* See io_park: an open gives up the CPU whether or not it finds the file. */
@@ -243,18 +268,9 @@ static void hle_open_body(void) {
     if (!(flags & (PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC))) {
         iso_entry e;
         if (iso_lookup(guest, &e) == 0) {
-            for (int i = 0; i < MAX_FILES; i++) {
-                if (g_file[i].used) continue;
-                g_file[i].f = e.f; g_file[i].used = 1; g_file[i].dirty = 0;
-                g_file[i].image = 1; g_file[i].writable = 0; g_file[i].host[0] = '\0';
-                g_file[i].base = e.base; g_file[i].len = e.len; g_file[i].pos = 0;
-                g_file[i].has_result = g_file[i].close_pending = g_file[i].running = 0;
-                g_file[i].sector_mode = e.is_device;
-                psp_ret((uint32_t)(i + 3));
-                return;
-            }
-            fclose(e.f);
-            psp_ret(SCE_ERROR_EMFILE);
+            const int i = io_file_take(e.f, 1, e.base, e.len, e.is_device);
+            if (i < 0) { fclose(e.f); psp_ret(SCE_ERROR_EMFILE); return; }
+            psp_ret((uint32_t)(i + FD_FIRST));
             return;
         }
     }
@@ -274,23 +290,10 @@ static void hle_open_body(void) {
             psp_ret(IO_ERROR_NOENT);
             return;
         }
-        for (int i = 0; i < MAX_FILES; i++) {
-            if (g_file[i].used) continue;
-            g_file[i].f = f;
-            g_file[i].used = 1;
-            g_file[i].dirty = 0;
-            g_file[i].image = 1; g_file[i].writable = 0; g_file[i].host[0] = '\0';
-            g_file[i].base = 0;
-            g_file[i].pos  = 0;
-            g_file[i].len  = (fseeko(f, 0, SEEK_END) == 0 && ftello(f) > 0)
-                             ? (uint64_t)ftello(f) : 0;
-            g_file[i].has_result = g_file[i].close_pending = g_file[i].running = 0;
-            g_file[i].sector_mode = 1;
-            psp_ret((uint32_t)(i + 3));
-            return;
-        }
-        fclose(f);
-        psp_ret(SCE_ERROR_EMFILE);
+        const int i = io_file_take(f, 1, 0, 0, 1);
+        if (i < 0) { fclose(f); psp_ret(SCE_ERROR_EMFILE); return; }
+        g_file[i].len = host_file_size(f);
+        psp_ret((uint32_t)(i + FD_FIRST));
         return;
     }
 
@@ -362,28 +365,16 @@ static void hle_open_body(void) {
         return;
     }
 
-    for (int i = 0; i < MAX_FILES; i++) {
-        if (g_file[i].used) continue;
-        g_file[i].f = f;
-        g_file[i].used = 1;
-        g_file[i].dirty = 0;
-        g_file[i].image = 0;
-        g_file[i].writable = strcmp(mode, "rb") != 0;
-        snprintf(g_file[i].host, sizeof g_file[i].host, "%s", host);
-        g_file[i].base = 0;
-        g_file[i].pos  = 0;
-        g_file[i].has_result = g_file[i].close_pending = g_file[i].running = 0;
-        g_file[i].sector_mode = 0;
-        /* A host file's window is the whole file. Writable files start empty
-         * and grow, so the length is refreshed on write rather than fixed. */
-        g_file[i].len = (fseeko(f, 0, SEEK_END) == 0 && ftello(f) > 0)
-                        ? (uint64_t)ftello(f) : 0;
-        rewind(f);
-        psp_ret((uint32_t)(i + 3));   /* 0-2 are reserved for the std streams */
-        return;
-    }
-    fclose(f);
-    psp_ret(SCE_ERROR_EMFILE);
+    const int i = io_file_take(f, 0, 0, 0, 0);
+    if (i < 0) { fclose(f); psp_ret(SCE_ERROR_EMFILE); return; }
+    io_file *h = &g_file[i];
+    h->writable = strcmp(mode, "rb") != 0;
+    snprintf(h->host, sizeof h->host, "%s", host);
+    /* A host file's window is the whole file. Writable files start empty
+     * and grow, so the length is refreshed on write rather than fixed. */
+    h->len = host_file_size(f);
+    rewind(f);
+    psp_ret((uint32_t)(i + FD_FIRST));
 }
 
 /* A file system call gives up the CPU while its driver works.
@@ -424,7 +415,7 @@ static void io_park(void) {
 }
 
 static io_file *fd_arg(void) {
-    int32_t fd = (int32_t)psp_arg(0) - 3;
+    int32_t fd = (int32_t)psp_arg(0) - FD_FIRST;
     if (fd < 0 || fd >= MAX_FILES || !g_file[fd].used) return NULL;
     return &g_file[fd];
 }
@@ -759,8 +750,7 @@ static void hle_getstat_body(void) {
         return;
     }
 
-    uint64_t size = 0;
-    if (fseeko(f, 0, SEEK_END) == 0) { const off_t n = ftello(f); if (n > 0) size = (uint64_t)n; }
+    const uint64_t size = host_file_size(f);
     fclose(f);
 
     if (out) write_stat(out, 0, size, 0);   /* a host file has no disc sector */
@@ -1462,8 +1452,8 @@ uint8_t *psp_io_read_whole(const char *guest, size_t *len) {
 }
 
 uint8_t *psp_io_read_fd(uint32_t fd, size_t *len, int *on_disc) {
-    if (fd < 3 || fd - 3 >= MAX_FILES || !g_file[fd - 3].used || !g_file[fd - 3].f) return NULL;
-    const io_file *o = &g_file[fd - 3];
+    if (fd < FD_FIRST || fd - FD_FIRST >= MAX_FILES || !g_file[fd - FD_FIRST].used || !g_file[fd - FD_FIRST].f) return NULL;
+    const io_file *o = &g_file[fd - FD_FIRST];
     if (on_disc) *on_disc = o->image;
     return read_window(o->f, o->base, o->len, len);
 }
@@ -1587,25 +1577,18 @@ static void hle_OpenAsync(void) {
     hle_Open();
     g_io_async = 0;
     const uint32_t opened = psp_cpu.r[PSP_REG_V0];
-    const int32_t fd = (int32_t)opened - 3;
+    const int32_t fd = (int32_t)opened - FD_FIRST;
     if (fd >= 0 && fd < MAX_FILES && g_file[fd].used) {
         async_done(&g_file[fd], (int64_t)(int32_t)opened);
         return;                           /* the descriptor, to poll on */
     }
     /* The open failed: the error is what the new descriptor's wait delivers,
      * and collecting it frees the slot again (close_pending). */
-    for (int i = 0; i < MAX_FILES; i++) {
-        if (g_file[i].used) continue;
-        g_file[i].f = NULL; g_file[i].used = 1;
-        g_file[i].image = g_file[i].writable = 0; g_file[i].host[0] = '\0';
-        g_file[i].base = g_file[i].len = g_file[i].pos = 0;
-        g_file[i].sector_mode = 0;
-        g_file[i].close_pending = 1;
-        async_done(&g_file[i], (int64_t)(int32_t)opened);
-        psp_ret((uint32_t)(i + 3));
-        return;
-    }
-    /* No free slot: the error itself is all there is to return. */
+    const int i = io_file_take(NULL, 0, 0, 0, 0);
+    if (i < 0) return;   /* No free slot: the error itself is all there is to return. */
+    g_file[i].close_pending = 1;
+    async_done(&g_file[i], (int64_t)(int32_t)opened);
+    psp_ret((uint32_t)(i + FD_FIRST));
 }
 
 static void hle_ReadAsync(void) {
