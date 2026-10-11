@@ -45,6 +45,10 @@
 
 #include <stdio.h>
 
+/* Longer than any constructor table: past it, a run of code pointers is
+ * something else, and a walk stops. */
+enum { CTORS_MAX = 4096 };
+
 int psp_ctors_find(uint32_t lo, uint32_t hi, uint32_t code_lo, uint32_t code_hi,
                    uint32_t *out_addr, int *out_count) {
     uint32_t best_addr = 0;
@@ -57,7 +61,7 @@ int psp_ctors_find(uint32_t lo, uint32_t hi, uint32_t code_lo, uint32_t code_hi,
             uint32_t v = psp_read32(p);
             if (v < code_lo || v >= code_hi || (v & 3)) break;
             n++;
-            if (n > 4096) break;                  /* not a constructor table */
+            if (n > CTORS_MAX) break;             /* not a constructor table */
         }
         /* Null-terminated, and long enough not to be a coincidence. */
         if (n >= 2 && psp_read32(p) == 0 && n > best_count) {
@@ -84,7 +88,7 @@ int psp_ctors_run(uint32_t table) {
         psp_cpu.r[PSP_REG_RA] = 0;
         psp_dispatch(fn);
         n++;
-        if (n > 4096) break;
+        if (n > CTORS_MAX) break;
     }
     return n;
 }
