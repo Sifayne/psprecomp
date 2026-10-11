@@ -4326,6 +4326,38 @@ static void flush_model(void) {
     g.mu.batches++;
     if (g.mu.profile) { const double t4 = gl_now_us(); g.mu.t_state += t1 - t0; g.mu.t_ubo += t2 - t1; g.mu.t_ebo += t3 - t2; g.mu.t_draw += t4 - t3; }
 }
+/* A GE 4x3 matrix (three columns of three, then the translation) into a
+ * block's column-major 4x4; the bottom row's three zeroes are the block's. */
+static void mat43_to_44(float out[16], const float in[12]) {
+    for (int c = 0; c < 3; c++) for (int r3 = 0; r3 < 3; r3++) out[c*4+r3] = in[c*3+r3];
+    for (int r3 = 0; r3 < 3; r3++) out[12+r3] = in[9+r3];
+    out[15] = 1.0f;
+}
+
+/* The scene part of a draw's block: everything but the world and texture
+ * matrices and the texture size, which change from draw to draw. */
+static void pack_scene_block(xform_block *xb, const psp_xform_state *xs) {
+    memset(xb, 0, sizeof *xb);
+    mat43_to_44(xb->view, xs->view);
+    memcpy(xb->proj, xs->proj, sizeof xb->proj);
+    for (int i = 0; i < 4; i++) {
+        xb->lmeta[i*4] = xs->light[i].enable; xb->lmeta[i*4+1] = xs->light[i].type; xb->lmeta[i*4+2] = xs->light[i].kind;
+        memcpy(xb->lpos + i*4, xs->light[i].pos, 12); memcpy(xb->ldir + i*4, xs->light[i].dir, 12);
+        memcpy(xb->latten + i*4, xs->light[i].atten, 12);
+        xb->lexpcut[i*4] = xs->light[i].exponent; xb->lexpcut[i*4+1] = xs->light[i].cutoff;
+        memcpy(xb->lamb + i*4, xs->light[i].amb, 12); memcpy(xb->ldif + i*4, xs->light[i].dif, 12); memcpy(xb->lspec + i*4, xs->light[i].spec, 12);
+    }
+    memcpy(xb->memis, xs->mat_emissive, 12); memcpy(xb->mamb, xs->mat_ambient, 12);
+    memcpy(xb->mdif, xs->mat_diffuse, 12); memcpy(xb->mspec, xs->mat_specular, 12); memcpy(xb->gamb, xs->global_amb, 12);
+    xb->coef_fog[0] = xs->mat_spec_coef; xb->coef_fog[1] = xs->fog_end; xb->coef_fog[2] = xs->fog_range;
+    xb->flags[0] = xs->lighting; xb->flags[1] = xs->mat_update; xb->flags[2] = xs->mat_alpha; xb->flags[3] = xs->fog_enable;
+    xb->texmap_vp[0] = xs->tex_map_mode; xb->texmap_vp[1] = xs->tex_proj_mode; xb->texmap_vp[2] = xs->vp_set; xb->texmap_vp[3] = xs->depth_clamp;
+    xb->texsize_off[2] = xs->off_x; xb->texsize_off[3] = xs->off_y;
+    xb->vps[0] = xs->vp_xs; xb->vps[1] = xs->vp_ys; xb->vps[2] = xs->vp_zs;
+    xb->vpc[0] = xs->vp_xc; xb->vpc[1] = xs->vp_yc; xb->vpc[2] = xs->vp_zc;
+    xb->cull_strip[0] = xs->cull_enable; xb->cull_strip[1] = xs->cull_ccw;
+}
+
 /* One display-list primitive of transformed triangles: appended to the
  * pending batch under the current GL state. The batch is drawn by
  * flush_model, which every state change, CPU-path draw, finish and present
@@ -4368,35 +4400,14 @@ static void gl_draw_model(int prim, const psp_model_vertex *v, int count, const 
         memcpy(xb, &g.mu.last_xb, sizeof *xb);
         g.mu.scene_hits++;
     } else {
-        memset(xb, 0, sizeof *xb);
-        for (int c = 0; c < 3; c++) for (int r3 = 0; r3 < 3; r3++) xb->view[c*4+r3] = xs->view[c*3+r3];
-        for (int r3 = 0; r3 < 3; r3++) xb->view[12+r3] = xs->view[9+r3];
-        xb->view[15] = 1.0f;
-        memcpy(xb->proj, xs->proj, sizeof xb->proj);
-        for (int i = 0; i < 4; i++) {
-            xb->lmeta[i*4] = xs->light[i].enable; xb->lmeta[i*4+1] = xs->light[i].type; xb->lmeta[i*4+2] = xs->light[i].kind;
-            memcpy(xb->lpos + i*4, xs->light[i].pos, 12); memcpy(xb->ldir + i*4, xs->light[i].dir, 12);
-            memcpy(xb->latten + i*4, xs->light[i].atten, 12);
-            xb->lexpcut[i*4] = xs->light[i].exponent; xb->lexpcut[i*4+1] = xs->light[i].cutoff;
-            memcpy(xb->lamb + i*4, xs->light[i].amb, 12); memcpy(xb->ldif + i*4, xs->light[i].dif, 12); memcpy(xb->lspec + i*4, xs->light[i].spec, 12);
-        }
-        memcpy(xb->memis, xs->mat_emissive, 12); memcpy(xb->mamb, xs->mat_ambient, 12);
-        memcpy(xb->mdif, xs->mat_diffuse, 12); memcpy(xb->mspec, xs->mat_specular, 12); memcpy(xb->gamb, xs->global_amb, 12);
-        xb->coef_fog[0] = xs->mat_spec_coef; xb->coef_fog[1] = xs->fog_end; xb->coef_fog[2] = xs->fog_range;
-        xb->flags[0] = xs->lighting; xb->flags[1] = xs->mat_update; xb->flags[2] = xs->mat_alpha; xb->flags[3] = xs->fog_enable;
-        xb->texmap_vp[0] = xs->tex_map_mode; xb->texmap_vp[1] = xs->tex_proj_mode; xb->texmap_vp[2] = xs->vp_set; xb->texmap_vp[3] = xs->depth_clamp;
-        xb->texsize_off[2] = xs->off_x; xb->texsize_off[3] = xs->off_y;
-        xb->vps[0] = xs->vp_xs; xb->vps[1] = xs->vp_ys; xb->vps[2] = xs->vp_zs;
-        xb->vpc[0] = xs->vp_xc; xb->vpc[1] = xs->vp_yc; xb->vpc[2] = xs->vp_zc;
-        xb->cull_strip[0] = xs->cull_enable; xb->cull_strip[1] = xs->cull_ccw;
+        pack_scene_block(xb, xs);
         memcpy(&g.mu.last_xs, xs, sizeof g.mu.last_xs);
         memcpy(&g.mu.last_xb, xb, sizeof g.mu.last_xb);
         g.mu.last_valid = 1;
         g.mu.scene_misses++;
     }
-    for (int c = 0; c < 3; c++) for (int r3 = 0; r3 < 3; r3++) { xb->world[c*4+r3] = xs->world[c*3+r3]; xb->tgen[c*4+r3] = xs->tgen[c*3+r3]; }
-    for (int r3 = 0; r3 < 3; r3++) { xb->world[12+r3] = xs->world[9+r3]; xb->tgen[12+r3] = xs->tgen[9+r3]; }
-    xb->world[15] = xb->tgen[15] = 1.0f;
+    mat43_to_44(xb->world, xs->world);
+    mat43_to_44(xb->tgen, xs->tgen);
     xb->texsize_off[0] = (float)xs->tex_w; xb->texsize_off[1] = (float)xs->tex_h;
     xb->cull_strip[2] = prim == PSP_PRIM_TRIANGLE_STRIP; xb->cull_strip[3] = g.resolution && r->display;
     xb->lodi[0] = g.tex.lod_mode; xb->lodi[1] = g.tex.lod_bias16;
