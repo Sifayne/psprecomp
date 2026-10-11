@@ -332,7 +332,25 @@ static void give_token_locked(int to, uint64_t stopped) {
  * token back from the thread this function had just marked RUNNING. Two slots
  * were left RUNNING, one of them holding nothing, and since only READY slots
  * are ever selected that thread could never be scheduled again. */
+static void host_exit(void);
+
+/* A host thread's stop (psp_sched_stop_all) while this guest thread ran gave
+ * the token to the main context and killed the thread, which runs on to its
+ * next call into the scheduler -- or was in one, idling below with the lock
+ * let go. There it must not hand over the token it no longer has: that took
+ * it from the main context, which then waited for it for ever. Nor may the
+ * wait it was setting up keep it alive. It is dead again, and leaves, as a
+ * parked thread the stop killed does. */
+static void leave_if_stopped_locked(void) {
+    if (!g_stopping || g_self == MAIN_SLOT || g_running == g_self) return;
+    g_slot[g_self].state = PSP_SCHED_DEAD;
+    psp_os_unlock(&g_lock);
+    host_exit();
+}
+
 static int handoff_locked(void) {
+    leave_if_stopped_locked();
+
     /* One token, one RUNNING slot. Cheap -- the selection scan below already
      * walks the same array -- and it turns a silent corruption into a named
      * one, which is the whole reason the bug above took as long as it did. */
@@ -374,6 +392,7 @@ static int handoff_locked(void) {
      * guest time on for ever. */
     int timer_runs = 0, ge_runs = 0, intr_runs = 0;
     while (best < 0) {
+        leave_if_stopped_locked();
         const uint64_t soonest = soonest_locked();
         const uint64_t timer = timer_runs < IDLE_TIMER_CAP && !psp_ktimer_in_handler()
                              ? psp_ktimer_next_due() : 0;
@@ -427,6 +446,7 @@ static int handoff_locked(void) {
         expire_locked(psp_clock_peek());
         best = pick_locked();
     }
+    leave_if_stopped_locked();
 
     if (best < 0) {
         /* Nothing can run. Every thread is blocked on something no running
@@ -1065,12 +1085,16 @@ static int live_locked(void) {
 }
 
 void psp_sched_stop_all(const char *why) {
-    /* Recorded before anything is killed: the caller is a guest thread that
-     * will not exist past the thread exit below. */
+    /* Recorded before anything is killed: the caller may be a guest thread
+     * that will not exist past the thread exit below. */
     g_stop_reason = why;
     g_stopping    = 1;
     psp_os_lock(&g_lock);
-    const int me = g_running;
+    /* The caller's own slot, not the token's: a host thread that is no
+     * guest's -- the window's, as it closes or on a SIGINT -- is the main
+     * slot here and comes back, with the rest of the shutdown to do. Read
+     * from the token, it ended itself whenever a guest had the CPU. */
+    const int me = g_self;
     for (int i = 1; i < g_slot_hi; i++)
         if (g_slot[i].used) g_slot[i].state = PSP_SCHED_DEAD;
     g_slot[MAIN_SLOT].state = PSP_SCHED_RUNNING;
