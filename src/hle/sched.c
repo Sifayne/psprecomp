@@ -929,7 +929,7 @@ static void yield_as(int displaced) {
     psp_os_unlock(&g_lock);
 }
 
-/* Give up the CPU for one scheduling round, to a thread of *any* priority.
+/* Give up the CPU for `usec` of guest time, to a thread of *any* priority.
  *
  * A yield cannot express this. It marks the caller READY and hands off, and the
  * handoff picks the most urgent READY thread -- which is the caller again
@@ -940,9 +940,9 @@ static void yield_as(int displaced) {
  * the frame loop went round two million times.
  *
  * A delay on hardware makes the thread genuinely not runnable for its duration,
- * which is what lets anything below it run. There is no clock here, so the
- * duration cannot be honoured -- but the *ineligibility* can, for one round.
- * That is the half of the semantics that matters. */
+ * which is what lets anything below it run, and so it does here: the caller
+ * sleeps until its deadline in guest time, and when nothing else is runnable
+ * the handoff moves the clock to it (idle_locked). */
 int psp_sched_delay(uint64_t usec) {
     if (!g_threading || psp_interrupt_in_handler()) return PSP_SCHED_EXPIRED;
     psp_os_lock(&g_lock);

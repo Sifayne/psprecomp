@@ -1880,6 +1880,37 @@ static void test_waits_with_threads(void) {
     psp_threadman_reset();
 }
 
+/* A zero timeout is a deadline that has already arrived: a wait that succeeds
+ * at once leaves 0 in the word, not the 1 that the shortest future deadline
+ * would leave, and one that cannot succeed times out without a reschedule --
+ * an equal-priority thread that is ready does not run inside it. */
+static void test_zero_timeout(void) {
+    psp_register(TW_FLAG, body_tw_flag);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t WAIT = psp_nid("sceKernelWaitSema");
+
+    const uint32_t sema = call5(psp_nid("sceKernelCreateSema"), guest_name("zero"), 0, 1, 1, 0);
+    psp_write32(TW_TMO, 0);
+    CHECK(call(WAIT, sema, 1, TW_TMO, 0) == 0, "a zero-timeout wait for a count that is there");
+    CHECK(psp_read32(TW_TMO) == 0, "it spent none of a zero timeout, but left %u",
+          psp_read32(TW_TMO));
+
+    tw_ran = 0;
+    tw_start(TW_FLAG);
+    psp_write32(TW_TMO, 0);
+    const uint32_t rc = call(WAIT, sema, 1, TW_TMO, 0);
+    CHECK(rc == SCE_KERNEL_ERROR_WAIT_TIMEOUT, "a zero-timeout wait that cannot succeed: %08X", rc);
+    CHECK(tw_ran == 0, "an equal-priority thread ran inside a zero-timeout wait");
+    CHECK(psp_read32(TW_TMO) == 0, "a zero timeout left %u", psp_read32(TW_TMO));
+
+    psp_sched_drain(5);
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
 /* A send that cannot finish at once can still wake a more urgent receiver
  * before it parks: the bytes it offers satisfy one. That receiver then runs,
  * and whatever it does next to the pipe -- take the rest of the send, cancel
@@ -2430,6 +2461,7 @@ int main(void) {
     test_time_calls();
     test_pool_free_pointers();
     test_waits_with_threads();
+    test_zero_timeout();
     test_msgpipe_wait_ends_as_it_parks();
     test_stranded_waits();
     test_thread_end_waiters();

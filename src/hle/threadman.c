@@ -16,11 +16,12 @@
  * status, and the kernel objects it waits on. Waits park the caller and signals
  * release it.
  *
- * The one place the model still shows through: with no preemption and no clock,
- * a wait that nothing could ever satisfy -- because no other thread is runnable
- * -- cannot be waited out. A caller that supplied a timeout is told it elapsed;
- * one that did not is not lied to, because a fabricated timeout is something a
- * game acts on. See psp_wait_deadlock.
+ * The one place the model still shows through is a wait that nothing could
+ * ever end: no other thread is runnable and no timer or interrupt is due. One
+ * with a timeout is still waited out -- the scheduler moves the guest clock to
+ * its deadline -- but one without cannot be, and the run stops rather than
+ * tell the guest a timeout elapsed, because a fabricated timeout is something
+ * a game acts on. See psp_wait_deadlock.
  */
 
 #include "psprecomp/hle.h"
