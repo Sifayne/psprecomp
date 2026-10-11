@@ -1944,6 +1944,16 @@ static void test_audio_output2(void) {
     CHECK(call(rest, 0, 0, 0, 0) == remaining, "remaining frames independent of future length");
     psp_clock_advance_to(start + 12000);
     CHECK(call(rest, 0, 0, 0, 0) == 0, "headless PCM fully consumed");
+    /* Two slots, as the hardware has (uofw audio.c): a buffer is taken while
+     * one plays, so the game mixes the next while it does; a third waits. */
+    CHECK(call(length, 512, 0, 0, 0) == 0, "back to 512 frames");
+    CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 512, "first slot");
+    CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 512, "second slot, while the first plays");
+    CHECK(call(rest, 0, 0, 0, 0) == 1024, "both queued");
+    CHECK((int32_t)call(output, 0x8000, 0x08820000, 0, 0) < 0, "a third finds both slots taken");
+    psp_clock_advance_to(start + 12000 + 12000);   /* past the first buffer: 11.6 ms */
+    CHECK(call(output, 0x8000, 0x08820000, 0, 0) == 512, "a slot frees as a buffer finishes");
+    psp_clock_advance_to(start + 12000 + 60000);
     CHECK(call(release, 0, 0, 0, 0) == 0, "release headless channel");
     CHECK(call(psp_nid("sceAudioOutputBlocking"), 0, 0x8000, 0x08820000, 0) == 64,
           "ordinary channel retained its sample count");

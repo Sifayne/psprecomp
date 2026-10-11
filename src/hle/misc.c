@@ -1358,6 +1358,14 @@ static int output2_length_ok(uint32_t samples) {
     return samples >= 17 && samples <= 4111;
 }
 
+/* With no device pacing it, Output2 is a timeline with the hardware's two
+ * slots (uofw audio.c, audioSRCOutput): one buffer playing and one queued.
+ * Both are taken while what is queued reaches more than a buffer past now. */
+static int output2_slots_full(uint64_t now) {
+    const uint64_t buf = (uint64_t)g_audio[AUDIO_OUTPUT2_CHANNEL].samples * 1000000000ull / PSP_AUDIO_RATE;
+    return g_output2_until_ns > now + buf;
+}
+
 static void hle_Output2Reserve(void) {
     audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
     const uint32_t samples = psp_arg(0);
@@ -1400,14 +1408,13 @@ static void hle_Output2Blocking(void) {
     if (!pcm || !psp_mem_ptr(pcm, channel->samples * 4)) {
         psp_ret(O2_ADDRESS); return;
     }
-    /* No device: finish the previous transfer before accepting the next one.
+    /* No device, and both slots taken: wait for the one playing to finish.
      * If scheduling is disabled (unit probes), report busy without losing it. */
-    if (!sink_paces() && output2_remaining()) {
-        const uint64_t now = psp_clock_peek() * 1000ull;
-        if (g_output2_until_ns > now) {
-            psp_sched_set_step(O2_STEP_DRAIN);
-            psp_sched_delay((g_output2_until_ns - now + 999) / 1000);
-        }
+    const uint64_t now = psp_clock_peek() * 1000ull;
+    if (!sink_paces() && output2_slots_full(now)) {
+        const uint64_t buf = (uint64_t)channel->samples * 1000000000ull / PSP_AUDIO_RATE;
+        psp_sched_set_step(O2_STEP_DRAIN);
+        psp_sched_delay((g_output2_until_ns - buf - now + 999) / 1000);
     }
     output2_submit(volume, pcm);
 }
@@ -1416,7 +1423,7 @@ static void hle_Output2Blocking(void) {
  * save state restored inside that drain (output2_resume). */
 static void output2_submit(uint32_t volume, uint32_t pcm) {
     audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
-    if (!sink_paces() && output2_remaining()) { psp_ret(O2_BUSY); return; }
+    if (!sink_paces() && output2_slots_full(psp_clock_peek() * 1000ull)) { psp_ret(O2_BUSY); return; }
     const uint32_t samples = channel->samples;
     g_audio_blocks++;
     audio_note_gap(AUDIO_OUTPUT2_CHANNEL, samples);
@@ -1426,9 +1433,15 @@ static void output2_submit(uint32_t volume, uint32_t pcm) {
     if (sink_paces()) {
         wait_us = host;
     } else {
-        wait_us = ((uint64_t)samples * 1000000ull + PSP_AUDIO_RATE - 1) / PSP_AUDIO_RATE;
-        g_output2_until_ns = psp_clock_peek() * 1000ull
-                          + (uint64_t)samples * 1000000000ull / PSP_AUDIO_RATE;
+        /* Queued behind what is there, and back when the buffer before it
+         * has played -- at once if that finished while the game mixed this
+         * one. Waiting out the new buffer as well, as this did, left the
+         * speaker idle for every moment the game spent mixing the next:
+         * WipEout Pulse and The 3rd Birthday made 7-8% too little sound on
+         * the paced clock, and it stuttered. */
+        const uint64_t now = psp_clock_peek() * 1000ull, was = g_output2_until_ns;
+        g_output2_until_ns = (was > now ? was : now) + (uint64_t)samples * 1000000000ull / PSP_AUDIO_RATE;
+        wait_us = was > now ? (int64_t)((was - now + 999) / 1000) : 0;
     }
     psp_sched_set_step(O2_STEP_PLAY);
     if (wait_us > 0) psp_sched_delay((uint64_t)wait_us);
