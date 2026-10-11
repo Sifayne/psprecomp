@@ -658,21 +658,29 @@ static void reread(launcher *a) {
     refresh(a);
 }
 
+/* The end of what the game has written to stderr, for the message box if
+ * it fails: the newest bytes of child_error and buf together, as many as
+ * child_error holds with its terminator. */
+static void keep_child_error(launcher *a, const char *buf, size_t got) {
+    const size_t room = sizeof a->child_error - 1;
+    size_t keep = a->child_error_len;
+    if (keep + got > room) {            /* the oldest bytes make way */
+        const size_t drop = keep + got - room < keep ? keep + got - room : keep;
+        memmove(a->child_error, a->child_error + drop, keep - drop);
+        keep -= drop;
+    }
+    const size_t take = got < room - keep ? got : room - keep;     /* buf's newest */
+    memcpy(a->child_error + keep, buf + got - take, take);
+    a->child_error_len = keep + take;
+    a->child_error[a->child_error_len] = 0;
+}
+
 static void poll_child(launcher *a) {
     if (!a->child) return;
     char buf[512]; ssize_t got;
     while ((got = read(a->child_error_fd, buf, sizeof buf)) > 0) {
         fwrite(buf, 1, (size_t)got, stderr);
-        size_t keep = a->child_error_len;
-        if (keep + (size_t)got >= sizeof a->child_error) {
-            size_t discard = keep + (size_t)got - sizeof a->child_error + 1;
-            if (discard > keep) discard = keep;
-            memmove(a->child_error, a->child_error + discard, keep - discard); keep -= discard;
-        }
-        size_t take = (size_t)got < sizeof a->child_error - keep - 1 ? (size_t)got : sizeof a->child_error - keep - 1;
-        memcpy(a->child_error + keep, buf + (size_t)got - take, take);
-        a->child_error_len = keep + take;
-        a->child_error[a->child_error_len] = 0;
+        keep_child_error(a, buf, (size_t)got);
     }
     int status; pid_t done = waitpid(a->child, &status, WNOHANG);
     if (done <= 0) return;
@@ -853,11 +861,17 @@ static void work_strip(launcher *a) {
     }
 }
 
+/* What the status line says: a problem first, then the last thing done. */
+static const char *status_line(const launcher *a) {
+    if (a->load_failed) return a->status;
+    if (!a->valid) return a->validation;
+    if (*a->status) return a->status;
+    return a->dirty ? "Unsaved changes." : "Changes take effect when the game starts.";
+}
+
 static void footer(launcher *a) {
     if (working(a)) work_strip(a);
-    const char *status = a->load_failed ? a->status : !a->valid ? a->validation : *a->status ? a->status :
-                         a->dirty ? "Unsaved changes." : "Changes take effect when the game starts.";
-    if (a->load_failed || !a->valid) psp_ui_accent(status); else psp_ui_note(status);
+    if (a->load_failed || !a->valid) psp_ui_accent(status_line(a)); else psp_ui_note(status_line(a));
     if (a->view == VIEW_SETTINGS) {
         /* Packs and About have nothing to reset; the row keeps its place. */
         if (a->group > GROUP_PACK) psp_ui_gap("Reset to defaults");
@@ -930,7 +944,8 @@ static void render(launcher *a) {
     refresh(a);
     if (!a->page) {
         const char *names[PAGES_MAX];
-        if (group_pages(a, a->group = GROUP_PLAYER, names)) a->page = names[0];
+        a->group = GROUP_PLAYER;
+        if (group_pages(a, GROUP_PLAYER, names)) a->page = names[0];
     }
     psp_ui_set_pad(a->pad);
     psp_ui_begin();
@@ -1104,14 +1119,17 @@ static int add_game(launcher *a, char *spec) {
     return 0;
 }
 
+/* What start found: go on, or end now -- after --help, or on an error. */
+enum { START_OK, START_HELP, START_FAILED = 2 /* the exit status */ };
+
 static int start(launcher *a, int argc, char **argv, int *check_startup, const char **wanted) {
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--help")) { usage(); return 1; }
+        if (!strcmp(argv[i], "--help")) { usage(); return START_HELP; }
         if (!strcmp(argv[i], "--check-startup")) { *check_startup = 1; continue; }
         const char *flag = argv[i];
-        if (++i == argc) { fprintf(stderr, "%s needs a value\n", flag); return 2; }
+        if (++i == argc) { fprintf(stderr, "%s needs a value\n", flag); return START_FAILED; }
         if (!strcmp(flag, "--config")) {
-            if (strlen(argv[i]) >= sizeof a->path) { fprintf(stderr, "config path too long\n"); return 2; }
+            if (strlen(argv[i]) >= sizeof a->path) { fprintf(stderr, "config path too long\n"); return START_FAILED; }
             strcpy(a->path, argv[i]);
         } else if (!strcmp(flag, "--boot")) a->boot = argv[i];
         else if (!strcmp(flag, "--module")) a->module = argv[i];
@@ -1121,12 +1139,12 @@ static int start(launcher *a, int argc, char **argv, int *check_startup, const c
         else if (!strcmp(flag, "--library")) a->library = argv[i];
         else if (!strcmp(flag, "--importer")) a->importer = argv[i];
         else if (!strcmp(flag, "--packs")) a->packs_dir = argv[i];
-        else if (!strcmp(flag, "--game")) { if (add_game(a, argv[i])) return 2; }
-        else { fprintf(stderr, "unknown option: %s\n", flag); return 2; }
+        else if (!strcmp(flag, "--game")) { if (add_game(a, argv[i])) return START_FAILED; }
+        else { fprintf(stderr, "unknown option: %s\n", flag); return START_FAILED; }
     }
     if (!*a->path && xdg_path("XDG_CONFIG_HOME", ".config", "psprecomp/settings.ini", a->path, sizeof a->path)) {
         fprintf(stderr, "cannot find the settings folder: XDG_CONFIG_HOME or HOME must be an absolute path\n");
-        return 2;
+        return START_FAILED;
     }
     packs_load(a);
     /* A lone --boot and --module: a title of the first pack. */
@@ -1134,7 +1152,7 @@ static int start(launcher *a, int argc, char **argv, int *check_startup, const c
         static char spec[8192];
         snprintf(spec, sizeof spec, "%s|%s|%s|%s|%s", packs[0].info->titles && packs[0].info->titles[0] ? packs[0].info->titles[0] : "game",
                  packs[0].info->name, a->boot, a->module, a->iso ? a->iso : "");
-        if (add_game(a, spec)) return 2;
+        if (add_game(a, spec)) return START_FAILED;
     }
     for (int k = 0; k < a->game_count; k++) {
         a->games[k].pack = pack_of(a->games[k].slug);
@@ -1150,22 +1168,22 @@ static int start(launcher *a, int argc, char **argv, int *check_startup, const c
         }
     }
     if (!a->file) a->file = psp_settings_file_new();
-    if (!a->file) { fprintf(stderr, "out of memory\n"); return 2; }
+    if (!a->file) { fprintf(stderr, "out of memory\n"); return START_FAILED; }
     /* A first start shows the play defaults, or what the earlier settings
      * bring, unsaved until Save or Save and play: nothing the player changed
      * is at stake. */
     use_pack(a, pack_count ? 0 : -1);
-    if (library_load(a, 0)) return 2;
+    if (library_load(a, 0)) return START_FAILED;
     qsort(a->games, (size_t)a->game_count, sizeof a->games[0], title_order);
     if (a->game_count) {
         /* Open on the requested title, else the remembered one, else the first. */
         int at = *wanted ? -1 : 0;
         for (int k = 0; k < a->game_count; k++)
             if (!strcmp(a->games[k].slug, *wanted ? *wanted : psp_settings_file_game(a->file))) at = k;
-        if (at < 0) { fprintf(stderr, "--select: no such game: %s\n", *wanted); return 2; }
+        if (at < 0) { fprintf(stderr, "--select: no such game: %s\n", *wanted); return START_FAILED; }
         select_game(a, at);
     }
-    return 0;
+    return START_OK;
 }
 
 static int open_window(launcher *a) {
@@ -1206,7 +1224,7 @@ int main(int argc, char **argv) {
     const char *wanted = NULL;
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) { fprintf(stderr, "launcher: %s\n", SDL_GetError()); return 1; }
     const int rc = start(&a, argc, argv, &check_startup, &wanted);
-    if (rc) { SDL_Quit(); return rc == 1 ? 0 : rc; }
+    if (rc != START_OK) { SDL_Quit(); return rc == START_HELP ? 0 : rc; }
     fprintf(stderr, "launcher: preferences %s\n", a.path);
     if (check_startup && a.load_failed) { fprintf(stderr, "%s\n", a.status); return 2; }
     if (open_window(&a)) return 1;
