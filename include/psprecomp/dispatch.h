@@ -82,9 +82,6 @@ psp_fn_t psp_lookup(uint32_t addr);
  * instead of an access violation. */
 void psp_dispatch(uint32_t addr);
 
-/* Called when psp_dispatch hits an unregistered address. The default prints
- * the address and aborts; a host can override it to log and continue, which is
- * useful while discovery is still incomplete. */
 /* ---- function-entry trace ------------------------------------------------
  * Generated functions call psp_trace_enter() on entry when the code is built
  * with PSPRECOMP_TRACE; otherwise the call compiles away entirely.
@@ -133,6 +130,9 @@ typedef void (*psp_miss_ctx_fn_t)(void);
 void psp_set_miss_context(psp_miss_ctx_fn_t fn);
 void psp_miss_context(void);
 
+/* Called when psp_dispatch hits an unregistered address. The default prints
+ * the address and aborts; a host can override it to log and continue, which is
+ * useful while discovery is still incomplete. */
 typedef void (*psp_miss_fn_t)(uint32_t addr);
 void psp_set_miss_handler(psp_miss_fn_t fn);
 
