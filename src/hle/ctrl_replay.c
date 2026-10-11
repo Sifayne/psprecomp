@@ -55,6 +55,14 @@ enum {
 
 enum { WHEN_POLL, WHEN_US };
 
+/* When an event fires: a poll count or guest microseconds, counted from the
+ * start of the run or from where the previous event fired. */
+typedef struct {
+    int      unit;          /* WHEN_POLL | WHEN_US                         */
+    int      rel;           /* relative to where the previous event fired  */
+    uint64_t when;
+} stamp;
+
 /* The pad as the script lane holds it, or as the recorder last wrote it: the
  * buttons, the stick, the look channel's second stick, and one poll's mouse
  * travel. Neutral is nothing held, both sticks centred, the mouse still. */
@@ -76,9 +84,7 @@ static int pad_same(const pad_state *a, const pad_state *b) {
 
 typedef struct {
     int      kind;
-    int      when_unit;     /* WHEN_POLL | WHEN_US                         */
-    int      when_rel;      /* relative to where the previous event fired  */
-    uint64_t when;
+    stamp    at;
     uint32_t mask;
     uint8_t  ax, ay;
     uint8_t  rx, ry;        /* the look channel: the second stick...       */
@@ -156,11 +162,11 @@ static uint32_t parse_buttons(const char *s, int line, int *ok) {
 
 /* `@N` `+N` `T.Ts` `+T.Ts`. Returns 0 if `tok` is not a timestamp at all,
  * which is how an unstamped line is recognised -- it defaults to `+1`. */
-static int parse_when(const char *tok, int *unit, int *rel, uint64_t *out) {
+static int parse_when(const char *tok, stamp *out) {
     const char *p = tok;
-    *rel = 0;
+    out->rel = 0;
     if (*p == '@') { p++; }
-    else if (*p == '+') { *rel = 1; p++; }
+    else if (*p == '+') { out->rel = 1; p++; }
     else if (!(*p >= '0' && *p <= '9')) return 0;
 
     char *end = NULL;
@@ -168,8 +174,8 @@ static int parse_when(const char *tok, int *unit, int *rel, uint64_t *out) {
     if (end == p) return 0;
 
     if (*end == 's' || *end == 'S') {
-        *unit = WHEN_US;
-        *out  = (uint64_t)(v * 1e6);
+        out->unit = WHEN_US;
+        out->when = (uint64_t)(v * 1e6);
         return 1;
     }
     if (*end != '\0') return 0;
@@ -177,12 +183,12 @@ static int parse_when(const char *tok, int *unit, int *rel, uint64_t *out) {
      * index. `@` and `+` are what make an unstamped `down cross` legible as
      * unstamped rather than as poll zero. */
     if (tok[0] != '@' && tok[0] != '+') return 0;
-    *unit = WHEN_POLL;
-    *out  = (uint64_t)(v < 0 ? 0 : v);
+    out->unit = WHEN_POLL;
+    out->when = (uint64_t)(v < 0 ? 0 : v);
     return 1;
 }
 
-static ev *push(int kind, int unit, int rel, uint64_t when, int line) {
+static ev *push(int kind, stamp at, int line) {
     if (g_ev_n == g_ev_cap) {
         const int cap = g_ev_cap ? g_ev_cap * 2 : 4096;
         ev *grown = realloc(g_ev, (size_t)cap * sizeof *g_ev);
@@ -191,8 +197,7 @@ static ev *push(int kind, int unit, int rel, uint64_t when, int line) {
     }
     ev *e = &g_ev[g_ev_n++];
     memset(e, 0, sizeof *e);
-    e->kind = kind; e->when_unit = unit; e->when_rel = rel;
-    e->when = when; e->line = line;
+    e->kind = kind; e->at = at; e->line = line;
     return e;
 }
 
@@ -229,6 +234,157 @@ static int parse_look(char *q, long *rx, long *ry, long *mdx, long *mdy) {
     return 1;
 }
 
+/* A stick line's numbers, `ax ay [rx ry [mdx mdy]]`, and whether the look
+ * pair was among them. What a line leaves out is centred and still. */
+typedef struct { long ax, ay, rx, ry, mdx, mdy; int look; } stick_line;
+#define STICKS_CENTRED(look) { STICK_CENTRE, STICK_CENTRE, STICK_CENTRE, STICK_CENTRE, 0, 0, look }
+
+static stick_line parse_sticks(char *q) {
+    stick_line s = STICKS_CENTRED(0);
+    s.ax = strtol(q, &q, 10);
+    s.ay = strtol(q, &q, 10);
+    s.look = parse_look(q, &s.rx, &s.ry, &s.mdx, &s.mdy);
+    return s;
+}
+
+static void set_sticks(ev *e, const stick_line *s) {
+    e->ax = (uint8_t)s->ax; e->ay = (uint8_t)s->ay;
+    e->rx = (uint8_t)s->rx; e->ry = (uint8_t)s->ry;
+    e->mdx = (int)s->mdx; e->mdy = (int)s->mdy; e->look = s->look;
+}
+
+/* The line's stamp, when its first word is one, and what follows it; else
+ * `+1`, the next poll, and the whole line. */
+static char *parse_stamp(char *s, stamp *at) {
+    size_t n = 0;
+    while (s[n] && s[n] != ' ' && s[n] != '\t') n++;
+    const char saved = s[n];
+    s[n] = 0;
+    const int stamped = parse_when(s, at);
+    s[n] = saved;
+    if (stamped) return s + n;
+    at->unit = WHEN_POLL; at->rel = 1; at->when = 1;
+    return s;
+}
+
+/* End the first word of `s` where it ends; what follows it, past blanks. */
+static char *split_word(char *s) {
+    size_t n = 0;
+    while (s[n] && s[n] != ' ' && s[n] != '\t') n++;
+    char *rest = s + n;
+    if (*rest) *rest++ = 0;
+    while (*rest == ' ' || *rest == '\t') rest++;
+    return rest;
+}
+
+/* One directive and its argument, stamped `at`. Returns how many errors it
+ * found: 0 or 1. */
+static int parse_directive(const char *dir, char *arg, stamp at, int line, int *seen_timed) {
+    if (!strcasecmp(dir, "drain")) {
+        if (*seen_timed) warn(line, "drain must precede the first timed line", NULL);
+        g_drain = atoi(arg);
+        return *seen_timed;
+    }
+    if (!strcasecmp(dir, "minhold")) {
+        if (*seen_timed) warn(line, "minhold must precede the first timed line", NULL);
+        g_minhold = atoi(arg);
+        if (g_minhold < 1) g_minhold = 1;
+        return *seen_timed;
+    }
+
+    /* Facts of the recorded session (psp_ctrl_replay_note): adopted at
+     * parse, wherever they stand, since the recorder writes each the
+     * first time the guest asks for it. */
+    if (!strcasecmp(dir, "date")) {
+        psp_rtc_set_date_us(strtoull(arg, NULL, 10));
+        return 0;
+    }
+    if (!strcasecmp(dir, "zone")) {
+        char *end;
+        const long minutes = strtol(arg, &end, 10);
+        psp_sysparam_set_zone((int)minutes, (int)strtol(end, NULL, 10));
+        return 0;
+    }
+
+    *seen_timed = 1;
+
+    if (!strcasecmp(dir, "down") || !strcasecmp(dir, "up")) {
+        int ok; uint32_t m = parse_buttons(arg, line, &ok);
+        if (!ok) return 1;
+        ev *e = push(!strcasecmp(dir, "down") ? EV_DOWN : EV_UP, at, line);
+        if (e) e->mask = m;
+
+    } else if (!strcasecmp(dir, "tap")) {
+        /* Expands here rather than at run time, so the player has one
+         * kind of thing to do and the hold length is fixed at parse. */
+        char *sp = strpbrk(arg, " \t");
+        long hold = g_minhold;
+        if (sp) { *sp = 0; hold = strtol(sp + 1, NULL, 10); if (hold < 1) hold = g_minhold; }
+        int ok; uint32_t m = parse_buttons(arg, line, &ok);
+        if (!ok) return 1;
+        ev *e = push(EV_DOWN, at, line);
+        if (e) e->mask = m;
+        e = push(EV_UP, (stamp){ WHEN_POLL, 1, (uint64_t)hold }, line);
+        if (e) e->mask = m;
+
+    } else if (!strcasecmp(dir, "state")) {
+        /* What the recorder writes: the whole lane in one event, so a
+         * poll where two things changed replays as one poll. */
+        char *p2 = strpbrk(arg, " \t");
+        stick_line s = STICKS_CENTRED(0);
+        if (p2) { *p2 = 0; s = parse_sticks(p2 + 1); }
+        int ok; uint32_t m = parse_buttons(arg, line, &ok);
+        if (!ok) return 1;
+        ev *e = push(EV_STATE, at, line);
+        if (e) { e->mask = m; set_sticks(e, &s); }
+
+    } else if (!strcasecmp(dir, "analog")) {
+        /* `analog x y` is the stick; `analog x y rx ry` both sticks;
+         * `center` centres whatever the script holds. */
+        stick_line s = STICKS_CENTRED(1);
+        if (strncasecmp(arg, "cent", 4)) s = parse_sticks(arg);
+        ev *e = push(EV_ANALOG, at, line);
+        if (e) set_sticks(e, &s);
+
+    } else if (!strcasecmp(dir, "mouse")) {
+        /* One poll's worth of mouse travel. A drag is a run of these,
+         * one per poll, which is what the recorder writes for one. */
+        char *q = arg;
+        const long dx = strtol(q, &q, 10);
+        const long dy = strtol(q, NULL, 10);
+        ev *e = push(EV_MOUSE, at, line);
+        if (e) { e->mdx = (int)dx; e->mdy = (int)dy; e->look = 1; }
+
+    } else if (!strcasecmp(dir, "neutral")) {
+        push(EV_NEUTRAL, at, line);
+
+    } else if (!strcasecmp(dir, "wait")) {
+        /* `wait 3s` and `wait 40` are stamps in directive position: they
+         * move the cursor so the next relative stamp counts from here. */
+        stamp w;
+        char tmp[64];
+        snprintf(tmp, sizeof tmp, "+%s", arg);
+        if (!parse_when(tmp, &w)) { warn(line, "wait wants <n> or <n>s", arg); return 1; }
+        push(EV_WAIT, w, line);
+
+    } else if (!strcasecmp(dir, "mark")) {
+        ev *e = push(EV_MARK, at, line);
+        if (e) {
+            char *t = arg;
+            if (*t == '"') { t++; char *q = strrchr(t, '"'); if (q) *q = 0; }
+            e->text = strdup(t);
+        }
+
+    } else if (!strcasecmp(dir, "stop")) {
+        push(EV_STOP, at, line);
+
+    } else {
+        warn(line, "unknown directive", dir);
+        return 1;
+    }
+    return 0;
+}
+
 static int parse_file(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -247,161 +403,12 @@ static int parse_file(const char *path) {
         while (*s == ' ' || *s == '\t') s++;
         if (!*s) continue;
 
-        /* Split off the first token, then decide whether it was a stamp. */
-        char *tok = s;
-        size_t tn = 0;
-        while (tok[tn] && tok[tn] != ' ' && tok[tn] != '\t') tn++;
-        char saved = tok[tn];
-        tok[tn] = 0;
-
-        int unit = WHEN_POLL, rel = 1;
-        uint64_t when = 1;
-        char *rest;
-        if (parse_when(tok, &unit, &rel, &when)) {
-            tok[tn] = saved;
-            rest = tok + tn;
-        } else {
-            /* No stamp: default `+1`, the next poll. */
-            tok[tn] = saved;
-            rest = tok;
-            unit = WHEN_POLL; rel = 1; when = 1;
-        }
-        while (*rest == ' ' || *rest == '\t') rest++;
-        if (!*rest) { warn(line, "timestamp with no directive", NULL); errors++; continue; }
-
-        /* The directive, then its argument. */
-        char *dir = rest;
-        size_t dn = 0;
-        while (dir[dn] && dir[dn] != ' ' && dir[dn] != '\t') dn++;
-        char *arg = dir + dn;
-        char dsaved = *arg;
-        *arg = 0;
-        if (dsaved) arg++;
-        while (*arg == ' ' || *arg == '\t') arg++;
-
-        if (!strcasecmp(dir, "drain")) {
-            if (seen_timed) { warn(line, "drain must precede the first timed line", NULL); errors++; }
-            g_drain = atoi(arg);
-            continue;
-        }
-        if (!strcasecmp(dir, "minhold")) {
-            if (seen_timed) { warn(line, "minhold must precede the first timed line", NULL); errors++; }
-            g_minhold = atoi(arg);
-            if (g_minhold < 1) g_minhold = 1;
-            continue;
-        }
-
-        /* Facts of the recorded session (psp_ctrl_replay_note): adopted at
-         * parse, wherever they stand, since the recorder writes each the
-         * first time the guest asks for it. */
-        if (!strcasecmp(dir, "date")) {
-            psp_rtc_set_date_us(strtoull(arg, NULL, 10));
-            continue;
-        }
-        if (!strcasecmp(dir, "zone")) {
-            char *end;
-            const long minutes = strtol(arg, &end, 10);
-            psp_sysparam_set_zone((int)minutes, (int)strtol(end, NULL, 10));
-            continue;
-        }
-
-        seen_timed = 1;
-
-        if (!strcasecmp(dir, "down") || !strcasecmp(dir, "up")) {
-            int ok; uint32_t m = parse_buttons(arg, line, &ok);
-            if (!ok) { errors++; continue; }
-            ev *e = push(!strcasecmp(dir, "down") ? EV_DOWN : EV_UP, unit, rel, when, line);
-            if (e) e->mask = m;
-
-        } else if (!strcasecmp(dir, "tap")) {
-            /* Expands here rather than at run time, so the player has one
-             * kind of thing to do and the hold length is fixed at parse. */
-            char *sp = strpbrk(arg, " \t");
-            long hold = g_minhold;
-            if (sp) { *sp = 0; hold = strtol(sp + 1, NULL, 10); if (hold < 1) hold = g_minhold; }
-            int ok; uint32_t m = parse_buttons(arg, line, &ok);
-            if (!ok) { errors++; continue; }
-            ev *e = push(EV_DOWN, unit, rel, when, line);
-            if (e) e->mask = m;
-            e = push(EV_UP, WHEN_POLL, 1, (uint64_t)hold, line);
-            if (e) e->mask = m;
-
-        } else if (!strcasecmp(dir, "state")) {
-            /* What the recorder writes: the whole lane in one event, so a
-             * poll where two things changed replays as one poll. */
-            char *p2 = strpbrk(arg, " \t");
-            long ax = 128, ay = 128, rx = 128, ry = 128, mdx = 0, mdy = 0;
-            int look = 0;
-            if (p2) {
-                *p2 = 0;
-                char *q = p2 + 1;
-                ax = strtol(q, &q, 10);
-                ay = strtol(q, &q, 10);
-                look = parse_look(q, &rx, &ry, &mdx, &mdy);
-            }
-            int ok; uint32_t m = parse_buttons(arg, line, &ok);
-            if (!ok) { errors++; continue; }
-            ev *e = push(EV_STATE, unit, rel, when, line);
-            if (e) {
-                e->mask = m; e->ax = (uint8_t)ax; e->ay = (uint8_t)ay;
-                e->rx = (uint8_t)rx; e->ry = (uint8_t)ry;
-                e->mdx = (int)mdx; e->mdy = (int)mdy; e->look = look;
-            }
-
-        } else if (!strcasecmp(dir, "analog")) {
-            /* `analog x y` is the stick; `analog x y rx ry` both sticks;
-             * `center` centres whatever the script holds. */
-            long ax = 128, ay = 128, rx = 128, ry = 128, mdx = 0, mdy = 0;
-            int look = 1;
-            if (strncasecmp(arg, "cent", 4)) {
-                char *q = arg;
-                ax = strtol(q, &q, 10);
-                ay = strtol(q, &q, 10);
-                look = parse_look(q, &rx, &ry, &mdx, &mdy);
-            }
-            ev *e = push(EV_ANALOG, unit, rel, when, line);
-            if (e) {
-                e->ax = (uint8_t)ax; e->ay = (uint8_t)ay;
-                e->rx = (uint8_t)rx; e->ry = (uint8_t)ry;
-                e->mdx = (int)mdx; e->mdy = (int)mdy; e->look = look;
-            }
-
-        } else if (!strcasecmp(dir, "mouse")) {
-            /* One poll's worth of mouse travel. A drag is a run of these,
-             * one per poll, which is what the recorder writes for one. */
-            char *q = arg;
-            const long dx = strtol(q, &q, 10);
-            const long dy = strtol(q, NULL, 10);
-            ev *e = push(EV_MOUSE, unit, rel, when, line);
-            if (e) { e->mdx = (int)dx; e->mdy = (int)dy; e->look = 1; }
-
-        } else if (!strcasecmp(dir, "neutral")) {
-            push(EV_NEUTRAL, unit, rel, when, line);
-
-        } else if (!strcasecmp(dir, "wait")) {
-            /* `wait 3s` and `wait 40` are stamps in directive position: they
-             * move the cursor so the next relative stamp counts from here. */
-            int u2, r2; uint64_t w2;
-            char tmp[64];
-            snprintf(tmp, sizeof tmp, "+%s", arg);
-            if (!parse_when(tmp, &u2, &r2, &w2)) { warn(line, "wait wants <n> or <n>s", arg); errors++; continue; }
-            push(EV_WAIT, u2, 1, w2, line);
-
-        } else if (!strcasecmp(dir, "mark")) {
-            ev *e = push(EV_MARK, unit, rel, when, line);
-            if (e) {
-                char *t = arg;
-                if (*t == '"') { t++; char *q = strrchr(t, '"'); if (q) *q = 0; }
-                e->text = strdup(t);
-            }
-
-        } else if (!strcasecmp(dir, "stop")) {
-            push(EV_STOP, unit, rel, when, line);
-
-        } else {
-            warn(line, "unknown directive", dir);
-            errors++;
-        }
+        stamp at;
+        char *dir = parse_stamp(s, &at);
+        while (*dir == ' ' || *dir == '\t') dir++;
+        if (!*dir) { warn(line, "timestamp with no directive", NULL); errors++; continue; }
+        char *arg = split_word(dir);
+        errors += parse_directive(dir, arg, at, line, &seen_timed);
     }
     fclose(f);
 
@@ -530,11 +537,11 @@ int psp_ctrl_replay_drain(void)  { return g_drain; }
 /* Is event `e` due at (polls, us)? Relative stamps count from where the
  * previous event fired, which is why `g_prev_*` is updated on every fire. */
 static int due(const ev *e, uint32_t polls, uint64_t us) {
-    if (e->when_unit == WHEN_POLL) {
-        uint64_t at = e->when_rel ? (uint64_t)g_prev_poll + e->when : e->when;
+    if (e->at.unit == WHEN_POLL) {
+        uint64_t at = e->at.rel ? (uint64_t)g_prev_poll + e->at.when : e->at.when;
         return (uint64_t)polls >= at;
     }
-    uint64_t at = e->when_rel ? g_prev_us + e->when : e->when;
+    uint64_t at = e->at.rel ? g_prev_us + e->at.when : e->at.when;
     return us >= at;
 }
 
