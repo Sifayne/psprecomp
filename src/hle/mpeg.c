@@ -638,6 +638,7 @@ static int mpeg_logging(void) {
 #define PS_PROGRAM_END  0xB9u
 #define PS_VIDEO_STREAM 0xE0u
 #define PS_PRIVATE_1    0xBDu  /* the audio: ATRAC3+ frames behind a 4-byte private header */
+#define PS_PRIVATE_HDR  4u     /* that header's length */
 
 static mpeg_ctx *ctx_for_ringbuffer(uint32_t rb) {
     for (unsigned i=0;i<MAX_MPEG;i++)
@@ -796,6 +797,44 @@ static void mpeg_compact(mpeg_ctx *c) {
     }
 }
 
+/* The first video since the clock jumped: unless it opens on a start code,
+ * skipped to the next, which ends the NAL the splice cut through. */
+static void pes_check_splice(mpeg_ctx *c, const uint8_t *q) {
+    c->es_splice = 0;
+    if (!(start_code(q) || (q[0] == 0 && start_code(q + 1))))
+        { c->es_skip = 1; c->splices++; }
+}
+/* The MPEG-2 PES header: flags at +7, and when bit 7 is set a 33-bit PTS in
+ * the five bytes from +9, the marker bits between its three pieces. The low
+ * 32 bits are what the PSP keeps. `t` is the PTS's first byte. */
+static void pes_note_pts(mpeg_ctx *c, int audio, const uint8_t *t) {
+    const uint32_t pts = ((uint32_t)(t[0] & 0x0E) << 29) | ((uint32_t)t[1] << 22) |
+                         ((uint32_t)(t[2] & 0xFE) << 14) | ((uint32_t)t[3] << 7) |
+                         ((uint32_t)t[4] >> 1);
+    if (audio) {
+        c->npes_a_pts++;
+        if (!c->apts_seen) { c->apts0 = pts; c->apts_seen = 1; c->atrac_pts = pts; }
+    } else {
+        c->npes_v_pts++;
+        c->vpts = grow_for_one(c->vpts, c->nvpts, &c->vpts_cap, 4096, sizeof *c->vpts);
+        if (c->nvpts < c->vpts_cap) {
+            c->vpts[c->nvpts].es_off = c->es_len;
+            c->vpts[c->nvpts].pts    = pts;
+            c->nvpts++;
+        }
+    }
+}
+/* PSPRECOMP_MPEG=1: the opening bytes of the first audio PES payload. */
+static void log_first_audio(const uint8_t *q, size_t n) {
+    if (!mpeg_logging()) return;
+    static int shown;
+    if (!shown++ && n >= 12) {
+        fprintf(stderr, "mpeg: first audio PES payload:");
+        for (unsigned k = 0; k < 12; k++) fprintf(stderr, " %02X", q[k]);
+        fprintf(stderr, "\n");
+    }
+}
+
 /* Pull the video payload out of a run of program stream bytes, carrying
  * across chunk boundaries whatever does not fit.
  *
@@ -822,92 +861,59 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
 
     /* Work over whatever a previous chunk left held, if anything. */
     const uint8_t *p = buf;
-    size_t plen_all = len;
+    size_t avail = len;
     uint8_t *work = NULL;
     if (c->es_pend_len) {
         work = malloc(c->es_pend_len + len);
         if (!work) return;
         memcpy(work, c->es_pend, c->es_pend_len);
         memcpy(work + c->es_pend_len, buf, len);
-        plen_all = c->es_pend_len + len;
+        avail = c->es_pend_len + len;
         c->es_pend_len = 0;
         p = work;
     }
 
     size_t i = 0;
-    while (i + 4 <= plen_all) {
+    while (i + 4 <= avail) {
         if (!start_code(p + i)) { i++; continue; }
         const uint8_t id = p[i+3];
 
         if (id == PS_PACK_START) {
             /* 14 fixed bytes, then however many stuffing bytes the low three
              * bits of the last one claim. */
-            if (i + 14 > plen_all) break;
+            if (i + 14 > avail) break;
             pack_clock(c, p + i + 4);
             i += 14 + (size_t)(p[i+13] & 7);
             continue;
         }
         if (id == PS_PROGRAM_END) { i += 4; continue; }
-        if (i + 6 > plen_all) break;
+        if (i + 6 > avail) break;
 
         const size_t plen = ((size_t)p[i+4] << 8) | p[i+5];
         if (id == PS_SYSTEM_HDR) { i += 6 + plen; continue; }
 
         if (id == PS_VIDEO_STREAM || id == PS_PRIVATE_1) {
             const int audio = id == PS_PRIVATE_1;
-            if (i + 9 > plen_all) break;
+            if (i + 9 > avail) break;
             const size_t hdrlen = p[i+8];
             const size_t off    = i + 9 + hdrlen;
-            /* The MPEG-2 PES header: flags at +7, and when bit 7 is set a
-             * 33-bit PTS in the five bytes from +9, the marker bits between
-             * its three pieces. The low 32 bits are what the PSP keeps. */
             if (audio) c->npes_a++; else c->npes_v++;
-            if (!audio && c->es_splice && off + 4 <= plen_all) {
-                /* The first video since the clock jumped: unless it opens
-                 * on a start code, skipped to the next, which ends the NAL
-                 * the splice cut through. */
-                const uint8_t *q = p + off;
-                c->es_splice = 0;
-                if (!(start_code(q) || (q[0] == 0 && start_code(q + 1))))
-                    { c->es_skip = 1; c->splices++; }
-            }
-            if ((p[i+7] & 0x80) && hdrlen >= 5 && i + 14 <= plen_all) {
-                const uint8_t *t = p + i + 9;
-                const uint32_t pts = ((uint32_t)(t[0] & 0x0E) << 29) | ((uint32_t)t[1] << 22) |
-                                     ((uint32_t)(t[2] & 0xFE) << 14) | ((uint32_t)t[3] << 7) |
-                                     ((uint32_t)t[4] >> 1);
-                if (audio) {
-                    c->npes_a_pts++;
-                    if (!c->apts_seen) { c->apts0 = pts; c->apts_seen = 1; c->atrac_pts = pts; }
-                } else {
-                    c->npes_v_pts++;
-                    c->vpts = grow_for_one(c->vpts, c->nvpts, &c->vpts_cap, 4096, sizeof *c->vpts);
-                    if (c->nvpts < c->vpts_cap) {
-                        c->vpts[c->nvpts].es_off = c->es_len;
-                        c->vpts[c->nvpts].pts    = pts;
-                        c->nvpts++;
-                    }
-                }
-            }
+            if (!audio && c->es_splice && off + 4 <= avail) pes_check_splice(c, p + off);
+            if ((p[i+7] & 0x80) && hdrlen >= 5 && i + 14 <= avail) pes_note_pts(c, audio, p + i + 9);
             /* plen counts from just after itself, so the payload is what is
              * left of it once the PES header is taken off. */
             if (plen >= 3 + hdrlen) {
-                if (off > plen_all) break;   /* even the header extension spans */
+                if (off > avail) break;   /* even the header extension spans */
                 const size_t pay = plen - 3 - hdrlen;
                 size_t n = pay;
-                if (off + n > plen_all) n = plen_all - off;
+                if (off + n > avail) n = avail - off;
                 if (audio) {
-                    if (mpeg_logging()) {
-                        static int shown;
-                        if (!shown++ && n >= 12) {
-                            fprintf(stderr, "mpeg: first audio PES payload:");
-                            for (unsigned k = 0; k < 12; k++) fprintf(stderr, " %02X", p[off + k]);
-                            fprintf(stderr, "\n");
-                        }
-                    }
-                    c->aes_skip = 4; aes_append(c, p + off, n);
+                    log_first_audio(p + off, n);
+                    c->aes_skip = PS_PRIVATE_HDR;
+                    aes_append(c, p + off, n);
+                } else {
+                    es_append(c, p + off, n);
                 }
-                else       es_append(c, p + off, n);
                 if (n < pay) {
                     /* Everything from off to the end is payload; the rest of
                      * it arrives in later chunks and must not be parsed. */
@@ -924,9 +930,9 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
     /* Hold whatever did not parse for the next put. Larger than a header can
      * be means it was not a header; the next start code resyncs, which is
      * what the byte-scan is for. */
-    if (i < plen_all && plen_all - i <= sizeof c->es_pend) {
-        memcpy(c->es_pend, p + i, plen_all - i);
-        c->es_pend_len = plen_all - i;
+    if (i < avail && avail - i <= sizeof c->es_pend) {
+        memcpy(c->es_pend, p + i, avail - i);
+        c->es_pend_len = avail - i;
     }
     free(work);
 }
