@@ -487,7 +487,10 @@ static void cap_note_list(const ge_queue *q);
 static void view_log_note(void);          /* PSPRECOMP_VIEW_LOG; see below */
 static void view_log_note_world(void);
 static void cap_snapshot_memory(void);
-static uint32_t g_next_id;
+/* List ids order the queue: the walk and the guest take lists in id order.
+ * sceGeListEnQueue's count up from 0x80000 and sceGeListEnQueueHead's down
+ * from below it, so a list put at the head has the lowest id of all. */
+static uint32_t g_next_id, g_head_id;
 
 /* Vertices the draw path declined, split by why.
  *
@@ -777,7 +780,7 @@ void psp_ge_reset(void) {
     memset(&g_tl, 0, sizeof g_tl);
     g_bone16_ok = 0;
     memset(&g_light_eye_from, 0, sizeof g_light_eye_from);
-    g_next_id = 0x00080000u;
+    g_next_id = g_head_id = 0x00080000u;
 }
 
 void psp_ge_init(void) { psp_ge_reset(); ge_prof_init(); }
@@ -4925,6 +4928,10 @@ static void ge_release(int was_busy);
 static void ge_execute(void);
 static void ge_kick(void);
 
+/* SCE_ERROR_INVALID_VALUE: the firmware's refusal of an argument or a
+ * state it cannot act on. */
+#define GE_ERROR_INVALID_VALUE 0x800001FEu
+
 static void enqueue(int head) {
     /* (list, stall, cbid, arg) */
     ge_queue *q = NULL;
@@ -4935,7 +4942,7 @@ static void enqueue(int head) {
      * sceGeListUpdateStallAddr or ListSync can still resolve its id, but it
      * is holding a slot it no longer needs -- so when
      * the pool is full, the oldest finished list is what to give up. Ids come
-     * from a monotonic counter and are never reused, so a stale id resolves to
+     * from monotonic counters and are never reused, so a stale id resolves to
      * "unknown uid" rather than to somebody else's list.
      *
      * Without this nothing ever clears `used` and the pool is consumed once,
@@ -4952,8 +4959,16 @@ static void enqueue(int head) {
 
     if (!q) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
+    /* sceGeListEnQueueHead puts its list in front of every other, paused
+     * until sceGeContinue. Only a paused list at the front, or none, lets
+     * it: one drawing there refuses it with SCE_ERROR_INVALID_VALUE. That
+     * is the firmware as uOFW reconstructs it (_sceGeListEnQueue with head
+     * set), and PPSSPP does the same; not measured. */
+    ge_queue *const front = oldest_pending();
+    if (head && front && !front->paused) { psp_ret(GE_ERROR_INVALID_VALUE); return; }
+
     memset(q, 0, sizeof *q);
-    q->id    = g_next_id++;
+    q->id    = head ? --g_head_id : g_next_id++;
     /* Addresses are cut to 28 bits, as the GE sees them. libgu passes the
      * list and stall with the uncached bit (0x40000000) set, but JUMP and CALL
      * targets built from BASE carry no such bit, so a list that had jumped
@@ -4969,7 +4984,18 @@ static void enqueue(int head) {
     cap_note_list(q);
     q->used  = 1;
     q->cbid  = (int)psp_arg(2);
-    (void)head;
+    if (head) {
+        /* Nothing runs yet, and the call takes its time without the kick
+         * window. The list that was paused at the front waits behind this
+         * one as a queued list and goes on from its pause once this one is
+         * done, as the firmware's finish interrupt starts the next list. */
+        if (front) front->paused = front->xpaused = 0;
+        q->paused = q->xpaused = 1;
+        g_ge.lists++;
+        psp_clock_advance_to(psp_clock_peek() + GE_ENQUEUE_US);
+        psp_ret(q->id);
+        return;
+    }
 
     /* The GE starts on the queue here and runs it for GE_KICK_WINDOW_US
      * of its own time before EnQueue returns (see g_ge_t): geprobe step 26
@@ -5331,6 +5357,7 @@ static void ge_keep(void) {
     PSP_STATE_KEEP(g_ge_xfull);
     PSP_STATE_KEEP(g_ge_cb);
     PSP_STATE_KEEP(g_next_id);
+    PSP_STATE_KEEP(g_head_id);
     PSP_STATE_KEEP(g_tl);
     PSP_STATE_KEEP(g_ge);
     PSP_STATE_KEEP(g_imm);
