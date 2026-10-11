@@ -1495,11 +1495,7 @@ static void hle_CreateSema(void) {
     s->max_count  = (int32_t)psp_arg(3);
     s->uid = g_next_uid++;
     s->used = 1;
-    /* Through a local: source and destination are both inside g_sema, and the
-     * compiler cannot see that two distinct members never overlap. */
-    char nm[sizeof s->name];
-    memcpy(nm, s->name, sizeof nm);
-    snprintf(s->waitdesc, sizeof s->waitdesc, "sceKernelWaitSema(%s)", nm);
+    psp_wait_describe(s->waitdesc, sizeof s->waitdesc, "sceKernelWaitSema", s->name);
     sema_log(s, "create", s->count, 0);
     psp_ret(s->uid);
 }
@@ -1775,9 +1771,7 @@ static void hle_CreateEventFlag(void) {
     f->init_pattern = psp_arg(2);
     f->uid = g_next_uid++;
     f->used = 1;
-    char nm[sizeof f->name];
-    memcpy(nm, f->name, sizeof nm);
-    snprintf(f->waitdesc, sizeof f->waitdesc, "sceKernelWaitEventFlag(%s)", nm);
+    psp_wait_describe(f->waitdesc, sizeof f->waitdesc, "sceKernelWaitEventFlag", f->name);
     psp_ret(f->uid);
 }
 

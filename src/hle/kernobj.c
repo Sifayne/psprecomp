@@ -180,9 +180,7 @@ static void hle_CreateVpl(void) {
     v->uid       = psp_threadman_next_uid();
     if (base) vpl_init(v);
     v->used      = 1;
-    char nm[sizeof v->name];
-    memcpy(nm, v->name, sizeof nm);
-    snprintf(v->waitdesc, sizeof v->waitdesc, "sceKernelAllocateVpl(%s)", nm);
+    psp_wait_describe(v->waitdesc, sizeof v->waitdesc, "sceKernelAllocateVpl", v->name);
     psp_ret(v->uid);
 }
 
@@ -612,11 +610,8 @@ static void hle_CreateMsgPipe(void) {
     p->buf_size = size;
     p->uid      = psp_threadman_next_uid();
     p->alive    = 1;
-    char nm[sizeof p->name];
-    memcpy(nm, p->name, sizeof nm);
-    snprintf(p->senddesc, sizeof p->senddesc, "sceKernelSendMsgPipe(%s)", nm);
-    memcpy(nm, p->name, sizeof nm);
-    snprintf(p->recvdesc, sizeof p->recvdesc, "sceKernelReceiveMsgPipe(%s)", nm);
+    psp_wait_describe(p->senddesc, sizeof p->senddesc, "sceKernelSendMsgPipe", p->name);
+    psp_wait_describe(p->recvdesc, sizeof p->recvdesc, "sceKernelReceiveMsgPipe", p->name);
     psp_ret(p->uid);
 }
 
@@ -1199,9 +1194,7 @@ static void hle_CreateMbx(void) {
     m->attr  = attr;
     m->uid   = psp_threadman_next_uid();
     m->alive = 1;
-    char nm[sizeof m->name];
-    memcpy(nm, m->name, sizeof nm);
-    snprintf(m->waitdesc, sizeof m->waitdesc, "sceKernelReceiveMbx(%s)", nm);
+    psp_wait_describe(m->waitdesc, sizeof m->waitdesc, "sceKernelReceiveMbx", m->name);
     psp_ret(m->uid);
 }
 
@@ -1486,9 +1479,7 @@ static void hle_CreateFpl(void) {
     for (uint32_t i = 0; i < count; i++) f->freelist[i] = i;
     f->uid   = psp_threadman_next_uid();
     f->alive = 1;
-    char nm[sizeof f->name];
-    memcpy(nm, f->name, sizeof nm);
-    snprintf(f->waitdesc, sizeof f->waitdesc, "sceKernelAllocateFpl(%s)", nm);
+    psp_wait_describe(f->waitdesc, sizeof f->waitdesc, "sceKernelAllocateFpl", f->name);
     psp_ret(f->uid);
 }
 

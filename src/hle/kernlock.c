@@ -106,9 +106,7 @@ static void hle_CreateMutex(void) {
     m->owner      = init > 0 ? psp_sched_current() : 0;
     m->uid        = psp_threadman_next_uid();
     m->used       = 1;
-    char nm[sizeof m->name];
-    memcpy(nm, m->name, sizeof nm);
-    snprintf(m->waitdesc, sizeof m->waitdesc, "sceKernelLockMutex(%s)", nm);
+    psp_wait_describe(m->waitdesc, sizeof m->waitdesc, "sceKernelLockMutex", m->name);
     psp_ret(m->uid);
 }
 
@@ -482,9 +480,7 @@ static void hle_CreateLwMutex(void) {
     /* The waiter count lives in the workarea, and a waiter that times out or
      * is released leaves before it runs again (psp_waitq_leave). */
     m->q.mirror   = wa + LW_WAITING;
-    char nm[sizeof m->name];
-    memcpy(nm, m->name, sizeof nm);
-    snprintf(m->waitdesc, sizeof m->waitdesc, "sceKernelLockLwMutex(%s)", nm);
+    psp_wait_describe(m->waitdesc, sizeof m->waitdesc, "sceKernelLockLwMutex", m->name);
 
     /* The workarea is the object. Everything the guest can see about the lock
      * is written here, including the three pad words -- the tests print them,

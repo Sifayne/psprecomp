@@ -35,6 +35,7 @@
 #ifndef PSPRECOMP_WAITQ_H
 #define PSPRECOMP_WAITQ_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* ---- the timeout argument every kernel wait takes --------------------------
@@ -60,6 +61,12 @@
  * shortest real one there is, and gets the earliest deadline that exists so
  * that it expires through the ordinary path. */
 uint64_t psp_wait_deadline(uint32_t tmo_ptr);
+
+/* What a thread parked on an object is shown waiting on in the thread dump:
+ * `desc` becomes "<call>(<name>)", built once when the object is created.
+ * The scheduler keeps only the pointer, so it lives in the object. */
+void     psp_wait_describe(char *desc, size_t size, const char *call,
+                           const char *name);
 
 /* Mark the call in progress as one whose name ends in CB, so that the wait it
  * is about to perform delivers the caller's callbacks first.

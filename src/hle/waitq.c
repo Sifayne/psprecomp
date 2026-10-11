@@ -7,6 +7,7 @@
 #include "psprecomp/mem.h"
 #include "psprecomp/state.h"
 
+#include <stdio.h>
 #include <string.h>
 
 /* Which queue each parked thread is in; see psp_waitq_leave. One entry per
@@ -138,6 +139,12 @@ int psp_waitq_release_all(psp_waitq *q) {
 
 int psp_waitq_cancel_all(psp_waitq *q) {
     return release_all_as(q, PSP_WAIT_WOKE_CANCELLED);
+}
+
+/* In a function of its own, apart from the object both strings live in: the
+ * compiler cannot see there that two distinct members never overlap. */
+void psp_wait_describe(char *desc, size_t size, const char *call, const char *name) {
+    snprintf(desc, size, "%s(%s)", call, name);
 }
 
 static int g_cb_call;
