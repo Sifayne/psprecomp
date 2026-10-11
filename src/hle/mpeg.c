@@ -99,6 +99,12 @@ typedef struct {
     size_t   es_pend_len;
     /* Which substream the in-flight PES belongs to: 0 video, 1 audio. */
     int      es_pes_audio;
+    /* The last pack's system clock reference, and what a jump in it leaves
+     * to do (see pack_clock): es_splice until the next video payload shows
+     * whether the jump cut a NAL, es_skip until the next start code. */
+    uint64_t scr_last;
+    int      scr_seen, es_splice, es_skip;
+    unsigned splices;
     /* The audio elementary stream, the same way: ATRAC3+ frames back to back,
      * each an 8-byte 0F D0 header and its payload, with the 4-byte private
      * header every audio PES starts with taken off. */
@@ -230,6 +236,8 @@ void psp_mpeg_dump_sync(FILE *out) {
         if (c->dropped)
             fprintf(out, "    movie: %u of %u pictures decoded and dropped to hold the sound\n",
                     c->dropped, c->frames);
+        if (c->splices)
+            fprintf(out, "    movie: %u NALs cut by a splice in the stream left out\n", c->splices);
         fprintf(out, "    movie: lead every 250 pictures, ms:");
         for (int k = 0; k < 8 && k * 250 < c->frames; k++) fprintf(out, " %.0f", c->sync_trend[k] / 90.0);
         fprintf(out, "\n");
@@ -634,7 +642,67 @@ static int unwanted(const mpeg_ctx *c, unsigned id) {
 }
 static int es_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
     if (unwanted(c, 0)) return 0;
+    if (c->es_skip) {   /* the rest of a NAL a splice cut through */
+        size_t k = 0;
+        while (k + 3 <= n && !(p[k] == 0 && p[k+1] == 0 && p[k+2] == 1)) k++;
+        if (k + 3 > n) return 0;
+        c->es_skip = 0;
+        p += k;
+        n -= k;
+    }
     return buf_append(&c->es, &c->es_len, &c->es_cap, p, n);
+}
+
+/* Splices: where the packs stop being one stream.
+ *
+ * WipEout Pulse loops its menu movie in its own ring callback, and gets it
+ * wrong: at the end of the file it reads the start over the end it has just
+ * read (its code at 0x10FE38 passes the put's first byte again, not the
+ * byte after what it read). What arrives is runs of the file in the wrong
+ * order -- the last packets lost, some repeated, a stale run from the ring's
+ * previous lap -- at a different place each lap. A PSP gets the same bytes.
+ * On one, Sif saw a little smearing as it loops and no garbled blocks;
+ * decoded as it came, the same stream threw purple and white blocks across
+ * the ship, for up to twenty pictures at a time.
+ *
+ * The blocks come from the NAL each splice cuts through: its first part
+ * from one place in the file and its last from another, which the decoder
+ * takes for a picture. The repeated pictures between splices are whole and
+ * decode as themselves on the wrong reference, which is the smear. So the
+ * NAL a splice cuts through is left out, and nothing else.
+ *
+ * A pack's clock tells where: it rises through a stream, by at most 0.2 s
+ * a pack in the menu movie, so one that goes back, or forward by more than
+ * a second, starts another run. That is a cut only if the run does
+ * not start on a NAL of its own; a loop that rereads its file from the
+ * start begins with one, and the NAL before it is merely short, which the
+ * decoder conceals. */
+enum { MPEG_SCR_JUMP = 90000 };   /* one second of the 90 kHz clock */
+/* The 33-bit base of an MPEG-2 pack header's system clock reference, from
+ * the six bytes after the start code: 3, 15 and 15 bits between markers. */
+static void pack_clock(mpeg_ctx *c, const uint8_t *b) {
+    if ((b[0] >> 6) != 1) return;   /* not an MPEG-2 pack header */
+    const uint64_t scr = (uint64_t)((b[0] >> 3) & 7) << 30 | (uint64_t)(b[0] & 3) << 28 |
+                         (uint64_t)b[1] << 20 | (uint64_t)(b[2] >> 3) << 15 |
+                         (uint64_t)(b[2] & 3) << 13 | (uint64_t)b[3] << 5 | (uint64_t)(b[4] >> 3);
+    if (c->scr_seen && (scr <= c->scr_last || scr - c->scr_last > MPEG_SCR_JUMP)) c->es_splice = 1;
+    c->scr_last = scr;
+    c->scr_seen = 1;
+}
+/* Leave out the NAL a splice cut through: back to its start code here, and
+ * on to the next start code in what follows. It has not reached the decoder,
+ * which takes a NAL only once the next one's start code has arrived. */
+static void es_cut(mpeg_ctx *c) {
+    size_t end = c->es_pos;
+    for (size_t k = c->es_len; k >= c->es_pos + 3; k--)
+        if (c->es[k-3] == 0 && c->es[k-2] == 0 && c->es[k-1] == 1) { end = k - 3; break; }
+    while (end > c->es_pos && c->es[end - 1] == 0) end--;
+    c->es_len = end;
+    while (c->nvpts > c->vpts_next && c->vpts[c->nvpts - 1].es_off >= end) c->nvpts--;
+    for (size_t i = c->put_iv; i < c->nputs; i++)
+        if (c->puts[i].es_len > end) c->puts[i].es_len = end;
+    c->es_skip = 1;
+    c->splices++;
 }
 /* Audio payload, less whatever is still owed of the four bytes that open
  * every audio PES payload in this game's streams. Their meaning is not
@@ -737,6 +805,7 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
             /* 14 fixed bytes, then however many stuffing bytes the low three
              * bits of the last one claim. */
             if (i + 14 > plen_all) break;
+            pack_clock(c, p + i + 4);
             i += 14 + (size_t)(p[i+13] & 7);
             continue;
         }
@@ -755,6 +824,14 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
              * 33-bit PTS in the five bytes from +9, the marker bits between
              * its three pieces. The low 32 bits are what the PSP keeps. */
             if (audio) c->npes_a++; else c->npes_v++;
+            if (!audio && c->es_splice && off + 4 <= plen_all) {
+                /* The first video since the clock jumped: a cut unless it
+                 * opens on a start code. Before the stamp below, which
+                 * belongs to what is kept. */
+                const uint8_t *q = p + off;
+                c->es_splice = 0;
+                if (!(q[0] == 0 && q[1] == 0 && (q[2] == 1 || (q[2] == 0 && q[3] == 1)))) es_cut(c);
+            }
             if ((p[i+7] & 0x80) && hdrlen >= 5 && i + 14 <= plen_all) {
                 const uint8_t *t = p + i + 9;
                 const uint32_t pts = ((uint32_t)(t[0] & 0x0E) << 29) | ((uint32_t)t[1] << 22) |

@@ -41,6 +41,16 @@ static unsigned pes(unsigned at, unsigned id, uint32_t pts, const void *payload,
     memcpy(p+14,payload,size);
     return at+14+size;
 }
+/* An MPEG-2 pack header at the start of the packet, its clock at `scr`. */
+static unsigned pack(uint32_t scr) {
+    unsigned char *p = packet;
+    p[0]=0; p[1]=0; p[2]=1; p[3]=0xba;
+    p[4]=0x44|((scr>>27)&0x38)|((scr>>28)&3); p[5]=scr>>20;
+    p[6]=((scr>>12)&0xf8)|4|((scr>>13)&3); p[7]=scr>>5;
+    p[8]=((scr<<3)&0xf8)|4; p[9]=1;
+    p[10]=0x01; p[11]=0x89; p[12]=0xc3; p[13]=0xf8;
+    return 14;
+}
 static void feed(void) {
     psp_mem_write_block(psp_arg(0), packet, sizeof packet);
     psp_ret(1);
@@ -123,6 +133,50 @@ int main(void) {
         }
         CHECK(pixel[2]==0xFF000000u);
         CHECK(pixel[3]==0xFF000000u);
+    }
+    /* Two packs, the second opening inside a NAL. With their clock rising
+     * they are one stream, and the slice the first ends on runs on into the
+     * second's bytes and decodes as a fifth picture. With the clock going
+     * back between them they are a splice -- WipEout Pulse's menu movie at
+     * its loop -- and that slice is left out with the bytes that open the
+     * second, four pictures. */
+    {
+        enum { M = BASE + 0x500, R = BASE + 0x580, D = BASE + 0x60000, WK = BASE + 0x70000,
+               PIC = BASE + 0x40000, PICP = BASE + 0x2F0, INIT = BASE + 0x2F8 };
+        static const unsigned char aud[] = {0,0,0,1,9,0x30},
+                                   slice[] = {0,0,0,1,0x41,0x9a,0x38,0x15,0xea},
+                                   junk[] = {0xff,0xff,0x13,0x37};
+        unsigned char first[sizeof video + sizeof aud + sizeof slice];
+        unsigned char second[sizeof junk + sizeof aud + sizeof slice + sizeof aud];
+        memcpy(first, video, sizeof video);
+        memcpy(first + sizeof video, aud, sizeof aud);
+        memcpy(first + sizeof video + sizeof aud, slice, sizeof slice);
+        memcpy(second, junk, sizeof junk);
+        memcpy(second + sizeof junk, aud, sizeof aud);
+        memcpy(second + sizeof junk + sizeof aud, slice, sizeof slice);
+        memcpy(second + sizeof junk + sizeof aud + sizeof slice, aud, sizeof aud);
+        CHECK(call(0x606A4649,BASE + 0x80,0,0,0,0,0)==0);    /* Delete the two above: room */
+        CHECK(call(0x606A4649,BASE + 0x480,0,0,0,0,0)==0);
+        for (int back = 0; back < 2; back++) {
+            const uint32_t size = call(0xD7A29F46,4,0,0,0,0,0);
+            CHECK(call(0x37295ED8,R,4,D,size,CALLBACK,0)==0);
+            CHECK(call(0xD8C5F121,M,WK,0x10000,R,512,0)==0);
+            CHECK(call(0x42560F23,M,0,0,0,0,0)!=0);   /* RegistStream: video */
+            memset(packet,0,sizeof packet);
+            pes(pack(9000),0xe0,90000,first,sizeof first);
+            CHECK(call(0xB240A59E,R,1,4,0,0,0)==1);
+            memset(packet,0,sizeof packet);
+            pes(pack(back ? 3000 : 12000),0xe0,99009,second,sizeof second);
+            CHECK(call(0xB240A59E,R,1,3,0,0,0)==1);
+            psp_write32(PICP,PIC);
+            int pictures = 0;
+            while (pictures < 8 && call(0xFE246728,M,0,AU,0,0,0)==0) {
+                CHECK(call(0x0E3C2E9D,M,AU,16,PICP,INIT,0)==0);
+                pictures++;
+            }
+            CHECK(pictures == (back ? 4 : 5));
+            CHECK(call(0x606A4649,M,0,0,0,0,0)==0);
+        }
     }
     call(0x874624D6,0,0,0,0,0,0);
     psp_mem_free();
