@@ -727,7 +727,8 @@ static void draw(launcher *a) {
 /* ---- input ------------------------------------------------------------------------- */
 
 /* Escape, B or Cancel: out of the browser, out of a preparation, or out of
- * the launcher, asking first about unsaved changes. */
+ * the launcher, asking first about unsaved changes. B on a page goes back
+ * to its entry in the list first (psp_ui_back). */
 static void activate_back(launcher *a) {
     if (a->view == VIEW_PREPARING) { import_cancel(a); return; }
     if (a->view == VIEW_BROWSE) { a->view = VIEW_SETTINGS; psp_ui_focus_next(); return; }
@@ -775,7 +776,7 @@ static void event(launcher *a, const SDL_Event *e) {
     if (e->type == SDL_CONTROLLERBUTTONDOWN && a->pad &&
         e->cbutton.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(a->pad)) && free_keys) {
         switch (e->cbutton.button) {
-        case SDL_CONTROLLER_BUTTON_B: activate_back(a); return;
+        case SDL_CONTROLLER_BUTTON_B: if (!psp_ui_back()) activate_back(a); return;
         case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
         case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:
             if (a->view == VIEW_SETTINGS) step_page(a, e->cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER ? -1 : 1);

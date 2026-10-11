@@ -46,11 +46,20 @@ void psp_ui_panel_begin(void);          /* centred over the dimmed game */
 void psp_ui_panel_end(void);
 void psp_ui_screen_begin(void);         /* the whole window: the launcher */
 void psp_ui_screen_end(void);
-/* The list of pages, then the page, leaving footer UI units below them. */
+/* The list of pages, then the page, leaving footer UI units below them.
+ * The cursor moves within each with the arrows and D-pad; right on an entry,
+ * or choosing it with A or Enter, takes it into the entry's page, and left at
+ * the page's edge back to the entry. */
 void psp_ui_side_begin(float width, float footer);
 void psp_ui_side_next(void);
 void psp_ui_side_end(void);
 int  psp_ui_nav(const char *label, int selected);
+/* An entry that does something rather than show a page: A or a click
+ * chooses it, right does not. */
+int  psp_ui_nav_action(const char *label, int selected);
+/* B: an open list or a widget in use takes it, or the cursor goes from a
+ * page back to its entry -- 1 -- else 0: the screen's own back applies. */
+int  psp_ui_back(void);
 void psp_ui_group(const char *text);    /* a caption over a group of nav entries */
 /* One of a row of tabs; the caller puts them on one line. */
 int  psp_ui_tab(const char *label, int selected);
@@ -73,6 +82,9 @@ void psp_ui_same_line(void);
 int  psp_ui_button(const char *label);
 int  psp_ui_choice(const char *label, int *index, const char *const *labels, int count);
 int  psp_ui_number(const char *label, double *value, double min, double max, const char *format);
+/* A slider over the stops 0 to count, at *at, showing text: a press of the
+ * D-pad or an arrow moves it one stop over a range of up to 100. */
+int  psp_ui_stops(const char *label, int *at, int count, const char *text);
 int  psp_ui_toggle(const char *label, int *value);
 void psp_ui_disabled_begin(int disabled);
 void psp_ui_disabled_end(void);
@@ -81,6 +93,9 @@ void psp_ui_help(const char *text);
 void psp_ui_help_area(void);
 /* The first widget after this has focus when the panel appears. */
 void psp_ui_focus_next(void);
+/* What the keyboard and pad cursor was on in the last frame: the widget's
+ * label (a picture row's title), or "" for nothing of ours. */
+const char *psp_ui_focused(void);
 /* A table: headers, then rows of cells left to right. A button cell
  * returns 1 when chosen. */
 int  psp_ui_table_begin(const char *id, int columns, const char *const *headers);

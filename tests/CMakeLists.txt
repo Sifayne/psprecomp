@@ -269,6 +269,8 @@ if(PSPRECOMP_HOST)
     add_test(NAME overlay_pad COMMAND test_overlay pad)
     set_tests_properties(overlay_ui overlay_held overlay_bind overlay_pad PROPERTIES
         TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
+    # About a hundred presses of the pad, each held for a few frames.
+    set_tests_properties(overlay_pad PROPERTIES TIMEOUT 120)
 
     # The bindings: the table test against the input code before stage 6
     # (input_before.h), spelling, rebinding, host actions and the owner. It
