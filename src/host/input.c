@@ -210,6 +210,41 @@ static const struct { const char *name; uint16_t mod; } MODS[] = {
     { "Ctrl+", KMOD_CTRL }, { "Shift+", KMOD_SHIFT }, { "Alt+", KMOD_ALT }, { "Gui+", KMOD_GUI },
 };
 
+/* A key by its name. SDL names the comma key ",", which a list cannot hold,
+ * so it is "Comma" here. */
+static const char *key_name(SDL_Keycode k) { return k == SDLK_COMMA ? "Comma" : SDL_GetKeyName(k); }
+static SDL_Keycode key_from_name(const char *name) {
+    return !SDL_strcasecmp(name, "Comma") ? SDLK_COMMA : SDL_GetKeyFromName(name);
+}
+
+/* Half an axis: "+leftx", "-righty", or a trigger's bare name -- a trigger
+ * only has its upper half. */
+static void axis_half_name(SDL_GameControllerAxis a, int upper, char *out, size_t size) {
+    const int trigger = a == SDL_CONTROLLER_AXIS_TRIGGERLEFT || a == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
+    snprintf(out, size, "%s%s", trigger && upper ? "" : upper ? "+" : "-", SDL_GameControllerGetStringForAxis(a));
+}
+
+/* Which way a wheel turned: 0 up, 1 down, 2 left, 3 right, or -1. */
+static int wheel_notch(const SDL_MouseWheelEvent *w) {
+    int y = w->y, x = w->x;
+    if (w->direction == SDL_MOUSEWHEEL_FLIPPED) { y = -y; x = -x; }
+    return y > 0 ? 0 : y < 0 ? 1 : x < 0 ? 2 : x > 0 ? 3 : -1;
+}
+
+/* A bind.* key's device, from its "<device>." prefix; -1 for none. */
+static int device_of(const char *key) {
+    for (int d = 0; d < DEVICES; d++) {
+        const size_t n = strlen(DEVICE_NAME[d]);
+        if (!strncmp(key, DEVICE_NAME[d], n) && key[n] == '.') return d;
+    }
+    return -1;
+}
+
+/* one appended to the ", "-separated list in out, when it fits. */
+static void append_listed(char *out, size_t size, const char *one) {
+    if (strlen(out) + strlen(one) + 3 < size) { if (*out) strcat(out, ", "); strcat(out, one); }
+}
+
 /* One source, as a bind.* value spells it on its device. */
 static int parse_source(int device, const char *text, binding *b, char *why, size_t size) {
     b->mods = 0;
@@ -228,8 +263,7 @@ static int parse_source(int device, const char *text, binding *b, char *why, siz
             if (sc == SDL_SCANCODE_UNKNOWN) { snprintf(why, size, "no key position '%s'", text + 9); return -1; }
             b->src = SRC_SCANCODE; b->code = sc; return 0;
         }
-        /* SDL names the comma key ",", which a list cannot hold. */
-        const SDL_Keycode k = !SDL_strcasecmp(text, "Comma") ? SDLK_COMMA : SDL_GetKeyFromName(text);
+        const SDL_Keycode k = key_from_name(text);
         if (k == SDLK_UNKNOWN) { snprintf(why, size, "no key '%s'", text); return -1; }
         b->src = SRC_KEY; b->code = k; return 0;
     }
@@ -263,18 +297,13 @@ static void format_source(const binding *b, char *out, size_t size) {
         if (b->mods & MODS[i].mod) strcat(mods, MODS[i].name);
     switch (b->src) {
     case SRC_KEY:
-        snprintf(out, size, "%s%s", mods, b->code == SDLK_COMMA ? "Comma" : SDL_GetKeyName(b->code)); break;
+        snprintf(out, size, "%s%s", mods, key_name(b->code)); break;
     case SRC_SCANCODE:
         snprintf(out, size, "%sscancode:%s", mods, SDL_GetScancodeName((SDL_Scancode)b->code)); break;
     case SRC_BUTTON:
         snprintf(out, size, "%s", SDL_GameControllerGetStringForButton((SDL_GameControllerButton)b->code)); break;
-    case SRC_AXIS_POS: case SRC_AXIS_NEG: {
-        const SDL_GameControllerAxis a = (SDL_GameControllerAxis)b->code;
-        const int trigger = a == SDL_CONTROLLER_AXIS_TRIGGERLEFT || a == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
-        snprintf(out, size, "%s%s", trigger && b->src == SRC_AXIS_POS ? "" : b->src == SRC_AXIS_POS ? "+" : "-",
-                 SDL_GameControllerGetStringForAxis(a));
-        break;
-    }
+    case SRC_AXIS_POS: case SRC_AXIS_NEG:
+        axis_half_name((SDL_GameControllerAxis)b->code, b->src == SRC_AXIS_POS, out, size); break;
     case SRC_STICK: snprintf(out, size, "%s", b->code ? "rightxy" : "leftxy"); break;
     case SRC_MOUSE_BUTTON: snprintf(out, size, "%s", MOUSE_NAMES[b->code]); break;
     case SRC_WHEEL: snprintf(out, size, "%s", WHEEL_NAMES[b->code]); break;
@@ -379,11 +408,7 @@ static void build_defaults(void) {
  * preset must not keep the game from starting. */
 static int apply_binding(const char *key, const char *value) {
     char why[160] = "";
-    int device = -1;
-    for (int d = 0; d < DEVICES; d++) {
-        const size_t n = strlen(DEVICE_NAME[d]);
-        if (!strncmp(key, DEVICE_NAME[d], n) && key[n] == '.') device = d;
-    }
+    const int device = device_of(key);
     binding t = { 0 };
     if (device < 0 || parse_target(strchr(key, '.') + 1, &t)) {
         fprintf(stderr, "present: bind.%s: not a target here -- ignored\n", key);
@@ -846,9 +871,7 @@ int input_event(const SDL_Event *e) {
         break;
     case SDL_MOUSEWHEEL: {
         if (!g_mouse_grabbed) return INPUT_ACTION_NONE;
-        int y = e->wheel.y, x = e->wheel.x;
-        if (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { y = -y; x = -x; }
-        const int which = y > 0 ? 0 : y < 0 ? 1 : x < 0 ? 2 : x > 0 ? 3 : -1;
+        const int which = wheel_notch(&e->wheel);
         /* A wheel notch is a press the game sees for two of its polls. */
         for (int i = 0; i < g_nbinds; i++)
             if (g_binds[i].src == SRC_WHEEL && g_binds[i].code == which) {
@@ -903,18 +926,23 @@ enum { HOST_ROW_COUNT = sizeof HOST_ROWS / sizeof *HOST_ROWS,
 
 int input_rows(void) { return HOST_ROW_COUNT + (int)g_tin.action_count + HOST_ACTION_ROW_COUNT; }
 
-static const char *row_name(int row) {
-    if (row < HOST_ROW_COUNT) return HOST_ROWS[row].name;
+/* A row's target name, and its label: the host's buttons, the title's
+ * actions, then the host actions. */
+static const char *row_entry(int row, const char **label) {
+    if (row < HOST_ROW_COUNT) { *label = HOST_ROWS[row].label; return HOST_ROWS[row].name; }
     row -= HOST_ROW_COUNT;
-    if (row < (int)g_tin.action_count) return g_tin.actions[row].name;
-    return HOST_ACTION_ROWS[row - (int)g_tin.action_count].name;
+    if (row < (int)g_tin.action_count) { *label = g_tin.actions[row].label; return g_tin.actions[row].name; }
+    row -= (int)g_tin.action_count;
+    *label = HOST_ACTION_ROWS[row].label;
+    return HOST_ACTION_ROWS[row].name;
 }
 
+static const char *row_name(int row) { const char *label; return row_entry(row, &label); }
+
 const char *input_row_label(int row) {
-    if (row < HOST_ROW_COUNT) return HOST_ROWS[row].label;
-    row -= HOST_ROW_COUNT;
-    if (row < (int)g_tin.action_count) return g_tin.actions[row].label;
-    return HOST_ACTION_ROWS[row - (int)g_tin.action_count].label;
+    const char *label;
+    row_entry(row, &label);
+    return label;
 }
 
 /* The key on the keyboard a source is, for telling two spellings apart. */
@@ -970,7 +998,7 @@ static void sources_of(const binding *t, int device, const binding *without, cha
         if (without && same_source(b, without)) continue;
         char one[64];
         format_source(b, one, sizeof one);
-        if (strlen(out) + strlen(one) + 3 < size) { if (*out) strcat(out, ", "); strcat(out, one); }
+        append_listed(out, size, one);
     }
 }
 
@@ -983,7 +1011,7 @@ void input_row_sources(int row, int device, char *out, size_t size) {
         if (b->device != device || b->tgt != t.tgt || b->value != t.value) continue;
         char one[64];
         describe_source(b, one, sizeof one);
-        if (strlen(out) + strlen(one) + 3 < size) { if (*out) strcat(out, ", "); strcat(out, one); }
+        append_listed(out, size, one);
     }
 }
 
@@ -1019,7 +1047,7 @@ int input_spell(const SDL_Event *e, int device, char *out, size_t size) {
     switch (e->type) {
     case SDL_KEYDOWN:
         if (device != DEV_KEY || e->key.repeat) return 0;
-        snprintf(out, size, "%s", e->key.keysym.sym == SDLK_COMMA ? "Comma" : SDL_GetKeyName(e->key.keysym.sym));
+        snprintf(out, size, "%s", key_name(e->key.keysym.sym));
         return *out != 0;
     case SDL_CONTROLLERBUTTONDOWN:
         if (device != DEV_PAD) return 0;
@@ -1030,7 +1058,7 @@ int input_spell(const SDL_Event *e, int device, char *out, size_t size) {
         const SDL_GameControllerAxis a = (SDL_GameControllerAxis)e->caxis.axis;
         const int trigger = a == SDL_CONTROLLER_AXIS_TRIGGERLEFT || a == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
         if (trigger && e->caxis.value < 0) return 0;
-        snprintf(out, size, "%s%s", trigger ? "" : e->caxis.value > 0 ? "+" : "-", SDL_GameControllerGetStringForAxis(a));
+        axis_half_name(a, e->caxis.value > 0, out, size);
         return 1;
     }
     case SDL_MOUSEBUTTONDOWN:
@@ -1039,9 +1067,7 @@ int input_spell(const SDL_Event *e, int device, char *out, size_t size) {
         return 1;
     case SDL_MOUSEWHEEL: {
         if (device != DEV_MOUSE) return 0;
-        int y = e->wheel.y, x = e->wheel.x;
-        if (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { y = -y; x = -x; }
-        const int which = y > 0 ? 0 : y < 0 ? 1 : x < 0 ? 2 : x > 0 ? 3 : -1;
+        const int which = wheel_notch(&e->wheel);
         if (which < 0) return 0;
         snprintf(out, size, "%s", WHEEL_NAMES[which]);
         return 1;
@@ -1114,18 +1140,16 @@ static void print_controls(const psp_settings *s) {
         fprintf(stderr, "present: %s\n", g_title->gamepad_modern_help);
     /* The preset's bindings, as the table holds them. */
     for (int i = 0; i < s->bind_count; i++) {
-        const char *key = s->bind[i].key, *dot = strchr(key, '.');
+        const char *key = s->bind[i].key;
         binding t = { 0 };
-        int device = -1;
-        for (int d = 0; d < DEVICES; d++)
-            if ((size_t)(dot - key) == strlen(DEVICE_NAME[d]) && !strncmp(key, DEVICE_NAME[d], (size_t)(dot - key))) device = d;
-        if (device < 0 || parse_target(dot + 1, &t)) continue;
+        const int device = device_of(key);
+        if (device < 0 || parse_target(strchr(key, '.') + 1, &t)) continue;
         t.device = (uint8_t)device;
         char list[256] = "", one[64];
         for (int k = 0; k < g_nbinds; k++) {
             if (!same_target(&g_binds[k], &t)) continue;
             format_source(&g_binds[k], one, sizeof one);
-            if (strlen(list) + strlen(one) + 3 < sizeof list) { if (*list) strcat(list, ", "); strcat(list, one); }
+            append_listed(list, sizeof list, one);
         }
         fprintf(stderr, "present: bind.%s = %s\n", key, *list ? list : "(nothing)");
     }
