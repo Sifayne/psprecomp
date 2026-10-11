@@ -532,7 +532,7 @@ void psp_ctrl_replay_note(const char *line) {
 }
 
 int psp_ctrl_replay_active(void) { return g_loaded; }
-int psp_ctrl_replay_drain(void)  { return g_drain; }
+int psp_ctrl_replay_drain(void)  { return g_loaded ? g_drain : 0; }
 
 /* Is event `e` due at (polls, us)? Relative stamps count from where the
  * previous event fired, which is why `g_prev_*` is updated on every fire. */

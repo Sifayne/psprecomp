@@ -138,6 +138,21 @@ static void test_malformed_is_rejected(void) {
     CHECK(!psp_ctrl_replay_active(), "a file with bad lines does not load");
     CHECK(poll_pad(NULL, NULL) == 0, "and drives nothing");
     unload();
+
+    /* Nor does it set the run's length: a drain after a timed line is an
+     * error, and so is any bad line after a good drain. */
+    p = write_scenario("t-late-drain.pad", "@1 down cross\ndrain 90\n");
+    if (!p) return;
+    load(p);
+    CHECK(!psp_ctrl_replay_active() && psp_ctrl_replay_drain() == 0,
+          "a late drain is not reported: got %d", psp_ctrl_replay_drain());
+    unload();
+    p = write_scenario("t-bad-drain.pad", "drain 90\n@1 down nosuchbutton\n");
+    if (!p) return;
+    load(p);
+    CHECK(!psp_ctrl_replay_active() && psp_ctrl_replay_drain() == 0,
+          "a rejected scenario's drain is not reported: got %d", psp_ctrl_replay_drain());
+    unload();
 }
 
 /* ---- the semantics ------------------------------------------------------- */
@@ -543,6 +558,7 @@ int main(void) {
     test_long_scenario();
 
     remove("t-directives.pad"); remove("t-bad.pad"); remove("t-tap.pad");
+    remove("t-late-drain.pad"); remove("t-bad-drain.pad");
     remove("t-catchup.pad"); remove("t-lanes.pad"); remove("t-host.pad");
     remove("t-rt-src.pad"); remove("t-rt-rec.pad");
     remove("t-look.pad"); remove("t-look-rec.pad");
