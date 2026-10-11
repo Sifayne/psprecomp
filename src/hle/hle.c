@@ -9,6 +9,7 @@
 #include "psprecomp/os.h"
 #include "census.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,12 +26,17 @@ void psp_hle_set_host_work(void (*fn)(uint32_t nid, uint64_t elapsed_ns)) {
     g_host_work = fn;
 }
 
+/* The table index registered for `nid`, or -1. */
+static int find_entry(uint32_t nid) {
+    for (int i = 0; i < g_count; i++) if (g_entry[i].nid == nid) return i;
+    return -1;
+}
+
 void psp_hle_register(uint32_t nid, const char *lib, const char *name, psp_hle_fn fn) {
     /* Re-registering replaces, so a game repo can override one function
      * without forking the table. */
-    for (int i = 0; i < g_count; i++) {
-        if (g_entry[i].nid == nid) { g_fn[i] = fn; g_entry[i].name = name; return; }
-    }
+    const int i = find_entry(nid);
+    if (i >= 0) { g_fn[i] = fn; g_entry[i].name = name; return; }
     if (g_count >= HLE_MAX) return;
     g_entry[g_count].nid = nid;
     g_entry[g_count].lib = lib;
@@ -60,9 +66,8 @@ int psp_hle_is_named(int index) {
 }
 
 const char *psp_hle_name(uint32_t nid) {
-    for (int i = 0; i < g_count; i++)
-        if (g_entry[i].nid == nid) return g_entry[i].name;
-    return NULL;
+    const int i = find_entry(nid);
+    return i >= 0 ? g_entry[i].name : NULL;
 }
 
 int psp_hle_count(void) { return g_count; }
@@ -183,6 +188,18 @@ static int logging(void) {
         g_log = (v && *v && *v != '0') ? 1 : 0;
     }
     return g_log;
+}
+
+/* One line of that log for the call being made: the calling thread, what was
+ * called, as `fmt` describes it, and the first four arguments. */
+static void log_call(const char *fmt, ...) {
+    char what[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(what, sizeof what, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "hle: [%05X] %s(0x%08X, 0x%08X, 0x%08X, 0x%08X)\n",
+            psp_sched_current(), what, psp_arg(0), psp_arg(1), psp_arg(2), psp_arg(3));
 }
 
 /* PSPRECOMP_HLE_TRACE=<name> dumps the function trace at every call to that
@@ -351,13 +368,52 @@ static int firmware_library(const char *lib) {
 
 static uint32_t module_export(uint32_t nid) {
     if (!psp_modules_loaded()) return 0;
-    for (int i = 0; i < g_count; i++) if (g_entry[i].nid == nid) return 0;
+    if (find_entry(nid) >= 0) return 0;
     return psp_modules_export(nid);
 }
 
 static void hle_call(uint32_t nid, const char *lib);
 void psp_hle_call(uint32_t nid) { hle_call(nid, NULL); }
 void psp_hle_import(uint32_t nid, const char *lib) { hle_call(nid, lib); }
+
+/* A registered handler answers the call. */
+static void call_entry(int i, uint32_t nid) {
+    g_calls[i]++;
+    /* Logged before the call, not after: sceKernelExitThread and the
+     * exit-the-game calls never return, so a line emitted afterwards
+     * would omit exactly the call that ended the run. The result comes
+     * back on its own line for the calls that do return. */
+    if (logging()) log_call("%-36s", g_entry[i].name ? g_entry[i].name : "(unnamed)");
+    {
+        const char *tn = trace_name();
+        if (tn && g_entry[i].name && !strcmp(tn, g_entry[i].name)) {
+            fprintf(stderr, "hle: --- trace at %s ---\n", g_entry[i].name);
+            psp_trace_dump();
+        }
+    }
+    const uint64_t work_begin = g_host_work && g_call_depth == 1 ? psp_os_mono_ns() : 0;
+    g_fn[i]();
+    if (work_begin && g_host_work)
+        g_host_work(nid, psp_os_mono_ns() - work_begin);
+    if (logging())
+        fprintf(stderr, "hle: [%05X] %-36s  = 0x%08X\n",
+                psp_sched_current(), "", psp_cpu.r[PSP_REG_V0]);
+    if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name, 1);
+    /* The safe point (psprecomp/safepoint.h): this call is finished --
+     * v0 written -- and nothing after it has run yet. Only a call from
+     * the thread's own guest code, never one nested in a callback or
+     * a handler. */
+    if (psp_safepoint_armed && g_call_depth == 1) psp_safepoint(nid);
+    after_call();
+}
+
+/* How a call no handler answered ends, once its result is in $v0 (an
+ * answered one ends in after_call). */
+static void leave_unanswered(void) {
+    psp_interrupt_run_pending();
+    psp_census_call_leave();
+    g_call_depth--;
+}
 
 static void hle_call(uint32_t nid, const char *lib) {
     {
@@ -399,42 +455,9 @@ static void hle_call(uint32_t nid, const char *lib) {
      * replace or release a handler (src/hle/interrupt.c). */
     psp_display_tick();
 
-    for (int i = 0; i < g_count; i++) {
-        if (g_entry[i].nid == nid) {
-            g_calls[i]++;
-            /* Logged before the call, not after: sceKernelExitThread and the
-             * exit-the-game calls never return, so a line emitted afterwards
-             * would omit exactly the call that ended the run. The result comes
-             * back on its own line for the calls that do return. */
-            if (logging())
-                fprintf(stderr, "hle: [%05X] %-36s(0x%08X, 0x%08X, 0x%08X, 0x%08X)\n",
-                        psp_sched_current(),
-                        g_entry[i].name ? g_entry[i].name : "(unnamed)",
-                        psp_arg(0), psp_arg(1), psp_arg(2), psp_arg(3));
-            {
-                const char *tn = trace_name();
-                if (tn && g_entry[i].name && !strcmp(tn, g_entry[i].name)) {
-                    fprintf(stderr, "hle: --- trace at %s ---\n", g_entry[i].name);
-                    psp_trace_dump();
-                }
-            }
-            const uint64_t work_begin = g_host_work && g_call_depth == 1 ? psp_os_mono_ns() : 0;
-            g_fn[i]();
-            if (work_begin && g_host_work)
-                g_host_work(nid, psp_os_mono_ns() - work_begin);
-            if (logging())
-                fprintf(stderr, "hle: [%05X] %-36s  = 0x%08X\n",
-                        psp_sched_current(), "", psp_cpu.r[PSP_REG_V0]);
-            if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name, 1);
-            /* The safe point (psprecomp/safepoint.h): this call is finished --
-             * v0 written -- and nothing after it has run yet. Only a call from
-             * the thread's own guest code, never one nested in a callback or
-             * a handler. */
-            if (psp_safepoint_armed && g_call_depth == 1) psp_safepoint(nid);
-            after_call();
-            return;
-        }
-    }
+    const int i = find_entry(nid);
+    if (i >= 0) { call_entry(i, nid); return; }
+
     /* An import from a library neither the firmware nor any started module
      * provides is not linked: modprobe step 15 (fw 6.60) calls one from
      * module_start and gets SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED. A
@@ -442,25 +465,17 @@ static void hle_call(uint32_t nid, const char *lib) {
      * started or once it has stopped. */
     if (lib && !firmware_library(lib)) {
         g_calls_unlinked++;
-        if (logging())
-            fprintf(stderr, "hle: [%05X] 0x%08X <not linked: %s>(0x%08X, 0x%08X, 0x%08X, 0x%08X)\n",
-                    psp_sched_current(), nid, lib,
-                    psp_arg(0), psp_arg(1), psp_arg(2), psp_arg(3));
+        if (logging()) log_call("0x%08X <not linked: %s>", nid, lib);
         if (!g_quiet)
             fprintf(stderr, "psprecomp: 0x%08X of %s is not linked: no module provides the library\n",
                     nid, lib);
         psp_ret(SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED);
-        psp_interrupt_run_pending();
-        psp_census_call_leave();
-        g_call_depth--;
+        leave_unanswered();
         return;
     }
     note_zero(nid, NULL, 0);
     g_calls_unimpl++;
-    if (logging())
-        fprintf(stderr, "hle: [%05X] 0x%08X <unimplemented>(0x%08X, 0x%08X, 0x%08X, 0x%08X)\n",
-                psp_sched_current(), nid,
-                psp_arg(0), psp_arg(1), psp_arg(2), psp_arg(3));
+    if (logging()) log_call("0x%08X <unimplemented>", nid);
 
     /* Unimplemented. Naming the function is the whole point — bringing a game
      * up is largely the process of watching this message stop appearing, and
@@ -473,9 +488,7 @@ static void hle_call(uint32_t nid, const char *lib) {
     if (!g_quiet)
         fprintf(stderr, "psprecomp: unimplemented firmware call 0x%08X\n", nid);
     psp_ret(0);
-    psp_interrupt_run_pending();
-    psp_census_call_leave();
-    g_call_depth--;
+    leave_unanswered();
 }
 
 const char *psp_str(uint32_t addr, char *dst, size_t cap) {
