@@ -9,7 +9,7 @@ built there (compile_game.build_pack); install records are committed only
 after a complete successful build. Staged in usr/share/psprecomp with
 pack.py, compile_game.py and game_fingerprints.py. The PSPRECOMP_*_ROOT
 variables and the LRLIB1 library format are the contract with the launcher
-(src/host/launcher_library.h).
+(src/host/launcher.c).
 """
 import argparse
 import gzip
