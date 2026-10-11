@@ -170,7 +170,6 @@ typedef struct {
      * is where a player's own logic takes over, and this says which calls it
      * is still making when it does. */
     uint64_t post_avail, post_put, post_getavc, post_getatrac, post_avcdec, post_atracdec;
-    int      es_probe;        /* unused; kept so the probe can be re-armed cheaply */
     /* The PES timestamps, kept this time, anchored to where in the video
      * elementary stream their PES began. Only some pictures' PES carry one
      * -- one in ten through this game's intro -- so a picture whose data
@@ -533,24 +532,6 @@ static void hle_RingbufferAvailableSize(void) {
     psp_ret(count-(occupied<count?occupied:count));
 }
 
-/* sceMpegRingbufferPut(rb, numPackets, available)
- *
- * On hardware this invokes the game's own callback to copy packets in, then
- * accounts for them. Nothing consumes them here, so they are accepted and
- * immediately treated as consumed: the buffer never fills, and a feeder loop
- * that waits for space always gets it. Claiming zero were taken would stall
- * that loop forever, which is the failure this is avoiding. */
-/* Run a guest function from inside a firmware call and come back with $v0.
- *
- * The ring buffer is filled by a callback the *game* supplies, so there is no
- * way to get its data without re-entering guest code from here. The register
- * file is saved and restored around it because we are already standing in the
- * middle of somebody else's call: the caller's arguments are still live in
- * a0-a3 and its return address in $ra, and the callee will use all of them.
- *
- * $ra is zeroed rather than left alone so that returning from the callback ends
- * the dispatch instead of running off into whatever the interrupted caller was
- * going to do next. */
 /* PSPRECOMP_MPEG_DECODE=1 turns on the video path: the ring buffer is filled
  * from the game's callback, demuxed, and decoded.
  *
