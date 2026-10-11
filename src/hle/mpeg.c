@@ -246,6 +246,18 @@ static void mpeg_trace(unsigned event,uint32_t a,uint32_t b,uint32_t c,uint32_t 
     }
 }
 
+/* A dump of the movie at one stage, to the file the environment variable
+ * `var` names, opened the first time there is something to write. */
+typedef struct { const char *var; int checked; FILE *file; } mpeg_dump;
+static void dump_write(mpeg_dump *d, const void *p, size_t n) {
+    if (!d->checked) {
+        const char *path = getenv(d->var);
+        d->checked = 1;
+        if (path && *path) d->file = fopen(path, "wb");
+    }
+    if (d->file) { fwrite(p, 1, n, d->file); fflush(d->file); }
+}
+
 /* The audio clock's lead over the picture, in milliseconds, over the run. */
 void psp_mpeg_dump_sync(FILE *out) {
     for (int i = 0; i < MAX_MPEG; i++) {
@@ -1157,16 +1169,10 @@ static int avc_pump(mpeg_ctx *c) {
         unsigned char *planes[3] = { 0, 0, 0 };
         SBufferInfo info;
         memset(&info, 0, sizeof info);
-        {   /* PSPRECOMP_MPEG_ES=<file>: every NAL as it is given the decoder,
-             * start code and all -- an Annex B stream another decoder reads. */
-            static FILE *es_dump; static int es_checked;
-            if (!es_checked) {
-                const char *path = getenv("PSPRECOMP_MPEG_ES");
-                es_checked = 1;
-                if (path && *path) es_dump = fopen(path, "wb");
-            }
-            if (es_dump) { fwrite(c->es + start - 3, 1, nal_end - (start - 3), es_dump); fflush(es_dump); }
-        }
+        /* PSPRECOMP_MPEG_ES=<file>: every NAL as it is given the decoder,
+         * start code and all -- an Annex B stream another decoder reads. */
+        static mpeg_dump es_dump = { .var = "PSPRECOMP_MPEG_ES" };
+        dump_write(&es_dump, c->es + start - 3, nal_end - (start - 3));
         const uint64_t t0 = psp_os_mono_ns();
         (*d)->DecodeFrameNoDelay(d, c->es + start - 3, (int)(nal_end - (start - 3)),
                                  planes, &info);
@@ -1191,15 +1197,9 @@ static int avc_pump(mpeg_ctx *c) {
                         for (int y = 0; y < b->iHeight / 2; y++, d += b->iWidth / 2)
                             memcpy(d, planes[pl] + (size_t)y * b->iStride[1], (size_t)b->iWidth / 2);
                     c->pic_ready = 1;
-                    {   /* PSPRECOMP_MPEG_YUV=<file>: every picture, raw I420, as decoded. */
-                        static FILE *yuv_dump; static int yuv_checked;
-                        if (!yuv_checked) {
-                            const char *path = getenv("PSPRECOMP_MPEG_YUV");
-                            yuv_checked = 1;
-                            if (path && *path) yuv_dump = fopen(path, "wb");
-                        }
-                        if (yuv_dump) { fwrite(c->pic, 1, need, yuv_dump); fflush(yuv_dump); }
-                    }
+                    /* PSPRECOMP_MPEG_YUV=<file>: every picture, raw I420, as decoded. */
+                    static mpeg_dump yuv_dump = { .var = "PSPRECOMP_MPEG_YUV" };
+                    dump_write(&yuv_dump, c->pic, need);
                     /* The picture's own timestamp, from its PES; 25fps from
                      * the frame count only if the stream carried none -- which
                      * this game's intro does not do, and which ran its picture
@@ -1314,15 +1314,9 @@ static void hle_RingbufferPut(void) {
         uint32_t bytes=(uint32_t)copied*stride;
         const uint8_t *payload=psp_mem_ptr(target,bytes);
         if (!payload) { psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }
-        {   /* PSPRECOMP_MPEG_PS=<file>: the program stream as the game supplies it. */
-            static FILE *ps_dump; static int ps_checked;
-            if (!ps_checked) {
-                const char *path=getenv("PSPRECOMP_MPEG_PS");
-                ps_checked=1;
-                if (path && *path) ps_dump=fopen(path,"wb");
-            }
-            if (ps_dump) { fwrite(payload,1,bytes,ps_dump); fflush(ps_dump); }
-        }
+        /* PSPRECOMP_MPEG_PS=<file>: the program stream as the game supplies it. */
+        static mpeg_dump ps_dump = { .var = "PSPRECOMP_MPEG_PS" };
+        dump_write(&ps_dump,payload,bytes);
         ps_demux(context,payload,bytes);
         context->put_total+=bytes;
         context->puts=grow_for_one(context->puts,context->nputs,&context->puts_cap,1024,sizeof *context->puts);
