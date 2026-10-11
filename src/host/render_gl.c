@@ -2616,7 +2616,7 @@ static GLuint texcache_get(const psp_tex_state *t) {
     uint32_t supplied = 0;
     double sx = 1, sy = 1;
     const uint32_t base = t->addr & PSP_ADDR_MASK;
-    const uint64_t end = (uint64_t)base + (uint64_t)t->stride * t->h * (t->fmt == 3 ? 4 : 2);
+    const uint64_t end = (uint64_t)base + level_bytes(t, 0);
     /* In either mode: at native the scale is one and the view is a copy of
      * the target's rows under the texture, which is what a texture over a
      * 272-row target and 240 rows of whatever follows it needs. The one case

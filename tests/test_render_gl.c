@@ -80,6 +80,7 @@ static void begin_list(uint32_t fb, int stride, uint32_t vtype) {
     cmd(0x9C, fb & 0xFFFFFF);                           /* FBP */
     cmd(0x9D, ((fb >> 8) & 0xFF0000) | (uint32_t)stride); /* FBW + address high byte */
     cmd(0xD2, 3);                                       /* 8888 */
+    cmd(0xD4, 0); cmd(0xD5, 479u | 271u << 10);         /* SCISSOR: the screen */
     cmd(0x12, vtype);                                   /* VTYPE */
     cmd(0x01, VERTS & 0xFFFFFF);                        /* VADDR */
 }
@@ -226,6 +227,59 @@ static void test_flat_3d(void) {
     CHECK(n >= 50 && other == 0, "flat 3D line: %d pixel(s) of its second vertex's %06X, %d other", n, GREEN, other);
 }
 
+/* A textured sprite, 1:1, through mode: u16 uv, colour, s16 position. */
+#define VTYPE_2D_TEX (2u | (7u << 2) | (2u << 7) | (1u << 23))
+static void vertex_uv(int i, int x, int y, int u, int v) {
+    const uint32_t a = VERTS + (uint32_t)i * 16;
+    psp_write16(a, (uint16_t)u); psp_write16(a + 2, (uint16_t)v);
+    psp_write32(a + 4, 0xFFFFFFFFu);
+    psp_write16(a + 8, (uint16_t)x); psp_write16(a + 10, (uint16_t)y); psp_write16(a + 12, 0);
+}
+static void texture(uint32_t addr, int stride, int log2w, int log2h, int fmt) {
+    cmd(0x1E, 1);                                       /* TEXTUREMAPENABLE */
+    cmd(0xA0, addr & 0x00FFFFF0u);                      /* TEXADDR0 */
+    cmd(0xA8, ((addr >> 8) & 0x000F0000u) | (uint32_t)stride);
+    cmd(0xB8, (uint32_t)log2w | ((uint32_t)log2h << 8));
+    cmd(0xC3, (uint32_t)fmt);
+    cmd(0xC2, 0);                                       /* not swizzled */
+    cmd(0xC6, 0);                                       /* nearest */
+    cmd(0xC9, 3u | 1u << 8);                            /* REPLACE, RGBA */
+}
+static void sprite_tex(int x, int y, int w, int h) {
+    vertex_uv(0, x, y, 0, 0); vertex_uv(1, x + w, y + h, w, h);
+    cmd(0x04, (PRIM_SPRITES << 16) | 2);
+}
+
+/* A texture's bytes, for finding the render targets under it: its texels
+ * at their own size. A CLUT32 texture taken at two bytes a texel ended
+ * halfway, so a target drawn into its second half was neither read back nor
+ * seen, and the decoder read what guest memory held before the draw. The
+ * target here holds palette index 5 (green) from the GPU; guest memory still
+ * reads index 0 (red). */
+static void test_texture_span(void) {
+    const uint32_t TEX = 0x04100000u, CLUT = 0x08900000u;
+    const uint32_t TARGET = TEX + 48 * 64 * 4;          /* texture row 48 of 64 */
+    psp_write32(CLUT, 0xFF000000u | RED);
+    psp_write32(CLUT + 5 * 4, 0xFF000000u | GREEN);
+    begin_list(TARGET, 64, VTYPE_2D);
+    cmd(0xD4, 0); cmd(0xD5, 63u | 15u << 10);           /* SCISSOR: 64x16 */
+    vertex_2d(0, 0, 0, 0x000005u); vertex_2d(1, 64, 16, 0x000005u);
+    cmd(0x04, (PRIM_SPRITES << 16) | 2);
+    end_list();
+
+    begin_list(FB, 480, VTYPE_2D_TEX);
+    cmd(0xB0, CLUT & 0xFFFFFF); cmd(0xB1, (CLUT >> 8) & 0x0F0000);
+    cmd(0xC5, 3u | 0xFFu << 8);                         /* CLUTFORMAT: 8888, mask FF */
+    cmd(0xC4, 2);                                       /* LOADCLUT: 16 entries */
+    texture(TEX, 64, 6, 6, 7);                          /* CLUT32 */
+    sprite_tex(8, 160, 64, 64);
+    end_list();
+    shoot(FB);
+    CHECK(shot(18, 170) == RED, "CLUT32 texel above the target reads %06X, want %06X", shot(18, 170), RED);
+    CHECK(shot(18, 210) == GREEN, "CLUT32 texel in the target reads %06X, want the GPU's %06X",
+          shot(18, 210), GREEN);
+}
+
 int main(void) {
     if (psp_mem_init()) return 2;
     psp_hle_init(); psp_cpu_reset(); psp_sched_set_threading(0); psp_clock_reset();
@@ -254,6 +308,7 @@ int main(void) {
 
     test_flat_through();
     test_flat_3d();
+    test_texture_span();
 
     free(g_shot);
     counted.shutdown();
