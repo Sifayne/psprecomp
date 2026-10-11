@@ -5047,7 +5047,8 @@ static void hle_ListUpdateStallAddr(void) {
  * 2 DRAWING, 4 PAUSED (geprobe 5 step 57, fw 6.60). A list held at its
  * stall reads 2, not 3 (geprobe 6 steps 79 and 80). BREAK is not
  * modelled. */
-#define GE_SYNC_DONE 0
+enum { GE_LIST_DONE = 0, GE_LIST_QUEUED = 1, GE_LIST_DRAWING = 2, GE_LIST_PAUSED = 4 };
+/* ListSync's and DrawSync's mode: 0 waits, anything else peeks. */
 #define GE_SYNC_WAIT 0
 static ge_queue *oldest_pending(void) {
     ge_queue *best = NULL;
@@ -5059,13 +5060,13 @@ static ge_queue *oldest_pending(void) {
 
 static int list_status(ge_queue *q) {
     if (!q || !q->used) return 0x80000100;
-    if (q->done) return GE_SYNC_DONE;
-    if (q->paused) return 4;                                   /* PAUSED */
-    if (q != oldest_pending()) return 1;                       /* QUEUED */
+    if (q->done) return GE_LIST_DONE;
+    if (q->paused) return GE_LIST_PAUSED;
+    if (q != oldest_pending()) return GE_LIST_QUEUED;
     /* DRAWING, waiting at its stall too: geprobe 6 steps 79 and 80 (fw
      * 6.60) peek 2 on a list stalled at its start and after a SIGNAL, as
      * EnQueue returns and 10 ms later. */
-    return 2;
+    return GE_LIST_DRAWING;
 }
 
 /* The walk's own queue: lists it has not run to their end, oldest first. */
@@ -5772,7 +5773,7 @@ static void hle_ListSync(void) {
     ge_queue *q = find_queue(psp_arg(0));
     if (!q) { psp_ret(0x80000100); return; }
     if (psp_arg(1) == GE_SYNC_WAIT && !g_tl_in) ge_deliver(1);
-    if (q->done) { psp_ret(GE_SYNC_DONE); return; }
+    if (q->done) { psp_ret(GE_LIST_DONE); return; }
     /* NOWAIT tells the truth: 4 while paused, 1 queued behind another list,
      * 2 otherwise -- running, or waiting at its stall: geprobe 5 steps 57
      * and 58 and geprobe 6 steps 79 and 80 (fw 6.60). It used to read DONE
@@ -5789,7 +5790,7 @@ static void hle_ListSync(void) {
      * itself and carries on, so the game is unaffected. */
     psp_sched_yield();
     ge_wait(q->id);
-    psp_ret(q->done ? GE_SYNC_DONE : list_status(q));
+    psp_ret(q->done ? GE_LIST_DONE : list_status(q));
 }
 
 /* A finished list's id stops resolving once DrawSync(WAIT) has returned:
@@ -5806,11 +5807,11 @@ static void hle_DrawSync(void) {
      * step 57, fw 6.60) or waiting at its stall (geprobe 6 steps 79 and
      * 80). */
     if (psp_arg(0) != GE_SYNC_WAIT) {
-        psp_ret(oldest_pending() ? 2u : GE_SYNC_DONE);
+        psp_ret(oldest_pending() ? GE_LIST_DRAWING : GE_LIST_DONE);
         return;
     }
     if (!g_tl_in) ge_deliver(1);          /* a wait sees the handlers it owes run */
-    if (!oldest_pending()) { retire_done(); psp_ret(GE_SYNC_DONE); return; }
+    if (!oldest_pending()) { retire_done(); psp_ret(GE_LIST_DONE); return; }
     psp_sched_yield();
     ge_wait(UINT32_MAX);
     retire_done();
@@ -5818,7 +5819,7 @@ static void hle_DrawSync(void) {
      * division (draw_patch) would block this wait for ever on the PSP; here
      * it returns, so the host cannot freeze, and the list stays pending for
      * sceGeDrawSync's peek and sceGeBreak. Not measured. */
-    psp_ret(GE_SYNC_DONE);
+    psp_ret(GE_LIST_DONE);
 }
 
 /* sceGeBreak: mode 1 drops every list, mode 0 the one at the head. Only
