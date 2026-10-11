@@ -1135,7 +1135,7 @@ static int add_game(launcher *a, char *spec) {
 /* What start found: go on, or end now -- after --help, or on an error. */
 enum { START_OK, START_HELP, START_FAILED = 2 /* the exit status */ };
 
-static int start(launcher *a, int argc, char **argv, int *check_startup, const char **wanted) {
+static int parse_args(launcher *a, int argc, char **argv, int *check_startup, const char **wanted) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help")) { usage(); return START_HELP; }
         if (!strcmp(argv[i], "--check-startup")) { *check_startup = 1; continue; }
@@ -1155,24 +1155,28 @@ static int start(launcher *a, int argc, char **argv, int *check_startup, const c
         else if (!strcmp(flag, "--game")) { if (add_game(a, argv[i])) return START_FAILED; }
         else { fprintf(stderr, "unknown option: %s\n", flag); return START_FAILED; }
     }
-    if (!*a->path && xdg_path("XDG_CONFIG_HOME", ".config", "psprecomp/settings.ini", a->path, sizeof a->path)) {
-        fprintf(stderr, "cannot find the settings folder: XDG_CONFIG_HOME or HOME must be an absolute path\n");
-        return START_FAILED;
-    }
-    packs_load(a);
-    /* A lone --boot and --module: a title of the first pack. */
+    return START_OK;
+}
+
+/* Every game's pack. A lone --boot and --module are a title of the first
+ * pack, and a game no pack names plays under the first, when there is one. */
+static int assign_packs(launcher *a) {
     if (!a->game_count && a->boot && a->module && pack_count) {
         static char spec[8192];
         snprintf(spec, sizeof spec, "%s|%s|%s|%s|%s", packs[0].info->titles && packs[0].info->titles[0] ? packs[0].info->titles[0] : "game",
                  packs[0].info->name, a->boot, a->module, a->iso ? a->iso : "");
-        if (add_game(a, spec)) return START_FAILED;
+        if (add_game(a, spec)) return -1;
     }
     for (int k = 0; k < a->game_count; k++) {
         a->games[k].pack = pack_of(a->games[k].slug);
         if (a->games[k].pack < 0) a->games[k].pack = pack_count ? 0 : -1;
     }
-    a->movie_available = psp_mpeg_decoding_available();
-    a->pack = -1;
+    return 0;
+}
+
+/* The preferences file, or a new one when there is none. One that cannot be
+ * read is never written over (load_failed). */
+static int open_preferences(launcher *a) {
     char error[PSP_SETTINGS_ERROR];
     if (access(a->path, F_OK) == 0 || errno != ENOENT) {
         if (!(a->file = psp_settings_file_read(a->path, error))) {
@@ -1181,22 +1185,40 @@ static int start(launcher *a, int argc, char **argv, int *check_startup, const c
         }
     }
     if (!a->file) a->file = psp_settings_file_new();
-    if (!a->file) { fprintf(stderr, "out of memory\n"); return START_FAILED; }
+    if (!a->file) { fprintf(stderr, "out of memory\n"); return -1; }
+    return 0;
+}
+
+/* Open on the requested title, else the remembered one, else the first. */
+static int open_first_game(launcher *a, const char *wanted) {
+    if (!a->game_count) return START_OK;
+    int at = wanted ? -1 : 0;
+    for (int k = 0; k < a->game_count; k++)
+        if (!strcmp(a->games[k].slug, wanted ? wanted : psp_settings_file_game(a->file))) at = k;
+    if (at < 0) { fprintf(stderr, "--select: no such game: %s\n", wanted); return START_FAILED; }
+    select_game(a, at);
+    return START_OK;
+}
+
+static int start(launcher *a, int argc, char **argv, int *check_startup, const char **wanted) {
+    const int parsed = parse_args(a, argc, argv, check_startup, wanted);
+    if (parsed != START_OK) return parsed;
+    if (!*a->path && xdg_path("XDG_CONFIG_HOME", ".config", "psprecomp/settings.ini", a->path, sizeof a->path)) {
+        fprintf(stderr, "cannot find the settings folder: XDG_CONFIG_HOME or HOME must be an absolute path\n");
+        return START_FAILED;
+    }
+    packs_load(a);
+    if (assign_packs(a)) return START_FAILED;
+    a->movie_available = psp_mpeg_decoding_available();
+    a->pack = -1;
+    if (open_preferences(a)) return START_FAILED;
     /* A first start shows the play defaults, or what the earlier settings
      * bring, unsaved until Save or Save and play: nothing the player changed
      * is at stake. */
     use_pack(a, pack_count ? 0 : -1);
     if (library_load(a, 0)) return START_FAILED;
     qsort(a->games, (size_t)a->game_count, sizeof a->games[0], title_order);
-    if (a->game_count) {
-        /* Open on the requested title, else the remembered one, else the first. */
-        int at = *wanted ? -1 : 0;
-        for (int k = 0; k < a->game_count; k++)
-            if (!strcmp(a->games[k].slug, *wanted ? *wanted : psp_settings_file_game(a->file))) at = k;
-        if (at < 0) { fprintf(stderr, "--select: no such game: %s\n", *wanted); return START_FAILED; }
-        select_game(a, at);
-    }
-    return START_OK;
+    return open_first_game(a, *wanted);
 }
 
 static int open_window(launcher *a) {
