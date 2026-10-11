@@ -1534,11 +1534,17 @@ static int64_t floor_div(int64_t n, int64_t d) {
     return n / d - (n % d < 0);
 }
 
+/* One screen axis of a line's walk: at step k its pixel is
+ * floor((p + d*k) / s). */
+typedef struct { int64_t p, d, s; } line_axis;
+
+static int64_t line_pixel(const line_axis *a, int64_t k) { return floor_div(a->p + a->d * k, a->s); }
+
 /* Intersect the integer sample interval with lo <= floor((p + d*i)/s)
  * <= hi. Clipping the interval first bounds the work even for very long
  * offscreen lines; it must not restart interpolation at the scissor edge. */
-static int line_clip_axis(int64_t p, int64_t d, int64_t s, int lo, int hi,
-                          int64_t *first, int64_t *last) {
+static int line_clip_axis(const line_axis *a, int lo, int hi, int64_t *first, int64_t *last) {
+    const int64_t p = a->p, d = a->d, s = a->s;
     const int64_t low = (int64_t)lo * s, high = ((int64_t)hi + 1) * s - 1;
     if (!d) return p >= low && p <= high;
     const int64_t begin = d > 0 ? -floor_div(p - low, d)
@@ -1577,7 +1583,7 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
      * Major index k = 0..n-1: pixel M0 + sm*k along the major axis, its
      * centre c0 + 16*sm*k; the minor pixel is
      * floor((m_a*|dM| + dm*sm*(centre - M_a)) / (16*|dM|)). Both are
-     * floor((p + d*k) / s), so one clip serves either. */
+     * floor((p + d*k) / s) (a line_axis), so one clip serves either. */
     /* A line as long across as down is y-major: geprobe 15 (fw 6.60) scene
      * 100's 256 lines at exactly 45 degrees, from 64 start offsets in each
      * direction, take their colour from y (2496 pixels a step off as
@@ -1594,6 +1600,8 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
     const int64_t n = sm > 0 ? Mend - M0 : M0 - Mend;
     const int64_t c0 = 16 * M0 + 8;                         /* centre of k = 0 */
     const int64_t pm = ma * adM + dm * sm * (c0 - Ma), dmk = 16 * dm, smd = 16 * adM;
+    const line_axis major = { M0, sm, 1 }, minor = { pm, dmk, smd };
+    const line_axis *on_x = xmajor ? &major : &minor, *on_y = xmajor ? &minor : &major;
     /* The ends go by the pixel's diamond, |x - cx| + |y - cy| < 1/2: the
      * last pixel is left out when the end lies in its diamond, and the pixel
      * before the first is drawn when the start lies in its diamond. On the
@@ -1616,7 +1624,7 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
         const int64_t mb = ma + dm;
         int64_t k = n - 1;
         for (int end = 0; end < 2; end++, k = -1) {
-            const int64_t Mp = M0 + sm * k, mp = floor_div(pm + dmk * k, smd);
+            const int64_t Mp = line_pixel(&major, k), mp = line_pixel(&minor, k);
             const int64_t pM = end ? Ma : Mb, pmin = end ? ma : mb;
             const int64_t dMaj = pM - (16 * Mp + 8), dMin = pmin - (16 * mp + 8);
             const int64_t sum = (dMaj < 0 ? -dMaj : dMaj) + (dMin < 0 ? -dMin : dMin);
@@ -1625,8 +1633,7 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
         }
     }
     if (last < first) return;
-    if (!line_clip_axis(xmajor ? M0 : pm, xmajor ? sm : dmk, xmajor ? 1 : smd, x0, x1, &first, &last) ||
-        !line_clip_axis(xmajor ? pm : M0, xmajor ? dmk : sm, xmajor ? smd : 1, y0, y1, &first, &last))
+    if (!line_clip_axis(on_x, x0, x1, &first, &last) || !line_clip_axis(on_y, y0, y1, &first, &last))
         return;
     /* Colour and depth at the projected centre, on the triangle's gradient
      * rule: the difference times area_rcp's reciprocal of the major length,
@@ -1681,10 +1688,9 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
     for (int64_t k = first; k <= last; k++) {
         const int64_t dist16 = sm * (c0 - Ma) + 16 * k;    /* < 0 at k = -1 only */
         const float t = (float)((double)dist16 / (double)adM), s = 1.0f - t;
-        const int64_t Mp = M0 + sm * k, mp = floor_div(pm + dmk * k, smd);
         psp_vertex v = *a;
-        v.x = (int)(xmajor ? Mp : mp) * PSP_SUBPX + PSP_SUBPX / 2;
-        v.y = (int)(xmajor ? mp : Mp) * PSP_SUBPX + PSP_SUBPX / 2;
+        v.x = (int)line_pixel(on_x, k) * PSP_SUBPX + PSP_SUBPX / 2;
+        v.y = (int)line_pixel(on_y, k) * PSP_SUBPX + PSP_SUBPX / 2;
         v.z = (float)floor_div(za * 16384 + zg * dist16, 16384);
         v.rgba = 0;
         for (int c = 0; c < 4; c++)
