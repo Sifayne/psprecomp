@@ -566,23 +566,62 @@ static void quit_page(void) {
     }
 }
 
+/* Closed, the menu draws only what a key just did, for a moment. */
+static void closed_frame(void) {
+    const int toast_on = o.toast[0] && SDL_GetTicks64() < o.toast_until;
+    if (toast_on) {
+        psp_ui_begin();
+        psp_ui_toast(o.toast);
+        psp_ui_end();
+        o.shown = 1;
+    } else if (o.shown) {
+        psp_ui_clear();
+        o.shown = 0;
+    }
+}
+
+/* The list of pages, turning to the one chosen: 1 when Resume was. */
+static int page_list(void) {
+    const int resume = psp_ui_nav_action("Resume", o.page == PAGE_RESUME);
+    if (psp_ui_nav("Save state", o.page == PAGE_SAVE) && o.page != PAGE_SAVE) { o.page = PAGE_SAVE; read_slots(); }
+    if (psp_ui_nav("Load state", o.page == PAGE_LOAD) && o.page != PAGE_LOAD) { o.page = PAGE_LOAD; read_slots(); }
+    if (psp_ui_nav("Bindings", o.page == PAGE_BINDINGS)) o.page = PAGE_BINDINGS;
+    for (int p = 0; p < o.page_count; p++)
+        if (psp_ui_nav(o.pages[p], o.page == PAGE_SCHEMA + p)) o.page = PAGE_SCHEMA + p;
+    if (psp_ui_nav("Performance", o.page == page_performance())) o.page = page_performance();
+    if (psp_ui_nav("Quit", o.page == page_quit())) o.page = page_quit();
+    return resume;
+}
+
+static void page_body(void) {
+    if (o.page == PAGE_RESUME) {
+        psp_ui_heading("Paused");
+        psp_ui_text("The game waits here. Escape resumes it, and so do Menu, View + Menu and B on the controller.");
+    } else if (o.page == PAGE_SAVE) save_page();
+    else if (o.page == PAGE_LOAD) load_page();
+    else if (o.page == PAGE_BINDINGS) bindings_page();
+    else if (o.page == page_performance()) performance_page();
+    else if (o.page == page_quit()) quit_page();
+    else schema_page(o.pages[o.page - PAGE_SCHEMA]);
+}
+
+/* Press-to-bind waiting for a control: what to press, once all is let go. */
+static void capture_prompt(void) {
+    static const char *const how[] = {
+        "Press a key. Escape cancels, Delete unbinds.",
+        "Press a button, or push a stick or trigger. Escape cancels, Delete unbinds.",
+        "Press a mouse button or turn the wheel. Escape cancels, Delete unbinds.",
+    };
+    char text[256];
+    snprintf(text, sizeof text, "%s%s", o.capture_armed ? "" : "Let go of everything first. ",
+             how[o.capture_device]);
+    psp_ui_prompt(input_row_label(o.capture_row), text);
+}
+
 static void frame(void) {
     if (!o.started) return;
     poll_states();
-    const int toast_on = o.toast[0] && SDL_GetTicks64() < o.toast_until;
-    if (!o.open) {
-        /* Closed, the menu draws only what a key just did, for a moment. */
-        if (toast_on) {
-            psp_ui_begin();
-            psp_ui_toast(o.toast);
-            psp_ui_end();
-            o.shown = 1;
-        } else if (o.shown) {
-            psp_ui_clear();
-            o.shown = 0;
-        }
-        return;
-    }
+    if (!o.open) { closed_frame(); return; }
     o.shown = 1;
     psp_ui_set_pad(input_pad());
     if (o.capturing) {
@@ -595,39 +634,14 @@ static void frame(void) {
     snprintf(title, sizeof title, "%s -- paused", psp_title_info.name ? psp_title_info.name : "Game");
     psp_ui_accent(title);
     psp_ui_side_begin(220, 0);
-    const int resume = psp_ui_nav_action("Resume", o.page == PAGE_RESUME);
-    if (psp_ui_nav("Save state", o.page == PAGE_SAVE) && o.page != PAGE_SAVE) { o.page = PAGE_SAVE; read_slots(); }
-    if (psp_ui_nav("Load state", o.page == PAGE_LOAD) && o.page != PAGE_LOAD) { o.page = PAGE_LOAD; read_slots(); }
-    if (psp_ui_nav("Bindings", o.page == PAGE_BINDINGS)) o.page = PAGE_BINDINGS;
-    for (int p = 0; p < o.page_count; p++)
-        if (psp_ui_nav(o.pages[p], o.page == PAGE_SCHEMA + p)) o.page = PAGE_SCHEMA + p;
-    if (psp_ui_nav("Performance", o.page == page_performance())) o.page = page_performance();
-    if (psp_ui_nav("Quit", o.page == page_quit())) o.page = page_quit();
+    const int resume = page_list();
     psp_ui_side_next();
-    if (o.page == PAGE_RESUME) {
-        psp_ui_heading("Paused");
-        psp_ui_text("The game waits here. Escape resumes it, and so do Menu, View + Menu and B on the controller.");
-    } else if (o.page == PAGE_SAVE) save_page();
-    else if (o.page == PAGE_LOAD) load_page();
-    else if (o.page == PAGE_BINDINGS) bindings_page();
-    else if (o.page == page_performance()) performance_page();
-    else if (o.page == page_quit()) quit_page();
-    else schema_page(o.pages[o.page - PAGE_SCHEMA]);
+    page_body();
     psp_ui_help_area();
     if (o.status[0]) psp_ui_note(o.status);
     psp_ui_side_end();
     psp_ui_panel_end();
-    if (o.capturing) {
-        static const char *const how[] = {
-            "Press a key. Escape cancels, Delete unbinds.",
-            "Press a button, or push a stick or trigger. Escape cancels, Delete unbinds.",
-            "Press a mouse button or turn the wheel. Escape cancels, Delete unbinds.",
-        };
-        char text[256];
-        snprintf(text, sizeof text, "%s%s", o.capture_armed ? "" : "Let go of everything first. ",
-                 how[o.capture_device]);
-        psp_ui_prompt(input_row_label(o.capture_row), text);
-    }
+    if (o.capturing) capture_prompt();
     confirm_prompt();
     psp_ui_end();
     if (resume) close_menu();
