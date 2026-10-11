@@ -206,46 +206,17 @@ static void mutex_lock(int may_block, int has_timeout) {
                                          deadline);
     psp_threadman_wait_mark(0, 0);
 
-    /* Cancelled rather than deleted: the object is still there, so looking it
-     * up says nothing, and only the waker knew. */
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
-        return;
-    }
     /* Handed the mutex: a delete before we ran does not take it back
      * (syncprobe step 219). */
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
+    /* Woken any other way, mutex_release took it on our behalf. */
     m = find_mutex(id);
-    /* A wait ended by the object's deletion still reports how much of the
-     * timeout was left. It is easy to miss because the object is gone and the
-     * early return reads as a clean bail-out, but the caller's timeout word is
-     * the caller's, not the object's: eight tests across fpl and msgpipe print
-     * `timeout = 8ms remaining` where the unwritten word still said 10. */
-    if (!m) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
-
-    if (rc == PSP_SCHED_WOKEN) {
-        /* mutex_release took it on our behalf. */
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_found(rc, m, tmo_ptr, deadline)) return;
 
     psp_waitq_drop(&m->q, me);
-    if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
-        /* Forced out by sceKernelReleaseWaitThread: RELEASE_WAIT, as the
-         * sleep in threadprobe step 70 (fw 6.60) answers. */
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(rc == PSP_SCHED_EXPIRED ? SCE_KERNEL_ERROR_WAIT_TIMEOUT
-                                        : SCE_KERNEL_ERROR_RELEASE_WAIT);
-        return;
-    }
-    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+    /* Stranded: a timeout, with the timeout word left as it was. */
+    if (rc == PSP_SCHED_STRANDED) { psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT); return; }
+    psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
 static void hle_LockMutex(void)    { mutex_lock(1, 1); }
@@ -638,27 +609,19 @@ static void lw_lock(int may_block, int has_timeout, int flatten) {
                                          deadline);
     psp_threadman_wait_mark(0, 0);
 
+    /* Only the hand-over is answered before the lookup: an lwmutex has no
+     * cancel. */
     if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
     m = find_lw(uid);
-    if (!m) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    if (psp_wait_end_found(rc, m, tmo_ptr, deadline)) return;
 
-    if (rc == PSP_SCHED_WOKEN) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
     psp_waitq_drop(&m->q, me);
     psp_write32(wa + LW_WAITING, (uint32_t)psp_waitq_count(&m->q));
-    psp_wait_writeback(tmo_ptr, deadline);
-    /* Forced out by sceKernelReleaseWaitThread: RELEASE_WAIT (threadprobe
-     * step 70, fw 6.60), not a timeout. */
-    psp_ret(rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
-                                     : SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+    psp_wait_give_up(rc, tmo_ptr, deadline);
 #undef LW_FAIL
 }
 

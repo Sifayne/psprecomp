@@ -97,6 +97,36 @@ void     psp_wait_writeback(uint32_t tmo_ptr, uint64_t deadline);
  * type that woke such a waiter with plain psp_sched_wake -- NORMAL -- and
  * worked the answer out by looking the object up again would say DELETE. */
 
+/* ---- how a wait that parked ends -------------------------------------------
+ *
+ * Every object type answers in the same order, from what
+ * psp_sched_block_until returned (`rc`):
+ *
+ *   woken SATISFIED or CANCELLED   OK or WAIT_CANCEL, decided before the
+ *                                  object is looked up again
+ *   the object gone                WAIT_DELETE
+ *   woken any other way            OK: the waker settled it on our behalf
+ *   still queued                   the caller leaves the queue, then gives up
+ *
+ * Each of these writes the timeout back and returns the answer to the guest.
+ * The first two return 1 when they ended the wait. */
+
+/* The answers only the waker knew. Neither depends on whether the object is
+ * still there: what was handed over is not taken back by a delete that
+ * follows, and a cancel leaves the object in place, so finding it would prove
+ * nothing. */
+int  psp_wait_end_woken(int rc, uint32_t tmo_ptr, uint64_t deadline);
+
+/* The answers the object gives, once the caller has looked it up again;
+ * `object` is NULL when it was deleted under the wait. Returns 0 when the
+ * caller is still in its queue. */
+int  psp_wait_end_found(int rc, const void *object, uint32_t tmo_ptr,
+                        uint64_t deadline);
+
+/* A wait that is still queued, after the caller has left the queue: its
+ * deadline passed, or sceKernelReleaseWaitThread forced it out. */
+void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline);
+
 /* The attribute bit that selects most-urgent-first over first-come. */
 #define PSP_WAITQ_PRIORITY 0x100u
 

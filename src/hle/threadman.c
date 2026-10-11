@@ -1716,49 +1716,32 @@ static void hle_WaitSema(void) {
  * inside one (sema_wait_resume). */
 static void sema_wait_end(uint32_t id, uint32_t tmo_ptr, uint64_t deadline, uint32_t me, int rc) {
     wait_mark(0, 0);
-    if (rc == PSP_SCHED_WOKEN) {
-        const int why = psp_sched_wake_reason();
-        if (why == PSP_WAIT_WOKE_SATISFIED || why == PSP_WAIT_WOKE_CANCELLED) {
-            psp_wait_writeback(tmo_ptr, deadline);
-            psp_ret(why == PSP_WAIT_WOKE_SATISFIED ? SCE_KERNEL_ERROR_OK
-                                                   : SCE_KERNEL_ERROR_WAIT_CANCEL);
-            return;
-        }
-    }
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
 
     /* Gone while we were parked, which is what sceKernelDeleteSema releasing
      * its waiters looks like from in here -- and a different answer from asking
-     * about a semaphore that was already gone before the call. */
+     * about a semaphore that was already gone before the call.
+     *
+     * Woken otherwise, the signaller already took the count on our behalf, so
+     * there is nothing to re-test: being woken *is* the semaphore. */
     psp_sema *s = find_sema(id);
-    if (!s) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
-
-    if (rc == PSP_SCHED_WOKEN) {
-        /* The signaller already took the count on our behalf, so there is
-         * nothing to re-test: being woken *is* the semaphore. */
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_found(rc, s, tmo_ptr, deadline)) return;
 
     /* Not released, so we are still queued. Leaving may unblock the thread
      * behind us -- that is the second half of what fifo.expected measures. */
     psp_waitq_drop(&s->q, me);
     const int urgent = sema_release(s);
 
-    if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(rc == PSP_SCHED_EXPIRED ? SCE_KERNEL_ERROR_WAIT_TIMEOUT
-                                        : SCE_KERNEL_ERROR_RELEASE_WAIT);
-        if (urgent) psp_sched_preempt();
-        return;
-    }
-
     /* Stranded: nothing is runnable and no deadline can release us, so nobody
      * could ever signal this. A caller that asked for no timeout is not told
      * one elapsed -- a fabricated timeout is something a game acts on. */
-    wait_deadlock("sceKernelWaitSema");
-    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (rc == PSP_SCHED_STRANDED) {
+        wait_deadlock("sceKernelWaitSema");
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        return;
+    }
+    psp_wait_give_up(rc, tmo_ptr, deadline);
+    if (urgent) psp_sched_preempt();
 }
 
 static void sema_wait_resume(void) {
@@ -2002,35 +1985,18 @@ static void hle_WaitEventFlag(void) {
                                          deadline);
     wait_mark(0, 0);
     /* Released or cancelled: the waker already wrote the pattern. */
-    if (rc == PSP_SCHED_WOKEN) {
-        const int why = psp_sched_wake_reason();
-        if (why == PSP_WAIT_WOKE_SATISFIED || why == PSP_WAIT_WOKE_CANCELLED) {
-            psp_wait_writeback(tmo_ptr, deadline);
-            psp_ret(why == PSP_WAIT_WOKE_SATISFIED ? SCE_KERNEL_ERROR_OK
-                                                   : SCE_KERNEL_ERROR_WAIT_CANCEL);
-            return;
-        }
-    }
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
 
     /* Gone while we were parked, which is what sceKernelDeleteEventFlag
      * releasing its waiters looks like from in here -- and a different answer
-     * from asking about a flag that was already gone before the call. */
+     * from asking about a flag that was already gone before the call.
+     * DeleteEventFlag already wrote the flag's last pattern into our out word
+     * (syncprobe step 70 on fw 6.60: out=0C, not 0).
+     *
+     * Woken otherwise, flag_release already wrote the pattern we woke on and
+     * applied our clear, on our behalf and in the object's order. */
     f = find_flag(id);
-    if (!f) {
-        /* DeleteEventFlag already wrote the flag's last pattern into our out
-         * word (syncprobe step 70 on fw 6.60: out=0C, not 0). */
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE);
-        return;
-    }
-
-    if (rc == PSP_SCHED_WOKEN) {
-        /* flag_release already wrote the pattern we woke on and applied our
-         * clear, on our behalf and in the object's order. */
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_found(rc, f, tmo_ptr, deadline)) return;
 
     psp_waitq_drop(&f->q, me);
     /* A wait that ran out reports the pattern it did not get; a wait that never
@@ -2039,15 +2005,12 @@ static void hle_WaitEventFlag(void) {
      * from the 5ms one next to it. */
     if (out && !no_wait) psp_write32(out, f->pattern);
 
-    if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(rc == PSP_SCHED_EXPIRED ? SCE_KERNEL_ERROR_WAIT_TIMEOUT
-                                        : SCE_KERNEL_ERROR_RELEASE_WAIT);
+    if (rc == PSP_SCHED_STRANDED) {
+        wait_deadlock("sceKernelWaitEventFlag");
+        psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
-
-    wait_deadlock("sceKernelWaitEventFlag");
-    psp_ret(SCE_KERNEL_ERROR_OK);
+    psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
 /* ---- callbacks ----------------------------------------------------------- */

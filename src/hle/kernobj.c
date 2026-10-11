@@ -19,15 +19,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* What a wait that is still queued answers once it stops waiting: forced out
- * by sceKernelReleaseWaitThread it is RELEASE_WAIT (threadprobe step 70, fw
- * 6.60), otherwise its deadline passed. Either way the caller has already left
- * the queue and written the timeout back. */
-static uint32_t wait_end_code(int rc) {
-    return rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
-                                    : SCE_KERNEL_ERROR_WAIT_TIMEOUT;
-}
-
 /* ---- vpl: the variable-size pool ------------------------------------------
  *
  * Three numbers decide every `freeSize` the tests print, and all three are
@@ -384,31 +375,15 @@ static void vpl_allocate(int may_block, int has_timeout) {
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, v->waitdesc,
                                          deadline);
     psp_threadman_wait_mark(0, 0);
-    /* Cancelled rather than deleted: the object is still there, so looking it
-     * up says nothing, and only the waker knew. */
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
-        return;
-    }
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
-        psp_wait_writeback(tmo_ptr, deadline);    /* syncprobe step 222 */
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    /* Handed its block: OK even if the pool is deleted before we run
+     * (syncprobe step 222). */
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
+    /* Woken any other way, vpl_release allocated for us and wrote the
+     * pointer. */
     v = find_vpl(id);
-    if (!v) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
-
-    if (rc == PSP_SCHED_WOKEN) {
-        /* vpl_release allocated for us and wrote the pointer. */
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_found(rc, v, tmo_ptr, deadline)) return;
     psp_waitq_drop(&v->q, me);
-    psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(wait_end_code(rc));
+    psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
 static void hle_AllocateVpl(void)    { vpl_allocate(1, 1); }
@@ -963,45 +938,23 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
                                          sending ? p->senddesc : p->recvdesc,
                                          deadline);
     psp_threadman_wait_mark(0, 0);
-    /* Checked before the pipe is looked up again, because a pipe deleted
-     * between our release and our turn on the CPU does not undo the transfer.
-     * The other side moved the bytes on our behalf, took us out of the queue,
-     * and wrote how many -- it is the only one that knew, since an ASAP waiter
-     * can be released with less than it asked for. */
-    if (rc == PSP_SCHED_WOKEN) {
-        const int why = psp_sched_wake_reason();
-        if (why == PSP_WAIT_WOKE_SATISFIED) {
-            psp_wait_writeback(tmo_ptr, deadline);
-            psp_ret(SCE_KERNEL_ERROR_OK);
-            return;
-        }
-        /* Cancelled rather than deleted. The pipe is still there, so looking it
-         * up would say nothing; only the waker knew. */
-        if (why == PSP_WAIT_WOKE_CANCELLED) {
-            psp_wait_writeback(tmo_ptr, deadline);
-            psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
-            return;
-        }
-    }
-
+    /* A pipe deleted between our release and our turn on the CPU does not
+     * undo the transfer. The other side moved the bytes on our behalf, took
+     * us out of the queue, and wrote how many -- it is the only one that
+     * knew, since an ASAP waiter can be released with less than it asked
+     * for. */
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
     p = find_pipe(id);
-    if (!p) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    if (psp_wait_end_found(rc, p, tmo_ptr, deadline)) return;
     q = sending ? &p->send_q : &p->recv_q;
 
-    if (rc == PSP_SCHED_WOKEN) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
     /* A wait that ran out reports what it did get, which for a full-wait is
      * nothing: `bytes=0`, where an *argument* failure leaves the caller's
      * 0x1337 in place because it never waited. */
     for (int k = 0; k < q->n; k++)
         if (q->w[k].uid == me && out) { psp_write32(out, q->w[k].done); break; }
     psp_waitq_drop(q, me);
-    psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(wait_end_code(rc));
+    psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
 static void hle_SendMsgPipe(void)       { mpp_transfer(1, 1, 1); }
@@ -1326,30 +1279,13 @@ static void mbx_receive(int may_block, int has_timeout) {
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, m->waitdesc,
                                          deadline);
     psp_threadman_wait_mark(0, 0);
-    /* Cancelled rather than deleted: the object is still there, so looking it
-     * up says nothing, and only the waker knew. */
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
-        return;
-    }
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
-        psp_wait_writeback(tmo_ptr, deadline);    /* syncprobe step 221 */
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    /* Handed its message: OK even if the box is deleted before we run
+     * (syncprobe step 221). */
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
     m = find_mbx(id);
-    if (!m) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
-
-    if (rc == PSP_SCHED_WOKEN) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_found(rc, m, tmo_ptr, deadline)) return;
     psp_waitq_drop(&m->q, me);
-    psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(wait_end_code(rc));
+    psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
 static void hle_ReceiveMbx(void) { mbx_receive(1, 1); }
@@ -1615,34 +1551,11 @@ static void fpl_allocate(int may_block, int has_timeout) {
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, f->waitdesc,
                                          deadline);
     psp_threadman_wait_mark(0, 0);
-    /* Both of these are decided before the pool is looked up again, because
-     * neither answer depends on whether it is still there. A block already
-     * handed over is not taken back by the delete that follows, and a cancel
-     * leaves the pool in place so finding it would prove nothing. */
-    if (rc == PSP_SCHED_WOKEN) {
-        const int why = psp_sched_wake_reason();
-        if (why == PSP_WAIT_WOKE_SATISFIED) {
-            psp_wait_writeback(tmo_ptr, deadline);
-            psp_ret(SCE_KERNEL_ERROR_OK);
-            return;
-        }
-        if (why == PSP_WAIT_WOKE_CANCELLED) {
-            psp_wait_writeback(tmo_ptr, deadline);
-            psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
-            return;
-        }
-    }
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
     f = find_fpl(id);
-    if (!f) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
-    if (rc == PSP_SCHED_WOKEN) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_found(rc, f, tmo_ptr, deadline)) return;
     psp_waitq_drop(&f->q, me);
-    psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(wait_end_code(rc));
+    psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
 static void hle_AllocateFpl(void)    { fpl_allocate(1, 1); }

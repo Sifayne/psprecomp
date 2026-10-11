@@ -168,3 +168,34 @@ void psp_wait_writeback(uint32_t tmo_ptr, uint64_t deadline) {
     const uint64_t now = psp_clock_peek();
     psp_write32(tmo_ptr, now < deadline ? (uint32_t)(deadline - now) : 0);
 }
+
+int psp_wait_end_woken(int rc, uint32_t tmo_ptr, uint64_t deadline) {
+    if (rc != PSP_SCHED_WOKEN) return 0;
+    const int why = psp_sched_wake_reason();
+    if (why != PSP_WAIT_WOKE_SATISFIED && why != PSP_WAIT_WOKE_CANCELLED) return 0;
+    psp_wait_writeback(tmo_ptr, deadline);
+    psp_ret(why == PSP_WAIT_WOKE_SATISFIED ? SCE_KERNEL_ERROR_OK
+                                           : SCE_KERNEL_ERROR_WAIT_CANCEL);
+    return 1;
+}
+
+int psp_wait_end_found(int rc, const void *object, uint32_t tmo_ptr,
+                       uint64_t deadline) {
+    if (object && rc != PSP_SCHED_WOKEN) return 0;
+    /* A wait ended by the object's deletion still reports how much of the
+     * timeout was left. It is easy to miss because the object is gone, but the
+     * caller's timeout word is the caller's, not the object's: eight tests
+     * across fpl and msgpipe print `timeout = 8ms remaining` where the
+     * unwritten word still said 10. */
+    psp_wait_writeback(tmo_ptr, deadline);
+    psp_ret(object ? SCE_KERNEL_ERROR_OK : SCE_KERNEL_ERROR_WAIT_DELETE);
+    return 1;
+}
+
+/* Forced out by sceKernelReleaseWaitThread it is RELEASE_WAIT (threadprobe
+ * step 70, fw 6.60), not a timeout. */
+void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline) {
+    psp_wait_writeback(tmo_ptr, deadline);
+    psp_ret(rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
+                                     : SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+}
