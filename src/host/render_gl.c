@@ -1586,12 +1586,10 @@ static void rt_release(rendertarget *r) {
     rt_watch_writes();
 }
 
-/* A target's pixel to 8888 and back. A display format outside 0..3 (the
- * guest's own, through sceDisplaySetFrameBuf) reads as 5551 and writes as
- * 4444. */
+/* A target's pixel to 8888 and back. The format is 0..3: the GE's is two
+ * bits, and sceDisplaySetFrameBuf refuses any other. */
 static uint32_t decode_pixel(uint32_t v, int fmt) {
-    if (fmt == 3) return v;
-    return psp_pixel_unpack16(v, fmt == 0 || fmt == 2 ? fmt : 1);
+    return fmt == 3 ? v : psp_pixel_unpack16(v, fmt);
 }
 static uint32_t pack_pixel(uint32_t rgba, int fmt) {
     return fmt == 3 ? rgba : psp_pixel_pack16(rgba, fmt);

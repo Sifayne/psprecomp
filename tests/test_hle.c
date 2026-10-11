@@ -1577,6 +1577,14 @@ static void test_display(void) {
     CHECK(call(psp_nid("sceDisplaySetFrameBuf"), PSP_VRAM_BASE, 512, 3, 0) == 0,
           "set framebuffer");
     CHECK(psp_display_framebuffer() == PSP_VRAM_BASE, "framebuffer recorded");
+    /* A pixel format past 8888 is refused and the buffer kept: pspautotests'
+     * display/setframebuf reads 0x80000108 for 4 and for -1 on a PSP. */
+    CHECK(call(psp_nid("sceDisplaySetFrameBuf"), PSP_VRAM_BASE + 0x88000, 512, 4, 0) == 0x80000108u &&
+          call(psp_nid("sceDisplaySetFrameBuf"), PSP_VRAM_BASE + 0x88000, 512, 0xFFFFFFFFu, 0) == 0x80000108u,
+          "a pixel format past 8888 is refused");
+    CHECK(psp_display_framebuffer() == PSP_VRAM_BASE && psp_display_format() == 3,
+          "a refused framebuffer leaves the old one: %08X format %u",
+          psp_display_framebuffer(), psp_display_format());
 
     uint64_t v0 = psp_display_vblanks();
     call(psp_nid("sceDisplayWaitVblank"), 0, 0, 0, 0);
