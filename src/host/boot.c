@@ -460,6 +460,28 @@ static void rgb_of_8888(uint32_t p, uint8_t rgb[3]) {
     rgb[2] = (uint8_t)((p >> 16) & 0xFF);
 }
 
+/* A 16-bit pixel's red, green and blue, in display format `fmt`: red in the
+ * low bits, each channel at the top of its byte. Alpha is not shown. */
+static void rgb_of_16(uint16_t p, uint32_t fmt, uint8_t rgb[3]) {
+    switch (fmt) {
+    case 1:                                       /* 5551 */
+        rgb[0] = (uint8_t)((p & 0x1F) << 3);
+        rgb[1] = (uint8_t)(((p >> 5) & 0x1F) << 3);
+        rgb[2] = (uint8_t)(((p >> 10) & 0x1F) << 3);
+        return;
+    case 2:                                       /* 4444 */
+        rgb[0] = (uint8_t)((p & 0xF) << 4);
+        rgb[1] = (uint8_t)(((p >> 4) & 0xF) << 4);
+        rgb[2] = (uint8_t)(((p >> 8) & 0xF) << 4);
+        return;
+    default:                                      /* 5650 */
+        rgb[0] = (uint8_t)((p & 0x1F) << 3);
+        rgb[1] = (uint8_t)(((p >> 5) & 0x3F) << 2);
+        rgb[2] = (uint8_t)(((p >> 11) & 0x1F) << 3);
+        return;
+    }
+}
+
 /* Dump one buffer.
  *
  * Both are written, because picking one has already been misleading. The GE's
@@ -485,14 +507,8 @@ static void dump_one(uint32_t base, const char *path, const char *label) {
             const uint32_t at = base + (uint32_t)(y * (int)stride + x) *
                                 (fmt == 3 ? 4u : 2u);
             uint8_t rgb[3];
-            if (fmt == 3) {                       /* 8888 */
-                rgb_of_8888(psp_read32(at), rgb);
-            } else {                              /* 5650 / 5551 / 4444 */
-                const uint16_t p = (uint16_t)psp_read16(at);
-                rgb[0] = (uint8_t)((p & 0x1F) << 3);
-                rgb[1] = (uint8_t)(((p >> 5) & 0x3F) << 2);
-                rgb[2] = (uint8_t)(((p >> 11) & 0x1F) << 3);
-            }
+            if (fmt == 3) rgb_of_8888(psp_read32(at), rgb);
+            else rgb_of_16((uint16_t)psp_read16(at), fmt, rgb);
             if (rgb[0] || rgb[1] || rgb[2]) nonzero++;
             fwrite(rgb, 1, 3, f);
         }
