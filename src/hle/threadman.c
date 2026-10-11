@@ -1210,18 +1210,6 @@ static void hle_ResumeDispatchThread(void) {
     if (state) psp_sched_tick();
 }
 
-/* A module's entry point is not running on "no thread".
- *
- * On hardware the loader creates a thread to call module_start and that thread
- * has a priority like any other -- 0x20 for a user module. Here module_start
- * is called directly, so psp_sched_current() is zero until the guest creates
- * threads of its own, and answering 0 says "priority zero", which is a real
- * and very high priority rather than an absence.
- *
- * pspautotests threads/mutex/unlock2 opens by checking exactly this and
- * refuses to run at all when it is wrong. */
-#define PSP_MAIN_THREAD_PRIORITY 0x20
-
 /* The next uid, shared so that every kernel object type draws from one space --
  * which is what makes a handle of the wrong type resolve to nothing. */
 uint32_t psp_threadman_next_uid(void) { return g_next_uid++; }
@@ -1232,6 +1220,16 @@ const char *psp_threadman_thread_name(uint32_t uid) {
     return t ? t->name : "";
 }
 
+/* A module's entry point is not running on "no thread".
+ *
+ * On hardware the loader creates a thread to call module_start and that thread
+ * has a priority like any other -- 0x20 for a user module. Here module_start
+ * is called directly, so psp_sched_current() is zero until the guest creates
+ * threads of its own, and answering 0 says "priority zero", which is a real
+ * and very high priority rather than an absence.
+ *
+ * pspautotests threads/mutex/unlock2 opens by checking exactly this and
+ * refuses to run at all when it is wrong. */
 uint32_t psp_threadman_current_priority(void) {
     const psp_thread *c = current_thread();
     return c ? c->priority : PSP_MAIN_THREAD_PRIORITY;

@@ -199,7 +199,7 @@ void psp_sched_reset(void) {
     g_slot[MAIN_SLOT].used     = 1;
     g_slot[MAIN_SLOT].uid      = 0;
     g_slot[MAIN_SLOT].state    = PSP_SCHED_RUNNING;
-    g_slot[MAIN_SLOT].priority = 32;
+    g_slot[MAIN_SLOT].priority = PSP_MAIN_THREAD_PRIORITY;
     g_rq_seq     = 0;
     g_slot_hi    = MAIN_SLOT + 1;
     g_running    = MAIN_SLOT;
