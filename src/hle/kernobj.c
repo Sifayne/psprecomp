@@ -887,7 +887,11 @@ static void mpp_wait(psp_msgpipe *p, const mpp_request *rq, uint32_t tmo_ptr,
         return;
     }
 
-    if (urgent) psp_sched_preempt();
+    /* A thread the pump woke that outranks us runs when we park, not before:
+     * parking hands it the CPU anyway. It can finish our transfer, cancel the
+     * pipe or delete it, and each of those wakes us -- which does nothing to a
+     * thread not yet parked, so preempting first left us to park afterwards
+     * with nobody left to wake us. */
     psp_threadman_wait_mark(PSP_WAITTYPE_MSGPIPE, p->uid);
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                          rq->dir == MPP_SEND ? p->senddesc : p->recvdesc,
@@ -910,6 +914,9 @@ static void mpp_wait(psp_msgpipe *p, const mpp_request *rq, uint32_t tmo_ptr,
     if (left >= 0 && rq->out) psp_write32(rq->out, q->w[left].done);
     psp_waitq_drop(q, me);
     psp_wait_give_up(rc, tmo_ptr, deadline);
+    /* A wait that never parked -- its deadline had already arrived -- has not
+     * yet let that thread run. */
+    if (urgent) psp_sched_preempt();
 }
 
 /* send and receive are the same shape with the direction reversed, so they

@@ -1792,13 +1792,15 @@ static void body_tw_mbx(void)  { tw_rc = call(psp_nid("sceKernelReceiveMbx"), tw
 static void body_tw_neg(void)  { psp_cpu.r[PSP_REG_V0] = (uint32_t)-5; }
 static void body_tw_flag(void) { tw_ran = 1; }
 
-static uint32_t tw_start(uint32_t entry) {
+static uint32_t tw_start_at(uint32_t entry, uint32_t priority) {
     const uint32_t th = call5(psp_nid("sceKernelCreateThread"), guest_name("tw"), entry,
-                              0x20, 0x1000, 0);
+                              priority, 0x1000, 0);
     CHECK((int32_t)th > 0, "create a thread: %08X", th);
     call(psp_nid("sceKernelStartThread"), th, 0, 0, 0);
     return th;
 }
+
+static uint32_t tw_start(uint32_t entry) { return tw_start_at(entry, 0x20); }
 
 static uint32_t tw_waiters(void) {
     psp_write32(TW_INFO, 56);
@@ -1871,6 +1873,73 @@ static void test_waits_with_threads(void) {
     const uint32_t fd = call(psp_nid("sceIoOpen"), guest_name("ms0:/no/such/file.bin"), 1, 0, 0);
     CHECK(tw_ran == 1, "an equal-priority thread did not run inside sceIoOpen");
     CHECK(fd == 0x80010002u, "open of a missing file answered %08X", fd);
+
+    psp_sched_drain(5);
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
+/* A send that cannot finish at once can still wake a more urgent receiver
+ * before it parks: the bytes it offers satisfy one. That receiver then runs,
+ * and whatever it does next to the pipe -- take the rest of the send, cancel
+ * the pipe or delete it -- ends the sender's wait, which has to be parked by
+ * then for the wake to reach it. */
+#define MP_RECV 0x08802400u
+#define MP_SENT 0x08806300u
+#define MP_GOT  0x08806400u
+#define MP_OUT  0x08806500u
+
+enum { MP_TAKE_REST, MP_CANCEL, MP_DELETE };
+static uint32_t mp_pipe, mp_rc[2];
+static int      mp_then;
+
+static void body_mp_recv(void) {
+    const uint32_t RECV = psp_nid("sceKernelReceiveMsgPipe");
+    mp_rc[0] = call7(RECV, mp_pipe, MP_GOT, 4, 0, MP_OUT, 0, 0);
+    if (mp_then == MP_TAKE_REST)
+        mp_rc[1] = call7(RECV, mp_pipe, MP_GOT + 4, 4, 0, MP_OUT + 4, 0, 0);
+    else if (mp_then == MP_CANCEL)
+        mp_rc[1] = call(psp_nid("sceKernelCancelMsgPipe"), mp_pipe, 0, 0, 0);
+    else
+        mp_rc[1] = call(psp_nid("sceKernelDeleteMsgPipe"), mp_pipe, 0, 0, 0);
+}
+
+static void test_msgpipe_wait_ends_as_it_parks(void) {
+    psp_register(MP_RECV, body_mp_recv);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t SEND = psp_nid("sceKernelSendMsgPipe");
+    static const char *const then[] = { "takes the rest", "cancels", "deletes" };
+    static const uint32_t answer[] = { 0, SCE_KERNEL_ERROR_WAIT_CANCEL, SCE_KERNEL_ERROR_WAIT_DELETE };
+    static const uint32_t moved[] = { 8, 4, 4 };
+
+    for (int k = MP_TAKE_REST; k <= MP_DELETE; k++) {
+        mp_then = k;
+        mp_rc[0] = mp_rc[1] = 0xEEEEEEEEu;
+        mp_pipe = call5(psp_nid("sceKernelCreateMsgPipe"), guest_name("mpp"), 2, 0, 0, 0);
+        /* More urgent than us: it runs at once and parks on its first read. */
+        tw_start_at(MP_RECV, 0x10);
+        for (uint32_t i = 0; i < 8; i++) psp_write8(MP_SENT + i, (uint8_t)('a' + i));
+        psp_write32(TW_INFO, 0x1337);
+        psp_write32(TW_TMO, 10000);
+        const uint32_t rc = call7(SEND, mp_pipe, MP_SENT, 8, 0, TW_INFO, TW_TMO, 0);
+        CHECK(rc == answer[k], "a receiver that %s: the send answered %08X, expected %08X",
+              then[k], rc, answer[k]);
+        CHECK(psp_read32(TW_INFO) == moved[k], "a receiver that %s: the send moved %u bytes",
+              then[k], psp_read32(TW_INFO));
+        CHECK(psp_read32(TW_TMO) > 0, "a receiver that %s: the send waited out its timeout",
+              then[k]);
+        CHECK(mp_rc[0] == 0 && mp_rc[1] == 0, "a receiver that %s: it answered %08X, %08X",
+              then[k], mp_rc[0], mp_rc[1]);
+        if (k == MP_TAKE_REST) {
+            char got[9] = { 0 };
+            for (uint32_t i = 0; i < 8; i++) got[i] = (char)psp_read8(MP_GOT + i);
+            CHECK(!strcmp(got, "abcdefgh"), "the receiver read \"%s\"", got);
+        }
+        if (k != MP_DELETE) call(psp_nid("sceKernelDeleteMsgPipe"), mp_pipe, 0, 0, 0);
+    }
 
     psp_sched_drain(5);
     psp_sched_join_all();
@@ -2171,6 +2240,7 @@ int main(void) {
     test_time_calls();
     test_pool_free_pointers();
     test_waits_with_threads();
+    test_msgpipe_wait_ends_as_it_parks();
     test_host_work_boundary();
     test_system_params();
 
