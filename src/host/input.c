@@ -37,6 +37,13 @@
 
 /* ---- the default layouts --------------------------------------------------- */
 
+/* The PSP's buttons, as sceCtrl reports them. */
+enum {
+    BTN_SELECT = 0x0001, BTN_START = 0x0008, BTN_UP = 0x0010, BTN_RIGHT = 0x0020,
+    BTN_DOWN = 0x0040, BTN_LEFT = 0x0080, BTN_L = 0x0100, BTN_R = 0x0200,
+    BTN_TRIANGLE = 0x1000, BTN_CIRCLE = 0x2000, BTN_CROSS = 0x4000, BTN_SQUARE = 0x8000,
+};
+
 /* SDL key -> PSP button. A button is held exactly as long as its key is.
  *
  * The classic layout is the PSP's face laid on the keyboard -- arrows for the
@@ -51,27 +58,27 @@
  * game is the game's key assign, not this table's. Keys are keycodes, found
  * where the keyboard's layout puts them; the stick is by position. */
 static const psp_key_bind KEYS_CLASSIC[] = {
-    { SDLK_RIGHT,      0x000020 }, { SDLK_LEFT,      0x000080 },
-    { SDLK_DOWN,       0x000040 }, { SDLK_UP,        0x000010 },
-    { SDLK_RETURN,     0x000008 }, { SDLK_BACKSPACE, 0x000001 },
-    { SDLK_z,          0x004000 }, { SDLK_x,         0x002000 },
-    { SDLK_a,          0x008000 }, { SDLK_s,         0x001000 },
-    { SDLK_q,          0x000100 }, { SDLK_e,         0x000200 },
+    { SDLK_RIGHT,      BTN_RIGHT }, { SDLK_LEFT,      BTN_LEFT },
+    { SDLK_DOWN,       BTN_DOWN }, { SDLK_UP,        BTN_UP },
+    { SDLK_RETURN,     BTN_START }, { SDLK_BACKSPACE, BTN_SELECT },
+    { SDLK_z,          BTN_CROSS }, { SDLK_x,         BTN_CIRCLE },
+    { SDLK_a,          BTN_SQUARE }, { SDLK_s,         BTN_TRIANGLE },
+    { SDLK_q,          BTN_L }, { SDLK_e,         BTN_R },
 };
 
 static const psp_key_bind KEYS_WASD[] = {
-    { SDLK_RIGHT,      0x000020 }, { SDLK_LEFT,      0x000080 },
-    { SDLK_DOWN,       0x000040 }, { SDLK_UP,        0x000010 },
-    { SDLK_RETURN,     0x000008 }, { SDLK_BACKSPACE, 0x000001 },
-    { SDLK_z,          0x004000 }, { SDLK_SPACE,     0x004000 },
-    { SDLK_x,          0x002000 },
-    { SDLK_c,          0x008000 }, { SDLK_v,         0x001000 },
-    { SDLK_q,          0x000010 }, { SDLK_e,         0x000200 },
+    { SDLK_RIGHT,      BTN_RIGHT }, { SDLK_LEFT,      BTN_LEFT },
+    { SDLK_DOWN,       BTN_DOWN }, { SDLK_UP,        BTN_UP },
+    { SDLK_RETURN,     BTN_START }, { SDLK_BACKSPACE, BTN_SELECT },
+    { SDLK_z,          BTN_CROSS }, { SDLK_SPACE,     BTN_CROSS },
+    { SDLK_x,          BTN_CIRCLE },
+    { SDLK_c,          BTN_SQUARE }, { SDLK_v,         BTN_TRIANGLE },
+    { SDLK_q,          BTN_UP }, { SDLK_e,         BTN_R },
 };
 
 /* Mouse button -> PSP button, WASD only: SDL_BUTTON_LEFT/MIDDLE/RIGHT are
  * 1/2/3. */
-static const uint32_t MOUSE_WASD[4] = { 0, 0x008000, 0x000040, 0x000040 };
+static const uint32_t MOUSE_WASD[4] = { 0, BTN_SQUARE, BTN_DOWN, BTN_DOWN };
 
 /* The controller as a PSP, and the modern layout, which sends the face
  * buttons, bumpers, triggers and stick clicks as carriers (psprecomp/host/
@@ -79,26 +86,26 @@ static const uint32_t MOUSE_WASD[4] = { 0, 0x008000, 0x000040, 0x000040 };
  * in psp_title_info, and the pad speaks the PSP buttons the game already
  * understands. */
 static const psp_pad_bind PAD_CLASSIC[] = {
-    { SDL_CONTROLLER_BUTTON_DPAD_RIGHT,          0x000020 },
-    { SDL_CONTROLLER_BUTTON_DPAD_LEFT,           0x000080 },
-    { SDL_CONTROLLER_BUTTON_DPAD_DOWN,           0x000040 },
-    { SDL_CONTROLLER_BUTTON_DPAD_UP,             0x000010 },
-    { SDL_CONTROLLER_BUTTON_START,               0x000008 },
-    { SDL_CONTROLLER_BUTTON_BACK,                0x000001 },
-    { SDL_CONTROLLER_BUTTON_A,                   0x004000 },
-    { SDL_CONTROLLER_BUTTON_B,                   0x002000 },
-    { SDL_CONTROLLER_BUTTON_X,                   0x008000 },
-    { SDL_CONTROLLER_BUTTON_Y,                   0x001000 },
-    { SDL_CONTROLLER_BUTTON_LEFTSHOULDER,        0x000100 },
-    { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,       0x000200 },
+    { SDL_CONTROLLER_BUTTON_DPAD_RIGHT,          BTN_RIGHT },
+    { SDL_CONTROLLER_BUTTON_DPAD_LEFT,           BTN_LEFT },
+    { SDL_CONTROLLER_BUTTON_DPAD_DOWN,           BTN_DOWN },
+    { SDL_CONTROLLER_BUTTON_DPAD_UP,             BTN_UP },
+    { SDL_CONTROLLER_BUTTON_START,               BTN_START },
+    { SDL_CONTROLLER_BUTTON_BACK,                BTN_SELECT },
+    { SDL_CONTROLLER_BUTTON_A,                   BTN_CROSS },
+    { SDL_CONTROLLER_BUTTON_B,                   BTN_CIRCLE },
+    { SDL_CONTROLLER_BUTTON_X,                   BTN_SQUARE },
+    { SDL_CONTROLLER_BUTTON_Y,                   BTN_TRIANGLE },
+    { SDL_CONTROLLER_BUTTON_LEFTSHOULDER,        BTN_L },
+    { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,       BTN_R },
 };
 static const psp_pad_bind PAD_MODERN[] = {
-    { SDL_CONTROLLER_BUTTON_DPAD_RIGHT,          0x000020 },
-    { SDL_CONTROLLER_BUTTON_DPAD_LEFT,           0x000080 },
-    { SDL_CONTROLLER_BUTTON_DPAD_DOWN,           0x000040 },
-    { SDL_CONTROLLER_BUTTON_DPAD_UP,             0x000010 },
-    { SDL_CONTROLLER_BUTTON_START,               0x000008 },
-    { SDL_CONTROLLER_BUTTON_BACK,                0x000001 },
+    { SDL_CONTROLLER_BUTTON_DPAD_RIGHT,          BTN_RIGHT },
+    { SDL_CONTROLLER_BUTTON_DPAD_LEFT,           BTN_LEFT },
+    { SDL_CONTROLLER_BUTTON_DPAD_DOWN,           BTN_DOWN },
+    { SDL_CONTROLLER_BUTTON_DPAD_UP,             BTN_UP },
+    { SDL_CONTROLLER_BUTTON_START,               BTN_START },
+    { SDL_CONTROLLER_BUTTON_BACK,                BTN_SELECT },
     { SDL_CONTROLLER_BUTTON_A,                   PSP_PAD_A },
     { SDL_CONTROLLER_BUTTON_B,                   PSP_PAD_B },
     { SDL_CONTROLLER_BUTTON_X,                   PSP_PAD_X },
@@ -144,12 +151,12 @@ static int     g_nbinds;
 
 /* The PSP buttons and the host's own targets, by their bind.* names. */
 static const struct { const char *name; uint8_t tgt; uint32_t value; } TARGETS[] = {
-    { "select", TGT_BUTTONS, 0x0001 }, { "start", TGT_BUTTONS, 0x0008 },
-    { "up", TGT_BUTTONS, 0x0010 }, { "right", TGT_BUTTONS, 0x0020 },
-    { "down", TGT_BUTTONS, 0x0040 }, { "left", TGT_BUTTONS, 0x0080 },
-    { "l", TGT_BUTTONS, 0x0100 }, { "r", TGT_BUTTONS, 0x0200 },
-    { "triangle", TGT_BUTTONS, 0x1000 }, { "circle", TGT_BUTTONS, 0x2000 },
-    { "cross", TGT_BUTTONS, 0x4000 }, { "square", TGT_BUTTONS, 0x8000 },
+    { "select", TGT_BUTTONS, BTN_SELECT }, { "start", TGT_BUTTONS, BTN_START },
+    { "up", TGT_BUTTONS, BTN_UP }, { "right", TGT_BUTTONS, BTN_RIGHT },
+    { "down", TGT_BUTTONS, BTN_DOWN }, { "left", TGT_BUTTONS, BTN_LEFT },
+    { "l", TGT_BUTTONS, BTN_L }, { "r", TGT_BUTTONS, BTN_R },
+    { "triangle", TGT_BUTTONS, BTN_TRIANGLE }, { "circle", TGT_BUTTONS, BTN_CIRCLE },
+    { "cross", TGT_BUTTONS, BTN_CROSS }, { "square", TGT_BUTTONS, BTN_SQUARE },
     { "stick_up", TGT_STICK_DIR, DIR_UP }, { "stick_down", TGT_STICK_DIR, DIR_DOWN },
     { "stick_left", TGT_STICK_DIR, DIR_LEFT }, { "stick_right", TGT_STICK_DIR, DIR_RIGHT },
     { "walk", TGT_WALK, 0 }, { "stick", TGT_STICK, 0 }, { "look", TGT_LOOK, 0 },
