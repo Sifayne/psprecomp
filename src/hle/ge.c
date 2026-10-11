@@ -2794,6 +2794,16 @@ static struct {
     } light[4];
 } g_ls;
 
+/* H, the half vector of a light's L and the eye's direction, normalised. */
+static void half_vector(const double L[3], double H[3]) {
+    double Hv[3];
+    for (int k = 0; k < 3; k++) {
+        const ge_term h[2] = { ge_mul(L[k], 1.0), ge_mul(g_ls.E[k], 1.0) };
+        Hv[k] = ge_sum(h, 2);
+    }
+    gl_unit(Hv, H);
+}
+
 static void light_setup(void) {
     for (int k = 0; k < 3; k++) {
         g_ls.emissive[k]   = lit_colour_byte(g_tl.mat_emissive[k]);
@@ -2817,13 +2827,9 @@ static void light_setup(void) {
         }
         if (g_tl.light[i].type == 0) {
             const double Lv[3] = { g_tl.light[i].pos[0], g_tl.light[i].pos[1], g_tl.light[i].pos[2] };
-            double L[3], Hv[3], H[3];
+            double L[3], H[3];
             gl_unit(Lv, L);
-            for (int k = 0; k < 3; k++) {
-                const ge_term h[2] = { ge_mul(L[k], 1.0), ge_mul(g_ls.E[k], 1.0) };
-                Hv[k] = ge_sum(h, 2);
-            }
-            gl_unit(Hv, H);
+            half_vector(L, H);
             for (int k = 0; k < 3; k++) {
                 g_ls.light[i].L[k] = ge_sp_of(L[k]);
                 g_ls.light[i].H[k] = ge_sp_of(H[k]);
@@ -2860,24 +2866,13 @@ static double gl_dot_pre(int ok, double rs, const ge_sp a[3], const ge_sp u[3]) 
 /* x^k for the lighting, k already cut to 5 significant bits (ge_cut(k, 5, 0)). */
 static float gl_pow_k(double x, float k) { return x > 0.0 ? ge_pow((float)x, k) : 0.0f; }
 
-static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba, psp_vertex *lit) {
-    const int vc[3] = { (int)(*rgba & 0xFFu), (int)((*rgba >> 8) & 0xFFu), (int)((*rgba >> 16) & 0xFFu) };
-    /* MATERIAL_COLOR picks which material components the vertex colour
-     * supplies: bit 0 ambient, bit 1 diffuse, bit 2 specular. */
-    int m_amb[3], m_dif[3], m_spc[3];
-    for (int k = 0; k < 3; k++) {
-        m_amb[k] = (g_tl.mat_update & 1) ? vc[k] : g_ls.mat_amb[k];
-        m_dif[k] = (g_tl.mat_update & 2) ? vc[k] : g_ls.mat_dif[k];
-        m_spc[k] = (g_tl.mat_update & 4) ? vc[k] : g_ls.mat_spc[k];
-    }
+/* A vertex's material colours as bytes, after MATERIAL_COLOR. */
+typedef struct { int amb[3], dif[3], spc[3]; } lit_material;
 
-    int out[3], sec[3] = { 0, 0, 0 };
-    for (int k = 0; k < 3; k++)
-        out[k] = g_ls.emissive[k] + lit_mul(g_ls.global_amb[k], m_amb[k]);
-
-    /* With every light disabled the colour is emissive plus ambient and the
-     * normal never enters: skip the loop. Same result. */
-    if (any_light_enabled()) {
+/* Every enabled light's terms for one vertex (model-space position and
+ * normal), added into out, the primary colour, and sec, the secondary. */
+static void accumulate_lights(const float model[3], const float nm[3], const lit_material *m,
+                              int out[3], int sec[3]) {
     const ge_sp *W = g_ls.W;                     /* row i, column j at W[3j + i] */
     const ge_sp N[3] = { ge_sp_of(nm[0]), ge_sp_of(nm[1]), ge_sp_of(nm[2]) };
     const ge_sp M[3] = { ge_sp_of(model[0]), ge_sp_of(model[1]), ge_sp_of(model[2]) };
@@ -2931,12 +2926,8 @@ static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba
             ge_sp Hs[3];
             const ge_sp *H = g_ls.light[i].H;
             if (g_tl.light[i].type != 0) {
-                double Hv[3], Hb[3];
-                for (int k = 0; k < 3; k++) {
-                    const ge_term h[2] = { ge_mul(L[k], 1.0), ge_mul(g_ls.E[k], 1.0) };
-                    Hv[k] = ge_sum(h, 2);
-                }
-                gl_unit(Hv, Hb);
+                double Hb[3];
+                half_vector(L, Hb);
                 for (int k = 0; k < 3; k++) Hs[k] = ge_sp_of(Hb[k]);
                 H = Hs;
             }
@@ -2946,15 +2937,34 @@ static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba
         const int vd = lit_byte(dfac), vs = lit_byte(sfac);
         const int va = att >= 1.0f ? 255 : lit_byte(att), vsp = spot >= 1.0f ? 255 : lit_byte(spot);
         for (int k = 0; k < 3; k++) {
-            const int t = lit_mul(g_ls.light[i].amb[k], m_amb[k])
-                        + lit_mul(vd, lit_mul(g_ls.light[i].dif[k], m_dif[k]));
-            const int ts = lit_mul(vs, lit_mul(g_ls.light[i].spec[k], m_spc[k]));
+            const int t = lit_mul(g_ls.light[i].amb[k], m->amb[k])
+                        + lit_mul(vd, lit_mul(g_ls.light[i].dif[k], m->dif[k]));
+            const int ts = lit_mul(vs, lit_mul(g_ls.light[i].spec[k], m->spc[k]));
             out[k] += lit_mul(vsp, lit_mul(va, t));
             sec[k] += lit_mul(vsp, lit_mul(va, ts));
         }
     }
+}
 
+static void light_vertex(const float model[3], const float nm[3], uint32_t *rgba, psp_vertex *lit) {
+    const int vc[3] = { (int)(*rgba & 0xFFu), (int)((*rgba >> 8) & 0xFFu), (int)((*rgba >> 16) & 0xFFu) };
+    /* MATERIAL_COLOR picks which material components the vertex colour
+     * supplies: bit 0 ambient, bit 1 diffuse, bit 2 specular. */
+    lit_material m;
+    for (int k = 0; k < 3; k++) {
+        m.amb[k] = (g_tl.mat_update & 1) ? vc[k] : g_ls.mat_amb[k];
+        m.dif[k] = (g_tl.mat_update & 2) ? vc[k] : g_ls.mat_dif[k];
+        m.spc[k] = (g_tl.mat_update & 4) ? vc[k] : g_ls.mat_spc[k];
     }
+
+    int out[3], sec[3] = { 0, 0, 0 };
+    for (int k = 0; k < 3; k++)
+        out[k] = g_ls.emissive[k] + lit_mul(g_ls.global_amb[k], m.amb[k]);
+
+    /* With every light disabled the colour is emissive plus ambient and the
+     * normal never enters: skip the loop. Same result. */
+    if (any_light_enabled()) accumulate_lights(model, nm, &m, out, sec);
+
     /* The alpha comes from the material, or from the vertex when the vertex
      * is supplying the ambient. */
     uint32_t c = (g_tl.mat_update & 1) ? (*rgba & 0xFF000000u)
