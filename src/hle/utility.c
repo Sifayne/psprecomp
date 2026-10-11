@@ -87,6 +87,9 @@ static int savedata_log_on(void) {
 #define SD_FILELIST 1528u
 #define SD_SIZEINFO 1532u
 
+/* Where the saves live, one directory each (see the M4 section below). */
+#define SD_ROOT "ms0:/PSP/SAVEDATA"
+
 static uint32_t sd_optional(uint32_t p, uint32_t off) {
     return psp_read32(p) >= off+4 ? psp_read32(p+off) : 0;
 }
@@ -214,7 +217,7 @@ static void sd_getstr(uint32_t param, uint32_t off, uint32_t max, char *dst, siz
 
 /* ms0:/PSP/SAVEDATA/<game><save> for a candidate save name. */
 static void sd_dir(const char *game, const char *save, char *out, size_t cap) {
-    snprintf(out, cap, "ms0:/PSP/SAVEDATA/%s%s", game, save);
+    snprintf(out, cap, SD_ROOT "/%s%s", game, save);
 }
 
 static int sd_exists(const char *guest) {
@@ -745,10 +748,10 @@ static uint32_t sd_fill_sizes(uint32_t param) {
          * must not create the tree it measures. Missing tree reads as an
          * empty card on top of the fallback constants. */
         char host[1024];
-        psp_io_host_path("ms0:/PSP/SAVEDATA", host, sizeof host);
+        psp_io_host_path(SD_ROOT, host, sizeof host);
         struct statvfs sv;
         uint64_t sz = 0; int is_dir = 0;
-        if (psp_io_path_info("ms0:/PSP/SAVEDATA", &sz, &is_dir) == 0 && is_dir &&
+        if (psp_io_path_info(SD_ROOT, &sz, &is_dir) == 0 && is_dir &&
             statvfs(host, &sv) == 0)
             freebytes = (uint64_t)sv.f_bavail * (uint64_t)sv.f_frsize;
     }
@@ -916,7 +919,7 @@ static int sd_match(const char *pat, const char *s) {
 static uint32_t sd_do_list(uint32_t param, const char *game, const char *pattern) {
     uint32_t il = sd_optional(param, SD_IDLIST);
     char names[256][64];
-    int n = psp_io_list_names("ms0:/PSP/SAVEDATA", names, 256);
+    int n = psp_io_list_names(SD_ROOT, names, 256);
     if (n < 0 || !il) return SD_OK;
     qsort(names, (size_t)n, sizeof names[0], sd_cmp_str);
     size_t glen = strlen(game);
@@ -1132,7 +1135,7 @@ static uint32_t sd_do_mode(uint32_t param) {
          * secure file joins the list after the first and leaves the first
          * file as it was: TWO's list reads DATA.BIN DATA2.BIN, DATA.BIN
          * keeps its CRC, and both read back (steps 85-89). */
-        sd_write_sfo(dir, dir + strlen("ms0:/PSP/SAVEDATA/"), param);
+        sd_write_sfo(dir, dir + strlen(SD_ROOT "/"), param);
         return sd_io_error ? SD_ERASE_ACCESS : SD_OK;
 
     case SD_SIZES: return sd_fill_sizes(param);
@@ -1276,7 +1279,7 @@ static int sd_metadata(const char *dir, psp_savedata_slot *slot) {
 }
 static void sd_candidate_dir(int index, char *dir, size_t cap) {
     if (sd_view.mode==SD_LISTALLDEL)
-        snprintf(dir,cap,"ms0:/PSP/SAVEDATA/%s",sd_view.slots[index].name);
+        snprintf(dir,cap,SD_ROOT "/%s",sd_view.slots[index].name);
     else sd_dir(sd_view.game,sd_view.slots[index].name,dir,cap);
 }
 static int sd_add_candidate(const char *name) {
@@ -1313,7 +1316,7 @@ static int sd_add_candidate(const char *name) {
     return 0;
 }
 static int sd_expand_candidates(void) {
-    char names[1024][64]; int n=psp_io_list_names("ms0:/PSP/SAVEDATA",names,1024);
+    char names[1024][64]; int n=psp_io_list_names(SD_ROOT,names,1024);
     if (n<0) return 0;
     if (n==1024) fprintf(stderr,"savedata: more than 1023 entries under PSP/SAVEDATA; listing the first 1024\n");
     qsort(names,(size_t)n,sizeof names[0],sd_cmp_str);
@@ -1321,7 +1324,7 @@ static int sd_expand_candidates(void) {
     for (int i=0;i<n;i++) {
         if (names[i][0]=='.') continue;
         if (sd_view.mode!=SD_LISTALLDEL && strncmp(names[i],sd_view.game,prefix)) continue;
-        char dir[512]; snprintf(dir,sizeof dir,"ms0:/PSP/SAVEDATA/%s",names[i]);
+        char dir[512]; snprintf(dir,sizeof dir,SD_ROOT "/%s",names[i]);
         if (sd_plain_path(dir,1)!=1) continue;
         /* A foreign or unrepresentable directory is not one of this game's
          * slots: skip it rather than refusing the whole list. */

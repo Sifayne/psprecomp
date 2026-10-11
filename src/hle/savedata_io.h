@@ -59,7 +59,7 @@ static int sd_rename(const char *a, const char *b) {
 /* A process-wide card lock also prevents recovery from touching another
  * running game's staging directories. Nonblocking: report I/O failure. */
 static int sd_card_lock(void) {
-    psp_io_mkdir_all("ms0:/PSP/SAVEDATA");
+    psp_io_mkdir_all(SD_ROOT);
 #ifndef _WIN32
     char path[1024]; psp_io_host_path("ms0:/PSP/.savedata-lock", path, sizeof path);
     int fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
@@ -87,7 +87,7 @@ static void sd_sync_dir(const char *guest) {
     (void)guest;
 #endif
 }
-static void sd_sync_card(void) { sd_sync_dir("ms0:/PSP/SAVEDATA"); }
+static void sd_sync_card(void) { sd_sync_dir(SD_ROOT); }
 static int sd_copy_tree(const char *src, const char *dst, int depth) {
     if (depth > 8 || sd_plain_path(src, 1) != 1) return -1;
     psp_io_mkdir_all(dst);
@@ -127,8 +127,8 @@ static int sd_copy_tree(const char *src, const char *dst, int depth) {
 }
 static void sd_tx_paths(const char *dir, char *pending, char *backup) {
     const char *name=strrchr(dir,'/'); name=name ? name+1 : dir;
-    snprintf(pending,512,"ms0:/PSP/SAVEDATA/.pending-%s",name);
-    snprintf(backup,512,"ms0:/PSP/SAVEDATA/.backup-%s",name);
+    snprintf(pending,512,SD_ROOT "/.pending-%s",name);
+    snprintf(backup,512,SD_ROOT "/.backup-%s",name);
 }
 /* Caller holds the card lock. Recognize only our bounded save components. */
 static int sd_recover_one(const char *dir) {
@@ -145,11 +145,11 @@ static int sd_recover_one(const char *dir) {
 static int sd_recover_card(void) {
     /* Nothing to recover on a card without the tree, and nothing to create:
      * a read-only load must not build the directory it reads. */
-    int tree=sd_plain_path("ms0:/PSP/SAVEDATA",1);
+    int tree=sd_plain_path(SD_ROOT,1);
     if (tree<0) return -1;
     if (!tree) return 0;
     int lock=sd_card_lock(); if (lock<0) return -1;
-    char names[1024][64]; int n=psp_io_list_names("ms0:/PSP/SAVEDATA",names,1024), bad=0;
+    char names[1024][64]; int n=psp_io_list_names(SD_ROOT,names,1024), bad=0;
     sd_io_error=0;
     if (n<0) bad=1;
     if (n==1024) fprintf(stderr,"savedata: recovery scanned only the first 1024 entries under PSP/SAVEDATA\n");
@@ -157,7 +157,7 @@ static int sd_recover_card(void) {
         if (strncmp(names[i],".backup-",8) && strncmp(names[i],".pending-",9)) continue;
         const char *name=names[i]+(names[i][1]=='b'?8:9);
         if (!sd_component(name,0) || strlen(name)>33) continue;
-        char dir[512]; snprintf(dir,sizeof dir,"ms0:/PSP/SAVEDATA/%s",name);
+        char dir[512]; snprintf(dir,sizeof dir,SD_ROOT "/%s",name);
         if (sd_recover_one(dir)) bad=1;
     }
     sd_sync_card(); sd_card_unlock(lock); return bad || sd_io_error ? -1 : 0;
