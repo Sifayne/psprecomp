@@ -66,6 +66,7 @@ typedef struct { uint32_t pts_hi,pts_lo,dts_hi,dts_lo,es,size; } mpeg_au_wire;
 
 #define MAX_MPEG    4
 #define MAX_ES_BUF  MPEG_ES_SLOTS
+#define MAX_AU      64
 
 typedef struct {
     int      used;
@@ -76,7 +77,7 @@ typedef struct {
     int      es_used[MAX_ES_BUF];
     /* Host-side associations: InitAu does not publish its input buffer at +16.
      * Preserve it here for host ATRAC copying. Capacity is a host limit. */
-    struct { uint32_t address, buffer; } access_units[64];
+    struct { uint32_t address, buffer; } access_units[MAX_AU];
 
     /* The demuxed AVC elementary stream, accumulated across ring buffer puts.
      * The game hands us an MPEG program stream a few packets at a time; the
@@ -201,6 +202,15 @@ static mpeg_ctx g_mpeg[MAX_MPEG];
 
 /* Opt-in measurements of our host adapter, without changing guest behavior.
  * Event fields are documented in scripts/analyze-mpeg-trace.py. */
+enum {
+    MPEG_TRACE_INIT_AU     = 10,   /* sceMpegInitAu */
+    MPEG_TRACE_PUT         = 20,   /* sceMpegRingbufferPut */
+    MPEG_TRACE_ATRAC_AU    = 31,   /* sceMpegGetAtracAu, a frame fetched */
+    MPEG_TRACE_ATRAC_EMPTY = 32,   /* and none there, at most once a second */
+    MPEG_TRACE_ATRAC_IN    = 40,   /* sceMpegAtracDecode, its access unit */
+    MPEG_TRACE_ATRAC_OUT   = 41,   /* and what it decoded */
+    MPEG_TRACE_MEMORY      = 60,   /* 60-63: PSPRECOMP_MPEG_TRACE_MEMORY's 64 bytes */
+};
 static FILE *mpeg_trace_file(void) {
     static int checked;
     static FILE *file;
@@ -226,11 +236,11 @@ static void mpeg_trace(unsigned event,uint32_t a,uint32_t b,uint32_t c,uint32_t 
     fprintf(file,"%llu,%llu,%u,%u,%u,%u,%u\n",
                       (unsigned long long)((psp_os_mono_ns()-origin)/1000),
                       (unsigned long long)psp_clock_peek(),event,a,b,c,d);
-    if (memory && event==31 && psp_mem_ptr(memory,64)) {
+    if (memory && event==MPEG_TRACE_ATRAC_AU && psp_mem_ptr(memory,64)) {
         for (unsigned offset=0;offset<64;offset+=16)
             fprintf(file,"%llu,%llu,%u,%u,%u,%u,%u\n",
                     (unsigned long long)((psp_os_mono_ns()-origin)/1000),
-                    (unsigned long long)psp_clock_peek(),60+offset/16,
+                    (unsigned long long)psp_clock_peek(),MPEG_TRACE_MEMORY+offset/16,
                     psp_read32(memory+offset),psp_read32(memory+offset+4),
                     psp_read32(memory+offset+8),psp_read32(memory+offset+12));
     }
@@ -307,7 +317,7 @@ static mpeg_ctx *ctx_of(uint32_t address) {
     return NULL;
 }
 static uint32_t au_buffer(mpeg_ctx *context,uint32_t address) {
-    if (context) for (unsigned i=0;i<64;i++)
+    if (context) for (unsigned i=0;i<MAX_AU;i++)
         if (context->access_units[i].address==address) return context->access_units[i].buffer;
     /* Filled AUs may be copied by the guest before decode. Their SDK iEsBuffer
      * field carries the host decoder's supplied payload address. */
@@ -1296,7 +1306,7 @@ static void hle_RingbufferPut(void) {
     uint32_t callback=psp_read32(ring+RB_CALLBACK);
     const uint32_t args[3]={target,count,psp_read32(ring+RB_CALLBACK_ARG)};
     int32_t copied=callback?(int32_t)psp_call_guest(callback,args,3):0;
-    mpeg_trace(20,ring,count,(uint32_t)copied,context->aes_len-context->aes_pos);
+    mpeg_trace(MPEG_TRACE_PUT,ring,count,(uint32_t)copied,context->aes_len-context->aes_pos);
     if (copied<0) { psp_ret((uint32_t)copied); return; }
     if ((uint32_t)copied>count) { psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }
     context->es_eof=(uint32_t)copied<count;
@@ -1447,12 +1457,12 @@ static void hle_InitAu(void) {
     if (!context || !address || !psp_mem_ptr(address,sizeof(mpeg_au_wire))) {
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return;
     }
-    unsigned slot=64;
-    for (unsigned i=0;i<64;i++) {
+    unsigned slot=MAX_AU;
+    for (unsigned i=0;i<MAX_AU;i++) {
         if (context->access_units[i].address==address) { slot=i;break; }
-        if (!context->access_units[i].address && slot==64) slot=i;
+        if (!context->access_units[i].address && slot==MAX_AU) slot=i;
     }
-    if (slot==64) { psp_ret(SCE_MPEG_ERROR_NO_MEMORY);return; }
+    if (slot==MAX_AU) { psp_ret(SCE_MPEG_ERROR_NO_MEMORY);return; }
     context->access_units[slot].address=address;
     context->access_units[slot].buffer=buffer;
     int video=buffer>=1 && buffer<=MAX_ES_BUF && context->es_used[buffer-1];
@@ -1460,7 +1470,7 @@ static void hle_InitAu(void) {
      * zero size, and the timestamps left as they were. */
     psp_write32(address+AU_ES_BUFFER,buffer);
     psp_write32(address+AU_ES_SIZE,0);
-    mpeg_trace(10,address,buffer,video,0);
+    mpeg_trace(MPEG_TRACE_INIT_AU,address,buffer,video,0);
     psp_ret(0);
 }
 
@@ -1657,7 +1667,7 @@ static void hle_GetAtracAu(void) {
         static uint64_t last_empty;
         uint64_t now=psp_os_mono_ns();
         if (now-last_empty>=1000000000ull) {
-            mpeg_trace(32,au,c->aes_len,c->aes_pos,c->es_eof);last_empty=now;
+            mpeg_trace(MPEG_TRACE_ATRAC_EMPTY,au,c->aes_len,c->aes_pos,c->es_eof);last_empty=now;
         }
         if (c->es_eof) { c->aes_drained = 1; psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }
         psp_ret(SCE_MPEG_ERROR_NO_DATA);
@@ -1682,7 +1692,7 @@ static void hle_GetAtracAu(void) {
         c->a_last_ns = now; c->a_last_pts = c->atrac_pts; c->a_fetched++;
     }
     c->atrac_pts += MPEG_ATRAC_PTS_STEP;
-    mpeg_trace(31,au,au_buffer(c,au),(uint32_t)total,c->atrac_pts-MPEG_ATRAC_PTS_STEP);
+    mpeg_trace(MPEG_TRACE_ATRAC_AU,au,au_buffer(c,au),(uint32_t)total,c->atrac_pts-MPEG_ATRAC_PTS_STEP);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 /* sceMpegAvcDecode(mpeg, au, frameWidth, bufferAddr, initAddr)
@@ -1794,7 +1804,7 @@ static void hle_AtracDecode(void) {
     int16_t pcm[2048 * 2];
     int n = -1;
     if (mpeg_trace_file() && psp_mem_ptr(au,AU_ES_SIZE+4))
-        mpeg_trace(40,au,au_buffer(c,au),psp_read32(au+AU_ES_BUFFER),psp_read32(au+AU_ES_SIZE));
+        mpeg_trace(MPEG_TRACE_ATRAC_IN,au,au_buffer(c,au),psp_read32(au+AU_ES_BUFFER),psp_read32(au+AU_ES_SIZE));
     if (au) {
         const uint32_t esbuf = au_buffer(c,au);
         const uint32_t essz  = psp_read32(au + AU_ES_SIZE);
@@ -1832,7 +1842,7 @@ static void hle_AtracDecode(void) {
     if (mpeg_trace_file() && psp_mem_ptr(au,AU_PTS+8)) {
         unsigned audible=0;
         for (int i=0;i<n*2;i++) if (pcm[i]) audible++;
-        mpeg_trace(41,au,(uint32_t)decoded,audible,psp_read32(au+AU_PTS+4));
+        mpeg_trace(MPEG_TRACE_ATRAC_OUT,au,(uint32_t)decoded,audible,psp_read32(au+AU_PTS+4));
     }
     if (dst) {
         const uint32_t bytes = (uint32_t)n * 4u;
