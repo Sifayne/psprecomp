@@ -1942,8 +1942,10 @@ static void let_go(void) {
  * the GE when it moves: WipEout Pulse draws its first lists on the thread
  * that boots it and every later one on a render thread of its own. The
  * thread holding it is parked, waiting for its turn, while another runs, so
- * it is asked to let go there (psp_sched_run_on); one whose guest thread has
- * ended let go as it went. */
+ * it is asked to let go there (psp_sched_run_on). One whose guest thread has
+ * ended lets go on its way out (the host exit hook), after it has handed the
+ * CPU on, and psp_sched_run_on waits for that: a context still current on
+ * one thread cannot be made current on another. */
 /* The context, already set up, moved to this host thread (claim). */
 static int reclaim_context(unsigned long me) {
     if (g.thread == me) return 0;

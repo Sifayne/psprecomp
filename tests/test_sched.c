@@ -774,7 +774,75 @@ static void test_host_thread_stop_returns(void) {
     CHECK(!holder_after_delay, "the stopped guest thread carried on past its delay");
 }
 
+/* A thread that ends hands the CPU on first and lets go of what is its host
+ * thread's alone (the host exit hook) after, so the thread that gets the CPU
+ * can ask for that inside the gap. WipEout Pulse's render thread ended holding
+ * the GL context, and under CPU load the next thread to draw asked for it
+ * there: run_on, finding the ended thread parked nowhere, ran the release on
+ * the caller's own thread, which had nothing to release, and the draw was
+ * refused. The hook here sleeps, so the asker always lands in the gap; run_on
+ * has to wait for the hook. One case per way a thread ends. */
+#define ENTRY_CTX_HOLDER 0x0000F400u
+#define ENTRY_CTX_ASKER  0x0000F500u
+#define UID_CTX_HOLDER   0x0004000Du
+#define UID_CTX_ASKER    0x0004000Eu
+enum { END_RETURN, END_EXIT, END_TERMINATED, END_TERMINATES_ITSELF };
+static int ctx_end;
+static volatile int ctx_holder, ctx_freed, ctx_asked;
+static PSP_THREAD_LOCAL int t_ctx_tag;
+/* Only the holder's own host thread can release it, as with a GL context. */
+static void ctx_let_go(void) { if (t_ctx_tag && ctx_holder == t_ctx_tag) ctx_holder = 0; }
+static void ctx_exit_hook(void) {
+    if (!t_ctx_tag || ctx_holder != t_ctx_tag) return;
+    psp_os_sleep_until_ns(psp_os_mono_ns() + 100000000u);
+    ctx_let_go();
+}
+static void body_ctx_holder(void) {
+    t_ctx_tag = 7;
+    ctx_holder = t_ctx_tag;
+    if (ctx_end == END_EXIT) psp_sched_exit(psp_sched_current());
+    if (ctx_end == END_TERMINATED) psp_sched_block(psp_sched_current(), PSP_SCHED_BLOCKED, "test-ctx");
+    if (ctx_end == END_TERMINATES_ITSELF) psp_sched_terminate(psp_sched_current());
+}
+static void body_ctx_asker(void) {
+    if (ctx_end == END_TERMINATED) {
+        psp_sched_terminate(UID_CTX_HOLDER);
+        /* Time for the holder's host thread to wake and reach its hook. */
+        psp_os_sleep_until_ns(psp_os_mono_ns() + 20000000u);
+    }
+    psp_sched_run_on(UID_CTX_HOLDER, ctx_let_go);
+    ctx_freed = ctx_holder == 0;
+    ctx_asked = 1;
+}
+
+static void test_an_ended_thread_lets_go_before_it_is_asked(void) {
+    static const char *const how[] = {
+        "returning from its entry", "exiting", "terminated while parked", "terminating itself" };
+    psp_sched_set_host_exit_hook(ctx_exit_hook);
+    for (ctx_end = END_RETURN; ctx_end <= END_TERMINATES_ITSELF; ctx_end++) {
+        psp_sched_reset();
+        psp_sched_set_threading(1);
+        ctx_holder = ctx_freed = ctx_asked = 0;
+        /* The asker first: a start after the holder has ended would reuse the
+         * holder's slot, and reusing a slot waits out its host thread. The
+         * holder outranks the main context and runs as it is started. */
+        CHECK(psp_sched_spawn(UID_CTX_ASKER, ENTRY_CTX_ASKER, FAKE_SP, 0, 0, 0, 40) == 0,
+              "spawning the asker failed");
+        CHECK(psp_sched_spawn(UID_CTX_HOLDER, ENTRY_CTX_HOLDER, FAKE_SP, 0, 0, 0, 30) == 0,
+              "spawning the holder failed");
+        const int live = psp_sched_drain(5);
+        psp_sched_join_all();
+        CHECK(live == 0, "%s: %d thread(s) still alive", how[ctx_end], live);
+        CHECK(ctx_asked && ctx_freed,
+              "%s: the thread ended holding the context, and the next thread to ask "
+              "for it found it still held", how[ctx_end]);
+    }
+    psp_sched_set_host_exit_hook(NULL);
+}
+
 int main(void) {
+    psp_register(ENTRY_CTX_HOLDER, body_ctx_holder);
+    psp_register(ENTRY_CTX_ASKER, body_ctx_asker);
     psp_register(ENTRY_HOLDER, body_holder);
     psp_register(ENTRY_HOST_OWNER, body_host_owner);
     psp_register(ENTRY_ASK_MAIN, body_ask_main);
@@ -820,6 +888,7 @@ int main(void) {
     test_run_on_a_parked_thread();
     test_main_context_serves_and_exits_are_hooked();
     test_host_thread_stop_returns();
+    test_an_ended_thread_lets_go_before_it_is_asked();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);
