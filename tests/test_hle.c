@@ -1978,6 +1978,85 @@ static void test_msgpipe_wait_ends_as_it_parks(void) {
     psp_threadman_reset();
 }
 
+/* A poll takes its place in the queue it would join. A sender still waiting
+ * there is one whose remainder does not fit, and a first-come pipe serves
+ * nobody behind it, whatever room there is: send.expected's interleaved block
+ * has a 0x80 sender wait behind a 0x100 one with 0x80 free (`free=80,
+ * sending=2`). A poll in that place cannot finish without waiting, so it
+ * answers FULL -- not OK with bytes it never stored. */
+#define MQ_SEND 0x08802900u
+#define MQ_DATA 0x08806800u
+#define MQ_GOT  0x08806900u
+#define MQ_OUT  0x08806A00u   /* the poll's byte count; the sender's is at +4 */
+
+static uint32_t mq_pipe, mq_rc;
+
+static void body_mq_send(void) {
+    mq_rc = call7(psp_nid("sceKernelSendMsgPipe"), mq_pipe, MQ_DATA, 12, 0, MQ_OUT + 4, 0, 0);
+}
+
+static uint32_t mq_status(uint32_t at) {
+    psp_write32(TW_INFO, 56);
+    call(psp_nid("sceKernelReferMsgPipeStatus"), mq_pipe, TW_INFO, 0, 0);
+    return psp_read32(TW_INFO + at);
+}
+
+static void test_msgpipe_poll_waits_its_turn(void) {
+    psp_register(MQ_SEND, body_mq_send);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t TRY = psp_nid("sceKernelTrySendMsgPipe");
+    enum { FREE = 44, SENDING = 48 };
+    /* The waiting sender more urgent than us, then less: a first-come pipe
+     * keeps it ahead either way. A pipe that orders senders by priority puts
+     * us ahead of the less urgent one -- unmeasured, but it is what our own
+     * blocking send would do, and then the bytes really move. */
+    static const struct { uint32_t attr, prio, rc, left; } c[] = {
+        { 0x000, 0x10, SCE_KERNEL_ERROR_MSGPIPE_FULL, 6 },
+        { 0x000, 0x30, SCE_KERNEL_ERROR_MSGPIPE_FULL, 6 },
+        { 0x100, 0x30, 0,                             2 },
+    };
+
+    for (unsigned k = 0; k < sizeof c / sizeof c[0]; k++) {
+        mq_rc = 0xEEEEEEEEu;
+        mq_pipe = call5(psp_nid("sceKernelCreateMsgPipe"), guest_name("mpp"), 2, c[k].attr, 16, 0);
+        CHECK(call5(TRY, mq_pipe, MQ_DATA, 10, 0, 0) == 0, "case %u: store ten of sixteen bytes", k);
+        tw_start_at(MQ_SEND, c[k].prio);
+        call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0);
+        CHECK(mq_status(SENDING) == 1, "case %u: a twelve-byte send waits with six free", k);
+
+        psp_write32(MQ_OUT, 0x1337);
+        uint32_t rc = call5(TRY, mq_pipe, MQ_DATA, 4, 0, MQ_OUT);
+        const uint32_t moved = c[k].rc ? 0x1337 : 4;
+        CHECK(rc == c[k].rc, "case %u: a four-byte poll answered %08X, expected %08X", k, rc, c[k].rc);
+        CHECK(psp_read32(MQ_OUT) == moved, "case %u: it reported %u bytes, expected %u",
+              k, psp_read32(MQ_OUT), moved);
+        CHECK(mq_status(FREE) == c[k].left, "case %u: it left %u free, expected %u",
+              k, mq_status(FREE), c[k].left);
+        /* An ASAP poll behind it moves nothing either, and says so. */
+        if (c[k].rc) {
+            rc = call5(TRY, mq_pipe, MQ_DATA, 4, 1, MQ_OUT);
+            CHECK(rc == c[k].rc && psp_read32(MQ_OUT) == 0 && mq_status(FREE) == 6,
+                  "case %u: an ASAP poll answered %08X, %u bytes, %u free",
+                  k, rc, psp_read32(MQ_OUT), mq_status(FREE));
+        }
+
+        /* Taking the first ten makes room for the waiting twelve. */
+        CHECK(call7(psp_nid("sceKernelReceiveMsgPipe"), mq_pipe, MQ_GOT, 10, 0, 0, 0, 0) == 0,
+              "case %u: receive the first ten", k);
+        call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0);
+        CHECK(mq_rc == 0 && psp_read32(MQ_OUT + 4) == 12,
+              "case %u: the waiting send answered %08X with %u bytes", k, mq_rc, psp_read32(MQ_OUT + 4));
+        call(psp_nid("sceKernelDeleteMsgPipe"), mq_pipe, 0, 0, 0);
+    }
+
+    psp_sched_drain(5);
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
 /* A wait nothing can ever end -- no thread runnable, nothing due -- has one
  * answer whatever it waits on. With a timeout it times out, because for that
  * caller a timeout is the truth; with none the run stops, because a timeout
@@ -2463,6 +2542,7 @@ int main(void) {
     test_waits_with_threads();
     test_zero_timeout();
     test_msgpipe_wait_ends_as_it_parks();
+    test_msgpipe_poll_waits_its_turn();
     test_stranded_waits();
     test_thread_end_waiters();
     test_many_parked_threads();

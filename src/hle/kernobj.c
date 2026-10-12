@@ -822,6 +822,26 @@ typedef struct {
     uint32_t buf, len, mode, out;
 } mpp_request;
 
+/* Whether a thread already waiting in `dir`'s queue would be served before
+ * `me`. A pump has just run, so every waiter left is one it could not move,
+ * and nobody behind one is served either: send.expected's interleaved block
+ * has a 0x80 sender wait behind a 0x100 one that does not fit, with 0x80
+ * free (`free=80, sending=2`). The order is the pump's -- arrival, or priority
+ * with ties to whoever came first.
+ *
+ * Only a sender can be caught by it. A receiver still waiting has already
+ * emptied the buffer and every blocked sender into its own buffer, so there
+ * is nothing left for a poll behind it to take anyway. */
+static int mpp_behind(const psp_msgpipe *p, mpp_dir dir, uint32_t me) {
+    const psp_waitq *q     = dir == MPP_SEND ? &p->send_q : &p->recv_q;
+    const uint32_t   order = dir == MPP_SEND ? mpp_send_order(p) : mpp_recv_order(p);
+    if (!(order & PSP_WAITQ_PRIORITY)) return q->n > 0;
+    const int mine = psp_sched_priority(me);
+    for (int i = 0; i < q->n; i++)
+        if (psp_sched_priority(q->w[i].uid) <= mine) return 1;
+    return 0;
+}
+
 /* A poll reaches past the buffer exactly as a blocking call does -- a
  * try-receive on a pipe with no buffer at all still succeeds when a sender
  * is blocked on the other side, and msgpipe/tryreceive says so twice:
@@ -830,10 +850,13 @@ typedef struct {
  *
  * What it may not do is half-succeed. So it asks how much could move,
  * decides, and only then joins the queue -- by which point completing is
- * certain, and the ordinary pump does the work. */
+ * certain, and the ordinary pump does the work. A poll that would join behind
+ * a waiter can move nothing, however much room there is: it would have to
+ * wait its turn, and a poll does not wait. */
 static void mpp_poll(psp_msgpipe *p, const mpp_request *rq, int urgent) {
     const uint32_t me  = psp_sched_current();
-    const uint32_t cap = rq->dir == MPP_SEND ? mpp_send_capacity(p) : mpp_recv_capacity(p);
+    const uint32_t cap = mpp_behind(p, rq->dir, me) ? 0
+                       : rq->dir == MPP_SEND ? mpp_send_capacity(p) : mpp_recv_capacity(p);
     const uint32_t now = (rq->mode & MPP_MODE_ASAP) ? mpp_min(cap, rq->len) : rq->len;
     if (!now || now > cap) {
         /* ASAP moved nothing, and says so: `ASAP: Failed (800201b3,
