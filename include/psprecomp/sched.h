@@ -54,6 +54,14 @@ typedef enum {
 void psp_sched_init(void);
 void psp_sched_reset(void);
 
+/* The priority the main context runs at: the one a user module's
+ * module_start thread has on hardware (psp_threadman_current_priority). */
+#define PSP_MAIN_THREAD_PRIORITY 0x20
+
+/* Threads alive at once, plus the main context. Dead slots are reused (see
+ * psp_sched_spawn), so this bounds what is running, not what has run. */
+#define PSP_SCHED_THREADS_MAX 1026
+
 /* Turn real threading off, for a caller that must stay single-context and
  * deterministic.
  *
@@ -117,9 +125,13 @@ int  psp_sched_block(uint32_t uid, psp_sched_state why, const char *what);
  * the case an undated block has to refuse.
  *
  * `deadline_us` is absolute guest microseconds, from psp_clock_peek(); 0 means
- * no deadline, which makes this identical to psp_sched_block. A caller asking
- * for a zero-length timeout wants the shortest deadline that exists, not the
- * absence of one, so it should pass `psp_clock_peek() + 1`.
+ * no deadline, which makes this identical to psp_sched_block. A zero-length
+ * timeout is not the absence of one but a deadline that has already arrived,
+ * so a caller asking for one passes psp_clock_peek() itself (or 1 while the
+ * clock still reads 0), as psp_wait_deadline does: the wait expires at once,
+ * without a handoff. One microsecond later would park instead, and a wait
+ * that succeeds at once would leave 1 in the timeout word, where hardware
+ * leaves 0.
  *
  * Returns PSP_SCHED_WOKEN, PSP_SCHED_EXPIRED, PSP_SCHED_RELEASED or
  * PSP_SCHED_STRANDED. */
@@ -261,11 +273,14 @@ uint32_t psp_sched_current(void);
  * For host state that belongs to one host thread, as the GL backend's context
  * belongs to the GE's (src/hle/ge.c). `fn` runs no guest code and leaves
  * psp_cpu, the caller's, alone. Where `uid` is the caller, or is not parked
- * waiting for its turn, `fn` runs on the caller's thread instead. */
+ * waiting for its turn, `fn` runs on the caller's thread instead. Where `uid`
+ * has ended and its host thread has not yet run the host exit hook below, the
+ * caller first waits for it to. */
 void     psp_sched_run_on(uint32_t uid, void (*fn)(void));
 
 /* Called on a guest thread's host thread as it ends, before it goes: the
- * host lets go of what belongs to that host thread alone. */
+ * host lets go of what belongs to that host thread alone. It runs after the
+ * thread has handed the CPU on, and psp_sched_run_on waits for it. */
 void     psp_sched_set_host_exit_hook(void (*fn)(void));
 
 /* A thread's priority, or the least urgent value there is when it has no slot.

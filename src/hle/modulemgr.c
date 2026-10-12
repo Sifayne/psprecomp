@@ -159,20 +159,31 @@ static void forget(module *m) {
     clear(m);
 }
 
-/* A firmware call made on the guest's behalf, from inside another. The
- * caller's argument registers are put back afterwards; $v0 is the answer. */
-static uint32_t nested(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
-                       uint32_t a3, uint32_t t0, uint32_t t1) {
+/* A firmware call made on the guest's behalf, from inside another, with
+ * `nargs` arguments and zeros for the rest of the six. The caller's argument
+ * registers are put back afterwards; $v0 is the answer. */
+static uint32_t nested(uint32_t nid, const uint32_t *args, int nargs) {
     static const int regs[] = { PSP_REG_A0, PSP_REG_A1, PSP_REG_A2, PSP_REG_A3,
                                 PSP_REG_T0, PSP_REG_T1 };
     uint32_t keep[6];
-    const uint32_t args[6] = { a0, a1, a2, a3, t0, t1 };
-    for (int i = 0; i < 6; i++) { keep[i] = psp_cpu.r[regs[i]]; psp_cpu.r[regs[i]] = args[i]; }
+    for (int i = 0; i < 6; i++) {
+        keep[i] = psp_cpu.r[regs[i]];
+        psp_cpu.r[regs[i]] = i < nargs ? args[i] : 0;
+    }
     psp_hle_call(nid);
     const uint32_t v0 = psp_cpu.r[PSP_REG_V0];
     for (int i = 0; i < 6; i++) psp_cpu.r[regs[i]] = keep[i];
     return v0;
 }
+
+/* What a start or stop call hands module_start or module_stop, and the
+ * caller's SceKernelSMOption (0 for none). */
+typedef struct { uint32_t argsize, argp, opt; } module_args;
+
+/* Offsets in SceKernelSMOption {size, mpidstack, stacksize, priority,
+ * attribute}, and the size that has all of them. */
+enum { SMOPT_SIZE = 0, SMOPT_STACKSIZE = 8, SMOPT_PRIORITY = 12, SMOPT_ATTRIBUTE = 16,
+       SMOPT_BYTES = 20 };
 
 /* Run module_start or module_stop on a thread of its own and wait for it, as
  * the module manager does (uofw modulemgr.c _PrologueModule): prioritised and
@@ -184,25 +195,26 @@ static uint32_t nested(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
  * (ReferThreadStatus; modprobe steps 7 and 13, fw 6.60). Returns 0 with the
  * function's answer in *status, or the error that kept it from running. */
 static uint32_t run_thread_busy(const module *m, uint32_t entry, const char *name,
-                                uint32_t argsize, uint32_t argp, uint32_t opt, uint32_t *status);
+                                const module_args *args, uint32_t *status);
 
 static uint32_t run_thread(const module *m, uint32_t entry, const char *name,
-                           uint32_t argsize, uint32_t argp, uint32_t opt, uint32_t *status) {
+                           const module_args *args, uint32_t *status) {
     g_busy++;
-    const uint32_t rc = run_thread_busy(m, entry, name, argsize, argp, opt, status);
+    const uint32_t rc = run_thread_busy(m, entry, name, args, status);
     g_busy--;
     return rc;
 }
 
 static uint32_t run_thread_busy(const module *m, uint32_t entry, const char *name,
-                                uint32_t argsize, uint32_t argp, uint32_t opt, uint32_t *status) {
+                                const module_args *args, uint32_t *status) {
     uint32_t priority = m->im.start_priority ? m->im.start_priority : MODULE_INIT_PRIORITY;
     uint32_t stack = m->im.start_stack;
     uint32_t attr = m->im.start_attr;
-    if (opt && psp_read32(opt) >= 20) {
-        if (psp_read32(opt + 12)) priority = psp_read32(opt + 12);
-        if (psp_read32(opt + 8)) stack = psp_read32(opt + 8);
-        attr |= psp_read32(opt + 16) & THREAD_SM_LEGAL_ATTR;
+    const uint32_t opt = args->opt;
+    if (opt && psp_read32(opt + SMOPT_SIZE) >= SMOPT_BYTES) {
+        if (psp_read32(opt + SMOPT_PRIORITY)) priority = psp_read32(opt + SMOPT_PRIORITY);
+        if (psp_read32(opt + SMOPT_STACKSIZE)) stack = psp_read32(opt + SMOPT_STACKSIZE);
+        attr |= psp_read32(opt + SMOPT_ATTRIBUTE) & THREAD_SM_LEGAL_ATTR;
     }
     attr &= ~THREAD_MODE_BITS;
     if (!stack) stack = USER_DEFAULT_STACKSIZE;
@@ -217,14 +229,18 @@ static uint32_t run_thread_busy(const module *m, uint32_t entry, const char *nam
      * both. */
     const uint32_t gp = psp_cpu.r[PSP_REG_GP];
     if (m->im.gp) psp_cpu.r[PSP_REG_GP] = m->im.gp;
-    const uint32_t thid = nested(NID_CREATE_THREAD, name_at, entry, priority, stack, attr, 0);
+    const uint32_t create[] = { name_at, entry, priority, stack, attr };
+    const uint32_t thid = nested(NID_CREATE_THREAD, create, 5);
     uint32_t rc = thid;
-    if ((int32_t)thid >= 0) rc = nested(NID_START_THREAD, thid, argsize, argp, 0, 0, 0);
+    if ((int32_t)thid >= 0) {
+        const uint32_t start[] = { thid, args->argsize, args->argp };
+        rc = nested(NID_START_THREAD, start, 3);
+    }
     psp_cpu.r[PSP_REG_GP] = gp;
     if ((int32_t)thid < 0) return thid;
-    if ((int32_t)rc < 0) { nested(NID_DELETE_THREAD, thid, 0, 0, 0, 0, 0); return rc; }
-    *status = nested(NID_WAIT_THREAD_END, thid, 0, 0, 0, 0, 0);
-    nested(NID_DELETE_THREAD, thid, 0, 0, 0, 0, 0);
+    if ((int32_t)rc < 0) { nested(NID_DELETE_THREAD, &thid, 1); return rc; }
+    *status = nested(NID_WAIT_THREAD_END, &thid, 1);
+    nested(NID_DELETE_THREAD, &thid, 1);
     return SCE_KERNEL_ERROR_OK;
 }
 
@@ -300,18 +316,31 @@ static void hle_LoadModuleBufferUsbWlan(void) { psp_ret(PSP_MAIN_MODULE_ID); }
 
 /* ---- starting and stopping ------------------------------------------------- */
 
+/* The loaded module a start, stop or unload names. The executable is started
+ * already and answers OK; nothing else answers to an id the table does not
+ * hold. NULL once that is answered. */
+static module *named_module(uint32_t id) {
+    module *m = by_id(id);
+    if (!m) psp_ret(id == PSP_MAIN_MODULE_ID ? SCE_KERNEL_ERROR_OK : SCE_ERROR_KERNEL_UNKNOWN_MODULE);
+    return m;
+}
+
+/* Whether two modules export a NID in common. */
+static int exports_overlap(const module *a, const module *b) {
+    for (int i = 0; i < a->im.nexports; i++)
+        for (int k = 0; k < b->im.nexports; k++)
+            if (a->im.export_nid[i] == b->im.export_nid[k]) return 1;
+    return 0;
+}
+
 /* sceKernelStartModule(modid, argsize, argp, status, option): the module's id
  * if it stays resident, 0 if module_start said it would not, else the error. */
 static void hle_StartModule(void) {
-    const uint32_t id = psp_arg(0), argsize = psp_arg(1), argp = psp_arg(2);
-    const uint32_t statusp = psp_arg(3), opt = psp_arg(4);
-    module *m = by_id(id);
-    if (!m) {
-        /* The executable is started already; nothing else answers to an id
-         * the table does not hold. */
-        psp_ret(id == PSP_MAIN_MODULE_ID ? SCE_KERNEL_ERROR_OK : SCE_ERROR_KERNEL_UNKNOWN_MODULE);
-        return;
-    }
+    const uint32_t id = psp_arg(0);
+    const module_args args = { psp_arg(1), psp_arg(2), psp_arg(4) };
+    const uint32_t statusp = psp_arg(3);
+    module *m = named_module(id);
+    if (!m) return;
     /* modprobe step 7: a second start is the generic error, not the module
      * manager's own ALREADY_STARTED. */
     if (m->started) { psp_ret(SCE_ERROR_KERNEL_ERROR); return; }
@@ -322,19 +351,14 @@ static void hle_StartModule(void) {
     for (int i = 0; i < MODULES_MAX; i++) {
         const module *o = &g_mod[i];
         if (o == m || !o->used || !o->started || o->stopped) continue;
-        for (int a = 0; a < o->im.nexports; a++)
-            for (int b = 0; b < m->im.nexports; b++)
-                if (o->im.export_nid[a] == m->im.export_nid[b]) {
-                    psp_ret(SCE_ERROR_KERNEL_LIBRARY_ALREADY_EXISTS);
-                    return;
-                }
+        if (exports_overlap(o, m)) { psp_ret(SCE_ERROR_KERNEL_LIBRARY_ALREADY_EXISTS); return; }
     }
     /* Its libraries are registered before module_start runs, which may call
      * them through its own stubs. */
     m->started = 1;
     uint32_t status = SCE_KERNEL_RESIDENT;
     if (m->im.start) {
-        const uint32_t rc = run_thread(m, m->im.start, "SceModmgrStart", argsize, argp, opt, &status);
+        const uint32_t rc = run_thread(m, m->im.start, "SceModmgrStart", &args, &status);
         if (rc) { m->started = 0; psp_ret(rc); return; }
     }
     if (statusp) psp_write32(statusp, status);
@@ -345,10 +369,10 @@ static void hle_StartModule(void) {
 
 /* module_stop, if the module has one. 0 if it stopped, else its answer or
  * the error that kept it from running. */
-static uint32_t stop(module *m, uint32_t argsize, uint32_t argp, uint32_t opt, uint32_t *status) {
+static uint32_t stop(module *m, const module_args *args, uint32_t *status) {
     *status = SCE_KERNEL_STOP_SUCCESS;
     if (m->im.stop) {
-        const uint32_t rc = run_thread(m, m->im.stop, "SceKernelModmgrStop", argsize, argp, opt, status);
+        const uint32_t rc = run_thread(m, m->im.stop, "SceKernelModmgrStop", args, status);
         if (rc) return rc;
     }
     if (*status == SCE_KERNEL_STOP_SUCCESS) m->stopped = 1;
@@ -358,15 +382,13 @@ static uint32_t stop(module *m, uint32_t argsize, uint32_t argp, uint32_t opt, u
 /* sceKernelStopModule(modid, argsize, argp, status, option): 0, or the
  * module's id if module_stop refused. */
 static void hle_StopModule(void) {
-    module *m = by_id(psp_arg(0));
-    if (!m) {
-        psp_ret(psp_arg(0) == PSP_MAIN_MODULE_ID ? SCE_KERNEL_ERROR_OK : SCE_ERROR_KERNEL_UNKNOWN_MODULE);
-        return;
-    }
+    module *m = named_module(psp_arg(0));
+    if (!m) return;
     if (!m->started) { psp_ret(SCE_ERROR_KERNEL_MODULE_NOT_STARTED); return; }
     if (m->stopped) { psp_ret(SCE_ERROR_KERNEL_MODULE_ALREADY_STOPPED); return; }
     uint32_t status;
-    const uint32_t rc = stop(m, psp_arg(1), psp_arg(2), psp_arg(4), &status);
+    const module_args args = { psp_arg(1), psp_arg(2), psp_arg(4) };
+    const uint32_t rc = stop(m, &args, &status);
     if (psp_arg(3)) psp_write32(psp_arg(3), status);
     if (rc == SCE_KERNEL_STOP_FAIL) { psp_ret(m->id); return; }
     psp_ret(rc);
@@ -374,11 +396,8 @@ static void hle_StopModule(void) {
 
 /* sceKernelUnloadModule(modid): its id. */
 static void hle_UnloadModule(void) {
-    module *m = by_id(psp_arg(0));
-    if (!m) {
-        psp_ret(psp_arg(0) == PSP_MAIN_MODULE_ID ? SCE_KERNEL_ERROR_OK : SCE_ERROR_KERNEL_UNKNOWN_MODULE);
-        return;
-    }
+    module *m = named_module(psp_arg(0));
+    if (!m) return;
     /* modprobe step 7: CANNOT_REMOVE, not NOT_STOPPED. */
     if (m->started && !m->stopped) { psp_ret(SCE_ERROR_KERNEL_MODULE_CANNOT_REMOVE); return; }
     const uint32_t id = m->id;
@@ -390,26 +409,27 @@ static void hle_UnloadModule(void) {
  * whose thread then ends. From the executable it is the game's own exit,
  * which the boot host answers for StopUnloadSelfModuleWithStatus; these two
  * forms answer 0 there, as they did before any module could be loaded. */
-static void self_stop_unload(uint32_t exit_status, uint32_t argsize, uint32_t argp,
-                             uint32_t statusp, uint32_t opt) {
+static void self_stop_unload(uint32_t exit_status, const module_args *args, uint32_t statusp) {
     module *m = by_address(psp_cpu.r[PSP_REG_RA]);
     if (!m) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
     uint32_t status;
-    const uint32_t rc = stop(m, argsize, argp, opt, &status);
+    const uint32_t rc = stop(m, args, &status);
     if (statusp) psp_write32(statusp, status);
     if (rc != SCE_KERNEL_STOP_SUCCESS) { psp_ret(rc == SCE_KERNEL_STOP_FAIL ? m->id : rc); return; }
     forget(m);
-    nested(NID_EXIT_DELETE_THREAD, exit_status, 0, 0, 0, 0, 0);
+    nested(NID_EXIT_DELETE_THREAD, &exit_status, 1);
 }
 
 /* sceKernelSelfStopUnloadModule(exitStatus, argsize, argp) */
 static void hle_SelfStopUnloadModule(void) {
-    self_stop_unload(psp_arg(0), psp_arg(1), psp_arg(2), 0, 0);
+    const module_args args = { psp_arg(1), psp_arg(2), 0 };
+    self_stop_unload(psp_arg(0), &args, 0);
 }
 
 /* sceKernelStopUnloadSelfModule(argsize, argp, status, option) */
 static void hle_StopUnloadSelfModule(void) {
-    self_stop_unload(SCE_KERNEL_ERROR_OK, psp_arg(0), psp_arg(1), psp_arg(2), psp_arg(3));
+    const module_args args = { psp_arg(0), psp_arg(1), psp_arg(3) };
+    self_stop_unload(SCE_KERNEL_ERROR_OK, &args, psp_arg(2));
 }
 
 /* ---- which module -------------------------------------------------------- */

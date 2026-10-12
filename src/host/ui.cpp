@@ -130,6 +130,13 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
  * thread's, made through the same queue as ImGui's, under GL. */
 static struct { uint32_t gl; SDL_Texture *tex; int w, h; } g_img[PSP_UI_IMAGES];
 
+// A texture operation for the GL thread to carry out before it next draws.
+static void queue_op(const psp_ui_texture_op &op) {
+    pthread_mutex_lock(&g_lock);
+    g_pending.push_back(op);
+    pthread_mutex_unlock(&g_lock);
+}
+
 static void free_ops(ImVector<psp_ui_texture_op> &ops) {
     for (psp_ui_texture_op &op : ops) free((void *)op.pixels);
     ops.clear();
@@ -158,20 +165,20 @@ static void queue_textures(ImDrawData *data) {
             op.pixels = copy_rect(tex, 0, 0, tex->Width, tex->Height);
             tex->SetTexID((ImTextureID)op.texture);
             tex->SetStatus(ImTextureStatus_OK);
-            pthread_mutex_lock(&g_lock); g_pending.push_back(op); pthread_mutex_unlock(&g_lock);
+            queue_op(op);
         } else if (tex->Status == ImTextureStatus_WantUpdates) {
             for (ImTextureRect &r : tex->Updates) {
                 op.op = PSP_UI_TEXTURE_UPDATE;
                 op.texture = (uint32_t)tex->TexID;
                 op.x = r.x; op.y = r.y; op.w = r.w; op.h = r.h;
                 op.pixels = copy_rect(tex, r.x, r.y, r.w, r.h);
-                pthread_mutex_lock(&g_lock); g_pending.push_back(op); pthread_mutex_unlock(&g_lock);
+                queue_op(op);
             }
             tex->SetStatus(ImTextureStatus_OK);
         } else if (tex->Status == ImTextureStatus_WantDestroy) {
             op.op = PSP_UI_TEXTURE_DESTROY;
             op.texture = (uint32_t)tex->TexID;
-            pthread_mutex_lock(&g_lock); g_pending.push_back(op); pthread_mutex_unlock(&g_lock);
+            queue_op(op);
             tex->SetTexID(ImTextureID_Invalid);
             tex->SetStatus(ImTextureStatus_Destroyed);
         }
@@ -375,8 +382,9 @@ static void panes_after(void) {
     u.choose = 0;
     if (!u.side || !u.page) { u.cursor_pane = PANE_NONE; return; }
     ImGuiWindow *parent = u.side->ParentWindow;
-    const int in = !g.NavWindow ? PANE_NONE : ImGui::IsWindowChildOf(g.NavWindow, u.side, false) ? PANE_SIDE :
-                   ImGui::IsWindowChildOf(g.NavWindow, u.page, false) ? PANE_PAGE : PANE_NONE;
+    int in = PANE_NONE;                         // the pane the cursor is in
+    if (g.NavWindow && ImGui::IsWindowChildOf(g.NavWindow, u.side, false)) in = PANE_SIDE;
+    else if (g.NavWindow && ImGui::IsWindowChildOf(g.NavWindow, u.page, false)) in = PANE_PAGE;
     const ImGuiID shown_before = u.shown_before;
     u.cursor_pane = in;
     u.shown_before = u.shown;
@@ -401,12 +409,13 @@ static void panes_after(void) {
     // A page changed under the cursor (the launcher's bumpers) leaves it on
     // an item no longer drawn; an entry chosen while the cursor is in the
     // list takes it along.
-    if ((in == PANE_PAGE && !u.items[PANE_PAGE]) ||
-        (g.NavWindow == parent && (!g.NavId || g.NavId == u.side->ChildId)) ||
-        (in == PANE_SIDE && (!g.NavIdIsAlive || (u.shown != shown_before && g.NavId != u.shown))))
-        u.want = WANT_SIDE;
-    else if ((g.NavWindow == parent && g.NavId == u.page->ChildId) || (in == PANE_PAGE && !g.NavIdIsAlive))
-        u.want = WANT_PAGE;
+    const bool empty_page = in == PANE_PAGE && !u.items[PANE_PAGE];
+    const bool on_side_pane = g.NavWindow == parent && (!g.NavId || g.NavId == u.side->ChildId);
+    const bool entry_lost = in == PANE_SIDE && (!g.NavIdIsAlive || (u.shown != shown_before && g.NavId != u.shown));
+    const bool on_page_pane = g.NavWindow == parent && g.NavId == u.page->ChildId;
+    const bool item_lost = in == PANE_PAGE && !g.NavIdIsAlive;
+    if (empty_page || on_side_pane || entry_lost) u.want = WANT_SIDE;
+    else if (on_page_pane || item_lost) u.want = WANT_PAGE;
 }
 
 extern "C" void psp_ui_end(void) {
@@ -429,6 +438,14 @@ extern "C" void psp_ui_draw(SDL_Renderer *ren) {
 }
 
 // ---- widgets ------------------------------------------------------------------------
+
+// The next window, centred on the screen at this size (a height of 0 fits it).
+static void centre_next_window(ImVec2 size) {
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+}
 
 static void take_focus(void) {
     if (u.focus_next) { ImGui::SetItemDefaultFocus(); u.focus_next = 0; }
@@ -482,9 +499,7 @@ extern "C" void psp_ui_panel_begin(void) {
     ImGui::GetBackgroundDrawList()->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y),
                                                   IM_COL32(8, 12, 16, 150));
     const float w = vp->Size.x * 0.86f, h = vp->Size.y * 0.86f;
-    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always,
-                            ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(w < 1100 * u.scale ? w : 1100 * u.scale, h), ImGuiCond_Always);
+    centre_next_window(ImVec2(w < 1100 * u.scale ? w : 1100 * u.scale, h));
     ImGui::Begin("##menu", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoResize);
 }
@@ -761,9 +776,7 @@ extern "C" void psp_ui_prompt(const char *title, const char *text) {
     const ImGuiViewport *vp = ImGui::GetMainViewport();
     ImGui::GetForegroundDrawList()->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y),
                                                   IM_COL32(8, 12, 16, 120));
-    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always,
-                            ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(520 * u.scale, 0), ImGuiCond_Always);
+    centre_next_window(ImVec2(520 * u.scale, 0));
     ImGui::SetNextWindowFocus();
     ImGui::Begin("##prompt", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav);
@@ -772,28 +785,30 @@ extern "C" void psp_ui_prompt(const char *title, const char *text) {
     ImGui::End();
 }
 
+// A question's two answers: yes, then no -- which Escape and B give too.
+// With yes_first the answer the player asked for has the cursor, shown, so
+// Enter or A takes it at once and the arrows move to the other.
+static void answer_buttons(const char *yes, const char *no, bool yes_first, int *answer) {
+    if (ImGui::Button(yes)) *answer = 1;
+    note_focus(yes);
+    if (yes_first && ImGui::IsWindowAppearing()) { ImGui::SetItemDefaultFocus(); ImGui::SetNavCursorVisible(true); }
+    ImGui::SameLine();
+    if (ImGui::Button(no) || (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))) *answer = 0;
+    note_focus(no);
+}
+
 extern "C" int psp_ui_confirm(const char *title, const char *text, const char *yes, const char *no) {
     // A modal popup: it has the keys and the pad, and the page behind it
     // cannot be chosen until it is answered.
     if (!ImGui::IsPopupOpen("##confirm")) ImGui::OpenPopup("##confirm");
-    const ImGuiViewport *vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always,
-                            ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(520 * u.scale, 0), ImGuiCond_Always);
+    centre_next_window(ImVec2(520 * u.scale, 0));
     int answer = -1;
     if (ImGui::BeginPopupModal("##confirm", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                ImGuiWindowFlags_NoSavedSettings)) {
         psp_ui_heading(title);
         psp_ui_text(text);
         ImGui::Spacing();
-        if (ImGui::Button(yes)) answer = 1;
-        note_focus(yes);
-        // The answer the player asked for has the cursor, shown, so Enter or
-        // A takes it at once and the arrows move to the other.
-        if (ImGui::IsWindowAppearing()) { ImGui::SetItemDefaultFocus(); ImGui::SetNavCursorVisible(true); }
-        ImGui::SameLine();
-        if (ImGui::Button(no) || (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))) answer = 0;
-        note_focus(no);
+        answer_buttons(yes, no, true, &answer);
         if (answer >= 0) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
@@ -832,10 +847,7 @@ extern "C" int psp_ui_choose(const char *title, const char *text, const char *fi
 
 extern "C" int psp_ui_ask_text(const char *title, const char *hint, char *buf, int size, const char *yes, const char *no) {
     if (!ImGui::IsPopupOpen("##ask")) ImGui::OpenPopup("##ask");
-    const ImGuiViewport *vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always,
-                            ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(520 * u.scale, 0), ImGuiCond_Always);
+    centre_next_window(ImVec2(520 * u.scale, 0));
     int answer = -1;
     if (ImGui::BeginPopupModal("##ask", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                ImGuiWindowFlags_NoSavedSettings)) {
@@ -847,11 +859,7 @@ extern "C" int psp_ui_ask_text(const char *title, const char *hint, char *buf, i
         if (ImGui::InputText("##text", buf, (size_t)size,
                              ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll)) answer = 1;
         ImGui::Spacing();
-        if (ImGui::Button(yes)) answer = 1;
-        note_focus(yes);
-        ImGui::SameLine();
-        if (ImGui::Button(no) || (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))) answer = 0;
-        note_focus(no);
+        answer_buttons(yes, no, false, &answer);
         if (answer >= 0) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
@@ -883,7 +891,7 @@ extern "C" void psp_ui_image_set(int slot, const unsigned char *rgba, int w, int
         if (im.gl && (!rgba || im.w != w || im.h != h)) {
             op.op = PSP_UI_TEXTURE_DESTROY;
             op.texture = im.gl;
-            pthread_mutex_lock(&g_lock); g_pending.push_back(op); pthread_mutex_unlock(&g_lock);
+            queue_op(op);
             im.gl = 0;
         }
         if (rgba) {
@@ -895,7 +903,7 @@ extern "C" void psp_ui_image_set(int slot, const unsigned char *rgba, int w, int
             op.texture = im.gl;
             op.x = op.y = 0; op.w = w; op.h = h;
             op.pixels = copy;
-            pthread_mutex_lock(&g_lock); g_pending.push_back(op); pthread_mutex_unlock(&g_lock);
+            queue_op(op);
         }
     }
     im.w = rgba ? w : 0;

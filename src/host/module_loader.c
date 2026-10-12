@@ -3,6 +3,7 @@
 #include "module_loader.h"
 
 #include "psprecomp/host/title.h"
+#include "psprecomp/hle.h"
 #include "psprecomp/modules.h"
 #include "psprecomp/mem.h"
 #include "crypto/sha1.h"
@@ -14,7 +15,6 @@
 #define SCE_ERROR_KERNEL_ILLEGAL_OBJECT_FORMAT 0x8002012D
 #define SCE_ERROR_KERNEL_UNKNOWN_MODULE_FILE   0x8002012F
 #define SCE_ERROR_KERNEL_FILE_READ_ERROR       0x80020130
-#define SCE_ERROR_KERNEL_NO_MEMORY             0x80020190
 
 static char g_folder[1024];
 
@@ -38,6 +38,16 @@ static const psp_title_module *known(const uint8_t *file, size_t len) {
     return NULL;
 }
 
+/* The image parsed, rebased to where its code was recompiled to run and
+ * relocated there: 0 when it is the module the game was prepared with. */
+static int place_image(psp_blob *b, elf_info *e, const psp_title_module *k, psp_load_info *li) {
+    if (elf_parse(b->data, b->size, e) != 0) return -1;
+    int err = 0;
+    psp_rebase_image(e, k->base, &err);
+    if (err || psp_relocate_image(b->data, b->size, e, li) != 0) return -1;
+    return li->lo < k->base || li->hi > k->base + k->size ? -1 : 0;
+}
+
 /* The runtime's loader: the module a file is, mapped in where its code was
  * recompiled to run, relocated by the same code the recompiler moved it with
  * (loader.c), so the image and the C agree. Its code is registered already
@@ -54,12 +64,8 @@ static int load(const uint8_t *file, size_t len, psp_module_image *out) {
         return (int)SCE_ERROR_KERNEL_FILE_READ_ERROR;
     }
     elf_info e;
-    int err = 0;
-    const int parsed = elf_parse(b.data, b.size, &e) == 0;
     psp_load_info li;
-    if (!parsed || (psp_rebase_image(&e, k->base, &err), err) ||
-        psp_relocate_image(b.data, b.size, &e, &li) != 0 ||
-        li.lo < k->base || li.hi > k->base + k->size) {
+    if (place_image(&b, &e, k, &li) != 0) {
         fprintf(stderr, "psprecomp: %s is not the module this game was prepared with\n", path);
         psp_blob_free(&b);
         return (int)SCE_ERROR_KERNEL_ILLEGAL_OBJECT_FORMAT;
@@ -68,7 +74,7 @@ static int load(const uint8_t *file, size_t len, psp_module_image *out) {
     psp_module_write(&b, &e);
     const int rc = psp_module_describe(&b, &e, &li, out);
     psp_blob_free(&b);
-    return rc ? (int)SCE_ERROR_KERNEL_NO_MEMORY : 0;
+    return rc ? (int)SCE_KERNEL_ERROR_NO_MEMORY : 0;
 }
 
 int psp_host_modules_start(const char *module_path) {

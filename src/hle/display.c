@@ -30,6 +30,8 @@
 #define PSP_DISPLAY_PIXEL_FORMAT_5551 1
 #define PSP_DISPLAY_PIXEL_FORMAT_4444 2
 #define PSP_DISPLAY_PIXEL_FORMAT_8888 3
+/* SCE_ERROR_INVALID_FORMAT, sceDisplaySetFrameBuf's answer to any other. */
+#define SCE_DISPLAY_ERROR_INVALID_FORMAT 0x80000108u
 
 static uint32_t g_fb_addr;
 static uint32_t g_fb_width;      /* in pixels, the stride -- usually 512 */
@@ -144,23 +146,24 @@ static void expand(uint32_t px, uint32_t fmt, uint8_t out[4]) {
     }
 }
 
-/* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
- * no framebuffer has been set yet (which is itself worth knowing during
- * bring-up: the game never got as far as showing anything). */
-int psp_display_capture(const char *path) {
-    if (!g_fb_addr) return -1;
+/* The pixel at (x, y) of the picture at `base`, in `fmt` at the display's
+ * stride, as RGBA8888. */
+static void fb_pixel(uint32_t base, uint32_t fmt, int x, int y, uint8_t out[4]) {
+    const uint32_t bpp = (fmt == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4u : 2u;
+    const uint32_t at = base + (uint32_t)(y * (int)g_fb_width + x) * bpp;
+    expand(bpp == 4 ? psp_read32(at) : psp_read16(at), fmt, out);
+}
 
+/* The screen's worth of the picture at `base` as a binary PPM; -1 if the
+ * file cannot be made. */
+static int write_ppm(const char *path, uint32_t base, uint32_t fmt) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
     fprintf(f, "P6\n%d %d\n255\n", PSP_SCREEN_W, PSP_SCREEN_H);
-
-    const int bpp = (g_fb_format == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
     for (int y = 0; y < PSP_SCREEN_H; y++) {
         for (int x = 0; x < PSP_SCREEN_W; x++) {
-            uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_width + x) * (uint32_t)bpp;
-            uint32_t px = (bpp == 4) ? psp_read32(at) : psp_read16(at);
             uint8_t rgba[4];
-            expand(px, g_fb_format, rgba);
+            fb_pixel(base, fmt, x, y, rgba);
             fwrite(rgba, 1, 3, f);       /* PPM is RGB; alpha is dropped */
         }
     }
@@ -168,9 +171,16 @@ int psp_display_capture(const char *path) {
     return 0;
 }
 
+/* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
+ * no framebuffer has been set yet (which is itself worth knowing during
+ * bring-up: the game never got as far as showing anything). */
+int psp_display_capture(const char *path) {
+    if (!g_fb_addr) return -1;
+    return write_ppm(path, g_fb_addr, g_fb_format);
+}
+
 int psp_display_thumbnail(uint8_t *rgba, int w, int h) {
     if (!g_fb_addr || w <= 0 || h <= 0) return -1;
-    const int bpp = (g_fb_format == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
     for (int ty = 0; ty < h; ty++) {
         const int y0 = ty * PSP_SCREEN_H / h, y1 = (ty + 1) * PSP_SCREEN_H / h;
         for (int tx = 0; tx < w; tx++) {
@@ -178,9 +188,8 @@ int psp_display_thumbnail(uint8_t *rgba, int w, int h) {
             unsigned sum[3] = { 0, 0, 0 }, n = 0;
             for (int y = y0; y < y1; y++)
                 for (int x = x0; x < x1; x++) {
-                    const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_width + x) * (uint32_t)bpp;
                     uint8_t c[4];
-                    expand(bpp == 4 ? psp_read32(at) : psp_read16(at), g_fb_format, c);
+                    fb_pixel(g_fb_addr, g_fb_format, x, y, c);
                     sum[0] += c[0]; sum[1] += c[1]; sum[2] += c[2]; n++;
                 }
             uint8_t *out = rgba + ((size_t)ty * (size_t)w + (size_t)tx) * 4u;
@@ -236,19 +245,7 @@ static void dump_frame_seq(uint32_t base) {
 
     char path[1024];
     snprintf(path, sizeof path, "%s-%04d.ppm", prefix, written);
-    FILE *f = fopen(path, "wb");
-    if (!f) return;
-    fprintf(f, "P6\n%d %d\n255\n", PSP_SCREEN_W, PSP_SCREEN_H);
-    for (int y = 0; y < PSP_SCREEN_H; y++)
-        for (int x = 0; x < PSP_SCREEN_W; x++) {
-            const uint32_t p =
-                psp_read32(base + (uint32_t)(y * (int)g_fb_width + x) * 4u);
-            const uint8_t rgb[3] = { (uint8_t)(p & 0xFF), (uint8_t)((p >> 8) & 0xFF),
-                                     (uint8_t)((p >> 16) & 0xFF) };
-            fwrite(rgb, 1, 3, f);
-        }
-    fclose(f);
-    written++;
+    if (write_ppm(path, base, PSP_DISPLAY_PIXEL_FORMAT_8888) == 0) written++;
 }
 
 static void score_frame(uint32_t base) {
@@ -288,6 +285,10 @@ static void score_frame(uint32_t base) {
 
 static void hle_SetFrameBuf(void) {
     /* (topaddr, bufferwidth, pixelformat, sync) */
+    /* A pixel format past 8888 is refused, and the buffer shown is kept:
+     * pspautotests' display/setframebuf reads 0x80000108 for 4 and for -1
+     * on a PSP. So the backends see only 0..3. */
+    if (psp_arg(2) > PSP_DISPLAY_PIXEL_FORMAT_8888) { psp_ret(SCE_DISPLAY_ERROR_INVALID_FORMAT); return; }
     g_fb_addr   = psp_arg(0);
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);

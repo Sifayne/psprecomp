@@ -37,6 +37,9 @@
  * eject it or spin it down. */
 #define DRIVE_STATE (PSP_UMD_PRESENT | PSP_UMD_INITED | PSP_UMD_READY)
 
+/* 0x80010000 | errno: EINVAL, an argument refused. */
+#define SCE_ERROR_EINVAL 0x80010016u
+
 static uint32_t g_callback_id;
 /* What sceUmdGetDriveStat answers. Present, inited and ready from the start,
  * before any activation (UMD probe records 0-6, disc probe record 8/0);
@@ -63,7 +66,7 @@ static void hle_CheckMedium(void) { psp_ret(1); }
 static void hle_Activate(void) {
     const uint32_t unit = psp_arg(0);
     if (unit != 1 && unit != 2) {
-        psp_ret(0x80010016u); /* observed return for unit 0, probe record 13 */
+        psp_ret(SCE_ERROR_EINVAL); /* observed return for unit 0, probe record 13 */
         return;
     }
     if (g_callback_id)
@@ -87,7 +90,6 @@ static void hle_GetDriveStat(void) { psp_ret(g_drive_state); }
  * timeout result the timed variant recorded (0x800201a8); the untimed
  * variants would block for ever on hardware, and an error the caller can see
  * beats a wait nothing will end. */
-#define UMD_WAIT_TIMEOUT 0x800201a8u
 static void hle_WaitDriveStat(void) {
     const uint32_t want = psp_arg(0);
     if (want & g_drive_state) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
@@ -95,7 +97,7 @@ static void hle_WaitDriveStat(void) {
     if (!complained++)
         fprintf(stderr, "psprecomp: sceUmdWaitDriveStat waited for state 0x%x while the "
                         "drive reports 0x%x; returning the timeout error\n", want, g_drive_state);
-    psp_ret(UMD_WAIT_TIMEOUT);
+    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
 }
 
 static void hle_WaitDriveStatCB(void) {
@@ -107,13 +109,13 @@ static void hle_WaitDriveStatCB(void) {
 /* One callback registration, notified on activation. Registration by itself
  * does not imply a drive transition. */
 static void hle_RegisterCallback(void) {
-    if (!psp_threadman_callback_exists(psp_arg(0))) { psp_ret(0x80010016); return; }
+    if (!psp_threadman_callback_exists(psp_arg(0))) { psp_ret(SCE_ERROR_EINVAL); return; }
     g_callback_id = psp_arg(0);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_UnRegisterCallback(void) {
-    if (psp_arg(0) != g_callback_id) { psp_ret(0x80010016); return; }
+    if (psp_arg(0) != g_callback_id) { psp_ret(SCE_ERROR_EINVAL); return; }
     g_callback_id = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }

@@ -127,6 +127,56 @@ typedef struct {
     float    lod_slope;
 } psp_tex_state;
 
+/* TEXFORMAT (psp_tex_state.fmt): the direct-colour formats are the pixel
+ * formats, then come the palette indices and the compressed formats. */
+enum {
+    PSP_TFMT_5650 = 0, PSP_TFMT_5551, PSP_TFMT_4444, PSP_TFMT_8888,
+    PSP_TFMT_CLUT4, PSP_TFMT_CLUT8, PSP_TFMT_CLUT16, PSP_TFMT_CLUT32,
+    PSP_TFMT_DXT1, PSP_TFMT_DXT3, PSP_TFMT_DXT5
+};
+
+/* A texel's size in half-bytes, so CLUT4's half a byte is 1; 0 for the
+ * compressed formats and anything past them. */
+static inline int psp_texel_halfbytes(int fmt) {
+    switch (fmt) {
+    case PSP_TFMT_CLUT4:                      return 1;
+    case PSP_TFMT_CLUT8:                      return 2;
+    case PSP_TFMT_5650: case PSP_TFMT_5551:
+    case PSP_TFMT_4444: case PSP_TFMT_CLUT16: return 4;
+    case PSP_TFMT_8888: case PSP_TFMT_CLUT32: return 8;
+    default:                                  return 0;
+    }
+}
+
+/* The GE's codes for the texture function and the draw state below, in
+ * PSPSDK pspgu.h's order. TEXFUNC (psp_tex_state.func): */
+enum { PSP_TFX_MODULATE = 0, PSP_TFX_DECAL, PSP_TFX_BLEND, PSP_TFX_REPLACE, PSP_TFX_ADD };
+/* Comparisons, shared by the depth, alpha and stencil tests; the colour test
+ * takes the first four. */
+enum {
+    PSP_CMP_NEVER = 0, PSP_CMP_ALWAYS, PSP_CMP_EQUAL, PSP_CMP_NOTEQUAL,
+    PSP_CMP_LESS, PSP_CMP_LEQUAL, PSP_CMP_GREATER, PSP_CMP_GEQUAL
+};
+/* Blend factors (src, dst). The first two are the other side's colour. */
+enum {
+    PSP_BF_OTHER_COLOUR = 0, PSP_BF_ONE_MINUS_OTHER_COLOUR,
+    PSP_BF_SRC_ALPHA, PSP_BF_ONE_MINUS_SRC_ALPHA,
+    PSP_BF_DST_ALPHA, PSP_BF_ONE_MINUS_DST_ALPHA,
+    PSP_BF_DOUBLE_SRC_ALPHA, PSP_BF_ONE_MINUS_DOUBLE_SRC_ALPHA,
+    PSP_BF_DOUBLE_DST_ALPHA, PSP_BF_ONE_MINUS_DOUBLE_DST_ALPHA,
+    PSP_BF_FIXED                 /* FIXA for the source, FIXB for the destination */
+};
+/* Blend equations (eq). */
+enum {
+    PSP_BEQ_ADD = 0, PSP_BEQ_SUBTRACT, PSP_BEQ_REVERSE_SUBTRACT,
+    PSP_BEQ_MIN, PSP_BEQ_MAX, PSP_BEQ_ABS
+};
+/* Stencil operations (op_sfail, op_zfail, op_zpass). */
+enum {
+    PSP_STENCIL_KEEP = 0, PSP_STENCIL_ZERO, PSP_STENCIL_REPLACE,
+    PSP_STENCIL_INVERT, PSP_STENCIL_INCR, PSP_STENCIL_DECR
+};
+
 /* Blend and alpha-test state, as the GE encodes it. Factors and the equation
  * are GEBlendSrcFactor / GEBlendDstFactor / GEBlendMode codes; the alpha-test
  * function shares the GE's comparison codes with the depth test. */
@@ -188,6 +238,45 @@ enum {
     PSP_PRIM_SPRITES
 };
 
+/* The GE's pixel formats -- FRAMEBUF_PIX_FORMAT's, and the direct-colour
+ * texture and palette formats': 0 5650, 1 5551, 2 4444, 3 8888, red in the
+ * low bits. A 16-bit pixel widens to 8888 with each field's top bits
+ * repeated below it, so full scale stays 0xFF; 5650 is opaque and 5551's
+ * alpha bit reads 0 or 0xFF. Narrowing keeps each field's top bits. Both
+ * take any format but 0 and 1 as 4444. */
+static inline int psp_pixel_bytes(int fmt) { return fmt == 3 ? 4 : 2; }
+
+static inline uint32_t psp_pixel_unpack16(uint32_t p, int fmt) {
+    uint32_t r, g, b, a;
+    switch (fmt) {
+    case 0:
+        r = p & 0x1F;         r = (r << 3) | (r >> 2);
+        g = (p >> 5)  & 0x3F; g = (g << 2) | (g >> 4);
+        b = (p >> 11) & 0x1F; b = (b << 3) | (b >> 2);
+        a = 0xFF; break;
+    case 1:
+        r = p & 0x1F;         r = (r << 3) | (r >> 2);
+        g = (p >> 5)  & 0x1F; g = (g << 3) | (g >> 2);
+        b = (p >> 10) & 0x1F; b = (b << 3) | (b >> 2);
+        a = (p >> 15) ? 0xFF : 0x00; break;
+    default:
+        r = p & 0xF;          r = (r << 4) | r;
+        g = (p >> 4)  & 0xF;  g = (g << 4) | g;
+        b = (p >> 8)  & 0xF;  b = (b << 4) | b;
+        a = (p >> 12) & 0xF;  a = (a << 4) | a; break;
+    }
+    return (a << 24) | (b << 16) | (g << 8) | r;
+}
+
+static inline uint32_t psp_pixel_pack16(uint32_t rgba, int fmt) {
+    const uint32_t r = rgba & 0xFF, g = (rgba >> 8) & 0xFF, b = (rgba >> 16) & 0xFF, a = rgba >> 24;
+    switch (fmt) {
+    case 0:  return (r >> 3) | ((g >> 2) << 5) | ((b >> 3) << 11);
+    case 1:  return (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >> 7) << 15);
+    default: return (r >> 4) | ((g >> 4) << 4) | ((b >> 4) << 8) | ((a >> 4) << 12);
+    }
+}
+
 /* A vertex as the display list stores it, decoded but not yet transformed:
  * what draw_model receives. The colour is the vertex's own or, when the
  * format carries none, the material colour the CPU path would have used; u and
@@ -199,6 +288,17 @@ typedef struct {
     uint32_t rgba;
     float    u, v;
 } psp_model_vertex;
+
+/* The lighting and texture-mapping codes psp_xform_state carries, as the
+ * GE's registers give them (PSPSDK pspgu.h's order): a light's type and
+ * kind (LIGHTTYPE), the material colours the vertex colour supplies
+ * (MATERIALUPDATE, bits), where texture coordinates come from and what the
+ * texture matrix is applied to (TEXMAPMODE). */
+enum { PSP_LIGHT_DIRECTIONAL = 0, PSP_LIGHT_POINT, PSP_LIGHT_SPOT };
+enum { PSP_LIGHTKIND_DIFFUSE = 0, PSP_LIGHTKIND_SPECULAR, PSP_LIGHTKIND_POWERED };
+enum { PSP_MAT_AMBIENT = 1, PSP_MAT_DIFFUSE = 2, PSP_MAT_SPECULAR = 4 };
+enum { PSP_TEXMAP_UV = 0, PSP_TEXMAP_MATRIX, PSP_TEXMAP_SHADE };
+enum { PSP_TEXPROJ_POSITION = 0, PSP_TEXPROJ_UV, PSP_TEXPROJ_UNIT_NORMAL, PSP_TEXPROJ_NORMAL };
 
 /* Everything ge.c's transform pipeline applies between a psp_model_vertex and
  * the psp_vertex it hands to draw(), captured at the draw. Matrices are the
@@ -368,6 +468,13 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
                           psp_line_pixel_fn emit, void *opaque);
 int psp_render_line_lod16(const psp_tex_state *t,
                           const psp_vertex *a, const psp_vertex *b);
+/* A point list's level of detail: a gradient of one texel a pixel, at the
+ * mean w of its points. */
+int psp_render_points_lod16(const psp_tex_state *t, const psp_vertex *v, int count);
+/* A triangle's level of detail, from the greater of its texture gradients
+ * along x and y; 0 for a triangle with no area. */
+int psp_render_tri_lod16(const psp_tex_state *t, const psp_vertex *a,
+                         const psp_vertex *b, const psp_vertex *c);
 
 /* Add a backend the runtime does not carry. Anything needing a window or a GL
  * context lives in the host -- the core has no external dependencies and SDL2

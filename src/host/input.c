@@ -37,6 +37,13 @@
 
 /* ---- the default layouts --------------------------------------------------- */
 
+/* The PSP's buttons, as sceCtrl reports them. */
+enum {
+    BTN_SELECT = 0x0001, BTN_START = 0x0008, BTN_UP = 0x0010, BTN_RIGHT = 0x0020,
+    BTN_DOWN = 0x0040, BTN_LEFT = 0x0080, BTN_L = 0x0100, BTN_R = 0x0200,
+    BTN_TRIANGLE = 0x1000, BTN_CIRCLE = 0x2000, BTN_CROSS = 0x4000, BTN_SQUARE = 0x8000,
+};
+
 /* SDL key -> PSP button. A button is held exactly as long as its key is.
  *
  * The classic layout is the PSP's face laid on the keyboard -- arrows for the
@@ -51,27 +58,27 @@
  * game is the game's key assign, not this table's. Keys are keycodes, found
  * where the keyboard's layout puts them; the stick is by position. */
 static const psp_key_bind KEYS_CLASSIC[] = {
-    { SDLK_RIGHT,      0x000020 }, { SDLK_LEFT,      0x000080 },
-    { SDLK_DOWN,       0x000040 }, { SDLK_UP,        0x000010 },
-    { SDLK_RETURN,     0x000008 }, { SDLK_BACKSPACE, 0x000001 },
-    { SDLK_z,          0x004000 }, { SDLK_x,         0x002000 },
-    { SDLK_a,          0x008000 }, { SDLK_s,         0x001000 },
-    { SDLK_q,          0x000100 }, { SDLK_e,         0x000200 },
+    { SDLK_RIGHT,      BTN_RIGHT }, { SDLK_LEFT,      BTN_LEFT },
+    { SDLK_DOWN,       BTN_DOWN }, { SDLK_UP,        BTN_UP },
+    { SDLK_RETURN,     BTN_START }, { SDLK_BACKSPACE, BTN_SELECT },
+    { SDLK_z,          BTN_CROSS }, { SDLK_x,         BTN_CIRCLE },
+    { SDLK_a,          BTN_SQUARE }, { SDLK_s,         BTN_TRIANGLE },
+    { SDLK_q,          BTN_L }, { SDLK_e,         BTN_R },
 };
 
 static const psp_key_bind KEYS_WASD[] = {
-    { SDLK_RIGHT,      0x000020 }, { SDLK_LEFT,      0x000080 },
-    { SDLK_DOWN,       0x000040 }, { SDLK_UP,        0x000010 },
-    { SDLK_RETURN,     0x000008 }, { SDLK_BACKSPACE, 0x000001 },
-    { SDLK_z,          0x004000 }, { SDLK_SPACE,     0x004000 },
-    { SDLK_x,          0x002000 },
-    { SDLK_c,          0x008000 }, { SDLK_v,         0x001000 },
-    { SDLK_q,          0x000010 }, { SDLK_e,         0x000200 },
+    { SDLK_RIGHT,      BTN_RIGHT }, { SDLK_LEFT,      BTN_LEFT },
+    { SDLK_DOWN,       BTN_DOWN }, { SDLK_UP,        BTN_UP },
+    { SDLK_RETURN,     BTN_START }, { SDLK_BACKSPACE, BTN_SELECT },
+    { SDLK_z,          BTN_CROSS }, { SDLK_SPACE,     BTN_CROSS },
+    { SDLK_x,          BTN_CIRCLE },
+    { SDLK_c,          BTN_SQUARE }, { SDLK_v,         BTN_TRIANGLE },
+    { SDLK_q,          BTN_UP }, { SDLK_e,         BTN_R },
 };
 
 /* Mouse button -> PSP button, WASD only: SDL_BUTTON_LEFT/MIDDLE/RIGHT are
  * 1/2/3. */
-static const uint32_t MOUSE_WASD[4] = { 0, 0x008000, 0x000040, 0x000040 };
+static const uint32_t MOUSE_WASD[4] = { 0, BTN_SQUARE, BTN_DOWN, BTN_DOWN };
 
 /* The controller as a PSP, and the modern layout, which sends the face
  * buttons, bumpers, triggers and stick clicks as carriers (psprecomp/host/
@@ -79,26 +86,26 @@ static const uint32_t MOUSE_WASD[4] = { 0, 0x008000, 0x000040, 0x000040 };
  * in psp_title_info, and the pad speaks the PSP buttons the game already
  * understands. */
 static const psp_pad_bind PAD_CLASSIC[] = {
-    { SDL_CONTROLLER_BUTTON_DPAD_RIGHT,          0x000020 },
-    { SDL_CONTROLLER_BUTTON_DPAD_LEFT,           0x000080 },
-    { SDL_CONTROLLER_BUTTON_DPAD_DOWN,           0x000040 },
-    { SDL_CONTROLLER_BUTTON_DPAD_UP,             0x000010 },
-    { SDL_CONTROLLER_BUTTON_START,               0x000008 },
-    { SDL_CONTROLLER_BUTTON_BACK,                0x000001 },
-    { SDL_CONTROLLER_BUTTON_A,                   0x004000 },
-    { SDL_CONTROLLER_BUTTON_B,                   0x002000 },
-    { SDL_CONTROLLER_BUTTON_X,                   0x008000 },
-    { SDL_CONTROLLER_BUTTON_Y,                   0x001000 },
-    { SDL_CONTROLLER_BUTTON_LEFTSHOULDER,        0x000100 },
-    { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,       0x000200 },
+    { SDL_CONTROLLER_BUTTON_DPAD_RIGHT,          BTN_RIGHT },
+    { SDL_CONTROLLER_BUTTON_DPAD_LEFT,           BTN_LEFT },
+    { SDL_CONTROLLER_BUTTON_DPAD_DOWN,           BTN_DOWN },
+    { SDL_CONTROLLER_BUTTON_DPAD_UP,             BTN_UP },
+    { SDL_CONTROLLER_BUTTON_START,               BTN_START },
+    { SDL_CONTROLLER_BUTTON_BACK,                BTN_SELECT },
+    { SDL_CONTROLLER_BUTTON_A,                   BTN_CROSS },
+    { SDL_CONTROLLER_BUTTON_B,                   BTN_CIRCLE },
+    { SDL_CONTROLLER_BUTTON_X,                   BTN_SQUARE },
+    { SDL_CONTROLLER_BUTTON_Y,                   BTN_TRIANGLE },
+    { SDL_CONTROLLER_BUTTON_LEFTSHOULDER,        BTN_L },
+    { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,       BTN_R },
 };
 static const psp_pad_bind PAD_MODERN[] = {
-    { SDL_CONTROLLER_BUTTON_DPAD_RIGHT,          0x000020 },
-    { SDL_CONTROLLER_BUTTON_DPAD_LEFT,           0x000080 },
-    { SDL_CONTROLLER_BUTTON_DPAD_DOWN,           0x000040 },
-    { SDL_CONTROLLER_BUTTON_DPAD_UP,             0x000010 },
-    { SDL_CONTROLLER_BUTTON_START,               0x000008 },
-    { SDL_CONTROLLER_BUTTON_BACK,                0x000001 },
+    { SDL_CONTROLLER_BUTTON_DPAD_RIGHT,          BTN_RIGHT },
+    { SDL_CONTROLLER_BUTTON_DPAD_LEFT,           BTN_LEFT },
+    { SDL_CONTROLLER_BUTTON_DPAD_DOWN,           BTN_DOWN },
+    { SDL_CONTROLLER_BUTTON_DPAD_UP,             BTN_UP },
+    { SDL_CONTROLLER_BUTTON_START,               BTN_START },
+    { SDL_CONTROLLER_BUTTON_BACK,                BTN_SELECT },
     { SDL_CONTROLLER_BUTTON_A,                   PSP_PAD_A },
     { SDL_CONTROLLER_BUTTON_B,                   PSP_PAD_B },
     { SDL_CONTROLLER_BUTTON_X,                   PSP_PAD_X },
@@ -111,7 +118,9 @@ static const psp_pad_bind PAD_MODERN[] = {
 
 /* ---- sources, targets, bindings -------------------------------------------- */
 
-enum { DEV_KEY, DEV_PAD, DEV_MOUSE, DEVICES };
+/* The devices, numbered as the menu's INPUT_KEYBOARD, INPUT_CONTROLLER and
+ * INPUT_MOUSE (input.h). */
+enum { DEV_KEY = INPUT_KEYBOARD, DEV_PAD = INPUT_CONTROLLER, DEV_MOUSE = INPUT_MOUSE, DEVICES = INPUT_DEVICES };
 static const char *const DEVICE_NAME[DEVICES] = { "key", "pad", "mouse" };
 
 enum {
@@ -144,12 +153,12 @@ static int     g_nbinds;
 
 /* The PSP buttons and the host's own targets, by their bind.* names. */
 static const struct { const char *name; uint8_t tgt; uint32_t value; } TARGETS[] = {
-    { "select", TGT_BUTTONS, 0x0001 }, { "start", TGT_BUTTONS, 0x0008 },
-    { "up", TGT_BUTTONS, 0x0010 }, { "right", TGT_BUTTONS, 0x0020 },
-    { "down", TGT_BUTTONS, 0x0040 }, { "left", TGT_BUTTONS, 0x0080 },
-    { "l", TGT_BUTTONS, 0x0100 }, { "r", TGT_BUTTONS, 0x0200 },
-    { "triangle", TGT_BUTTONS, 0x1000 }, { "circle", TGT_BUTTONS, 0x2000 },
-    { "cross", TGT_BUTTONS, 0x4000 }, { "square", TGT_BUTTONS, 0x8000 },
+    { "select", TGT_BUTTONS, BTN_SELECT }, { "start", TGT_BUTTONS, BTN_START },
+    { "up", TGT_BUTTONS, BTN_UP }, { "right", TGT_BUTTONS, BTN_RIGHT },
+    { "down", TGT_BUTTONS, BTN_DOWN }, { "left", TGT_BUTTONS, BTN_LEFT },
+    { "l", TGT_BUTTONS, BTN_L }, { "r", TGT_BUTTONS, BTN_R },
+    { "triangle", TGT_BUTTONS, BTN_TRIANGLE }, { "circle", TGT_BUTTONS, BTN_CIRCLE },
+    { "cross", TGT_BUTTONS, BTN_CROSS }, { "square", TGT_BUTTONS, BTN_SQUARE },
     { "stick_up", TGT_STICK_DIR, DIR_UP }, { "stick_down", TGT_STICK_DIR, DIR_DOWN },
     { "stick_left", TGT_STICK_DIR, DIR_LEFT }, { "stick_right", TGT_STICK_DIR, DIR_RIGHT },
     { "walk", TGT_WALK, 0 }, { "stick", TGT_STICK, 0 }, { "look", TGT_LOOK, 0 },
@@ -203,6 +212,41 @@ static const struct { const char *name; uint16_t mod; } MODS[] = {
     { "Ctrl+", KMOD_CTRL }, { "Shift+", KMOD_SHIFT }, { "Alt+", KMOD_ALT }, { "Gui+", KMOD_GUI },
 };
 
+/* A key by its name. SDL names the comma key ",", which a list cannot hold,
+ * so it is "Comma" here. */
+static const char *key_name(SDL_Keycode k) { return k == SDLK_COMMA ? "Comma" : SDL_GetKeyName(k); }
+static SDL_Keycode key_from_name(const char *name) {
+    return !SDL_strcasecmp(name, "Comma") ? SDLK_COMMA : SDL_GetKeyFromName(name);
+}
+
+/* Half an axis: "+leftx", "-righty", or a trigger's bare name -- a trigger
+ * only has its upper half. */
+static void axis_half_name(SDL_GameControllerAxis a, int upper, char *out, size_t size) {
+    const int trigger = a == SDL_CONTROLLER_AXIS_TRIGGERLEFT || a == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
+    snprintf(out, size, "%s%s", trigger && upper ? "" : upper ? "+" : "-", SDL_GameControllerGetStringForAxis(a));
+}
+
+/* Which way a wheel turned: 0 up, 1 down, 2 left, 3 right, or -1. */
+static int wheel_notch(const SDL_MouseWheelEvent *w) {
+    int y = w->y, x = w->x;
+    if (w->direction == SDL_MOUSEWHEEL_FLIPPED) { y = -y; x = -x; }
+    return y > 0 ? 0 : y < 0 ? 1 : x < 0 ? 2 : x > 0 ? 3 : -1;
+}
+
+/* A bind.* key's device, from its "<device>." prefix; -1 for none. */
+static int device_of(const char *key) {
+    for (int d = 0; d < DEVICES; d++) {
+        const size_t n = strlen(DEVICE_NAME[d]);
+        if (!strncmp(key, DEVICE_NAME[d], n) && key[n] == '.') return d;
+    }
+    return -1;
+}
+
+/* one appended to the ", "-separated list in out, when it fits. */
+static void append_listed(char *out, size_t size, const char *one) {
+    if (strlen(out) + strlen(one) + 3 < size) { if (*out) strcat(out, ", "); strcat(out, one); }
+}
+
 /* One source, as a bind.* value spells it on its device. */
 static int parse_source(int device, const char *text, binding *b, char *why, size_t size) {
     b->mods = 0;
@@ -221,8 +265,7 @@ static int parse_source(int device, const char *text, binding *b, char *why, siz
             if (sc == SDL_SCANCODE_UNKNOWN) { snprintf(why, size, "no key position '%s'", text + 9); return -1; }
             b->src = SRC_SCANCODE; b->code = sc; return 0;
         }
-        /* SDL names the comma key ",", which a list cannot hold. */
-        const SDL_Keycode k = !SDL_strcasecmp(text, "Comma") ? SDLK_COMMA : SDL_GetKeyFromName(text);
+        const SDL_Keycode k = key_from_name(text);
         if (k == SDLK_UNKNOWN) { snprintf(why, size, "no key '%s'", text); return -1; }
         b->src = SRC_KEY; b->code = k; return 0;
     }
@@ -256,18 +299,13 @@ static void format_source(const binding *b, char *out, size_t size) {
         if (b->mods & MODS[i].mod) strcat(mods, MODS[i].name);
     switch (b->src) {
     case SRC_KEY:
-        snprintf(out, size, "%s%s", mods, b->code == SDLK_COMMA ? "Comma" : SDL_GetKeyName(b->code)); break;
+        snprintf(out, size, "%s%s", mods, key_name(b->code)); break;
     case SRC_SCANCODE:
         snprintf(out, size, "%sscancode:%s", mods, SDL_GetScancodeName((SDL_Scancode)b->code)); break;
     case SRC_BUTTON:
         snprintf(out, size, "%s", SDL_GameControllerGetStringForButton((SDL_GameControllerButton)b->code)); break;
-    case SRC_AXIS_POS: case SRC_AXIS_NEG: {
-        const SDL_GameControllerAxis a = (SDL_GameControllerAxis)b->code;
-        const int trigger = a == SDL_CONTROLLER_AXIS_TRIGGERLEFT || a == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
-        snprintf(out, size, "%s%s", trigger && b->src == SRC_AXIS_POS ? "" : b->src == SRC_AXIS_POS ? "+" : "-",
-                 SDL_GameControllerGetStringForAxis(a));
-        break;
-    }
+    case SRC_AXIS_POS: case SRC_AXIS_NEG:
+        axis_half_name((SDL_GameControllerAxis)b->code, b->src == SRC_AXIS_POS, out, size); break;
     case SRC_STICK: snprintf(out, size, "%s", b->code ? "rightxy" : "leftxy"); break;
     case SRC_MOUSE_BUTTON: snprintf(out, size, "%s", MOUSE_NAMES[b->code]); break;
     case SRC_WHEEL: snprintf(out, size, "%s", WHEEL_NAMES[b->code]); break;
@@ -298,10 +336,12 @@ static const char *mismatch(const binding *b) {
 
 /* ---- building the table ------------------------------------------------------ */
 
-static void add(int device, int src, int32_t code, int tgt, uint32_t value) {
-    if (g_nbinds >= BINDINGS_MAX) return;
-    g_binds[g_nbinds++] = (binding){ .device = (uint8_t)device, .src = (uint8_t)src, .code = code,
-                                     .tgt = (uint8_t)tgt, .value = value };
+static binding *add(int device, int src, int32_t code, int tgt, uint32_t value) {
+    if (g_nbinds >= BINDINGS_MAX) return NULL;
+    binding *b = &g_binds[g_nbinds++];
+    *b = (binding){ .device = (uint8_t)device, .src = (uint8_t)src, .code = code,
+                    .tgt = (uint8_t)tgt, .value = value };
+    return b;
 }
 
 static int same_target(const binding *a, const binding *b) {
@@ -336,8 +376,8 @@ static void build_defaults(void) {
     add(DEV_KEY, SRC_KEY, SDLK_F9, TGT_ACTION, INPUT_ACTION_QUICK_LOAD);
     add(DEV_KEY, SRC_KEY, SDLK_F6, TGT_ACTION, INPUT_ACTION_SLOT_PREV);
     add(DEV_KEY, SRC_KEY, SDLK_F7, TGT_ACTION, INPUT_ACTION_SLOT_NEXT);
-    add(DEV_KEY, SRC_KEY, SDLK_q, TGT_ACTION, INPUT_ACTION_QUIT);
-    g_binds[g_nbinds - 1].mods = KMOD_CTRL | KMOD_SHIFT;
+    binding *quit = add(DEV_KEY, SRC_KEY, SDLK_q, TGT_ACTION, INPUT_ACTION_QUIT);
+    if (quit) quit->mods = KMOD_CTRL | KMOD_SHIFT;
 
     /* The mouse: its buttons under WASD, its motion whenever it is captured. */
     if (g_keys_wasd) {
@@ -372,11 +412,7 @@ static void build_defaults(void) {
  * preset must not keep the game from starting. */
 static int apply_binding(const char *key, const char *value) {
     char why[160] = "";
-    int device = -1;
-    for (int d = 0; d < DEVICES; d++) {
-        const size_t n = strlen(DEVICE_NAME[d]);
-        if (!strncmp(key, DEVICE_NAME[d], n) && key[n] == '.') device = d;
-    }
+    const int device = device_of(key);
     binding t = { 0 };
     if (device < 0 || parse_target(strchr(key, '.') + 1, &t)) {
         fprintf(stderr, "present: bind.%s: not a target here -- ignored\n", key);
@@ -421,7 +457,18 @@ static void find_keys(void) {
         if (g_binds[i].src == SRC_KEY) g_binds[i].scancode = SDL_GetScancodeFromKey(g_binds[i].code);
 }
 
+/* The table: the layouts in force, then s's bind.* keys over them. */
+static void bind_table(const psp_settings *s) {
+    build_defaults();
+    for (int i = 0; i < s->bind_count; i++) apply_binding(s->bind[i].key, s->bind[i].value);
+    find_keys();
+}
+
 /* ---- working out the pad ------------------------------------------------------ */
+
+/* An axis half is pressed from halfway and let go below a quarter: separate
+ * points avoid chatter around one without making a light touch sticky. */
+enum { AXIS_PRESS = 16384, AXIS_RELEASE = 8192 };
 
 static uint8_t axis_byte(int16_t value) {
     /* The whole SDL range. The title's control profile applies one radial
@@ -438,11 +485,9 @@ static int down(binding *b) {
     case SRC_SCANCODE: return g_key_down[b->code];
     case SRC_BUTTON: return g_pad_down[b->code];
     case SRC_AXIS_POS: case SRC_AXIS_NEG: {
-        /* Separate 50%/25% press and release points avoid chatter around
-         * the actuation point without making a light touch sticky. */
         const int v = b->src == SRC_AXIS_POS ? g_pad_axis[b->code] : -(int)g_pad_axis[b->code];
-        if (!b->held && v >= 16384) b->held = 1;
-        if ( b->held && v <=  8192) b->held = 0;
+        if (!b->held && v >= AXIS_PRESS) b->held = 1;
+        if ( b->held && v <= AXIS_RELEASE) b->held = 0;
         return b->held;
     }
     case SRC_MOUSE_BUTTON: return (g_mouse_down & SDL_BUTTON(b->code)) != 0;
@@ -544,13 +589,17 @@ static void mouse_grab(int on) {
  * the game until the menu takes the controls. */
 static struct { unsigned buttons; int fired; } g_chord;
 
+unsigned input_chord_bit(int button) {
+    return button == SDL_CONTROLLER_BUTTON_BACK ? INPUT_CHORD_VIEW :
+           button == SDL_CONTROLLER_BUTTON_START ? INPUT_CHORD_MENU : 0u;
+}
+
 static int chord_button(uint8_t button, int is_down) {
-    const unsigned bit = button == SDL_CONTROLLER_BUTTON_BACK ? 1u :
-                         button == SDL_CONTROLLER_BUTTON_START ? 2u : 0u;
+    const unsigned bit = input_chord_bit(button);
     if (!bit) return 0;
     if (is_down) g_chord.buttons |= bit;
     else g_chord.buttons &= ~bit;
-    if (g_chord.buttons != 3) { g_chord.fired = 0; return 0; }
+    if (g_chord.buttons != INPUT_CHORD_BOTH) { g_chord.fired = 0; return 0; }
     if (g_chord.fired) return 0;
     g_chord.fired = 1;
     return 1;
@@ -590,7 +639,7 @@ static void sample_controller(void) {
         chord_button((uint8_t)b, g_pad_down[b]);
     }
     /* A pair already held when the pad is sampled is not a press. */
-    g_chord.fired = g_chord.buttons == 3;
+    g_chord.fired = g_chord.buttons == INPUT_CHORD_BOTH;
     for (int a = 0; a < SDL_CONTROLLER_AXIS_MAX; a++)
         g_pad_axis[a] = SDL_GameControllerGetAxis(g_controller, (SDL_GameControllerAxis)a);
 }
@@ -658,7 +707,7 @@ static int pressed_elsewhere(const SDL_Event *e) {
     if (!g_pad_last) return 0;
     SDL_JoystickID id;
     if (e->type == SDL_CONTROLLERBUTTONDOWN) id = e->cbutton.which;
-    else if (e->type == SDL_CONTROLLERAXISMOTION && abs(e->caxis.value) >= 16384) id = e->caxis.which;
+    else if (e->type == SDL_CONTROLLERAXISMOTION && abs(e->caxis.value) >= AXIS_PRESS) id = e->caxis.which;
     else return 0;
     if (id == g_controller_id) return 0;
     const int i = pad_slot(id);
@@ -696,8 +745,7 @@ void input_return(int owner) {
     g_return_at = 0;
 }
 
-/* Nothing held anywhere: every key, mouse button and button of the pad. */
-static int neutral(void) {
+int input_neutral(void) {
     int n;
     const Uint8 *keys = SDL_GetKeyboardState(&n);
     for (int i = 0; i < n; i++) if (keys[i]) return 0;
@@ -714,7 +762,7 @@ static void returning(void) {
     if (!g_returning) return;
     const Uint64 now = SDL_GetTicks64();
     if (!g_return_at) g_return_at = now;
-    const int calm = neutral();
+    const int calm = input_neutral();
     if (!calm && now - g_return_at < 1000) return;
     if (!calm)
         fprintf(stderr, "present: input still held a second after the %s closed; resuming game input\n",
@@ -780,18 +828,20 @@ static int input_types(Uint32 type) {
            type == SDL_CONTROLLERAXISMOTION;
 }
 
-int input_event(const SDL_Event *e) {
+/* Devices coming and going, the keyboard layout and focus, whoever owns the
+ * controls: 1 when e was one of those. */
+static int device_event(const SDL_Event *e) {
     switch (e->type) {
     case SDL_CONTROLLERDEVICEADDED:
         open_controller(e->cdevice.which);
-        return INPUT_ACTION_NONE;
+        return 1;
     case SDL_CONTROLLERDEVICEREMOVED:
         controller_removed(e->cdevice.which);
-        return INPUT_ACTION_NONE;
+        return 1;
     case SDL_KEYMAPCHANGED:
         find_keys();
         publish();
-        return INPUT_ACTION_NONE;
+        return 1;
     case SDL_WINDOWEVENT:
         if (e->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
             mouse_grab(0);
@@ -803,63 +853,77 @@ int input_event(const SDL_Event *e) {
             sample_controller();
             publish();
         }
-        return INPUT_ACTION_NONE;
-    default: break;
+        return 1;
+    default: return 0;
     }
-    if (!input_types(e->type)) return INPUT_ACTION_NONE;
-    if (g_owner != INPUT_GAME) { input_chord_event(e); return INPUT_ACTION_NONE; }
-    int menu = 0;
+}
 
+/* The host action bound to this key with modifiers, or NULL. */
+static const binding *modified_key_action(const SDL_Keysym *k) {
+    for (int i = 0; i < g_nbinds; i++)
+        if (g_binds[i].tgt == TGT_ACTION && g_binds[i].mods && key_matches(&g_binds[i], k)) return &g_binds[i];
+    return NULL;
+}
+
+/* What one control the game owns did, kept as the state the pad is worked
+ * out from: 0 when it is to be worked out again, -1 when the event changed
+ * nothing it reads. *menu is set when the event completed the menu chord. */
+static int note_control(const SDL_Event *e, int *menu) {
     switch (e->type) {
     case SDL_CONTROLLERBUTTONDOWN:
     case SDL_CONTROLLERBUTTONUP:
-        if (e->cbutton.which != g_controller_id && !pressed_elsewhere(e)) return INPUT_ACTION_NONE;
-        menu = chord_button(e->cbutton.button, e->cbutton.state);
+        if (e->cbutton.which != g_controller_id && !pressed_elsewhere(e)) return -1;
+        *menu = chord_button(e->cbutton.button, e->cbutton.state);
         if (e->cbutton.button < SDL_CONTROLLER_BUTTON_MAX) g_pad_down[e->cbutton.button] = e->cbutton.state != 0;
-        break;
+        return 0;
     case SDL_CONTROLLERAXISMOTION:
-        if (e->caxis.which != g_controller_id && !pressed_elsewhere(e)) return INPUT_ACTION_NONE;
+        if (e->caxis.which != g_controller_id && !pressed_elsewhere(e)) return -1;
         if (e->caxis.axis < SDL_CONTROLLER_AXIS_MAX) g_pad_axis[e->caxis.axis] = e->caxis.value;
-        break;
+        return 0;
     case SDL_MOUSEMOTION:
         /* Relative motion only while captured: a pointer crossing an
          * uncaptured window is not a look. */
         if (g_mouse_grabbed)
             for (int i = 0; i < g_nbinds; i++)
                 if (g_binds[i].src == SRC_MOTION) { psp_ctrl_add_mouse(e->motion.xrel, e->motion.yrel); break; }
-        return INPUT_ACTION_NONE;
+        return -1;
     case SDL_MOUSEBUTTONDOWN:
     case SDL_MOUSEBUTTONUP:
         /* The click that captures the pointer is not also a shot. */
-        if (!g_mouse_grabbed) { if (e->type == SDL_MOUSEBUTTONDOWN) mouse_grab(1); return INPUT_ACTION_NONE; }
+        if (!g_mouse_grabbed) { if (e->type == SDL_MOUSEBUTTONDOWN) mouse_grab(1); return -1; }
         if (e->button.button >= 1 && e->button.button <= 5) {
             if (e->type == SDL_MOUSEBUTTONDOWN) g_mouse_down |= SDL_BUTTON(e->button.button);
             else g_mouse_down &= ~SDL_BUTTON(e->button.button);
         }
-        break;
+        return 0;
     case SDL_MOUSEWHEEL: {
-        if (!g_mouse_grabbed) return INPUT_ACTION_NONE;
-        int y = e->wheel.y, x = e->wheel.x;
-        if (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { y = -y; x = -x; }
-        const int which = y > 0 ? 0 : y < 0 ? 1 : x < 0 ? 2 : x > 0 ? 3 : -1;
+        if (!g_mouse_grabbed) return -1;
+        const int which = wheel_notch(&e->wheel);
         /* A wheel notch is a press the game sees for two of its polls. */
         for (int i = 0; i < g_nbinds; i++)
             if (g_binds[i].src == SRC_WHEEL && g_binds[i].code == which) {
                 g_binds[i].held = 1;
                 g_binds[i].until = psp_ctrl_polls() + 2;
             }
-        break;
+        return 0;
     }
     case SDL_KEYDOWN:
     case SDL_KEYUP:
-        if (e->type == SDL_KEYDOWN && !e->key.repeat)
-            for (int i = 0; i < g_nbinds; i++)
-                if (g_binds[i].tgt == TGT_ACTION && g_binds[i].mods && key_matches(&g_binds[i], &e->key.keysym))
-                    return carry_out((int)g_binds[i].value);
         if (e->key.keysym.scancode > SDL_SCANCODE_UNKNOWN && e->key.keysym.scancode < SDL_NUM_SCANCODES)
             g_key_down[e->key.keysym.scancode] = e->key.state == SDL_PRESSED;
-        break;
+        return 0;
+    default: return 0;
     }
+}
+
+int input_event(const SDL_Event *e) {
+    if (device_event(e) || !input_types(e->type)) return INPUT_ACTION_NONE;
+    if (g_owner != INPUT_GAME) { input_chord_event(e); return INPUT_ACTION_NONE; }
+    /* A host action on a key with modifiers takes the key event whole. */
+    const binding *modified = e->type == SDL_KEYDOWN && !e->key.repeat ? modified_key_action(&e->key.keysym) : NULL;
+    if (modified) return carry_out((int)modified->value);
+    int menu = 0;
+    if (note_control(e, &menu)) return INPUT_ACTION_NONE;
     const int action = carry_out(actions());
     publish();
     return menu ? INPUT_ACTION_MENU : action;
@@ -896,18 +960,23 @@ enum { HOST_ROW_COUNT = sizeof HOST_ROWS / sizeof *HOST_ROWS,
 
 int input_rows(void) { return HOST_ROW_COUNT + (int)g_tin.action_count + HOST_ACTION_ROW_COUNT; }
 
-static const char *row_name(int row) {
-    if (row < HOST_ROW_COUNT) return HOST_ROWS[row].name;
+/* A row's target name, and its label: the host's buttons, the title's
+ * actions, then the host actions. */
+static const char *row_entry(int row, const char **label) {
+    if (row < HOST_ROW_COUNT) { *label = HOST_ROWS[row].label; return HOST_ROWS[row].name; }
     row -= HOST_ROW_COUNT;
-    if (row < (int)g_tin.action_count) return g_tin.actions[row].name;
-    return HOST_ACTION_ROWS[row - (int)g_tin.action_count].name;
+    if (row < (int)g_tin.action_count) { *label = g_tin.actions[row].label; return g_tin.actions[row].name; }
+    row -= (int)g_tin.action_count;
+    *label = HOST_ACTION_ROWS[row].label;
+    return HOST_ACTION_ROWS[row].name;
 }
 
+static const char *row_name(int row) { const char *label; return row_entry(row, &label); }
+
 const char *input_row_label(int row) {
-    if (row < HOST_ROW_COUNT) return HOST_ROWS[row].label;
-    row -= HOST_ROW_COUNT;
-    if (row < (int)g_tin.action_count) return g_tin.actions[row].label;
-    return HOST_ACTION_ROWS[row - (int)g_tin.action_count].label;
+    const char *label;
+    row_entry(row, &label);
+    return label;
 }
 
 /* The key on the keyboard a source is, for telling two spellings apart. */
@@ -963,7 +1032,7 @@ static void sources_of(const binding *t, int device, const binding *without, cha
         if (without && same_source(b, without)) continue;
         char one[64];
         format_source(b, one, sizeof one);
-        if (strlen(out) + strlen(one) + 3 < size) { if (*out) strcat(out, ", "); strcat(out, one); }
+        append_listed(out, size, one);
     }
 }
 
@@ -976,7 +1045,7 @@ void input_row_sources(int row, int device, char *out, size_t size) {
         if (b->device != device || b->tgt != t.tgt || b->value != t.value) continue;
         char one[64];
         describe_source(b, one, sizeof one);
-        if (strlen(out) + strlen(one) + 3 < size) { if (*out) strcat(out, ", "); strcat(out, one); }
+        append_listed(out, size, one);
     }
 }
 
@@ -1012,18 +1081,18 @@ int input_spell(const SDL_Event *e, int device, char *out, size_t size) {
     switch (e->type) {
     case SDL_KEYDOWN:
         if (device != DEV_KEY || e->key.repeat) return 0;
-        snprintf(out, size, "%s", e->key.keysym.sym == SDLK_COMMA ? "Comma" : SDL_GetKeyName(e->key.keysym.sym));
+        snprintf(out, size, "%s", key_name(e->key.keysym.sym));
         return *out != 0;
     case SDL_CONTROLLERBUTTONDOWN:
         if (device != DEV_PAD) return 0;
         snprintf(out, size, "%s", SDL_GameControllerGetStringForButton((SDL_GameControllerButton)e->cbutton.button));
         return 1;
     case SDL_CONTROLLERAXISMOTION: {
-        if (device != DEV_PAD || abs(e->caxis.value) < 16384) return 0;
+        if (device != DEV_PAD || abs(e->caxis.value) < AXIS_PRESS) return 0;
         const SDL_GameControllerAxis a = (SDL_GameControllerAxis)e->caxis.axis;
         const int trigger = a == SDL_CONTROLLER_AXIS_TRIGGERLEFT || a == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
         if (trigger && e->caxis.value < 0) return 0;
-        snprintf(out, size, "%s%s", trigger ? "" : e->caxis.value > 0 ? "+" : "-", SDL_GameControllerGetStringForAxis(a));
+        axis_half_name(a, e->caxis.value > 0, out, size);
         return 1;
     }
     case SDL_MOUSEBUTTONDOWN:
@@ -1032,9 +1101,7 @@ int input_spell(const SDL_Event *e, int device, char *out, size_t size) {
         return 1;
     case SDL_MOUSEWHEEL: {
         if (device != DEV_MOUSE) return 0;
-        int y = e->wheel.y, x = e->wheel.x;
-        if (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { y = -y; x = -x; }
-        const int which = y > 0 ? 0 : y < 0 ? 1 : x < 0 ? 2 : x > 0 ? 3 : -1;
+        const int which = wheel_notch(&e->wheel);
         if (which < 0) return 0;
         snprintf(out, size, "%s", WHEEL_NAMES[which]);
         return 1;
@@ -1046,11 +1113,6 @@ int input_spell(const SDL_Event *e, int device, char *out, size_t size) {
 void input_release_mouse(void) { mouse_grab(0); }
 
 /* ---- starting -------------------------------------------------------------------------- */
-
-static double option_value(const psp_settings *s, const char *key, double absent) {
-    const int id = psp_settings_find(key);
-    return id >= 0 ? s->number[id] : absent;
-}
 
 /* The modern layout's carriers only mean something to a title whose
  * replacements read them. */
@@ -1066,12 +1128,10 @@ static int gamepad_modern(const psp_settings *s) {
  * menu changed: what the host can apply while the game runs. The title's
  * input and its Modern controls stay as they started. */
 void input_rebuild(const psp_settings *s) {
-    g_keys_wasd = option_value(s, "KEYS", 0) != 0;
+    g_keys_wasd = psp_settings_number(s, "KEYS", 0) != 0;
     const int was_last = g_pad_last;
-    g_pad_last = option_value(s, "ACTIVE_PAD", 0) != 0;
-    build_defaults();
-    for (int i = 0; i < s->bind_count; i++) apply_binding(s->bind[i].key, s->bind[i].value);
-    find_keys();
+    g_pad_last = s->number[PSP_OPT_ACTIVE_PAD] != 0;
+    bind_table(s);
     if (g_pad_last && !was_last) open_controllers();
     publish();
 }
@@ -1080,12 +1140,10 @@ void input_rebuild(const psp_settings *s) {
 static void build(const psp_settings *s) {
     memset(&g_tin, 0, sizeof g_tin);
     if (g_title->input) g_title->input(s, &g_tin);
-    g_keys_wasd = option_value(s, "KEYS", 0) != 0;
+    g_keys_wasd = psp_settings_number(s, "KEYS", 0) != 0;
     g_gamepad_modern = gamepad_modern(s);
     g_keys_modern = s->input && (g_title->capabilities & PSP_TITLE_MODERN_CONTROLS);
-    build_defaults();
-    for (int i = 0; i < s->bind_count; i++) apply_binding(s->bind[i].key, s->bind[i].value);
-    find_keys();
+    bind_table(s);
 }
 
 static void print_controls(const psp_settings *s) {
@@ -1107,18 +1165,16 @@ static void print_controls(const psp_settings *s) {
         fprintf(stderr, "present: %s\n", g_title->gamepad_modern_help);
     /* The preset's bindings, as the table holds them. */
     for (int i = 0; i < s->bind_count; i++) {
-        const char *key = s->bind[i].key, *dot = strchr(key, '.');
+        const char *key = s->bind[i].key;
         binding t = { 0 };
-        int device = -1;
-        for (int d = 0; d < DEVICES; d++)
-            if ((size_t)(dot - key) == strlen(DEVICE_NAME[d]) && !strncmp(key, DEVICE_NAME[d], (size_t)(dot - key))) device = d;
-        if (device < 0 || parse_target(dot + 1, &t)) continue;
+        const int device = device_of(key);
+        if (device < 0 || parse_target(strchr(key, '.') + 1, &t)) continue;
         t.device = (uint8_t)device;
         char list[256] = "", one[64];
         for (int k = 0; k < g_nbinds; k++) {
             if (!same_target(&g_binds[k], &t)) continue;
             format_source(&g_binds[k], one, sizeof one);
-            if (strlen(list) + strlen(one) + 3 < sizeof list) { if (*list) strcat(list, ", "); strcat(list, one); }
+            append_listed(list, sizeof list, one);
         }
         fprintf(stderr, "present: bind.%s = %s\n", key, *list ? list : "(nothing)");
     }
@@ -1127,7 +1183,7 @@ static void print_controls(const psp_settings *s) {
 void input_start(const psp_settings *s) {
     build(s);
     print_controls(s);
-    g_pad_last = option_value(s, "ACTIVE_PAD", 0) != 0;
+    g_pad_last = s->number[PSP_OPT_ACTIVE_PAD] != 0;
     /* Mouse-look, only when asked for. Captured from the start so a run
      * launched for it is playable at once; Escape lets go, a click retakes. */
     g_mouse_want = s->mouse;

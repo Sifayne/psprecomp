@@ -142,6 +142,81 @@ static void suspending(unsigned behaviour) {
     call(0x05db22ce, (uint32_t)cb, 0, 0);    /* sceGeUnsetCallback */
     cases++;
 }
+/* sceGeListEnQueueHead (uOFW's _sceGeListEnQueue with head set; not
+ * measured): the list goes in front of every other, paused until
+ * sceGeContinue, and only while the list at the front is paused or there is
+ * none -- one drawing there, held at its stall here, refuses it with
+ * 0x800001FE. The paused list it goes in front of reads QUEUED, and goes on
+ * from its pause once the head list is done: the head list draws green
+ * where the other then draws red. */
+#define HEAD_LIST 0x08811000u
+static void head_list(uint32_t at) {
+    static const uint32_t words_b[] = {
+        0x10080000, 0x9c000000, 0x9d0401e0, 0xd2000003, 0x1280011c,
+        0x01820060,                          /* VADDR: vertices 8 and 9 */
+        0x04060002,                          /* green rectangle */
+        0x0f000000, 0x0c000000,
+    };
+    for (unsigned i = 0; i < sizeof words_b / sizeof words_b[0]; i++) psp_write32(at + 4 * i, words_b[i]);
+}
+static void enqueue_head(void) {
+    setup();                                 /* vertices and a clear frame */
+    vertex(8, 0, 0, 0xff00ff00u); vertex(9, 3, 3, 0xff00ff00u);
+    head_list(HEAD_LIST);
+    const uint32_t id_b = call(0x1c0d95a6, HEAD_LIST, 0, (uint32_t)-1);
+    CHECK(id_b < 0x80000000u);
+    CHECK(call(0x03444eb4, id_b, 1, 0) == 4); /* PAUSED, on an idle GE too */
+    CHECK(pixel(1) == 0);
+    CHECK(call(0x4c06e472, 0, 0, 0) == 0);    /* sceGeContinue */
+    call(0xb287bd61, 0, 0, 0);
+    CHECK(pixel(1) == 0xff00);
+    cases++;
+
+    setup();
+    vertex(8, 0, 0, 0xff00ff00u); vertex(9, 3, 3, 0xff00ff00u);
+    words = 0;
+    cmd(0x10080000); cmd(0x9c000000); cmd(0x9d0401e0); cmd(0xd2000003); cmd(0x1280011c);
+    cmd(0x0e030042); cmd(0x0c000000);         /* SIGNAL PAUSE */
+    cmd(0x0f000000); cmd(0x0c000000);         /* the pause's FINISH and END */
+    cmd(0x01820000);                         /* VADDR: the head list moved it */
+    cmd(0x04060002);                         /* red rectangle */
+    cmd(0x0f000000); cmd(0x0c000000);
+    head_list(HEAD_LIST);
+    const uint32_t id_a = call(0xab49e76a, LIST, LIST, (uint32_t)-1);
+    CHECK(call(0x1c0d95a6, HEAD_LIST, 0, (uint32_t)-1) == 0x800001feu);
+    call(0xe0d68148, id_a, 0, 0);             /* runs to the pause */
+    CHECK(call(0x03444eb4, id_a, 1, 0) == 4);
+    const uint32_t id_c = call(0x1c0d95a6, HEAD_LIST, 0, (uint32_t)-1);
+    CHECK(id_c < 0x80000000u);
+    CHECK(call(0x03444eb4, id_c, 1, 0) == 4 && call(0x03444eb4, id_a, 1, 0) == 1);
+    CHECK(pixel(1) == 0);
+    CHECK(call(0x4c06e472, 0, 0, 0) == 0);
+    call(0xb287bd61, 0, 0, 0);
+    CHECK(pixel(1) == 0xff);                 /* green, then red over it */
+    CHECK(call(0x03444eb4, id_a, 1, 0) == 0x80000100u && call(0x03444eb4, id_c, 1, 0) == 0x80000100u);
+    cases++;
+}
+/* A full pool gives up the finished list queued first. A head list's id is
+ * below every other, but one that has only just finished is the newest, and
+ * a late ListSync still finds it. */
+#define SHORT_LIST 0x08812000u
+static void reuse_oldest(void) {
+    psp_ge_reset();
+    psp_write32(SHORT_LIST, 0x0f000000); psp_write32(SHORT_LIST + 4, 0x0c000000);
+    uint32_t ids[7];
+    for (unsigned i = 0; i < 7; i++) {
+        ids[i] = call(0xab49e76a, SHORT_LIST, 0, (uint32_t)-1);
+        CHECK(ids[i] < 0x80000000u && call(0x03444eb4, ids[i], 0, 0) == 0);
+    }
+    const uint32_t head = call(0x1c0d95a6, SHORT_LIST, 0, (uint32_t)-1);
+    CHECK(head < ids[0] && call(0x4c06e472, 0, 0, 0) == 0);
+    CHECK(call(0x03444eb4, head, 0, 0) == 0);
+    CHECK(call(0xab49e76a, SHORT_LIST, 0, (uint32_t)-1) < 0x80000000u);
+    CHECK(call(0x03444eb4, ids[0], 1, 0) == 0x80000100u);
+    CHECK(call(0x03444eb4, head, 1, 0) == 0 && call(0x03444eb4, ids[1], 1, 0) == 0);
+    call(0xb287bd61, 0, 0, 0);
+    cases++;
+}
 static void environment(const char *key, const char *value) {
 #ifdef _WIN32
     _putenv_s(key, value);
@@ -199,6 +274,8 @@ int main(int argc, char **argv) {
             for (unsigned callbacks = 0; callbacks < 2; callbacks++) queued(streaming, callbacks);
         suspending(1);
         suspending(2);
+        enqueue_head();
+        reuse_oldest();
         setup();
         psp_ge_replay_list(LIST, 0, 0);
         check_pixels();

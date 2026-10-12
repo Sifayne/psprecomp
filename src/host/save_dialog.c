@@ -294,9 +294,11 @@ enum {
     BOX_X=356, BOX_Y=240, BOX_W=584, BOX_H=200, BOX_R=12,
     HINT_Y=504, BACKDROP_DIM=0
 };
+/* The utility's modes the dialog names, numbered as the HLE's SD_* are. */
+enum { MODE_LOAD=2, MODE_SAVE=3, MODE_LIST_LOAD=4, MODE_LIST_SAVE=5 };
 static const char *operation(void) {
-    if (ui.mode==3 || ui.mode==5) return "Save";
-    if (ui.mode==2 || ui.mode==4) return "Load";
+    if (ui.mode==MODE_SAVE || ui.mode==MODE_LIST_SAVE) return "Save";
+    if (ui.mode==MODE_LOAD || ui.mode==MODE_LIST_LOAD) return "Load";
     return "Delete";
 }
 /* `1/9/2015  7:40 PM  544 KB`: the utility's date line for an existing save. */
@@ -342,6 +344,13 @@ static void slot_rect(int r,int *o) {
     else if (r<0) { o[0]=SMALL_X; o[1]=SEL_Y-6-SMALL_STRIDE*(-r); o[2]=SMALL_W; o[3]=SMALL_H; }
     else { o[0]=SMALL_X; o[1]=SEL_Y+SEL_H+6+SMALL_STRIDE*(r-1); o[2]=SMALL_W; o[3]=SMALL_H; }
 }
+/* Where an entry r places from the selection is drawn, r fractional while
+ * the column slides: between the slots on either side. */
+static void slot_between(double r,int *box) {
+    double fl=floor(r),fr=r-fl; int a[4],b[4];
+    slot_rect((int)fl,a); slot_rect((int)fl+1,b);
+    for (int k=0;k<4;k++) box[k]=(int)lrint(a[k]+(b[k]-a[k])*fr);
+}
 /* Ease the drawn position toward the selection: about 60 ms to cover most of
  * a step, so held repeats (110 ms apart) chain into one continuous slide. */
 static void advance_scroll(void) {
@@ -361,16 +370,10 @@ static void icon_column(void) {
     for (int ring=3;ring>=0;ring--) for (int i=lo;i<=hi;i++) {
         if (i<0 || i>=ui.count) continue;
         double r=i-scroll_pos; if ((int)floor(fabs(r)+0.5)!=ring) continue;
-        double fl=floor(r),fr=r-fl; int a[4],b[4];
-        slot_rect((int)fl,a); slot_rect((int)fl+1,b);
-        for (int k=0;k<4;k++) box[k]=(int)lrint(a[k]+(b[k]-a[k])*fr);
+        slot_between(r,box);
         if (i!=ui.selected) icon_box(i,box[0],box[1],box[2],box[3]);
     }
-    {
-        double r=ui.selected-scroll_pos,fl=floor(r),fr=r-fl; int a[4],b[4];
-        slot_rect((int)fl,a); slot_rect((int)fl+1,b);
-        for (int k=0;k<4;k++) box[k]=(int)lrint(a[k]+(b[k]-a[k])*fr);
-    }
+    slot_between(ui.selected-scroll_pos,box);
     rgba frame={255,255,255,230};
     fill(box[0]-FRAME,box[1]-FRAME,box[2]+2*FRAME,FRAME,frame);
     fill(box[0]-FRAME,box[1]+box[3],box[2]+2*FRAME,FRAME,frame);
@@ -419,6 +422,14 @@ static void message_box(void) {
         text(f_small,BOX_X+BOX_W/2,top+mh+8,0,40,code,GREY,ALIGN_CENTER);
     }
 }
+/* What the GL owner copies: the canvas, or that there is nothing to show. */
+static void publish_pixels(int on) {
+    pthread_mutex_lock(&pixels_lock);
+    if (on) for (int y=0;y<SAVE_DIALOG_H;y++) memcpy(pixels+(size_t)y*SAVE_DIALOG_W,
+        (unsigned char *)canvas->pixels+(size_t)y*canvas->pitch,SAVE_DIALOG_W*4);
+    pixels_active=on; pixels_revision++;
+    pthread_mutex_unlock(&pixels_lock);
+}
 static void paint(void) {
     backdrop();
     if (ui.count && ui.selected>=0 && ui.selected<ui.count) {
@@ -430,11 +441,7 @@ static void paint(void) {
     text(f_banner,60,8,0,48,operation(),WHITE,ALIGN_LEFT);
     if (ui.stage!=PSP_SAVEDATA_LIST) message_box();
     hints();
-    pthread_mutex_lock(&pixels_lock);
-    for (int y=0;y<SAVE_DIALOG_H;y++) memcpy(pixels+(size_t)y*SAVE_DIALOG_W,
-        (unsigned char *)canvas->pixels+(size_t)y*canvas->pitch,SAVE_DIALOG_W*4);
-    pixels_active=1; pixels_revision++;
-    pthread_mutex_unlock(&pixels_lock);
+    publish_pixels(1);
 }
 int save_dialog_init(void) {
     if (initialized) return 0;
@@ -475,7 +482,7 @@ void save_dialog_shutdown(void) {
     if (f_title) TTF_CloseFont(f_title);
     texture=NULL; canvas=NULL; f_body=f_small=f_banner=f_title=NULL;
     initialized=active=0; uploaded=0;
-    pthread_mutex_lock(&pixels_lock); pixels_active=0; pixels_revision++; pthread_mutex_unlock(&pixels_lock);
+    publish_pixels(0);
     TTF_Quit();
 }
 int save_dialog_active(void) { return active; }
@@ -508,13 +515,15 @@ static void choose(int no) {
 static void accept(void) {
     send(ui.stage==PSP_SAVEDATA_CONFIRM && confirm_no ? PSP_SAVEDATA_CANCEL : PSP_SAVEDATA_ACCEPT,ui.selected);
 }
+/* psp_savedata_snapshot's answers. */
+enum { SNAPSHOT_INACTIVE, SNAPSHOT_UNCHANGED, SNAPSHOT_COPIED };
 void save_dialog_update(SDL_GameController *pad) {
     if (!initialized) return;
     uint64_t session=ui.session;
     int state=psp_savedata_snapshot(&ui),was=active;
-    active=state!=0;
+    active=state!=SNAPSHOT_INACTIVE;
     if (!active) {
-        if (was) { pthread_mutex_lock(&pixels_lock); pixels_active=0; pixels_revision++; pthread_mutex_unlock(&pixels_lock); }
+        if (was) publish_pixels(0);
         return;
     }
     if (!was || ui.session!=session) {
@@ -530,7 +539,7 @@ void save_dialog_update(SDL_GameController *pad) {
      * Controller's trackpad reads as a mouse button) never arms and the
      * dialog ignores every press, which is how the first live test went. */
     if (!armed && focused && (save_dialog_input_neutral(pad) || SDL_GetTicks64()-opened_at>=300)) armed=1;
-    if (state==2) {
+    if (state==SNAPSHOT_COPIED) {
         pending=0; confirm_no=0; scroll_target=ui.selected;
         if (ui.stage!=PSP_SAVEDATA_LIST) { scroll_pos=scroll_target; scrolling=0; }
         paint();
@@ -562,8 +571,6 @@ int save_dialog_event(const SDL_Event *e,SDL_JoystickID controller) {
     if (e->type==SDL_CONTROLLERDEVICEREMOVED) { armed=0; held_direction=held_side=0; }
     if (!active) return 0;
     if (e->type==SDL_KEYDOWN || e->type==SDL_KEYUP) {
-        /* Movement keys hold a direction that save_dialog_update repeats on the
-         * pad's clock; the desktop's own key repeat is ignored. */
         SDL_Keycode k=e->key.keysym.sym;
         int dir=(k==SDLK_UP || k==SDLK_w) ? -1 : (k==SDLK_DOWN || k==SDLK_s) ? 1 : 0;
         if (dir) {

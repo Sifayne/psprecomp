@@ -56,8 +56,6 @@
 
 void psp_recomp_register(void);
 
-/* The guest's user-mode stack. PSP puts it at the top of user RAM and grows it
- * down; the exact value matters less than leaving room below for the heap. */
 /* The entry stack. 256K is generous for module_start, and generous is right:
  * a recompiled frame is larger than the MIPS one it came from, and a stack
  * that overflows here corrupts the heap it was allocated from. */
@@ -66,6 +64,8 @@ void psp_recomp_register(void);
 /* Where a `jr $ra` out of the outermost call lands. Deliberately unmapped, so
  * arriving here is unambiguous rather than something that might be real code. */
 #define RA_DONE     0x0DEAD000u
+
+enum { SCREEN_W = 480, SCREEN_H = 272 };   /* the PSP's panel, fixed */
 
 /* ---- surviving the guest ---------------------------------------------------
  *
@@ -76,7 +76,8 @@ void psp_recomp_register(void);
 
 static sigjmp_buf g_abort;
 static volatile sig_atomic_t g_abort_valid;
-static int        g_reason;         /* 1 trap, 2 timeout, 3 fault, 4 dispatch miss */
+/* Why the guarded call stopped. */
+static enum { STOP_NONE, STOP_TRAP, STOP_TIMEOUT, STOP_FAULT, STOP_MISS, STOP_EXIT } g_reason;
 static uint32_t   g_reason_addr;
 static const char *g_reason_what;
 
@@ -100,17 +101,17 @@ static void abort_to_main(void) {
 }
 
 void psp_unimplemented(uint32_t addr, const char *what) {
-    g_reason = 1; g_reason_addr = addr; g_reason_what = what;
+    g_reason = STOP_TRAP; g_reason_addr = addr; g_reason_what = what;
     abort_to_main();
 }
 
 void psp_syscall(uint32_t id) {
-    g_reason = 1; g_reason_addr = id; g_reason_what = "syscall";
+    g_reason = STOP_TRAP; g_reason_addr = id; g_reason_what = "syscall";
     abort_to_main();
 }
 
 static void on_miss(uint32_t addr) {
-    g_reason = 4; g_reason_addr = addr; g_reason_what = "dispatch miss";
+    g_reason = STOP_MISS; g_reason_addr = addr; g_reason_what = "dispatch miss";
     abort_to_main();
 }
 
@@ -137,11 +138,7 @@ static uint32_t g_exit_status;
 static void hle_stop_unload_self(void) {
     g_guest_exited = 1;
     g_exit_status  = psp_arg(0);
-    /* Built with -DPSPRECOMP_TRACE this prints the functions entered on the way
-     * here, which is the only practical way to tell *which* abort fired: the
-     * abort wrapper has several callers and static analysis cannot say which
-     * one ran. Without the define it compiles to nothing and says so. */
-    g_reason = 5;
+    g_reason = STOP_EXIT;
 
     /* Only the main context may jump: g_abort belongs to its stack. A guest
      * thread stops the scheduler instead, and the main context reports the exit
@@ -150,6 +147,10 @@ static void hle_stop_unload_self(void) {
         psp_sched_stop_all("sceKernelExitGame");   /* does not return */
         return;
     }
+    /* Built with -DPSPRECOMP_TRACE this prints the functions entered on the way
+     * here, which is the only practical way to tell *which* abort fired: the
+     * abort wrapper has several callers and static analysis cannot say which
+     * one ran. Without the define it compiles to nothing and says so. */
     abort_to_main();
 }
 
@@ -217,8 +218,11 @@ static void watch_hit(uint32_t addr) {
         for (int j = 0; j < 3; j++) {
             const uint32_t m = ms[j];
             /* Module data as well as the heap: a static matrix buffer lives
-             * in the loaded image, and excluding it printed nothing at all. */
-            if (m <= 0x1000u || m + 64 >= PSP_RAM_BASE + PSP_RAM_SIZE) continue;
+             * in the loaded image, and excluding it printed nothing at all.
+             * Only where all 64 bytes are mapped, though: a read anywhere
+             * else counts as a bad access, and those decide the run's exit
+             * status. Small numbers are not pointers. */
+            if (m <= 0x1000u || psp_mem_mapped_span(m) < 64) continue;
             fprintf(stderr, "         [%s as 4x4]", mn[j]);
             for (int i = 0; i < 16; i++) {
                 union { uint32_t u; float f; } c; c.u = psp_read32(m + (uint32_t)i * 4);
@@ -235,21 +239,6 @@ static void watch_hit(uint32_t addr) {
     psp_trace_dump();
 }
 
-/* Write the framebuffer the display is scanning out to a PPM.
- *
- * The whole point of a rasterizer is that you can look at what it produced,
- * and until now nothing here could: the GE counted geometry and the summary
- * reported numbers. A PPM because it needs no library and any viewer opens it.
- *
- * The image is what the *guest* believes it is showing -- the address comes
- * from its last sceDisplaySetFrameBuf -- so an empty file is a real answer
- * too: it means the game never pointed the display anywhere. */
-/* Which parts of VRAM have anything in them.
- *
- * "The texture sampled black" has two very different causes -- the texture is
- * not there, or it is somewhere else -- and guessing between them has already
- * cost more than measuring would have. This walks VRAM in 64K blocks and says
- * which ones are non-zero, so the answer is visible rather than inferred. */
 /* PSPRECOMP_FINDPTR=<hex> reports every address in the loaded module holding
  * that value as a 32-bit word.
  *
@@ -293,30 +282,6 @@ static void find_pointer(uint32_t lo, uint32_t size) {
     printf("\n");
 }
 
-/* PSPRECOMP_REACHED=<hex>[,<hex>...] says, for each address, whether control
- * ever arrived there.
- *
- * "Does this code run" has been answered here with gdb breakpoints and with
- * PSPRECOMP_WATCH. Breakpoints are external and one batch per run; the watch
- * hooks PSP_ENTER, which the emitter writes once per function *body*, so a
- * watch on anything that is not a function entry never fires and reports a
- * negative it cannot actually see. dispatch.c records that flaw producing a
- * confidently wrong conclusion. The mark bitmap covers every label instead.
- *
- * It has a smaller version of the same limit, and it matters. PSP_MARK is
- * emitted only at *labels* -- branch and jump targets, function entries, split
- * entries, fall-through targets. A `jal` site, or a store in the middle of a
- * block, is not a label and can never be marked, so asking about one gets
- * "not reached" when the truth is "cannot be seen from here".
- * psp_trace_was_marked only reports -1 for an address outside the module; it
- * cannot tell an unlabelled address from an unvisited one. So map an address
- * to the label that covers it before asking:
- *
- *     grep -o 'L_[0-9A-F]\{8\}: PSP_MARK' generated/<slug>_funcs.c | sort -u
- *
- * and take the greatest label <= the address within the same function. Control
- * reaching that label is control reaching the block the instruction sits in,
- * which is the question worth asking anyway. */
 /* PSPRECOMP_PEEK=<hex>[,<hex>...] prints what is at each address when the run
  * stops: the word, and the byte, because guest structs mix both and which one
  * a field is decides what "zero" means.
@@ -365,10 +330,64 @@ static void watch_memory(void) {
     }
 }
 
+/* PSPRECOMP_REACHED=<hex>[,<hex>...] says, for each address, whether control
+ * ever arrived there.
+ *
+ * "Does this code run" has been answered here with gdb breakpoints and with
+ * PSPRECOMP_WATCH. Breakpoints are external and one batch per run; the watch
+ * hooks PSP_ENTER, which the emitter writes once per function *body*, so a
+ * watch on anything that is not a function entry never fires and reports a
+ * negative it cannot actually see. dispatch.c records that flaw producing a
+ * confidently wrong conclusion. The mark bitmap covers every label instead.
+ *
+ * It has a smaller version of the same limit, and it matters. PSP_MARK is
+ * emitted only at *labels* -- branch and jump targets, function entries, split
+ * entries, fall-through targets. A `jal` site, or a store in the middle of a
+ * block, is not a label and can never be marked, so asking about one gets
+ * "not reached" when the truth is "cannot be seen from here".
+ * psp_trace_was_marked only reports -1 for an address outside the module; it
+ * cannot tell an unlabelled address from an unvisited one. So map an address
+ * to the label that covers it before asking:
+ *
+ *     grep -o 'L_[0-9A-F]\{8\}: PSP_MARK' generated/<slug>_funcs.c | sort -u
+ *
+ * and take the greatest label <= the address within the same function. Control
+ * reaching that label is control reaching the block the instruction sits in,
+ * which is the question worth asking anyway. */
 enum { MAX_REACHED = 32 };
 static uint32_t g_reached[MAX_REACHED];
 static int      g_reached_n;
 static uint32_t g_marks_lo, g_marks_hi;
+
+static void reached_init(uint32_t lo, uint32_t hi) {
+    const char *v = getenv("PSPRECOMP_REACHED");
+    const char *d = getenv("PSPRECOMP_REACHED_DUMP");
+    /* The dump reads the same bitmap, so either request has to allocate it --
+     * otherwise asking only for the dump gets an empty one and reads as "no
+     * code ran". */
+    if ((!v || !*v) && (!d || !*d)) return;
+    for (const char *p = v ? v : ""; *p && g_reached_n < MAX_REACHED; ) {
+        char *end;
+        const uint32_t a = (uint32_t)strtoul(p, &end, 0);
+        if (end == p) break;
+        g_reached[g_reached_n++] = a;
+        p = (*end == ',') ? end + 1 : end;
+    }
+    g_marks_lo = lo;
+    g_marks_hi = hi;
+    psp_trace_marks_init(lo, (hi - lo) / 4);
+    printf("      reached   %d address(es) watched (needs a PSPRECOMP_TRACE build)\n",
+           g_reached_n);
+}
+
+static void reached_report(void) {
+    for (int i = 0; i < g_reached_n; i++) {
+        const int m = psp_trace_was_marked(g_reached[i]);
+        printf("reached:  0x%08X  %s\n", g_reached[i],
+               m < 0 ? "not observable -- outside the loaded module"
+                     : m ? "reached" : "not reached (or not a label -- see PSPRECOMP_REACHED)");
+    }
+}
 
 /* PSPRECOMP_REACHED_DUMP=<file> writes every label control actually reached.
  *
@@ -406,36 +425,12 @@ static void reached_dump(void) {
            (unsigned long long)n, v);
 }
 
-static void reached_init(uint32_t lo, uint32_t hi) {
-    const char *v = getenv("PSPRECOMP_REACHED");
-    const char *d = getenv("PSPRECOMP_REACHED_DUMP");
-    /* The dump reads the same bitmap, so either request has to allocate it --
-     * otherwise asking only for the dump gets an empty one and reads as "no
-     * code ran". */
-    if ((!v || !*v) && (!d || !*d)) return;
-    for (const char *p = v ? v : ""; *p && g_reached_n < MAX_REACHED; ) {
-        char *end;
-        const uint32_t a = (uint32_t)strtoul(p, &end, 0);
-        if (end == p) break;
-        g_reached[g_reached_n++] = a;
-        p = (*end == ',') ? end + 1 : end;
-    }
-    g_marks_lo = lo;
-    g_marks_hi = hi;
-    psp_trace_marks_init(lo, (hi - lo) / 4);
-    printf("      reached   %d address(es) watched (needs a PSPRECOMP_TRACE build)\n",
-           g_reached_n);
-}
-
-static void reached_report(void) {
-    for (int i = 0; i < g_reached_n; i++) {
-        const int m = psp_trace_was_marked(g_reached[i]);
-        printf("reached:  0x%08X  %s\n", g_reached[i],
-               m < 0 ? "not observable -- outside the loaded module"
-                     : m ? "reached" : "not reached (or not a label -- see PSPRECOMP_REACHED)");
-    }
-}
-
+/* Which parts of VRAM have anything in them.
+ *
+ * "The texture sampled black" has two very different causes -- the texture is
+ * not there, or it is somewhere else -- and guessing between them has already
+ * cost more than measuring would have. This walks VRAM in 64K blocks and says
+ * which ones are non-zero, so the answer is visible rather than inferred. */
 static void survey_vram(void) {
     enum { BLOCK = 0x10000 };
     printf("vram:     ");
@@ -454,6 +449,31 @@ static void survey_vram(void) {
     printf("\n");
 }
 
+/* A panel-sized PPM, its header written; NULL when it cannot be created. */
+static FILE *ppm_create(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (f) fprintf(f, "P6\n%d %d\n255\n", SCREEN_W, SCREEN_H);
+    return f;
+}
+
+/* An 8888 pixel's red, green and blue: its low three bytes. */
+static void rgb_of_8888(uint32_t p, uint8_t rgb[3]) {
+    rgb[0] = (uint8_t)(p & 0xFF);
+    rgb[1] = (uint8_t)((p >> 8) & 0xFF);
+    rgb[2] = (uint8_t)((p >> 16) & 0xFF);
+}
+
+/* A 16-bit pixel's red, green and blue, in display format `fmt`, widened as
+ * the window shows them (psp_pixel_unpack16: each channel's high bits
+ * repeated into its low ones, so full white is FFFFFF). The format numbers
+ * above 3 read as 5650, as they always have here. Alpha is not shown. */
+static void rgb_of_16(uint16_t p, uint32_t fmt, uint8_t rgb[3]) {
+    const uint32_t c = psp_pixel_unpack16(p, fmt == 1 || fmt == 2 ? (int)fmt : 0);
+    rgb[0] = (uint8_t)(c & 0xFF);
+    rgb[1] = (uint8_t)((c >> 8) & 0xFF);
+    rgb[2] = (uint8_t)((c >> 16) & 0xFF);
+}
+
 /* Dump one buffer.
  *
  * Both are written, because picking one has already been misleading. The GE's
@@ -468,41 +488,64 @@ static void dump_one(uint32_t base, const char *path, const char *label) {
         return;
     }
 
-    enum { W = 480, H = 272 };          /* the panel, whatever the stride is */
-    FILE *f = fopen(path, "wb");
+    /* The panel, whatever the stride is. */
+    FILE *f = ppm_create(path);
     if (!f) { printf("frame:    cannot write %s\n", path); return; }
-    fprintf(f, "P6\n%d %d\n255\n", W, H);
 
     const uint32_t fmt = psp_display_format();
     uint64_t nonzero = 0;
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) {
+    for (int y = 0; y < SCREEN_H; y++) {
+        for (int x = 0; x < SCREEN_W; x++) {
             const uint32_t at = base + (uint32_t)(y * (int)stride + x) *
                                 (fmt == 3 ? 4u : 2u);
             uint8_t rgb[3];
-            if (fmt == 3) {                       /* 8888 */
-                const uint32_t p = psp_read32(at);
-                rgb[0] = (uint8_t)(p & 0xFF);
-                rgb[1] = (uint8_t)((p >> 8) & 0xFF);
-                rgb[2] = (uint8_t)((p >> 16) & 0xFF);
-            } else {                              /* 5650 / 5551 / 4444 */
-                const uint16_t p = (uint16_t)psp_read16(at);
-                rgb[0] = (uint8_t)((p & 0x1F) << 3);
-                rgb[1] = (uint8_t)(((p >> 5) & 0x3F) << 2);
-                rgb[2] = (uint8_t)(((p >> 11) & 0x1F) << 3);
-            }
+            if (fmt == 3) rgb_of_8888(psp_read32(at), rgb);
+            else rgb_of_16((uint16_t)psp_read16(at), fmt, rgb);
             if (rgb[0] || rgb[1] || rgb[2]) nonzero++;
             fwrite(rgb, 1, 3, f);
         }
     }
     fclose(f);
     printf("frame%s:  %s  (0x%08X stride %u fmt %u, %llu of %d pixels differing from the corner)\n",
-           label, path, base, stride, fmt, (unsigned long long)nonzero, W * H);
+           label, path, base, stride, fmt, (unsigned long long)nonzero, SCREEN_W * SCREEN_H);
 }
 
+/* And the fullest frame the run ever presented, which is the one that
+ * answers "did anything appear" -- the two buffers dumped above only say what
+ * was in them at the instant the run stopped. */
+static void dump_best_frame(const char *path) {
+    const uint64_t score = psp_display_best_score();
+    if (!score) {
+        printf("frame(best): no presented frame had a non-black pixel\n");
+        return;
+    }
+    char best[1024];
+    snprintf(best, sizeof best, "%s.best.ppm", path);
+    FILE *f = ppm_create(best);
+    if (!f) { printf("frame(best): cannot write %s\n", best); return; }
+    const uint32_t *px = psp_display_best();
+    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
+        uint8_t rgb[3];
+        rgb_of_8888(px[i], rgb);
+        fwrite(rgb, 1, 3, f);
+    }
+    fclose(f);
+    printf("frame(best): %s  (0x%08X, %llu of %d pixels differing from the corner)\n",
+           best, psp_display_best_addr(), (unsigned long long)score, SCREEN_W * SCREEN_H);
+}
+
+/* Write the framebuffer the display is scanning out to a PPM.
+ *
+ * The whole point of a rasterizer is that you can look at what it produced,
+ * and until now nothing here could: the GE counted geometry and the summary
+ * reported numbers. A PPM because it needs no library and any viewer opens it.
+ *
+ * The image is what the *guest* believes it is showing -- the address comes
+ * from its last sceDisplaySetFrameBuf -- so an empty file is a real answer
+ * too: it means the game never pointed the display anywhere. */
 static void dump_framebuffer(void) {
-    const char *path = getenv("PSPRECOMP_FRAME");
-    if (!path || !*path) path = "frame.ppm";
+    const char *asked = getenv("PSPRECOMP_FRAME");
+    const char *path = asked && *asked ? asked : "frame.ppm";
 
     const uint32_t ge = psp_ge_target();
     const uint32_t disp = psp_display_framebuffer();
@@ -514,35 +557,10 @@ static void dump_framebuffer(void) {
         dump_one(disp, alt, "(shown)");
     }
 
-    /* And the fullest frame the run ever presented, which is the one that
-     * answers "did anything appear" -- the two above only say what was in the
-     * buffers at the instant the run stopped. */
-    const char *asked = getenv("PSPRECOMP_FRAME");
-    if (!asked || !*asked) {
+    if (asked && *asked)
+        dump_best_frame(path);
+    else
         printf("frame(best): not scored -- set PSPRECOMP_FRAME to keep the fullest presented frame\n");
-        return;
-    }
-    const uint64_t score = psp_display_best_score();
-    if (!score) {
-        printf("frame(best): no presented frame had a non-black pixel\n");
-        return;
-    }
-    char best[1024];
-    snprintf(best, sizeof best, "%s.best.ppm", path);
-    FILE *f = fopen(best, "wb");
-    if (!f) { printf("frame(best): cannot write %s\n", best); return; }
-    enum { W = 480, H = 272 };
-    fprintf(f, "P6\n%d %d\n255\n", W, H);
-    const uint32_t *px = psp_display_best();
-    for (int i = 0; i < W * H; i++) {
-        const uint32_t p = px[i];
-        const uint8_t rgb[3] = { (uint8_t)(p & 0xFF), (uint8_t)((p >> 8) & 0xFF),
-                                 (uint8_t)((p >> 16) & 0xFF) };
-        fwrite(rgb, 1, 3, f);
-    }
-    fclose(f);
-    printf("frame(best): %s  (0x%08X, %llu of %d pixels differing from the corner)\n",
-           best, psp_display_best_addr(), (unsigned long long)score, W * H);
 }
 
 static void install_watch(void) {
@@ -637,8 +655,6 @@ static void install_bad_hook(void) {
 
 #define ALT_STACK_SIZE ((size_t)(SIGSTKSZ < 65536 ? 65536 : SIGSTKSZ))
 
-/* Each thread needs its own: sigaltstack is per-thread, and the fault most
- * worth catching is a blown stack, which leaves no room to run a handler. */
 /* Freed when its thread ends: a save state loaded while the game runs ends
  * and starts every guest thread, so a run may start thousands. */
 static pthread_key_t g_alt_key;
@@ -652,6 +668,8 @@ static void alt_stack_free(void *sp) {
 }
 static void alt_stack_key(void) { pthread_key_create(&g_alt_key, alt_stack_free); }
 
+/* Each thread needs its own: sigaltstack is per-thread, and the fault most
+ * worth catching is a blown stack, which leaves no room to run a handler. */
 static void install_alt_stack(void) {
     stack_t ss;
     ss.ss_sp    = malloc(ALT_STACK_SIZE);
@@ -677,7 +695,7 @@ static void on_signal_info(int sig, siginfo_t *si, void *uc) {
 }
 
 static void on_signal(int sig) {
-    g_reason = (sig == SIGALRM) ? 2 : 3;
+    g_reason = (sig == SIGALRM) ? STOP_TIMEOUT : STOP_FAULT;
 
     /* A guest thread cannot jump to g_abort: that belongs to the main stack.
      * Nor can it be unwound -- it is part-way down a host call stack of
@@ -698,11 +716,12 @@ static void on_signal(int sig) {
 
 static const char *reason_str(void) {
     switch (g_reason) {
-    case 1: return g_reason_what ? g_reason_what : "unimplemented";
-    case 2: return "timed out";
-    case 3: return "host fault (SIGSEGV/SIGBUS)";
-    case 4: return "dispatch miss";
-    case 5: return "guest called exit";
+    case STOP_NONE:    break;
+    case STOP_TRAP:    return g_reason_what ? g_reason_what : "unimplemented";
+    case STOP_TIMEOUT: return "timed out";
+    case STOP_FAULT:   return "host fault (SIGSEGV/SIGBUS)";
+    case STOP_MISS:    return "dispatch miss";
+    case STOP_EXIT:    return "guest called exit";
     }
     return "?";
 }
@@ -725,7 +744,7 @@ static void install_handlers(void) {
 
 /* Run one guest call with a wall-clock bound, reporting rather than dying. */
 static int guarded_call(uint32_t addr, unsigned timeout_s, const char *what) {
-    g_reason = 0;
+    g_reason = STOP_NONE;
     if (sigsetjmp(g_abort, 1) == 0) {
         g_abort_valid = 1;
         alarm(timeout_s);
@@ -737,8 +756,8 @@ static int guarded_call(uint32_t addr, unsigned timeout_s, const char *what) {
     alarm(0);
     g_abort_valid = 0;
     printf("    %-28s stopped: %s", what, reason_str());
-    if (g_reason == 1 || g_reason == 4) printf(" at 0x%08X", g_reason_addr);
-    if (g_reason == 5) printf("(%u)", g_exit_status);
+    if (g_reason == STOP_TRAP || g_reason == STOP_MISS) printf(" at 0x%08X", g_reason_addr);
+    if (g_reason == STOP_EXIT) printf("(%u)", g_exit_status);
     printf("\n");
     /* However the call stopped, the functions entered on the way there are the
      * useful part -- and a timeout needs them most, because unlike a trap it
@@ -787,134 +806,140 @@ static int report_cplinit(const psp_blob *b, const elf_info *e) {
 
 /* ---- entry ----------------------------------------------------------------- */
 
-int main(int argc, char **argv) {
-    const char *module = NULL, *iso = NULL, *config = NULL, *load_state = NULL;
-    int inspect = 0, force_window = 0, state_id = 0;
+/* What a phase of main returns to let the boot go on; anything else is the
+ * process's exit status. */
+enum { BOOT_GO_ON = -1 };
+
+typedef struct {
+    const char *module, *iso, *config, *load_state;
+    int inspect, force_window, state_id;
+} boot_args;
+
+/* The module being booted: its file, its ELF headers and where it loaded. */
+typedef struct {
+    psp_blob blob;
+    elf_info elf;
+    psp_load_info load;
+} boot_module;
+
+/* What the end-of-run summary reports. */
+typedef struct {
+    int ctors_ok, entry_ok;     /* 0 when the step worked or did not run */
+    const char *load_state;     /* the state the run started from, or NULL */
+    int live;                   /* guest threads still running */
+    /* The clock at the point guest execution stopped. */
+    int clock_realtime;
+    uint64_t clock_guest_us, clock_wall_us, clock_held_us;
+} boot_outcome;
+
+static int parse_args(int argc, char **argv, boot_args *a) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--config") || !strcmp(argv[i], "--load-state")) {
             const char *option = argv[i];
             if (++i == argc) { fprintf(stderr, "missing option value\n"); return 2; }
-            if (!strcmp(option, "--config")) config = argv[i];
-            else load_state = argv[i];
-        } else if (!strcmp(argv[i], "--print-settings")) inspect = 1;
-        else if (!strcmp(argv[i], "--state-id")) state_id = 1;
-        else if (!strcmp(argv[i], "--window")) force_window = 1;
+            if (!strcmp(option, "--config")) a->config = argv[i];
+            else a->load_state = argv[i];
+        } else if (!strcmp(argv[i], "--print-settings")) a->inspect = 1;
+        else if (!strcmp(argv[i], "--state-id")) a->state_id = 1;
+        else if (!strcmp(argv[i], "--window")) a->force_window = 1;
         else if (!strcmp(argv[i], "--help")) {
             puts("boot [module.elf] [disc.iso] [--config FILE] [--print-settings] [--window]\n"
                  "     [--load-state FILE] [--state-id]");
             return 0;
         } else if (argv[i][0] == '-') { fprintf(stderr,"unknown option: %s\n",argv[i]); return 2; }
-        else if (!module) module = argv[i];
-        else if (!iso) iso = argv[i];
+        else if (!a->module) a->module = argv[i];
+        else if (!a->iso) a->iso = argv[i];
         else { fprintf(stderr,"unexpected argument: %s\n",argv[i]); return 2; }
     }
-    psp_settings settings;
-    char settings_error[PSP_SETTINGS_ERROR];
-    if (psp_settings_load(&settings, config, settings_error)) {
-        fprintf(stderr, "settings: %s\n", settings_error); return 2;
+    return BOOT_GO_ON;
+}
+
+/* The settings as resolved for this launch: the file and the environment,
+ * then the launch policy and the title's. */
+static int load_settings(const boot_args *a, psp_settings *settings) {
+    char error[PSP_SETTINGS_ERROR];
+    if (psp_settings_load(settings, a->config, error)) {
+        fprintf(stderr, "settings: %s\n", error); return -1;
     }
     /* The interactive launcher supplies --window; direct boot stays headless
      * by default. This is launch policy, not a saved temporary override. */
-    if (force_window) {
-        psp_settings_set(&settings, PSP_OPT_WINDOW, "1", PSP_SOURCE_COMMAND_LINE, settings_error);
-        psp_settings_resolve(&settings, settings_error);
+    if (a->force_window) {
+        psp_settings_set(settings, PSP_OPT_WINDOW, "1", PSP_SOURCE_COMMAND_LINE, error);
+        psp_settings_resolve(settings, error);
     }
     /* The title's policy, such as a default only it needs or a fallback for
      * a host linked without its replacements. */
-    if (psp_title_info.settings) psp_title_info.settings(&settings);
-    if (inspect) { psp_settings_print(&settings, stdout); return 0; }
-    if (!module) {
-        fprintf(stderr, "boot <module.elf> [disc.iso] [--config FILE]\n");
-        return 2;
-    }
-    psp_settings_use(&settings);
-    psp_settings_print(&settings, stdout);
-    if (psp_mpeg_set_decoding((int)settings.number[PSP_OPT_MPEG_DECODE])) {
+    if (psp_title_info.settings) psp_title_info.settings(settings);
+    return 0;
+}
+
+/* Install the settings for the run, print them, and refuse what this build
+ * or the title cannot do with them. */
+static int use_settings(const psp_settings *settings) {
+    psp_settings_use(settings);
+    psp_settings_print(settings, stdout);
+    if (psp_mpeg_set_decoding((int)settings->number[PSP_OPT_MPEG_DECODE])) {
         fprintf(stderr,"settings: intro decoding requires a runtime built with OpenH264\n");
-        return 2;
+        return -1;
     }
     /* What the title sets up from its settings, or refuses to run with. */
-    if (psp_title_info.start && psp_title_info.start(&settings) != 0) return 2;
+    if (psp_title_info.start && psp_title_info.start(settings) != 0) return -1;
 #ifndef HAVE_SDL2
-    if (settings.window) {
-        fprintf(stderr,"settings: windowed play requires a host built with SDL2\n"); return 2;
+    if (settings->window) {
+        fprintf(stderr,"settings: windowed play requires a host built with SDL2\n"); return -1;
     }
 #endif
+    return 0;
+}
 
-    psp_blob b;
-    if (psp_blob_read(module, &b) != 0) { fprintf(stderr, "cannot read %s\n", module); return 1; }
-    elf_info e;
-    if (elf_parse(b.data, b.size, &e) != 0) { fprintf(stderr, "not an ELF/PRX\n"); return 1; }
-    if (psp_mem_init() != 0) { fprintf(stderr, "no guest memory\n"); return 1; }
-
-    install_handlers();
-    psp_set_miss_handler(on_miss);
-
-    printf("module:   %s\n", module);
-
-    /* 1 — load and relocate. */
-    psp_load_info li;
-    if (psp_load_module(&b, &e, &li) != 0) { fprintf(stderr, "cannot load module\n"); return 1; }
-    printf("  [1] load      0x%08X + %u bytes, %d relocations\n",
-           li.lo, li.hi - li.lo, li.nrelocs);
-    reached_init(li.lo, li.hi);
-    watch_memory();
-
-    /* 2 — registration and firmware. */
+/* 2 — registration and firmware. */
+static int start_runtime(const boot_args *a, const psp_settings *settings, const boot_module *m) {
     psp_recomp_register();
     psp_hle_init();
     /* The console's own settings, as the game will read them: the player's
      * System page. */
-    psp_sysparam_set(settings.language, settings.confirm_cross, settings.value[PSP_OPT_NICKNAME]);
-    if (psp_interrupt_set_module(li.lo, li.hi, li.gp) != 0) {
+    psp_sysparam_set(settings->language, settings->confirm_cross, settings->value[PSP_OPT_NICKNAME]);
+    if (psp_interrupt_set_module(m->load.lo, m->load.hi, m->load.gp) != 0) {
         fprintf(stderr, "cannot register module interrupt context\n");
-        return 1;
+        return -1;
     }
     /* After psp_hle_init, which resets the allocator. */
-    psp_sysmem_reserve_module(li.lo, li.hi);
+    psp_sysmem_reserve_module(m->load.lo, m->load.hi);
     /* The executable as sceKernelQueryModuleInfo describes it, and room and a
      * loader for the modules the title loads at run time (docs/MODULES.md):
      * before any guest code runs, while nothing holds a pointer into the
      * module window. */
-    psp_host_modules_main(&b, &e, &li);
-    if (psp_host_modules_start(module) != 0) return 1;
-    if (iso) psp_io_set_umd_image(iso);
+    psp_host_modules_main(&m->blob, &m->elf, &m->load);
+    if (psp_host_modules_start(a->module) != 0) return -1;
+    if (a->iso) psp_io_set_umd_image(a->iso);
     psp_hle_register(0x8F2DF740u, "ModuleMgrForUser", "StopUnloadSelfModule",
                      hle_stop_unload_self);
     if (psp_title_info.keep) psp_title_info.keep();
     printf("  [2] runtime   %u functions registered\n", psp_dispatch_count());
-    /* --state-id: this build as save states know it (psprecomp/state.h), for
-     * the importer to note beside the build; everything it covers has
-     * registered by now. */
-    if (state_id) {
-        uint64_t exe = 0, fp = 0;
-        psp_state_id(&exe, &fp);
-        printf("state-id: exe %016llx fingerprint %016llx\n", (unsigned long long)exe, (unsigned long long)fp);
-        return fp ? 0 : 1;
-    }
+    return 0;
+}
 
-    /* Presentation, before the module loads: the real-time clock anchors to
-     * the moment it is enabled, and that moment should be the start of the
-     * run rather than the end of the load. PSPRECOMP_WINDOW enables the SDL
-     * layer -- window, pad, audio -- and implies pacing; PSPRECOMP_REALTIME
-     * paces a headless run on its own, which is what makes a wall-clock
-     * measurement of a real scene honest. */
-    /* PSPRECOMP_RENDER picks the presentation backend. Until now nothing
-     * outside tests/test_raster.c called psp_render_select, so the software
-     * backend was the only one a real run could ever have -- "chosen at run
-     * time" in RENDERER.md was an aspiration, not a fact.
-     *
-     * An unknown name is fatal rather than a warning. psp_render_select leaves
-     * the current backend in place and returns -1, so continuing would run the
-     * software rasterizer while the operator believed they had asked for
-     * something else, and every number the run produced would be attributed to
-     * the wrong backend. That is the shape of failure this project keeps
-     * finding: a call that quietly answers something other than what was
-     * asked. */
-    const int aspect_option = psp_settings_find("ASPECT");
-    const int adaptive_aspect = aspect_option >= 0 && settings.number[aspect_option] != 0;
-    const int resolution = (int)settings.number[PSP_OPT_RESOLUTION];
-    const char *render = settings.render == 2 ? "gl" : settings.render == 3 ? "null" : "software";
+/* ASPECT=window: the title's option, when its schema has one. */
+static int adaptive_aspect(const psp_settings *settings) {
+    return psp_settings_number(settings, "ASPECT", 0) != 0;
+}
+
+static int renderer_is_gl(void) { return strcmp(psp_render_current()->name, "gl") == 0; }
+
+/* PSPRECOMP_RENDER picks the presentation backend. Until now nothing
+ * outside tests/test_raster.c called psp_render_select, so the software
+ * backend was the only one a real run could ever have -- "chosen at run
+ * time" in RENDERER.md was an aspiration, not a fact.
+ *
+ * An unknown name is fatal rather than a warning. psp_render_select leaves
+ * the current backend in place and returns -1, so continuing would run the
+ * software rasterizer while the operator believed they had asked for
+ * something else, and every number the run produced would be attributed to
+ * the wrong backend. That is the shape of failure this project keeps
+ * finding: a call that quietly answers something other than what was
+ * asked. */
+static int select_renderer(const psp_settings *settings) {
+    const char *render = psp_renderer_name(settings->render);
 
     /* Backends the runtime cannot carry are registered before anything can
      * select one. "gl" is absent from the list on a host built without SDL2,
@@ -924,7 +949,7 @@ int main(int argc, char **argv) {
     if (gl && psp_render_register(gl) != 0)
         fprintf(stderr, "render: could not register the GL backend\n");
 
-    if (render && psp_render_select(render) != 0) {
+    if (psp_render_select(render) != 0) {
         fprintf(stderr, "unknown render backend \"%s\"\navailable:", render);
         for (size_t i = 0; psp_render_backend_name(i); i++)
             fprintf(stderr, " %s", psp_render_backend_name(i));
@@ -933,7 +958,6 @@ int main(int argc, char **argv) {
     }
     /* Chosen or defaulted, the backend gets its init(). Both current backends
      * return 0 without doing anything; a windowed one will not. */
-    enum { SCREEN_W = 480, SCREEN_H = 272 };   /* the PSP's panel, fixed */
     if (psp_render_current()->init(SCREEN_W, SCREEN_H) != 0) {
         fprintf(stderr, "render backend \"%s\" failed to initialise\n",
                 psp_render_current()->name);
@@ -941,48 +965,59 @@ int main(int argc, char **argv) {
     }
     printf("      render    %s (resolved settings)\n", psp_render_current()->name);
 
-    /* A GL backend needs somewhere to put a context, so it brings the window
-     * with it whether or not PSPRECOMP_WINDOW was asked for -- and if there is
-     * no window there is no run, rather than a run that quietly draws nothing.
-     *
-     * The cost is that a GL run is paced in real time, because the window
-     * implies it. Comparing GL against the software path therefore is not yet
-     * comparing like with like: headless replays are unpaced and reach
-     * different frame counts. That is the display-list capture prerequisite's
-     * job and is why it exists. */
-    const int want_gl = strcmp(psp_render_current()->name, "gl") == 0;
-    if (resolution && !want_gl) {
+    const int want_gl = renderer_is_gl();
+    if ((int)settings->number[PSP_OPT_RESOLUTION] && !want_gl) {
         fprintf(stderr, "PSPRECOMP_RESOLUTION=window requires the gl renderer\n");
         return 2;
     }
-    if (adaptive_aspect && !want_gl) {
+    if (adaptive_aspect(settings) && !want_gl) {
         fprintf(stderr, "PSPRECOMP_ASPECT=window requires the gl renderer; "
                         "remove PSPRECOMP_RENDER=%s or select gl\n",
                 psp_render_current()->name);
         return 2;
     }
+    return BOOT_GO_ON;
+}
 
+/* Presentation, before the module loads: the real-time clock anchors to
+ * the moment it is enabled, and that moment should be the start of the
+ * run rather than the end of the load. PSPRECOMP_WINDOW enables the SDL
+ * layer -- window, pad, audio -- and implies pacing; PSPRECOMP_REALTIME
+ * paces a headless run on its own, which is what makes a wall-clock
+ * measurement of a real scene honest.
+ *
+ * A GL backend needs somewhere to put a context, so it brings the window
+ * with it whether or not PSPRECOMP_WINDOW was asked for -- and if there is
+ * no window there is no run, rather than a run that quietly draws nothing.
+ *
+ * The cost is that a GL run is paced in real time, because the window
+ * implies it. Comparing GL against the software path therefore is not yet
+ * comparing like with like: headless replays are unpaced and reach
+ * different frame counts. That is the display-list capture prerequisite's
+ * job and is why it exists. */
+static int start_presentation(const psp_settings *settings, int *windowed) {
+    const int want_gl = renderer_is_gl();
     /* TIMING: paced (0) or real time (1). */
-    psp_clock_paced_preference(settings.number[PSP_OPT_TIMING] == 0);
-    int windowed = 0;
-    if (settings.window) {
+    psp_clock_paced_preference(settings->number[PSP_OPT_TIMING] == 0);
+    *windowed = 0;
+    if (settings->window) {
         if (want_gl) present_want_gl();
         present_use_overlay();          /* the in-game menu: Escape, or View + Menu */
         if (present_start() == 0) {
-            windowed = 1;
+            *windowed = 1;
             printf("      window    on (SDL2: video, pad, audio; %s)\n",
                    psp_clock_is_paced() ? "paced: the game's clock at the screen's pace" : "real-time pacing");
-            if (adaptive_aspect)
+            if (adaptive_aspect(settings))
                 printf("      aspect    window -- expanded view follows the drawable; "
                        "HUD stays in the native safe area\n");
         } else if (want_gl) {
             fprintf(stderr, "render: the gl backend needs a window and there "
                             "is none -- refusing rather than drawing nowhere\n");
-            return 1;
+            return -1;
         } else {
             printf("      window    unavailable -- running headless\n");
         }
-    } else if (settings.realtime) {
+    } else if (settings->realtime) {
         if (psp_clock_paced_requested()) {
             psp_clock_paced(1);
             printf("      pacing    paced: the virtual clock at the wall's pace (headless)\n");
@@ -991,53 +1026,56 @@ int main(int argc, char **argv) {
             printf("      pacing    real-time (headless)\n");
         }
     }
+    return 0;
+}
 
-    install_watch();
-    install_bad_hook();
-    psp_sched_set_thread_hook(install_alt_stack);
-    printf("      disc      %s\n", iso ? iso : "(none -- raw umd: opens will fail)");
-
-    /* Continue where I quit (STATE_START): the state the menu wrote when the
-     * game last closed, if this build can load it. One it cannot is moved
-     * aside before this run quits and writes its own: the earlier version's
-     * place, which the menu offers to continue in that version, and which
-     * keeps that build from being removed (psprecomp/builds.h). */
-    if (!load_state && settings.number[PSP_OPT_STATE_START]) {
-        static char quit[1100];
-        psp_state_info info;
-        psp_state_file("quit", quit, sizeof quit);
-        if (psp_state_peek(quit, &info, NULL)) printf("      state     nothing to continue from yet\n");
-        else if (!info.usable) {
-            char earlier[1100];
-            psp_state_file("earlier", earlier, sizeof earlier);
-            const int moved = !rename(quit, earlier);
-            printf("      state     %s is from another build of the game; starting fresh%s%s\n", quit,
-                   moved ? ", it kept as " : "", moved ? earlier : "");
-        }
-        else load_state = quit;
+/* Continue where I quit (STATE_START): the state the menu wrote when the
+ * game last closed, if this build can load it; NULL to start fresh. One it
+ * cannot is moved aside before this run quits and writes its own: the
+ * earlier version's place, which the menu offers to continue in that
+ * version, and which keeps that build from being removed
+ * (psprecomp/builds.h). */
+static const char *quit_state(void) {
+    static char quit[1100];
+    psp_state_info info;
+    psp_state_file("quit", quit, sizeof quit);
+    if (psp_state_peek(quit, &info, NULL)) {
+        printf("      state     nothing to continue from yet\n");
+        return NULL;
     }
-
-    /* A save state replaces steps 3 to 5: its threads are already past
-     * module_start, each continuing where the state left it once the drain
-     * below lets them run (psprecomp/state.h). */
-    int ctors_ok = 0, entry_ok = 0;
-    if (load_state) {
-        char why[512];
-        if (psp_state_load(load_state, why, sizeof why) != 0) {
-            fprintf(stderr, "state: %s\n", why);
-            return 1;
-        }
-        printf("  [3] state     %s: guest time %.6f s, poll %u\n", load_state,
-               psp_clock_peek() / 1e6, psp_ctrl_polls());
-        goto threads;
+    if (!info.usable) {
+        char earlier[1100];
+        psp_state_file("earlier", earlier, sizeof earlier);
+        const int moved = !rename(quit, earlier);
+        printf("      state     %s is from another build of the game; starting fresh%s%s\n", quit,
+               moved ? ", it kept as " : "", moved ? earlier : "");
+        return NULL;
     }
+    return quit;
+}
 
+/* A save state replaces steps 3 to 5: its threads are already past
+ * module_start, each continuing where the state left it once the drain
+ * lets them run (psprecomp/state.h). */
+static int load_saved_state(const char *path) {
+    char why[512];
+    if (psp_state_load(path, why, sizeof why) != 0) {
+        fprintf(stderr, "state: %s\n", why);
+        return -1;
+    }
+    printf("  [3] state     %s: guest time %.6f s, poll %u\n", path,
+           psp_clock_peek() / 1e6, psp_ctrl_polls());
+    return 0;
+}
+
+/* Steps 3 to 5, from the module's own start. */
+static int boot_fresh(const boot_module *m, boot_outcome *run) {
     /* 3 — machine state. $k0 points at a thread control block; the allocator
      *     reaches through it for the reent structure, so it has to be real
      *     before any allocation, not just before the first C++ object. */
     memset(&psp_cpu, 0, sizeof psp_cpu);
     psp_cpu_reset_fp();      /* a fresh thread's float/vector registers are NaN */
-    psp_cpu.r[PSP_REG_GP] = li.gp;
+    psp_cpu.r[PSP_REG_GP] = m->load.gp;
 
     /* The stack is *allocated*, not just pointed at the top of RAM.
      *
@@ -1048,7 +1086,7 @@ int main(int argc, char **argv) {
      * same way here is both more faithful and the only way the allocator can
      * know not to hand it to someone else. */
     const uint32_t stack = psp_sysmem_alloc(MAIN_STACK_SIZE, 1);
-    if (!stack) { fprintf(stderr, "cannot allocate the entry stack\n"); return 1; }
+    if (!stack) { fprintf(stderr, "cannot allocate the entry stack\n"); return -1; }
     psp_cpu.r[PSP_REG_SP] = (stack + MAIN_STACK_SIZE - 64) & ~15u;
     psp_cpu.r[PSP_RA_INDEX] = RA_DONE;
     printf("  [3] state     sp=0x%08X  (%uK stack, k0/reent not yet set up)\n",
@@ -1073,114 +1111,127 @@ int main(int argc, char **argv) {
      *
      * Kept as a report so the table is still visible at boot. */
     printf("  [4] ctors\n");
-    ctors_ok = report_cplinit(&b, &e);
+    run->ctors_ok = report_cplinit(&m->blob, &m->elf);
 
     /* 5 — module_start. */
-    printf("  [5] entry     0x%08X\n", e.entry);
-    entry_ok = guarded_call(e.entry, 10, "module_start");
+    printf("  [5] entry     0x%08X\n", m->elf.entry);
+    run->entry_ok = guarded_call(m->elf.entry, 10, "module_start");
     /* module_start's stack dies with the entry call. Started guest threads
      * have their own stacks and copied arguments. Keeping this 256 KiB block
      * reserved prevents the game's MSEC/VSYNC audio workers from starting. */
-    if (entry_ok == 0) {
+    if (run->entry_ok == 0) {
         psp_sysmem_release(stack);
         printf("      entry stack released (%u KiB)\n", MAIN_STACK_SIZE / 1024);
     }
+    return 0;
+}
 
-threads:
-    /* 6 — the threads module_start left behind.
-     *
-     * The usual shape is that module_start creates a thread, starts it, and
-     * returns immediately: the game is in the thread, not the entry point. So
-     * returning from module_start is the beginning of the run, not the end. */
-    int live = psp_sched_live();
-    printf("  [6] threads   %d spawned by module_start\n", live);
-    if (g_guest_exited) printf("      (the guest already exited during entry)\n");
-    /* How long to let the guest run, most specific first:
-     *
-     *   PSPRECOMP_DRAIN=<seconds>   explicit; 0 or less means no limit
-     *   a window                    no limit -- a person is driving
-     *   the scenario's own header   what that recording needs
-     *   60s                         the headless bring-up default
-     *
-     * The window rule is the one worth explaining. A wall-clock cut in the
-     * middle of someone playing is never what they wanted: it ends the run
-     * exactly where the interesting part was starting, and it looks like a
-     * crash. Closing the window already stops the run properly -- present.c
-     * raises psp_sched_stop_all("window closed"), which wakes the drain and
-     * prints the full report -- so the person at the keyboard is a better
-     * judge of when to stop than a timer is. A scenario carrying a `stop`
-     * still ends on it, window or not.
-     *
-     * Headless keeps its limit, and deliberately: an automated run with no
-     * deadline is a hung machine nobody is watching. */
-    int drain_s = 60;
+/* How long to let the guest run, most specific first:
+ *
+ *   PSPRECOMP_DRAIN=<seconds>   explicit; 0 or less means no limit
+ *   a window                    no limit -- a person is driving
+ *   the scenario's own header   what that recording needs
+ *   60s                         the headless bring-up default
+ *
+ * The window rule is the one worth explaining. A wall-clock cut in the
+ * middle of someone playing is never what they wanted: it ends the run
+ * exactly where the interesting part was starting, and it looks like a
+ * crash. Closing the window already stops the run properly -- present.c
+ * raises psp_sched_stop_all("window closed"), which wakes the drain and
+ * prints the full report -- so the person at the keyboard is a better
+ * judge of when to stop than a timer is. A scenario carrying a `stop`
+ * still ends on it, window or not.
+ *
+ * Headless keeps its limit, and deliberately: an automated run with no
+ * deadline is a hung machine nobody is watching. */
+static int drain_seconds(int windowed) {
     const char *drain_env = getenv("PSPRECOMP_DRAIN");
     if (drain_env && *drain_env) {   /* empty is unset, not "no limit" */
-        drain_s = atoi(drain_env);
+        const int drain_s = atoi(drain_env);
         if (drain_s <= 0) {
-            drain_s = 0;
             printf("      drain     no limit (PSPRECOMP_DRAIN=0)\n");
-        } else {
-            printf("      drain     %ds (PSPRECOMP_DRAIN)\n", drain_s);
+            return 0;
         }
-    } else if (windowed) {
-        drain_s = 0;
+        printf("      drain     %ds (PSPRECOMP_DRAIN)\n", drain_s);
+        return drain_s;
+    }
+    if (windowed) {
         printf("      drain     no limit (window open; close it to end the run)\n");
-    } else if (psp_ctrl_replay_drain() > 0) {
+        return 0;
+    }
+    if (psp_ctrl_replay_drain() > 0) {
         /* A scenario knows how long it needs to run -- reaching a menu three
          * screens in takes longer than the 60s bring-up default -- so it
          * carries that with it. Ending early looks exactly like a scenario
          * that does not work: the events past the cut are simply never
          * delivered. PSPRECOMP_DRAIN still wins, so a run can be shortened. */
-        drain_s = psp_ctrl_replay_drain();
+        const int drain_s = psp_ctrl_replay_drain();
         printf("      drain     %ds (from the scenario)\n", drain_s);
+        return drain_s;
     }
-    if (live > 0) live = psp_sched_drain(drain_s);
+    return 60;
+}
 
-    /* Capture this before frame dumps and reports do host-side work. The two
-     * values describe the run at the point guest execution stopped, not how
-     * long printing its diagnostics happened to take. */
-    uint64_t clock_guest_us = 0, clock_wall_us = 0;
-    const int clock_realtime =
-        psp_clock_realtime_stats(&clock_guest_us, &clock_wall_us);
-    const uint64_t clock_held_us = psp_clock_held_us();
+static void print_clock(const boot_outcome *run) {
+    if (!run->clock_realtime) return;
+    /* Host pauses hold the guest clock (psprecomp/safepoint.h): the
+     * drift is measured against the wall time the guest was given. */
+    const int64_t lag_us = (int64_t)(run->clock_wall_us - run->clock_held_us) - (int64_t)run->clock_guest_us;
+    if (run->clock_held_us)
+        printf("clock:    %.3f s guest / %.3f s wall, %.3f s of it paused "
+               "(%+.3f ms wall less pauses minus guest)\n",
+               run->clock_guest_us / 1.0e6, run->clock_wall_us / 1.0e6, run->clock_held_us / 1.0e6,
+               lag_us / 1000.0);
+    else
+        printf("clock:    %.3f s guest / %.3f s wall (%+.3f ms wall minus guest)\n",
+               run->clock_guest_us / 1.0e6, run->clock_wall_us / 1.0e6,
+               lag_us / 1000.0);
+}
 
-    /* Disarm before the summary. Everything below reads guest memory --
-     * dump_framebuffer, survey_vram, find_pointer -- and a trap armed for the
-     * guest firing inside the report would kill the process while printing
-     * the thing it was armed to explain. */
-    psp_mem_set_bad_hook(0, NULL);
+/* Stack-balance totals, not just the first few.
+ *
+ * psp_trace_sp stops printing after 24 sites and psp_trace_sp_call after
+ * 16, which is the right call for a log -- but it means counting lines in
+ * the output measures the cap rather than the module. Both counters
+ * saturate on this game, so a change that halved the real number would
+ * look identical from the log alone. Only meaningful in a TRACE=1 build;
+ * both are zero otherwise, so the line reports that rather than implying a
+ * clean run. */
+static void print_stack_balance(void) {
+    const unsigned long long sp_bad  = (unsigned long long)psp_sp_violations();
+    const unsigned long long spc_bad = (unsigned long long)psp_sp_call_violations();
+    if (sp_bad || spc_bad) {
+        /* Leaks and sites first: the raw total counts returns, so one hot
+         * function buries the rest, and a positive delta is an artifact of
+         * discovery splitting a function rather than a defect. */
+        printf("sp:       %llu leak(s) in %u site(s); %llu unbalanced return(s), "
+               "%llu callee(s) that did not restore\n",
+               (unsigned long long)psp_sp_leaks(), psp_sp_sites(),
+               sp_bad, spc_bad);
+        psp_sp_dump(stdout, 12);
+    } else {
+        printf("sp:       no imbalance recorded (build with TRACE=1 to measure)\n");
+    }
+}
 
+static void print_summary(const boot_outcome *run, const boot_module *m) {
     printf("---\n");
-    printf("ctors:    %s\n", ctors_ok == 0 ? "ok" : "incomplete");
+    printf("ctors:    %s\n", run->ctors_ok == 0 ? "ok" : "incomplete");
     if (g_guest_exited) printf("entry:    guest exited with status %u\n", g_exit_status);
-    else if (load_state) printf("entry:    a loaded state (%s)\n", load_state);
-    else                printf("entry:    %s\n", entry_ok == 0 ? "returned" : "stopped");
+    else if (run->load_state) printf("entry:    a loaded state (%s)\n", run->load_state);
+    else                printf("entry:    %s\n", run->entry_ok == 0 ? "returned" : "stopped");
     /* A force-stopped run also leaves zero threads alive -- stop_all marks them
      * dead -- so "all finished" would be printed for a run the host just
      * killed. The stop reason is the difference between a run that ended and
      * one that was ended. */
-    const char *stopped = live == 0 ? psp_sched_stop_reason() : NULL;
+    const char *stopped = run->live == 0 ? psp_sched_stop_reason() : NULL;
     if (stopped)
         printf("threads:  stopped by the host (%s)\n", stopped);
     else
         printf("threads:  %s\n",
-               live == 0 ? "all finished" : "still alive (see the deadlock report above)");
+               run->live == 0 ? "all finished" : "still alive (see the deadlock report above)");
     printf("bad mem:  %llu accesses\n", (unsigned long long)psp_mem_bad_access);
-    if (clock_realtime) {
-        /* Host pauses hold the guest clock (psprecomp/safepoint.h): the
-         * drift is measured against the wall time the guest was given. */
-        const int64_t lag_us = (int64_t)(clock_wall_us - clock_held_us) - (int64_t)clock_guest_us;
-        if (clock_held_us)
-            printf("clock:    %.3f s guest / %.3f s wall, %.3f s of it paused "
-                   "(%+.3f ms wall less pauses minus guest)\n",
-                   clock_guest_us / 1.0e6, clock_wall_us / 1.0e6, clock_held_us / 1.0e6,
-                   lag_us / 1000.0);
-        else
-            printf("clock:    %.3f s guest / %.3f s wall (%+.3f ms wall minus guest)\n",
-                   clock_guest_us / 1.0e6, clock_wall_us / 1.0e6,
-                   lag_us / 1000.0);
-    }
+    print_clock(run);
     if (psp_clock_is_realtime() || psp_clock_is_paced()) { psp_audio_dump_gaps(stdout); psp_mpeg_dump_sync(stdout); }
     present_audio_report(stdout);
     psp_mem_dump_bad(stdout, g_bad_top);
@@ -1199,35 +1250,10 @@ threads:
     printf("disc read: %llu bytes\n", (unsigned long long)psp_io_bytes_read());
     printf("pixels:   %llu drawn by the rasterizer\n",
            (unsigned long long)psp_ge_pixels());
-
-    /* Stack-balance totals, not just the first few.
-     *
-     * psp_trace_sp stops printing after 24 sites and psp_trace_sp_call after
-     * 16, which is the right call for a log -- but it means counting lines in
-     * the output measures the cap rather than the module. Both counters
-     * saturate on this game, so a change that halved the real number would
-     * look identical from the log alone. Only meaningful in a TRACE=1 build;
-     * both are zero otherwise, so the line reports that rather than implying a
-     * clean run. */
-    {
-        const unsigned long long sp_bad  = (unsigned long long)psp_sp_violations();
-        const unsigned long long spc_bad = (unsigned long long)psp_sp_call_violations();
-        if (sp_bad || spc_bad) {
-            /* Leaks and sites first: the raw total counts returns, so one hot
-             * function buries the rest, and a positive delta is an artifact of
-             * discovery splitting a function rather than a defect. */
-            printf("sp:       %llu leak(s) in %u site(s); %llu unbalanced return(s), "
-                   "%llu callee(s) that did not restore\n",
-                   (unsigned long long)psp_sp_leaks(), psp_sp_sites(),
-                   sp_bad, spc_bad);
-            psp_sp_dump(stdout, 12);
-        } else {
-            printf("sp:       no imbalance recorded (build with TRACE=1 to measure)\n");
-        }
-    }
+    print_stack_balance();
     psp_ge_dump_stats(stdout);
     render_gl_report(stdout);
-    find_pointer(li.lo, li.hi - li.lo);
+    find_pointer(m->load.lo, m->load.hi - m->load.lo);
     reached_report();
     reached_dump();
     peek();
@@ -1240,6 +1266,91 @@ threads:
     printf("  most-called firmware functions:\n");
     psp_hle_dump_calls(stdout, 12);
     psp_hle_dump_recent(stdout);
+}
+
+int main(int argc, char **argv) {
+    boot_args args = { 0 };
+    int status = parse_args(argc, argv, &args);
+    if (status != BOOT_GO_ON) return status;
+
+    psp_settings settings;
+    if (load_settings(&args, &settings) != 0) return 2;
+    if (args.inspect) { psp_settings_print(&settings, stdout); return 0; }
+    if (!args.module) {
+        fprintf(stderr, "boot <module.elf> [disc.iso] [--config FILE]\n");
+        return 2;
+    }
+    if (use_settings(&settings) != 0) return 2;
+
+    boot_module m;
+    if (psp_blob_read(args.module, &m.blob) != 0) { fprintf(stderr, "cannot read %s\n", args.module); return 1; }
+    if (elf_parse(m.blob.data, m.blob.size, &m.elf) != 0) { fprintf(stderr, "not an ELF/PRX\n"); return 1; }
+    if (psp_mem_init() != 0) { fprintf(stderr, "no guest memory\n"); return 1; }
+
+    install_handlers();
+    psp_set_miss_handler(on_miss);
+
+    printf("module:   %s\n", args.module);
+
+    /* 1 — load and relocate. */
+    if (psp_load_module(&m.blob, &m.elf, &m.load) != 0) { fprintf(stderr, "cannot load module\n"); return 1; }
+    printf("  [1] load      0x%08X + %u bytes, %d relocations\n",
+           m.load.lo, m.load.hi - m.load.lo, m.load.nrelocs);
+    reached_init(m.load.lo, m.load.hi);
+    watch_memory();
+
+    if (start_runtime(&args, &settings, &m) != 0) return 1;
+    /* --state-id: this build as save states know it (psprecomp/state.h), for
+     * the importer to note beside the build; everything it covers has
+     * registered by now. */
+    if (args.state_id) {
+        uint64_t exe = 0, fp = 0;
+        psp_state_id(&exe, &fp);
+        printf("state-id: exe %016llx fingerprint %016llx\n", (unsigned long long)exe, (unsigned long long)fp);
+        return fp ? 0 : 1;
+    }
+    status = select_renderer(&settings);
+    if (status != BOOT_GO_ON) return status;
+    int windowed;
+    if (start_presentation(&settings, &windowed) != 0) return 1;
+
+    install_watch();
+    install_bad_hook();
+    psp_sched_set_thread_hook(install_alt_stack);
+    printf("      disc      %s\n", args.iso ? args.iso : "(none -- raw umd: opens will fail)");
+
+    boot_outcome run = { .load_state = args.load_state };
+    if (!run.load_state && settings.number[PSP_OPT_STATE_START]) run.load_state = quit_state();
+    if (run.load_state) {
+        if (load_saved_state(run.load_state) != 0) return 1;
+    } else if (boot_fresh(&m, &run) != 0) {
+        return 1;
+    }
+
+    /* 6 — the threads module_start left behind.
+     *
+     * The usual shape is that module_start creates a thread, starts it, and
+     * returns immediately: the game is in the thread, not the entry point. So
+     * returning from module_start is the beginning of the run, not the end. */
+    run.live = psp_sched_live();
+    printf("  [6] threads   %d spawned by module_start\n", run.live);
+    if (g_guest_exited) printf("      (the guest already exited during entry)\n");
+    const int drain_s = drain_seconds(windowed);
+    if (run.live > 0) run.live = psp_sched_drain(drain_s);
+
+    /* Capture this before frame dumps and reports do host-side work. The two
+     * values describe the run at the point guest execution stopped, not how
+     * long printing its diagnostics happened to take. */
+    run.clock_realtime = psp_clock_realtime_stats(&run.clock_guest_us, &run.clock_wall_us);
+    run.clock_held_us = psp_clock_held_us();
+
+    /* Disarm before the summary. Everything below reads guest memory --
+     * dump_framebuffer, survey_vram, find_pointer -- and a trap armed for the
+     * guest firing inside the report would kill the process while printing
+     * the thing it was armed to explain. */
+    psp_mem_set_bad_hook(0, NULL);
+
+    print_summary(&run, &m);
 
     /* Guest threads that would not stop are still running guest code, and that
      * code is still reading and writing guest memory. Freeing it here is a
@@ -1252,13 +1363,13 @@ threads:
      * about to end and the kernel reclaims everything. So the teardown is
      * skipped whenever anything is still live, and _exit avoids running
      * atexit handlers that would reach the same memory. */
-    const int rc = (ctors_ok == 0 && entry_ok == 0 && psp_mem_bad_access == 0) ? 0 : 1;
-    if (live > 0) {
+    const int rc = (run.ctors_ok == 0 && run.entry_ok == 0 && psp_mem_bad_access == 0) ? 0 : 1;
+    if (run.live > 0) {
         fflush(NULL);
         _exit(rc);
     }
 
     psp_mem_free();
-    psp_blob_free(&b);
+    psp_blob_free(&m.blob);
     return rc;
 }

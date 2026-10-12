@@ -1,11 +1,11 @@
 /* psprecomp — the kernel's memory and message objects.
  *
- * Variable-size pools (vpl) here; fixed pools, mailboxes and message pipes to
- * follow. What they have in common is that their *internals* are observable:
- * pspautotests reports a pool's free size after every operation, so the header
- * size, the alignment and the per-pool overhead are all pinned by the captures
- * rather than being ours to choose. An allocator that merely worked would
- * disagree with hardware on every line.
+ * Variable-size pools (vpl), message pipes, mailboxes, fixed pools and
+ * thread-local pools. What they have in common is that their *internals* are
+ * observable: pspautotests reports a pool's free size after every operation,
+ * so the header size, the alignment and the per-pool overhead are all pinned
+ * by the captures rather than being ours to choose. An allocator that merely
+ * worked would disagree with hardware on every line.
  */
 
 #include "psprecomp/hle.h"
@@ -18,15 +18,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* What a wait that is still queued answers once it stops waiting: forced out
- * by sceKernelReleaseWaitThread it is RELEASE_WAIT (threadprobe step 70, fw
- * 6.60), otherwise its deadline passed. Either way the caller has already left
- * the queue and written the timeout back. */
-static uint32_t wait_end_code(int rc) {
-    return rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
-                                    : SCE_KERNEL_ERROR_WAIT_TIMEOUT;
-}
 
 /* ---- vpl: the variable-size pool ------------------------------------------
  *
@@ -189,9 +180,7 @@ static void hle_CreateVpl(void) {
     v->uid       = psp_threadman_next_uid();
     if (base) vpl_init(v);
     v->used      = 1;
-    char nm[sizeof v->name];
-    memcpy(nm, v->name, sizeof nm);
-    snprintf(v->waitdesc, sizeof v->waitdesc, "sceKernelAllocateVpl(%s)", nm);
+    psp_wait_describe(v->waitdesc, sizeof v->waitdesc, "sceKernelAllocateVpl", v->name);
     psp_ret(v->uid);
 }
 
@@ -338,14 +327,14 @@ static int vpl_release(psp_vpl *v) {
     return urgent;
 }
 
-static void vpl_allocate(int may_block, int has_timeout) {
-    if (may_block && !psp_sched_can_wait()) {
+static void vpl_allocate(psp_wait_form form) {
+    if (form == PSP_WAIT_BLOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t id      = psp_arg(0);
     const uint32_t bytes   = psp_arg(1);
     const uint32_t out     = psp_arg(2);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(3) : 0;
+    const uint32_t tmo_ptr = form == PSP_WAIT_BLOCK ? psp_arg(3) : 0;
 
     psp_vpl *v = find_vpl(id);
     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_VPLID); return; }
@@ -374,7 +363,7 @@ static void vpl_allocate(int may_block, int has_timeout) {
         return;
     }
 
-    if (!may_block) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    if (form == PSP_WAIT_POLL) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     if (psp_waitq_add(&v->q, me, bytes, 0, out) != 0) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
@@ -384,35 +373,19 @@ static void vpl_allocate(int may_block, int has_timeout) {
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, v->waitdesc,
                                          deadline);
     psp_threadman_wait_mark(0, 0);
-    /* Cancelled rather than deleted: the object is still there, so looking it
-     * up says nothing, and only the waker knew. */
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
-        return;
-    }
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
-        psp_wait_writeback(tmo_ptr, deadline);    /* syncprobe step 222 */
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    /* Handed its block: OK even if the pool is deleted before we run
+     * (syncprobe step 222). */
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
+    /* Woken any other way, vpl_release allocated for us and wrote the
+     * pointer. */
     v = find_vpl(id);
-    if (!v) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
-
-    if (rc == PSP_SCHED_WOKEN) {
-        /* vpl_release allocated for us and wrote the pointer. */
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_found(rc, v, tmo_ptr, deadline)) return;
     psp_waitq_drop(&v->q, me);
-    psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(wait_end_code(rc));
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelAllocateVpl");
 }
 
-static void hle_AllocateVpl(void)    { vpl_allocate(1, 1); }
-static void hle_TryAllocateVpl(void) { vpl_allocate(0, 0); }
+static void hle_AllocateVpl(void)    { vpl_allocate(PSP_WAIT_BLOCK); }
+static void hle_TryAllocateVpl(void) { vpl_allocate(PSP_WAIT_POLL); }
 
 static void hle_FreeVpl(void) {
     const uint32_t id  = psp_arg(0);
@@ -637,11 +610,8 @@ static void hle_CreateMsgPipe(void) {
     p->buf_size = size;
     p->uid      = psp_threadman_next_uid();
     p->alive    = 1;
-    char nm[sizeof p->name];
-    memcpy(nm, p->name, sizeof nm);
-    snprintf(p->senddesc, sizeof p->senddesc, "sceKernelSendMsgPipe(%s)", nm);
-    memcpy(nm, p->name, sizeof nm);
-    snprintf(p->recvdesc, sizeof p->recvdesc, "sceKernelReceiveMsgPipe(%s)", nm);
+    psp_wait_describe(p->senddesc, sizeof p->senddesc, "sceKernelSendMsgPipe", p->name);
+    psp_wait_describe(p->recvdesc, sizeof p->recvdesc, "sceKernelReceiveMsgPipe", p->name);
     psp_ret(p->uid);
 }
 
@@ -663,8 +633,8 @@ static int mpp_abandon(psp_waitq *q, int reason) {
 static void hle_DeleteMsgPipe(void) {
     psp_msgpipe *p = find_pipe(psp_arg(0));
     if (!p) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MPPID); return; }
-    int urgent = mpp_abandon(&p->send_q, 0);
-    urgent |= mpp_abandon(&p->recv_q, 0);
+    int urgent = mpp_abandon(&p->send_q, PSP_WAIT_WOKE_NORMAL);
+    urgent |= mpp_abandon(&p->recv_q, PSP_WAIT_WOKE_NORMAL);
     if (p->base) psp_sysmem_release(p->base);
     p->alive = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -839,16 +809,150 @@ static void mpp_pump(psp_msgpipe *p, uint32_t exclude, int *urgent) {
     }
 }
 
+typedef enum { MPP_SEND, MPP_RECEIVE } mpp_dir;
+
+/* The queue a transfer in direction `dir` waits in. */
+static psp_waitq *mpp_queue(psp_msgpipe *p, mpp_dir dir) {
+    return dir == MPP_SEND ? &p->send_q : &p->recv_q;
+}
+
+/* A send or receive as the guest asked for it. */
+typedef struct {
+    mpp_dir  dir;
+    uint32_t buf, len, mode, out;
+} mpp_request;
+
+/* Whether a thread already waiting in `dir`'s queue would be served before
+ * `me`. A pump has just run, so every waiter left is one it could not move,
+ * and nobody behind one is served either: send.expected's interleaved block
+ * has a 0x80 sender wait behind a 0x100 one that does not fit, with 0x80
+ * free (`free=80, sending=2`). The order is the pump's -- arrival, or priority
+ * with ties to whoever came first.
+ *
+ * Only a sender can be caught by it. A receiver still waiting has already
+ * emptied the buffer and every blocked sender into its own buffer, so there
+ * is nothing left for a poll behind it to take anyway. */
+static int mpp_behind(const psp_msgpipe *p, mpp_dir dir, uint32_t me) {
+    const psp_waitq *q     = dir == MPP_SEND ? &p->send_q : &p->recv_q;
+    const uint32_t   order = dir == MPP_SEND ? mpp_send_order(p) : mpp_recv_order(p);
+    if (!(order & PSP_WAITQ_PRIORITY)) return q->n > 0;
+    const int mine = psp_sched_priority(me);
+    for (int i = 0; i < q->n; i++)
+        if (psp_sched_priority(q->w[i].uid) <= mine) return 1;
+    return 0;
+}
+
+/* A poll reaches past the buffer exactly as a blocking call does -- a
+ * try-receive on a pipe with no buffer at all still succeeds when a sender
+ * is blocked on the other side, and msgpipe/tryreceive says so twice:
+ * `Partial packet: OK (bytes=128)` and `Complete packet: OK (bytes=256)`,
+ * both against `buffer=0`.
+ *
+ * What it may not do is half-succeed. So it asks how much could move,
+ * decides, and only then joins the queue -- by which point completing is
+ * certain, and the ordinary pump does the work. A poll that would join behind
+ * a waiter can move nothing, however much room there is: it would have to
+ * wait its turn, and a poll does not wait. */
+static void mpp_poll(psp_msgpipe *p, const mpp_request *rq, int urgent) {
+    const uint32_t me  = psp_sched_current();
+    const uint32_t cap = mpp_behind(p, rq->dir, me) ? 0
+                       : rq->dir == MPP_SEND ? mpp_send_capacity(p) : mpp_recv_capacity(p);
+    const uint32_t now = (rq->mode & MPP_MODE_ASAP) ? mpp_min(cap, rq->len) : rq->len;
+    if (!now || now > cap) {
+        /* ASAP moved nothing, and says so: `ASAP: Failed (800201b3,
+         * bytes=0)`. A full-wait failure leaves the word alone, which is
+         * how the tests tell the two apart -- they pre-seed it 0x1337. */
+        if ((rq->mode & MPP_MODE_ASAP) && rq->out) psp_write32(rq->out, 0);
+        psp_ret(rq->dir == MPP_SEND ? SCE_KERNEL_ERROR_MSGPIPE_FULL
+                                    : SCE_KERNEL_ERROR_MSGPIPE_EMPTY);
+        if (urgent) psp_sched_preempt();
+        return;
+    }
+    psp_waitq *q = mpp_queue(p, rq->dir);
+    /* Asking for exactly what is there, as a full-wait: the pump then fills
+     * it precisely rather than stopping at the first byte. */
+    if (psp_waitq_add(q, me, now, 0, rq->buf) != 0) {
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+    mpp_pump(p, me, &urgent);
+    (void)psp_waitq_drop(q, me);
+    mpp_pump(p, 0, &urgent);
+    if (rq->out) psp_write32(rq->out, now);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_preempt();
+}
+
+/* The blocking form: finished by the pump if it can be, parked otherwise. */
+static void mpp_wait(psp_msgpipe *p, const mpp_request *rq, uint32_t tmo_ptr,
+                     uint64_t deadline, int urgent) {
+    const uint32_t id = p->uid, me = psp_sched_current();
+    psp_waitq *q = mpp_queue(p, rq->dir);
+    if (psp_waitq_add(q, me, rq->len, rq->mode, rq->buf) != 0) {
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+    q->w[q->n - 1].nout = rq->out;
+    mpp_pump(p, me, &urgent);
+
+    const int i = psp_waitq_find(q, me);
+    if (i < 0 || mpp_satisfied(&q->w[i])) {
+        const uint32_t done = i >= 0 ? q->w[i].done : rq->len;
+        if (i >= 0) {
+            psp_waitq_take(q, i);
+            /* Out of the way: whoever was behind us can move now. */
+            mpp_pump(p, 0, &urgent);
+        }
+        if (rq->out) psp_write32(rq->out, done);
+        psp_wait_writeback(tmo_ptr, deadline);
+        psp_ret(SCE_KERNEL_ERROR_OK);
+        if (urgent) psp_sched_preempt();
+        return;
+    }
+
+    /* A thread the pump woke that outranks us runs when we park, not before:
+     * parking hands it the CPU anyway. It can finish our transfer, cancel the
+     * pipe or delete it, and each of those wakes us -- which does nothing to a
+     * thread not yet parked, so preempting first left us to park afterwards
+     * with nobody left to wake us. */
+    psp_threadman_wait_mark(PSP_WAITTYPE_MSGPIPE, p->uid);
+    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
+                                         rq->dir == MPP_SEND ? p->senddesc : p->recvdesc,
+                                         deadline);
+    psp_threadman_wait_mark(0, 0);
+    /* A pipe deleted between our release and our turn on the CPU does not
+     * undo the transfer. The other side moved the bytes on our behalf, took
+     * us out of the queue, and wrote how many -- it is the only one that
+     * knew, since an ASAP waiter can be released with less than it asked
+     * for. */
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
+    p = find_pipe(id);
+    if (psp_wait_end_found(rc, p, tmo_ptr, deadline)) return;
+    q = mpp_queue(p, rq->dir);
+
+    /* A wait that ran out reports what it did get, which for a full-wait is
+     * nothing: `bytes=0`, where an *argument* failure leaves the caller's
+     * 0x1337 in place because it never waited. */
+    const int left = psp_waitq_find(q, me);
+    if (left >= 0 && rq->out) psp_write32(rq->out, q->w[left].done);
+    psp_waitq_drop(q, me);
+    psp_wait_give_up(rc, tmo_ptr, deadline,
+                     rq->dir == MPP_SEND ? "sceKernelSendMsgPipe" : "sceKernelReceiveMsgPipe");
+    /* A wait that never parked -- its deadline had already arrived -- has not
+     * yet let that thread run. */
+    if (urgent) psp_sched_preempt();
+}
+
 /* send and receive are the same shape with the direction reversed, so they
- * share a body: `sending` picks which queue is ours and which is theirs, which
- * error a full-or-empty poll gives, and which way the bytes go.
+ * share a body: the direction picks which queue is ours and which is theirs,
+ * which error a full-or-empty poll gives, and which way the bytes go.
  *
  * The caller joins its own queue before anything moves, rather than trying the
  * transfer first and queueing only on failure. That is what puts it in the
  * right place in the order relative to threads already waiting, and it means
  * the immediate case and the blocking case are the same code. */
-static void mpp_transfer(int sending, int may_block, int has_timeout) {
-    if (may_block && !psp_sched_can_wait()) {
+static void mpp_transfer(mpp_dir dir, psp_wait_form form) {
+    if (form == PSP_WAIT_BLOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t id      = psp_arg(0);
@@ -856,7 +960,7 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
     const uint32_t len     = psp_arg(2);
     const uint32_t mode    = psp_arg(3);
     const uint32_t out     = psp_arg(4);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(5) : 0;
+    const uint32_t tmo_ptr = form == PSP_WAIT_BLOCK ? psp_arg(5) : 0;
 
     psp_msgpipe *p = find_pipe(id);
     if (!p) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MPPID); return; }
@@ -891,123 +995,15 @@ static void mpp_transfer(int sending, int may_block, int has_timeout) {
      * takes changes what is left. */
     mpp_pump(p, 0, &urgent);
 
-    const uint32_t me = psp_sched_current();
-
-    /* A poll reaches past the buffer exactly as a blocking call does -- a
-     * try-receive on a pipe with no buffer at all still succeeds when a sender
-     * is blocked on the other side, and msgpipe/tryreceive says so twice:
-     * `Partial packet: OK (bytes=128)` and `Complete packet: OK (bytes=256)`,
-     * both against `buffer=0`.
-     *
-     * What it may not do is half-succeed. So it asks how much could move,
-     * decides, and only then joins the queue -- by which point completing is
-     * certain, and the ordinary pump does the work. */
-    if (!may_block) {
-        const uint32_t cap = sending ? mpp_send_capacity(p) : mpp_recv_capacity(p);
-        const uint32_t now = (mode & MPP_MODE_ASAP) ? mpp_min(cap, len) : len;
-        if (!now || now > cap) {
-            /* ASAP moved nothing, and says so: `ASAP: Failed (800201b3,
-             * bytes=0)`. A full-wait failure leaves the word alone, which is
-             * how the tests tell the two apart -- they pre-seed it 0x1337. */
-            if ((mode & MPP_MODE_ASAP) && out) psp_write32(out, 0);
-            psp_ret(sending ? SCE_KERNEL_ERROR_MSGPIPE_FULL
-                            : SCE_KERNEL_ERROR_MSGPIPE_EMPTY);
-            if (urgent) psp_sched_preempt();
-            return;
-        }
-        psp_waitq *pq = sending ? &p->send_q : &p->recv_q;
-        /* Asking for exactly what is there, as a full-wait: the pump then fills
-         * it precisely rather than stopping at the first byte. */
-        if (psp_waitq_add(pq, me, now, 0, buf) != 0) {
-            psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
-            return;
-        }
-        mpp_pump(p, me, &urgent);
-        for (int k = 0; k < pq->n; k++)
-            if (pq->w[k].uid == me) { psp_waitq_take(pq, k); break; }
-        mpp_pump(p, 0, &urgent);
-        if (out) psp_write32(out, now);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        if (urgent) psp_sched_preempt();
-        return;
-    }
-
-    psp_waitq *q = sending ? &p->send_q : &p->recv_q;
-    if (psp_waitq_add(q, me, len, mode, buf) != 0) {
-        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
-        return;
-    }
-    q->w[q->n - 1].nout = out;
-    mpp_pump(p, me, &urgent);
-
-    int i = -1;
-    for (int k = 0; k < q->n; k++) if (q->w[k].uid == me) { i = k; break; }
-    const uint32_t done = i >= 0 ? q->w[i].done : len;
-
-    if (i < 0 || mpp_satisfied(&q->w[i])) {
-        if (i >= 0) {
-            psp_waitq_take(q, i);
-            /* Out of the way: whoever was behind us can move now. */
-            mpp_pump(p, 0, &urgent);
-        }
-        if (out) psp_write32(out, done);
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        if (urgent) psp_sched_preempt();
-        return;
-    }
-
-    if (urgent) psp_sched_preempt();
-    psp_threadman_wait_mark(PSP_WAITTYPE_MSGPIPE, p->uid);
-    const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
-                                         sending ? p->senddesc : p->recvdesc,
-                                         deadline);
-    psp_threadman_wait_mark(0, 0);
-    /* Checked before the pipe is looked up again, because a pipe deleted
-     * between our release and our turn on the CPU does not undo the transfer.
-     * The other side moved the bytes on our behalf, took us out of the queue,
-     * and wrote how many -- it is the only one that knew, since an ASAP waiter
-     * can be released with less than it asked for. */
-    if (rc == PSP_SCHED_WOKEN) {
-        const int why = psp_sched_wake_reason();
-        if (why == PSP_WAIT_WOKE_SATISFIED) {
-            psp_wait_writeback(tmo_ptr, deadline);
-            psp_ret(SCE_KERNEL_ERROR_OK);
-            return;
-        }
-        /* Cancelled rather than deleted. The pipe is still there, so looking it
-         * up would say nothing; only the waker knew. */
-        if (why == PSP_WAIT_WOKE_CANCELLED) {
-            psp_wait_writeback(tmo_ptr, deadline);
-            psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
-            return;
-        }
-    }
-
-    p = find_pipe(id);
-    if (!p) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
-    q = sending ? &p->send_q : &p->recv_q;
-
-    if (rc == PSP_SCHED_WOKEN) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
-    /* A wait that ran out reports what it did get, which for a full-wait is
-     * nothing: `bytes=0`, where an *argument* failure leaves the caller's
-     * 0x1337 in place because it never waited. */
-    for (int k = 0; k < q->n; k++)
-        if (q->w[k].uid == me && out) { psp_write32(out, q->w[k].done); break; }
-    psp_waitq_drop(q, me);
-    psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(wait_end_code(rc));
+    const mpp_request rq = { dir, buf, len, mode, out };
+    if (form == PSP_WAIT_POLL) mpp_poll(p, &rq, urgent);
+    else                       mpp_wait(p, &rq, tmo_ptr, deadline, urgent);
 }
 
-static void hle_SendMsgPipe(void)       { mpp_transfer(1, 1, 1); }
-static void hle_TrySendMsgPipe(void)    { mpp_transfer(1, 0, 0); }
-static void hle_ReceiveMsgPipe(void)    { mpp_transfer(0, 1, 1); }
-static void hle_TryReceiveMsgPipe(void) { mpp_transfer(0, 0, 0); }
+static void hle_SendMsgPipe(void)       { mpp_transfer(MPP_SEND, PSP_WAIT_BLOCK); }
+static void hle_TrySendMsgPipe(void)    { mpp_transfer(MPP_SEND, PSP_WAIT_POLL); }
+static void hle_ReceiveMsgPipe(void)    { mpp_transfer(MPP_RECEIVE, PSP_WAIT_BLOCK); }
+static void hle_TryReceiveMsgPipe(void) { mpp_transfer(MPP_RECEIVE, PSP_WAIT_POLL); }
 
 static void hle_CancelMsgPipe(void) {
     psp_msgpipe *p = find_pipe(psp_arg(0));
@@ -1229,9 +1225,7 @@ static void hle_CreateMbx(void) {
     m->attr  = attr;
     m->uid   = psp_threadman_next_uid();
     m->alive = 1;
-    char nm[sizeof m->name];
-    memcpy(nm, m->name, sizeof nm);
-    snprintf(m->waitdesc, sizeof m->waitdesc, "sceKernelReceiveMbx(%s)", nm);
+    psp_wait_describe(m->waitdesc, sizeof m->waitdesc, "sceKernelReceiveMbx", m->name);
     psp_ret(m->uid);
 }
 
@@ -1279,13 +1273,13 @@ static void hle_SendMbx(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-static void mbx_receive(int may_block, int has_timeout) {
-    if (may_block && !psp_sched_can_wait()) {
+static void mbx_receive(psp_wait_form form) {
+    if (form == PSP_WAIT_BLOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t id      = psp_arg(0);
     const uint32_t out     = psp_arg(1);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
+    const uint32_t tmo_ptr = form == PSP_WAIT_BLOCK ? psp_arg(2) : 0;
 
     psp_mbx *m = find_mbx(id);
     if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_MBXID); return; }
@@ -1315,7 +1309,7 @@ static void mbx_receive(int may_block, int has_timeout) {
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
-    if (!may_block) { psp_ret(SCE_KERNEL_ERROR_MBOX_NOMSG); return; }
+    if (form == PSP_WAIT_POLL) { psp_ret(SCE_KERNEL_ERROR_MBOX_NOMSG); return; }
 
     const uint32_t me = psp_sched_current();
     if (psp_waitq_add(&m->q, me, 0, 0, out) != 0) {
@@ -1326,34 +1320,17 @@ static void mbx_receive(int may_block, int has_timeout) {
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, m->waitdesc,
                                          deadline);
     psp_threadman_wait_mark(0, 0);
-    /* Cancelled rather than deleted: the object is still there, so looking it
-     * up says nothing, and only the waker knew. */
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
-        return;
-    }
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
-        psp_wait_writeback(tmo_ptr, deadline);    /* syncprobe step 221 */
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    /* Handed its message: OK even if the box is deleted before we run
+     * (syncprobe step 221). */
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
     m = find_mbx(id);
-    if (!m) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
-
-    if (rc == PSP_SCHED_WOKEN) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_found(rc, m, tmo_ptr, deadline)) return;
     psp_waitq_drop(&m->q, me);
-    psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(wait_end_code(rc));
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelReceiveMbx");
 }
 
-static void hle_ReceiveMbx(void) { mbx_receive(1, 1); }
-static void hle_PollMbx(void)    { mbx_receive(0, 0); }
+static void hle_ReceiveMbx(void) { mbx_receive(PSP_WAIT_BLOCK); }
+static void hle_PollMbx(void)    { mbx_receive(PSP_WAIT_POLL); }
 
 static void hle_CancelReceiveMbx(void) {
     psp_mbx *m = find_mbx(psp_arg(0));
@@ -1472,6 +1449,32 @@ static psp_fpl *find_fpl(uint32_t id) {
     return NULL;
 }
 
+/* What a block of a fixed or thread-local pool costs: its size rounded up to
+ * the alignment in the option block's second word, and never below four.
+ * Returns 0 when that alignment is neither zero nor a power of two.
+ *
+ * Both pools refuse that with the *partition* code, which is the one thing
+ * about either that could not have been guessed. fpl/create sweeps it: 0, 1,
+ * 2, 4 and 8 are accepted; -1, 3, 5, 6 and 7 are refused.
+ *
+ * And it spaces the blocks out rather than merely placing the pool.
+ * fpl/tryallocate creates 0x10-byte blocks with alignment 32 and measures 32
+ * bytes between two of them; every other section of that test leaves the
+ * options null and measures 16. tls/get creates one-byte blocks three times
+ * over, with alignment 0x100, 1 and 0, and reads the spacing back as 0x100, 4
+ * and 4 -- so anything below four is four, which is also what a pool created
+ * without options gets. */
+static int pool_stride(uint32_t opt, uint32_t bsize, uint32_t *stride) {
+    uint32_t align = 4;
+    if (opt && psp_mem_ptr(opt, 8)) {
+        const uint32_t a = psp_read32(opt + 4);
+        if (a && (a & (a - 1))) return 0;
+        if (a > align) align = a;
+    }
+    *stride = (bsize + align - 1) & ~(align - 1);
+    return 1;
+}
+
 static void hle_CreateFpl(void) {
     /* (name, partition, attr, blockSize, numBlocks, option) */
     const uint32_t name  = psp_arg(0);
@@ -1493,25 +1496,11 @@ static void hle_CreateFpl(void) {
      * ILLEGAL_MEMSIZE where merely asking for too much answers NO_MEMORY. */
     if (count > 0xFFFFFFFFu / bsize) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
 
-    /* The option block's second word is an alignment, and it must be zero or a
-     * power of two. create.expected sweeps it: 0, 1, 2, 4 and 8 are accepted;
-     * -1, 3, 5, 6 and 7 are refused -- and refused with the *partition* code,
-     * which is the one thing about it that could not have been guessed. */
-    const uint32_t opt = psp_arg(5);
-    uint32_t align = 4;
-    if (opt && psp_mem_ptr(opt, 8)) {
-        const uint32_t a = psp_read32(opt + 4);
-        if (a && (a & (a - 1))) {
-            psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
-            return;
-        }
-        if (a > align) align = a;
+    uint32_t stride;
+    if (!pool_stride(psp_arg(5), bsize, &stride)) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
+        return;
     }
-    /* And having been checked, it spaces the blocks out, the same way a
-     * tlspl's does. fpl/tryallocate creates 0x10-byte blocks with alignment 32
-     * and measures 32 bytes between two of them; every other section of that
-     * test leaves the options null and measures 16. */
-    const uint32_t stride = (bsize + align - 1) & ~(align - 1);
 
     if (count > 0xFFFFFFFFu / stride) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
     const uint32_t base = psp_sysmem_alloc(stride * count, 0);
@@ -1533,9 +1522,7 @@ static void hle_CreateFpl(void) {
     for (uint32_t i = 0; i < count; i++) f->freelist[i] = i;
     f->uid   = psp_threadman_next_uid();
     f->alive = 1;
-    char nm[sizeof f->name];
-    memcpy(nm, f->name, sizeof nm);
-    snprintf(f->waitdesc, sizeof f->waitdesc, "sceKernelAllocateFpl(%s)", nm);
+    psp_wait_describe(f->waitdesc, sizeof f->waitdesc, "sceKernelAllocateFpl", f->name);
     psp_ret(f->uid);
 }
 
@@ -1584,13 +1571,13 @@ static int fpl_release(psp_fpl *f) {
     return urgent;
 }
 
-static void fpl_allocate(int may_block, int has_timeout) {
-    if (may_block && !psp_sched_can_wait()) {
+static void fpl_allocate(psp_wait_form form) {
+    if (form == PSP_WAIT_BLOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t id      = psp_arg(0);
     const uint32_t out     = psp_arg(1);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
+    const uint32_t tmo_ptr = form == PSP_WAIT_BLOCK ? psp_arg(2) : 0;
 
     psp_fpl *f = find_fpl(id);
     if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_FPLID); return; }
@@ -1604,7 +1591,7 @@ static void fpl_allocate(int may_block, int has_timeout) {
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
-    if (!may_block) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    if (form == PSP_WAIT_POLL) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     const uint32_t me = psp_sched_current();
     if (psp_waitq_add(&f->q, me, 0, 0, out) != 0) {
@@ -1615,38 +1602,15 @@ static void fpl_allocate(int may_block, int has_timeout) {
     const int rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED, f->waitdesc,
                                          deadline);
     psp_threadman_wait_mark(0, 0);
-    /* Both of these are decided before the pool is looked up again, because
-     * neither answer depends on whether it is still there. A block already
-     * handed over is not taken back by the delete that follows, and a cancel
-     * leaves the pool in place so finding it would prove nothing. */
-    if (rc == PSP_SCHED_WOKEN) {
-        const int why = psp_sched_wake_reason();
-        if (why == PSP_WAIT_WOKE_SATISFIED) {
-            psp_wait_writeback(tmo_ptr, deadline);
-            psp_ret(SCE_KERNEL_ERROR_OK);
-            return;
-        }
-        if (why == PSP_WAIT_WOKE_CANCELLED) {
-            psp_wait_writeback(tmo_ptr, deadline);
-            psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
-            return;
-        }
-    }
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
     f = find_fpl(id);
-    if (!f) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
-    if (rc == PSP_SCHED_WOKEN) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_found(rc, f, tmo_ptr, deadline)) return;
     psp_waitq_drop(&f->q, me);
-    psp_wait_writeback(tmo_ptr, deadline);
-    psp_ret(wait_end_code(rc));
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelAllocateFpl");
 }
 
-static void hle_AllocateFpl(void)    { fpl_allocate(1, 1); }
-static void hle_TryAllocateFpl(void) { fpl_allocate(0, 0); }
+static void hle_AllocateFpl(void)    { fpl_allocate(PSP_WAIT_BLOCK); }
+static void hle_TryAllocateFpl(void) { fpl_allocate(PSP_WAIT_POLL); }
 
 static void hle_FreeFpl(void) {
     const uint32_t id  = psp_arg(0);
@@ -1838,25 +1802,11 @@ static void hle_CreateTlspl(void) {
     if (bsize == 0 || (int32_t)bsize < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
     if (count == 0 || (int32_t)count < 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMSIZE); return; }
 
-    /* The option block's second word is an alignment, and it rounds the block
-     * up rather than merely placing the pool. tls/get creates one-byte blocks
-     * three times over, with alignment 0x100, 1 and 0, and reads the spacing
-     * back as 0x100, 4 and 4 -- so anything below four is four, which is also
-     * what a pool created without options gets. */
-    const uint32_t opt = psp_arg(5);
-    uint32_t align = 4;
-    if (opt && psp_mem_ptr(opt, 8)) {
-        const uint32_t a = psp_read32(opt + 4);
-        /* And it must be a power of two, refused with the *partition* code --
-         * which is what an fpl does with the same field, and the one thing
-         * about either that could not have been guessed. */
-        if (a && (a & (a - 1))) {
-            psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
-            return;
-        }
-        if (a > align) align = a;
+    uint32_t stride;
+    if (!pool_stride(psp_arg(5), bsize, &stride)) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
+        return;
     }
-    const uint32_t stride = (bsize + align - 1) & ~(align - 1);
     /* A pool whose size does not fit in a word is an illegal *size*, where one
      * that merely does not fit in memory is out of memory: 0x1000 blocks of
      * 0x100 is a megabyte and succeeds, 0x10000 of them answers NO_MEMORY, and

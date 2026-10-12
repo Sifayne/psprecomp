@@ -66,6 +66,7 @@ typedef struct { uint32_t pts_hi,pts_lo,dts_hi,dts_lo,es,size; } mpeg_au_wire;
 
 #define MAX_MPEG    4
 #define MAX_ES_BUF  MPEG_ES_SLOTS
+#define MAX_AU      64
 
 typedef struct {
     int      used;
@@ -76,7 +77,7 @@ typedef struct {
     int      es_used[MAX_ES_BUF];
     /* Host-side associations: InitAu does not publish its input buffer at +16.
      * Preserve it here for host ATRAC copying. Capacity is a host limit. */
-    struct { uint32_t address, buffer; } access_units[64];
+    struct { uint32_t address, buffer; } access_units[MAX_AU];
 
     /* The demuxed AVC elementary stream, accumulated across ring buffer puts.
      * The game hands us an MPEG program stream a few packets at a time; the
@@ -170,7 +171,6 @@ typedef struct {
      * is where a player's own logic takes over, and this says which calls it
      * is still making when it does. */
     uint64_t post_avail, post_put, post_getavc, post_getatrac, post_avcdec, post_atracdec;
-    int      es_probe;        /* unused; kept so the probe can be re-armed cheaply */
     /* The PES timestamps, kept this time, anchored to where in the video
      * elementary stream their PES began. Only some pictures' PES carry one
      * -- one in ten through this game's intro -- so a picture whose data
@@ -192,9 +192,7 @@ typedef struct {
      * access units were fetched and what they were stamped. A stream fetched
      * at real time advances its stamps as fast as the wall; slower means the
      * decoder cannot keep up, and the other stream runs away from it. */
-    uint64_t v_first_ns, v_last_ns, a_first_ns, a_last_ns;
-    uint32_t v_first_pts, v_last_pts, a_first_pts, a_last_pts;
-    uint32_t v_fetched, a_fetched;
+    struct mpeg_fetches { uint64_t first_ns, last_ns; uint32_t first_pts, last_pts, n; } vfetch, afetch;
     uint64_t dec_ns, copy_ns, adec_ns;   /* host time in the H.264 decoder, the picture copy, the audio decoder */
 } mpeg_ctx;
 
@@ -202,6 +200,15 @@ static mpeg_ctx g_mpeg[MAX_MPEG];
 
 /* Opt-in measurements of our host adapter, without changing guest behavior.
  * Event fields are documented in scripts/analyze-mpeg-trace.py. */
+enum {
+    MPEG_TRACE_INIT_AU     = 10,   /* sceMpegInitAu */
+    MPEG_TRACE_PUT         = 20,   /* sceMpegRingbufferPut */
+    MPEG_TRACE_ATRAC_AU    = 31,   /* sceMpegGetAtracAu, a frame fetched */
+    MPEG_TRACE_ATRAC_EMPTY = 32,   /* and none there, at most once a second */
+    MPEG_TRACE_ATRAC_IN    = 40,   /* sceMpegAtracDecode, its access unit */
+    MPEG_TRACE_ATRAC_OUT   = 41,   /* and what it decoded */
+    MPEG_TRACE_MEMORY      = 60,   /* 60-63: PSPRECOMP_MPEG_TRACE_MEMORY's 64 bytes */
+};
 static FILE *mpeg_trace_file(void) {
     static int checked;
     static FILE *file;
@@ -227,14 +234,39 @@ static void mpeg_trace(unsigned event,uint32_t a,uint32_t b,uint32_t c,uint32_t 
     fprintf(file,"%llu,%llu,%u,%u,%u,%u,%u\n",
                       (unsigned long long)((psp_os_mono_ns()-origin)/1000),
                       (unsigned long long)psp_clock_peek(),event,a,b,c,d);
-    if (memory && event==31 && psp_mem_ptr(memory,64)) {
+    if (memory && event==MPEG_TRACE_ATRAC_AU && psp_mem_ptr(memory,64)) {
         for (unsigned offset=0;offset<64;offset+=16)
             fprintf(file,"%llu,%llu,%u,%u,%u,%u,%u\n",
                     (unsigned long long)((psp_os_mono_ns()-origin)/1000),
-                    (unsigned long long)psp_clock_peek(),60+offset/16,
+                    (unsigned long long)psp_clock_peek(),MPEG_TRACE_MEMORY+offset/16,
                     psp_read32(memory+offset),psp_read32(memory+offset+4),
                     psp_read32(memory+offset+8),psp_read32(memory+offset+12));
     }
+}
+
+/* A dump of the movie at one stage, to the file the environment variable
+ * `var` names, opened the first time there is something to write. */
+typedef struct { const char *var; int checked; FILE *file; } mpeg_dump;
+static void dump_write(mpeg_dump *d, const void *p, size_t n) {
+    if (!d->checked) {
+        const char *path = getenv(d->var);
+        d->checked = 1;
+        if (path && *path) d->file = fopen(path, "wb");
+    }
+    if (d->file) { fwrite(p, 1, n, d->file); fflush(d->file); }
+}
+
+/* An access unit fetched at `pts`, against the clock less host pauses. */
+static void fetch_note(struct mpeg_fetches *f, uint32_t pts) {
+    const uint64_t now = psp_clock_run_ns();
+    if (!f->n) { f->first_ns = now; f->first_pts = pts; }
+    f->last_ns = now; f->last_pts = pts; f->n++;
+}
+static void fetch_report(FILE *out, const char *stream, const char *what, const struct mpeg_fetches *f) {
+    if (f->n > 1)
+        fprintf(out, "    movie: %s  %u AUs fetched, stamps %u..%u (%.1f s of %s) over %.1f s of wall clock\n",
+                stream, f->n, f->first_pts, f->last_pts,
+                (f->last_pts - f->first_pts) / 90000.0, what, (f->last_ns - f->first_ns) / 1e9);
 }
 
 /* The audio clock's lead over the picture, in milliseconds, over the run. */
@@ -256,14 +288,8 @@ void psp_mpeg_dump_sync(FILE *out) {
         fprintf(out, "    movie: lead every 250 pictures, ms:");
         for (int k = 0; k < 8 && k * 250 < c->frames; k++) fprintf(out, " %.0f", c->sync_trend[k] / 90.0);
         fprintf(out, "\n");
-        if (c->v_fetched > 1)
-            fprintf(out, "    movie: video  %u AUs fetched, stamps %u..%u (%.1f s of picture) over %.1f s of wall clock\n",
-                    c->v_fetched, c->v_first_pts, c->v_last_pts,
-                    (c->v_last_pts - c->v_first_pts) / 90000.0, (c->v_last_ns - c->v_first_ns) / 1e9);
-        if (c->a_fetched > 1)
-            fprintf(out, "    movie: audio  %u AUs fetched, stamps %u..%u (%.1f s of sound) over %.1f s of wall clock\n",
-                    c->a_fetched, c->a_first_pts, c->a_last_pts,
-                    (c->a_last_pts - c->a_first_pts) / 90000.0, (c->a_last_ns - c->a_first_ns) / 1e9);
+        fetch_report(out, "video", "picture", &c->vfetch);
+        fetch_report(out, "audio", "sound", &c->afetch);
         if (c->post_avail || c->post_put)
             fprintf(out, "    movie: after the file ended -- ring polls %llu, puts %llu, "
                          "video fetch %llu decode %llu, audio fetch %llu decode %llu\n",
@@ -308,7 +334,7 @@ static mpeg_ctx *ctx_of(uint32_t address) {
     return NULL;
 }
 static uint32_t au_buffer(mpeg_ctx *context,uint32_t address) {
-    if (context) for (unsigned i=0;i<64;i++)
+    if (context) for (unsigned i=0;i<MAX_AU;i++)
         if (context->access_units[i].address==address) return context->access_units[i].buffer;
     /* Filled AUs may be copied by the guest before decode. Their SDK iEsBuffer
      * field carries the host decoder's supplied payload address. */
@@ -400,8 +426,8 @@ static int mpeg_decoding(void);
 static int mpeg_logging(void);
 /* PSPRECOMP_MPEG_NODROP=1 keeps every picture, drift and all: the control for
  * any question of the form "is the dropping doing this?" The host can set the
- * same policy through psp_mpeg_set_drop; see the catch-up comment in
- * hle_GetAvcAu for what each choice costs this game. */
+ * same policy through psp_mpeg_set_drop; see the comment on avc_catch_up
+ * for what each choice costs this game. */
 static int g_drop_override = -1;
 int psp_mpeg_set_drop(int enabled) {
     if (enabled < -1 || enabled > 1) return -1;
@@ -453,6 +479,51 @@ static int ring_poll_spins(mpeg_ctx *c) {
  * lives in host memory, which is where the elementary streams live anyway.
  * One packet stays held until the stream is over, so the ring never reads as
  * entirely free before it is. */
+static uint32_t ring_packets_held(mpeg_ctx *c, uint32_t packets, uint32_t pkt_size) {
+    /* The last put each decoder has wholly consumed, in ring bytes. */
+    while (c->put_iv < c->nputs && c->puts[c->put_iv].es_len  <= c->es_pos)  c->put_iv++;
+    while (c->put_ia < c->nputs && c->puts[c->put_ia].aes_len <= c->aes_pos) c->put_ia++;
+    const uint64_t pv = c->put_iv ? c->puts[c->put_iv - 1].put_bytes : 0;
+    const uint64_t pa = c->put_ia ? c->puts[c->put_ia - 1].put_bytes : 0;
+    /* Only a stream the game registered reads its packets. WipEout
+     * Pulse plays the movie behind its title screen with no audio
+     * registered: counting the audio as a consumer had it past every
+     * put, the ring read empty for ever, and the game, which waits
+     * for the ring to fill before it decodes, read the whole file
+     * into host memory at 45 MB a second. */
+    const uint64_t consumed = c->registered == 1u ? pv
+                            : c->registered == 2u ? pa
+                            : pv > pa ? pv : pa;
+    uint64_t held = (c->put_total - consumed + pkt_size - 1) / pkt_size;
+    /* The floor of one packet is for playback, not for the end.
+     *
+     * It is there because the game reads an entirely free ring as
+     * nothing having been buffered; what it does at the *end* is the
+     * mirror of that, and it is what the movie waits on -- its reader
+     * thread stops putting and polls this until the ring reads empty,
+     * 759 million times in one run when the answer never came. So the
+     * floor lifts once the file has been fully delivered: everything
+     * the ring ever held is on our side by then, and an empty ring is
+     * the truth as well as the signal.
+     *
+     * Until the file has been fully delivered, hold what the
+     * decoders have not taken -- the game reads an entirely free ring
+     * as nothing having been buffered, and gives up. Once it has been
+     * delivered, the ring is empty, and saying so is both true and
+     * necessary: the ring is a transport, everything it ever carried
+     * is on our side by then, and the player waits for exactly this
+     * to finish a movie. Waiting for the decoders instead deadlocks
+     * it, because it stops fetching about three seconds before the
+     * data ends -- the stream's tail is padding it does not want --
+     * so the last packets are never accounted consumed. Its drain
+     * thread then spins for a frame buffer that its display side,
+     * finished, will never return: 850 million ring polls in a run
+     * that never left the movie. */
+    if (c->es_eof) held = 0;
+    else if (held == 0) held = 1;
+    if (held > packets) held = packets;
+    return (uint32_t)held;
+}
 static void hle_RingbufferAvailableSize(void) {
     const uint32_t rb = psp_arg(0);
     mpeg_ctx *bound=rb?ctx_of(psp_read32(rb+RB_MPEG)):NULL;
@@ -463,55 +534,7 @@ static void hle_RingbufferAvailableSize(void) {
         const uint32_t packets  = psp_read32(rb + RB_PACKETS);
         const uint32_t pkt_size = psp_read32(rb + RB_PACKET_SIZE);
         if (c && packets && pkt_size) {
-            /* The last put each decoder has wholly consumed, in ring bytes. */
-            while (c->put_iv < c->nputs && c->puts[c->put_iv].es_len  <= c->es_pos)  c->put_iv++;
-            while (c->put_ia < c->nputs && c->puts[c->put_ia].aes_len <= c->aes_pos) c->put_ia++;
-            const uint64_t pv = c->put_iv ? c->puts[c->put_iv - 1].put_bytes : 0;
-            const uint64_t pa = c->put_ia ? c->puts[c->put_ia - 1].put_bytes : 0;
-            /* Only a stream the game registered reads its packets. WipEout
-             * Pulse plays the movie behind its title screen with no audio
-             * registered: counting the audio as a consumer had it past every
-             * put, the ring read empty for ever, and the game, which waits
-             * for the ring to fill before it decodes, read the whole file
-             * into host memory at 45 MB a second. */
-            const uint64_t consumed = c->registered == 1u ? pv
-                                    : c->registered == 2u ? pa
-                                    : pv > pa ? pv : pa;
-            uint64_t held = (c->put_total - consumed + pkt_size - 1) / pkt_size;
-            /* The floor of one packet is for playback, not for the end.
-             *
-             * It is there because the game reads an entirely free ring as
-             * nothing having been buffered; what it does at the *end* is the
-             * mirror of that, and it is what the movie waits on -- its reader
-             * thread stops putting and polls this until the ring reads empty,
-             * 759 million times in one run when the answer never came. So the
-             * floor lifts once the file has been fully delivered: everything
-             * the ring ever held is on our side by then, and an empty ring is
-             * the truth as well as the signal.
-             *
-             * Consumption still governs the count, with one correction. The
-             * video's read position stops at the start of the last NAL it
-             * decoded and so never reaches the end of its stream, which would
-             * leave a put forever unaccounted; the audio's does reach the end
-             * of its own, exactly, since frames are walked whole. So when the
-             * audio has taken everything, or either stream has said it is
-             * drained, the ring is empty. */
-            /* Until the file has been fully delivered, hold what the
-             * decoders have not taken -- the game reads an entirely free ring
-             * as nothing having been buffered, and gives up. Once it has been
-             * delivered, the ring is empty, and saying so is both true and
-             * necessary: the ring is a transport, everything it ever carried
-             * is on our side by then, and the player waits for exactly this
-             * to finish a movie. Waiting for the decoders instead deadlocks
-             * it, because it stops fetching about three seconds before the
-             * data ends -- the stream's tail is padding it does not want --
-             * so the last packets are never accounted consumed. Its drain
-             * thread then spins for a frame buffer that its display side,
-             * finished, will never return: 850 million ring polls in a run
-             * that never left the movie. */
-            if (c->es_eof) held = 0;
-            else if (held == 0) held = 1;
-            if (held > packets) held = packets;
+            const uint32_t held = ring_packets_held(c, packets, pkt_size);
             /* The game's reader polls this in a hot loop while the ring is
              * full -- 284 million calls in a 75-second run. A packet frees when
              * a decoder consumes one, never sooner than a frame later, so a
@@ -523,8 +546,8 @@ static void hle_RingbufferAvailableSize(void) {
              * fair test of "full" -- the reader wants room for a read's
              * worth -- so an eighth is. Only a poll that spins sleeps: see
              * ring_poll_spins. */
-            if (held * 8 >= (uint64_t)packets * 7 && ring_poll_spins(c)) psp_sched_delay(8000);
-            psp_ret(packets - (uint32_t)held);
+            if ((uint64_t)held * 8 >= (uint64_t)packets * 7 && ring_poll_spins(c)) psp_sched_delay(8000);
+            psp_ret(packets - held);
             return;
         }
     }
@@ -533,24 +556,6 @@ static void hle_RingbufferAvailableSize(void) {
     psp_ret(count-(occupied<count?occupied:count));
 }
 
-/* sceMpegRingbufferPut(rb, numPackets, available)
- *
- * On hardware this invokes the game's own callback to copy packets in, then
- * accounts for them. Nothing consumes them here, so they are accepted and
- * immediately treated as consumed: the buffer never fills, and a feeder loop
- * that waits for space always gets it. Claiming zero were taken would stall
- * that loop forever, which is the failure this is avoiding. */
-/* Run a guest function from inside a firmware call and come back with $v0.
- *
- * The ring buffer is filled by a callback the *game* supplies, so there is no
- * way to get its data without re-entering guest code from here. The register
- * file is saved and restored around it because we are already standing in the
- * middle of somebody else's call: the caller's arguments are still live in
- * a0-a3 and its return address in $ra, and the callee will use all of them.
- *
- * $ra is zeroed rather than left alone so that returning from the callback ends
- * the dispatch instead of running off into whatever the interrupted caller was
- * going to do next. */
 /* PSPRECOMP_MPEG_DECODE=1 turns on the video path: the ring buffer is filled
  * from the game's callback, demuxed, and decoded.
  *
@@ -638,6 +643,7 @@ static int mpeg_logging(void) {
 #define PS_PROGRAM_END  0xB9u
 #define PS_VIDEO_STREAM 0xE0u
 #define PS_PRIVATE_1    0xBDu  /* the audio: ATRAC3+ frames behind a 4-byte private header */
+#define PS_PRIVATE_HDR  4u     /* that header's length */
 
 static mpeg_ctx *ctx_for_ringbuffer(uint32_t rb) {
     for (unsigned i=0;i<MAX_MPEG;i++)
@@ -658,6 +664,21 @@ static int buf_append(uint8_t **buf, size_t *len, size_t *cap, const uint8_t *p,
     *len += n;
     return 0;
 }
+/* An array of `n` elements of `size` bytes with room for one more: as it was
+ * if it has room, else doubled (to `first` when empty); as it was, and still
+ * full, if it cannot grow. */
+static void *grow_for_one(void *arr, size_t n, size_t *cap, size_t first, size_t size) {
+    if (n < *cap) return arr;
+    const size_t want = *cap ? *cap * 2 : first;
+    void *grown = realloc(arr, want * size);
+    if (!grown) return arr;
+    *cap = want;
+    return grown;
+}
+/* Whether a start code, 00 00 01, opens `p`. */
+static int start_code(const uint8_t *p) {
+    return p[0] == 0 && p[1] == 0 && p[2] == 1;
+}
 /* A stream nobody registered is never read: kept, it would only pile up. */
 static int unwanted(const mpeg_ctx *c, unsigned id) {
     return c->registered && !(c->registered & (1u << id));
@@ -666,18 +687,14 @@ static int es_append(mpeg_ctx *c, const uint8_t *p, size_t n) {
     if (unwanted(c, 0)) return 0;
     if (c->es_skip) {   /* the rest of a NAL a splice cut through */
         size_t k = 0;
-        while (k + 3 <= n && !(p[k] == 0 && p[k+1] == 0 && p[k+2] == 1)) k++;
+        while (k + 3 <= n && !start_code(p + k)) k++;
         if (k + 3 > n) return 0;
         c->es_skip = 0;
         p += k;
         n -= k;
     }
     if (n && c->scr_seen && (!c->nvscr || c->vscr[c->nvscr - 1].scr != c->scr_last)) {
-        if (c->nvscr == c->vscr_cap) {
-            const size_t cap = c->vscr_cap ? c->vscr_cap * 2 : 1024;
-            struct mpeg_vscr *grown = (struct mpeg_vscr *)realloc(c->vscr, cap * sizeof *grown);
-            if (grown) { c->vscr = grown; c->vscr_cap = cap; }
-        }
+        c->vscr = grow_for_one(c->vscr, c->nvscr, &c->vscr_cap, 1024, sizeof *c->vscr);
         if (c->nvscr < c->vscr_cap) {
             c->vscr[c->nvscr].es_off = c->es_len;
             c->vscr[c->nvscr].scr = c->scr_last;
@@ -785,6 +802,44 @@ static void mpeg_compact(mpeg_ctx *c) {
     }
 }
 
+/* The first video since the clock jumped: unless it opens on a start code,
+ * skipped to the next, which ends the NAL the splice cut through. */
+static void pes_check_splice(mpeg_ctx *c, const uint8_t *q) {
+    c->es_splice = 0;
+    if (!(start_code(q) || (q[0] == 0 && start_code(q + 1))))
+        { c->es_skip = 1; c->splices++; }
+}
+/* The MPEG-2 PES header: flags at +7, and when bit 7 is set a 33-bit PTS in
+ * the five bytes from +9, the marker bits between its three pieces. The low
+ * 32 bits are what the PSP keeps. `t` is the PTS's first byte. */
+static void pes_note_pts(mpeg_ctx *c, int audio, const uint8_t *t) {
+    const uint32_t pts = ((uint32_t)(t[0] & 0x0E) << 29) | ((uint32_t)t[1] << 22) |
+                         ((uint32_t)(t[2] & 0xFE) << 14) | ((uint32_t)t[3] << 7) |
+                         ((uint32_t)t[4] >> 1);
+    if (audio) {
+        c->npes_a_pts++;
+        if (!c->apts_seen) { c->apts0 = pts; c->apts_seen = 1; c->atrac_pts = pts; }
+    } else {
+        c->npes_v_pts++;
+        c->vpts = grow_for_one(c->vpts, c->nvpts, &c->vpts_cap, 4096, sizeof *c->vpts);
+        if (c->nvpts < c->vpts_cap) {
+            c->vpts[c->nvpts].es_off = c->es_len;
+            c->vpts[c->nvpts].pts    = pts;
+            c->nvpts++;
+        }
+    }
+}
+/* PSPRECOMP_MPEG=1: the opening bytes of the first audio PES payload. */
+static void log_first_audio(const uint8_t *q, size_t n) {
+    if (!mpeg_logging()) return;
+    static int shown;
+    if (!shown++ && n >= 12) {
+        fprintf(stderr, "mpeg: first audio PES payload:");
+        for (unsigned k = 0; k < 12; k++) fprintf(stderr, " %02X", q[k]);
+        fprintf(stderr, "\n");
+    }
+}
+
 /* Pull the video payload out of a run of program stream bytes, carrying
  * across chunk boundaries whatever does not fit.
  *
@@ -811,96 +866,59 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
 
     /* Work over whatever a previous chunk left held, if anything. */
     const uint8_t *p = buf;
-    size_t plen_all = len;
+    size_t avail = len;
     uint8_t *work = NULL;
     if (c->es_pend_len) {
         work = malloc(c->es_pend_len + len);
         if (!work) return;
         memcpy(work, c->es_pend, c->es_pend_len);
         memcpy(work + c->es_pend_len, buf, len);
-        plen_all = c->es_pend_len + len;
+        avail = c->es_pend_len + len;
         c->es_pend_len = 0;
         p = work;
     }
 
     size_t i = 0;
-    while (i + 4 <= plen_all) {
-        if (!(p[i] == 0 && p[i+1] == 0 && p[i+2] == 1)) { i++; continue; }
+    while (i + 4 <= avail) {
+        if (!start_code(p + i)) { i++; continue; }
         const uint8_t id = p[i+3];
 
         if (id == PS_PACK_START) {
             /* 14 fixed bytes, then however many stuffing bytes the low three
              * bits of the last one claim. */
-            if (i + 14 > plen_all) break;
+            if (i + 14 > avail) break;
             pack_clock(c, p + i + 4);
             i += 14 + (size_t)(p[i+13] & 7);
             continue;
         }
         if (id == PS_PROGRAM_END) { i += 4; continue; }
-        if (i + 6 > plen_all) break;
+        if (i + 6 > avail) break;
 
         const size_t plen = ((size_t)p[i+4] << 8) | p[i+5];
         if (id == PS_SYSTEM_HDR) { i += 6 + plen; continue; }
 
         if (id == PS_VIDEO_STREAM || id == PS_PRIVATE_1) {
             const int audio = id == PS_PRIVATE_1;
-            if (i + 9 > plen_all) break;
+            if (i + 9 > avail) break;
             const size_t hdrlen = p[i+8];
             const size_t off    = i + 9 + hdrlen;
-            /* The MPEG-2 PES header: flags at +7, and when bit 7 is set a
-             * 33-bit PTS in the five bytes from +9, the marker bits between
-             * its three pieces. The low 32 bits are what the PSP keeps. */
             if (audio) c->npes_a++; else c->npes_v++;
-            if (!audio && c->es_splice && off + 4 <= plen_all) {
-                /* The first video since the clock jumped: unless it opens
-                 * on a start code, skipped to the next, which ends the NAL
-                 * the splice cut through. */
-                const uint8_t *q = p + off;
-                c->es_splice = 0;
-                if (!(q[0] == 0 && q[1] == 0 && (q[2] == 1 || (q[2] == 0 && q[3] == 1))))
-                    { c->es_skip = 1; c->splices++; }
-            }
-            if ((p[i+7] & 0x80) && hdrlen >= 5 && i + 14 <= plen_all) {
-                const uint8_t *t = p + i + 9;
-                const uint32_t pts = ((uint32_t)(t[0] & 0x0E) << 29) | ((uint32_t)t[1] << 22) |
-                                     ((uint32_t)(t[2] & 0xFE) << 14) | ((uint32_t)t[3] << 7) |
-                                     ((uint32_t)t[4] >> 1);
-                if (audio) {
-                    c->npes_a_pts++;
-                    if (!c->apts_seen) { c->apts0 = pts; c->apts_seen = 1; c->atrac_pts = pts; }
-                } else {
-                    c->npes_v_pts++;
-                    if (c->nvpts == c->vpts_cap) {
-                        const size_t cap = c->vpts_cap ? c->vpts_cap * 2 : 4096;
-                        struct mpeg_vpts *nv = (struct mpeg_vpts *)realloc(c->vpts, cap * sizeof *nv);
-                        if (nv) { c->vpts = nv; c->vpts_cap = cap; }
-                    }
-                    if (c->nvpts < c->vpts_cap) {
-                        c->vpts[c->nvpts].es_off = c->es_len;
-                        c->vpts[c->nvpts].pts    = pts;
-                        c->nvpts++;
-                    }
-                }
-            }
+            if (!audio && c->es_splice && off + 4 <= avail) pes_check_splice(c, p + off);
+            if ((p[i+7] & 0x80) && hdrlen >= 5 && i + 14 <= avail) pes_note_pts(c, audio, p + i + 9);
             /* plen counts from just after itself, so the payload is what is
              * left of it once the PES header is taken off. */
             if (plen >= 3 + hdrlen) {
-                if (off > plen_all) break;   /* even the header extension spans */
+                if (off > avail) break;   /* even the header extension spans */
                 const size_t pay = plen - 3 - hdrlen;
                 size_t n = pay;
-                if (off + n > plen_all) n = plen_all - off;
+                if (off + n > avail) n = avail - off;
                 if (audio) {
-                    if (mpeg_logging()) {
-                        static int shown;
-                        if (!shown++ && n >= 12) {
-                            fprintf(stderr, "mpeg: first audio PES payload:");
-                            for (unsigned k = 0; k < 12; k++) fprintf(stderr, " %02X", p[off + k]);
-                            fprintf(stderr, "\n");
-                        }
-                    }
-                    c->aes_skip = 4; aes_append(c, p + off, n);
+                    log_first_audio(p + off, n);
+                    c->aes_skip = PS_PRIVATE_HDR;
+                    aes_append(c, p + off, n);
+                } else {
+                    es_append(c, p + off, n);
                 }
-                else       es_append(c, p + off, n);
                 if (n < pay) {
                     /* Everything from off to the end is payload; the rest of
                      * it arrives in later chunks and must not be parsed. */
@@ -917,9 +935,9 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
     /* Hold whatever did not parse for the next put. Larger than a header can
      * be means it was not a header; the next start code resyncs, which is
      * what the byte-scan is for. */
-    if (i < plen_all && plen_all - i <= sizeof c->es_pend) {
-        memcpy(c->es_pend, p + i, plen_all - i);
-        c->es_pend_len = plen_all - i;
+    if (i < avail && avail - i <= sizeof c->es_pend) {
+        memcpy(c->es_pend, p + i, avail - i);
+        c->es_pend_len = avail - i;
     }
     free(work);
 }
@@ -935,6 +953,22 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
  * then reports one ready, which saves this code from having to work out where
  * access units begin -- a job that needs more of the bitstream syntax than is
  * worth parsing twice. */
+
+/* One pixel of a decoded picture as R, G, B. BT.601, and *limited* range:
+ * this stream declares tv range, so Y runs 16..235 and passing it through
+ * unscaled lifts the blacks -- a first frame that should read 16 came out 30
+ * against ffmpeg's decode of the same bytes. */
+static void yuv_to_rgb(int y, int u, int v, uint8_t rgb[3]) {
+    const int Y = y - 16, U = u - 128, V = v - 128;
+    const int Yr = 76309 * Y;
+    const int r = (Yr + 104597 * V) >> 16;
+    const int g = (Yr -  53279 * V - 25674 * U) >> 16;
+    const int b = (Yr + 132201 * U) >> 16;
+    rgb[0] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+    rgb[1] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g);
+    rgb[2] = (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b);
+}
+
 #if PSPRECOMP_HAVE_OPENH264
 #include <wels/codec_api.h>
 
@@ -942,7 +976,7 @@ static void ps_demux(mpeg_ctx *c, const uint8_t *buf, size_t len) {
  * or len if there is none. */
 static size_t nal_next(const uint8_t *p, size_t len, size_t from) {
     for (size_t i = from; i + 3 <= len; i++)
-        if (p[i] == 0 && p[i+1] == 0 && p[i+2] == 1) return i + 3;
+        if (start_code(p + i)) return i + 3;
     return len;
 }
 
@@ -1035,12 +1069,12 @@ static void avc_note_sps(mpeg_ctx *c, const uint8_t *p, size_t len) {
 static int avc_in_sequence(mpeg_ctx *c, size_t at, size_t len) {
     const uint8_t *p = c->es + at;
     const unsigned type = p[0] & 0x1Fu, ref_idc = (p[0] >> 5) & 3u;
-    if (type != 1 && type != 5) return 1;
+    if (type != NAL_SLICE && type != NAL_SLICE_IDR) return 1;
     /* The clock of the pack the slice starts in. */
     while (c->vscr_next + 1 < c->nvscr && c->vscr[c->vscr_next + 1].es_off <= at) c->vscr_next++;
     const int timed = c->vscr_next < c->nvscr && c->vscr[c->vscr_next].es_off <= at;
     const uint64_t scr = timed ? c->vscr[c->vscr_next].scr : 0;
-    if (type == 5) {   /* an IDR's frame_num is 0 */
+    if (type == NAL_SLICE_IDR) {   /* an IDR's frame_num is 0 */
         c->ref_frame_num = 0;
         c->ref_seen = 1;
     } else {
@@ -1074,24 +1108,135 @@ static void dump_ppm(const char *path, unsigned char *pl[3], const SSysMEMBuffer
     fprintf(f, "P6\n%d %d\n255\n", w, h);
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++) {
-            /* BT.601, and *limited* range: this stream declares tv range, so Y
-             * runs 16..235 and passing it through unscaled lifts the blacks --
-             * a first frame that should read 16 came out 30 against ffmpeg's
-             * decode of the same bytes. */
-            const int Y = pl[0][y * b->iStride[0] + x] - 16;
-            const int U = pl[1][(y / 2) * b->iStride[1] + x / 2] - 128;
-            const int V = pl[2][(y / 2) * b->iStride[1] + x / 2] - 128;
-            const int Yr = 76309 * Y;
-            int r  = (Yr + 104597 * V) >> 16;
-            int g  = (Yr -  53279 * V - 25674 * U) >> 16;
-            int bl = (Yr + 132201 * U) >> 16;
-            unsigned char px[3] = {
-                (unsigned char)(r < 0 ? 0 : r > 255 ? 255 : r),
-                (unsigned char)(g < 0 ? 0 : g > 255 ? 255 : g),
-                (unsigned char)(bl < 0 ? 0 : bl > 255 ? 255 : bl) };
+            uint8_t px[3];
+            yuv_to_rgb(pl[0][y * b->iStride[0] + x],
+                       pl[1][(y / 2) * b->iStride[1] + x / 2],
+                       pl[2][(y / 2) * b->iStride[1] + x / 2], px);
             fwrite(px, 1, 3, f);
         }
     fclose(f);
+}
+
+/* The decoder, created the first time it is needed; NULL, and never tried
+ * again, if openh264 will not make one. */
+static ISVCDecoder *avc_open(mpeg_ctx *c) {
+    if (c->dec) return (ISVCDecoder *)c->dec;
+    ISVCDecoder *dec = NULL;
+    if (WelsCreateDecoder(&dec) != 0 || !dec) { c->dec_failed = 1; return NULL; }
+    SDecodingParam prm;
+    memset(&prm, 0, sizeof prm);
+    /* What a damaged picture lacks comes from the picture before it, an
+     * IDR included. Plain slice copy fills an IDR's missing part with
+     * mid-gray instead (openh264, error_concealment.cpp): WipEout Pulse
+     * cuts the IDR at its menu movie's loop point, and a gray band
+     * flashed across the menu each time the movie looped. */
+    prm.eEcActiveIdc = ERROR_CON_SLICE_COPY_CROSS_IDR;
+    prm.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+    if ((*dec)->Initialize(dec, &prm) != 0) {
+        WelsDestroyDecoder(dec); c->dec_failed = 1; return NULL;
+    }
+    c->dec = dec;
+    return dec;
+}
+
+/* The next whole NAL at or after the decoder's position: its header byte at
+ * *start, and *end where its bytes stop. 0 if there is none yet. */
+static int nal_bounds(const mpeg_ctx *c, size_t *start, size_t *end) {
+    const size_t s = nal_next(c->es, c->es_len, c->es_pos);
+    if (s >= c->es_len) return 0;
+    const size_t next = nal_next(c->es, c->es_len, s);
+    size_t e;
+    if (next >= c->es_len) {
+        /* No following start code. Mid-stream that means "incomplete, wait
+         * for more"; at end of stream it means this is the last NAL and
+         * everything left is it -- a tail that would otherwise never
+         * decode, and the last frames of the movie would silently drop. */
+        if (!c->es_eof) return 0;
+        e = c->es_len;
+    } else {
+        /* next points past the next start code's 0x01; back up over it and
+         * any trailing zero of a four-byte start code. */
+        e = next - 3;
+        while (e > s && c->es[e - 1] == 0) e--;
+    }
+    *start = s;
+    *end = e;
+    return 1;
+}
+
+/* Copy the picture out while it is still ours to read. 0 if there was no
+ * memory for it. */
+static int pic_copy_out(mpeg_ctx *c, unsigned char *planes[3], const SSysMEMBuffer *b) {
+    const size_t need = (size_t)b->iWidth * (size_t)b->iHeight * 3 / 2;
+    if (!c->pic || c->pic_w != b->iWidth || c->pic_h != b->iHeight) {
+        free(c->pic);
+        c->pic = (uint8_t *)malloc(need);
+        c->pic_w = b->iWidth;
+        c->pic_h = b->iHeight;
+    }
+    if (!c->pic) return 0;
+    uint8_t *out = c->pic;
+    for (int y = 0; y < b->iHeight; y++, out += b->iWidth)
+        memcpy(out, planes[0] + (size_t)y * b->iStride[0], (size_t)b->iWidth);
+    for (int pl = 1; pl <= 2; pl++)
+        for (int y = 0; y < b->iHeight / 2; y++, out += b->iWidth / 2)
+            memcpy(out, planes[pl] + (size_t)y * b->iStride[1], (size_t)b->iWidth / 2);
+    c->pic_ready = 1;
+    /* PSPRECOMP_MPEG_YUV=<file>: every picture, raw I420, as decoded. */
+    static mpeg_dump yuv_dump = { .var = "PSPRECOMP_MPEG_YUV" };
+    dump_write(&yuv_dump, c->pic, need);
+    return 1;
+}
+
+/* 90 kHz ticks between pictures: 29.97fps until measured, and a measurement
+ * taken only between 60 and 12.5 fps. */
+enum { MPEG_FRAME_DUR_GUESS = 3003, MPEG_FRAME_DUR_MIN = 1500, MPEG_FRAME_DUR_MAX = 7200 };
+
+/* The picture's own timestamp, from its PES. A picture whose
+ * PES carried none is counted on from the last one that did
+ * (from 0 before any) at the measured frame duration, 29.97fps
+ * until there is one. Counting frames at a fixed 25fps instead
+ * of reading the PES ran this game's intro 20% slow against the
+ * sound. `nal_end` is where the picture's data ends. */
+static void pic_assign_pts(mpeg_ctx *c, size_t nal_end) {
+    /* An anchor inside this picture's data takes it; any
+     * earlier unused anchor is stale and dropped. */
+    int anchored = 0;
+    while (c->vpts_next < c->nvpts && c->vpts[c->vpts_next].es_off < nal_end) {
+        c->pts = c->vpts[c->vpts_next].pts;
+        anchored = 1;
+        c->vpts_next++;
+    }
+    if (!c->frame_dur) c->frame_dur = MPEG_FRAME_DUR_GUESS;
+    if (anchored) {
+        /* Measured over the whole run, first anchor to
+         * this one: two adjacent anchors a dozen frames
+         * apart gave 35.6 ms for a 33.4 ms stream. */
+        if (!c->anchor0_frame) { c->anchor0_pts = c->pts; c->anchor0_frame = c->frames; }
+        else if (c->frames > c->anchor0_frame) {
+            const uint32_t dur = (c->pts - c->anchor0_pts) / (uint32_t)(c->frames - c->anchor0_frame);
+            if (dur >= MPEG_FRAME_DUR_MIN && dur <= MPEG_FRAME_DUR_MAX) c->frame_dur = dur;
+        }
+        c->anchor_pts   = c->pts;
+        c->anchor_frame = c->frames;
+    } else if (c->anchor_frame) {
+        c->pts = c->anchor_pts + c->frame_dur * (uint32_t)(c->frames - c->anchor_frame);
+    } else {
+        c->pts = c->frame_dur * (uint32_t)c->frames;
+    }
+}
+
+/* PSPRECOMP_MPEG_FRAME=<file>: picture PSPRECOMP_MPEG_FRAME_NO (the first
+ * when unset) as a PPM. */
+static void pic_dump_ppm(const mpeg_ctx *c, unsigned char *planes[3], const SSysMEMBuffer *b) {
+    const char *fp = getenv("PSPRECOMP_MPEG_FRAME");
+    const char *fn = getenv("PSPRECOMP_MPEG_FRAME_NO");
+    const int want = fn ? atoi(fn) : 1;
+    if (fp && c->frames == want) {
+        dump_ppm(fp, planes, b);
+        fprintf(stderr, "mpeg: decoded frame %d, %dx%d -> %s\n", c->frames,
+                b->iWidth, b->iHeight, fp);
+    }
 }
 
 /* Decode up to ONE picture and stop. Returns 1 if it produced one.
@@ -1108,142 +1253,37 @@ static void dump_ppm(const char *path, unsigned char *pl[3], const SSysMEMBuffer
  * that difference zero, so the buffer always looks empty. */
 static int avc_pump(mpeg_ctx *c) {
     if (c->dec_failed) return 0;
-    if (!c->dec) {
-        ISVCDecoder *d = NULL;
-        if (WelsCreateDecoder(&d) != 0 || !d) { c->dec_failed = 1; return 0; }
-        SDecodingParam prm;
-        memset(&prm, 0, sizeof prm);
-        /* What a damaged picture lacks comes from the picture before it, an
-         * IDR included. Plain slice copy fills an IDR's missing part with
-         * mid-gray instead (openh264, error_concealment.cpp): WipEout Pulse
-         * cuts the IDR at its menu movie's loop point, and a gray band
-         * flashed across the menu each time the movie looped. */
-        prm.eEcActiveIdc = ERROR_CON_SLICE_COPY_CROSS_IDR;
-        prm.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-        if ((*d)->Initialize(d, &prm) != 0) {
-            WelsDestroyDecoder(d); c->dec_failed = 1; return 0;
-        }
-        c->dec = d;
-    }
-    ISVCDecoder *d = (ISVCDecoder *)c->dec;
+    ISVCDecoder *dec = avc_open(c);
+    if (!dec) return 0;
 
     int produced = 0;
-    size_t pos = c->es_pos;
-    while (pos < c->es_len) {
-        const size_t start = nal_next(c->es, c->es_len, pos);
-        if (start >= c->es_len) break;
-        size_t end = nal_next(c->es, c->es_len, start);
-        size_t nal_end;
-        if (end >= c->es_len) {
-            /* No following start code. Mid-stream that means "incomplete, wait
-             * for more"; at end of stream it means this is the last NAL and
-             * everything left is it -- a tail that would otherwise never
-             * decode, and the last frames of the movie would silently drop. */
-            if (!c->es_eof) break;
-            nal_end = c->es_len;
-        } else {
-            /* end points past the next start code's 0x01; back up over it and
-             * any trailing zero of a four-byte start code. */
-            nal_end = end - 3;
-            while (nal_end > start && c->es[nal_end - 1] == 0) nal_end--;
-        }
-        if ((c->es[start] & 0x1F) == 7) avc_note_sps(c, c->es + start + 1, nal_end - start - 1);
+    size_t start, nal_end;
+    while (nal_bounds(c, &start, &nal_end)) {
+        if ((c->es[start] & 0x1F) == NAL_SPS) avc_note_sps(c, c->es + start + 1, nal_end - start - 1);
         if (!avc_in_sequence(c, start, nal_end - start)) {
-            pos = nal_end;
-            c->es_pos = pos;
+            c->es_pos = nal_end;
             continue;
         }
 
         unsigned char *planes[3] = { 0, 0, 0 };
         SBufferInfo info;
         memset(&info, 0, sizeof info);
-        {   /* PSPRECOMP_MPEG_ES=<file>: every NAL as it is given the decoder,
-             * start code and all -- an Annex B stream another decoder reads. */
-            static FILE *es_dump; static int es_checked;
-            if (!es_checked) {
-                const char *path = getenv("PSPRECOMP_MPEG_ES");
-                es_checked = 1;
-                if (path && *path) es_dump = fopen(path, "wb");
-            }
-            if (es_dump) { fwrite(c->es + start - 3, 1, nal_end - (start - 3), es_dump); fflush(es_dump); }
-        }
+        /* PSPRECOMP_MPEG_ES=<file>: every NAL as it is given the decoder,
+         * start code and all -- an Annex B stream another decoder reads. */
+        static mpeg_dump es_dump = { .var = "PSPRECOMP_MPEG_ES" };
+        dump_write(&es_dump, c->es + start - 3, nal_end - (start - 3));
         const uint64_t t0 = psp_os_mono_ns();
-        (*d)->DecodeFrameNoDelay(d, c->es + start - 3, (int)(nal_end - (start - 3)),
-                                 planes, &info);
+        (*dec)->DecodeFrameNoDelay(dec, c->es + start - 3, (int)(nal_end - (start - 3)),
+                                   planes, &info);
         c->dec_ns += psp_os_mono_ns() - t0;
         if (info.iBufferStatus == 1 && planes[0]) {
+            const SSysMEMBuffer *b = &info.UsrData.sSystemBuffer;
             c->frames++;
             produced++;
-            {   /* Copy the picture out while it is still ours to read. */
-                const SSysMEMBuffer *b = &info.UsrData.sSystemBuffer;
-                const size_t need = (size_t)b->iWidth * (size_t)b->iHeight * 3 / 2;
-                if (!c->pic || c->pic_w != b->iWidth || c->pic_h != b->iHeight) {
-                    free(c->pic);
-                    c->pic = (uint8_t *)malloc(need);
-                    c->pic_w = b->iWidth;
-                    c->pic_h = b->iHeight;
-                }
-                if (c->pic) {
-                    uint8_t *d = c->pic;
-                    for (int y = 0; y < b->iHeight; y++, d += b->iWidth)
-                        memcpy(d, planes[0] + (size_t)y * b->iStride[0], (size_t)b->iWidth);
-                    for (int pl = 1; pl <= 2; pl++)
-                        for (int y = 0; y < b->iHeight / 2; y++, d += b->iWidth / 2)
-                            memcpy(d, planes[pl] + (size_t)y * b->iStride[1], (size_t)b->iWidth / 2);
-                    c->pic_ready = 1;
-                    {   /* PSPRECOMP_MPEG_YUV=<file>: every picture, raw I420, as decoded. */
-                        static FILE *yuv_dump; static int yuv_checked;
-                        if (!yuv_checked) {
-                            const char *path = getenv("PSPRECOMP_MPEG_YUV");
-                            yuv_checked = 1;
-                            if (path && *path) yuv_dump = fopen(path, "wb");
-                        }
-                        if (yuv_dump) { fwrite(c->pic, 1, need, yuv_dump); fflush(yuv_dump); }
-                    }
-                    /* The picture's own timestamp, from its PES; 25fps from
-                     * the frame count only if the stream carried none -- which
-                     * this game's intro does not do, and which ran its picture
-                     * 20% slow against the sound. */
-                    {
-                        /* An anchor inside this picture's data takes it; any
-                         * earlier unused anchor is stale and dropped. */
-                        int anchored = 0;
-                        while (c->vpts_next < c->nvpts && c->vpts[c->vpts_next].es_off < nal_end) {
-                            c->pts = c->vpts[c->vpts_next].pts;
-                            anchored = 1;
-                            c->vpts_next++;
-                        }
-                        if (!c->frame_dur) c->frame_dur = 3003;   /* 29.97fps until measured */
-                        if (anchored) {
-                            /* Measured over the whole run, first anchor to
-                             * this one: two adjacent anchors a dozen frames
-                             * apart gave 35.6 ms for a 33.4 ms stream. */
-                            if (!c->anchor0_frame) { c->anchor0_pts = c->pts; c->anchor0_frame = c->frames; }
-                            else if (c->frames > c->anchor0_frame) {
-                                const uint32_t d = (c->pts - c->anchor0_pts) / (uint32_t)(c->frames - c->anchor0_frame);
-                                if (d >= 1500 && d <= 7200) c->frame_dur = d;
-                            }
-                            c->anchor_pts   = c->pts;
-                            c->anchor_frame = c->frames;
-                        } else if (c->anchor_frame) {
-                            c->pts = c->anchor_pts + c->frame_dur * (uint32_t)(c->frames - c->anchor_frame);
-                        } else {
-                            c->pts = c->frame_dur * (uint32_t)c->frames;
-                        }
-                    }
-                }
-            }
+            if (pic_copy_out(c, planes, b)) pic_assign_pts(c, nal_end);
             if (mpeg_logging() && (c->frames == 1 || c->frames % 50 == 0))
                 fprintf(stderr, "mpeg: %d frames decoded\n", c->frames);
-            const char *fp = getenv("PSPRECOMP_MPEG_FRAME");
-            const char *fn = getenv("PSPRECOMP_MPEG_FRAME_NO");
-            const int want = fn ? atoi(fn) : 1;
-            if (fp && c->frames == want) {
-                dump_ppm(fp, planes, &info.UsrData.sSystemBuffer);
-                fprintf(stderr, "mpeg: decoded frame %d, %dx%d -> %s\n", c->frames,
-                        info.UsrData.sSystemBuffer.iWidth,
-                        info.UsrData.sSystemBuffer.iHeight, fp);
-            }
+            pic_dump_ppm(c, planes, b);
         }
         /* Past the NAL just decoded, not back to its start.
          *
@@ -1258,8 +1298,7 @@ static int avc_pump(mpeg_ctx *c) {
          * thread stops putting at the end of the file and polls that count
          * until the ring reads empty -- 753 million times in one run, the
          * game never finishing the movie. */
-        pos = nal_end;
-        c->es_pos = pos;
+        c->es_pos = nal_end;
         if (produced) break;          /* one picture per call */
     }
     return produced;
@@ -1306,7 +1345,7 @@ static void hle_RingbufferPut(void) {
     uint32_t callback=psp_read32(ring+RB_CALLBACK);
     const uint32_t args[3]={target,count,psp_read32(ring+RB_CALLBACK_ARG)};
     int32_t copied=callback?(int32_t)psp_call_guest(callback,args,3):0;
-    mpeg_trace(20,ring,count,(uint32_t)copied,context->aes_len-context->aes_pos);
+    mpeg_trace(MPEG_TRACE_PUT,ring,count,(uint32_t)copied,context->aes_len-context->aes_pos);
     if (copied<0) { psp_ret((uint32_t)copied); return; }
     if ((uint32_t)copied>count) { psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }
     context->es_eof=(uint32_t)copied<count;
@@ -1314,22 +1353,12 @@ static void hle_RingbufferPut(void) {
         uint32_t bytes=(uint32_t)copied*stride;
         const uint8_t *payload=psp_mem_ptr(target,bytes);
         if (!payload) { psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }
-        {   /* PSPRECOMP_MPEG_PS=<file>: the program stream as the game supplies it. */
-            static FILE *ps_dump; static int ps_checked;
-            if (!ps_checked) {
-                const char *path=getenv("PSPRECOMP_MPEG_PS");
-                ps_checked=1;
-                if (path && *path) ps_dump=fopen(path,"wb");
-            }
-            if (ps_dump) { fwrite(payload,1,bytes,ps_dump); fflush(ps_dump); }
-        }
+        /* PSPRECOMP_MPEG_PS=<file>: the program stream as the game supplies it. */
+        static mpeg_dump ps_dump = { .var = "PSPRECOMP_MPEG_PS" };
+        dump_write(&ps_dump,payload,bytes);
         ps_demux(context,payload,bytes);
         context->put_total+=bytes;
-        if (context->nputs==context->puts_cap) {
-            size_t capacity=context->puts_cap?context->puts_cap*2:1024;
-            struct mpeg_put *grown=realloc(context->puts,capacity*sizeof *grown);
-            if (grown) { context->puts=grown;context->puts_cap=capacity; }
-        }
+        context->puts=grow_for_one(context->puts,context->nputs,&context->puts_cap,1024,sizeof *context->puts);
         if (context->nputs<context->puts_cap) {
             struct mpeg_put *put=context->puts+context->nputs++;
             put->put_bytes=context->put_total;put->es_len=context->es_len;put->aes_len=context->aes_len;
@@ -1461,12 +1490,12 @@ static void hle_InitAu(void) {
     if (!context || !address || !psp_mem_ptr(address,sizeof(mpeg_au_wire))) {
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return;
     }
-    unsigned slot=64;
-    for (unsigned i=0;i<64;i++) {
+    unsigned slot=MAX_AU;
+    for (unsigned i=0;i<MAX_AU;i++) {
         if (context->access_units[i].address==address) { slot=i;break; }
-        if (!context->access_units[i].address && slot==64) slot=i;
+        if (!context->access_units[i].address && slot==MAX_AU) slot=i;
     }
-    if (slot==64) { psp_ret(SCE_MPEG_ERROR_NO_MEMORY);return; }
+    if (slot==MAX_AU) { psp_ret(SCE_MPEG_ERROR_NO_MEMORY);return; }
     context->access_units[slot].address=address;
     context->access_units[slot].buffer=buffer;
     int video=buffer>=1 && buffer<=MAX_ES_BUF && context->es_used[buffer-1];
@@ -1474,7 +1503,7 @@ static void hle_InitAu(void) {
      * zero size, and the timestamps left as they were. */
     psp_write32(address+AU_ES_BUFFER,buffer);
     psp_write32(address+AU_ES_SIZE,0);
-    mpeg_trace(10,address,buffer,video,0);
+    mpeg_trace(MPEG_TRACE_INIT_AU,address,buffer,video,0);
     psp_ret(0);
 }
 
@@ -1493,6 +1522,53 @@ static void no_decoder(const char *what) {
             "  audio will not play; everything else continues.\n", what);
 }
 
+/* Catching up, by not drawing a picture.
+ *
+ * The sound plays at its own rate whatever the host is doing -- a speaker
+ * drains at 44.1kHz -- and the picture goes as fast as this machine
+ * decodes and draws it, which here is 98.5% of real time. The difference
+ * is small and it only accumulates: Sif watched the whole intro and the
+ * sound ran away from the picture, a second by the end.
+ *
+ * So a picture that is already late is decoded and dropped rather than
+ * handed over, and the game draws the next one instead. That trade is
+ * lopsided in our favour: the decode of a 480x272 frame costs about 2 ms
+ * and its drawing about 6, so a drop buys back most of a frame's time.
+ *
+ * It has a cost this game makes visible: it times its subtitles by
+ * counting the pictures it decodes, so every dropped picture puts the
+ * captions one frame behind the sound, and 4% of them withheld put the
+ * captions seconds behind by the end of the intro (Sif confirmed the
+ * drift disappears with PSPRECOMP_MPEG_NODROP=1). Skipping only the pixel
+ * copy while still handing every picture over was tried and freezes the
+ * screen instead: the game asks for a picture every two vertical blanks,
+ * so once behind it cannot catch up without content being skipped. The
+ * host therefore offers both policies -- hold every picture (captions
+ * exact, the sound gradually ahead) or drop (the sound held, captions
+ * gradually behind) -- through psp_mpeg_set_drop, and the cure for both
+ * is a picture loop that never straddles a third blank.
+ *
+ * Measured against the lead at the first picture rather than zero, since
+ * a movie may legitimately start with its audio ahead; two frames of
+ * slack so ordinary jitter does not drop anything; and at most two in a
+ * row, so a machine that cannot keep up at all shows a slow picture
+ * rather than a frozen one. Only when the run is paced against a clock:
+ * an unpaced headless replay has no real time to be late against, and
+ * dropping there would make replays depend on how fast the host is. Not
+ * once the file has been fully delivered either: dropping walks the
+ * elementary stream ahead of the player, and at the end of a movie that
+ * means running out of pictures while it is still asking for them. */
+static void avc_catch_up(mpeg_ctx *c) {
+    if (!(psp_clock_is_realtime() && c->sync_based && !c->es_eof && !mpeg_nodrop())) return;
+    for (int drop = 0; drop < 2; drop++) {
+        if ((int32_t)(c->atrac_pts - c->pts) - c->sync_base <= 2 * (int32_t)c->frame_dur) break;
+        const uint32_t kept = c->pts;
+        c->pic_ready = 0;
+        if (!avc_pump(c)) { c->pic_ready = 1; c->pts = kept; break; }
+        c->dropped++;
+    }
+}
+
 /* Two answers, and which one is right depends on whether a frame can ever
  * arrive -- see the header comment for the disassembly behind this.
  *
@@ -1506,7 +1582,7 @@ static void no_decoder(const char *what) {
  * picture, honest behaviour, and no hang. */
 static void hle_GetAvcAu(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
-    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_getavc++; }
+    if (c && c->es_eof) c->post_getavc++;
     if (c && !c->es_len && !c->es_eof) { psp_ret(SCE_MPEG_ERROR_NO_DATA); return; }
     if (!mpeg_decoding()) {
         no_decoder("sceMpegGetAvcAu");
@@ -1549,51 +1625,7 @@ static void hle_GetAvcAu(void) {
         return;
     }
 
-    /* Catching up, by not drawing a picture.
-     *
-     * The sound plays at its own rate whatever the host is doing -- a speaker
-     * drains at 44.1kHz -- and the picture goes as fast as this machine
-     * decodes and draws it, which here is 98.5% of real time. The difference
-     * is small and it only accumulates: Sif watched the whole intro and the
-     * sound ran away from the picture, a second by the end.
-     *
-     * So a picture that is already late is decoded and dropped rather than
-     * handed over, and the game draws the next one instead. That trade is
-     * lopsided in our favour: the decode of a 480x272 frame costs about 2 ms
-     * and its drawing about 6, so a drop buys back most of a frame's time.
-     *
-     * It has a cost this game makes visible: it times its subtitles by
-     * counting the pictures it decodes, so every dropped picture puts the
-     * captions one frame behind the sound, and 4% of them withheld put the
-     * captions seconds behind by the end of the intro (Sif confirmed the
-     * drift disappears with PSPRECOMP_MPEG_NODROP=1). Skipping only the pixel
-     * copy while still handing every picture over was tried and freezes the
-     * screen instead: the game asks for a picture every two vertical blanks,
-     * so once behind it cannot catch up without content being skipped. The
-     * host therefore offers both policies -- hold every picture (captions
-     * exact, the sound gradually ahead) or drop (the sound held, captions
-     * gradually behind) -- through psp_mpeg_set_drop, and the cure for both
-     * is a picture loop that never straddles a third blank.
-     *
-     * Measured against the lead at the first picture rather than zero, since
-     * a movie may legitimately start with its audio ahead; two frames of
-     * slack so ordinary jitter does not drop anything; and at most two in a
-     * row, so a machine that cannot keep up at all shows a slow picture
-     * rather than a frozen one. Only when the run is paced against a clock:
-     * an unpaced headless replay has no real time to be late against, and
-     * dropping there would make replays depend on how fast the host is. Not
-     * once the file has been fully delivered either: dropping walks the
-     * elementary stream ahead of the player, and at the end of a movie that
-     * means running out of pictures while it is still asking for them. */
-    if (psp_clock_is_realtime() && c->sync_based && !c->es_eof && !mpeg_nodrop()) {
-        for (int drop = 0; drop < 2; drop++) {
-            if ((int32_t)(c->atrac_pts - c->pts) - c->sync_base <= 2 * (int32_t)c->frame_dur) break;
-            const uint32_t kept = c->pts;
-            c->pic_ready = 0;
-            if (!avc_pump(c)) { c->pic_ready = 1; c->pts = kept; break; }
-            c->dropped++;
-        }
-    }
+    avc_catch_up(c);
 
     const uint32_t au = psp_arg(2);
     if (au) {
@@ -1608,11 +1640,7 @@ static void hle_GetAvcAu(void) {
     }
     if (mpeg_logging() && c->frames <= 3)
         fprintf(stderr, "mpeg: GetAvcAu -> frame %d, pts %u\n", c->frames, c->pts);
-    {
-        const uint64_t now = psp_clock_run_ns();   /* less host pauses */
-        if (!c->v_fetched) { c->v_first_ns = now; c->v_first_pts = c->pts; }
-        c->v_last_ns = now; c->v_last_pts = c->pts; c->v_fetched++;
-    }
+    fetch_note(&c->vfetch, c->pts);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 /* The audio access unit: the next ATRAC3+ frame of the movie.
@@ -1638,13 +1666,18 @@ static void hle_GetAvcAu(void) {
 #define AT3P_SYNC1 0xD0u
 #define AT3P_HDR   8u
 
+/* The payload size a frame's header gives: in 8-byte units, less one. */
+static uint32_t at3p_payload(const uint8_t *h) {
+    return ((((uint32_t)h[2] & 3u) << 8) | h[3]) * 8u + 8u;
+}
+
 /* The frame at aes_pos: its total size with the header, or 0 if there is not
  * a whole one yet. Resyncs on the 0F D0 pair if the position has drifted. */
 static size_t aes_frame(mpeg_ctx *c) {
     while (c->aes_pos + AT3P_HDR <= c->aes_len) {
         const uint8_t *h = c->aes + c->aes_pos;
         if (h[0] == AT3P_SYNC0 && h[1] == AT3P_SYNC1) {
-            const size_t payload = ((((size_t)h[2] & 3u) << 8) | h[3]) * 8u + 8u;
+            const size_t payload = at3p_payload(h);
             return c->aes_pos + AT3P_HDR + payload <= c->aes_len ? AT3P_HDR + payload : 0;
         }
         c->aes_pos++;
@@ -1654,7 +1687,7 @@ static size_t aes_frame(mpeg_ctx *c) {
 
 static void hle_GetAtracAu(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
-    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_getatrac++; }
+    if (c && c->es_eof) c->post_getatrac++;
     if (!mpeg_decoding() || !c) {
         no_decoder("sceMpegGetAtracAu");
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
@@ -1666,7 +1699,7 @@ static void hle_GetAtracAu(void) {
         static uint64_t last_empty;
         uint64_t now=psp_os_mono_ns();
         if (now-last_empty>=1000000000ull) {
-            mpeg_trace(32,au,c->aes_len,c->aes_pos,c->es_eof);last_empty=now;
+            mpeg_trace(MPEG_TRACE_ATRAC_EMPTY,au,c->aes_len,c->aes_pos,c->es_eof);last_empty=now;
         }
         if (c->es_eof) { c->aes_drained = 1; psp_ret(SCE_MPEG_ERROR_INVALID_VALUE); return; }
         psp_ret(SCE_MPEG_ERROR_NO_DATA);
@@ -1685,13 +1718,9 @@ static void hle_GetAtracAu(void) {
         psp_write32(au + AU_ES_SIZE, (uint32_t)total);
     }
     c->aes_pos += total;
-    {
-        const uint64_t now = psp_clock_run_ns();   /* less host pauses */
-        if (!c->a_fetched) { c->a_first_ns = now; c->a_first_pts = c->atrac_pts; }
-        c->a_last_ns = now; c->a_last_pts = c->atrac_pts; c->a_fetched++;
-    }
+    fetch_note(&c->afetch, c->atrac_pts);
     c->atrac_pts += MPEG_ATRAC_PTS_STEP;
-    mpeg_trace(31,au,au_buffer(c,au),(uint32_t)total,c->atrac_pts-MPEG_ATRAC_PTS_STEP);
+    mpeg_trace(MPEG_TRACE_ATRAC_AU,au,au_buffer(c,au),(uint32_t)total,c->atrac_pts-MPEG_ATRAC_PTS_STEP);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 /* sceMpegAvcDecode(mpeg, au, frameWidth, bufferAddr, initAddr)
@@ -1723,25 +1752,19 @@ static void write_picture(mpeg_ctx *c, uint32_t dst, uint32_t stride) {
 
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
-            const int yy = Y[(size_t)y * w + x] - 16;
-            const int u  = U[(size_t)(y / 2) * (w / 2) + x / 2] - 128;
-            const int v  = V[(size_t)(y / 2) * (w / 2) + x / 2] - 128;
-            const int yr = 76309 * yy;
-            int r  = (yr + 104597 * v) >> 16;
-            int g  = (yr -  53279 * v - 25674 * u) >> 16;
-            int b  = (yr + 132201 * u) >> 16;
-            r = r < 0 ? 0 : r > 255 ? 255 : r;
-            g = g < 0 ? 0 : g > 255 ? 255 : g;
-            b = b < 0 ? 0 : b > 255 ? 255 : b;
+            uint8_t px[3];
+            yuv_to_rgb(Y[(size_t)y * w + x],
+                       U[(size_t)(y / 2) * (w / 2) + x / 2],
+                       V[(size_t)(y / 2) * (w / 2) + x / 2], px);
             psp_write32(dst + ((uint32_t)y * stride + (uint32_t)x) * 4,
-                        0xFF000000u | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r);
+                        0xFF000000u | ((uint32_t)px[2] << 16) | ((uint32_t)px[1] << 8) | (uint32_t)px[0]);
         }
     }
 }
 
 static void hle_AvcDecode(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
-    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_avcdec++; }
+    if (c && c->es_eof) c->post_avcdec++;
     if (!mpeg_decoding() || !c) {
         no_decoder("sceMpegAvcDecode");
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
@@ -1791,6 +1814,41 @@ static void hle_AvcDecode(void) {
     if (init_ptr) psp_write32(init_ptr, got ? 1u : 0u);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
+/* The access unit's frame decoded into `pcm`: the samples it made, or -1
+ * when there is no whole frame or no decoder. */
+static int atrac_au_decode(mpeg_ctx *c, uint32_t au, uint32_t init, int16_t pcm[2048 * 2]) {
+    if (!au) return -1;
+    const uint32_t esbuf = au_buffer(c,au);
+    const uint32_t essz  = psp_read32(au + AU_ES_SIZE);
+    uint8_t frame[MPEG_ATRAC_ES_SIZE];
+    if (!esbuf || essz < AT3P_HDR || essz > sizeof frame ||
+        psp_mem_read_block(frame, esbuf, essz) != 0 ||
+        frame[0] != AT3P_SYNC0 || frame[1] != AT3P_SYNC1) return -1;
+    const uint32_t payload = at3p_payload(frame);
+    /* Sample rate index and channel configuration, as the OMA/AA3
+     * container spells them: rates 32000, 44100, 48000, 88200, 96000;
+     * channel configuration 1 is mono and 2 stereo. */
+    static const uint32_t rates[8] = { 32000, 44100, 48000, 88200, 96000, 44100, 44100, 44100 };
+    const uint32_t rate = rates[(frame[2] >> 5) & 7];
+    const uint32_t chan = ((frame[2] >> 2) & 7) == 1 ? 1u : 2u;
+    if (payload + AT3P_HDR > essz) return -1;
+    if (c->adec && c->adec_block != payload) { psp_at3_close((psp_at3_dec *)c->adec); c->adec = NULL; }
+    if (!c->adec) {
+        c->adec = psp_at3_open(0x1000u, payload, chan, rate, NULL, 0);
+        c->adec_block = payload;
+        if (!c->adec) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "psprecomp: sceMpegAtracDecode has no decoder for the movie's "
+                                "audio; it plays silent.\n");
+        }
+    } else if (init) psp_at3_flush((psp_at3_dec *)c->adec);
+    const uint64_t t0 = psp_os_mono_ns();
+    const int n = psp_at3_decode((psp_at3_dec *)c->adec, frame + AT3P_HDR, payload, pcm, 2048);
+    c->adec_ns += psp_os_mono_ns() - t0;
+    return n;
+}
+
 /* sceMpegAtracDecode(mpeg, au, buffer, init): the frame the access unit
  * holds, decoded to 2048 stereo samples in the caller's buffer
  * (sceMpegQueryAtracEsSize's second answer, 8192 bytes). The decoder is
@@ -1799,7 +1857,7 @@ static void hle_AvcDecode(void) {
  * silence of the same length -- the movie keeps its clock either way. */
 static void hle_AtracDecode(void) {
     mpeg_ctx *c = ctx_of(psp_arg(0));
-    { mpeg_ctx *pc = ctx_of(psp_arg(0)); if (pc && pc->es_eof) pc->post_atracdec++; }
+    if (c && c->es_eof) c->post_atracdec++;
     if (!mpeg_decoding() || !c) {
         no_decoder("sceMpegAtracDecode");
         psp_ret(SCE_MPEG_ERROR_INVALID_VALUE);
@@ -1807,47 +1865,15 @@ static void hle_AtracDecode(void) {
     }
     const uint32_t au = psp_arg(1), dst = psp_arg(2), init = psp_arg(3);
     int16_t pcm[2048 * 2];
-    int n = -1;
     if (mpeg_trace_file() && psp_mem_ptr(au,AU_ES_SIZE+4))
-        mpeg_trace(40,au,au_buffer(c,au),psp_read32(au+AU_ES_BUFFER),psp_read32(au+AU_ES_SIZE));
-    if (au) {
-        const uint32_t esbuf = au_buffer(c,au);
-        const uint32_t essz  = psp_read32(au + AU_ES_SIZE);
-        uint8_t frame[MPEG_ATRAC_ES_SIZE];
-        if (esbuf && essz >= AT3P_HDR && essz <= sizeof frame &&
-            psp_mem_read_block(frame, esbuf, essz) == 0 &&
-            frame[0] == AT3P_SYNC0 && frame[1] == AT3P_SYNC1) {
-            const uint32_t payload = ((((uint32_t)frame[2] & 3u) << 8) | frame[3]) * 8u + 8u;
-            /* Sample rate index and channel configuration, as the OMA/AA3
-             * container spells them: rates 32000, 44100, 48000, 88200, 96000;
-             * channel configuration 1 is mono and 2 stereo. */
-            static const uint32_t rates[8] = { 32000, 44100, 48000, 88200, 96000, 44100, 44100, 44100 };
-            const uint32_t rate = rates[(frame[2] >> 5) & 7];
-            const uint32_t chan = ((frame[2] >> 2) & 7) == 1 ? 1u : 2u;
-            if (payload + AT3P_HDR <= essz) {
-                if (c->adec && c->adec_block != payload) { psp_at3_close((psp_at3_dec *)c->adec); c->adec = NULL; }
-                if (!c->adec) {
-                    c->adec = psp_at3_open(0x1000u, payload, chan, rate, NULL, 0);
-                    c->adec_block = payload;
-                    if (!c->adec) {
-                        static int said;
-                        if (!said++)
-                            fprintf(stderr, "psprecomp: sceMpegAtracDecode has no decoder for the movie's "
-                                            "audio; it plays silent.\n");
-                    }
-                } else if (init) psp_at3_flush((psp_at3_dec *)c->adec);
-                const uint64_t t0 = psp_os_mono_ns();
-                n = psp_at3_decode((psp_at3_dec *)c->adec, frame + AT3P_HDR, payload, pcm, 2048);
-                c->adec_ns += psp_os_mono_ns() - t0;
-            }
-        }
-    }
+        mpeg_trace(MPEG_TRACE_ATRAC_IN,au,au_buffer(c,au),psp_read32(au+AU_ES_BUFFER),psp_read32(au+AU_ES_SIZE));
+    int n = atrac_au_decode(c, au, init, pcm);
     int decoded=n;
     if (n < 0) { memset(pcm, 0, sizeof pcm); n = 2048; }
     if (mpeg_trace_file() && psp_mem_ptr(au,AU_PTS+8)) {
         unsigned audible=0;
         for (int i=0;i<n*2;i++) if (pcm[i]) audible++;
-        mpeg_trace(41,au,(uint32_t)decoded,audible,psp_read32(au+AU_PTS+4));
+        mpeg_trace(MPEG_TRACE_ATRAC_OUT,au,(uint32_t)decoded,audible,psp_read32(au+AU_PTS+4));
     }
     if (dst) {
         const uint32_t bytes = (uint32_t)n * 4u;

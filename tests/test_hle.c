@@ -857,6 +857,43 @@ static void test_io_dirs(void) {
     }
 #endif
 
+    /* A write moves the descriptor's position and grows its file: the same
+     * descriptor finds the new end and reads back what it wrote, a write
+     * after a seek lands there, and an append lands at the end. */
+    {
+        const uint32_t LSEEK32 = psp_nid("sceIoLseek32");
+        const uint32_t RW = guest_name("ms0:/PSP/SAVEDATA/ZZZ/RW.BIN");
+        fd = call(OPEN, RW, 0x603 /* RDWR | CREAT | TRUNC */, 0777, 0);
+        CHECK(call(WRITE, fd, SRC, 64, 0) == 64, "a read-write descriptor writes");
+        uint32_t at = call(LSEEK32, fd, 0, 1 /* SEEK_CUR */, 0);
+        CHECK(at == 64, "a write moves the position, got %u", at);
+        at = call(LSEEK32, fd, 0, 2 /* SEEK_END */, 0);
+        CHECK(at == 64, "a write grows the file its descriptor sees, got %u", at);
+        CHECK(call(LSEEK32, fd, 16, 0 /* SEEK_SET */, 0) == 16, "a seek inside what was written");
+        for (uint32_t i = 0; i < 16; i++) psp_write8(DST + i, 0);
+        uint32_t got = call(READ, fd, DST, 16, 0);
+        same = got == 16;
+        for (uint32_t i = 0; i < 16; i++) same &= psp_read8(DST + i) == (uint8_t)((16 + i) * 3 + 1);
+        CHECK(same, "the same descriptor reads back what it wrote, %u bytes", got);
+        call(LSEEK32, fd, 8, 0 /* SEEK_SET */, 0);
+        CHECK(call(WRITE, fd, SRC + 40, 4, 0) == 4, "a write after a seek");
+        CHECK(call(CLOSE, fd, 0, 0, 0) == 0, "close succeeds");
+        fd = call(OPEN, RW, 0x0102 /* WRONLY | APPEND */, 0, 0);
+        CHECK(call(WRITE, fd, SRC, 4, 0) == 4, "an append writes");
+        at = call(LSEEK32, fd, 0, 1 /* SEEK_CUR */, 0);
+        CHECK(at == 68, "an append leaves the position at the end, got %u", at);
+        CHECK(call(CLOSE, fd, 0, 0, 0) == 0, "close succeeds");
+        fd = call(OPEN, RW, 0x0001, 0, 0);
+        got = call(READ, fd, DST, 128, 0);
+        same = got == 68;
+        for (uint32_t i = 0; i < 64; i++)
+            same &= psp_read8(DST + i) == (uint8_t)(((i >= 8 && i < 12) ? i + 32 : i) * 3 + 1);
+        for (uint32_t i = 0; i < 4; i++) same &= psp_read8(DST + 64 + i) == (uint8_t)(i * 3 + 1);
+        CHECK(same, "the seeked write landed at 8 and the append at 64, %u bytes", got);
+        call(CLOSE, fd, 0, 0, 0);
+        call(REMOVE, RW, 0, 0, 0);
+    }
+
     CHECK(call(REMOVE, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0, 0, 0) == 0,
           "remove deletes");
     CHECK(call(REMOVE, guest_name("ms0:/PSP/SAVEDATA/ZZZ/DATA.BIN"), 0, 0, 0) == 0x80010002,
@@ -1577,6 +1614,14 @@ static void test_display(void) {
     CHECK(call(psp_nid("sceDisplaySetFrameBuf"), PSP_VRAM_BASE, 512, 3, 0) == 0,
           "set framebuffer");
     CHECK(psp_display_framebuffer() == PSP_VRAM_BASE, "framebuffer recorded");
+    /* A pixel format past 8888 is refused and the buffer kept: pspautotests'
+     * display/setframebuf reads 0x80000108 for 4 and for -1 on a PSP. */
+    CHECK(call(psp_nid("sceDisplaySetFrameBuf"), PSP_VRAM_BASE + 0x88000, 512, 4, 0) == 0x80000108u &&
+          call(psp_nid("sceDisplaySetFrameBuf"), PSP_VRAM_BASE + 0x88000, 512, 0xFFFFFFFFu, 0) == 0x80000108u,
+          "a pixel format past 8888 is refused");
+    CHECK(psp_display_framebuffer() == PSP_VRAM_BASE && psp_display_format() == 3,
+          "a refused framebuffer leaves the old one: %08X format %u",
+          psp_display_framebuffer(), psp_display_format());
 
     uint64_t v0 = psp_display_vblanks();
     call(psp_nid("sceDisplayWaitVblank"), 0, 0, 0, 0);
@@ -1792,13 +1837,15 @@ static void body_tw_mbx(void)  { tw_rc = call(psp_nid("sceKernelReceiveMbx"), tw
 static void body_tw_neg(void)  { psp_cpu.r[PSP_REG_V0] = (uint32_t)-5; }
 static void body_tw_flag(void) { tw_ran = 1; }
 
-static uint32_t tw_start(uint32_t entry) {
+static uint32_t tw_start_at(uint32_t entry, uint32_t priority) {
     const uint32_t th = call5(psp_nid("sceKernelCreateThread"), guest_name("tw"), entry,
-                              0x20, 0x1000, 0);
+                              priority, 0x1000, 0);
     CHECK((int32_t)th > 0, "create a thread: %08X", th);
     call(psp_nid("sceKernelStartThread"), th, 0, 0, 0);
     return th;
 }
+
+static uint32_t tw_start(uint32_t entry) { return tw_start_at(entry, 0x20); }
 
 static uint32_t tw_waiters(void) {
     psp_write32(TW_INFO, 56);
@@ -1873,6 +1920,644 @@ static void test_waits_with_threads(void) {
     CHECK(fd == 0x80010002u, "open of a missing file answered %08X", fd);
 
     psp_sched_drain(5);
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
+/* A zero timeout is a deadline that has already arrived: a wait that succeeds
+ * at once leaves 0 in the word, not the 1 that the shortest future deadline
+ * would leave, and one that cannot succeed times out without a reschedule --
+ * an equal-priority thread that is ready does not run inside it. */
+static void test_zero_timeout(void) {
+    psp_register(TW_FLAG, body_tw_flag);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t WAIT = psp_nid("sceKernelWaitSema");
+
+    const uint32_t sema = call5(psp_nid("sceKernelCreateSema"), guest_name("zero"), 0, 1, 1, 0);
+    psp_write32(TW_TMO, 0);
+    CHECK(call(WAIT, sema, 1, TW_TMO, 0) == 0, "a zero-timeout wait for a count that is there");
+    CHECK(psp_read32(TW_TMO) == 0, "it spent none of a zero timeout, but left %u",
+          psp_read32(TW_TMO));
+
+    tw_ran = 0;
+    tw_start(TW_FLAG);
+    psp_write32(TW_TMO, 0);
+    const uint32_t rc = call(WAIT, sema, 1, TW_TMO, 0);
+    CHECK(rc == SCE_KERNEL_ERROR_WAIT_TIMEOUT, "a zero-timeout wait that cannot succeed: %08X", rc);
+    CHECK(tw_ran == 0, "an equal-priority thread ran inside a zero-timeout wait");
+    CHECK(psp_read32(TW_TMO) == 0, "a zero timeout left %u", psp_read32(TW_TMO));
+
+    psp_sched_drain(5);
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
+/* A send that cannot finish at once can still wake a more urgent receiver
+ * before it parks: the bytes it offers satisfy one. That receiver then runs,
+ * and whatever it does next to the pipe -- take the rest of the send, cancel
+ * the pipe or delete it -- ends the sender's wait, which has to be parked by
+ * then for the wake to reach it. */
+#define MP_RECV 0x08802400u
+#define MP_SENT 0x08806300u
+#define MP_GOT  0x08806400u
+#define MP_OUT  0x08806500u
+
+enum { MP_TAKE_REST, MP_CANCEL, MP_DELETE };
+static uint32_t mp_pipe, mp_rc[2];
+static int      mp_then;
+
+static void body_mp_recv(void) {
+    const uint32_t RECV = psp_nid("sceKernelReceiveMsgPipe");
+    mp_rc[0] = call7(RECV, mp_pipe, MP_GOT, 4, 0, MP_OUT, 0, 0);
+    if (mp_then == MP_TAKE_REST)
+        mp_rc[1] = call7(RECV, mp_pipe, MP_GOT + 4, 4, 0, MP_OUT + 4, 0, 0);
+    else if (mp_then == MP_CANCEL)
+        mp_rc[1] = call(psp_nid("sceKernelCancelMsgPipe"), mp_pipe, 0, 0, 0);
+    else
+        mp_rc[1] = call(psp_nid("sceKernelDeleteMsgPipe"), mp_pipe, 0, 0, 0);
+}
+
+static void test_msgpipe_wait_ends_as_it_parks(void) {
+    psp_register(MP_RECV, body_mp_recv);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t SEND = psp_nid("sceKernelSendMsgPipe");
+    static const char *const then[] = { "takes the rest", "cancels", "deletes" };
+    static const uint32_t answer[] = { 0, SCE_KERNEL_ERROR_WAIT_CANCEL, SCE_KERNEL_ERROR_WAIT_DELETE };
+    static const uint32_t moved[] = { 8, 4, 4 };
+
+    for (int k = MP_TAKE_REST; k <= MP_DELETE; k++) {
+        mp_then = k;
+        mp_rc[0] = mp_rc[1] = 0xEEEEEEEEu;
+        mp_pipe = call5(psp_nid("sceKernelCreateMsgPipe"), guest_name("mpp"), 2, 0, 0, 0);
+        /* More urgent than us: it runs at once and parks on its first read. */
+        tw_start_at(MP_RECV, 0x10);
+        for (uint32_t i = 0; i < 8; i++) psp_write8(MP_SENT + i, (uint8_t)('a' + i));
+        psp_write32(TW_INFO, 0x1337);
+        psp_write32(TW_TMO, 10000);
+        const uint32_t rc = call7(SEND, mp_pipe, MP_SENT, 8, 0, TW_INFO, TW_TMO, 0);
+        CHECK(rc == answer[k], "a receiver that %s: the send answered %08X, expected %08X",
+              then[k], rc, answer[k]);
+        CHECK(psp_read32(TW_INFO) == moved[k], "a receiver that %s: the send moved %u bytes",
+              then[k], psp_read32(TW_INFO));
+        CHECK(psp_read32(TW_TMO) > 0, "a receiver that %s: the send waited out its timeout",
+              then[k]);
+        CHECK(mp_rc[0] == 0 && mp_rc[1] == 0, "a receiver that %s: it answered %08X, %08X",
+              then[k], mp_rc[0], mp_rc[1]);
+        if (k == MP_TAKE_REST) {
+            char got[9] = { 0 };
+            for (uint32_t i = 0; i < 8; i++) got[i] = (char)psp_read8(MP_GOT + i);
+            CHECK(!strcmp(got, "abcdefgh"), "the receiver read \"%s\"", got);
+        }
+        if (k != MP_DELETE) call(psp_nid("sceKernelDeleteMsgPipe"), mp_pipe, 0, 0, 0);
+    }
+
+    psp_sched_drain(5);
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
+/* A poll takes its place in the queue it would join. A sender still waiting
+ * there is one whose remainder does not fit, and a first-come pipe serves
+ * nobody behind it, whatever room there is: send.expected's interleaved block
+ * has a 0x80 sender wait behind a 0x100 one with 0x80 free (`free=80,
+ * sending=2`). A poll in that place cannot finish without waiting, so it
+ * answers FULL -- not OK with bytes it never stored. */
+#define MQ_SEND 0x08802900u
+#define MQ_DATA 0x08806800u
+#define MQ_GOT  0x08806900u
+#define MQ_OUT  0x08806A00u   /* the poll's byte count; the sender's is at +4 */
+
+static uint32_t mq_pipe, mq_rc;
+
+static void body_mq_send(void) {
+    mq_rc = call7(psp_nid("sceKernelSendMsgPipe"), mq_pipe, MQ_DATA, 12, 0, MQ_OUT + 4, 0, 0);
+}
+
+static uint32_t mq_status(uint32_t at) {
+    psp_write32(TW_INFO, 56);
+    call(psp_nid("sceKernelReferMsgPipeStatus"), mq_pipe, TW_INFO, 0, 0);
+    return psp_read32(TW_INFO + at);
+}
+
+static void test_msgpipe_poll_waits_its_turn(void) {
+    psp_register(MQ_SEND, body_mq_send);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t TRY = psp_nid("sceKernelTrySendMsgPipe");
+    enum { FREE = 44, SENDING = 48 };
+    /* The waiting sender more urgent than us, then less: a first-come pipe
+     * keeps it ahead either way. A pipe that orders senders by priority puts
+     * us ahead of the less urgent one -- unmeasured, but it is what our own
+     * blocking send would do, and then the bytes really move. */
+    static const struct { uint32_t attr, prio, rc, left; } c[] = {
+        { 0x000, 0x10, SCE_KERNEL_ERROR_MSGPIPE_FULL, 6 },
+        { 0x000, 0x30, SCE_KERNEL_ERROR_MSGPIPE_FULL, 6 },
+        { 0x100, 0x30, 0,                             2 },
+    };
+
+    for (unsigned k = 0; k < sizeof c / sizeof c[0]; k++) {
+        mq_rc = 0xEEEEEEEEu;
+        mq_pipe = call5(psp_nid("sceKernelCreateMsgPipe"), guest_name("mpp"), 2, c[k].attr, 16, 0);
+        CHECK(call5(TRY, mq_pipe, MQ_DATA, 10, 0, 0) == 0, "case %u: store ten of sixteen bytes", k);
+        tw_start_at(MQ_SEND, c[k].prio);
+        call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0);
+        CHECK(mq_status(SENDING) == 1, "case %u: a twelve-byte send waits with six free", k);
+
+        psp_write32(MQ_OUT, 0x1337);
+        uint32_t rc = call5(TRY, mq_pipe, MQ_DATA, 4, 0, MQ_OUT);
+        const uint32_t moved = c[k].rc ? 0x1337 : 4;
+        CHECK(rc == c[k].rc, "case %u: a four-byte poll answered %08X, expected %08X", k, rc, c[k].rc);
+        CHECK(psp_read32(MQ_OUT) == moved, "case %u: it reported %u bytes, expected %u",
+              k, psp_read32(MQ_OUT), moved);
+        CHECK(mq_status(FREE) == c[k].left, "case %u: it left %u free, expected %u",
+              k, mq_status(FREE), c[k].left);
+        /* An ASAP poll behind it moves nothing either, and says so. */
+        if (c[k].rc) {
+            rc = call5(TRY, mq_pipe, MQ_DATA, 4, 1, MQ_OUT);
+            CHECK(rc == c[k].rc && psp_read32(MQ_OUT) == 0 && mq_status(FREE) == 6,
+                  "case %u: an ASAP poll answered %08X, %u bytes, %u free",
+                  k, rc, psp_read32(MQ_OUT), mq_status(FREE));
+        }
+
+        /* Taking the first ten makes room for the waiting twelve. */
+        CHECK(call7(psp_nid("sceKernelReceiveMsgPipe"), mq_pipe, MQ_GOT, 10, 0, 0, 0, 0) == 0,
+              "case %u: receive the first ten", k);
+        call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0);
+        CHECK(mq_rc == 0 && psp_read32(MQ_OUT + 4) == 12,
+              "case %u: the waiting send answered %08X with %u bytes", k, mq_rc, psp_read32(MQ_OUT + 4));
+        call(psp_nid("sceKernelDeleteMsgPipe"), mq_pipe, 0, 0, 0);
+    }
+
+    psp_sched_drain(5);
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
+/* A wait nothing can ever end -- no thread runnable, nothing due -- has one
+ * answer whatever it waits on. With a timeout it times out, because for that
+ * caller a timeout is the truth; with none the run stops, because a timeout
+ * it never asked for is something a game acts on. Threading off is where
+ * every wait is such a wait, timed or not: none can park. */
+#define ST_HOLD 0x08802500u
+#define ST_LW   0x08806600u   /* the lwmutex's workarea */
+#define ST_OUT  0x08806700u
+
+static uint32_t st_mutex;
+
+/* Takes both locks and sleeps for good, so neither is ever let go. */
+static void body_st_hold(void) {
+    call(psp_nid("sceKernelLockMutex"), st_mutex, 1, 0, 0);
+    call(psp_nid("sceKernelLockLwMutex"), ST_LW, 1, 0, 0);
+    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
+}
+
+static void test_stranded_waits(void) {
+    psp_register(ST_HOLD, body_st_hold);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t nm = guest_name("stranded");
+    st_mutex = call(psp_nid("sceKernelCreateMutex"), nm, 0, 0, 0);
+    call5(psp_nid("sceKernelCreateLwMutex"), ST_LW, nm, 0, 0, 0);
+    const uint32_t holder = tw_start_at(ST_HOLD, 0x10);
+    const uint32_t sema = call5(psp_nid("sceKernelCreateSema"), nm, 0, 0, 1, 0);
+    const uint32_t flag = call(psp_nid("sceKernelCreateEventFlag"), nm, 0, 0, 0);
+    const uint32_t vpl  = call5(psp_nid("sceKernelCreateVpl"), nm, 2, 0, 0x100, 0);
+    call(psp_nid("sceKernelTryAllocateVpl"), vpl, 8, ST_OUT, 0);
+    const uint32_t fpl  = call7(psp_nid("sceKernelCreateFpl"), nm, 2, 0, 16, 1, 0, 0);
+    call(psp_nid("sceKernelTryAllocateFpl"), fpl, ST_OUT, 0, 0);
+    const uint32_t mbx  = call(psp_nid("sceKernelCreateMbx"), nm, 0, 0, 0);
+    const uint32_t pipe = call5(psp_nid("sceKernelCreateMsgPipe"), nm, 2, 0, 0, 0);
+    psp_sched_set_threading(0);
+
+    static const char *const what[] = {
+        "WaitSema", "WaitEventFlag", "LockMutex", "LockLwMutex", "AllocateVpl",
+        "AllocateFpl", "ReceiveMbx", "ReceiveMsgPipe", "WaitThreadEnd",
+    };
+    for (int timed = 1; timed >= 0; timed--) {
+        for (int k = 0; k < (int)(sizeof what / sizeof *what); k++) {
+            psp_write32(TW_TMO, 1000);
+            const uint32_t tmo = timed ? TW_TMO : 0;
+            uint32_t rc = 0;
+            switch (k) {
+            case 0: rc = call(psp_nid("sceKernelWaitSema"), sema, 1, tmo, 0); break;
+            case 1: rc = call5(psp_nid("sceKernelWaitEventFlag"), flag, 1, 1, ST_OUT, tmo); break;
+            case 2: rc = call(psp_nid("sceKernelLockMutex"), st_mutex, 1, tmo, 0); break;
+            case 3: rc = call(psp_nid("sceKernelLockLwMutex"), ST_LW, 1, tmo, 0); break;
+            case 4: rc = call(psp_nid("sceKernelAllocateVpl"), vpl, 0xE0, ST_OUT, tmo); break;
+            case 5: rc = call(psp_nid("sceKernelAllocateFpl"), fpl, ST_OUT, tmo, 0); break;
+            case 6: rc = call(psp_nid("sceKernelReceiveMbx"), mbx, ST_OUT, tmo, 0); break;
+            case 7: rc = call7(psp_nid("sceKernelReceiveMsgPipe"), pipe, ST_OUT, 4, 0, 0, tmo, 0); break;
+            case 8: rc = call(psp_nid("sceKernelWaitThreadEnd"), holder, tmo, 0, 0); break;
+            }
+            const int stopped = psp_sched_stop_reason() != NULL;
+            if (timed) {
+                CHECK(rc == SCE_KERNEL_ERROR_WAIT_TIMEOUT && !stopped,
+                      "a stranded %s with a timeout answered %08X%s", what[k], rc,
+                      stopped ? " and stopped the run" : "");
+                CHECK(psp_read32(TW_TMO) == 0, "and left %u of its timeout, not 0",
+                      psp_read32(TW_TMO));
+            }
+            else
+                CHECK(stopped, "a stranded %s with no timeout answered %08X and the run went on",
+                      what[k], rc);
+            /* The stop ended the holder; a reset lets the next wait be seen. */
+            if (stopped) { psp_sched_join_all(); psp_sched_reset(); }
+        }
+    }
+
+    psp_sched_stop_all("test_stranded_waits");
+    psp_sched_join_all();
+    psp_threadman_reset();
+}
+
+/* Every thread parked in sceKernelWaitThreadEnd is woken when the thread
+ * ends: one that waits for good, however many timed waits come and go beside
+ * it, and each of 32 that wait at once. A 33rd is refused, as a full object
+ * queue refuses one, rather than taking the place of one already there. */
+#define TE_SLEEP 0x08802600u
+#define TE_WAIT  0x08802700u
+#define TE_MANY  33
+
+static uint32_t te_target, te_rc[TE_MANY];
+static int      te_next;
+
+static void body_te_sleep(void) { call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0); }
+static void body_te_wait(void) {
+    const int me = te_next++;
+    te_rc[me] = call(psp_nid("sceKernelWaitThreadEnd"), te_target, 0, 0, 0);
+}
+
+static void test_thread_end_waiters(void) {
+    psp_register(TE_SLEEP, body_te_sleep);
+    psp_register(TE_WAIT, body_te_wait);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t DELAY = psp_nid("sceKernelDelayThread");
+    const uint32_t ENDED = SCE_KERNEL_ERROR_THREAD_TERMINATED;
+
+    /* One for good, and forty that give up beside it. */
+    te_target = tw_start(TE_SLEEP);
+    te_next = 0;
+    te_rc[0] = 0xEEEEEEEEu;
+    tw_start(TE_WAIT);
+    call(DELAY, 1000, 0, 0, 0);
+    for (int i = 0; i < 40; i++) {
+        psp_write32(TW_TMO, 100);
+        const uint32_t rc = call(psp_nid("sceKernelWaitThreadEnd"), te_target, TW_TMO, 0, 0);
+        if (rc != SCE_KERNEL_ERROR_WAIT_TIMEOUT) {
+            CHECK(0, "timed wait %d for a sleeping thread answered %08X", i, rc);
+            break;
+        }
+    }
+    call(psp_nid("sceKernelTerminateThread"), te_target, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(te_rc[0] == ENDED, "the waiter beside forty timed waits answered %08X", te_rc[0]);
+
+    /* Thirty-three at once. */
+    te_target = tw_start(TE_SLEEP);
+    te_next = 0;
+    for (int i = 0; i < TE_MANY; i++) { te_rc[i] = 0xEEEEEEEEu; tw_start(TE_WAIT); }
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(te_rc[TE_MANY - 1] == SCE_KERNEL_ERROR_NO_MEMORY,
+          "waiter %d of %d answered %08X before the end", TE_MANY, TE_MANY, te_rc[TE_MANY - 1]);
+    call(psp_nid("sceKernelTerminateThread"), te_target, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    for (int i = 0; i < TE_MANY - 1; i++)
+        CHECK(te_rc[i] == ENDED, "waiter %d of %d answered %08X", i + 1, TE_MANY, te_rc[i]);
+
+    psp_sched_stop_all("test_thread_end_waiters");
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
+/* Every thread parked in an object's queue leaves it the moment its wait is
+ * ended from outside (threadprobe step 78) -- the 600th as much as the first.
+ * 600 waiters take nineteen semaphores, at most 32 to a queue. */
+#define PK_WAIT  0x08802800u
+#define PK_MANY  600
+#define PK_SEMAS ((PK_MANY + 31) / 32)
+
+static uint32_t pk_sema[PK_SEMAS], pk_rc[PK_MANY];
+static int      pk_next;
+
+static void body_pk_wait(void) {
+    const int me = pk_next++;
+    pk_rc[me] = call(psp_nid("sceKernelWaitSema"), pk_sema[me / 32], 1, 0, 0);
+}
+
+static uint32_t pk_waiters(uint32_t sema) {
+    psp_write32(TW_INFO, 56);
+    call(psp_nid("sceKernelReferSemaStatus"), sema, TW_INFO, 0, 0);
+    return psp_read32(TW_INFO + 52);
+}
+
+static void test_many_parked_threads(void) {
+    psp_register(PK_WAIT, body_pk_wait);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+
+    for (int i = 0; i < PK_SEMAS; i++)
+        pk_sema[i] = call5(psp_nid("sceKernelCreateSema"), guest_name("pk"), 0, 0, 1, 0);
+    static uint32_t th[PK_MANY];
+    pk_next = 0;
+    for (int i = 0; i < PK_MANY; i++) th[i] = tw_start(PK_WAIT);
+    call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0);
+    CHECK(pk_next == PK_MANY, "%d of %d threads are waiting", pk_next, PK_MANY);
+
+    const uint32_t last = pk_sema[(PK_MANY - 1) / 32];
+    const uint32_t before = pk_waiters(last);
+    CHECK(call(psp_nid("sceKernelReleaseWaitThread"), th[PK_MANY - 1], 0, 0, 0) == 0,
+          "release the last thread to park");
+    CHECK(pk_waiters(last) == before - 1, "its semaphore has %u waiters after the release, %u before",
+          pk_waiters(last), before);
+
+    call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0);
+    CHECK(pk_rc[PK_MANY - 1] == SCE_KERNEL_ERROR_RELEASE_WAIT,
+          "the released thread answered %08X", pk_rc[PK_MANY - 1]);
+
+    for (int i = 0; i < PK_SEMAS; i++) call(psp_nid("sceKernelDeleteSema"), pk_sema[i], 0, 0, 0);
+    CHECK(psp_sched_drain(5) == 0, "every waiter finished");
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
+/* A thread terminated while it waits leaves the wait then and there, as one
+ * whose wait is released does (threadprobe step 78): out of the object's
+ * queue, so the next signal reaches a live waiter, and off the list of the
+ * thread it waited to see end. Its call never answers, so nothing it was in
+ * the middle of receiving is reported to it. */
+#define TM_WAIT 0x08802900u
+#define TM_CB   0x08802A00u
+#define TM_LW   0x08806800u   /* the lwmutex's workarea */
+#define TM_BUF  0x08806900u
+#define TM_OUT  0x08806A00u
+
+enum { TM_SEMA, TM_LWMUTEX, TM_PIPE, TM_THREAD_END, TM_SLEEP, TM_DELAY, TM_SLEEP_CB };
+static uint32_t tm_obj, tm_need[2], tm_rc[2], tm_cb, tm_cb_name;
+static int      tm_kind, tm_next, tm_with_cb;
+
+static void body_tm_cb(void) { psp_ret(0); }
+
+/* Waits as tm_kind says, after making a callback of its own if tm_with_cb;
+ * the n-th start of the scenario answers in tm_rc[n]. */
+static void body_tm_wait(void) {
+    const int me = tm_next++;
+    if (tm_with_cb) tm_cb = call(psp_nid("sceKernelCreateCallback"), tm_cb_name, TM_CB, 0, 0);
+    uint32_t rc = 0;
+    switch (tm_kind) {
+    case TM_SEMA:       rc = call(psp_nid("sceKernelWaitSema"), tm_obj, tm_need[me], 0, 0); break;
+    case TM_LWMUTEX:    rc = call(psp_nid("sceKernelLockLwMutex"), TM_LW, 1, 0, 0); break;
+    case TM_PIPE:       rc = call7(psp_nid("sceKernelReceiveMsgPipe"), tm_obj, TM_BUF, 4, 0, TM_OUT, 0, 0); break;
+    case TM_THREAD_END: rc = call(psp_nid("sceKernelWaitThreadEnd"), tm_obj, 0, 0, 0); break;
+    case TM_SLEEP:      rc = call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0); break;
+    case TM_DELAY:      rc = call(psp_nid("sceKernelDelayThread"), 1000000, 0, 0, 0); break;
+    case TM_SLEEP_CB:   rc = call(psp_nid("sceKernelSleepThreadCB"), 0, 0, 0, 0); break;
+    }
+    tm_rc[me] = rc;
+}
+
+/* Two threads start, in order, and park. */
+static uint32_t tm_start_two(int kind, uint32_t need0, uint32_t need1) {
+    tm_kind = kind;
+    tm_next = 0;
+    tm_need[0] = need0; tm_need[1] = need1;
+    tm_rc[0] = tm_rc[1] = 0xEEEEEEEEu;
+    const uint32_t first = tw_start(TM_WAIT);
+    tw_start(TM_WAIT);
+    call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0);
+    return first;
+}
+
+static uint32_t tm_sema_waiters(uint32_t *count) {
+    psp_write32(TW_INFO, 56);
+    call(psp_nid("sceKernelReferSemaStatus"), tm_obj, TW_INFO, 0, 0);
+    *count = psp_read32(TW_INFO + 44);
+    return psp_read32(TW_INFO + 52);
+}
+
+static void test_terminated_waiters(void) {
+    psp_register(TM_WAIT, body_tm_wait);
+    psp_register(TE_SLEEP, body_te_sleep);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t DELAY     = psp_nid("sceKernelDelayThread");
+    const uint32_t TERMINATE = psp_nid("sceKernelTerminateThread");
+    const uint32_t DELETE    = psp_nid("sceKernelDeleteThread");
+    const uint32_t nm = guest_name("tm");
+    uint32_t count, waiters;
+
+    /* Two wait on an empty first-come semaphore and the first is terminated:
+     * one waiter is left, and a signal is its. */
+    static const char *const how[] = { "TerminateThread", "TerminateDeleteThread" };
+    for (int del = 0; del <= 1; del++) {
+        tm_obj = call5(psp_nid("sceKernelCreateSema"), nm, 0, 0, 1, 0);
+        const uint32_t first = tm_start_two(TM_SEMA, 1, 1);
+        call(del ? psp_nid("sceKernelTerminateDeleteThread") : TERMINATE, first, 0, 0, 0);
+        waiters = tm_sema_waiters(&count);
+        CHECK(waiters == 1, "%s on a semaphore waiter left %u waiters, expected 1", how[del], waiters);
+        call(psp_nid("sceKernelSignalSema"), tm_obj, 1, 0, 0);
+        call(DELAY, 1000, 0, 0, 0);
+        CHECK(tm_rc[1] == 0, "%s: the waiter behind answered %08X after a signal",
+              how[del], tm_rc[1]);
+        call(psp_nid("sceKernelDeleteSema"), tm_obj, 0, 0, 0);
+        call(DELAY, 1000, 0, 0, 0);   /* anyone the delete woke answers now */
+        if (!del) call(DELETE, first, 0, 0, 0);
+    }
+
+    /* The head of a first-come queue holds back the waiters behind it until it
+     * leaves; threads/semaphores/fifo measures that with a timeout. Terminated,
+     * it leaves at once, and the one behind takes what is there. */
+    tm_obj = call5(psp_nid("sceKernelCreateSema"), nm, 0, 1, 2, 0);
+    uint32_t first = tm_start_two(TM_SEMA, 2, 1);
+    waiters = tm_sema_waiters(&count);
+    CHECK(waiters == 2 && count == 1, "behind a head that wants 2: %u waiters, count %u",
+          waiters, count);
+    call(TERMINATE, first, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    waiters = tm_sema_waiters(&count);
+    CHECK(tm_rc[1] == 0 && count == 0 && waiters == 0,
+          "the head terminated: the one behind answered %08X, count %u, %u waiters",
+          tm_rc[1], count, waiters);
+    call(psp_nid("sceKernelDeleteSema"), tm_obj, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    call(DELETE, first, 0, 0, 0);
+
+    /* An lwmutex keeps its waiter count in the workarea, where the guest reads
+     * it, and an unlock with nobody left waiting leaves it free. */
+    call5(psp_nid("sceKernelCreateLwMutex"), TM_LW, nm, 0, 1, 0);
+    tm_kind = TM_LWMUTEX;
+    tm_next = 0;
+    first = tw_start(TM_WAIT);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(psp_read32(TM_LW + 12) == 1, "lwmutex: %u waiters", psp_read32(TM_LW + 12));
+    call(TERMINATE, first, 0, 0, 0);
+    CHECK(psp_read32(TM_LW + 12) == 0, "lwmutex waiter terminated: the workarea counts %u waiters",
+          psp_read32(TM_LW + 12));
+    call(psp_nid("sceKernelUnlockLwMutex"), TM_LW, 1, 0, 0);
+    CHECK(psp_read32(TM_LW + 0) == 0, "unlocked with its waiter terminated: count %u, thread %08X",
+          psp_read32(TM_LW + 0), psp_read32(TM_LW + 4));
+    call(psp_nid("sceKernelDeleteLwMutex"), TM_LW, 0, 0, 0);
+    call(DELETE, first, 0, 0, 0);
+
+    /* A pipe with no buffer: the terminated receiver takes nothing from a
+     * send that follows, and its byte count is left as it was. */
+    tm_obj = call5(psp_nid("sceKernelCreateMsgPipe"), nm, 2, 0, 0, 0);
+    tm_kind = TM_PIPE;
+    tm_next = 0;
+    psp_write32(TM_OUT, 0x1337);
+    first = tw_start(TM_WAIT);
+    call(DELAY, 1000, 0, 0, 0);
+    call(TERMINATE, first, 0, 0, 0);
+    psp_write32(TW_INFO, 56);
+    call(psp_nid("sceKernelReferMsgPipeStatus"), tm_obj, TW_INFO, 0, 0);
+    CHECK(psp_read32(TW_INFO + 52) == 0, "pipe receiver terminated: %u receivers wait",
+          psp_read32(TW_INFO + 52));
+    const uint32_t sent = call5(psp_nid("sceKernelTrySendMsgPipe"), tm_obj, TM_BUF + 0x40, 4, 0,
+                                TW_TMO);
+    CHECK(sent != 0, "a send to a pipe whose only receiver was terminated went through");
+    CHECK(psp_read32(TM_OUT) == 0x1337, "the terminated receiver's byte count became %u",
+          psp_read32(TM_OUT));
+    call(psp_nid("sceKernelDeleteMsgPipe"), tm_obj, 0, 0, 0);
+    call(DELETE, first, 0, 0, 0);
+
+    /* Terminated in WaitThreadEnd, then started again to sleep: the end of the
+     * thread it had waited for does not wake it. */
+    tm_obj = tw_start(TE_SLEEP);
+    tm_kind = TM_THREAD_END;
+    tm_next = 0;
+    tm_rc[0] = tm_rc[1] = 0xEEEEEEEEu;
+    first = tw_start(TM_WAIT);
+    call(DELAY, 1000, 0, 0, 0);
+    call(TERMINATE, first, 0, 0, 0);
+    tm_kind = TM_SLEEP;
+    call(psp_nid("sceKernelStartThread"), first, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    call(TERMINATE, tm_obj, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(tm_rc[1] == 0xEEEEEEEEu,
+          "restarted to sleep, it was woken (%08X) by the end of the thread it had waited for",
+          tm_rc[1]);
+
+    psp_sched_stop_all("test_terminated_waiters");
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
+/* A thread terminated in a sleep, a delay or a CB wait is in none of them
+ * once it is started again: refer.expected reads `wait=0` for a sleeper the
+ * moment it is terminated. So a wakeup while it has not yet slept is banked
+ * for its next sleep, a refer names the wait it is in now, and a notify does
+ * not end a wait without CB in its name -- nor does one it was terminated
+ * before running keep its next SleepThreadCB from being woken by name. */
+static uint32_t tr_refer(uint32_t th, uint32_t offset) {
+    psp_write32(TW_INFO, 104);
+    call(psp_nid("sceKernelReferThreadStatus"), th, TW_INFO, 0, 0);
+    return psp_read32(TW_INFO + offset);
+}
+
+/* One thread, started to wait as `kind` says and parked there. At 0x30 it is
+ * less urgent than us, so when it is started again it is ready and has not
+ * yet run. */
+static uint32_t tr_park(int kind, int with_cb) {
+    tm_kind = kind;
+    tm_with_cb = with_cb;
+    tm_next = 0;
+    tm_rc[0] = tm_rc[1] = 0xEEEEEEEEu;
+    const uint32_t th = tw_start_at(TM_WAIT, 0x30);
+    call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0);
+    return th;
+}
+
+static void test_restarted_after_terminated_wait(void) {
+    psp_register(TM_WAIT, body_tm_wait);
+    psp_register(TM_CB, body_tm_cb);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t DELAY     = psp_nid("sceKernelDelayThread");
+    const uint32_t TERMINATE = psp_nid("sceKernelTerminateThread");
+    const uint32_t START     = psp_nid("sceKernelStartThread");
+    const uint32_t WAKEUP    = psp_nid("sceKernelWakeupThread");
+    const uint32_t NOTIFY    = psp_nid("sceKernelNotifyCallback");
+    const uint32_t GONE      = psp_nid("sceKernelTerminateDeleteThread");
+    tm_cb_name = guest_name("tr");
+    uint32_t count, waiters;
+
+    /* Terminated asleep, started again, and woken before it runs: the wakeup
+     * is banked, and the sleep it goes on to answers at once. */
+    uint32_t th = tr_park(TM_SLEEP, 0);
+    call(TERMINATE, th, 0, 0, 0);
+    call(START, th, 0, 0, 0);
+    CHECK(call(WAKEUP, th, 0, 0, 0) == 0, "wake a restarted thread that has not run");
+    CHECK(tr_refer(th, 76) == 1, "terminated asleep and restarted: %u wakeups banked, expected 1",
+          tr_refer(th, 76));
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(tm_rc[1] == 0, "terminated asleep and restarted: its next sleep answered %08X", tm_rc[1]);
+    call(GONE, th, 0, 0, 0);
+
+    /* Terminated in a delay, started again to wait on a semaphore: a refer
+     * names the semaphore. */
+    tm_obj = call5(psp_nid("sceKernelCreateSema"), tm_cb_name, 0, 0, 1, 0);
+    tm_need[1] = 1;
+    th = tr_park(TM_DELAY, 0);
+    call(TERMINATE, th, 0, 0, 0);
+    tm_kind = TM_SEMA;
+    call(START, th, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(tr_refer(th, 68) == PSP_WAITTYPE_SEMA && tr_refer(th, 72) == tm_obj,
+          "terminated in a delay, restarted into WaitSema: waitType %X waitId %08X",
+          tr_refer(th, 68), tr_refer(th, 72));
+    call(GONE, th, 0, 0, 0);
+
+    /* Terminated in SleepThreadCB, started again to make a callback and wait
+     * on the semaphore: a notify leaves it waiting. */
+    th = tr_park(TM_SLEEP_CB, 1);
+    call(TERMINATE, th, 0, 0, 0);
+    tm_kind = TM_SEMA;
+    call(START, th, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(call(NOTIFY, tm_cb, 1, 0, 0) == 0, "notify the restarted thread's callback");
+    call(DELAY, 1000, 0, 0, 0);
+    waiters = tm_sema_waiters(&count);
+    CHECK(tm_rc[1] == 0xEEEEEEEEu && waiters == 1,
+          "terminated in SleepThreadCB, restarted into WaitSema: a notify ended it (%08X), %u waiters",
+          tm_rc[1], waiters);
+    call(GONE, th, 0, 0, 0);
+    call(psp_nid("sceKernelDeleteSema"), tm_obj, 0, 0, 0);
+
+    /* Terminated in SleepThreadCB after a notify readied it to run the
+     * handler, before it could: started again into SleepThreadCB, it is
+     * woken by name. */
+    th = tr_park(TM_SLEEP_CB, 1);
+    call(NOTIFY, tm_cb, 1, 0, 0);
+    call(TERMINATE, th, 0, 0, 0);
+    call(START, th, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(call(WAKEUP, th, 0, 0, 0) == 0, "wake a restarted thread in SleepThreadCB");
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(tm_rc[1] == 0,
+          "terminated with a notify undelivered, restarted into SleepThreadCB: a wakeup left it asleep (%08X)",
+          tm_rc[1]);
+    call(GONE, th, 0, 0, 0);
+
+    tm_with_cb = 0;
+    psp_sched_stop_all("test_restarted_after_terminated_wait");
     psp_sched_join_all();
     psp_sched_set_threading(0);
     psp_threadman_reset();
@@ -2171,6 +2856,14 @@ int main(void) {
     test_time_calls();
     test_pool_free_pointers();
     test_waits_with_threads();
+    test_zero_timeout();
+    test_msgpipe_wait_ends_as_it_parks();
+    test_msgpipe_poll_waits_its_turn();
+    test_stranded_waits();
+    test_thread_end_waiters();
+    test_many_parked_threads();
+    test_terminated_waiters();
+    test_restarted_after_terminated_wait();
     test_host_work_boundary();
     test_system_params();
 

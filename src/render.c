@@ -33,11 +33,9 @@ uint64_t psp_render_flat_pixels(void) { return g_px_flat; }
 uint64_t psp_render_zfail_pixels(void) { return g_px_zfail; }
 
 uint64_t psp_render_pixels(void) { return g_pixels; }
-static uint64_t g_filter_split;
 static uint64_t g_raster_ns;         /* see sw_draw */
 void     psp_render_reset_pixels(void) {
     g_pixels = g_px_tex = g_px_flat = g_px_zfail = g_px_blend = g_px_atest = 0;
-    g_filter_split = 0;
     g_raster_ns = 0;
 }
 
@@ -70,22 +68,7 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
     g_fb_fmt = fmt & 3;
 }
 
-static uint32_t pack16(uint32_t rgba, int fmt) {
-    const uint32_t r = rgba & 0xFF, g = (rgba >> 8) & 0xFF, b = (rgba >> 16) & 0xFF, a = rgba >> 24;
-    switch (fmt) {
-    case 0:  return (r >> 3) | ((g >> 2) << 5) | ((b >> 3) << 11);
-    case 1:  return (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >> 7) << 15);
-    default: return (r >> 4) | ((g >> 4) << 4) | ((b >> 4) << 8) | ((a >> 4) << 12);
-    }
-}
-
 /* ---- texture sampling -----------------------------------------------------
- *
- * One format, 5650, and one function, modulate. That is not a simplification
- * of the hardware but a description of this game: over a full run it sets no
- * other, and the GE state report says so. Anything else draws untextured, so a
- * format arriving that is not handled shows up as flat colour rather than as
- * plausible-looking wrong pixels.
  *
  * Sampled at pixel centres, nearest or bilinear as GE_TEXFILTER asks. The claim
  * that used to stand here -- that a 1:1 blit "samples texel centres either
@@ -116,37 +99,17 @@ static void sw_texture(const psp_tex_state *t) {
     dump_texture();
 }
 
-enum {
-    GE_TFMT_5650 = 0, GE_TFMT_5551 = 1, GE_TFMT_4444 = 2, GE_TFMT_8888 = 3,
-    GE_TFMT_CLUT4 = 4, GE_TFMT_CLUT8 = 5, GE_TFMT_CLUT16 = 6, GE_TFMT_CLUT32 = 7
-};
-
-static struct {
-    uint32_t addr;
-    int      fmt, shift, mask, start;
-} g_clut;
+static psp_clut_state g_clut;
 
 static void sw_clut(uint32_t addr, int format, int shift, int mask, int start) {
-    g_clut.addr = addr; g_clut.fmt = format;
-    g_clut.shift = shift; g_clut.mask = mask; g_clut.start = start;
-}
-
-/* Bytes per texel, doubled, so the 4-bit format can be expressed as 1. */
-static int tex_halfbytes(int fmt) {
-    switch (fmt) {
-    case GE_TFMT_CLUT4:                     return 1;
-    case GE_TFMT_CLUT8:                     return 2;
-    case GE_TFMT_5650: case GE_TFMT_5551:
-    case GE_TFMT_4444: case GE_TFMT_CLUT16: return 4;
-    case GE_TFMT_8888: case GE_TFMT_CLUT32: return 8;
-    default:                                return 0;
-    }
+    const psp_clut_state c = { addr, format, shift, mask, start };
+    g_clut = c;
 }
 
 static int texture_usable(void) {
     if (!g_tex.addr || g_tex.w <= 0 || g_tex.h <= 0) return 0;
-    if (!tex_halfbytes(g_tex.fmt)) return 0;
-    if (g_tex.fmt >= GE_TFMT_CLUT4 && !g_clut.addr) return 0;
+    if (!psp_texel_halfbytes(g_tex.fmt)) return 0;
+    if (g_tex.fmt >= PSP_TFMT_CLUT4 && !g_clut.addr) return 0;
     return 1;
 }
 
@@ -160,44 +123,18 @@ static uint32_t swizzled_byte(uint32_t byte_x, uint32_t y, uint32_t row_bytes) {
     return block + (y % 8) * 16 + (byte_x % 16);
 }
 
-/* 16-bit palette and texel formats, expanded to eight bits a channel with the
- * high bits replicated down so full-scale stays 0xFF rather than 0xF8. */
-static uint32_t expand16(uint32_t p, int fmt) {
-    uint32_t r, g, b, a;
-    switch (fmt) {
-    case GE_TFMT_5650:
-        r = p & 0x1F;         r = (r << 3) | (r >> 2);
-        g = (p >> 5)  & 0x3F; g = (g << 2) | (g >> 4);
-        b = (p >> 11) & 0x1F; b = (b << 3) | (b >> 2);
-        a = 0xFF; break;
-    case GE_TFMT_5551:
-        r = p & 0x1F;         r = (r << 3) | (r >> 2);
-        g = (p >> 5)  & 0x1F; g = (g << 3) | (g >> 2);
-        b = (p >> 10) & 0x1F; b = (b << 3) | (b >> 2);
-        a = (p >> 15) ? 0xFF : 0x00; break;
-    default: /* 4444 */
-        r = p & 0xF;          r = (r << 4) | r;
-        g = (p >> 4)  & 0xF;  g = (g << 4) | g;
-        b = (p >> 8)  & 0xF;  b = (b << 4) | b;
-        a = (p >> 12) & 0xF;  a = (a << 4) | a; break;
-    }
-    return (a << 24) | (b << 16) | (g << 8) | r;
-}
-
 typedef struct { uint32_t tex_bytes, clut_bytes; size_t padded; } decode_bounds;
 
 static uint32_t clut_entry(uint32_t raw, decode_bounds *bounds) {
     const uint32_t idx =
         (uint32_t)((((int)raw >> g_clut.shift) & g_clut.mask) | g_clut.start);
-    const uint32_t bytes = g_clut.fmt == 3 ? 4u : 2u;
+    const uint32_t bytes = (uint32_t)psp_pixel_bytes(g_clut.fmt);
     if (bounds && ((uint64_t)idx + 1) * bytes > bounds->clut_bytes) {
         bounds->padded++;
         return 0;
     }
     if (g_clut.fmt == 3) return psp_read32(g_clut.addr + idx * 4u);
-    return expand16((uint32_t)psp_read16(g_clut.addr + idx * 2u),
-                    g_clut.fmt == 0 ? GE_TFMT_5650 :
-                    g_clut.fmt == 1 ? GE_TFMT_5551 : GE_TFMT_4444);
+    return psp_pixel_unpack16((uint32_t)psp_read16(g_clut.addr + idx * 2u), g_clut.fmt);
 }
 
 /* Floor, not truncate.
@@ -205,8 +142,8 @@ static uint32_t clut_entry(uint32_t raw, decode_bounds *bounds) {
  * (int) rounds toward zero, so a u in (-1, 0) lands on texel 0 rather than -1:
  * invisible while the sampler clamps, half a texture out the moment one
  * repeats, and an inverted fractional part for anything that wants the weights.
- * floorf would do it, but this file has no <math.h> and on the SSE2 baseline
- * that is a libm call in a per-pixel loop. */
+ * floorf would do it, but on the SSE2 baseline that is a libm call in a
+ * per-pixel loop. */
 static int ifloor(float f) { const int i = (int)f; return i - (f < (float)i); }
 
 /* One axis of a texel coordinate, wrapped the way the game asked.
@@ -231,7 +168,7 @@ static uint32_t sample_texel_bounded(int u, int v, decode_bounds *bounds) {
     u = wrap_axis(u, g_tex.w, g_tex.wrap_s);
     v = wrap_axis(v, g_tex.h, g_tex.wrap_t);
 
-    const int hb = tex_halfbytes(g_tex.fmt);
+    const int hb = psp_texel_halfbytes(g_tex.fmt);
     const uint32_t row_bytes = ((uint32_t)g_tex.stride * (uint32_t)hb) / 2u;
     if (bounds) {
         const uint32_t bx = ((uint32_t)u * (uint32_t)hb) / 2u;
@@ -243,13 +180,13 @@ static uint32_t sample_texel_bounded(int u, int v, decode_bounds *bounds) {
         }
     }
 
-    if (g_tex.fmt == GE_TFMT_CLUT4) {
+    if (g_tex.fmt == PSP_TFMT_CLUT4) {
         const uint32_t bx = (uint32_t)u / 2u;
         const uint32_t off = swizzled_byte(bx, (uint32_t)v, row_bytes);
         const uint32_t byte = psp_read8(g_tex.addr + off);
         return clut_entry((u & 1) ? (byte >> 4) : (byte & 0xF), bounds);
     }
-    if (g_tex.fmt == GE_TFMT_CLUT8) {
+    if (g_tex.fmt == PSP_TFMT_CLUT8) {
         const uint32_t off = swizzled_byte((uint32_t)u, (uint32_t)v, row_bytes);
         return clut_entry(psp_read8(g_tex.addr + off), bounds);
     }
@@ -259,20 +196,20 @@ static uint32_t sample_texel_bounded(int u, int v, decode_bounds *bounds) {
      * masked ff indexes entry 67 -- and they drew flat white while the formats
      * were refused. This game's census has never named either; the tests are
      * the reason they exist. */
-    if (g_tex.fmt == GE_TFMT_CLUT16) {
+    if (g_tex.fmt == PSP_TFMT_CLUT16) {
         const uint32_t off = swizzled_byte((uint32_t)u * 2u, (uint32_t)v, row_bytes);
         return clut_entry(psp_read16(g_tex.addr + off), bounds);
     }
-    if (g_tex.fmt == GE_TFMT_CLUT32) {
+    if (g_tex.fmt == PSP_TFMT_CLUT32) {
         const uint32_t off = swizzled_byte((uint32_t)u * 4u, (uint32_t)v, row_bytes);
         return clut_entry(psp_read32(g_tex.addr + off), bounds);
     }
-    if (g_tex.fmt == GE_TFMT_8888) {
+    if (g_tex.fmt == PSP_TFMT_8888) {
         const uint32_t off = swizzled_byte((uint32_t)u * 4u, (uint32_t)v, row_bytes);
         return psp_read32(g_tex.addr + off);
     }
     const uint32_t off = swizzled_byte((uint32_t)u * 2u, (uint32_t)v, row_bytes);
-    return expand16((uint32_t)psp_read16(g_tex.addr + off), g_tex.fmt);
+    return psp_pixel_unpack16((uint32_t)psp_read16(g_tex.addr + off), g_tex.fmt);
 }
 
 static uint32_t sample_texel(int u, int v) {
@@ -328,38 +265,10 @@ static void dump_texture(void) {
     g_dumped_n++;
 }
 
-/* ---- filtering -----------------------------------------------------------
- *
- * GE_TEXFILTER was parsed into the GE's state from the beginning and read by
- * nothing: set_texture had no filter parameter, so the state could not reach a
- * backend even in principle. This game asks for linear on both fields.
- *
- * Values are GU_NEAREST 0 and GU_LINEAR 1, then 4..7 for the mipmap variants
- * (2 and 3 are not legal). Bit 0 selects linear *within* the level across all
- * six, so the mip chain -- which nothing here builds -- does not have to exist
- * for the in-level choice to be right. */
+/* Nothing counts primitives whose two filters differ: the counter this
+ * reported was never incremented. */
+uint64_t psp_render_filter_split(void) { return 0; }
 
-uint64_t psp_render_filter_split(void) { return g_filter_split; }
-
-
-/* Bilinear, with the half-texel that makes it agree with nearest at 1:1.
- *
- * Texel k covers [k, k+1), so its centre is at k + 0.5 and the four taps belong
- * around u - 0.5. Dropping that offset is the usual way to get this wrong: it
- * averages every texel with its neighbour during a 1:1 blit and softens a UI
- * layer that the hardware leaves sharp. With it, a 1:1 blit lands on frac 0,
- * puts all the weight on one tap, and comes out bit-identical to nearest.
- *
- * All four channels, alpha included. This game's logo is an alpha mask -- white
- * throughout, the letterforms entirely in the alpha channel -- so filtering
- * only RGB and taking alpha from a single tap would leave the edges exactly as
- * hard as nearest and look like the filter had never been implemented. */
-/* Bilinear, with the weights hardware uses: the fraction of a texel is kept to
- * four bits, floored. gpu/filtering/precisionlinear2d stretches two texels over
- * 256 pixels, so a continuous filter would start changing the colour at pixel
- * 64, by one step; hardware first changes it at pixel 72 -- one sixteenth of a
- * texel in -- and by 0x10 (ff -> ef), and on the reversed sprite starts at 64,
- * where the fraction is already fifteen sixteenths. Sixteen levels, floored. */
 /* Decode one mip level into a caller's RGBA8 buffer, through the same sampler
  * the software path draws with.
  *
@@ -385,14 +294,8 @@ static size_t decode_level(const psp_tex_state *t, int level,
      * that state, so a GPU backend decoding through here would have found a
      * stale palette -- silently, and only for the CLUT formats, which is the
      * kind of wrongness that looks like a sampler bug for a day. */
-    const struct { uint32_t addr; int fmt, shift, mask, start; } saved_clut = {
-        g_clut.addr, g_clut.fmt, g_clut.shift, g_clut.mask, g_clut.start
-    };
-    if (clut) {
-        g_clut.addr = clut->addr; g_clut.fmt = clut->fmt;
-        g_clut.shift = clut->shift; g_clut.mask = clut->mask;
-        g_clut.start = clut->start;
-    }
+    const psp_clut_state saved_clut = g_clut;
+    if (clut) g_clut = *clut;
     g_tex = *t;
     if (level > 0) {
         g_tex.addr   = t->lv_addr[level];
@@ -408,23 +311,18 @@ static size_t decode_level(const psp_tex_state *t, int level,
         bounds->clut_bytes = psp_mem_mapped_span(g_clut.addr);
     }
     const int w = g_tex.w, h = g_tex.h;
-    if (w <= 0 || h <= 0 || (size_t)w * (size_t)h > cap) {
-        g_tex = saved;
-        g_clut.addr = saved_clut.addr; g_clut.fmt = saved_clut.fmt;
-        g_clut.shift = saved_clut.shift; g_clut.mask = saved_clut.mask;
-        g_clut.start = saved_clut.start;
-        return 0;
+    size_t n = 0;
+    if (w > 0 && h > 0 && (size_t)w * (size_t)h <= cap) {
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                out[(size_t)y * (size_t)w + (size_t)x] = sample_texel_bounded(x, y, bounds);
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        n = (size_t)w * (size_t)h;
     }
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-            out[(size_t)y * (size_t)w + (size_t)x] = sample_texel_bounded(x, y, bounds);
-    if (out_w) *out_w = w;
-    if (out_h) *out_h = h;
     g_tex = saved;
-    g_clut.addr = saved_clut.addr; g_clut.fmt = saved_clut.fmt;
-    g_clut.shift = saved_clut.shift; g_clut.mask = saved_clut.mask;
-    g_clut.start = saved_clut.start;
-    return (size_t)w * (size_t)h;
+    g_clut = saved_clut;
+    return n;
 }
 
 size_t psp_render_decode_level(const psp_tex_state *t, int level,
@@ -443,6 +341,17 @@ size_t psp_render_decode_level_padded(const psp_tex_state *t, int level,
     return count;
 }
 
+/* ---- filtering -----------------------------------------------------------
+ *
+ * GE_TEXFILTER was parsed into the GE's state from the beginning and read by
+ * nothing: set_texture had no filter parameter, so the state could not reach a
+ * backend even in principle. This game asks for linear on both fields.
+ *
+ * Values are GU_NEAREST 0 and GU_LINEAR 1, then 4..7 for the mipmap variants
+ * (2 and 3 are not legal). Bit 0 selects linear *within* the level across all
+ * six, so the mip chain -- which nothing here builds -- does not have to exist
+ * for the in-level choice to be right. */
+
 /* A bilinear coordinate in sixteenths of a texel, the half texel taken off:
  * the coordinate cut toward zero to a sixteenth first, as nearest's is
  * (nearest_texel), then less 8. geprobe 23 (fw 6.60) scene 144 reads the
@@ -456,6 +365,25 @@ static int linear_sixteenths(float t) {
     return (int)(s >= 0.0f ? s + 1.0e-3f : s - 1.0e-3f) - 8;
 }
 
+/* Bilinear, with the half-texel that makes it agree with nearest at 1:1.
+ *
+ * Texel k covers [k, k+1), so its centre is at k + 0.5 and the four taps belong
+ * around u - 0.5. Dropping that offset is the usual way to get this wrong: it
+ * averages every texel with its neighbour during a 1:1 blit and softens a UI
+ * layer that the hardware leaves sharp. With it, a 1:1 blit lands on frac 0,
+ * puts all the weight on one tap, and comes out bit-identical to nearest.
+ *
+ * All four channels, alpha included. This game's logo is an alpha mask -- white
+ * throughout, the letterforms entirely in the alpha channel -- so filtering
+ * only RGB and taking alpha from a single tap would leave the edges exactly as
+ * hard as nearest and look like the filter had never been implemented.
+ *
+ * The weights are the hardware's: the fraction of a texel is kept to four
+ * bits, floored. gpu/filtering/precisionlinear2d stretches two texels over
+ * 256 pixels, so a continuous filter would start changing the colour at pixel
+ * 64, by one step; hardware first changes it at pixel 72 -- one sixteenth of a
+ * texel in -- and by 0x10 (ff -> ef), and on the reversed sprite starts at 64,
+ * where the fraction is already fifteen sixteenths. Sixteen levels, floored. */
 static uint32_t sample_bilinear(float u, float v) {
     /* The coordinate is quantised to sixteenths, floored, and split into the
      * texel and the weight. Floored, not rounded: gpu/filtering's linear tests
@@ -633,19 +561,19 @@ static uint32_t apply_texfunc(uint32_t tex, uint32_t col) {
         const uint32_t t = chan(tex, i), c = chan(col, i), e = chan(g_tex.env, i);
         uint32_t o;
         switch (g_tex.func) {
-        case 1:  o = g_tex.tcc_rgba ? (t * ta + c * (255u - ta) + 255u) >> sh : t << d; break;  /* DECAL */
-        case 2:  o = (c * (255u - t) + e * t + 255u) >> sh;                            break;  /* BLEND   */
-        case 3:  o = t << d;                                                            break;  /* REPLACE */
-        case 4:  o = (t + c) << d;                                                      break;  /* ADD     */
-        default: o = (t * (c + 1u)) >> sh;                                              break;  /* MODULATE */
+        case PSP_TFX_DECAL:   o = g_tex.tcc_rgba ? (t * ta + c * (255u - ta) + 255u) >> sh : t << d; break;
+        case PSP_TFX_BLEND:   o = (c * (255u - t) + e * t + 255u) >> sh;                            break;
+        case PSP_TFX_REPLACE: o = t << d;                                                            break;
+        case PSP_TFX_ADD:     o = (t + c) << d;                                                      break;
+        default:              o = (t * (c + 1u)) >> sh;                                              break;  /* MODULATE */
         }
         out |= (o > 255u ? 255u : o) << (i * 8);
     }
     uint32_t a;
     switch (g_tex.func) {
-    case 1:  a = ca;                                             break;  /* DECAL keeps the vertex alpha */
-    case 3:  a = g_tex.tcc_rgba ? ta : ca;                       break;  /* REPLACE */
-    default: a = g_tex.tcc_rgba ? (ta * (ca + 1u)) >> 8 : ca;    break;  /* MODULATE, BLEND, ADD */
+    case PSP_TFX_DECAL:   a = ca;                                          break;  /* keeps the vertex alpha */
+    case PSP_TFX_REPLACE: a = g_tex.tcc_rgba ? ta : ca;                    break;
+    default:              a = g_tex.tcc_rgba ? (ta * (ca + 1u)) >> 8 : ca; break;  /* MODULATE, BLEND, ADD */
     }
     return out | (a << 24);
 }
@@ -669,10 +597,10 @@ static void put_pixel(int x, int y, uint32_t rgba, int stencil) {
         const uint32_t at16 = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
         if (stencil >= 0) rgba = (rgba & 0x00FFFFFFu) | ((uint32_t)stencil << 24);
         else if (!g_bs.write_alpha && g_fb_fmt != 0)
-            rgba = (rgba & 0x00FFFFFFu) | (expand16((uint32_t)psp_read16(at16), g_fb_fmt) & 0xFF000000u);
-        uint32_t px = pack16(rgba, g_fb_fmt);
+            rgba = (rgba & 0x00FFFFFFu) | (psp_pixel_unpack16((uint32_t)psp_read16(at16), g_fb_fmt) & 0xFF000000u);
+        uint32_t px = psp_pixel_pack16(rgba, g_fb_fmt);
         if (g_bs.pixel_mask) {
-            const uint32_t keep = pack16(g_bs.pixel_mask, g_fb_fmt);
+            const uint32_t keep = psp_pixel_pack16(g_bs.pixel_mask, g_fb_fmt);
             px = ((uint32_t)psp_read16(at16) & keep) | (px & ~keep);
         }
         psp_write16(at16, (uint16_t)px);
@@ -708,7 +636,7 @@ static void put_pixel(int x, int y, uint32_t rgba, int stencil) {
  * zero on a fresh start. For a GEQUAL title that rejects nothing, as the old
  * host-side DEPTH_RESET of 0 was chosen to. */
 static uint32_t g_zb_addr = PSP_VRAM_BASE, g_zb_stride = 512;
-static struct { int test, func, write; } g_zs = { 0, 1 /* always */, 0 };
+static struct { int test, func, write; } g_zs = { 0, PSP_CMP_ALWAYS, 0 };
 
 static void sw_depth(int test_enable, int func, int write_enable) {
     g_zs.test = test_enable; g_zs.func = func; g_zs.write = write_enable;
@@ -758,21 +686,25 @@ static int depth_value(float z) {
     return (int)z;
 }
 
-/* GE comparison codes: 0 never, 1 always, 2 equal, 3 notequal, 4 less,
- * 5 lequal, 6 greater, 7 gequal. */
+/* a against b by one of the GE's comparison codes (PSP_CMP_*), shared by
+ * the depth, stencil, alpha and colour tests. */
+static int compare(int func, int a, int b) {
+    switch (func) {
+    case PSP_CMP_NEVER:    return 0;
+    case PSP_CMP_EQUAL:    return a == b;
+    case PSP_CMP_NOTEQUAL: return a != b;
+    case PSP_CMP_LESS:     return a <  b;
+    case PSP_CMP_LEQUAL:   return a <= b;
+    case PSP_CMP_GREATER:  return a >  b;
+    case PSP_CMP_GEQUAL:   return a >= b;
+    default:               return 1;
+    }
+}
+
 static int depth_pass(int x, int y, int z) {
     if (!g_zs.test) return 1;
     const int d = psp_read16(depth_addr(x, y));
-    switch (g_zs.func) {
-    case 0: return 0;
-    case 2: return z == d;
-    case 3: return z != d;
-    case 4: return z <  d;
-    case 5: return z <= d;
-    case 6: return z >  d;
-    case 7: return z >= d;
-    default: return 1;
-    }
+    return compare(g_zs.func, z, d);
 }
 
 /* ---- blending ------------------------------------------------------------ */
@@ -845,17 +777,17 @@ static int blend_scaled(int code, int i, uint32_t src, uint32_t dst, int is_src)
     const int other = (int)(is_src ? chan(dst, i) : chan(src, i));
     const int sa = (int)chan(src, 3), da = (int)chan(dst, 3);
     switch (code) {
-    case 0:  return blend_term(c, other);
-    case 1:  return blend_term(c, 255 - other);
-    case 2:  return blend_term(c, sa);
-    case 3:  return blend_term(c, 255 - sa);
-    case 4:  return blend_term(c, da);
-    case 5:  return blend_term(c, 255 - da);
-    case 6:  return blend_term(c, 2 * sa);
-    case 7:  return blend_term(c, 255 - 2 * sa);
-    case 8:  return blend_term(c, 2 * da);
-    case 9:  return blend_term(c, 255 - 2 * da);
-    default: return blend_term(c, (int)chan(is_src ? g_bs.fixa : g_bs.fixb, i));
+    case PSP_BF_OTHER_COLOUR:               return blend_term(c, other);
+    case PSP_BF_ONE_MINUS_OTHER_COLOUR:     return blend_term(c, 255 - other);
+    case PSP_BF_SRC_ALPHA:                  return blend_term(c, sa);
+    case PSP_BF_ONE_MINUS_SRC_ALPHA:        return blend_term(c, 255 - sa);
+    case PSP_BF_DST_ALPHA:                  return blend_term(c, da);
+    case PSP_BF_ONE_MINUS_DST_ALPHA:        return blend_term(c, 255 - da);
+    case PSP_BF_DOUBLE_SRC_ALPHA:           return blend_term(c, 2 * sa);
+    case PSP_BF_ONE_MINUS_DOUBLE_SRC_ALPHA: return blend_term(c, 255 - 2 * sa);
+    case PSP_BF_DOUBLE_DST_ALPHA:           return blend_term(c, 2 * da);
+    case PSP_BF_ONE_MINUS_DOUBLE_DST_ALPHA: return blend_term(c, 255 - 2 * da);
+    default:   /* PSP_BF_FIXED */           return blend_term(c, (int)chan(is_src ? g_bs.fixa : g_bs.fixb, i));
     }
 }
 
@@ -867,33 +799,23 @@ static uint32_t blend(uint32_t src, uint32_t dst) {
         const int dd = blend_scaled(g_bs.dst, i, src, dst, 0);
         int v;
         switch (g_bs.eq) {
-        case 1:  v = ss - dd; break;
-        case 2:  v = dd - ss; break;
-        case 3:  v = s < d ? s : d; break;
-        case 4:  v = s > d ? s : d; break;
-        case 5:  v = s > d ? s - d : d - s; break;
-        default: v = ss + dd; break;
+        case PSP_BEQ_SUBTRACT:         v = ss - dd; break;
+        case PSP_BEQ_REVERSE_SUBTRACT: v = dd - ss; break;
+        case PSP_BEQ_MIN:              v = s < d ? s : d; break;
+        case PSP_BEQ_MAX:              v = s > d ? s : d; break;
+        case PSP_BEQ_ABS:              v = s > d ? s - d : d - s; break;
+        default:                       v = ss + dd; break;   /* ADD */
         }
         out |= clamp255(v) << (i * 8);
     }
     return out;
 }
 
-/* The stencil test, against the framebuffer's alpha byte. Same function codes
- * as the depth and alpha tests. */
+/* The stencil test, against the framebuffer's alpha byte. */
 static int stencil_pass(uint32_t cur) {
     const int a = (int)(cur & (uint32_t)g_bs.stencil_mask);
     const int r = g_bs.stencil_ref & g_bs.stencil_mask;
-    switch (g_bs.stencil_func) {
-    case 0: return 0;
-    case 2: return a == r;
-    case 3: return a != r;
-    case 4: return a <  r;
-    case 5: return a <= r;
-    case 6: return a >  r;
-    case 7: return a >= r;
-    default: return 1;
-    }
+    return compare(g_bs.stencil_func, a, r);
 }
 
 /* INCR and DECR count in the target's own stencil width: one step of a 4444
@@ -904,12 +826,12 @@ static int stencil_pass(uint32_t cur) {
 static uint32_t stencil_op(int op, uint32_t cur) {
     const uint32_t step = g_fb_fmt == 2 ? 0x11u : (g_fb_fmt == 1 ? 0xFFu : 1u);
     switch (op) {
-    case 1:  return 0u;                                  /* ZERO    */
-    case 2:  return (uint32_t)g_bs.stencil_ref & 0xFFu;  /* REPLACE */
-    case 3:  return ~cur & 0xFFu;                        /* INVERT  */
-    case 4:  return cur <= 255u - step ? cur + step : 255u;   /* INCR */
-    case 5:  return cur >= step ? cur - step : 0u;            /* DECR */
-    default: return cur;                                 /* KEEP    */
+    case PSP_STENCIL_ZERO:    return 0u;
+    case PSP_STENCIL_REPLACE: return (uint32_t)g_bs.stencil_ref & 0xFFu;
+    case PSP_STENCIL_INVERT:  return ~cur & 0xFFu;
+    case PSP_STENCIL_INCR:    return cur <= 255u - step ? cur + step : 255u;
+    case PSP_STENCIL_DECR:    return cur >= step ? cur - step : 0u;
+    default:                  return cur;   /* KEEP */
     }
 }
 
@@ -924,8 +846,8 @@ static void write_stencil_only(int x, int y, uint32_t value) {
     if (g_fb_fmt != 3) {
         const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2;
         const uint32_t old = (uint32_t)psp_read16(at);
-        const uint32_t px = pack16((expand16(old, g_fb_fmt) & 0x00FFFFFFu) | (value << 24), g_fb_fmt);
-        const uint32_t k16 = pack16(keep, g_fb_fmt);
+        const uint32_t px = psp_pixel_pack16((psp_pixel_unpack16(old, g_fb_fmt) & 0x00FFFFFFu) | (value << 24), g_fb_fmt);
+        const uint32_t k16 = psp_pixel_pack16(keep, g_fb_fmt);
         psp_write16(at, (uint16_t)((old & k16) | (px & ~k16)));
         return;
     }
@@ -942,12 +864,7 @@ static int colour_pass(uint32_t rgba) {
     if (!g_bs.colour_test) return 1;
     const uint32_t c = rgba & g_bs.colour_mask & 0x00FFFFFFu;
     const uint32_t r = g_bs.colour_ref & g_bs.colour_mask & 0x00FFFFFFu;
-    switch (g_bs.colour_func & 3) {
-    case 0:  return 0;
-    case 2:  return c == r;
-    case 3:  return c != r;
-    default: return 1;
-    }
+    return compare(g_bs.colour_func & 3, (int)c, (int)r);
 }
 
 /* Logic op (LOE 0x28, LOP 0xE6), source s against destination d, in the
@@ -980,27 +897,18 @@ static int alpha_pass(uint32_t rgba) {
     if (!g_bs.alpha_test) return 1;
     const int a = (int)(chan(rgba, 3) & (uint32_t)g_bs.alpha_mask);
     const int r = g_bs.alpha_ref & g_bs.alpha_mask;
-    switch (g_bs.alpha_func) {
-    case 0: return 0;
-    case 2: return a == r;
-    case 3: return a != r;
-    case 4: return a <  r;
-    case 5: return a <= r;
-    case 6: return a >  r;
-    case 7: return a >= r;
-    default: return 1;
-    }
+    return compare(g_bs.alpha_func, a, r);
 }
 
 static uint32_t get_pixel(int x, int y) {
     if (!g_fb_addr || !g_fb_stride) return 0;
     if (g_fb_fmt != 3) {
-        const uint32_t px = expand16((uint32_t)psp_read16(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2), g_fb_fmt);
+        const uint32_t px = psp_pixel_unpack16((uint32_t)psp_read16(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 2), g_fb_fmt);
         /* A 5650 target has no alpha and no stencil, and the blend reads its
          * destination alpha as zero: gpu/commands/blend565's "Double dest
          * alpha" rows are black and its "Inverse double dest alpha" rows are
          * the source colour whole. The texture sampler's 5650 is opaque, which
-         * is why this is not in expand16. */
+         * is why this is not in psp_pixel_unpack16. */
         return g_fb_fmt == 0 ? (px & 0x00FFFFFFu) : px;
     }
     return psp_read32(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4);
@@ -1080,7 +988,7 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
     }
     if (g_bs.enable) { rgba = blend(rgba, get_pixel(x, y)); g_px_blend++; }
     /* Dither: an offset per screen position, then the 16-bit formats keep
-     * the top bits as always (pack16). geprobe step 10 (fw 6.60) dithers
+     * the top bits as always (psp_pixel_pack16). geprobe step 10 (fw 6.60) dithers
      * 8888 too: its grey ramp, 7F and 80 at (240,136) and (241,136), reads
      * 86 and 78 there under the probe's +7/-8 matrix row. Placed after the
      * blend; the order against blending is not measured. */
@@ -1103,13 +1011,8 @@ static void shade_pixel(int x, int y, float z, uint32_t rgba) {
     put_pixel(x, y, rgba, stencil);
 }
 
-/* Sample positions per pixel edge. Two is enough to express the pixel centre
- * as an integer -- 2*(x + 0.5) is 2x + 1 -- which is all this needs today.
- *
- * Named rather than written as literal 2s because sub-pixel vertex precision
- * is the same substitution: the hardware rasterizes at sixteenths, so SUBPX 16
- * with positions snapped to 28.4 turns this function into that one without
- * touching its structure. */
+/* Sample positions per pixel edge, the hardware's sixteenths, and a pixel
+ * centre's offset in them. */
 #define SUBPX      PSP_SUBPX
 #define SUBPX_HALF (PSP_SUBPX / 2)
 
@@ -1165,6 +1068,144 @@ static uint32_t plane_chan(int64_t acc) {
     return v < 0 ? 0u : (v > 255 ? 255u : (uint32_t)v);
 }
 
+static int min3(int a, int b, int c) { return a < b ? (a < c ? a : c) : (b < c ? b : c); }
+static int max3(int a, int b, int c) { return a > b ? (a > c ? a : c) : (b > c ? b : c); }
+
+/* A tall triangle's long edge, in aligned groups of four pixels: when 3
+ * times the triangle's height in sixteenths reaches 2^17 (2731 pixels),
+ * the pixel of each group farthest from the inside along that edge takes
+ * the nearest's decision -- the last of the group (x = 3 mod 4) on an
+ * edge with the inside to its left, the first (x = 0 mod 4) with it to
+ * the right -- as if its three steps across had been dropped. geprobe 20
+ * (fw 6.60) scenes 125-127: 660 windows, each crossed by one edge, and
+ * every one of the 241 long edges past that height drawn so, none of the
+ * 419 others; the threshold lies between 130,533 and 131,364. Scene 98's
+ * window 1, the 80 pixels it was off, is such an edge. The copy happens
+ * only where the far pixel's centre plus a sixteenth lies within the
+ * triangle's x extent, min x <= 16 x + 9 <= max x: geprobe 21 scene 128,
+ * 220 windows on edges leaning 0 to 184 pixels, the small leans' far
+ * pixels falling either side of a corner's x -- which also leaves a
+ * vertical edge alone, its far pixels all beyond the extent (scene 98's
+ * window 4, 2981 pixels tall: 136 pixels off when it was not) -- and
+ * geprobe 22 scene 134, far pixels -2 to +2 sixteenths from min and max
+ * x: a centre one sixteenth short of min x copies, one on max x does not.
+ * A triangle level at its top or bottom has two edges of full height, and
+ * only its left one, the inside to its right, takes it, whichever corner
+ * comes first (scenes 129 and 134: 364 windows, the level corners in all
+ * six orders). Coverage only: the pixel's colour and depth are its own.
+ *
+ * Per edge k: the pixel in each group of four that copies (at[k], -1 for
+ * none) and what its edge function is lifted by (lift[k]). */
+typedef struct { int at[3]; int64_t lift[3]; int on; } tall_edge;
+
+static tall_edge tall_edge_quirk(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
+                                 const int64_t dys[3]) {
+    tall_edge q = { { -1, -1, -1 }, { 0, 0, 0 }, 0 };
+    const int64_t ylo = min3(a->y, b->y, c->y), yhi = max3(a->y, b->y, c->y);
+    const int64_t h = yhi - ylo;
+    if (3 * h >= (1 << 17)) {
+        int left = 0;
+        for (int k = 0; k < 3; k++) left |= dys[k] == -h;
+        for (int k = 0; k < 3; k++)
+            if (dys[k] == -h || (dys[k] == h && !left)) {
+                q.at[k] = dys[k] > 0 ? 3 : 0;
+                q.lift[k] = 3 * h * SUBPX;
+            }
+    }
+    q.on = q.at[0] >= 0 || q.at[1] >= 0 || q.at[2] >= 0;
+    return q;
+}
+
+/* The corner every plane starts from: the end of the long edge (top to
+ * bottom) on the long edge's side. With the middle corner left of that edge
+ * the long edge is the right side and the planes start from the rightmost
+ * corner; with it right, from the leftmost; ties to the upper. */
+static int plane_anchor(const psp_vertex *const vs[3]) {
+    int o[3] = { 0, 1, 2 };                           /* by y, then x */
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2 - i; j++) {
+            const psp_vertex *p = vs[o[j]], *q = vs[o[j + 1]];
+            if (p->y > q->y || (p->y == q->y && p->x > q->x)) { const int s = o[j]; o[j] = o[j + 1]; o[j + 1] = s; }
+        }
+    /* Two corners level at the bottom: the left one is the bottom,
+     * as at the top the left one is the top, so a flat-topped or
+     * flat-bottomed triangle starts from its leftmost corner
+     * (geprobe 5 scene 27's flat-bottomed triangle; scenes 46 and 50's
+     * flat-topped ones). */
+    if (vs[o[1]]->y == vs[o[2]]->y) { const int s = o[1]; o[1] = o[2]; o[2] = s; }
+    const psp_vertex *tv = vs[o[0]], *mv = vs[o[1]], *bv = vs[o[2]];
+    const int from_right = (int64_t)(bv->x - tv->x) * (mv->y - tv->y) - (int64_t)(bv->y - tv->y) * (mv->x - tv->x) >= 0;
+    int k0 = -1;
+    for (int k = 0; k < 3; k++)
+        if (k0 < 0 || (from_right ? vs[k]->x > vs[k0]->x : vs[k]->x < vs[k0]->x) ||
+            (vs[k]->x == vs[k0]->x && vs[k]->y < vs[k0]->y))
+            k0 = k;
+    return k0;
+}
+
+/* What every plane of a triangle shares: its corners, the one the planes
+ * start from, 1/area as area_rcp gives it, and the first pixel's centre. */
+typedef struct {
+    const psp_vertex *v[3];
+    int     k0;
+    int64_t rq;
+    int     rsh;
+    int64_t px, py;
+} tri_planes;
+
+/* One plane's value at the first pixel centre and its steps a pixel across
+ * and down, in 1/16384ths. */
+typedef struct { int64_t acc, dx, dy; } plane;
+
+/* The plane through the three corner values val[]: the gradient is the
+ * numerator times area_rcp's 1/area, floored to 1/1024 a pixel, and the
+ * plane starts from corner k0's value. */
+static plane plane_setup(const tri_planes *t, const int64_t val[3]) {
+    const psp_vertex *a = t->v[0], *b = t->v[1], *c = t->v[2], *k = t->v[t->k0];
+    const int64_t nx = (val[1] - val[0]) * (c->y - a->y) - (val[2] - val[0]) * (b->y - a->y);
+    const int64_t ny = (val[2] - val[0]) * (b->x - a->x) - (val[1] - val[0]) * (c->x - a->x);
+    const int64_t gx = floor_shr(nx * t->rq, t->rsh - 14), gy = floor_shr(ny * t->rq, t->rsh - 14);
+    const plane p = { val[t->k0] * 16384 + gx * (t->px - k->x) + gy * (t->py - k->y),
+                      gx * SUBPX, gy * SUBPX };
+    return p;
+}
+
+/* Plane i's corner values: the colour's channels 0-3, the fog coefficient
+ * 4, the secondary colour's channels 5-7. */
+static void plane_values(int i, const psp_vertex *const v[3], int64_t val[3]) {
+    for (int k = 0; k < 3; k++) {
+        if (i == 4)     val[k] = v[k]->fog;
+        else if (i > 4) val[k] = v[k]->spec_set ? chan(v[k]->spec, i - 5) : 0;
+        else            val[k] = chan(v[k]->rgba, i);
+    }
+}
+
+/* col's RGB plus a secondary colour (0xBBGGRR), each channel clamped. */
+static uint32_t add_secondary(uint32_t col, uint32_t spec) {
+    for (int k = 0; k < 3; k++) {
+        const uint32_t s = chan(col, k) + chan(spec, k);
+        col = (col & ~(0xFFu << (8 * k))) | (s > 255 ? 255u : s) << (8 * k);
+    }
+    return col;
+}
+
+/* A pixel's texture coordinates from its exact edge weights w0..w2. They
+ * stay exact until the homogeneous divide: normalizing each one to float
+ * first can put an exact integer UV just below its texel boundary, and
+ * half-pixel aligned UI quads expose that as ragged nearest edges.
+ * Transformed vertices retain reciprocal clip W (and a texture projection
+ * Q), so this is the divide the PSP uses on oblique geometry; through-mode
+ * vertices carry ones and reduce exactly to the affine result. */
+static void tri_uv(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
+                   int64_t w0, int64_t w1, int64_t w2, float *u, float *v) {
+    const double q0 = (double)w0 * a->inv_w;
+    const double q1 = (double)w1 * b->inv_w;
+    const double q2 = (double)w2 * c->inv_w;
+    const double den = q0 * a->tex_q + q1 * b->tex_q + q2 * c->tex_q;
+    *u = den != 0.0 ? (float)((q0 * a->u + q1 * b->u + q2 * c->u) / den) : 0.0f;
+    *v = den != 0.0 ? (float)((q0 * a->v + q1 * b->v + q2 * c->v) / den) : 0.0f;
+}
+
 /* Barycentric fill with integer edge functions, evaluated at pixel centres.
  *
  * Sampling at the pixel *corner* -- which is what this did -- puts the sample
@@ -1186,10 +1227,8 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     /* Positions arrive in 1/16 pixel; the pixel box that can contain a centre
      * inside them is floor(min/16) .. floor((max + 15)/16), and the shifts
      * floor for negatives where a division would not. */
-    int minx = a->x < b->x ? (a->x < c->x ? a->x : c->x) : (b->x < c->x ? b->x : c->x);
-    int maxx = a->x > b->x ? (a->x > c->x ? a->x : c->x) : (b->x > c->x ? b->x : c->x);
-    int miny = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
-    int maxy = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
+    int minx = min3(a->x, b->x, c->x), maxx = max3(a->x, b->x, c->x);
+    int miny = min3(a->y, b->y, c->y), maxy = max3(a->y, b->y, c->y);
     const int64_t xlo = minx, xhi = maxx;
     minx >>= 4; miny >>= 4;
     maxx = (maxx + 15) >> 4; maxy = (maxy + 15) >> 4;
@@ -1226,46 +1265,8 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     const int64_t bias1 = edge_is_top_left(d1x, d1y) ? 0 : -1;
     const int64_t bias2 = edge_is_top_left(d2x, d2y) ? 0 : -1;
 
-    /* A tall triangle's long edge, in aligned groups of four pixels: when 3
-     * times the triangle's height in sixteenths reaches 2^17 (2731 pixels),
-     * the pixel of each group farthest from the inside along that edge takes
-     * the nearest's decision -- the last of the group (x = 3 mod 4) on an
-     * edge with the inside to its left, the first (x = 0 mod 4) with it to
-     * the right -- as if its three steps across had been dropped. geprobe 20
-     * (fw 6.60) scenes 125-127: 660 windows, each crossed by one edge, and
-     * every one of the 241 long edges past that height drawn so, none of the
-     * 419 others; the threshold lies between 130,533 and 131,364. Scene 98's
-     * window 1, the 80 pixels it was off, is such an edge. The copy happens
-     * only where the far pixel's centre plus a sixteenth lies within the
-     * triangle's x extent, min x <= 16 x + 9 <= max x: geprobe 21 scene 128,
-     * 220 windows on edges leaning 0 to 184 pixels, the small leans' far
-     * pixels falling either side of a corner's x -- which also leaves a
-     * vertical edge alone, its far pixels all beyond the extent (scene 98's
-     * window 4, 2981 pixels tall: 136 pixels off when it was not) -- and
-     * geprobe 22 scene 134, far pixels -2 to +2 sixteenths from min and max
-     * x: a centre one sixteenth short of min x copies, one on max x does not.
-     * A triangle level at its top or bottom has two edges of full height, and
-     * only its left one, the inside to its right, takes it, whichever corner
-     * comes first (scenes 129 and 134: 364 windows, the level corners in all
-     * six orders). Coverage only: the pixel's colour and depth are its own. */
-    int64_t far_lift[3] = { 0, 0, 0 };
-    int far_at[3] = { -1, -1, -1 };
-    {
-        const int64_t ylo = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
-        const int64_t yhi = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
-        const int64_t h = yhi - ylo;
-        if (3 * h >= (1 << 17)) {
-            const int64_t dys[3] = { d0y, d1y, d2y };
-            int left = 0;
-            for (int k = 0; k < 3; k++) left |= dys[k] == -h;
-            for (int k = 0; k < 3; k++)
-                if (dys[k] == -h || (dys[k] == h && !left)) {
-                    far_at[k] = dys[k] > 0 ? 3 : 0;
-                    far_lift[k] = 3 * h * SUBPX;
-                }
-        }
-    }
-    const int quirk = far_at[0] >= 0 || far_at[1] >= 0 || far_at[2] >= 0;
+    const int64_t dys[3] = { d0y, d1y, d2y };
+    const tall_edge quirk = tall_edge_quirk(a, b, c, dys);
 
     /* The three edge functions at the centre of the first pixel, in the same
      * 1/16 units the positions came in. They sum to area, so they are the
@@ -1278,7 +1279,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     int64_t row2 = d2x * (py - b->y) - d2y * (px - b->x);
 
     /* Colour is a plane per channel, and not the barycentric blend that
-     * depth and texture coordinates use below: geprobe (fw 6.60) measured
+     * texture coordinates use below: geprobe (fw 6.60) measured
      *
      *     c(px, py) = cA + gx * (px - xA) + gy * (py - yA)
      *
@@ -1293,7 +1294,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      * the long edge (top to bottom) on that edge's side -- the rightmost
      * corner when the middle one lies left of the long edge, the leftmost
      * when it lies right, ties to the upper, and of two corners level at
-     * the bottom the left one (see zk0 below). All three corners compete,
+     * the bottom the left one (plane_anchor). All three corners compete,
      * on screen or off and inside the scissor or not. geprobe 14 (fw 6.60)
      * scenes 83-98 settle it: one triangle at 48 orientations, 8 shapes in
      * 6 vertex orders, ties swept through by sixteenths, every sub-pixel
@@ -1322,168 +1323,78 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
      *
      * Kept in 1/16384ths of a channel (1/1024 of a step times the 1/16 grid)
      * so every pixel is exact integer arithmetic. */
-    int64_t col_acc[8] = { 0 }, col_dx[8] = { 0 }, col_dy[8] = { 0 };
-    int64_t z_acc = 0, z_dx = 0, z_dy = 0;
+    plane col[8] = { { 0, 0, 0 } };
     const int flat = g_bs.shade_flat;
     const int sec = !flat && (a->spec_set || b->spec_set || c->spec_set);
     const int nplanes = sec ? 8 : 5;
-    {
-        const psp_vertex *vs[3] = { a, b, c };
-        /* Every plane starts from the end of the long edge (top to bottom)
-         * on the long edge's side. With the middle corner left of that edge
-         * the long edge is the right side and the planes start from the
-         * rightmost corner; with it right, from the leftmost. */
-        int z_from_right, zk0 = -1;
-        {
-            int o[3] = { 0, 1, 2 };                           /* by y, then x */
-            for (int i = 0; i < 2; i++)
-                for (int j = 0; j < 2 - i; j++) {
-                    const psp_vertex *p = vs[o[j]], *q = vs[o[j + 1]];
-                    if (p->y > q->y || (p->y == q->y && p->x > q->x)) { const int s = o[j]; o[j] = o[j + 1]; o[j + 1] = s; }
-                }
-            /* Two corners level at the bottom: the left one is the bottom,
-             * as at the top the left one is the top, so a flat-topped or
-             * flat-bottomed triangle starts from its leftmost corner
-             * (geprobe 5 scene 27's flat-bottomed triangle; scenes 46 and 50's
-             * flat-topped ones). */
-            if (vs[o[1]]->y == vs[o[2]]->y) { const int s = o[1]; o[1] = o[2]; o[2] = s; }
-            const psp_vertex *tv = vs[o[0]], *mv = vs[o[1]], *bv = vs[o[2]];
-            z_from_right = (int64_t)(bv->x - tv->x) * (mv->y - tv->y) - (int64_t)(bv->y - tv->y) * (mv->x - tv->x) >= 0;
-        }
-        for (int k = 0; k < 3; k++)
-            if (zk0 < 0 || (z_from_right ? vs[k]->x > vs[zk0]->x : vs[k]->x < vs[zk0]->x) ||
-                (vs[k]->x == vs[zk0]->x && vs[k]->y < vs[zk0]->y))
-                zk0 = k;
-        const int k0 = zk0;
-        int64_t rq; int rsh;
-        area_rcp(area, &rq, &rsh);
-        for (int i = flat ? 4 : 0; i < nplanes; i++) {
-            int64_t c0, c1, c2, ck;
-            if (i == 4) {
-                c0 = a->fog; c1 = b->fog; c2 = c->fog; ck = vs[k0]->fog;
-            } else if (i > 4) {
-                c0 = a->spec_set ? chan(a->spec, i - 5) : 0;
-                c1 = b->spec_set ? chan(b->spec, i - 5) : 0;
-                c2 = c->spec_set ? chan(c->spec, i - 5) : 0;
-                ck = vs[k0]->spec_set ? chan(vs[k0]->spec, i - 5) : 0;
-            } else {
-                c0 = chan(a->rgba, i); c1 = chan(b->rgba, i); c2 = chan(c->rgba, i);
-                ck = chan(vs[k0]->rgba, i);
-            }
-            const int64_t nx = (c1 - c0) * (c->y - a->y) - (c2 - c0) * (b->y - a->y);
-            const int64_t ny = (c2 - c0) * (b->x - a->x) - (c1 - c0) * (c->x - a->x);
-            const int64_t gx = floor_shr(nx * rq, rsh - 14), gy = floor_shr(ny * rq, rsh - 14);
-            col_acc[i] = ck * 16384
-                       + gx * (px - vs[k0]->x) + gy * (py - vs[k0]->y);
-            col_dx[i] = gx * SUBPX;
-            col_dy[i] = gy * SUBPX;
-        }
-        /* Depth is a plane too, in the same 1/16384 units, with the same
-         * gradient: the numerator times area_rcp's 1/area, floored to 1/1024
-         * a pixel. The vertex depths are integers -- through mode's as
-         * given, a transformed vertex's floored from ge_screen_z -- but the
-         * plane starts from its own corner, zk0 above: the end of the long
-         * edge on that edge's side, the rightmost corner when the middle one
-         * lies left of the long edge and the leftmost when it lies right.
-         * geprobe 10 (fw 6.60) scene 57 shows it. It draws scene 48's 48 3D
-         * triangles again in through mode at psprecomp's corners, with the
-         * depth the PSP gives each corner as a point: this rule reproduces
-         * every pixel of all 48, where the colour's leftmost corner fits 28
-         * and no single corner, nor top, bottom, depth or angle, fits more
-         * than 31. With those corner depths scene 48's 3D planes match too,
-         * 47 of 48 (one corner a sixteenth off), so the 3D path is the same.
-         * The right triangles of scenes 27, 46 and 50, which settled the
-         * plane, have their middle corner right of a vertical long edge, so
-         * there the rule is the leftmost, as before; scenes 17 and 36 go to
-         * no pixel off and scene 27 from 1867 to 1290; with geprobe 12's
-         * vertex depths every 3D depth plane matches. Corners outside the
-         * scissor compete too: geprobe 14 scene 97 draws scene 87's
-         * triangles with corner depths, and an anchor among the corners
-         * inside the scissor is 10,584 depth pixels off where this is none. */
-        {
-            int64_t zv[3];
-            for (int k = 0; k < 3; k++) {
-                const float z = vs[k]->z;
-                zv[k] = !(z > 0.0f) ? 0 : (z >= 65535.0f ? 65535 : (int64_t)z);
-            }
-            const int64_t nx = (zv[1] - zv[0]) * (c->y - a->y) - (zv[2] - zv[0]) * (b->y - a->y);
-            const int64_t ny = (zv[2] - zv[0]) * (b->x - a->x) - (zv[1] - zv[0]) * (c->x - a->x);
-            const int64_t gx = floor_shr(nx * rq, rsh - 14), gy = floor_shr(ny * rq, rsh - 14);
-            z_acc = zv[zk0] * 16384 + gx * (px - vs[zk0]->x) + gy * (py - vs[zk0]->y);
-            z_dx = gx * SUBPX;
-            z_dy = gy * SUBPX;
-        }
+    tri_planes tp = { { a, b, c }, 0, 0, 0, px, py };
+    tp.k0 = plane_anchor(tp.v);
+    area_rcp(area, &tp.rq, &tp.rsh);
+    for (int i = flat ? 4 : 0; i < nplanes; i++) {
+        int64_t val[3];
+        plane_values(i, tp.v, val);
+        col[i] = plane_setup(&tp, val);
     }
+    /* Depth is a plane too, in the same 1/16384 units, with the same
+     * gradient: the numerator times area_rcp's 1/area, floored to 1/1024
+     * a pixel. The vertex depths are integers -- through mode's as
+     * given, a transformed vertex's floored from ge_screen_z -- but the
+     * plane starts from its own corner, plane_anchor's: the end of the long
+     * edge on that edge's side, the rightmost corner when the middle one
+     * lies left of the long edge and the leftmost when it lies right.
+     * geprobe 10 (fw 6.60) scene 57 shows it. It draws scene 48's 48 3D
+     * triangles again in through mode at psprecomp's corners, with the
+     * depth the PSP gives each corner as a point: this rule reproduces
+     * every pixel of all 48, where the colour's leftmost corner fits 28
+     * and no single corner, nor top, bottom, depth or angle, fits more
+     * than 31. With those corner depths scene 48's 3D planes match too,
+     * 47 of 48 (one corner a sixteenth off), so the 3D path is the same.
+     * The right triangles of scenes 27, 46 and 50, which settled the
+     * plane, have their middle corner right of a vertical long edge, so
+     * there the rule is the leftmost, as before; scenes 17 and 36 go to
+     * no pixel off and scene 27 from 1867 to 1290; with geprobe 12's
+     * vertex depths every 3D depth plane matches. Corners outside the
+     * scissor compete too: geprobe 14 scene 97 draws scene 87's
+     * triangles with corner depths, and an anchor among the corners
+     * inside the scissor is 10,584 depth pixels off where this is none. */
+    const int64_t zv[3] = { depth_value(a->z), depth_value(b->z), depth_value(c->z) };
+    plane depth = plane_setup(&tp, zv);
 
-    /* The edge functions are already the barycentric numerators, so texture
+    /* The edge functions are the barycentric numerators, so texture
      * coordinates come out of the same three values the coverage test
-     * computes.
-     *
-     * Texture coordinates
-     * are not: transformed vertices retain reciprocal clip W (and a texture
-     * projection Q), so the textured branch below performs the homogeneous
-     * divide the PSP uses on oblique geometry. Through-mode vertices carry
-     * ones and reduce exactly to the old affine result. */
-    const float inv = 1.0f / (float)area;
+     * computes (tri_uv). */
     const int textured = texture_usable();
-    int lod16 = 0;
-    if (textured) {
-        /* The texture gradient across the triangle: solve the affine map from
-         * pixels to texels on the two edges from a. */
-        const float e1x = (float)(b->x - a->x) / 16.0f, e1y = (float)(b->y - a->y) / 16.0f;
-        const float e2x = (float)(c->x - a->x) / 16.0f, e2y = (float)(c->y - a->y) / 16.0f;
-        const float det = e1x * e2y - e1y * e2x;
-        if (det != 0.0f) {
-            const float du1 = b->u - a->u, du2 = c->u - a->u, dv1 = b->v - a->v, dv2 = c->v - a->v;
-            const float dudx = (du1 * e2y - du2 * e1y) / det, dudy = (du2 * e1x - du1 * e2x) / det;
-            const float dvdx = (dv1 * e2y - dv2 * e1y) / det, dvdy = (dv2 * e1x - dv1 * e2x) / det;
-            const float rx = sqrtf(dudx * dudx + dvdx * dvdx), ry = sqrtf(dudy * dudy + dvdy * dvdy);
-            const float w = (psp_render_vertex_w(a) + psp_render_vertex_w(b) + psp_render_vertex_w(c)) / 3.0f;
-            lod16 = psp_render_lod16(&g_tex, rx > ry ? rx : ry, w);
-        }
-    }
+    const int lod16 = textured ? psp_render_tri_lod16(&g_tex, a, b, c) : 0;
 
     for (int y = miny; y <= maxy; y++) {
         int64_t w0 = row0, w1 = row1, w2 = row2;
         int64_t acc[8];
-        for (int i = 0; i < nplanes; i++) acc[i] = col_acc[i];
-        int64_t zacc = z_acc;
+        for (int i = 0; i < nplanes; i++) acc[i] = col[i].acc;
+        int64_t zacc = depth.acc;
         for (int x = minx; x <= maxx; x++) {
             int64_t t0 = w0, t1 = w1, t2 = w2;
-            if (quirk) {
+            if (quirk.on) {
                 const int64_t xc = (int64_t)SUBPX * x + SUBPX_HALF + 1;
                 if (xc >= xlo && xc <= xhi) {
-                    if ((x & 3) == far_at[0]) t0 += far_lift[0];
-                    if ((x & 3) == far_at[1]) t1 += far_lift[1];
-                    if ((x & 3) == far_at[2]) t2 += far_lift[2];
+                    if ((x & 3) == quirk.at[0]) t0 += quirk.lift[0];
+                    if ((x & 3) == quirk.at[1]) t1 += quirk.lift[1];
+                    if ((x & 3) == quirk.at[2]) t2 += quirk.lift[2];
                 }
             }
             if (t0 + bias0 >= 0 && t1 + bias1 >= 0 && t2 + bias2 >= 0) {
-                const float l0 = (float)w0 * inv;
-                const float l1 = (float)w1 * inv;
-                const float l2 = (float)w2 * inv;
-
                 const int64_t zi = zacc >> 14;
                 const float z = zi < 0 ? 0.0f : (zi > 65535 ? 65535.0f : (float)zi);
 
                 const int fg = (int)plane_chan(acc[4]);
 
-                uint32_t col = last_rgba;
+                uint32_t rgba = last_rgba;
                 if (!flat)
-                    col = plane_chan(acc[0]) | plane_chan(acc[1]) << 8 |
-                          plane_chan(acc[2]) << 16 | plane_chan(acc[3]) << 24;
+                    rgba = plane_chan(acc[0]) | plane_chan(acc[1]) << 8 |
+                           plane_chan(acc[2]) << 16 | plane_chan(acc[3]) << 24;
 
                 if (textured) {
-                    /* Keep exact edge weights until the homogeneous divide.
-                     * Normalizing each one to float first can put an exact
-                     * integer UV just below its texel boundary. Half-pixel
-                     * aligned UI quads expose this as ragged nearest edges. */
-                    const double q0 = (double)w0 * a->inv_w;
-                    const double q1 = (double)w1 * b->inv_w;
-                    const double q2 = (double)w2 * c->inv_w;
-                    const double den = q0 * a->tex_q + q1 * b->tex_q + q2 * c->tex_q;
-                    const float u = den != 0.0 ? (float)((q0 * a->u + q1 * b->u + q2 * c->u) / den) : 0.0f;
-                    const float v = den != 0.0 ? (float)((q0 * a->v + q1 * b->v + q2 * c->v) / den) : 0.0f;
+                    float u, v;
+                    tri_uv(a, b, c, w0, w1, w2, &u, &v);
                     const uint32_t texel = sample_mip(u, v, lod16);
                     /* The watched pixel's two inputs, separately: which of the
                      * texel and the shaded vertex colour is the dark one is
@@ -1491,29 +1402,27 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
                     if (x == g_pw_x && y == g_pw_y)
                         fprintf(stderr, "pixsrc: (%d,%d) vcol %08X texel %08X uv %.1f,%.1f "
                                         "func %d tcc %d tex %08X %dx%d fmt %d lod %d\n",
-                                x, y, col, texel, (double)u, (double)v, g_tex.func,
+                                x, y, rgba, texel, (double)u, (double)v, g_tex.func,
                                 g_tex.tcc_rgba, g_tex.addr, g_tex.w, g_tex.h, g_tex.fmt, lod16);
-                    col = apply_texfunc(texel, col);
+                    rgba = apply_texfunc(texel, rgba);
                     g_px_tex++;
                 } else g_px_flat++;
                 /* After the texture function, which is what the mode is for:
                  * geprobe 14 scene 95's secondary-alone row draws through a
                  * black REPLACE texture and reads the secondary colour. */
                 if (sec)
-                    for (int k = 0; k < 3; k++) {
-                        const uint32_t v = chan(col, k) + plane_chan(acc[5 + k]);
-                        col = (col & ~(0xFFu << (8 * k))) | (v > 255 ? 255u : v) << (8 * k);
-                    }
-                col = apply_fog(col, fg);
-                shade_pixel(x, y, z, col);
+                    rgba = add_secondary(rgba, plane_chan(acc[5]) | plane_chan(acc[6]) << 8 |
+                                               plane_chan(acc[7]) << 16);
+                rgba = apply_fog(rgba, fg);
+                shade_pixel(x, y, z, rgba);
             }
             w0 -= d0y * SUBPX; w1 -= d1y * SUBPX; w2 -= d2y * SUBPX;
-            for (int i = 0; i < nplanes; i++) acc[i] += col_dx[i];
-            zacc += z_dx;
+            for (int i = 0; i < nplanes; i++) acc[i] += col[i].dx;
+            zacc += depth.dx;
         }
         row0 += d0x * SUBPX; row1 += d1x * SUBPX; row2 += d2x * SUBPX;
-        for (int i = 0; i < nplanes; i++) col_acc[i] += col_dy[i];
-        z_acc += z_dy;
+        for (int i = 0; i < nplanes; i++) col[i].acc += col[i].dy;
+        depth.acc += depth.dy;
     }
 }
 
@@ -1625,11 +1534,17 @@ static int64_t floor_div(int64_t n, int64_t d) {
     return n / d - (n % d < 0);
 }
 
+/* One screen axis of a line's walk: at step k its pixel is
+ * floor((p + d*k) / s). */
+typedef struct { int64_t p, d, s; } line_axis;
+
+static int64_t line_pixel(const line_axis *a, int64_t k) { return floor_div(a->p + a->d * k, a->s); }
+
 /* Intersect the integer sample interval with lo <= floor((p + d*i)/s)
  * <= hi. Clipping the interval first bounds the work even for very long
  * offscreen lines; it must not restart interpolation at the scissor edge. */
-static int line_clip_axis(int64_t p, int64_t d, int64_t s, int lo, int hi,
-                          int64_t *first, int64_t *last) {
+static int line_clip_axis(const line_axis *a, int lo, int hi, int64_t *first, int64_t *last) {
+    const int64_t p = a->p, d = a->d, s = a->s;
     const int64_t low = (int64_t)lo * s, high = ((int64_t)hi + 1) * s - 1;
     if (!d) return p >= low && p <= high;
     const int64_t begin = d > 0 ? -floor_div(p - low, d)
@@ -1668,7 +1583,7 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
      * Major index k = 0..n-1: pixel M0 + sm*k along the major axis, its
      * centre c0 + 16*sm*k; the minor pixel is
      * floor((m_a*|dM| + dm*sm*(centre - M_a)) / (16*|dM|)). Both are
-     * floor((p + d*k) / s), so one clip serves either. */
+     * floor((p + d*k) / s) (a line_axis), so one clip serves either. */
     /* A line as long across as down is y-major: geprobe 15 (fw 6.60) scene
      * 100's 256 lines at exactly 45 degrees, from 64 start offsets in each
      * direction, take their colour from y (2496 pixels a step off as
@@ -1685,6 +1600,8 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
     const int64_t n = sm > 0 ? Mend - M0 : M0 - Mend;
     const int64_t c0 = 16 * M0 + 8;                         /* centre of k = 0 */
     const int64_t pm = ma * adM + dm * sm * (c0 - Ma), dmk = 16 * dm, smd = 16 * adM;
+    const line_axis major = { M0, sm, 1 }, minor = { pm, dmk, smd };
+    const line_axis *on_x = xmajor ? &major : &minor, *on_y = xmajor ? &minor : &major;
     /* The ends go by the pixel's diamond, |x - cx| + |y - cy| < 1/2: the
      * last pixel is left out when the end lies in its diamond, and the pixel
      * before the first is drawn when the start lies in its diamond. On the
@@ -1707,7 +1624,7 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
         const int64_t mb = ma + dm;
         int64_t k = n - 1;
         for (int end = 0; end < 2; end++, k = -1) {
-            const int64_t Mp = M0 + sm * k, mp = floor_div(pm + dmk * k, smd);
+            const int64_t Mp = line_pixel(&major, k), mp = line_pixel(&minor, k);
             const int64_t pM = end ? Ma : Mb, pmin = end ? ma : mb;
             const int64_t dMaj = pM - (16 * Mp + 8), dMin = pmin - (16 * mp + 8);
             const int64_t sum = (dMaj < 0 ? -dMaj : dMaj) + (dMin < 0 ? -dMin : dMin);
@@ -1716,8 +1633,7 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
         }
     }
     if (last < first) return;
-    if (!line_clip_axis(xmajor ? M0 : pm, xmajor ? sm : dmk, xmajor ? 1 : smd, x0, x1, &first, &last) ||
-        !line_clip_axis(xmajor ? pm : M0, xmajor ? dmk : sm, xmajor ? smd : 1, y0, y1, &first, &last))
+    if (!line_clip_axis(on_x, x0, x1, &first, &last) || !line_clip_axis(on_y, y0, y1, &first, &last))
         return;
     /* Colour and depth at the projected centre, on the triangle's gradient
      * rule: the difference times area_rcp's reciprocal of the major length,
@@ -1755,8 +1671,7 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
             const int64_t sb = b->spec_set ? chan(b->spec, c) : 0;
             sg[c] = floor_shr((sb - sv[c]) * 16384 * lq, lsh);
         }
-    const int64_t za = !(a->z > 0.0f) ? 0 : (a->z >= 65535.0f ? 65535 : (int64_t)a->z);
-    const int64_t zb = !(b->z > 0.0f) ? 0 : (b->z >= 65535.0f ? 65535 : (int64_t)b->z);
+    const int64_t za = depth_value(a->z), zb = depth_value(b->z);
     const int64_t zg = floor_shr((zb - za) * 16384 * lq, lsh);
     /* Texture coordinates at the same point. Unprojected (through
      * mode), the texture coordinates go by a fixed step, texels a sixteenth,
@@ -1773,10 +1688,9 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
     for (int64_t k = first; k <= last; k++) {
         const int64_t dist16 = sm * (c0 - Ma) + 16 * k;    /* < 0 at k = -1 only */
         const float t = (float)((double)dist16 / (double)adM), s = 1.0f - t;
-        const int64_t Mp = M0 + sm * k, mp = floor_div(pm + dmk * k, smd);
         psp_vertex v = *a;
-        v.x = (int)(xmajor ? Mp : mp) * PSP_SUBPX + PSP_SUBPX / 2;
-        v.y = (int)(xmajor ? mp : Mp) * PSP_SUBPX + PSP_SUBPX / 2;
+        v.x = (int)line_pixel(on_x, k) * PSP_SUBPX + PSP_SUBPX / 2;
+        v.y = (int)line_pixel(on_y, k) * PSP_SUBPX + PSP_SUBPX / 2;
         v.z = (float)floor_div(za * 16384 + zg * dist16, 16384);
         v.rgba = 0;
         for (int c = 0; c < 4; c++)
@@ -1797,6 +1711,28 @@ void psp_render_walk_line(const psp_vertex *a, const psp_vertex *b,
         v.inv_w = v.tex_q = 1.0f;
         emit(&v, opaque);
     }
+}
+
+int psp_render_tri_lod16(const psp_tex_state *t, const psp_vertex *a,
+                         const psp_vertex *b, const psp_vertex *c) {
+    /* The texture gradient across the triangle: solve the affine map from
+     * pixels to texels on the two edges from a. */
+    const float e1x = (float)(b->x - a->x) / 16.0f, e1y = (float)(b->y - a->y) / 16.0f;
+    const float e2x = (float)(c->x - a->x) / 16.0f, e2y = (float)(c->y - a->y) / 16.0f;
+    const float det = e1x * e2y - e1y * e2x;
+    if (det == 0.0f) return 0;
+    const float du1 = b->u - a->u, du2 = c->u - a->u, dv1 = b->v - a->v, dv2 = c->v - a->v;
+    const float dudx = (du1 * e2y - du2 * e1y) / det, dudy = (du2 * e1x - du1 * e2x) / det;
+    const float dvdx = (dv1 * e2y - dv2 * e1y) / det, dvdy = (dv2 * e1x - dv1 * e2x) / det;
+    const float rx = sqrtf(dudx * dudx + dvdx * dvdx), ry = sqrtf(dudy * dudy + dvdy * dvdy);
+    const float w = (psp_render_vertex_w(a) + psp_render_vertex_w(b) + psp_render_vertex_w(c)) / 3.0f;
+    return psp_render_lod16(t, rx > ry ? rx : ry, w);
+}
+
+int psp_render_points_lod16(const psp_tex_state *t, const psp_vertex *v, int count) {
+    float w = 0.0f;
+    for (int i = 0; i < count; i++) w += psp_render_vertex_w(&v[i]);
+    return psp_render_lod16(t, 1.0f, count ? w / (float)count : 1.0f);
 }
 
 int psp_render_line_lod16(const psp_tex_state *t,
@@ -1822,11 +1758,7 @@ static void sw_point_sample(const psp_vertex *v, void *opaque) {
      * triangle's does: geprobe 14 (fw 6.60) scene 95's corner points read
      * primary plus secondary, and through a black REPLACE texture the
      * secondary alone. */
-    if (v->spec_set)
-        for (int k = 0; k < 3; k++) {
-            const uint32_t s = chan(col, k) + chan(v->spec, k);
-            col = (col & ~(0xFFu << (8 * k))) | (s > 255 ? 255u : s) << (8 * k);
-        }
+    if (v->spec_set) col = add_secondary(col, v->spec);
     shade_pixel(x, y, v->z, apply_fog(col, v->fog));
 }
 
@@ -1835,9 +1767,7 @@ static void sw_draw(int prim, const psp_vertex *v, int count) {
     const uint64_t t0 = now_ns();
     switch (prim) {
     case PSP_PRIM_POINTS: {
-        float w = 0.0f;
-        for (int i = 0; i < count; i++) w += psp_render_vertex_w(&v[i]);
-        int lod16 = psp_render_lod16(&g_tex, 1.0f, count ? w / (float)count : 1.0f);
+        int lod16 = psp_render_points_lod16(&g_tex, v, count);
         for (int i = 0; i < count; i++) sw_point_sample(&v[i], &lod16);
         break;
     }

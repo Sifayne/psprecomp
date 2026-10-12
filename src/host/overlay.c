@@ -146,8 +146,8 @@ static void open_menu(void) {
     o.capturing = 0;
     /* What the pad holds now: the pair that opened it, perhaps. */
     SDL_GameController *pad = input_pad();
-    o.pad_pair = pad ? (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) ? 1u : 0u) |
-                       (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) ? 2u : 0u) : 0u;
+    o.pad_pair = pad ? (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) ? INPUT_CHORD_VIEW : 0u) |
+                       (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) ? INPUT_CHORD_MENU : 0u) : 0u;
     o.status[0] = 0;
     input_take(INPUT_OVERLAY);
     psp_pause_request(1);
@@ -185,18 +185,6 @@ static int is_open(void) { return o.open; }
 
 /* ---- events ------------------------------------------------------------------------ */
 
-static int held_anything(void) {
-    int n;
-    const Uint8 *keys = SDL_GetKeyboardState(&n);
-    for (int i = 0; i < n; i++) if (keys[i]) return 1;
-    if (SDL_GetMouseState(NULL, NULL)) return 1;
-    SDL_GameController *pad = input_pad();
-    if (pad)
-        for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++)
-            if (SDL_GameControllerGetButton(pad, (SDL_GameControllerButton)i)) return 1;
-    return 0;
-}
-
 static void capture_event(const SDL_Event *e) {
     if (e->type == SDL_KEYDOWN && !e->key.repeat && o.capture_armed) {
         if (e->key.keysym.sym == SDLK_ESCAPE) { o.capturing = 0; return; }
@@ -227,14 +215,15 @@ static void event(const SDL_Event *e) {
     if (e->type == SDL_KEYDOWN && !e->key.repeat && e->key.keysym.sym == SDLK_ESCAPE &&
         !psp_ui_popup_open() && !o.confirm) { close_menu(); return; }
     if ((e->type == SDL_CONTROLLERBUTTONDOWN || e->type == SDL_CONTROLLERBUTTONUP) && e->cbutton.which == input_pad_id()) {
-        const unsigned bit = e->cbutton.button == SDL_CONTROLLER_BUTTON_BACK ? 1u :
-                             e->cbutton.button == SDL_CONTROLLER_BUTTON_START ? 2u : 0u;
+        const unsigned bit = input_chord_bit(e->cbutton.button);
         if (bit) {
             const unsigned before = o.pad_pair;
             if (e->cbutton.state) o.pad_pair |= bit; else o.pad_pair &= ~bit;
             /* View + Menu together, or Menu alone, closes it: on the way
              * down, so the release of the pair that opened it does not. */
-            if (e->cbutton.state && ((o.pad_pair == 3 && before != 3) || (bit == 2 && !(before & 1)))) {
+            const int pair = o.pad_pair == INPUT_CHORD_BOTH && before != INPUT_CHORD_BOTH;
+            const int menu_alone = bit == INPUT_CHORD_MENU && !(before & INPUT_CHORD_VIEW);
+            if (e->cbutton.state && (pair || menu_alone)) {
                 close_menu();
                 return;
             }
@@ -253,10 +242,9 @@ static void event(const SDL_Event *e) {
 
 static void option_row(int k);
 
-/* The player's "Save states" options. */
-static int load_mode(void) {             /* 0 ask first, 1 load at once, 2 keep an undo */
-    return (int)o.edit.number[PSP_OPT_STATE_LOAD];
-}
+/* The player's "Save states" options. STATE_LOAD's choices: */
+enum { LOAD_ASK, LOAD_AT_ONCE, LOAD_KEEP_UNDO };
+static int load_mode(void) { return (int)o.edit.number[PSP_OPT_STATE_LOAD]; }
 static int continue_at_start(void) { return o.edit.number[PSP_OPT_STATE_START] != 0; }
 
 static void slot_path(int slot, char *out, size_t size) {
@@ -383,7 +371,7 @@ static void request(int kind, int slot) {
  * game as it is kept first when undo is wanted. The game goes on to its
  * next safe point to load, so the menu closes. */
 static void load_from(int slot) {
-    if (load_mode() == 2 && slot != SLOT_UNDO) {
+    if (load_mode() == LOAD_KEEP_UNDO && slot != SLOT_UNDO) {
         o.load_after = slot + 1;
         request(PSP_STATE_SAVE, SLOT_UNDO);
     } else {
@@ -457,7 +445,7 @@ static void ask_load(int slot) {
         toast(line);
         return;
     }
-    if (load_mode() != 0) { load_from(slot); return; }
+    if (load_mode() != LOAD_ASK) { load_from(slot); return; }
     if (!o.open) open_menu();
     o.page = PAGE_LOAD;
     o.confirm = slot + 1;
@@ -581,7 +569,7 @@ static void confirm_prompt(void) {
                  "that version, as it was then; what has happened since you last saved here is lost.", name);
     else if (o.confirm_load)
         snprintf(text, sizeof text, "Load %s? What has happened since it was saved is lost%s.", name,
-                 load_mode() == 2 ? ", unless you load \"Before the last load\"" : "");
+                 load_mode() == LOAD_KEEP_UNDO ? ", unless you load \"Before the last load\"" : "");
     else
         snprintf(text, sizeof text, "Replace %s with the game as it is now?", name);
     const int answer = psp_ui_confirm(o.confirm_load ? "Load state" : "Save state", text,
@@ -677,35 +665,22 @@ static void quit_page(void) {
     }
 }
 
-static void frame(void) {
-    if (!o.started) return;
-    poll_states();
+/* Closed, the menu draws only what a key just did, for a moment. */
+static void closed_frame(void) {
     const int toast_on = o.toast[0] && SDL_GetTicks64() < o.toast_until;
-    if (!o.open) {
-        /* Closed, the menu draws only what a key just did, for a moment. */
-        if (toast_on) {
-            psp_ui_begin();
-            psp_ui_toast(o.toast);
-            psp_ui_end();
-            o.shown = 1;
-        } else if (o.shown) {
-            psp_ui_clear();
-            o.shown = 0;
-        }
-        return;
+    if (toast_on) {
+        psp_ui_begin();
+        psp_ui_toast(o.toast);
+        psp_ui_end();
+        o.shown = 1;
+    } else if (o.shown) {
+        psp_ui_clear();
+        o.shown = 0;
     }
-    o.shown = 1;
-    psp_ui_set_pad(input_pad());
-    if (o.capturing) {
-        if (!o.capture_armed && !held_anything()) o.capture_armed = 1;
-        if (SDL_GetTicks64() - o.capture_since >= CAPTURE_MS) o.capturing = 0;
-    }
-    psp_ui_begin();
-    psp_ui_panel_begin();
-    char title[160];
-    snprintf(title, sizeof title, "%s -- paused", psp_title_info.name ? psp_title_info.name : "Game");
-    psp_ui_accent(title);
-    psp_ui_side_begin(220, 0);
+}
+
+/* The list of pages, turning to the one chosen: 1 when Resume was. */
+static int page_list(void) {
     const int resume = psp_ui_nav_action("Resume", o.page == PAGE_RESUME);
     if (psp_ui_nav("Save state", o.page == PAGE_SAVE) && o.page != PAGE_SAVE) { o.page = PAGE_SAVE; read_slots(); }
     if (psp_ui_nav("Load state", o.page == PAGE_LOAD) && o.page != PAGE_LOAD) { o.page = PAGE_LOAD; read_slots(); }
@@ -714,7 +689,10 @@ static void frame(void) {
         if (psp_ui_nav(o.pages[p], o.page == PAGE_SCHEMA + p)) o.page = PAGE_SCHEMA + p;
     if (psp_ui_nav("Performance", o.page == page_performance())) o.page = page_performance();
     if (psp_ui_nav("Quit", o.page == page_quit())) o.page = page_quit();
-    psp_ui_side_next();
+    return resume;
+}
+
+static void page_body(void) {
     if (o.page == PAGE_RESUME) {
         psp_ui_heading("Paused");
         psp_ui_text("The game waits here. Escape resumes it, and so do Menu, View + Menu and B on the controller.");
@@ -724,21 +702,45 @@ static void frame(void) {
     else if (o.page == page_performance()) performance_page();
     else if (o.page == page_quit()) quit_page();
     else schema_page(o.pages[o.page - PAGE_SCHEMA]);
+}
+
+/* Press-to-bind waiting for a control: what to press, once all is let go. */
+static void capture_prompt(void) {
+    static const char *const how[] = {
+        "Press a key. Escape cancels, Delete unbinds.",
+        "Press a button, or push a stick or trigger. Escape cancels, Delete unbinds.",
+        "Press a mouse button or turn the wheel. Escape cancels, Delete unbinds.",
+    };
+    char text[256];
+    snprintf(text, sizeof text, "%s%s", o.capture_armed ? "" : "Let go of everything first. ",
+             how[o.capture_device]);
+    psp_ui_prompt(input_row_label(o.capture_row), text);
+}
+
+static void frame(void) {
+    if (!o.started) return;
+    poll_states();
+    if (!o.open) { closed_frame(); return; }
+    o.shown = 1;
+    psp_ui_set_pad(input_pad());
+    if (o.capturing) {
+        if (!o.capture_armed && input_neutral()) o.capture_armed = 1;
+        if (SDL_GetTicks64() - o.capture_since >= CAPTURE_MS) o.capturing = 0;
+    }
+    psp_ui_begin();
+    psp_ui_panel_begin();
+    char title[160];
+    snprintf(title, sizeof title, "%s -- paused", psp_title_info.name ? psp_title_info.name : "Game");
+    psp_ui_accent(title);
+    psp_ui_side_begin(220, 0);
+    const int resume = page_list();
+    psp_ui_side_next();
+    page_body();
     psp_ui_help_area();
     if (o.status[0]) psp_ui_note(o.status);
     psp_ui_side_end();
     psp_ui_panel_end();
-    if (o.capturing) {
-        static const char *const how[] = {
-            "Press a key. Escape cancels, Delete unbinds.",
-            "Press a button, or push a stick or trigger. Escape cancels, Delete unbinds.",
-            "Press a mouse button or turn the wheel. Escape cancels, Delete unbinds.",
-        };
-        char text[256];
-        snprintf(text, sizeof text, "%s%s", o.capture_armed ? "" : "Let go of everything first. ",
-                 how[o.capture_device]);
-        psp_ui_prompt(input_row_label(o.capture_row), text);
-    }
+    if (o.capturing) capture_prompt();
     confirm_prompt();
     psp_ui_end();
     if (resume) close_menu();

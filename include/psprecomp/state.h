@@ -59,8 +59,10 @@ void psp_state_register(const psp_state_part *part);
 /* What a state's bytes mean, beyond what the fingerprint sees for itself.
  * Raise it when a kept variable's bytes, or a part's chunks, change meaning
  * without any kept variable changing size: states written before then would
- * load into the new build and be misread. */
-#define PSP_STATE_LAYOUT 1
+ * load into the new build and be misread.
+ *   2  a thread's WaitThreadEnd waiters (psp_thread.enders) are packed. They
+ *      wrapped at 32 with emptied places kept, and the count grew past 32. */
+#define PSP_STATE_LAYOUT 2
 
 /* This build, as states know it: the executable's hash, and the
  * fingerprint of everything a state's bytes depend on -- the file format,
