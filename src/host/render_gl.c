@@ -386,6 +386,7 @@ typedef struct {
     GLint fogenable, fogcolour;
     GLint texscale, bloom;
     GLint snap, snaph;
+    GLint flat;
 } uniforms;
 /* The std140 block both model shaders read (Xform), laid out by hand: every
  * member is a vec4 / ivec4 / mat4 so the C offsets are the GLSL ones. */
@@ -905,6 +906,7 @@ static const char *GS_MODEL_SRC =
     "layout(std140) uniform Xform { XformBlock xb[16]; };\n"
     "#define X xb[v[0].draw]\n"
     "uniform int u_texenable;\n"
+    "uniform int u_flat;\n"
     "uniform vec2 u_viewport; uniform vec4 u_placement; uniform float u_ybias;\n"
     "out vec4 v_col;\n"
     "noperspective out vec3 v_uvq;\n"
@@ -991,6 +993,7 @@ static const char *GS_MODEL_SRC =
     "/* emit_tri, ge.c, for one triangle of the batch. */\n"
     "void main() {\n"
     "    CV tri[3]; tri[0] = cv_of(0); tri[1] = cv_of(1); tri[2] = cv_of(2);\n"
+    "    if (u_flat != 0) { tri[0].col = tri[2].col; tri[1].col = tri[2].col; }\n"
     "    int behind = 0;\n"
     "    for (int i = 0; i < 3; i++) if (tri[i].c.w <= 0.0) behind++;\n"
     "    if (behind == 3) return;\n"
@@ -1366,7 +1369,7 @@ static void lookup_uniforms(GLuint prog, uniforms *u) {
     U(env, "u_env"); U(tex, "u_tex"); U(texscale, "u_texscale"); U(bloom, "u_bloom");
     U(minfilter, "u_minfilter"); U(magfilter, "u_magfilter"); U(wraps, "u_wraps"); U(wrapt, "u_wrapt");
     U(miptop, "u_miptop"); U(fogenable, "u_fogenable"); U(fogcolour, "u_fogcolour");
-    U(snap, "u_snap"); U(snaph, "u_snaph");
+    U(snap, "u_snap"); U(snaph, "u_snaph"); U(flat, "u_flat");
 #undef U
 }
 static void use_program(GLuint prog, uniforms *u) { p_glUseProgram(prog); g.cur_prog = prog; g.u = u; }
@@ -1583,12 +1586,10 @@ static void rt_release(rendertarget *r) {
     rt_watch_writes();
 }
 
-/* A target's pixel to 8888 and back. A display format outside 0..3 (the
- * guest's own, through sceDisplaySetFrameBuf) reads as 5551 and writes as
- * 4444. */
+/* A target's pixel to 8888 and back. The format is 0..3: the GE's is two
+ * bits, and sceDisplaySetFrameBuf refuses any other. */
 static uint32_t decode_pixel(uint32_t v, int fmt) {
-    if (fmt == 3) return v;
-    return psp_pixel_unpack16(v, fmt == 0 || fmt == 2 ? fmt : 1);
+    return fmt == 3 ? v : psp_pixel_unpack16(v, fmt);
 }
 static uint32_t pack_pixel(uint32_t rgba, int fmt) {
     return fmt == 3 ? rgba : psp_pixel_pack16(rgba, fmt);
@@ -2552,9 +2553,11 @@ static GLuint texcache_native(const psp_tex_state *t, uint32_t supplied) {
      * palette.  Returning its RGBA attachment used to skip that byte-level
      * reinterpretation and produced the bright menu shards and mirrored
      * mission foreground.  Synchronise such aliases to guest memory and send
-     * them through the common decoder instead. */
+     * them through the common decoder instead. Targets are found by the
+     * address without its cache bits, as texcache_get finds them. */
+    const uint32_t base = t->addr & PSP_ADDR_MASK;
     for (int i = 0; i < g.n_rts; i++) {
-        if (g.rts[i].used && g.rts[i].addr == t->addr) {
+        if (g.rts[i].used && g.rts[i].addr == base) {
             g.tex_from_rt++;
             rendertarget *r = &g.rts[i];
             if (r->configured && samples_target_whole(r, t)) {
@@ -2574,7 +2577,7 @@ static GLuint texcache_native(const psp_tex_state *t, uint32_t supplied) {
      * level the sampler can reach before decoding; checking only level zero
      * leaves a perfectly keyed cache holding yesterday's generated mip. */
     for (int level = 1; level <= top; level++) {
-        const uint32_t addr = level_addr(t, level);
+        const uint32_t addr = level_addr(t, level) & PSP_ADDR_MASK;
         for (int i = 0; addr && i < g.n_rts; i++) {
             rendertarget *r = &g.rts[i];
             if (!r->used || r->addr != addr) continue;
@@ -2615,7 +2618,7 @@ static GLuint texcache_get(const psp_tex_state *t) {
     uint32_t supplied = 0;
     double sx = 1, sy = 1;
     const uint32_t base = t->addr & PSP_ADDR_MASK;
-    const uint64_t end = (uint64_t)base + (uint64_t)t->stride * t->h * (t->fmt == 3 ? 4 : 2);
+    const uint64_t end = (uint64_t)base + level_bytes(t, 0);
     /* In either mode: at native the scale is one and the view is a copy of
      * the target's rows under the texture, which is what a texture over a
      * 272-row target and 240 rows of whatever follows it needs. The one case
@@ -2790,11 +2793,15 @@ static int triangle_lod16(const psp_vertex *a, const psp_vertex *b,
     return g.tex_enable ? psp_render_tri_lod16(&g.tex, a, b, c) : 0;
 }
 
+/* Flat shading (SHADE clear) makes the triangle its last vertex's colour,
+ * c as gl_draw passes it, the rule render.c's sw_tri keeps. */
 static void push_triangle(const psp_vertex *a, const psp_vertex *b,
                           const psp_vertex *c) {
     const int lod16 = triangle_lod16(a, b, c);
     reserve_vertices(3);
-    push(a, lod16); push(b, lod16); push(c, lod16);
+    psp_vertex fa = *a, fb = *b;
+    if (g.bs.shade_flat) fa.rgba = fb.rgba = c->rgba;
+    push(&fa, lod16); push(&fb, lod16); push(c, lod16);
 }
 
 /* A sprite is two triangles from opposite corners, axis-aligned, taking its
@@ -3199,7 +3206,11 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
         const int y1 = reach_y ? g.h - 1 + reach_y : g.sc_valid && g.sc_y1 < r->guest_h - 1 ? g.sc_y1 : r->guest_h - 1;
         for (int i = 0; i + 1 < count; i += prim == PSP_PRIM_LINES ? 2 : 1) {
             int lod16 = psp_render_line_lod16(&g.tex, &v[i], &v[i + 1]);
-            psp_render_walk_line(&v[i], &v[i + 1], x0, y0, x1, y1, push_point_sample, &lod16);
+            /* A flat-shaded line is its second vertex's colour throughout,
+             * as in render.c. */
+            psp_vertex fa = v[i];
+            if (g.bs.shade_flat) fa.rgba = v[i + 1].rgba;
+            psp_render_walk_line(&fa, &v[i + 1], x0, y0, x1, y1, push_point_sample, &lod16);
         }
         break;
     }
@@ -3222,7 +3233,7 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
     case PSP_PRIM_SPRITES:                         /* in pairs */
         for (int i = 0; i + 1 < count; i += 2) push_sprite(&v[i]);
         break;
-    default:
+    default:                                       /* type 7, which names no primitive */
         g.unsupported_prims++;
         break;
     }
@@ -3487,7 +3498,7 @@ static void apply_blend(void) {
                   double_alpha ? 3 : preblend_src ? (g.bs.dst == PSP_BF_ONE_MINUS_SRC_ALPHA ? 2 : 1) : 0);
 }
 
-/* The shader's texture, fog and alpha-test uniforms. */
+/* The shader's texture, fog, shading and alpha-test uniforms. */
 static void apply_uniforms(void) {
     p_glUniform1i(g.u->texenable, g.tex_enable ? 1 : 0);
     p_glUniform1i(g.u->texfunc, g.tex.func);
@@ -3516,6 +3527,8 @@ static void apply_uniforms(void) {
     p_glUniform1i(g.u->fogenable, g.fog_enable ? 1 : 0);
     p_glUniform3f(g.u->fogcolour, channel01(g.fog_colour, 0), channel01(g.fog_colour, 1),
                   channel01(g.fog_colour, 2));
+    /* The model path's only: the CPU path's vertices are flattened in C. */
+    p_glUniform1i(g.u->flat, g.bs.shade_flat ? 1 : 0);
 
     p_glUniform1i(g.u->atest, g.bs.alpha_test ? g.bs.alpha_func : 1);
     p_glUniform1i(g.u->aref,  g.bs.alpha_ref);
@@ -4623,7 +4636,7 @@ static void report_unrepresented(FILE *out) {
         fprintf(out, ", %llu batch flush(es) from overflow",
                 (unsigned long long)g.batch_overflows);
     if (g.unsupported_prims)
-        fprintf(out, ", %llu point/line draw(s) skipped",
+        fprintf(out, ", %llu draw(s) of primitive type 7 skipped",
                 (unsigned long long)g.unsupported_prims);
     if (g.partial_pixel_masks)
         fprintf(out, ", %llu draw(s) with a partial pixel mask written whole",

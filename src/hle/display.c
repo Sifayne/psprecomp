@@ -30,6 +30,8 @@
 #define PSP_DISPLAY_PIXEL_FORMAT_5551 1
 #define PSP_DISPLAY_PIXEL_FORMAT_4444 2
 #define PSP_DISPLAY_PIXEL_FORMAT_8888 3
+/* SCE_ERROR_INVALID_FORMAT, sceDisplaySetFrameBuf's answer to any other. */
+#define SCE_DISPLAY_ERROR_INVALID_FORMAT 0x80000108u
 
 static uint32_t g_fb_addr;
 static uint32_t g_fb_width;      /* in pixels, the stride -- usually 512 */
@@ -283,6 +285,10 @@ static void score_frame(uint32_t base) {
 
 static void hle_SetFrameBuf(void) {
     /* (topaddr, bufferwidth, pixelformat, sync) */
+    /* A pixel format past 8888 is refused, and the buffer shown is kept:
+     * pspautotests' display/setframebuf reads 0x80000108 for 4 and for -1
+     * on a PSP. So the backends see only 0..3. */
+    if (psp_arg(2) > PSP_DISPLAY_PIXEL_FORMAT_8888) { psp_ret(SCE_DISPLAY_ERROR_INVALID_FORMAT); return; }
     g_fb_addr   = psp_arg(0);
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);
