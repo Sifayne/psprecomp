@@ -16,10 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Threads alive at once, plus the main context. Dead slots are reused (see
- * psp_sched_spawn), so this bounds what is running, not what has run; the
- * thread manager's table is the same size. */
-#define MAX_SCHED_THREADS 1026
+#define MAX_SCHED_THREADS PSP_SCHED_THREADS_MAX
 #define MAIN_SLOT         0        /* the context module_start runs on */
 /* Timer handlers one idle handoff may run before it gives up; see there. */
 #define IDLE_TIMER_CAP    100000

@@ -12,9 +12,9 @@
 
 /* Which queue each parked thread is in; see psp_waitq_leave. One entry per
  * waiting thread, kept packed, with room for every thread the scheduler can
- * hold (MAX_SCHED_THREADS in sched.c). At 512 the 513th thread to park got
- * no entry, and psp_waitq_leave then missed it on a timeout or a release. */
-#define WAITQ_PARKED_MAX 1026
+ * hold. At 512 the 513th thread to park got no entry, and psp_waitq_leave
+ * then missed it on a timeout or a release. */
+#define WAITQ_PARKED_MAX PSP_SCHED_THREADS_MAX
 static struct { uint32_t uid; psp_waitq *q; } g_parked[WAITQ_PARKED_MAX];
 static int g_nparked;
 

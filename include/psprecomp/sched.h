@@ -58,6 +58,10 @@ void psp_sched_reset(void);
  * module_start thread has on hardware (psp_threadman_current_priority). */
 #define PSP_MAIN_THREAD_PRIORITY 0x20
 
+/* Threads alive at once, plus the main context. Dead slots are reused (see
+ * psp_sched_spawn), so this bounds what is running, not what has run. */
+#define PSP_SCHED_THREADS_MAX 1026
+
 /* Turn real threading off, for a caller that must stay single-context and
  * deterministic.
  *
