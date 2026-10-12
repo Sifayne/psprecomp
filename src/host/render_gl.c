@@ -3235,7 +3235,7 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
     case PSP_PRIM_SPRITES:                         /* in pairs */
         for (int i = 0; i + 1 < count; i += 2) push_sprite(&v[i]);
         break;
-    default:                                       /* type 7, which names no primitive */
+    default:                                       /* type 7, which nothing here draws */
         g.unsupported_prims++;
         break;
     }
