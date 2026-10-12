@@ -1,11 +1,11 @@
-/* A game's prepared builds and the one a save state needs (src/host/builds.h):
+/* A game's prepared builds and the one a save state needs (psprecomp/builds.h):
  * a build's identity, noted or hashed from its executable and then noted;
  * the build a state's executable names; and which builds are removed -- the
  * ones no state needs, never the current one, never a folder that is not a
  * build or a link to one, and nothing while the states cannot be read or
  * the current build cannot say its fingerprint. Its argument is a folder to
  * work in. */
-#include "../src/host/builds.h"
+#include "psprecomp/builds.h"
 #include "psprecomp/mem.h"
 
 #include <assert.h>

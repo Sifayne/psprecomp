@@ -1001,7 +1001,7 @@ int main(int argc, char **argv) {
      * game last closed, if this build can load it. One it cannot is moved
      * aside before this run quits and writes its own: the earlier version's
      * place, which the menu offers to continue in that version, and which
-     * keeps that build from being removed (src/host/builds.h). */
+     * keeps that build from being removed (psprecomp/builds.h). */
     if (!load_state && settings.number[PSP_OPT_STATE_START]) {
         static char quit[1100];
         psp_state_info info;

@@ -523,7 +523,7 @@ class Library:
 
     def note_state_id(self, build, log):
         """The build as save states know it (boot --state-id), noted beside
-        it for the launcher and the game's menu (src/host/builds.h): a state
+        it for the launcher and the game's menu (psprecomp/builds.h): a state
         this build cannot load is played in the build that wrote it."""
         try:
             done = subprocess.run([str(build / "game"), str(build / "module.elf"), "--state-id"], env=self.env,
@@ -539,7 +539,7 @@ class Library:
 
     def earlier_build(self, book, module_path):
         """An earlier build of an installed game, kept for its save states
-        (src/host/builds.h): its folder in the game's folder of builds, with
+        (psprecomp/builds.h): its folder in the game's folder of builds, with
         its own game, module and record, for the same disc."""
         folder = Path(module_path).parent
         slug = folder.parent.name

@@ -16,7 +16,7 @@
 #include "psprecomp/host/settings.h"
 #include "psprecomp/hle.h"
 #include "psprecomp/state.h"
-#include "builds.h"
+#include "psprecomp/builds.h"
 #include "pages.h"
 #include "ui.h"
 #include <SDL2/SDL.h>
@@ -94,7 +94,7 @@ typedef struct {
     pid_t child; int child_error_fd;
     char child_error[2048]; size_t child_error_len;
     /* The build the game's place on quitting needs, when this one cannot
-     * load it (src/host/builds.h), the player's answer, and when the place
+     * load it (psprecomp/builds.h), the player's answer, and when the place
      * was saved. */
     char earlier[4096]; int earlier_choice; int64_t earlier_saved;
 } launcher;
@@ -323,7 +323,7 @@ static int game_folder(launcher *a, const char *kind, char *out, size_t cap) {
     int n = snprintf(out, cap, "%s/%s/%s", root, kind, a->games[a->game].slug);
     return n > 0 && (size_t)n < cap ? 0 : -1;
 }
-/* States across updates (src/host/builds.h). The selected game's place on
+/* States across updates (psprecomp/builds.h). The selected game's place on
  * quitting, when the build about to play cannot load it but the build that
  * wrote it is kept: that build, into a->earlier. A build that cannot say
  * its fingerprint is asked nothing of; the game sets the place aside

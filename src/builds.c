@@ -1,8 +1,8 @@
-/* A game's prepared builds, and the one a save state needs. See builds.h. */
+/* A game's prepared builds, and the one a save state needs. See psprecomp/builds.h. */
 #if !defined(_GNU_SOURCE) && !defined(_XOPEN_SOURCE)
 #define _XOPEN_SOURCE 700
 #endif
-#include "builds.h"
+#include "psprecomp/builds.h"
 
 #include "psprecomp/state.h"
 

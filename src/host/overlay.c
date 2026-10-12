@@ -24,7 +24,7 @@
  * The C here is the menu; src/host/ui.cpp draws it with Dear ImGui. Both run
  * on the SDL thread only. */
 #include "overlay.h"
-#include "builds.h"
+#include "psprecomp/builds.h"
 
 #include "input.h"
 #include "pages.h"
@@ -85,7 +85,7 @@ static struct {
     int have[SLOT_FILES];
     psp_state_info info[SLOT_FILES];
     /* For a state this build cannot load: the build that wrote it, when it
-     * is kept (src/host/builds.h), to restart the game in. */
+     * is kept (psprecomp/builds.h), to restart the game in. */
     int kept[SLOT_FILES];
     char build[SLOT_FILES][1024];
     unsigned waiting;

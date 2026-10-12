@@ -1391,7 +1391,7 @@ them, decided with Sif:
 - **The fingerprint** (format 3, above under *What a state holds*): a state
   loads into any build whose layout's fingerprint it shares, so an update
   that leaves what a state holds alone keeps every state loadable.
-- **The earlier build, kept** (`src/host/builds.h`). The importer already kept
+- **The earlier build, kept** (`psprecomp/builds.h`). The importer already kept
   every prepared build, `games/<slug>/<build>-<time>`. It now notes each new
   one's identity beside it, `state-id` (`boot --state-id`: the executable's
   hash and the fingerprint); a build from before has its executable hashed

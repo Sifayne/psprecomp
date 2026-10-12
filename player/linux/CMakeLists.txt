@@ -51,10 +51,9 @@ target_compile_options(player_imgui PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-fno-exce
 set_target_properties(player_imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(player_imgui PRIVATE runtime PkgConfig::SDL)
 set(PLAYER_UI "${TOOLKIT}/src/host/overlay.c" $<TARGET_OBJECTS:player_imgui>)
-set(PLAYER_BUILDS "${TOOLKIT}/src/host/builds.c")
 set(PLAYER_HOST "${TOOLKIT}/src/host/present.c" "${TOOLKIT}/src/host/input.c" "${TOOLKIT}/src/host/save_dialog.c"
-    "${TOOLKIT}/src/host/render_gl.c" ${PLAYER_UI} "${PLAYER_SETTINGS}" "${PLAYER_BUILDS}")
-set(PLAYER_LAUNCHER "${TOOLKIT}/src/host/launcher.c" "${PLAYER_BUILDS}")
+    "${TOOLKIT}/src/host/render_gl.c" ${PLAYER_UI} "${PLAYER_SETTINGS}")
+set(PLAYER_LAUNCHER "${TOOLKIT}/src/host/launcher.c")
 
 # What every game links on the player's machine, with its pack's host
 # objects or, for a game with no pack, title_plain.c (compile_game.py): the
@@ -91,8 +90,7 @@ add_library(test_pack_plugin MODULE "${TOOLKIT}/tests/test_pack_plugin.c" "${TOO
 target_include_directories(test_pack_plugin PRIVATE "${TOOLKIT}/include")
 set_target_properties(test_pack_plugin PROPERTIES PREFIX "" OUTPUT_NAME launcher
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packs/gamma/built")
-add_executable(player-launcher-tests "${TOOLKIT}/tests/test_launcher.c" $<TARGET_OBJECTS:player_imgui> "${PLAYER_SETTINGS}"
-    "${PLAYER_BUILDS}")
+add_executable(player-launcher-tests "${TOOLKIT}/tests/test_launcher.c" $<TARGET_OBJECTS:player_imgui> "${PLAYER_SETTINGS}")
 target_compile_definitions(player-launcher-tests PRIVATE HAVE_SDL2)
 target_compile_options(player-launcher-tests PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_link_libraries(player-launcher-tests PRIVATE runtime PkgConfig::SDL ${CMAKE_DL_LIBS})

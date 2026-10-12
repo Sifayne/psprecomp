@@ -476,7 +476,7 @@ static void bind(void) {
     finish_loop("bind");
 }
 
-/* States from an earlier version (src/host/builds.h): what the menu says of
+/* States from an earlier version (psprecomp/builds.h): what the menu says of
  * one whose build is kept and of one whose build is gone; that loading the
  * kept one asks to restart in that version, and the gone one is refused; and
  * what the restart starts with -- this run's arguments, with the build's

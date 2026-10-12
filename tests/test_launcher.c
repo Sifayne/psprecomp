@@ -227,7 +227,7 @@ int main(int argc, char **argv) {
     select_game(&a, 3); draw(&a);
     assert(a.pack == -1 && !group_pages(&a, GROUP_PACK, names) && group_pages(&a, GROUP_PLAYER, names) == 6);
 
-    /* States across updates (src/host/builds.h). Zeta's builds: the one it
+    /* States across updates (psprecomp/builds.h). Zeta's builds: the one it
      * plays, the earlier one its place on quitting was saved in, and a spare
      * no state needs. Play asks where to play; each answer starts its build,
      * the earlier one by its own module; and once the game is over the spare
