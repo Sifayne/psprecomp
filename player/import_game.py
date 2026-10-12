@@ -498,6 +498,7 @@ class Library:
                 shutil.move(module_path, ready / "module.elf")
                 if modules:
                     shutil.move(tmp / "modules", ready / "modules")
+                self.note_state_id(ready, log)
             after = iso.stat()
             if (after.st_size, after.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
                 raise ValueError("The ISO changed during preparation. Please import it again.")
@@ -519,6 +520,47 @@ class Library:
             self.refresh()
             print(f"Ready: {profile['title']}. Choose Save and play.", flush=True)
             return slug
+
+    def note_state_id(self, build, log):
+        """The build as save states know it (boot --state-id), noted beside
+        it for the launcher and the game's menu (src/host/builds.h): a state
+        this build cannot load is played in the build that wrote it."""
+        try:
+            done = subprocess.run([str(build / "game"), str(build / "module.elf"), "--state-id"], env=self.env,
+                                  cwd=str(build), capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"state-id: {error}", file=log, flush=True)
+            return
+        found = re.search(r"^state-id: exe ([0-9a-f]{16}) fingerprint ([0-9a-f]{16})$", done.stdout, re.M)
+        if not found or done.returncode:
+            print(f"state-id: the build could not say (exit {done.returncode})", file=log, flush=True)
+            return
+        (build / "state-id").write_text(f"exe {found[1]}\nfingerprint {found[2]}\n")
+
+    def earlier_build(self, book, module_path):
+        """An earlier build of an installed game, kept for its save states
+        (src/host/builds.h): its folder in the game's folder of builds, with
+        its own game, module and record, for the same disc."""
+        folder = Path(module_path).parent
+        slug = folder.parent.name
+        entry = book["games"].get(slug)
+        if (entry is None or folder.parent != self.data / "games" / slug or folder == Path(entry["directory"])
+                or Path(module_path).name != "module.elf" or not (folder / "module.elf").is_file()
+                or not (folder / "game").is_file() or not os.access(folder / "game", os.X_OK)):
+            return None
+        try:
+            record = json.loads((folder / "build.json").read_text())
+        except (OSError, ValueError):
+            return None
+        if record.get("elf_sha256") != entry.get("elf_sha256"):
+            return None
+        try:
+            iso = Path(entry["iso"]).stat()
+        except OSError:
+            return None
+        if iso.st_size != entry.get("iso_size") or iso.st_mtime_ns != entry.get("iso_mtime_ns"):
+            return None
+        return slug, dict(entry, directory=str(folder))
 
     def disc_modules(self, run, ar, iso, tmp, executable):
         """Every module on the disc, ready to recompile beside the executable
@@ -590,7 +632,12 @@ class Library:
         book = self.records()
         found = next(((slug, entry) for slug, entry in book["games"].items()
                       if Path(entry["directory"]) / "module.elf" == Path(module_path)), None)
-        if not found or not self.ready(*found):
+        if found and not self.ready(*found):
+            raise ValueError("This game needs preparation or its ISO has moved. Use Add game to select the ISO again.")
+        # An earlier build, kept for a save state only it can load, plays as
+        # it was built: whatever the app has become since.
+        found = found or self.earlier_build(book, module_path)
+        if not found:
             raise ValueError("This game needs preparation or its ISO has moved. Use Add game to select the ISO again.")
         slug, entry = found
         save_root = self.data / "saves" / slug
