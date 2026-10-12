@@ -121,9 +121,13 @@ int  psp_sched_block(uint32_t uid, psp_sched_state why, const char *what);
  * the case an undated block has to refuse.
  *
  * `deadline_us` is absolute guest microseconds, from psp_clock_peek(); 0 means
- * no deadline, which makes this identical to psp_sched_block. A caller asking
- * for a zero-length timeout wants the shortest deadline that exists, not the
- * absence of one, so it should pass `psp_clock_peek() + 1`.
+ * no deadline, which makes this identical to psp_sched_block. A zero-length
+ * timeout is not the absence of one but a deadline that has already arrived,
+ * so a caller asking for one passes psp_clock_peek() itself (or 1 while the
+ * clock still reads 0), as psp_wait_deadline does: the wait expires at once,
+ * without a handoff. One microsecond later would park instead, and a wait
+ * that succeeds at once would leave 1 in the timeout word, where hardware
+ * leaves 0.
  *
  * Returns PSP_SCHED_WOKEN, PSP_SCHED_EXPIRED, PSP_SCHED_RELEASED or
  * PSP_SCHED_STRANDED. */

@@ -16,11 +16,12 @@
  * status, and the kernel objects it waits on. Waits park the caller and signals
  * release it.
  *
- * The one place the model still shows through: with no preemption and no clock,
- * a wait that nothing could ever satisfy -- because no other thread is runnable
- * -- cannot be waited out. A caller that supplied a timeout is told it elapsed;
- * one that did not is not lied to, because a fabricated timeout is something a
- * game acts on. See wait_deadlock.
+ * The one place the model still shows through is a wait that nothing could
+ * ever end: no other thread is runnable and no timer or interrupt is due. One
+ * with a timeout is still waited out -- the scheduler moves the guest clock to
+ * its deadline -- but one without cannot be, and the run stops rather than
+ * tell the guest a timeout elapsed, because a fabricated timeout is something
+ * a game acts on. See psp_wait_deadlock.
  */
 
 #include "psprecomp/hle.h"
@@ -65,7 +66,8 @@ enum { WAIT_NONE = 0, WAIT_SLEEP, WAIT_DELAY };
 #define PSP_THREAD_STATUS_SUSPEND 8
 #define PSP_THREAD_STATUS_STOPPED 16
 
-/* Threads one thread's end can release (psp_thread.enders). */
+/* Threads one thread's end can release (psp_thread.enders): as many as can
+ * wait on one object (PSP_WAITQ_MAX), and a 33rd is refused the same way. */
 #define MAX_THREAD_ENDERS 32
 
 typedef struct {
@@ -222,9 +224,6 @@ void psp_threadman_reset(void) {
 static void on_thread_end(uint32_t uid, uint32_t status);
 static void thread_ended(psp_thread *t, uint32_t status);
 static void drop_callbacks_of(uint32_t thread_uid);
-/* An emptied psp_thread.enders entry. Not 0, which is the main context. */
-#define NO_ENDER 0xFFFFFFFFu
-
 /* A timed wait ran out: out of its object's queue now (see psp_waitq_leave). */
 static void on_wait_expired(uint32_t uid) { (void)psp_waitq_leave(uid); }
 
@@ -275,27 +274,6 @@ static psp_evflag *find_flag(uint32_t id) {
     for (int i = 0; i < g_flag_hi; i++)
         if (g_flag[i].used && g_flag[i].uid == id) return &g_flag[i];
     return NULL;
-}
-
-/* A wait that can never complete, made by a caller that asked for no timeout.
- *
- * Reporting a timeout here is a lie, and a load-bearing one: this game's
- * user_main waits on its game thread with no timeout, and on being told the
- * wait timed out it deletes that thread -- still live, mid-frame -- and quits.
- * The whole run ended in a screen clear because of it.
- *
- * So the run stops and says why. A caller that *did* pass a timeout still gets
- * one, because for that caller a timeout is a true answer. */
-static void wait_deadlock(const char *what) {
-    fprintf(stderr,
-        "psprecomp: %s cannot be satisfied -- no thread is runnable, so nothing\n"
-        "  can ever signal it, and the caller passed no timeout. Reporting a\n"
-        "  timeout would make the guest act on a falsehood, so the run stops\n"
-        "  here instead. Live threads:\n", what);
-    psp_sched_dump_threads(stderr);
-    /* The reason rides along so the boot summary can tell a stopped run from
-     * one that finished -- both leave zero threads alive. */
-    psp_sched_stop_all(what);
 }
 
 /* Defined down with the waits, but needed above them: by the signal, and by
@@ -806,9 +784,8 @@ static void thread_ended(psp_thread *t, uint32_t status) {
     drop_callbacks_of(t->uid);
     psp_kernobj_thread_ended(t->uid);
     psp_kernlock_thread_ended(t->uid);
-    for (int i = 0; i < t->nenders && i < MAX_THREAD_ENDERS; i++) {
+    for (int i = 0; i < t->nenders; i++) {
         const uint32_t w = t->enders[i];
-        if (w == NO_ENDER) continue;
         psp_thread *wr = find_thread(w);
         if (wr) wr->end_status = status;
         else if (w == 0) g_main_end_status = status;
@@ -831,11 +808,27 @@ static void wait_mark(uint32_t type, uint32_t id) {
 }
 void psp_threadman_wait_mark(uint32_t type, uint32_t id) { wait_mark(type, id); }
 
+/* Join the threads waiting for `t` to end, in arrival order. -1 when the
+ * list is full, which the wait refuses as a full object queue refuses one
+ * (psp_waitq_add): a list that wrapped instead wrote over its first waiters,
+ * which then never woke. */
+static int add_ender(psp_thread *t, uint32_t w) {
+    if (t->nenders >= MAX_THREAD_ENDERS) return -1;
+    t->enders[t->nenders++] = w;
+    return 0;
+}
+
 /* A waiter that gave up (timeout or release) takes itself off the list, or the
- * end would wake it later out of whatever it was waiting on by then. */
+ * end would wake it later out of whatever it was waiting on by then. The list
+ * stays packed, so a thread polled with short timeouts does not fill it. */
 static void drop_ender(psp_thread *t, uint32_t w) {
-    for (int i = 0; i < t->nenders && i < MAX_THREAD_ENDERS; i++)
-        if (t->enders[i] == w) t->enders[i] = NO_ENDER;
+    for (int i = 0; i < t->nenders; i++) {
+        if (t->enders[i] != w) continue;
+        memmove(&t->enders[i], &t->enders[i + 1],
+                (size_t)(t->nenders - i - 1) * sizeof t->enders[0]);
+        t->nenders--;
+        return;
+    }
 }
 
 /* An entry that returns ends the thread with its $v0, and a negative one is
@@ -892,21 +885,16 @@ static void thread_end_wait(uint32_t thid, uint32_t timeout, uint64_t deadline, 
         const uint32_t me = psp_sched_current();
         int rc = restored;
         if (restored == WAIT_BEGINS) {
-            t->enders[t->nenders++ % MAX_THREAD_ENDERS] = me;
+            if (add_ender(t, me) != 0) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
             wait_mark(PSP_WAITTYPE_THREADEND, thid);
             rc = psp_sched_block_until(me, PSP_SCHED_BLOCKED,
                                        "sceKernelWaitThreadEnd", deadline);
         }
         restored = WAIT_BEGINS;
         wait_mark(0, 0);
-        if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
-            if ((t = find_thread(thid)) != NULL) drop_ender(t, me);
-            psp_wait_give_up(rc, timeout, deadline);
-            return;
-        }
         if (rc != PSP_SCHED_WOKEN) {
-            wait_deadlock("sceKernelWaitThreadEnd");
-            psp_ret(SCE_KERNEL_ERROR_OK);
+            if ((t = find_thread(thid)) != NULL) drop_ender(t, me);
+            psp_wait_give_up(rc, timeout, deadline, "sceKernelWaitThreadEnd");
             return;
         }
         /* Woken, and the thread is gone: it was freed as it ended, by
@@ -1118,7 +1106,7 @@ static void sleep_end(int rc) {
         return;
     }
     if (rc != PSP_SCHED_WOKEN) {
-        wait_deadlock("sceKernelSleepThread");
+        psp_wait_deadlock("sceKernelSleepThread");
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
@@ -1236,6 +1224,49 @@ static void hle_GetThreadCurrentPriority(void) {
     psp_ret(psp_threadman_current_priority());
 }
 
+/* Stop a thread that has not ended: both terminate calls. Returns nonzero if
+ * a thread it let go outranks the caller.
+ *
+ * A thread terminated in a wait leaves it then and there, as one whose wait
+ * is released does (threadprobe step 78, fw 6.60) -- but it never runs again,
+ * so what its wait would have done on the way out is done here. It leaves the
+ * object's queue: a queue that kept it gave the next signal's count to a
+ * thread that was gone, and woke nobody. It leaves the list of the thread it
+ * waited to see end, which would otherwise wake it out of whatever it waits
+ * on after being started again. And a semaphore's queue is run again, as a
+ * waiter that times out runs it itself (sema_wait_end), because a waiter that
+ * held the head of a first-come queue held back the one behind it.
+ *
+ * A sleep, a delay or a CB wait ends here too: threads/refer.expected reads
+ * `wait=1` for a sleeper and `wait=0` the moment it is terminated. Each is
+ * marked on the thread and cleared on the way out of the call, which a
+ * terminated thread never makes, so the mark outlived the wait into the
+ * thread's next run. A wakeup then went to a sleep that was over instead of
+ * being banked, a refer named a delay that was over, a notify ended a wait
+ * that delivers no callbacks, and a SleepThreadCB took a wakeup for a notify
+ * and slept on.
+ *
+ * Unmeasured: no probe step terminates a waiter and then reads its object.
+ * Release and timeout (step 59) both leave at once, and terminate is taken to
+ * leave the same way. */
+static int terminate(psp_thread *t) {
+    psp_sched_terminate(t->uid);
+    (void)psp_waitq_leave_terminated(t->uid);
+    int urgent = 0;
+    if (t->wait_type == PSP_WAITTYPE_THREADEND) {
+        psp_thread *target = find_thread(t->wait_id);
+        if (target) drop_ender(target, t->uid);
+    } else if (t->wait_type == PSP_WAITTYPE_SEMA) {
+        psp_sema *s = find_sema(t->wait_id);
+        if (s) urgent = sema_release(s);
+    }
+    t->wait_type = t->wait_id = 0;
+    t->wait_kind = WAIT_NONE;
+    t->cb_wait = t->cb_wake = 0;
+    thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
+    return urgent;
+}
+
 /* Terminate stops a thread without freeing it. Unimplemented until now, which
  * mattered more than it looks: pspautotests' checkpoint helper terminates its
  * rescheduler thread between every pair of checks, and a terminate that does
@@ -1260,9 +1291,9 @@ static void hle_TerminateThread(void) {
      * host thread if there is one. Only the first existed, and it is a no-op
      * whenever the second is what is needed. */
     psp_sched_cancel_spawn(t->uid);
-    psp_sched_terminate(t->uid);
-    thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
+    const int urgent = terminate(t);
     psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_preempt();
 }
 
 /* Terminate-and-delete is not terminate followed by delete: it accepts a thread
@@ -1278,13 +1309,11 @@ static void hle_TerminateThread(void) {
 static void hle_TerminateDeleteThread(void) {
     psp_thread *t = other_thread(psp_arg(0));
     if (!t) return;
-    if (!thread_dormant(t)) {
-        psp_sched_terminate(t->uid);
-        thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
-    }
+    const int urgent = thread_dormant(t) ? 0 : terminate(t);
     psp_sched_cancel_spawn(t->uid);
     free_thread(t);
     psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_preempt();
 }
 
 /* sceKernelChangeCurrentThreadAttr(clear, set)
@@ -1694,16 +1723,7 @@ static void sema_wait_end(uint32_t id, uint32_t tmo_ptr, uint64_t deadline, uint
      * behind us -- that is the second half of what fifo.expected measures. */
     psp_waitq_drop(&s->q, me);
     const int urgent = sema_release(s);
-
-    /* Stranded: nothing is runnable and no deadline can release us, so nobody
-     * could ever signal this. A caller that asked for no timeout is not told
-     * one elapsed -- a fabricated timeout is something a game acts on. */
-    if (rc == PSP_SCHED_STRANDED) {
-        wait_deadlock("sceKernelWaitSema");
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
-    psp_wait_give_up(rc, tmo_ptr, deadline);
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelWaitSema");
     if (urgent) psp_sched_preempt();
 }
 
@@ -1966,12 +1986,7 @@ static void hle_WaitEventFlag(void) {
      * from the 5ms one next to it. */
     if (out && !no_wait) psp_write32(out, f->pattern);
 
-    if (rc == PSP_SCHED_STRANDED) {
-        wait_deadlock("sceKernelWaitEventFlag");
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
-    psp_wait_give_up(rc, tmo_ptr, deadline);
+    psp_wait_give_up(rc, tmo_ptr, deadline, "sceKernelWaitEventFlag");
 }
 
 /* ---- callbacks ----------------------------------------------------------- */
@@ -2611,7 +2626,7 @@ static void sleep_cb(int restored) {
             return;
         }
         if (rc != PSP_SCHED_WOKEN) {
-            wait_deadlock("sceKernelSleepThreadCB");
+            psp_wait_deadlock("sceKernelSleepThreadCB");
             psp_ret(SCE_KERNEL_ERROR_OK);
             return;
         }

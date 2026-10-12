@@ -120,7 +120,14 @@ typedef enum { PSP_WAIT_POLL, PSP_WAIT_BLOCK } psp_wait_form;
  *   still queued                   the caller leaves the queue, then gives up
  *
  * Each of the three below writes the timeout back and returns the answer to
- * the guest; the first two return 1 when they ended the wait. */
+ * the guest; the first two return 1 when they ended the wait.
+ *
+ * A wait that could not park at all -- PSP_SCHED_STRANDED: nothing is
+ * runnable and nothing is due, so nothing can ever end it -- is still queued,
+ * and gives up like any other. That is a timeout for a caller that passed
+ * one -- which happens only where no wait can park (threading off), or to the
+ * main context parked as the run is stopped -- and a caller that passed none
+ * stops the run instead (psp_wait_deadlock). */
 
 /* The answers only the waker knew. Neither depends on whether the object is
  * still there: what was handed over is not taken back by a delete that
@@ -136,8 +143,14 @@ int  psp_wait_end_found(int rc, const void *object, uint32_t tmo_ptr,
 
 /* A wait that is still queued, after the caller has left the queue:
  * RELEASE_WAIT when sceKernelReleaseWaitThread forced it out, WAIT_TIMEOUT
- * otherwise. */
-void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline);
+ * otherwise -- or, stranded with no timeout, psp_wait_deadlock(`call`). */
+void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline,
+                      const char *call);
+
+/* A wait nothing can ever end, made by a caller that asked for no timeout:
+ * the run stops, and says why. `call` is the stop's reason, so it has to
+ * outlive the run (a string literal). */
+void psp_wait_deadlock(const char *call);
 
 /* The attribute bit that selects most-urgent-first over first-come. */
 #define PSP_WAITQ_PRIORITY 0x100u
@@ -180,8 +193,9 @@ int  psp_waitq_add(psp_waitq *q, uint32_t uid, uint32_t need, uint32_t mode,
 int  psp_waitq_find(const psp_waitq *q, uint32_t uid);
 
 /* Remove a waiter by uid, wherever it sits. For a thread that stopped waiting
- * without being released -- its timeout elapsed, the object was deleted under
- * it, or the guest terminated it. Returns 1 if it was there. */
+ * without being released -- its timeout elapsed, or the object was deleted
+ * under it. (A thread terminated in its wait never runs to call this:
+ * psp_waitq_leave_terminated.) Returns 1 if it was there. */
 int  psp_waitq_drop(psp_waitq *q, uint32_t uid);
 
 /* The index of the waiter to release next under `attr`, or -1 when empty.
@@ -214,6 +228,11 @@ int  psp_waitq_count(const psp_waitq *q);
  * other threads' uids (the copies event flags and semaphores work on) are not
  * recorded. */
 int  psp_waitq_leave(uint32_t uid);
+/* The same for a thread terminated in its wait, except that nothing is
+ * written to its out-parameter: the call it was in never returns, and
+ * TerminateDeleteThread frees the stack such a word usually lives on. The
+ * workarea count of an lwmutex is the object's, and is still rewritten. */
+int  psp_waitq_leave_terminated(uint32_t uid);
 /* Forget every parked thread, with the objects: psp_threadman_reset. */
 void psp_waitq_reset(void);
 /* Names the parked-thread table to the save state (psprecomp/state.h);
