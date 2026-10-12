@@ -258,10 +258,13 @@ static void slot_path(int slot, char *out, size_t size) {
     psp_state_file(name, out, size);
 }
 
+/* Into `out` (48 bytes is room for every one), which it returns. The named
+ * files' names were returned without filling `out`, which every caller
+ * prints: their toasts and questions named nothing. */
 static const char *slot_name(int slot, char *out, size_t size) {
-    if (slot == SLOT_QUIT) return "When you quit";
-    if (slot == SLOT_UNDO) return "Before the last load";
-    snprintf(out, size, "Slot %d", slot + 1);
+    if (slot == SLOT_QUIT) snprintf(out, size, "When you quit");
+    else if (slot == SLOT_UNDO) snprintf(out, size, "Before the last load");
+    else snprintf(out, size, "Slot %d", slot + 1);
     return out;
 }
 
@@ -324,7 +327,7 @@ static void toast(const char *text) {
 static int g_waiting_slot, g_waiting_load;
 
 static void request(int kind, int slot) {
-    char path[1100], name[32], line[128];
+    char path[1100], name[48], line[128];
     slot_path(slot, path, sizeof path);
     if (kind == PSP_STATE_SAVE && make_dir(psp_state_dir())) {
         snprintf(line, sizeof line, "Not saved: the folder %.60s cannot be made.", psp_state_dir());
@@ -356,7 +359,7 @@ static void load_from(int slot) {
 }
 
 static void ask_load(int slot) {
-    char name[32], line[160];
+    char name[48], line[160];
     slot_name(slot, name, sizeof name);
     if (!o.have[slot] || !o.info[slot].usable) {
         snprintf(line, sizeof line, "%s %s.", name, !o.have[slot] ? "is empty" :
@@ -380,7 +383,7 @@ static void ask_save(int slot) {
 /* What the keys do: save to the current slot, load it, choose it. */
 static void action(int a) {
     if (!o.started) return;
-    char name[32], detail[160], line[220];
+    char name[48], detail[160], line[220];
     switch (a) {
     case INPUT_ACTION_QUICK_SAVE:
         request(PSP_STATE_SAVE, o.slot);
@@ -406,7 +409,7 @@ static void action(int a) {
 static void poll_states(void) {
     if (!o.waiting) return;
     int ok = 0;
-    char message[384], name[32], line[460];
+    char message[384], name[48], line[460];
     if (psp_state_result(&ok, message, sizeof message) < o.waiting) return;
     o.waiting = 0;
     if (o.load_after) {
@@ -445,7 +448,7 @@ static void before_quit(void) {
 }
 
 static void save_page(void) {
-    char line[200], name[32], detail[160], title[64], id[16];
+    char line[200], name[48], detail[160], title[64], id[16];
     psp_ui_heading("Save state");
     snprintf(line, sizeof line, "Quick save writes to the current slot, Slot %d.", o.slot + 1);
     psp_ui_note(line);
@@ -461,7 +464,7 @@ static void save_page(void) {
 }
 
 static void load_page(void) {
-    char name[32], detail[160], title[64], id[16];
+    char name[48], detail[160], title[64], id[16];
     psp_ui_heading("Load state");
     for (int i = 0; i < SLOT_FILES; i++) {
         if (i >= SLOTS && !o.have[i]) continue;
@@ -481,7 +484,7 @@ static void load_page(void) {
 static void confirm_prompt(void) {
     if (!o.confirm) { psp_ui_confirm_close(); return; }
     const int slot = o.confirm - 1;
-    char name[32], text[256];
+    char name[48], text[256];
     slot_name(slot, name, sizeof name);
     if (o.confirm_load)
         snprintf(text, sizeof text, "Load %s? What has happened since it was saved is lost%s.", name,
