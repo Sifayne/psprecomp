@@ -1,9 +1,10 @@
 /* The in-game menu (docs/PLAYER-LAYER.md §4).
  *
- * Escape, or View + Menu on the controller, opens it; the same, Resume or
- * Menu alone close it. F5 saves the game to the current slot and F9 loads
- * it, asking first unless the player chose otherwise; F6 and F7 choose the
- * slot. What a key did shows at the foot of the screen for a moment. Open, it holds the game at the next safe point
+ * Escape, or View + Menu on the controller, opens it; the same, Resume, B
+ * from the list of pages, or Menu alone close it. F5 saves the game to the
+ * current slot and F9 loads it, asking first unless the player chose
+ * otherwise; F6 and F7 choose the slot. What a key did shows at the foot of
+ * the screen for a moment. Open, it holds the game at the next safe point
  * (psprecomp/safepoint.h) and has the controls (src/host/input.c): the mouse
  * is let go, everything held is released and the game sees a neutral pad,
  * and on closing the game gets them back once they are let go.
@@ -228,6 +229,12 @@ static void event(const SDL_Event *e) {
                 close_menu();
                 return;
             }
+        }
+        /* B goes back: from a page to its entry, from the list out of the
+         * menu. An open list or a question takes it first. */
+        if (e->cbutton.button == SDL_CONTROLLER_BUTTON_B && e->cbutton.state && !o.confirm && !psp_ui_back()) {
+            close_menu();
+            return;
         }
     }
     psp_ui_event(e);
@@ -600,7 +607,7 @@ static void frame(void) {
     snprintf(title, sizeof title, "%s -- paused", psp_title_info.name ? psp_title_info.name : "Game");
     psp_ui_accent(title);
     psp_ui_side_begin(220, 0);
-    const int resume = psp_ui_nav("Resume", o.page == PAGE_RESUME);
+    const int resume = psp_ui_nav_action("Resume", o.page == PAGE_RESUME);
     if (psp_ui_nav("Save state", o.page == PAGE_SAVE) && o.page != PAGE_SAVE) { o.page = PAGE_SAVE; read_slots(); }
     if (psp_ui_nav("Load state", o.page == PAGE_LOAD) && o.page != PAGE_LOAD) { o.page = PAGE_LOAD; read_slots(); }
     if (psp_ui_nav("Bindings", o.page == PAGE_BINDINGS)) o.page = PAGE_BINDINGS;
@@ -611,7 +618,7 @@ static void frame(void) {
     psp_ui_side_next();
     if (o.page == PAGE_RESUME) {
         psp_ui_heading("Paused");
-        psp_ui_text("The game waits here. Escape, Menu, or View + Menu on the controller resumes it.");
+        psp_ui_text("The game waits here. Escape resumes it, and so do Menu, View + Menu and B on the controller.");
     } else if (o.page == PAGE_SAVE) save_page();
     else if (o.page == PAGE_LOAD) load_page();
     else if (o.page == PAGE_BINDINGS) bindings_page();

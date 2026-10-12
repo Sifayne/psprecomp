@@ -40,6 +40,7 @@
 #include "psprecomp/render.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/hle.h"
+#include "psprecomp/clock.h"
 #include "psprecomp/os.h"
 #include "psprecomp/safepoint.h"
 #include "psprecomp/sched.h"
@@ -384,6 +385,7 @@ typedef struct {
     GLint minfilter, magfilter, wraps, wrapt, miptop;
     GLint fogenable, fogcolour;
     GLint texscale, bloom;
+    GLint snap, snaph;
 } uniforms;
 /* The std140 block both model shaders read (Xform), laid out by hand: every
  * member is a vec4 / ivec4 / mat4 so the C offsets are the GLSL ones. */
@@ -547,9 +549,9 @@ static struct {
     /* Adaptive aspect (PSPRECOMP_ASPECT=window). Virtual PSP width/height
      * are latched per frame; g.w/g.h means identity. The staging target
      * downsamples expanded attachments to guest dimensions for readback. */
-    int      wide_w, wide_h, batch_class, batch_band, batch_glyph, batch_bloom;
+    int      wide_w, wide_h, batch_class, batch_band, batch_glyph, batch_bloom, batch_snap;
     float    viewport_x, viewport_y, viewport_w, viewport_h;
-    uint64_t glyph_draws;
+    uint64_t glyph_draws, snap_draws;
     uint64_t bloom_draws;
     GLuint   stage_fbo, stage_tex;
     int      stage_w, stage_h;
@@ -593,7 +595,7 @@ static unsigned shot_counters[2]; /* window images: game presents, dialog redraw
 static void flush(void);
 /* Why a pending model batch is about to end. The multi-draw batches only as
  * far as the state between two draws allows; these say which setter it was. */
-enum { FB_TARGET, FB_SCISSOR, FB_TEXTURE, FB_CLUT, FB_DEPTH, FB_BLEND, FB_FOG, FB_GLYPH, FB_CLASS, FB_CPU, FB_FINISH, FB_PRESENT, FB_FULL, FB_COUNT };
+enum { FB_TARGET, FB_SCISSOR, FB_TEXTURE, FB_CLUT, FB_DEPTH, FB_BLEND, FB_FOG, FB_GLYPH, FB_CLASS, FB_CPU, FB_FINISH, FB_PRESENT, FB_FULL, FB_SNAP, FB_COUNT };
 static void flush_ends(int k) { if (g.mu.npend) g.mu.flush_by[k]++; }
 static int  claim(void);
 enum { RB_SLOTS = 3, RB_SLOT_BYTES = 1024 * 1024 };
@@ -1062,6 +1064,8 @@ static const char *FS_SRC =
     "uniform vec3 u_env;\n"
     "uniform sampler2D u_tex;\n"
     "uniform vec2 u_texscale;\n"
+    "uniform vec4 u_snap;\n"       /* native_texel_draw: guest-to-target scale and offset, or 0 */
+    "uniform float u_snaph;\n"
     "uniform int u_bloom;\n"
     "uniform int u_minfilter;\n"
     "uniform int u_magfilter;\n"
@@ -1153,6 +1157,12 @@ static const char *FS_SRC =
     "vec4 texfunc(vec4 c) {\n"
     "    c = rgba8(c);\n"
     "    vec2 uv = (v_uvq.z != 0.0) ? v_uvq.xy / v_uvq.z : vec2(0.0);\n"
+    "    vec2 uvx = dFdx(uv), uvy = dFdy(uv);\n"
+    "    if (u_snap.x > 0.0) {\n"        /* to the centre of the guest pixel, y down */
+    "        vec2 f = vec2(gl_FragCoord.x, u_snaph - gl_FragCoord.y);\n"
+    "        vec2 d = (floor((f - u_snap.zw) / u_snap.xy) + 0.5) * u_snap.xy + u_snap.zw - f;\n"
+    "        uv += uvx * d.x - uvy * d.y;\n"
+    "    }\n"
     "    vec4 t = sample_psp(uv);\n"
     "    vec3 tc = t.rgb; float ta = (u_tcc != 0) ? t.a : 1.0;\n"
     "    vec3 rgb; float a;\n"
@@ -1359,6 +1369,7 @@ static void lookup_uniforms(GLuint prog, uniforms *u) {
     U(env, "u_env"); U(tex, "u_tex"); U(texscale, "u_texscale"); U(bloom, "u_bloom");
     U(minfilter, "u_minfilter"); U(magfilter, "u_magfilter"); U(wraps, "u_wraps"); U(wrapt, "u_wrapt");
     U(miptop, "u_miptop"); U(fogenable, "u_fogenable"); U(fogcolour, "u_fogcolour");
+    U(snap, "u_snap"); U(snaph, "u_snaph");
 #undef U
 }
 static void use_program(GLuint prog, uniforms *u) { p_glUseProgram(prog); g.cur_prog = prog; g.u = u; }
@@ -2885,6 +2896,32 @@ static int bitmap_glyph_draw(int prim, const psp_vertex *v, int count) {
     return 1;
 }
 
+/* A draw that maps a texture of the PSP's own size one texel to one guest
+ * pixel, axis-aligned and filtered: screen-space, or through a projection
+ * with w = 1 (WipEout's menu draws its header that way). The PSP samples it
+ * at its pixels' centres; at a higher resolution the target's pixel centres
+ * fall between those, and bilinear reads past the texels drawn -- at a
+ * sprite's top edge a quarter of the row above. WipEout Pulse's menu video
+ * wraps that round to row 511 of its 512x512 buffer, memory after the
+ * frame, and the screen's top line flickered with whatever lay there; every
+ * sprite edge blurred into its neighbour. Such a draw samples at the centre
+ * of the guest pixel each fragment lies in (u_snap). */
+static int native_texel_draw(int prim, const psp_vertex *v, int count) {
+    const rendertarget *r = &g.rts[g.cur_rt];
+    if (!g.resolution || !r->display || (r->sx <= 1.0 && r->sy <= 1.0) || !g.tex_enable || g.bound_top ||
+        g.tex_sx != 1.0f || g.tex_sy != 1.0f || !((g.tex.min_filter | g.tex.mag_filter) & 1) ||
+        prim < PSP_PRIM_TRIANGLES || count < 2)
+        return 0;
+    const float du = v[0].u - (float)v[0].x / PSP_SUBPX, dv = v[0].v - (float)v[0].y / PSP_SUBPX;
+    /* Positions are on the GE's 1/16 grid: a sixteenth, and a little more. */
+    for (int i = 0; i < count; i++)
+        if (fabsf(v[i].tex_q - 1.0f) > 0.0001f || fabsf(v[i].inv_w - 1.0f) > 0.0001f ||
+            fabsf(v[i].u - (float)v[i].x / PSP_SUBPX - du) > 0.07f ||
+            fabsf(v[i].v - (float)v[i].y / PSP_SUBPX - dv) > 0.07f)
+            return 0;
+    return 1;
+}
+
 /* The title's final glow composite (psp_title_info.bloom): a full-display
  * sprite reading the whole of a small scratch target. Match the producer and
  * the draw, not the VRAM address, which other work reuses (The 3rd
@@ -2925,6 +2962,9 @@ static void gl_draw(int prim, const psp_vertex *v, int count) {
     const int glyph = bitmap_glyph_draw(prim, v, count);
     if (glyph != g.batch_glyph) { flush_ends(FB_GLYPH); flush(); g.batch_glyph = glyph; }
     if (glyph) g.glyph_draws++;
+    const int snap = !glyph && native_texel_draw(prim, v, count);
+    if (snap != g.batch_snap) { flush_ends(FB_SNAP); flush(); g.batch_snap = snap; }
+    if (snap) g.snap_draws++;
     const int bloom = bloom_composite(prim, v, count);
     if (bloom != g.batch_bloom) {
         flush_ends(FB_CLASS); flush(); g.batch_bloom = bloom; g.mu.state_gen++;
@@ -3368,6 +3408,16 @@ static void apply_state(void) {
     p_glUniform1i(g.u->bloom, g.batch_bloom);
     p_glUniform1i(g.u->minfilter, g.batch_glyph ? g.tex.min_filter & ~1 : g.tex.min_filter);
     p_glUniform1i(g.u->magfilter, g.batch_glyph ? g.tex.mag_filter & ~1 : g.tex.mag_filter);
+    if (g.batch_snap) {
+        /* The guest-to-target mapping the scissor uses. */
+        const rendertarget *r = &g.rts[g.cur_rt];
+        const int hud = r->wide && g.batch_class != CLASS_SCENE;
+        p_glUniform4f(g.u->snap, (float)(hud ? r->ui_scale : r->sx), (float)(hud ? r->ui_scale : r->sy),
+                      (float)(hud ? rt_off(r) : 0), (float)(hud ? rt_off_y(r) : 0));
+        p_glUniform1f(g.u->snaph, (float)r->h);
+    } else {
+        p_glUniform4f(g.u->snap, 0.0f, 0.0f, 0.0f, 0.0f);
+    }
     p_glUniform1i(g.u->wraps, g.tex.wrap_s ? 1 : 0);
     p_glUniform1i(g.u->wrapt, g.tex.wrap_t ? 1 : 0);
     p_glUniform1i(g.u->miptop, g.bound_top);
@@ -4042,6 +4092,20 @@ static void gl_present(void) {
                 (unsigned long long)(g.model_draws - md), (unsigned long long)(g.mu.batches - mb),
                 (unsigned long long)(g.glyph_draws - gl_));
         d = g.draws; sc = g.class_scene; hu = g.class_hud; md = g.model_draws; mb = g.mu.batches; gl_ = g.glyph_draws; gc = cmds; gv = vtx;
+        /* And what the frame cost: wall time since the last present, the
+         * pacers' sleep in it (the rest is the host's work), the run's lag
+         * behind the wall, and the texture and readback work, all in ms. */
+        static uint64_t w0, sl0, dec0, up0, rb0, imp0;
+        const uint64_t now = psp_os_mono_ns(), slept = psp_clock_slept_ns();
+        uint64_t guest = 0, wall = 0;
+        const int mapped = psp_clock_realtime_stats(&guest, &wall);
+        const double lag = mapped ? ((double)wall - (double)psp_clock_held_us() - (double)guest) / 1e3 : 0.0;
+        fprintf(stderr, "frame-time present %llu: guest %.3f s poll %u; wall %.2f slept %.2f lag %.1f; decode %.2f upload %.2f readback %.2f imports %llu\n",
+                (unsigned long long)g.presents, psp_clock_peek() / 1e6, psp_ctrl_polls(),
+                w0 ? (now - w0) / 1e6 : 0.0, w0 ? (slept - sl0) / 1e6 : 0.0, lag,
+                (g.tex_decode_ns - dec0) / 1e6, (g.tex_upload_ns - up0) / 1e6, (g.readback_ns - rb0) / 1e6,
+                (unsigned long long)(g.cpu_uploads - imp0));
+        w0 = now; sl0 = slept; dec0 = g.tex_decode_ns; up0 = g.tex_upload_ns; rb0 = g.readback_ns; imp0 = g.cpu_uploads;
     }
     /* Count deferred alpha/stencil transfers inside the GPU frame timer. */
     for (int i = 0; i < g.n_rts; i++) stencil_to_alpha(&g.rts[i]);
@@ -4187,6 +4251,7 @@ static void gl_draw_model(int prim, const psp_model_vertex *v, int count, const 
     if (count < 3 || count > MODEL_MAX_VERTS) return;
     if (rt_prepare(g.cur_rt) != 0) return;
     if (g.batch_glyph) { flush_ends(FB_GLYPH); flush(); g.batch_glyph = 0; }
+    if (g.batch_snap) { flush_ends(FB_SNAP); flush(); g.batch_snap = 0; }
     if (g.batch_bloom) { flush_ends(FB_CLASS); flush(); g.batch_bloom = 0; g.mu.state_gen++; }
     if (g.adaptive_aspect) {
         /* ge.c sends only perspective geometry through draw_model. Affine
@@ -4310,7 +4375,7 @@ void render_gl_report(FILE *out) {
             g.model_unavailable ? "CPU" : "GPU", (unsigned long long)g.model_draws, (unsigned long long)g.mu.batches, (unsigned long long)g.model_verts, (unsigned long long)g.mu.setters_skipped,
             (unsigned long long)g.mu.scene_hits, (unsigned long long)(g.mu.scene_hits + g.mu.scene_misses));
     {
-        static const char *const cause[FB_COUNT] = { "target", "scissor", "texture", "clut", "depth", "blend", "fog", "glyph", "class", "cpu draw", "finish", "present", "full" };
+        static const char *const cause[FB_COUNT] = { "target", "scissor", "texture", "clut", "depth", "blend", "fog", "glyph", "class", "cpu draw", "finish", "present", "full", "native texels" };
         fprintf(out, "\n          batches ended by:");
         for (int k = 0; k < FB_COUNT; k++) if (g.mu.flush_by[k]) fprintf(out, " %s %llu", cause[k], (unsigned long long)g.mu.flush_by[k]);
     }
@@ -4339,10 +4404,10 @@ void render_gl_report(FILE *out) {
         else
             fprintf(out, " %08X(unused)", g.rts[i].addr);
     if (g.resolution)
-        fprintf(out, "\n          resolution: window %dx%d, %llu resize(s), %llu CPU upload(s), %llu GPU texture view(s), %llu bitmap font draw(s)",
+        fprintf(out, "\n          resolution: window %dx%d, %llu resize(s), %llu CPU upload(s), %llu GPU texture view(s), %llu bitmap font draw(s), %llu sampled at guest pixels",
                 g.pixel_w, g.pixel_h, (unsigned long long)g.resizes,
                 (unsigned long long)g.cpu_uploads, (unsigned long long)g.rt_views,
-                (unsigned long long)g.glyph_draws);
+                (unsigned long long)g.glyph_draws, (unsigned long long)g.snap_draws);
     if (g.smooth_bloom)
         fprintf(out, "\n          bloom: smooth, %llu composite draw(s)", (unsigned long long)g.bloom_draws);
     if (g.adaptive_aspect)

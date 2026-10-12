@@ -14,8 +14,11 @@
  *                        comes back; focus loss leaves it open
  *   test_overlay bind    press-to-bind, a live volume, and the change saved
  *                        to the preferences file the game was started with
- *   test_overlay pad     controller only: open, walk the pages, choose,
- *                        resume */
+ *   test_overlay pad     controller only: into a page and back out, a slot
+ *                        saved and a full one replaced, the slots scrolled
+ *                        to the options under them, lists, the bindings
+ *                        table, the volume a step a press, Mute; B back,
+ *                        then out of the menu */
 #define psp_sched_stop_all fixture_stop_all
 #define psp_ctrl_set fixture_ctrl_set
 #define psp_ctrl_set_look fixture_ctrl_set_look
@@ -266,16 +269,42 @@ static void held(void) {
     finish_loop("held");
 }
 
-/* Controller only: the pad opens the menu, walks its pages with the D-pad,
- * chooses with A, and resumes from Resume. */
-static int on_bindings(void) { return o.open && o.page == PAGE_BINDINGS; }
+/* Controller only: the pad opens the menu and walks its list of pages with
+ * the D-pad. A or right on an entry goes into its page -- to the row it was on
+ * there, else the current slot, else the first -- and left at the page's
+ * edge or B back to the entry; B from the list resumes, and right on Resume
+ * does not. On the pages: a slot saved to, a full one replaced after the
+ * question (B says no), the slots scrolled through to the options under
+ * them and not past the last, a list opened and chosen from and another
+ * closed with B, the bindings table crossed and left at its foot, the volume
+ * taken with A and moved a step a press, Mute. */
 static int on_save(void) { return o.open && o.page == PAGE_SAVE; }
 static int have_pad(void) { return input_pad() != NULL; }
+static int popup_up(void) { return psp_ui_popup_open(); }
+static int popup_down(void) { return !psp_ui_popup_open(); }
+static int saving(void) { return o.waiting != 0; }
+static int muted(void) { return o.mute; }
 static void press(SDL_Joystick *joy, int button) {
     virtual_button(joy, button, 1);
     SDL_Delay(80);
     virtual_button(joy, button, 0);
     SDL_Delay(80);
+}
+/* The cursor on the widget with this label, or this label then "##". */
+static const char *wanted;
+static int cursor_matches(void) {
+    const char *f = psp_ui_focused();
+    const size_t n = strlen(wanted);
+    return !strncmp(f, wanted, n) && (!f[n] || !strncmp(f + n, "##", 2));
+}
+static int cursor_on(const char *label) { wanted = label; return waits_for(cursor_matches); }
+static int still_on(const char *label) { SDL_Delay(150); wanted = label; return cursor_matches(); }
+static void pad_menu(SDL_Joystick *joy) {
+    virtual_button(joy, SDL_CONTROLLER_BUTTON_BACK, 1);
+    virtual_button(joy, SDL_CONTROLLER_BUTTON_START, 1);
+    assert(waits_for(menu_owns));
+    virtual_button(joy, SDL_CONTROLLER_BUTTON_BACK, 0);
+    virtual_button(joy, SDL_CONTROLLER_BUTTON_START, 0);
 }
 static void pad(void) {
     start_loop("pad");
@@ -287,22 +316,111 @@ static void pad(void) {
     SDL_JoystickSetVirtualAxis(joy, SDL_CONTROLLER_AXIS_TRIGGERLEFT, -32768);
     SDL_JoystickSetVirtualAxis(joy, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, -32768);
     assert(waits_for(have_pad));
-    virtual_button(joy, SDL_CONTROLLER_BUTTON_BACK, 1);
-    virtual_button(joy, SDL_CONTROLLER_BUTTON_START, 1);
-    assert(waits_for(menu_owns));
-    virtual_button(joy, SDL_CONTROLLER_BUTTON_BACK, 0);
-    virtual_button(joy, SDL_CONTROLLER_BUTTON_START, 0);
-    SDL_Delay(150);
-    /* Focus starts on Resume; down once is Save state, three times Bindings. */
+    pad_menu(joy);
+    assert(cursor_on("Resume"));
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+    assert(still_on("Resume") && o.open);
+    /* Save state: A goes in on the current slot; A on an empty one saves. */
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("Save state"));
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(waits_for(on_save) && cursor_on("Slot 1  (current)"));
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("Slot 2"));
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(waits_for(saving) && g_waiting_slot == 1 && !g_waiting_load);
+    o.waiting = 0;
+    /* A full slot asks first: B says no, A on Replace saves. */
+    o.have[2] = 1; o.info[2].usable = 1;
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("Slot 3"));
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(cursor_on("Replace") && o.confirm == 3);
+    press(joy, SDL_CONTROLLER_BUTTON_B);
+    assert(cursor_on("Slot 3  (current)") && !o.confirm && !o.waiting && o.open);
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(cursor_on("Replace"));
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(waits_for(saving) && g_waiting_slot == 2 && !o.confirm);
+    o.waiting = 0;
+    /* B goes back to the entry, right in again to the row it left, left
+     * back out. */
+    press(joy, SDL_CONTROLLER_BUTTON_B);
+    assert(cursor_on("Save state") && o.open);
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+    assert(cursor_on("Slot 3  (current)"));
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+    assert(cursor_on("Save state"));
+    /* Load state: in on the current slot, down through the slots as the
+     * page scrolls, to the options under them, and the last keeps it. */
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("Load state"));
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(cursor_on("Slot 3  (current)"));
+    for (int i = 0; i < 7; i++) press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("Slot 10"));
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on(psp_settings_option(PSP_OPT_STATE_LOAD)->label));
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    const char *start = psp_settings_option(PSP_OPT_STATE_START)->label;
+    assert(cursor_on(start));
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(still_on(start));
+    /* A opens its list, and down and A choose the other; B closes it
+     * again, leaving the menu open. */
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(waits_for(popup_up));
     press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
     press(joy, SDL_CONTROLLER_BUTTON_A);
-    assert(waits_for(on_save));
-    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
-    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(waits_for(popup_down) && o.edit.number[PSP_OPT_STATE_START] == 1 && cursor_on(start));
     press(joy, SDL_CONTROLLER_BUTTON_A);
-    assert(waits_for(on_bindings));
-    /* Back up the list to Resume, and choose it. */
-    for (int i = 0; i < 3; i++) press(joy, SDL_CONTROLLER_BUTTON_DPAD_UP);
+    assert(waits_for(popup_up));
+    press(joy, SDL_CONTROLLER_BUTTON_B);
+    assert(waits_for(popup_down) && o.open && cursor_on(start));
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_UP);
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(waits_for(popup_down) && o.edit.number[PSP_OPT_STATE_START] == 0);
+    /* Bindings: in on the table's first cell, across a row, down past its
+     * last row -- the table scrolls -- to the button under it. */
+    press(joy, SDL_CONTROLLER_BUTTON_B);
+    assert(cursor_on("Load state"));
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("Bindings"));
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(cursor_on("0.0"));
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+    assert(cursor_on("0.1"));
+    for (int i = 0; i < input_rows() + 2 && !cursor_on("Restore the defaults"); i++)
+        press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("Restore the defaults"));
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+    assert(cursor_on("Bindings"));
+    /* Audio: A takes the volume and the D-pad moves it, B lets it go and
+     * the menu stays; Mute toggles with A. */
+    for (int i = 0; i < 6 && !cursor_on("Audio"); i++) press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("Audio"));
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(cursor_on(psp_settings_option(PSP_OPT_VOLUME)->label));
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+    press(joy, SDL_CONTROLLER_BUTTON_B);
+    assert(still_on(psp_settings_option(PSP_OPT_VOLUME)->label) && o.open);
+    assert(o.edit.number[PSP_OPT_VOLUME] == 90);
+    press(joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("Mute"));
+    press(joy, SDL_CONTROLLER_BUTTON_A);
+    assert(waits_for(muted));
+    /* B to the entry, B again resumes. */
+    press(joy, SDL_CONTROLLER_BUTTON_B);
+    assert(cursor_on("Audio") && o.open);
+    press(joy, SDL_CONTROLLER_BUTTON_B);
+    assert(waits_for(menu_shut));
+    assert(waits_for(game_owns));
+    /* Opened again, it is on Resume, and A resumes. */
+    pad_menu(joy);
+    assert(cursor_on("Resume"));
     press(joy, SDL_CONTROLLER_BUTTON_A);
     assert(waits_for(menu_shut));
     assert(waits_for(game_owns));

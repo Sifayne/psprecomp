@@ -544,6 +544,17 @@ void psp_ctrl_replay_reset(void);
 void psp_ctrl_replay_keep(void);
 /* Advance the scenario to (polls, us), applying at most one visible edge. */
 void psp_ctrl_replay_step(uint32_t polls, uint64_t us);
+/* Add a line to the recording, if one is being made: the facts of the
+ * session a replay must adopt, written the first time the guest asks for
+ * each (the date, the time zone). */
+void psp_ctrl_replay_note(const char *line);
+/* The date guest time 0 stands for, in microseconds since 1970, and the
+ * host's time zone (minutes east of UTC outside daylight saving, and whether
+ * daylight saving is in force). A replay sets them from its recording's
+ * `date` and `zone` lines, so the session sees what the recorded one did. */
+void psp_rtc_set_date_us(uint64_t unix_us);
+void psp_sysparam_set_zone(int minutes, int dst);
+void psp_sysparam_forget_zone(void);
 /* Record the composed pad state, look channel included; writes a line only
  * when it changes. */
 void psp_ctrl_replay_record(uint32_t polls, uint64_t us,

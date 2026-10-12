@@ -266,7 +266,7 @@ int main(void) {
     assert(!psp_settings_set(&s, PSP_OPT_VOLUME, "40", PSP_SOURCE_FILE, error));
     assert(!psp_settings_bind(&s, "pad.fire", NULL, error));
     assert(!psp_settings_save_origin(&s, error));
-    assert(contains(path, "DISPLAY=2\nVOLUME=40\n") && contains(path, "MPEG_DECODE=1\nWINDOW=1\n"));
+    assert(contains(path, "DISPLAY=2\nVOLUME=40\n") && contains(path, "MPEG_DECODE=1\nTIMING=paced\nWINDOW=1\n"));
     assert(!contains(path, "bind.pad.fire"));
     unsetenv("PSPRECOMP_DISPLAY");
     assert(!psp_settings_load(&s, path, error));

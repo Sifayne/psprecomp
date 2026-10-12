@@ -290,6 +290,21 @@ Gaps found in the code while checking this file, none of them on a phase above:
       picture, so each movie leaks them.
 - [ ] **Secure savedata** — secure modes store plaintext. saveprobe already
       holds the hardware's secure saves under known keys.
+- [ ] **Save states across updates** — a state names the executable that
+      wrote it (`src/hle/state.c`: a hash of the binary, with the counts of
+      functions and resume sites) and holds that build's kept variables byte
+      for byte. Any app update prepares the game again, so every state of it
+      then reads "From another build of the game, so it cannot be loaded":
+      a player who updates loses them. Two ways out, not exclusive (Sif, 10
+      Oct):
+      - *Keep the build.* The importer already keeps every prepared build
+        (`games/<slug>/<build>-<time>`, about 60 MB each, never pruned). The
+        launcher could find the build a state was written by and offer to
+        play that one, and prune builds no state needs.
+      - *Portable states.* Give each part's layout a version (or name its
+        fields) with a way to read older ones, and name resume sites rather
+        than count them, so a newer build reads an older state. Guest memory
+        already carries over as it is.
 - [ ] **Windows** — the Windows half of `src/os.c` has not been through a
       Windows build in this fork.
 - [ ] **The rest of the host** — `present.c`, the settings mechanism, the

@@ -823,6 +823,38 @@ What is not built yet:
   with the menu opened on Audio, the packaged game drew it over the paused
   picture.
 
+*Changed, 10 Oct.* With a pad alone the pages could not be used: Sif could
+not save a state without the mouse. Every page was walked with a virtual pad:
+- **Right on the side list** reached the page only where one of its rows lay
+  level with the entry, so the save slots were out of reach. Down past Quit
+  landed on Slot 4.
+- **The cursor got lost.** Down from the first slots could jump back into the
+  list. B, left at a page's edge, or down past the last slot left it on
+  nothing.
+- **It stuck on a row.** ImGui forgets the item a pad's move starts from
+  unless it lies wholly inside the window. A full-width row, 4 px wider each
+  side, never does, so the row could win its own move (Load state, Slot 6).
+- **The foot of the bindings table**, Restore the defaults, was out of reach.
+- **The volume did not move.** A press moved its 0..100 slider by 1, and the
+  option's step of 5 put it back.
+
+Now, as Sif chose:
+- **Two panes** (`ui.cpp`). The cursor moves within the list or the page.
+  - Right on an entry, or choosing it with A or Enter, goes into its page:
+    to the row it was on there last, else the current slot, else the first.
+  - Left at the page's edge, or B, goes back to the entry.
+  - B on the list closes the menu; in the launcher it leaves, as before.
+  - Right does not choose Resume.
+- **Up or down past a pane's edge** reaches the launcher's tabs and buttons.
+  Up from them returns to where the cursor left.
+- **A pad's move** keeps the item it starts from while that is in view.
+- **A number with steps** slides over its steps: the volume moves 5% a press.
+- **Tests.** `test_overlay pad` and `test_launcher` drive all of it with a
+  virtual pad. Each part fails on the old code.
+
+Still keyboard-only: cancelling or clearing a binding (Escape, Delete). A pad
+waits out the 5 s.
+
 ## 5. Save states
 
 ### Why the obvious approach does not work here
@@ -1403,9 +1435,14 @@ thread ends.
     selected game's pack's under its name, then Packs and About;
   - *Reset to defaults* resets the group of the page shown, after a
     question; the bindings stay;
-  - Add game, and the preparation's progress, take the page's place.
-- **Controls:** Escape and B go back. The bumpers step through the pages,
-  and Start plays.
+  - Add game takes the page's place.
+  - While a game is prepared or a pack added or removed, the settings stay
+    open, with the progress under them: what it is doing, a bar (filled from
+    the compile's "Compiling game: n/N", moving with no measure before and
+    after), and Stop. Play, Add game and the pack buttons wait for it, and
+    leaving asks first (10 Oct).
+- **Controls:** Escape and B go back; B on a page goes to its entry first
+  (§4, 10 Oct). The bumpers step through the pages, and Start plays.
 - **Packs:** those the launcher was linked with (`launcher_one.c`, a game's
   development launcher), and those in `--packs DIR`. Each added pack has a
   `launcher.so`, which exports `psp_title_settings`, `psp_launcher_info`

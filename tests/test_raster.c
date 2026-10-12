@@ -2741,6 +2741,45 @@ static void test_hardware_texel_boundaries(void) {
           "line at u = 2 and 3.009: %06X %06X %06X", pixel(67, 226), pixel(68, 226), pixel(96, 226));
 }
 
+/* Shade mapping (TEX_MAP_MODE 2): the coordinates come from the world-space
+ * normal dotted with two lights' vectors -- U = (1 + L0.N) / 2, V = (1 +
+ * L1.N) / 2 with TEX_SHADE_LS 0x100 -- and not from the vertex's own, which
+ * point elsewhere. The lights are off and their vectors not unit length; the
+ * second case turns the world a quarter about z, which the normal follows.
+ * A texture that names its own texels reads back where it sampled. WipEout
+ * Pulse's buildings and ships shade this way; read from the vertex, its
+ * shade texture sat on them as fixed white spots. */
+static void test_shade_mapping(void) {
+    static const struct { float world[12]; float n[3]; uint32_t want; } C[] = {
+        { { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 }, { 0.6f, -0.8f, 0 }, 0x19CC },    /* u 204.8, v 25.6 */
+        { { 0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0 }, { -0.8f, -0.6f, 0 }, 0x19CC },  /* the same world normal */
+    };
+    upload_ramp_texture(256, 256);
+    for (unsigned c = 0; c < sizeof C / sizeof C[0]; c++) {
+        psp_ge_reset(); clear_fb();
+        centre_point_state(0x0001FFu);                     /* float uv, 8888, float normal, float position */
+        cmd(0x3A, 0);
+        for (int i = 0; i < 12; i++) cmd_float(0x3B, C[c].world[i]);
+        texture_state(TEX, 256, 8, 8, 3 /* 8888 */, 0, 0 /* nearest */);
+        cmd(0xC7, 0); cmd(0xC9, 3);
+        cmd(0x48, 0x3F8000); cmd(0x49, 0x3F8000); cmd(0x4A, 0); cmd(0x4B, 0);
+        cmd(0xC0, 2); cmd(0xC1, 0x100);
+        cmd_float(0x63, 3.0f); cmd_float(0x64, 0); cmd_float(0x65, 0);    /* light 0 */
+        cmd_float(0x66, 0); cmd_float(0x67, 2.0f); cmd_float(0x68, 0);    /* light 1 */
+        const float v[9] = { 0.25f, 0.75f, 0, C[c].n[0], C[c].n[1], C[c].n[2], 0, 0, 0 };
+        for (int i = 0; i < 9; i++) {
+            uint32_t w; memcpy(&w, &v[i], 4);
+            if (i == 2) w = 0xFFFFFFFFu;                       /* the colour, white */
+            psp_write32(VERTS + 4u * (uint32_t)i, w);
+        }
+        cmd(0x04, 1);
+        end_list();
+        const uint32_t got = pixel(240, 136) & 0xFFFF;
+        CHECK(got == C[c].want, "shade mapping case %u: texel %04X, want %04X (the vertex's own read C040)",
+              c, got, C[c].want);
+    }
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -2777,6 +2816,7 @@ int main(void) {
     test_rsqrt_ge();
     test_light_world();
     test_morph_fields_ge();
+    test_shade_mapping();
     test_clip_xy_lines();
     test_triangle_fans();
     test_long_edge_groups();

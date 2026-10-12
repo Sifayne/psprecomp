@@ -193,6 +193,7 @@ static int fx16_sat(float f) {
 #define GE_SCISSOR1     0xD4
 #define GE_SCISSOR2     0xD5
 #define GE_TEXMAPMODE   0xC0
+#define GE_TEXSHADELS   0xC1
 #define GE_TEXSCALEU    0x48
 #define GE_TEXSCALEV    0x49
 #define GE_TEXOFFSETU   0x4A
@@ -560,6 +561,9 @@ static struct {
     float tgen[12];
     int   tgen_n;
     int   tex_map_mode, tex_proj_mode;
+    /* TEX_SHADE_LS (0xC1): the two lights whose vectors shade mapping (map
+     * mode 2) dots with the normal, for U (bits 0..1) and for V (8..9). */
+    int   tex_shade_u, tex_shade_v;
     /* DEPTH_CLIP_ENABLE (0x1C). On the PSP this flag means *clamp*, not
      * clip: with it set, geometry beyond the near or far plane is drawn with
      * its depth clamped; with it clear, it is clipped away. gpu/clipping
@@ -1429,6 +1433,36 @@ static void read_uv_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, i
     float u, v;
     out->u = out->v = 0.0f;
     if (read_uv_raw_at(vp, addr, vtype, tex_off, &u, &v)) uv_to_texels(u, v, out);
+}
+
+/* Shade mapping (TEX_MAP_MODE 2, sceGuTexMapMode's GU_ENVIRONMENT_MAP): the
+ * coordinates come from the normal, not the vertex. Each is half of one
+ * plus the world-space normal, normalised, dotted with a light's vector,
+ * normalised -- the two lights TEX_SHADE_LS names, enabled or not -- so a
+ * face reads one place in the texture by which way it faces. The vertex's
+ * own coordinates, which this used before, are the base texture's: they
+ * spread WipEout Pulse's shade texture over every face of its buildings, its
+ * ships too, as fixed white spots. Not measured on hardware: which of the
+ * register's fields feeds U, that the normal is the world-space one, and
+ * that the texture scale applies and the offset does not. Against a
+ * reference frame of WipEout's race start, world space with bits 0..1 as U
+ * came closest: mean difference 4.7 on its tower, against 6.4 in eye space
+ * and 7.8 with U and V swapped. */
+static void mul_3x3(const float m[12], const float in[3], float out[3]);
+static float shade_axis(int light, const float n[3]) {
+    const float *l = g_tl.light[light & 3].pos;
+    const float len = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+    return len > 0.0f ? (l[0] * n[0] + l[1] * n[1] + l[2] * n[2]) / len : n[2];
+}
+static void shade_map_uv(const float model_nrm[3], psp_vertex *o) {
+    float n[3];
+    mul_3x3(g_tl.world, model_nrm, n);
+    const float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (len > 0.0f) { n[0] /= len; n[1] /= len; n[2] /= len; }
+    else { n[0] = n[1] = 0.0f; n[2] = 1.0f; }
+    o->u = (1.0f + shade_axis(g_tl.tex_shade_u, n)) * 0.5f * g_ge.tex_scale_u * (float)g_ge.tex_w;
+    o->v = (1.0f + shade_axis(g_tl.tex_shade_v, n)) * 0.5f * g_ge.tex_scale_v * (float)g_ge.tex_h;
+    note_uv(o->u, o->v);
 }
 
 /* World and view are 4 columns of 3 rows; the implied bottom row makes the
@@ -3041,6 +3075,8 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
     const uint64_t _x0 = ge_prof_now();
     if (g_tl.lighting) { lights_to_eye(); light_setup(); }
     const int any_light = g_tl.lighting && any_light_enabled();
+    /* The normal, read for lighting, and for shade mapping lit or not. */
+    const int want_normal = any_light || g_tl.tex_map_mode == 2;
 
     /* The backend's transform, when it offers one. Triangles only (points,
      * lines and sprites stay here), and not screen-space projections, whose
@@ -3105,10 +3141,15 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
                 if (!read_pos_model_at(vp, a, vtype, pos_off, m->pos)) break;
                 m->rgba = base_colour;
                 if (vertex_colour) m->rgba = read_colour_at(vp, a, vtype, col_off);
-                if (any_light) read_normal_model_at(vp, a, vtype, norm_off, m->nrm);
+                if (want_normal) read_normal_model_at(vp, a, vtype, norm_off, m->nrm);
                 else { m->nrm[0] = m->nrm[1] = 0.0f; m->nrm[2] = 1.0f; }
                 psp_vertex uv;
                 read_uv_model_at(vp, a, vtype, tex_off, &uv);
+                /* Shade mapping's coordinates come from here, the transform
+                 * stays the backend's: a second pass over the same geometry
+                 * tests for equal depth, and WipEout Pulse's buildings draw
+                 * their concrete that way over the shade pass. */
+                if (g_tl.tex_map_mode == 2) shade_map_uv(m->nrm, &uv);
                 m->u = uv.u; m->v = uv.v;
                 note_colour(m->rgba);
             }
@@ -3164,7 +3205,7 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             } else {
                 a = vertex_addr(done + decoded, stride);
                 if (blended) {
-                    if (!read_mvert(a, g_ge.vtype, col_off, pos_off, tex_off, norm_off, any_light, &mv)) break;
+                    if (!read_mvert(a, g_ge.vtype, col_off, pos_off, tex_off, norm_off, want_normal, &mv)) break;
                     memcpy(model, mv.pos, sizeof model);
                 } else {
                     vp = (const uint8_t *)psp_mem_ptr(a, (uint32_t)stride);
@@ -3221,6 +3262,12 @@ static void draw_prim_transformed(uint32_t type, uint32_t count,
             note_colour(o->rgba);
             if (blended) { o->u = mv.u; o->v = mv.v; }
             else read_uv_model_at(vp, a, g_ge.vtype, tex_off, o);
+            if (g_tl.tex_map_mode == 2) {
+                float nm[3];
+                if (blended) memcpy(nm, mv.nrm, sizeof nm);
+                else read_normal_model_at(vp, a, g_ge.vtype, norm_off, nm);
+                shade_map_uv(nm, o);
+            }
             if (g_tl.tex_map_mode == 1) {
                 /* The source row the matrix is applied to. GU_POSITION is the
                  * model-space position, GU_UV the vertex's own coordinates,
@@ -4696,6 +4743,10 @@ static void run_list_body(ge_queue *q) {
         case GE_TEXMAPMODE:
             g_tl.tex_map_mode  = (int)(arg & 3);
             g_tl.tex_proj_mode = (int)((arg >> 8) & 3);
+            break;
+        case GE_TEXSHADELS:
+            g_tl.tex_shade_u = (int)(arg & 3);
+            g_tl.tex_shade_v = (int)((arg >> 8) & 3);
             break;
         case GE_DEPTHCLIPENABLE: g_tl.depth_clamp = (int)(arg & 1); break;
         case GE_LIGHTINGENABLE: g_tl.lighting = (int)(arg & 1); break;

@@ -728,7 +728,54 @@ static void test_main_context_serves_and_exits_are_hooked(void) {
           "the exit hook ran %d time(s), on the ending thread's host thread: %d", exit_hooks, exit_hook_on_own);
 }
 
+/* A host thread that is no guest's -- the window's, as it closes or on a
+ * SIGINT -- stops the run while a guest thread has the CPU. The call comes
+ * back to it: the host thread has the rest of the shutdown to do. It once
+ * read who had the CPU rather than who called, and so ended the window's
+ * thread in the guest's place, and the run never finished.
+ *
+ * The guest thread, dead now, runs on to its next call into the scheduler:
+ * here a delay, as Armored Core 3 Portable's threads were in when the window
+ * closed. It must leave there, neither taking the token back from the main
+ * context nor counted alive by the wait it set up. */
+#define ENTRY_HOLDER 0x0000F300u
+#define UID_HOLDER   0x0004000Cu
+static volatile int holder_running, holder_go, stopper_returned, holder_after_delay;
+static void body_holder(void) {
+    holder_running = 1;
+    const uint64_t until = psp_os_mono_ns() + 2000000000ull;
+    while (!holder_go && psp_os_mono_ns() < until) {}
+    psp_sched_delay(1000);
+    holder_after_delay = 1;
+}
+static void stopper(void *arg) {
+    (void)arg;
+    while (!holder_running) psp_os_sleep_until_ns(psp_os_mono_ns() + 1000000u);
+    psp_sched_stop_all("host-stop");
+    stopper_returned = 1;
+    holder_go = 1;
+}
+
+static void test_host_thread_stop_returns(void) {
+    psp_sched_reset();
+    psp_sched_set_threading(1);
+    holder_running = holder_go = stopper_returned = holder_after_delay = 0;
+    /* Started first: the holder outranks the main context, so spawning it
+     * runs it at once and the spawn returns once the holder is stopped. */
+    psp_os_thread t;
+    CHECK(psp_os_thread_start(&t, stopper, NULL, 256 * 1024) == 0, "starting the host thread failed");
+    CHECK(psp_sched_spawn(UID_HOLDER, ENTRY_HOLDER, FAKE_SP, 0, 0, 0, 30) == 0,
+          "spawning the holder failed");
+    psp_sched_drain(5);
+    psp_os_thread_join(&t);
+    psp_sched_join_all();
+    CHECK(stopper_returned, "the host thread that stopped the run was ended in the guest thread's place");
+    CHECK(psp_sched_live() == 0, "%d thread(s) still alive after the stop", psp_sched_live());
+    CHECK(!holder_after_delay, "the stopped guest thread carried on past its delay");
+}
+
 int main(void) {
+    psp_register(ENTRY_HOLDER, body_holder);
     psp_register(ENTRY_HOST_OWNER, body_host_owner);
     psp_register(ENTRY_ASK_MAIN, body_ask_main);
     psp_register(ENTRY_HOST_ASKER, body_host_asker);
@@ -772,6 +819,7 @@ int main(void) {
     test_thread_counters();
     test_run_on_a_parked_thread();
     test_main_context_serves_and_exits_are_hooked();
+    test_host_thread_stop_returns();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

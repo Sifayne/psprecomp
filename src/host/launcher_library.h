@@ -102,7 +102,7 @@ static void browser_scan(launcher *a,const char *path) {
     psp_ui_focus_next();
 }
 static void browser_open(launcher *a,int kind) {
-    if (!a->importer) return;
+    if (!a->importer || working(a)) return;
     a->view=VIEW_BROWSE; a->browse=kind;
     browser_scan(a,*a->browser_path?a->browser_path:getenv("HOME")?getenv("HOME"):"/");
 }
@@ -134,7 +134,7 @@ static void import_start(launcher *a,int work,const char *what) {
     setpgid(pid,pid); sigprocmask(SIG_SETMASK,&previous,NULL);
     close(pipes[1]); fcntl(pipes[0],F_SETFL,O_NONBLOCK);
     a->import_pid=pid; a->import_fd=pipes[0]; a->import_used=0;
-    a->import_cancelled=0; a->work=work; a->view=VIEW_PREPARING; psp_ui_focus_next();
+    a->import_cancelled=0; a->work=work; a->view=VIEW_SETTINGS;
     snprintf(a->import_status,sizeof a->import_status,"%s",work==WORK_IMPORT?"Checking the selected ISO...":
              work==WORK_INSTALL?"Checking the pack...":"Removing the pack...");
 }
@@ -160,7 +160,7 @@ static void import_poll(launcher *a) {
         } else if (a->import_used+1<sizeof a->import_line) a->import_line[a->import_used++]=buffer[i];
     }
     int status; if (waitpid(a->import_pid,&status,WNOHANG)<=0) return;
-    close(a->import_fd); a->import_pid=0; a->view=VIEW_SETTINGS; psp_ui_focus_next();
+    close(a->import_fd); a->import_pid=0;
     const int ok=!a->import_cancelled && WIFEXITED(status) && WEXITSTATUS(status)==0;
     if (a->import_cancelled) snprintf(a->status,sizeof a->status,"%s",a->work==WORK_IMPORT?
         "Preparation canceled. Existing games and saves are unchanged.":"Canceled. Your packs are unchanged.");

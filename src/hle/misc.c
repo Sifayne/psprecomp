@@ -161,16 +161,24 @@ static void hle_OpenPSIDGetOpenPSID(void)   { psp_ret(SCE_KERNEL_ERROR_OK); }
  * tick, which this now feeds, was deterministic before. */
 #define WALL_FIXED_UNIX 1767225600u   /* 2026-01-01 00:00:00 UTC */
 
+static int g_date_have;
+static uint64_t g_date_base;       /* microseconds since 1970 at guest time 0 */
+
+void psp_rtc_set_date_us(uint64_t unix_us) { g_date_base = unix_us; g_date_have = 1; }
+
+/* On the paced clock the date is the host's too, and a recording notes it
+ * so its replay sees the same day. */
 static uint64_t wall_us(void) {
-    static int have;
-    static uint64_t base;          /* microseconds since 1970 at guest time 0 */
-    if (!have) {
-        base = psp_clock_is_realtime()
-             ? (uint64_t)time(NULL) * 1000000u - psp_clock_peek()
-             : (uint64_t)WALL_FIXED_UNIX * 1000000u;
-        have = 1;
+    if (!g_date_have) {
+        g_date_base = psp_clock_is_realtime() || psp_clock_is_paced()
+                    ? (uint64_t)time(NULL) * 1000000u - psp_clock_peek()
+                    : (uint64_t)WALL_FIXED_UNIX * 1000000u;
+        g_date_have = 1;
+        char line[48];
+        snprintf(line, sizeof line, "date %llu", (unsigned long long)g_date_base);
+        psp_ctrl_replay_note(line);
     }
-    return base + psp_clock_peek();
+    return g_date_base + psp_clock_peek();
 }
 
 static void hle_LibcTime(void) {
@@ -1127,6 +1135,12 @@ void psp_audio_set_output(int64_t (*fn)(int ch, uint32_t samples, uint32_t fmt,
 
 void psp_audio_set_pending(uint32_t (*fn)(int ch)) { g_audio_pending = fn; }
 
+/* Whether the host device paces the guest's audio waits. It gets every
+ * buffer either way; but on the paced clock (psp_clock_paced, clock.h) the
+ * waits are the virtual speaker's, so the guest does not see the host's
+ * device timing and a recorded session replays exactly. */
+static int sink_paces(void) { return g_audio_out && !psp_clock_is_paced(); }
+
 /* PSPRECOMP_AUDIO_DUMP=<prefix> appends every output buffer, raw signed
  * 16-bit as the game wrote it, to <prefix>.chN.raw -- one file per channel,
  * with a line on stderr naming its shape. A headless run has no speaker, and
@@ -1226,9 +1240,11 @@ static int64_t audio_output_common(int buf_arg, int lvol_arg, int rvol_arg) {
         return 0;
     audio_note_gap(ch, g_audio[ch].samples);
     audio_dump(ch, g_audio[ch].samples, g_audio[ch].format, psp_arg(buf_arg));
-    if (g_audio_out)
-        return g_audio_out((int)ch, g_audio[ch].samples, g_audio[ch].format,
-                           psp_arg(buf_arg), psp_arg(lvol_arg), psp_arg(rvol_arg));
+    if (g_audio_out) {
+        const int64_t host = g_audio_out((int)ch, g_audio[ch].samples, g_audio[ch].format,
+                                         psp_arg(buf_arg), psp_arg(lvol_arg), psp_arg(rvol_arg));
+        if (sink_paces()) return host;
+    }
 
     /* No host sink, but a blocking output still takes the time the samples
      * take. Returning zero here made a call with "Blocking" in its name return
@@ -1330,7 +1346,7 @@ enum { O2_STEP_DRAIN = 1, O2_STEP_PLAY };
 static void output2_submit(uint32_t volume, uint32_t pcm);
 
 static uint32_t output2_remaining(void) {
-    if (g_audio_out)
+    if (sink_paces())
         return g_audio_pending ? g_audio_pending(AUDIO_OUTPUT2_CHANNEL) : 0;
     const uint64_t now = psp_clock_peek() * 1000ull;
     if (now >= g_output2_until_ns) return 0;
@@ -1340,6 +1356,14 @@ static uint32_t output2_remaining(void) {
 
 static int output2_length_ok(uint32_t samples) {
     return samples >= 17 && samples <= 4111;
+}
+
+/* With no device pacing it, Output2 is a timeline with the hardware's two
+ * slots (uofw audio.c, audioSRCOutput): one buffer playing and one queued.
+ * Both are taken while what is queued reaches more than a buffer past now. */
+static int output2_slots_full(uint64_t now) {
+    const uint64_t buf = (uint64_t)g_audio[AUDIO_OUTPUT2_CHANNEL].samples * 1000000000ull / PSP_AUDIO_RATE;
+    return g_output2_until_ns > now + buf;
 }
 
 static void hle_Output2Reserve(void) {
@@ -1384,14 +1408,13 @@ static void hle_Output2Blocking(void) {
     if (!pcm || !psp_mem_ptr(pcm, channel->samples * 4)) {
         psp_ret(O2_ADDRESS); return;
     }
-    /* No device: finish the previous transfer before accepting the next one.
+    /* No device, and both slots taken: wait for the one playing to finish.
      * If scheduling is disabled (unit probes), report busy without losing it. */
-    if (!g_audio_out && output2_remaining()) {
-        const uint64_t now = psp_clock_peek() * 1000ull;
-        if (g_output2_until_ns > now) {
-            psp_sched_set_step(O2_STEP_DRAIN);
-            psp_sched_delay((g_output2_until_ns - now + 999) / 1000);
-        }
+    const uint64_t now = psp_clock_peek() * 1000ull;
+    if (!sink_paces() && output2_slots_full(now)) {
+        const uint64_t buf = (uint64_t)channel->samples * 1000000000ull / PSP_AUDIO_RATE;
+        psp_sched_set_step(O2_STEP_DRAIN);
+        psp_sched_delay((g_output2_until_ns - buf - now + 999) / 1000);
     }
     output2_submit(volume, pcm);
 }
@@ -1400,18 +1423,25 @@ static void hle_Output2Blocking(void) {
  * save state restored inside that drain (output2_resume). */
 static void output2_submit(uint32_t volume, uint32_t pcm) {
     audio_ch *channel = &g_audio[AUDIO_OUTPUT2_CHANNEL];
-    if (!g_audio_out && output2_remaining()) { psp_ret(O2_BUSY); return; }
+    if (!sink_paces() && output2_slots_full(psp_clock_peek() * 1000ull)) { psp_ret(O2_BUSY); return; }
     const uint32_t samples = channel->samples;
     g_audio_blocks++;
     audio_note_gap(AUDIO_OUTPUT2_CHANNEL, samples);
     audio_dump(AUDIO_OUTPUT2_CHANNEL, samples, 0, pcm);
     int64_t wait_us;
-    if (g_audio_out) {
-        wait_us = g_audio_out(AUDIO_OUTPUT2_CHANNEL, samples, 0, pcm, volume, volume);
+    const int64_t host = g_audio_out ? g_audio_out(AUDIO_OUTPUT2_CHANNEL, samples, 0, pcm, volume, volume) : 0;
+    if (sink_paces()) {
+        wait_us = host;
     } else {
-        wait_us = ((uint64_t)samples * 1000000ull + PSP_AUDIO_RATE - 1) / PSP_AUDIO_RATE;
-        g_output2_until_ns = psp_clock_peek() * 1000ull
-                          + (uint64_t)samples * 1000000000ull / PSP_AUDIO_RATE;
+        /* Queued behind what is there, and back when the buffer before it
+         * has played -- at once if that finished while the game mixed this
+         * one. Waiting out the new buffer as well, as this did, left the
+         * speaker idle for every moment the game spent mixing the next:
+         * WipEout Pulse and The 3rd Birthday made 7-8% too little sound on
+         * the paced clock, and it stuttered. */
+        const uint64_t now = psp_clock_peek() * 1000ull, was = g_output2_until_ns;
+        g_output2_until_ns = (was > now ? was : now) + (uint64_t)samples * 1000000000ull / PSP_AUDIO_RATE;
+        wait_us = was > now ? (int64_t)((was - now + 999) / 1000) : 0;
     }
     psp_sched_set_step(O2_STEP_PLAY);
     if (wait_us > 0) psp_sched_delay((uint64_t)wait_us);
@@ -1450,6 +1480,10 @@ void psp_misc_reset(void) {
 }
 
 void psp_misc_init(void) {
+    /* A new run works its date and time zone out afresh, before a replay's
+     * recorded ones are parsed below. */
+    g_date_have = 0;
+    psp_sysparam_forget_zone();
     psp_misc_reset();
     g_hold_buttons = parse_pad();
     parse_pad_press();

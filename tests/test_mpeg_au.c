@@ -4,7 +4,9 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/dispatch.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define BASE 0x08810000u
 #define MPEG BASE
@@ -41,11 +43,26 @@ static unsigned pes(unsigned at, unsigned id, uint32_t pts, const void *payload,
     memcpy(p+14,payload,size);
     return at+14+size;
 }
+/* An MPEG-2 pack header at the start of the packet, its clock at `scr`. */
+static unsigned pack(uint32_t scr) {
+    unsigned char *p = packet;
+    p[0]=0; p[1]=0; p[2]=1; p[3]=0xba;
+    p[4]=0x44|((scr>>27)&0x38)|((scr>>28)&3); p[5]=scr>>20;
+    p[6]=((scr>>12)&0xf8)|4|((scr>>13)&3); p[7]=scr>>5;
+    p[8]=((scr<<3)&0xf8)|4; p[9]=1;
+    p[10]=0x01; p[11]=0x89; p[12]=0xc3; p[13]=0xf8;
+    return 14;
+}
 static void feed(void) {
     psp_mem_write_block(psp_arg(0), packet, sizeof packet);
     psp_ret(1);
 }
 int main(void) {
+    /* Every NAL the decoder is given, for the splice test below:
+     * PSPRECOMP_MPEG_ES is read once, at the first decode. */
+    char es_path[] = "/tmp/mpeg_au_es_XXXXXX";
+    const int es_fd = mkstemp(es_path);
+    if (es_fd >= 0) { close(es_fd); setenv("PSPRECOMP_MPEG_ES", es_path, 1); }
     CHECK(psp_mem_init()==0); psp_cpu_reset(); psp_hle_init();
     psp_cpu.r[PSP_REG_SP]=BASE+0x8000;
     if (!psp_mpeg_decoding_available()) { puts("mpeg_au: skipped (no OpenH264)"); return 77; }
@@ -91,6 +108,182 @@ int main(void) {
         CHECK(call(0xB240A59E,RB2,1,3,0,0,0)==1);
         CHECK(call(0xB5F6DC87,RB2,0,0,0,0,0)==2);     /* AvailableSize */
     }
+    /* An IDR cut short after the three black pictures: what it lacks is
+     * concealed from the picture before it, black, not filled with mid-gray
+     * -- the band that flashed over WipEout Pulse's menu where its movie
+     * loops. */
+    {
+        enum { MPEG3 = BASE + 0x480, RB3 = BASE + 0x400, DATA3 = BASE + 0x48000, WORK3 = BASE + 0x50000,
+               PIC = BASE + 0x40000, PICP = BASE + 0x2F0, INIT = BASE + 0x2F8 };
+        static const unsigned char cut[] = {
+            0,0,0,1,9,0x10, 0,0,0,1,0x65,0x88,0x84,          /* the IDR's slice, two bytes of it */
+            0,0,0,1,9,0x30, 0,0,0,1,0x41,0x9a,0x38,0x15,0xea,
+            0,0,0,1,9,0x30
+        };
+        unsigned char es[sizeof video + sizeof cut];
+        memcpy(es, video, sizeof video); memcpy(es + sizeof video, cut, sizeof cut);
+        const uint32_t ring3 = call(0xD7A29F46,4,0,0,0,0,0);
+        CHECK(call(0x37295ED8,RB3,4,DATA3,ring3,CALLBACK,0)==0);
+        CHECK(call(0xD8C5F121,MPEG3,WORK3,0x10000,RB3,512,0)==0);
+        CHECK(call(0x42560F23,MPEG3,0,0,0,0,0)!=0);   /* RegistStream: video */
+        memset(packet,0,sizeof packet);
+        pes(0,0xe0,90000,es,sizeof es);
+        CHECK(call(0xB240A59E,RB3,1,4,0,0,0)==1);
+        psp_write32(PICP,PIC);
+        uint32_t pixel[4] = {0};
+        for (unsigned i=0;i<4;i++) {
+            psp_write32(PIC,0x12345678);
+            CHECK(call(0xFE246728,MPEG3,0,AU,0,0,0)==0);              /* GetAvcAu */
+            CHECK(call(0x0E3C2E9D,MPEG3,AU,16,PICP,INIT,0)==0);      /* AvcDecode */
+            CHECK(psp_read32(INIT)==1);
+            pixel[i]=psp_read32(PIC);
+        }
+        CHECK(pixel[2]==0xFF000000u);
+        CHECK(pixel[3]==0xFF000000u);
+    }
+    /* Two packs, the second opening inside a NAL. With their clock rising
+     * they are one stream: the slice the first ends on runs on into the
+     * second's opening bytes, and five pictures decode. With the clock
+     * going back they are a splice -- WipEout Pulse's menu movie at its
+     * loop -- and the splice ends that slice: the second's bytes up to its
+     * next start code never reach the decoder (its input, PSPRECOMP_MPEG_ES,
+     * has the rising run's mark and not the falling one's), the slice still
+     * decodes, and the picture after it, back in time, is refused: four.
+     * The slices are the video's first P with frame_num made 3 and 4, so
+     * that they follow its last. */
+    {
+        enum { M = BASE + 0x500, R = BASE + 0x580, D = BASE + 0x60000, WK = BASE + 0x70000,
+               PIC = BASE + 0x40000, PICP = BASE + 0x2F0, INIT = BASE + 0x2F8 };
+        static const unsigned char aud[] = {0,0,0,1,9,0x30},
+                                   p3[] = {0,0,0,1,0x41,0x9a,0x78,0x15,0xea},
+                                   p4[] = {0,0,0,1,0x41,0x9a,0x98,0x15,0xea};
+        static const char *const mark[2] = {"\xff\xffpsprecomp-rise", "\xff\xffpsprecomp-fall"};
+        CHECK(call(0x606A4649,BASE + 0x80,0,0,0,0,0)==0);    /* Delete the two above: room */
+        CHECK(call(0x606A4649,BASE + 0x480,0,0,0,0,0)==0);
+        for (int back = 0; back < 2; back++) {
+            unsigned char first[sizeof video + sizeof aud + sizeof p3];
+            memcpy(first, video, sizeof video);
+            memcpy(first + sizeof video, aud, sizeof aud);
+            memcpy(first + sizeof video + sizeof aud, p3, sizeof p3);
+            unsigned char second[16 + 2 * sizeof aud + sizeof p4];
+            size_t m = 0;
+            memcpy(second + m, mark[back], 16); m += 16;
+            memcpy(second + m, aud, sizeof aud); m += sizeof aud;
+            memcpy(second + m, p4, sizeof p4); m += sizeof p4;
+            memcpy(second + m, aud, sizeof aud); m += sizeof aud;
+            const uint32_t size = call(0xD7A29F46,4,0,0,0,0,0);
+            CHECK(call(0x37295ED8,R,4,D,size,CALLBACK,0)==0);
+            CHECK(call(0xD8C5F121,M,WK,0x10000,R,512,0)==0);
+            CHECK(call(0x42560F23,M,0,0,0,0,0)!=0);   /* RegistStream: video */
+            memset(packet,0,sizeof packet);
+            pes(pack(9000),0xe0,90000,first,sizeof first);
+            CHECK(call(0xB240A59E,R,1,4,0,0,0)==1);
+            memset(packet,0,sizeof packet);
+            pes(pack(back ? 3000 : 12000),0xe0,99009,second,(unsigned)m);
+            CHECK(call(0xB240A59E,R,1,3,0,0,0)==1);
+            psp_write32(PICP,PIC);
+            int pictures = 0;
+            while (pictures < 8 && call(0xFE246728,M,0,AU,0,0,0)==0) {
+                CHECK(call(0x0E3C2E9D,M,AU,16,PICP,INIT,0)==0);
+                pictures++;
+            }
+            CHECK(pictures == (back ? 4 : 5));
+            CHECK(call(0x606A4649,M,0,0,0,0,0)==0);
+        }
+        FILE *f = es_fd >= 0 ? fopen(es_path, "rb") : NULL;
+        CHECK(f != NULL);
+        if (f) {
+            static unsigned char given[1 << 16];
+            const size_t len = fread(given, 1, sizeof given, f);
+            fclose(f);
+            int seen[2] = {0, 0};
+            for (int k = 0; k < 2; k++)
+                for (size_t i = 0; i + 16 <= len && !seen[k]; i++)
+                    seen[k] = !memcmp(given + i, mark[k], 16);
+            CHECK(seen[0]);
+            CHECK(!seen[1]);
+        }
+    }
+    /* A picture in sequence by number whose pack's clock leaps on: after
+     * the video and its P numbered 3, a pack opening cleanly on a P
+     * numbered 4. Its clock 30 ms on, it is the fifth picture; two seconds
+     * on, it is from elsewhere in the file and refused. An IDR after it is
+     * taken either way, and restarts the clock. */
+    {
+        enum { M = BASE + 0x500, R = BASE + 0x580, D = BASE + 0x60000, WK = BASE + 0x70000,
+               PIC = BASE + 0x40000, PICP = BASE + 0x2F0, INIT = BASE + 0x2F8 };
+        static const unsigned char aud[] = {0,0,0,1,9,0x30},
+                                   p3[] = {0,0,0,1,0x41,0x9a,0x78,0x15,0xea},
+                                   p4[] = {0,0,0,1,0x41,0x9a,0x98,0x15,0xea};
+        for (int leap = 0; leap < 2; leap++) {
+            unsigned char first[sizeof video + sizeof aud + sizeof p3 + sizeof aud];
+            size_t n = 0;
+            memcpy(first + n, video, sizeof video); n += sizeof video;
+            memcpy(first + n, aud, sizeof aud); n += sizeof aud;
+            memcpy(first + n, p3, sizeof p3); n += sizeof p3;
+            memcpy(first + n, aud, sizeof aud); n += sizeof aud;
+            unsigned char second[sizeof p4 + sizeof video];
+            size_t m = 0;
+            memcpy(second + m, p4, sizeof p4); m += sizeof p4;
+            memcpy(second + m, video, sizeof video); m += sizeof video;   /* an AUD, then the IDR's unit */
+            const uint32_t size = call(0xD7A29F46,4,0,0,0,0,0);
+            CHECK(call(0x37295ED8,R,4,D,size,CALLBACK,0)==0);
+            CHECK(call(0xD8C5F121,M,WK,0x10000,R,512,0)==0);
+            CHECK(call(0x42560F23,M,0,0,0,0,0)!=0);   /* RegistStream: video */
+            memset(packet,0,sizeof packet);
+            pes(pack(9000),0xe0,90000,first,(unsigned)n);
+            CHECK(call(0xB240A59E,R,1,4,0,0,0)==1);
+            memset(packet,0,sizeof packet);
+            pes(pack(leap ? 9000 + 180000 : 9000 + 2700),0xe0,99009,second,(unsigned)m);
+            CHECK(call(0xB240A59E,R,1,3,0,0,0)==1);
+            psp_write32(PICP,PIC);
+            int pictures = 0;
+            while (pictures < 12 && call(0xFE246728,M,0,AU,0,0,0)==0) {
+                CHECK(call(0x0E3C2E9D,M,AU,16,PICP,INIT,0)==0);
+                pictures++;
+            }
+            /* 4, p4, then the second video's IDR and its first P (its last
+             * waits for a start code after it): 7, or 6 without p4. */
+            CHECK(pictures == (leap ? 6 : 7));
+            CHECK(call(0x606A4649,M,0,0,0,0,0)==0);
+        }
+    }
+    /* A picture out of sequence: after the video's P pictures numbered 1
+     * and 2, its first P again, then one numbered 3. The repeat is refused
+     * and 3 follows 2: four pictures. Decoded, the repeat made a fifth on
+     * the wrong reference -- the blocky trail behind the ship each time
+     * WipEout Pulse's menu movie loops. */
+    {
+        enum { M = BASE + 0x500, R = BASE + 0x580, D = BASE + 0x60000, WK = BASE + 0x70000,
+               PIC = BASE + 0x40000, PICP = BASE + 0x2F0, INIT = BASE + 0x2F8 };
+        static const unsigned char aud[] = {0,0,0,1,9,0x30},
+                                   p1[] = {0,0,0,1,0x41,0x9a,0x38,0x15,0xea},
+                                   p3[] = {0,0,0,1,0x41,0x9a,0x78,0x15,0xea};
+        unsigned char es[sizeof video + 2 * (sizeof aud + sizeof p1) + sizeof aud];
+        size_t n = 0;
+        memcpy(es + n, video, sizeof video); n += sizeof video;
+        memcpy(es + n, aud, sizeof aud); n += sizeof aud;
+        memcpy(es + n, p1, sizeof p1); n += sizeof p1;
+        memcpy(es + n, aud, sizeof aud); n += sizeof aud;
+        memcpy(es + n, p3, sizeof p3); n += sizeof p3;
+        memcpy(es + n, aud, sizeof aud); n += sizeof aud;
+        const uint32_t size = call(0xD7A29F46,4,0,0,0,0,0);
+        CHECK(call(0x37295ED8,R,4,D,size,CALLBACK,0)==0);
+        CHECK(call(0xD8C5F121,M,WK,0x10000,R,512,0)==0);
+        CHECK(call(0x42560F23,M,0,0,0,0,0)!=0);   /* RegistStream: video */
+        memset(packet,0,sizeof packet);
+        pes(pack(9000),0xe0,90000,es,(unsigned)n);
+        CHECK(call(0xB240A59E,R,1,4,0,0,0)==1);
+        psp_write32(PICP,PIC);
+        int pictures = 0;
+        while (pictures < 8 && call(0xFE246728,M,0,AU,0,0,0)==0) {
+            CHECK(call(0x0E3C2E9D,M,AU,16,PICP,INIT,0)==0);
+            pictures++;
+        }
+        CHECK(pictures == 4);
+        CHECK(call(0x606A4649,M,0,0,0,0,0)==0);
+    }
+    if (es_fd >= 0) unlink(es_path);
     call(0x874624D6,0,0,0,0,0,0);
     psp_mem_free();
     puts(failed ? "mpeg_au: FAILED" : "mpeg_au: passed"); return failed!=0;

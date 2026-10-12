@@ -167,6 +167,17 @@ static int number_row(const psp_settings *s, int id, const char *label, const ch
     double v = s->number[id] * scale;
     char bare[PSP_SETTINGS_NAME + 4];
     snprintf(bare, sizeof bare, "##%s", d->key);
+    /* A number in steps slides over its steps, so a press of the D-pad or an
+     * arrow -- one stop of a short range -- is never less than a step. */
+    if (d->step > 0 && (d->max - d->min) / d->step <= 1000) {
+        const int count = (int)floor((d->max - d->min) / d->step + 0.5);
+        int at = (int)floor((s->number[id] - d->min) / d->step + 0.5);
+        char text[64];
+        snprintf(text, sizeof text, d->format ? d->format : "%.2f", v);
+        if (!psp_ui_stops(d->special ? bare : label, &at, count, text)) return 0;
+        snprintf(value, size, "%.9g", d->min + at * d->step);
+        return 1;
+    }
     if (!psp_ui_number(d->special ? bare : label, &v, d->min * scale, d->max * scale,
                        d->format ? d->format : "%.2f")) return 0;
     double n = v / scale;

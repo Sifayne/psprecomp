@@ -7,6 +7,7 @@
 #include "ui.h"
 
 #include "imgui.h"
+#include "imgui_internal.h"     // the panes' cursor: FocusItem, the move request
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_sdlrenderer2.h"
 
@@ -20,6 +21,18 @@
 
 // ---- state ----------------------------------------------------------------------
 
+// The side list and its page are panes. ImGui moves the cursor within one;
+// between them the toolkit moves it, so it never lands on whatever row lies
+// level with it, nor on nothing: right on an entry, or choosing one with A or
+// Enter, goes into its page -- to the item it was on there last, else the
+// default (the current slot), else the first -- and left at the page's edge,
+// or psp_ui_back(), goes back to the entry whose page shows. Up or down past
+// a pane's edge goes to the nearest of its parent's own items (the
+// launcher's tabs and buttons), if any.
+enum { PANE_NONE, PANE_SIDE, PANE_PAGE };
+enum { WANT_NONE, WANT_SIDE, WANT_PAGE, WANT_ITEM };
+enum { REMEMBERED = 16, OTHERS = 32 };
+
 static struct {
     int started;
     SDL_Window *win;
@@ -29,6 +42,27 @@ static struct {
     char help[512];             // the help of the widget with focus, this frame
     char shown_help[512];       // ... and what the help area shows
     int focus_next;
+    char focused[128];          // the label the cursor was on, last frame
+    char focusing[128];         // ... and this frame
+    // The panes, this frame: which is being drawn, their windows, the entry
+    // whose page shows (and one chosen this frame), the items in each, and
+    // the parent's own items.
+    int pane;
+    ImGuiWindow *side, *page;
+    ImGuiID shown, picked;
+    int items[3];
+    struct { ImGuiWindow *window; ImGuiID id; float x0, y0, x1, y1; } other[OTHERS];
+    int others;
+    // Where the cursor is to go, asked at the end of a frame and done as the
+    // next draws the item (want_rank: how good the page's pick so far is);
+    // an entry to choose, as A would; whether to go into the page drawn next.
+    int want, want_rank;
+    ImGuiID want_item, choose;
+    ImGuiID side_return;        // the entry the cursor left the list from, up or down
+    int enter;
+    int cursor_pane;            // where the cursor was at the end of the last frame
+    ImGuiID shown_before;       // ... and the entry whose page showed
+    struct { ImGuiID page, item; } remembered[REMEMBERED];
     int table_column;
     float footer;               // what the side list and its page leave below
 } u;
@@ -59,6 +93,7 @@ static void style(float scale) {
     c[ImGuiCol_HeaderActive] = rgb(239, 184, 90, 0.40f);
     c[ImGuiCol_CheckMark] = ACCENT;         c[ImGuiCol_SliderGrab] = ACCENT;
     c[ImGuiCol_SliderGrabActive] = ACCENT;  c[ImGuiCol_NavCursor] = ACCENT;
+    c[ImGuiCol_PlotHistogram] = ACCENT;     // a progress bar's fill
     c[ImGuiCol_TableHeaderBg] = PANEL;      c[ImGuiCol_TableBorderStrong] = BORDER;
     c[ImGuiCol_TableBorderLight] = BORDER;  c[ImGuiCol_TableRowBg] = BG;
     c[ImGuiCol_TableRowBgAlt] = rgb(20, 27, 35);
@@ -279,12 +314,105 @@ extern "C" void psp_ui_begin(void) {
     if (scale != u.scale) { style(scale); u.scale = scale; }
     if (u.ren) ImGui_ImplSDLRenderer2_NewFrame();
     ImGui_ImplSDL2_NewFrame();
+    // A pad's move starts from the visible part of the window, and ImGui
+    // forgets the item it starts from unless that is wholly inside -- which
+    // a full-width row, 4 px wider each side, never is -- so the row itself
+    // could win the move. An item still in view is kept.
+    ImGuiContext &g = *GImGui;
+    const ImGuiID nav_before = g.NavId;
+    ImGuiWindow *nav_window = g.NavWindow;
+    const ImRect item_before = nav_window ? ImGui::WindowRectRelToAbs(nav_window, nav_window->NavRectRel[ImGuiNavLayer_Main]) : ImRect();
     ImGui::NewFrame();
+    if (g.NavMoveSubmitted && !g.NavId && nav_before && g.NavWindow == nav_window && g.NavLayer == ImGuiNavLayer_Main &&
+        nav_window->InnerRect.Overlaps(item_before))
+        g.NavId = nav_before;
     snprintf(u.shown_help, sizeof u.shown_help, "%s", u.help);
     u.help[0] = 0;
+    u.focusing[0] = 0;
+    u.side = u.page = NULL;
+    u.shown = u.picked = 0;
+    u.items[PANE_SIDE] = u.items[PANE_PAGE] = 0;
+    u.others = 0;
+}
+
+static ImGuiID remembered(ImGuiID page) {
+    for (const auto &r : u.remembered) if (r.page == page) return r.item;
+    return 0;
+}
+
+static void remember(ImGuiID page, ImGuiID item) {
+    int at = 0;
+    for (int i = 0; i < REMEMBERED; i++) {
+        if (u.remembered[i].page == page) { at = i; break; }
+        if (!u.remembered[i].page) at = i;
+    }
+    u.remembered[at].page = page;
+    u.remembered[at].item = item;
+}
+
+// The nearest of the panes' parent's own items up or down from the cursor.
+static ImGuiID other_toward(ImGuiDir dir, const ImRect &from, ImGuiWindow *parent) {
+    ImGuiID best = 0;
+    float best_d = FLT_MAX;
+    for (int i = 0; i < u.others; i++) {
+        if (u.other[i].window != parent) continue;
+        const auto &r = u.other[i];
+        const float gap = dir == ImGuiDir_Down ? r.y0 - from.Max.y : from.Min.y - r.y1;
+        if (gap < -1.0f) continue;
+        const float across = r.x1 < from.Min.x ? from.Min.x - r.x1 : r.x0 > from.Max.x ? r.x0 - from.Max.x : 0.0f;
+        const float d = gap + 2.0f * across;
+        if (d < best_d) { best_d = d; best = u.other[i].id; }
+    }
+    return best;
+}
+
+// After a frame: a move that found nothing in its pane goes on to the other
+// pane or the parent; the cursor on a pane itself (ImGui's cancel leaves it
+// there), on nothing, or in an empty page goes to the entry whose page shows.
+static void panes_after(void) {
+    ImGuiContext &g = *GImGui;
+    u.want = WANT_NONE;
+    u.choose = 0;
+    if (!u.side || !u.page) { u.cursor_pane = PANE_NONE; return; }
+    ImGuiWindow *parent = u.side->ParentWindow;
+    const int in = !g.NavWindow ? PANE_NONE : ImGui::IsWindowChildOf(g.NavWindow, u.side, false) ? PANE_SIDE :
+                   ImGui::IsWindowChildOf(g.NavWindow, u.page, false) ? PANE_PAGE : PANE_NONE;
+    const ImGuiID shown_before = u.shown_before;
+    u.cursor_pane = in;
+    u.shown_before = u.shown;
+    if (in == PANE_PAGE) {
+        if (g.NavId && u.shown) remember(u.shown, g.NavId);
+        u.side_return = 0;
+    }
+    if (in && g.NavMoveSubmitted && ImGui::NavMoveRequestButNoResultYet() && !(g.NavMoveFlags & ImGuiNavMoveFlags_IsTabbing)) {
+        const ImGuiDir dir = g.NavMoveDir;
+        if (in == PANE_SIDE && dir == ImGuiDir_Right) u.choose = g.NavId;
+        else if (in == PANE_PAGE && dir == ImGuiDir_Left) u.want = WANT_SIDE;
+        else if (dir == ImGuiDir_Up || dir == ImGuiDir_Down) {
+            const ImRect from = ImGui::WindowRectRelToAbs(g.NavWindow, g.NavWindow->NavRectRel[g.NavLayer]);
+            if ((u.want_item = other_toward(dir, from, parent))) {
+                u.want = WANT_ITEM;
+                if (in == PANE_SIDE) u.side_return = g.NavId;
+            }
+        }
+        return;
+    }
+    if (g.NavMoveSubmitted || g.NavInitRequest || !g.NavWindow) return;
+    // A page changed under the cursor (the launcher's bumpers) leaves it on
+    // an item no longer drawn; an entry chosen while the cursor is in the
+    // list takes it along.
+    if ((in == PANE_PAGE && !u.items[PANE_PAGE]) ||
+        (g.NavWindow == parent && (!g.NavId || g.NavId == u.side->ChildId)) ||
+        (in == PANE_SIDE && (!g.NavIdIsAlive || (u.shown != shown_before && g.NavId != u.shown))))
+        u.want = WANT_SIDE;
+    else if ((g.NavWindow == parent && g.NavId == u.page->ChildId) || (in == PANE_PAGE && !g.NavIdIsAlive))
+        u.want = WANT_PAGE;
 }
 
 extern "C" void psp_ui_end(void) {
+    memcpy(u.focused, u.focusing, sizeof u.focused);
+    panes_after();
+    u.want_rank = 0;
     ImGui::Render();
     if (!u.ren) snapshot_frame(ImGui::GetDrawData());
 }
@@ -306,7 +434,48 @@ static void take_focus(void) {
     if (u.focus_next) { ImGui::SetItemDefaultFocus(); u.focus_next = 0; }
 }
 
+static void focus_here(void) {
+    ImGui::FocusItem();
+    ImGui::SetNavCursorVisible(true);
+}
+
+// Every widget, once drawn: what has the cursor, the panes' counts and the
+// parent's items, and the cursor brought here if it is wanted here. A
+// default is the page's pick before its first item, after what it last had.
+static void note_focus(const char *label, int is_default = 0) {
+    ImGuiContext &g = *GImGui;
+    if (ImGui::IsItemFocused()) snprintf(u.focusing, sizeof u.focusing, "%s", label);
+    const ImGuiID id = g.LastItemData.ID;
+    if (!id || (g.LastItemData.ItemFlags & ImGuiItemFlags_NoNav)) return;
+    if (u.pane) u.items[u.pane]++;
+    else if (u.others < OTHERS) {
+        const ImRect &r = g.LastItemData.NavRect;
+        u.other[u.others].window = g.CurrentWindow;
+        u.other[u.others].id = id;
+        u.other[u.others].x0 = r.Min.x; u.other[u.others].y0 = r.Min.y;
+        u.other[u.others].x1 = r.Max.x; u.other[u.others++].y1 = r.Max.y;
+    }
+    if (u.want == WANT_SIDE && u.pane == PANE_SIDE) {
+        const int rank = u.side_return && id == u.side_return ? 2 : id == u.shown ? 1 : 0;
+        if (rank > u.want_rank) { u.want_rank = rank; focus_here(); }
+    }
+    else if (u.want == WANT_ITEM && id == u.want_item) { focus_here(); u.want = WANT_NONE; }
+    else if (u.want == WANT_PAGE && u.pane == PANE_PAGE) {
+        const int rank = id == remembered(u.shown) ? 3 : is_default ? 2 : 1;
+        if (rank > u.want_rank) { u.want_rank = rank; focus_here(); }
+    }
+}
+
 extern "C" void psp_ui_focus_next(void) { u.focus_next = 1; }
+extern "C" const char *psp_ui_focused(void) { return u.focused; }
+
+extern "C" int psp_ui_back(void) {
+    if (!u.started) return 0;
+    if (psp_ui_popup_open() || ImGui::IsAnyItemActive()) return 1;    // ImGui's own: closing a list, letting go
+    if (u.cursor_pane != PANE_PAGE) return 0;
+    u.want = WANT_SIDE;
+    return 1;
+}
 
 extern "C" void psp_ui_panel_begin(void) {
     const ImGuiViewport *vp = ImGui::GetMainViewport();
@@ -340,25 +509,51 @@ extern "C" void psp_ui_screen_end(void) { ImGui::End(); }
 
 extern "C" void psp_ui_side_begin(float width, float footer) {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, PANEL);
-    ImGui::BeginChild("##side", ImVec2(width * u.scale, -footer * u.scale),
-                      ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
+    ImGui::BeginChild("##side", ImVec2(width * u.scale, -footer * u.scale), ImGuiChildFlags_Borders);
+    u.side = ImGui::GetCurrentWindow();
+    u.pane = PANE_SIDE;
+    u.enter = 0;
     u.footer = footer;
 }
 extern "C" void psp_ui_side_next(void) {
     ImGui::EndChild();
+    if (u.want == WANT_SIDE) { u.want = WANT_NONE; u.side_return = 0; }
     ImGui::SameLine();
-    ImGui::BeginChild("##page", ImVec2(0, -u.footer * u.scale), ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
+    ImGui::BeginChild("##page", ImVec2(0, -u.footer * u.scale), ImGuiChildFlags_Borders);
+    u.page = ImGui::GetCurrentWindow();
+    u.pane = PANE_PAGE;
+    if (u.picked) u.shown = u.picked;
+    if (u.enter) { u.want = WANT_PAGE; u.want_rank = 0; u.side_return = 0; }
 }
 extern "C" void psp_ui_side_end(void) {
     ImGui::EndChild();
+    if (u.want == WANT_PAGE) u.want = WANT_NONE;
+    u.pane = PANE_NONE;
     ImGui::PopStyleColor();
 }
 
-extern "C" int psp_ui_nav(const char *label, int selected) {
-    const int chosen = ImGui::Selectable(label, selected != 0);
+// A side entry. Chosen with A or Enter, or with right, the cursor goes into
+// its page; an action -- Resume -- is chosen with A or a click alone.
+static int side_entry(const char *label, int selected, int action) {
+    int chosen = ImGui::Selectable(label, selected != 0);
+    if (u.pane == PANE_SIDE) {
+        ImGuiContext &g = *GImGui;
+        const ImGuiID id = g.LastItemData.ID;
+        if (selected) u.shown = id;
+        const int by_right = !action && u.choose && id == u.choose;
+        if (by_right) { chosen = 1; u.choose = 0; }
+        if (chosen) {
+            u.picked = id;
+            if (by_right || g.NavActivateId == id || g.NavActivatePressedId == id) u.enter = 1;
+        }
+    }
+    note_focus(label);
     if (selected) take_focus();
     return chosen;
 }
+
+extern "C" int psp_ui_nav(const char *label, int selected) { return side_entry(label, selected, 0); }
+extern "C" int psp_ui_nav_action(const char *label, int selected) { return side_entry(label, selected, 1); }
 
 extern "C" void psp_ui_group(const char *text) {
     ImGui::Spacing();
@@ -373,6 +568,7 @@ extern "C" int psp_ui_tab(const char *label, int selected) {
     ImGui::PushStyleColor(ImGuiCol_Text, selected ? TEXT : MUTED);
     const ImVec2 at = ImGui::GetCursorScreenPos();
     const int chosen = ImGui::Button(label);
+    note_focus(label);
     const ImVec2 size = ImGui::GetItemRectSize();
     if (selected)
         ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(at.x, at.y + size.y - 3 * u.scale),
@@ -387,6 +583,7 @@ extern "C" int psp_ui_button_primary(const char *label) {
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, rgb(247, 202, 122));
     ImGui::PushStyleColor(ImGuiCol_Text, BG);
     const int chosen = ImGui::Button(label);
+    note_focus(label);
     ImGui::PopStyleColor(3);
     take_focus();
     return chosen;
@@ -433,6 +630,7 @@ extern "C" void psp_ui_same_line(void) { ImGui::SameLine(); }
 
 extern "C" int psp_ui_button(const char *label) {
     const int chosen = ImGui::Button(label);
+    note_focus(label);
     take_focus();
     return chosen;
 }
@@ -458,6 +656,7 @@ extern "C" int psp_ui_choice(const char *label, int *index, const char *const *l
         }
         ImGui::EndCombo();
     }
+    note_focus(label);
     take_focus();
     ImGui::PopID();
     return changed;
@@ -470,14 +669,40 @@ extern "C" int psp_ui_number(const char *label, double *value, double min, doubl
     // ratio, so each part of it gets its share of the bar.
     const ImGuiSliderFlags flags = min > 0 && max / min >= 100 ? ImGuiSliderFlags_Logarithmic : 0;
     const int changed = ImGui::SliderScalar("##number", ImGuiDataType_Double, value, &min, &max, format, flags);
+    note_focus(label);
     take_focus();
     ImGui::PopID();
     return changed;
 }
 
+extern "C" int psp_ui_stops(const char *label, int *at, int count, const char *text) {
+    ImGui::PushID(label);
+    row_label(label);
+    // The text is the slider's format, with its own '%' doubled.
+    char shown[160];
+    size_t n = 0;
+    for (const char *c = text; *c && n + 2 < sizeof shown; c++) {
+        if (*c == '%') shown[n++] = '%';
+        shown[n++] = *c;
+    }
+    shown[n] = 0;
+    const int changed = ImGui::SliderInt("##stops", at, 0, count, shown, ImGuiSliderFlags_NoInput);
+    note_focus(label);
+    take_focus();
+    ImGui::PopID();
+    return changed;
+}
+
+extern "C" void psp_ui_progress(float fraction, const char *text, float right) {
+    const float width = right > 0 ? ImGui::GetContentRegionAvail().x - right * u.scale : -FLT_MIN;
+    // ImGui animates a negative fraction along with time.
+    ImGui::ProgressBar(fraction < 0 ? -(float)ImGui::GetTime() : fraction, ImVec2(width, 0), text);
+}
+
 extern "C" int psp_ui_toggle(const char *label, int *value) {
     bool on = *value != 0;
     const int changed = ImGui::Checkbox(label, &on);
+    note_focus(label);
     *value = on;
     take_focus();
     return changed;
@@ -497,9 +722,17 @@ extern "C" void psp_ui_help_area(void) {
 }
 
 extern "C" int psp_ui_table_begin(const char *id, int columns, const char *const *headers) {
+    // Its scrolling window is part of the page around it for the cursor, so
+    // down from its last row reaches what is under it.
+    ImGuiContext &g = *GImGui;
+    g.NextWindowData.HasFlags |= ImGuiNextWindowDataFlags_HasChildFlags;
+    g.NextWindowData.ChildFlags = ImGuiChildFlags_NavFlattened;
     if (!ImGui::BeginTable(id, columns, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                            ImGuiTableFlags_SizingStretchProp,
-                           ImVec2(0, -ImGui::GetTextLineHeightWithSpacing() * 2.5f))) return 0;
+                           ImVec2(0, -ImGui::GetTextLineHeightWithSpacing() * 2.5f))) {
+        g.NextWindowData.ClearFlags();      // not left for the next window
+        return 0;
+    }
     ImGui::TableSetupScrollFreeze(0, 1);
     for (int i = 0; i < columns; i++) ImGui::TableSetupColumn(headers[i], 0, i == 0 ? 1.4f : 1.0f);
     ImGui::TableHeadersRow();
@@ -516,6 +749,7 @@ extern "C" int psp_ui_table_button(const char *id, const char *text, int highlig
     ImGui::PushID(id);
     if (highlight) ImGui::PushStyleColor(ImGuiCol_Text, ACCENT);
     const int chosen = ImGui::Selectable(*text ? text : "-", highlight != 0);
+    note_focus(id);
     if (highlight) ImGui::PopStyleColor();
     take_focus();
     ImGui::PopID();
@@ -553,11 +787,13 @@ extern "C" int psp_ui_confirm(const char *title, const char *text, const char *y
         psp_ui_text(text);
         ImGui::Spacing();
         if (ImGui::Button(yes)) answer = 1;
+        note_focus(yes);
         // The answer the player asked for has the cursor, shown, so Enter or
         // A takes it at once and the arrows move to the other.
         if (ImGui::IsWindowAppearing()) { ImGui::SetItemDefaultFocus(); ImGui::SetNavCursorVisible(true); }
         ImGui::SameLine();
         if (ImGui::Button(no) || (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))) answer = 0;
+        note_focus(no);
         if (answer >= 0) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
@@ -582,8 +818,10 @@ extern "C" int psp_ui_ask_text(const char *title, const char *hint, char *buf, i
                              ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll)) answer = 1;
         ImGui::Spacing();
         if (ImGui::Button(yes)) answer = 1;
+        note_focus(yes);
         ImGui::SameLine();
         if (ImGui::Button(no) || (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))) answer = 0;
+        note_focus(no);
         if (answer >= 0) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
@@ -639,6 +877,7 @@ extern "C" int psp_ui_picture_row(const char *id, int image, const char *title, 
     ImGui::PushID(id);
     const ImVec2 at = ImGui::GetCursorScreenPos();
     const int chosen = ImGui::Selectable("##row", highlight != 0, 0, ImVec2(0, h));
+    note_focus(title, highlight);
     take_focus();
     ImDrawList *dl = ImGui::GetWindowDrawList();
     const ImVec2 a(at.x, at.y), b(at.x + w, at.y + h);

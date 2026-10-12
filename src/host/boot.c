@@ -952,13 +952,16 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* TIMING: paced (0) or real time (1). */
+    psp_clock_paced_preference(settings.number[PSP_OPT_TIMING] == 0);
     int windowed = 0;
     if (settings.window) {
         if (want_gl) present_want_gl();
         present_use_overlay();          /* the in-game menu: Escape, or View + Menu */
         if (present_start() == 0) {
             windowed = 1;
-            printf("      window    on (SDL2: video, pad, audio; implies real-time pacing)\n");
+            printf("      window    on (SDL2: video, pad, audio; %s)\n",
+                   psp_clock_is_paced() ? "paced: the game's clock at the screen's pace" : "real-time pacing");
             if (adaptive_aspect)
                 printf("      aspect    window -- expanded view follows the drawable; "
                        "HUD stays in the native safe area\n");
@@ -970,8 +973,13 @@ int main(int argc, char **argv) {
             printf("      window    unavailable -- running headless\n");
         }
     } else if (settings.realtime) {
-        psp_clock_realtime(1);
-        printf("      pacing    real-time (headless)\n");
+        if (psp_clock_paced_requested()) {
+            psp_clock_paced(1);
+            printf("      pacing    paced: the virtual clock at the wall's pace (headless)\n");
+        } else {
+            psp_clock_realtime(1);
+            printf("      pacing    real-time (headless)\n");
+        }
     }
 
     install_watch();
@@ -1154,7 +1162,7 @@ threads:
                    clock_guest_us / 1.0e6, clock_wall_us / 1.0e6,
                    lag_us / 1000.0);
     }
-    if (psp_clock_is_realtime()) { psp_audio_dump_gaps(stdout); psp_mpeg_dump_sync(stdout); }
+    if (psp_clock_is_realtime() || psp_clock_is_paced()) { psp_audio_dump_gaps(stdout); psp_mpeg_dump_sync(stdout); }
     present_audio_report(stdout);
     psp_mem_dump_bad(stdout, g_bad_top);
     if (g_bad_snapshot && g_bad_snapshot[0]) {

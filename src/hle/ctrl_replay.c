@@ -69,10 +69,11 @@ typedef struct {
     int      line;          /* for diagnostics                             */
 } ev;
 
-#define MAX_EVENTS 4096
-
+/* The event list grows as a scenario needs. It was a fixed 4096, and a
+ * recorded race of 4402 events lost its last 306 -- and its end -- without a
+ * word, so the replay left the recorded line near the finish. */
 static ev       *g_ev;
-static int       g_ev_n;
+static int       g_ev_n, g_ev_cap, g_ev_lost;
 static int       g_cursor;
 static int       g_minhold = 2;
 static int       g_drain;          /* 0 = the scenario did not say         */
@@ -168,7 +169,12 @@ static int parse_when(const char *tok, int *unit, int *rel, uint64_t *out) {
 }
 
 static ev *push(int kind, int unit, int rel, uint64_t when, int line) {
-    if (g_ev_n >= MAX_EVENTS) return NULL;
+    if (g_ev_n == g_ev_cap) {
+        const int cap = g_ev_cap ? g_ev_cap * 2 : 4096;
+        ev *grown = realloc(g_ev, (size_t)cap * sizeof *g_ev);
+        if (!grown) { g_ev_lost++; return NULL; }
+        g_ev = grown; g_ev_cap = cap;
+    }
     ev *e = &g_ev[g_ev_n++];
     memset(e, 0, sizeof *e);
     e->kind = kind; e->when_unit = unit; e->when_rel = rel;
@@ -215,8 +221,7 @@ static int parse_file(const char *path) {
         fprintf(stderr, "psprecomp: replay: cannot open %s\n", path);
         return -1;
     }
-    g_ev = calloc(MAX_EVENTS, sizeof *g_ev);
-    if (!g_ev) { fclose(f); return -1; }
+    g_ev = NULL; g_ev_n = g_ev_cap = g_ev_lost = 0;
 
     char raw[512];
     int  line = 0, errors = 0, seen_timed = 0;
@@ -269,6 +274,20 @@ static int parse_file(const char *path) {
             if (seen_timed) { warn(line, "minhold must precede the first timed line", NULL); errors++; }
             g_minhold = atoi(arg);
             if (g_minhold < 1) g_minhold = 1;
+            continue;
+        }
+
+        /* Facts of the recorded session (psp_ctrl_replay_note): adopted at
+         * parse, wherever they stand, since the recorder writes each the
+         * first time the guest asks for it. */
+        if (!strcasecmp(dir, "date")) {
+            psp_rtc_set_date_us(strtoull(arg, NULL, 10));
+            continue;
+        }
+        if (!strcasecmp(dir, "zone")) {
+            char *end;
+            const long minutes = strtol(arg, &end, 10);
+            psp_sysparam_set_zone((int)minutes, (int)strtol(end, NULL, 10));
             continue;
         }
 
@@ -372,6 +391,10 @@ static int parse_file(const char *path) {
     }
     fclose(f);
 
+    if (g_ev_lost) {
+        fprintf(stderr, "psprecomp: replay: %d event(s) of %s could not be stored\n", g_ev_lost, path);
+        errors++;
+    }
     if (errors) {
         fprintf(stderr, "psprecomp: replay: %d error(s) in %s -- not loading it\n",
                 errors, path);
@@ -437,7 +460,7 @@ void psp_ctrl_replay_keep(void) {
 void psp_ctrl_replay_reset(void) {
     for (int i = 0; i < g_ev_n; i++) free(g_ev[i].text);
     free(g_ev);
-    g_ev = NULL; g_ev_n = 0; g_cursor = 0;
+    g_ev = NULL; g_ev_n = g_ev_cap = 0; g_cursor = 0;
     g_minhold = 2; g_drain = 0;
     g_loaded = g_finished = g_tainted = 0;
     g_prev_poll = 0; g_prev_us = 0;
@@ -472,11 +495,18 @@ void psp_ctrl_replay_init(void) {
                 "# recorded by psprecomp\n"
                 "# clock: %s\n"
                 "# @poll stamps reproduce in either clock regime; seconds do not.\n",
-                psp_clock_is_realtime() ? "wall (windowed)" : "virtual (headless)");
+                psp_clock_paced_requested() ? "paced (replays exactly in a paced window)"
+                : psp_clock_is_realtime() ? "wall (windowed)" : "virtual (headless)");
             fflush(g_rec);
             fprintf(stderr, "psprecomp: replay: recording to %s\n", rec);
         }
     }
+}
+
+void psp_ctrl_replay_note(const char *line) {
+    if (!g_rec || !line) return;
+    fprintf(g_rec, "%s\n", line);
+    fflush(g_rec);
 }
 
 int psp_ctrl_replay_active(void) { return g_loaded; }

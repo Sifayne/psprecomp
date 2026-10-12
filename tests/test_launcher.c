@@ -53,6 +53,24 @@ static void key(launcher *a, SDL_Keycode sym) {
     SDL_Event e; memset(&e, 0, sizeof e);       /* {0} would set the union's first member alone */
     e.type = SDL_KEYDOWN; e.key.keysym.sym = sym; event(a, &e);
 }
+/* The pad, pressed and let go over a few frames each. */
+static void frames(launcher *a, int n) {
+    for (int i = 0; i < n; i++) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) event(a, &e);
+        draw(a);
+    }
+}
+static void press(launcher *a, SDL_Joystick *joy, int button) {
+    assert(!SDL_JoystickSetVirtualButton(joy, button, 1)); frames(a, 3);
+    assert(!SDL_JoystickSetVirtualButton(joy, button, 0)); frames(a, 3);
+}
+/* The cursor on the widget with this label, or this label then "##". */
+static int cursor_on(const char *label) {
+    const char *f = psp_ui_focused();
+    const size_t n = strlen(label);
+    return !strncmp(f, label, n) && (!f[n] || !strncmp(f + n, "##", 2));
+}
 static int has_page(const launcher *a, int group, const char *name) {
     const char *names[PAGES_MAX];
     const int n = group_pages(a, group, names);
@@ -72,6 +90,7 @@ int main(int argc, char **argv) {
      * come before SDL_Init. */
     assert(SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI, "0", SDL_HINT_OVERRIDE));
     assert(SDL_SetHintWithPriority(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT, "0x0000/0x0000", SDL_HINT_OVERRIDE));
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     assert(!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER));
 
     /* The earlier apps' settings: Alpha's own app's (presets), Beta's game's
@@ -177,11 +196,79 @@ int main(int argc, char **argv) {
     a.importer = "/bin/false";
     browser_open(&a, BROWSE_ISO); assert(a.view == VIEW_BROWSE); draw(&a);
     key(&a, SDLK_ESCAPE); assert(a.view == VIEW_SETTINGS);
-    a.view = VIEW_PREPARING; a.work = WORK_INSTALL; draw(&a); a.view = VIEW_SETTINGS;
+    /* A preparation keeps the settings open, its progress under them. A
+     * stand-in importer reports the compile and waits: play, Add game and
+     * Add pack wait for it, closing asks first, and Stop ends it. */
+    snprintf(path, sizeof path, "%s/importer.sh", root);
+    putfile(path, "#!/bin/sh\necho 'Compiling game: 12/32'\nexec sleep 30\n");
+    assert(!chmod(path, 0755));
+    a.importer = path;
+    import_start(&a, WORK_IMPORT, "/no/such.iso");
+    assert(working(&a) && a.view == VIEW_SETTINGS);
+    for (int i = 0; i < 300 && strcmp(a.import_status, "Compiling game: 12/32"); i++) { SDL_Delay(10); import_poll(&a); }
+    assert(!strcmp(a.import_status, "Compiling game: 12/32"));
+    show_page(&a, GROUP_PACKS, "Packs"); draw(&a);
+    show_page(&a, GROUP_PLAYER, "Display"); draw(&a);
+    a.status[0] = 0;
+    launch_game(&a);
+    assert(strstr(a.status, "Wait for the game") && !a.child);
+    browser_open(&a, BROWSE_ISO);
+    assert(a.view == VIEW_SETTINGS);
+    activate_back(&a);
+    assert(a.confirm == CONFIRM_STOP && a.running);
+    draw(&a); draw(&a);
+    a.confirm = CONFIRM_NONE; draw(&a);
+    import_cancel(&a);
+    for (int i = 0; i < 300 && working(&a); i++) { SDL_Delay(10); import_poll(&a); }
+    assert(!working(&a) && strstr(a.status, "Preparation canceled") && a.running);
+    a.importer = "/bin/false";
     select_game(&a, 2); draw(&a);
     /* The plain game: the player's pages alone. */
     select_game(&a, 3); draw(&a);
     assert(a.pack == -1 && !group_pages(&a, GROUP_PACK, names) && group_pages(&a, GROUP_PLAYER, names) == 6);
+
+    /* Controller only: down reaches the list of pages; A goes into a page,
+     * B back to its entry, right in again to the row it left, left out; a
+     * bumper takes the cursor along the list; down past the list's last
+     * entry reaches the buttons under it, and up from them a pane; B from the
+     * list leaves. */
+    const int pad_index = SDL_JoystickAttachVirtual(SDL_JOYSTICK_TYPE_GAMECONTROLLER, SDL_CONTROLLER_AXIS_MAX,
+                                                    SDL_CONTROLLER_BUTTON_MAX, 0);
+    assert(pad_index >= 0);
+    SDL_Joystick *joy = SDL_JoystickOpen(pad_index);
+    assert(joy);
+    SDL_JoystickSetVirtualAxis(joy, SDL_CONTROLLER_AXIS_TRIGGERLEFT, -32768);
+    SDL_JoystickSetVirtualAxis(joy, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, -32768);
+    frames(&a, 3);
+    assert(a.pad);
+    a.group = GROUP_PLAYER; a.page = "Display"; a.dirty = 0;
+    for (int i = 0; i < 8 && !cursor_on("Display"); i++) press(&a, joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("Display"));
+    const char *first = psp_settings_option(PSP_OPT_RESOLUTION)->label;
+    const char *second = psp_settings_option(PSP_OPT_WINDOW_MODE)->label;
+    press(&a, joy, SDL_CONTROLLER_BUTTON_A);
+    assert(cursor_on(first));
+    press(&a, joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on(second));
+    press(&a, joy, SDL_CONTROLLER_BUTTON_B);
+    assert(cursor_on("Display") && a.running && !a.confirm);
+    press(&a, joy, SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+    assert(cursor_on(second));
+    press(&a, joy, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+    assert(cursor_on("Display"));
+    press(&a, joy, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+    assert(!strcmp(a.page, "Audio") && cursor_on("Audio"));
+    for (int i = 0; i < 12 && !cursor_on("About"); i++) press(&a, joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("About"));
+    press(&a, joy, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    assert(cursor_on("Reset to defaults") || cursor_on("Cancel"));
+    press(&a, joy, SDL_CONTROLLER_BUTTON_DPAD_UP);
+    assert(cursor_on("About"));
+    press(&a, joy, SDL_CONTROLLER_BUTTON_B);
+    assert(!a.running);
+    a.running = 1;
+    SDL_JoystickClose(joy);
+    SDL_JoystickDetachVirtual(pad_index);
     close_window(&a);
 
     psp_settings_file_free(a.file);
@@ -189,6 +276,6 @@ int main(int argc, char **argv) {
     SDL_Quit();
     char rm[700]; snprintf(rm, sizeof rm, "rm -r -- '%s'", root);
     assert(!system(rm));
-    puts("launcher: packs linked and installed, pages, pack switches, resets, earlier settings, library, ring and screens passed");
+    puts("launcher: packs linked and installed, pages, pack switches, resets, earlier settings, library, ring, screens and the pad passed");
     return 0;
 }
