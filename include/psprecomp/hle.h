@@ -565,8 +565,9 @@ void psp_ctrl_replay_taint(uint32_t polls);
 /* Close the recording and report. `summary` may be NULL. */
 void psp_ctrl_replay_finish(FILE *summary);
 int  psp_ctrl_replay_active(void);
-/* The scenario's own `drain <s>`, or 0 if it did not say. A host may use it
- * as the default so a scenario carries the run length it needs. */
+/* The scenario's own `drain <s>`, or 0 if it did not say or did not load. A
+ * host may use it as the default so a scenario carries the run length it
+ * needs. */
 int  psp_ctrl_replay_drain(void);
 
 /* ---- host presentation hooks ----------------------------------------------

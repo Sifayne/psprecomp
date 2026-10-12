@@ -387,10 +387,20 @@ typedef struct {
     int has_list;
 } sd_sfo_state;
 
+/* The `n` bytes at b as a PARAM.SFO: its magic, and an entry table, key
+ * table and data table that start inside it. The data table may start at
+ * the very end, as may an entry's value, when there is nothing in it: a
+ * value of `len` bytes at d is inside when d <= n and len <= n - d. 0 with
+ * the key and data tables' offsets and the entry count, or -1. */
+static int sd_sfo_header(const uint8_t *b, size_t n, uint32_t *keys, uint32_t *data, uint32_t *count) {
+    if (n < 20 || sd_le32(b) != SD_SFO_MAGIC) return -1;
+    *keys = sd_le32(b + 8); *data = sd_le32(b + 12); *count = sd_le32(b + 16);
+    return *count > (n - 20) / 16 || *keys >= n || *data > n ? -1 : 0;
+}
+
 static const uint8_t *sd_sfo_value(const uint8_t *b, size_t n, const char *key, uint32_t *len) {
-    if (n < 20 || sd_le32(b) != SD_SFO_MAGIC) return NULL;
-    uint32_t keys = sd_le32(b + 8), data = sd_le32(b + 12), count = sd_le32(b + 16);
-    if (count > (n - 20) / 16 || keys >= n || data > n) return NULL;
+    uint32_t keys, data, count;
+    if (sd_sfo_header(b, n, &keys, &data, &count)) return NULL;
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *e = b + 20 + i * 16;
         uint64_t k = (uint64_t)keys + sd_le16(e), d = (uint64_t)data + sd_le32(e + 12);
@@ -1488,7 +1498,10 @@ static void sd_outcome(uint32_t result, const char *message) {
     g_savedata_done=1;
     sd_publish();
 }
-/* Read metadata, including saves written by the old minimal SFO writer. */
+/* Read metadata, including saves written by the old minimal SFO writer.
+ * -1, a corrupted save, when the file is not an SFO or any entry's key or
+ * value lies outside it: sd_sfo_value, which looks one key up, checks
+ * only the value it returns. */
 static int sd_metadata(const char *dir, psp_savedata_slot *slot) {
     char guest[512],host[1024]; snprintf(guest,sizeof guest,"%s/PARAM.SFO",dir);
     if (sd_plain_path(guest,0)!=1) return -1;
@@ -1496,14 +1509,13 @@ static int sd_metadata(const char *dir, psp_savedata_slot *slot) {
     FILE *f=fopen(host,"rb"); if (!f) return -1;
     unsigned char b[16384]; size_t n=fread(b,1,sizeof b,f); int bad=ferror(f);
     if (fclose(f)) bad=1;
-    if (bad || n<20 || sd_le32(b)!=SD_SFO_MAGIC) return -1;
-    uint32_t keys=sd_le32(b+8),data=sd_le32(b+12),count=sd_le32(b+16);
-    if (count>(n-20)/16 || keys>=n || data>=n) return -1;
+    uint32_t keys,data,count;
+    if (bad || sd_sfo_header(b,n,&keys,&data,&count)) return -1;
     for (uint32_t i=0;i<count;i++) {
         const unsigned char *e=b+20+i*16;
         uint64_t k=(uint64_t)keys+sd_le16(e), d=(uint64_t)data+sd_le32(e+12);
         uint32_t len=sd_le32(e+4);
-        if (k>=n || d>=n || len>n-d || !memchr(b+k,0,n-k)) return -1;
+        if (k>=n || d>n || len>n-d || !memchr(b+k,0,n-k)) return -1;
         if (!len || !memchr(b+d,0,len)) continue;
         const char *key=(const char *)b+k, *value=(const char *)b+d;
         if (!strcmp(key,"SAVEDATA_TITLE") || (!strcmp(key,"TITLE") && !slot->title[0]))

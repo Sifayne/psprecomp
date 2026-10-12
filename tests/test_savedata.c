@@ -274,6 +274,37 @@ static void put_file(const char *save,const char *file,const void *b,size_t n) {
     snprintf(path,sizeof path,"%s/ms/PSP/SAVEDATA/UITEST001%s/%s",root,save,file);
     FILE *f=fopen(path,"wb"); assert(f); assert(fwrite(b,1,n,f)==n); fclose(f);
 }
+static void put_le(unsigned char *b,unsigned at,uint32_t v,unsigned bytes) {
+    for (unsigned i=0;i<bytes;i++) b[at+i]=(unsigned char)(v>>8*i);
+}
+/* A PARAM.SFO header, its key and data tables at `keys` and `data`. */
+static void sfo_head(unsigned char *b,uint32_t keys,uint32_t data,uint32_t count) {
+    put_le(b,0,0x46535000u,4); put_le(b,4,0x101,4); put_le(b,8,keys,4); put_le(b,12,data,4); put_le(b,16,count,4);
+}
+/* Entry i, a string: its key at key_off in the key table, `len` bytes of
+ * value at data_off in the data table. */
+static void sfo_entry(unsigned char *b,unsigned i,uint32_t key_off,uint32_t len,uint32_t data_off) {
+    unsigned char *e=b+20+i*16;
+    put_le(e,0,key_off,2); put_le(e,2,0x0204,2); put_le(e,4,len,4); put_le(e,8,len,4); put_le(e,12,data_off,4);
+}
+/* An empty value may end PARAM.SFO, its data starting where the file
+ * ends; and the data table itself starts there when every value is
+ * empty. Neither makes the save corrupted. Leaves SLOT01 as errors()
+ * did, its PARAM.SFO not an SFO at all. */
+static void sfo_bounds(void) {
+    unsigned char b[84]={0};
+    sfo_head(b,52,76,2); sfo_entry(b,0,0,5,0); sfo_entry(b,1,15,0,8);
+    memcpy(b+52,"SAVEDATA_TITLE\0DETAIL",22); memcpy(b+76,"edge",5);
+    put_file("SLOT01","PARAM.SFO",b,84);
+    setup(4,"",""); start(); assert(!view.slots[1].broken && !strcmp(view.slots[1].title,"edge"));
+    respond(PSP_SAVEDATA_CANCEL,0); assert(finish()==1);
+    memset(b,0,sizeof b);
+    sfo_head(b,36,44,1); sfo_entry(b,0,0,0,0); memcpy(b+36,"DETAIL",7);
+    put_file("SLOT01","PARAM.SFO",b,44);
+    setup(4,"",""); start(); assert(!view.slots[1].broken);
+    respond(PSP_SAVEDATA_CANCEL,0); assert(finish()==1);
+    put_file("SLOT01","PARAM.SFO","broken",6);
+}
 static const uint32_t fl=0x08817000, ents=0x08818000;
 /* setup() without the save-name list: AUTOSAVE would otherwise move an
  * overwrite to the list's first entry. */
@@ -492,7 +523,7 @@ int main(void) {
     snprintf(root,sizeof root,"savedata-test-card"); _mkdir(root);
 #endif
     assert(psp_mem_init()==0); psp_cpu_reset(); psp_hle_init(); psp_io_set_root(root); psp_savedata_set_host(1);
-    lifecycle(); roundtrip(); deletion(); errors(); request_safety(); headless(); scripts(); coverage();
+    lifecycle(); roundtrip(); deletion(); errors(); sfo_bounds(); request_safety(); headless(); scripts(); coverage();
     fw660_status(); fw660_sfo(); fw660_keys(); fw660_cross_mode(); fw660_sizes(); fw660_list();
     assert(psp_mem_bad_access==0); psp_mem_free();
     printf("savedata: lifecycle, independent slots, writeback, metadata, cancellation, overwrite, deletion, errors, recovery, scripts, focus, new-data artwork, foreign directories and the firmware 6.60 savedata rules passed\n");

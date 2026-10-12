@@ -218,8 +218,11 @@ static void watch_hit(uint32_t addr) {
         for (int j = 0; j < 3; j++) {
             const uint32_t m = ms[j];
             /* Module data as well as the heap: a static matrix buffer lives
-             * in the loaded image, and excluding it printed nothing at all. */
-            if (m <= 0x1000u || m + 64 >= PSP_RAM_BASE + PSP_RAM_SIZE) continue;
+             * in the loaded image, and excluding it printed nothing at all.
+             * Only where all 64 bytes are mapped, though: a read anywhere
+             * else counts as a bad access, and those decide the run's exit
+             * status. Small numbers are not pointers. */
+            if (m <= 0x1000u || psp_mem_mapped_span(m) < 64) continue;
             fprintf(stderr, "         [%s as 4x4]", mn[j]);
             for (int i = 0; i < 16; i++) {
                 union { uint32_t u; float f; } c; c.u = psp_read32(m + (uint32_t)i * 4);
@@ -460,6 +463,28 @@ static void rgb_of_8888(uint32_t p, uint8_t rgb[3]) {
     rgb[2] = (uint8_t)((p >> 16) & 0xFF);
 }
 
+/* A 16-bit pixel's red, green and blue, in display format `fmt`: red in the
+ * low bits, each channel at the top of its byte. Alpha is not shown. */
+static void rgb_of_16(uint16_t p, uint32_t fmt, uint8_t rgb[3]) {
+    switch (fmt) {
+    case 1:                                       /* 5551 */
+        rgb[0] = (uint8_t)((p & 0x1F) << 3);
+        rgb[1] = (uint8_t)(((p >> 5) & 0x1F) << 3);
+        rgb[2] = (uint8_t)(((p >> 10) & 0x1F) << 3);
+        return;
+    case 2:                                       /* 4444 */
+        rgb[0] = (uint8_t)((p & 0xF) << 4);
+        rgb[1] = (uint8_t)(((p >> 4) & 0xF) << 4);
+        rgb[2] = (uint8_t)(((p >> 8) & 0xF) << 4);
+        return;
+    default:                                      /* 5650 */
+        rgb[0] = (uint8_t)((p & 0x1F) << 3);
+        rgb[1] = (uint8_t)(((p >> 5) & 0x3F) << 2);
+        rgb[2] = (uint8_t)(((p >> 11) & 0x1F) << 3);
+        return;
+    }
+}
+
 /* Dump one buffer.
  *
  * Both are written, because picking one has already been misleading. The GE's
@@ -485,14 +510,8 @@ static void dump_one(uint32_t base, const char *path, const char *label) {
             const uint32_t at = base + (uint32_t)(y * (int)stride + x) *
                                 (fmt == 3 ? 4u : 2u);
             uint8_t rgb[3];
-            if (fmt == 3) {                       /* 8888 */
-                rgb_of_8888(psp_read32(at), rgb);
-            } else {                              /* 5650 / 5551 / 4444 */
-                const uint16_t p = (uint16_t)psp_read16(at);
-                rgb[0] = (uint8_t)((p & 0x1F) << 3);
-                rgb[1] = (uint8_t)(((p >> 5) & 0x3F) << 2);
-                rgb[2] = (uint8_t)(((p >> 11) & 0x1F) << 3);
-            }
+            if (fmt == 3) rgb_of_8888(psp_read32(at), rgb);
+            else rgb_of_16((uint16_t)psp_read16(at), fmt, rgb);
             if (rgb[0] || rgb[1] || rgb[2]) nonzero++;
             fwrite(rgb, 1, 3, f);
         }

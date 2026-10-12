@@ -1192,10 +1192,12 @@ static int pic_copy_out(mpeg_ctx *c, unsigned char *planes[3], const SSysMEMBuff
  * taken only between 60 and 12.5 fps. */
 enum { MPEG_FRAME_DUR_GUESS = 3003, MPEG_FRAME_DUR_MIN = 1500, MPEG_FRAME_DUR_MAX = 7200 };
 
-/* The picture's own timestamp, from its PES; 25fps from
- * the frame count only if the stream carried none -- which
- * this game's intro does not do, and which ran its picture
- * 20% slow against the sound. `nal_end` is where the picture's data ends. */
+/* The picture's own timestamp, from its PES. A picture whose
+ * PES carried none is counted on from the last one that did
+ * (from 0 before any) at the measured frame duration, 29.97fps
+ * until there is one. Counting frames at a fixed 25fps instead
+ * of reading the PES ran this game's intro 20% slow against the
+ * sound. `nal_end` is where the picture's data ends. */
 static void pic_assign_pts(mpeg_ctx *c, size_t nal_end) {
     /* An anchor inside this picture's data takes it; any
      * earlier unused anchor is stale and dropped. */

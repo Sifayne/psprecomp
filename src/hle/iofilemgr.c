@@ -359,8 +359,8 @@ static void open_host_file(const char *guest, uint32_t flags) {
     io_file *h = &g_file[i];
     h->writable = strcmp(mode, "rb") != 0;
     snprintf(h->host, sizeof h->host, "%s", host);
-    /* A host file's window is the whole file. Writable files start empty
-     * and grow, so the length is refreshed on write rather than fixed. */
+    /* A host file's window is the whole file. A write past its end grows it
+     * (hle_Write), so the length is refreshed on write rather than fixed. */
     h->len = host_file_size(f);
     rewind(f);
     psp_ret((uint32_t)(i + FD_FIRST));
@@ -444,21 +444,21 @@ static void hle_Close(void) {
     if (flush) io_park();
 }
 
-static void hle_read_body(io_file *h, uint32_t dst, uint32_t size);
+static void hle_read_body(io_file *h, uint32_t dst, uint32_t asked);
 
 static void hle_Read(void) {
     io_file *h = fd_arg();
-    uint32_t dst = psp_arg(1), size = psp_arg(2);
+    uint32_t dst = psp_arg(1), asked = psp_arg(2);
     if (!h || !h->f) { psp_ret(IO_ERROR_BADF); return; }
-    if (!size) { psp_ret(0); return; }
-    if (h->sector_mode) size *= ISO_SECTOR;   /* the count is in sectors */
-    hle_read_body(h, dst, size);
+    if (!asked) { psp_ret(0); return; }
+    hle_read_body(h, dst, asked);
     io_park();
 }
 
-static void hle_read_body(io_file *h, uint32_t dst, uint32_t size) {
-    /* What the caller asked for, in its own unit: sectors on the raw device. */
-    const uint32_t asked = h->sector_mode ? size / ISO_SECTOR : size;
+/* `asked` is in the caller's own unit: sectors on the raw device. */
+static void hle_read_body(io_file *h, uint32_t dst, uint32_t asked) {
+    /* In bytes, 64 bits wide: 2^21 sectors are 4 GiB. */
+    uint64_t size = h->sector_mode ? (uint64_t)asked * ISO_SECTOR : asked;
 
     /* Read through a host buffer and then place it, so a read that straddles
      * the end of a guest region is rejected by the memory layer rather than
@@ -475,14 +475,14 @@ static void hle_read_body(io_file *h, uint32_t dst, uint32_t size) {
         psp_ret(0);
         return;
     }
-    if (size > h->len - h->pos) size = (uint32_t)(h->len - h->pos);
+    if (size > h->len - h->pos) size = h->len - h->pos;
 
-    uint8_t *tmp = (uint8_t *)malloc(size);
+    uint8_t *tmp = (uint8_t *)malloc((size_t)size);
     if (!tmp) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     size_t got = 0;
     if (fseeko(h->f, (off_t)(h->base + h->pos), SEEK_SET) == 0)
-        got = fread(tmp, 1, size, h->f);
+        got = fread(tmp, 1, (size_t)size, h->f);
     h->pos += got;
     if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
         /* Fall back to byte-at-a-time so a partially mapped destination still
@@ -533,8 +533,16 @@ static void hle_Write(void) {
     uint8_t *tmp = (uint8_t *)malloc(size ? size : 1);
     if (!tmp) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
     for (uint32_t i = 0; i < size; i++) tmp[i] = psp_read8(src + i);
-    size_t put = fwrite(tmp, 1, size, h->f);
+    /* At the descriptor's position, which moves past what was written and
+     * may grow the file. An append open writes at the end whatever the
+     * position said, so the host says where the write ended. */
+    size_t put = 0;
+    if (fseeko(h->f, (off_t)(h->base + h->pos), SEEK_SET) == 0)
+        put = fwrite(tmp, 1, size, h->f);
     free(tmp);
+    const off_t end = ftello(h->f);
+    h->pos = end >= 0 ? (uint64_t)end - h->base : h->pos + put;
+    if (h->pos > h->len) h->len = h->pos;
     if (size) h->dirty = 1;
     psp_ret((uint32_t)put);
     if (size) io_park();
