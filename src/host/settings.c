@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -640,6 +641,19 @@ int psp_settings_file_has(const psp_settings_file *f, int pack) {
     return pack_section((psp_settings_file *)f, 0) != NULL;
 }
 
+/* A key this build does not know is skipped, not a reason to refuse the
+ * file: a newer version may have added it, and a build kept for an older
+ * save state reads the settings the newer launcher writes. Kept in the file,
+ * which writing it back leaves alone. Said once per key. */
+static void unknown_key(const char *section_name, const char *key) {
+    static char said[16][64];
+    for (int i = 0; i < 16; i++) {
+        if (!said[i][0]) { snprintf(said[i], sizeof said[i], "%s", key); break; }
+        if (!strcmp(said[i], key)) return;
+    }
+    fprintf(stderr, "settings: [%s]: '%.200s' is no option of this version; ignored\n", section_name, key);
+}
+
 int psp_settings_file_get(psp_settings_file *f, psp_settings *s, char *error) {
     const psp_settings_schema *sc = need_schema();
     psp_settings next;
@@ -648,8 +662,9 @@ int psp_settings_file_get(psp_settings_file *f, psp_settings *s, char *error) {
     for (int i = 0; player && i < player->count; i++) {
         const char *key = player->lines[i].key;
         const int id = psp_settings_find(key);
-        if (id < 0 || id >= PSP_PLAYER_OPTIONS) {
-            snprintf(error, PSP_SETTINGS_ERROR, "[player]: unknown option '%.200s'", key);
+        if (id < 0) { unknown_key("player", key); continue; }
+        if (id >= PSP_PLAYER_OPTIONS) {
+            snprintf(error, PSP_SETTINGS_ERROR, "[player]: a game's own option, which belongs in its pack's section: '%.200s'", key);
             return -1;
         }
         if (psp_settings_set(&next, id, player->lines[i].value, PSP_SOURCE_FILE, error)) return -1;
@@ -662,9 +677,10 @@ int psp_settings_file_get(psp_settings_file *f, psp_settings *s, char *error) {
             continue;
         }
         const int id = psp_settings_find(key);
-        if (id < 0 || id < PSP_PLAYER_OPTIONS) {
-            snprintf(error, PSP_SETTINGS_ERROR, "[%s]: %s '%.200s'", pack->name,
-                     id < 0 ? "unknown option" : "an option of every game's, which belongs in [player]:", key);
+        if (id < 0) { unknown_key(pack->name, key); continue; }
+        if (id < PSP_PLAYER_OPTIONS) {
+            snprintf(error, PSP_SETTINGS_ERROR, "[%s]: an option of every game's, which belongs in [player]: '%.200s'",
+                     pack->name, key);
             return -1;
         }
         if (psp_settings_set(&next, id, value, PSP_SOURCE_FILE, error)) return -1;
