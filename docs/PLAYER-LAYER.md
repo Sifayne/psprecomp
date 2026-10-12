@@ -1051,6 +1051,22 @@ As built in stage 8 (`include/psprecomp/state.h`, `src/hle/state.c`):
 Stage 9 added a thumbnail as the first chunk and the wall-clock time of the
 save to the header, so a slot list reads only the start of each file.
 
+*Changed, 11 Oct (format 3):* a state loads into any build with its
+**fingerprint**, not only the one that wrote it (`psp_state_id`). The
+fingerprint hashes what a state's bytes depend on: the format,
+`PSP_STATE_LAYOUT` (raised by hand when a kept variable's bytes or a part's
+chunks change meaning without a size changing), the guest code it enters --
+every registered function's and resume site's guest address
+(`psp_dispatch_fingerprint`) -- and the kept variables' names and sizes in
+order. An update to the player, the renderer or the launcher leaves it alone;
+a change to what the runtime keeps does not. The header still carries the
+executable's hash, by which the launcher finds the build a state needs when
+no other can load it. `boot --state-id` prints both, once everything the
+fingerprint covers has registered. Checked on Armored Core: Last Raven: a
+state saved mid-mission by one build, loaded by a build with different
+machine code and its kept variables moved, ran on frame for frame as in the
+build that wrote it.
+
 **Guest memory:** RAM, VRAM, the scratchpad and the module image. Each is
 written as a 4 KB page map plus the pages that are not all zero.
 
@@ -1070,9 +1086,11 @@ end to end, after a list of their names, sizes and addresses:
   stream-handle counter.
 
 A kept variable holds no host pointer, except into another kept variable.
-All of them sit in one executable, so a load moves every one by the same
-distance (`psp_state_delta`). The parked-thread table (`waitq.c`) and the
-GE's events are relocated by it. With the zero pages skipped, the kept
+A load remembers where the state had each one, and such a pointer follows
+its variable to where this build has it (`psp_state_moved`): one executable
+moves them all by the same distance, but another build places each one
+differently. The parked-thread table (`waitq.c`) and the GE's events are
+relocated this way. With the zero pages skipped, the kept
 variables come to 0.26 MB in a Last Raven mission.
 
 The plan's first form was one linker section (`__attribute__((section))`)
@@ -1363,6 +1381,53 @@ One leak showed in the first loop and was fixed in both games' `boot.c`.
 Each guest thread's 64 kB signal stack was never freed, and a load starts
 every thread again. A thread-specific key now frees each one when its
 thread ends.
+
+### States across updates (11 Oct, with Sif)
+
+Every app update prepares a game again, and a state loaded only into the
+build that wrote it, so an update lost every state. Two things now keep
+them, decided with Sif:
+
+- **The fingerprint** (format 3, above under *What a state holds*): a state
+  loads into any build whose layout's fingerprint it shares, so an update
+  that leaves what a state holds alone keeps every state loadable.
+- **The earlier build, kept** (`psprecomp/builds.h`). The importer already kept
+  every prepared build, `games/<slug>/<build>-<time>`. It now notes each new
+  one's identity beside it, `state-id` (`boot --state-id`: the executable's
+  hash and the fingerprint); a build from before has its executable hashed
+  the first time it is asked, and the note written. A state no build since
+  can load is played in the build whose executable wrote it:
+  - **Play** in the launcher, with *Continue where I quit*, when the place on
+    quitting is such a state and its build is kept, asks where to play:
+    *Continue in the earlier version*, which runs that build on that place,
+    as it played then; *Start in this version*; or *Cancel*. The importer
+    runs an earlier build of an installed game for the same disc and
+    executable (`earlier_build`), whatever the app has become.
+  - **Starting fresh** keeps the place: the game moves a place on quitting it
+    cannot load to `earlier.state` before it writes its own (`boot.c`).
+  - **The game's menu** lists it, *When you quit an earlier version*, and any
+    slot from an earlier version, with when it was saved. Loading one asks,
+    then the game becomes that build: its own executable and module, the
+    same disc, settings and window, and `--load-state` (`restart_in`). A state
+    whose build is gone says so, and cannot be loaded.
+  - **A build no state needs is removed**: one only states this build cannot
+    load name. The launcher looks when it starts, when a game ends and when
+    a game has been prepared; never while one runs or is being prepared, and
+    not at all while the states cannot be read or the current build cannot
+    say its fingerprint. Only folders with a `game` and a `build.json` are
+    touched, never through a link.
+
+An earlier build reads the settings a newer launcher writes, so a key a
+version does not know is now skipped with a warning, not a reason to refuse
+the file (`src/host/settings.c`). A build from before that change refuses a
+file with an option added after it; none has been added since fixes-16.
+
+Checked: the fingerprint across builds on Armored Core: Last Raven (above);
+`test_builds` (identities, the build a state names, and what is removed);
+`test_launcher` (the question, each answer starting its build, and the
+removal after the game); `test_overlay earlier` (the menu's rows, the
+question, and the restart's arguments); `test_import_game` (the note, and an
+earlier build played or refused).
 
 ## 6. One app, and packs the player adds (stage 10)
 

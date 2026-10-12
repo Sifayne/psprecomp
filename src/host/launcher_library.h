@@ -3,6 +3,7 @@
  * launcher type; the drawing is launcher.c's. */
 static void activate_back(launcher *a);
 static void packs_load(launcher *a);
+static void prune_builds(launcher *a);
 
 /* A game's pack: the first here whose titles name its slug, else -1. */
 static int pack_of(const char *slug) {
@@ -167,6 +168,7 @@ static void import_poll(launcher *a) {
     else if (!ok) snprintf(a->status,sizeof a->status,"%.250s",a->import_status);
     else if (a->work==WORK_IMPORT) {
         if (!library_load(a,1)) snprintf(a->status,sizeof a->status,"Your game is ready. Choose Save and play.");
+        prune_builds(a);
     } else if (a->work==WORK_INSTALL) {
         const int before=pack_count;
         packs_load(a);

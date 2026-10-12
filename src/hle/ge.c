@@ -5369,10 +5369,14 @@ void psp_ge_state_load(const void *buf) {
  * timeline and its events, the callbacks and every register. A state is
  * saved between firmware calls, so no walk is in progress. */
 static int ge_load(psp_state_reader *r, char *why, size_t size) {
-    (void)r; (void)why; (void)size;
-    /* The events' lists are kept with them: their pointers move as one. */
-    for (unsigned i = 0; i < GE_EVENTS; i++)
-        if (g_ev[i].q) g_ev[i].q = (ge_queue *)((char *)g_ev[i].q + psp_state_delta());
+    (void)r;
+    /* The events' lists are kept too, each moved to where this build has it. */
+    for (unsigned i = 0; i < GE_EVENTS; i++) {
+        if (!g_ev[i].q) continue;
+        ge_queue *q = (ge_queue *)psp_state_moved(g_ev[i].q);
+        if (!q) { snprintf(why, size, "a GE event's list is in no kept variable"); return -1; }
+        g_ev[i].q = q;
+    }
     /* Caches of the registers, rebuilt from them as needed. */
     g_bone16_ok = 0;
     memset(&g_light_eye_from, 0, sizeof g_light_eye_from);

@@ -66,6 +66,12 @@ int           psp_resume_chain(uint32_t site, uint32_t stop, uint32_t *missing);
 void          psp_resume_override(uint32_t addr, psp_resume_fn original, psp_resume_fn fn);
 /* Whether a replaced function at `addr` resumes: a title registered it. */
 int           psp_resume_overridden(uint32_t addr);
+/* The guest code a save state relies on: the guest address of every
+ * registered function and label, in address order, then of every resume
+ * site, hashed (FNV-1a). Two builds that agree on it enter the same guest
+ * code at the same places, however differently their host code is built.
+ * 0 when it cannot be worked out. */
+uint64_t      psp_dispatch_fingerprint(void);
 
 /* Register one recompiled function. The generated code calls this for every
  * function it defines, from a single init routine. */

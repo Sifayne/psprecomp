@@ -227,6 +227,80 @@ int main(int argc, char **argv) {
     select_game(&a, 3); draw(&a);
     assert(a.pack == -1 && !group_pages(&a, GROUP_PACK, names) && group_pages(&a, GROUP_PLAYER, names) == 6);
 
+    /* States across updates (psprecomp/builds.h). Zeta's builds: the one it
+     * plays, the earlier one its place on quitting was saved in, and a spare
+     * no state needs. Play asks where to play; each answer starts its build,
+     * the earlier one by its own module; and once the game is over the spare
+     * is removed, the other two kept. */
+    {
+        char games[600], cur[700], old[700], spare[700], states[600], file[800], boot[600], disc[600], launched[600];
+        snprintf(games, sizeof games, "%s/data/psprecomp/games/zeta", root);
+        snprintf(cur, sizeof cur, "%s/cur", games);
+        snprintf(old, sizeof old, "%s/old", games);
+        snprintf(spare, sizeof spare, "%s/spare", games);
+        const char *const ids[3] = { "exe 0000000000000c0c\nfingerprint 000000000000f00d\n",
+                                     "exe 0000000000000a0a\nfingerprint 000000000000beef\n",
+                                     "exe 0000000000000b0b\n" };
+        const char *const dirs[3] = { cur, old, spare };
+        for (int k = 0; k < 3; k++) {
+            snprintf(file, sizeof file, "%s/game", dirs[k]); putfile(file, "#!/bin/sh\n");
+            snprintf(file, sizeof file, "%s/build.json", dirs[k]); putfile(file, "{}\n");
+            snprintf(file, sizeof file, "%s/module.elf", dirs[k]); putfile(file, "");
+            snprintf(file, sizeof file, "%s/state-id", dirs[k]); putfile(file, ids[k]);
+        }
+        /* The place on quitting: format 3, the earlier build's. */
+        snprintf(states, sizeof states, "%s/data/psprecomp/states/zeta", root);
+        snprintf(file, sizeof file, "%s/quit.state", states);
+        putfile(file, "");
+        struct {
+            char magic[8]; uint32_t format, header_size; uint64_t exe;
+            uint32_t functions, resume_sites; uint64_t guest_us; uint32_t polls, reserved; int64_t saved; uint64_t fingerprint;
+        } h = { {'P','S','P','S','T','A','T','1'}, 3, sizeof h, 0xa0a, 0, 0, 0, 0, 0, 1760000000, 0xbeef };
+        FILE *f = fopen(file, "wb"); assert(f);
+        static const unsigned char rest[64];
+        fwrite(&h, sizeof h, 1, f); fwrite(rest, 1, sizeof rest, f); fclose(f);
+        snprintf(launched, sizeof launched, "%s/launched.txt", root);
+        snprintf(boot, sizeof boot, "%s/boot.sh", root);
+        char script[800]; snprintf(script, sizeof script, "#!/bin/sh\necho \"$1\" > '%s'\n", launched);
+        putfile(boot, script); assert(!chmod(boot, 0755));
+        snprintf(disc, sizeof disc, "%s/disc.iso", root); putfile(disc, "");
+        static char module[800];
+        snprintf(module, sizeof module, "%s/module.elf", cur);
+        a.games[3].boot = boot; a.games[3].module = module; a.games[3].iso = disc;
+        select_game(&a, 3);
+        char error[PSP_SETTINGS_ERROR];
+        assert(!psp_settings_set(&a.edit, PSP_OPT_STATE_START, "continue", PSP_SOURCE_FILE, error));
+        a.status[0] = 0;
+        launch_game(&a);
+        assert(a.confirm == CONFIRM_EARLIER && !a.child && !strcmp(a.earlier, old));
+        draw(&a); draw(&a);
+        for (int answer = 1; answer <= 2; answer++) {
+            remove(launched);
+            a.confirm = CONFIRM_NONE; a.earlier_choice = answer;
+            launch_game(&a);
+            assert(a.child);
+            for (int i = 0; i < 500 && a.child; i++) { SDL_Delay(10); poll_child(&a); }
+            assert(!a.child);
+            a.running = 1;
+            assert(contains(launched, answer == 1 ? old : cur));
+        }
+        /* After the game: the spare is gone, the others stay. */
+        snprintf(file, sizeof file, "%s/game", spare); assert(access(file, F_OK));
+        snprintf(file, sizeof file, "%s/game", old); assert(!access(file, F_OK));
+        snprintf(file, sizeof file, "%s/game", cur); assert(!access(file, F_OK));
+        /* A place this build can load is not asked about. */
+        h.fingerprint = 0xf00d; h.exe = 0xc0c;
+        snprintf(file, sizeof file, "%s/quit.state", states);
+        f = fopen(file, "wb"); assert(f); fwrite(&h, sizeof h, 1, f); fwrite(rest, 1, sizeof rest, f); fclose(f);
+        remove(launched);
+        launch_game(&a);
+        assert(!a.confirm && a.child);
+        for (int i = 0; i < 500 && a.child; i++) { SDL_Delay(10); poll_child(&a); }
+        a.running = 1;
+        assert(contains(launched, cur));
+        SDL_ShowWindow(a.window);
+    }
+
     /* Controller only: down reaches the list of pages; A goes into a page,
      * B back to its entry, right in again to the row it left, left out; a
      * bumper takes the cursor along the list; down past the list's last

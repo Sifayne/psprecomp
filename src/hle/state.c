@@ -5,7 +5,8 @@
  *
  *   header   "PSPSTAT1", format version, the executable's hash, the counts
  *            of registered functions and resume sites, guest time, polls,
- *            when it was saved
+ *            when it was saved, and the fingerprint of the layout
+ *            (psp_state_id; format 3 on)
  *   chunks   tag (8 bytes), size (8), bytes; the thumbnail first, so a slot
  *            list reads only the start of each file
  *
@@ -36,7 +37,7 @@
 #include <malloc.h>
 #endif
 
-enum { FORMAT = 2, PAGE = 4096, PARTS_MAX = 32, KEPT_MAX = 256, KEPT_NAME = 48 };
+enum { FORMAT = 3, PAGE = 4096, PARTS_MAX = 32, KEPT_MAX = 256, KEPT_NAME = 48 };
 static const char MAGIC[8] = { 'P', 'S', 'P', 'S', 'T', 'A', 'T', '1' };
 
 typedef struct {
@@ -47,7 +48,10 @@ typedef struct {
     uint64_t guest_us;
     uint32_t polls, reserved;
     int64_t  saved;
+    uint64_t fingerprint;
 } header;
+/* Format 2's header: this one without the fingerprint. */
+enum { HEADER2 = offsetof(header, fingerprint) };
 
 struct psp_state_writer { FILE *f; int failed; };
 struct psp_state_reader { uint8_t *data; size_t size; };
@@ -57,9 +61,17 @@ static int g_nparts;
 static struct { const char *name; void *data; size_t size; } g_kept[KEPT_MAX];
 static int g_nkept;
 static int g_loaded;
-static intptr_t g_delta;
+/* Where the loaded state had each kept variable (psp_state_moved). */
+static uint64_t g_saved_at[KEPT_MAX];
+static int g_nsaved;
 
-intptr_t psp_state_delta(void) { return g_delta; }
+void *psp_state_moved(const void *saved) {
+    const uint64_t p = (uint64_t)(uintptr_t)saved;
+    for (int i = 0; i < g_nsaved; i++)
+        if (p >= g_saved_at[i] && p < g_saved_at[i] + g_kept[i].size)
+            return (char *)g_kept[i].data + (p - g_saved_at[i]);
+    return NULL;
+}
 
 void psp_state_keep(const char *name, void *data, size_t size) {
     for (int i = 0; i < g_nkept; i++) if (g_kept[i].data == data) return;
@@ -87,9 +99,8 @@ int psp_state_loaded(void) { return g_loaded; }
 
 /* ---- identity ---------------------------------------------------------------- */
 
-/* The build: FNV-1a over the executable's own bytes. A state holds this
- * build's layout -- its variables, its structures -- and nothing else can
- * read it. */
+/* The build: FNV-1a over the executable's own bytes, by which the launcher
+ * finds the build that wrote a state. */
 static uint64_t exe_hash(void) {
     static uint64_t cached;
     if (cached) return cached;
@@ -110,6 +121,33 @@ static uint64_t exe_hash(void) {
     }
     cached = h ? h : 1;
     return cached;
+}
+
+/* The layout (psp_state_id): what a state's bytes depend on, and nothing
+ * else of the build, so that an update which leaves it alone -- the player,
+ * the renderer, the launcher -- keeps every state loadable. */
+static uint64_t fnv(uint64_t h, const void *data, size_t n) {
+    const unsigned char *b = (const unsigned char *)data;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+static uint64_t fingerprint(void) {
+    const uint32_t version[2] = { FORMAT, PSP_STATE_LAYOUT };
+    const uint64_t code = psp_dispatch_fingerprint();
+    if (!code) return 0;
+    uint64_t h = fnv(1469598103934665603ull, version, sizeof version);
+    h = fnv(h, &code, sizeof code);
+    for (int i = 0; i < g_nkept; i++) {
+        const uint64_t size = g_kept[i].size;
+        h = fnv(h, g_kept[i].name, strlen(g_kept[i].name) + 1);
+        h = fnv(h, &size, sizeof size);
+    }
+    return h ? h : 1;
+}
+
+void psp_state_id(uint64_t *exe, uint64_t *fp) {
+    if (exe) *exe = exe_hash();
+    if (fp) *fp = fingerprint();
 }
 
 /* ---- chunks ------------------------------------------------------------------- */
@@ -232,20 +270,21 @@ static int put_kept(psp_state_writer *w) {
 }
 
 /* Every variable back where this process keeps it. They must be the ones
- * that were saved, in the same order; and one distance must separate every
- * one from where it was, or no kept pointer could be moved by it. */
+ * that were saved, in the same order; where each one was is remembered, so
+ * that a kept pointer to it can follow it (psp_state_moved) -- another
+ * build places each variable differently. */
 static int get_kept(psp_state_reader *r) {
     size_t n;
     const kept_entry *dir = psp_state_get(r, "keptdir", &n);
     if (!dir || n != (size_t)g_nkept * sizeof *dir) return -1;
+    g_nsaved = 0;
     for (int i = 0; i < g_nkept; i++) {
         kept_entry e;
         memcpy(&e, &dir[i], sizeof e);
         if (strncmp(e.name, g_kept[i].name, sizeof e.name - 1) || e.size != g_kept[i].size) return -1;
-        const intptr_t delta = (intptr_t)(uintptr_t)g_kept[i].data - (intptr_t)e.addr;
-        if (i && delta != g_delta) return -1;
-        g_delta = delta;
+        g_saved_at[i] = e.addr;
     }
+    g_nsaved = g_nkept;
     const size_t total = kept_total();
     uint8_t *all = malloc(total ? total : 1);
     if (!all) return -1;
@@ -290,6 +329,7 @@ int psp_state_save(const char *path, char *why, size_t size) {
     h.guest_us = psp_clock_peek();
     h.polls = psp_ctrl_polls();
     h.saved = (int64_t)time(NULL);
+    h.fingerprint = fingerprint();
     if (fwrite(&h, sizeof h, 1, w.f) != 1) w.failed = 1;
     /* What the player last saw. A backend that draws away from guest memory
      * puts it there first, so the thumbnail and VRAM are both the frame. */
@@ -341,12 +381,15 @@ static int read_state(const char *path, psp_state_reader *r, char *why, size_t s
     header h;
     if (!r->size) { snprintf(why, size, "%s: unreadable", path); goto bad; }
     memcpy(&h, r->data, sizeof h);
+    if (!memcmp(h.magic, MAGIC, sizeof MAGIC) && h.format == 2 && h.header_size == HEADER2) {
+        snprintf(why, size, "%s: written by another build of the game", path);
+        goto bad;
+    }
     if (memcmp(h.magic, MAGIC, sizeof MAGIC) || h.format != FORMAT || h.header_size != sizeof h) {
         snprintf(why, size, "%s: not a state this player writes", path);
         goto bad;
     }
-    if (h.exe_hash != exe_hash() || h.functions != (uint32_t)psp_dispatch_count() ||
-        h.resume_sites != (uint32_t)psp_resume_count()) {
+    if (!h.fingerprint || h.fingerprint != fingerprint()) {
         snprintf(why, size, "%s: written by another build of the game", path);
         goto bad;
     }
@@ -484,13 +527,19 @@ int psp_state_peek(const char *path, psp_state_info *info, uint8_t *thumb) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     header h;
+    memset(&h, 0, sizeof h);
     int rc = -1;
-    if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, MAGIC, sizeof MAGIC)) {
+    /* Format 2's header is this one's without the fingerprint: read, its
+     * state still names the executable that can load it. */
+    if (fread(&h, HEADER2, 1, f) == 1 && !memcmp(h.magic, MAGIC, sizeof MAGIC)) {
         rc = 0;
-        info->usable = h.format == FORMAT && h.header_size == sizeof h && h.exe_hash == exe_hash() &&
-                       h.functions == (uint32_t)psp_dispatch_count() &&
-                       h.resume_sites == (uint32_t)psp_resume_count();
-        if (h.format == FORMAT && h.header_size == sizeof h) {
+        const int known = (h.format == FORMAT && h.header_size == sizeof h &&
+                           fread(&h.fingerprint, sizeof h.fingerprint, 1, f) == 1) ||
+                          (h.format == 2 && h.header_size == HEADER2);
+        info->usable = h.format == FORMAT && known && h.fingerprint && h.fingerprint == fingerprint();
+        if (known) {
+            info->exe = h.exe_hash;
+            info->fingerprint = h.fingerprint;
             info->saved = h.saved;
             info->guest_us = h.guest_us;
             info->polls = h.polls;

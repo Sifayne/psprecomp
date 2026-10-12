@@ -789,7 +789,7 @@ static int report_cplinit(const psp_blob *b, const elf_info *e) {
 
 int main(int argc, char **argv) {
     const char *module = NULL, *iso = NULL, *config = NULL, *load_state = NULL;
-    int inspect = 0, force_window = 0;
+    int inspect = 0, force_window = 0, state_id = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--config") || !strcmp(argv[i], "--load-state")) {
             const char *option = argv[i];
@@ -797,10 +797,11 @@ int main(int argc, char **argv) {
             if (!strcmp(option, "--config")) config = argv[i];
             else load_state = argv[i];
         } else if (!strcmp(argv[i], "--print-settings")) inspect = 1;
+        else if (!strcmp(argv[i], "--state-id")) state_id = 1;
         else if (!strcmp(argv[i], "--window")) force_window = 1;
         else if (!strcmp(argv[i], "--help")) {
             puts("boot [module.elf] [disc.iso] [--config FILE] [--print-settings] [--window]\n"
-                 "     [--load-state FILE]");
+                 "     [--load-state FILE] [--state-id]");
             return 0;
         } else if (argv[i][0] == '-') { fprintf(stderr,"unknown option: %s\n",argv[i]); return 2; }
         else if (!module) module = argv[i];
@@ -882,6 +883,15 @@ int main(int argc, char **argv) {
                      hle_stop_unload_self);
     if (psp_title_info.keep) psp_title_info.keep();
     printf("  [2] runtime   %u functions registered\n", psp_dispatch_count());
+    /* --state-id: this build as save states know it (psprecomp/state.h), for
+     * the importer to note beside the build; everything it covers has
+     * registered by now. */
+    if (state_id) {
+        uint64_t exe = 0, fp = 0;
+        psp_state_id(&exe, &fp);
+        printf("state-id: exe %016llx fingerprint %016llx\n", (unsigned long long)exe, (unsigned long long)fp);
+        return fp ? 0 : 1;
+    }
 
     /* Presentation, before the module loads: the real-time clock anchors to
      * the moment it is enabled, and that moment should be the start of the
@@ -988,13 +998,22 @@ int main(int argc, char **argv) {
     printf("      disc      %s\n", iso ? iso : "(none -- raw umd: opens will fail)");
 
     /* Continue where I quit (STATE_START): the state the menu wrote when the
-     * game last closed, if this build can load it. */
+     * game last closed, if this build can load it. One it cannot is moved
+     * aside before this run quits and writes its own: the earlier version's
+     * place, which the menu offers to continue in that version, and which
+     * keeps that build from being removed (psprecomp/builds.h). */
     if (!load_state && settings.number[PSP_OPT_STATE_START]) {
         static char quit[1100];
         psp_state_info info;
         psp_state_file("quit", quit, sizeof quit);
         if (psp_state_peek(quit, &info, NULL)) printf("      state     nothing to continue from yet\n");
-        else if (!info.usable) printf("      state     %s is from another build of the game; starting fresh\n", quit);
+        else if (!info.usable) {
+            char earlier[1100];
+            psp_state_file("earlier", earlier, sizeof earlier);
+            const int moved = !rename(quit, earlier);
+            printf("      state     %s is from another build of the game; starting fresh%s%s\n", quit,
+                   moved ? ", it kept as " : "", moved ? earlier : "");
+        }
         else load_state = quit;
     }
 

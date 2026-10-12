@@ -325,8 +325,8 @@ int main(void) {
     assert(!psp_settings_file_get(f, &s, error) && s.number[T_INPUT] == 1 && s.number[PSP_OPT_VOLUME] == 10);
     psp_settings_file_free(f);
 
-    /* An unknown key, a key in the wrong section or a bad value refuses the
-     * file and leaves what was loaded before untouched. */
+    /* A key in the wrong section or a bad value refuses the file and leaves
+     * what was loaded before untouched. (An unknown key does not: below.) */
     const char *invalid[] = {
         "version=3\n",
         "[player]\n",
@@ -339,7 +339,6 @@ int main(void) {
         "version=2\n[player]\n[player]\n",
         "version=2\n[player]\nINPUT=modern\n",
         "version=2\n[pack test]\nRENDER=gl\n",
-        "version=2\n[pack test]\nCAPTURE=oops\n",
         "version=2\n[pack test]\nDEADZONE=NaN\n",
         "version=2\n[pack test]\nbind.key.cross=Z\nbind.key.cross=X\n",
         "version=2\n[pack test]\nbind.keyboard.cross=Z\n",
@@ -350,6 +349,21 @@ int main(void) {
         before = s;
         assert(psp_settings_load(&s, path, error));
         assert(!memcmp(&before, &s, sizeof s));
+    }
+    /* A key no option of this version has is a newer version's: skipped,
+     * the rest read, and kept when the file is written back -- a build kept
+     * for an older save state reads what a newer launcher wrote. */
+    putfile(path, "version=2\n[player]\nVOLUME=7\nFROM_THE_FUTURE=1\n[pack test]\nCAPTURE=oops\nNEWER_YET=2\n");
+    assert(!psp_settings_load(&s, path, error) && s.number[PSP_OPT_VOLUME] == 7);
+    f = psp_settings_file_read(path, error); assert(f);
+    assert(!psp_settings_file_get(f, &s, error));
+    assert(!psp_settings_file_put(f, &s, error));
+    assert(!psp_settings_file_write(f, path, error));
+    psp_settings_file_free(f);
+    {
+        FILE *back = fopen(path, "r"); char text[4096] = {0};
+        assert(back && fread(text, 1, sizeof text - 1, back) > 0); fclose(back);
+        assert(strstr(text, "FROM_THE_FUTURE=1") && strstr(text, "NEWER_YET=2"));
     }
     /* Another pack's keys are its own business, and a preset is never read. */
     putfile(path, "version=2\n[pack else]\nWHATEVER=1\n[preset X]\nNOPE=2\n");

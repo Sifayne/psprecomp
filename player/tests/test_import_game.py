@@ -113,6 +113,8 @@ class ImportTests(unittest.TestCase):
         self.library = self.library_now()
 
     def fake_run(self, args, **kwargs):
+        if args[-1] == '--state-id':   # the prepared game, saying how save states know it
+            return subprocess.CompletedProcess(args, 0, 'module: x\nstate-id: exe 00000000000000aa fingerprint 00000000000000bb\n')
         if args[1] == 'info':
             return subprocess.CompletedProcess(args, 0, '  DISC_ID            ' + self.disc + '\n'
                                                         '  TITLE              A Game & "Its" Name\n')
@@ -281,6 +283,40 @@ class ImportTests(unittest.TestCase):
         head[52:56] = (1).to_bytes(4, 'little')
         head[72:76] = memsz.to_bytes(4, 'little')
         return bytes(head)
+
+    def test_new_build_notes_how_save_states_know_it(self):
+        with patch.object(importer.subprocess, 'run', self.fake_run):
+            slug = self.library.import_iso(self.iso)
+        folder = Path(self.library.records()['games'][slug]['directory'])
+        self.assertEqual((folder / 'state-id').read_text(), 'exe 00000000000000aa\nfingerprint 00000000000000bb\n')
+
+    def test_earlier_build_plays_for_its_save_states(self):
+        entry = self.install()
+        entry['elf_sha256'] = hashlib.sha256(self.module).hexdigest()
+        book = self.library.records()
+        book['games'][FIRST] = entry
+        self.library.record.write_text(json.dumps(book))
+
+        def earlier(name, slug=FIRST, sha=entry['elf_sha256']):
+            folder = self.data / 'games' / slug / name
+            folder.mkdir(parents=True)
+            (folder / 'game').write_text('#!/bin/sh\nexit 0\n')
+            (folder / 'game').chmod(0o755)
+            (folder / 'module.elf').write_bytes(self.module)
+            (folder / 'build.json').write_text(json.dumps({'elf_sha256': sha}))
+            return folder
+        kept = earlier('earlier-1')
+        ran = []
+        with patch.object(importer.os, 'execve', lambda exe, argv, env: ran.append((exe, argv))), \
+             patch.object(importer.os, 'dup2', lambda a, b: None), patch.object(importer.os, 'chdir', lambda p: None):
+            self.library.launch(kept / 'module.elf', self.iso, ['--load-state', 'x.state'])
+            self.assertEqual(ran[-1][0], str(kept / 'game'))
+            self.assertEqual(ran[-1][1][1:], [str(kept / 'module.elf'), str(self.iso), '--load-state', 'x.state'])
+            # Another game's folder, or another executable's build, is not one.
+            for folder in (earlier('foreign', slug=SECOND), earlier('other', sha='0' * 64)):
+                with self.assertRaises(ValueError):
+                    self.library.launch(folder / 'module.elf', self.iso, [])
+            self.assertEqual(len(ran), 1)
 
     def test_plain_game_modules_are_recompiled_beside_it(self):
         self.disc = 'UNKN12345'

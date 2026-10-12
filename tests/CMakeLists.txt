@@ -267,7 +267,8 @@ if(PSPRECOMP_HOST)
     add_test(NAME overlay_held COMMAND test_overlay held)
     add_test(NAME overlay_bind COMMAND test_overlay bind)
     add_test(NAME overlay_pad COMMAND test_overlay pad)
-    set_tests_properties(overlay_ui overlay_held overlay_bind overlay_pad PROPERTIES
+    add_test(NAME overlay_earlier COMMAND test_overlay earlier)
+    set_tests_properties(overlay_ui overlay_held overlay_bind overlay_pad overlay_earlier PROPERTIES
         TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
     # About a hundred presses of the pad, each held for a few frames.
     set_tests_properties(overlay_pad PROPERTIES TIMEOUT 120)
@@ -295,6 +296,16 @@ if(PSPRECOMP_HOST)
     target_include_directories(test_pack_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
     set_target_properties(test_pack_plugin PROPERTIES PREFIX "" OUTPUT_NAME launcher
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/packs/gamma/built)
+    # A game's builds and the one a save state needs.
+    add_executable(test_builds test_builds.c)
+    target_link_libraries(test_builds PRIVATE psprecomp_host)
+    if(MSVC)
+        target_compile_options(test_builds PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_builds PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME builds COMMAND test_builds ${CMAKE_CURRENT_BINARY_DIR})
+
     add_executable(test_player_launcher test_launcher.c)
     target_link_libraries(test_player_launcher PRIVATE psprecomp_host ${CMAKE_DL_LIBS})
     set_target_properties(test_player_launcher PROPERTIES ENABLE_EXPORTS ON)

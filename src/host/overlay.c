@@ -24,6 +24,7 @@
  * The C here is the menu; src/host/ui.cpp draws it with Dear ImGui. Both run
  * on the SDL thread only. */
 #include "overlay.h"
+#include "psprecomp/builds.h"
 
 #include "input.h"
 #include "pages.h"
@@ -46,13 +47,17 @@
 #include <time.h>
 #ifdef _WIN32
 #include <direct.h>
+#else
+#include <limits.h>
+#include <unistd.h>
 #endif
 
 enum { CAPTURE_MS = 5000, TOAST_MS = 2500 };
 enum { PAGE_RESUME, PAGE_SAVE, PAGE_LOAD, PAGE_BINDINGS, PAGE_SCHEMA };   /* then the schema's, Performance, Quit */
-/* The state files: ten slots, the one written on quitting, and the one a
- * load keeps for undoing it. */
-enum { SLOTS = 10, SLOT_QUIT = SLOTS, SLOT_UNDO, SLOT_FILES };
+/* The state files: ten slots, the one written on quitting, the one a load
+ * keeps for undoing it, and an earlier version's quitting one, which a newer
+ * build moved aside before writing its own (boot.c). */
+enum { SLOTS = 10, SLOT_QUIT = SLOTS, SLOT_UNDO, SLOT_EARLIER, SLOT_FILES };
 static const char STATES_PAGE[] = "Save states";
 
 static struct {
@@ -79,6 +84,10 @@ static struct {
     int slot;
     int have[SLOT_FILES];
     psp_state_info info[SLOT_FILES];
+    /* For a state this build cannot load: the build that wrote it, when it
+     * is kept (psprecomp/builds.h), to restart the game in. */
+    int kept[SLOT_FILES];
+    char build[SLOT_FILES][1024];
     unsigned waiting;
     int load_after;
     int confirm, confirm_load;
@@ -254,20 +263,28 @@ static void slot_path(int slot, char *out, size_t size) {
     char name[24];
     if (slot == SLOT_QUIT) snprintf(name, sizeof name, "quit");
     else if (slot == SLOT_UNDO) snprintf(name, sizeof name, "undo");
+    else if (slot == SLOT_EARLIER) snprintf(name, sizeof name, "earlier");
     else snprintf(name, sizeof name, "slot-%d", (slot + 1) % 100);
     psp_state_file(name, out, size);
 }
 
+/* Into `out` (48 bytes is room for every one), which it returns. The named
+ * files' names were returned without filling `out`, which every caller
+ * prints: their toasts and questions named nothing. */
 static const char *slot_name(int slot, char *out, size_t size) {
-    if (slot == SLOT_QUIT) return "When you quit";
-    if (slot == SLOT_UNDO) return "Before the last load";
-    snprintf(out, size, "Slot %d", slot + 1);
+    if (slot == SLOT_QUIT) snprintf(out, size, "When you quit");
+    else if (slot == SLOT_UNDO) snprintf(out, size, "Before the last load");
+    else if (slot == SLOT_EARLIER) snprintf(out, size, "When you quit an earlier version");
+    else snprintf(out, size, "Slot %d", slot + 1);
     return out;
 }
 
 static void slot_detail(int slot, char *out, size_t size) {
     if (!o.have[slot]) { snprintf(out, size, "Empty"); return; }
-    if (!o.info[slot].usable) { snprintf(out, size, "From another build of the game, so it cannot be loaded"); return; }
+    if (!o.info[slot].usable && !o.kept[slot]) {
+        snprintf(out, size, "From another build of the game, which is no longer kept, so it cannot be loaded");
+        return;
+    }
     const time_t t = (time_t)o.info[slot].saved;
     struct tm tm;
 #ifdef _WIN32
@@ -278,8 +295,25 @@ static void slot_detail(int slot, char *out, size_t size) {
     char when[64];
     strftime(when, sizeof when, "%d %b %H:%M", &tm);
     const uint64_t secs = o.info[slot].guest_us / 1000000u;
-    snprintf(out, size, "%s, played %u:%02u:%02u", when, (unsigned)(secs / 3600),
-             (unsigned)(secs / 60 % 60), (unsigned)(secs % 60));
+    snprintf(out, size, "%s, played %u:%02u:%02u%s", when, (unsigned)(secs / 3600),
+             (unsigned)(secs / 60 % 60), (unsigned)(secs % 60),
+             o.info[slot].usable ? "" : ". Saved in an earlier version: loading it restarts the game in that version");
+}
+
+/* The folder of this game's builds: the parent of the one running. */
+static int games_folder(char *out, size_t size) {
+#ifdef __linux__
+    char self[PATH_MAX], build[PATH_MAX];
+    const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n <= 0) return -1;
+    self[n] = 0;
+    psp_build_games(self, build, sizeof build);
+    psp_build_games(build, out, size);
+    return 0;
+#else
+    (void)out; (void)size;
+    return -1;
+#endif
 }
 
 /* What every state file holds, and its thumbnail for the lists. */
@@ -290,6 +324,9 @@ static void read_slots(void) {
         slot_path(i, path, sizeof path);
         o.have[i] = !psp_state_peek(path, &o.info[i], thumb);
         psp_ui_image_set(i, o.have[i] && o.info[i].has_thumb ? thumb : NULL, PSP_STATE_THUMB_W, PSP_STATE_THUMB_H);
+        char games[1024];
+        o.kept[i] = o.have[i] && !o.info[i].usable && !games_folder(games, sizeof games) &&
+                    !psp_build_find(games, o.info[i].exe, o.build[i], sizeof o.build[i]);
     }
 }
 
@@ -324,7 +361,7 @@ static void toast(const char *text) {
 static int g_waiting_slot, g_waiting_load;
 
 static void request(int kind, int slot) {
-    char path[1100], name[32], line[128];
+    char path[1100], name[48], line[128];
     slot_path(slot, path, sizeof path);
     if (kind == PSP_STATE_SAVE && make_dir(psp_state_dir())) {
         snprintf(line, sizeof line, "Not saved: the folder %.60s cannot be made.", psp_state_dir());
@@ -355,12 +392,68 @@ static void load_from(int slot) {
     close_menu();
 }
 
+/* What a restart in another build starts with: this run's own arguments
+ * (`cmdline`, NUL-separated, as /proc/self/cmdline has them) with the
+ * executable and the module replaced by the build's, any state to load
+ * dropped, and `state` to load. Returns the count; argv ends with NULL. */
+static int restart_args(char *cmdline, size_t n, char *game, char *module, char *state, char **argv, int cap) {
+    int argc = 0, at = 0, k = 0;
+    argv[argc++] = game;
+    argv[argc++] = module;
+    for (size_t i = 0; i < n && argc < cap - 3; i += strlen(cmdline + i) + 1, k++) {
+        char *arg = cmdline + i;
+        if (k < 2) continue;                      /* the executable and its module */
+        if (!strcmp(arg, "--load-state")) { at = 1; continue; }
+        if (at) { at = 0; continue; }
+        argv[argc++] = arg;
+    }
+    argv[argc++] = "--load-state";
+    argv[argc++] = state;
+    argv[argc] = NULL;
+    return argc;
+}
+
+/* A state from an earlier version, loaded the only way it can be: this
+ * process becomes the build that wrote it, given the same disc, settings
+ * and window, and that state to load in place of a fresh start (boot.c,
+ * --load-state). Returns only when that build cannot be started. */
+static void restart_in(int slot) {
+    char line[256];
+#ifdef __linux__
+    static char state[1100], game[1100], module[1100], cmdline[16384];
+    slot_path(slot, state, sizeof state);
+    snprintf(game, sizeof game, "%s/game", o.build[slot]);
+    snprintf(module, sizeof module, "%s/module.elf", o.build[slot]);
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    const size_t n = f ? fread(cmdline, 1, sizeof cmdline - 1, f) : 0;
+    if (f) fclose(f);
+    char *argv[64];
+    restart_args(cmdline, n, game, module, state, argv, 64);
+    fprintf(stderr, "present: restarting in %s to load %s\n", o.build[slot], state);
+    fflush(NULL);
+    extern char **environ;
+    execve(game, argv, environ);
+    snprintf(line, sizeof line, "Could not start the earlier version: %s", strerror(errno));
+#else
+    (void)slot;
+    snprintf(line, sizeof line, "An earlier version's state can only be loaded on Linux.");
+#endif
+    toast(line);
+}
+
 static void ask_load(int slot) {
-    char name[32], line[160];
+    char name[48], line[160];
     slot_name(slot, name, sizeof name);
+    if (o.have[slot] && !o.info[slot].usable && o.kept[slot]) {
+        if (!o.open) open_menu();
+        o.page = PAGE_LOAD;
+        o.confirm = slot + 1;
+        o.confirm_load = 2;
+        return;
+    }
     if (!o.have[slot] || !o.info[slot].usable) {
         snprintf(line, sizeof line, "%s %s.", name, !o.have[slot] ? "is empty" :
-                 "is from another build of the game, so it cannot be loaded");
+                 "is from another build of the game that is no longer kept, so it cannot be loaded");
         toast(line);
         return;
     }
@@ -380,7 +473,7 @@ static void ask_save(int slot) {
 /* What the keys do: save to the current slot, load it, choose it. */
 static void action(int a) {
     if (!o.started) return;
-    char name[32], detail[160], line[220];
+    char name[48], detail[160], line[220];
     switch (a) {
     case INPUT_ACTION_QUICK_SAVE:
         request(PSP_STATE_SAVE, o.slot);
@@ -406,7 +499,7 @@ static void action(int a) {
 static void poll_states(void) {
     if (!o.waiting) return;
     int ok = 0;
-    char message[384], name[32], line[460];
+    char message[384], name[48], line[460];
     if (psp_state_result(&ok, message, sizeof message) < o.waiting) return;
     o.waiting = 0;
     if (o.load_after) {
@@ -445,7 +538,7 @@ static void before_quit(void) {
 }
 
 static void save_page(void) {
-    char line[200], name[32], detail[160], title[64], id[16];
+    char line[200], name[48], detail[160], title[64], id[16];
     psp_ui_heading("Save state");
     snprintf(line, sizeof line, "Quick save writes to the current slot, Slot %d.", o.slot + 1);
     psp_ui_note(line);
@@ -461,7 +554,7 @@ static void save_page(void) {
 }
 
 static void load_page(void) {
-    char name[32], detail[160], title[64], id[16];
+    char name[48], detail[160], title[64], id[16];
     psp_ui_heading("Load state");
     for (int i = 0; i < SLOT_FILES; i++) {
         if (i >= SLOTS && !o.have[i]) continue;
@@ -481,18 +574,24 @@ static void load_page(void) {
 static void confirm_prompt(void) {
     if (!o.confirm) { psp_ui_confirm_close(); return; }
     const int slot = o.confirm - 1;
-    char name[32], text[256];
+    char name[48], text[320];
     slot_name(slot, name, sizeof name);
-    if (o.confirm_load)
+    if (o.confirm_load == 2)
+        snprintf(text, sizeof text, "%s was saved in an earlier version of the game. Loading it restarts the game in "
+                 "that version, as it was then; what has happened since you last saved here is lost.", name);
+    else if (o.confirm_load)
         snprintf(text, sizeof text, "Load %s? What has happened since it was saved is lost%s.", name,
                  load_mode() == 2 ? ", unless you load \"Before the last load\"" : "");
     else
         snprintf(text, sizeof text, "Replace %s with the game as it is now?", name);
     const int answer = psp_ui_confirm(o.confirm_load ? "Load state" : "Save state", text,
-                                      o.confirm_load ? "Load" : "Replace", "Cancel");
+                                      o.confirm_load == 2 ? "Restart and load" : o.confirm_load ? "Load" : "Replace",
+                                      "Cancel");
     if (answer < 0) return;
+    const int kind = o.confirm_load;
     o.confirm = 0;
-    if (answer && o.confirm_load) load_from(slot);
+    if (answer && kind == 2) restart_in(slot);
+    else if (answer && kind) load_from(slot);
     else if (answer) request(PSP_STATE_SAVE, slot);
 }
 

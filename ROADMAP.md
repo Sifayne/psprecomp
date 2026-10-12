@@ -284,27 +284,26 @@ Gaps found in the code while checking this file, none of them on a phase above:
 - [ ] **Static-constructor discovery** — `src/ctors.c` picks the single
       longest null-terminated table; its own notes say candidates should be
       scored on locality before it is trusted on another title.
-- [ ] **MPEG decode** — the opt-in path plays The 3rd Birthday's movies, in
-      up to four contexts. `sceMpegDelete` only frees the slot, and
-      `sceMpegCreate` clears a reused one without freeing its decoder or
-      picture, so each movie leaks them.
+- [x] **MPEG decode** — the opt-in path plays The 3rd Birthday's and
+      WipEout Pulse's movies, in up to four contexts. `sceMpegDelete` now lets
+      go of a movie's decoders and streams; each movie but the last leaked
+      them.
 - [ ] **Secure savedata** — secure modes store plaintext. saveprobe already
       holds the hardware's secure saves under known keys.
-- [ ] **Save states across updates** — a state names the executable that
-      wrote it (`src/hle/state.c`: a hash of the binary, with the counts of
-      functions and resume sites) and holds that build's kept variables byte
-      for byte. Any app update prepares the game again, so every state of it
-      then reads "From another build of the game, so it cannot be loaded":
-      a player who updates loses them. Two ways out, not exclusive (Sif, 10
-      Oct):
-      - *Keep the build.* The importer already keeps every prepared build
-        (`games/<slug>/<build>-<time>`, about 60 MB each, never pruned). The
-        launcher could find the build a state was written by and offer to
-        play that one, and prune builds no state needs.
-      - *Portable states.* Give each part's layout a version (or name its
-        fields) with a way to read older ones, and name resume sites rather
-        than count them, so a newer build reads an older state. Guest memory
-        already carries over as it is.
+- [x] **Save states across updates** — an update made every state
+      unloadable: a state loaded only into the executable that wrote it.
+      Both ways out, as decided with Sif on 10 and 11 Oct
+      ([`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md) §5, *States across
+      updates*):
+      - *Portable where nothing changed.* A state loads into any build with
+        its layout's fingerprint (the guest code, the kept variables' names
+        and sizes, `PSP_STATE_LAYOUT`), so an update that leaves those alone
+        keeps it.
+      - *Keep the build.* A state no build since can load is played in the
+        build that wrote it: the launcher asks, the game's menu restarts in
+        it, and a build no state needs is removed.
+      Still open: states that move across a change of layout, which would
+      need each part and kept variable to read its older forms.
 - [ ] **Windows** — the Windows half of `src/os.c` has not been through a
       Windows build in this fork.
 - [ ] **The rest of the host** — `present.c`, the settings mechanism, the

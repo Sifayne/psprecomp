@@ -7,6 +7,7 @@
 #include "psprecomp/mem.h"
 #include "psprecomp/state.h"
 
+#include <stdio.h>
 #include <string.h>
 
 /* Which queue each parked thread is in; see psp_waitq_leave. One entry per
@@ -59,8 +60,8 @@ int psp_waitq_drop(psp_waitq *q, uint32_t uid) {
 void psp_waitq_reset(void) { g_nparked = 0; }
 
 /* A save state keeps the table as it is. Every queue is inside an object the
- * state keeps too, so a load moves each pointer by the distance they all
- * moved (psp_state_delta). */
+ * state keeps too, so a load moves each pointer to where that object is now
+ * (psp_state_moved). */
 static const char *waitq_refuse(void) {
     for (int i = 0; i < g_nparked; i++)
         if (!psp_state_is_kept(g_parked[i].q)) return "a thread waits on an object the state does not keep";
@@ -68,9 +69,12 @@ static const char *waitq_refuse(void) {
 }
 
 static int waitq_load(psp_state_reader *r, char *why, size_t size) {
-    (void)r; (void)why; (void)size;
-    for (int i = 0; i < g_nparked; i++)
-        g_parked[i].q = (psp_waitq *)((char *)g_parked[i].q + psp_state_delta());
+    (void)r;
+    for (int i = 0; i < g_nparked; i++) {
+        psp_waitq *q = (psp_waitq *)psp_state_moved(g_parked[i].q);
+        if (!q) { snprintf(why, size, "a parked thread's queue is in no kept variable"); return -1; }
+        g_parked[i].q = q;
+    }
     return 0;
 }
 
