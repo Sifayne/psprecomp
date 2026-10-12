@@ -219,7 +219,10 @@ void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline,
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
-    psp_wait_writeback(tmo_ptr, deadline);
+    /* A stranded wait is told its timeout ran out, so none of it is left,
+     * though the clock never came to the deadline. */
+    if (rc == PSP_SCHED_STRANDED) psp_write32(tmo_ptr, 0);
+    else psp_wait_writeback(tmo_ptr, deadline);
     psp_ret(rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
                                      : SCE_KERNEL_ERROR_WAIT_TIMEOUT);
 }

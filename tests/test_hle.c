@@ -2160,10 +2160,13 @@ static void test_stranded_waits(void) {
             case 8: rc = call(psp_nid("sceKernelWaitThreadEnd"), holder, tmo, 0, 0); break;
             }
             const int stopped = psp_sched_stop_reason() != NULL;
-            if (timed)
+            if (timed) {
                 CHECK(rc == SCE_KERNEL_ERROR_WAIT_TIMEOUT && !stopped,
                       "a stranded %s with a timeout answered %08X%s", what[k], rc,
                       stopped ? " and stopped the run" : "");
+                CHECK(psp_read32(TW_TMO) == 0, "and left %u of its timeout, not 0",
+                      psp_read32(TW_TMO));
+            }
             else
                 CHECK(stopped, "a stranded %s with no timeout answered %08X and the run went on",
                       what[k], rc);
