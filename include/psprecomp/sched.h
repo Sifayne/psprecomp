@@ -269,11 +269,14 @@ uint32_t psp_sched_current(void);
  * For host state that belongs to one host thread, as the GL backend's context
  * belongs to the GE's (src/hle/ge.c). `fn` runs no guest code and leaves
  * psp_cpu, the caller's, alone. Where `uid` is the caller, or is not parked
- * waiting for its turn, `fn` runs on the caller's thread instead. */
+ * waiting for its turn, `fn` runs on the caller's thread instead. Where `uid`
+ * has ended and its host thread has not yet run the host exit hook below, the
+ * caller first waits for it to. */
 void     psp_sched_run_on(uint32_t uid, void (*fn)(void));
 
 /* Called on a guest thread's host thread as it ends, before it goes: the
- * host lets go of what belongs to that host thread alone. */
+ * host lets go of what belongs to that host thread alone. It runs after the
+ * thread has handed the CPU on, and psp_sched_run_on waits for it. */
 void     psp_sched_set_host_exit_hook(void (*fn)(void));
 
 /* A thread's priority, or the least urgent value there is when it has no slot.

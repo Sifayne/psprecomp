@@ -334,6 +334,19 @@ static void give_token_locked(int to, uint64_t stopped) {
  * are ever selected that thread could never be scheduled again. */
 static void host_exit(void);
 
+/* Host threads on their way out, by slot: their guest thread has ended, they
+ * run no more guest code, and they have not yet let go of what is theirs
+ * alone (host_let_go). psp_sched_run_on waits for them. Host state, so no
+ * save state's. */
+static uint8_t g_leaving[MAX_SCHED_THREADS];
+
+/* This host thread's guest thread has ended. Set before the token is handed
+ * on: the thread that gets it may at once ask this one to let go, and has to
+ * find it leaving rather than gone. The main context never leaves. */
+static void leaving_locked(void) {
+    if (g_self != MAIN_SLOT) g_leaving[g_self] = 1;
+}
+
 /* A host thread's stop (psp_sched_stop_all) while this guest thread ran gave
  * the token to the main context and killed the thread, which runs on to its
  * next call into the scheduler -- or was in one, idling below with the lock
@@ -344,6 +357,7 @@ static void host_exit(void);
 static void leave_if_stopped_locked(void) {
     if (!g_stopping || g_self == MAIN_SLOT || g_running == g_self) return;
     g_slot[g_self].state = PSP_SCHED_DEAD;
+    leaving_locked();
     psp_os_unlock(&g_lock);
     host_exit();
 }
@@ -530,7 +544,7 @@ static int serve_locked(int me) {
 static int await_turn_locked(int me) {
     while (g_running != me) {
         if (serve_locked(me)) continue;
-        if (g_slot[me].state == PSP_SCHED_DEAD) return -1;
+        if (g_slot[me].state == PSP_SCHED_DEAD) { leaving_locked(); return -1; }
         g_parked[me] = 1;
         psp_os_cond_wait(&g_turn, &g_lock);
         g_parked[me] = 0;
@@ -546,13 +560,36 @@ static int await_turn_locked(int me) {
 static void (*g_host_exit_hook)(void);
 void psp_sched_set_host_exit_hook(void (*fn)(void)) { g_host_exit_hook = fn; }
 
-static void host_exit(void) {
+/* The hook, then the word to a psp_sched_run_on waiting for it. */
+static void host_let_go(void) {
     if (g_host_exit_hook) g_host_exit_hook();
+    psp_os_lock(&g_lock);
+    g_leaving[g_self] = 0;
+    psp_os_cond_broadcast(&g_turn);
+    psp_os_unlock(&g_lock);
+}
+
+static void host_exit(void) {
+    host_let_go();
     psp_os_thread_exit();
+}
+
+/* Whether a host thread of `uid`, other than the caller's, is on its way out.
+ * Every slot is asked: a uid can have an ended slot beside a live one
+ * (slot_of). */
+static int uid_leaving_locked(uint32_t uid) {
+    for (int i = 1; i < g_slot_hi; i++)
+        if (g_leaving[i] && i != g_self && g_slot[i].uid == uid) return 1;
+    return 0;
 }
 
 void psp_sched_run_on(uint32_t uid, void (*fn)(void)) {
     psp_os_lock(&g_lock);
+    /* A thread that ends hands the CPU on before its host thread lets go
+     * (host_let_go), and what it holds it holds until then, with nobody
+     * parked to ask. So the caller waits for that; `fn` then has nothing left
+     * to do there and runs here. */
+    while (uid_leaving_locked(uid)) psp_os_cond_wait(&g_turn, &g_lock);
     const int s = slot_of(uid);
     if (s < 0 || s == g_self || !g_parked[s] || g_serve >= 0) {
         psp_os_unlock(&g_lock);
@@ -688,6 +725,7 @@ static void thread_end(sched_slot *t) {
 
     psp_os_lock(&g_lock);
     t->state = PSP_SCHED_DEAD;
+    leaving_locked();
     /* A failed handoff here means this was the last thread that could run. The
      * token is left with nobody and the main context's drain reports it; there
      * is nothing for a dead thread to do about it. */
@@ -713,7 +751,7 @@ static void thread_main(void *arg) {
     t_base = &base;
     if (setjmp(base)) { resume_slot(&g_slot[g_self]); }
     else thread_run(t);
-    if (g_host_exit_hook) g_host_exit_hook();
+    host_let_go();
 }
 
 /* A slot for a new thread, or -1 when the table is full.
@@ -1077,6 +1115,7 @@ void psp_sched_exit(uint32_t uid) {
     const int me = self_slot(uid);
     psp_os_lock(&g_lock);
     g_slot[me].state = PSP_SCHED_DEAD;
+    leaving_locked();
     /* As in thread_main: a failed handoff leaves the token with nobody, which
      * is the drain's to report. This thread is leaving either way. */
     (void)handoff_locked();
@@ -1146,6 +1185,7 @@ void psp_sched_stop_all(const char *why) {
     for (int i = 1; i < g_slot_hi; i++)
         if (g_slot[i].used) g_slot[i].state = PSP_SCHED_DEAD;
     g_slot[MAIN_SLOT].state = PSP_SCHED_RUNNING;
+    leaving_locked();
     give_token_locked(MAIN_SLOT, psp_clock_peek());
     psp_os_cond_broadcast(&g_turn);
     psp_os_unlock(&g_lock);
@@ -1314,6 +1354,7 @@ int psp_sched_terminate(uint32_t uid) {
      * that has gone DEAD, and its caller leaves through psp_os_thread_exit. */
     psp_os_cond_broadcast(&g_turn);
     if (self) {
+        leaving_locked();
         (void)handoff_locked();
         psp_os_unlock(&g_lock);
         /* The main context is not a guest thread and has nowhere to exit to --
@@ -1543,8 +1584,9 @@ static void resume_main(void *arg) {
     if (g_thread_hook) g_thread_hook();
     jmp_buf base;
     t_base = &base;
-    if (setjmp(base)) { resume_slot(&g_slot[g_self]); return; }
-    resume_slot(t);
+    if (setjmp(base)) resume_slot(&g_slot[g_self]);
+    else resume_slot(t);
+    host_let_go();
 }
 
 static void resume_slot(sched_slot *t) {
