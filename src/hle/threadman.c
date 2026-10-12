@@ -1237,6 +1237,15 @@ static void hle_GetThreadCurrentPriority(void) {
  * waiter that times out runs it itself (sema_wait_end), because a waiter that
  * held the head of a first-come queue held back the one behind it.
  *
+ * A sleep, a delay or a CB wait ends here too: threads/refer.expected reads
+ * `wait=1` for a sleeper and `wait=0` the moment it is terminated. Each is
+ * marked on the thread and cleared on the way out of the call, which a
+ * terminated thread never makes, so the mark outlived the wait into the
+ * thread's next run. A wakeup then went to a sleep that was over instead of
+ * being banked, a refer named a delay that was over, a notify ended a wait
+ * that delivers no callbacks, and a SleepThreadCB took a wakeup for a notify
+ * and slept on.
+ *
  * Unmeasured: no probe step terminates a waiter and then reads its object.
  * Release and timeout (step 59) both leave at once, and terminate is taken to
  * leave the same way. */
@@ -1252,6 +1261,8 @@ static int terminate(psp_thread *t) {
         if (s) urgent = sema_release(s);
     }
     t->wait_type = t->wait_id = 0;
+    t->wait_kind = WAIT_NONE;
+    t->cb_wait = t->cb_wake = 0;
     thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
     return urgent;
 }

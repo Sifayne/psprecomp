@@ -2174,17 +2174,22 @@ static void test_many_parked_threads(void) {
  * thread it waited to see end. Its call never answers, so nothing it was in
  * the middle of receiving is reported to it. */
 #define TM_WAIT 0x08802900u
+#define TM_CB   0x08802A00u
 #define TM_LW   0x08806800u   /* the lwmutex's workarea */
 #define TM_BUF  0x08806900u
 #define TM_OUT  0x08806A00u
 
-enum { TM_SEMA, TM_LWMUTEX, TM_PIPE, TM_THREAD_END, TM_SLEEP };
-static uint32_t tm_obj, tm_need[2], tm_rc[2];
-static int      tm_kind, tm_next;
+enum { TM_SEMA, TM_LWMUTEX, TM_PIPE, TM_THREAD_END, TM_SLEEP, TM_DELAY, TM_SLEEP_CB };
+static uint32_t tm_obj, tm_need[2], tm_rc[2], tm_cb, tm_cb_name;
+static int      tm_kind, tm_next, tm_with_cb;
 
-/* Waits as tm_kind says; the n-th start of the scenario answers in tm_rc[n]. */
+static void body_tm_cb(void) { psp_ret(0); }
+
+/* Waits as tm_kind says, after making a callback of its own if tm_with_cb;
+ * the n-th start of the scenario answers in tm_rc[n]. */
 static void body_tm_wait(void) {
     const int me = tm_next++;
+    if (tm_with_cb) tm_cb = call(psp_nid("sceKernelCreateCallback"), tm_cb_name, TM_CB, 0, 0);
     uint32_t rc = 0;
     switch (tm_kind) {
     case TM_SEMA:       rc = call(psp_nid("sceKernelWaitSema"), tm_obj, tm_need[me], 0, 0); break;
@@ -2192,6 +2197,8 @@ static void body_tm_wait(void) {
     case TM_PIPE:       rc = call7(psp_nid("sceKernelReceiveMsgPipe"), tm_obj, TM_BUF, 4, 0, TM_OUT, 0, 0); break;
     case TM_THREAD_END: rc = call(psp_nid("sceKernelWaitThreadEnd"), tm_obj, 0, 0, 0); break;
     case TM_SLEEP:      rc = call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0); break;
+    case TM_DELAY:      rc = call(psp_nid("sceKernelDelayThread"), 1000000, 0, 0, 0); break;
+    case TM_SLEEP_CB:   rc = call(psp_nid("sceKernelSleepThreadCB"), 0, 0, 0, 0); break;
     }
     tm_rc[me] = rc;
 }
@@ -2320,6 +2327,110 @@ static void test_terminated_waiters(void) {
           tm_rc[1]);
 
     psp_sched_stop_all("test_terminated_waiters");
+    psp_sched_join_all();
+    psp_sched_set_threading(0);
+    psp_threadman_reset();
+}
+
+/* A thread terminated in a sleep, a delay or a CB wait is in none of them
+ * once it is started again: refer.expected reads `wait=0` for a sleeper the
+ * moment it is terminated. So a wakeup while it has not yet slept is banked
+ * for its next sleep, a refer names the wait it is in now, and a notify does
+ * not end a wait without CB in its name -- nor does one it was terminated
+ * before running keep its next SleepThreadCB from being woken by name. */
+static uint32_t tr_refer(uint32_t th, uint32_t offset) {
+    psp_write32(TW_INFO, 104);
+    call(psp_nid("sceKernelReferThreadStatus"), th, TW_INFO, 0, 0);
+    return psp_read32(TW_INFO + offset);
+}
+
+/* One thread, started to wait as `kind` says and parked there. At 0x30 it is
+ * less urgent than us, so when it is started again it is ready and has not
+ * yet run. */
+static uint32_t tr_park(int kind, int with_cb) {
+    tm_kind = kind;
+    tm_with_cb = with_cb;
+    tm_next = 0;
+    tm_rc[0] = tm_rc[1] = 0xEEEEEEEEu;
+    const uint32_t th = tw_start_at(TM_WAIT, 0x30);
+    call(psp_nid("sceKernelDelayThread"), 1000, 0, 0, 0);
+    return th;
+}
+
+static void test_restarted_after_terminated_wait(void) {
+    psp_register(TM_WAIT, body_tm_wait);
+    psp_register(TM_CB, body_tm_cb);
+    psp_sysmem_reset();
+    psp_threadman_reset();
+    psp_sched_set_threading(1);
+    const uint32_t DELAY     = psp_nid("sceKernelDelayThread");
+    const uint32_t TERMINATE = psp_nid("sceKernelTerminateThread");
+    const uint32_t START     = psp_nid("sceKernelStartThread");
+    const uint32_t WAKEUP    = psp_nid("sceKernelWakeupThread");
+    const uint32_t NOTIFY    = psp_nid("sceKernelNotifyCallback");
+    const uint32_t GONE      = psp_nid("sceKernelTerminateDeleteThread");
+    tm_cb_name = guest_name("tr");
+    uint32_t count, waiters;
+
+    /* Terminated asleep, started again, and woken before it runs: the wakeup
+     * is banked, and the sleep it goes on to answers at once. */
+    uint32_t th = tr_park(TM_SLEEP, 0);
+    call(TERMINATE, th, 0, 0, 0);
+    call(START, th, 0, 0, 0);
+    CHECK(call(WAKEUP, th, 0, 0, 0) == 0, "wake a restarted thread that has not run");
+    CHECK(tr_refer(th, 76) == 1, "terminated asleep and restarted: %u wakeups banked, expected 1",
+          tr_refer(th, 76));
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(tm_rc[1] == 0, "terminated asleep and restarted: its next sleep answered %08X", tm_rc[1]);
+    call(GONE, th, 0, 0, 0);
+
+    /* Terminated in a delay, started again to wait on a semaphore: a refer
+     * names the semaphore. */
+    tm_obj = call5(psp_nid("sceKernelCreateSema"), tm_cb_name, 0, 0, 1, 0);
+    tm_need[1] = 1;
+    th = tr_park(TM_DELAY, 0);
+    call(TERMINATE, th, 0, 0, 0);
+    tm_kind = TM_SEMA;
+    call(START, th, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(tr_refer(th, 68) == PSP_WAITTYPE_SEMA && tr_refer(th, 72) == tm_obj,
+          "terminated in a delay, restarted into WaitSema: waitType %X waitId %08X",
+          tr_refer(th, 68), tr_refer(th, 72));
+    call(GONE, th, 0, 0, 0);
+
+    /* Terminated in SleepThreadCB, started again to make a callback and wait
+     * on the semaphore: a notify leaves it waiting. */
+    th = tr_park(TM_SLEEP_CB, 1);
+    call(TERMINATE, th, 0, 0, 0);
+    tm_kind = TM_SEMA;
+    call(START, th, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(call(NOTIFY, tm_cb, 1, 0, 0) == 0, "notify the restarted thread's callback");
+    call(DELAY, 1000, 0, 0, 0);
+    waiters = tm_sema_waiters(&count);
+    CHECK(tm_rc[1] == 0xEEEEEEEEu && waiters == 1,
+          "terminated in SleepThreadCB, restarted into WaitSema: a notify ended it (%08X), %u waiters",
+          tm_rc[1], waiters);
+    call(GONE, th, 0, 0, 0);
+    call(psp_nid("sceKernelDeleteSema"), tm_obj, 0, 0, 0);
+
+    /* Terminated in SleepThreadCB after a notify readied it to run the
+     * handler, before it could: started again into SleepThreadCB, it is
+     * woken by name. */
+    th = tr_park(TM_SLEEP_CB, 1);
+    call(NOTIFY, tm_cb, 1, 0, 0);
+    call(TERMINATE, th, 0, 0, 0);
+    call(START, th, 0, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(call(WAKEUP, th, 0, 0, 0) == 0, "wake a restarted thread in SleepThreadCB");
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(tm_rc[1] == 0,
+          "terminated with a notify undelivered, restarted into SleepThreadCB: a wakeup left it asleep (%08X)",
+          tm_rc[1]);
+    call(GONE, th, 0, 0, 0);
+
+    tm_with_cb = 0;
+    psp_sched_stop_all("test_restarted_after_terminated_wait");
     psp_sched_join_all();
     psp_sched_set_threading(0);
     psp_threadman_reset();
@@ -2624,6 +2735,7 @@ int main(void) {
     test_thread_end_waiters();
     test_many_parked_threads();
     test_terminated_waiters();
+    test_restarted_after_terminated_wait();
     test_host_work_boundary();
     test_system_params();
 
