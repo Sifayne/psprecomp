@@ -84,7 +84,9 @@ void psp_waitq_keep(void) {
     psp_state_register(&part);
 }
 
-int psp_waitq_leave(uint32_t uid) {
+/* `answered` is whether the thread's call will return, and so whether it is
+ * told what it was handed. */
+static int leave(uint32_t uid, int answered) {
     const int p = parked_find(uid);
     if (p < 0) return 0;
     psp_waitq *q = g_parked[p].q;
@@ -93,11 +95,15 @@ int psp_waitq_leave(uint32_t uid) {
         g_parked[p] = g_parked[--g_nparked];
         return 0;
     }
-    if (q->w[i].nout) psp_write32(q->w[i].nout, q->w[i].done);
+    if (answered && q->w[i].nout) psp_write32(q->w[i].nout, q->w[i].done);
     (void)psp_waitq_take(q, i);
     if (q->mirror) psp_write32(q->mirror, (uint32_t)q->n);
     return 1;
 }
+
+int psp_waitq_leave(uint32_t uid) { return leave(uid, 1); }
+
+int psp_waitq_leave_terminated(uint32_t uid) { return leave(uid, 0); }
 
 int psp_waitq_pick(const psp_waitq *q, uint32_t attr) {
     if (q->n == 0) return -1;

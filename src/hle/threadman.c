@@ -1224,6 +1224,38 @@ static void hle_GetThreadCurrentPriority(void) {
     psp_ret(psp_threadman_current_priority());
 }
 
+/* Stop a thread that has not ended: both terminate calls. Returns nonzero if
+ * a thread it let go outranks the caller.
+ *
+ * A thread terminated in a wait leaves it then and there, as one whose wait
+ * is released does (threadprobe step 78, fw 6.60) -- but it never runs again,
+ * so what its wait would have done on the way out is done here. It leaves the
+ * object's queue: a queue that kept it gave the next signal's count to a
+ * thread that was gone, and woke nobody. It leaves the list of the thread it
+ * waited to see end, which would otherwise wake it out of whatever it waits
+ * on after being started again. And a semaphore's queue is run again, as a
+ * waiter that times out runs it itself (sema_wait_end), because a waiter that
+ * held the head of a first-come queue held back the one behind it.
+ *
+ * Unmeasured: no probe step terminates a waiter and then reads its object.
+ * Release and timeout (step 59) both leave at once, and terminate is taken to
+ * leave the same way. */
+static int terminate(psp_thread *t) {
+    psp_sched_terminate(t->uid);
+    (void)psp_waitq_leave_terminated(t->uid);
+    int urgent = 0;
+    if (t->wait_type == PSP_WAITTYPE_THREADEND) {
+        psp_thread *target = find_thread(t->wait_id);
+        if (target) drop_ender(target, t->uid);
+    } else if (t->wait_type == PSP_WAITTYPE_SEMA) {
+        psp_sema *s = find_sema(t->wait_id);
+        if (s) urgent = sema_release(s);
+    }
+    t->wait_type = t->wait_id = 0;
+    thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
+    return urgent;
+}
+
 /* Terminate stops a thread without freeing it. Unimplemented until now, which
  * mattered more than it looks: pspautotests' checkpoint helper terminates its
  * rescheduler thread between every pair of checks, and a terminate that does
@@ -1248,9 +1280,9 @@ static void hle_TerminateThread(void) {
      * host thread if there is one. Only the first existed, and it is a no-op
      * whenever the second is what is needed. */
     psp_sched_cancel_spawn(t->uid);
-    psp_sched_terminate(t->uid);
-    thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
+    const int urgent = terminate(t);
     psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_preempt();
 }
 
 /* Terminate-and-delete is not terminate followed by delete: it accepts a thread
@@ -1266,13 +1298,11 @@ static void hle_TerminateThread(void) {
 static void hle_TerminateDeleteThread(void) {
     psp_thread *t = other_thread(psp_arg(0));
     if (!t) return;
-    if (!thread_dormant(t)) {
-        psp_sched_terminate(t->uid);
-        thread_ended(t, SCE_KERNEL_ERROR_THREAD_TERMINATED);
-    }
+    const int urgent = thread_dormant(t) ? 0 : terminate(t);
     psp_sched_cancel_spawn(t->uid);
     free_thread(t);
     psp_ret(SCE_KERNEL_ERROR_OK);
+    if (urgent) psp_sched_preempt();
 }
 
 /* sceKernelChangeCurrentThreadAttr(clear, set)

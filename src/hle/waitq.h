@@ -193,8 +193,9 @@ int  psp_waitq_add(psp_waitq *q, uint32_t uid, uint32_t need, uint32_t mode,
 int  psp_waitq_find(const psp_waitq *q, uint32_t uid);
 
 /* Remove a waiter by uid, wherever it sits. For a thread that stopped waiting
- * without being released -- its timeout elapsed, the object was deleted under
- * it, or the guest terminated it. Returns 1 if it was there. */
+ * without being released -- its timeout elapsed, or the object was deleted
+ * under it. (A thread terminated in its wait never runs to call this:
+ * psp_waitq_leave_terminated.) Returns 1 if it was there. */
 int  psp_waitq_drop(psp_waitq *q, uint32_t uid);
 
 /* The index of the waiter to release next under `attr`, or -1 when empty.
@@ -227,6 +228,11 @@ int  psp_waitq_count(const psp_waitq *q);
  * other threads' uids (the copies event flags and semaphores work on) are not
  * recorded. */
 int  psp_waitq_leave(uint32_t uid);
+/* The same for a thread terminated in its wait, except that nothing is
+ * written to its out-parameter: the call it was in never returns, and
+ * TerminateDeleteThread frees the stack such a word usually lives on. The
+ * workarea count of an lwmutex is the object's, and is still rewritten. */
+int  psp_waitq_leave_terminated(uint32_t uid);
 /* Forget every parked thread, with the objects: psp_threadman_reset. */
 void psp_waitq_reset(void);
 /* Names the parked-thread table to the save state (psprecomp/state.h);
