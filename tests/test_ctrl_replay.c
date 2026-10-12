@@ -506,14 +506,16 @@ static void test_long_scenario(void) {
 }
 
 /* A recording's facts: the date and time zone its session saw. The recorder
- * writes each the first time the guest asks, and a replay adopts them at
- * parse, wherever they stand in the file. */
+ * writes each the first time the guest asks, and a replay adopts them when
+ * the file loads, wherever they stand in it. */
 static void test_session_facts(void) {
     unsetenv("PSPRECOMP_REPLAY");
     setenv("PSPRECOMP_REPLAY_REC", "t-facts-rec.pad", 1);
     psp_misc_init();
     psp_cpu.r[PSP_REG_A0] = 0; psp_hle_call(0x27CC57F0);         /* sceKernelLibcTime */
     const uint32_t first = psp_cpu.r[PSP_REG_V0];
+    psp_cpu.r[PSP_REG_A0] = 6; psp_cpu.r[PSP_REG_A1] = BUF; psp_hle_call(0xA5DA2406);
+    const uint32_t host_zone = psp_read32(BUF);
     psp_cpu.r[PSP_REG_A0] = 0; psp_hle_call(0x27CC57F0);
     unload();
     FILE *f = fopen("t-facts-rec.pad", "r");
@@ -521,7 +523,6 @@ static void test_session_facts(void) {
     while (f && fgets(line, sizeof line, f)) if (!strncmp(line, "date ", 5)) dates++;
     if (f) fclose(f);
     CHECK(dates == 1, "the date is recorded once, when first asked: %d line(s)", dates);
-    (void)first;
 
     load(write_scenario("t-facts.pad", "@1 tap cross\ndate 1234567000000\nzone 540 1\n"));
     psp_cpu.r[PSP_REG_A0] = 0; psp_hle_call(0x27CC57F0);
@@ -532,7 +533,17 @@ static void test_session_facts(void) {
     psp_cpu.r[PSP_REG_A0] = 7; psp_cpu.r[PSP_REG_A1] = BUF; psp_hle_call(0xA5DA2406);
     CHECK(psp_read32(BUF) == 1u, "and so is its daylight saving");
     unload();
-    remove("t-facts.pad"); remove("t-facts-rec.pad");
+
+    /* A scenario refused for a bad line sets neither. */
+    load(write_scenario("t-facts-bad.pad", "date 1234567000000\nzone 540 1\n@1 down nosuchbutton\n"));
+    CHECK(!psp_ctrl_replay_active(), "the scenario with a bad line does not load");
+    psp_cpu.r[PSP_REG_A0] = 0; psp_hle_call(0x27CC57F0);
+    CHECK(psp_cpu.r[PSP_REG_V0] - first < 60u, "a refused scenario's date is not the run's: %u",
+          (unsigned)psp_cpu.r[PSP_REG_V0]);
+    psp_cpu.r[PSP_REG_A0] = 6; psp_cpu.r[PSP_REG_A1] = BUF; psp_hle_call(0xA5DA2406);
+    CHECK(psp_read32(BUF) == host_zone, "nor its zone: %d", (int)psp_read32(BUF));
+    unload();
+    remove("t-facts.pad"); remove("t-facts-bad.pad"); remove("t-facts-rec.pad");
 }
 
 int main(void) {

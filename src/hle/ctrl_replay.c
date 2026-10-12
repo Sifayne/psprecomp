@@ -106,6 +106,14 @@ static int       g_loaded;
 static int       g_finished;
 static int       g_tainted;
 
+/* The recorded session's date and time zone (psp_ctrl_replay_note), held
+ * until the file loads, so a scenario refused for a bad line sets neither. */
+static struct {
+    int      have_date, have_zone;
+    uint64_t date_us;
+    int      zone_minutes, zone_dst;
+} g_facts;
+
 /* Where the previous event fired. Relative stamps are resolved against this
  * at run time, not at parse time: a `+1` after a `2.0s` has to mean "one poll
  * after that actually happened", and only the run knows when that was. */
@@ -292,17 +300,19 @@ static int parse_directive(const char *dir, char *arg, stamp at, int line, int *
         return *seen_timed;
     }
 
-    /* Facts of the recorded session (psp_ctrl_replay_note): adopted at
-     * parse, wherever they stand, since the recorder writes each the
-     * first time the guest asks for it. */
+    /* Facts of the recorded session (psp_ctrl_replay_note): read wherever
+     * they stand, since the recorder writes each the first time the guest
+     * asks for it, and adopted when the file loads. */
     if (!strcasecmp(dir, "date")) {
-        psp_rtc_set_date_us(strtoull(arg, NULL, 10));
+        g_facts.date_us = strtoull(arg, NULL, 10);
+        g_facts.have_date = 1;
         return 0;
     }
     if (!strcasecmp(dir, "zone")) {
         char *end;
-        const long minutes = strtol(arg, &end, 10);
-        psp_sysparam_set_zone((int)minutes, (int)strtol(end, NULL, 10));
+        g_facts.zone_minutes = (int)strtol(arg, &end, 10);
+        g_facts.zone_dst = (int)strtol(end, NULL, 10);
+        g_facts.have_zone = 1;
         return 0;
     }
 
@@ -487,6 +497,7 @@ void psp_ctrl_replay_reset(void) {
     g_ev = NULL; g_ev_n = g_ev_cap = 0; g_cursor = 0;
     g_minhold = 2; g_drain = 0;
     g_loaded = g_finished = g_tainted = 0;
+    memset(&g_facts, 0, sizeof g_facts);
     g_prev_poll = 0; g_prev_us = 0;
     g_lane = (pad_state)PAD_NEUTRAL; g_analog_owned = g_look_owned = 0;
     if (g_rec) { fclose(g_rec); g_rec = NULL; }
@@ -501,6 +512,8 @@ void psp_ctrl_replay_init(void) {
     if (path && *path) {
         if (parse_file(path) == 0) {
             g_loaded = 1;
+            if (g_facts.have_date) psp_rtc_set_date_us(g_facts.date_us);
+            if (g_facts.have_zone) psp_sysparam_set_zone(g_facts.zone_minutes, g_facts.zone_dst);
             fprintf(stderr, "psprecomp: replay: %s -- %d event(s), minhold %d, "
                             "clock %s\n",
                     path, g_ev_n, g_minhold,
