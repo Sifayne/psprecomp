@@ -168,6 +168,15 @@ void psp_write16(uint32_t addr, uint16_t val);
 void psp_write32(uint32_t addr, uint32_t val);
 void psp_write_f32(uint32_t addr, float val);
 
+/* A 64-bit value as the guest keeps one: two words, the low word first. */
+static inline uint64_t psp_read64(uint32_t addr) {
+    return (uint64_t)psp_read32(addr) | ((uint64_t)psp_read32(addr + 4) << 32);
+}
+static inline void psp_write64(uint32_t addr, uint64_t val) {
+    psp_write32(addr, (uint32_t)val);
+    psp_write32(addr + 4, (uint32_t)(val >> 32));
+}
+
 /* Bulk copy into guest memory — used by the loader to place PRX segments. */
 int psp_mem_write_block(uint32_t addr, const void *src, uint32_t len);
 int psp_mem_read_block(void *dst, uint32_t addr, uint32_t len);

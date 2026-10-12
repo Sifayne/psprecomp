@@ -186,6 +186,14 @@ const void *psp_state_get(psp_state_reader *r, const char *tag, size_t *size) {
 
 /* ---- guest memory ---------------------------------------------------------------- */
 
+/* How many of a region's bytes page `p` holds: a whole page, but for a short
+ * last one. */
+static uint32_t page_len(uint32_t p, uint32_t pages, uint32_t size) {
+    return p == pages - 1 && size % PAGE ? size % PAGE : PAGE;
+}
+
+static int page_marked(const uint8_t *map, uint32_t p) { return (map[p / 8] & (1u << (p % 8))) != 0; }
+
 /* A region as a page map and the pages it marks. */
 static int put_region(psp_state_writer *w, const char *tag, const uint8_t *bytes, uint32_t size) {
     const uint32_t pages = (size + PAGE - 1) / PAGE;
@@ -194,7 +202,7 @@ static int put_region(psp_state_writer *w, const char *tag, const uint8_t *bytes
     if (!map) return -1;
     size_t kept = 0;
     for (uint32_t p = 0; p < pages; p++) {
-        const uint32_t len = p == pages - 1 && size % PAGE ? size % PAGE : PAGE;
+        const uint32_t len = page_len(p, pages, size);
         for (uint32_t i = 0; i < len; i++)
             if (bytes[(size_t)p * PAGE + i]) { map[p / 8] |= (uint8_t)(1u << (p % 8)); kept++; break; }
     }
@@ -206,8 +214,8 @@ static int put_region(psp_state_writer *w, const char *tag, const uint8_t *bytes
     memcpy(out + 8, map, map_bytes);
     uint8_t *at = out + 8 + map_bytes;
     for (uint32_t p = 0; p < pages; p++) {
-        if (!(map[p / 8] & (1u << (p % 8)))) continue;
-        const uint32_t len = p == pages - 1 && size % PAGE ? size % PAGE : PAGE;
+        if (!page_marked(map, p)) continue;
+        const uint32_t len = page_len(p, pages, size);
         memset(at, 0, PAGE);
         memcpy(at, bytes + (size_t)p * PAGE, len);
         at += PAGE;
@@ -231,9 +239,9 @@ static int get_region(psp_state_reader *r, const char *tag, uint8_t *bytes, uint
     const uint8_t *map = in + 8, *at = in + 8 + map_bytes;
     memset(bytes, 0, size);
     for (uint32_t p = 0; p < pages; p++) {
-        if (!(map[p / 8] & (1u << (p % 8)))) continue;
+        if (!page_marked(map, p)) continue;
         if ((size_t)(at + PAGE - in) > n) return -1;
-        const uint32_t len = p == pages - 1 && size % PAGE ? size % PAGE : PAGE;
+        const uint32_t len = page_len(p, pages, size);
         memcpy(bytes + (size_t)p * PAGE, at, len);
         at += PAGE;
     }
@@ -562,16 +570,17 @@ int psp_state_peek(const char *path, psp_state_info *info, uint8_t *thumb) {
  * its poll where nothing refuses it, and says when it was taken, and each
  * different reason it waited for, once. PSPRECOMP_LOAD_STATE: the same for
  * loads into the running game, as many times as asked. */
-static struct { uint32_t poll; char path[512]; } g_script[8];
+enum { SCRIPT_MAX = 8, SAID_MAX = 8 };
+static struct { uint32_t poll; char path[512]; } g_script[SCRIPT_MAX];
 static int g_nscript, g_script_at;
 static struct { uint32_t poll; unsigned times; char path[512]; } g_reload;
-static char g_said[8][160];
+static char g_said[SAID_MAX][160];
 static int g_nsaid;
 
 void psp_state_init(void) {
     g_nscript = g_script_at = 0;
     const char *spec = getenv("PSPRECOMP_SAVE_STATE");
-    while (spec && *spec && g_nscript < 8) {
+    while (spec && *spec && g_nscript < SCRIPT_MAX) {
         char *end;
         const unsigned long poll = strtoul(spec, &end, 10);
         if (end == spec || *end != ':') break;
@@ -603,7 +612,7 @@ void psp_state_init(void) {
 static void say_refused(const char *what, const char *refused) {
     for (int i = 0; i < g_nsaid; i++) if (!strncmp(g_said[i], refused, sizeof g_said[i] - 1)) return;
     fprintf(stderr, "state: not %s at poll %u yet: %s\n", what, psp_ctrl_polls(), refused);
-    if (g_nsaid < 8) snprintf(g_said[g_nsaid++], sizeof g_said[0], "%.159s", refused);
+    if (g_nsaid < SAID_MAX) snprintf(g_said[g_nsaid++], sizeof g_said[0], "%.159s", refused);
 }
 
 /* The host's request, and the last result, shared with any thread. */

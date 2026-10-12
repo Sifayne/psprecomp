@@ -36,6 +36,7 @@ void present_use_overlay(void);
  * nothing to link against. The declaration becomes a stub rather than the call
  * site becoming conditional: a host without SDL2 has to build, and asking for a
  * window on one should say why it did not get one instead of failing to link. */
+static inline void present_note_frame(void) { }
 static inline void present_audio_report(FILE *out) { (void)out; }
 static inline void present_use_overlay(void) { }
 static inline int present_start(void) {
@@ -95,7 +96,6 @@ static inline void  present_aspect_scene_size(int *w, int *h) { *w = 480; *h = 2
 static inline void  present_aspect_latch_scene_size(int w, int h) { (void)w; (void)h; }
 static inline void  present_aspect_extent(int dw, int dh, int *w, int *h) { (void)dw; (void)dh; *w = 480; *h = 272; }
 static inline void  present_gl_swap(void) { }
-static inline void  present_note_frame(void) { }
 static inline void *present_gl_proc(const char *name) { (void)name; return 0; }
 #endif
 

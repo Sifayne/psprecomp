@@ -96,11 +96,17 @@ int psp_settings_name_valid(const char *name) {
     return 1;
 }
 
+/* A pack's id: a name without spaces or /, since it names a section and a
+ * folder. */
+static int pack_id_valid(const char *id) {
+    return psp_settings_name_valid(id) && !strchr(id, ' ') && !strchr(id, '/');
+}
+
 void psp_settings_schema_use(const psp_settings_schema *s) {
     const char *why = NULL;
     if (!s || s->count < 0 || (s->count && !s->options) || PSP_PLAYER_OPTIONS + s->count > PSP_SETTINGS_MAX)
         why = "a pack has 0 to PSP_SETTINGS_MAX - PSP_PLAYER_OPTIONS options";
-    else if (s->count && (!s->id || !psp_settings_name_valid(s->id) || strchr(s->id, ' ') || strchr(s->id, '/')))
+    else if (s->count && (!s->id || !pack_id_valid(s->id)))
         why = "a pack with options needs an id without spaces or /";
     /* A table shorter than its declared size leaves empty options at the
      * end, which would shift every index after them. */
@@ -163,6 +169,72 @@ static int text_ok(const char *v) {
     return 1;
 }
 
+/* A value as an option stores it: its number (a choice's index, -1 for the
+ * special word), a size's dimensions, and its canonical spelling. */
+typedef struct {
+    double number;
+    int width, height;
+    char canonical[PSP_SETTINGS_VALUE];
+} parsed_value;
+
+static int parse_choice(const psp_option_def *d, const char *value, parsed_value *v, char *error) {
+    /* Explicit conventional booleans; empty environment values are unset. */
+    if (!strcmp(d->choices, "0|1")) {
+        if (!strcmp(value, "true") || !strcmp(value, "on")) value = "1";
+        if (!strcmp(value, "false") || !strcmp(value, "off")) value = "0";
+    }
+    char part[PSP_SETTINGS_VALUE];
+    for (int i = 0; token(d->choices, i, part, sizeof part); i++) {
+        if (!strcmp(part, value)) {
+            v->number = i;
+            snprintf(v->canonical, sizeof v->canonical, "%s", value);
+            return 0;
+        }
+    }
+    snprintf(error, PSP_SETTINGS_ERROR, "%s: expected %s, got '%s'", d->key, d->choices, value);
+    return -1;
+}
+
+static int parse_text(const psp_option_def *d, const char *value, parsed_value *v, char *error) {
+    if (!text_ok(value))
+        return fail(error, d->key, "expected UTF-8 text with no control characters, "
+                                   "and no spaces at either end");
+    snprintf(v->canonical, sizeof v->canonical, "%s", value);
+    return 0;
+}
+
+static int parse_size(const psp_option_def *d, const char *value, parsed_value *v, char *error) {
+    char *end; errno = 0;
+    long ww = strtol(value, &end, 10);
+    if (errno || end == value || *end != 'x') return fail(error, d->key, "expected WIDTHxHEIGHT");
+    const char *tail = end + 1; long hh = strtol(tail, &end, 10);
+    if (errno || end == tail || *end || ww < 1 || hh < 1 || ww > 16384 || hh > 16384)
+        return fail(error, d->key, "dimensions must be whole numbers from 1 to 16384");
+    v->width = (int)ww; v->height = (int)hh;
+    snprintf(v->canonical, sizeof v->canonical, "%dx%d", v->width, v->height);
+    return 0;
+}
+
+/* A number, an integer, or the option's special word. */
+static int parse_number(const psp_option_def *d, const char *value, parsed_value *v, char *error) {
+    if (d->special && !strcmp(value, d->special)) {
+        v->number = -1; snprintf(v->canonical, sizeof v->canonical, "%s", value);
+        return 0;
+    }
+    char *end; errno = 0;
+    const double n = strtod(value, &end);
+    if (errno || end == value || *end || !isfinite(n) || n < d->min || n > d->max) {
+        snprintf(error, PSP_SETTINGS_ERROR, "%s: expected a finite number from %g to %g%s%s",
+                 d->key, d->min, d->max, d->special ? ", or " : "", d->special ? d->special : "");
+        return -1;
+    }
+    if (d->type == PSP_OPTION_INTEGER && floor(n) != n)
+        return fail(error, d->key, "expected a whole number");
+    v->number = n;
+    snprintf(v->canonical, sizeof v->canonical, "%.9g", n);
+    return 0;
+}
+
 int psp_settings_set(psp_settings *s, int id, const char *value,
                      enum psp_settings_source source, char *error) {
     const psp_option_def *d = psp_settings_option(id);
@@ -179,53 +251,14 @@ int psp_settings_set(psp_settings *s, int id, const char *value,
             break;
         }
     }
-    double n = 0;
-    int w = 0, h = 0;
-    char canonical[PSP_SETTINGS_VALUE];
-    if (d->type == PSP_OPTION_CHOICE) {
-        int found = 0;
-        /* Explicit conventional booleans; empty environment values are unset. */
-        if (!strcmp(d->choices, "0|1")) {
-            if (!strcmp(value, "true") || !strcmp(value, "on")) value = "1";
-            if (!strcmp(value, "false") || !strcmp(value, "off")) value = "0";
-        }
-        for (int i = 0; token(d->choices, i, part, sizeof part); i++) {
-            if (!strcmp(part, value)) { n = i; found = 1; break; }
-        }
-        if (!found) {
-            snprintf(error, PSP_SETTINGS_ERROR, "%s: expected %s, got '%s'", d->key, d->choices, value);
-            return -1;
-        }
-        snprintf(canonical, sizeof canonical, "%s", value);
-    } else if (d->type == PSP_OPTION_TEXT) {
-        if (!text_ok(value))
-            return fail(error, d->key, "expected UTF-8 text with no control characters, "
-                                       "and no spaces at either end");
-        snprintf(canonical, sizeof canonical, "%s", value);
-    } else if (d->type == PSP_OPTION_SIZE) {
-        char *end; errno = 0;
-        long ww = strtol(value, &end, 10);
-        if (errno || end == value || *end != 'x') return fail(error, d->key, "expected WIDTHxHEIGHT");
-        const char *tail = end + 1; long hh = strtol(tail, &end, 10);
-        if (errno || end == tail || *end || ww < 1 || hh < 1 || ww > 16384 || hh > 16384)
-            return fail(error, d->key, "dimensions must be whole numbers from 1 to 16384");
-        w = (int)ww; h = (int)hh;
-        snprintf(canonical, sizeof canonical, "%dx%d", w, h);
-    } else if (d->special && !strcmp(value, d->special)) {
-        n = -1; snprintf(canonical, sizeof canonical, "%s", value);
-    } else {
-        char *end; errno = 0; n = strtod(value, &end);
-        if (errno || end == value || *end || !isfinite(n) || n < d->min || n > d->max) {
-            snprintf(error, PSP_SETTINGS_ERROR, "%s: expected a finite number from %g to %g%s%s",
-                     d->key, d->min, d->max, d->special ? ", or " : "", d->special ? d->special : "");
-            return -1;
-        }
-        if (d->type == PSP_OPTION_INTEGER && floor(n) != n)
-            return fail(error, d->key, "expected a whole number");
-        snprintf(canonical, sizeof canonical, "%.9g", n);
-    }
-    strcpy(s->value[id], canonical); s->number[id] = n; s->source[id] = source;
-    if (d->type == PSP_OPTION_SIZE) { s->width = w; s->height = h; }
+    parsed_value v = { 0 };
+    const int rc = d->type == PSP_OPTION_CHOICE ? parse_choice(d, value, &v, error)
+                 : d->type == PSP_OPTION_TEXT   ? parse_text(d, value, &v, error)
+                 : d->type == PSP_OPTION_SIZE   ? parse_size(d, value, &v, error)
+                 :                                parse_number(d, value, &v, error);
+    if (rc) return -1;
+    strcpy(s->value[id], v.canonical); s->number[id] = v.number; s->source[id] = source;
+    if (d->type == PSP_OPTION_SIZE) { s->width = v.width; s->height = v.height; }
     return 0;
 }
 
@@ -250,14 +283,20 @@ int psp_settings_assign(psp_settings *s, const char *assignments,
     *s = next; return 0;
 }
 
+/* Whether a bind.* key's first len characters name a device: the keyboard,
+ * the controller or the mouse, as the host's input spells them. */
+static int bind_device(const char *key, size_t len) {
+    static const char *const devices[] = { "key", "pad", "mouse" };
+    for (size_t d = 0; d < sizeof devices / sizeof *devices; d++)
+        if (len == strlen(devices[d]) && !strncmp(key, devices[d], len)) return 1;
+    return 0;
+}
+
 int psp_settings_bind(psp_settings *s, const char *key, const char *value, char *error) {
     char where[PSP_BIND_KEY + 8];
     snprintf(where, sizeof where, "bind.%.*s", PSP_BIND_KEY, key ? key : "");
     const char *dot = key ? strchr(key, '.') : NULL;
-    const size_t device = dot ? (size_t)(dot - key) : 0;
-    if (!dot || strlen(key) >= PSP_BIND_KEY || !dot[1] ||
-        !((device == 3 && !strncmp(key, "key", 3)) || (device == 3 && !strncmp(key, "pad", 3)) ||
-          (device == 5 && !strncmp(key, "mouse", 5))))
+    if (!dot || strlen(key) >= PSP_BIND_KEY || !dot[1] || !bind_device(key, (size_t)(dot - key)))
         return fail(error, where, "expected bind.key.<target>, bind.pad.<target> or bind.mouse.<target>");
     for (const char *c = dot + 1; *c; c++)
         if (!islower((unsigned char)*c) && !isdigit((unsigned char)*c) && *c != '_')
@@ -339,17 +378,22 @@ int psp_settings_env(psp_settings *s, char *error) {
  * English for any the PSP does not have ("C" and "POSIX" among them).
  * Chinese is Traditional for Taiwan, Hong Kong and Macau, and for a locale
  * that names the script, Simplified otherwise. */
+/* The PSP's numbering of the languages that need naming here. */
+enum { LANG_JAPANESE = 0, LANG_ENGLISH = 1, LANG_CHINESE_TRADITIONAL = 10, LANG_CHINESE_SIMPLIFIED = 11 };
+
 int psp_settings_host_language(void) {
     const char *v = NULL;
     static const char *const vars[] = { "LC_ALL", "LC_MESSAGES", "LANG" };
     for (int i = 0; i < 3 && !(v && *v); i++) v = getenv(vars[i]);
-    if (!v || !*v) return 1;
+    if (!v || !*v) return LANG_ENGLISH;
+    /* In the PSP's order, from Japanese at 0 up to Korean. */
     static const char *const codes[] = { "ja", "en", "fr", "es", "de", "it", "nl", "pt", "ru", "ko" };
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < (int)(sizeof codes / sizeof *codes); i++)
         if (!strncmp(v, codes[i], 2) && !isalpha((unsigned char)v[2])) return i;
     if (!strncmp(v, "zh", 2) && !isalpha((unsigned char)v[2]))
-        return strstr(v, "_TW") || strstr(v, "_HK") || strstr(v, "_MO") || strstr(v, "Hant") ? 10 : 11;
-    return 1;
+        return strstr(v, "_TW") || strstr(v, "_HK") || strstr(v, "_MO") || strstr(v, "Hant")
+               ? LANG_CHINESE_TRADITIONAL : LANG_CHINESE_SIMPLIFIED;
+    return LANG_ENGLISH;
 }
 
 int psp_settings_resolve(psp_settings *s, char *error) {
@@ -358,15 +402,15 @@ int psp_settings_resolve(psp_settings *s, char *error) {
     for (int i = 0; i < psp_settings_count(); i++)
         if ((psp_settings_option(i)->flags & PSP_OPTION_NEEDS_GL) && s->number[i]) enhanced = 1;
     s->render = (int)s->number[PSP_OPT_RENDER];
-    if (!s->render) s->render = enhanced ? 2 : 1; /* software=1, gl=2, null=3 */
-    if (enhanced && s->render != 2)
+    if (!s->render) s->render = enhanced ? PSP_RENDERER_GL : PSP_RENDERER_SOFTWARE;
+    if (enhanced && s->render != PSP_RENDERER_GL)
         return fail(error, "RENDER", sc->gl_error ? sc->gl_error
                                      : "this choice requires OpenGL; choose Automatic or OpenGL");
     if (sc->resolve && sc->resolve(s, error)) return -1;
-    s->window = s->number[PSP_OPT_WINDOW] != 0 || s->number[PSP_OPT_WINDOW_MODE] != 0 || s->render == 2;
+    s->window = s->number[PSP_OPT_WINDOW] != 0 || s->number[PSP_OPT_WINDOW_MODE] != 0 || s->render == PSP_RENDERER_GL;
     s->realtime = s->window || s->number[PSP_OPT_REALTIME] != 0;
     s->language = s->number[PSP_OPT_LANGUAGE] ? (int)s->number[PSP_OPT_LANGUAGE] - 1 : psp_settings_host_language();
-    s->confirm_cross = s->number[PSP_OPT_CONFIRM] ? s->number[PSP_OPT_CONFIRM] == 1 : s->language != 0;
+    s->confirm_cross = s->number[PSP_OPT_CONFIRM] ? s->number[PSP_OPT_CONFIRM] == 1 : s->language != LANG_JAPANESE;
     return 0;
 }
 
@@ -395,7 +439,7 @@ void psp_settings_print(const psp_settings *s, FILE *out) {
     for (int i = 0; i < s->bind_count; i++)
         fprintf(out, "bind.%-19s = %-12s [file]\n", s->bind[i].key, s->bind[i].value);
     fprintf(out, "effective: renderer=%s gamepad=%s window=%d realtime=%d language=%d confirm=%s",
-            s->render == 2 ? "gl" : s->render == 3 ? "null" : "software",
+            psp_renderer_name(s->render),
             s->gamepad ? "modern" : "classic", s->window, s->realtime,
             s->language, s->confirm_cross ? "cross" : "circle");
     if (sc->print_effective) sc->print_effective(s, out);
@@ -519,14 +563,13 @@ static int player_key(const char *key) {
  * <pack id>/<name> for a preset an earlier app's file brought. */
 static int section_name_valid(const char *name) {
     if (!strcmp(name, "player") || !strcmp(name, "pack")) return 1;
-    if (!strncmp(name, "pack ", 5))
-        return psp_settings_name_valid(name + 5) && !strchr(name + 5, ' ') && !strchr(name + 5, '/');
+    if (!strncmp(name, "pack ", 5)) return pack_id_valid(name + 5);
     if (strncmp(name, "preset ", 7)) return 0;
     const char *slash = strchr(name + 7, '/');
     if (!slash) return psp_settings_name_valid(name + 7);
     char id[SECTION_NAME];
     snprintf(id, sizeof id, "%.*s", (int)(slash - name - 7), name + 7);
-    return psp_settings_name_valid(id) && !strchr(id, ' ') && psp_settings_name_valid(slash + 1);
+    return pack_id_valid(id) && psp_settings_name_valid(slash + 1);
 }
 
 static char *trim(char *s) {
@@ -560,47 +603,70 @@ static int convert_presets(psp_settings_file *f, const char *selected, char *why
     return 0;
 }
 
+/* A file being read: the section its lines go to, and what its header said. */
+typedef struct {
+    psp_settings_file *f;
+    section *at;                /* NULL before the first section */
+    int version;
+    char selected[PSP_SETTINGS_NAME];
+} reader;
+
+/* Why a line is refused, into why: -1. */
+static int refuse(char *why, const char *message) {
+    snprintf(why, PSP_SETTINGS_ERROR, "%s", message);
+    return -1;
+}
+
+/* "[name]": the section the next lines go to. */
+static int read_section(reader *r, char *v, char *why) {
+    size_t n = strlen(v);
+    if (n < 3 || v[n-1] != ']') return refuse(why, "expected [section]");
+    v[n-1] = 0; v++;
+    if (!r->version) return refuse(why, "expected version= before the first section");
+    if (r->version == 1 ? strncmp(v, "preset ", 7) || !psp_settings_name_valid(v + 7) : !section_name_valid(v)) {
+        snprintf(why, PSP_SETTINGS_ERROR, "unexpected section [%.200s]", v); return -1;
+    }
+    if (section_find(r->f, v)) { snprintf(why, PSP_SETTINGS_ERROR, "duplicate section [%.200s]", v); return -1; }
+    if (!(r->at = section_add(r->f, v))) return refuse(why, "out of memory");
+    return 0;
+}
+
+/* Before the first section: version=, game= and, in version 1, selected=. */
+static int read_header(reader *r, const char *key, const char *v, char *why) {
+    if (!strcmp(key, "version") && !r->version && (!strcmp(v, "1") || !strcmp(v, "2"))) r->version = *v - '0';
+    else if (!strcmp(key, "selected") && r->version == 1 && !*r->selected && psp_settings_name_valid(v)) strcpy(r->selected, v);
+    else if (!strcmp(key, "game") && !*r->f->game && psp_settings_name_valid(v)) strcpy(r->f->game, v);
+    else return refuse(why, "expected version=1 or 2, at most one game=Slug and, in version 1, selected=Name, before the sections");
+    return 0;
+}
+
+/* One line: blank or a comment, a section header, or key=value. */
+static int read_line(reader *r, char *line, char *why) {
+    char *v = trim(line);
+    if (!*v || *v == '#' || *v == ';') return 0;
+    if (*v == '[') return read_section(r, v, why);
+    char *eq = strchr(v, '=');
+    if (!eq) return refuse(why, "expected key=value");
+    *eq = 0; char *key = trim(v); v = trim(eq + 1);
+    if (!r->at) return read_header(r, key, v, why);
+    if (!*key) return refuse(why, "expected key=value");
+    if (section_get(r->at, key)) { snprintf(why, PSP_SETTINGS_ERROR, "duplicate key '%.200s'", key); return -1; }
+    if (section_set(r->at, key, v)) return refuse(why, "out of memory");
+    return 0;
+}
+
 psp_settings_file *psp_settings_file_read(const char *path, char *error) {
     FILE *in = fopen(path, "r");
     if (!in) { fail(error, path, strerror(errno)); return NULL; }
     psp_settings_file *f = psp_settings_file_new();
     if (!f) { fclose(in); fail(error, path, "out of memory"); return NULL; }
-    char line[512], selected[PSP_SETTINGS_NAME] = "", why[PSP_SETTINGS_ERROR] = "";
-    int version = 0, lineno = 0, bad = 0;
-    section *at = NULL;
-    while (fgets(line, sizeof line, in)) {
+    reader r = { .f = f };
+    char line[512], why[PSP_SETTINGS_ERROR] = "";
+    int lineno = 0, bad = 0;
+    while (!bad && fgets(line, sizeof line, in)) {
         lineno++;
-        if (!strchr(line, '\n') && !feof(in)) { strcpy(why, "line too long"); bad = 1; break; }
-        char *v = trim(line);
-        if (!*v || *v == '#' || *v == ';') continue;
-        if (*v == '[') {
-            size_t n = strlen(v);
-            if (n < 3 || v[n-1] != ']') { strcpy(why, "expected [section]"); bad = 1; break; }
-            v[n-1] = 0; v++;
-            if (!version) { strcpy(why, "expected version= before the first section"); bad = 1; break; }
-            if (version == 1 ? strncmp(v, "preset ", 7) || !psp_settings_name_valid(v + 7) : !section_name_valid(v)) {
-                snprintf(why, sizeof why, "unexpected section [%.200s]", v); bad = 1; break;
-            }
-            if (section_find(f, v)) { snprintf(why, sizeof why, "duplicate section [%.200s]", v); bad = 1; break; }
-            if (!(at = section_add(f, v))) { strcpy(why, "out of memory"); bad = 1; break; }
-            continue;
-        }
-        char *eq = strchr(v, '=');
-        if (!eq) { strcpy(why, "expected key=value"); bad = 1; break; }
-        *eq = 0; char *key = trim(v); v = trim(eq + 1);
-        if (!at) {
-            if (!strcmp(key, "version") && !version && (!strcmp(v, "1") || !strcmp(v, "2"))) version = *v - '0';
-            else if (!strcmp(key, "selected") && version == 1 && !*selected && psp_settings_name_valid(v)) strcpy(selected, v);
-            else if (!strcmp(key, "game") && !*f->game && psp_settings_name_valid(v)) strcpy(f->game, v);
-            else {
-                strcpy(why, "expected version=1 or 2, at most one game=Slug and, in version 1, selected=Name, before the sections");
-                bad = 1; break;
-            }
-            continue;
-        }
-        if (!*key) { strcpy(why, "expected key=value"); bad = 1; break; }
-        if (section_get(at, key)) { snprintf(why, sizeof why, "duplicate key '%.200s'", key); bad = 1; break; }
-        if (section_set(at, key, v)) { strcpy(why, "out of memory"); bad = 1; break; }
+        if (!strchr(line, '\n') && !feof(in)) bad = refuse(why, "line too long");
+        else bad = read_line(&r, line, why);
     }
     if (!bad && ferror(in)) { snprintf(why, sizeof why, "read failed: %s", strerror(errno)); bad = 1; }
     fclose(in);
@@ -609,9 +675,9 @@ psp_settings_file *psp_settings_file_read(const char *path, char *error) {
         psp_settings_file_free(f);
         return NULL;
     }
-    if (!version) strcpy(why, "requires version=1 or 2");
-    else if (version == 1 && (!f->count || !*selected)) strcpy(why, "a version 1 file needs at least one preset and selected=Name");
-    else if (version == 1) convert_presets(f, selected, why);
+    if (!r.version) strcpy(why, "requires version=1 or 2");
+    else if (r.version == 1 && (!f->count || !*r.selected)) strcpy(why, "a version 1 file needs at least one preset and selected=Name");
+    else if (r.version == 1) convert_presets(f, r.selected, why);
     if (*why) {
         snprintf(error, PSP_SETTINGS_ERROR, "%s: %.300s", path, why);
         psp_settings_file_free(f);
@@ -732,8 +798,7 @@ int psp_settings_file_set_game(psp_settings_file *f, const char *slug, char *err
 int psp_settings_file_adopt(psp_settings_file *f, const psp_settings_file *old,
                             const char *pack_id, char *error) {
     char name[SECTION_NAME];
-    if (!psp_settings_name_valid(pack_id) || strchr(pack_id, ' ') || strchr(pack_id, '/'))
-        return fail(error, pack_id, "not a pack id");
+    if (!pack_id_valid(pack_id)) return fail(error, pack_id, "not a pack id");
     const section *player = section_find(old, "player");
     if (player && !section_find(f, "player") && section_copy(f, player, "player"))
         return fail(error, "settings", "out of memory");

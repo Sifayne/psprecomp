@@ -54,6 +54,10 @@ typedef enum {
 void psp_sched_init(void);
 void psp_sched_reset(void);
 
+/* The priority the main context runs at: the one a user module's
+ * module_start thread has on hardware (psp_threadman_current_priority). */
+#define PSP_MAIN_THREAD_PRIORITY 0x20
+
 /* Turn real threading off, for a caller that must stay single-context and
  * deterministic.
  *

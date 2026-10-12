@@ -45,16 +45,16 @@ int psp_waitq_add(psp_waitq *q, uint32_t uid, uint32_t need, uint32_t mode,
     return 0;
 }
 
+int psp_waitq_find(const psp_waitq *q, uint32_t uid) {
+    for (int i = 0; i < q->n; i++) if (q->w[i].uid == uid) return i;
+    return -1;
+}
+
 int psp_waitq_drop(psp_waitq *q, uint32_t uid) {
-    for (int i = 0; i < q->n; i++) {
-        if (q->w[i].uid != uid) continue;
-        memmove(&q->w[i], &q->w[i + 1],
-                (size_t)(q->n - i - 1) * sizeof q->w[0]);
-        q->n--;
-        parked_clear(uid, q);
-        return 1;
-    }
-    return 0;
+    const int i = psp_waitq_find(q, uid);
+    if (i < 0) return 0;
+    (void)psp_waitq_take(q, i);
+    return 1;
 }
 
 void psp_waitq_reset(void) { g_nparked = 0; }
@@ -89,15 +89,15 @@ int psp_waitq_leave(uint32_t uid) {
     const int p = parked_find(uid);
     if (p < 0) return 0;
     psp_waitq *q = g_parked[p].q;
-    for (int i = 0; i < q->n; i++) {
-        if (q->w[i].uid != uid) continue;
-        if (q->w[i].nout) psp_write32(q->w[i].nout, q->w[i].done);
-        (void)psp_waitq_drop(q, uid);
-        if (q->mirror) psp_write32(q->mirror, (uint32_t)q->n);
-        return 1;
+    const int i = psp_waitq_find(q, uid);
+    if (i < 0) {
+        g_parked[p] = g_parked[--g_nparked];
+        return 0;
     }
-    g_parked[p] = g_parked[--g_nparked];
-    return 0;
+    if (q->w[i].nout) psp_write32(q->w[i].nout, q->w[i].done);
+    (void)psp_waitq_take(q, i);
+    if (q->mirror) psp_write32(q->mirror, (uint32_t)q->n);
+    return 1;
 }
 
 int psp_waitq_pick(const psp_waitq *q, uint32_t attr) {
@@ -144,6 +144,12 @@ int psp_waitq_cancel_all(psp_waitq *q) {
     return release_all_as(q, PSP_WAIT_WOKE_CANCELLED);
 }
 
+/* In a function of its own, apart from the object both strings live in: the
+ * compiler cannot see there that two distinct members never overlap. */
+void psp_wait_describe(char *desc, size_t size, const char *call, const char *name) {
+    snprintf(desc, size, "%s(%s)", call, name);
+}
+
 static int g_cb_call;
 
 void psp_wait_cb_pending(int on) { g_cb_call = on; }
@@ -171,4 +177,35 @@ void psp_wait_writeback(uint32_t tmo_ptr, uint64_t deadline) {
     if (!tmo_ptr) return;
     const uint64_t now = psp_clock_peek();
     psp_write32(tmo_ptr, now < deadline ? (uint32_t)(deadline - now) : 0);
+}
+
+int psp_wait_end_woken(int rc, uint32_t tmo_ptr, uint64_t deadline) {
+    if (rc != PSP_SCHED_WOKEN) return 0;
+    const int why = psp_sched_wake_reason();
+    if (why != PSP_WAIT_WOKE_SATISFIED && why != PSP_WAIT_WOKE_CANCELLED) return 0;
+    psp_wait_writeback(tmo_ptr, deadline);
+    psp_ret(why == PSP_WAIT_WOKE_SATISFIED ? SCE_KERNEL_ERROR_OK
+                                           : SCE_KERNEL_ERROR_WAIT_CANCEL);
+    return 1;
+}
+
+int psp_wait_end_found(int rc, const void *object, uint32_t tmo_ptr,
+                       uint64_t deadline) {
+    if (object && rc != PSP_SCHED_WOKEN) return 0;
+    /* A wait ended by the object's deletion still reports how much of the
+     * timeout was left. It is easy to miss because the object is gone, but the
+     * caller's timeout word is the caller's, not the object's: eight tests
+     * across fpl and msgpipe print `timeout = 8ms remaining` where the
+     * unwritten word still said 10. */
+    psp_wait_writeback(tmo_ptr, deadline);
+    psp_ret(object ? SCE_KERNEL_ERROR_OK : SCE_KERNEL_ERROR_WAIT_DELETE);
+    return 1;
+}
+
+/* Forced out by sceKernelReleaseWaitThread it is RELEASE_WAIT (threadprobe
+ * step 70, fw 6.60), not a timeout. */
+void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline) {
+    psp_wait_writeback(tmo_ptr, deadline);
+    psp_ret(rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
+                                     : SCE_KERNEL_ERROR_WAIT_TIMEOUT);
 }

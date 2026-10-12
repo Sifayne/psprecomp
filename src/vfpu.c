@@ -213,6 +213,8 @@ static void write_dst(uint32_t vreg, int size, const float in[4]) {
  * vsat move bits and keep denormals and NaN payloads as they are, as the
  * hardware does. The dot-product unit below applies the same rules itself. */
 #define VNAN_BITS 0x7F800001u
+/* The same with the quiet bit the host's own arithmetic sets on it. */
+#define VNAN_QUIET_BITS 0x7FC00001u
 
 static inline float vin(float f) {
     const uint32_t b = psp_f32_to_bits(f);
@@ -280,7 +282,7 @@ float psp_vfpu_dot(const float a[4], const float b[4]) {
                 (ex == 255 && ey == 0) ||          /* inf * 0             */
                 (ey == 255 && ex == 0) ||          /* 0 * inf             */
                 (has_inf && has_inf != sgn))       /* inf - inf           */
-                return psp_bits_to_f32(0x7F800001u);
+                return psp_bits_to_f32(VNAN_BITS);
             has_inf = sgn;
         }
 
@@ -879,6 +881,8 @@ void psp_vfpu9(uint32_t vd, uint32_t vs, int kind, int size) {
     eat_prefixes();
 }
 
+/* Defined with the packed-integer conversions below, which is where it belongs;
+ * declared here because vf2i and vi2f precede them. */
 static void read_bits(uint32_t vs, int size, uint32_t out[4]);
 
 /* ---- float/integer conversion with a scale -------------------------------
@@ -927,10 +931,6 @@ void psp_vf2i(uint32_t vd, uint32_t vs, int mode, int scale, int size) {
             psp_cpu.v[r[i]] = psp_bits_to_f32(d[i]);
     eat_prefixes();
 }
-
-/* Defined with the packed-integer conversions below, which is where it belongs;
- * declared here because vi2f is the one caller that precedes them. */
-static void read_bits(uint32_t vs, int size, uint32_t out[4]);
 
 void psp_vi2f(uint32_t vd, uint32_t vs, int scale, int size) {
     uint32_t s[4];
@@ -1839,8 +1839,6 @@ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
     eat_prefixes();
 }
 
-/* Compare, writing one condition bit per lane plus the any/all summary bits
- * that vcmov and the bvt/bvf branches read. */
 /* ---- the comparison ring ------------------------------------------------- */
 
 #define VCMP_RING 24
@@ -1859,12 +1857,22 @@ static int      g_vcmp_on;
 
 void psp_vfpu_cmp_record(int enable) { g_vcmp_on = enable; }
 
-void psp_vfpu_note_dot(uint32_t vd, uint32_t vs, uint32_t vt,
-                       const float *sv, const float *tv, float result) {
-    if (!g_vcmp_on) return;
+/* The ring's next record, numbered. Cleared, not just assigned: the ring is
+ * shared by vcmp and vdot, and a slot that still said is_dot printed a
+ * comparison's operands beside the previous dot product's result. That read
+ * as a dot of two zero vectors returning -1.997, which is impossible and cost
+ * a detour. */
+static vcmp_rec *vcmp_slot(void) {
     vcmp_rec *r = &g_vcmp[g_vcmp_n % VCMP_RING];
     memset(r, 0, sizeof *r);
     r->seq = g_vcmp_n++;
+    return r;
+}
+
+void psp_vfpu_note_dot(uint32_t vd, uint32_t vs, uint32_t vt,
+                       const float *sv, const float *tv, float result) {
+    if (!g_vcmp_on) return;
+    vcmp_rec *r = vcmp_slot();
     r->is_dot = 1;
     r->vd = vd; r->vs = vs; r->vt = vt; r->lanes = 4;
     r->result = result;
@@ -1876,38 +1884,38 @@ static const char *VCMP_NAME[16] = {
     "EZ","EN","EI","ES","NZ","NN","NI","NS"
 };
 
-void psp_vfpu_dump_cmps(FILE *out) {
-    if (!g_vcmp_on) return;
-
-    /* How much of the register file nothing has written.
-     *
-     * psp_cpu_reset_fp fills the VFPU with 0x7F800001, which is what the
-     * hardware powers on holding, and arithmetic quiets it to 0x7FC00001. A
-     * register still carrying either has never been written this run -- so a
-     * NaN reaching a comparison is not necessarily a NaN the game computed,
-     * and the difference decides whether to look at the arithmetic or at
-     * whatever was supposed to load the register. */
+/* How much of the register file nothing has written.
+ *
+ * psp_cpu_reset_fp fills the VFPU with 0x7F800001, which is what the
+ * hardware powers on holding, and arithmetic quiets it to 0x7FC00001. A
+ * register still carrying either has never been written this run -- so a
+ * NaN reaching a comparison is not necessarily a NaN the game computed,
+ * and the difference decides whether to look at the arithmetic or at
+ * whatever was supposed to load the register. */
+static void dump_untouched(FILE *out) {
     int untouched = 0;
     for (int i = 0; i < 128; i++) {
         const uint32_t b = psp_f32_to_bits(psp_cpu.v[i]);
-        if (b == 0x7F800001u || b == 0x7FC00001u) untouched++;
+        if (b == VNAN_BITS || b == VNAN_QUIET_BITS) untouched++;
     }
     fprintf(out, "  vfpu file: %d of 128 registers still hold the power-on "
                  "NaN (0x7F800001, quieted 0x7FC00001)\n", untouched);
+}
 
-    /* The whole file, in the layout vfpu.h describes -- eight 4x4 matrices,
-     * element (m, row, col) at v[m*4 + col*32 + row].
-     *
-     * This is what PSPRECOMP_VDUMP gives, except that VDUMP hangs off the
-     * interpreter's step loop and so cannot see a recompiled run -- and a bug
-     * that only appears several minutes into real gameplay is not reachable by
-     * the interpreter. Printed once, at the fault: the next instruction
-     * destroys it.
-     *
-     * Printed as matrices rather than as a flat array on purpose. A flat dump
-     * indexed 0..127 invites reading slot 107 as "register v107", and the two
-     * are not the same thing -- that mistake turns a register nothing wrote
-     * into a wrong-destination bug that was never there. */
+/* The whole file, in the layout vfpu.h describes -- eight 4x4 matrices,
+ * element (m, row, col) at v[m*4 + col*32 + row].
+ *
+ * This is what PSPRECOMP_VDUMP gives, except that VDUMP hangs off the
+ * interpreter's step loop and so cannot see a recompiled run -- and a bug
+ * that only appears several minutes into real gameplay is not reachable by
+ * the interpreter. Printed once, at the fault: the next instruction
+ * destroys it.
+ *
+ * Printed as matrices rather than as a flat array on purpose. A flat dump
+ * indexed 0..127 invites reading slot 107 as "register v107", and the two
+ * are not the same thing -- that mistake turns a register nothing wrote
+ * into a wrong-destination bug that was never there. */
+static void dump_register_file(FILE *out) {
     for (int m = 0; m < 8; m++) {
         fprintf(out, "    M%d ", m);
         for (int row = 0; row < 4; row++) {
@@ -1919,7 +1927,20 @@ void psp_vfpu_dump_cmps(FILE *out) {
         }
         fprintf(out, "\n");
     }
+}
 
+/* A vector instruction's size suffix. */
+static const char *size_suffix(int size) {
+    switch (size) {
+    case 1:  return "s";
+    case 2:  return "p";
+    case 3:  return "t";
+    default: return "q";
+    }
+}
+
+/* The comparison ring, newest first. */
+static void dump_cmp_ring(FILE *out) {
     if (!g_vcmp_n) { fprintf(out, "  (no VFPU comparison recorded)\n"); return; }
 
     const uint64_t n = g_vcmp_n < VCMP_RING ? g_vcmp_n : VCMP_RING;
@@ -1939,8 +1960,7 @@ void psp_vfpu_dump_cmps(FILE *out) {
             continue;
         }
         fprintf(out, "    #%llu vcmp.%s %-2s v%u,v%u  cc %02X -> %02X\n",
-                (unsigned long long)r->seq,
-                r->size == 1 ? "s" : r->size == 2 ? "p" : r->size == 3 ? "t" : "q",
+                (unsigned long long)r->seq, size_suffix(r->size),
                 VCMP_NAME[r->cond & 0xF], r->vs, r->vt,
                 r->cc_before, r->cc_after);
         for (int k = 0; k < r->lanes; k++) {
@@ -1957,6 +1977,20 @@ void psp_vfpu_dump_cmps(FILE *out) {
     }
 }
 
+void psp_vfpu_dump_cmps(FILE *out) {
+    if (!g_vcmp_on) return;
+    dump_untouched(out);
+    dump_register_file(out);
+    dump_cmp_ring(out);
+}
+
+/* Condition-code bits 4 and 5: some lane's comparison held, and every one
+ * did. Bits 0-3 are the lanes'. */
+#define VCC_ANY (1u << 4)
+#define VCC_ALL (1u << 5)
+
+/* Compare, writing one condition bit per lane plus the any/all summary bits
+ * that vcmov and the bvt/bvf branches read. */
 void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
     float sv[4], tv[4];
     const int n = read_src(vs, size, PFXS, sv);
@@ -1995,8 +2029,8 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
         }
         if (r) { cc |= 1u << i; any = 1; } else { all = 0; }
     }
-    if (any) cc |= 1u << 4;
-    if (all) cc |= 1u << 5;
+    if (any) cc |= VCC_ANY;
+    if (all) cc |= VCC_ALL;
 
     /* Only the bits this comparison is about are written: one per lane it
      * actually compared, plus the any/all pair. A `vcmp.t` leaves bit 3 alone,
@@ -2011,7 +2045,7 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
      * *before* this vcmp; one instruction later it reads the new one, for
      * every size and both directions (v3 step 117). The old value is kept in
      * the otherwise unused control slot 3 for psp_mfvc_cc_after_vcmp. */
-    const uint32_t affected = (1u << 4) | (1u << 5) | ((1u << n) - 1u);
+    const uint32_t affected = VCC_ANY | VCC_ALL | ((1u << n) - 1u);
     const uint32_t before = psp_cpu.vfpu_cc;
     psp_cpu.vfpu_ctrl[PSP_VFPU_CC] = before;
     psp_cpu.vfpu_cc = (psp_cpu.vfpu_cc & ~affected) | (cc & affected);
@@ -2021,13 +2055,7 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
      * are already applied to sv/tv here, which is the point: what the compare
      * saw, not what the instruction named. */
     if (g_vcmp_on) {
-        vcmp_rec *r = &g_vcmp[g_vcmp_n % VCMP_RING];
-        /* Cleared, not just assigned: the ring is shared with vdot, and a slot
-         * that still said is_dot printed this comparison's operands beside the
-         * previous dot product's result. That read as a dot of two zero
-         * vectors returning -1.997, which is impossible and cost a detour. */
-        memset(r, 0, sizeof *r);
-        r->seq = g_vcmp_n++;
+        vcmp_rec *r = vcmp_slot();
         r->cond = cond; r->vs = vs; r->vt = vt; r->size = size; r->lanes = n;
         r->cc_before = before; r->cc_after = psp_cpu.vfpu_cc;
         for (int i = 0; i < 4; i++) { r->s[i] = i < n ? sv[i] : 0.0f;

@@ -55,6 +55,12 @@ uint32_t psp_sysmem_compiled_sdk(void) { return g_sdk_version; }
 /* User memory starts here; below it belongs to the kernel. */
 #define PSP_USER_BASE   0x08800000u
 
+/* The hardware allocator works in 256-byte granules. */
+#define GRANULE 0x100u
+
+static uint32_t granule_down(uint32_t n) { return n & ~(GRANULE - 1); }
+static uint32_t granule_up(uint32_t n)   { return granule_down(n + GRANULE - 1); }
+
 void psp_sysmem_reset(void) {
     memset(g_block, 0, sizeof g_block);
     g_next_uid = UID_BASE;
@@ -89,7 +95,7 @@ void psp_sysmem_reserve_module(uint32_t lo, uint32_t hi) {
          * -- it formats into the null it got back, over its own code at address
          * zero -- so it presented as a wild pointer rather than as an
          * out-of-memory, which is a long way from the cause. */
-        const uint32_t image = hi > lo ? ((hi - lo) + 0xFFu) & ~0xFFu : 0;
+        const uint32_t image = hi > lo ? granule_up(hi - lo) : 0;
         g_heap_lo = PSP_USER_BASE + image + 0x4000u;
         return;
     }
@@ -162,6 +168,20 @@ static uint32_t place_high(uint32_t size, uint32_t align) {
     return 0;
 }
 
+/* Record a block placed at `addr`, or NULL when the table is full. The
+ * caller names it. */
+static mem_block *claim_block(uint32_t addr, uint32_t size) {
+    mem_block *b = alloc_slot();
+    if (!b) return NULL;
+    b->uid = g_next_uid++;
+    b->addr = addr;
+    b->size = size;
+    fprintf(stderr, "AllocPartition -> uid 0x%X at 0x%08X size %u (ends 0x%08X)\n",
+            b->uid, b->addr, b->size, b->addr + b->size);
+    b->used = 1;
+    return b;
+}
+
 uint32_t psp_sysmem_free(void) {
     uint32_t used = 0;
     for (int i = 0; i < MAX_BLOCKS; i++)
@@ -177,20 +197,14 @@ uint32_t psp_sysmem_alloc(uint32_t size, int from_high) {
      * handle and no error. msgpipe/create asks for exactly that and expects
      * `Failed (80020190)`. */
     if (size > 0xFFFFFF00u) return 0;
-    uint32_t rounded = (size + 0xFF) & ~0xFFu;
-    if (!rounded) rounded = 0x100;
+    uint32_t rounded = granule_up(size);
+    if (!rounded) rounded = GRANULE;
 
-    uint32_t addr = from_high ? place_high(rounded, 0x100) : place_low(rounded, 0x100);
+    uint32_t addr = from_high ? place_high(rounded, GRANULE) : place_low(rounded, GRANULE);
     if (!addr) return 0;
 
-    mem_block *b = alloc_slot();
+    mem_block *b = claim_block(addr, rounded);
     if (!b) return 0;
-    b->uid = g_next_uid++;
-    b->addr = addr;
-    b->size = rounded;
-    fprintf(stderr, "AllocPartition -> uid 0x%X at 0x%08X size %u (ends 0x%08X)\n",
-            b->uid, b->addr, b->size, b->addr + b->size);
-    b->used = 1;
     snprintf(b->name, sizeof b->name, "internal");
     return addr;
 }
@@ -248,17 +262,17 @@ static void hle_AllocPartitionMemory(void) {
     if (type > PSP_SMEM_HighAligned) { psp_ret(SYSMEM_ERR_BAD_TYPE); return; }
     if (size == 0) { psp_ret(SYSMEM_ERR_NO_ROOM); return; }
 
-    /* The hardware allocator works in 256-byte granules. Rounding up matters:
-     * a game that allocates 100 bytes and then writes 256 is relying on it. */
-    uint32_t rounded = (size + 0xFF) & ~0xFFu;
+    /* Rounded up to a granule. That matters: a game that allocates 100 bytes
+     * and then writes 256 is relying on it. */
+    uint32_t rounded = granule_up(size);
     if (rounded == 0) { psp_ret(SYSMEM_ERR_NO_ROOM); return; }
 
-    uint32_t align = 0x100;
+    uint32_t align = GRANULE;
     if (type == PSP_SMEM_LowAligned || type == PSP_SMEM_HighAligned) {
         /* Step 144: 0x1000 and 0x10000 are honoured; 3 and 0 are refused. */
         align = want;
         if (!align || (align & (align - 1))) { psp_ret(SYSMEM_ERR_BAD_ALIGN); return; }
-        if (align < 0x100) align = 0x100;
+        if (align < GRANULE) align = GRANULE;
     }
 
     uint32_t addr = 0;
@@ -273,8 +287,8 @@ static void hle_AllocPartitionMemory(void) {
          * granule holding want + size -- 0x1000 bytes asked for at +0x80
          * took 0x1100 from the total free. This kept the rounded size, 0x1000,
          * which left the last 0x80 bytes the caller asked for outside it. */
-        rounded = ((want + size + 0xFFu) & ~0xFFu) - (want & ~0xFFu);
-        want &= ~0xFFu;
+        rounded = granule_up(want + size) - granule_down(want);
+        want = granule_down(want);
         if (want >= g_heap_lo && want + rounded <= g_heap_hi && !overlaps(want, rounded))
             addr = want;
         break;
@@ -283,15 +297,8 @@ static void hle_AllocPartitionMemory(void) {
     /* Step 147: more than the largest free run is MEMBLOCK_ALLOC_FAILED. */
     if (!addr) { psp_ret(SYSMEM_ERR_NO_ROOM); return; }
 
-    mem_block *b = alloc_slot();
+    mem_block *b = claim_block(addr, rounded);
     if (!b) { psp_ret(SYSMEM_ERR_NO_ROOM); return; }
-
-    b->uid = g_next_uid++;
-    b->addr = addr;
-    b->size = rounded;
-    fprintf(stderr, "AllocPartition -> uid 0x%X at 0x%08X size %u (ends 0x%08X)\n",
-            b->uid, b->addr, b->size, b->addr + b->size);
-    b->used = 1;
     psp_str(name_ptr, b->name, sizeof b->name);
 
     psp_ret(b->uid);

@@ -928,18 +928,9 @@ static uint64_t rtc_now(void) {
     return wall_us() + (uint64_t)RTC_DAYS_TO_1970 * RTC_US_PER_DAY;
 }
 
-static void rtc_write_tick(uint32_t at, uint64_t t) {
-    psp_write32(at, (uint32_t)t);
-    psp_write32(at + 4, (uint32_t)(t >> 32));
-}
-
-static uint64_t rtc_read_tick(uint32_t at) {
-    return (uint64_t)psp_read32(at) | ((uint64_t)psp_read32(at + 4) << 32);
-}
-
 static void hle_RtcGetCurrentTick(void) {
     const uint32_t out = psp_arg(0);
-    if (out) rtc_write_tick(out, rtc_now());
+    if (out) psp_write64(out, rtc_now());
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1007,13 +998,13 @@ static void hle_RtcGetTick(void) {
     const uint32_t date = psp_arg(0), out = psp_arg(1);
     rtc_date d = rtc_read_date(date);
     if (d.month > 12) d.month = 12;
-    if (out) rtc_write_tick(out, rtc_tick_of(&d));
+    if (out) psp_write64(out, rtc_tick_of(&d));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_RtcSetTick(void) {
     const uint32_t date = psp_arg(0), in = psp_arg(1);
-    const rtc_date d = rtc_date_of(rtc_read_tick(in));
+    const rtc_date d = rtc_date_of(psp_read64(in));
     rtc_write_date(date, &d);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1040,7 +1031,7 @@ static void hle_RtcSetTime_t(void) {
 
 /* Step 140: -1, 0, 1. */
 static void hle_RtcCompareTick(void) {
-    const uint64_t a = rtc_read_tick(psp_arg(0)), b = rtc_read_tick(psp_arg(1));
+    const uint64_t a = psp_read64(psp_arg(0)), b = psp_read64(psp_arg(1));
     psp_ret(a < b ? 0xFFFFFFFFu : a > b ? 1u : 0u);
 }
 
@@ -1054,8 +1045,8 @@ static uint64_t arg64(int i) { return (uint64_t)psp_arg(i) | ((uint64_t)psp_arg(
 
 static void rtc_add(uint64_t delta) {
     const uint32_t dst = psp_arg(0);
-    const uint64_t t = rtc_read_tick(psp_arg(1)) + delta;
-    if (dst) rtc_write_tick(dst, t);
+    const uint64_t t = psp_read64(psp_arg(1)) + delta;
+    if (dst) psp_write64(dst, t);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1069,14 +1060,14 @@ static void hle_RtcTickAddWeeks(void)  { rtc_add((uint64_t)((int64_t)(int32_t)ps
 
 static void rtc_add_months(int64_t months) {
     const uint32_t dst = psp_arg(0);
-    const uint64_t src = rtc_read_tick(psp_arg(1));
+    const uint64_t src = psp_read64(psp_arg(1));
     rtc_date d = rtc_date_of(src);
     const int64_t m0 = d.year * 12 + (d.month - 1) + months;
     d.year  = floor_div(m0, 12);
     d.month = m0 - d.year * 12 + 1;
     const int last = rtc_month_days(d.year, d.month);
     if (d.day > last) d.day = last;
-    if (dst) rtc_write_tick(dst, rtc_tick_of(&d));
+    if (dst) psp_write64(dst, rtc_tick_of(&d));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1089,7 +1080,7 @@ static void hle_RtcTickAddYears(void)  { rtc_add_months((int64_t)(int32_t)psp_ar
 static void hle_RtcFormatRFC3339(void) {
     const uint32_t buf = psp_arg(0), in = psp_arg(1);
     const int32_t tz = (int32_t)psp_arg(2);
-    const rtc_date d = rtc_date_of(rtc_read_tick(in) + (uint64_t)((int64_t)tz * 60000000));
+    const rtc_date d = rtc_date_of(psp_read64(in) + (uint64_t)((int64_t)tz * 60000000));
     char s[48], z[8];
     if (tz == 0) snprintf(z, sizeof z, "Z");
     else snprintf(z, sizeof z, "%c%02d:%02d", tz < 0 ? '-' : '+',

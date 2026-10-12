@@ -41,6 +41,7 @@
 #endif
 
 #define MAX_FILES 64
+#define FD_FIRST  3   /* descriptors 0-2 are the std streams: g_file[i] is i + FD_FIRST */
 #define MAX_DIRS  16
 
 /* Open flags, as the guest passes them. */
@@ -50,6 +51,15 @@
 #define PSP_O_APPEND 0x0100
 #define PSP_O_CREAT  0x0200
 #define PSP_O_TRUNC  0x0400
+
+/* Results that are 0x80010000 | errno (uofw include/common/errors.h); NOENT
+ * and BADF come from the disc probe, in io_observed.h. */
+#define SCE_ERROR_ENOMEM   0x8001000Cu   /* errno 12 */
+#define SCE_ERROR_EACCES   0x8001000Du   /* 13 */
+#define SCE_ERROR_EEXIST   0x80010011u   /* 17 */
+#define SCE_ERROR_ENODEV   0x80010013u   /* 19 */
+#define SCE_ERROR_EINVAL   0x80010016u   /* 22 */
+#define SCE_ERROR_EMFILE   0x80010018u   /* 24: every descriptor taken */
 
 /* An open file. `base`/`len` describe a window inside `f`, which is what makes
  * a file inside a disc image indistinguishable from a host file to everything
@@ -217,92 +227,88 @@ typedef struct {
 } iso_entry;
 static int iso_lookup(const char *guest, iso_entry *e);
 
+/* Take a free descriptor for `f`, a read-only window of `len` bytes from
+ * `base`, read from its start, counted in sectors on the raw device. The
+ * slot's index, or -1 when every one is taken. */
+static int io_file_take(FILE *f, int image, uint64_t base, uint64_t len, int sector_mode) {
+    for (int i = 0; i < MAX_FILES; i++) {
+        io_file *h = &g_file[i];
+        if (h->used) continue;
+        h->f = f; h->used = 1; h->dirty = 0;
+        h->image = image; h->writable = 0; h->host[0] = '\0';
+        h->base = base; h->len = len; h->pos = 0;
+        h->has_result = h->close_pending = h->running = 0;
+        h->sector_mode = sector_mode;
+        return i;
+    }
+    return -1;
+}
+
+/* An open host file's size, leaving it at its end; 0 when it cannot be told. */
+static uint64_t host_file_size(FILE *f) {
+    if (fseeko(f, 0, SEEK_END) != 0) return 0;
+    const off_t n = ftello(f);
+    return n > 0 ? (uint64_t)n : 0;
+}
+
 static void io_park(void);
 static void hle_open_body(void);
 /* See io_park: an open gives up the CPU whether or not it finds the file. */
 static void hle_Open(void) { hle_open_body(); io_park(); }
 
-static void hle_open_body(void) {
-    char guest[512], host[1024];
-    psp_str(psp_arg(0), guest, sizeof guest);
-    uint32_t flags = psp_arg(1);
-
-    /* A disc path is served from the image if there is one. The raw device
-     * falls out of this as the case with nothing after the colon. A directory
-     * opens too: the disc probe opened disc0:/SUB as a file and read its raw
-     * directory records back, with the extent's size at SEEK_END. */
-    if (!(flags & (PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC))) {
-        iso_entry e;
-        if (iso_lookup(guest, &e) == 0) {
-            for (int i = 0; i < MAX_FILES; i++) {
-                if (g_file[i].used) continue;
-                g_file[i].f = e.f; g_file[i].used = 1; g_file[i].dirty = 0;
-                g_file[i].image = 1; g_file[i].writable = 0; g_file[i].host[0] = '\0';
-                g_file[i].base = e.base; g_file[i].len = e.len; g_file[i].pos = 0;
-                g_file[i].has_result = g_file[i].close_pending = g_file[i].running = 0;
-                g_file[i].sector_mode = e.is_device;
-                psp_ret((uint32_t)(i + 3));
-                return;
-            }
-            fclose(e.f);
-            psp_ret(0x80010018);
-            return;
-        }
-    }
-
-    if (is_raw_umd(guest)) {
-        if (!g_umd_image[0]) {
-            static int complained;
-            if (!complained++)
-                fprintf(stderr, "psprecomp: %s opened as a raw device, but no disc "
-                                "image is set (psp_io_set_umd_image)\n", guest);
-            psp_ret(IO_ERROR_NOENT);
-            return;
-        }
-        FILE *f = fopen(g_umd_image, "rb");
-        if (!f) {
-            fprintf(stderr, "psprecomp: cannot open disc image %s\n", g_umd_image);
-            psp_ret(IO_ERROR_NOENT);
-            return;
-        }
-        for (int i = 0; i < MAX_FILES; i++) {
-            if (g_file[i].used) continue;
-            g_file[i].f = f;
-            g_file[i].used = 1;
-            g_file[i].dirty = 0;
-            g_file[i].image = 1; g_file[i].writable = 0; g_file[i].host[0] = '\0';
-            g_file[i].base = 0;
-            g_file[i].pos  = 0;
-            g_file[i].len  = (fseeko(f, 0, SEEK_END) == 0 && ftello(f) > 0)
-                             ? (uint64_t)ftello(f) : 0;
-            g_file[i].has_result = g_file[i].close_pending = g_file[i].running = 0;
-            g_file[i].sector_mode = 1;
-            psp_ret((uint32_t)(i + 3));
-            return;
-        }
-        fclose(f);
-        psp_ret(0x80010018);
+/* The raw device: the whole image, counted in sectors. */
+static void open_raw_device(const char *guest) {
+    if (!g_umd_image[0]) {
+        static int complained;
+        if (!complained++)
+            fprintf(stderr, "psprecomp: %s opened as a raw device, but no disc "
+                            "image is set (psp_io_set_umd_image)\n", guest);
+        psp_ret(IO_ERROR_NOENT);
         return;
     }
+    FILE *f = fopen(g_umd_image, "rb");
+    if (!f) {
+        fprintf(stderr, "psprecomp: cannot open disc image %s\n", g_umd_image);
+        psp_ret(IO_ERROR_NOENT);
+        return;
+    }
+    const int i = io_file_take(f, 1, 0, 0, 1);
+    if (i < 0) { fclose(f); psp_ret(SCE_ERROR_EMFILE); return; }
+    g_file[i].len = host_file_size(f);
+    psp_ret((uint32_t)(i + FD_FIRST));
+}
 
+/* FAT-illegal names fail at open with INVALID_ARG (the savedata suite's
+ * A?C probe): ? * < > | " and controls never name a real file. Only the
+ * host branch -- disc names are fixed. Checked on the guest subpath so
+ * no host root can smuggle a character in. */
+static int fat_name_illegal(const char *guest) {
+    const char *colon = strchr(guest, ':');
+    const char *sub = colon ? colon + 1 : guest;
+    for (const char *c = sub; *c; c++) {
+        unsigned char u = (unsigned char)*c;
+        if (u < 32 || u == '?' || u == '*' || u == '<' || u == '>' ||
+            u == '|' || u == '"')
+            return 1;
+    }
+    return 0;
+}
+
+/* The host fopen mode for the guest's open flags. */
+static const char *fopen_mode(uint32_t flags) {
+    if (flags & PSP_O_TRUNC)                     return (flags & PSP_O_RDWR) == PSP_O_RDWR ? "w+b" : "wb";
+    if (flags & PSP_O_APPEND)                    return "ab";
+    if ((flags & PSP_O_RDWR) == PSP_O_RDWR)      return "r+b";
+    if (flags & PSP_O_WRONLY)                    return (flags & PSP_O_CREAT) ? "wb" : "r+b";
+    return "rb";
+}
+
+/* A path under the host root. */
+static void open_host_file(const char *guest, uint32_t flags) {
+    char host[1024];
     map_path(guest, host, sizeof host);
 
-    /* FAT-illegal names fail at open with INVALID_ARG (the savedata suite's
-     * A?C probe): ? * < > | " and controls never name a real file. Only the
-     * host branch -- disc names are fixed. Checked on the guest subpath so
-     * no host root can smuggle a character in. */
-    {
-        const char *colon = strchr(guest, ':');
-        const char *sub = colon ? colon + 1 : guest;
-        for (const char *c = sub; *c; c++) {
-            unsigned char u = (unsigned char)*c;
-            if (u < 32 || u == '?' || u == '*' || u == '<' || u == '>' ||
-                u == '|' || u == '"') {
-                psp_ret(0x80010016);
-                return;
-            }
-        }
-    }
+    if (fat_name_illegal(guest)) { psp_ret(SCE_ERROR_EINVAL); return; }
 
 #ifndef _WIN32
     /* A Memory Stick directory does not open as a file: EACCES, or EINVAL
@@ -313,7 +319,7 @@ static void hle_open_body(void) {
         struct stat st;
         if (stat(host, &st) == 0 && S_ISDIR(st.st_mode)) {
             const size_t n = strlen(guest);
-            psp_ret(n && (guest[n - 1] == '/' || guest[n - 1] == '\\') ? 0x80010016u : 0x8001000Du);
+            psp_ret(n && (guest[n - 1] == '/' || guest[n - 1] == '\\') ? SCE_ERROR_EINVAL : SCE_ERROR_EACCES);
             return;
         }
     }
@@ -330,12 +336,7 @@ static void hle_open_body(void) {
         if (slash) { *slash = '\0'; mkdir_parents(dir); }
     }
 
-    const char *mode = "rb";
-    if (flags & PSP_O_TRUNC)                  mode = (flags & PSP_O_RDWR) == PSP_O_RDWR ? "w+b" : "wb";
-    else if (flags & PSP_O_APPEND)            mode = "ab";
-    else if ((flags & PSP_O_RDWR) == PSP_O_RDWR) mode = "r+b";
-    else if (flags & PSP_O_WRONLY)            mode = (flags & PSP_O_CREAT) ? "wb" : "r+b";
-
+    const char *mode = fopen_mode(flags);
     FILE *f = fopen(host, mode);
     if (!f && (flags & PSP_O_CREAT)) f = fopen(host, "w+b");
     if (!f) {
@@ -353,28 +354,39 @@ static void hle_open_body(void) {
         return;
     }
 
-    for (int i = 0; i < MAX_FILES; i++) {
-        if (g_file[i].used) continue;
-        g_file[i].f = f;
-        g_file[i].used = 1;
-        g_file[i].dirty = 0;
-        g_file[i].image = 0;
-        g_file[i].writable = strcmp(mode, "rb") != 0;
-        snprintf(g_file[i].host, sizeof g_file[i].host, "%s", host);
-        g_file[i].base = 0;
-        g_file[i].pos  = 0;
-        g_file[i].has_result = g_file[i].close_pending = g_file[i].running = 0;
-        g_file[i].sector_mode = 0;
-        /* A host file's window is the whole file. Writable files start empty
-         * and grow, so the length is refreshed on write rather than fixed. */
-        g_file[i].len = (fseeko(f, 0, SEEK_END) == 0 && ftello(f) > 0)
-                        ? (uint64_t)ftello(f) : 0;
-        rewind(f);
-        psp_ret((uint32_t)(i + 3));   /* 0-2 are reserved for the std streams */
-        return;
+    const int i = io_file_take(f, 0, 0, 0, 0);
+    if (i < 0) { fclose(f); psp_ret(SCE_ERROR_EMFILE); return; }
+    io_file *h = &g_file[i];
+    h->writable = strcmp(mode, "rb") != 0;
+    snprintf(h->host, sizeof h->host, "%s", host);
+    /* A host file's window is the whole file. Writable files start empty
+     * and grow, so the length is refreshed on write rather than fixed. */
+    h->len = host_file_size(f);
+    rewind(f);
+    psp_ret((uint32_t)(i + FD_FIRST));
+}
+
+static void hle_open_body(void) {
+    char guest[512];
+    psp_str(psp_arg(0), guest, sizeof guest);
+    uint32_t flags = psp_arg(1);
+
+    /* A disc path is served from the image if there is one. The raw device
+     * falls out of this as the case with nothing after the colon. A directory
+     * opens too: the disc probe opened disc0:/SUB as a file and read its raw
+     * directory records back, with the extent's size at SEEK_END. */
+    if (!(flags & (PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC))) {
+        iso_entry e;
+        if (iso_lookup(guest, &e) == 0) {
+            const int i = io_file_take(e.f, 1, e.base, e.len, e.is_device);
+            if (i < 0) { fclose(e.f); psp_ret(SCE_ERROR_EMFILE); return; }
+            psp_ret((uint32_t)(i + FD_FIRST));
+            return;
+        }
     }
-    fclose(f);
-    psp_ret(0x80010018);              /* too many open files */
+
+    if (is_raw_umd(guest)) open_raw_device(guest);
+    else open_host_file(guest, flags);
 }
 
 /* A file system call gives up the CPU while its driver works.
@@ -415,7 +427,7 @@ static void io_park(void) {
 }
 
 static io_file *fd_arg(void) {
-    int32_t fd = (int32_t)psp_arg(0) - 3;
+    int32_t fd = (int32_t)psp_arg(0) - FD_FIRST;
     if (fd < 0 || fd >= MAX_FILES || !g_file[fd].used) return NULL;
     return &g_file[fd];
 }
@@ -439,7 +451,6 @@ static void hle_Read(void) {
     uint32_t dst = psp_arg(1), size = psp_arg(2);
     if (!h || !h->f) { psp_ret(IO_ERROR_BADF); return; }
     if (!size) { psp_ret(0); return; }
-    const uint32_t asked = size;
     if (h->sector_mode) size *= ISO_SECTOR;   /* the count is in sectors */
     hle_read_body(h, dst, size);
     io_park();
@@ -467,7 +478,7 @@ static void hle_read_body(io_file *h, uint32_t dst, uint32_t size) {
     if (size > h->len - h->pos) size = (uint32_t)(h->len - h->pos);
 
     uint8_t *tmp = (uint8_t *)malloc(size);
-    if (!tmp) { psp_ret(0x80020190); return; }
+    if (!tmp) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
     size_t got = 0;
     if (fseeko(h->f, (off_t)(h->base + h->pos), SEEK_SET) == 0)
@@ -520,7 +531,7 @@ static void hle_Write(void) {
     }
 
     uint8_t *tmp = (uint8_t *)malloc(size ? size : 1);
-    if (!tmp) { psp_ret(0x80020190); return; }
+    if (!tmp) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
     for (uint32_t i = 0; i < size; i++) tmp[i] = psp_read8(src + i);
     size_t put = fwrite(tmp, 1, size, h->f);
     free(tmp);
@@ -611,8 +622,7 @@ static void write_stat(uint32_t out, int is_dir, uint64_t size, uint32_t lba) {
     for (uint32_t i = 0; i < PSP_STAT_LEN; i += 4) psp_write32(out + i, 0);
     psp_write32(out + 0, (is_dir ? FIO_S_IFDIR : FIO_S_IFREG) | FIO_S_IRWXU);
     psp_write32(out + 4, is_dir ? FIO_SO_IFDIR : FIO_SO_IFREG);
-    psp_write32(out + 8,  (uint32_t)size);
-    psp_write32(out + 12, (uint32_t)(size >> 32));
+    psp_write64(out + 8, size);
 
     /* st_private[0] is the file's first sector on the disc.
      *
@@ -663,8 +673,7 @@ static void write_fat_stat(uint32_t out, const struct stat *st) {
     const int ro = !(st->st_mode & 0222);
     psp_write32(out + 0, (dir ? FIO_S_IFDIR : FIO_S_IFREG) | (ro ? 0x016Du : 0x01FFu));
     psp_write32(out + 4, (dir ? FIO_SO_IFDIR : FIO_SO_IFREG) | (ro ? 0x01u : 0));
-    psp_write32(out + 8,  (uint32_t)size);
-    psp_write32(out + 12, (uint32_t)(size >> 32));
+    psp_write64(out + 8, size);
     write_date(out + 16, st->st_ctime, 1);
     write_date(out + 32, st->st_atime, 0);
     write_date(out + 48, st->st_mtime, 1);
@@ -683,8 +692,7 @@ static void hle_Getstat(void) { hle_getstat_body(); io_park(); }   /* io_park */
 static void write_disc_stat(uint32_t out, int is_dir, uint64_t size, uint32_t lba) {
     psp_write32(out + 0, is_dir ? IO_DISC_DIR_MODE : IO_DISC_FILE_MODE);
     psp_write32(out + 4, is_dir ? IO_DISC_DIR_ATTR : IO_DISC_FILE_ATTR);
-    psp_write32(out + 8,  (uint32_t)size);
-    psp_write32(out + 12, (uint32_t)(size >> 32));
+    psp_write64(out + 8, size);
     for (uint32_t t = 16; t < 64; t += 16) {
         psp_write32(out + t, IO_DISC_TIME_WORD0);
         psp_write32(out + t + 4, 0);
@@ -754,8 +762,7 @@ static void hle_getstat_body(void) {
         return;
     }
 
-    uint64_t size = 0;
-    if (fseeko(f, 0, SEEK_END) == 0) { const off_t n = ftello(f); if (n > 0) size = (uint64_t)n; }
+    const uint64_t size = host_file_size(f);
     fclose(f);
 
     if (out) write_stat(out, 0, size, 0);   /* a host file has no disc sector */
@@ -780,7 +787,20 @@ static void hle_getstat_body(void) {
  * compiles in are the 8.3-style ones this reads.
  */
 #define ISO_PVD_SECTOR  16u
+#define ISO_PVD_ROOT    156u    /* the root directory's record in the descriptor */
 #define ISO_DIR_IS_DIR  0x02u   /* flags byte in a directory record */
+/* A directory record's fields by offset (ECMA-119 9.1), after its length
+ * byte: the extent's first sector and its length, each the little-endian
+ * half of a both-endian pair; the flags; the name's length; the name. */
+#define ISO_REC_LBA      2u
+#define ISO_REC_SIZE     10u
+#define ISO_REC_FLAGS    25u
+#define ISO_REC_NAME_LEN 32u
+#define ISO_REC_NAME     33u
+
+/* An extent on the disc: its first sector, its length in bytes, and whether
+ * it holds a directory. */
+typedef struct { uint32_t lba, len; int is_dir; } iso_extent;
 
 static uint32_t rd32le(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -811,11 +831,24 @@ static int iso_name_eq(const uint8_t *rec_name, unsigned rec_len, const char *wa
     return i == n && want[i] == '\0';
 }
 
-/* Find `path` under the directory extent at `lba`, `bytes` long. On success
- * fills the extent and length of what it found. */
-static int iso_lookup_in(FILE *f, uint32_t lba, uint32_t bytes,
-                         const char *path, uint32_t *out_lba, uint32_t *out_len,
-                         int *out_is_dir) {
+/* The directory record at *off in an extent of `bytes`, with *off moved past
+ * it; NULL at the end, or at a record that runs past it. A directory record
+ * never straddles a sector, so a zero length is padding to the end of this
+ * one. */
+static const uint8_t *iso_record(const uint8_t *dir, uint32_t bytes, uint32_t *off) {
+    while (*off + ISO_REC_NAME <= bytes) {
+        const uint8_t *r = dir + *off;
+        if (!r[0]) { *off = (*off / ISO_SECTOR + 1) * ISO_SECTOR; continue; }
+        if (*off + r[0] > bytes) return NULL;
+        *off += r[0];
+        return r;
+    }
+    return NULL;
+}
+
+/* Find `path` under the directory extent `dir`. On success fills `found`
+ * with the extent of what it found. */
+static int iso_lookup_in(FILE *f, iso_extent dir, const char *path, iso_extent *found) {
     /* Split off the first component. */
     while (*path == '/' || *path == '\\') path++;
     if (!*path) return -1;
@@ -827,37 +860,28 @@ static int iso_lookup_in(FILE *f, uint32_t lba, uint32_t bytes,
     comp[c] = '\0';
     const char *rest = path + c;
 
-    uint8_t *dir = (uint8_t *)malloc(bytes ? bytes : 1);
-    if (!dir) return -1;
-    if (iso_read_at(f, (uint64_t)lba * ISO_SECTOR, dir, bytes) != 0) { free(dir); return -1; }
+    uint8_t *recs = (uint8_t *)malloc(dir.len ? dir.len : 1);
+    if (!recs) return -1;
+    if (iso_read_at(f, (uint64_t)dir.lba * ISO_SECTOR, recs, dir.len) != 0) { free(recs); return -1; }
 
     int rc = -1;
-    for (uint32_t off = 0; off + 33 <= bytes; ) {
-        const uint32_t rec = dir[off];
-        if (!rec) {
-            /* A directory record never straddles a sector, so a zero length is
-             * padding to the end of this one. */
-            off = (off / ISO_SECTOR + 1) * ISO_SECTOR;
-            continue;
+    uint32_t off = 0;
+    for (const uint8_t *r; (r = iso_record(recs, dir.len, &off)) != NULL; ) {
+        const unsigned nlen = r[ISO_REC_NAME_LEN];
+        if ((uint32_t)(r - recs) + ISO_REC_NAME + nlen > dir.len ||
+            !iso_name_eq(r + ISO_REC_NAME, nlen, comp)) continue;
+        const iso_extent e = { rd32le(r + ISO_REC_LBA), rd32le(r + ISO_REC_SIZE),
+                               (r[ISO_REC_FLAGS] & ISO_DIR_IS_DIR) != 0 };
+        while (*rest == '/' || *rest == '\\') rest++;
+        if (!*rest) {
+            *found = e;
+            rc = 0;
+        } else if (e.is_dir) {
+            rc = iso_lookup_in(f, e, rest, found);
         }
-        if (off + rec > bytes) break;
-        const uint8_t *r = dir + off;
-        const unsigned nlen = r[32];
-        if (off + 33 + nlen <= bytes && iso_name_eq(r + 33, nlen, comp)) {
-            const uint32_t elba = rd32le(r + 2), elen = rd32le(r + 10);
-            const int isdir = (r[25] & ISO_DIR_IS_DIR) != 0;
-            while (*rest == '/' || *rest == '\\') rest++;
-            if (!*rest) {
-                *out_lba = elba; *out_len = elen; *out_is_dir = isdir;
-                rc = 0;
-            } else if (isdir) {
-                rc = iso_lookup_in(f, elba, elen, rest, out_lba, out_len, out_is_dir);
-            }
-            break;
-        }
-        off += rec;
+        break;
     }
-    free(dir);
+    free(recs);
     return rc;
 }
 
@@ -920,8 +944,8 @@ static int iso_lookup(const char *guest, iso_entry *e)
     }
 
     /* The root directory record sits at offset 156 of the descriptor. */
-    const uint8_t *root = pvd + 156;
-    const uint32_t root_lba = rd32le(root + 2), root_len = rd32le(root + 10);
+    const uint8_t *rr = pvd + ISO_PVD_ROOT;
+    const iso_extent root = { rd32le(rr + ISO_REC_LBA), rd32le(rr + ISO_REC_SIZE), 1 };
 
     memset(e, 0, sizeof *e);
     e->f = f;
@@ -932,8 +956,8 @@ static int iso_lookup(const char *guest, iso_entry *e)
             e->len = (uint64_t)ftello(f); e->is_device = 1;
             return 0;
         }
-        e->base = (uint64_t)root_lba * ISO_SECTOR;   /* disc0:/ is the root */
-        e->len = root_len; e->is_dir = e->is_root = 1;
+        e->base = (uint64_t)root.lba * ISO_SECTOR;   /* disc0:/ is the root */
+        e->len = root.len; e->is_dir = e->is_root = 1;
         return 0;
     }
 
@@ -945,15 +969,14 @@ static int iso_lookup(const char *guest, iso_entry *e)
         return 0;
     }
 
-    uint32_t lba = 0, blen = 0;
-    int isdir = 0;
-    if (iso_lookup_in(f, root_lba, root_len, p, &lba, &blen, &isdir) != 0) {
+    iso_extent found;
+    if (iso_lookup_in(f, root, p, &found) != 0) {
         fclose(f);
         return -1;
     }
-    e->base = (uint64_t)lba * ISO_SECTOR;
-    e->len = blen;
-    e->is_dir = isdir;
+    e->base = (uint64_t)found.lba * ISO_SECTOR;
+    e->len = found.len;
+    e->is_dir = found.is_dir;
     return 0;
 }
 
@@ -963,7 +986,7 @@ static void hle_Rename(void) {
     psp_str(psp_arg(1), b, sizeof b);
     map_path(a, ha, sizeof ha);
     map_path(b, hb, sizeof hb);
-    psp_ret(rename(ha, hb) == 0 ? 0 : 0x80010002);
+    psp_ret(rename(ha, hb) == 0 ? 0 : IO_ERROR_NOENT);
 }
 
 /* ---- directories --------------------------------------------------------- */
@@ -1087,7 +1110,7 @@ static void hle_Dopen(void) {
                 return;
             }
             fclose(e.f);
-            psp_ret(0x80010018);
+            psp_ret(SCE_ERROR_EMFILE);
             return;
         }
     }
@@ -1105,7 +1128,7 @@ static void hle_Dopen(void) {
         struct _finddata_t fd;
         snprintf(pattern, sizeof pattern, "%s/*", host);
         intptr_t h = _findfirst(pattern, &fd);
-        if (h == -1) { psp_ret(0x80010002); return; }
+        if (h == -1) { psp_ret(IO_ERROR_NOENT); return; }
         do {
             if (!(ok = dir_add(d, &cap, fd.name))) break;
             io_dirent *e = &d->ent[d->n - 1];
@@ -1116,7 +1139,7 @@ static void hle_Dopen(void) {
         _findclose(h);
 #else
         DIR *dd = opendir(host);
-        if (!dd) { psp_ret(0x80010002); return; }
+        if (!dd) { psp_ret(IO_ERROR_NOENT); return; }
         for (struct dirent *de; (de = readdir(dd)) != NULL;) {
             if (!(ok = dir_add(d, &cap, de->d_name))) break;
             char path[1300];
@@ -1125,7 +1148,7 @@ static void hle_Dopen(void) {
         }
         closedir(dd);
 #endif
-        if (!ok) { free(d->ent); d->ent = NULL; psp_ret(0x8001000C); return; }   /* ENOMEM */
+        if (!ok) { free(d->ent); d->ent = NULL; psp_ret(SCE_ERROR_ENOMEM); return; }
         d->used = 1;
         d->fat = is_ms_path(guest);
         g_dir_sort_fat = d->fat;
@@ -1134,7 +1157,7 @@ static void hle_Dopen(void) {
         psp_ret((uint32_t)(i + 1));
         return;
     }
-    psp_ret(0x80010018);
+    psp_ret(SCE_ERROR_EMFILE);
 }
 
 /* Fill a SceIoDirent: the entry's SceIoStat (88 bytes, as sceIoGetstat
@@ -1145,7 +1168,7 @@ static void hle_Dopen(void) {
 static void hle_Dread(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
     uint32_t dirent = psp_arg(1);
-    if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(0x80020323); return; }
+    if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(IO_ERROR_BADF); return; }
     /* An entry is an 88-byte stat and a 256-byte name. A buffer that is not
      * there is refused (PSPSDK's ILLEGAL_ADDR; not measured) rather than
      * written through, and the listing does not advance. */
@@ -1157,21 +1180,14 @@ static void hle_Dread(void) {
         /* Walk the extent's records in stored order, skipping the self and
          * parent records: the probe's root listing was SUB, ALPHA.BIN,
          * BETA.TXT, with no "." or "..". */
-        while (entry->off + 33 <= entry->bytes) {
-            const uint8_t *r = entry->records + entry->off;
-            const uint32_t rec = r[0];
-            if (!rec) {                   /* padding to the end of this sector */
-                entry->off = (entry->off / ISO_SECTOR + 1) * ISO_SECTOR;
-                continue;
-            }
-            if (entry->off + rec > entry->bytes) break;
-            entry->off += rec;
-            const unsigned nlen = r[32];
-            if (33 + nlen > rec || (nlen == 1 && r[33] <= 1)) continue;
-            write_disc_stat(destination, (r[25] & ISO_DIR_IS_DIR) != 0, rd32le(r + 10), rd32le(r + 2));
+        for (const uint8_t *r; (r = iso_record(entry->records, entry->bytes, &entry->off)) != NULL; ) {
+            const unsigned nlen = r[ISO_REC_NAME_LEN];
+            if (ISO_REC_NAME + nlen > (uint32_t)r[0] || (nlen == 1 && r[ISO_REC_NAME] <= 1)) continue;
+            write_disc_stat(destination, (r[ISO_REC_FLAGS] & ISO_DIR_IS_DIR) != 0,
+                            rd32le(r + ISO_REC_SIZE), rd32le(r + ISO_REC_LBA));
             char output[256] = {0};
-            const unsigned length = iso_name_len(r + 33, nlen);
-            memcpy(output, r + 33, length < 255 ? length : 255);
+            const unsigned length = iso_name_len(r + ISO_REC_NAME, nlen);
+            memcpy(output, r + ISO_REC_NAME, length < 255 ? length : 255);
             psp_mem_write_block(destination + PSP_STAT_LEN, output, sizeof output);
             psp_ret(1);
             return;
@@ -1226,8 +1242,6 @@ static void hle_Dread(void) {
  * into an emulator-specific path we do not implement.
  *
  * Left unimplemented it printed once per call and the caller kept asking. */
-/* 0x80010000 | errno, with ENODEV = 19. */
-#define SCE_ERROR_ENODEV   0x80010013u
 
 /* The Memory Stick, as PSPSDK's pspmscm.h asks about it (BSD):
  *   - "fatms0:" 0x02415821 registers an insert/eject callback, its uid in
@@ -1268,7 +1282,7 @@ static void hle_Devctl(void) {
 
 static void hle_Dclose(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
-    if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(0x80020323); return; }
+    if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(IO_ERROR_BADF); return; }
     free(g_dir[id].ent);
     g_dir[id].ent = NULL;
     g_dir[id].n = g_dir[id].pos = 0;
@@ -1303,11 +1317,11 @@ static void hle_Mkdir(void) {
 
     const size_t n = strlen(guest);
     if (n >= 2 && (guest[n - 1] == '/' || guest[n - 1] == '\\') && guest[n - 2] != ':') {
-        psp_ret(0x80010016);
+        psp_ret(SCE_ERROR_EINVAL);
         return;
     }
     struct stat st;
-    if (stat(host, &st) == 0) { psp_ret(0x80010011); return; }  /* EEXIST */
+    if (stat(host, &st) == 0) { psp_ret(SCE_ERROR_EEXIST); return; }
     {
         static const char *const always[] = { "ms0:/PSP", "ms0:/PSP/SAVEDATA", "ms0:/PSP/GAME" };
         char up[512];
@@ -1321,8 +1335,8 @@ static void hle_Mkdir(void) {
     snprintf(parent, sizeof parent, "%s", host);
     char *slash = strrchr(parent, '/');
     if (slash) *slash = '\0';
-    if (slash && (stat(parent, &st) != 0 || !STAT_ISDIR(st))) { psp_ret(0x80010002); return; }
-    psp_ret(MKDIR_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
+    if (slash && (stat(parent, &st) != 0 || !STAT_ISDIR(st))) { psp_ret(IO_ERROR_NOENT); return; }
+    psp_ret(MKDIR_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : IO_ERROR_NOENT);
 }
 
 /* A directory with something in it is ACCESS_DENIED (0x8001000D, sysprobe
@@ -1332,7 +1346,7 @@ static void hle_Rmdir(void) {
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
     if (RMDIR_ONE(host) == 0) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
-    psp_ret(errno == ENOTEMPTY || errno == EEXIST ? 0x8001000D : 0x80010002);
+    psp_ret(errno == ENOTEMPTY || errno == EEXIST ? SCE_ERROR_EACCES : IO_ERROR_NOENT);
 }
 
 /* A read-only file is ACCESS_DENIED (sysprobe step 4, after Chstat made it
@@ -1343,11 +1357,11 @@ static void hle_Remove(void) {
     map_path(guest, host, sizeof host);
     struct stat st;
     if (stat(host, &st) == 0 && !STAT_ISDIR(st) && !(st.st_mode & 0222)) {
-        psp_ret(0x8001000D);
+        psp_ret(SCE_ERROR_EACCES);
         io_park();
         return;
     }
-    psp_ret(UNLINK_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : 0x80010002);
+    psp_ret(UNLINK_ONE(host) == 0 ? SCE_KERNEL_ERROR_OK : IO_ERROR_NOENT);
     io_park();
 }
 
@@ -1356,7 +1370,7 @@ static void hle_Chdir(void) {
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
     struct stat st;
-    if (stat(host, &st) != 0 || !STAT_ISDIR(st)) { psp_ret(0x80010002); return; }
+    if (stat(host, &st) != 0 || !STAT_ISDIR(st)) { psp_ret(IO_ERROR_NOENT); return; }
     snprintf(g_cwd, sizeof g_cwd, "%s", host);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1381,7 +1395,7 @@ static void hle_Chstat(void) {
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
     struct stat st;
-    if (stat(host, &st) != 0) { psp_ret(0x80010002); return; }
+    if (stat(host, &st) != 0) { psp_ret(IO_ERROR_NOENT); return; }
     const uint32_t in = psp_arg(1), bits = psp_arg(2);
 #ifndef _WIN32
     int ro = !(st.st_mode & 0222);
@@ -1459,8 +1473,8 @@ uint8_t *psp_io_read_whole(const char *guest, size_t *len) {
 }
 
 uint8_t *psp_io_read_fd(uint32_t fd, size_t *len, int *on_disc) {
-    if (fd < 3 || fd - 3 >= MAX_FILES || !g_file[fd - 3].used || !g_file[fd - 3].f) return NULL;
-    const io_file *o = &g_file[fd - 3];
+    if (fd < FD_FIRST || fd - FD_FIRST >= MAX_FILES || !g_file[fd - FD_FIRST].used || !g_file[fd - FD_FIRST].f) return NULL;
+    const io_file *o = &g_file[fd - FD_FIRST];
     if (on_disc) *on_disc = o->image;
     return read_window(o->f, o->base, o->len, len);
 }
@@ -1562,10 +1576,6 @@ int psp_io_remove_tree(const char *guest) {
  *   - collecting sceIoCloseAsync releases the descriptor, and a bad or
  *     released descriptor is IO_ERROR_BADF.
  */
-/* uofw include/common/errors.h: BAD_FILE_DESCRIPTOR and NO_ASYNC_OP. */
-#define SCE_ERROR_BADF     0x80020323u
-#define SCE_ERROR_NOASYNC  0x8002032Au
-
 static void async_done(io_file *h, int64_t value) {
     h->result = value;
     h->has_result = 1;
@@ -1588,25 +1598,18 @@ static void hle_OpenAsync(void) {
     hle_Open();
     g_io_async = 0;
     const uint32_t opened = psp_cpu.r[PSP_REG_V0];
-    const int32_t fd = (int32_t)opened - 3;
+    const int32_t fd = (int32_t)opened - FD_FIRST;
     if (fd >= 0 && fd < MAX_FILES && g_file[fd].used) {
         async_done(&g_file[fd], (int64_t)(int32_t)opened);
         return;                           /* the descriptor, to poll on */
     }
     /* The open failed: the error is what the new descriptor's wait delivers,
      * and collecting it frees the slot again (close_pending). */
-    for (int i = 0; i < MAX_FILES; i++) {
-        if (g_file[i].used) continue;
-        g_file[i].f = NULL; g_file[i].used = 1;
-        g_file[i].image = g_file[i].writable = 0; g_file[i].host[0] = '\0';
-        g_file[i].base = g_file[i].len = g_file[i].pos = 0;
-        g_file[i].sector_mode = 0;
-        g_file[i].close_pending = 1;
-        async_done(&g_file[i], (int64_t)(int32_t)opened);
-        psp_ret((uint32_t)(i + 3));
-        return;
-    }
-    /* No free slot: the error itself is all there is to return. */
+    const int i = io_file_take(NULL, 0, 0, 0, 0);
+    if (i < 0) return;   /* No free slot: the error itself is all there is to return. */
+    g_file[i].close_pending = 1;
+    async_done(&g_file[i], (int64_t)(int32_t)opened);
+    psp_ret((uint32_t)(i + FD_FIRST));
 }
 
 static void hle_ReadAsync(void) {
@@ -1673,10 +1676,7 @@ static void hle_CloseAsync(void) {
 }
 
 static void collect_async(io_file *h, uint32_t out) {
-    if (out) {
-        psp_write32(out,     (uint32_t)(uint64_t)h->result);
-        psp_write32(out + 4, (uint32_t)((uint64_t)h->result >> 32));
-    }
+    if (out) psp_write64(out, (uint64_t)h->result);
     h->has_result = h->running = 0;
     if (h->close_pending) {
         if (h->f) fclose(h->f);

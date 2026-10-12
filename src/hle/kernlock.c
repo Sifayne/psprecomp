@@ -63,18 +63,19 @@ static psp_mutex *find_mutex(uint32_t id) {
     return NULL;
 }
 
-/* How much a lock may ask for.
+/* How much a lock may ask for, and an unlock give back.
  *
  * A non-recursive mutex takes exactly one; a recursive one takes any positive
  * number that does not carry the total past INT_MAX. Both halves are measured:
  * `Lock 0 => 2` is refused with ILLEGAL_COUNT without the attribute and
  * accepted with it, and `Lock 1 => INT_MAX` is refused with LOCK_OVERFLOW where
- * `Lock 1 => INT_MAX - 1` succeeds at exactly INT_MAX. */
-static uint32_t lock_count_error(const psp_mutex *m, int32_t count) {
+ * `Lock 1 => INT_MAX - 1` succeeds at exactly INT_MAX. An unlock follows the
+ * same rules, minus the overflow check. */
+static uint32_t mutex_count_error(const psp_mutex *m, int32_t count, int locking) {
     if (count <= 0) return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
     if (count > 1 && !(m->attr & MUTEX_ATTR_RECURSE))
         return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-    if (m->count > INT32_MAX - count) return SCE_KERNEL_ERROR_MUTEX_LOCK_OVERFLOW;
+    if (locking && m->count > INT32_MAX - count) return SCE_KERNEL_ERROR_MUTEX_LOCK_OVERFLOW;
     return SCE_KERNEL_ERROR_OK;
 }
 
@@ -106,9 +107,7 @@ static void hle_CreateMutex(void) {
     m->owner      = init > 0 ? psp_sched_current() : 0;
     m->uid        = psp_threadman_next_uid();
     m->used       = 1;
-    char nm[sizeof m->name];
-    memcpy(nm, m->name, sizeof nm);
-    snprintf(m->waitdesc, sizeof m->waitdesc, "sceKernelLockMutex(%s)", nm);
+    psp_wait_describe(m->waitdesc, sizeof m->waitdesc, "sceKernelLockMutex", m->name);
     psp_ret(m->uid);
 }
 
@@ -148,18 +147,18 @@ void psp_kernlock_thread_ended(uint32_t uid) {
 }
 
 /* The common body of the two blocking locks and the non-blocking one. */
-static void mutex_lock(int may_block, int has_timeout) {
-    if (may_block && !psp_sched_can_wait()) {
+static void mutex_lock(psp_wait_form form) {
+    if (form == PSP_WAIT_BLOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t id      = psp_arg(0);
     const int32_t  count   = (int32_t)psp_arg(1);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
+    const uint32_t tmo_ptr = form == PSP_WAIT_BLOCK ? psp_arg(2) : 0;
 
     psp_mutex *m = find_mutex(id);
     if (!m) { psp_ret(SCE_KERNEL_ERROR_NOT_FOUND_MUTEX); return; }
 
-    const uint32_t bad = lock_count_error(m, count);
+    const uint32_t bad = mutex_count_error(m, count, 1);
     if (bad) { psp_ret(bad); return; }
 
     const uint32_t me = psp_sched_current();
@@ -195,7 +194,7 @@ static void mutex_lock(int may_block, int has_timeout) {
         return;
     }
 
-    if (!may_block) { psp_ret(SCE_KERNEL_ERROR_MUTEX_LOCKED); return; }
+    if (form == PSP_WAIT_POLL) { psp_ret(SCE_KERNEL_ERROR_MUTEX_LOCKED); return; }
 
     if (psp_waitq_add(&m->q, me, (uint32_t)count, 0, 0) != 0) {
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
@@ -206,50 +205,21 @@ static void mutex_lock(int may_block, int has_timeout) {
                                          deadline);
     psp_threadman_wait_mark(0, 0);
 
-    /* Cancelled rather than deleted: the object is still there, so looking it
-     * up says nothing, and only the waker knew. */
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_CANCELLED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_WAIT_CANCEL);
-        return;
-    }
     /* Handed the mutex: a delete before we ran does not take it back
      * (syncprobe step 219). */
-    if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_woken(rc, tmo_ptr, deadline)) return;
+    /* Woken any other way, mutex_release took it on our behalf. */
     m = find_mutex(id);
-    /* A wait ended by the object's deletion still reports how much of the
-     * timeout was left. It is easy to miss because the object is gone and the
-     * early return reads as a clean bail-out, but the caller's timeout word is
-     * the caller's, not the object's: eight tests across fpl and msgpipe print
-     * `timeout = 8ms remaining` where the unwritten word still said 10. */
-    if (!m) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
-
-    if (rc == PSP_SCHED_WOKEN) {
-        /* mutex_release took it on our behalf. */
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
+    if (psp_wait_end_found(rc, m, tmo_ptr, deadline)) return;
 
     psp_waitq_drop(&m->q, me);
-    if (rc == PSP_SCHED_EXPIRED || rc == PSP_SCHED_RELEASED) {
-        /* Forced out by sceKernelReleaseWaitThread: RELEASE_WAIT, as the
-         * sleep in threadprobe step 70 (fw 6.60) answers. */
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(rc == PSP_SCHED_EXPIRED ? SCE_KERNEL_ERROR_WAIT_TIMEOUT
-                                        : SCE_KERNEL_ERROR_RELEASE_WAIT);
-        return;
-    }
-    psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
+    /* Stranded: a timeout, with the timeout word left as it was. */
+    if (rc == PSP_SCHED_STRANDED) { psp_ret(SCE_KERNEL_ERROR_WAIT_TIMEOUT); return; }
+    psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
-static void hle_LockMutex(void)    { mutex_lock(1, 1); }
-static void hle_TryLockMutex(void) { mutex_lock(0, 0); }
+static void hle_LockMutex(void)    { mutex_lock(PSP_WAIT_BLOCK); }
+static void hle_TryLockMutex(void) { mutex_lock(PSP_WAIT_POLL); }
 
 static void hle_UnlockMutex(void) {
     const uint32_t id    = psp_arg(0);
@@ -258,11 +228,8 @@ static void hle_UnlockMutex(void) {
     psp_mutex *m = find_mutex(id);
     if (!m) { psp_ret(SCE_KERNEL_ERROR_NOT_FOUND_MUTEX); return; }
 
-    /* The count rules are the lock's, minus the overflow check. */
-    if (count <= 0 || (count > 1 && !(m->attr & MUTEX_ATTR_RECURSE))) {
-        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
-        return;
-    }
+    const uint32_t bad = mutex_count_error(m, count, 0);
+    if (bad) { psp_ret(bad); return; }
     /* Not held at all, and holding it fewer times than is being given back:
      * two different mistakes with two different codes, both measured. */
     if (m->count == 0)     { psp_ret(SCE_KERNEL_ERROR_MUTEX_UNLOCKED); return; }
@@ -511,9 +478,7 @@ static void hle_CreateLwMutex(void) {
     /* The waiter count lives in the workarea, and a waiter that times out or
      * is released leaves before it runs again (psp_waitq_leave). */
     m->q.mirror   = wa + LW_WAITING;
-    char nm[sizeof m->name];
-    memcpy(nm, m->name, sizeof nm);
-    snprintf(m->waitdesc, sizeof m->waitdesc, "sceKernelLockLwMutex(%s)", nm);
+    psp_wait_describe(m->waitdesc, sizeof m->waitdesc, "sceKernelLockLwMutex", m->name);
 
     /* The workarea is the object. Everything the guest can see about the lock
      * is written here, including the three pad words -- the tests print them,
@@ -570,33 +535,36 @@ static uint32_t lw_count_error(uint32_t wa, int32_t count, int locking) {
     return SCE_KERNEL_ERROR_OK;
 }
 
-/* The pre-6.00 sceKernelTryLockLwMutex reports one code for every failure.
+/* The three lock calls: the one that waits, and the two that do not. */
+typedef enum { LW_LOCK, LW_TRY, LW_TRY_600 } lw_call;
+
+/* What a lock that fails answers. The pre-6.00 sceKernelTryLockLwMutex
+ * reports one code for every failure.
  *
  * Not a simplification on our part: try.expected has fifteen failing cases and
  * every one of them answers 0x800201C4, where try600.expected gives the precise
  * code for the same call on the same inputs. The `_600` suffix is a firmware
  * revision that made the error vocabulary specific, and both exports are still
  * present with their own NIDs. */
-static void lw_lock(int may_block, int has_timeout, int flatten) {
-    if (may_block && !psp_sched_can_wait()) {
+static uint32_t lw_lock_error(lw_call call, uint32_t code) {
+    return call == LW_TRY ? SCE_KERNEL_ERROR_LWMUTEX_TRY_FAILED : code;
+}
+
+static void lw_lock(lw_call call) {
+    if (call == LW_LOCK && !psp_sched_can_wait()) {
         psp_ret(SCE_KERNEL_ERROR_CAN_NOT_WAIT); return;
     }
     const uint32_t wa      = psp_arg(0);
     const int32_t  count   = (int32_t)psp_arg(1);
-    const uint32_t tmo_ptr = has_timeout ? psp_arg(2) : 0;
-
-#define LW_FAIL(code) do { \
-        psp_ret(flatten ? SCE_KERNEL_ERROR_LWMUTEX_TRY_FAILED : (code)); \
-        return; \
-    } while (0)
+    const uint32_t tmo_ptr = call == LW_LOCK ? psp_arg(2) : 0;
 
     if (lw_bad_pointer(wa)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_SIZE); return; }
     const uint32_t bad = lw_count_error(wa, count, 1);
-    if (bad) LW_FAIL(bad);
+    if (bad) { psp_ret(lw_lock_error(call, bad)); return; }
 
     psp_lwmutex *rec = NULL;
     const uint32_t gone = lw_resolve(wa, &rec, 0);
-    if (gone) LW_FAIL(gone);
+    if (gone) { psp_ret(lw_lock_error(call, gone)); return; }
 
     const uint64_t deadline = psp_wait_deadline(tmo_ptr);
     const uint32_t me   = psp_sched_current();
@@ -612,14 +580,20 @@ static void lw_lock(int may_block, int has_timeout, int flatten) {
     }
 
     if (psp_read32(wa + LW_THREAD) == me) {
-        if (!(attr & LWMUTEX_ATTR_RECURSE)) LW_FAIL(SCE_KERNEL_ERROR_LWMUTEX_RECURSIVE);
+        if (!(attr & LWMUTEX_ATTR_RECURSE)) {
+            psp_ret(lw_lock_error(call, SCE_KERNEL_ERROR_LWMUTEX_RECURSIVE));
+            return;
+        }
         psp_write32(wa + LW_COUNT, (uint32_t)(cur + count));
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
 
-    if (!may_block) LW_FAIL(SCE_KERNEL_ERROR_LWMUTEX_LOCKED);
+    if (call != LW_LOCK) {
+        psp_ret(lw_lock_error(call, SCE_KERNEL_ERROR_LWMUTEX_LOCKED));
+        return;
+    }
 
     /* Only here does the kernel need to exist: a thread cannot be parked
      * against a workarea alone. */
@@ -638,33 +612,24 @@ static void lw_lock(int may_block, int has_timeout, int flatten) {
                                          deadline);
     psp_threadman_wait_mark(0, 0);
 
+    /* Only the hand-over is answered before the lookup: an lwmutex has no
+     * cancel. */
     if (rc == PSP_SCHED_WOKEN && psp_sched_wake_reason() == PSP_WAIT_WOKE_SATISFIED) {
         psp_wait_writeback(tmo_ptr, deadline);
         psp_ret(SCE_KERNEL_ERROR_OK);
         return;
     }
     m = find_lw(uid);
-    if (!m) { psp_wait_writeback(tmo_ptr, deadline);
-              psp_ret(SCE_KERNEL_ERROR_WAIT_DELETE); return; }
+    if (psp_wait_end_found(rc, m, tmo_ptr, deadline)) return;
 
-    if (rc == PSP_SCHED_WOKEN) {
-        psp_wait_writeback(tmo_ptr, deadline);
-        psp_ret(SCE_KERNEL_ERROR_OK);
-        return;
-    }
     psp_waitq_drop(&m->q, me);
     psp_write32(wa + LW_WAITING, (uint32_t)psp_waitq_count(&m->q));
-    psp_wait_writeback(tmo_ptr, deadline);
-    /* Forced out by sceKernelReleaseWaitThread: RELEASE_WAIT (threadprobe
-     * step 70, fw 6.60), not a timeout. */
-    psp_ret(rc == PSP_SCHED_RELEASED ? SCE_KERNEL_ERROR_RELEASE_WAIT
-                                     : SCE_KERNEL_ERROR_WAIT_TIMEOUT);
-#undef LW_FAIL
+    psp_wait_give_up(rc, tmo_ptr, deadline);
 }
 
-static void hle_LockLwMutex(void)        { lw_lock(1, 1, 0); }
-static void hle_TryLockLwMutex(void)     { lw_lock(0, 0, 1); }
-static void hle_TryLockLwMutex600(void)  { lw_lock(0, 0, 0); }
+static void hle_LockLwMutex(void)        { lw_lock(LW_LOCK); }
+static void hle_TryLockLwMutex(void)     { lw_lock(LW_TRY); }
+static void hle_TryLockLwMutex600(void)  { lw_lock(LW_TRY_600); }
 
 static void hle_UnlockLwMutex(void) {
     const uint32_t wa    = psp_arg(0);

@@ -35,6 +35,7 @@
 #ifndef PSPRECOMP_WAITQ_H
 #define PSPRECOMP_WAITQ_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* ---- the timeout argument every kernel wait takes --------------------------
@@ -60,6 +61,12 @@
  * shortest real one there is, and gets the earliest deadline that exists so
  * that it expires through the ordinary path. */
 uint64_t psp_wait_deadline(uint32_t tmo_ptr);
+
+/* What a thread parked on an object is shown waiting on in the thread dump:
+ * `desc` becomes "<call>(<name>)", built once when the object is created.
+ * The scheduler keeps only the pointer, so it lives in the object. */
+void     psp_wait_describe(char *desc, size_t size, const char *call,
+                           const char *name);
 
 /* Mark the call in progress as one whose name ends in CB, so that the wait it
  * is about to perform delivers the caller's callbacks first.
@@ -97,6 +104,41 @@ void     psp_wait_writeback(uint32_t tmo_ptr, uint64_t deadline);
  * type that woke such a waiter with plain psp_sched_wake -- NORMAL -- and
  * worked the answer out by looking the object up again would say DELETE. */
 
+/* The two forms of a call that can wait: the plain one parks, with the
+ * caller's timeout, and the Try or Poll one answers at once and takes none. */
+typedef enum { PSP_WAIT_POLL, PSP_WAIT_BLOCK } psp_wait_form;
+
+/* ---- how a wait that parked ends -------------------------------------------
+ *
+ * Every object type answers in the same order, from what
+ * psp_sched_block_until returned (`rc`):
+ *
+ *   woken SATISFIED or CANCELLED   OK or WAIT_CANCEL, decided before the
+ *                                  object is looked up again
+ *   the object gone                WAIT_DELETE
+ *   woken any other way            OK: the waker settled it on our behalf
+ *   still queued                   the caller leaves the queue, then gives up
+ *
+ * Each of the three below writes the timeout back and returns the answer to
+ * the guest; the first two return 1 when they ended the wait. */
+
+/* The answers only the waker knew. Neither depends on whether the object is
+ * still there: what was handed over is not taken back by a delete that
+ * follows, and a cancel leaves the object in place, so finding it would prove
+ * nothing. */
+int  psp_wait_end_woken(int rc, uint32_t tmo_ptr, uint64_t deadline);
+
+/* The answers the object gives, once the caller has looked it up again;
+ * `object` is NULL when it was deleted under the wait. Returns 0 when the
+ * caller is still in its queue. */
+int  psp_wait_end_found(int rc, const void *object, uint32_t tmo_ptr,
+                        uint64_t deadline);
+
+/* A wait that is still queued, after the caller has left the queue:
+ * RELEASE_WAIT when sceKernelReleaseWaitThread forced it out, WAIT_TIMEOUT
+ * otherwise. */
+void psp_wait_give_up(int rc, uint32_t tmo_ptr, uint64_t deadline);
+
 /* The attribute bit that selects most-urgent-first over first-come. */
 #define PSP_WAITQ_PRIORITY 0x100u
 
@@ -133,6 +175,9 @@ typedef struct {
 /* Append a waiter. Returns 0, or -1 if the queue is full. */
 int  psp_waitq_add(psp_waitq *q, uint32_t uid, uint32_t need, uint32_t mode,
                    uint32_t out);
+
+/* The index of `uid`'s entry, or -1 when it has none. */
+int  psp_waitq_find(const psp_waitq *q, uint32_t uid);
 
 /* Remove a waiter by uid, wherever it sits. For a thread that stopped waiting
  * without being released -- its timeout elapsed, the object was deleted under
