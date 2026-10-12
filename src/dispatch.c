@@ -439,6 +439,31 @@ int psp_resume_count(void) {
     return n;
 }
 
+static int addr_order(const void *l, const void *r) {
+    const uint32_t a = *(const uint32_t *)l, b = *(const uint32_t *)r;
+    return a < b ? -1 : a > b;
+}
+static uint64_t fnv_word(uint64_t h, uint32_t w) {
+    for (int k = 0; k < 4; k++) { h ^= (uint8_t)(w >> (8 * k)); h *= 1099511628211ull; }
+    return h;
+}
+uint64_t psp_dispatch_fingerprint(void) {
+    uint32_t *addrs = (uint32_t *)malloc((g_count ? g_count : 1) * sizeof *addrs);
+    if (!addrs) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g_cap && n < g_count; i++) if (g_table[i].used) addrs[n++] = g_table[i].addr;
+    qsort(addrs, n, sizeof *addrs, addr_order);
+    uint64_t h = 1469598103934665603ull;
+    h = fnv_word(h, n);
+    for (uint32_t i = 0; i < n; i++) h = fnv_word(h, addrs[i]);
+    free(addrs);
+    for (int t = 0; t < g_nresume_tables; t++) {
+        h = fnv_word(h, (uint32_t)g_resume[t].count);
+        for (int i = 0; i < g_resume[t].count; i++) h = fnv_word(h, g_resume[t].sites[i].site);
+    }
+    return h ? h : 1;
+}
+
 static struct { uint32_t addr; psp_resume_fn original, fn; } g_override[8];
 static int g_noverride;
 

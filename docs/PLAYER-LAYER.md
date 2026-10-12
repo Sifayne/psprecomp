@@ -1051,6 +1051,22 @@ As built in stage 8 (`include/psprecomp/state.h`, `src/hle/state.c`):
 Stage 9 added a thumbnail as the first chunk and the wall-clock time of the
 save to the header, so a slot list reads only the start of each file.
 
+*Changed, 11 Oct (format 3):* a state loads into any build with its
+**fingerprint**, not only the one that wrote it (`psp_state_id`). The
+fingerprint hashes what a state's bytes depend on: the format,
+`PSP_STATE_LAYOUT` (raised by hand when a kept variable's bytes or a part's
+chunks change meaning without a size changing), the guest code it enters --
+every registered function's and resume site's guest address
+(`psp_dispatch_fingerprint`) -- and the kept variables' names and sizes in
+order. An update to the player, the renderer or the launcher leaves it alone;
+a change to what the runtime keeps does not. The header still carries the
+executable's hash, by which the launcher finds the build a state needs when
+no other can load it. `boot --state-id` prints both, once everything the
+fingerprint covers has registered. Checked on Armored Core: Last Raven: a
+state saved mid-mission by one build, loaded by a build with different
+machine code and its kept variables moved, ran on frame for frame as in the
+build that wrote it.
+
 **Guest memory:** RAM, VRAM, the scratchpad and the module image. Each is
 written as a 4 KB page map plus the pages that are not all zero.
 
@@ -1070,9 +1086,11 @@ end to end, after a list of their names, sizes and addresses:
   stream-handle counter.
 
 A kept variable holds no host pointer, except into another kept variable.
-All of them sit in one executable, so a load moves every one by the same
-distance (`psp_state_delta`). The parked-thread table (`waitq.c`) and the
-GE's events are relocated by it. With the zero pages skipped, the kept
+A load remembers where the state had each one, and such a pointer follows
+its variable to where this build has it (`psp_state_moved`): one executable
+moves them all by the same distance, but another build places each one
+differently. The parked-thread table (`waitq.c`) and the GE's events are
+relocated this way. With the zero pages skipped, the kept
 variables come to 0.26 MB in a Last Raven mission.
 
 The plan's first form was one linker section (`__attribute__((section))`)

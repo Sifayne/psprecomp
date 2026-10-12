@@ -8,13 +8,15 @@
  * natively from the return sites on its guest stack (psp_resume_chain), so
  * no host frame needs to survive.
  *
- * A state belongs to the build that wrote it: it carries a hash of the
- * executable and loads into nothing else. That is what lets most of it be
- * plain bytes: the runtime's guest-visible statics, and a title's, each
- * named once with psp_state_keep. A kept variable holds no host
- * pointer, except one into another kept variable (psp_state_delta). What
- * does -- open files, decoders -- is saved and rebuilt by a part
- * (psp_state_part) instead. */
+ * A state belongs to the builds that lay it out the same way: it carries
+ * the layout's fingerprint (psp_state_id) and loads into nothing else. That
+ * is what lets most of it be plain bytes: the runtime's guest-visible
+ * statics, and a title's, each named once with psp_state_keep. A kept
+ * variable holds no host pointer, except one into another kept variable
+ * (psp_state_moved). What does -- open files, decoders -- is saved and
+ * rebuilt by a part (psp_state_part) instead. It also carries a hash of the
+ * executable that wrote it, by which the launcher finds that build again
+ * when no other can load it. */
 #ifndef PSPRECOMP_STATE_H
 #define PSPRECOMP_STATE_H
 
@@ -54,9 +56,25 @@ typedef struct {
 } psp_state_part;
 void psp_state_register(const psp_state_part *part);
 
+/* What a state's bytes mean, beyond what the fingerprint sees for itself.
+ * Raise it when a kept variable's bytes, or a part's chunks, change meaning
+ * without any kept variable changing size: states written before then would
+ * load into the new build and be misread. */
+#define PSP_STATE_LAYOUT 1
+
+/* This build, as states know it: the executable's hash, and the
+ * fingerprint of everything a state's bytes depend on -- the file format,
+ * PSP_STATE_LAYOUT, the guest code it enters (psp_dispatch_fingerprint), and
+ * the kept variables' names and sizes in order. A state loads into a build
+ * with its fingerprint, whatever the executable. Complete once the game's
+ * code, the firmware and the title have registered, before presentation. */
+void psp_state_id(uint64_t *exe, uint64_t *fingerprint);
+
 /* A loaded state's variables sit where this process put them, not where the
- * saving one had them: a kept pointer to a kept variable moves by this. */
-intptr_t psp_state_delta(void);
+ * saving one had them, and another build places each one differently: a
+ * kept pointer to a kept variable, as it was saved, and where it points now.
+ * NULL for one into no kept variable. */
+void *psp_state_moved(const void *saved);
 /* Whether a pointer is into a kept variable, so that it can be kept. */
 int psp_state_is_kept(const void *p);
 
@@ -86,13 +104,16 @@ int psp_state_load_here(const char *path, char *why, size_t size);
 
 /* What a list of states shows, read without loading one: whether this build
  * can load it, when it was saved (seconds since 1970), the guest's time in it
- * -- how long the game had been played -- and its poll count. */
+ * -- how long the game had been played -- and its poll count; and the
+ * executable that wrote it and its fingerprint (0 in a state from before
+ * there were fingerprints), by which the build that can load it is found. */
 typedef struct {
     int      usable;
     int64_t  saved;
     uint64_t guest_us;
     uint32_t polls;
     int      has_thumb;
+    uint64_t exe, fingerprint;
 } psp_state_info;
 enum { PSP_STATE_THUMB_W = 240, PSP_STATE_THUMB_H = 136 };
 /* The header, and the thumbnail as RGBA (PSP_STATE_THUMB_W x _H) when `thumb`

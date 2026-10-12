@@ -9,6 +9,7 @@
 #include "psprecomp/mem.h"
 #include "psprecomp/state.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,17 @@ static void site(uint32_t at) { (void)at; }
 static const psp_resume_site SITES[] = { { 0x08804000u, site } };
 
 static struct { uint32_t a, b[4]; } g_kept;
+/* A state's header, as state.c lays it out. */
+typedef struct {
+    char magic[8];
+    uint32_t format, header_size;
+    uint64_t exe_hash;
+    uint32_t functions, resume_sites;
+    uint64_t guest_us;
+    uint32_t polls, reserved;
+    int64_t  saved;
+    uint64_t fingerprint;
+} state_header;
 static uint32_t g_other;
 
 int main(int argc, char **argv) {
@@ -101,6 +113,70 @@ int main(int argc, char **argv) {
     const unsigned asked = psp_state_request(PSP_STATE_SAVE, "unused");
     CHECK(asked > 0 && psp_state_result(&ok, NULL, 0) < asked, "a request is not answered before a safe point");
     CHECK(psp_state_request(PSP_STATE_LOAD, "unused") == asked + 1, "requests are numbered in order");
+
+    /* The build as states know it. The fingerprint is what a load is decided
+     * by: it follows the guest code and the kept variables, not the order
+     * functions were registered in. */
+    uint64_t exe = 0, fp = 0, fp2 = 0;
+    psp_state_id(&exe, &fp);
+    CHECK(exe && fp, "a build has an id: exe %llx fingerprint %llx", (unsigned long long)exe, (unsigned long long)fp);
+    const uint64_t code = psp_dispatch_fingerprint();
+    psp_register(0x08804100u, NULL);
+    psp_register(0x08804200u, NULL);
+    const uint64_t code2 = psp_dispatch_fingerprint();
+    CHECK(code2 != code, "a function more is other code");
+    psp_state_id(NULL, &fp2);
+    CHECK(fp2 != fp, "and another fingerprint");
+    psp_dispatch_reset();
+    psp_hle_init();
+    psp_resume_register(SITES, 1);
+    psp_register(0x08804200u, NULL);
+    psp_register(0x08804100u, NULL);
+    CHECK(psp_dispatch_fingerprint() == code2, "registered in another order, the same code");
+    psp_state_id(NULL, &fp);
+    CHECK(fp == fp2, "and the same fingerprint");
+    PSP_STATE_KEEP(g_other);
+    psp_state_id(NULL, &fp2);
+    CHECK(fp2 != fp, "a variable more is another layout");
+    CHECK(psp_state_moved(&g_kept) == NULL, "before a load nothing has moved");
+
+    /* Headers, as a slot list reads them. */
+    state_header h;
+    memset(&h, 0, sizeof h);
+    memcpy(h.magic, "PSPSTAT1", 8);
+    h.guest_us = 61000000;
+    h.saved = 1760000000;
+    /* Format 3, from another executable with this layout: it loads here. */
+    h.format = 3;
+    h.header_size = sizeof h;
+    h.exe_hash = exe ^ 1;
+    h.fingerprint = fp2;
+    snprintf(path, sizeof path, "%s/state-header.bin", dir);
+    f = fopen(path, "wb");
+    if (f) { fwrite(&h, sizeof h, 1, f); fclose(f); }
+    CHECK(psp_state_peek(path, &info, NULL) == 0 && info.usable && info.exe == (exe ^ 1) && info.fingerprint == fp2 &&
+          info.guest_us == 61000000, "another executable, this layout: usable %d", info.usable);
+    /* Another layout: not here, but it names its executable. */
+    h.fingerprint = fp2 ^ 1;
+    f = fopen(path, "wb");
+    if (f) { fwrite(&h, sizeof h, 1, f); fclose(f); }
+    CHECK(psp_state_peek(path, &info, NULL) == 0 && !info.usable && info.exe == (exe ^ 1),
+          "another layout: usable %d", info.usable);
+    /* Format 2 had no fingerprint: never loadable now, still named. */
+    h.format = 2;
+    h.header_size = (uint32_t)offsetof(state_header, fingerprint);
+    f = fopen(path, "wb");
+    if (f) {   /* and the chunks a real one has after it */
+        static const unsigned char rest[64];
+        fwrite(&h, h.header_size, 1, f);
+        fwrite(rest, 1, sizeof rest, f);
+        fclose(f);
+    }
+    CHECK(psp_state_peek(path, &info, NULL) == 0 && !info.usable && info.exe == (exe ^ 1) && !info.fingerprint &&
+          info.saved == 1760000000, "format 2: usable %d exe %llx", info.usable, (unsigned long long)info.exe);
+    why[0] = '\0';
+    CHECK(psp_state_load(path, why, sizeof why) == -1 && strstr(why, "another build"), "format 2 loads: %s", why);
+    remove(path);
 
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("state: ok\n");
