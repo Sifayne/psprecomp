@@ -321,6 +321,7 @@ static const char *const PRIM_NAME[8] = {
 
 typedef struct {
     uint32_t id;
+    uint32_t serial;    /* its place among every list queued, of either kind */
     uint32_t list;      /* current read pointer */
     uint32_t stall;     /* stop before this address; 0 means "no stall" */
     uint32_t base;      /* GE_BASE: high bits for addresses */
@@ -4941,9 +4942,11 @@ static void enqueue(int head) {
      * finished list is kept until DrawSync(WAIT) retires it, so that a late
      * sceGeListUpdateStallAddr or ListSync can still resolve its id, but it
      * is holding a slot it no longer needs -- so when
-     * the pool is full, the oldest finished list is what to give up. Ids come
-     * from monotonic counters and are never reused, so a stale id resolves to
-     * "unknown uid" rather than to somebody else's list.
+     * the pool is full, the oldest finished list is what to give up: the
+     * first queued, by serial, since a head list's id is below every other
+     * whenever it came. Ids come from monotonic counters and are never
+     * reused, so a stale id resolves to "unknown uid" rather than to
+     * somebody else's list.
      *
      * Without this nothing ever clears `used` and the pool is consumed once,
      * for the life of the process. The game gets MAX_QUEUES display lists in
@@ -4955,7 +4958,7 @@ static void enqueue(int head) {
      * the geometry was submitted and turned away. */
     if (!q)
         for (int i = 0; i < MAX_QUEUES; i++)
-            if (g_queue[i].done && (!q || g_queue[i].id < q->id)) q = &g_queue[i];
+            if (g_queue[i].done && (!q || g_queue[i].serial < q->serial)) q = &g_queue[i];
 
     if (!q) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 
@@ -4963,11 +4966,14 @@ static void enqueue(int head) {
      * until sceGeContinue. Only a paused list at the front, or none, lets
      * it: one drawing there refuses it with SCE_ERROR_INVALID_VALUE. That
      * is the firmware as uOFW reconstructs it (_sceGeListEnQueue with head
-     * set), and PPSSPP does the same; not measured. */
+     * set); not measured. */
     ge_queue *const front = oldest_pending();
     if (head && front && !front->paused) { psp_ret(GE_ERROR_INVALID_VALUE); return; }
 
     memset(q, 0, sizeof *q);
+    /* Each list queued moves one counter by one, so their difference counts
+     * them all. */
+    q->serial = g_next_id - g_head_id;
     q->id    = head ? --g_head_id : g_next_id++;
     /* Addresses are cut to 28 bits, as the GE sees them. libgu passes the
      * list and stall with the uncached bit (0x40000000) set, but JUMP and CALL

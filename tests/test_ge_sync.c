@@ -196,6 +196,27 @@ static void enqueue_head(void) {
     CHECK(call(0x03444eb4, id_a, 1, 0) == 0x80000100u && call(0x03444eb4, id_c, 1, 0) == 0x80000100u);
     cases++;
 }
+/* A full pool gives up the finished list queued first. A head list's id is
+ * below every other, but one that has only just finished is the newest, and
+ * a late ListSync still finds it. */
+#define SHORT_LIST 0x08812000u
+static void reuse_oldest(void) {
+    psp_ge_reset();
+    psp_write32(SHORT_LIST, 0x0f000000); psp_write32(SHORT_LIST + 4, 0x0c000000);
+    uint32_t ids[7];
+    for (unsigned i = 0; i < 7; i++) {
+        ids[i] = call(0xab49e76a, SHORT_LIST, 0, (uint32_t)-1);
+        CHECK(ids[i] < 0x80000000u && call(0x03444eb4, ids[i], 0, 0) == 0);
+    }
+    const uint32_t head = call(0x1c0d95a6, SHORT_LIST, 0, (uint32_t)-1);
+    CHECK(head < ids[0] && call(0x4c06e472, 0, 0, 0) == 0);
+    CHECK(call(0x03444eb4, head, 0, 0) == 0);
+    CHECK(call(0xab49e76a, SHORT_LIST, 0, (uint32_t)-1) < 0x80000000u);
+    CHECK(call(0x03444eb4, ids[0], 1, 0) == 0x80000100u);
+    CHECK(call(0x03444eb4, head, 1, 0) == 0 && call(0x03444eb4, ids[1], 1, 0) == 0);
+    call(0xb287bd61, 0, 0, 0);
+    cases++;
+}
 static void environment(const char *key, const char *value) {
 #ifdef _WIN32
     _putenv_s(key, value);
@@ -254,6 +275,7 @@ int main(int argc, char **argv) {
         suspending(1);
         suspending(2);
         enqueue_head();
+        reuse_oldest();
         setup();
         psp_ge_replay_list(LIST, 0, 0);
         check_pixels();
