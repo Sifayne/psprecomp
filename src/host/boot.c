@@ -998,13 +998,22 @@ int main(int argc, char **argv) {
     printf("      disc      %s\n", iso ? iso : "(none -- raw umd: opens will fail)");
 
     /* Continue where I quit (STATE_START): the state the menu wrote when the
-     * game last closed, if this build can load it. */
+     * game last closed, if this build can load it. One it cannot is moved
+     * aside before this run quits and writes its own: the earlier version's
+     * place, which the menu offers to continue in that version, and which
+     * keeps that build from being removed (src/host/builds.h). */
     if (!load_state && settings.number[PSP_OPT_STATE_START]) {
         static char quit[1100];
         psp_state_info info;
         psp_state_file("quit", quit, sizeof quit);
         if (psp_state_peek(quit, &info, NULL)) printf("      state     nothing to continue from yet\n");
-        else if (!info.usable) printf("      state     %s is from another build of the game; starting fresh\n", quit);
+        else if (!info.usable) {
+            char earlier[1100];
+            psp_state_file("earlier", earlier, sizeof earlier);
+            const int moved = !rename(quit, earlier);
+            printf("      state     %s is from another build of the game; starting fresh%s%s\n", quit,
+                   moved ? ", it kept as " : "", moved ? earlier : "");
+        }
         else load_state = quit;
     }
 

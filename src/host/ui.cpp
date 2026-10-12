@@ -800,6 +800,36 @@ extern "C" int psp_ui_confirm(const char *title, const char *text, const char *y
     return answer;
 }
 
+extern "C" int psp_ui_choose(const char *title, const char *text, const char *first, const char *second,
+                             const char *cancel) {
+    // psp_ui_confirm's box, with a second answer between the first and the
+    // way back.
+    if (!ImGui::IsPopupOpen("##confirm")) ImGui::OpenPopup("##confirm");
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(560 * u.scale, 0), ImGuiCond_Always);
+    int answer = -1;
+    if (ImGui::BeginPopupModal("##confirm", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                               ImGuiWindowFlags_NoSavedSettings)) {
+        psp_ui_heading(title);
+        psp_ui_text(text);
+        ImGui::Spacing();
+        if (ImGui::Button(first)) answer = 1;
+        note_focus(first);
+        if (ImGui::IsWindowAppearing()) { ImGui::SetItemDefaultFocus(); ImGui::SetNavCursorVisible(true); }
+        ImGui::SameLine();
+        if (ImGui::Button(second)) answer = 2;
+        note_focus(second);
+        ImGui::SameLine();
+        if (ImGui::Button(cancel) || (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))) answer = 0;
+        note_focus(cancel);
+        if (answer >= 0) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    return answer;
+}
+
 extern "C" int psp_ui_ask_text(const char *title, const char *hint, char *buf, int size, const char *yes, const char *no) {
     if (!ImGui::IsPopupOpen("##ask")) ImGui::OpenPopup("##ask");
     const ImGuiViewport *vp = ImGui::GetMainViewport();

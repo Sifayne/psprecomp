@@ -267,7 +267,8 @@ if(PSPRECOMP_HOST)
     add_test(NAME overlay_held COMMAND test_overlay held)
     add_test(NAME overlay_bind COMMAND test_overlay bind)
     add_test(NAME overlay_pad COMMAND test_overlay pad)
-    set_tests_properties(overlay_ui overlay_held overlay_bind overlay_pad PROPERTIES
+    add_test(NAME overlay_earlier COMMAND test_overlay earlier)
+    set_tests_properties(overlay_ui overlay_held overlay_bind overlay_pad overlay_earlier PROPERTIES
         TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
     # About a hundred presses of the pad, each held for a few frames.
     set_tests_properties(overlay_pad PROPERTIES TIMEOUT 120)

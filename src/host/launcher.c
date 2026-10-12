@@ -15,6 +15,8 @@
 #include "psprecomp/host/launcher.h"
 #include "psprecomp/host/settings.h"
 #include "psprecomp/hle.h"
+#include "psprecomp/state.h"
+#include "builds.h"
 #include "pages.h"
 #include "ui.h"
 #include <SDL2/SDL.h>
@@ -28,6 +30,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -36,7 +39,7 @@ extern char **environ;
 enum { UI_W = 1120, UI_H = 800, MAX_GAMES = 32, MAX_FILES = 1024, MAX_PACKS = 16 };
 enum { VIEW_SETTINGS, VIEW_BROWSE };
 enum { GROUP_PLAYER, GROUP_PACK, GROUP_PACKS, GROUP_ABOUT };
-enum { CONFIRM_NONE, CONFIRM_RESET, CONFIRM_DISCARD, CONFIRM_REMOVE, CONFIRM_STOP };
+enum { CONFIRM_NONE, CONFIRM_RESET, CONFIRM_DISCARD, CONFIRM_REMOVE, CONFIRM_STOP, CONFIRM_EARLIER };
 /* What the browser looks for, and what the importer is doing. */
 enum { BROWSE_ISO, BROWSE_PACK };
 enum { WORK_IMPORT, WORK_INSTALL, WORK_REMOVE };
@@ -90,6 +93,10 @@ typedef struct {
     char status[PSP_SETTINGS_ERROR], validation[PSP_SETTINGS_ERROR];
     pid_t child; int child_error_fd;
     char child_error[2048]; size_t child_error_len;
+    /* The build the game's place on quitting needs, when this one cannot
+     * load it (src/host/builds.h), the player's answer, and when the place
+     * was saved. */
+    char earlier[4096]; int earlier_choice; int64_t earlier_saved;
 } launcher;
 
 /* ---- packs ------------------------------------------------------------------------ */
@@ -316,6 +323,44 @@ static int game_folder(launcher *a, const char *kind, char *out, size_t cap) {
     int n = snprintf(out, cap, "%s/%s/%s", root, kind, a->games[a->game].slug);
     return n > 0 && (size_t)n < cap ? 0 : -1;
 }
+/* States across updates (src/host/builds.h). The selected game's place on
+ * quitting, when the build about to play cannot load it but the build that
+ * wrote it is kept: that build, into a->earlier. A build that cannot say
+ * its fingerprint is asked nothing of; the game sets the place aside
+ * itself if it cannot load it (boot.c). */
+static int earlier_needed(launcher *a) {
+    char states[4096], quit[4200], current[4096], games[4096];
+    if (!a->game_count || !a->module || game_folder(a, "states", states, sizeof states) || !*states) return 0;
+    snprintf(quit, sizeof quit, "%s/quit.state", states);
+    psp_state_info info;
+    if (psp_state_peek(quit, &info, NULL) || !info.exe) return 0;
+    psp_build_games(a->module, current, sizeof current);
+    uint64_t exe, fp;
+    if (psp_build_id(current, &exe, &fp) || !fp || info.fingerprint == fp) return 0;
+    psp_build_games(current, games, sizeof games);
+    if (psp_build_find(games, info.exe, a->earlier, sizeof a->earlier)) return 0;
+    a->earlier_saved = info.saved;
+    return 1;
+}
+
+/* The builds no state needs, removed: of every game ready to play, beside
+ * the build it plays. Never while a game runs or one is being prepared. */
+static void prune_builds(launcher *a) {
+    if (a->child || working(a)) return;
+    for (int i = 0; i < a->game_count; i++) {
+        const game_entry *g = &a->games[i];
+        if (!g->boot || !*g->boot || !g->module || !*g->module) continue;
+        char root[4096], states[4200], current[4096], games[4096], removed[1024];
+        if (data_root(root, sizeof root)) return;
+        snprintf(states, sizeof states, "%s/states/%s", root, g->slug);
+        psp_build_games(g->module, current, sizeof current);
+        psp_build_games(current, games, sizeof games);
+        const int n = psp_builds_prune(games, current, states, removed, sizeof removed);
+        if (n) fprintf(stderr, "launcher: removed %d earlier build(s) of %s that no save state needs: %s\n",
+                       n, g->slug, removed);
+    }
+}
+
 /* A launch path in absolute form, so it still resolves after the child
  * changes directory. Nothing is canonicalised; the spelling is kept. */
 static int absolute(const char *path, char *out, size_t cap) {
@@ -352,6 +397,14 @@ static void launch_game(launcher *a) {
         strcpy(a->status, "The null renderer is for diagnostics. Choose OpenGL or software before playing."); return;
     }
     if (save(a)) return;
+    /* A place on quitting only an earlier build can load: the player
+     * chooses where to play (CONFIRM_EARLIER), which comes back here. */
+    const int earlier = a->earlier_choice;
+    a->earlier_choice = 0;
+    if (!earlier && effective.number[PSP_OPT_STATE_START] && earlier_needed(a)) { a->confirm = CONFIRM_EARLIER; return; }
+    char earlier_module[4200];
+    snprintf(earlier_module, sizeof earlier_module, "%s/module.elf", a->earlier);
+    const char *module_path = earlier == 1 ? earlier_module : a->module;
     char save_root[4096], state_root[4096], boot[4096], module[4096], iso[4096], config[4096];
     if (game_folder(a, "saves", save_root, sizeof save_root)) {
         strcpy(a->status, "Cannot find the save folder: PSPRECOMP_DATA_ROOT, XDG_DATA_HOME or HOME must be an absolute path."); return;
@@ -359,11 +412,12 @@ static void launch_game(launcher *a) {
     if (*save_root && make_directories(save_root)) {
         snprintf(a->status, sizeof a->status, "Cannot make the save folder %.300s: %s", save_root, strerror(errno)); return;
     }
-    if (absolute(a->boot, boot, sizeof boot) || absolute(a->module, module, sizeof module) ||
+    if (absolute(a->boot, boot, sizeof boot) || absolute(module_path, module, sizeof module) ||
         (a->iso && absolute(a->iso, iso, sizeof iso)) || absolute(a->path, config, sizeof config)) {
         strcpy(a->status, "Cannot launch: a game path is too long."); return;
     }
     if (*save_root) fprintf(stderr, "launcher: saves %s\n", save_root);
+    if (earlier == 1) fprintf(stderr, "launcher: playing the earlier build %s\n", a->earlier);
     /* The game's environment, with its state folder: built before the fork,
      * since only async-signal-safe calls may follow it. */
     static char state_var[4200];
@@ -445,6 +499,7 @@ static void poll_child(launcher *a) {
     if (done <= 0) return;
     close(a->child_error_fd); a->child = 0;
     reread(a);
+    prune_builds(a);
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) { a->running = 0; return; }
     SDL_ShowWindow(a->window); SDL_RaiseWindow(a->window);
     snprintf(a->status, sizeof a->status, "The game stopped (%s %d). See the log for details.",
@@ -655,6 +710,24 @@ static void footer(launcher *a) {
 static void confirm_prompt(launcher *a) {
     if (!a->confirm) { psp_ui_confirm_close(); return; }
     char text[512];
+    if (a->confirm == CONFIRM_EARLIER) {
+        /* Where to play, when the place on quitting is an earlier version's:
+         * there, as that version was, or here from the start, keeping that
+         * place for the game's menu. Backing out plays nothing. */
+        char when[64] = "";
+        const time_t t = (time_t)a->earlier_saved;
+        struct tm tm;
+        if (t && localtime_r(&t, &tm)) strftime(when, sizeof when, " on %d %b at %H:%M", &tm);
+        snprintf(text, sizeof text, "You last quit %s in an earlier version of the player%s. That version is kept, so you "
+                 "can continue there, as it played then. Or start this version from the beginning: your place in the "
+                 "earlier one stays in the game's menu, under Load state.", game_title(a), when);
+        const int answer = psp_ui_choose("Continue where you quit?", text, "Continue in the earlier version",
+                                         "Start in this version", "Cancel");
+        if (answer < 0) return;
+        a->confirm = CONFIRM_NONE;
+        if (answer) { a->earlier_choice = answer; launch_game(a); }
+        return;
+    }
     const char *title = "", *yes = "";
     if (a->confirm == CONFIRM_RESET && a->group == GROUP_PLAYER) {
         title = "Reset to defaults?"; yes = "Reset";
@@ -923,6 +996,7 @@ static int start(launcher *a, int argc, char **argv, int *check_startup, const c
      * is at stake. */
     use_pack(a, pack_count ? 0 : -1);
     if (library_load(a, 0)) return 2;
+    prune_builds(a);
     qsort(a->games, (size_t)a->game_count, sizeof a->games[0], title_order);
     if (a->game_count) {
         /* Open on the requested title, else the remembered one, else the first. */

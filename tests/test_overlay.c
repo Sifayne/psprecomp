@@ -476,9 +476,40 @@ static void bind(void) {
     finish_loop("bind");
 }
 
+/* States from an earlier version (src/host/builds.h): what the menu says of
+ * one whose build is kept and of one whose build is gone; that loading the
+ * kept one asks to restart in that version, and the gone one is refused; and
+ * what the restart starts with -- this run's arguments, with the build's
+ * executable and module, and the state to load in place of any other. */
+static void earlier(void) {
+    char detail[256];
+    o.open = 1;
+    o.have[SLOT_EARLIER] = 1; o.info[SLOT_EARLIER].usable = 0; o.kept[SLOT_EARLIER] = 0;
+    slot_detail(SLOT_EARLIER, detail, sizeof detail);
+    assert(strstr(detail, "no longer kept"));
+    ask_load(SLOT_EARLIER);
+    assert(!o.confirm);
+    o.kept[SLOT_EARLIER] = 1; o.info[SLOT_EARLIER].saved = 1760000000; o.info[SLOT_EARLIER].guest_us = 3723000000ull;
+    slot_detail(SLOT_EARLIER, detail, sizeof detail);
+    assert(strstr(detail, "played 1:02:03") && strstr(detail, "earlier version"));
+    ask_load(SLOT_EARLIER);
+    assert(o.confirm == SLOT_EARLIER + 1 && o.confirm_load == 2);
+    o.confirm = 0;
+    char cmdline[] = "/games/g/new/game\0/games/g/new/module.elf\0/disc.iso\0--config\0/c.ini\0"
+                     "--load-state\0/s/x.state\0--window";
+    char game[] = "/games/g/old/game", module[] = "/games/g/old/module.elf", state[] = "/s/earlier.state";
+    char *argv[16];
+    const int n = restart_args(cmdline, sizeof cmdline, game, module, state, argv, 16);
+    const char *want[] = { game, module, "/disc.iso", "--config", "/c.ini", "--window", "--load-state", state };
+    assert(n == 8 && !argv[8]);
+    for (int i = 0; i < 8; i++) assert(!strcmp(argv[i], want[i]));
+    puts("menu: an earlier version's state, kept or not, and the restart that loads it");
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
     if (!strcmp(argv[1], "ui")) ui();
+    else if (!strcmp(argv[1], "earlier")) earlier();
     else if (!strcmp(argv[1], "held")) held();
     else if (!strcmp(argv[1], "bind")) bind();
     else if (!strcmp(argv[1], "pad")) pad();

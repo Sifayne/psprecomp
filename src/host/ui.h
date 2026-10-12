@@ -111,6 +111,10 @@ void psp_ui_table_end(void);
 void psp_ui_prompt(const char *title, const char *text);
 /* The same with an answer: 1 for `yes`, 0 for `no`, -1 while it waits. */
 int  psp_ui_confirm(const char *title, const char *text, const char *yes, const char *no);
+/* A question with two answers and a way back: 1 for `first`, 2 for
+ * `second`, 0 for `cancel` -- Escape and B too, so backing out never takes
+ * an answer -- and -1 while it waits. Withdrawn by psp_ui_confirm_close. */
+int  psp_ui_choose(const char *title, const char *text, const char *first, const char *second, const char *cancel);
 /* The question withdrawn without an answer, when its asker no longer waits. */
 void psp_ui_confirm_close(void);
 /* A line of text asked for, edited in buf: 1 when given, 0 when not, -1
