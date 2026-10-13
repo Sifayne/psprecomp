@@ -334,6 +334,7 @@ typedef struct {
      * reporting on the clock"). */
     int      done;
     int      paused;    /* stopped at a PAUSE until sceGeContinue */
+    int      ran;       /* paused after it had run: started, for sceGeListDeQueue */
     int      psig;      /* between a PAUSE's SIGNAL and its FINISH */
     /* Where the walk itself is, which may be ahead. */
     int      xdone;     /* walked to its end */
@@ -490,6 +491,10 @@ static void cap_note_list(const ge_queue *q);
 static void view_log_note(void);          /* PSPRECOMP_VIEW_LOG; see below */
 static void view_log_note_world(void);
 static void cap_snapshot_memory(void);
+/* The last word of each command the GE has run, as its command registers
+ * hold it: what sceGeGetCmd reads. */
+static uint32_t g_ge_cmd[256];
+
 /* List ids order the queue: the walk and the guest take lists in id order.
  * sceGeListEnQueue's count up from 0x80000 and sceGeListEnQueueHead's down
  * from below it, so a list put at the head has the lowest id of all. */
@@ -781,6 +786,7 @@ void psp_ge_reset(void) {
     g_col_n = 0; g_col_last_valid = 0;
     g_clear_draws = g_clear_z_draws = 0;
     memset(&g_tl, 0, sizeof g_tl);
+    memset(g_ge_cmd, 0, sizeof g_ge_cmd);
     g_bone16_ok = 0;
     memset(&g_light_eye_from, 0, sizeof g_light_eye_from);
     g_next_id = g_head_id = 0x00080000u;
@@ -4765,6 +4771,10 @@ static int run_finish(ge_queue *q, uint32_t arg, uint64_t t0) {
      * has nothing to batch. A backend that accumulates geometry has no
      * flush point without this, so its batch spans a whole frame. */
     psp_render_current()->finish();
+    /* The END after it is the list's last word. The walk stops here, but
+     * the GE runs that END, so its register holds it (sceGeGetCmd). */
+    const uint8_t *end = psp_mem_ptr(q->list, 4);
+    if (end && end[3] == GE_END) memcpy(&g_ge_cmd[GE_END], end, 4);
     /* The list is done before its handler runs, so a handler that
      * asks after it is told so. Not measured. */
     ge_x_done(q, t0);
@@ -4863,6 +4873,7 @@ static void run_list_body(ge_queue *q) {
         const uint64_t t0 = g_ge_t;
         q->list += 4;
         g_ge.commands++;
+        g_ge_cmd[cmd] = word;
         g_ge_t += GE_COMMAND_UNITS;
 
         switch (cmd) {
@@ -4932,11 +4943,15 @@ static void ge_execute(void);
 static void ge_kick(void);
 
 /* The firmware's refusals, with uOFW's names (include/common/errors.h):
- * an argument or a state it cannot act on, a full pool, and an id that
- * names no list. */
+ * an argument or a state it cannot act on, a list it cannot take out of
+ * the queue, a full pool, an id that names no list, and an index past a
+ * table's end. */
 #define GE_ERROR_INVALID_VALUE 0x800001FEu
+#define GE_ERROR_BUSY          0x80000021u
 #define GE_ERROR_OUT_OF_MEMORY 0x80000022u
 #define GE_ERROR_INVALID_ID    0x80000100u
+#define GE_ERROR_INVALID_INDEX 0x80000102u
+#define GE_ERROR_PRIV_REQUIRED 0x80000023u
 
 static void enqueue(int head) {
     /* (list, stall, cbid, arg) */
@@ -5044,9 +5059,8 @@ static void enqueue(int head) {
      * DrawSync, even 10 ms later. Tiny lists that pspgu's helpers poll
      * have finished by then because the kick window ran them.
      *
-     * Not yet modelled: DeQueue and GetCmd/GetMtx/GetStack (unregistered,
-     * so they answer 0). EnQueueHead, sceGeBreak and the queue-full code
-     * are, after uOFW's reconstruction; none of them is measured. */
+     * EnQueueHead, DeQueue, sceGeBreak and the queue-full code follow
+     * uOFW's reconstruction; none of them is measured. */
     g_ge.lists++;
     /* The call itself takes time: step 81's first SIGNAL, the list's first
      * word, calls its handler 41-51 microseconds after the call is made,
@@ -5183,7 +5197,7 @@ static void ge_advance(uint64_t limit, int defer, int follow, uint32_t through) 
             g_tl_done_at = e.at;
             break;
         case GE_EV_PAUSE:
-            if (ev_live(&e)) { e.q->paused = 1; e.q->psig = 0; }
+            if (ev_live(&e)) { e.q->paused = 1; e.q->psig = 0; e.q->ran = 1; }
             break;
         case GE_EV_PSIG:
             if (ev_live(&e)) e.q->psig = 1;
@@ -5378,6 +5392,7 @@ static void ge_keep(void) {
     PSP_STATE_KEEP(g_head_id);
     PSP_STATE_KEEP(g_tl);
     PSP_STATE_KEEP(g_ge);
+    PSP_STATE_KEEP(g_ge_cmd);
     PSP_STATE_KEEP(g_imm);
     PSP_STATE_KEEP(g_ge_owner);
     psp_state_register(&part);
@@ -5929,6 +5944,73 @@ static void hle_Continue(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* sceGeListDeQueue: takes a list out of the queue before the GE has
+ * started it, as uOFW reconstructs it. An id that names no list answers
+ * SCE_ERROR_INVALID_ID; a list the GE has started -- the one running or
+ * waiting at its stall, one paused after it ran, or one finished and not
+ * yet retired by DrawSync(WAIT) -- SCE_ERROR_BUSY. A list
+ * sceGeListEnQueueHead put in front, paused, has not started. Not measured.
+ * The walk may have run the list already, ahead of what the guest has
+ * seen: it leaves the queue all the same, and what it drew stays drawn. */
+static void hle_ListDeQueue(void) {
+    ge_queue *q = find_queue(psp_arg(0));
+    if (!q) { psp_ret(GE_ERROR_INVALID_ID); return; }
+    if (q->done || q->ran || (q == oldest_pending() && !q->paused)) {
+        psp_ret(GE_ERROR_BUSY);
+        return;
+    }
+    for (unsigned i = g_ev_held ? 1u : 0u; i < g_ev_n;)
+        if (ev_at(i)->q == q && ev_at(i)->qid == q->id) ev_remove(i); else i++;
+    q->used = 0;
+    ge_execute();                /* the walk may have been held in it */
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* sceGeGetCmd(cmd): the last word of that command the GE has run, as
+ * uOFW's reads the command registers; 0xFF and past answer
+ * SCE_ERROR_INVALID_INDEX. The walk may be ahead of what the guest has
+ * seen. Not measured. */
+static void hle_GetCmd(void) {
+    const uint32_t cmd = psp_arg(0);
+    psp_ret(cmd < 0xFF ? g_ge_cmd[cmd] : GE_ERROR_INVALID_INDEX);
+}
+
+/* sceGeGetMtx(id, int *mtx): a matrix as the GE holds it, each element the
+ * 24-bit float its upload command carried (ge_float, undone). The ids are
+ * uOFW's ge_user.h SCE_GE_MTX_*: bones 0-7, world, view, projection (16
+ * elements; the others have 12) and texture generation. An id past them
+ * answers SCE_ERROR_INVALID_INDEX; a buffer the call cannot write,
+ * SCE_ERROR_PRIV_REQUIRED, the firmware's answer to a kernel address. Not
+ * measured. */
+enum { GE_MTX_WORLD = 8, GE_MTX_VIEW, GE_MTX_PROJ, GE_MTX_TGEN, GE_MTX_COUNT };
+static void hle_GetMtx(void) {
+    const uint32_t id = psp_arg(0), out = psp_arg(1);
+    if (id >= GE_MTX_COUNT) { psp_ret(GE_ERROR_INVALID_INDEX); return; }
+    const float *m = id == GE_MTX_WORLD ? g_tl.world
+                   : id == GE_MTX_VIEW  ? g_tl.view
+                   : id == GE_MTX_PROJ  ? g_tl.proj
+                   : id == GE_MTX_TGEN  ? g_tl.tgen
+                   : &g_tl.bone[12 * id];
+    const uint32_t n = id == GE_MTX_PROJ ? 16 : 12;
+    if (!psp_mem_ptr(out, 4 * n)) { psp_ret(GE_ERROR_PRIV_REQUIRED); return; }
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t bits;
+        memcpy(&bits, &m[i], sizeof bits);
+        psp_write32(out + 4 * i, bits >> 8);
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* sceGeGetStack(id, SceGeStack *): uOFW's reads the front list's software
+ * stack, the frames a SIGNAL call behaviour pushes. Those behaviours are
+ * not modelled (run_signal), so the stack is always empty: 0 frames for an
+ * id below 0 or with no list pending, and SCE_ERROR_INVALID_INDEX for any
+ * frame asked for. */
+static void hle_GetStack(void) {
+    const int32_t id = (int32_t)psp_arg(0);
+    psp_ret(id >= 0 && oldest_pending() ? GE_ERROR_INVALID_INDEX : 0);
+}
+
 /* sceGeSetCallback(PspGeCallbackData *): signal_func, signal_arg,
  * finish_func, finish_arg, copied now; the id goes to sceGeListEnQueue. The
  * table holds 16 and a full one answers 0x80000022: geprobe 5 step 59 (fw
@@ -5973,6 +6055,7 @@ void psp_ge_register(void) {
     ge_keep();
     psp_hle_register(0xAB49E76A, "sceGe_user", "sceGeListEnQueue",         hle_ListEnQueue);
     psp_hle_register(0x1C0D95A6, "sceGe_user", "sceGeListEnQueueHead",     hle_ListEnQueueHead);
+    psp_hle_register(0x5FB86AB0, "sceGe_user", "sceGeListDeQueue",         hle_ListDeQueue);
     psp_hle_register(0xE0D68148, "sceGe_user", "sceGeListUpdateStallAddr", hle_ListUpdateStallAddr);
     psp_hle_register(0x03444EB4, "sceGe_user", "sceGeListSync",            hle_ListSync);
     psp_hle_register(0xB287BD61, "sceGe_user", "sceGeDrawSync",            hle_DrawSync);
@@ -5980,6 +6063,9 @@ void psp_ge_register(void) {
     psp_hle_register(0x4C06E472, "sceGe_user", "sceGeContinue",            hle_Continue);
     psp_hle_register(0xA4FC06A4, "sceGe_user", "sceGeSetCallback",         hle_SetCallback);
     psp_hle_register(0x05DB22CE, "sceGe_user", "sceGeUnsetCallback",       hle_UnsetCallback);
+    psp_hle_register(0xDC93CFEF, "sceGe_user", "sceGeGetCmd",              hle_GetCmd);
+    psp_hle_register(0x57C8945B, "sceGe_user", "sceGeGetMtx",              hle_GetMtx);
+    psp_hle_register(0xE66CB92E, "sceGe_user", "sceGeGetStack",            hle_GetStack);
     psp_hle_register(0xE47E40E4, "sceGe_user", "sceGeEdramGetAddr",        hle_EdramGetAddr);
     psp_hle_register(0x1F6752AD, "sceGe_user", "sceGeEdramGetSize",        hle_EdramGetSize);
 }
