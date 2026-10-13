@@ -297,7 +297,9 @@ static int fx16_sat(float f) {
 /* PATCHPRIMITIVE: what a patch is drawn as. */
 enum { GE_PATCH_TRIANGLES = 0, GE_PATCH_LINES = 1, GE_PATCH_POINTS = 2 };
 
-#define MAX_QUEUES 8
+/* The firmware's display-list pool: 64 lists, as uOFW reconstructs it
+ * (g_displayLists[MAX_COUNT_DL]); not measured. */
+#define MAX_QUEUES 64
 #define GE_STACK   8
 
 /* SIGNAL behaviour emitted by sceGuSignal(GU_SIGNAL_PAUSE); PSPSDK's pspgu.h
@@ -4929,9 +4931,12 @@ static void ge_release(int was_busy);
 static void ge_execute(void);
 static void ge_kick(void);
 
-/* SCE_ERROR_INVALID_VALUE: the firmware's refusal of an argument or a
- * state it cannot act on. */
+/* The firmware's refusals, with uOFW's names (include/common/errors.h):
+ * an argument or a state it cannot act on, a full pool, and an id that
+ * names no list. */
 #define GE_ERROR_INVALID_VALUE 0x800001FEu
+#define GE_ERROR_OUT_OF_MEMORY 0x80000022u
+#define GE_ERROR_INVALID_ID    0x80000100u
 
 static void enqueue(int head) {
     /* (list, stall, cbid, arg) */
@@ -4960,7 +4965,10 @@ static void enqueue(int head) {
         for (int i = 0; i < MAX_QUEUES; i++)
             if (g_queue[i].done && (!q || g_queue[i].serial < q->serial)) q = &g_queue[i];
 
-    if (!q) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    /* A pool of lists still pending answers SCE_ERROR_OUT_OF_MEMORY, as
+     * uOFW's _sceGeListEnQueue does when its free queue is empty; not
+     * measured. */
+    if (!q) { psp_ret(GE_ERROR_OUT_OF_MEMORY); return; }
 
     /* sceGeListEnQueueHead puts its list in front of every other, paused
      * until sceGeContinue. Only a paused list at the front, or none, lets
@@ -5037,8 +5045,8 @@ static void enqueue(int head) {
      * have finished by then because the kick window ran them.
      *
      * Not yet modelled: DeQueue and GetCmd/GetMtx/GetStack (unregistered,
-     * so they answer 0), and the queue-full code (hardware 0x80000022; a
-     * full pool here answers NO_MEMORY). EnQueueHead and sceGeBreak are. */
+     * so they answer 0). EnQueueHead, sceGeBreak and the queue-full code
+     * are, after uOFW's reconstruction; none of them is measured. */
     g_ge.lists++;
     /* The call itself takes time: step 81's first SIGNAL, the list's first
      * word, calls its handler 41-51 microseconds after the call is made,
@@ -5093,7 +5101,7 @@ static ge_queue *oldest_pending(void) {
 }
 
 static int list_status(ge_queue *q) {
-    if (!q || !q->used) return 0x80000100;
+    if (!q || !q->used) return GE_ERROR_INVALID_ID;
     if (q->done) return GE_LIST_DONE;
     if (q->paused) return GE_LIST_PAUSED;
     if (q != oldest_pending()) return GE_LIST_QUEUED;
@@ -5810,7 +5818,7 @@ void psp_ge_current_target(uint32_t *addr, uint32_t *stride, int *fmt) {
 
 static void hle_ListSync(void) {
     ge_queue *q = find_queue(psp_arg(0));
-    if (!q) { psp_ret(0x80000100); return; }
+    if (!q) { psp_ret(GE_ERROR_INVALID_ID); return; }
     if (psp_arg(1) == GE_SYNC_WAIT && !g_tl_in) ge_deliver(1);
     if (q->done) { psp_ret(GE_LIST_DONE); return; }
     /* NOWAIT tells the truth: 4 while paused, 1 queued behind another list,

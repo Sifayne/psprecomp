@@ -196,15 +196,17 @@ static void enqueue_head(void) {
     CHECK(call(0x03444eb4, id_a, 1, 0) == 0x80000100u && call(0x03444eb4, id_c, 1, 0) == 0x80000100u);
     cases++;
 }
-/* A full pool gives up the finished list queued first. A head list's id is
- * below every other, but one that has only just finished is the newest, and
- * a late ListSync still finds it. */
+/* The pool holds 64 lists (uOFW's; not measured). A full one gives up the
+ * finished list queued first: a head list's id is below every other, but
+ * one that has only just finished is the newest, and a late ListSync still
+ * finds it. */
+#define POOL 64
 #define SHORT_LIST 0x08812000u
 static void reuse_oldest(void) {
     psp_ge_reset();
     psp_write32(SHORT_LIST, 0x0f000000); psp_write32(SHORT_LIST + 4, 0x0c000000);
-    uint32_t ids[7];
-    for (unsigned i = 0; i < 7; i++) {
+    uint32_t ids[POOL - 1];
+    for (unsigned i = 0; i < POOL - 1; i++) {
         ids[i] = call(0xab49e76a, SHORT_LIST, 0, (uint32_t)-1);
         CHECK(ids[i] < 0x80000000u && call(0x03444eb4, ids[i], 0, 0) == 0);
     }
@@ -215,6 +217,23 @@ static void reuse_oldest(void) {
     CHECK(call(0x03444eb4, ids[0], 1, 0) == 0x80000100u);
     CHECK(call(0x03444eb4, head, 1, 0) == 0 && call(0x03444eb4, ids[1], 1, 0) == 0);
     call(0xb287bd61, 0, 0, 0);
+    cases++;
+}
+/* With every list still pending -- each held at its stall -- the 65th is
+ * refused with SCE_ERROR_OUT_OF_MEMORY, as uOFW's _sceGeListEnQueue answers
+ * an empty free queue. */
+#define STALLED_LISTS 0x08814000u
+static void pool_full(void) {
+    psp_ge_reset();
+    for (unsigned i = 0; i < POOL; i++) {
+        const uint32_t at = STALLED_LISTS + 16 * i;
+        psp_write32(at, 0x0f000000); psp_write32(at + 4, 0x0c000000);
+        CHECK(call(0xab49e76a, at, at, (uint32_t)-1) < 0x80000000u);
+    }
+    const uint32_t at = STALLED_LISTS + 16 * POOL;
+    CHECK(call(0xab49e76a, at, at, (uint32_t)-1) == 0x80000022u);
+    call(0xb448ec0d, 1, 0, 0);                /* sceGeBreak(1) drops them all */
+    psp_ge_reset();
     cases++;
 }
 static void environment(const char *key, const char *value) {
@@ -276,6 +295,7 @@ int main(int argc, char **argv) {
         suspending(2);
         enqueue_head();
         reuse_oldest();
+        pool_full();
         setup();
         psp_ge_replay_list(LIST, 0, 0);
         check_pixels();
