@@ -244,6 +244,9 @@ const char *psp_sched_stop_reason(void);
  * out at least once (0 otherwise). */
 void     psp_poll_reset(void);
 uint64_t psp_poll_longest(uint32_t *at);
+/* How many back edges a stretch runs before its polls act (sched.c,
+ * POLL_ACT); a test sets it low. Returns the value it replaces. */
+uint64_t psp_poll_set_act(uint64_t back_edges);
 
 /* Whether psp_sched_stop_all has been called. A thread running guest code
  * between firmware calls never looks at the token, so a stop only reaches it

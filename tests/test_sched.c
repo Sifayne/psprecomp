@@ -32,6 +32,7 @@
 #include "psprecomp/cpu.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/os.h"
+#include "psprecomp/recomp_rt.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -643,6 +644,56 @@ static void test_expired_delay_preempts_a_spinner(void) {
           "before the spinner gave up at %d", spin_at_wake, SPIN_LIMIT);
 }
 
+/* A thread that loops with no firmware call at all (PSP_POLL, recomp_rt.h)
+ * gives way to an expired delay too, once its stretch has run past the
+ * threshold: each budget after it is guest time, with the reschedule a call
+ * would have run. Hardware: a 5 ms delay ends inside a less urgent thread's
+ * 30 ms spin, which is preempted (threadprobe fw660-v3 [84]). Below the
+ * threshold a loop changes nothing, not even the clock. */
+#define ENTRY_LOOP_SLEEPER 0x0000E100u
+#define ENTRY_LOOPER       0x0000E200u
+#define UID_LOOP_SLEEPER   0x0004000Bu
+#define UID_LOOPER         0x0004000Cu
+#define LOOP_ACT           (4l * 65536)
+#define LOOP_LIMIT         (64l * 65536)
+static long loop_count, loop_at_wake;
+
+static void body_loop_sleeper(void) {
+    psp_sched_delay(2000);
+    loop_at_wake = loop_count;
+    sleeper_woke = 1;
+    check_one_running("inside the loop's sleeper, after its delay");
+}
+
+static void body_looper(void) {
+    for (loop_count = 0; loop_count < LOOP_LIMIT && !sleeper_woke; loop_count++) PSP_POLL(0x08900000u);
+}
+
+static void test_expired_delay_preempts_a_loop(void) {
+    psp_sched_reset();
+    psp_sched_set_threading(1);
+    psp_clock_reset();
+    sleeper_woke = 0;
+    loop_count = loop_at_wake = 0;
+
+    const uint64_t t0 = psp_clock_peek();
+    for (long i = 0; i < 200000; i++) PSP_POLL(0x08900000u);
+    CHECK(psp_clock_peek() == t0, "a loop under the threshold moved the clock");
+
+    const uint64_t act = psp_poll_set_act(LOOP_ACT);
+    CHECK(psp_sched_spawn(UID_LOOP_SLEEPER, ENTRY_LOOP_SLEEPER, FAKE_SP, 0, 0, 0, 30) == 0,
+          "spawning the loop's sleeper failed");
+    CHECK(psp_sched_spawn(UID_LOOPER, ENTRY_LOOPER, FAKE_SP, 0, 0, 0, 40) == 0,
+          "spawning the looper failed");
+    const int live = psp_sched_drain(5);
+    psp_poll_set_act(act);
+    CHECK(live == 0, "%d thread(s) still alive", live);
+    CHECK(sleeper_woke, "the loop's sleeper never woke");
+    CHECK(loop_at_wake >= LOOP_ACT && loop_at_wake < LOOP_LIMIT,
+          "the sleeper ran after %ld back edges; it should have been let in past the "
+          "threshold (%ld) and before the loop gave up (%ld)", loop_at_wake, LOOP_ACT, LOOP_LIMIT);
+}
+
 /* psp_sched_run_on: a function run on a parked thread's own host thread while
  * the caller waits, as the GE's walk is handed to the thread whose host thread
  * holds the GL context (src/hle/ge.c). Host-thread-local state tells the two
@@ -845,6 +896,8 @@ int main(void) {
     psp_register(ENTRY_CTX_ASKER, body_ctx_asker);
     psp_register(ENTRY_HOLDER, body_holder);
     psp_register(ENTRY_HOST_OWNER, body_host_owner);
+    psp_register(ENTRY_LOOP_SLEEPER, body_loop_sleeper);
+    psp_register(ENTRY_LOOPER, body_looper);
     psp_register(ENTRY_ASK_MAIN, body_ask_main);
     psp_register(ENTRY_HOST_ASKER, body_host_asker);
     psp_register(ENTRY_Q_C + 0x30, body_st);
@@ -874,6 +927,7 @@ int main(void) {
     test_timed_wait_expires_when_nothing_can_satisfy_it();
     test_timed_wait_prefers_a_signal();
     test_expired_delay_preempts_a_spinner();
+    test_expired_delay_preempts_a_loop();
     test_block_and_wake_round_trip();
     test_thread_identity();
     test_guest_thread_unsatisfiable_wait();

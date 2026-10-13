@@ -52,6 +52,10 @@ void psp_hle_call(uint32_t nid);
  * library neither the firmware nor a started module provides answers
  * SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED, as an unlinked import does. */
 void psp_hle_import(uint32_t nid, const char *lib);
+/* A loop that has run long without a firmware call (sched.c, psp_poll):
+ * `us` of guest time, then what a call's entry and return give the rest of
+ * the machine, with no call. */
+void psp_hle_poll(uint64_t us);
 /* How a call a thread can be parked in finishes on a thread restored from a
  * save state (psprecomp/state.h): the handler's code after its wait, from
  * what the wait left in the thread's record. A call without one refuses a
