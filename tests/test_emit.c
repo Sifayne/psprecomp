@@ -655,6 +655,71 @@ static void test_replace_absent_changes_nothing(void) {
     a_analysis_free(&an);
 }
 
+/* Every backward transfer counts down the loop budget (recomp_rt.h,
+ * PSP_POLL): a conditional branch back, a `j` back to a label and a `j` back
+ * to the function's own entry (a tail call to itself) all poll, so a thread
+ * looping without a firmware call still reaches the runtime. The forward
+ * branches do not. */
+#define LP_BASE 0x08805000u
+
+static const uint32_t LP_CODE[] = {
+    0x2484FFFF,  /* +00  addiu $a0, $a0, -1                                  */
+    0x1480FFFE,  /* +04  bne   $a0, $zero, +00   back                         */
+    0x00000000,  /* +08  nop                                                  */
+    0x24A5FFFF,  /* +0C  addiu $a1, $a1, -1                                  */
+    0x10A00003,  /* +10  beq   $a1, $zero, +20   forward                      */
+    0x00000000,  /* +14  nop                                                  */
+    0x0A201403,  /* +18  j     +0C               back, to a label             */
+    0x00000000,  /* +1C  nop                                                  */
+    0x10C00003,  /* +20  beq   $a2, $zero, +30   forward                      */
+    0x00000000,  /* +24  nop                                                  */
+    0x0A201400,  /* +28  j     +00               back, to the entry           */
+    0x00000000,  /* +2C  nop                                                  */
+    0x03E00008,  /* +30  jr    $ra                                            */
+    0x00000000,  /* +34  nop                                                  */
+};
+
+static void test_back_edges_poll(void) {
+    uint8_t code[sizeof LP_CODE];
+    for (size_t i = 0; i < sizeof LP_CODE / sizeof LP_CODE[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(LP_CODE[i]);
+        code[i * 4 + 1] = (uint8_t)(LP_CODE[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(LP_CODE[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(LP_CODE[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = LP_BASE;
+    an.size = (uint32_t)sizeof code;
+
+    const uint32_t seed = LP_BASE;
+    CHECK(a_discover(&an, &seed, 1, 1) == 0, "loops: discovery runs");
+
+    emit_opts o = {0};
+    o.outdir = ".";
+    o.prefix = "t_lp";
+    o.module = "synthetic";
+    CHECK(a_emit(&an, &o) == 0, "loops: emission succeeds");
+
+    char *src = slurp("./t_lp_funcs.c", NULL);
+    CHECK(src != NULL, "loops: generated .c is readable");
+    if (!src) { a_analysis_free(&an); return; }
+
+    int entry = 0, inner = 0, other = 0;
+    for (const char *p = src; (p = strstr(p, "PSP_POLL(")) != NULL; p++) {
+        if (!strncmp(p, "PSP_POLL(0x08805000u)", 21)) entry++;
+        else if (!strncmp(p, "PSP_POLL(0x0880500Cu)", 21)) inner++;
+        else other++;
+    }
+    CHECK(entry == 2 && inner == 1 && other == 0,
+          "loops: the branch back and the jump to the entry name +00, the jump to the label +0C,"
+          " and nothing else polls: %d, %d, %d", entry, inner, other);
+    free(src);
+    a_analysis_free(&an);
+}
+
 int main(void) {
     uint8_t code[sizeof CODE];
     for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
@@ -760,6 +825,7 @@ int main(void) {
     test_cc_latency_and_fpu_trap();
     test_replace_leaves_the_symbol_to_the_host();
     test_replace_absent_changes_nothing();
+    test_back_edges_poll();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

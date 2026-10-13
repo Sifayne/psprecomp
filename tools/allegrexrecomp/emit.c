@@ -983,7 +983,8 @@ static void emit_function(ectx *c, const a_func *fn) {
                 if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "        "); }
                 if (in.is_call) fprintf(f, "        %s = 0x%08Xu;\n", RN[31], a + 8);
                 if (owned_by(an, in.target, owner))
-                    { if (in.target <= a) fprintf(f, "        PSP_LOOP(0x%08Xu);\n", in.target);
+                    { if (in.target <= a) fprintf(f, "        PSP_LOOP(0x%08Xu); PSP_POLL(0x%08Xu);\n",
+                                                  in.target, in.target);
                       fprintf(f, "        goto L_%08X;\n", in.target); }
                 else
                     { emit_static_call(c, in.target); fprintf(f, "        return;\n"); }
@@ -1004,7 +1005,8 @@ static void emit_function(ectx *c, const a_func *fn) {
                 if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "      "); }
                 if (in.is_call) fprintf(f, "      %s = 0x%08Xu;\n", RN[31], a + 8);
                 if (owned_by(an, in.target, owner))
-                    { if (in.target <= a) fprintf(f, "      if (_c) PSP_LOOP(0x%08Xu);\n", in.target);
+                    { if (in.target <= a) fprintf(f, "      if (_c) { PSP_LOOP(0x%08Xu); PSP_POLL(0x%08Xu); }\n",
+                                                  in.target, in.target);
                       fprintf(f, "      if (_c) goto L_%08X; }\n", in.target); }
                 else {
                     fprintf(f, "      if (_c) { ");
@@ -1074,7 +1076,7 @@ static void emit_function(ectx *c, const a_func *fn) {
                     if (c->is_slot[widx(an, la)]) continue;
                     fprintf(f, "      case 0x%08Xu:\n", la);
                 }
-                fprintf(f, "        _entry = _jt; goto _reenter_%08X;\n", fn->addr);
+                fprintf(f, "        PSP_POLL(_jt); _entry = _jt; goto _reenter_%08X;\n", fn->addr);
                 fprintf(f, "      default: break;\n");
                 fprintf(f, "      }\n");
                 fprintf(f, "      psp_dispatch(_jt); }\n    return;\n");
@@ -1089,8 +1091,11 @@ static void emit_function(ectx *c, const a_func *fn) {
         if (in.is_jump) {                        /* j */
             if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
             if (owned_by(an, in.target, owner) && !is_function(an, in.target)) {
+                if (in.target <= a) fprintf(f, "    PSP_POLL(0x%08Xu);\n", in.target);
                 fprintf(f, "    goto L_%08X;\n", in.target);
             } else {
+                /* A tail call to itself is a loop back to its entry. */
+                if (in.target == owner) fprintf(f, "    PSP_POLL(0x%08Xu);\n", in.target);
                 emit_static_call(c, in.target);  /* tail call */
                 fprintf(f, "    return;\n");
             }

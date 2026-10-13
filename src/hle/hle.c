@@ -421,6 +421,7 @@ static void hle_call(uint32_t nid, const char *lib) {
         if (to) { psp_dispatch(to); return; }
     }
     g_call_depth++;
+    psp_poll_reset();
     /* Where the guest resumes after this call: its $ra, set by the jal. */
     psp_census_call_enter(nid, psp_cpu.r[PSP_REG_RA]);
     /* Every firmware call costs a tick of guest time.

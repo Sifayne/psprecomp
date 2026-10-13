@@ -237,6 +237,13 @@ void psp_sched_stop_all(const char *why);
  * print "all finished" for a run the host had just killed, which read as
  * success. This is the difference. */
 const char *psp_sched_stop_reason(void);
+/* Loops without firmware calls (recomp_rt.h, PSP_POLL). A firmware call or a
+ * switch ends the stretch a thread has run since its last one and fills
+ * the budget again; psp_poll_longest says how many back edges the longest
+ * stretch so far ran, and `at` the loop it was in, when it ran the budget
+ * out at least once (0 otherwise). */
+void     psp_poll_reset(void);
+uint64_t psp_poll_longest(uint32_t *at);
 
 /* Whether psp_sched_stop_all has been called. A thread running guest code
  * between firmware calls never looks at the token, so a stop only reaches it

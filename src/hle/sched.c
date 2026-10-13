@@ -547,6 +547,7 @@ static int await_turn_locked(int me) {
         g_parked[me] = 0;
     }
     psp_cpu = g_slot[me].ctx;
+    psp_poll_reset();
     return 0;
 }
 
@@ -1039,6 +1040,38 @@ int psp_sched_delay(uint64_t usec) {
  * carries on, and the slice was what let those workers run. Hardware gives up
  * the CPU inside file I/O instead (threadprobe step 86, fw 6.60), which
  * iofilemgr.c's io_park models; that, not a slice, is what lets them run. */
+/* ---- loops without firmware calls -------------------------------------- */
+
+/* For now the budget only measures: how far the games run between firmware
+ * calls decides how big it can be before it is allowed to act. */
+#define POLL_BUDGET 65535
+int32_t psp_poll_left = POLL_BUDGET;
+static uint64_t g_poll_runs;          /* budgets run out in this stretch */
+static uint32_t g_poll_at;            /* where the last one ran out */
+static uint64_t g_poll_longest;
+static uint32_t g_poll_longest_at;
+
+void psp_poll(uint32_t at) {
+    g_poll_runs++;
+    g_poll_at = at;
+    psp_poll_left = POLL_BUDGET;
+}
+
+void psp_poll_reset(void) {
+    const uint64_t n = g_poll_runs * (POLL_BUDGET + 1u) + (uint64_t)(POLL_BUDGET - psp_poll_left);
+    if (n > g_poll_longest) {
+        g_poll_longest = n;
+        g_poll_longest_at = g_poll_runs ? g_poll_at : 0;
+    }
+    g_poll_runs = 0;
+    psp_poll_left = POLL_BUDGET;
+}
+
+uint64_t psp_poll_longest(uint32_t *at) {
+    if (at) *at = g_poll_longest_at;
+    return g_poll_longest;
+}
+
 void psp_sched_tick(void) {
     if (!g_threading || !g_dispatch || psp_ktimer_in_handler() ||
         psp_interrupt_in_handler() || !psp_interrupt_enabled()) return;
