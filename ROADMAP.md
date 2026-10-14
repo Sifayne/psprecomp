@@ -271,16 +271,28 @@ its name.
 
 Gaps found in the code while checking this file, none of them on a phase above:
 
-- [ ] **The GE's queue calls** — DeQueue and GetCmd/GetMtx/GetStack are
-      unregistered, and a full list pool answers NO_MEMORY rather than the
-      hardware's 0x80000022 (`src/hle/ge.c`). What the GE draws is done:
+- [x] **The GE's queue calls** — DeQueue, GetCmd, GetMtx and GetStack, and a
+      pool of 64 lists whose full answer is 0x80000022, follow uOFW's
+      reconstruction (`src/hle/ge.c`); none is measured, and a geprobe step
+      could. Still unregistered: sceGeSaveContext and sceGeRestoreContext.
+      SIGNAL's call, jump and return behaviours are not modelled, so
+      GetStack's software stack is always empty. What the GE draws is done:
       skinning, morphing, patches, bounding boxes and the rest match the PSP
       bit for bit through geprobe 23. The GL backend's own gaps are listed in
       [`docs/RENDERER.md`](docs/RENDERER.md).
-- [ ] **Preemption** — a thread yields only at firmware calls, so one that
-      spins without calling the kernel hangs (reported, not silent). The 3rd
-      Birthday's host adds a 1 ms yield after GE calls to keep its sound
-      threads fed.
+- [x] **Preemption** — every backward branch and jump in recompiled code
+      counts down a budget (`PSP_POLL`, `include/psprecomp/recomp_rt.h`). A
+      thread that loops 64 M back edges without a firmware call is then
+      treated as an interrupt would treat it: guest time moves on, the GE,
+      interrupts and timers run, and a more urgent thread takes over. 64 M
+      is eight times the longest stretch the replay gate's runs make, so
+      they run as before. Still open:
+      - the PSP time a back edge stands for (20 ns) is not measured;
+      - a loop under 64 M back edges still holds the CPU until it ends.
+
+      The 3rd Birthday's 1 ms yield after GE calls is a different problem:
+      in real time its software renderer's host time is counted as the main
+      thread's guest time, which starves its movie threads.
 - [ ] **Static-constructor discovery** — `src/ctors.c` picks the single
       longest null-terminated table; its own notes say candidates should be
       scored on locality before it is trusted on another title.
@@ -288,8 +300,15 @@ Gaps found in the code while checking this file, none of them on a phase above:
       WipEout Pulse's movies, in up to four contexts. `sceMpegDelete` now lets
       go of a movie's decoders and streams; each movie but the last leaked
       them.
-- [ ] **Secure savedata** — secure modes store plaintext. saveprobe already
-      holds the hardware's secure saves under known keys.
+- [ ] **Secure savedata** — secure modes store plaintext, so neither a PSP's
+      secure save nor one written here moves to the other. On hold (decided
+      with Sif, 12 Oct). What is known:
+      - uOFW's reconstruction of sceChnnlsv reproduces all 35 secure data
+        files in saveprobe's logs (size and CRC32).
+      - It needs KIRK keyseed keys, which per [`docs/DECRYPT.md`](docs/DECRYPT.md)
+        would come from the player's key file.
+      - PARAM.SFO's three hashes are unchecked: saveprobe's binary saves are
+        not in this repository, and the one at 0x20 is keyed to each PSP.
 - [x] **Save states across updates** — an update made every state
       unloadable: a state loaded only into the executable that wrote it.
       Both ways out, as decided with Sif on 10 and 11 Oct

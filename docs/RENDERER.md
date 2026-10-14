@@ -486,9 +486,11 @@ thousand times too fast that cost no time in a Sync):
   usual `sceGuFinish` then `sceGuSync`, the finish handler runs inside the
   Sync.
 - A guest that spins on a flag set by a GE handler without making any
-  firmware call never sees it set. psprecomp cannot interrupt recompiled
-  code, which is already true of alarms and vtimers (`src/hle/ktimer.c`).
-  With any firmware call in the loop, the GE progresses and the handler runs.
+  firmware call sees it set only once its loop has run 64 M back edges.
+  From there each loop budget moves the clock and gives the GE, interrupts
+  and timers their turn, as a firmware call would (`PSP_POLL`,
+  `src/hle/sched.c`). With any firmware call in the loop, the GE progresses
+  and the handler runs at once.
 - Peeks that read done may now read 2 or 4, including on a list waiting at
   its stall, such as a libgu list still being built. A heavy list enqueued
   without a stall can still be drawing when EnQueue returns.
