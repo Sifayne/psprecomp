@@ -452,6 +452,90 @@ found no difference in texels, padding counts, bad-access counts or the bytes
 shown to the VRAM observer. Upload (5.4–6.5 s) is now the larger part of
 texture binding.
 
+Most of that upload was the same texels again. A census logged every full
+upload and row refresh on the race (8,849 frames) with its reason, in a copy
+of `render_gl.c`. It also hashed the bytes each decode read, to tell a real
+change from a rewrite. On e12e44d, with all of the CPU work in this section,
+the race decoded and uploaded 634 KiB of RGBA a frame:
+
+| Why the texels were decoded again | KiB a frame | Share |
+|---|---|---|
+| Write generation moved, texels and palette byte for byte the same | 431 | 68% |
+| Rows refreshed, mostly of the display buffer sampled as a 512×512 texture | 191 | 30% |
+| New entries, evictions, and texels or palettes that did change | 12 | 2% |
+
+The first row is WipEout's texture pool in VRAM. The race's textures are
+CLUT4 and CLUT8, swizzled, with mip chains, and each palette sits just before
+its texels. The game copies them into the pool again and again with the same
+bytes. Each copy moves the write generation, and the cache took that as new
+content: about 143,000 full decodes and uploads over the race. Slot collisions
+and palette-keyed duplicates were not a factor (1,554 evictions in all, and
+almost no entry was made again with bytes it had held before).
+
+So the cache now checks the bytes. An entry uploaded again because its bytes
+changed keeps a copy of the guest bytes it was decoded from: each level and
+the palette, or one range per row for a texture refreshed by rows. When its
+generation moves the next time, the bytes are compared with the copy first.
+If they are all the same, the entry already holds what a decode would give,
+and it is revalidated without one. A refresh by rows decodes only the rows
+whose bytes differ from the copy. The copy holds exactly the bytes the decoder
+reads; a level wider than its stride reads past its rows and gets no copy.
+Bytes under an asynchronous readback still in flight are never read for a
+copy or a comparison, because touching them would land the readback earlier
+than anything else would. They count as changed. Copies are kept for entries
+that have changed at least once, within a budget of 64 MiB; the race holds
+3.1 MiB in 1,448 of them.
+
+On the race, uploads fell from 148,993 to 6,835 and the RGBA decoded from
+5,476 to 1,560 MiB. Base and new ran side by side, twice, as release e12e44d
+with only `render_gl.c`'s object swapped. That object was built the way the
+package builds the game archives; the base source rebuilds byte-identical
+to the release's.
+
+| | e12e44d | Bytes checked against a copy |
+|---|---|---|
+| Process CPU, first 150 s | 60.5 s, 59.8 s | 53.7 s, 54.6 s (−10%) |
+| `timing: texture bind` | 11.6 s, 11.0 s | 3.8 s, 3.5 s |
+| ... decode | 3.2 s, 3.1 s | 0.6 s, 0.6 s |
+| ... upload | 5.8 s, 5.7 s | 0.6 s, 0.6 s |
+
+Mesa's own threads did not get cheaper. `gl0`, `cs0` and `gdrv0` used 8.0 and
+6.0 s before and 8.8 and 7.5 s after, with `gl0` up by about 1 s. An upload
+from client memory makes glthread synchronize: `glTexImage2D` and
+`glTexSubImage2D` are marked `marshal_sync` unless a pixel unpack buffer is
+bound
+([`gl_API.xml`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/mesa/glapi/glapi/gen/gl_API.xml)).
+When it synchronizes, glthread runs its pending batch on the calling thread
+([`_mesa_glthread_finish`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/mesa/main/glthread.c)).
+With 95% fewer uploads, draw work that used to run on the game's thread
+during those syncs now runs on `gl0`. The saving shows up on the game's
+thread, and in the process total. The uploads that remain still synchronize;
+sending them through a pixel unpack buffer would not.
+
+What is left, 180 KiB a frame, changes for real:
+- 74%: the display texture's rows 272–407. They lie over two 256-wide 8888
+  targets that are drawn every frame. A 512-wide view cannot take them from
+  the GPU, so they are read back and decoded. The game probably samples only
+  the top 272 rows, but knowing that would take each draw's texture
+  coordinate range, which the GPU transform does not report.
+- 13%: 512×512 8888 textures in main RAM, different almost every time they
+  are bound.
+- 8%: pool textures that did change, and new ones.
+- 5%: rows over the 5650 target. Its 16-bit pixels must come from guest
+  memory for the decode to match.
+
+The output did not change. A variant that, on every decode the copy saved,
+read the texture back with `glGetTexImage` and compared it with a fresh
+decode found no difference over the whole race: 478,900 levels in 142,158
+skipped decodes, and all 168,427 rows kept. The GL runs of the readability gate matched base
+byte for byte: The 3rd Birthday's 8 window images, the race's 15 images and
+its 8,849 frames at 154.521 s of guest time, and the race start, twice. Only
+the race's wall clock differs. The gate's software-renderer runs never reach
+`render_gl.c`. `tests/test_texcache_gl.c` draws through the GL backend:
+rewrites of the same texels and palette, then a changed texel, a changed
+palette entry and one changed row. It fails when a skip ignores changed
+bytes.
+
 The vertex path was then made cheaper without changing a result. Almost
 none of it is the CPU transform. Counted over 120 s of the same race, 99.6%
 of transformed vertices (399 M, in 4.0 M draws) took the GL backend's own

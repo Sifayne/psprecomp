@@ -238,6 +238,14 @@ if(PSPRECOMP_HOST)
     set_tests_properties(save_dialog PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "SDL_VIDEODRIVER=dummy")
 
+    # The GL backend's texture cache when guest memory is written again, in
+    # a context SDL's offscreen driver makes; without one it skips.
+    add_executable(test_texcache_gl test_texcache_gl.c)
+    target_link_libraries(test_texcache_gl PRIVATE psprecomp_host)
+    add_test(NAME texcache_gl COMMAND test_texcache_gl)
+    set_tests_properties(texcache_gl PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "SDL_VIDEODRIVER=offscreen;SDL_AUDIODRIVER=dummy")
+
     # Includes present.c for its internals, so it links the host layer only
     # for the save dialog. The quit shortcuts alone, then the real SDL loop
     # closed by the keyboard and by a virtual controller.
