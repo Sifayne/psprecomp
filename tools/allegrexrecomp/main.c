@@ -650,6 +650,67 @@ static int load_and_discover(const char *path, const uint32_t *base, psp_blob *b
     return 0;
 }
 
+/* Whether a firmware call is answered: by the runtime's table, or by the one
+ * call the player's boot registers itself (StopUnloadSelfModule,
+ * src/host/boot.c). Anything else reports itself as unimplemented when the
+ * game makes it -- unless another module on the disc exports it, which only
+ * a look at the whole disc can tell (scripts/sweep.py). */
+static int answered(uint32_t nid) {
+    return psp_hle_registered(nid) || nid == 0x8F2DF740u;
+}
+
+/* Whether a call to `addr` will find code: a function entry, or one merged
+ * into another function, which the emitter gives a label and a dispatch
+ * thunk (split_entry). */
+static int discovered(const a_analysis *an, uint32_t addr) {
+    for (int i = 0; i < an->nfuncs; i++) if (an->funcs[i].addr == addr) return 1;
+    const uint32_t w = (addr - an->base) / 4;
+    return addr >= an->base && !(addr & 3) && w < an->nwords && an->split_entry && an->split_entry[w];
+}
+
+/* The module's static constructors, from its own tables, each of which has
+ * to be a discovered function or the module's initialiser dispatches into
+ * nothing (src/host/boot.c, report_cplinit): .cplinit's (constructor,
+ * priority) pairs, ended by a zero constructor, and GCC's .ctors, a -1, the
+ * entries, then 0. A module without section headers says neither; that is
+ * the case src/ctors.c's scan was written for. */
+static void report_ctors(const psp_blob *b, const elf_info *e, const a_analysis *an, int list) {
+    if (!e->shoff || !e->shnum) {
+        printf("ctors:      no section headers: the tables are not named\n");
+        return;
+    }
+    psp_section s;
+    unsigned listed = 0, found = 0;
+    if (psp_find_section(b, e, ".cplinit", &s) == 0) {
+        for (uint32_t at = s.offset; at + 8 <= s.offset + s.size && at + 8 <= b->size; at += 8) {
+            const uint32_t fn = (uint32_t)b->data[at] | (uint32_t)b->data[at + 1] << 8 |
+                                (uint32_t)b->data[at + 2] << 16 | (uint32_t)b->data[at + 3] << 24;
+            if (!fn) break;
+            listed++;
+            if (discovered(an, fn)) found++;
+            else if (list) printf("  undiscovered .cplinit constructor 0x%08X\n", fn);
+        }
+        printf("ctors:      .cplinit %u, %u of them discovered\n", listed, found);
+    } else {
+        printf("ctors:      .cplinit absent\n");
+    }
+    listed = found = 0;
+    if (psp_find_section(b, e, ".ctors", &s) == 0) {
+        for (uint32_t at = s.offset; at + 4 <= s.offset + s.size && at + 4 <= b->size; at += 4) {
+            const uint32_t fn = (uint32_t)b->data[at] | (uint32_t)b->data[at + 1] << 8 |
+                                (uint32_t)b->data[at + 2] << 16 | (uint32_t)b->data[at + 3] << 24;
+            if (fn == 0xFFFFFFFFu) continue;
+            if (!fn) break;
+            listed++;
+            if (discovered(an, fn)) found++;
+            else if (list) printf("  undiscovered .ctors constructor 0x%08X\n", fn);
+        }
+        printf("ctors:      .ctors %u, %u of them discovered\n", listed, found);
+    } else {
+        printf("ctors:      .ctors absent\n");
+    }
+}
+
 static int cmd_funcs(const char *path, int list) {
     psp_blob b;
     elf_info e;
@@ -726,6 +787,18 @@ static int cmd_funcs(const char *path, int list) {
                                 printf("  %-24s 0x%08X  thunk 0x%08X\n",
                                        imp[i].lib, imp[i].nid, imp[i].addr);
                 }
+
+                /* The calls nothing in this runtime answers (answered). */
+                if (psp_mem_init() == 0) {
+                    psp_hle_init();
+                    int missing = 0;
+                    for (int i = 0; i < nimp; i++) missing += !answered(imp[i].nid);
+                    printf("\nunimplemented: %d of %d firmware calls\n", missing, nimp);
+                    if (list)
+                        for (int i = 0; i < nimp; i++)
+                            if (!answered(imp[i].nid))
+                                printf("  unimplemented %-24s 0x%08X\n", imp[i].lib, imp[i].nid);
+                }
                 free(imp);
             }
         }
@@ -733,6 +806,25 @@ static int cmd_funcs(const char *path, int list) {
 
     printf("indirect:   %d computed-jump sites; %d tables resolved -> %d targets\n",
            an.nindirects, an.ntables, an.ntable_targets);
+    report_ctors(&b, &e, &an, list);
+
+    /* The functions this module offers other modules, by NID: an import
+     * another module on the disc takes from it is answered by it. */
+    if (e.modinfo_size) {
+        psp_module_info mi3;
+        if (psp_modinfo_parse(b.data, b.size, e.modinfo_offset, &mi3) == 0) {
+            const uint32_t bias = e.nsegments ? e.seg[0].offset - e.seg[0].addr : 0;
+            psp_export ex[1024];
+            int nex = psp_collect_export_table(b.data, b.size, &mi3, bias, ex, 1024);
+            if (nex > 1024) nex = 1024;
+            int fns = 0;
+            for (int i = 0; i < nex; i++) fns += !ex[i].syslib && !ex[i].variable;
+            printf("exports:    %d functions to other modules\n", fns);
+            if (list)
+                for (int i = 0; i < nex; i++)
+                    if (!ex[i].syslib && !ex[i].variable) printf("  export 0x%08X\n", ex[i].nid);
+        }
+    }
 
     /* The honest VFPU cost for this title: measured over discovered code, not
      * over a segment that is mostly data. */
