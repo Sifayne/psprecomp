@@ -202,6 +202,12 @@ set_tests_properties(mpeg_au PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_vrnd_observed test_vrnd_observed.c)
 target_link_libraries(test_vrnd_observed PRIVATE psprecomp)
 
+# The vertex path's short cuts against the exact GE arithmetic, bit for bit.
+# Includes src/hle/ge.c itself for its static functions.
+add_executable(test_ge_arith test_ge_arith.c)
+target_link_libraries(test_ge_arith PRIVATE psprecomp)
+add_test(NAME ge_arith COMMAND test_ge_arith)
+
 add_executable(test_vertex_observed test_vertex_observed.c)
 target_link_libraries(test_vertex_observed PRIVATE psprecomp)
 add_test(NAME vertex_observed COMMAND test_vertex_observed
