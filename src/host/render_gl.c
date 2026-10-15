@@ -3919,12 +3919,14 @@ static GLuint dialog_program, dialog_texture, dialog_vao;
 static uint64_t dialog_revision;
 static uint32_t dialog_pixels[SAVE_DIALOG_W * SAVE_DIALOG_H];
 static int dialog_failed;
-/* The utility replaces the picture: the overlay is fitted into the game's
- * picture box, and the box is blacked out first so a wider game image does
- * not show beside the 480:272 dialog. */
+/* The savedata utility replaces the picture: the overlay is fitted into the
+ * game's picture box, and the box is blacked out first so a wider game image
+ * does not show beside the 480:272 dialog. A message dialog goes over the
+ * picture instead. */
 static void gl_dialog_overlay(int x, int y, int width, int height) {
     uint64_t previous=dialog_revision;
-    if (!save_dialog_copy_pixels(dialog_pixels,&dialog_revision) || dialog_failed) return;
+    const int shown=save_dialog_copy_pixels(dialog_pixels,&dialog_revision);
+    if (!shown || dialog_failed) return;
     GLint old_program,old_texture,old_vao,viewport[4];
     p_glGetIntegerv(GL_CURRENT_PROGRAM,&old_program);
     p_glGetIntegerv(GL_TEXTURE_BINDING_2D,&old_texture);
@@ -3959,9 +3961,10 @@ static void gl_dialog_overlay(int x, int y, int width, int height) {
     }
     int w=width,h=(int)((int64_t)width*SAVE_DIALOG_H/SAVE_DIALOG_W);
     if (h>height) { h=height; w=(int)((int64_t)h*SAVE_DIALOG_W/SAVE_DIALOG_H); }
+    /* A message dialog goes over the picture (save_dialog_copy_pixels). */
     p_glEnable(GL_SCISSOR_TEST); p_glScissor(x,y,width,height);
     p_glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
-    p_glClearColor(0.0f,0.0f,0.0f,1.0f); p_glClear(GL_COLOR_BUFFER_BIT);
+    if (shown==1) { p_glClearColor(0.0f,0.0f,0.0f,1.0f); p_glClear(GL_COLOR_BUFFER_BIT); }
     p_glViewport(x+(width-w)/2,y+(height-h)/2,w,h);
     p_glDisable(GL_DEPTH_TEST); p_glDisable(GL_STENCIL_TEST); p_glDisable(GL_SCISSOR_TEST);
     p_glDisable(GL_CULL_FACE); p_glEnable(GL_BLEND);

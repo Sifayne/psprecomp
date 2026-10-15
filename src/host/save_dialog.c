@@ -2,6 +2,7 @@
  * a complete copied image. PSP status and all file mutations belong to HLE. */
 #include "psprecomp/host/save_dialog.h"
 #include "psprecomp/savedata.h"
+#include "psprecomp/msgdialog.h"
 #include <SDL2/SDL_ttf.h>
 #include <math.h>
 #include <pthread.h>
@@ -40,7 +41,7 @@ static int scrolling;
 static pthread_mutex_t pixels_lock=PTHREAD_MUTEX_INITIALIZER;
 static uint32_t pixels[SAVE_DIALOG_W*SAVE_DIALOG_H];
 static uint64_t pixels_revision;
-static int pixels_active;
+static int pixels_active, pixels_over;
 static char init_error[256];
 
 /* ---- decoded images ------------------------------------------------------
@@ -390,17 +391,19 @@ static void info_column(void) {
     text(f_body,COL_X,326,COL_W,40,slot->broken?"Corrupted Data":slot->title,WHITE,ALIGN_LEFT);
     if (slot->exists && !slot->broken) text(f_small,COL_X,368,COL_W,4*TTF_FontLineSkip(f_small),slot->detail,WHITE,ALIGN_LEFT);
 }
-static void hints(void) {
-    const char *left=ui.confirm_circle?"Back":"Enter",*right=ui.confirm_circle?"Enter":"Back";
+/* The cross and the circle, each with what it does, centred on row y. */
+static void button_hints(int confirm_circle,const char *confirm,const char *cancel,int y) {
+    const char *left=confirm_circle?cancel:confirm,*right=confirm_circle?confirm:cancel;
     int glyph=22,gap=10,space=48;
     int total=glyph+gap+text_width(f_small,left)+space+glyph+gap+text_width(f_small,right);
-    int x=(SAVE_DIALOG_W-total)/2,cy=HINT_Y+TTF_FontLineSkip(f_small)/2;
+    int x=(SAVE_DIALOG_W-total)/2,cy=y+TTF_FontLineSkip(f_small)/2;
     cross(x+2+glyph/2.0,cy+2,7.5,3,SHADOW); cross(x+glyph/2.0,cy,7.5,3,WHITE);
-    x+=glyph+gap; x+=text(f_small,x,HINT_Y,0,40,left,WHITE,ALIGN_LEFT) ? text_width(f_small,left) : 0;
+    x+=glyph+gap; x+=text(f_small,x,y,0,40,left,WHITE,ALIGN_LEFT) ? text_width(f_small,left) : 0;
     x+=space;
     ring(x+2+glyph/2.0,cy+2,8,2.5,SHADOW); ring(x+glyph/2.0,cy,8,2.5,WHITE);
-    x+=glyph+gap; text(f_small,x,HINT_Y,0,40,right,WHITE,ALIGN_LEFT);
+    x+=glyph+gap; text(f_small,x,y,0,40,right,WHITE,ALIGN_LEFT);
 }
+static void hints(void) { button_hints(ui.confirm_circle,"Enter","Back",HINT_Y); }
 static void message_box(void) {
     rgba plate={0,0,0,158},edge={255,255,255,90};
     rounded(BOX_X,BOX_Y,BOX_W,BOX_H,BOX_R,plate);
@@ -422,12 +425,13 @@ static void message_box(void) {
         text(f_small,BOX_X+BOX_W/2,top+mh+8,0,40,code,GREY,ALIGN_CENTER);
     }
 }
-/* What the GL owner copies: the canvas, or that there is nothing to show. */
-static void publish_pixels(int on) {
+/* What the GL owner copies: the canvas, or that there is nothing to show;
+ * `over` when it goes over the game's picture rather than in its place. */
+static void publish_pixels(int on,int over) {
     pthread_mutex_lock(&pixels_lock);
     if (on) for (int y=0;y<SAVE_DIALOG_H;y++) memcpy(pixels+(size_t)y*SAVE_DIALOG_W,
         (unsigned char *)canvas->pixels+(size_t)y*canvas->pitch,SAVE_DIALOG_W*4);
-    pixels_active=on; pixels_revision++;
+    pixels_active=on; pixels_over=on && over; pixels_revision++;
     pthread_mutex_unlock(&pixels_lock);
 }
 static void paint(void) {
@@ -441,7 +445,53 @@ static void paint(void) {
     text(f_banner,60,8,0,48,operation(),WHITE,ALIGN_LEFT);
     if (ui.stage!=PSP_SAVEDATA_LIST) message_box();
     hints();
-    publish_pixels(1);
+    publish_pixels(1,0);
+}
+
+/* ---- the message dialog ----------------------------------------------------
+ * sceUtilityMsgDialog's picture (psprecomp/msgdialog.h): a band across the
+ * game's own picture, drawn over it rather than in its place, with the
+ * message -- or the error's code -- Yes and No when it asks, and the buttons
+ * that answer it. The dialog reads the pad itself (src/hle/utility.c), so
+ * nothing here takes input. */
+static psp_msgdialog_view md;
+static int md_on;
+enum { MD_BAND_Y=128, MD_BAND_H=288, MD_TEXT_W=760 };
+static void paint_message(void) {
+    memset(canvas->pixels,0,(size_t)canvas->pitch*SAVE_DIALOG_H);
+    fill(0,0,SAVE_DIALOG_W,SAVE_DIALOG_H,(rgba){0,0,0,90});
+    fill(0,MD_BAND_Y,SAVE_DIALOG_W,MD_BAND_H,(rgba){0,0,0,170});
+    fill(0,MD_BAND_Y,SAVE_DIALOG_W,2,(rgba){255,255,255,110});
+    fill(0,MD_BAND_Y+MD_BAND_H-2,SAVE_DIALOG_W,2,(rgba){255,255,255,110});
+    char error[64];
+    const char *message=md.message;
+    if (md.error_mode) { snprintf(error,sizeof error,"An error has occurred.\n(%08X)",md.error); message=error; }
+    SDL_Surface *m=render_text(f_body,message,MD_TEXT_W,ALIGN_CENTER,(SDL_Color){255,255,255,255});
+    const int mh=m?m->h:0;
+    if (m) SDL_FreeSurface(m);
+    const int answers=md.yes_no ? TTF_FontLineSkip(f_body)+28 : 0;
+    int top=MD_BAND_Y+(MD_BAND_H-60-answers-mh)/2;
+    if (top<MD_BAND_Y+16) top=MD_BAND_Y+16;
+    text(f_body,SAVE_DIALOG_W/2,top,MD_TEXT_W,MD_BAND_H-60-answers,message,WHITE,ALIGN_CENTER);
+    if (md.yes_no) {
+        const char *options[2]={"Yes","No"};
+        const int cx[2]={SAVE_DIALOG_W/2-70,SAVE_DIALOG_W/2+70},y=MD_BAND_Y+MD_BAND_H-60-answers+8;
+        for (int i=0;i<2;i++) {
+            int w=text_width(f_body,options[i]),h=TTF_FontLineSkip(f_body);
+            if (i==md.selected_no) rounded(cx[i]-w/2-22,y-5,w+44,h+10,10,(rgba){255,255,255,64});
+            text(f_body,cx[i],y,0,h+4,options[i],WHITE,ALIGN_CENTER);
+        }
+    }
+    button_hints(md.confirm_circle,md.ok_label[0]?md.ok_label:md.yes_no?"Enter":"OK",
+                 md.cancel_label[0]?md.cancel_label:"Back",MD_BAND_Y+MD_BAND_H-48);
+    publish_pixels(1,1);
+}
+/* With the savedata dialog closed: the message dialog, if one is up. */
+static void update_message(void) {
+    const int state=psp_msgdialog_snapshot(&md),was=md_on;
+    md_on=state!=0;
+    if (md_on && state==2) paint_message();
+    else if (!md_on && was) publish_pixels(0,0);
 }
 int save_dialog_init(void) {
     if (initialized) return 0;
@@ -482,7 +532,7 @@ void save_dialog_shutdown(void) {
     if (f_title) TTF_CloseFont(f_title);
     texture=NULL; canvas=NULL; f_body=f_small=f_banner=f_title=NULL;
     initialized=active=0; uploaded=0;
-    publish_pixels(0);
+    publish_pixels(0,0);
     TTF_Quit();
 }
 int save_dialog_active(void) { return active; }
@@ -523,9 +573,11 @@ void save_dialog_update(SDL_GameController *pad) {
     int state=psp_savedata_snapshot(&ui),was=active;
     active=state!=SNAPSHOT_INACTIVE;
     if (!active) {
-        if (was) publish_pixels(0);
+        if (was) publish_pixels(0,0);
+        update_message();
         return;
     }
+    if (md_on) md_on=0;
     if (!was || ui.session!=session) {
         armed=0; pending=0; held_direction=held_side=key_direction=0;
         scroll_pos=scroll_target=ui.selected; scrolling=0;
@@ -600,7 +652,7 @@ int save_dialog_event(const SDL_Event *e,SDL_JoystickID controller) {
         e->type==SDL_CONTROLLERBUTTONDOWN || e->type==SDL_CONTROLLERBUTTONUP || e->type==SDL_CONTROLLERAXISMOTION;
 }
 void save_dialog_draw_software(SDL_Renderer *renderer) {
-    if (!active || !canvas) return;
+    if ((!active && !md_on) || !canvas) return;
     if (!texture) {
         texture=SDL_CreateTexture(renderer,SDL_PIXELFORMAT_RGBA32,SDL_TEXTUREACCESS_STREAMING,SAVE_DIALOG_W,SAVE_DIALOG_H);
         if (texture) SDL_SetTextureBlendMode(texture,SDL_BLENDMODE_BLEND);
@@ -613,7 +665,7 @@ void save_dialog_draw_software(SDL_Renderer *renderer) {
 }
 int save_dialog_copy_pixels(uint32_t *out,uint64_t *revision) {
     pthread_mutex_lock(&pixels_lock);
-    int on=pixels_active;
+    int on=pixels_active ? 1+pixels_over : 0;
     if (on && *revision!=pixels_revision) {
         memcpy(out,pixels,sizeof pixels); *revision=pixels_revision;
     }
