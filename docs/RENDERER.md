@@ -359,6 +359,54 @@ fixed hangar capture costs 1.27 ms and remains byte-identical before and after
 instrumentation. The measured ~30 fps cadence is therefore not GPU saturation;
 even a 16.7 ms budget has substantial headroom on this host.
 
+The CPU side was profiled the same way. The profile used WipEout Pulse's recorded
+race (`race2.pad`, paced, 60 fps) on the toolkit-fixes-21 release on a Ryzen
+7 5800X3D, sampled every 2 ms of process CPU time by
+`build/wipeout-run/profwatch.so`. The first 145 s used 84 s of CPU, nearly
+all of it on the one guest thread that runs at a time. That is about 10 ms of
+a 16.7 ms frame, matching the 10.0 ms host-work p50 that the frame-time log
+recorded for the same race at toolkit-fixes-13. The samples
+split as follows:
+
+| Where | Share of CPU |
+|---|---|
+| GE list processing on the CPU (`run_list_body`, inclusive) | 45% |
+| ... CPU vertex path (`draw_prim_transformed`) | 23% |
+| ... of which `uv_to_texels` (GE-exact TEXSCALE/TEXOFFSET) | 9.3% |
+| ... texture decode (`decode_level` via `sample_texel_bounded`) | 14% |
+| Mesa driver (libgallium) | 9.5% |
+| `psp_mem_ptr` + `psp_read*`/`psp_write*` + `psp_mem_mark_write` (self) | 22% |
+| VFPU/FPU helpers | 6% |
+| Scheduler drain waits (`psp_sched_drain` timed waits) | 6.5% |
+
+The guest-memory row is spread across both sides. The largest single callers
+of `psp_mem_ptr` are the texture decoder's per-texel `psp_read8`/`psp_read32`,
+and `psp_sv_q` stores account for most `psp_mem_mark_write` time. The
+release's own report agrees: texture decode is 13.7 s over the 155 s race
+(5,476 MiB of RGBA decoded) and upload is 5.5 s.
+
+The GL API, SDL and presenting are small here: under 10% together, nearly
+all of it inside the driver. A different host API (SDL3, Vulkan, SDL_GPU)
+would only reach that slice. The costs that matter are our own CPU work:
+- per-texel guest reads in the texture decoder
+- the double-precision GE arithmetic per vertex
+- out-of-line guest memory access, from the recompiled code and the decoder alike
+
+The first of those is now fixed. `decode_rows` in `src/render.c` decodes a
+level one row at a time from host memory. It resolves the guest address once
+per row, or once per 16-byte piece of a swizzled row, and it caches palette
+entries for the level. A row that reaches past its memory region or the
+padding bound still goes through `sample_texel_bounded`, so the padding counts
+stay exact. On the same race, decode fell from 14.0 s to 2.9–3.2 s, saving
+about 1.2 ms a frame. That was two runs of each on the fixes-21 app with only
+`render.c.o` swapped. The readability gate's race measured 13.9 s before and
+2.9 s after. The output did not change: every gate product matched byte for
+byte. A differential fuzz against the per-texel decoder covered all eleven
+formats, swizzled and linear, at region ends and with unmapped palettes. It
+found no difference in texels, padding counts, bad-access counts or the bytes
+shown to the VRAM observer. Upload (5.4–6.5 s) is now the larger part of
+texture binding.
+
 The fixed-list oracle also pins the small arithmetic details that a plausible
 GL image can hide. Interpolated colour and texture-function output are
 quantized at the software path's RGBA8 boundaries; fog and masked alpha tests
