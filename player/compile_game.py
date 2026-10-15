@@ -15,6 +15,10 @@ import subprocess
 import sys
 
 TARGET = ['-target', 'x86_64-linux-gnu.2.35']
+# A game's C, compiled to ThinLTO bitcode: its link optimizes it together
+# with the runtime and player archives, which the package builds the same
+# way (player/linux/build.py, game_archives).
+GAME = ['-std=gnu11', '-fno-strict-aliasing', '-fwrapv', '-flto=thin']
 # What the launcher may see of a pack's launcher.so; the rest stays its own.
 EXPORTS = '{ global: psp_title_settings; psp_launcher_info; psp_pack_api; local: *; };\n'
 
@@ -96,8 +100,7 @@ def compile_game(app, pack, host_objects, profile, module, output, jobs, env, lo
     run([sys.executable, '-I', '-B', resources / 'emit-split.py',
          generated / f'{slug}_funcs.c', obj, '32'])
     includes = sorted({p.parent for p in pack.device_host}) if pack else []
-    cc = [app / 'usr/zig/zig', 'cc', *TARGET,
-          '-std=gnu11', '-fno-strict-aliasing', '-fwrapv', '-I', resources / 'include',
+    cc = [app / 'usr/zig/zig', 'cc', *TARGET, *GAME, '-I', resources / 'include',
           '-I', generated, '-I', obj, *[a for d in includes for a in ('-I', d)]]
     chunks = sorted(obj.glob(f'{slug}_funcs_[0-9][0-9].c'))
 
@@ -123,8 +126,7 @@ def compile_game(app, pack, host_objects, profile, module, output, jobs, env, lo
              '--base', f"0x{m['base']:08X}", '--module', str(m['index'])])
         split = max(1, min(32, m['image'].stat().st_size // (512 * 1024) + 1))
         run([sys.executable, '-I', '-B', resources / 'emit-split.py', mgen / f'{name}_funcs.c', mobj, str(split)])
-        mcc = [app / 'usr/zig/zig', 'cc', *TARGET, '-std=gnu11', '-fno-strict-aliasing', '-fwrapv',
-               '-I', resources / 'include', '-I', mgen, '-I', mobj]
+        mcc = [app / 'usr/zig/zig', 'cc', *TARGET, *GAME, '-I', resources / 'include', '-I', mgen, '-I', mobj]
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
             list(pool.map(lambda src: run([*mcc, '-O2', '-c', src, '-o', src.with_suffix('.o')]),
                           sorted(mobj.glob(f'{name}_funcs_[0-9][0-9].c'))))
@@ -148,7 +150,14 @@ def compile_game(app, pack, host_objects, profile, module, output, jobs, env, lo
         run([*cc, '-O2', '-DHAVE_SDL2', f'-DPSP_PLAIN_MODULE_COUNT={len(rows)}', '-c', resources / 'title_plain.c',
              '-o', obj / 'title_plain.o'])
     print('Finishing game setup...', flush=True)
-    run([*cc, '-O2', *sorted(obj.glob('*.o')), *module_objects, *host_objects,
+    link_game(app, [*sorted(obj.glob('*.o')), *module_objects, *host_objects], output, run)
+
+
+def link_game(app, objects, output, run):
+    """A game from its objects and the player and runtime archives, run once
+    to show that it starts."""
+    app, resources = Path(app), Path(__file__).resolve().parent
+    run([app / 'usr/zig/zig', 'cc', *TARGET, *GAME, '-O2', *objects,
          '-Wl,--start-group', resources / 'libplayer.a', resources / 'libruntime.a', '-Wl,--end-group',
          '-L', app / 'usr/lib', '-lSDL2', '-lSDL2_ttf', '-lopenh264', '-lavcodec', '-lavutil',
          '-lm', '-lpthread', '-Wl,-rpath,$ORIGIN/lib', '-o', output])

@@ -9,7 +9,10 @@
 # build.cmake) builds the pack's checks, in a folder of its own whose
 # programs land in pack-<id>/. It may use the variables and targets set
 # here: TOOLKIT, PACK, RECOMP, PLAYER_SETTINGS, PLAYER_HOST, PLAYER_UI,
-# PLAYER_LAUNCHER, the targets runtime and PkgConfig::SDL. Last Raven's
+# PLAYER_LAUNCHER, the targets runtime and PkgConfig::SDL. build.py also
+# configures this file a second time with no packs and the app's own zig cc,
+# and builds only runtime and player there: the archives games link
+# (build.py, game_archives). Last Raven's
 # packaging/linux/CMakeLists.txt until stage 2 of docs/PLAYER-LAYER.md split
 # it; stage 10 made the app one for every pack.
 cmake_minimum_required(VERSION 3.16)

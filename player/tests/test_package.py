@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Exercise the staged application outside its build tree, without a game
-or a pack.
+"""Exercise the staged application outside its build tree, without a game's
+code or a pack.
 
     test_package.py APPDIR"""
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -110,6 +111,38 @@ class PackageTests(unittest.TestCase):
         before = self.config.read_bytes()
         self.run_app("--check-startup", success=False)
         self.assertEqual(before, self.config.read_bytes())
+
+    def test_a_game_links_with_the_staged_archives(self):
+        # The archives a game links are the app's zig cc's ThinLTO bitcode,
+        # which nothing else in the build links. A plain game with no code
+        # of its own, linked by the app's own recipe, starts.
+        resources = self.app / "usr/share" / ID
+        for name in ("libruntime.a", "libplayer.a"):
+            self.assertIn(b"BC\xc0\xde", (resources / name).read_bytes(), name)
+        spec = importlib.util.spec_from_file_location("compile_game", resources / "compile_game.py")
+        recipes = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(recipes)
+        game = self.root / "link check"
+        game.mkdir()
+        (game / "title.c").write_text(
+            '#include "psprecomp/host/title.h"\n'
+            'const char psp_plain_title[] = "Link check";\n'
+            'const psp_title_module psp_plain_modules[] = {{0}};\n'
+            'void psp_recomp_register(void) {}\n')
+        env = {**self.env, "ZIG_GLOBAL_CACHE_DIR": str(self.root / "compiler-cache"),
+               "ZIG_LOCAL_CACHE_DIR": str(self.root / "compiler-cache/local"),
+               "LD_LIBRARY_PATH": str(self.app / "usr/lib")}
+        cc = [self.app / "usr/zig/zig", "cc", *recipes.TARGET, *recipes.GAME, "-O2", "-I", resources / "include"]
+        log_path = game / "build.log"
+        try:
+            with log_path.open("w") as log:
+                run = recipes._runner(game, env, log)
+                run([*cc, "-c", game / "title.c", "-o", game / "title.o"])
+                run([*cc, "-DHAVE_SDL2", "-c", resources / "title_plain.c", "-o", game / "title_plain.o"])
+                recipes.link_game(self.app, [game / "title.o", game / "title_plain.o"], game / "game", run)
+        except ValueError:
+            self.fail(log_path.read_text())
+        self.assertIn("effective: renderer=", log_path.read_text())
 
     def test_no_game_payload_and_complete_notices(self):
         self.assertEqual({p.name for p in (self.app / "usr/bin").iterdir()},

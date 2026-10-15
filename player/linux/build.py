@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import preparation
 WORKDIR = Path(__file__).resolve().parents[3]
 TOOLKIT = WORKDIR / "psprecomp"
 sys.path.insert(0, str(TOOLKIT / "player"))
+import compile_game  # noqa: E402
 import pack as packs  # noqa: E402
 
 PACKS = [packs.load(p) for p in sorted((WORKDIR / "packs").iterdir())] if (WORKDIR / "packs").is_dir() else []
@@ -70,6 +72,26 @@ def cmake(source, name, flags):
          "-DCMAKE_CXX_FLAGS=-march=x86-64 -mtune=generic", *flags])
     run(["cmake", "--build", obj, "--parallel", JOBS])
     run(["cmake", "--install", obj])
+    return obj
+
+
+def game_archives(zig):
+    """libruntime.a and libplayer.a as every game links them: the same
+    targets, their C compiled by the app's own zig cc into ThinLTO bitcode,
+    so a game's link (compile_game.py) optimizes its code and theirs
+    together. The player's C++ (ui.cpp, ImGui) stays the builder's. The
+    app's own programs and checks link the builder's archives."""
+    tools = BUILD / "zig-tools"
+    tools.mkdir()
+    for name, command in (("cc", ["cc", *compile_game.TARGET]), ("ar", ["ar"]), ("ranlib", ["ranlib"])):
+        (tools / name).write_text(f'#!/bin/sh\nexec {shlex.join([str(zig), *command])} "$@"\n')
+        (tools / name).chmod(0o755)
+    obj = BUILD / "game-archives"
+    run(["cmake", "-S", RECIPE, "-B", obj, "-G", "Ninja", f"-DDEPS={DEPS}", f"-DFFMPEG={FFMPEG}",
+         f"-DTOOLKIT={TOOLKIT}", f"-DCMAKE_C_COMPILER={tools / 'cc'}", f"-DCMAKE_AR={tools / 'ar'}",
+         f"-DCMAKE_RANLIB={tools / 'ranlib'}", "-DCMAKE_C_FLAGS=-flto=thin",
+         "-DCMAKE_CXX_FLAGS=-march=x86-64 -mtune=generic"])
+    run(["cmake", "--build", obj, "--parallel", JOBS, "--target", "runtime", "player"])
     return obj
 
 
@@ -231,6 +253,8 @@ def main():
         pack_ui.mkdir()
         for command in pack.checks:
             check(command, pack_ui, font / "ttf/DejaVuSans.ttf", obj / f"pack-{pack.id}")
+    print("Building the runtime and player archives games link, with the app's own Zig...", flush=True)
+    archives = game_archives(tools["zig"] / "zig")
     print("Staging only app binaries, dependencies, font and notices...", flush=True)
     (APP / "usr/lib").mkdir(parents=True)
     copy(obj / "launcher", APP / "usr/bin/launcher")
@@ -268,7 +292,7 @@ def main():
     for src, dest in notices:
         copy(src, APP / "licenses" / dest)
     shutil.copytree(FFMPEG / "share/licenses/ffmpeg", APP / "licenses/ffmpeg")
-    preparation.stage_tools(sys.modules[__name__], tools, obj)
+    preparation.stage_tools(sys.modules[__name__], tools, obj, archives)
     copy(RECIPE / "README.txt", APP / "README.txt")
     # The original font rendering credit is required by the FreeType license.
     (APP / "licenses/THIRD-PARTY.txt").write_text(
