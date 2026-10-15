@@ -4441,10 +4441,20 @@ static void gl_draw_model(int prim, const psp_model_vertex *v, int count, const 
     const size_t voff = ring_alloc(RING_VBO, (size_t)count * sizeof(psp_model_vertex), sizeof(psp_model_vertex), 0);
     const int base = (int)(voff / sizeof(psp_model_vertex));
     ring_write(RING_VBO, voff, v, (size_t)count * sizeof(psp_model_vertex));
-    static GLuint dix[MODEL_MAX_VERTS];
-    for (int i = 0; i < count; i++) dix[i] = (GLuint)g.mu.npend;
     g_rings.r[RING_DRAW].head = (size_t)(base + count) * sizeof(GLuint);
-    ring_write(RING_DRAW, (size_t)base * sizeof(GLuint), dix, (size_t)count * sizeof(GLuint));
+    /* Stored straight into a mapped ring. Staged in an array, the copy into
+     * the persistent mapping was an inline rep movsq that took most of this
+     * function's time in WipEout Pulse's race (2% of the whole run's CPU);
+     * plain stores of the same words do not. */
+    const GLuint draw_index = (GLuint)g.mu.npend;
+    if (g_rings.r[RING_DRAW].map) {
+        GLuint *d = (GLuint *)(void *)(g_rings.r[RING_DRAW].map + (size_t)base * sizeof(GLuint));
+        for (int i = 0; i < count; i++) d[i] = draw_index;
+    } else {
+        static GLuint dix[MODEL_MAX_VERTS];
+        for (int i = 0; i < count; i++) dix[i] = draw_index;
+        ring_write(RING_DRAW, (size_t)base * sizeof(GLuint), dix, (size_t)count * sizeof(GLuint));
+    }
     g.mu.vbo_head = base + count;
     g.mu.pend_count[g.mu.npend] = count; g.mu.pend_base[g.mu.npend] = base; g.mu.pend_prim[g.mu.npend] = prim;
     g.mu.npend++;
