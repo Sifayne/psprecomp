@@ -254,18 +254,12 @@ its name.
 - [x] VFPU completion. The emitter translates every VFPU instruction the
       decoder names; a sub-encoding the runtime does not recognise traps by
       name.
-- [ ] Save states, an SDL2 + Dear ImGui frontend, controller remapping.
-      The host layer has started: `PSPRECOMP_HOST` builds `src/host/` as
-      `psprecomp_host`, with the savedata dialog and the presentation layer
-      (SDL2 window, input, audio); player settings are `psprecomp_settings`.
-      Last Raven's titles use them; The 3rd Birthday's copies and both
-      games' GL backends remain (see *Open work*). `player/` builds the
-      AppImage for a title pack (`player/README.md`); Last Raven is the
-      first. RAM snapshots (`PSPRECOMP_RAMSNAP`) are an instrument, not save
-      states. The plan is [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md): one
-      player in this repository, every game a title pack compiled on the
-      player's machine, and the three features staged from a shared safe
-      point and host pause.
+- [x] Save states, an SDL2 + Dear ImGui frontend, controller remapping:
+      the player layer, stages 1-11 of [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md).
+      One psprecomp app holds the launcher, the in-game menu, settings,
+      bindings and save states. Every game is a title pack compiled on the
+      player's machine, or a plain game with no pack. RAM snapshots
+      (`PSPRECOMP_RAMSNAP`) remain an instrument, not save states.
 
 ## Open work
 
@@ -325,18 +319,22 @@ Gaps found in the code while checking this file, none of them on a phase above:
       need each part and kept variable to read its older forms.
 - [ ] **Windows** — the Windows half of `src/os.c` has not been through a
       Windows build in this fork.
-- [ ] **The rest of the host** — `present.c`, the settings mechanism, the
-      launcher and the GL backend (`render_gl.c`) are here (`src/host/`), and
-      both games use them, stating what is theirs in `psp_title_info`. Each
-      still carries its own `boot.c`, and they have drifted apart. The order
-      was stages 1–3 of [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md). `boot.c` is where both
-      register `sceKernelStopUnloadSelfModuleWithStatus` (0x8F2DF740, whose
-      name does not hash to its NID; uofw `start-stopModule.c`), because its
-      exit path needs the host.
-- [ ] **Hardware probe set 25** — what the games rely on and no PSP has
-      answered: vector `vrnd` lane order and D prefix (`src/vfpu.c`), a GE
-      signal handler rewriting the list words behind its SIGNAL now that lists
-      are drawn as they are released (`src/hle/ge.c`), and `sceIoMkdir` with a
-      missing parent and `sceIoChstat` (`src/hle/iofilemgr.c`). Then the vrnd,
-      savedata and mpeg provenance checkers, built but unregistered, can be
-      checked against hardware logs instead of an emulator's.
+- [x] **The rest of the host** — `present.c`, the settings mechanism, the
+      launcher, the GL backend (`render_gl.c`) and, since stage 11 of
+      [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md), the boot (`src/host/boot.c`) are
+      all here and shared. Each game states what is its own through
+      `psp_title_info` and its pack's hooks. `boot.c` registers
+      `sceKernelStopUnloadSelfModuleWithStatus` (0x8F2DF740, whose name does
+      not hash to its NID; uofw `start-stopModule.c`), because its exit path
+      needs the host.
+- [x] **Hardware probe set 25** — applied on 9 Oct (#8): vector `vrnd`'s lane
+      order and D prefix, a GE signal handler that suspends the list,
+      `sceIoMkdir` with a missing parent, and the module manager. Left for a
+      later set:
+      - sysprobe's `sce_lbn` steps, which need a UMD in the drive;
+      - `sceIoChstat`'s archive bit and creation time;
+      - geprobe's far marker for Continue, and scene 148 (no dcache);
+      - vfpuprobe's `$ra` in two fresh threads;
+      - the vrnd, savedata and mpeg provenance checkers, built but
+        unregistered, to be checked against hardware logs instead of an
+        emulator's.
