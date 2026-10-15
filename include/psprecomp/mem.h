@@ -158,15 +158,100 @@ int psp_mem_watch_hits(void);
  * 32 reports before the write in question. */
 void psp_mem_watch_arm(int armed);
 
-uint8_t  psp_read8 (uint32_t addr);
-uint16_t psp_read16(uint32_t addr);
-uint32_t psp_read32(uint32_t addr);
-float    psp_read_f32(uint32_t addr);
+/* ---- the accessors' inline map -------------------------------------------
+ *
+ * Nearly every guest load and store lands in main RAM or in the module image,
+ * and there it needs nothing but an offset and, for a store, a new write
+ * generation. psp_read* and psp_write* below answer those inline from this
+ * map, and hand everything else to their out-of-line *_slow halves: VRAM (its
+ * access observer), the scratchpad, unmapped addresses, an access that runs
+ * past a window's end, and every store while the write watch or the write
+ * observer could be told about it. A window holds only addresses that
+ * psp_mem_ptr maps to that one backing, so both halves agree on every byte,
+ * and the two windows never overlap. mem.c keeps the map current; nothing
+ * else may write it. */
+#define PSP_MEM_GRANULE_SHIFT 8   /* one write generation per 256 bytes */
 
-void psp_write8 (uint32_t addr, uint8_t  val);
-void psp_write16(uint32_t addr, uint16_t val);
-void psp_write32(uint32_t addr, uint32_t val);
-void psp_write_f32(uint32_t addr, float val);
+typedef struct {
+    uint8_t  *host;         /* the backing byte of guest address `base` */
+    uint64_t *written;      /* write generations, granule 0 at `base` */
+    uint32_t  base;         /* masked guest address */
+    uint32_t  load_span;    /* bytes from base a load may reach inline; 0 for none */
+    uint32_t  store_span;   /* the same for a store */
+} psp_mem_window;
+
+typedef struct {
+    psp_mem_window ram;     /* checked first: it holds the stacks */
+    psp_mem_window module;
+    uint64_t write_serial;  /* psp_mem_write_serial() */
+} psp_mem_fast_map;
+
+extern psp_mem_fast_map psp_mem_fast;
+
+/* The window holding all `size` bytes at masked address `a` for a load
+ * (store 0) or a store (store 1), or NULL. */
+static inline const psp_mem_window *psp_mem_window_at(uint32_t a, uint32_t size, int store) {
+    const psp_mem_window *w = &psp_mem_fast.ram;
+    if ((uint64_t)(a - w->base) + size <= (store ? w->store_span : w->load_span)) return w;
+    w = &psp_mem_fast.module;
+    if ((uint64_t)(a - w->base) + size <= (store ? w->store_span : w->load_span)) return w;
+    return NULL;
+}
+
+/* What psp_mem_mark_write does for a store of `size` bytes at `off` in a
+ * window: one new generation on the granules it touches (at most two, as
+ * size <= 256). */
+static inline void psp_mem_stamp(uint64_t *written, uint32_t off, uint32_t size) {
+    uint64_t stamp = psp_mem_fast.write_serial + 1;
+    stamp += !stamp;   /* zero is the pristine-memory generation */
+    psp_mem_fast.write_serial = stamp;
+    written[off >> PSP_MEM_GRANULE_SHIFT] = stamp;
+    written[(off + size - 1u) >> PSP_MEM_GRANULE_SHIFT] = stamp;
+}
+
+/* The out-of-line halves: any address, the observers, the write watch, and
+ * the bad-access count. Call psp_read* and psp_write* instead. */
+uint8_t  psp_read8_slow (uint32_t addr);
+uint16_t psp_read16_slow(uint32_t addr);
+uint32_t psp_read32_slow(uint32_t addr);
+float    psp_read_f32_slow(uint32_t addr);
+
+void psp_write8_slow (uint32_t addr, uint8_t  val);
+void psp_write16_slow(uint32_t addr, uint16_t val);
+void psp_write32_slow(uint32_t addr, uint32_t val);
+void psp_write_f32_slow(uint32_t addr, float val);
+
+#define PSP_MEM_READ(TYPE, addr, slow)                                         \
+    const uint32_t a = (addr) & PSP_ADDR_MASK;                                 \
+    const psp_mem_window *w = psp_mem_window_at(a, (uint32_t)sizeof(TYPE), 0); \
+    if (!w) return slow(addr);                                                 \
+    TYPE v;                                                                    \
+    memcpy(&v, w->host + (a - w->base), sizeof v);                             \
+    return v;
+
+/* The window's fields are read before the store: they are not written by it,
+ * but nothing tells the compiler so. */
+#define PSP_MEM_WRITE(TYPE, addr, val, slow)                                   \
+    const uint32_t a = (addr) & PSP_ADDR_MASK;                                 \
+    const psp_mem_window *w = psp_mem_window_at(a, (uint32_t)sizeof(TYPE), 1); \
+    if (!w) { slow(addr, val); return; }                                       \
+    const uint32_t off = a - w->base;                                          \
+    uint64_t *const written = w->written;                                      \
+    memcpy(w->host + off, &(val), sizeof(TYPE));                               \
+    psp_mem_stamp(written, off, (uint32_t)sizeof(TYPE));
+
+static inline uint8_t  psp_read8 (uint32_t addr) { PSP_MEM_READ(uint8_t,  addr, psp_read8_slow)  }
+static inline uint16_t psp_read16(uint32_t addr) { PSP_MEM_READ(uint16_t, addr, psp_read16_slow) }
+static inline uint32_t psp_read32(uint32_t addr) { PSP_MEM_READ(uint32_t, addr, psp_read32_slow) }
+static inline float    psp_read_f32(uint32_t addr) { PSP_MEM_READ(float,  addr, psp_read_f32_slow) }
+
+static inline void psp_write8 (uint32_t addr, uint8_t  val) { PSP_MEM_WRITE(uint8_t,  addr, val, psp_write8_slow)  }
+static inline void psp_write16(uint32_t addr, uint16_t val) { PSP_MEM_WRITE(uint16_t, addr, val, psp_write16_slow) }
+static inline void psp_write32(uint32_t addr, uint32_t val) { PSP_MEM_WRITE(uint32_t, addr, val, psp_write32_slow) }
+static inline void psp_write_f32(uint32_t addr, float  val) { PSP_MEM_WRITE(float,    addr, val, psp_write_f32_slow) }
+
+#undef PSP_MEM_READ
+#undef PSP_MEM_WRITE
 
 /* A 64-bit value as the guest keeps one: two words, the low word first. */
 static inline uint64_t psp_read64(uint32_t addr) {

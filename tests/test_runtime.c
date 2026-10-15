@@ -797,6 +797,90 @@ static void test_memory(void) {
     psp_mem_free();
 }
 
+/* psp_read* and psp_write* answer RAM and the module image inline, from
+ * psp_mem_fast, and hand the rest to their *_slow halves. Both halves must
+ * give the same bytes, the same bad-access count, the same generations and
+ * the same observer calls, at every edge of a window. */
+static void test_memory_windows(void) {
+    CHECK(psp_mem_init() == 0, "memory init");
+    const uint32_t ram_end = PSP_RAM_BASE + PSP_RAM_SIZE;
+
+    /* A module inside RAM, so RAM's window stops at it and the module's
+     * starts there. */
+    CHECK(psp_mem_map_module(0x08900000u, 0x1000u) == 0, "module maps inside RAM");
+    static const uint32_t probes[] = {
+        PSP_RAM_BASE, PSP_RAM_BASE + 0x3FEu, 0x088FFFFCu, 0x088FFFFEu, 0x08900000u,
+        0x08900FFCu, 0x08900FFEu, 0x08901000u, ram_end - 4u, ram_end - 2u, ram_end,
+        PSP_SCRATCH_BASE, PSP_VRAM_BASE + 0x10u, 0x00000000u, 0x488FFFFCu, 0x88900004u,
+    };
+    for (size_t i = 0; i < sizeof probes / sizeof probes[0]; i++) {
+        const uint32_t a = probes[i];
+        /* Fill through the out-of-line half, read back through both. */
+        psp_write32_slow(a, 0xA1B2C3D4u ^ a);
+        const uint64_t bad = psp_mem_bad_access;
+        const uint32_t slow32 = psp_read32_slow(a);
+        const uint16_t slow16 = psp_read16_slow(a + 2u);
+        const uint8_t  slow8  = psp_read8_slow(a + 1u);
+        const uint64_t slow_bad = psp_mem_bad_access - bad;
+        CHECK(psp_read32(a) == slow32 && psp_read16(a + 2u) == slow16 && psp_read8(a + 1u) == slow8 &&
+                  psp_mem_bad_access - bad == 2 * slow_bad,
+              "loads at 0x%08X agree with the out-of-line half", a);
+
+        /* Store through the inline half, compare with a store through the
+         * other one: the same bytes, one generation each, the same count. */
+        uint64_t serial = psp_mem_write_serial();
+        uint64_t bad_before = psp_mem_bad_access;
+        psp_write32(a, 0x0F1E2D3Cu);
+        const uint32_t inline_bytes = psp_read32_slow(a);
+        const uint64_t inline_stamps = psp_mem_write_serial() - serial;
+        const uint64_t inline_bad = psp_mem_bad_access - bad_before;
+        const uint64_t inline_gen = psp_mem_range_generation(a, 4);
+        psp_write32_slow(a, 0xA1B2C3D4u ^ a);
+        serial = psp_mem_write_serial();
+        bad_before = psp_mem_bad_access;
+        psp_write32_slow(a, 0x0F1E2D3Cu);
+        CHECK(inline_bytes == psp_read32_slow(a) && inline_stamps == psp_mem_write_serial() - serial &&
+                  inline_bad == psp_mem_bad_access - bad_before &&
+                  (inline_gen == 0) == (psp_mem_range_generation(a, 4) == 0),
+              "a store at 0x%08X matches the out-of-line half", a);
+    }
+
+    /* A store across a granule boundary stamps both granules with the one
+     * generation it takes. */
+    uint64_t serial = psp_mem_write_serial();
+    psp_write32(PSP_RAM_BASE + 0x3FEu, 0x11223344u);
+    CHECK(psp_mem_write_serial() == serial + 1 &&
+              psp_mem_range_generation(PSP_RAM_BASE + 0x300u, 1) == serial + 1 &&
+              psp_mem_range_generation(PSP_RAM_BASE + 0x400u, 1) == serial + 1,
+          "an unaligned store stamps both granules it touches with one generation");
+
+    /* The module's bytes are its own: a store into it leaves RAM alone, and
+     * one above it lands in RAM. */
+    psp_write32(0x08900010u, 0x55u);
+    psp_write32(0x08901010u, 0x66u);
+    CHECK(psp_mem.ram[0x900010u] == 0 && psp_mem.ram[0x901010u] == 0x66u,
+          "the module shadows RAM inline as it does out of line");
+
+    /* A write observer over part of RAM closes RAM's inline stores: the store
+     * inside its range is reported, the one outside is not, and both are
+     * stamped. Removing it reopens them. */
+    psp_mem_set_write_observer(observe_write);
+    psp_mem_set_write_observer_range(PSP_RAM_BASE + 0x100u, PSP_RAM_BASE + 0x140u);
+    observed_writes = 0;
+    psp_write32(PSP_RAM_BASE + 0x13Cu, 0x77u);
+    CHECK(observed_writes == 1 && observed_addr == PSP_RAM_BASE + 0x13Cu && observed_size == 4,
+          "a RAM store inside the observer's range is reported");
+    serial = psp_mem_write_serial();
+    psp_write32(PSP_RAM_BASE + 0x2000u, 0x88u);
+    CHECK(observed_writes == 1 && psp_mem_range_generation(PSP_RAM_BASE + 0x2000u, 4) == serial + 1,
+          "one outside it is stamped and not reported");
+    psp_mem_set_write_observer_range(PSP_VRAM_BASE, PSP_VRAM_BASE + PSP_VRAM_SIZE);
+    psp_write32(PSP_RAM_BASE + 0x13Cu, 0x99u);
+    CHECK(observed_writes == 1, "an observer over VRAM is not told about RAM");
+    psp_mem_set_write_observer(NULL);
+    psp_mem_free();
+}
+
 static void test_unaligned(void) {
     CHECK(psp_mem_init() == 0, "memory init");
 
@@ -851,6 +935,7 @@ int main(void) {
     test_square_root();
     test_fpu();
     test_memory();
+    test_memory_windows();
     test_unaligned();
 
     if (failures) {

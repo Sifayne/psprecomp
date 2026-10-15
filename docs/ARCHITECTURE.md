@@ -90,6 +90,17 @@ than reading past the allocation, and unmapped accesses are **counted** in
 should reach a steady state with that counter flat; when it climbs, the
 analysis missed something.
 
+The loads and stores the recompiled code makes (`psp_read*`, `psp_write*`)
+are inline. Main RAM and the module image, where a game linked at 0 keeps its
+globals, are reached without a call through a two-window map
+(`psp_mem_fast`), and a store there stamps the same write generation
+`psp_mem_mark_write` would. Everything else goes to their out-of-line
+`*_slow` halves: VRAM and its access observer, the scratchpad, unmapped and
+straddling addresses, and every store while the write watch or an overlapping
+write observer is set. The windows hold only addresses that `psp_mem_ptr()`
+maps to that backing, so both paths agree on every byte. On WipEout's recorded
+race this took 14% off the CPU time (`docs/RENDERER.md`).
+
 ## The GE (Graphics Engine)
 
 A fixed-function GPU driven by a **display list** — a command stream of 32-bit

@@ -8,8 +8,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-psp_memory psp_mem;
-uint64_t   psp_mem_bad_access;
+psp_memory       psp_mem;
+psp_mem_fast_map psp_mem_fast;
+uint64_t         psp_mem_bad_access;
+
+static void update_windows(void);
 
 /* A relocatable module can live outside all three fixed memory windows. Keep
  * its backing and write-generation table beside the fixed regions so the
@@ -31,13 +34,12 @@ static uint64_t *g_module_write;
  * runs under that same token, so ordinary integers are sufficient here; making
  * every recompiled store atomic would buy no additional ordering and charge
  * the hottest path in the runtime for it. */
-enum { WRITE_GRANULE_SHIFT = 8, WRITE_GRANULE = 1 << WRITE_GRANULE_SHIFT };
+enum { WRITE_GRANULE_SHIFT = PSP_MEM_GRANULE_SHIFT, WRITE_GRANULE = 1 << WRITE_GRANULE_SHIFT };
 /* The granules that cover a size in bytes. */
 #define GRANULES(bytes) (((bytes) + WRITE_GRANULE - 1) / WRITE_GRANULE)
 static uint64_t g_ram_write[GRANULES(PSP_RAM_SIZE)];
 static uint64_t g_vram_write[GRANULES(PSP_VRAM_SIZE)];
 static uint64_t g_scratch_write[GRANULES(PSP_SCRATCH_SIZE)];
-static uint64_t g_write_serial;
 
 /* Whether the module image overlaps each fixed region, set when it is mapped.
  * The module is checked first everywhere, so its part of such a region is
@@ -126,11 +128,11 @@ static uint64_t *backing_piece(uint32_t a, uint32_t *off, uint64_t *stop) {
 }
 
 static uint64_t next_stamp(void) {
-    uint64_t stamp = ++g_write_serial;
+    uint64_t stamp = ++psp_mem_fast.write_serial;
     /* Zero is the pristine-memory generation. In practice wrapping a 64-bit
      * write count is unreachable; retaining the invariant still costs one
-     * branch and keeps the API honest. */
-    if (!stamp) stamp = ++g_write_serial;
+     * branch and keeps the API honest. psp_mem_stamp does the same. */
+    if (!stamp) stamp = ++psp_mem_fast.write_serial;
     return stamp;
 }
 
@@ -184,7 +186,7 @@ static MEM_NOINLINE uint64_t walk_range(uint32_t addr, uint32_t size, int mark) 
     return result;
 }
 
-uint64_t psp_mem_write_serial(void) { return g_write_serial; }
+uint64_t psp_mem_write_serial(void) { return psp_mem_fast.write_serial; }
 
 uint64_t psp_mem_range_generation(uint32_t addr, uint32_t size) {
     if (!size) return 0;
@@ -200,10 +202,12 @@ void psp_mem_set_write_observer(void (*observer)(uint32_t, uint32_t)) {
     g_write_observer = observer;
     g_write_watch_lo = 0;
     g_write_watch_hi = UINT32_MAX;
+    update_windows();
 }
 void psp_mem_set_write_observer_range(uint32_t lo, uint32_t hi) {
     g_write_watch_lo = lo & PSP_ADDR_MASK;
     g_write_watch_hi = hi & PSP_ADDR_MASK;
+    update_windows();
 }
 
 static void (*g_vram_observer)(uint32_t, uint32_t);
@@ -241,9 +245,13 @@ static int g_whits;
  * writes nobody asked about and never reaches the one that matters. */
 static uint32_t g_wvalue;
 static int g_wfilter;
-void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; g_wfilter = 0; }
+void psp_mem_watch_write(uint32_t addr) {
+    g_wwatch = addr; g_whits = 0; g_wfilter = 0;
+    update_windows();
+}
 void psp_mem_watch_write_value(uint32_t addr, uint32_t val) {
     g_wwatch = addr; g_whits = 0; g_wvalue = val; g_wfilter = 1;
+    update_windows();
 }
 int psp_mem_watch_hits(void) { return g_whits; }
 
@@ -292,6 +300,41 @@ static void note_write_val(uint32_t addr, uint32_t width, uint32_t val) {
                 psp_trace_recent(1), psp_trace_recent(2),
                 psp_trace_recent(3), psp_trace_recent(4));
     }
+}
+
+/* A store the inline path may make: none while the watch is set, since
+ * note_write_val must see every one, and none in a window the write observer
+ * could be told about. The observer is called when a < hi && a + size > lo,
+ * which no store inside w can satisfy if w starts at or above hi or ends at
+ * or below lo. */
+static uint32_t store_span(const psp_mem_window *w) {
+    if (g_wwatch) return 0;
+    if (g_write_observer && w->base < g_write_watch_hi &&
+        (uint64_t)w->base + w->load_span > g_write_watch_lo)
+        return 0;
+    return w->load_span;
+}
+
+/* Bring psp_mem_fast up to date after the backing, the module image, the
+ * write observer or the watch changes. The module window is the whole image,
+ * as psp_mem_ptr checks it first. RAM's is all of RAM, unless the module
+ * overlaps it: then only the part below the module, so that no window holds an
+ * address psp_mem_ptr would give to the other backing, and the two windows
+ * never overlap. */
+static void update_windows(void) {
+    psp_mem_window *module = &psp_mem_fast.module, *ram = &psp_mem_fast.ram;
+    module->host = g_module;
+    module->written = g_module_write;
+    module->base = g_module_base;
+    module->load_span = g_module && g_module_write ? g_module_size : 0;
+    ram->host = psp_mem.ram;
+    ram->written = g_ram_write;
+    ram->base = PSP_RAM_BASE;
+    ram->load_span = !psp_mem.ram ? 0
+                   : !g_module_in_ram ? PSP_RAM_SIZE
+                   : g_module_base > PSP_RAM_BASE ? g_module_base - PSP_RAM_BASE : 0;
+    module->store_span = store_span(module);
+    ram->store_span = store_span(ram);
 }
 
 /* A census, because "few enough to simply print" stopped being true.
@@ -467,6 +510,7 @@ int psp_mem_init(void) {
      * that survived the old allocation to revalidate against the now-pristine
      * page tables rather than taking its global-serial fast path. */
     next_stamp();
+    update_windows();
     return 0;
 }
 
@@ -483,6 +527,7 @@ void psp_mem_free(void) {
     g_module_write = NULL;
     g_module_base = g_module_size = 0;
     g_module_in_ram = g_module_in_vram = g_module_in_scratch = 0;
+    update_windows();
 }
 
 int psp_mem_map_module(uint32_t base, uint32_t size) {
@@ -498,12 +543,14 @@ int psp_mem_map_module(uint32_t base, uint32_t size) {
         g_module_write = NULL;
         g_module_size = 0;
         g_module_in_ram = g_module_in_vram = g_module_in_scratch = 0;
+        update_windows();
         return -1;
     }
     g_module_base = base;
     g_module_size = size;
     find_module_overlaps();
     next_stamp();
+    update_windows();
     return 0;
 }
 
@@ -518,12 +565,16 @@ int psp_mem_grow_module(uint32_t end) {
     const size_t had = GRANULES((size_t)g_module_size);
     const size_t pages = GRANULES((size_t)size);
     uint64_t *write = (uint64_t *)realloc(g_module_write, pages * sizeof(uint64_t));
-    if (!write) return -1;
+    if (!write) {
+        update_windows();   /* the image moved */
+        return -1;
+    }
     g_module_write = write;
     memset(g_module_write + had, 0, (pages - had) * sizeof(uint64_t));
     g_module_size = size;
     find_module_overlaps();
     next_stamp();
+    update_windows();
     return 0;
 }
 
@@ -581,7 +632,8 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
     return NULL;
 }
 
-/* Reads of unmapped memory return 0 and are counted. Silently returning 0 is
+/* The accessors' out-of-line halves, for whatever psp_mem_fast does not hold.
+ * Reads of unmapped memory return 0 and are counted. Silently returning 0 is
  * what hardware roughly does, but a recompiled game should never be doing it
  * in a steady state — the counter is how you notice. */
 #define READ_BODY(TYPE)                              \
@@ -591,10 +643,10 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
     memcpy(&v, p, sizeof v);                         \
     return v;
 
-uint8_t  psp_read8 (uint32_t addr) { READ_BODY(uint8_t)  }
-uint16_t psp_read16(uint32_t addr) { READ_BODY(uint16_t) }
-uint32_t psp_read32(uint32_t addr) { READ_BODY(uint32_t) }
-float    psp_read_f32(uint32_t addr) { READ_BODY(float)  }
+uint8_t  psp_read8_slow (uint32_t addr) { READ_BODY(uint8_t)  }
+uint16_t psp_read16_slow(uint32_t addr) { READ_BODY(uint16_t) }
+uint32_t psp_read32_slow(uint32_t addr) { READ_BODY(uint32_t) }
+float    psp_read_f32_slow(uint32_t addr) { READ_BODY(float)  }
 
 #define WRITE_BODY(TYPE)                             \
     void *p = psp_mem_ptr(addr, (uint32_t)sizeof(TYPE)); \
@@ -604,10 +656,10 @@ float    psp_read_f32(uint32_t addr) { READ_BODY(float)  }
     memcpy(p, &val, sizeof(TYPE));                   \
     psp_mem_mark_write(addr, (uint32_t)sizeof(TYPE));
 
-void psp_write8 (uint32_t addr, uint8_t  val) { WRITE_BODY(uint8_t)  }
-void psp_write16(uint32_t addr, uint16_t val) { WRITE_BODY(uint16_t) }
-void psp_write32(uint32_t addr, uint32_t val) { WRITE_BODY(uint32_t) }
-void psp_write_f32(uint32_t addr, float  val) { WRITE_BODY(float)    }
+void psp_write8_slow (uint32_t addr, uint8_t  val) { WRITE_BODY(uint8_t)  }
+void psp_write16_slow(uint32_t addr, uint16_t val) { WRITE_BODY(uint16_t) }
+void psp_write32_slow(uint32_t addr, uint32_t val) { WRITE_BODY(uint32_t) }
+void psp_write_f32_slow(uint32_t addr, float  val) { WRITE_BODY(float)    }
 
 int psp_mem_write_block(uint32_t addr, const void *src, uint32_t len) {
     void *p = psp_mem_ptr(addr, len);
