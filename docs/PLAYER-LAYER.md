@@ -1082,8 +1082,8 @@ end to end, after a list of their names, sizes and addresses:
 - SAS voices and reverb;
 - the GE's lists, event ring, timeline, callbacks, registers, immediate-mode
   vertices and owner;
-- UMD state, the savedata dialog's status words, and the movie
-  stream-handle counter.
+- UMD state, the savedata and message dialogs' status words, and the
+  movie stream-handle counter.
 
 A kept variable holds no host pointer, except into another kept variable.
 A load remembers where the state had each one, and such a pointer follows
@@ -1167,7 +1167,7 @@ baselines, built with resume entries and with a save taken mid-run.
   handler, a replaced function no title registered);
 - a thread switched away inside a call (a yield or a preemption);
 - a thread waiting in a call with no finish;
-- a movie context open, or the savedata dialog open;
+- a movie context open, or the savedata or message dialog open;
 - a file open for writing, or a directory open.
 
 In the replays, the only refusals were movies: a save asked for during one
