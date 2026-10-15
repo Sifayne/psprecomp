@@ -672,8 +672,9 @@ static int discovered(const a_analysis *an, uint32_t addr) {
  * to be a discovered function or the module's initialiser dispatches into
  * nothing (src/host/boot.c, report_cplinit): .cplinit's (constructor,
  * priority) pairs, ended by a zero constructor, and GCC's .ctors, a -1, the
- * entries, then 0. A module without section headers says neither; that is
- * the case src/ctors.c's scan was written for. */
+ * entries, then 0. A module without section headers says neither, and
+ * would need its tables found some other way: no disc swept so far has had
+ * one with constructors to find (ROADMAP). */
 static void report_ctors(const psp_blob *b, const elf_info *e, const a_analysis *an, int list) {
     if (!e->shoff || !e->shnum) {
         printf("ctors:      no section headers: the tables are not named\n");

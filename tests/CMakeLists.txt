@@ -105,10 +105,6 @@ add_executable(test_vfpu test_vfpu.c)
 target_link_libraries(test_vfpu PRIVATE psprecomp)
 add_test(NAME vfpu COMMAND test_vfpu)
 
-add_executable(test_ctors test_ctors.c)
-target_link_libraries(test_ctors PRIVATE psprecomp)
-add_test(NAME ctors COMMAND test_ctors)
-
 # The handoff token. Guest thread bodies are plain C functions registered in
 # the dispatch table, so no module and no game data is involved.
 add_executable(test_sched test_sched.c)
