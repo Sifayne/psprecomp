@@ -9,11 +9,14 @@ int save_dialog_init(void);
 const char *save_dialog_error(void);
 void save_dialog_shutdown(void);
 void save_dialog_update(SDL_GameController *pad);
+/* The savedata dialog, which takes the controls; not a message dialog. */
 int save_dialog_active(void);
 int save_dialog_input_neutral(SDL_GameController *pad);
 int save_dialog_event(const SDL_Event *event, SDL_JoystickID controller);
 void save_dialog_draw_software(SDL_Renderer *renderer);
-/* GL-owner call: copies a completed RGBA overlay. No SDL calls. Returns active. */
+/* GL-owner call: copies a completed RGBA overlay. No SDL calls. Returns 0 when
+ * nothing is up, 1 for the savedata dialog, which takes the picture's place,
+ * and 2 for a message dialog, which goes over it. */
 int save_dialog_copy_pixels(uint32_t *out, uint64_t *revision);
 /* Same completed pixels for visual test artifacts. SDL thread only. */
 int save_dialog_capture(const char *path);

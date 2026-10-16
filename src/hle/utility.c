@@ -8,6 +8,7 @@
 #include "psprecomp/sched.h"
 #include "psprecomp/state.h"
 #include "psprecomp/clock.h"
+#include "psprecomp/msgdialog.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1467,7 +1468,9 @@ int psp_savedata_set_script(const char *path) {
 /* For the park census (census.h). */
 int psp_utility_census(void) { return g_savedata_state; }
 
+static void md_reset(void);
 void psp_utility_init(void) {
+    md_reset();
     g_savedata_state=PSP_UTILITY_DIALOG_NONE;
     g_savedata_param=0; g_savedata_done=0; g_savedata_interactive=0;
     memset(&sd_view,0,sizeof sd_view); sd_view.session=++sd_serial;
@@ -1833,13 +1836,16 @@ static void hle_SavedataInitStart(void) {
  * blocking wait, a yield another thread took), which also covers a poll
  * from any other thread. A zero-length sceKernelDelayThread does not count:
  * it does not stand aside on fw 6.60 (threadprobe step 80). */
-static int sd_shutdown_done(void) {
-    if (psp_display_vblanks()!=g_savedata_shutdown_vblank) return 1;
+static int shutdown_done(uint64_t vblank, uint32_t thread, uint32_t releases) {
+    if (psp_display_vblanks()!=vblank) return 1;
     const uint32_t me=psp_sched_current();
-    if (me!=g_savedata_shutdown_thread) return 1;
+    if (me!=thread) return 1;
     psp_sched_stats st;
     psp_sched_stats_of(me,&st);
-    return st.releases!=g_savedata_shutdown_releases;
+    return st.releases!=releases;
+}
+static int sd_shutdown_done(void) {
+    return shutdown_done(g_savedata_shutdown_vblank,g_savedata_shutdown_thread,g_savedata_shutdown_releases);
 }
 static void hle_SavedataGetStatus(void) {
     if (g_savedata_state==PSP_UTILITY_DIALOG_FINISHED && sd_shutdown_done())
@@ -1902,6 +1908,202 @@ static void hle_SavedataShutdownStart(void) {
     psp_ret(0);
 }
 
+/* ---- the message dialog ---------------------------------------------------
+ *
+ * sceUtilityMsgDialog, as a PSP answers pspautotests' utility/msgdialog
+ * (dialog and abort):
+ *   - InitStart returns 0, and the status is 1 (INIT) for 34 frames, then 2
+ *     (VISIBLE), when the result word after the common block becomes 0;
+ *   - a request it refuses shows all the same, and 9 frames after VISIBLE is
+ *     3 with the refusal as its result: an unknown option bit (0x80110501;
+ *     checked in a 580-byte request in text mode, in a 708-byte one in both
+ *     modes), or an error dialog with error number 0 (0x80110502);
+ *   - Abort while VISIBLE returns 0, and 0 again if asked twice, and the next
+ *     Update makes it 3. Before any message dialog it answers 0x80110005, and
+ *     0x80110001 in any other status;
+ *   - ShutdownStart from 3 returns 0, and the status is 4 (FINISHED) until the
+ *     caller stands aside, as for the savedata dialog (shutdown_done).
+ * The dialog reads the pad itself, one poll per Update (psp_ctrl_utility_poll),
+ * so a replay drives it as it drives the game. The confirm button closes it
+ * with Yes, or No where the cursor is -- left and right move it in a Yes/No
+ * dialog -- and the cancel button with Back, written to buttonPressed in a
+ * request of 580 bytes and up. Not measured: which of those the PSP reports
+ * for each button, a request of another size, an InitStart while a dialog is
+ * up, and ShutdownStart in another status. */
+#define MD_SIZE_V1      572u
+#define MD_SIZE_V2      580u
+#define MD_SIZE_V3      708u
+#define MD_RESULT       48u    /* the result word after the common block */
+#define MD_MODE         52u
+#define MD_ERROR        56u
+#define MD_MESSAGE      60u
+#define MD_OPTIONS      572u
+#define MD_PRESSED      576u
+#define MD_OK_LABEL     580u
+#define MD_CANCEL_LABEL 644u
+/* PSPSDK psputility_msgdialog.h; 0x20 takes the 708-byte request's labels. */
+enum { MD_MODE_ERROR = 0 };
+enum { MD_OPT_TEXT = 0x1, MD_OPT_YESNO = 0x10, MD_OPT_LABELS = 0x20, MD_OPT_DEFAULT_NO = 0x100 };
+enum { MD_PRESSED_YES = 1, MD_PRESSED_NO = 2, MD_PRESSED_BACK = 3 };
+#define MD_BAD_OPTIONS  0x80110501u
+#define MD_BAD_ERROR    0x80110502u
+#define MD_NO_DIALOG    0x80110005u
+#define MD_BAD_STATUS   0x80110001u
+#define MD_BAD_SIZE     0x80110004u    /* the savedata dialog's for a bad request */
+enum { MD_SHOW_FRAMES = 34, MD_REFUSE_FRAMES = 9 };
+/* PSPSDK pspctrl.h */
+enum { MD_RIGHT = 0x20, MD_LEFT = 0x80, MD_CIRCLE = 0x2000, MD_CROSS = 0x4000 };
+
+static struct {
+    int      state, started, aborting, yes_no, selected_no, confirm_circle;
+    uint32_t param, size, refusal, held;
+    uint64_t opened, shown;            /* vblank counts at InitStart and VISIBLE */
+    uint64_t shutdown_vblank;
+    uint32_t shutdown_thread, shutdown_releases;
+} g_md;
+static psp_os_mutex md_lock = PSP_OS_MUTEX_INIT;
+static psp_msgdialog_view md_view;     /* under md_lock */
+
+int psp_msgdialog_snapshot(psp_msgdialog_view *out) {
+    psp_os_lock(&md_lock);
+    int r = 0;
+    if (md_view.active) {
+        r = out->session == md_view.session && out->revision == md_view.revision ? 1 : 2;
+        if (r == 2) *out = md_view;
+    }
+    psp_os_unlock(&md_lock);
+    return r;
+}
+
+static void md_reset(void) {
+    memset(&g_md, 0, sizeof g_md);
+    psp_os_lock(&md_lock);
+    md_view.active = 0;
+    md_view.revision++;
+    psp_os_unlock(&md_lock);
+}
+
+static void md_publish(int active) {
+    psp_os_lock(&md_lock);
+    md_view.active = active;
+    md_view.selected_no = g_md.selected_no;
+    md_view.revision++;
+    psp_os_unlock(&md_lock);
+}
+
+static void md_copy(char *out, uint32_t at, uint32_t cap) {
+    uint32_t i = 0;
+    for (; i + 1 < cap; i++) if (!(out[i] = (char)psp_read8(at + i))) break;
+    out[i] = 0;
+}
+
+static void hle_MsgDialogInitStart(void) {
+    if (g_md.state == PSP_UTILITY_DIALOG_FINISHED) g_md.state = PSP_UTILITY_DIALOG_NONE;
+    if (g_md.state != PSP_UTILITY_DIALOG_NONE) { psp_ret(MD_BAD_STATUS); return; }
+    const uint32_t p = psp_arg(0);
+    const uint32_t size = psp_mem_ptr(p, 4) ? psp_read32(p) : 0;
+    if (size < MD_SIZE_V1 || !psp_mem_ptr(p, size >= MD_SIZE_V3 ? MD_SIZE_V3 : size)) { psp_ret(MD_BAD_SIZE); return; }
+    const int text = psp_read32(p + MD_MODE) != MD_MODE_ERROR;
+    const uint32_t options = size >= MD_SIZE_V2 ? psp_read32(p + MD_OPTIONS) : 0;
+    const uint32_t known = MD_OPT_TEXT | MD_OPT_YESNO | MD_OPT_LABELS | MD_OPT_DEFAULT_NO;
+    g_md.refusal = (options & ~known) && size >= (text ? MD_SIZE_V2 : MD_SIZE_V3) ? MD_BAD_OPTIONS
+                 : !text && !psp_read32(p + MD_ERROR) ? MD_BAD_ERROR : 0;
+    g_md.param = p; g_md.size = size;
+    g_md.started = 1; g_md.aborting = 0;
+    g_md.yes_no = (options & MD_OPT_YESNO) != 0;
+    g_md.selected_no = g_md.yes_no && (options & MD_OPT_DEFAULT_NO);
+    g_md.confirm_circle = psp_read32(p + 8) == 0;
+    g_md.opened = psp_display_vblanks();
+    g_md.state = PSP_UTILITY_DIALOG_INIT;
+    psp_os_lock(&md_lock);
+    md_view.session++;
+    md_view.active = 0;
+    md_view.error_mode = !text;
+    md_view.error = psp_read32(p + MD_ERROR);
+    md_view.yes_no = g_md.yes_no;
+    md_view.confirm_circle = g_md.confirm_circle;
+    md_copy(md_view.message, p + MD_MESSAGE, sizeof md_view.message);
+    md_view.ok_label[0] = md_view.cancel_label[0] = 0;
+    if (size >= MD_SIZE_V3 && (options & MD_OPT_LABELS)) {
+        md_copy(md_view.ok_label, p + MD_OK_LABEL, sizeof md_view.ok_label);
+        md_copy(md_view.cancel_label, p + MD_CANCEL_LABEL, sizeof md_view.cancel_label);
+    }
+    psp_os_unlock(&md_lock);
+    psp_ret(0);
+}
+
+/* What time does: the dialog shows, and a refused one ends. */
+static void md_advance(void) {
+    const uint64_t now = psp_display_vblanks();
+    if (g_md.state == PSP_UTILITY_DIALOG_INIT && now - g_md.opened >= MD_SHOW_FRAMES) {
+        g_md.state = PSP_UTILITY_DIALOG_VISIBLE;
+        g_md.shown = now;
+        if (!g_md.refusal) {
+            psp_write32(g_md.param + MD_RESULT, 0);
+            g_md.held = ~0u;            /* nothing held before it counts */
+            md_publish(1);
+        }
+    }
+    if (g_md.state == PSP_UTILITY_DIALOG_VISIBLE && g_md.refusal && now - g_md.shown >= MD_REFUSE_FRAMES) {
+        g_md.state = PSP_UTILITY_DIALOG_QUIT;
+        psp_write32(g_md.param + MD_RESULT, g_md.refusal);
+    }
+}
+
+static void md_close(int pressed) {
+    if (pressed && g_md.size >= MD_SIZE_V2) psp_write32(g_md.param + MD_PRESSED, (uint32_t)pressed);
+    g_md.state = PSP_UTILITY_DIALOG_QUIT;
+    md_publish(0);
+}
+
+static void hle_MsgDialogGetStatus(void) {
+    if (g_md.state == PSP_UTILITY_DIALOG_FINISHED &&
+        shutdown_done(g_md.shutdown_vblank, g_md.shutdown_thread, g_md.shutdown_releases))
+        g_md.state = PSP_UTILITY_DIALOG_NONE;
+    md_advance();
+    psp_ret((uint32_t)g_md.state);
+}
+
+static void hle_MsgDialogUpdate(void) {
+    md_advance();
+    if (g_md.state == PSP_UTILITY_DIALOG_VISIBLE && !g_md.refusal) {
+        if (g_md.aborting) {
+            md_close(0);
+        } else {
+            const uint32_t now = psp_ctrl_utility_poll(), pressed = now & ~g_md.held;
+            g_md.held = now;
+            const uint32_t confirm = g_md.confirm_circle ? MD_CIRCLE : MD_CROSS;
+            const uint32_t cancel  = g_md.confirm_circle ? MD_CROSS : MD_CIRCLE;
+            if (g_md.yes_no && (pressed & (MD_LEFT | MD_RIGHT)) &&
+                g_md.selected_no != ((pressed & MD_RIGHT) != 0)) {
+                g_md.selected_no = (pressed & MD_RIGHT) != 0;
+                md_publish(1);
+            }
+            if (pressed & confirm)     md_close(g_md.selected_no ? MD_PRESSED_NO : MD_PRESSED_YES);
+            else if (pressed & cancel) md_close(MD_PRESSED_BACK);
+        }
+    }
+    psp_ret(0);
+}
+
+static void hle_MsgDialogShutdownStart(void) {
+    if (g_md.state != PSP_UTILITY_DIALOG_QUIT) { psp_ret(MD_BAD_STATUS); return; }
+    g_md.state = PSP_UTILITY_DIALOG_FINISHED;
+    g_md.shutdown_vblank = psp_display_vblanks();
+    g_md.shutdown_thread = psp_sched_current();
+    psp_sched_stats st;
+    psp_sched_stats_of(g_md.shutdown_thread, &st);
+    g_md.shutdown_releases = st.releases;
+    psp_ret(0);
+}
+
+static void hle_MsgDialogAbort(void) {
+    if (!g_md.started) { psp_ret(MD_NO_DIALOG); return; }
+    if (g_md.state != PSP_UTILITY_DIALOG_VISIBLE || g_md.refusal) { psp_ret(MD_BAD_STATUS); return; }
+    g_md.aborting = 1;
+    psp_ret(0);
+}
+
 /* sceUtilityLoadModule / sceUtilityUnloadModule(PSP_MODULE_xxx): "0 on
  * success, < 0 on error" (PSPSDK src/utility/psputility_modules.h; BSD). The
  * libraries they would load -- AV codecs, mpeg, atrac, network -- are part of
@@ -1912,12 +2114,16 @@ static void hle_SavedataShutdownStart(void) {
 static void hle_UtilityLoadModule(void)   { psp_ret(0); }
 static void hle_UtilityUnloadModule(void) { psp_ret(0); }
 
-/* A save state (psprecomp/state.h) waits for the savedata dialog to close:
- * it is a host window with its own state. Its status words are kept, since a
- * game reads FINISHED for a while after the dialog is gone. */
+/* A save state (psprecomp/state.h) waits for the savedata dialog and the
+ * message dialog to close: each is a host window with its own state. Their
+ * status words are kept, since a game reads FINISHED for a while after a
+ * dialog is gone. */
 static const char *utility_refuse(void) {
-    return g_savedata_state >= PSP_UTILITY_DIALOG_INIT && g_savedata_state <= PSP_UTILITY_DIALOG_QUIT
-         ? "the savedata dialog is open" : NULL;
+    if (g_savedata_state >= PSP_UTILITY_DIALOG_INIT && g_savedata_state <= PSP_UTILITY_DIALOG_QUIT)
+        return "the savedata dialog is open";
+    if (g_md.state >= PSP_UTILITY_DIALOG_INIT && g_md.state <= PSP_UTILITY_DIALOG_QUIT)
+        return "a message dialog is open";
+    return NULL;
 }
 
 /* PSPRECOMP_SAVEDATA_SCRIPT's place, for a run that continues a state with
@@ -2052,6 +2258,7 @@ void psp_utility_register(void) {
     PSP_STATE_KEEP(sd_request);
     PSP_STATE_KEEP(sd_serial);
     PSP_STATE_KEEP(sd_ordinal);
+    PSP_STATE_KEEP(g_md);
     psp_state_register(&part);
     psp_hle_register(0x2A2B3DE0,"sceUtility","sceUtilityLoadModule",hle_UtilityLoadModule);
     psp_hle_register(0xE49BFE92,"sceUtility","sceUtilityUnloadModule",hle_UtilityUnloadModule);
@@ -2059,6 +2266,11 @@ void psp_utility_register(void) {
     psp_hle_register(0x8874DBE0,"sceUtility","sceUtilitySavedataGetStatus",hle_SavedataGetStatus);
     psp_hle_register(0xD4B95FFB,"sceUtility","sceUtilitySavedataUpdate",hle_SavedataUpdate);
     psp_hle_register(0x9790B33C,"sceUtility","sceUtilitySavedataShutdownStart",hle_SavedataShutdownStart);
+    psp_hle_register(0x2AD8E239,"sceUtility","sceUtilityMsgDialogInitStart",hle_MsgDialogInitStart);
+    psp_hle_register(0x9A1C91D7,"sceUtility","sceUtilityMsgDialogGetStatus",hle_MsgDialogGetStatus);
+    psp_hle_register(0x95FC253B,"sceUtility","sceUtilityMsgDialogUpdate",hle_MsgDialogUpdate);
+    psp_hle_register(0x67AF3428,"sceUtility","sceUtilityMsgDialogShutdownStart",hle_MsgDialogShutdownStart);
+    psp_hle_register(0x4928BD96,"sceUtility","sceUtilityMsgDialogAbort",hle_MsgDialogAbort);
     psp_hle_register(0xA5DA2406,"sceUtility","sceUtilityGetSystemParamInt",hle_GetSystemParamInt);
     psp_hle_register(0x34B78343,"sceUtility","sceUtilityGetSystemParamString",hle_GetSystemParamString);
 }

@@ -174,6 +174,10 @@ foreach(value "2,2" "5,2" "2," "-1" "2,no" "4294967296")
              COMMAND test_ge_capture invalid capture-invalid-${id} "${value}")
 endforeach()
 
+add_executable(test_msgdialog test_msgdialog.c)
+target_link_libraries(test_msgdialog PRIVATE psprecomp)
+add_test(NAME msgdialog COMMAND test_msgdialog)
+
 add_executable(test_savedata test_savedata.c)
 target_link_libraries(test_savedata PRIVATE psprecomp)
 if(MSVC)

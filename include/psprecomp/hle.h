@@ -500,6 +500,9 @@ uint32_t psp_ctrl_polls(void);
 /* Buttons newly pressed in the last merged poll, including recorded carrier
  * bits. This is a snapshot, not a queue: menu/paused polls do not accumulate. */
 uint32_t psp_ctrl_pressed_buttons(void);
+/* A firmware utility reading the pad itself, as one poll: what a read the
+ * game made would see, replay and recording included. */
+uint32_t psp_ctrl_utility_poll(void);
 /* The stick as the guest last read it (merged lane, 0..255 centred on 128),
  * for native replacements that want the magnitude the game's own control code
  * discards. Same value a recording holds, so a replay reproduces it. */
