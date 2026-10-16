@@ -17,8 +17,11 @@ import sys
 TARGET = ['-target', 'x86_64-linux-gnu.2.35']
 # A game's C, compiled to ThinLTO bitcode: its link optimizes it together
 # with the runtime and player archives, which the package builds the same
-# way (player/linux/build.py, game_archives).
-GAME = ['-std=gnu11', '-fno-strict-aliasing', '-fwrapv', '-flto=thin']
+# way (player/linux/build.py, game_archives). Without debug info, which zig
+# cc adds by default: for generated C it was most of the game's file, and
+# nothing reads it. Profiles and gdb's backtraces need only the symbol table
+# and .eh_frame, which stay.
+GAME = ['-std=gnu11', '-fno-strict-aliasing', '-fwrapv', '-flto=thin', '-g0']
 # What the launcher may see of a pack's launcher.so; the rest stays its own.
 EXPORTS = '{ global: psp_title_settings; psp_launcher_info; psp_pack_api; local: *; };\n'
 

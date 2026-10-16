@@ -516,9 +516,10 @@ deterministic products:
 
 Only the race's wall clock differs.
 
-The third is fixed too. `psp_read*` and `psp_write*` are now inline in
-`include/psprecomp/mem.h`. Main RAM and the module image are reached without a
-call, through a two-window map that `src/mem.c` keeps current. WipEout's
+The third is fixed too. `psp_read*` and `psp_write*` answer main RAM and the
+module image first, from a two-window map that `src/mem.c` keeps current,
+before any of `psp_mem_ptr`'s region checks. (They were inline at first; the
+part on preparation below takes them back out of line.) WipEout's
 executable is linked at 0, so its globals live in the module image. A store
 there stamps the same write generation, with the same serial, that
 `psp_mem_mark_write` would. VRAM, the scratchpad, bad addresses, and stores
@@ -542,9 +543,9 @@ there. What is left is mostly the texture decoder's per-texel VRAM reads, which
 the row decoder above replaces. The output did not change: the readability
 gate matched byte for byte (64 of 64 products, apart from the race's wall
 clock), and the pspautotests sweep gave the same output on all 422 stable
-tests. The cost is code size. The game's code doubles (15 to 32 MB of text, 60
-to 184 MB on disk with debug info), and preparing WipEout took 118 s instead
-of 56 s.
+tests. Inline, the cost was code size. The game's code doubled (15 to 32 MB of
+text, 60 to 184 MB on disk with debug info), and preparing WipEout took 118 s
+instead of 56 s.
 
 ThinLTO is now adopted. The package builds the runtime and player archives
 twice. The builder's gcc builds the ones the app's own programs and checks
@@ -574,6 +575,57 @@ All four pack games were prepared, linked and replayed with the new
 archives, and both packs' files are byte-identical to release-new's. The
 archives and the recipe are part of every game's fingerprint, so each game
 is prepared once more after the update.
+
+What did preparation pay for? Inline, every one of WipEout's ~190,000 loads
+and stores carried both window checks, and every store its generation stamp.
+Compiled on their own (zig cc `-O2`, no LTO, no debug info), its 32 chunks of
+generated C make 12.5 MB of code with out-of-line accessors and 29.3 MB with
+inline ones. The stores are 9.4 MB of the difference and the loads 7.1 MB; the
+second window costs 7.3 MB and the stamp 4.2 MB. Marking the slow halves cold
+makes the code larger.
+
+At run time the inlining bought nothing. Below are release builds of each
+variant on the same race (CPU at 150 s against the inline build, the mean of
+rounds run four or five builds side by side), with WipEout's preparation (the
+best of two or three imports; other sessions kept the load at 4–25):
+
+| Accessors | CPU | Game code | Game file | Preparing WipEout |
+|---|---|---|---|---|
+| inline (as merged) | — | 36.8 MB | 214 MB | 147 s |
+| inline for RAM only, the module out of line | −3.5% | 29.5 MB | 159 MB | 113 s |
+| loads inline, stores out of line | −5.1% | 26.8 MB | 142 MB | 103 s |
+| out of line, through the map | −3.0% | 19.8 MB | 82 MB | 78 s |
+| out of line, before the map | +11.7% | 20.6 MB | 83 MB | 76 s |
+
+The rounds disagree by up to 4% (two homes of the inline build, side by side,
+by 0.7%), so every variant that keeps the map runs as fast as the inline one.
+Only the accessors from before the map are slower. The map was the win, not
+the inlining. `psp_read*` and `psp_write*` are out-of-line functions again,
+`noinline` so that a game's ThinLTO link does not copy them back into every
+call site, and the map is private to `src/mem.c`. The slow halves are
+`noinline` too: the inline build's link had copied them into about 4,000 call
+sites.
+
+zig cc adds DWARF by default, and for generated C it was most of the game's
+file. Nothing reads it: profwatch symbolizes with `nm`, gdb's backtraces need
+only the symbol table and `.eh_frame`, and save states are guest state.
+`compile_game.py` passes `-g0`, which takes WipEout's game from 82 to 32 MB.
+Together:
+
+| | CPU | Game code | Game file | Preparing WipEout |
+|---|---|---|---|---|
+| inline, as merged | — | 36.8 MB | 214 MB | 147 s |
+| out of line, `-g0` | −3.0% | 19.8 MB | 32 MB | 64–83 s |
+
+Compiling the generated C without `-flto=thin`, with the runtime still ThinLTO,
+would bring preparation to 57 s and the code to 15.2 MB, at about 1% more CPU
+on average, within the rounds' noise. That gives up ThinLTO across the game's
+own code, a decision of its own, so it is not part of this change.
+
+The output did not change. The readability gate matched base byte for byte:
+64 of 64 products, apart from the race's wall clock. (Silent Line's replay ran
+on its own, once its deleted input pad was restored.) The pspautotests sweep
+gave the same output on all 422 stable tests.
 
 Each of these changes was measured on its own against release-new (e2479ce)
 or, for ThinLTO, against the inline-memory build. Release-merged (e12e44d) is

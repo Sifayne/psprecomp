@@ -797,8 +797,8 @@ static void test_memory(void) {
     psp_mem_free();
 }
 
-/* psp_read* and psp_write* answer RAM and the module image inline, from
- * psp_mem_fast, and hand the rest to their *_slow halves. Both halves must
+/* psp_read* and psp_write* answer RAM and the module image from mem.c's two
+ * windows, and hand the rest to their *_slow halves. Both halves must
  * give the same bytes, the same bad-access count, the same generations and
  * the same observer calls, at every edge of a window. */
 static void test_memory_windows(void) {
@@ -815,7 +815,7 @@ static void test_memory_windows(void) {
     };
     for (size_t i = 0; i < sizeof probes / sizeof probes[0]; i++) {
         const uint32_t a = probes[i];
-        /* Fill through the out-of-line half, read back through both. */
+        /* Fill through the slow half, read back through both. */
         psp_write32_slow(a, 0xA1B2C3D4u ^ a);
         const uint64_t bad = psp_mem_bad_access;
         const uint32_t slow32 = psp_read32_slow(a);
@@ -824,25 +824,25 @@ static void test_memory_windows(void) {
         const uint64_t slow_bad = psp_mem_bad_access - bad;
         CHECK(psp_read32(a) == slow32 && psp_read16(a + 2u) == slow16 && psp_read8(a + 1u) == slow8 &&
                   psp_mem_bad_access - bad == 2 * slow_bad,
-              "loads at 0x%08X agree with the out-of-line half", a);
+              "loads at 0x%08X agree with the slow half", a);
 
-        /* Store through the inline half, compare with a store through the
-         * other one: the same bytes, one generation each, the same count. */
+        /* Store through the windows, compare with a store through the
+         * slow half: the same bytes, one generation each, the same count. */
         uint64_t serial = psp_mem_write_serial();
         uint64_t bad_before = psp_mem_bad_access;
         psp_write32(a, 0x0F1E2D3Cu);
-        const uint32_t inline_bytes = psp_read32_slow(a);
-        const uint64_t inline_stamps = psp_mem_write_serial() - serial;
-        const uint64_t inline_bad = psp_mem_bad_access - bad_before;
-        const uint64_t inline_gen = psp_mem_range_generation(a, 4);
+        const uint32_t fast_bytes = psp_read32_slow(a);
+        const uint64_t fast_stamps = psp_mem_write_serial() - serial;
+        const uint64_t fast_bad = psp_mem_bad_access - bad_before;
+        const uint64_t fast_gen = psp_mem_range_generation(a, 4);
         psp_write32_slow(a, 0xA1B2C3D4u ^ a);
         serial = psp_mem_write_serial();
         bad_before = psp_mem_bad_access;
         psp_write32_slow(a, 0x0F1E2D3Cu);
-        CHECK(inline_bytes == psp_read32_slow(a) && inline_stamps == psp_mem_write_serial() - serial &&
-                  inline_bad == psp_mem_bad_access - bad_before &&
-                  (inline_gen == 0) == (psp_mem_range_generation(a, 4) == 0),
-              "a store at 0x%08X matches the out-of-line half", a);
+        CHECK(fast_bytes == psp_read32_slow(a) && fast_stamps == psp_mem_write_serial() - serial &&
+                  fast_bad == psp_mem_bad_access - bad_before &&
+                  (fast_gen == 0) == (psp_mem_range_generation(a, 4) == 0),
+              "a store at 0x%08X matches the slow half", a);
     }
 
     /* A store across a granule boundary stamps both granules with the one
@@ -859,9 +859,9 @@ static void test_memory_windows(void) {
     psp_write32(0x08900010u, 0x55u);
     psp_write32(0x08901010u, 0x66u);
     CHECK(psp_mem.ram[0x900010u] == 0 && psp_mem.ram[0x901010u] == 0x66u,
-          "the module shadows RAM inline as it does out of line");
+          "the module shadows RAM in the windows as it does in the slow half");
 
-    /* A write observer over part of RAM closes RAM's inline stores: the store
+    /* A write observer over part of RAM closes RAM's window to stores: the store
      * inside its range is reported, the one outside is not, and both are
      * stamped. Removing it reopens them. */
     psp_mem_set_write_observer(observe_write);
