@@ -70,6 +70,8 @@ const char *psp_hle_name(uint32_t nid) {
     return i >= 0 ? g_entry[i].name : NULL;
 }
 
+int psp_hle_registered(uint32_t nid) { return find_entry(nid) >= 0; }
+
 int psp_hle_count(void) { return g_count; }
 
 uint32_t psp_call_guest(uint32_t addr, const uint32_t *args, int nargs) {

@@ -105,10 +105,6 @@ add_executable(test_vfpu test_vfpu.c)
 target_link_libraries(test_vfpu PRIVATE psprecomp)
 add_test(NAME vfpu COMMAND test_vfpu)
 
-add_executable(test_ctors test_ctors.c)
-target_link_libraries(test_ctors PRIVATE psprecomp)
-add_test(NAME ctors COMMAND test_ctors)
-
 # The handoff token. Guest thread bodies are plain C functions registered in
 # the dispatch table, so no module and no game data is involved.
 add_executable(test_sched test_sched.c)
@@ -173,6 +169,10 @@ foreach(value "2,2" "5,2" "2," "-1" "2,no" "4294967296")
     add_test(NAME ge_capture_invalid_${id}
              COMMAND test_ge_capture invalid capture-invalid-${id} "${value}")
 endforeach()
+
+add_executable(test_msgdialog test_msgdialog.c)
+target_link_libraries(test_msgdialog PRIVATE psprecomp)
+add_test(NAME msgdialog COMMAND test_msgdialog)
 
 add_executable(test_savedata test_savedata.c)
 target_link_libraries(test_savedata PRIVATE psprecomp)

@@ -749,9 +749,9 @@ static void ramsnap_step(uint32_t poll) {
     }
 }
 
-/* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16.
- * Delivers `samples` entries of the merged state and returns that count. */
-static void ctrl_fill(uint32_t samples) {
+/* One poll of the pad: the replay, the recorder and the scripts step, and
+ * the lanes merge. Returns the buttons; the stick goes to `ax`, `ay`. */
+static uint32_t ctrl_merge(uint8_t *out_ax, uint8_t *out_ay) {
     const uint64_t us = psp_clock_peek();
     g_ctrl_polls++;
     if (g_watch_from && g_ctrl_polls == g_watch_from) psp_mem_watch_arm(1);
@@ -798,6 +798,24 @@ static void ctrl_fill(uint32_t samples) {
     psp_ctrl_replay_record(g_ctrl_polls, us, buttons, ax, ay,
                            g_ctrl_last_rx, g_ctrl_last_ry,
                            g_ctrl_last_mdx, g_ctrl_last_mdy);
+    *out_ax = ax;
+    *out_ay = ay;
+    return buttons;
+}
+
+/* A firmware utility's own read of the pad -- the message dialog reads it
+ * itself on a PSP -- as one poll, so a replay delivers its presses and a
+ * recording keeps them, as for a read the game makes. */
+uint32_t psp_ctrl_utility_poll(void) {
+    uint8_t ax, ay;
+    return ctrl_merge(&ax, &ay);
+}
+
+/* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16.
+ * Delivers `samples` entries of the merged state and returns that count. */
+static void ctrl_fill(uint32_t samples) {
+    uint8_t ax, ay;
+    const uint32_t buttons = ctrl_merge(&ax, &ay);
 
     /* Room past the delivered samples is left untouched. */
     const uint32_t buf = psp_arg(0);

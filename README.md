@@ -93,7 +93,6 @@ psprecomp/
 │   ├── mem.c                 # Memory map, cache mirrors, write generations, observers
 │   ├── dispatch.c            # Address → function table, tracing, stack auditing
 │   ├── vfpu.c                # Vector unit: arithmetic, matrix ops, prefixes
-│   ├── ctors.c               # Static-constructor discovery and execution
 │   ├── render.c              # Render backend interface; software and null backends
 │   ├── os.c                  # Host threads, locks and clock (POSIX and Windows)
 │   └── hle/                  # Firmware, by module
@@ -126,7 +125,7 @@ psprecomp/
 │   ├── render.h              # The backend interface a host implements
 │   ├── savedata.h            # Savedata host bridge
 │   ├── recomp_rt.h           # Semantic helpers the generated C calls
-│   ├── vfpu.h  ctors.h  os.h # Vector unit, static constructors, host primitives
+│   ├── vfpu.h  os.h          # Vector unit, host primitives
 │
 ├── tests/                    # 18 self-contained suites (25 ctest cases), no game data
 └── docs/                     # See Documentation below

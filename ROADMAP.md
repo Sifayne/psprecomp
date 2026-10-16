@@ -246,11 +246,22 @@ its name.
 
 ## Phase 6 — corpus and player-facing layer
 
-- [ ] `scripts/sweep` over a large PSP corpus as a correctness harness:
-      decrypt-all, decode-all, report coverage. Every module that fails is a
-      concrete decoder or container bug, and the aggregate VFPU percentage
-      tells us which titles are cheap targets. There is no `scripts/`
-      directory yet.
+- [x] `scripts/sweep.py` over a corpus as a correctness harness. It reads
+      every module on every disc as the importer reads it, then decodes and
+      discovers it. Its report (`build/sweep/REPORT.md`) gives each module's
+      decode and discovery coverage, VFPU share and constructors. It also
+      ranks the firmware calls nothing answers by how many discs need them,
+      naming them from the SDK headers.
+
+      The first run (14 Oct) took seven discs, 39 modules:
+      - every module unwraps;
+      - the seven executables decode with no unknown word;
+      - VFPU is 0.02-0.31% of discovered code;
+      - the 308 unknown words are in three Sony PRXs without section
+        headers, whose extent includes their data;
+      - 219 calls go unanswered. The message dialog (sceUtilityMsgDialog's
+        InitStart, Update, GetStatus and ShutdownStart) is imported by all
+        seven discs; netconf by four.
 - [x] VFPU completion. The emitter translates every VFPU instruction the
       decoder names; a sub-encoding the runtime does not recognise traps by
       name.
@@ -287,9 +298,17 @@ Gaps found in the code while checking this file, none of them on a phase above:
       The 3rd Birthday's 1 ms yield after GE calls is a different problem:
       in real time its software renderer's host time is counted as the main
       thread's guest time, which starves its movie threads.
-- [ ] **Static-constructor discovery** — `src/ctors.c` picks the single
-      longest null-terminated table; its own notes say candidates should be
-      scored on locality before it is trusted on another title.
+- [x] **Static-constructor discovery** — a module names its constructors in
+      `.cplinit`, and discovery seeds from it, from relocations in a PRX, and
+      from the data-pointer scan in an executable. The corpus sweep checks
+      them on every module. Across seven discs, all 1,028 constructors in six
+      executables are reachable: 1,027 in `.cplinit`, and one in `.ctors`.
+      The only modules without section headers are three Sony library PRXs
+      on WipEout Pulse's disc, whose pointers come through their relocations.
+      `src/ctors.c`'s scan for null-terminated pointer runs had no callers and
+      no disc that needed it, so it was retired (14 Oct). A module without
+      section headers and relocations would need its constructors found some
+      other way; the sweep reports one as soon as a disc has it.
 - [x] **MPEG decode** — the opt-in path plays The 3rd Birthday's and
       WipEout Pulse's movies, in up to four contexts. `sceMpegDelete` now lets
       go of a movie's decoders and streams; each movie but the last leaked

@@ -35,7 +35,6 @@
 #include "decode.h"          /* PSP_RA_INDEX */
 #include "psprecomp/clock.h"
 #include "psprecomp/cpu.h"
-#include "psprecomp/ctors.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/hle.h"

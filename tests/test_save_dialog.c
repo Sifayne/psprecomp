@@ -121,6 +121,48 @@ static void nofont(void) {
  * save, the stick moves and repeats on the dialog's own clock, input is
  * ignored while the window is unfocused, and A then saves. Answers 77 when no
  * system font is found. */
+/* A message dialog (sceUtilityMsgDialog) goes over the game's picture --
+ * save_dialog_copy_pixels answers 2, and the picture shows through around a
+ * darker band holding the text -- and takes no controls: the dialog reads
+ * the pad itself (src/hle/utility.c). */
+static uint32_t md_pixels[SAVE_DIALOG_W * SAVE_DIALOG_H];
+static void message_dialog(SDL_GameController *pad) {
+    const uint32_t p = 0x08820000u;
+    for (uint32_t i = 0; i < 708; i++) psp_write8(p + i, 0);
+    psp_write32(p, 708);
+    psp_write32(p + 8, 1);
+    psp_write32(p + 52, 1);
+    string(p + 60, "Saving. Do not remove the memory stick.");
+    psp_write32(p + 572, 0x11);             /* text, with Yes and No */
+    CHECK(call(0x2AD8E239u, p) == 0, "MsgDialogInitStart");
+    for (int i = 0; i < 40 && call(0x9A1C91D7u, 0) != 2; i++) call(WAIT_VBLANK_START, 0);
+    save_dialog_update(pad);
+    uint64_t revision = 0;
+    CHECK(save_dialog_copy_pixels(md_pixels, &revision) == 2, "a message dialog goes over the picture");
+    CHECK(!save_dialog_active(), "and takes no controls");
+    const unsigned corner = md_pixels[0] >> 24;
+    const unsigned band = md_pixels[(size_t)(SAVE_DIALOG_H / 2) * SAVE_DIALOG_W + 8] >> 24;
+    CHECK(corner > 0 && corner < 128 && band >= 160, "dimmed (alpha %u) around a darker band (%u)", corner, band);
+    int text = 0;
+    for (size_t y = SAVE_DIALOG_H / 4; y < 3 * SAVE_DIALOG_H / 4 && !text; y++)
+        for (size_t x = 0; x < SAVE_DIALOG_W && !text; x++) text = (md_pixels[y * SAVE_DIALOG_W + x] & 0xFFFFFFu) == 0xFFFFFFu;
+    CHECK(text, "with the message in white");
+    /* SAVE_DIALOG_SHOTS=<dir> keeps the picture, to look at. */
+    const char *shots = getenv("SAVE_DIALOG_SHOTS");
+    if (shots) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/msgdialog.bmp", shots);
+        CHECK(save_dialog_capture(path) == 0, "a picture of it in %s", path);
+    }
+    CHECK(call(0x4928BD96u, 0) == 0, "MsgDialogAbort");
+    call(0x95FC253Bu, 1);
+    save_dialog_update(pad);
+    CHECK(!save_dialog_copy_pixels(md_pixels, &revision), "gone once it closes");
+    CHECK(call(0x67AF3428u, 0) == 0, "MsgDialogShutdownStart");
+    call(WAIT_VBLANK_START, 0);
+    CHECK(call(0x9A1C91D7u, 0) == 0, "and its status is 0");
+}
+
 static int controller(void) {
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
@@ -212,6 +254,7 @@ static int controller(void) {
     finish();
     CHECK(slot_written("SLOT02"), "the save reached the selected slot on the memory stick");
     save_dialog_update(pad);
+    message_dialog(pad);
     SDL_GameControllerClose(pad);
     SDL_JoystickDetachVirtual(index);
     save_dialog_shutdown();

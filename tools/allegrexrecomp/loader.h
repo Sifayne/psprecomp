@@ -89,10 +89,10 @@ uint32_t psp_rebase_image(elf_info *e, uint32_t base, int *err);
 /* Look a section up by name.
  *
  * Worth preferring over a heuristic scan wherever the module names what it
- * wants. `psp_ctors_find` looks for the longest null-terminated run of code
- * pointers, which is a guess that vtables also satisfy; `.cplinit` says so
- * outright. The same lesson as the relocation tables: the metadata is in the
- * file, so read it. */
+ * wants. A scan for null-terminated runs of code pointers, which vtables also
+ * satisfy, was retired unused: `.cplinit` names the constructors outright. The
+ * same lesson as the relocation tables: the metadata is in the file, so read
+ * it. */
 typedef struct { uint32_t addr, offset, size; } psp_section;
 int psp_find_section(const psp_blob *b, const elf_info *e, const char *name,
                      psp_section *out);
