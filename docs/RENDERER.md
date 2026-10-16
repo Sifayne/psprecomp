@@ -536,6 +536,54 @@ rewrites of the same texels and palette, then a changed texel, a changed
 palette entry and one changed row. It fails when a skip ignores changed
 bytes.
 
+The uploads that remain no longer make glthread synchronize. Every texel
+upload now goes through `tex_image` or `tex_sub_image`: a cached level, a
+refreshed row span, a CPU import, a target's first contents, the save dialog
+and the menu's textures. They copy the texels into a sixth persistently
+mapped ring, `RING_UNPACK` (16 MiB), bind it as the pixel unpack buffer for
+that one call, and name an offset into it. glthread then queues the call
+like a draw. On Mesa 26.2.4, radeonsi asks for blit- and compute-based
+texture transfers, so the texels reach the texture by a copy on the GPU
+([`try_pbo_upload`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-26.2.4/src/mesa/state_tracker/st_cb_texture.c)),
+not by the driver reading the mapping.
+The ring's ranges come back under the frame fences, like the other rings'.
+An upload over a quarter of the ring, and every upload when the rings are
+not persistently mapped, still goes from client memory. The decoder does not
+write into the mapping itself. The mapping is write-combined, and the 8888
+decode reads back each row it gathers into its output. libc's `memcpy` does
+the copy in its AVX loop, with no `rep movs`: 55 samples (0.11 s) over the
+race, for 1,567 MiB.
+
+Base (aa17354, the copies above) and new ran side by side, twice, with only
+`render_gl.c`'s object swapped. Other sessions kept the machine at a load of
+8 to 12, which is why the CPU is higher than in the table above.
+
+| | Bytes checked against a copy | Unpack ring |
+|---|---|---|
+| Process CPU, first 150 s | 70.4 s, 64.5 s | 70.4 s, 63.6 s |
+| Guest thread | 55.9 s, 51.1 s | 55.8 s, 50.2 s |
+| `gl0` + `cs0` + `gdrv0` | 10.95 s, 10.00 s | 11.03 s, 10.06 s |
+| `timing: texture bind` | 4.6 s, 4.2 s | 4.0 s, 3.6 s |
+| ... upload | 0.80 s, 0.67 s | 0.11 s, 0.11 s |
+| Fence waits, rings and readback | 2.11 s, 1.87 s | 2.26 s, 1.99 s |
+
+Time inside the upload calls fell by 85%, and texture binding by about
+0.6 s. About 0.1–0.15 s of that came back as longer fence waits, probably
+because glthread now runs further behind, so a wait finds more of it still
+queued. The CPU did not change beyond the spread between runs. The work
+moved rather than went away. Before, a synchronizing upload ran glthread's
+pending batch on the guest thread; now `gl0` runs it. The texels are still
+copied once on the CPU, into the ring now rather than into the driver's
+staging buffer. The race is paced, so what the guest thread gains is time
+within its frame, about 50 µs, not CPU.
+
+The output did not change. The GL runs of the readability gate matched base
+byte for byte: The 3rd Birthday's 8 window images (547 of its uploads went
+through the ring), the race's 15 images and its 8,849 frames at 154.521 s of
+guest time, and the race start, twice. Only the race's wall clock differs.
+`tests/test_texcache_gl.c` now uploads through the ring, and it fails when
+the offset an upload names is one texel off.
+
 The vertex path was then made cheaper without changing a result. Almost
 none of it is the CPU transform. Counted over 120 s of the same race, 99.6%
 of transformed vertices (399 M, in 4.0 M draws) took the GL backend's own

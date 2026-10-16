@@ -218,7 +218,8 @@ static int gl_load(void) {
 /* ---- the streaming rings ------------------------------------------------
  *
  * Every vertex, draw index, triangle index, transform block and CPU-path
- * batch the backend hands the GPU goes through one of five rings. With
+ * batch the backend hands the GPU goes through one of five rings, and every
+ * texel upload through a sixth (see the texel uploads below). With
  * ARB_buffer_storage (GL 4.4, and any Mesa or vendor driver of the last
  * decade) each ring is one persistently and coherently mapped buffer: the
  * CPU writes into memory the GPU reads from, no glBufferSubData, no driver
@@ -235,7 +236,7 @@ static PFNGLMAPBUFFERRANGEPROC p_glMapBufferRange;
 static PFNGLFENCESYNCPROC      p_glFenceSync;
 static PFNGLCLIENTWAITSYNCPROC p_glClientWaitSync;
 static PFNGLDELETESYNCPROC     p_glDeleteSync;
-enum { RING_VBO, RING_DRAW, RING_EBO, RING_UBO, RING_BATCH, RING_COUNT, RING_FRAMES = 8 };
+enum { RING_VBO, RING_DRAW, RING_EBO, RING_UBO, RING_BATCH, RING_UNPACK, RING_COUNT, RING_FRAMES = 8 };
 typedef struct { GLuint buf; GLenum target; size_t size, head; uint8_t *map; int wrapped; } gl_ring;
 static struct {
     int persistent, decided;
@@ -590,6 +591,7 @@ static struct {
     uint64_t tex_from_rt, tex_alias_from_rt;
     uint64_t mip_chains, mip_levels, mip_incomplete;
     uint64_t tex_bind_ns, tex_generation_ns, tex_decode_ns, tex_upload_ns;
+    uint64_t tex_ring_uploads, tex_ring_bytes;   /* through the unpack ring */
 
     float   *batch;          /* position, colour, UV, fog and homogeneous terms */
     size_t   batch_n;
@@ -627,6 +629,48 @@ static void readback_rt(int i);
 static void readback_complete(int i);
 static void stencil_to_alpha(rendertarget *r);
 static void rt_import(rendertarget *r);
+
+/* ---- texel uploads ------------------------------------------------------
+ *
+ * glTexImage2D and glTexSubImage2D from client memory are synchronous under
+ * Mesa's glthread (gl_API.xml marks them marshal_sync unless a pixel unpack
+ * buffer is bound): the calling thread waits for the GL thread to drain, runs
+ * the batch it had pending itself, then copies the texels. With the rings
+ * persistently mapped the texels are copied into the unpack ring instead and
+ * the call names an offset into it, which glthread queues like a draw and the
+ * driver copies on the GPU. Its ranges come back under the frame fences like
+ * any other ring's. The decoder does not write into the mapping itself: it is
+ * write-combined, and the 8888 decode reads back the row it gathered there.
+ * The unpack buffer is bound only for the call, so every other pixel
+ * transfer, and a glTexImage2D with no texels, still names client memory. An
+ * upload larger than a quarter of the ring goes from client memory rather
+ * than wait out every frame in flight. */
+enum { UNPACK_RING_BYTES = 16 * 1024 * 1024, UNPACK_ALIGN = 256 };
+/* Copy `bytes` of *texels into the unpack ring, bind it and point *texels at
+ * the copy's offset. 0, with nothing changed, where the ring is not used. */
+static int unpack_begin(const void **texels, size_t bytes) {
+    const gl_ring *r = &g_rings.r[RING_UNPACK];
+    if (!*texels || !r->map || bytes > r->size / 4) return 0;
+    const size_t off = ring_alloc(RING_UNPACK, bytes, UNPACK_ALIGN, 0);
+    memcpy(r->map + off, *texels, bytes);
+    p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, r->buf);
+    *texels = (const void *)(uintptr_t)off;
+    g.tex_ring_uploads++;
+    g.tex_ring_bytes += bytes;
+    return 1;
+}
+/* Level `level` of the bound texture, w x h RGBA8 texels (or none). */
+static void tex_image(GLint level, int w, int h, const void *texels) {
+    const int ring = unpack_begin(&texels, (size_t)w * (size_t)h * 4u);
+    p_glTexImage2D(GL_TEXTURE_2D, level, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    if (ring) p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
+/* A w x h rectangle of the bound texture's level 0 at x, y. */
+static void tex_sub_image(int x, int y, int w, int h, const void *texels) {
+    const int ring = unpack_begin(&texels, (size_t)w * (size_t)h * 4u);
+    p_glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    if (ring) p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
 
 static unsigned long this_thread(void) {
     return (unsigned long)pthread_self();
@@ -1669,7 +1713,7 @@ static int rt_allocate(rendertarget *r, int inherit) {
                 initial[(size_t)(r->h - 1 - y) * r->w + x] = guest_pixel(r, gx, gy);
             }
     }
-    p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, r->w, r->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, initial);
+    tex_image(0, r->w, r->h, initial);
     free(initial);
     p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -1874,8 +1918,7 @@ static int import_run(rendertarget *r, int y, int start, int end, uint32_t *valu
                                         value, mask, r->fmt);
             row[k - left] = value;
         }
-        p_glTexSubImage2D(GL_TEXTURE_2D, 0, left, r->h - 1 - py, right - left, 1, GL_RGBA,
-                          GL_UNSIGNED_BYTE, row);
+        tex_sub_image(left, r->h - 1 - py, right - left, 1, row);
     }
     free(previous);
     return 1;
@@ -2119,6 +2162,12 @@ static int claim(void) {
     p_glDisable(GL_DITHER);
 
     setup_batch_pipeline();
+    /* The texel uploads' ring, only worth having mapped (see unpack_begin);
+     * it is bound only around an upload. */
+    if (g_rings.persistent) {
+        ring_create(RING_UNPACK, GL_PIXEL_UNPACK_BUFFER, UNPACK_RING_BYTES);
+        p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    }
 
     g.batch = calloc(GL_MAX_VERTS * FLOATS_PER_VERT, sizeof(float));
     if (!g.batch) { g.failed = 1; return -1; }
@@ -2554,7 +2603,7 @@ static int refresh_row_span(const texcache_entry *e, const psp_tex_state *t, int
     if (!decoded || dw != t->w || dh != y1 - y0) return 0;
     if (!*bound) { p_glBindTexture(GL_TEXTURE_2D, e->tex); *bound = 1; }
     const uint64_t upload_t0 = psp_os_mono_ns();
-    p_glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    tex_sub_image(0, y0, dw, dh, texels);
     g.tex_upload_ns += psp_os_mono_ns() - upload_t0;
     g.tex_upload_pixels += decoded;
     g.tex_rows_refreshed += (uint64_t)dh;
@@ -2692,8 +2741,7 @@ static GLuint texcache_upload(texcache_entry *e, const psp_tex_state *t, int top
         if (decoded == 0)
             break;
         const uint64_t upload_t0 = psp_os_mono_ns();
-        p_glTexImage2D(GL_TEXTURE_2D, level, GL_RGBA8, dw, dh, 0,
-                       GL_RGBA, GL_UNSIGNED_BYTE, texels);
+        tex_image(level, dw, dh, texels);
         g.tex_upload_ns += psp_os_mono_ns() - upload_t0;
         g.tex_upload_pixels += decoded;
         uploaded_top = level;
@@ -4131,11 +4179,11 @@ static void gl_dialog_overlay(int x, int y, int width, int height) {
         p_glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
         p_glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
         p_glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
-        p_glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,SAVE_DIALOG_W,SAVE_DIALOG_H,0,GL_RGBA,GL_UNSIGNED_BYTE,dialog_pixels);
+        tex_image(0,SAVE_DIALOG_W,SAVE_DIALOG_H,dialog_pixels);
     } else {
         p_glBindTexture(GL_TEXTURE_2D,dialog_texture);
         if (previous!=dialog_revision)
-            p_glTexSubImage2D(GL_TEXTURE_2D,0,0,0,SAVE_DIALOG_W,SAVE_DIALOG_H,GL_RGBA,GL_UNSIGNED_BYTE,dialog_pixels);
+            tex_sub_image(0,0,SAVE_DIALOG_W,SAVE_DIALOG_H,dialog_pixels);
     }
     int w=width,h=(int)((int64_t)width*SAVE_DIALOG_H/SAVE_DIALOG_W);
     if (h>height) { h=height; w=(int)((int64_t)h*SAVE_DIALOG_W/SAVE_DIALOG_H); }
@@ -4187,14 +4235,14 @@ static void ui_take(const psp_ui_texture_op *ops, int count) {
             p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, op->w, op->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, op->pixels);
+            tex_image(0, op->w, op->h, op->pixels);
             ui_textures[slot].id = op->texture;
             ui_textures[slot].tex = tex;
         } else if (op->op == PSP_UI_TEXTURE_UPDATE) {
             const GLuint tex = ui_texture(op->texture);
             if (!tex || !op->pixels) continue;
             p_glBindTexture(GL_TEXTURE_2D, tex);
-            p_glTexSubImage2D(GL_TEXTURE_2D, 0, op->x, op->y, op->w, op->h, GL_RGBA, GL_UNSIGNED_BYTE, op->pixels);
+            tex_sub_image(op->x, op->y, op->w, op->h, op->pixels);
         } else {
             for (int i = 0; i < UI_TEXTURES_MAX; i++)
                 if (ui_textures[i].id == op->texture) {
@@ -4690,6 +4738,9 @@ static void report_paths(FILE *out) {
     }
     fprintf(out, "\n          rings: %s, %u frame fence(s), %u wait(s) totalling %.1f ms",
             g_rings.persistent ? "persistently mapped" : "glBufferSubData with orphaning", g_rings.fences, g_rings.waits, g_rings.wait_us / 1e3);
+    if (g_rings.r[RING_UNPACK].map)
+        fprintf(out, "; %llu texel transfer(s) of %.1f MiB through the unpack ring",
+                (unsigned long long)g.tex_ring_uploads, g.tex_ring_bytes / 1048576.0);
     if (g.mu.profile)
         fprintf(out, "\n          model path time: append %.1f ms, state %.1f ms, blocks %.1f ms, indices %.1f ms, draw calls %.1f ms",
                 g.mu.t_append / 1e3, g.mu.t_state / 1e3, g.mu.t_ubo / 1e3, g.mu.t_ebo / 1e3, g.mu.t_draw / 1e3);
