@@ -576,9 +576,122 @@ archives and the recipe are part of every game's fingerprint, so each game
 is prepared once more after the update.
 
 Each of these changes was measured on its own against release-new (e2479ce)
-or, for ThinLTO, against the inline-memory build. They overlap: the texture
-decoder was one of the largest callers of out-of-line memory access. Their
-combined effect has not been measured yet.
+or, for ThinLTO, against the inline-memory build. Release-merged (e12e44d) is
+the first release with all four, built by the player packaging as release-new
+was. It ran the race side by side with release-new, one in each of two homes
+on the same machine, and both were dumped at 150 s. That was done twice:
+
+| | release-new (e2479ce) | All four (e12e44d) |
+|---|---|---|
+| Process CPU, first 150 s | 95.4 s, 96.1 s | 62.3 s, 61.5 s (−35%) |
+| ... the guest threads, by `/proc` | 86.3 s | 52.1 s (−40%) |
+| ... Mesa's own threads, by `/proc` | 8.4 s | 8.8 s |
+| GL report: texture bind | 23.5 s, 23.8 s | 12.1 s, 12.5 s |
+| ... of which decode | 13.9 s, 14.4 s | 3.2 s, 3.3 s |
+| ... of which upload | 6.2 s, 6.7 s | 5.9 s, 6.3 s |
+| GL report: model-path append | 5.7 s, 7.5 s | 1.7 s, 1.4 s |
+| GPU draw and blit, mean a frame | 0.96 ms, 0.91 ms | 0.93 ms, 0.93 ms |
+| Preparing WipEout | 70.1 s, 57.0 s | 159.2 s, 156.3 s |
+| ... CPU time of the preparation | 223 s, 173 s | 920 s, 920 s |
+| Game code (text) | 15.1 MB | 36.8 MB |
+
+The `/proc` rows are means of the two runs. Both builds rendered all 8,849
+of the race's frames. The guest threads now use 5.8 ms of CPU per 16.7 ms
+frame, down from 9.6 ms. The four savings measured one at a time add up to
+more than the 34 s saved together, because they overlap. Release-new spent
+20.5 s in out-of-line memory access, called from the generated code (8.8 s),
+the VFPU's `sv.q` and `lv.q` (6.2 s) and the texture decoder (4.4 s).
+
+Other sessions' builds kept the machine busy, so the runs need some context:
+- Each pair started at a load average of 4–7.
+- The second pair was interrupted when the machine slept 23 s into the run.
+  Both runs lost the same 5.7 s on resume, and both agree with the first pair
+  within 1.5%.
+- A third pair started just as other sessions' links raised the load from 5
+  to 16. Release-new fell 11 s behind the race, and both builds used more CPU
+  (109.5 s and 79.6 s, −27%), so that pair is left out.
+- The preparations ran one at a time, alternating, at load 9–16. Their wall
+  time depends on idle cores, because the ThinLTO link runs on about seven
+  of them. Their CPU time does not (919.5 s and 919.7 s).
+
+The readability gate ran on the release itself and matched release-new byte
+for byte: 64 of 64 products, apart from the race's wall clock. The four pack
+games were prepared, linked and replayed with the new archives. WipEout's
+headless stage ends at the runtime's 60 s headless drain, not at the gate's
+90 s limit, so under load it renders fewer than its 16 frames. With
+`PSPRECOMP_DRAIN=150` it rendered all 16, each one identical. Run side by
+side, both builds render that stage at the same speed: 62.7 and 64.2 ns a
+pixel.
+
+The CPU now splits as below. Each guest-thread sample is counted under the
+source file of the function it landed in. For the ThinLTO build that comes
+from `nm -l` on the game. Release-new's gcc runtime carries no line info, so
+its functions are mapped through the members of the staged archives. The
+threads that block SIGPROF are taken from `/proc` instead, as described
+above. Shares are of the process's CPU; seconds are means of the two runs:
+
+| Where (self time) | release-new | All four |
+|---|---|---|
+| GE lists and vertex decode (`ge.c`) | 18.2 s (19.0%) | 14.6 s (23.6%) |
+| Mesa driver, its own threads (`/proc`) | 8.4 s (8.7%) | 8.8 s (14.2%) |
+| FPU/VFPU helpers (`vfpu.c`, `recomp_rt.h`) | 10.7 s (11.2%) | 8.6 s (13.9%) |
+| Mesa driver, on the guest thread | 8.0 s (8.3%) | 7.7 s (12.4%) |
+| Generated game code | 4.8 s (5.0%) | 7.5 s (12.2%) |
+| libc, nearly all of it `memcpy` | 4.9 s (5.1%) | 5.7 s (9.1%) |
+| Texture decode (`render.c`) | 7.8 s (8.1%) | 2.6 s (4.3%) |
+| GL backend (`render_gl.c`) | 7.8 s (8.1%) | 2.2 s (3.6%) |
+| Scheduler and other HLE | 2.2 s (2.2%) | 1.4 s (2.2%) |
+| Audio and video decoding, vDSO clock reads | 1.9 s (2.0%) | 2.0 s (3.2%) |
+| Guest memory access, out of line (`mem.c`, `mem.h`) | 20.6 s (21.5%) | 0.6 s (1.0%) |
+
+The main context and the SDL threads use under 1 s. Out-of-line memory
+access is nearly gone. Some of it comes back where the accesses are now
+inline: the generated code is 2.7 s higher. The GL backend fell mostly
+because `gl_draw_model` no longer copies with `rep movsq`. The driver did not
+change. At 16.4 s across both kinds of thread, it is now 27% of the process
+instead of 17%.
+
+The top 20 self functions on the guest threads:
+
+| | Function | All four | release-new |
+|---|---|---|---|
+| 1 | Mesa driver (libgallium is stripped, so this is all of its functions) | 7.5 s (12.1%) | 7.7 s |
+| 2 | `memcpy` | 3.7 s (6.0%) | 3.1 s |
+| 3 | `uv_axis_texels` | 3.3 s (5.3%) | `uv_to_texels`: 8.6 s |
+| 4 | `draw_prim_transformed` | 2.7 s (4.3%) | inside `draw_prim`: 4.3 s |
+| 5 | `psp_sv_q` | 1.9 s (3.1%) | 1.9 s |
+| 6 | `clut_entry_cached` | 1.9 s (3.0%) | `clut_entry`: 1.0 s |
+| 7 | `run_list` | 1.8 s (2.9%) | `run_list_body`: 1.6 s |
+| 8 | `read_uv_model_at` | 1.8 s (2.8%) | new |
+| 9 | `psp_vfpu_dot` | 1.6 s (2.6%) | 1.7 s |
+| 10 | `psp_lv_q` | 1.3 s (2.1%) | 1.0 s |
+| 11 | `read_vec3_model` | 1.2 s (1.9%) | 1.1 s |
+| 12 | `shade_map_uv` | 1.1 s (1.7%) | 1.1 s |
+| 13 | `hle_call` | 0.9 s (1.5%) | 0.8 s |
+| 14 | `read_src` (VFPU operand reads) | 0.9 s (1.5%) | 1.2 s |
+| 15 | `read_uv_raw_at` | 0.8 s (1.3%) | 0.8 s |
+| 16 | `decode_level` | 0.8 s (1.2%) | 0.4 s |
+| 17 | `read_colour_at` | 0.7 s (1.1%) | inlined (0.01 s) |
+| 18 | vDSO `clock_gettime` | 0.7 s (1.1%) | 0.8 s |
+| 19 | `gl_draw_model` | 0.5 s (0.9%) | 4.9 s |
+| 20 | `psp_body_0002FEDC` (generated) | 0.5 s (0.8%) | 0.4 s |
+
+That ranks the next work:
+- The vertex decode that feeds the GPU transform is still our largest cost,
+  at 14.6 s (24%). The texture-coordinate split, `uv_axis_texels`, leads it,
+  followed by the transform loop and the per-vertex readers.
+- The GL driver takes 16.4 s (27%) across the guest thread and its own
+  threads. This is the share a different host API could reach. Of its 7.5 s
+  on the guest thread, 3.4 s is under `gl_texture`, uploading textures.
+- The VFPU helpers take 8.6 s (14%), plus 0.9 s of `memcpy` called from
+  `read_src`. `sv.q`, `vdot` and `lv.q` lead.
+- The generated code takes 7.5 s (12%), spread thin: its hottest function
+  takes 0.5 s.
+- Texture upload took 5.9–6.3 s by the report, for 148,993 uploads, and none
+  of the four changes touched it. The driver accounts for 3.4 s of it, and
+  `memcpy` called from `gl_texture` itself for 0.7 s.
+- Texture decode is down to 3.2 s by the report, most of it
+  `clut_entry_cached`.
 
 The fixed-list oracle also pins the small arithmetic details that a plausible
 GL image can hide. Interpolated colour and texture-function output are
