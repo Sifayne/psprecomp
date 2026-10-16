@@ -72,6 +72,8 @@ void psp_hle_set_quiet(int quiet);
 /* Look up what is registered, for reporting. Returns NULL if absent. */
 const char *psp_hle_name(uint32_t nid);
 int         psp_hle_count(void);
+/* Whether a handler answers `nid`, named or not. */
+int         psp_hle_registered(uint32_t nid);
 
 /* Every registered entry, for the coverage report a game repo wants: which of
  * a module's imports actually exist yet. */

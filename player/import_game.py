@@ -78,6 +78,28 @@ def atomic_write(path, content):
         Path(tmp).unlink(missing_ok=True)
 
 
+def unwrap_module(run, data, out, pspdecrypt):
+    """A module file's ELF, or None: the ~SCE wrapper off, the ~PSP decrypted
+    by `pspdecrypt` (its files in `out`; `run` raises ValueError when it
+    fails), a gzip inflated. The corpus sweep reads discs through this too
+    (scripts/sweep.py)."""
+    if data[:4] == b"~SCE":
+        data = data[int.from_bytes(data[4:8], "little"):]
+    if data[:4] == b"~PSP":
+        (out / "module.psp").write_bytes(data)
+        try:
+            run([pspdecrypt, "-o", out / "module.dec", out / "module.psp"])
+        except ValueError:
+            return None
+        data = (out / "module.dec").read_bytes()
+    if data[:2] == b"\x1f\x8b":
+        try:
+            data = gzip.decompress(data)
+        except (OSError, EOFError):
+            return None
+    return data if data[:4] == b"\x7fELF" else None
+
+
 class Library:
     def __init__(self, app, data, state, resources=None):
         self.app, self.data, self.state = map(lambda p: Path(p).resolve(), (app, data, state))
@@ -601,23 +623,10 @@ class Library:
         return modules
 
     def module_image(self, run, data, out):
-        """A module file as the recompiler reads it, or None: the ~SCE wrapper
-        off, the ~PSP decrypted, a gzip inflated; a relocatable PRX."""
-        if data[:4] == b"~SCE":
-            data = data[int.from_bytes(data[4:8], "little"):]
-        if data[:4] == b"~PSP":
-            (out / "module.psp").write_bytes(data)
-            try:
-                run([self.app / "usr/bin/pspdecrypt", "-o", out / "module.dec", out / "module.psp"])
-            except ValueError:
-                return None
-            data = (out / "module.dec").read_bytes()
-        if data[:2] == b"\x1f\x8b":
-            try:
-                data = gzip.decompress(data)
-            except (OSError, EOFError):
-                return None
-        if data[:4] != b"\x7fELF" or int.from_bytes(data[16:18], "little") != 0xFFA0:
+        """A module file as the recompiler reads it, or None: unwrapped
+        (unwrap_module), and a relocatable PRX."""
+        data = unwrap_module(run, data, out, self.app / "usr/bin/pspdecrypt")
+        if data is None or int.from_bytes(data[16:18], "little") != 0xFFA0:
             return None
         return data
 
