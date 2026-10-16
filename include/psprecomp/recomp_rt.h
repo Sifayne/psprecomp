@@ -585,6 +585,21 @@ static inline int psp_fcmp(unsigned cond, float a, float b) {
     }
 }
 
+/* ---- loops --------------------------------------------------------------- */
+
+/* A loop's back edge. Recompiled code reaches the runtime only at firmware
+ * calls, so a thread that loops without one is out of the scheduler's
+ * reach. Every backward branch and jump counts psp_poll_left down; each
+ * firmware call and each switch fills it again, and a thread that runs it
+ * out calls psp_poll (sched.c) with the loop's address. */
+extern int32_t psp_poll_left;
+void psp_poll(uint32_t at);
+#if defined(__GNUC__) || defined(__clang__)
+#  define PSP_POLL(a) do { if (__builtin_expect(--psp_poll_left < 0, 0)) psp_poll(a); } while (0)
+#else
+#  define PSP_POLL(a) do { if (--psp_poll_left < 0) psp_poll(a); } while (0)
+#endif
+
 #ifdef __cplusplus
 }
 #endif

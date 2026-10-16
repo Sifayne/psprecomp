@@ -196,15 +196,17 @@ static void enqueue_head(void) {
     CHECK(call(0x03444eb4, id_a, 1, 0) == 0x80000100u && call(0x03444eb4, id_c, 1, 0) == 0x80000100u);
     cases++;
 }
-/* A full pool gives up the finished list queued first. A head list's id is
- * below every other, but one that has only just finished is the newest, and
- * a late ListSync still finds it. */
+/* The pool holds 64 lists (uOFW's; not measured). A full one gives up the
+ * finished list queued first: a head list's id is below every other, but
+ * one that has only just finished is the newest, and a late ListSync still
+ * finds it. */
+#define POOL 64
 #define SHORT_LIST 0x08812000u
 static void reuse_oldest(void) {
     psp_ge_reset();
     psp_write32(SHORT_LIST, 0x0f000000); psp_write32(SHORT_LIST + 4, 0x0c000000);
-    uint32_t ids[7];
-    for (unsigned i = 0; i < 7; i++) {
+    uint32_t ids[POOL - 1];
+    for (unsigned i = 0; i < POOL - 1; i++) {
         ids[i] = call(0xab49e76a, SHORT_LIST, 0, (uint32_t)-1);
         CHECK(ids[i] < 0x80000000u && call(0x03444eb4, ids[i], 0, 0) == 0);
     }
@@ -215,6 +217,103 @@ static void reuse_oldest(void) {
     CHECK(call(0x03444eb4, ids[0], 1, 0) == 0x80000100u);
     CHECK(call(0x03444eb4, head, 1, 0) == 0 && call(0x03444eb4, ids[1], 1, 0) == 0);
     call(0xb287bd61, 0, 0, 0);
+    cases++;
+}
+/* With every list still pending -- each held at its stall -- the 65th is
+ * refused with SCE_ERROR_OUT_OF_MEMORY, as uOFW's _sceGeListEnQueue answers
+ * an empty free queue. */
+#define STALLED_LISTS 0x08814000u
+static void pool_full(void) {
+    psp_ge_reset();
+    for (unsigned i = 0; i < POOL; i++) {
+        const uint32_t at = STALLED_LISTS + 16 * i;
+        psp_write32(at, 0x0f000000); psp_write32(at + 4, 0x0c000000);
+        CHECK(call(0xab49e76a, at, at, (uint32_t)-1) < 0x80000000u);
+    }
+    const uint32_t at = STALLED_LISTS + 16 * POOL;
+    CHECK(call(0xab49e76a, at, at, (uint32_t)-1) == 0x80000022u);
+    call(0xb448ec0d, 1, 0, 0);                /* sceGeBreak(1) drops them all */
+    psp_ge_reset();
+    cases++;
+}
+/* sceGeGetCmd, sceGeGetMtx and sceGeGetStack, as uOFW reconstructs them
+ * (not measured): the last word of each command run; a matrix as the 24-bit
+ * floats its upload carried; and the front list's software stack, always
+ * empty here. */
+#define STATE_LIST 0x08817000u
+#define BUF        0x08818000u
+static void get_state(void) {
+    psp_ge_reset();
+    unsigned n = 0;
+    psp_write32(STATE_LIST + 4 * n++, 0x10080000);          /* BASE */
+    psp_write32(STATE_LIST + 4 * n++, 0xd2000003);          /* 8888 */
+    psp_write32(STATE_LIST + 4 * n++, 0x3a000000);          /* WORLD from 0 */
+    for (unsigned i = 0; i < 12; i++) psp_write32(STATE_LIST + 4 * n++, 0x3b000000u | (0x3f8000u + i));
+    psp_write32(STATE_LIST + 4 * n++, 0x3e000000);          /* PROJ from 0 */
+    for (unsigned i = 0; i < 16; i++) psp_write32(STATE_LIST + 4 * n++, 0x3f000000u | (0x400000u + i));
+    psp_write32(STATE_LIST + 4 * n++, 0x0f000000); psp_write32(STATE_LIST + 4 * n++, 0x0c000000);
+    CHECK(call(0xe66cb92e, (uint32_t)-1, 0, 0) == 0 && call(0xe66cb92e, 0, BUF, 0) == 0);
+    const uint32_t id = call(0xab49e76a, STATE_LIST, 0, (uint32_t)-1);
+    call(0xb287bd61, 0, 0, 0);
+    CHECK(call(0xdc93cfef, 0x10, 0, 0) == 0x10080000u && call(0xdc93cfef, 0xd2, 0, 0) == 0xd2000003u);
+    CHECK(call(0xdc93cfef, 0x3b, 0, 0) == 0x3b3f800bu && call(0xdc93cfef, 0x0c, 0, 0) == 0x0c000000u);
+    CHECK(call(0xdc93cfef, 0xff, 0, 0) == 0x80000102u);
+    CHECK(call(0x57c8945b, 8, BUF, 0) == 0);
+    int same = 1;
+    for (unsigned i = 0; i < 12; i++) same &= psp_read32(BUF + 4 * i) == 0x3f8000u + i;
+    CHECK(same);
+    CHECK(call(0x57c8945b, 10, BUF, 0) == 0);
+    for (unsigned i = 0; i < 16; i++) same &= psp_read32(BUF + 4 * i) == 0x400000u + i;
+    CHECK(same);
+    CHECK(call(0x57c8945b, 12, BUF, 0) == 0x80000102u && call(0x57c8945b, (uint32_t)-1, BUF, 0) == 0x80000102u);
+    (void)id;
+    /* With a list pending, held at its stall: no frame to read. */
+    const uint32_t held = call(0xab49e76a, STATE_LIST, STATE_LIST, (uint32_t)-1);
+    CHECK(call(0xe66cb92e, (uint32_t)-1, 0, 0) == 0 && call(0xe66cb92e, 0, BUF, 0) == 0x80000102u);
+    call(0xb448ec0d, 1, 0, 0);
+    (void)held;
+    cases++;
+}
+/* sceGeListDeQueue (uOFW's; not measured): a list behind another, not yet
+ * started, leaves the queue and never draws; the running list, a finished
+ * one and one paused after it ran answer SCE_ERROR_BUSY; a head list,
+ * paused before it ran, can go; an unknown id is SCE_ERROR_INVALID_ID. */
+#define HELD_LIST  0x08819000u
+#define DRAW_LIST  0x08819100u
+static void dequeue(void) {
+    setup();                                 /* vertices and a clear frame */
+    psp_write32(HELD_LIST, 0x0f000000); psp_write32(HELD_LIST + 4, 0x0c000000);
+    static const uint32_t draw[] = {
+        0x10080000, 0x9c000000, 0x9d0401e0, 0xd2000003, 0x1280011c,
+        0x01820000, 0x04060002,              /* red rectangle */
+        0x0f000000, 0x0c000000,
+    };
+    for (unsigned i = 0; i < sizeof draw / sizeof draw[0]; i++) psp_write32(DRAW_LIST + 4 * i, draw[i]);
+    const uint32_t a = call(0xab49e76a, HELD_LIST, HELD_LIST, (uint32_t)-1);
+    const uint32_t b = call(0xab49e76a, DRAW_LIST, 0, (uint32_t)-1);
+    CHECK(call(0x03444eb4, b, 1, 0) == 1);   /* QUEUED behind the held one */
+    CHECK(call(0x5fb86ab0, a, 0, 0) == 0x80000021u);
+    CHECK(call(0x5fb86ab0, b, 0, 0) == 0);
+    CHECK(call(0x03444eb4, b, 1, 0) == 0x80000100u && call(0x5fb86ab0, b, 0, 0) == 0x80000100u);
+    call(0xe0d68148, a, HELD_LIST + 8, 0);   /* the held one runs out */
+    call(0xb287bd61, 0, 0, 0);
+    CHECK(pixel(1) == 0);                    /* the dequeued one never drew */
+
+    const uint32_t done = call(0xab49e76a, HELD_LIST, 0, (uint32_t)-1);
+    CHECK(call(0x03444eb4, done, 0, 0) == 0 && call(0x5fb86ab0, done, 0, 0) == 0x80000021u);
+    call(0xb287bd61, 0, 0, 0);
+    const uint32_t head = call(0x1c0d95a6, DRAW_LIST, 0, (uint32_t)-1);
+    CHECK(call(0x03444eb4, head, 1, 0) == 4 && call(0x5fb86ab0, head, 0, 0) == 0);
+    CHECK(call(0xb287bd61, 1, 0, 0) == 0 && pixel(1) == 0);
+
+    words = 0;
+    cmd(0x0e030042); cmd(0x0c000000);         /* SIGNAL PAUSE */
+    cmd(0x0f000000); cmd(0x0c000000);         /* the pause's FINISH and END */
+    cmd(0x0f000000); cmd(0x0c000000);
+    const uint32_t p = call(0xab49e76a, LIST, LIST, (uint32_t)-1);
+    call(0xe0d68148, p, 0, 0);                /* runs to the pause */
+    CHECK(call(0x03444eb4, p, 1, 0) == 4 && call(0x5fb86ab0, p, 0, 0) == 0x80000021u);
+    call(0xb448ec0d, 1, 0, 0);
     cases++;
 }
 static void environment(const char *key, const char *value) {
@@ -276,6 +375,9 @@ int main(int argc, char **argv) {
         suspending(2);
         enqueue_head();
         reuse_oldest();
+        pool_full();
+        get_state();
+        dequeue();
         setup();
         psp_ge_replay_list(LIST, 0, 0);
         check_pixels();

@@ -266,6 +266,24 @@ static void after_call(void) {
     g_call_depth--;
 }
 
+/* A loop that has run long without a firmware call: its time, then the GE
+ * and the display catch up, interrupts and timers run, and a thread that
+ * now outranks this one takes the CPU -- as the interrupt's return hands it
+ * over on hardware, where a 5 ms delay ends inside another thread's 30 ms
+ * spin (threadprobe fw660-v3 [84]: intrPreempt). Paced, the time is waited
+ * for, as a spin takes real time; in real time the clock adopts the wall. */
+void psp_hle_poll(uint64_t us) {
+    if (psp_clock_is_realtime()) psp_clock_tick();
+    else psp_clock_advance_to(psp_clock_peek() + us);
+    psp_ge_tick();
+    psp_display_tick();
+    psp_interrupt_run_pending();
+    psp_sched_tick();
+    psp_ktimer_tick();
+    psp_display_tick();
+    psp_interrupt_run_pending();
+}
+
 /* ---- finishing a call after a save state loads ------------------------------- */
 
 /* The calls a thread can be parked in when a state is saved, and how each
@@ -423,6 +441,7 @@ static void hle_call(uint32_t nid, const char *lib) {
         if (to) { psp_dispatch(to); return; }
     }
     g_call_depth++;
+    psp_poll_reset();
     /* Where the guest resumes after this call: its $ra, set by the jal. */
     psp_census_call_enter(nid, psp_cpu.r[PSP_REG_RA]);
     /* Every firmware call costs a tick of guest time.

@@ -265,33 +265,39 @@ its name.
 - [x] VFPU completion. The emitter translates every VFPU instruction the
       decoder names; a sub-encoding the runtime does not recognise traps by
       name.
-- [ ] Save states, an SDL2 + Dear ImGui frontend, controller remapping.
-      The host layer has started: `PSPRECOMP_HOST` builds `src/host/` as
-      `psprecomp_host`, with the savedata dialog and the presentation layer
-      (SDL2 window, input, audio); player settings are `psprecomp_settings`.
-      Last Raven's titles use them; The 3rd Birthday's copies and both
-      games' GL backends remain (see *Open work*). `player/` builds the
-      AppImage for a title pack (`player/README.md`); Last Raven is the
-      first. RAM snapshots (`PSPRECOMP_RAMSNAP`) are an instrument, not save
-      states. The plan is [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md): one
-      player in this repository, every game a title pack compiled on the
-      player's machine, and the three features staged from a shared safe
-      point and host pause.
+- [x] Save states, an SDL2 + Dear ImGui frontend, controller remapping:
+      the player layer, stages 1-11 of [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md).
+      One psprecomp app holds the launcher, the in-game menu, settings,
+      bindings and save states. Every game is a title pack compiled on the
+      player's machine, or a plain game with no pack. RAM snapshots
+      (`PSPRECOMP_RAMSNAP`) remain an instrument, not save states.
 
 ## Open work
 
 Gaps found in the code while checking this file, none of them on a phase above:
 
-- [ ] **The GE's queue calls** — DeQueue and GetCmd/GetMtx/GetStack are
-      unregistered, and a full list pool answers NO_MEMORY rather than the
-      hardware's 0x80000022 (`src/hle/ge.c`). What the GE draws is done:
+- [x] **The GE's queue calls** — DeQueue, GetCmd, GetMtx and GetStack, and a
+      pool of 64 lists whose full answer is 0x80000022, follow uOFW's
+      reconstruction (`src/hle/ge.c`); none is measured, and a geprobe step
+      could. Still unregistered: sceGeSaveContext and sceGeRestoreContext.
+      SIGNAL's call, jump and return behaviours are not modelled, so
+      GetStack's software stack is always empty. What the GE draws is done:
       skinning, morphing, patches, bounding boxes and the rest match the PSP
       bit for bit through geprobe 23. The GL backend's own gaps are listed in
       [`docs/RENDERER.md`](docs/RENDERER.md).
-- [ ] **Preemption** — a thread yields only at firmware calls, so one that
-      spins without calling the kernel hangs (reported, not silent). The 3rd
-      Birthday's host adds a 1 ms yield after GE calls to keep its sound
-      threads fed.
+- [x] **Preemption** — every backward branch and jump in recompiled code
+      counts down a budget (`PSP_POLL`, `include/psprecomp/recomp_rt.h`). A
+      thread that loops 64 M back edges without a firmware call is then
+      treated as an interrupt would treat it: guest time moves on, the GE,
+      interrupts and timers run, and a more urgent thread takes over. 64 M
+      is eight times the longest stretch the replay gate's runs make, so
+      they run as before. Still open:
+      - the PSP time a back edge stands for (20 ns) is not measured;
+      - a loop under 64 M back edges still holds the CPU until it ends.
+
+      The 3rd Birthday's 1 ms yield after GE calls is a different problem:
+      in real time its software renderer's host time is counted as the main
+      thread's guest time, which starves its movie threads.
 - [x] **Static-constructor discovery** — a module names its constructors in
       `.cplinit`, and discovery seeds from it, from relocations in a PRX, and
       from the data-pointer scan in an executable. The corpus sweep checks
@@ -307,8 +313,15 @@ Gaps found in the code while checking this file, none of them on a phase above:
       WipEout Pulse's movies, in up to four contexts. `sceMpegDelete` now lets
       go of a movie's decoders and streams; each movie but the last leaked
       them.
-- [ ] **Secure savedata** — secure modes store plaintext. saveprobe already
-      holds the hardware's secure saves under known keys.
+- [ ] **Secure savedata** — secure modes store plaintext, so neither a PSP's
+      secure save nor one written here moves to the other. On hold (decided
+      with Sif, 12 Oct). What is known:
+      - uOFW's reconstruction of sceChnnlsv reproduces all 35 secure data
+        files in saveprobe's logs (size and CRC32).
+      - It needs KIRK keyseed keys, which per [`docs/DECRYPT.md`](docs/DECRYPT.md)
+        would come from the player's key file.
+      - PARAM.SFO's three hashes are unchecked: saveprobe's binary saves are
+        not in this repository, and the one at 0x20 is keyed to each PSP.
 - [x] **Save states across updates** — an update made every state
       unloadable: a state loaded only into the executable that wrote it.
       Both ways out, as decided with Sif on 10 and 11 Oct
@@ -325,18 +338,22 @@ Gaps found in the code while checking this file, none of them on a phase above:
       need each part and kept variable to read its older forms.
 - [ ] **Windows** — the Windows half of `src/os.c` has not been through a
       Windows build in this fork.
-- [ ] **The rest of the host** — `present.c`, the settings mechanism, the
-      launcher and the GL backend (`render_gl.c`) are here (`src/host/`), and
-      both games use them, stating what is theirs in `psp_title_info`. Each
-      still carries its own `boot.c`, and they have drifted apart. The order
-      was stages 1–3 of [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md). `boot.c` is where both
-      register `sceKernelStopUnloadSelfModuleWithStatus` (0x8F2DF740, whose
-      name does not hash to its NID; uofw `start-stopModule.c`), because its
-      exit path needs the host.
-- [ ] **Hardware probe set 25** — what the games rely on and no PSP has
-      answered: vector `vrnd` lane order and D prefix (`src/vfpu.c`), a GE
-      signal handler rewriting the list words behind its SIGNAL now that lists
-      are drawn as they are released (`src/hle/ge.c`), and `sceIoMkdir` with a
-      missing parent and `sceIoChstat` (`src/hle/iofilemgr.c`). Then the vrnd,
-      savedata and mpeg provenance checkers, built but unregistered, can be
-      checked against hardware logs instead of an emulator's.
+- [x] **The rest of the host** — `present.c`, the settings mechanism, the
+      launcher, the GL backend (`render_gl.c`) and, since stage 11 of
+      [`docs/PLAYER-LAYER.md`](docs/PLAYER-LAYER.md), the boot (`src/host/boot.c`) are
+      all here and shared. Each game states what is its own through
+      `psp_title_info` and its pack's hooks. `boot.c` registers
+      `sceKernelStopUnloadSelfModuleWithStatus` (0x8F2DF740, whose name does
+      not hash to its NID; uofw `start-stopModule.c`), because its exit path
+      needs the host.
+- [x] **Hardware probe set 25** — applied on 9 Oct (#8): vector `vrnd`'s lane
+      order and D prefix, a GE signal handler that suspends the list,
+      `sceIoMkdir` with a missing parent, and the module manager. Left for a
+      later set:
+      - sysprobe's `sce_lbn` steps, which need a UMD in the drive;
+      - `sceIoChstat`'s archive bit and creation time;
+      - geprobe's far marker for Continue, and scene 148 (no dcache);
+      - vfpuprobe's `$ra` in two fresh threads;
+      - the vrnd, savedata and mpeg provenance checkers, built but
+        unregistered, to be checked against hardware logs instead of an
+        emulator's.

@@ -13,6 +13,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
+#include "psprecomp/recomp_rt.h"
 #include "crypto/sha1.h"
 
 #include <stdio.h>
@@ -2813,6 +2814,26 @@ static void test_system_params(void) {
     psp_sysparam_set(1, 1, "PSP");
 }
 
+/* PSP_POLL (recomp_rt.h): a firmware call ends the stretch of back edges a
+ * thread ran since its last one, and the longest is kept, with the loop it
+ * ran the budget out in. */
+static void test_loop_budget(void) {
+    const uint32_t now = psp_nid("sceKernelGetSystemTimeLow");
+    uint32_t at = 1;
+    call(now, 0, 0, 0, 0);
+    for (int i = 0; i < 100; i++) PSP_POLL(0x08900000u);
+    call(now, 0, 0, 0, 0);
+    CHECK(psp_poll_longest(&at) == 100 && at == 0, "100 back edges, under the budget: %llu at %08X",
+          (unsigned long long)psp_poll_longest(NULL), at);
+    for (int i = 0; i < 200000; i++) PSP_POLL(0x08900040u);
+    call(now, 0, 0, 0, 0);
+    CHECK(psp_poll_longest(&at) == 200000 && at == 0x08900040u, "200000 back edges, over it: %llu at %08X",
+          (unsigned long long)psp_poll_longest(NULL), at);
+    for (int i = 0; i < 1000; i++) PSP_POLL(0x08900080u);
+    call(now, 0, 0, 0, 0);
+    CHECK(psp_poll_longest(&at) == 200000 && at == 0x08900040u, "a shorter stretch leaves the longest");
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -2861,6 +2882,7 @@ int main(void) {
     test_msgpipe_poll_waits_its_turn();
     test_stranded_waits();
     test_thread_end_waiters();
+    test_loop_budget();
     test_many_parked_threads();
     test_terminated_waiters();
     test_restarted_after_terminated_wait();

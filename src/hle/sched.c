@@ -547,6 +547,7 @@ static int await_turn_locked(int me) {
         g_parked[me] = 0;
     }
     psp_cpu = g_slot[me].ctx;
+    psp_poll_reset();
     return 0;
 }
 
@@ -1039,6 +1040,67 @@ int psp_sched_delay(uint64_t usec) {
  * carries on, and the slice was what let those workers run. Hardware gives up
  * the CPU inside file I/O instead (threadprobe step 86, fw 6.60), which
  * iofilemgr.c's io_park models; that, not a slice, is what lets them run. */
+/* ---- loops without firmware calls -------------------------------------- */
+
+/* A budget of back edges, polled each time it runs out. Polls act once a
+ * stretch has run POLL_ACT back edges without a firmware call, and each
+ * budget run out after that is POLL_US of guest time, a back edge taken as
+ * POLL_NS of the PSP's (a short loop's iteration: some seven cycles at
+ * 333 MHz; not measured), with what a firmware call would give the rest of
+ * the machine (psp_hle_poll).
+ *
+ * POLL_ACT is eight times the longest stretch the replay gate's runs make,
+ * so those run as they did: Silent Line's mission replay, 7.93 M back edges
+ * between two firmware calls; then Armored Core 3 Portable's 3.77 M,
+ * WipEout's race 3.53 M, Last Raven's 2.25 M and The 3rd Birthday's 45 K
+ * (2026-10-12). */
+#define POLL_BUDGET 65535
+#define POLL_ACT    (64ull << 20)
+#define POLL_NS     20u
+#define POLL_US     ((POLL_BUDGET + 1u) * POLL_NS / 1000u)
+int32_t psp_poll_left = POLL_BUDGET;
+static uint64_t g_poll_act = POLL_ACT;
+static uint64_t g_poll_runs;          /* budgets run out in this stretch */
+static uint32_t g_poll_at;            /* where the last one ran out */
+static uint64_t g_poll_longest;
+static uint32_t g_poll_longest_at;
+
+void psp_poll(uint32_t at) {
+    g_poll_runs++;
+    g_poll_at = at;
+    psp_poll_left = POLL_BUDGET;
+    /* A thread a stop (psp_sched_stop_all) killed while it looped leaves
+     * here, as one the stop found parked in a call does. */
+    if (g_stopping) {
+        psp_os_lock(&g_lock);
+        leave_if_stopped_locked();
+        psp_os_unlock(&g_lock);
+    }
+    if (!g_threading || g_poll_runs * (POLL_BUDGET + 1u) < g_poll_act) return;
+    psp_hle_poll(POLL_US);
+}
+
+uint64_t psp_poll_set_act(uint64_t back_edges) {
+    const uint64_t was = g_poll_act;
+    g_poll_act = back_edges;
+    return was;
+}
+
+void psp_poll_reset(void) {
+    const uint64_t n = g_poll_runs * (POLL_BUDGET + 1u) + (uint64_t)(POLL_BUDGET - psp_poll_left);
+    if (n > g_poll_longest) {
+        g_poll_longest = n;
+        g_poll_longest_at = g_poll_runs ? g_poll_at : 0;
+    }
+    g_poll_runs = 0;
+    psp_poll_left = POLL_BUDGET;
+}
+
+uint64_t psp_poll_longest(uint32_t *at) {
+    if (at) *at = g_poll_longest_at;
+    return g_poll_longest;
+}
+
 void psp_sched_tick(void) {
     if (!g_threading || !g_dispatch || psp_ktimer_in_handler() ||
         psp_interrupt_in_handler() || !psp_interrupt_enabled()) return;
@@ -1538,7 +1600,8 @@ static const char *sched_refuse(void) {
             return why;
         }
         if (p->kind == PSP_PARK_YIELD || p->kind == PSP_PARK_PREEMPT) {
-            snprintf(why, sizeof why, "thread 0x%08X was switched away inside a firmware call", t->uid);
+            snprintf(why, sizeof why, "thread 0x%08X was switched away %s", t->uid,
+                     p->calls ? "inside a firmware call" : "in a loop, between firmware calls");
             return why;
         }
         if (p->calls != 1 || !psp_hle_resumable(p->nid)) {

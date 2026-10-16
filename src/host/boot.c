@@ -1230,6 +1230,12 @@ static void print_summary(const boot_outcome *run, const boot_module *m) {
         printf("threads:  %s\n",
                run->live == 0 ? "all finished" : "still alive (see the deadlock report above)");
     printf("bad mem:  %llu accesses\n", (unsigned long long)psp_mem_bad_access);
+    /* How far a thread ran between firmware calls: the measure a loop
+     * budget for preemption has to stay above (recomp_rt.h, PSP_POLL). */
+    uint32_t loop_at;
+    const unsigned long long longest = (unsigned long long)psp_poll_longest(&loop_at);
+    if (loop_at) printf("loops:    %llu back edges at most between firmware calls, the longest in the loop at 0x%08X\n", longest, loop_at);
+    else         printf("loops:    %llu back edges at most between firmware calls\n", longest);
     print_clock(run);
     if (psp_clock_is_realtime() || psp_clock_is_paced()) { psp_audio_dump_gaps(stdout); psp_mpeg_dump_sync(stdout); }
     present_audio_report(stdout);

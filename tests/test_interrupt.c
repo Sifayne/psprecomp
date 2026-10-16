@@ -7,6 +7,7 @@
 #include "psprecomp/clock.h"
 #include "psprecomp/sched.h"
 #include "psprecomp/vfpu.h"
+#include "psprecomp/recomp_rt.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,6 +172,30 @@ static void quiet_pending(void) {
     psp_interrupt_run_pending();CHECK(quiet_hits==2 && low_hits==1);
     sceKernelDisableSubIntr(30,2);sceKernelDisableSubIntr(25,0);
 }
+/* A thread waits in a loop with no firmware call at all (PSP_POLL) for a
+ * flag a Vblank handler sets. Past the threshold its polls move the clock
+ * on, the Vblank comes, and the handler runs on the looping thread, as the
+ * interrupt does on hardware. */
+static volatile unsigned flag_set;
+static long flag_loops;
+static void flag_handler(void) { flag_set=1; sceKernelDisableSubIntr(30,3); }
+static void flag_waiter(void) {
+    for (flag_loops=0; !flag_set && flag_loops<64l*65536; flag_loops++) PSP_POLL(0x08806100u);
+}
+static void native_vblank_flag_loop(void) {
+    reset();flag_set=0;
+    psp_register(HANDLER,flag_handler);
+    CHECK(invoke(0xCA04A2B9,30,3,HANDLER,0)==0);
+    CHECK(sceKernelEnableSubIntr(30,3)==0);
+    psp_register(0x08806100,flag_waiter);
+    psp_sched_set_threading(1);
+    const uint64_t act=psp_poll_set_act(4l*65536);
+    CHECK(psp_sched_spawn(0x7001,0x08806100,0x09ffe000,0,0,0,32)==0);
+    CHECK(psp_sched_drain(2)==0);
+    psp_poll_set_act(act);
+    CHECK(flag_set && flag_loops<64l*65536);
+    psp_sched_join_all();psp_sched_reset();
+}
 int main(int argc,char **argv) {
     if (argc!=2 || !(observations=fopen(argv[1],"r"))) return 2;
     if (psp_mem_init()!=0) return 2;
@@ -180,6 +205,7 @@ int main(int argc,char **argv) {
     native_context();
     native_idle_wakeup();
     quiet_pending();
+    native_vblank_flag_loop();
     psp_sched_reset();psp_mem_free();
     printf("interrupt: %u observations, %u checks, %u failures\n",records,checks,failures);
     return failures?1:0;
