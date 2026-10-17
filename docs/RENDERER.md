@@ -877,6 +877,30 @@ That ranks the next work:
 - Texture decode is down to 3.2 s by the report, most of it
   `clut_entry_cached`.
 
+That list was taken on release-merged, before three later changes:
+- The texture-cache copies and the unpack ring, described above, took the
+  texture-upload item.
+- The window-map accessors without DWARF took back the preparation cost.
+
+All of it was then applied to origin/main (29f5279), which had taken PRs
+#14–#17 since release-new. Both releases below package the Last Raven pack at
+e190cb3: c91cb23's settings test, updated for main's b972a1c, which skips a
+settings key it does not know instead of refusing it. Built by the player
+packaging, the two releases ran the readability gate against each other. All
+64 products matched byte for byte, apart from the race's wall clock. WipEout's
+headless stage was rerun with `PSPRECOMP_DRAIN=150` for its sixteenth frame.
+The race ran side by side twice more on a quiet machine (load 1.3–1.7), each
+build dumped at 150 s:
+
+| | main (29f5279) | main with this work |
+|---|---|---|
+| Process CPU, first 150 s | 87.0 s, 85.2 s | 55.9 s, 54.7 s (−36%) |
+| Race frames rendered | 8,849 | 8,849 |
+| WipEout's game file | 58 MB | 32 MB |
+| ... `size` text | 20.0 MB | 26.3 MB |
+
+Per 16.7 ms frame, the process now uses about 6.1 ms of CPU instead of 9.6 ms.
+
 The fixed-list oracle also pins the small arithmetic details that a plausible
 GL image can hide. Interpolated colour and texture-function output are
 quantized at the software path's RGBA8 boundaries; fog and masked alpha tests
