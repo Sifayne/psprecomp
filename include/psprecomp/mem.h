@@ -158,6 +158,14 @@ int psp_mem_watch_hits(void);
  * 32 reports before the write in question. */
 void psp_mem_watch_arm(int armed);
 
+/* Guest loads and stores. Nearly every one lands in main RAM or in the module
+ * image, and there it needs nothing but an offset and, for a store, a new
+ * write generation: mem.c answers those first, from a two-window map it keeps
+ * current, and hands everything else to the *_slow halves below. They are out
+ * of line on purpose. Made inline, every one of WipEout's ~190,000 loads and
+ * stores carried both window checks and the generation stamp: the game's code
+ * doubled, its preparation took twice as long, and it ran no faster
+ * (docs/RENDERER.md). */
 uint8_t  psp_read8 (uint32_t addr);
 uint16_t psp_read16(uint32_t addr);
 uint32_t psp_read32(uint32_t addr);
@@ -167,6 +175,19 @@ void psp_write8 (uint32_t addr, uint8_t  val);
 void psp_write16(uint32_t addr, uint16_t val);
 void psp_write32(uint32_t addr, uint32_t val);
 void psp_write_f32(uint32_t addr, float val);
+
+/* The halves for whatever the map does not hold: any address, the observers,
+ * the write watch, and the bad-access count. Call psp_read* and psp_write*
+ * instead; these are public so the runtime test can compare the two. */
+uint8_t  psp_read8_slow (uint32_t addr);
+uint16_t psp_read16_slow(uint32_t addr);
+uint32_t psp_read32_slow(uint32_t addr);
+float    psp_read_f32_slow(uint32_t addr);
+
+void psp_write8_slow (uint32_t addr, uint8_t  val);
+void psp_write16_slow(uint32_t addr, uint16_t val);
+void psp_write32_slow(uint32_t addr, uint32_t val);
+void psp_write_f32_slow(uint32_t addr, float val);
 
 /* A 64-bit value as the guest keeps one: two words, the low word first. */
 static inline uint64_t psp_read64(uint32_t addr) {

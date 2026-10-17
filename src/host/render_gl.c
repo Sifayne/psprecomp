@@ -218,7 +218,8 @@ static int gl_load(void) {
 /* ---- the streaming rings ------------------------------------------------
  *
  * Every vertex, draw index, triangle index, transform block and CPU-path
- * batch the backend hands the GPU goes through one of five rings. With
+ * batch the backend hands the GPU goes through one of five rings, and every
+ * texel upload through a sixth (see the texel uploads below). With
  * ARB_buffer_storage (GL 4.4, and any Mesa or vendor driver of the last
  * decade) each ring is one persistently and coherently mapped buffer: the
  * CPU writes into memory the GPU reads from, no glBufferSubData, no driver
@@ -235,7 +236,7 @@ static PFNGLMAPBUFFERRANGEPROC p_glMapBufferRange;
 static PFNGLFENCESYNCPROC      p_glFenceSync;
 static PFNGLCLIENTWAITSYNCPROC p_glClientWaitSync;
 static PFNGLDELETESYNCPROC     p_glDeleteSync;
-enum { RING_VBO, RING_DRAW, RING_EBO, RING_UBO, RING_BATCH, RING_COUNT, RING_FRAMES = 8 };
+enum { RING_VBO, RING_DRAW, RING_EBO, RING_UBO, RING_BATCH, RING_UNPACK, RING_COUNT, RING_FRAMES = 8 };
 typedef struct { GLuint buf; GLenum target; size_t size, head; uint8_t *map; int wrapped; } gl_ring;
 static struct {
     int persistent, decided;
@@ -357,11 +358,18 @@ static void ring_write(int i, size_t off, const void *data, size_t bytes) {
  * those generations, so an in-place update reuses the GL texture object but
  * uploads fresh texels. A global serial makes the common no-write case O(1);
  * page ranges are scanned only after guest memory changed somewhere.
+ *
+ * A write is not a change, though. WipEout copies its textures into a pool
+ * in VRAM over and over, byte for byte the same, and on its race that was
+ * two thirds of every texel decoded and uploaded. So an entry whose bytes
+ * were written once since its upload keeps a copy of them, and after that a
+ * moved generation is checked against the copy before anything is decoded.
  */
 enum {
     TEXCACHE_MAX = 512,
     TEXCACHE_PROBES = 32,
     TEXEL_CAP = 512 * 512,
+    TEXCOPY_BUDGET = 64 << 20,   /* bytes held in copies across the cache */
     RT_MAX = 8
 };
 
@@ -462,6 +470,16 @@ typedef struct {
  * HUD and inset 3D PREVIEW geometry use the centered menu area. */
 enum { CLASS_SCENE = 0, CLASS_HUD = 1, CLASS_PREVIEW = 2 };
 
+/* The guest bytes a cache entry's texels were decoded from, in the ranges
+ * the decoder reads (see texcache_copy_new), and which of those ranges the
+ * copy holds. The range table follows the struct. */
+typedef struct {
+    int      n, by_rows;
+    uint32_t bytes;
+    struct { uint32_t addr, len, off; int known; } *range;
+    uint8_t *data;
+} texcache_copy;
+
 typedef struct {
     int      used;
     uint32_t addr, stride;
@@ -472,6 +490,7 @@ typedef struct {
     uint64_t content_generation, validated_serial;
     uint64_t last_used;
     GLuint   tex;
+    texcache_copy *copy;
 } texcache_entry;
 
 /* ---- state ------------------------------------------------------------------
@@ -564,12 +583,15 @@ static struct {
     int      cache_entries;
     uint64_t cache_clock;
     uint64_t tex_requests, tex_uploads, tex_hits, tex_fast_hits, tex_revalidated, tex_row_refreshes, tex_rows_refreshed;
+    uint64_t tex_same_bytes, tex_rows_same, tex_copies;
+    size_t   tex_copy_bytes;
     uint64_t tex_invalidations, tex_misses, tex_evictions, tex_too_big;
     uint64_t tex_vram_uploads, tex_upload_pixels;
     uint64_t tex_padded_uploads, tex_padded_pixels;
     uint64_t tex_from_rt, tex_alias_from_rt;
     uint64_t mip_chains, mip_levels, mip_incomplete;
     uint64_t tex_bind_ns, tex_generation_ns, tex_decode_ns, tex_upload_ns;
+    uint64_t tex_ring_uploads, tex_ring_bytes;   /* through the unpack ring */
 
     float   *batch;          /* position, colour, UV, fog and homogeneous terms */
     size_t   batch_n;
@@ -607,6 +629,48 @@ static void readback_rt(int i);
 static void readback_complete(int i);
 static void stencil_to_alpha(rendertarget *r);
 static void rt_import(rendertarget *r);
+
+/* ---- texel uploads ------------------------------------------------------
+ *
+ * glTexImage2D and glTexSubImage2D from client memory are synchronous under
+ * Mesa's glthread (gl_API.xml marks them marshal_sync unless a pixel unpack
+ * buffer is bound): the calling thread waits for the GL thread to drain, runs
+ * the batch it had pending itself, then copies the texels. With the rings
+ * persistently mapped the texels are copied into the unpack ring instead and
+ * the call names an offset into it, which glthread queues like a draw and the
+ * driver copies on the GPU. Its ranges come back under the frame fences like
+ * any other ring's. The decoder does not write into the mapping itself: it is
+ * write-combined, and the 8888 decode reads back the row it gathered there.
+ * The unpack buffer is bound only for the call, so every other pixel
+ * transfer, and a glTexImage2D with no texels, still names client memory. An
+ * upload larger than a quarter of the ring goes from client memory rather
+ * than wait out every frame in flight. */
+enum { UNPACK_RING_BYTES = 16 * 1024 * 1024, UNPACK_ALIGN = 256 };
+/* Copy `bytes` of *texels into the unpack ring, bind it and point *texels at
+ * the copy's offset. 0, with nothing changed, where the ring is not used. */
+static int unpack_begin(const void **texels, size_t bytes) {
+    const gl_ring *r = &g_rings.r[RING_UNPACK];
+    if (!*texels || !r->map || bytes > r->size / 4) return 0;
+    const size_t off = ring_alloc(RING_UNPACK, bytes, UNPACK_ALIGN, 0);
+    memcpy(r->map + off, *texels, bytes);
+    p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, r->buf);
+    *texels = (const void *)(uintptr_t)off;
+    g.tex_ring_uploads++;
+    g.tex_ring_bytes += bytes;
+    return 1;
+}
+/* Level `level` of the bound texture, w x h RGBA8 texels (or none). */
+static void tex_image(GLint level, int w, int h, const void *texels) {
+    const int ring = unpack_begin(&texels, (size_t)w * (size_t)h * 4u);
+    p_glTexImage2D(GL_TEXTURE_2D, level, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    if (ring) p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
+/* A w x h rectangle of the bound texture's level 0 at x, y. */
+static void tex_sub_image(int x, int y, int w, int h, const void *texels) {
+    const int ring = unpack_begin(&texels, (size_t)w * (size_t)h * 4u);
+    p_glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    if (ring) p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
 
 static unsigned long this_thread(void) {
     return (unsigned long)pthread_self();
@@ -1649,7 +1713,7 @@ static int rt_allocate(rendertarget *r, int inherit) {
                 initial[(size_t)(r->h - 1 - y) * r->w + x] = guest_pixel(r, gx, gy);
             }
     }
-    p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, r->w, r->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, initial);
+    tex_image(0, r->w, r->h, initial);
     free(initial);
     p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -1854,8 +1918,7 @@ static int import_run(rendertarget *r, int y, int start, int end, uint32_t *valu
                                         value, mask, r->fmt);
             row[k - left] = value;
         }
-        p_glTexSubImage2D(GL_TEXTURE_2D, 0, left, r->h - 1 - py, right - left, 1, GL_RGBA,
-                          GL_UNSIGNED_BYTE, row);
+        tex_sub_image(left, r->h - 1 - py, right - left, 1, row);
     }
     free(previous);
     return 1;
@@ -2099,6 +2162,12 @@ static int claim(void) {
     p_glDisable(GL_DITHER);
 
     setup_batch_pipeline();
+    /* The texel uploads' ring, only worth having mapped (see unpack_begin);
+     * it is bound only around an upload. */
+    if (g_rings.persistent) {
+        ring_create(RING_UNPACK, GL_PIXEL_UNPACK_BUFFER, UNPACK_RING_BYTES);
+        p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    }
 
     g.batch = calloc(GL_MAX_VERTS * FLOATS_PER_VERT, sizeof(float));
     if (!g.batch) { g.failed = 1; return -1; }
@@ -2281,6 +2350,14 @@ static uint64_t range_generation_excluding_rts(uint32_t addr, uint32_t size, uin
     }
     return newest;
 }
+/* Bytes of the current palette a CLUT texture can read. CLUT start is
+ * already in entries (multiples of sixteen), and mask is applied before
+ * ORing it. Running through their greatest possible index covers every
+ * palette read without knowing the texel values. */
+static uint32_t clut_span(void) {
+    const uint32_t entries = (uint32_t)(g.clut.start | g.clut.mask) + 1u;
+    return entries * (uint32_t)psp_pixel_bytes(g.clut.fmt);
+}
 static uint64_t texture_generation(const psp_tex_state *t, int top, uint32_t supplied) {
     uint64_t newest = 0;
     for (int level = 0; level <= top; level++) {
@@ -2289,12 +2366,7 @@ static uint64_t texture_generation(const psp_tex_state *t, int top, uint32_t sup
         if (gen > newest) newest = gen;
     }
     if (is_clut_format(t->fmt) && g.clut.addr) {
-        /* CLUT start is already in entries (multiples of sixteen), and mask is
-         * applied before ORing it. Tracking through their greatest possible
-         * index covers every palette read without knowing the texel values. */
-        const uint32_t entries = (uint32_t)(g.clut.start | g.clut.mask) + 1u;
-        const uint32_t bytes = entries * (uint32_t)psp_pixel_bytes(g.clut.fmt);
-        const uint64_t gen = range_generation_excluding_rts(g.clut.addr, bytes, 0);
+        const uint64_t gen = range_generation_excluding_rts(g.clut.addr, clut_span(), 0);
         if (gen > newest) newest = gen;
     }
     return newest;
@@ -2399,17 +2471,158 @@ static int samples_target_whole(const rendertarget *r, const psp_tex_state *t) {
            t->stride == r->stride && t->w == r->w && t->h == r->h && texture_top(t) == 0;
 }
 
+/* Textures whose changed bytes are re-decoded a row at a time
+ * (texcache_refresh_rows): direct colour, unswizzled, one level. */
+static int refreshes_by_rows(const psp_tex_state *t) {
+    return texture_top(t) == 0 && !t->swizzled && t->fmt <= PSP_TFMT_8888;
+}
+
+/* ---- the copies of decoded bytes --------------------------------------------
+ *
+ * A copy holds the bytes one entry's texels were decoded from, in ranges:
+ * one per row for an entry refreshed by rows, otherwise one per level and
+ * one for the palette. While every range the decoder reads is held and
+ * unchanged, decoding again would give the texels the entry already has.
+ *
+ * Reading guest bytes under a readback still in flight would land it
+ * (rt_guest_access) earlier than anything else would have. A copy never
+ * reads such bytes: it leaves their range unheld, or calls it changed. */
+static int readback_pending_over(uint32_t addr, uint32_t len) {
+    const uint64_t a = addr & PSP_ADDR_MASK, b = a + len;
+    for (int k = 0; k < RB_SLOTS; k++) {
+        if (!g_rb.pend[k].valid) continue;
+        const rendertarget *r = &g.rts[g_rb.pend[k].rt];
+        if (b > r->addr && a < rt_end(r)) return 1;
+    }
+    return 0;
+}
+
+/* Whether the decoder's reads for a level stay inside level_bytes. A row
+ * reads (w * halfbytes + 1) / 2 bytes from its start, and a swizzled one
+ * reaches only whole 16-byte blocks of its stride; a level wider than its
+ * stride reads past the end of its rows. */
+static int level_reads_inside(const psp_tex_state *t, int level) {
+    const int halfbytes = psp_texel_halfbytes(t->fmt);
+    const uint32_t row = (level_stride(t, level) * (uint32_t)halfbytes) / 2u;
+    const uint64_t read = ((uint64_t)level_w(t, level) * (uint64_t)halfbytes + 1u) / 2u;
+    const uint32_t room = t->swizzled && row >= 16u ? row & ~15u : row;
+    return halfbytes && read <= room;
+}
+
+static void texcache_copy_free(texcache_entry *e) {
+    if (!e->copy) return;
+    g.tex_copy_bytes -= e->copy->bytes;
+    free(e->copy->data);
+    free(e->copy);
+    e->copy = NULL;
+}
+
+/* Range i of a copy for t: a row of an entry refreshed by rows; otherwise
+ * level i, and after the levels the palette. */
+static void copy_range_of(const psp_tex_state *t, int top, int by_rows, int i,
+                          uint32_t *addr, uint32_t *len) {
+    if (by_rows) {
+        *len = level_bytes(t, 0) / (uint32_t)t->h;
+        *addr = t->addr + (uint32_t)i * *len;
+    } else if (i <= top) {
+        *addr = level_addr(t, i);
+        *len = level_bytes(t, i);
+    } else {
+        *addr = g.clut.addr;
+        *len = clut_span();
+    }
+}
+
+/* An empty copy for t (every range unheld), or NULL if the decoder can read
+ * outside the ranges or the copies' budget is spent. */
+static texcache_copy *texcache_copy_new(const psp_tex_state *t, int top) {
+    for (int level = 0; level <= top; level++)
+        if (!level_reads_inside(t, level) || !level_bytes(t, level)) return NULL;
+    const int by_rows = refreshes_by_rows(t);
+    const int n = by_rows ? t->h : top + 1 + (is_clut_format(t->fmt) && g.clut.addr);
+    uint64_t bytes = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t addr, len;
+        copy_range_of(t, top, by_rows, i, &addr, &len);
+        bytes += len;
+    }
+    if (g.tex_copy_bytes + bytes > TEXCOPY_BUDGET) return NULL;
+    texcache_copy *c = calloc(1, sizeof *c + (size_t)n * sizeof *c->range);
+    if (!c) return NULL;
+    if (!(c->data = malloc((size_t)bytes))) { free(c); return NULL; }
+    c->n = n; c->by_rows = by_rows; c->bytes = (uint32_t)bytes;
+    c->range = (void *)(c + 1);
+    uint32_t off = 0;
+    for (int i = 0; i < n; i++) {
+        copy_range_of(t, top, by_rows, i, &c->range[i].addr, &c->range[i].len);
+        c->range[i].off = off;
+        off += c->range[i].len;
+    }
+    g.tex_copy_bytes += c->bytes;
+    g.tex_copies++;
+    return c;
+}
+
+/* Range i's guest bytes, or NULL where they are unmapped or under a
+ * readback in flight. */
+static const uint8_t *copy_source(const texcache_copy *c, int i) {
+    if (readback_pending_over(c->range[i].addr, c->range[i].len)) return NULL;
+    return psp_mem_ptr(c->range[i].addr, c->range[i].len);
+}
+
+/* Take range i from guest memory: called with the texels just decoded. */
+static void copy_take(texcache_copy *c, int i) {
+    const uint8_t *p = copy_source(c, i);
+    c->range[i].known = p != NULL;
+    if (p) memcpy(c->data + c->range[i].off, p, c->range[i].len);
+}
+
+static int copy_unchanged(const texcache_copy *c, int i) {
+    if (!c->range[i].known) return 0;
+    const uint8_t *p = copy_source(c, i);
+    return p && memcmp(c->data + c->range[i].off, p, c->range[i].len) == 0;
+}
+
+/* Every range of the copy held and unchanged. */
+static int copy_all_unchanged(const texcache_copy *c) {
+    for (int i = 0; i < c->n; i++)
+        if (!copy_unchanged(c, i)) return 0;
+    return 1;
+}
+
+/* Rows [y0, y1) of t decoded and sent into the entry's texture, which the
+ * first call binds. 0 if the decoder disagrees about their size. */
+static int refresh_row_span(const texcache_entry *e, const psp_tex_state *t, int y0, int y1,
+                            uint32_t row_bytes, uint32_t *texels, int *bound) {
+    psp_tex_state sub = *t;
+    sub.addr = t->addr + (uint32_t)y0 * row_bytes;
+    sub.h = y1 - y0;
+    sub.lv_addr[0] = sub.addr; sub.lv_h[0] = sub.h;
+    int dw = 0, dh = 0;
+    const size_t decoded = decode_level_counted(&sub, 0, texels, &dw, &dh);
+    if (!decoded || dw != t->w || dh != y1 - y0) return 0;
+    if (!*bound) { p_glBindTexture(GL_TEXTURE_2D, e->tex); *bound = 1; }
+    const uint64_t upload_t0 = psp_os_mono_ns();
+    tex_sub_image(0, y0, dw, dh, texels);
+    g.tex_upload_ns += psp_os_mono_ns() - upload_t0;
+    g.tex_upload_pixels += decoded;
+    g.tex_rows_refreshed += (uint64_t)dh;
+    return 1;
+}
+
 /* A cached texture whose bytes changed under it is re-decoded only where
  * they changed: the rows whose write generation moved past the entry's,
  * merged across short gaps and sent with glTexSubImage2D. The display
  * buffer sampled as a 512-row texture is the case: an off-screen target
  * read back under its lower rows used to cost the whole megabyte again.
- * Direct-colour, unswizzled, single-level textures only -- a palette
- * change or a swizzle is not a row. Returns 0 to ask for the full upload,
- * which then overwrites whatever rows this may already have refreshed. */
+ * Within those runs a row whose bytes still match the entry's copy keeps
+ * the texels it has. Direct-colour, unswizzled, single-level textures only
+ * -- a palette change or a swizzle is not a row. Returns 0 to ask for the
+ * full upload, which then overwrites whatever rows this may already have
+ * refreshed. */
 static int texcache_refresh_rows(texcache_entry *e, const psp_tex_state *t, uint32_t supplied,
                                  uint64_t generation) {
-    if (texture_top(t) != 0 || e->uploaded_top != 0 || t->swizzled || t->fmt > PSP_TFMT_8888 || !e->tex) return 0;
+    if (!refreshes_by_rows(t) || e->uploaded_top != 0 || !e->tex) return 0;
     if (t->w <= 0 || t->h <= 0) return 0;
     const int bpp = psp_pixel_bytes(t->fmt);
     const uint32_t row_bytes = (uint32_t)t->stride * (uint32_t)bpp;
@@ -2417,6 +2630,8 @@ static int texcache_refresh_rows(texcache_entry *e, const psp_tex_state *t, uint
     const uint32_t base = level_addr(t, 0);
     uint32_t *texels = texel_scratch();
     if (!texels) return 0;
+    if (!e->copy) e->copy = texcache_copy_new(t, 0);
+    texcache_copy *copy = e->copy;
     enum { GAP = 16, RUNS_MAX = 16 };
     int runs = 0, bound = 0;
     for (int y = 0; y < t->h;) {
@@ -2428,19 +2643,19 @@ static int texcache_refresh_rows(texcache_entry *e, const psp_tex_state *t, uint
         }
         y1 = last + 1;
         if (++runs > RUNS_MAX) return 0;
-        psp_tex_state sub = *t;
-        sub.addr = t->addr + (uint32_t)y * row_bytes;
-        sub.h = y1 - y;
-        sub.lv_addr[0] = sub.addr; sub.lv_h[0] = sub.h;
-        int dw = 0, dh = 0;
-        const size_t decoded = decode_level_counted(&sub, 0, texels, &dw, &dh);
-        if (!decoded || dw != t->w || dh != y1 - y) return 0;
-        if (!bound) { p_glBindTexture(GL_TEXTURE_2D, e->tex); bound = 1; }
-        const uint64_t upload_t0 = psp_os_mono_ns();
-        p_glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, texels);
-        g.tex_upload_ns += psp_os_mono_ns() - upload_t0;
-        g.tex_upload_pixels += decoded;
-        g.tex_rows_refreshed += (uint64_t)dh;
+        /* The changed rows, a span at a time, each up to a row that still
+         * holds its texels. Decoding a span cannot change that row: bytes
+         * under a readback in flight never count as unchanged. */
+        for (int a = y; a < y1;) {
+            int b = a;
+            while (b < y1 && !(copy && copy_unchanged(copy, b))) b++;
+            if (b > a) {
+                if (!refresh_row_span(e, t, a, b, row_bytes, texels, &bound)) return 0;
+                for (int r = a; copy && r < b; r++) copy_take(copy, r);
+            }
+            if (b < y1) g.tex_rows_same++;
+            a = b + 1;
+        }
         y = y1;
     }
     e->content_generation = generation;
@@ -2472,7 +2687,11 @@ static int texcache_lookup(const psp_tex_state *t, int top, uint32_t supplied, s
                 g.tex_generation_ns += psp_os_mono_ns() - gen_t0;
                 if (generation != e->content_generation) {
                     g.tex_invalidations++;
-                    if (!texcache_refresh_rows(e, t, supplied, generation)) {
+                    if (e->copy && !e->copy->by_rows && copy_all_unchanged(e->copy)) {
+                        e->content_generation = generation;
+                        e->validated_serial = memory_serial;
+                        g.tex_same_bytes++;
+                    } else if (!texcache_refresh_rows(e, t, supplied, generation)) {
                         *slot = at;
                         return 0;
                     }
@@ -2498,10 +2717,16 @@ static int texcache_lookup(const psp_tex_state *t, int top, uint32_t supplied, s
     return 0;
 }
 
-/* Decode every level of t and upload it into cache entry e. */
+/* Decode every level of t and upload it into cache entry e. An entry
+ * uploaded again because its bytes changed takes a copy of them, so the
+ * next change can be checked against it (see the copies above). */
 static GLuint texcache_upload(texcache_entry *e, const psp_tex_state *t, int top, uint32_t supplied,
                               int in_vram) {
-    if (!cache_matches(e, t, top)) g.tex_misses++;
+    const int again = cache_matches(e, t, top);
+    if (!again) {
+        g.tex_misses++;
+        texcache_copy_free(e);
+    }
     uint32_t *texels = texel_scratch();
     if (!texels) return 0;
 
@@ -2516,8 +2741,7 @@ static GLuint texcache_upload(texcache_entry *e, const psp_tex_state *t, int top
         if (decoded == 0)
             break;
         const uint64_t upload_t0 = psp_os_mono_ns();
-        p_glTexImage2D(GL_TEXTURE_2D, level, GL_RGBA8, dw, dh, 0,
-                       GL_RGBA, GL_UNSIGNED_BYTE, texels);
+        tex_image(level, dw, dh, texels);
         g.tex_upload_ns += psp_os_mono_ns() - upload_t0;
         g.tex_upload_pixels += decoded;
         uploaded_top = level;
@@ -2539,6 +2763,8 @@ static GLuint texcache_upload(texcache_entry *e, const psp_tex_state *t, int top
     g.tex_generation_ns += psp_os_mono_ns() - gen_t0;
     cache_record(e, t, top, uploaded_top, generation,
                  psp_mem_write_serial());
+    if (again && !e->copy) e->copy = texcache_copy_new(t, top);
+    for (int i = 0; e->copy && i < e->copy->n; i++) copy_take(e->copy, i);
     g.bound_top = uploaded_top;
     g.tex_uploads++;
     if (in_vram) g.tex_vram_uploads++;
@@ -3953,11 +4179,11 @@ static void gl_dialog_overlay(int x, int y, int width, int height) {
         p_glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
         p_glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
         p_glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
-        p_glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,SAVE_DIALOG_W,SAVE_DIALOG_H,0,GL_RGBA,GL_UNSIGNED_BYTE,dialog_pixels);
+        tex_image(0,SAVE_DIALOG_W,SAVE_DIALOG_H,dialog_pixels);
     } else {
         p_glBindTexture(GL_TEXTURE_2D,dialog_texture);
         if (previous!=dialog_revision)
-            p_glTexSubImage2D(GL_TEXTURE_2D,0,0,0,SAVE_DIALOG_W,SAVE_DIALOG_H,GL_RGBA,GL_UNSIGNED_BYTE,dialog_pixels);
+            tex_sub_image(0,0,SAVE_DIALOG_W,SAVE_DIALOG_H,dialog_pixels);
     }
     int w=width,h=(int)((int64_t)width*SAVE_DIALOG_H/SAVE_DIALOG_W);
     if (h>height) { h=height; w=(int)((int64_t)h*SAVE_DIALOG_W/SAVE_DIALOG_H); }
@@ -4009,14 +4235,14 @@ static void ui_take(const psp_ui_texture_op *ops, int count) {
             p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, op->w, op->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, op->pixels);
+            tex_image(0, op->w, op->h, op->pixels);
             ui_textures[slot].id = op->texture;
             ui_textures[slot].tex = tex;
         } else if (op->op == PSP_UI_TEXTURE_UPDATE) {
             const GLuint tex = ui_texture(op->texture);
             if (!tex || !op->pixels) continue;
             p_glBindTexture(GL_TEXTURE_2D, tex);
-            p_glTexSubImage2D(GL_TEXTURE_2D, 0, op->x, op->y, op->w, op->h, GL_RGBA, GL_UNSIGNED_BYTE, op->pixels);
+            tex_sub_image(op->x, op->y, op->w, op->h, op->pixels);
         } else {
             for (int i = 0; i < UI_TEXTURES_MAX; i++)
                 if (ui_textures[i].id == op->texture) {
@@ -4441,10 +4667,20 @@ static void gl_draw_model(int prim, const psp_model_vertex *v, int count, const 
     const size_t voff = ring_alloc(RING_VBO, (size_t)count * sizeof(psp_model_vertex), sizeof(psp_model_vertex), 0);
     const int base = (int)(voff / sizeof(psp_model_vertex));
     ring_write(RING_VBO, voff, v, (size_t)count * sizeof(psp_model_vertex));
-    static GLuint dix[MODEL_MAX_VERTS];
-    for (int i = 0; i < count; i++) dix[i] = (GLuint)g.mu.npend;
     g_rings.r[RING_DRAW].head = (size_t)(base + count) * sizeof(GLuint);
-    ring_write(RING_DRAW, (size_t)base * sizeof(GLuint), dix, (size_t)count * sizeof(GLuint));
+    /* Stored straight into a mapped ring. Staged in an array, the copy into
+     * the persistent mapping was an inline rep movsq that took most of this
+     * function's time in WipEout Pulse's race (2% of the whole run's CPU);
+     * plain stores of the same words do not. */
+    const GLuint draw_index = (GLuint)g.mu.npend;
+    if (g_rings.r[RING_DRAW].map) {
+        GLuint *d = (GLuint *)(void *)(g_rings.r[RING_DRAW].map + (size_t)base * sizeof(GLuint));
+        for (int i = 0; i < count; i++) d[i] = draw_index;
+    } else {
+        static GLuint dix[MODEL_MAX_VERTS];
+        for (int i = 0; i < count; i++) dix[i] = draw_index;
+        ring_write(RING_DRAW, (size_t)base * sizeof(GLuint), dix, (size_t)count * sizeof(GLuint));
+    }
     g.mu.vbo_head = base + count;
     g.mu.pend_count[g.mu.npend] = count; g.mu.pend_base[g.mu.npend] = base; g.mu.pend_prim[g.mu.npend] = prim;
     g.mu.npend++;
@@ -4502,6 +4738,9 @@ static void report_paths(FILE *out) {
     }
     fprintf(out, "\n          rings: %s, %u frame fence(s), %u wait(s) totalling %.1f ms",
             g_rings.persistent ? "persistently mapped" : "glBufferSubData with orphaning", g_rings.fences, g_rings.waits, g_rings.wait_us / 1e3);
+    if (g_rings.r[RING_UNPACK].map)
+        fprintf(out, "; %llu texel transfer(s) of %.1f MiB through the unpack ring",
+                (unsigned long long)g.tex_ring_uploads, g.tex_ring_bytes / 1048576.0);
     if (g.mu.profile)
         fprintf(out, "\n          model path time: append %.1f ms, state %.1f ms, blocks %.1f ms, indices %.1f ms, draw calls %.1f ms",
                 g.mu.t_append / 1e3, g.mu.t_state / 1e3, g.mu.t_ubo / 1e3, g.mu.t_ebo / 1e3, g.mu.t_draw / 1e3);
@@ -4582,6 +4821,10 @@ static void report_textures(FILE *out) {
             (unsigned long long)g.tex_vram_uploads,
             (unsigned long long)g.tex_from_rt,
             (unsigned long long)g.tex_row_refreshes, (unsigned long long)g.tex_rows_refreshed);
+    if (g.tex_copies)
+        fprintf(out, ", %llu rewrite(s) of the same bytes, %llu unchanged row(s) kept, %llu cop(ies) of %.1f MiB",
+                (unsigned long long)g.tex_same_bytes, (unsigned long long)g.tex_rows_same,
+                (unsigned long long)g.tex_copies, g.tex_copy_bytes / 1048576.0);
     if (g.tex_alias_from_rt)
         fprintf(out, ", %llu target alias decode(s)",
                 (unsigned long long)g.tex_alias_from_rt);

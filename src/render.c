@@ -125,9 +125,12 @@ static uint32_t swizzled_byte(uint32_t byte_x, uint32_t y, uint32_t row_bytes) {
 
 typedef struct { uint32_t tex_bytes, clut_bytes; size_t padded; } decode_bounds;
 
+static uint32_t clut_index(uint32_t raw) {
+    return (uint32_t)((((int)raw >> g_clut.shift) & g_clut.mask) | g_clut.start);
+}
+
 static uint32_t clut_entry(uint32_t raw, decode_bounds *bounds) {
-    const uint32_t idx =
-        (uint32_t)((((int)raw >> g_clut.shift) & g_clut.mask) | g_clut.start);
+    const uint32_t idx = clut_index(raw);
     const uint32_t bytes = (uint32_t)psp_pixel_bytes(g_clut.fmt);
     if (bounds && ((uint64_t)idx + 1) * bytes > bounds->clut_bytes) {
         bounds->padded++;
@@ -269,8 +272,131 @@ static void dump_texture(void) {
  * reported was never incremented. */
 uint64_t psp_render_filter_split(void) { return 0; }
 
-/* Decode one mip level into a caller's RGBA8 buffer, through the same sampler
- * the software path draws with.
+/* ---- decoding a level from host memory --------------------------------------
+ *
+ * sample_texel_bounded works out one texel's guest address and resolves it
+ * through psp_mem_ptr's region tests, every texel, and on WipEout's race that
+ * was most of the decode time (docs/RENDERER.md, "CPU profile"). A level is
+ * decoded a row at a time instead, from host memory. The texels come out the
+ * same; what has to stay the same around them is the padding count, the
+ * bad-access log and the VRAM observer, so anything that would touch those
+ * differently goes through the per-texel path. */
+
+/* Palette entries already read in this decode. mask is eight bits and start
+ * five bits shifted up four, so no index reaches 512. An entry past the
+ * padding bound, or unmapped, is never cached: every texel that asks for it
+ * is counted again, as it was per texel. */
+#define CLUT_CACHE 512
+typedef struct { uint8_t have[CLUT_CACHE]; uint32_t rgba[CLUT_CACHE]; } clut_cache;
+
+static uint32_t clut_entry_cached(uint32_t raw, decode_bounds *bounds, clut_cache *cache) {
+    const uint32_t idx = clut_index(raw);
+    if (idx < CLUT_CACHE && cache->have[idx]) return cache->rgba[idx];
+    const uint32_t bytes = (uint32_t)psp_pixel_bytes(g_clut.fmt);
+    if (bounds && ((uint64_t)idx + 1) * bytes > bounds->clut_bytes)
+        return clut_entry(raw, bounds);
+    const uint8_t *p = psp_mem_ptr(g_clut.addr + idx * bytes, bytes);
+    if (!p) return clut_entry(raw, bounds);
+    uint32_t rgba;
+    if (bytes == 4) {
+        memcpy(&rgba, p, 4);
+    } else {
+        uint16_t v;
+        memcpy(&v, p, 2);
+        rgba = psp_pixel_unpack16(v, g_clut.fmt);
+    }
+    if (idx < CLUT_CACHE) {
+        cache->have[idx] = 1;
+        cache->rgba[idx] = rgba;
+    }
+    return rgba;
+}
+
+/* Row y's first len bytes, in texel order, copied into row: the whole row of
+ * a linear texture in one piece, or a swizzled one's 16 bytes from each block
+ * it crosses. Each piece is resolved through psp_mem_ptr once, so the VRAM
+ * observer is shown the same bytes the per-texel reads would have shown it.
+ * Returns 0 if a piece is unmapped or reaches past the padding bound, and the
+ * per-texel path then decodes the row and counts which texels did. */
+static int gather_row(uint32_t y, uint32_t len, uint32_t row_bytes,
+                      const decode_bounds *bounds, uint8_t *row) {
+    const uint32_t piece = g_tex.swizzled && row_bytes >= 16 ? 16u : len;
+    for (uint32_t bx = 0; bx < len; bx += piece) {
+        const uint32_t n = len - bx < piece ? len - bx : piece;
+        const uint32_t off = swizzled_byte(bx, y, row_bytes);
+        if (bounds && (uint64_t)off + n > bounds->tex_bytes) return 0;
+        const uint8_t *p = psp_mem_ptr(g_tex.addr + off, n);
+        if (!p) return 0;
+        memcpy(row + bx, p, n);
+    }
+    return 1;
+}
+
+/* One gathered row into RGBA, as sample_texel_bounded reads each format. */
+static void decode_row(const uint8_t *row, int w, uint32_t *out,
+                       decode_bounds *bounds, clut_cache *cache) {
+    switch (g_tex.fmt) {
+    case PSP_TFMT_CLUT4:
+        for (int x = 0; x < w; x++) {
+            const uint32_t byte = row[x / 2];
+            out[x] = clut_entry_cached((x & 1) ? (byte >> 4) : (byte & 0xF), bounds, cache);
+        }
+        break;
+    case PSP_TFMT_CLUT8:
+        for (int x = 0; x < w; x++) out[x] = clut_entry_cached(row[x], bounds, cache);
+        break;
+    case PSP_TFMT_CLUT16:
+        for (int x = 0; x < w; x++) {
+            uint16_t v;
+            memcpy(&v, row + (size_t)x * 2u, 2);
+            out[x] = clut_entry_cached(v, bounds, cache);
+        }
+        break;
+    case PSP_TFMT_CLUT32:
+        for (int x = 0; x < w; x++) {
+            uint32_t v;
+            memcpy(&v, row + (size_t)x * 4u, 4);
+            out[x] = clut_entry_cached(v, bounds, cache);
+        }
+        break;
+    case PSP_TFMT_8888:
+        if ((const void *)row != (const void *)out) memcpy(out, row, (size_t)w * 4u);
+        break;
+    default:
+        for (int x = 0; x < w; x++) {
+            uint16_t v;
+            memcpy(&v, row + (size_t)x * 2u, 2);
+            out[x] = psp_pixel_unpack16(v, g_tex.fmt);
+        }
+        break;
+    }
+}
+
+/* The level g_tex names, w by h, into out. 8888 rows are gathered straight
+ * into out, since they need no conversion. A row too wide for the buffer, or
+ * one gather_row refuses, is sampled a texel at a time. */
+static void decode_rows(int w, int h, uint32_t *out, decode_bounds *bounds) {
+    static clut_cache cache;
+    const int hb = psp_texel_halfbytes(g_tex.fmt);
+    const int fast = hb != 0;
+    if (fast && g_tex.fmt >= PSP_TFMT_CLUT4) memset(cache.have, 0, sizeof cache.have);
+    const uint32_t row_bytes = ((uint32_t)g_tex.stride * (uint32_t)hb) / 2u;
+    const uint32_t len = ((uint32_t)w * (uint32_t)hb + 1u) / 2u;
+    uint8_t buf[4096];
+    for (int y = 0; y < h; y++) {
+        uint32_t *dst = out + (size_t)y * (size_t)w;
+        uint8_t *row = g_tex.fmt == PSP_TFMT_8888 ? (uint8_t *)dst : buf;
+        if (fast && (row != buf || len <= sizeof buf) &&
+            gather_row((uint32_t)y, len, row_bytes, bounds, row)) {
+            decode_row(row, w, dst, bounds, &cache);
+        } else {
+            for (int x = 0; x < w; x++) dst[x] = sample_texel_bounded(x, y, bounds);
+        }
+    }
+}
+
+/* Decode one mip level into a caller's RGBA8 buffer, reading each texel the
+ * way the software path's sampler does (decode_rows).
  *
  * A GPU backend has to hand GL or Vulkan decoded texels, and the decode is the
  * fiddly part -- five formats, two CLUT widths with their shift/mask/start
@@ -313,9 +439,7 @@ static size_t decode_level(const psp_tex_state *t, int level,
     const int w = g_tex.w, h = g_tex.h;
     size_t n = 0;
     if (w > 0 && h > 0 && (size_t)w * (size_t)h <= cap) {
-        for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++)
-                out[(size_t)y * (size_t)w + (size_t)x] = sample_texel_bounded(x, y, bounds);
+        decode_rows(w, h, out, bounds);
         if (out_w) *out_w = w;
         if (out_h) *out_h = h;
         n = (size_t)w * (size_t)h;

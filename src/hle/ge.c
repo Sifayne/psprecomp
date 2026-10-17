@@ -1230,7 +1230,7 @@ static uint32_t widen_colour(uint32_t fmt, uint32_t c) {
     /* The vertex colour formats 4, 5 and 6 are pixel formats 0, 1 and 2. */
     return fmt >= 4 && fmt <= 6 ? psp_pixel_unpack16(c, (int)fmt - 4) : c;
 }
-static uint32_t read_colour_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int col_off) {
+static inline uint32_t read_colour_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int col_off) {
     const uint32_t fmt = VT_COLOR(vtype);
     uint32_t c;
     if (fmt == 7) {
@@ -1330,7 +1330,7 @@ static inline float rd_f32(const uint8_t *vp, uint32_t addr, int off) {
  * of 32768, an s8 of 128. Reading them raw instead puts a unit cube 32768
  * units across, which projects to nothing recognisable and looks like a
  * broken matrix rather than a scaling mistake. Answers 0 for format 0. */
-static int read_vec3_model(const uint8_t *vp, uint32_t addr, int fmt, int off, float out[3]) {
+static inline int read_vec3_model(const uint8_t *vp, uint32_t addr, int fmt, int off, float out[3]) {
     switch (fmt) {
     case 1:
         for (int k = 0; k < 3; k++) out[k] = (float)(int8_t)rd_u8(vp, addr, off + k) / 128.0f;
@@ -1373,7 +1373,7 @@ static void read_normal_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtyp
  * -1.0 and the right edge came out texel 0. Neither TEXSCALE nor TEXOFFSET was
  * decoded before: gpu/filtering/precisionnearest3d scales by 0.5, and its texel
  * boundary landed at a quarter of the sprite instead of the middle. */
-static int read_uv_raw_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, float *u, float *v) {
+static inline int read_uv_raw_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, float *u, float *v) {
     *u = *v = 0.0f;
     if (tex_off < 0) return 0;
     switch (VT_TEX(vtype)) {
@@ -1384,12 +1384,6 @@ static int read_uv_raw_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int 
     case 3: *u = rd_f32(vp, addr, tex_off); *v = rd_f32(vp, addr, tex_off + 4); return 1;
     default: return 0;
     }
-}
-static void uv_to_texels(float u, float v, psp_vertex *out);
-static void read_uv_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off, psp_vertex *out) {
-    float u, v;
-    out->u = out->v = 0.0f;
-    if (read_uv_raw_at(vp, addr, vtype, tex_off, &u, &v)) uv_to_texels(u, v, out);
 }
 
 /* Shade mapping (TEX_MAP_MODE 2, sceGuTexMapMode's GU_ENVIRONMENT_MAP): the
@@ -1406,20 +1400,30 @@ static void read_uv_model_at(const uint8_t *vp, uint32_t addr, uint32_t vtype, i
  * came closest: mean difference 4.7 on its tower, against 6.4 in eye space
  * and 7.8 with U and V swapped. */
 static void mul_3x3(const float m[12], const float in[3], float out[3]);
-static float shade_axis(int light, const float n[3]) {
-    const float *l = g_tl.light[light & 3].pos;
-    const float len = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+/* The two lights' vectors and lengths, which every vertex of a draw shares. */
+typedef struct { const float *l[2]; float len[2]; } shade_lights;
+static void shade_lights_of(shade_lights *s) {
+    const int which[2] = { g_tl.tex_shade_u, g_tl.tex_shade_v };
+    for (int i = 0; i < 2; i++) {
+        const float *l = g_tl.light[which[i] & 3].pos;
+        s->l[i] = l;
+        s->len[i] = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+    }
+}
+static float shade_axis(const shade_lights *s, int i, const float n[3]) {
+    const float *l = s->l[i];
+    const float len = s->len[i];
     return len > 0.0f ? (l[0] * n[0] + l[1] * n[1] + l[2] * n[2]) / len : n[2];
 }
-static void shade_map_uv(const float model_nrm[3], psp_vertex *o) {
+static void shade_map_uv(const shade_lights *s, const float model_nrm[3], float *u, float *v) {
     float n[3];
     mul_3x3(g_tl.world, model_nrm, n);
     const float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
     if (len > 0.0f) { n[0] /= len; n[1] /= len; n[2] /= len; }
     else { n[0] = n[1] = 0.0f; n[2] = 1.0f; }
-    o->u = (1.0f + shade_axis(g_tl.tex_shade_u, n)) * 0.5f * g_ge.tex_scale_u * (float)g_ge.tex_w;
-    o->v = (1.0f + shade_axis(g_tl.tex_shade_v, n)) * 0.5f * g_ge.tex_scale_v * (float)g_ge.tex_h;
-    note_uv(o->u, o->v);
+    *u = (1.0f + shade_axis(s, 0, n)) * 0.5f * g_ge.tex_scale_u * (float)g_ge.tex_w;
+    *v = (1.0f + shade_axis(s, 1, n)) * 0.5f * g_ge.tex_scale_v * (float)g_ge.tex_h;
+    note_uv(*u, *v);
 }
 
 /* World and view are 4 columns of 3 rows; the implied bottom row makes the
@@ -1625,22 +1629,156 @@ static inline double ge_sum(const ge_term *t, int n) {
     return ge_ldexp(s < 0 ? -(double)m : (double)m, e - 15 + sh);
 }
 
-/* A vertex's texture coordinates, in units, through TEXSCALE and TEXOFFSET to
- * texels: u s + o as one GE sum of two GE products (ge_mul, ge_sum), then the
- * texture's size. geprobe 22 (fw 6.60) scene 140 reads 600 plain float
- * coordinates at scales 1, 2^8 and 2^12 through a texture that names its own
- * texels, and this fits all 1800 readings; the float sum, as before, missed
- * 119 at 2^12. */
+/* A vertex's texture coordinate, in units, through TEXSCALE and TEXOFFSET to
+ * texels, one axis: u s + o as one GE sum of two GE products (ge_mul,
+ * ge_sum), then the texture's size. geprobe 22 (fw 6.60) scene 140 reads 600
+ * plain float coordinates at scales 1, 2^8 and 2^12 through a texture that
+ * names its own texels, and this fits all 1800 readings; the float sum, as
+ * before, missed 119 at 2^12. */
+static float uv_axis_exact(float u, float scale, float offset, uint32_t size) {
+    const ge_sp us = ge_sp_of(u), ss = ge_sp_of(scale), os = ge_sp_of(offset);
+    const ge_term t[2] = { ge_mul_sp(&us, &ss), ge_mul_sp(&os, &GE_SP_ONE) };
+    return (float)(ge_sum(t, 2) * (double)size);
+}
+
+/* uv_axis_exact for every vertex of a draw, which all share the scale, the
+ * offset and the size: those are split once, and a u that is a normal float
+ * is split from its own bits -- the leading one and the top 15 of its 23
+ * fraction bits are the double's ge_split takes, its exponent the double's --
+ * for the same ge_mul_sp product and the same ge_sum. A zero u leaves the
+ * offset's term alone, whose answer is kept. A subnormal, infinite or NaN u,
+ * and a scale or offset that is neither zero nor a normal float, take
+ * uv_axis_exact.
+ *
+ * A scale whose split is a power of two with no offset -- sceGuTexScale(1, 1)
+ * and sceGuTexOffset(0, 0), the usual state -- is shorter still: the product
+ * is u cut to 16 bits, its significand unchanged and its exponent moved by
+ * the scale's, and ge_sum of that one term is the term. That is the float
+ * with its low 8 fraction bits cleared, times the scale's power of two and
+ * the size, a product of at most 48 bits a double holds exactly, as it holds
+ * ge_sum's sum times the size. test_ge_arith checks the two bit for bit. */
+enum { UV_EXACT, UV_POW2, UV_SUM };
+typedef struct {
+    uint32_t key[3];     /* the scale's and the offset's bits, and the size */
+    int      ok, path;
+    float    scale, offset;
+    double   size;
+    int64_t  smag;       /* the scale's 16-bit significand */
+    int      sexp;       /* its exponent */
+    uint32_t sneg;       /* its sign, bit 31 */
+    int64_t  omag;       /* the offset's ge_sum term, 0 for no offset */
+    int64_t  oneg;       /* 1 for a negative offset */
+    int      oexp;
+    double   k;          /* UV_POW2: the scale's power of two times the size */
+    float    zero;       /* the answer for a zero u */
+} uv_axis;
+
+/* A normal float's 16-bit significand and exponent (ge_split's), and whether
+ * it is one. */
+static inline int uv_split(uint32_t b, int64_t *mag, int *exp) {
+    const uint32_t ex = (b >> 23) & 0xFFu;
+    *mag = (int64_t)(0x8000u | ((b >> 8) & 0x7FFFu));
+    *exp = (int)ex - 127;
+    return ex != 0 && ex != 0xFFu;
+}
+
+static const uv_axis *uv_axis_of(uv_axis *a, float scale, float offset, uint32_t size) {
+    uint32_t key[3] = { 0, 0, size };
+    memcpy(&key[0], &scale, sizeof key[0]);
+    memcpy(&key[1], &offset, sizeof key[1]);
+    if (a->ok && !memcmp(key, a->key, sizeof key)) return a;
+    memcpy(a->key, key, sizeof key);
+    a->ok = 1;
+    a->scale = scale; a->offset = offset; a->size = (double)size;
+    a->zero = uv_axis_exact(0.0f, scale, offset, size);
+    a->sneg = key[0] & 0x80000000u;
+    const int scale_ok = uv_split(key[0], &a->smag, &a->sexp);
+    a->omag = 0; a->oexp = 0;
+    const int offset_ok = !(key[1] << 1) || uv_split(key[1], &a->omag, &a->oexp);
+    a->oneg = a->omag && key[1] >> 31;
+    if (!scale_ok || !offset_ok) a->path = UV_EXACT;
+    else if (a->smag == 0x8000 && !a->omag) {
+        a->path = UV_POW2;
+        a->k = ge_ldexp(a->sneg ? -a->size : a->size, a->sexp);
+    } else a->path = UV_SUM;
+    return a;
+}
+
+/* uv_axis_texels for all but a normal u under UV_POW2. The sum below holds
+ * for UV_POW2 too. */
+static float uv_axis_other(const uv_axis *a, float u) {
+    uint32_t b;
+    memcpy(&b, &u, sizeof b);
+    int64_t mag;
+    int exp;
+    if (a->path == UV_EXACT) return uv_axis_exact(u, a->scale, a->offset, (uint32_t)a->size);
+    if (!uv_split(b, &mag, &exp)) {
+        if (!(b << 1)) return a->zero;
+        return uv_axis_exact(u, a->scale, a->offset, (uint32_t)a->size);
+    }
+    /* ge_sum of the product's term and the offset's, as it sums them: each
+     * on the grid of the larger exponent, cut toward zero, added, and the
+     * total cut to 16 bits. The product's term is never zero. The signs are
+     * applied as two's complement negations, without branches: a texture's
+     * coordinates have both. */
+    const int64_t m1 = (mag * a->smag) >> 15;
+    const int e1 = exp + a->sexp;
+    const int64_t neg1 = (int64_t)((b ^ a->sneg) >> 31);
+    int64_t s;
+    int e = e1;
+    if (!a->omag) s = (m1 ^ -neg1) + neg1;
+    else {
+        if (a->oexp > e) e = a->oexp;
+        const int d1 = e - e1, d2 = e - a->oexp;
+        const int64_t t1 = m1 >> (d1 < 63 ? d1 : 63), t2 = a->omag >> (d2 < 63 ? d2 : 63);
+        s = ((t1 ^ -neg1) + neg1) + ((t2 ^ -a->oneg) + a->oneg);
+        if (!s) return (float)(0.0 * a->size);
+    }
+    /* The total to 16 bits, then its magnitude times the size, converted,
+     * and the sign put back: rounding to nearest is the same either side of
+     * zero. */
+    const int64_t sneg = s >> 63;
+    int64_t m = (s ^ sneg) - sneg;
+    const int len = 64 - __builtin_clzll((uint64_t)m);
+    const int sh = len > 16 ? len - 16 : 0;
+    m >>= sh;
+    uint64_t r = ge_bits(ge_ldexp((double)m, e - 15 + sh) * a->size);
+    r ^= (uint64_t)sneg << 63;
+    return (float)ge_from_bits(r);
+}
+static inline float uv_axis_texels(const uv_axis *a, float u) {
+    uint32_t b;
+    memcpy(&b, &u, sizeof b);
+    if (a->path == UV_POW2 && ((b >> 23) & 0xFFu) - 1u < 0xFEu) {   /* a normal u */
+        const uint32_t cut = b & ~0xFFu;
+        float f;
+        memcpy(&f, &cut, sizeof f);
+        return (float)((double)f * a->k);
+    }
+    return uv_axis_other(a, u);
+}
+
+/* Both axes under the registers as they stand. */
+typedef struct { uv_axis u, v; } uv_xform;
+static const uv_xform *uv_xform_now(void) {
+    static uv_xform x;
+    uv_axis_of(&x.u, g_ge.tex_scale_u, g_ge.tex_offset_u, g_ge.tex_w);
+    uv_axis_of(&x.v, g_ge.tex_scale_v, g_ge.tex_offset_v, g_ge.tex_h);
+    return &x;
+}
+static inline void uv_texels_with(const uv_xform *x, float u, float v, float *tu, float *tv) {
+    *tu = uv_axis_texels(&x->u, u);
+    *tv = uv_axis_texels(&x->v, v);
+    note_uv(*tu, *tv);
+}
 static void uv_to_texels(float u, float v, psp_vertex *out) {
-    static ge_sp_memo su, ou, sv, ov;
-    const ge_sp us = ge_sp_of(u), vs = ge_sp_of(v);
-    const ge_term tu[2] = { ge_mul_sp(&us, ge_sp_memo_of(&su, g_ge.tex_scale_u)),
-                            ge_mul_sp(ge_sp_memo_of(&ou, g_ge.tex_offset_u), &GE_SP_ONE) };
-    const ge_term tv[2] = { ge_mul_sp(&vs, ge_sp_memo_of(&sv, g_ge.tex_scale_v)),
-                            ge_mul_sp(ge_sp_memo_of(&ov, g_ge.tex_offset_v), &GE_SP_ONE) };
-    out->u = (float)(ge_sum(tu, 2) * (double)g_ge.tex_w);
-    out->v = (float)(ge_sum(tv, 2) * (double)g_ge.tex_h);
-    note_uv(out->u, out->v);
+    uv_texels_with(uv_xform_now(), u, v, &out->u, &out->v);
+}
+static void read_uv_model_at(const uv_xform *x, const uint8_t *vp, uint32_t addr, uint32_t vtype, int tex_off,
+                             float *tu, float *tv) {
+    float u, v;
+    *tu = *tv = 0.0f;
+    if (read_uv_raw_at(vp, addr, vtype, tex_off, &u, &v)) uv_texels_with(x, u, v, tu, tv);
 }
 
 static double ge_dot4(const double row[4], const double in[4]) {
@@ -3109,6 +3247,10 @@ static uint32_t decode_model_batch(const ge_vlayout *vl, uint32_t first, uint32_
     }
     const uint32_t base_colour = current_colour();
     const int vertex_colour = vl->col_off >= 0 && VT_COLOR(vtype) >= 4;
+    const uv_xform *ux = uv_xform_now();
+    const int shade = g_tl.tex_map_mode == PSP_TEXMAP_SHADE;
+    shade_lights sl;
+    if (shade) shade_lights_of(&sl);
     uint32_t decoded = 0;
     for (; decoded < n; decoded++) {
         uint32_t a;
@@ -3130,14 +3272,12 @@ static uint32_t decode_model_batch(const ge_vlayout *vl, uint32_t first, uint32_
         if (vertex_colour) m->rgba = read_colour_at(vp, a, vtype, vl->col_off);
         if (want_normal) read_normal_model_at(vp, a, vtype, vl->norm_off, m->nrm);
         else { m->nrm[0] = m->nrm[1] = 0.0f; m->nrm[2] = 1.0f; }
-        psp_vertex uv;
-        read_uv_model_at(vp, a, vtype, vl->tex_off, &uv);
+        read_uv_model_at(ux, vp, a, vtype, vl->tex_off, &m->u, &m->v);
         /* Shade mapping's coordinates come from here, the transform
          * stays the backend's: a second pass over the same geometry
          * tests for equal depth, and WipEout Pulse's buildings draw
          * their concrete that way over the shade pass. */
-        if (g_tl.tex_map_mode == PSP_TEXMAP_SHADE) shade_map_uv(m->nrm, &uv);
-        m->u = uv.u; m->v = uv.v;
+        if (shade) shade_map_uv(&sl, m->nrm, &m->u, &m->v);
         note_colour(m->rgba);
     }
     return decoded;
@@ -3281,12 +3421,14 @@ static int decode_xform_vertex(const xform_draw *d, uint32_t i, psp_vertex *o, f
     const uint64_t _p3 = ge_prof_now();
     note_colour(o->rgba);
     if (d->blended) { o->u = mv.u; o->v = mv.v; }
-    else read_uv_model_at(vp, a, vtype, vl->tex_off, o);
+    else read_uv_model_at(uv_xform_now(), vp, a, vtype, vl->tex_off, &o->u, &o->v);
     if (g_tl.tex_map_mode == PSP_TEXMAP_SHADE) {
         float nm[3];
         if (d->blended) memcpy(nm, mv.nrm, sizeof nm);
         else read_normal_model_at(vp, a, vtype, vl->norm_off, nm);
-        shade_map_uv(nm, o);
+        shade_lights sl;
+        shade_lights_of(&sl);
+        shade_map_uv(&sl, nm, &o->u, &o->v);
     }
     if (g_tl.tex_map_mode == PSP_TEXMAP_MATRIX) texgen_uv(model, o);
 

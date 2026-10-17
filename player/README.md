@@ -28,6 +28,12 @@ launcher's Packs page or with `--add-pack`. Each pack's checks run in the
 builder, and its file is added to a copy of the staged app as a player would
 add it, which compiles the pack with the app's own Zig.
 
+The runtime and player archives are built twice. The builder's gcc builds
+the ones the app's own programs and checks link. The app's own `zig cc`
+builds the ones staged for games, as ThinLTO bitcode, so that a game's link
+optimizes the game's code and theirs together. The player's C++ (`ui.cpp`
+and ImGui) stays the builder's in both.
+
 The build needs an x86-64 Linux host with:
 - Python 3.9+, curl, tar and Bubblewrap;
 - unprivileged user namespaces.

@@ -36,12 +36,12 @@ def build_tools(b):
     return dict(zlib=zlib, ssl=ssl, decrypt=decrypt, python=python, prefix=prefix, zig=zig)
 
 
-def stage_tools(b, tools, obj):
+def stage_tools(b, tools, obj, archives):
     resource = b.RESOURCES
     # The on-device recipes and what they read: psprecomp's and SDL's
     # headers, the recompiler's loader headers, the runtime and player
-    # archives every game links, and the pack API marker each pack's
-    # launcher.so is built with.
+    # archives every game links (archives: b.game_archives), and the pack
+    # API marker each pack's launcher.so is built with.
     for name in ("import_game.py", "compile_game.py", "emit-split.py", "pack.py"):
         b.copy(b.TOOLKIT / "player" / name, resource / name)
     b.copy(b.RECIPE / "game_fingerprints.py", resource / "game_fingerprints.py")
@@ -49,8 +49,8 @@ def stage_tools(b, tools, obj):
     shutil.copytree(b.DEPS / "include/SDL2", resource / "include/SDL2")
     for header in sorted((b.TOOLKIT / "tools/allegrexrecomp").glob("*.h")):
         b.copy(header, resource / "recomp" / header.name)
-    b.copy(obj / "libruntime.a", resource / "libruntime.a")
-    b.copy(obj / "libplayer.a", resource / "libplayer.a")
+    b.copy(archives / "libruntime.a", resource / "libruntime.a")
+    b.copy(archives / "libplayer.a", resource / "libplayer.a")
     b.copy(b.TOOLKIT / "src/host/pack_api.c", resource / "pack_api.c")
     b.copy(b.TOOLKIT / "src/host/title_plain.c", resource / "title_plain.c")
     # Whole-app identity is provenance only. Game compatibility is recorded

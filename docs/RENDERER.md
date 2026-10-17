@@ -359,6 +359,548 @@ fixed hangar capture costs 1.27 ms and remains byte-identical before and after
 instrumentation. The measured ~30 fps cadence is therefore not GPU saturation;
 even a 16.7 ms budget has substantial headroom on this host.
 
+The CPU side was profiled the same way. The profile used WipEout Pulse's recorded
+race (`race2.pad`, paced, 60 fps) on the toolkit-fixes-21 release on a Ryzen
+7 5800X3D, sampled every 2 ms of process CPU time by
+`build/wipeout-run/profwatch.so`. The first 145 s used 84 s of CPU, nearly
+all of it on the one guest thread that runs at a time. That is about 10 ms of
+a 16.7 ms frame, matching the 10.0 ms host-work p50 that the frame-time log
+recorded for the same race at toolkit-fixes-13. The samples
+split as follows:
+
+| Where | Share of CPU |
+|---|---|
+| GE list processing on the CPU (`run_list_body`, inclusive) | 45% |
+| ... CPU vertex path (`draw_prim_transformed`) | 23% |
+| ... of which `uv_to_texels` (GE-exact TEXSCALE/TEXOFFSET) | 9.3% |
+| ... texture decode (`decode_level` via `sample_texel_bounded`) | 14% |
+| Mesa driver (libgallium) on the guest thread | 9.5% |
+| Mesa's own threads (`gl0`, `cs0`, `gdrv0`), sampled as the drain's wait | 6.5% |
+| `psp_mem_ptr` + `psp_read*`/`psp_write*` + `psp_mem_mark_write` (self) | 22% |
+| VFPU/FPU helpers | 6% |
+
+The guest-memory row is spread across both sides. The largest single callers
+of `psp_mem_ptr` are the texture decoder's per-texel `psp_read8`/`psp_read32`,
+and `psp_sv_q` stores account for most `psp_mem_mark_write` time. The
+release's own report agrees: texture decode is 13.7 s over the 155 s race
+(5,476 MiB of RGBA decoded) and upload is 5.5 s.
+
+The sampler first reported that 6.5% as the scheduler, in
+`psp_os_cond_wait_until` under `psp_sched_drain`. That was wrong. ITIMER_PROF
+counts the CPU time of all threads, but its SIGPROF is process-directed. The
+kernel delivers such a signal to any thread that does not block it
+([signal(7)](https://man7.org/linux/man-pages/man7/signal.7.html),
+[setitimer(2)](https://man7.org/linux/man-pages/man2/setitimer.2.html)).
+Mesa's worker threads block every signal (`SigBlk` fffffffe3ffbfaff in
+`/proc/PID/task/*/status`), and so does SDL's audio thread. Their CPU time
+therefore expires the timer, but the sample lands on a thread that accepts
+the signal. That thread is usually asleep, most often the main context
+waiting in its drain. A re-run on release-new (e2479ce), comparing samples
+with each thread's utime+stime from `/proc` at the dump (150 s, 96 s of CPU),
+shows it:
+
+| Thread | CPU by `/proc` | CPU by samples |
+|---|---|---|
+| guest thread holding the token | 86.4 s | 86.7 s |
+| main context (the drain) | 0.39 s | 6.50 s, 6.48 s of it in the wait |
+| Mesa `gl0` 4.41 + `cs0` 1.57 + `gdrv0` 0.77, shader and SDL audio threads | 6.91 s | 0 |
+
+The samples in a blocking wait add up to 6.89 s, which matches the
+6.91 s of CPU used by the threads that block SIGPROF. So when you read a
+profwatch dump, treat samples in `pthread_cond_wait`, `clock_nanosleep` or
+similar waits (glibc is stripped, so these symbolize as `sem_trywait` /
+`__nptl_death_event`) as driver and audio time, not as the waiting thread's.
+
+The scheduler costs little. The drain does not poll. Its deadline is the
+run's drain limit (a year when there is none), and it timed out 0 times.
+It does wake on every handoff, because each handoff broadcasts the one
+`g_turn` condition variable that every parked host thread waits on. Counters
+in a copy of `sched.c`, over 80 s of the race, measured:
+
+- 254 handoffs/s, each waking about 5 host threads
+- 218 drain wakeups/s, all spurious
+- 822 spurious guest-thread wakeups/s, out of 896
+
+The drain thread used 1.7 ms of CPU per second for its wakeups, about
+7.7 µs each. At that rate the whole herd comes to about 8 ms/s, around 1%
+of the process's CPU, and almost none of it on the thread holding the token.
+Per-slot condition variables would remove it. They would also change the
+handoff, `psp_sched_run_on`, the stop and terminate paths and the save-state
+retire/reload, which is where the SIGINT hang (eb7c51b) and the GL-claim race
+lived. For ~1% that was not worth the risk, so the scheduler is unchanged.
+
+The GL API, SDL and presenting therefore come to about 16%: 9.5% in the driver
+on the guest thread and 6.5% on its own threads. That is more than the 10%
+first estimated but still not the bulk. A different host API (SDL3, Vulkan,
+SDL_GPU) would only reach that slice. The costs that matter are our own CPU work:
+- per-texel guest reads in the texture decoder
+- the double-precision GE arithmetic per vertex
+- out-of-line guest memory access, from the recompiled code and the decoder alike
+
+The first of those is now fixed. `decode_rows` in `src/render.c` decodes a
+level one row at a time from host memory. It resolves the guest address once
+per row, or once per 16-byte piece of a swizzled row, and it caches palette
+entries for the level. A row that reaches past its memory region or the
+padding bound still goes through `sample_texel_bounded`, so the padding counts
+stay exact. On the same race, decode fell from 14.0 s to 2.9–3.2 s, saving
+about 1.2 ms a frame. That was two runs of each on the fixes-21 app with only
+`render.c.o` swapped. The readability gate's race measured 13.9 s before and
+2.9 s after. The output did not change: every gate product matched byte for
+byte. A differential fuzz against the per-texel decoder covered all eleven
+formats, swizzled and linear, at region ends and with unmapped palettes. It
+found no difference in texels, padding counts, bad-access counts or the bytes
+shown to the VRAM observer. Upload (5.4–6.5 s) is now the larger part of
+texture binding.
+
+Most of that upload was the same texels again. A census logged every full
+upload and row refresh on the race (8,849 frames) with its reason, in a copy
+of `render_gl.c`. It also hashed the bytes each decode read, to tell a real
+change from a rewrite. On e12e44d, with all of the CPU work in this section,
+the race decoded and uploaded 634 KiB of RGBA a frame:
+
+| Why the texels were decoded again | KiB a frame | Share |
+|---|---|---|
+| Write generation moved, texels and palette byte for byte the same | 431 | 68% |
+| Rows refreshed, mostly of the display buffer sampled as a 512×512 texture | 191 | 30% |
+| New entries, evictions, and texels or palettes that did change | 12 | 2% |
+
+The first row is WipEout's texture pool in VRAM. The race's textures are
+CLUT4 and CLUT8, swizzled, with mip chains, and each palette sits just before
+its texels. The game copies them into the pool again and again with the same
+bytes. Each copy moves the write generation, and the cache took that as new
+content: about 143,000 full decodes and uploads over the race. Slot collisions
+and palette-keyed duplicates were not a factor (1,554 evictions in all, and
+almost no entry was made again with bytes it had held before).
+
+So the cache now checks the bytes. An entry uploaded again because its bytes
+changed keeps a copy of the guest bytes it was decoded from: each level and
+the palette, or one range per row for a texture refreshed by rows. When its
+generation moves the next time, the bytes are compared with the copy first.
+If they are all the same, the entry already holds what a decode would give,
+and it is revalidated without one. A refresh by rows decodes only the rows
+whose bytes differ from the copy. The copy holds exactly the bytes the decoder
+reads; a level wider than its stride reads past its rows and gets no copy.
+Bytes under an asynchronous readback still in flight are never read for a
+copy or a comparison, because touching them would land the readback earlier
+than anything else would. They count as changed. Copies are kept for entries
+that have changed at least once, within a budget of 64 MiB; the race holds
+3.1 MiB in 1,448 of them.
+
+On the race, uploads fell from 148,993 to 6,835 and the RGBA decoded from
+5,476 to 1,560 MiB. Base and new ran side by side, twice, as release e12e44d
+with only `render_gl.c`'s object swapped. That object was built the way the
+package builds the game archives; the base source rebuilds byte-identical
+to the release's.
+
+| | e12e44d | Bytes checked against a copy |
+|---|---|---|
+| Process CPU, first 150 s | 60.5 s, 59.8 s | 53.7 s, 54.6 s (−10%) |
+| `timing: texture bind` | 11.6 s, 11.0 s | 3.8 s, 3.5 s |
+| ... decode | 3.2 s, 3.1 s | 0.6 s, 0.6 s |
+| ... upload | 5.8 s, 5.7 s | 0.6 s, 0.6 s |
+
+Mesa's own threads did not get cheaper. `gl0`, `cs0` and `gdrv0` used 8.0 and
+6.0 s before and 8.8 and 7.5 s after, with `gl0` up by about 1 s. An upload
+from client memory makes glthread synchronize: `glTexImage2D` and
+`glTexSubImage2D` are marked `marshal_sync` unless a pixel unpack buffer is
+bound
+([`gl_API.xml`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/mesa/glapi/glapi/gen/gl_API.xml)).
+When it synchronizes, glthread runs its pending batch on the calling thread
+([`_mesa_glthread_finish`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/mesa/main/glthread.c)).
+With 95% fewer uploads, draw work that used to run on the game's thread
+during those syncs now runs on `gl0`. The saving shows up on the game's
+thread, and in the process total. The uploads that remain still synchronize;
+sending them through a pixel unpack buffer would not.
+
+What is left, 180 KiB a frame, changes for real:
+- 74%: the display texture's rows 272–407. They lie over two 256-wide 8888
+  targets that are drawn every frame. A 512-wide view cannot take them from
+  the GPU, so they are read back and decoded. The game probably samples only
+  the top 272 rows, but knowing that would take each draw's texture
+  coordinate range, which the GPU transform does not report.
+- 13%: 512×512 8888 textures in main RAM, different almost every time they
+  are bound.
+- 8%: pool textures that did change, and new ones.
+- 5%: rows over the 5650 target. Its 16-bit pixels must come from guest
+  memory for the decode to match.
+
+The output did not change. A variant that, on every decode the copy saved,
+read the texture back with `glGetTexImage` and compared it with a fresh
+decode found no difference over the whole race: 478,900 levels in 142,158
+skipped decodes, and all 168,427 rows kept. The GL runs of the readability gate matched base
+byte for byte: The 3rd Birthday's 8 window images, the race's 15 images and
+its 8,849 frames at 154.521 s of guest time, and the race start, twice. Only
+the race's wall clock differs. The gate's software-renderer runs never reach
+`render_gl.c`. `tests/test_texcache_gl.c` draws through the GL backend:
+rewrites of the same texels and palette, then a changed texel, a changed
+palette entry and one changed row. It fails when a skip ignores changed
+bytes.
+
+The uploads that remain no longer make glthread synchronize. Every texel
+upload now goes through `tex_image` or `tex_sub_image`: a cached level, a
+refreshed row span, a CPU import, a target's first contents, the save dialog
+and the menu's textures. They copy the texels into a sixth persistently
+mapped ring, `RING_UNPACK` (16 MiB), bind it as the pixel unpack buffer for
+that one call, and name an offset into it. glthread then queues the call
+like a draw. On Mesa 26.2.4, radeonsi asks for blit- and compute-based
+texture transfers, so the texels reach the texture by a copy on the GPU
+([`try_pbo_upload`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-26.2.4/src/mesa/state_tracker/st_cb_texture.c)),
+not by the driver reading the mapping.
+The ring's ranges come back under the frame fences, like the other rings'.
+An upload over a quarter of the ring, and every upload when the rings are
+not persistently mapped, still goes from client memory. The decoder does not
+write into the mapping itself. The mapping is write-combined, and the 8888
+decode reads back each row it gathers into its output. libc's `memcpy` does
+the copy in its AVX loop, with no `rep movs`: 55 samples (0.11 s) over the
+race, for 1,567 MiB.
+
+Base (aa17354, the copies above) and new ran side by side, twice, with only
+`render_gl.c`'s object swapped. Other sessions kept the machine at a load of
+8 to 12, which is why the CPU is higher than in the table above.
+
+| | Bytes checked against a copy | Unpack ring |
+|---|---|---|
+| Process CPU, first 150 s | 70.4 s, 64.5 s | 70.4 s, 63.6 s |
+| Guest thread | 55.9 s, 51.1 s | 55.8 s, 50.2 s |
+| `gl0` + `cs0` + `gdrv0` | 10.95 s, 10.00 s | 11.03 s, 10.06 s |
+| `timing: texture bind` | 4.6 s, 4.2 s | 4.0 s, 3.6 s |
+| ... upload | 0.80 s, 0.67 s | 0.11 s, 0.11 s |
+| Fence waits, rings and readback | 2.11 s, 1.87 s | 2.26 s, 1.99 s |
+
+Time inside the upload calls fell by 85%, and texture binding by about
+0.6 s. About 0.1–0.15 s of that came back as longer fence waits, probably
+because glthread now runs further behind, so a wait finds more of it still
+queued. The CPU did not change beyond the spread between runs. The work
+moved rather than went away. Before, a synchronizing upload ran glthread's
+pending batch on the guest thread; now `gl0` runs it. The texels are still
+copied once on the CPU, into the ring now rather than into the driver's
+staging buffer. The race is paced, so what the guest thread gains is time
+within its frame, about 50 µs, not CPU.
+
+The output did not change. The GL runs of the readability gate matched base
+byte for byte: The 3rd Birthday's 8 window images (547 of its uploads went
+through the ring), the race's 15 images and its 8,849 frames at 154.521 s of
+guest time, and the race start, twice. Only the race's wall clock differs.
+`tests/test_texcache_gl.c` now uploads through the ring, and it fails when
+the offset an upload names is one texel off.
+
+The vertex path was then made cheaper without changing a result. Almost
+none of it is the CPU transform. Counted over 120 s of the same race, 99.6%
+of transformed vertices (399 M, in 4.0 M draws) took the GL backend's own
+transform (`draw_model`). The CPU transform took 259 k screen-space draws
+(the HUD, 1.7 M vertices) and 1 k point, line and sprite draws. No draw was
+skinned, morphed or tessellated, and `model_ok` never refused one. So the
+23% is the CPU decode that feeds the GPU transform, which covers:
+- reading each vertex's position, colour and normal
+- taking its texture coordinates through the GE-exact TEXSCALE/TEXOFFSET sum
+- shade mapping, for 14% of the vertices
+- `gl_draw_model`'s append
+
+Moving the HUD's draws to the GPU transform would gain nothing: they are 0.4%
+of vertices, and the backend tells HUD from scene by that path's screen-space
+flag. Three changes made the decode cheaper:
+- `uv_to_texels` splits the scale and the offset once per value rather than
+  once per vertex. A coordinate that is a normal float goes through the same
+  `ge_mul_sp` product and `ge_sum` sum, split from its own bits. With a
+  power-of-two scale and no offset (86% of the race's coordinates) that is
+  the float with its low 8 fraction bits cleared, times one constant.
+  `tests/test_ge_arith.c` compares it bit for bit with the sum built from
+  `ge_mul` over 10 M inputs:
+  - every 8- and 16-bit coordinate under geprobe 22's scales 1, 2^8 and 2^12
+    and the offsets its scene 140 used
+  - random floats of every exponent
+  - zeroes, subnormals, infinities and NaNs
+
+  It allows one difference: which NaN comes out of the plain double sum
+  that non-finite inputs take, because that depends on the compiler's
+  operand order.
+- The decode loop takes its readers inline, and shade mapping takes its two
+  lights' lengths once a batch. The float operations are the same ones.
+- `gl_draw_model` stores each vertex's draw index straight into the mapped
+  ring. Staged in an array, the copy compiled to an inline `rep movsq` into
+  the persistent mapping, which took about 2% of the run's CPU by itself.
+
+For a fair comparison, both builds ran the race at the same time, so they
+shared the machine's load. One was release-new; the other was the same app
+with the new `ge.c` and `render_gl.c` objects swapped in. Both were dumped at
+150 s:
+
+| | Before | After |
+|---|---|---|
+| Process CPU, first 150 s | 90.2 s | 79.9 s |
+| Vertex path: the decode for `draw_model`, and `gl_draw_model` | 19.4 s (21.5%) | 10.5 s (13.1%) |
+| ... `uv_to_texels` | 8.7 s | inline, and 1.3 s in rare-case calls |
+| ... `gl_draw_model` and its copies | 3.8 s | 1.4 s |
+| The GL report's model-path append time | 4.68 s | 2.13 s |
+
+The decode loop alone, with its data in cache, went from 18.0 to 5.8 ns a
+vertex for 8-bit coordinates and a float position, and from 36.4 to 18.1 ns
+with shade mapping. Both builds decode identical bytes.
+
+The readability pass's replay gate (`build/readability/gate.sh`) ran with the
+two objects swapped into release-new. It matches release-new in all 64
+deterministic products:
+- the four pack replays' GE captures, audio and log lines
+- WipEout's headless frames
+- The 3rd Birthday's GL window images
+- the race's 15 images and its 8,849 frames
+- the race start, twice
+
+Only the race's wall clock differs.
+
+The third is fixed too. `psp_read*` and `psp_write*` answer main RAM and the
+module image first, from a two-window map that `src/mem.c` keeps current,
+before any of `psp_mem_ptr`'s region checks. (They were inline at first; the
+part on preparation below takes them back out of line.) WipEout's
+executable is linked at 0, so its globals live in the module image. A store
+there stamps the same write generation, with the same serial, that
+`psp_mem_mark_write` would. VRAM, the scratchpad, bad addresses, and stores
+while the write watch or an overlapping write observer is set still go out of
+line. The comparison was release-new (e2479ce) against the same build with the
+change: every runtime object rebuilt with the package's gcc, and the game
+recompiled at import. CPU time at the 150 s mark of the same race, two runs
+each:
+
+| Build | CPU at 150 s |
+|---|---|
+| release-new (e2479ce) | 94.1 s, 88.5 s |
+| inline guest memory access | 80.0 s, 77.1 s (−14%) |
+| ... with the runtime built by zig cc instead of gcc | 80.0 s, 75.7 s |
+| ... plus ThinLTO across the runtime and the game | 72.6 s, 71.7 s (a further −7%) |
+
+Other sessions kept the load average at 2–6, and repeat runs of one build
+differ by up to 6%. Out-of-line memory access fell from about 20 s to 4.3 s of
+CPU. The generated code took back about 2.5 s, because the accesses now run
+there. What is left is mostly the texture decoder's per-texel VRAM reads, which
+the row decoder above replaces. The output did not change: the readability
+gate matched byte for byte (64 of 64 products, apart from the race's wall
+clock), and the pspautotests sweep gave the same output on all 422 stable
+tests. Inline, the cost was code size. The game's code doubled (15 to 32 MB of
+text, 60 to 184 MB on disk with debug info), and preparing WipEout took 118 s
+instead of 56 s.
+
+ThinLTO is now adopted. The package builds the runtime and player archives
+twice. The builder's gcc builds the ones the app's own programs and checks
+link. The app's own zig cc builds the ones staged for games, as ThinLTO
+bitcode (`game_archives` in `player/linux/build.py`). The player's C++
+(`ui.cpp` and ImGui) stays gcc's in both. `compile_game.py` compiles a
+game's C with `-flto=thin` too, so its link optimizes the generated code and
+the runtime together. Nothing else in the build links the game archives, so
+a package check links a plain game with no code of its own against them and
+starts it. The measurements below come from two full releases on the same
+race: inline guest memory access on e2479ce with gcc archives, and the same
+build with this change. One run of each ran side by side, twice:
+
+| Release | CPU at 150 s | Preparing WipEout | Game code |
+|---|---|---|---|
+| inline memory access, gcc archives | 77.4 s, 77.6 s | 114.9 s, 114.9 s | 32.3 MB |
+| ... with ThinLTO | 72.3 s, 71.9 s (−7%) | 130.5 s, 130.5 s (+14%) | 36.8 MB |
+
+The saving is the same 7% the experiment measured. The preparation cost is
+about half the experiment's 30 s. The experiment's imports ran one at a time
+under changing load: its two builds without LTO, gcc and zig, already
+differed by 17 s. These imports ran back to back, alternating, and each
+release's two runs agreed to 0.1 s. With debug info, the game's file grows
+from 176 to 214 MB. The output did not change. The readability gate matched
+base byte for byte: 64 of 64 products, apart from the race's wall clock.
+All four pack games were prepared, linked and replayed with the new
+archives, and both packs' files are byte-identical to release-new's. The
+archives and the recipe are part of every game's fingerprint, so each game
+is prepared once more after the update.
+
+What did preparation pay for? Inline, every one of WipEout's ~190,000 loads
+and stores carried both window checks, and every store its generation stamp.
+Compiled on their own (zig cc `-O2`, no LTO, no debug info), its 32 chunks of
+generated C make 12.5 MB of code with out-of-line accessors and 29.3 MB with
+inline ones. The stores are 9.4 MB of the difference and the loads 7.1 MB; the
+second window costs 7.3 MB and the stamp 4.2 MB. Marking the slow halves cold
+makes the code larger.
+
+At run time the inlining bought nothing. Below are release builds of each
+variant on the same race (CPU at 150 s against the inline build, the mean of
+rounds run four or five builds side by side), with WipEout's preparation (the
+best of two or three imports; other sessions kept the load at 4–25):
+
+| Accessors | CPU | Game code | Game file | Preparing WipEout |
+|---|---|---|---|---|
+| inline (as merged) | — | 36.8 MB | 214 MB | 147 s |
+| inline for RAM only, the module out of line | −3.5% | 29.5 MB | 159 MB | 113 s |
+| loads inline, stores out of line | −5.1% | 26.8 MB | 142 MB | 103 s |
+| out of line, through the map | −3.0% | 19.8 MB | 82 MB | 78 s |
+| out of line, before the map | +11.7% | 20.6 MB | 83 MB | 76 s |
+
+The rounds disagree by up to 4% (two homes of the inline build, side by side,
+by 0.7%), so every variant that keeps the map runs as fast as the inline one.
+Only the accessors from before the map are slower. The map was the win, not
+the inlining. `psp_read*` and `psp_write*` are out-of-line functions again,
+`noinline` so that a game's ThinLTO link does not copy them back into every
+call site, and the map is private to `src/mem.c`. The slow halves are
+`noinline` too: the inline build's link had copied them into about 4,000 call
+sites.
+
+zig cc adds DWARF by default, and for generated C it was most of the game's
+file. Nothing reads it: profwatch symbolizes with `nm`, gdb's backtraces need
+only the symbol table and `.eh_frame`, and save states are guest state.
+`compile_game.py` passes `-g0`, which takes WipEout's game from 82 to 32 MB.
+Together:
+
+| | CPU | Game code | Game file | Preparing WipEout |
+|---|---|---|---|---|
+| inline, as merged | — | 36.8 MB | 214 MB | 147 s |
+| out of line, `-g0` | −3.0% | 19.8 MB | 32 MB | 64–83 s |
+
+Compiling the generated C without `-flto=thin`, with the runtime still ThinLTO,
+would bring preparation to 57 s and the code to 15.2 MB, at about 1% more CPU
+on average, within the rounds' noise. That gives up ThinLTO across the game's
+own code, a decision of its own, so it is not part of this change.
+
+The output did not change. The readability gate matched base byte for byte:
+64 of 64 products, apart from the race's wall clock. (Silent Line's replay ran
+on its own, once its deleted input pad was restored.) The pspautotests sweep
+gave the same output on all 422 stable tests.
+
+Each of these changes was measured on its own against release-new (e2479ce)
+or, for ThinLTO, against the inline-memory build. Release-merged (e12e44d) is
+the first release with all four, built by the player packaging as release-new
+was. It ran the race side by side with release-new, one in each of two homes
+on the same machine, and both were dumped at 150 s. That was done twice:
+
+| | release-new (e2479ce) | All four (e12e44d) |
+|---|---|---|
+| Process CPU, first 150 s | 95.4 s, 96.1 s | 62.3 s, 61.5 s (−35%) |
+| ... the guest threads, by `/proc` | 86.3 s | 52.1 s (−40%) |
+| ... Mesa's own threads, by `/proc` | 8.4 s | 8.8 s |
+| GL report: texture bind | 23.5 s, 23.8 s | 12.1 s, 12.5 s |
+| ... of which decode | 13.9 s, 14.4 s | 3.2 s, 3.3 s |
+| ... of which upload | 6.2 s, 6.7 s | 5.9 s, 6.3 s |
+| GL report: model-path append | 5.7 s, 7.5 s | 1.7 s, 1.4 s |
+| GPU draw and blit, mean a frame | 0.96 ms, 0.91 ms | 0.93 ms, 0.93 ms |
+| Preparing WipEout | 70.1 s, 57.0 s | 159.2 s, 156.3 s |
+| ... CPU time of the preparation | 223 s, 173 s | 920 s, 920 s |
+| Game code (text) | 15.1 MB | 36.8 MB |
+
+The `/proc` rows are means of the two runs. Both builds rendered all 8,849
+of the race's frames. The guest threads now use 5.8 ms of CPU per 16.7 ms
+frame, down from 9.6 ms. The four savings measured one at a time add up to
+more than the 34 s saved together, because they overlap. Release-new spent
+20.5 s in out-of-line memory access, called from the generated code (8.8 s),
+the VFPU's `sv.q` and `lv.q` (6.2 s) and the texture decoder (4.4 s).
+
+Other sessions' builds kept the machine busy, so the runs need some context:
+- Each pair started at a load average of 4–7.
+- The second pair was interrupted when the machine slept 23 s into the run.
+  Both runs lost the same 5.7 s on resume, and both agree with the first pair
+  within 1.5%.
+- A third pair started just as other sessions' links raised the load from 5
+  to 16. Release-new fell 11 s behind the race, and both builds used more CPU
+  (109.5 s and 79.6 s, −27%), so that pair is left out.
+- The preparations ran one at a time, alternating, at load 9–16. Their wall
+  time depends on idle cores, because the ThinLTO link runs on about seven
+  of them. Their CPU time does not (919.5 s and 919.7 s).
+
+The readability gate ran on the release itself and matched release-new byte
+for byte: 64 of 64 products, apart from the race's wall clock. The four pack
+games were prepared, linked and replayed with the new archives. WipEout's
+headless stage ends at the runtime's 60 s headless drain, not at the gate's
+90 s limit, so under load it renders fewer than its 16 frames. With
+`PSPRECOMP_DRAIN=150` it rendered all 16, each one identical. Run side by
+side, both builds render that stage at the same speed: 62.7 and 64.2 ns a
+pixel.
+
+The CPU now splits as below. Each guest-thread sample is counted under the
+source file of the function it landed in. For the ThinLTO build that comes
+from `nm -l` on the game. Release-new's gcc runtime carries no line info, so
+its functions are mapped through the members of the staged archives. The
+threads that block SIGPROF are taken from `/proc` instead, as described
+above. Shares are of the process's CPU; seconds are means of the two runs:
+
+| Where (self time) | release-new | All four |
+|---|---|---|
+| GE lists and vertex decode (`ge.c`) | 18.2 s (19.0%) | 14.6 s (23.6%) |
+| Mesa driver, its own threads (`/proc`) | 8.4 s (8.7%) | 8.8 s (14.2%) |
+| FPU/VFPU helpers (`vfpu.c`, `recomp_rt.h`) | 10.7 s (11.2%) | 8.6 s (13.9%) |
+| Mesa driver, on the guest thread | 8.0 s (8.3%) | 7.7 s (12.4%) |
+| Generated game code | 4.8 s (5.0%) | 7.5 s (12.2%) |
+| libc, nearly all of it `memcpy` | 4.9 s (5.1%) | 5.7 s (9.1%) |
+| Texture decode (`render.c`) | 7.8 s (8.1%) | 2.6 s (4.3%) |
+| GL backend (`render_gl.c`) | 7.8 s (8.1%) | 2.2 s (3.6%) |
+| Scheduler and other HLE | 2.2 s (2.2%) | 1.4 s (2.2%) |
+| Audio and video decoding, vDSO clock reads | 1.9 s (2.0%) | 2.0 s (3.2%) |
+| Guest memory access, out of line (`mem.c`, `mem.h`) | 20.6 s (21.5%) | 0.6 s (1.0%) |
+
+The main context and the SDL threads use under 1 s. Out-of-line memory
+access is nearly gone. Some of it comes back where the accesses are now
+inline: the generated code is 2.7 s higher. The GL backend fell mostly
+because `gl_draw_model` no longer copies with `rep movsq`. The driver did not
+change. At 16.4 s across both kinds of thread, it is now 27% of the process
+instead of 17%.
+
+The top 20 self functions on the guest threads:
+
+| | Function | All four | release-new |
+|---|---|---|---|
+| 1 | Mesa driver (libgallium is stripped, so this is all of its functions) | 7.5 s (12.1%) | 7.7 s |
+| 2 | `memcpy` | 3.7 s (6.0%) | 3.1 s |
+| 3 | `uv_axis_texels` | 3.3 s (5.3%) | `uv_to_texels`: 8.6 s |
+| 4 | `draw_prim_transformed` | 2.7 s (4.3%) | inside `draw_prim`: 4.3 s |
+| 5 | `psp_sv_q` | 1.9 s (3.1%) | 1.9 s |
+| 6 | `clut_entry_cached` | 1.9 s (3.0%) | `clut_entry`: 1.0 s |
+| 7 | `run_list` | 1.8 s (2.9%) | `run_list_body`: 1.6 s |
+| 8 | `read_uv_model_at` | 1.8 s (2.8%) | new |
+| 9 | `psp_vfpu_dot` | 1.6 s (2.6%) | 1.7 s |
+| 10 | `psp_lv_q` | 1.3 s (2.1%) | 1.0 s |
+| 11 | `read_vec3_model` | 1.2 s (1.9%) | 1.1 s |
+| 12 | `shade_map_uv` | 1.1 s (1.7%) | 1.1 s |
+| 13 | `hle_call` | 0.9 s (1.5%) | 0.8 s |
+| 14 | `read_src` (VFPU operand reads) | 0.9 s (1.5%) | 1.2 s |
+| 15 | `read_uv_raw_at` | 0.8 s (1.3%) | 0.8 s |
+| 16 | `decode_level` | 0.8 s (1.2%) | 0.4 s |
+| 17 | `read_colour_at` | 0.7 s (1.1%) | inlined (0.01 s) |
+| 18 | vDSO `clock_gettime` | 0.7 s (1.1%) | 0.8 s |
+| 19 | `gl_draw_model` | 0.5 s (0.9%) | 4.9 s |
+| 20 | `psp_body_0002FEDC` (generated) | 0.5 s (0.8%) | 0.4 s |
+
+That ranks the next work:
+- The vertex decode that feeds the GPU transform is still our largest cost,
+  at 14.6 s (24%). The texture-coordinate split, `uv_axis_texels`, leads it,
+  followed by the transform loop and the per-vertex readers.
+- The GL driver takes 16.4 s (27%) across the guest thread and its own
+  threads. This is the share a different host API could reach. Of its 7.5 s
+  on the guest thread, 3.4 s is under `gl_texture`, uploading textures.
+- The VFPU helpers take 8.6 s (14%), plus 0.9 s of `memcpy` called from
+  `read_src`. `sv.q`, `vdot` and `lv.q` lead.
+- The generated code takes 7.5 s (12%), spread thin: its hottest function
+  takes 0.5 s.
+- Texture upload took 5.9–6.3 s by the report, for 148,993 uploads, and none
+  of the four changes touched it. The driver accounts for 3.4 s of it, and
+  `memcpy` called from `gl_texture` itself for 0.7 s.
+- Texture decode is down to 3.2 s by the report, most of it
+  `clut_entry_cached`.
+
+That list was taken on release-merged, before three later changes:
+- The texture-cache copies and the unpack ring, described above, took the
+  texture-upload item.
+- The window-map accessors without DWARF took back the preparation cost.
+
+All of it was then applied to origin/main (29f5279), which had taken PRs
+#14–#17 since release-new. Both releases below package the Last Raven pack at
+e190cb3: c91cb23's settings test, updated for main's b972a1c, which skips a
+settings key it does not know instead of refusing it. Built by the player
+packaging, the two releases ran the readability gate against each other. All
+64 products matched byte for byte, apart from the race's wall clock. WipEout's
+headless stage was rerun with `PSPRECOMP_DRAIN=150` for its sixteenth frame.
+The race ran side by side twice more on a quiet machine (load 1.3–1.7), each
+build dumped at 150 s:
+
+| | main (29f5279) | main with this work |
+|---|---|---|
+| Process CPU, first 150 s | 87.0 s, 85.2 s | 55.9 s, 54.7 s (−36%) |
+| Race frames rendered | 8,849 | 8,849 |
+| WipEout's game file | 58 MB | 32 MB |
+| ... `size` text | 20.0 MB | 26.3 MB |
+
+Per 16.7 ms frame, the process now uses about 6.1 ms of CPU instead of 9.6 ms.
+
 The fixed-list oracle also pins the small arithmetic details that a plausible
 GL image can hide. Interpolated colour and texture-function output are
 quantized at the software path's RGBA8 boundaries; fog and masked alpha tests
